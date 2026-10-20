@@ -92,7 +92,7 @@ fn sparse_layout(layer: cuteafd_loader::V41Exl3Layer) -> cuteafd_loader::V41Exl3
     cuteafd_loader::V41Exl3Residency {
         layer, world: 4, rank: 3,
         intermediate_start: 1536, experts: 256, intermediate: 512, tiers: vec![4],
-        projection_counts: vec![[256; 3]], buffers: vec![], loads: vec![],
+        projection_counts: vec![[256; 3]], unit_map: None, buffers: vec![], loads: vec![],
     }
 }
 

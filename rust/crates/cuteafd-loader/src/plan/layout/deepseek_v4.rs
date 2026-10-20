@@ -172,12 +172,11 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
     let attention = report.requested_attention.unwrap_or(if devices.len() == 2 && context.is_some() {
         crate::placement::AttentionPlacement::Context
     } else { crate::placement::AttentionPlacement::Heads });
+    let host_marks = v4::host_marks_enabled(devices.len(), attention != crate::placement::AttentionPlacement::Heads,
+        options.host_cache_bytes != Some(0));
     let mark_slots = if let Some(slots) = options.prefix_slots { slots }
-        else if options.host_cache_bytes != Some(0) && (devices.len() == 1
-            || attention != crate::placement::AttentionPlacement::Heads) {
-            if options.mimo_prefix_entries == 0 { 0 } else { cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS }
-        } else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
-            shape.native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes)? };
+        else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
+            shape.native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes, host_marks)? };
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),

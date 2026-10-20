@@ -17,8 +17,8 @@
 //! `weight` U8 `[N, K/2]` (two E2M1 codes per byte, the even element in the
 //! low nibble) and `weight_scale` U8 `[N, K/32]` (UE8M0 exponents). The same
 //! programs widen them exactly to BF16 (`fp8-mimop` packages). Legacy padded
-//! slices split `I` in whole 32-element scale blocks and pad to 128; exact
-//! round-robin packages use whole H128 blocks. Opt-in balanced TP6 packages
+//! slices split `I` in whole 32-element scale blocks and pad to 128.
+//! Exact-even packages use whole H128 blocks. Uneven native MXFP4 packages
 //! keep exact K32 widths (352, 352, 352, 352, 320, 320), rotated by absolute
 //! layer. Down scale rows alone are padded to their u32 physical pitch.
 //!
@@ -138,8 +138,8 @@ pub struct Fp8ExpertTensors {
     format: ExpertFormat,
     tensors: Arc<HashMap<String, Located>>,
     activations: Vec<cuteafd_core::FfnActivation>,
-    placement: cuteafd_core::tp_units::TpPlacement,
     slice_layer: usize,
+    coordinator: bool,
 }
 
 /// Parallel readers in the projection-at-a-time native expert loader.
@@ -189,9 +189,11 @@ pub enum Slicing {
     Blocks(usize),
 }
 
-/// Use unequal whole-H128 slices only when every rank's width is packaged.
+/// Use unequal native-unit slices only when every rank's width is packaged.
 /// An incomplete Spark tree or CUTEAFD_FP8_EXACT_SLICES=0 selects the legacy
-/// padded layout. The worker validates its width against the planner recipe
+/// padded layout, except exact-even native splits need no width-specific package.
+/// NVFP4 retains H128 storage padding unless its exact-even width needs none.
+/// The worker validates its width against the planner recipe
 /// before allocation; the coordinator package tree never defines Spark slicing.
 pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
     rank: usize) -> (PathBuf, Slicing) {
@@ -201,8 +203,10 @@ pub fn exact_layout_directory(directory: &Path, tensors: &Fp8ExpertTensors, tp: 
 
 fn exact_layout_directory_with(directory: &Path, tensors: &Fp8ExpertTensors, tp: usize,
     rank: usize, enabled: bool) -> (PathBuf, Slicing) {
-    let padded = (directory.to_path_buf(), Slicing::Padded);
-    if !enabled || tp < 2 || rank >= tp { return padded; }
+    if tp == 0 || rank >= tp { return (directory.to_path_buf(), Slicing::Padded); }
+    let padded = (directory.to_path_buf(), tensors.slicing_for_directory(directory, tp));
+    if tensors.needs_nvfp4_padding(tp) { return padded; }
+    if !enabled || tp < 2 { return padded; }
     let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|name| name.to_str()))
         else { return padded; };
     let exact = tensors.exact_slicing(tp);
@@ -329,7 +333,7 @@ impl Fp8ExpertTensors {
         };
         let mut catalog = Self { snapshot: snapshot.to_path_buf(), shape, prefix: prefix.to_string(), mtp_layers,
             format: ExpertFormat::Fp8Block128, tensors: Arc::new(tensors), activations,
-            placement: cuteafd_core::tp_units::TpPlacement::active()?, slice_layer: first_selected_layer(shape, layers) };
+            slice_layer: first_selected_layer(shape, layers), coordinator: false };
         let first_layer = layers.and_then(|selected| selected.first().copied()).unwrap_or(shape.first_layer);
         let first = catalog.name(first_layer, 0, Fp8Projection::Gate);
         if catalog.located(&first)?.dtype == DType::Bf16 {
@@ -383,23 +387,39 @@ impl Fp8ExpertTensors {
         self.format
     }
 
-    pub fn exact_slicing(&self, tp: usize) -> Slicing {
-        if self.placement == cuteafd_core::tp_units::TpPlacement::Balanced
-            && self.format == ExpertFormat::Mxfp4 && tp == 6 { Slicing::Blocks(32) }
-        else { Slicing::Blocks(128) }
+    /// Coordinator packages retain their fixed contiguous H128 rank ABI.
+    pub fn for_coordinator(&self) -> Self {
+        let mut view = self.clone();
+        view.coordinator = true;
+        view
+    }
+
+    fn slice_rule(&self, units: usize, tp: usize) -> cuteafd_core::tp_units::UnitRule {
+        if self.coordinator { cuteafd_core::tp_units::UnitRule::Contiguous }
+        else { cuteafd_core::tp_units::layer_rule(units, tp) }
+    }
+
+    pub fn exact_slicing(&self, _tp: usize) -> Slicing {
+        Slicing::Blocks(if self.coordinator { 128 } else { self.block() })
+    }
+
+    fn needs_nvfp4_padding(&self, tp: usize) -> bool {
+        self.format == ExpertFormat::Nvfp4 && !self.coordinator
+            && (tp == 0 || self.shape.intermediate == 0 || self.shape.intermediate % (128 * tp) != 0)
     }
 
     pub fn unit_map(&self, tp: usize, rank: usize, slicing: Slicing) -> Result<cuteafd_core::tp_units::RankUnits> {
         let block = match slicing { Slicing::Blocks(g) => g, Slicing::Padded => self.block() };
-        let rule = if slicing == Slicing::Blocks(32) && self.format == ExpertFormat::Mxfp4 {
-            self.placement.rule(block)
-        } else { cuteafd_core::tp_units::UnitRule::Contiguous };
+        let rule = self.slice_rule(self.shape.intermediate / block, tp);
         Ok(cuteafd_core::tp_units::RankUnits::new(rule, self.shape.experts,
             self.shape.intermediate, block, self.slice_layer, tp, rank)?)
     }
 
     pub fn slicing_for_directory(&self, directory: &Path, tp: usize) -> Slicing {
-        if directory.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains("-w")) {
+        if self.needs_nvfp4_padding(tp) {
+            Slicing::Padded
+        } else if directory.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains("-w"))
+            || (tp > 0 && self.shape.intermediate > 0 && self.shape.intermediate % (self.block() * tp) == 0) {
             self.exact_slicing(tp)
         } else { Slicing::Padded }
     }
@@ -551,11 +571,9 @@ impl Fp8ExpertTensors {
         let Slicing::Blocks(g) = slicing else { return self.rank_range(tp, rank) };
         ensure!(rank < tp, "rank {rank} of TP{tp}");
         let i = self.shape.intermediate;
-        ensure!(g > 0 && g % self.block() == 0 && (g % 128 == 0 || self.format == ExpertFormat::Mxfp4)
-            && i % g == 0 && i / g >= tp,
+        ensure!(g > 0 && g % self.block() == 0 && i % g == 0 && i / g >= tp,
             "intermediate {i} does not split into whole {g}-row blocks over {tp} ranks");
-        let rule = if g == 32 && self.format == ExpertFormat::Mxfp4 { self.placement.rule(g) }
-            else { cuteafd_core::tp_units::UnitRule::Contiguous };
+        let rule = self.slice_rule(i / g, tp);
         let map = cuteafd_core::tp_units::RankUnits::new(rule, 1, i, g, self.slice_layer, tp, rank)?;
         let ranges = map.column_ranges(0)?;
         ensure!(ranges.len() == 1, "fixed-width package requires one contiguous range");
@@ -671,8 +689,9 @@ impl Fp8ExpertTensors {
     pub fn rank_range(&self, tp: usize, rank: usize) -> Result<(usize, usize)> {
         ensure!(rank < tp, "rank {rank} of TP{tp}");
         self.slice(tp)?;
-        let map = cuteafd_core::tp_units::RankUnits::new(cuteafd_core::tp_units::UnitRule::Contiguous,
-            1, self.shape.intermediate, self.block(), 0, tp, rank)?;
+        let map = cuteafd_core::tp_units::RankUnits::new(
+            self.slice_rule(self.shape.intermediate / self.block(), tp),
+            1, self.shape.intermediate, self.block(), self.slice_layer, tp, rank)?;
         let range = map.column_ranges(0)?.remove(0);
         Ok((range.start, range.len()))
     }
@@ -972,7 +991,7 @@ mod tests {
         let shape = RoutedExpertShape { layers: 78, first_layer: 3, experts: 256, topk: 8, hidden: 6144, intermediate,
             draft_stages: 0, draft_experts: 0 };
         Fp8ExpertTensors { snapshot: PathBuf::new(), shape, prefix: "model.".into(), mtp_layers: false, format,
-            tensors: Arc::new(HashMap::new()), activations: Vec::new(), placement: Default::default(), slice_layer: 0 }
+            tensors: Arc::new(HashMap::new()), activations: Vec::new(), slice_layer: 0, coordinator: false }
     }
 
     fn ranges(tensors: &Fp8ExpertTensors, tp: usize) -> Vec<(usize, usize)> {
@@ -1457,7 +1476,6 @@ mod tests {
     #[test]
     fn balanced_k32_slices_reconstruct_source_bytes_and_pad_scale_rows() -> Result<()> {
         use crate::plan::testing::{mxfp4, write_snapshot};
-        use cuteafd_core::tp_units::TpPlacement;
         let dir = tempfile::tempdir()?;
         let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2, topk: 1,
             hidden: 256, intermediate: 2048, draft_stages: 0, draft_experts: 0 };
@@ -1469,50 +1487,167 @@ mod tests {
         }
         write_snapshot(dir.path(), &serde_json::json!({}), &fixtures, None);
         let mut tensors = Fp8ExpertTensors::read(dir.path(), shape)?;
-        tensors.placement = TpPlacement::Balanced;
         for located in tensors.tensors.values() {
             let bytes = (0..located.bytes as usize).map(|i| ((i * 17 + i / 13 + 7) % 251) as u8).collect::<Vec<_>>();
             std::fs::OpenOptions::new().write(true).open(dir.path().join(&located.shard))?
                 .write_all_at(&bytes, located.offset)?;
         }
         let slicing = Slicing::Blocks(32);
-        for layer in [0, 3, 40, 77] {
-            tensors.slice_layer = layer;
-            for expert in 0..shape.experts {
-                for projection in Fp8Projection::ALL {
-                    let (w, s) = tensors.projection_bytes(projection);
-                    let mut weights = vec![0; w];
-                    let mut scales = vec![0; s];
-                    tensors.read_projection_once(0, expert, projection, &mut weights, &mut scales)?;
-                    let mut reconstructed = [vec![0; w], vec![0; s]];
-                    for rank in 0..6 {
-                        let sizes = tensors.slice_bytes_with(projection, 6, rank, slicing)?;
-                        let mut weight = vec![0; sizes.0];
-                        let mut scale = vec![0; sizes.1];
-                        tensors.read_slice_with(0, expert, projection, 6, rank, slicing,
-                            &mut weight, &mut scale, &mut Vec::new())?;
-                        let windows = tensors.projection_slices(projection, 6, rank, slicing)?;
-                        if projection == Fp8Projection::Down {
-                            assert_eq!(windows[1].destination_pitch, 12);
-                            assert_eq!(scale.len(), 256 * 12);
-                        }
-                        for (index, (window, actual, source)) in windows.into_iter()
-                            .zip([weight, scale]).zip([&weights, &scales])
-                            .map(|((window, actual), source)| (window, actual, source)).enumerate() {
-                            for row in 0..window.rows {
-                                let src = window.source_offset + row * window.source_pitch;
-                                let dst = row * window.destination_pitch;
-                                assert_eq!(&actual[dst..dst + window.width], &source[src..src + window.width]);
-                                assert!(actual[dst + window.width..dst + window.destination_pitch].iter().all(|&b| b == 0));
-                                reconstructed[index][src..src + window.width].copy_from_slice(&actual[dst..dst + window.width]);
+        for (tp, scale_pitch) in [(3, 24), (6, 12)] {
+            assert_eq!(tensors.exact_slicing(tp), slicing);
+            for layer in [0, 3, 40, 77] {
+                tensors.slice_layer = layer;
+                for expert in 0..shape.experts {
+                    for projection in Fp8Projection::ALL {
+                        let (w, s) = tensors.projection_bytes(projection);
+                        let mut weights = vec![0; w];
+                        let mut scales = vec![0; s];
+                        tensors.read_projection_once(0, expert, projection, &mut weights, &mut scales)?;
+                        let mut reconstructed = [vec![0; w], vec![0; s]];
+                        for rank in 0..tp {
+                            let sizes = tensors.slice_bytes_with(projection, tp, rank, slicing)?;
+                            let mut weight = vec![0; sizes.0];
+                            let mut scale = vec![0; sizes.1];
+                            tensors.read_slice_with(0, expert, projection, tp, rank, slicing,
+                                &mut weight, &mut scale, &mut Vec::new())?;
+                            let windows = tensors.projection_slices(projection, tp, rank, slicing)?;
+                            if projection == Fp8Projection::Down {
+                                assert_eq!(windows[1].destination_pitch, scale_pitch);
+                                assert_eq!(scale.len(), 256 * scale_pitch);
+                            }
+                            for (index, (window, actual, source)) in windows.into_iter()
+                                .zip([weight, scale]).zip([&weights, &scales])
+                                .map(|((window, actual), source)| (window, actual, source)).enumerate() {
+                                for row in 0..window.rows {
+                                    let src = window.source_offset + row * window.source_pitch;
+                                    let dst = row * window.destination_pitch;
+                                    assert_eq!(&actual[dst..dst + window.width], &source[src..src + window.width]);
+                                    assert!(actual[dst + window.width..dst + window.destination_pitch].iter().all(|&b| b == 0));
+                                    reconstructed[index][src..src + window.width].copy_from_slice(&actual[dst..dst + window.width]);
+                                }
                             }
                         }
+                        assert_eq!(reconstructed, [weights, scales]);
                     }
-                    assert_eq!(reconstructed, [weights, scales]);
                 }
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn qwen_coordinator_keeps_fixed_h128_halves_while_sparks_use_native_k16() -> Result<()> {
+        let tensors = catalog(ExpertFormat::Nvfp4, 640);
+        let root = tempfile::tempdir()?;
+        let package = root.path().join("fp8-qwen4-nvfp4a4");
+        for name in ["tp2", "tp2-w384", "tp2-w256"] {
+            std::fs::create_dir_all(package.join(name))?;
+        }
+        for layer in 0..8 {
+            let mut view = tensors.clone();
+            view.slice_layer = layer;
+            let coordinator = view.for_coordinator();
+            for (rank, expected) in [(0, (0, 384)), (1, (384, 256))] {
+                let (directory, slicing) = exact_layout_directory_with(&package.join("tp2"), &coordinator, 2, rank, true);
+                assert_eq!(slicing, Slicing::Blocks(128));
+                assert_eq!(directory, package.join(format!("tp2-w{}", expected.1)));
+                assert_eq!(coordinator.rank_range_with(2, rank, slicing)?, expected);
+                assert_eq!(coordinator.unit_map(2, rank, slicing)?.rule,
+                    cuteafd_core::tp_units::UnitRule::Contiguous);
+                let (directory, slicing) = exact_layout_directory_with(&package.join("tp2"), &view, 2, rank, true);
+                assert_eq!((directory, slicing), (package.join("tp2"), Slicing::Padded));
+                assert_eq!(view.rank_range_with(2, rank, slicing)?, (rank * 320, 320));
+                assert_eq!(view.rank_width(2, rank, slicing)?, 384);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nvfp4_layer_rotation_reconstructs_native_k16_bytes_with_padded_storage() -> Result<()> {
+        use crate::plan::testing::{nvfp4, write_snapshot};
+        use crate::plan::experts::spark_recipe;
+        for intermediate in [640, 2048] {
+            let root = tempfile::tempdir()?;
+            let shape = RoutedExpertShape { layers: 1, first_layer: 0, experts: 2,
+                topk: 1, hidden: 256, intermediate, draft_stages: 0, draft_experts: 0 };
+            let fixtures = (0..shape.experts).flat_map(|expert| {
+                [("gate", intermediate, 256), ("up", intermediate, 256), ("down", 256, intermediate)]
+                    .into_iter().flat_map(move |(projection, n, k)|
+                        nvfp4(&format!("model.layers.0.mlp.experts.{expert}.{projection}_proj"), n, k))
+            }).collect::<Vec<_>>();
+            write_snapshot(root.path(), &serde_json::json!({}), &fixtures, None);
+            let mut tensors = Fp8ExpertTensors::read(root.path(), shape)?;
+            for (name, located) in tensors.tensors.iter() {
+                let bytes = if name.ends_with("_scale_2") || name.ends_with(".input_scale") {
+                    0.25f32.to_le_bytes().to_vec()
+                } else { (0..located.bytes as usize).map(|i| ((i * 17 + i / 13 + 7) % 251) as u8).collect() };
+                std::fs::OpenOptions::new().write(true).open(root.path().join(&located.shard))?
+                    .write_all_at(&bytes, located.offset)?;
+            }
+            for world in [2, 3, 4, 5, 6] {
+                let package = if world == 5 { "glmf:nvfp4" } else { "glm:nvfp4" };
+                let recipe = spark_recipe(package, intermediate, world)?;
+                for layer in 0..world {
+                    tensors.slice_layer = layer;
+                    for expert in 0..shape.experts {
+                        for projection in Fp8Projection::ALL {
+                            let (w, s) = tensors.projection_bytes(projection);
+                            let mut source = [vec![0; w], vec![0; s]];
+                            let [weight, scale] = &mut source;
+                            tensors.read_projection_once(0, expert, projection, weight, scale)?;
+                            let mut reconstructed = [vec![0; w], vec![0; s]];
+                            for rank in 0..world {
+                                let (directory, slicing) = exact_layout_directory_with(Path::new("tp"),
+                                    &tensors, world, rank, true);
+                                assert_eq!(directory, Path::new("tp"));
+                                assert_eq!(slicing, recipe.slicing);
+                                let map = tensors.unit_map(world, rank, slicing)?;
+                                assert_eq!(map.unit_columns, 16);
+                                let live = tensors.rank_range(world, rank)?;
+                                assert_eq!(map.column_ranges(expert)?, [live.0..live.0 + live.1]);
+                                assert_eq!(tensors.rank_width(world, rank, slicing)?,
+                                    recipe.width_for_layer(rank, layer).unwrap());
+                                let sizes = tensors.slice_bytes_with(projection, world, rank, slicing)?;
+                                let mut actual = [vec![255; sizes.0], vec![255; sizes.1]];
+                                let [weight, scale] = &mut actual;
+                                tensors.read_slice_with(0, expert, projection, world, rank, slicing,
+                                    weight, scale, &mut Vec::new())?;
+                                let windows = tensors.projection_slices(projection, world, rank, slicing)?;
+                                for (index, window) in windows.into_iter().enumerate() {
+                                    let mut expected = vec![0; actual[index].len()];
+                                    for row in 0..window.rows {
+                                        let src = window.source_offset + row * window.source_pitch;
+                                        let dst = row * window.destination_pitch;
+                                        expected[dst..dst + window.width].copy_from_slice(&source[index][src..src + window.width]);
+                                        reconstructed[index][src..src + window.width].copy_from_slice(&actual[index][dst..dst + window.width]);
+                                    }
+                                    assert_eq!(actual[index], expected,
+                                        "I{intermediate} TP{world} L{layer} r{rank} {projection:?}");
+                                }
+                            }
+                            // Scalar metadata is replicated separately, not part of matrix windows.
+                            let start = s - 8;
+                            reconstructed[1][start..].copy_from_slice(&source[1][start..]);
+                            assert_eq!(reconstructed, source);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_even_mxfp4_preserves_source_ranges_at_native_granularity() {
+        let tensors = catalog(ExpertFormat::Mxfp4, 2304);
+        for tp in [3, 4, 6] {
+            assert_eq!(tensors.exact_slicing(tp), Slicing::Blocks(32));
+            for rank in 0..tp {
+                assert_eq!(tensors.rank_range_with(tp, rank, Slicing::Blocks(32)).unwrap(),
+                    (rank * (2304 / tp), 2304 / tp));
+            }
+        }
     }
 
     #[test]
@@ -1524,8 +1659,82 @@ mod tests {
     }
 
     #[test]
+    fn packaged_world_directory_slicing_matches_coordinator_fingerprints() -> Result<()> {
+        use crate::plan::experts::spark_recipe;
+        use cuteafd_core::tp_units::RankUnits;
+        for (package, format) in [
+            ("mimo:fp8", ExpertFormat::Fp8Block128),
+            ("mimof:fp8", ExpertFormat::Mxfp4), ("mimop:fp8", ExpertFormat::Mxfp4),
+            ("glm:fp8", ExpertFormat::Fp8Block128), ("glmf:fp8", ExpertFormat::Fp8Block128),
+            ("qwen4:fp8", ExpertFormat::Fp8Block128), ("step5:fp8", ExpertFormat::Fp8Block128),
+            ("step5:bf16", ExpertFormat::Bf16), ("step5:nvfp4", ExpertFormat::Nvfp4),
+            ("glm:nvfp4", ExpertFormat::Nvfp4), ("glm:nvfp4a4", ExpertFormat::Nvfp4),
+            ("glmf:nvfp4", ExpertFormat::Nvfp4), ("glmf:nvfp4a4", ExpertFormat::Nvfp4),
+            ("qwen4:nvfp4", ExpertFormat::Nvfp4), ("qwen4:nvfp4a4", ExpertFormat::Nvfp4),
+        ] {
+            for intermediate in [640, 1536, 2048, 2304, 3072] {
+                let mut tensors = catalog(format, intermediate);
+                for world in 1..=6 {
+                    let Ok(recipe) = spark_recipe(package, intermediate, world) else { continue };
+                    let root = tempfile::tempdir()?;
+                    let directory = root.path().join(format!("tp{world}"));
+                    std::fs::create_dir(&directory)?;
+                    for layout in &recipe.required_layouts {
+                        std::fs::create_dir_all(root.path().join(layout))?;
+                    }
+                    for layer in [0, 1, 40, 77] {
+                        tensors.slice_layer = layer;
+                        for rank in 0..world {
+                            let (selected, slicing) = exact_layout_directory_with(&directory, &tensors, world, rank, true);
+                            let worker_slicing = tensors.slicing_for_directory(&selected, world);
+                            let context = format!("{package} i{intermediate} tp{world} L{layer} r{rank}");
+                            assert_eq!(slicing, worker_slicing, "{context}");
+                            assert_eq!(worker_slicing, recipe.slicing, "{context}");
+                            let unit = match recipe.slicing { Slicing::Blocks(g) => g, Slicing::Padded => tensors.block() };
+                            let coordinator = RankUnits::new(recipe.rule, tensors.shape.experts,
+                                intermediate, unit, layer, world, rank)?;
+                            let worker = tensors.unit_map(world, rank, worker_slicing)?;
+                            assert_eq!(coordinator.fingerprint(), worker.fingerprint(), "{context}");
+                            assert_eq!(tensors.rank_width(world, rank, worker_slicing)?,
+                                recipe.widths[recipe.rank_for_layer(rank, layer)], "{context}");
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_even_directory_keeps_source_ranges_and_stored_bytes() -> Result<()> {
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4, ExpertFormat::Bf16] {
+            let tensors = catalog(format, 2048);
+            for tp in [2, 4] {
+                let directory = PathBuf::from(format!("tp{tp}"));
+                let slicing = tensors.slicing_for_directory(&directory, tp);
+                assert_eq!(slicing, Slicing::Blocks(tensors.block()));
+                for rank in 0..tp {
+                    assert_eq!(tensors.rank_range_with(tp, rank, slicing)?, tensors.rank_range(tp, rank)?);
+                    assert_eq!(tensors.rank_width(tp, rank, slicing)?, tensors.rank_width(tp, rank, Slicing::Padded)?);
+                    for projection in Fp8Projection::ALL {
+                        assert_eq!(tensors.projection_slices(projection, tp, rank, slicing)?,
+                            tensors.projection_slices(projection, tp, rank, Slicing::Padded)?);
+                        assert_eq!(tensors.slice_bytes_with(projection, tp, rank, slicing)?,
+                            tensors.slice_bytes_with(projection, tp, rank, Slicing::Padded)?);
+                    }
+                }
+                assert_eq!(exact_layout_directory_with(&directory, &tensors, tp, 0, false),
+                    (directory, slicing));
+            }
+            assert_eq!(tensors.slicing_for_directory(Path::new("tp6"), 6), Slicing::Padded);
+            assert_eq!(tensors.slicing_for_directory(Path::new("tp0"), 0), Slicing::Padded);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn package_selection_requires_every_rank_width_and_honors_opt_out() {
-        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4, ExpertFormat::Nvfp4] {
+        for format in [ExpertFormat::Fp8Block128, ExpertFormat::Mxfp4] {
             let tensors = catalog(format, 2048);
             let dir = tempfile::tempdir().unwrap();
             let padded = dir.path().join("tp6");
@@ -1534,21 +1743,24 @@ mod tests {
                 assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, true),
                     (padded.clone(), Slicing::Padded));
             }
-            std::fs::create_dir(dir.path().join("tp6-w384")).unwrap();
+            let exact = tensors.exact_slicing(6);
+            let widest = tensors.rank_width(6, 0, exact).unwrap();
+            let narrowest = tensors.rank_width(6, 5, exact).unwrap();
+            std::fs::create_dir(dir.path().join(format!("tp6-w{widest}"))).unwrap();
             assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, 0, true),
                 (padded.clone(), Slicing::Padded));
-            std::fs::create_dir(dir.path().join("tp6-w256")).unwrap();
+            std::fs::create_dir(dir.path().join(format!("tp6-w{narrowest}"))).unwrap();
             for rank in 0..6 {
-                let width = tensors.rank_width(6, rank, Slicing::Blocks(128)).unwrap();
+                let width = tensors.rank_width(6, rank, exact).unwrap();
                 assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, true),
-                    (dir.path().join(format!("tp6-w{width}")), Slicing::Blocks(128)));
+                    (dir.path().join(format!("tp6-w{width}")), exact));
                 assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, false),
                     (padded.clone(), Slicing::Padded));
             }
             assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, 6, true),
                 (padded.clone(), Slicing::Padded));
             assert_eq!(exact_layout_directory_with(&padded, &tensors, 1, 0, true),
-                (padded, Slicing::Padded));
+                (padded, exact));
         }
     }
 
@@ -1565,6 +1777,6 @@ mod tests {
         assert_eq!((0..6).map(|r| tensors.rank_width(6, r, Slicing::Padded).unwrap()).sum::<usize>(), 2304);
         let (w, s) = tensors.slice_bytes_with(Fp8Projection::Down, 6, 5, exact).unwrap();
         assert_eq!((w, s), (6144 * 256 / 2, 6144 * 256 / 32));
-        assert!(tensors.rank_range_with(6, 0, Slicing::Blocks(96)).is_err());
+        assert!(tensors.rank_range_with(6, 0, Slicing::Blocks(48)).is_err());
     }
 }

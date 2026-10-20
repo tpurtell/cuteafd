@@ -106,6 +106,9 @@ fn declared_w4a4(snapshot: &Path) -> bool {
 /// before the run was stored: there is nothing to recompute from.
 fn bar_met(check: &Check) -> Option<bool> {
     let run: crate::fidelity::Run = serde_json::from_value(check.metrics.get("run")?.clone()).ok()?;
+    // Archived flat-era runs did not record a precision tier. Do not invent one
+    // from today's cache or rewrite their published status while re-rendering.
+    run.precision.as_ref()?;
     Some(crate::fidelity::verdict(&run).pass)
 }
 
@@ -174,6 +177,30 @@ mod tests {
         let mut twice = report.clone();
         reconcile(&mut twice);
         assert_eq!(crate::render::card::card_svg(&twice), card);
+    }
+
+    #[test]
+    fn failed_nvfp4_tier_verdict_keeps_calibrated_w4a4_info_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut report = nvfp4_card(tmp.path(), experts("NVFP4"));
+        let panel = crate::sample::full_report();
+        let mut run: crate::fidelity::Run = serde_json::from_value(
+            panel.panel("fidelity").unwrap().latest().unwrap()["decode"].clone()).unwrap();
+        run.precision = Some(crate::fidelity_precision::Precision::new(4.0, "nvfp4", false, "test").unwrap());
+        for p in &mut run.score.records { p.kl = 0.0655; }
+        let verdict = crate::fidelity::verdict(&run);
+        assert!(!verdict.pass);
+        assert!(verdict.reasons.iter().any(|s| s.contains("KL above 3 to <6 bpw tier bar 0.05")));
+        let check = report.baseline.as_mut().unwrap().quality.checks.iter_mut().find(|c| c.id == "fidelity").unwrap();
+        check.set("run", json!(run)); check.set("verdict", json!(verdict));
+        check.set("precision", json!(run.precision));
+        check.status = CheckStatus::Fail;
+        reconcile(&mut report);
+        let check = report.baseline.as_ref().unwrap().quality.check("fidelity").unwrap();
+        assert_eq!(check.status, CheckStatus::Info);
+        assert_eq!(check.note.as_deref(), Some(CALIBRATED_W4A4));
+        assert_eq!(check.metrics["verdict"]["pass"], false);
+        assert!(crate::render::card::card_svg(&report).contains("4.0 bpw"));
     }
 
     #[test]

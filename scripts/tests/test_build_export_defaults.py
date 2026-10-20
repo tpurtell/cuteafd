@@ -88,3 +88,11 @@ def test_dense_qwen_aot_opt_in_reaches_native_and_fingerprints():
         assert f'-e "{variable}=${{{variable}:-OFF}}"' in launcher
         build = (ROOT / f'scripts/build/build-{mode}-artifacts.sh').read_text()
         assert f'-DCUTEAFD_ENABLE_QWEN_DENSE_AOT="$( [[ "$role" == coordinator ]] && echo "${{{variable}:-OFF}}" || echo OFF)"' in build
+
+
+def test_v41_release_exports_all_decoder_families_and_compact_companions():
+    cmake = (ROOT / 'native/cmake/shared/exl3.cmake').read_text()
+    release = (ROOT / 'scripts/build/build-release-artifacts.sh').read_text()
+    assert 'set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING' in cmake
+    assert '${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}' in release
+    assert '--compact-companions' in cmake

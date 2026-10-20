@@ -141,6 +141,11 @@ pub fn card_svg(report: &Report) -> String {
         Some(b) => (b.quality.badge(), b.quality.status),
         None => ("quality not verified".to_string(), crate::report::CheckStatus::Pending),
     };
+    if let Some(precision) = baseline.and_then(|b| b.quality.check("fidelity"))
+        .and_then(|c| c.metrics.get("precision"))
+        .and_then(|v| serde_json::from_value::<crate::fidelity_precision::Precision>(v.clone()).ok()) {
+        doc.text(pad, 205.0, Font::new(12.0, t.ink2), &fit(&precision.label(), 12.0, WIDTH - 2.0 * pad));
+    }
     let color = t.status(status);
     let width = (text_width(&badge, 14.0) + 36.0).min(520.0);
     doc.text(pad, HEIGHT - 28.0, Font::new(13.0, t.muted), &fit(&build, 13.0, WIDTH - 2.0 * pad - width - 24.0));

@@ -81,6 +81,39 @@ def test_mimop_k32_tp6_uses_production_exact_slice_export():
                     "--layouts", "tp6", "--exact-slices"])
 
 
+@pytest.mark.parametrize("geometry,bits", [
+    ("qwen4", "45"), ("glm", "45"), ("glmf", "34"), ("dsv4f", "23"),
+    ("v41", "23"), ("v41", "34"), ("v41", "45"),
+])
+def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, geometry, bits):
+    name = f"exl3-compact-{geometry}-k{bits}"
+    _, exporter, args = next(job for job in compare_sm.jobs("all") if job[0] == name)
+    assert exporter == "package_exl3_aot.py"
+    package = compare_sm.load_file("test_compact_package", ROOT / "python/tools/aot/package_exl3_aot.py")
+    profiles = package.compact_profiles(geometry, package.build_profiles("spark", geometry))
+    capacities = package.package_capacities(geometry, compare_sm.CAPACITIES)
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
+        export=lambda *values, **options: recorded.append((values, options))))
+    compare_sm._export_exl3(args, tmp_path)
+    assert [(values[0], values[1], values[2], values[3], values[5], values[6], values[7])
+            for values, _ in recorded] == [
+        (tmp_path / profile / f"m{rows}", width, experts, rows, "auto", topk, dtype)
+        for profile, width, experts, topk, dtype, _ in profiles for rows in capacities]
+    for values, options in recorded:
+        assert values[4] == tuple(map(int, bits))
+        assert options["compile_only"] and options["compact_weights"]
+        assert options["tile"] == (64, 128, 64, 128)
+        assert not options.get("warp_specialized") and not options.get("wire_input")
+        rows = values[3]
+        assert options.get("route_block", 8) == package.route_block(geometry, rows)
+        assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
+    widths = {profile[1] for profile in profiles}
+    assert widths == ({256, 384} if geometry == "qwen4" else
+                      {640} if geometry == "v41" else {384, 768})
+
+
 def test_identical_object_ignores_context_metadata(tmp_path):
     report = compare_sm.compare(*exports(tmp_path))
     assert report["programs"][0]["classification"] == "identical"

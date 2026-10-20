@@ -673,7 +673,7 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
     if let Some(exl3) = catalog.exl3() {
         anyhow::ensure!(slicing == Slicing::Blocks(128), "GLM EXL3 needs disjoint whole-128-row Spark slices");
         return (0..ranks).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
-            let arena = exl3.residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?
+            let arena = exl3.balanced_residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)?
                 .device_arena_layout()?.1 as u64;
             sum.checked_add(arena).ok_or_else(|| anyhow::anyhow!("GLM Spark EXL3 residency overflow"))
         })).collect();
@@ -681,8 +681,11 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
     let tensors = catalog.fp8().filter(|t| matches!(t.format(), ExpertFormat::Fp8Block128 | ExpertFormat::Nvfp4))
         .ok_or_else(|| anyhow::anyhow!("GLM Spark inventory needs EXL3, FP8 or native NVFP4 headers"))?;
     for &layer in layers { tensors.validate_layer(layer)?; }
-    (0..ranks).map(|rank| native_layer_resident(tensors, ranks, rank, slicing)?
-        .checked_mul(layers.len() as u64).ok_or_else(|| anyhow::anyhow!("GLM Spark residency overflow"))).collect()
+    (0..ranks).map(|rank| layers.iter().try_fold(0u64, |sum, &layer| {
+        let view = tensors.for_layer_metadata(layer)?;
+        sum.checked_add(native_layer_resident(&view, ranks, rank, slicing)?)
+            .ok_or_else(|| anyhow::anyhow!("GLM Spark residency overflow"))
+    })).collect()
 }
 
 pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
@@ -1475,22 +1478,32 @@ mod tests {
         let scalars = 3 * 256 * 8;
         let bytes = |width| 3 * 256 * 6144 * width * (8 + 1) / 16 + scalars;
         for ranks in [2, 3, 4, 6] {
-            for slicing in [Slicing::Blocks(128), Slicing::Padded] {
+            for slicing in [Slicing::Blocks(16), Slicing::Blocks(128), Slicing::Padded] {
                 let whole_suffix = spark_resident_bytes(&catalog, &[1, 2, 3], ranks, slicing).unwrap();
                 let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, slicing).unwrap();
                 for rank in 0..ranks {
-                    let width = catalog.fp8().unwrap().rank_width(ranks, rank, slicing).unwrap() as u64;
-                    assert_eq!(selected[rank], 2 * bytes(width));
-                    assert_eq!(whole_suffix[rank], 3 * bytes(width));
+                    let expected = |layers: &[usize]| layers.iter().map(|&layer| {
+                        let width = match slicing {
+                            Slicing::Padded => (128usize.div_ceil(ranks) * 16).div_ceil(128) * 128,
+                            Slicing::Blocks(g) => {
+                                let owner = (rank + ranks - layer % ranks) % ranks;
+                                let units = 2048 / g;
+                                (units / ranks + usize::from(owner < units % ranks)) * g
+                            }
+                        };
+                        bytes(width as u64)
+                    }).sum::<u64>();
+                    assert_eq!(selected[rank], expected(&[2, 3]));
+                    assert_eq!(whole_suffix[rank], expected(&[1, 2, 3]));
                 }
             }
         }
         let exact = spark_resident_bytes(&catalog, &[3], 6, Slicing::Blocks(128)).unwrap();
         let padded = spark_resident_bytes(&catalog, &[3], 6, Slicing::Padded).unwrap();
-        assert_eq!(exact, [bytes(384), bytes(384), bytes(384), bytes(384), bytes(256), bytes(256)]);
+        assert_eq!(exact, [bytes(384), bytes(256), bytes(256), bytes(384), bytes(384), bytes(384)]);
         assert_eq!(padded, vec![bytes(384); 6]);
         // Per-expert alpha/input scales replicate; they must not shrink with the slice.
-        assert_ne!(exact[0] * 2, exact[4] * 3);
+        assert_ne!(exact[0] * 2, exact[1] * 3);
         assert_eq!(exact.iter().sum::<u64>(), bytes(2048) + 5 * scalars);
         assert!(spark_resident_bytes(&catalog, &[], 0, Slicing::Padded).unwrap().is_empty());
         for (layers, ranks) in [(vec![], 4), (vec![1], 4), (vec![3, 2], 4),
@@ -1516,13 +1529,17 @@ mod tests {
             let selected = spark_resident_bytes(&catalog, &[2, 3], ranks, Slicing::Blocks(128)).unwrap();
             for (rank, &bytes) in selected.iter().enumerate() {
                 let expected: u64 = [2, 3].into_iter().map(|layer|
-                    catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)
+                    catalog.exl3().unwrap().balanced_residency(crate::V41Exl3Layer::Backbone(layer), ranks, rank)
                         .unwrap().device_arena_layout().unwrap().1 as u64).sum();
                 assert_eq!(bytes, expected);
                 assert_eq!(bytes % (2 << 20), 0);
             }
-            assert_eq!(spark_resident_bytes(&catalog, &[3], ranks, Slicing::Blocks(128)).unwrap(),
-                selected.iter().map(|bytes| bytes / 2).collect::<Vec<_>>());
+            let single = spark_resident_bytes(&catalog, &[3], ranks, Slicing::Blocks(128)).unwrap();
+            for (rank, actual) in single.into_iter().enumerate() {
+                let expected = catalog.exl3().unwrap().balanced_residency(
+                    crate::V41Exl3Layer::Backbone(3), ranks, rank).unwrap();
+                assert_eq!(actual, expected.device_arena_layout().unwrap().1 as u64);
+            }
         }
         assert!(spark_resident_bytes(&catalog, &[2, 3], 6, Slicing::Padded).is_err());
     }

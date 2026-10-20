@@ -225,7 +225,6 @@ TARGET_HEAD
 SPARK_INTAKE
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
-TP_PLACEMENT
 ATTENTION_PLAN_ROWS
 PROFILE
 PROFILE_DIR
@@ -380,7 +379,6 @@ ENABLE_BENCH
 EXPERT_FORMAT
 EXPERT_PORT
 FP8_EXPERT_PREFILL
-TP_PLACEMENT
 GATEWAY
 HOST_CACHE_BYTES
 HOST_ISA
@@ -438,8 +436,6 @@ WIP_ROOT
 EOF
   _spark_slot_keys HOST LANE_A LANE_B
 }
-tp_placement="$(get TP_PLACEMENT round-robin)"
-case "$tp_placement" in round-robin|balanced) ;; *) release_die "TP_PLACEMENT must be round-robin or balanced" ;; esac
 vision="$(get VISION auto)"
 audio="$(get AUDIO auto)"
 vision_replicas="$(get VISION_REPLICAS 1)"
@@ -561,12 +557,11 @@ fi
 shared_env_args=(-e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
-  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}"
-  -e "CUTEAFD_TP_PLACEMENT=$tp_placement")
+  -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
 if [[ $attention_plan_rows != auto ]]; then
   shared_env_args+=(-e "CUTEAFD_ATTENTION_PLAN_ROWS=$attention_plan_rows")
 fi
-shared_worker_env_args=(-e "CUTEAFD_TP_PLACEMENT=$tp_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
+shared_worker_env_args=(-e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)")
 }
 shared_bench_nonce_args() {
 bench_nonce_env_args=()
@@ -2553,7 +2548,7 @@ audio_encoder_hash=""
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
   # HF_HOME=/hf: the planner resolves draft snapshots under it, like serving.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "CUTEAFD_TP_PLACEMENT=$tp_placement" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e HF_HOME=/hf -v "$hub:/hf/hub:ro" "${wip_mount_args[@]}" "${exlr8_mounts[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"

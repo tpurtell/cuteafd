@@ -815,9 +815,13 @@ def test_shared_wip_same_slot_and_distinct_serving_instances(entry, tmp_path):
     jobs = [cards.generate(entry,n,a,tmp_path,tmp_path/'api-key',{},set(),None,1) for n,a in arms.items()]
     assert {j['entry']['set']['WIP_INSTANCE'] for j in jobs} == {'usage-build'}
     assert len({j['entry']['set']['INSTANCE'] for j in jobs}) == 2
-    arms['on']['slot'] = 'different'
-    with pytest.raises(ValueError,match='identical slots'):
-        cards.shared_wip(arms,[],[],1)
+    # A base and a candidate sealed in different slots of one instance.
+    split = cards.arms_from(['base=peer-base:9', 'cand=peer-cand:8'])
+    cards.shared_wip(split,['base=one-build','cand=one-build'],[],1)
+    split_jobs = {n: cards.generate(entry,n,a,tmp_path,tmp_path/'api-key',{},set(),None,1) for n,a in split.items()}
+    assert {j['entry']['set']['WIP_INSTANCE'] for j in split_jobs.values()} == {'one-build'}
+    assert len({j['entry']['set']['INSTANCE'] for j in split_jobs.values()}) == 2
+    assert {n: j['entry']['run_args'][1] for n, j in split_jobs.items()} == {'base': '9', 'cand': '8'}
     for builds,parallel in [(['off=HEAD'],1),([],2)]:
         with pytest.raises(ValueError,match='refuses'):
             cards.shared_wip(cards.arms_from(['off=off:s']),['off=shared'],builds,parallel)

@@ -1062,8 +1062,20 @@ mod tests {
                 let planned = super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state)
                     .unwrap();
                 let allocated = cuteafd_engine::prefix::MarkArena::slots_for(lanes, prefix.prefix_cache_entries, mark,
-                    prefix.prefix_cache_mark_mib << 20);
+                    prefix.prefix_cache_mark_mib << 20, prefix.host_cache_bytes.enabled());
                 assert_eq!((planned, allocated), (slots, slots), "{lanes} lanes, {index:?}, {state:?}");
+            }
+        }
+        let hosted = Cli::parse_from(["serve", "--host-cache-bytes", "auto"]).prefix;
+        for lanes in [1, 16, 64] {
+            for (index, state) in [(IndexCache::Keys, KdaState::F32), (IndexCache::Compact, KdaState::Bf16)] {
+                let bytes = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, index.into(), state.bytes() as u64)
+                    .unwrap().ranks[0].retained_mark_bytes;
+                let planned = super::ArenaMarks::Rule(hosted.mark_rule(lanes))
+                    .slots_on(&cfg, cfg.layers, index, state).unwrap();
+                assert_eq!(planned as u64, cuteafd_core::prefix::mark_slots_with_host(lanes as u64,
+                    hosted.prefix_cache_entries as u64, bytes, (hosted.prefix_cache_mark_mib as u64) << 20, true));
+                assert_eq!(planned, 2);
             }
         }
         // What either admission now reserves is the arena the ledger measured as `prefix`: FP32 at 8

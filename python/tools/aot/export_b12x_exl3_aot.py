@@ -97,7 +97,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
             'int device = -1; if (cudaGetDevice(&device) != cudaSuccess || device != ctx->device) return int(cudaErrorInvalidDevice);',
             *checks, *declarations, f'return {entry["wrapper"]}({", ".join(args)});', '}']
     core, epilogue = manifest['objects']
-    info = [2, manifest['hidden'], manifest['intermediate'], manifest['experts'],
+    info = [manifest.get('native_info_version', 2), manifest['hidden'], manifest['intermediate'], manifest['experts'],
         manifest['capacity'], manifest['top_k'], len(manifest['bits']),
         len(core['pointer_slots']), len(core['scalar_slots']),
         len(epilogue['pointer_slots']), len(epilogue['scalar_slots']),
@@ -118,7 +118,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            fused_input_rotation: bool = False, warp_specialized: bool = False,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
-           compile_only: bool = False, activation: str = "silu") -> dict:
+           compile_only: bool = False, activation: str = "silu",
+           compact_weights: bool = False) -> dict:
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -126,6 +127,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Packed routes are grouped into M blocks of route_block rows per expert; each
     # block decodes its expert's Trellis tiles once, so larger blocks amortize the
     # decode over more rows once many rows share an expert (large prefill).
+    if compact_weights and (len(bits) != 2 or warp_specialized or decode_schedule is not None):
+        raise ValueError("compact weights require cooperative two-tier exports without a decode schedule")
     if activation not in ("silu", "situ"):
         raise ValueError("EXL3 activation must be silu or situ")
     if activation == "situ" and swiglu_limit is not None:
@@ -232,6 +235,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                 rotation["ws_input_stages"] = ws_input_stages
             if ws_dynamic_tiles:
                 rotation["ws_dynamic_tiles"] = True
+        if compact_weights:
+            rotation["compact_weights"] = True
         schedule = {} if decode_schedule is None else {"decode_schedule": decode_schedule}
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
                                       force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
@@ -294,6 +299,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if compact_weights:
+        manifest.update(descriptor_rows=7, native_info_version=3)
     if activation != "silu":
         manifest["activation"] = activation
     if experts > 512:
@@ -358,6 +365,8 @@ def main() -> None:
                         help="Warp-specialized input-row ring depth (default: kernel policy)")
     parser.add_argument("--ws-dynamic-tiles", action="store_true",
                         help="Warp-specialized CTAs claim tiles from a workspace counter")
+    parser.add_argument("--compact-weights", action="store_true",
+                        help="Seven-row per-expert compact weights (native info version 3)")
     parser.add_argument("--token-major-rotation", action="store_true",
                         help="Rotate each token's input once for all of its routes (packed routes)")
     parser.add_argument("--decode-schedule",
@@ -375,7 +384,7 @@ def main() -> None:
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
            activation=args.activation,
-           decode_schedule=args.decode_schedule)
+           decode_schedule=args.decode_schedule, compact_weights=args.compact_weights)
 
 
 if __name__ == "__main__":

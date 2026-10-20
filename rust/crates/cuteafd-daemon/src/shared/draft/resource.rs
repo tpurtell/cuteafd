@@ -674,7 +674,7 @@ mod tests {
             InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3, 4]).unwrap();
         let reports: Vec<_> = (0..2).map(|rank| InstalledExpertGrouping::new(loaded.clone(), rank, 256,
@@ -707,7 +707,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 2, "topology": [2, 1], "ownership_wire": false,
         })).unwrap();
         let loaded = WorkerSelection::new(identity, &[3]).unwrap();
         let report = |rank, bf16_group| {
@@ -740,7 +740,7 @@ mod tests {
             InstalledExpertGrouping, InstalledExpertVariant, WorkerIdentity, WorkerSelection};
         let identity: WorkerIdentity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [4096, 288, 8, 2048, 45],
-            "world": 6, "topology": [6, 1], "ownership_wire": false, "placement": "round-robin",
+            "world": 6, "topology": [6, 1], "ownership_wire": false,
         })).unwrap();
         let report = |rank, layers: &[usize], bytes| {
             let loaded = WorkerSelection::new(identity.clone(), layers).unwrap();

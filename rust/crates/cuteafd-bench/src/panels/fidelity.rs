@@ -37,6 +37,7 @@ pub fn score(client: &Client, info: &ServerInfo, tier: &str, path: &str, progres
     model_record["max_context"] = json!(max_context);
     model_record["full_prefill_logits"] = json!(prefill_unavailable(info).is_none());
     model_record["snapshot"] = json!(info.configuration.snapshot);
+    model_record["settings"] = json!(info.configuration.settings);
     let checkpoint = info.checkpoint();
     // The checkpoint, not an aliased served name, binds the reference and history.
     run_with(&args, &checkpoint, &model_record, |request| {

@@ -168,6 +168,14 @@ impl<'a> NativeExperts<'a> {
         let weights = self.weights(layer)?;
         let execution = w.native_shared.as_ref().context("EXLR8 lane shared workspace")?;
         let stride = weights.layout.hidden * 2;
+        static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let trace = *TRACE.get_or_init(|| std::env::var("CUTEAFD_EXLR8_TILE_TRACE").is_ok_and(|v| v == "1"));
+        let issued = |first, operation, returned| {
+            if trace {
+                eprintln!("EXLR8 shared enqueue rank={} layer={layer} rows={rows} first={first} stream={stream:p} operation={operation} returned={returned}",
+                    weights.layout.rank);
+            }
+        };
         for first in (0..rows).step_by(ROWS) {
             let count = (rows - first).min(ROWS);
             let input = view(w.x.buffer, first * stride, count * stride)?;
@@ -175,9 +183,15 @@ impl<'a> NativeExperts<'a> {
             // SAFETY: one stream orders copies, K1 and copies out before the next
             // chunk reuses the bounded arena; no host synchronization is needed.
             unsafe {
+                issued(first, "input_copy", false);
                 library.copy_d2d_async(execution.input()?, input, input.bytes, stream)?;
+                issued(first, "input_copy", true);
+                issued(first, "execute", false);
                 execution.run(weights, count, stream)?;
+                issued(first, "execute", true);
+                issued(first, "output_copy", false);
                 library.copy_d2d_async(output, execution.output()?, output.bytes, stream)?;
+                issued(first, "output_copy", true);
             }
         }
         Ok(())

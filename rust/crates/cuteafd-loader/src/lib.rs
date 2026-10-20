@@ -14,7 +14,7 @@ pub use families::deepseek_v41::v41_catalog::{
     V41StorageBudget, V41Tensor, V41TensorPlacement, V41CoordinatorTensorReader,
 };
 pub use families::deepseek_v41::v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, V41Exl3Residency, V41Exl3ResidentBuffer};
-pub use families::deepseek_v41::v41_exl3_staging::V41Exl3TensorSlice;
+pub use families::deepseek_v41::v41_exl3_staging::{V41Exl3TensorGather, V41Exl3TensorSlice};
 pub use families::deepseek_v41::v41_exl3::{read_v41_exl3_manifest, V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
     V41Exl3ProjectionKind, V41_EXL3_SCHEMA};
 pub use families::deepseek_v41::v41_nvfp4::{

@@ -5633,7 +5633,9 @@ mod prefill_lane_tests {
             ("integration/cuteafd/_common.py", 0x7e63_b6fc_ae75_9f0a),
             // 34698ec2's RowTiledBf16Projection is opt-in; skinny_config,
             // skinny_max_rows and the default GLM RoutedBf16Projection paths are unchanged.
-            ("gemm/bf16_gemv/_skinny.py", 0x3351_3301_8c37_3f8f),
+            // Fork #71 adds Step-5 DECODE_TMA_TILES keys (4096,12288), (4096,6144), (384,4096) and
+            // (3072,4096): none is a GLM Flash [N,K], and each retile keeps the same K order.
+            ("gemm/bf16_gemv/_skinny.py", 0x0afd_d59f_c563_86f3),
         ] {
             let bytes = std::fs::read(root.join(path)).unwrap();
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64,

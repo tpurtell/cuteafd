@@ -24,7 +24,6 @@ pub struct WorkerIdentity {
     world: u32,
     topology: [u8; 2],
     ownership_wire: bool,
-    placement: cuteafd_core::tp_units::TpPlacement,
 }
 
 impl WorkerIdentity {
@@ -42,9 +41,7 @@ impl WorkerIdentity {
         Ok(Self { checkpoint: identity.fingerprint, manifest: identity.manifest,
             geometry: [geometry.hidden, geometry.experts, geometry.topk, geometry.intermediate, geometry.layers],
             world: u32::try_from(world)?, topology: [selected.topology().tp(), selected.topology().ep()],
-            ownership_wire: selected.ownership_topology().is_some(),
-            placement: if manifest.is_some() { cuteafd_core::tp_units::TpPlacement::Balanced }
-                else { cuteafd_core::tp_units::TpPlacement::active()? } })
+            ownership_wire: selected.ownership_topology().is_some() })
     }
 }
 
@@ -844,7 +841,7 @@ impl Drop for EndpointReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false, placement: Default::default() } }
+    fn identity() -> WorkerIdentity { WorkerIdentity { checkpoint: "0".repeat(64), manifest: None, geometry: [6144, 384, 8, 2048, 70], world: 2, topology: [2, 1], ownership_wire: false } }
     #[test]
     fn exlr8_bootstrap_refuses_different_manifest_name_or_content() {
         use cuteafd_loader::plan::checkpoint::identity::ManifestIdentity;
@@ -920,7 +917,6 @@ mod tests {
         assert!(rejection.to_string().contains("version 1; expected 3"));
         let envelope = serde_json::to_value(admission_selection())?;
         assert!(envelope["identity"].get("manifest").is_none());
-        assert_eq!(envelope["identity"]["placement"], "round-robin");
         assert_eq!(envelope["version"], VERSION);
         Ok(())
     }
@@ -1101,7 +1097,7 @@ mod tests {
             let selection = WorkerSelection::new(WorkerIdentity {
                 checkpoint: "0".repeat(64), manifest: None,
                 geometry: [4096, 352, 8, 1536, 91], world: 6,
-                topology: [6, 1], ownership_wire: false, placement: Default::default(),
+                topology: [6, 1], ownership_wire: false,
             }, &(3..91).collect::<Vec<_>>())?.with_model(model)?;
             let mut reports = Vec::new();
             for rank in 0..6 {
@@ -1576,9 +1572,6 @@ mod tests {
         for invalid in [vec![70], vec![14, 13], vec![13, 13]] { assert!(WorkerSelection::new(identity(), &invalid).is_err()); }
         let mut other = identity(); other.checkpoint = "1".repeat(64);
         assert!(selection.validate_for(&other).is_err());
-        let mut other = identity(); other.placement = cuteafd_core::tp_units::TpPlacement::Balanced;
-        assert!(selection.validate_for(&other).unwrap_err().to_string().contains("placement"));
-        assert_ne!(selection.digest().unwrap(), WorkerSelection::new(other, &[13, 14, 15, 20]).unwrap().digest().unwrap());
         assert_ne!(selection.digest().unwrap(), WorkerSelection::new(identity(), &[14, 15, 20]).unwrap().digest().unwrap());
         assert!(WorkerSelection::new(identity(), &[]).unwrap().ranges().is_empty());
         let mut invalid = identity(); invalid.world = 9;

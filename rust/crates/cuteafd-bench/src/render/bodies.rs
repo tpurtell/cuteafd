@@ -419,6 +419,16 @@ impl<'a> View<'a> {
                 doc.text(w, y + 13.0, Font::new(10.0, t.muted).anchor(Anchor::End), &seconds(check.seconds));
             }
             y += 22.0;
+            if check.id == "fidelity" {
+                if let Some(precision) = check.metrics.get("precision")
+                    .and_then(|v| serde_json::from_value::<crate::fidelity_precision::Precision>(v.clone()).ok()) {
+                    for line in wrap(&precision.label(), 10.5, w - 22.0) {
+                        doc.text(22.0, y + 11.0, Font::new(10.5, t.ink2), &line);
+                        y += 16.0;
+                    }
+                    y += 4.0;
+                }
+            }
         }
         y
     }

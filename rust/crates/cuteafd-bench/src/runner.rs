@@ -417,6 +417,7 @@ impl Bench {
             "readiness_s": crate::context::readiness_s(),
             "full_prefill_logits": crate::fidelity_dataset::prefill_admitted(&crate::context::get().settings),
             "snapshot": crate::context::get().snapshot,
+            "settings": crate::context::get().settings,
             "fingerprint": fingerprint,
             "model": info.as_ref().map(|i| i.model.clone()),
             "checkpoint": crate::context::get().snapshot.as_ref().and_then(|p| crate::report::hub_repo(&p.to_string_lossy()))

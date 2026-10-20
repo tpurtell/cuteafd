@@ -299,7 +299,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
         manifest["qualification_sha256"].as_str().context("qualification hash")?)?)?;
     let label = qualification_label(&qualification, &manifest)?;
     Ok((reference, digest(&bytes), json!({"repository":repo,"revision":commit,"config":config,
-        "qualification":label,"text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
+        "qualification":label,"root_checkpoint":manifest["root_checkpoint"],
+        "text_checkpoint":manifest.get("text_checkpoint").unwrap_or(&manifest["checkpoint"])})))
 }
 
 fn tensor<'a>(bytes: &'a [u8], name: &str, dtype: &str, shape: &[usize]) -> Result<&'a [u8]> {

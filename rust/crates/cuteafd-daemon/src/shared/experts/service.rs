@@ -672,12 +672,26 @@ mod tests {
     }
 
     #[test]
+    fn spark_exl3_uses_compressed_shards_for_every_registered_world() {
+        for world in [1, 2, 3, 4, 6] {
+            for rank in 0..world {
+                assert_eq!(config(world, rank, None).exl3_selection(7).unwrap(),
+                    ExpertLayer::BackboneExl3Tp { layer: 7, rank, world });
+            }
+        }
+    }
+
+    #[test]
     fn canonical_tp1_selects_whole_exl3_experts_and_rank_package() {
         let one = config(1, 0, None);
         assert_eq!(one.selection(7).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world: 1 });
         assert!(one.selection(7).unwrap().role() > 7);
         assert_eq!(one.native_group().unwrap(), None);
-        assert!(one.exl3_directory_for(&[4, 5]).ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], "tp1-rank0").ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], "tp6-compact-rank0").ends_with("tp6-compact-rank0"));
+        let mut explicit = one;
+        explicit.exl3_aot_dir = Some("/custom-export".into());
+        assert_eq!(explicit.exl3_directory_for(&[4, 5], "tp6-compact-rank0"), PathBuf::from("/custom-export"));
     }
 
     #[test]
@@ -723,7 +737,7 @@ mod tests {
             let config = config(3, rank, Some(SparkTopology::NATIVE_TP3_EP1));
             assert_eq!(config.exl3_selection(7).unwrap(),
                 ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
-            assert!(config.exl3_directory_for(&[2, 3]).ends_with(format!("tp3-rank{rank}")));
+            assert!(config.exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
             assert_eq!(config.native_group().unwrap(), Some(0));
         }
         let config = config(6, 0, Some(SparkTopology::NATIVE_TP3_EP2));
@@ -1166,13 +1180,10 @@ impl NativeExpertServiceConfig {
                 "compact EXL3 ownership wire requires TP3EP1");
         }
         let topology = world.topology();
-        // TP4 and TP2 preserve their existing storage selectors; compact TP3
-        // uses compressed shards rather than the native replicated role.
-        if topology.tp() == 3 {
-            return Ok(ExpertLayer::BackboneExl3Tp { layer,
-                rank: topology.tp_rank(self.rank)? as usize, world: 3 });
-        }
-        self.selection(layer)
+        // Spark EXL3 always uses the compressed-shard variant. Coordinator
+        // BackboneTp2 keeps its separate legacy layout and arithmetic.
+        Ok(ExpertLayer::BackboneExl3Tp { layer,
+            rank: topology.tp_rank(self.rank)? as usize, world: topology.tp() as usize })
     }
 
     fn native_group(&self) -> Result<Option<u8>> {
@@ -1181,13 +1192,28 @@ impl NativeExpertServiceConfig {
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
     /// decoder tiers (multi-family images) with the legacy single-family
     /// location as fallback. An explicit --exl3-aot-dir is used verbatim.
-    fn exl3_directory_for(&self, tiers: &[usize]) -> PathBuf {
+    fn exl3_directory_for(&self, tiers: &[usize], layout: &str) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
-            crate::shared::experts::exl3::aot_layout_directory(
-                &self.library,
-                tiers,
-                &format!("tp{}-rank{}", self.world, self.rank),
-            )
+            crate::shared::experts::exl3::aot_layout_directory(&self.library, tiers, layout)
         })
+    }
+
+    fn exl3_directory(&self, catalog: &OfficialV41Catalog) -> Result<PathBuf> {
+        let layer = *self.resident_layers(catalog.routed_experts().layers)?.first()
+            .context("EXL3 package selection requires a resident layer")?;
+        let plan = crate::shared::experts::exl3::planned_residency(catalog,
+            self.exl3_selection(layer)?)?;
+        Ok(self.exl3_directory_for(&plan.tiers, &plan.aot_layout()))
+    }
+
+    fn validate_exl3_residency(&self, catalog: &OfficialV41Catalog, directory: &std::path::Path) -> Result<()> {
+        let geometry = catalog.routed_experts().geometry()?;
+        for layer in self.resident_layers(catalog.routed_experts().layers)? {
+            let plan = crate::shared::experts::exl3::planned_residency(catalog,
+                self.exl3_selection(layer)?)?;
+            crate::shared::experts::exl3::worker::Exl3Worker::validate_planned_residency(
+                directory, self.capacity, self.exl3_schedule, &plan, geometry)?;
+        }
+        Ok(())
     }
 }

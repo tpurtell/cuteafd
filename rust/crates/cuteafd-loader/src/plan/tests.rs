@@ -1073,7 +1073,7 @@ fn glm5_flash_modelopt_nvfp4_experts_are_ready() {
     let catalog = crate::read_expert_catalog(dir.path()).unwrap();
     let tensors = catalog.fp8().unwrap();
     assert_eq!(tensors.format(), crate::formats::fp8_experts::ExpertFormat::Nvfp4);
-    assert_eq!(tensors.rank_range(3, 2).unwrap(), (1376, 672));
+    assert_eq!(tensors.rank_range(3, 2).unwrap(), (688, 688));
     let report_tp5 = plan(dir.path(), &quant_options(5)).unwrap();
     assert!(report_tp5.executable(), "{}", render(&report_tp5));
     assert_eq!(component(&report_tp5, Component::RoutedExpert).status, Status::Ready, "{}", render(&report_tp5));
@@ -1152,12 +1152,12 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
     tensors.extend([t("visual.blocks.0.norm.weight", "BF16", &[64]),
         t("audio_encoder.norm.weight", "BF16", &[64])]);
     let dir = snapshot_tp(config, &tensors, Some(4));
-    for (ranks, executable) in [(0, false), (2, true), (3, false), (4, true), (6, false)] {
+    for (ranks, executable) in [(0, false), (2, true), (3, true), (4, true), (6, false)] {
         let report = plan(dir.path(), &sparks(ranks)).unwrap();
         assert_eq!(report.executable(), executable, "{ranks}: {}", render(&report));
         let experts = report.experts.as_ref().unwrap();
         assert_eq!((experts.package.as_str(), experts.block, experts.spark_worlds.as_slice()),
-            ("mimof:fp8 (MXFP4)", 32, &[2, 4][..]));
+            ("mimof:fp8 (MXFP4)", 32, &[2, 3, 4][..]));
         assert_eq!(component(&report, Component::Vision).status, Status::Unused);
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("family mimof")));
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("follow checkpoint tensors")));
@@ -2535,9 +2535,12 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // 2048 over six ranks: exact whole-block slices (384 x 4, 256 x 2), no padding.
+    // Layer 1 rotates native K32 ownership: rank 0 has 320 columns, rank 4 has 352.
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
-    assert_eq!(experts(0) * 2, experts(4) * 3);
+    // Both widths store 12 down-scale bytes per hidden row, rather than 10/11.
+    let down_scale_padding = |groups: u64| 384 * 6144 * (12 - groups);
+    assert_eq!((experts(0) - down_scale_padding(10)) * 11,
+        (experts(4) - down_scale_padding(11)) * 10);
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
 
@@ -3651,6 +3654,15 @@ fn release_smoke_prefix_working_set_geometry_ceilings() -> anyhow::Result<()> {
             }
             low
         };
+        println!("{name}: mark_bytes_per_rank={:?}", geometry.ranks.iter().map(|r| r.retained_mark_bytes).collect::<Vec<_>>());
+        if id == "deepseek_v4" {
+            let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(&checkpoint.snapshot, stages)?;
+            let heads = capacity::deepseek_v4_cache_geometry(&cfg, 2, 4096, stages)?;
+            let bytes: u64 = heads.ranks.iter().map(|rank| rank.retained_mark_bytes).sum();
+            let slots = mark_slots_with_host(concurrency, entries, bytes, budget, false);
+            println!("{name}: TP2 Heads host-off follow-up: slots={slots}->2 requires multi-replica host restore; freed_GiB_per_GPU={:?}",
+                heads.ranks.iter().map(|rank| (slots - 2) as f64 * rank.retained_mark_bytes as f64 / gib).collect::<Vec<_>>());
+        }
         let rank_marks = geometry.ranks.iter().map(|r| format!("{:.3}", r.retained_mark_bytes as f64 / (1 << 20) as f64)).collect::<Vec<_>>().join("/");
         println!("| {name} | {attention} | {concurrency} | {context} | {rank_marks} | {old_slots}/{new_slots} | {:.3}/{:.3} | {gain} | {:.3}/{:.3} | {}/{} | {}/{} |",
             (mark * old_slots) as f64 / gib, (mark * new_slots) as f64 / gib, old_quota as f64 / gib, new_quota as f64 / gib,

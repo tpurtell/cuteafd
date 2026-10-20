@@ -80,6 +80,8 @@ impl<'a> Fp8MoeTp2<'a> {
     pub(crate) fn plan(tensors: &Fp8ExpertTensors, directory: &Path, rank: usize,
         max_rows: usize) -> Result<Fp8MoeTp2Plan> {
         ensure!(rank < 2, "invalid FP8 MoE TP2 rank");
+        let coordinator = tensors.for_coordinator();
+        let tensors = &coordinator;
         let (directory, slicing) = exact_layout(directory, tensors, 2, rank);
         // SAFETY: the engine selects a trusted, generated package; the read
         // calls only its static geometry and scratch ABI, not CUDA creation.
@@ -94,6 +96,8 @@ impl<'a> Fp8MoeTp2<'a> {
 
     pub(crate) fn load(device: Device<'a>, tensors: &Fp8ExpertTensors, directory: &Path,
         layers: Vec<usize>, rank: usize, max_rows: usize, budget: usize) -> Result<Self> {
+        let coordinator = tensors.for_coordinator();
+        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), rank)?;
         let plan = Self::plan(tensors, directory, rank, max_rows)?;
         let resident = plan.resident_layer_bytes.checked_mul(layers.len())
@@ -119,6 +123,8 @@ impl<'a> Fp8MoeTp2<'a> {
         layers: Vec<usize>, max_rows: usize, budgets: [usize; 2]) -> Result<[Self; 2]> {
         ensure!(devices[0].id != devices[1].id && std::ptr::eq(devices[0].library, devices[1].library),
             "invalid FP8 MoE TP2 device pair");
+        let coordinator = tensors.for_coordinator();
+        let tensors = &coordinator;
         validate_layers(&layers, tensors.shape(), 0)?;
         let started = std::time::Instant::now();
         let _scope = cuteafd_ffi::memory_ledger::scope("experts/TP2 FP8 expert layer halves");

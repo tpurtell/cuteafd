@@ -319,7 +319,8 @@ pub fn full_report() -> Report {
         tier: "standard".into(), path_shape: "decode-shaped".into(), kl_kind: "full-vocabulary".into(),
         verify_rows: None, reference_selection: None, standard_balance: None, dataset: Some(json!({"config": "synthetic-long-config-for-responsive-layout",
             "revision": "a".repeat(40)})), engine: "synthetic".into(), settings: json!({}), seconds: 346.0,
-        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06, tripwire_expect: None };
+        score: fidelity_score, floor_top1: 0.985, floor_kl: 0.06,
+        precision: Some(crate::fidelity_precision::Precision::new(3.25, "exl3", false, "synthetic").unwrap()), tripwire_expect: None };
     let full_score = fidelity_run.score.clone();
     fidelity_run.score = crate::reference::Fidelity::from_records(full_score.records.iter().filter(|p| p.window[1..].parse::<usize>().unwrap() < 32).cloned().collect());
     fidelity_run.tier = crate::fidelity_dataset::STANDARD_TIER.into();

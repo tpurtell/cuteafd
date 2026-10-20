@@ -9,7 +9,7 @@ Each record of the log is one layer-step (one Spark wave: a step's MoE layer).
 An expert is split into UNITS (16) 128-channel units. A rule places every unit
 of every expert on a rank (#408 design comment):
 
-  exl3-k4      EXL3 K4 today: each expert sliced 16 ways round-robin, unit u
+  exl3-k4      Offline fixed EXL3 reference: unit u
                on rank u mod N (every expert puts ceil(16/N) units on rank 0).
   exlr8-unit   EXLR8: unit u of expert e in layer L on rank (16e + u + L) mod N.
                With --shared the shared expert is e = EXPERTS (256) and is

@@ -150,6 +150,11 @@ Each card is one launch of the basic profile: tok/s for C1 decode and concurrent
   vision on for EXL3. [Details](docs/models/qwen4.md#known-limits)
 - **GLM Flash tr3** vision needs `CHAT_TEMPLATE_FROM=zai-org/GLM-5.3-Flash`;
   without it `VISION=auto` serves text only and says so.
+- **GLM 5.3 EXLR8** (work/p0 only, not in a release): with multi-lane prefill,
+  prompts beyond about 8K tokens can hang at the coordinator's peer wait
+  ([#408](https://github.com/tpurtell/cuteafd/issues/408)). Use
+  `CUTEAFD_GLM_PREFILL_LANES=1` in the launch environment for long prompts
+  until the fix lands.
 
 ### Methodology
 

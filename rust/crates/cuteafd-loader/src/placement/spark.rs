@@ -157,7 +157,8 @@ impl SparkAssignment {
             let resident = match layout {
                 SparkResidentLayout::Exl3 { world, rank } => {
                     let manifest = catalog.exl3().context("Spark EXL3 layout needs checkpoint trellis headers")?;
-                    let plan = manifest.residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    let plan = manifest.balanced_residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
+                    slice.unit_map = plan.unit_map.as_ref().map(|map| map.fingerprint());
                     slice.first = u32::try_from(plan.intermediate_start)?;
                     slice.width = u32::try_from(plan.intermediate)?;
                     slice.stored_width = slice.width;
@@ -170,6 +171,15 @@ impl SparkAssignment {
                 SparkResidentLayout::Fp8 { world, rank, slicing } => {
                     let tensors = catalog.fp8().context("Spark FP8-family layout needs checkpoint weight/scale headers")?
                         .for_layer(layer)?;
+                    // Exact-even mixed layers share source ranges, but seal each
+                    // format's native units just as its independent worker group does.
+                    let slicing = match slicing {
+                        crate::formats::fp8_experts::Slicing::Blocks(block)
+                            if world > 0 && geometry.intermediate as usize % (block * world) == 0
+                                && geometry.intermediate as usize % (tensors.block() * world) == 0 =>
+                            tensors.exact_slicing(world),
+                        other => other,
+                    };
                     let (first, width) = tensors.rank_range_with(world, rank, slicing)?;
                     slice.unit_map = Some(tensors.unit_map(world, rank, slicing)?.fingerprint());
                     slice.first = u32::try_from(first)?;
@@ -325,10 +335,11 @@ mod tests {
         let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
             SparkResidentLayout::Exl3 { world: 4, rank: 3 },
             &endpoints, rings).unwrap();
-        let plan = catalog.exl3().unwrap().residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
+        let plan = catalog.exl3().unwrap().balanced_residency(crate::V41Exl3Layer::Backbone(0), 4, 3).unwrap();
         assert_eq!(assignment.resident_bytes, plan.device_arena_layout().unwrap().1 as u64);
         assert!(assignment.resident_bytes > plan.bytes() as u64);
-        assert_eq!((assignment.slices[0].first, assignment.slices[0].width), (512, 128));
+        assert_eq!(assignment.slices[0].unit_map, plan.unit_map.as_ref().map(|map| map.fingerprint()));
+        assert_eq!(assignment.slices[0].width, plan.intermediate as u32);
         assert_eq!(assignment.slices[0].tiers, plan.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
         assert_eq!(assignment.slices[0].projection_counts,
             plan.projection_counts.iter().map(|row| row.map(|count| count as u32)).collect::<Vec<_>>());
@@ -361,7 +372,7 @@ mod tests {
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Blocks(128) }, &endpoints, rings).unwrap();
             let padded = SparkAssignment::from_catalog(&catalog, &working, 5,
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Padded }, &endpoints, rings).unwrap();
-            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1792, 256, 256));
+            assert_eq!((exact.slices[0].first, exact.slices[0].width, exact.slices[0].stored_width), (1536, 256, 256));
             assert_eq!(padded.slices[0].stored_width, 384);
             assert!(exact.resident_bytes < padded.resident_bytes);
             assert_eq!(exact.io, padded.io);
@@ -417,8 +428,10 @@ mod tests {
                 assert_eq!(bf16.resident_bytes, 3 * 4096 * u64::from(slice.stored_width) * 2 * 2);
                 assert_eq!(mixed.resident_bytes, fp8.resident_bytes + bf16.resident_bytes);
                 assert_eq!(mixed.slices, [fp8.slices[0].clone(), slice.clone()]);
+                let view = original.for_layer(2).unwrap();
+                let (first, width) = view.rank_range_with(world, rank, Slicing::Blocks(128)).unwrap();
                 assert_eq!((slice.first, slice.width, slice.stored_width),
-                    (fp8.slices[0].first, fp8.slices[0].width, fp8.slices[0].stored_width));
+                    (first as u32, width as u32, width as u32));
                 assert_eq!(mixed.io, bf16.io);
             }
         }

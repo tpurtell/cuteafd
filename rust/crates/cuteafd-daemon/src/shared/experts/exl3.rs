@@ -91,12 +91,12 @@ fn residency_selection(layer: ExpertLayer) -> Result<(V41Exl3Layer, usize, usize
     })
 }
 
-fn layout(catalog: &OfficialV41Catalog, layer: ExpertLayer) -> Result<V41Exl3Residency> {
+pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer) -> Result<V41Exl3Residency> {
+    let spark = matches!(layer, ExpertLayer::BackboneExl3Tp { .. });
     let (layer, world, rank) = residency_selection(layer)?;
-    catalog
-        .exl3()
-        .context("EXL3 residency requires a routed EXL3 checkpoint")?
-        .residency(layer, world, rank)
+    let manifest = catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
+    if spark { manifest.balanced_residency(layer, world, rank) }
+        else { manifest.residency(layer, world, rank) }
 }
 
 fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<ExpertLoadBudget> {
@@ -136,7 +136,7 @@ impl<'a> Exl3Weights<'a> {
         catalog: &OfficialV41Catalog,
         layer: ExpertLayer,
     ) -> Result<ExpertLoadBudget> {
-        budget(catalog, &layout(catalog, layer)?)
+        budget(catalog, &planned_residency(catalog, layer)?)
     }
 
     pub(crate) fn buffer(&self, name: &str) -> Result<CuteafdDeviceBuffer> {
@@ -166,7 +166,7 @@ impl<'a> Exl3Weights<'a> {
         for &layer in layers {
             let mut pinned = 0;
             for rank in 0..2 {
-                let plan = layout(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
+                let plan = planned_residency(catalog, ExpertLayer::BackboneTp2 { layer, rank })?;
                 let budget = budget(catalog, &plan)?;
                 ensure!(budget.peak_device_bytes()? <= remaining[rank], "paired EXL3 admission exceeded");
                 remaining[rank] -= budget.resident_bytes;
@@ -290,7 +290,7 @@ impl<'a> Exl3Weights<'a> {
         layer: ExpertLayer,
         available_device_bytes: usize,
     ) -> Result<Self> {
-        let layout = layout(catalog, layer)?;
+        let layout = planned_residency(catalog, layer)?;
         let budget = budget(catalog, &layout)?;
         ensure!(
             budget.peak_device_bytes()? <= available_device_bytes,
@@ -464,6 +464,26 @@ mod tests {
                          (V41Exl3Layer::Backbone(7), 2, 1)));
         assert!(matches!(residency_selection(ExpertLayer::Backbone { layer: 7, rank: 3 })?,
                          (V41Exl3Layer::Backbone(7), 4, 3)));
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_coordinator_tp2_keeps_legacy_residency_while_sparks_use_compact() -> Result<()> {
+        use cuteafd_loader::plan::testing::{qwen4_config, qwen4_exl3, write_snapshot};
+        let root = tempfile::tempdir()?;
+        let (tensors, _) = qwen4_exl3(1, 4);
+        write_snapshot(root.path(), &qwen4_config(1), &tensors, None);
+        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+        for rank in 0..2 {
+            let coordinator = planned_residency(&catalog, ExpertLayer::BackboneTp2 { layer: 0, rank })?;
+            let legacy = catalog.exl3().unwrap().residency(V41Exl3Layer::Backbone(0), 2, rank)?;
+            assert_eq!(serde_json::to_value(&coordinator)?, serde_json::to_value(&legacy)?);
+            assert!(coordinator.unit_map.is_none());
+            let spark = planned_residency(&catalog,
+                ExpertLayer::BackboneExl3Tp { layer: 0, rank, world: 2 })?;
+            assert!(spark.unit_map.is_some());
+            assert_eq!(spark.aot_layout(), format!("tp2-compact-rank{rank}"));
+        }
         Ok(())
     }
 

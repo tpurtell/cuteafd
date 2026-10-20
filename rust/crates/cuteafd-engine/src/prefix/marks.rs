@@ -25,14 +25,10 @@ impl MarkArena {
         Self { free: (0..count).rev().collect(), slots, slot_bytes }
     }
 
-    /// Slots to preallocate: at least `2 * lanes + 2` (a capture and a restore in flight per
-    /// lane plus two retained), raised to hold two marks per retained entry pair
-    /// (`2 * entries + 2`, both banks full plus the pending pair) while that fits `budget_bytes`.
-    /// Recurrent families (hundred-MiB marks) stay near the lane floor and lean on the host tier;
-    /// MiMo's 25-39 MB marks fit a full retention of both banks.
-    pub fn slots_for(lanes: usize, entries: usize, slot_bytes: usize, budget_bytes: usize) -> usize {
-        cuteafd_core::prefix::mark_slots_for(
-            lanes as u64, entries as u64, slot_bytes as u64, budget_bytes as u64,
+    /// Host-enabled caches need only staging slots; host-off caches retain marks on device.
+    pub fn slots_for(lanes: usize, entries: usize, slot_bytes: usize, budget_bytes: usize, host: bool) -> usize {
+        cuteafd_core::prefix::mark_slots_with_host(
+            lanes as u64, entries as u64, slot_bytes as u64, budget_bytes as u64, host,
         ) as usize
     }
 
@@ -71,12 +67,12 @@ mod tests {
     fn arena_sizing_keeps_the_lane_floor_and_the_byte_budget() {
         const MIB: usize = 1 << 20;
         // MiMo V2.6 Pro: 39.3 MB marks, 20 entries per bank, 2 GiB budget: all 42 fit.
-        assert_eq!(MarkArena::slots_for(1, 20, 39_321_600, 2048 * MIB), 42);
+        assert_eq!(MarkArena::slots_for(1, 20, 39_321_600, 2048 * MIB, false), 42);
         // GLM 5.3 Flash: 141 MiB marks, same budget: 14 slots.
-        assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 2048 * MIB), 14);
+        assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 2048 * MIB, false), 14);
         // The floor wins over a tiny budget; a disabled cache takes nothing.
-        assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 0), 6);
-        assert_eq!(MarkArena::slots_for(2, 0, 141 * MIB, 2048 * MIB), 0);
+        assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 0, false), 6);
+        assert_eq!(MarkArena::slots_for(2, 0, 141 * MIB, 2048 * MIB, false), 0);
     }
 
     #[test]

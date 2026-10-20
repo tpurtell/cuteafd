@@ -95,14 +95,11 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let resolved = attention.unwrap_or(if gpus == 2 && context.is_some() {
         cuteafd_loader::placement::AttentionPlacement::Context
     } else { cuteafd_loader::placement::AttentionPlacement::Heads });
-    let host_marks = inputs.prefix.is_some_and(|p| p.host_cache_bytes.enabled())
-        && (gpus == 1 || resolved != cuteafd_loader::placement::AttentionPlacement::Heads);
-    let mark_slots = match inputs.prefix.map_or(0, |p| p.prefix_cache_entries) {
-        0 => 0,
-        _ if host_marks => cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS,
-        entries => v4::mark_slots(&cache_cfg, gpus, prefill, inputs.cache_stages, args.max_sequences as u64,
-            entries as u64, (inputs.prefix.map_or(0, |p| p.prefix_cache_mark_mib) as u64) << 20)?,
-    };
+    let host_marks = v4::host_marks_enabled(gpus, resolved != cuteafd_loader::placement::AttentionPlacement::Heads,
+        inputs.prefix.is_some_and(|p| p.host_cache_bytes.enabled()));
+    let mark_slots = v4::mark_slots(&cache_cfg, gpus, prefill, inputs.cache_stages, args.max_sequences as u64,
+        inputs.prefix.map_or(0, |p| p.prefix_cache_entries) as u64,
+        (inputs.prefix.map_or(0, |p| p.prefix_cache_mark_mib) as u64) << 20, host_marks)?;
     let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
         inputs.manifest, inputs.family, gpus == 2, prefill, decode)?;
     let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(&cache_cfg, prefill, decode,

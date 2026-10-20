@@ -993,13 +993,13 @@ impl<'a> GlmEngine<'a> {
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
         let bytes = t * h * 2;
         if let Some(w1) = w1 {
-            // The embedded rows to the second GPU, which runs one layer ahead of the host's
-            // rank-0 work (all its inputs are pushes from rank 0).
             self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
-            self.peer_attention(0, 0, w1, rows, cap, &ranked[0], bytes)?;
         }
         self.norm(w, &layers[0], "input_norm", 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
+            if let Some(w1) = w1 {
+                self.peer_attention(index, 0, w1, rows, cap, &ranked[0], bytes)?;
+            }
             self.attention_unit(0, w, index, layer, rows, cap, &ranked[0], 0)?;
             // h += attention; x = post_attention_layernorm(h)
             let (attended, ffn) = (slot(index, false, 0), slot(index, true, 0));
@@ -1008,13 +1008,7 @@ impl<'a> GlmEngine<'a> {
                     self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes)?;
                     self.exchange()?.wait(0, attended)?;
                     self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
-                    // Rank 1: this layer's FFN side, then the next layer's attention.
-                    if !self.tp2_layer(index) {
-                        self.peer_post(index, 0, w1, rows, bytes)?;
-                        if index + 1 < layers.len() {
-                            self.peer_attention(index + 1, 0, w1, rows, cap, &ranked[0], bytes)?;
-                        }
-                    }
+                    self.peer_ffn(index, 0, w1, rows, cap, bytes)?;
                 }
                 None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
@@ -1028,11 +1022,6 @@ impl<'a> GlmEngine<'a> {
             } else if self.tp2_layer(index) {
                 self.moe_front(w, layer, t)?;
                 self.tp2_pair(index, 0, w, w1.context("TP2 peer workspace")?, t, cap)?;
-                let w1 = w1.context("TP2 peer workspace")?;
-                self.peer_post(index, 0, w1, rows, bytes)?;
-                if index + 1 < layers.len() {
-                    self.peer_attention(index + 1, 0, w1, rows, cap, &ranked[0], bytes)?;
-                }
             } else if let Some(skip) = &self.skip {
                 self.moe_front(w, layer, t)?;
                 let ranks = self.moe_skip(w, index, layer, t, cap)?;
@@ -1049,10 +1038,11 @@ impl<'a> GlmEngine<'a> {
                 Some(next) => next.ptr("input_norm")?,
                 None => self.weights.norm.buffer.ptr,
             };
-            if w1.is_some() {
+            if let Some(w1) = w1 {
                 if !layer.dense && !self.tp2_layer(index) && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                 }
+                self.peer_post(index, 0, w1, rows, bytes)?;
                 self.exchange()?.wait(0, ffn)?;
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, 0, rows)?; }
                 else { self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -1127,8 +1117,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Rank 1's attention half of unit (`index`, `lane`): (layer 0: the embedded
     /// rows and input norm), its heads' attention, the attention all-reduce and
-    /// post-attention norm, then its dense-MLP partial or shared-expert half,
-    /// pushed to rank 0.
+    /// post-attention norm. Both ranks queue this front before either queues FFN work.
     #[allow(clippy::too_many_arguments)]
     fn peer_attention(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar, cap: &str,
         tables: &[StepTables; 2], bytes: usize) -> Result<()> {
@@ -1139,10 +1128,17 @@ impl<'a> GlmEngine<'a> {
             self.norm_full(1, w1, layer.ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
         }
         self.attention_unit(1, w1, index, layer, rows, cap, tables, lane)?;
-        let (attended, ffn) = (slot(index, false, lane), slot(index, true, lane));
+        let attended = slot(index, false, lane);
         exchange.push(1, attended, w1.delta.buffer.ptr, bytes)?;
         exchange.wait(1, attended)?;
-        self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)?;
+        self.norm_full(1, w1, layer.ptr("post_norm")?, 2, rows, w1.delta.buffer.ptr, self.recv(1, attended)?)
+    }
+
+    fn peer_ffn(&self, index: usize, lane: usize, w1: &Workspace<'_>, rows: Scalar,
+        cap: &str, bytes: usize) -> Result<()> {
+        let peer = self.peer()?;
+        let (layer, exchange) = (&peer.layers[index], self.exchange()?);
+        let ffn = slot(index, true, lane);
         if layer.dense {
             self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, w1.delta.buffer.ptr, rows)?;
             exchange.push(1, ffn, w1.delta.buffer.ptr, bytes)
@@ -1727,42 +1723,21 @@ impl<'a> GlmEngine<'a> {
         let cap = "m4096";
         let rows_of = |lane: usize| Scalar::I32(counts[lane] as i32);
         let bytes_of_lane = |lane: usize| counts[lane] * self.cfg.hidden * 2;
-        // The head split's second GPU: each lane's embedded rows (its tables went with rank
-        // 0's), then every lane's layer-0 attention (rank 1 runs a unit ahead of the host).
+        // Transfer embeddings in DIRECT publication order. Attention is paired per unit.
         if let Some(peers) = &peer_workspaces {
             // Only this step's lanes (the workspace list keeps every lane ever used).
             for (lane, w) in workspaces.iter().take(lanes.len()).enumerate() {
                 let w1 = peers.get(lane)?;
                 self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes_of_lane(lane))?;
             }
-            if self.tp2.is_none() {
-                for lane in 0..lanes.len() {
-                    self.peer_attention(0, lane, peers.get(lane)?, rows_of(lane), cap, &ranked[lane], bytes_of_lane(lane))?;
-                }
-            }
         }
-        // After rank 0 queued unit (index, lane)'s FFN: rank 1's FFN exchange of that unit
-        // and its lane's next attention.
-        let peer_next = |(index, lane): (usize, usize)| -> Result<()> {
-            let Some(peers) = &peer_workspaces else { return Ok(()) };
-            let w1 = peers.get(lane)?;
-            self.peer_post(index, lane, w1, rows_of(lane), bytes_of_lane(lane))?;
-            if self.tp2.is_none() && index + 1 < layers.len() {
-                self.peer_attention(index + 1, lane, w1, rows_of(lane), cap, &ranked[lane], bytes_of_lane(lane))?;
-            }
-            Ok(())
-        };
         // The drafter taps the chunk's last TAP_ROWS rows: each lane's part of
         // that window, at its offset among the tap rows.
         let window = total - total.min(super::dflash::TAP_ROWS);
         let attention = |(index, lane): (usize, usize)| -> Result<()> {
-            // Local pairs wait for rank1's result. Queue only this unit's
-            // peer front, never a future lane's unmatched attention wait.
-            if self.tp2.is_some() {
-                if let Some(peers) = &peer_workspaces {
-                    self.peer_attention(index, lane, peers.get(lane)?, rows_of(lane), cap,
-                        &ranked[lane], bytes_of_lane(lane))?;
-                }
+            if let Some(peers) = &peer_workspaces {
+                self.peer_attention(index, lane, peers.get(lane)?, rows_of(lane), cap,
+                    &ranked[lane], bytes_of_lane(lane))?;
             }
             let (w, layer, rows) = (workspaces[lane], &layers[index], rows_of(lane));
             if index == 0 {
@@ -1774,6 +1749,8 @@ impl<'a> GlmEngine<'a> {
                 self.exchange()?.push(0, attended, w.delta.buffer.ptr, bytes_of_lane(lane))?;
                 self.exchange()?.wait(0, attended)?;
                 self.norm_full(0, w, layer.ptr("post_norm")?, 2, rows, w.delta.buffer.ptr, self.recv(0, attended)?)?;
+                self.peer_ffn(index, lane, peer_workspaces.as_ref().context("peer workspaces")?.get(lane)?,
+                    rows, cap, bytes_of_lane(lane))?;
             } else {
                 self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
@@ -1806,7 +1783,8 @@ impl<'a> GlmEngine<'a> {
                 if ranks.is_some() && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes_of_lane(lane))?;
                 }
-                if ranks.is_some() && self.tp2.is_some() { peer_next((index, lane))?; }
+                self.peer_post(index, lane, peer_workspaces.as_ref().context("peer workspaces")?.get(lane)?,
+                    rows, bytes_of_lane(lane))?;
                 self.exchange()?.wait(0, ffn)?;
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, lane, rows)?; }
                 else { self.norm_full(0, w, weight, 2, rows, w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -1839,17 +1817,14 @@ impl<'a> GlmEngine<'a> {
         for (position, &unit) in units.iter().enumerate() {
             let (index, lane) = unit;
             if layers[index].dense {
-                peer_next(unit)?;
                 post(unit, None)?;
             } else if self.tp2_layer(index) {
                 let w1 = peer_workspaces.as_ref().context("TP2 peer workspaces")?.get(lane)?;
                 self.tp2_pair(index, lane, workspaces[lane], w1, counts[lane], cap)?;
-                peer_next(unit)?;
                 post(unit, None)?;
             } else {
                 self.moe_stage(workspaces[lane], index, &layers[index], counts[lane], cap)?;
                 self.lane_send(workspaces[lane], index, counts[lane], &mut transports[lane])?;
-                if self.tp2.is_none() { peer_next(unit)?; }
                 inflight.push_back(unit);
             }
             match units.get(position + 1).copied() {

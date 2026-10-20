@@ -176,6 +176,7 @@ pub fn run(args: &RunArgs) -> Result<Vec<Run>> {
     let mut model_record = models["data"][0].clone();
     model_record["full_prefill_logits"] = status["full_prefill_logits"].clone();
     model_record["snapshot"] = status["snapshot"].clone();
+    model_record["settings"] = status["settings"].clone();
     let mut runs = vec![run_with(args, model, &model_record, |body| {
         request(&agent, &format!("{base}/v1/bench/probe"), &args.api_key, &body)
     }, |_, _, _| {})?];
@@ -234,10 +235,11 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             && d["config"] == s.config && d["revision"] == s.revision));
     if !ancestry_match { validate_served_reference(&reference, model, dataset_identity.is_some())?; }
     if explicit {
-        let root = dataset_identity.as_ref().filter(|d| d["repository"] == crate::fidelity_dataset::REPOSITORY)
-            .and_then(|d| crate::fidelity_match::PUBLICATIONS.iter()
-            .find(|p| d["config"] == p.config && d["revision"] == p.revision))
-            .map(|p| p.root).unwrap_or(&reference.checkpoint).to_owned();
+        let root = dataset_identity.as_ref().and_then(|d| d["root_checkpoint"]["id"].as_str())
+            .or_else(|| dataset_identity.as_ref().filter(|d| d["repository"] == crate::fidelity_dataset::REPOSITORY)
+                .and_then(|d| crate::fidelity_match::PUBLICATIONS.iter()
+                    .find(|p| d["config"] == p.config && d["revision"] == p.revision)).map(|p| p.root))
+            .unwrap_or(&reference.checkpoint).to_owned();
         selection = Some(crate::fidelity_match::Resolution { reference_match: "explicit".into(),
             reference_root: root, text_checkpoint: Some(reference.checkpoint.clone()),
             resolved_chain: selection.map(|s| s.resolved_chain).unwrap_or_default(),
@@ -248,6 +250,8 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         selection.text_checkpoint = Some(dataset_identity.as_ref().and_then(|d| d["text_checkpoint"].as_str())
             .unwrap_or(&reference.checkpoint).to_owned());
     }
+    let precision = crate::fidelity_precision::resolve(model, snapshot, &model_record["settings"],
+        selection.as_ref().map(|s| s.reference_root.as_str()).unwrap_or(&reference.checkpoint), selection.as_ref())?;
     let standard = args.tier == "standard";
     let admitted = model_record["full_prefill_logits"] == true;
     let windows = if standard {
@@ -306,7 +310,7 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
                 else if rows.is_some() { "full-vocabulary" } else { "top32-plus-tail" }.into(),
             dataset: dataset_identity.clone(), reference_selection: selection.clone(), standard_balance: standard_balance.clone(), verify_rows: args.verify_rows, engine, settings,
             seconds: started.elapsed().as_secs_f64(), score, floor_top1: reference.expect.top1_min,
-            floor_kl: reference.expect.kl_max, tripwire_expect: reference.expect.tripwires.clone() }
+            floor_kl: reference.expect.kl_max, precision: Some(precision.clone()), tripwire_expect: reference.expect.tripwires.clone() }
     };
     for (i, window) in windows.iter().enumerate() {
         let end = window.positions.last().context("empty window")?.pos + 1;
@@ -338,6 +342,9 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
             "decode" => "decode-shaped",
             _ => bail!("unsupported reported scoring path: {actual_path}"),
         };
+        ensure!(crate::fidelity_precision::selected_manifest(&response["server"]["settings"])
+            == crate::fidelity_precision::selected_manifest(&model_record["settings"]),
+            "active EXLR8 manifest changed since discovery");
         if i == 0 {
             engine = this_engine; settings = response["server"].clone(); shape = this_shape.into();
         } else {
@@ -558,7 +565,7 @@ mod tests {
             checkpoint: "test".into(), set_sha256: "set".into(), reference_sha256: "ref".into(),
             tier: "quick".into(), path_shape: "decode-shaped".into(), kl_kind: "top32-plus-tail".into(),
             verify_rows: None, dataset: None, reference_selection: None, standard_balance: None, engine: "test".into(), settings: json!({}), seconds: 0.0,
-            score, floor_top1: 0.9, floor_kl: 0.06, tripwire_expect: None };
+            score, floor_top1: 0.9, floor_kl: 0.06, precision: None, tripwire_expect: None };
         assert!(run_pass(&run));
         run.score.missing = 1; assert!(!run_pass(&run));
         run.score.missing = 0; run.score.non_finite = 1; assert!(!run_pass(&run));

@@ -78,7 +78,7 @@ fn replicated_tie_seed_mode() -> Result<ReplicatedExpertTieSeedMode> {
 }
 
 impl ReplicatedGroupPlanner {
-    fn new(topology: SparkTopology) -> Result<Self> {
+    pub(crate) fn new(topology: SparkTopology) -> Result<Self> {
         Self::new_with_seed_mode(topology, replicated_tie_seed_mode()?)
     }
 

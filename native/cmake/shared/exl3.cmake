@@ -13,11 +13,9 @@ else()
   message(FATAL_ERROR "EXL3 AOT requires a single native SM120 or SM121 target")
 endif()
 set(CUTEAFD_V41_EXL3_CAPACITIES "1;16;80;256;1024;4096" CACHE STRING "EXL3 batch capacities to package")
-# V7 ships two decoder families side by side: the uniform K=2 raw
-# publication family (resident tiers [2,3]) and the staged K3.25 family
-# ([3,4]). Each family lands in its own sibling package directory
-# (exl3-k23, exl3-k34) and the daemon selects by checkpoint tiers.
-set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4" CACHE STRING "EXL3 decoder tier families to package; one comma-joined tier list per family")
+# Decoder families land in sibling packages (exl3-k23, exl3-k34, exl3-k45);
+# the daemon selects the family from checkpoint tiers.
+set(CUTEAFD_V41_EXL3_BIT_FAMILIES "2,3;3,4;4,5" CACHE STRING "EXL3 decoder tier families to package; one comma-joined tier list per family")
 set(CUTEAFD_V41_EXL3_BITS "" CACHE STRING "Single EXL3 decoder tier family override (replaces CUTEAFD_V41_EXL3_BIT_FAMILIES)")
 set(CUTEAFD_V41_EXL3_TILES "" CACHE STRING "Per-profile EXL3 tile overrides for a controlled A/B (for example tp3-width768=all:128,128,128,128, or tp3-width768=16:64,256,64,256)")
 if(CUTEAFD_V41_EXL3_BITS)
@@ -61,10 +59,15 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
   if(NOT CUTEAFD_EXL3_FAMILY_TAG MATCHES "^[0-9]+$")
     message(FATAL_ERROR "EXL3 tier family '${family}' must be comma-joined integers")
   endif()
+  set(CUTEAFD_EXL3_COMPACT_ARGS)
+  list(LENGTH CUTEAFD_EXL3_FAMILY_TIERS CUTEAFD_EXL3_TIER_COUNT)
+  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND CUTEAFD_EXL3_TIER_COUNT EQUAL 2)
+    set(CUTEAFD_EXL3_COMPACT_ARGS --compact-companions)
+  endif()
   set(CUTEAFD_EXL3_PACKAGE "${CMAKE_CURRENT_BINARY_DIR}/exl3-k${CUTEAFD_EXL3_FAMILY_TAG}")
   string(JOIN "|" CUTEAFD_EXL3_CONFIG_KEY "role=${CUTEAFD_EXL3_ROLE}"
     "layouts=${CUTEAFD_EXL3_REQUIRE_LAYOUTS}" "capacities=${CUTEAFD_V41_EXL3_CAPACITIES}"
-    "tiers=${family}" "tiles=${CUTEAFD_EXL3_TILE_ARGS}")
+    "tiers=${family}" "compact=${CUTEAFD_EXL3_COMPACT_ARGS}" "tiles=${CUTEAFD_EXL3_TILE_ARGS}")
   set(CUTEAFD_EXL3_CONFIG_STAMP "${CMAKE_CURRENT_BINARY_DIR}/v41_exl3_k${CUTEAFD_EXL3_FAMILY_TAG}_config.stamp")
   file(GENERATE OUTPUT "${CUTEAFD_EXL3_CONFIG_STAMP}" CONTENT "${CUTEAFD_EXL3_CONFIG_KEY}\n")
   set(CUTEAFD_EXL3_BYPRODUCTS)
@@ -83,7 +86,7 @@ foreach(family IN LISTS CUTEAFD_V41_EXL3_BIT_FAMILIES)
       "${Python3_EXECUTABLE}" "${CUTEAFD_EXL3_TOOL}" build
       --role "${CUTEAFD_EXL3_ROLE}" --capacities "${CUTEAFD_EXL3_CAPACITIES_ARG}"
       --bits ${CUTEAFD_EXL3_FAMILY_TIERS}
-      ${CUTEAFD_EXL3_REQUIRE_ARGS} ${CUTEAFD_EXL3_TILE_ARGS}
+      ${CUTEAFD_EXL3_REQUIRE_ARGS} ${CUTEAFD_EXL3_TILE_ARGS} ${CUTEAFD_EXL3_COMPACT_ARGS}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/v41_exl3_exports/k${CUTEAFD_EXL3_FAMILY_TAG}"
       --output "${CUTEAFD_EXL3_PACKAGE}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_EXL3_CUDA_INCLUDE}"
@@ -117,6 +120,11 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   set(CUTEAFD_EXL3_FAMILY_TAG "${CMAKE_MATCH_2}")
   string(REGEX REPLACE "([2-5])" "\\1;" CUTEAFD_EXL3_FAMILY_TIERS "${CUTEAFD_EXL3_FAMILY_TAG}")
   list(FILTER CUTEAFD_EXL3_FAMILY_TIERS EXCLUDE REGEX "^$")
+  set(CUTEAFD_EXL3_COMPACT_ARGS)
+  list(LENGTH CUTEAFD_EXL3_FAMILY_TIERS CUTEAFD_EXL3_TIER_COUNT)
+  if(CUTEAFD_EXL3_ROLE STREQUAL "spark" AND CUTEAFD_EXL3_TIER_COUNT EQUAL 2)
+    set(CUTEAFD_EXL3_COMPACT_ARGS --compact-companions)
+  endif()
   set(CUTEAFD_EXL3_PACKAGE "${CMAKE_CURRENT_BINARY_DIR}/exl3-${CUTEAFD_EXL3_GEOMETRY}-k${CUTEAFD_EXL3_FAMILY_TAG}")
   set(CUTEAFD_EXL3_CONFIG_STAMP "${CMAKE_CURRENT_BINARY_DIR}/exl3_${CUTEAFD_EXL3_GEOMETRY}_k${CUTEAFD_EXL3_FAMILY_TAG}_config.stamp")
   set(CUTEAFD_EXL3_GEOMETRY_LAYOUTS ${CUTEAFD_EXL3_LAYOUTS})
@@ -201,7 +209,7 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
   list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS "," CUTEAFD_EXL3_GEOMETRY_REQUIRE)
   string(JOIN "|" CUTEAFD_EXL3_CONFIG_KEY "geometry=${CUTEAFD_EXL3_GEOMETRY}" "role=${CUTEAFD_EXL3_ROLE}"
     "layouts=${CUTEAFD_EXL3_GEOMETRY_REQUIRE}" "capacities=${CUTEAFD_V41_EXL3_CAPACITIES}"
-    "tiers=${CUTEAFD_EXL3_FAMILY_TIERS}")
+    "tiers=${CUTEAFD_EXL3_FAMILY_TIERS}" "compact=${CUTEAFD_EXL3_COMPACT_ARGS}")
   file(GENERATE OUTPUT "${CUTEAFD_EXL3_CONFIG_STAMP}" CONTENT "${CUTEAFD_EXL3_CONFIG_KEY}\n")
   add_custom_command(
     OUTPUT "${CUTEAFD_EXL3_PACKAGE}/manifest.json"
@@ -212,6 +220,7 @@ foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
       --capacities "${CUTEAFD_EXL3_CAPACITIES_ARG}"
       --bits ${CUTEAFD_EXL3_FAMILY_TIERS}
       --require-layout "${CUTEAFD_EXL3_GEOMETRY_REQUIRE}" ${CUTEAFD_EXL3_PROFILE_ARGS}
+      ${CUTEAFD_EXL3_COMPACT_ARGS}
       --build-dir "${CMAKE_CURRENT_BINARY_DIR}/exl3_exports/${CUTEAFD_EXL3_GEOMETRY}-k${CUTEAFD_EXL3_FAMILY_TAG}"
       --output "${CUTEAFD_EXL3_PACKAGE}"
       --cxx "${CMAKE_CXX_COMPILER}" --cuda-include "${CUTEAFD_EXL3_CUDA_INCLUDE}"

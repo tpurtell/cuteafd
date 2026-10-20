@@ -79,7 +79,7 @@ pub struct MarkRule {
 impl MarkRule {
     /// Slots of the arena for marks of `mark_bytes` (every rank's part): what the runtime
     /// allocates (`MarkArena::slots_for`) and what its planner reserves
-    /// ([`cuteafd_core::prefix::mark_slots_for`]). The budget holds whole marks, so the count
+    /// ([`cuteafd_core::prefix::mark_slots_with_host`]). The budget holds whole marks, so the count
     /// depends on the exact mark bytes: size both sides from the same mark.
     pub fn slots(self, mark_bytes: usize) -> usize {
         cuteafd_core::prefix::mark_slots_with_host(self.lanes as u64, self.entries as u64, mark_bytes as u64,
@@ -233,6 +233,27 @@ mod tests {
     struct Cli {
         #[command(flatten)]
         prefix: PrefixArgs,
+    }
+
+    #[test]
+    fn runtime_mark_rule_matches_shared_planner_and_arena_with_or_without_host() {
+        for host in ["0", "auto", "32GiB"] {
+            for entries in [0, 1, 20] {
+                let cli = Cli::parse_from(["serve", "--host-cache-bytes", host,
+                    "--prefix-cache-entries", &entries.to_string()]);
+                for lanes in [1, 16, 64] {
+                    // Paged MLA (no positional mark), dense/recurrent state, and SWA marks.
+                    for bytes in [0, 37_500_000, 147_619_840, 256 << 20] {
+                        let rule = cli.prefix.mark_rule(lanes);
+                        let planned = cuteafd_core::prefix::mark_slots_with_host(lanes as u64, entries,
+                            bytes as u64, rule.budget_bytes, host != "0") as usize;
+                        let arena = cuteafd_engine::prefix::MarkArena::slots_for(lanes, entries as usize, bytes,
+                            rule.budget_bytes as usize, host != "0");
+                        assert_eq!((rule.slots(bytes), arena), (planned, planned));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

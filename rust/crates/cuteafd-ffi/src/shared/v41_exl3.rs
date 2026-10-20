@@ -6,6 +6,7 @@ use std::{ffi::c_void, marker::PhantomData, path::Path, ptr::NonNull, rc::Rc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct V41Exl3Info {
+    pub version: u32,
     /// Bytes per output element: BF16 (2) or FP32 (4).
     pub output_element_bytes: usize,
     pub hidden: usize,
@@ -45,7 +46,7 @@ impl V41Exl3Info {
 
     fn from_words_for_geometry(words: [u32; 16], geometry: cuteafd_core::ExpertGeometry) -> Result<Self> {
         ensure!(
-            words[0] == 2
+            (words[0] == 2 || (words[0] == 3 && words[6] == 2))
                 && matches!(words[15], 2 | 4)
                 && words[1] == geometry.hidden
                 && exl3_shard_widths(geometry).contains(&words[2])
@@ -72,6 +73,7 @@ impl V41Exl3Info {
             "invalid EXL3 pointer/scalar ABI"
         );
         Ok(Self {
+            version: words[0],
             output_element_bytes: words[15] as usize,
             hidden: words[1] as usize,
             intermediate: words[2] as usize,
@@ -295,6 +297,21 @@ mod info_tests {
         let reloaded = unsafe { V41Exl3Kernel::load(&path)? };
         assert_eq!(reloaded.info().tier_count, 4);
         Ok(())
+    }
+
+    #[test]
+    fn compact_native_info_requires_two_tiers_and_explicit_version() {
+        let base = [3u32, 5120, 384, 384, 16, 6, 2, 44, 18, 7, 3, 3, 4, 0, 0, 2];
+        assert_eq!(V41Exl3Info::from_words(base).unwrap().version, 3);
+        for version in [0, 1, 4, u32::MAX] {
+            let mut words = base;
+            words[0] = version;
+            assert!(V41Exl3Info::from_words(words).is_err());
+        }
+        let mut words = base;
+        words[6] = 3;
+        words[13] = 5;
+        assert!(V41Exl3Info::from_words(words).is_err());
     }
 
     #[test]

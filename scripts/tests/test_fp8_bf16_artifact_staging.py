@@ -62,6 +62,8 @@ def test_qwen_tp5_exact_slice_has_no_padding():
 
 
 def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
+    assert package_tool.exact_widths(2048, 3) == [768, 640, 640]
+    assert package_tool.exact_widths(2048, 3, 32) == [704, 672, 672]
     assert package_tool.exact_widths(2048, 6, 32) == [352, 352, 352, 352, 320, 320]
     assert package_tool.exact_widths(2048, 6, 16) == []
     # Importing geometry is CPU-only; no exporter or CUDA context is involved.
@@ -83,6 +85,13 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
         assert geometry.slice == width
     with pytest.raises(SystemExit, match="no rank"):
         package_tool.layout_geometry(base, "tp6-w336")
+    for width in (768, 640, 704, 672):
+        tp, geometry = package_tool.layout_geometry(base, f"tp3-w{width}")
+        assert tp == 3
+        assert geometry.slice == width
+    for width in (656, 688, 736):
+        with pytest.raises(SystemExit, match="no rank"):
+            package_tool.layout_geometry(base, f"tp3-w{width}")
 
 
 @pytest.mark.parametrize("counts,expected", [("", ""), ("5", "--layouts;tp5"),

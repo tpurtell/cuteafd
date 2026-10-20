@@ -30,15 +30,15 @@ def test_every_unit_has_exactly_one_owner(rule, world):
             assert counts.max() - counts.min() <= 1
 
 
-def test_rotated_is_the_exlr8_owner():
+def test_uneven_rotated_is_the_exlr8_owner():
     # loader plan/exlr8.rs owner(): (units * expert + unit + layer) % ranks, and its test vector.
-    for e, u, layer, n in ((0, 0, 3, 6), (7, 15, 40, 6), (255, 9, 77, 4), (256, 5, 40, 6)):
+    for e, u, layer, n in ((0, 0, 3, 6), (7, 15, 40, 6), (255, 9, 77, 3), (256, 5, 40, 6)):
         assert tp.unit_owner('rotated', 16, e, u, layer, n) == (16 * e + u + layer) % n
     assert [u for u in range(16) if tp.unit_owner('rotated', 16, 256, u, 40, 6) == 1] == [5, 11]
 
 
-def test_contiguous_matches_todays_exact_slices():
-    # package_fp8_moe_aot.exact_widths / plan::experts widths: TP6 of 2048 is 384x4 + 256x2.
+def test_contiguous_reference_preserves_whole_units():
+    # Reference whole-H128 contiguous partition: TP6 of 2048 is 384x4 + 256x2.
     counts = tp.count_matrix('contiguous', GLM, 40, 6)
     assert (counts * 128 == [384, 384, 384, 384, 256, 256]).all()
     k32 = tp.count_matrix('contiguous', tp.Geometry(384, 2048, 32), 40, 6)
@@ -213,3 +213,18 @@ def test_rust_shared_map_fingerprints(rule, experts, intermediate, unit, layer, 
     assert digest.hexdigest() == expected
     source = (ROOT / 'rust/crates/cuteafd-core/src/tp_units.rs').read_text()
     assert expected in source
+
+
+@pytest.mark.parametrize('rule', tp.STATIC_RULES)
+@pytest.mark.parametrize('intermediate,world', [(2048, 2), (2048, 4), (2304, 3), (2304, 6), (1536, 6), (3072, 6)])
+def test_even_balanced_is_identical_to_contiguous(rule, intermediate, world):
+    for unit in (32, 128):
+        geometry = tp.Geometry(8, intermediate, unit)
+        for layer in (0, 3, 40, 77):
+            for rank in range(world):
+                expected = tp.rank_units('contiguous', geometry, layer, world, rank)
+                actual = tp.rank_units(rule, geometry, layer, world, rank)
+                assert actual == expected
+                assert actual.width_classes() == expected.width_classes()
+                for expert in range(geometry.experts):
+                    assert actual.column_ranges(expert, unit) == expected.column_ranges(expert, unit)

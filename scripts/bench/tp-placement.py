@@ -12,13 +12,15 @@ expert e in layer L to a rank of an N-rank Spark world. Units per expert:
 U = intermediate / unit. Rules (all checkpoint-independent closed forms
 except `fitted`):
 
-  contiguous     today's exact slices: rank r owns one contiguous run of whole
+  contiguous     offline contiguous reference: rank r owns one contiguous run of whole
                  units, the first U mod N ranks one extra (TP6 of 16: 3,3,3,3,2,2
                  for every expert of every layer). With unit=32 (MXFP4 K32
                  scale groups, MiMo) this is 352,352,352,352,320,320.
   layer-rotation contiguous runs shifted by L: the heavy ranks move per layer,
                  every expert of a layer shares them.
-  rotated        EXLR8 FORMAT.md: rank = (U*e + u + L) mod N (#408).
+  rotated        rank = (U*e + u + L) mod N for uneven worlds (#408).
+                 Static policies keep divisible worlds contiguous, unlike the
+                 raw EXLR8 checkpoint ownership primitive in the Rust loader.
   fitted         offline experiment only: per (layer, expert), the set of heavy
                  ranks chosen by local search on fit-half routes.
 
@@ -60,6 +62,10 @@ def unit_owner(rule: str, units: int, expert, unit, layer: int, world: int):
     if not 1 <= world <= units:
         raise ValueError(f'world {world} needs 1..{units} ranks')
     expert, unit = np.asarray(expert), np.asarray(unit)
+    if rule not in STATIC_RULES:
+        raise ValueError('unknown rule ' + rule)
+    if units % world == 0:
+        rule = 'contiguous'
     if rule == 'rotated':
         return (units * expert + unit + layer) % world
     base, extra = divmod(units, world)

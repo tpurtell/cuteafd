@@ -25,7 +25,7 @@ pub(super) struct Fp8Group {
 
 impl Fp8Group {
     fn plan(catalog: &OfficialV41Catalog, config: &NativeExpertServiceConfig) -> Result<Vec<Self>> {
-        use cuteafd_loader::formats::fp8_experts::{ExpertFormat, Slicing};
+        use cuteafd_loader::formats::fp8_experts::ExpertFormat;
         let tensors = catalog.fp8().context("native expert groups require checkpoint tensors")?;
         ensure!(config.spark_world()?.wire() == cuteafd_transport::expert::SparkWire::Canonical,
             "native expert packages require canonical Spark wire");
@@ -47,10 +47,6 @@ impl Fp8Group {
                 cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"),
                     tensors.shape().intermediate, config.world)?.rank_for_layer(config.rank, layer), slicing,
                 tensors.rank_width(config.world, config.rank, slicing)?)?;
-            if config.world == 5 {
-                ensure!(slicing == Slicing::Blocks(128) || tensors.shape().intermediate % (128 * config.world) == 0,
-                    "Spark TP5 requires whole-H128 rank-width packages");
-            }
             let metadata = fp8::package_metadata(&directory, &tensors, &layers, config.world, config.rank, slicing)?;
             let capacity = config.capacity as usize;
             let mut scratch = metadata.scratch_for(capacity)?.max(256);
@@ -99,9 +95,10 @@ impl<'a> WarmModules<'a> {
             }
             return Ok(Self::Fp8(Some(groups)));
         }
-        if let Some(manifest) = catalog.exl3() {
-            let directory = config.exl3_directory_for(manifest.decoder_tiers());
+        if catalog.exl3().is_some() {
+            let directory = config.exl3_directory(catalog)?;
             Exl3Worker::validate_exports(&directory, config.capacity, config.rank, config.exl3_schedule)?;
+            config.validate_exl3_residency(catalog, &directory)?;
             let modules = cuteafd_core::Exl3RowPolicy::active().capacities(config.capacity as usize)?
                 .into_iter().map(|capacity| {
                     // SAFETY: exports were validated above; no arenas or weights are allocated.
@@ -169,6 +166,9 @@ mod tests {
             "Exl3Workspace::new", "Fp8Experts::load", "weights.execution"] {
             assert!(!source.contains(forbidden), "module phase contains {forbidden}");
         }
+        let exl3 = source.split("if catalog.exl3().is_some() {").nth(1).unwrap();
+        assert!(exl3.find("config.validate_exl3_residency(catalog, &directory)?").unwrap()
+            < exl3.find("Exl3Modules::load").unwrap());
         let worker = include_str!("local.rs");
         let modules = worker.find("let mut modules = match super::modules::WarmModules::load").unwrap();
         let weights = worker.find("load_weights(&library").unwrap();

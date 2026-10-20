@@ -160,8 +160,8 @@ mod draft_prefix_tests {
         let target = 256u64 << 20;
         let draft = 20u64 << 20;
         let bytes = |enabled| aggregate_mark_bytes(target, draft + 8, enabled).unwrap();
-        let slots = |enabled| cuteafd_engine::prefix::MarkArena::slots_for(16, 24, bytes(enabled) as usize, 12usize << 30);
-        assert_eq!(slots(false), cuteafd_engine::prefix::MarkArena::slots_for(16, 24, target as usize, 12usize << 30));
+        let slots = |enabled| cuteafd_engine::prefix::MarkArena::slots_for(16, 24, bytes(enabled) as usize, 12usize << 30, false);
+        assert_eq!(slots(false), cuteafd_engine::prefix::MarkArena::slots_for(16, 24, target as usize, 12usize << 30, false));
         assert!(slots(true) <= slots(false));
         assert_eq!(bytes(false), target);
         assert!(draft_prefix_reservations(false, draft + 8, 42, 18).unwrap().is_empty());
@@ -974,6 +974,8 @@ mod tests {
         // Sixteen live requests need capture/restore slots even when retained
         // entry marks do not fit the nominal mark-cache budget.
         assert_eq!(mark_slots(&cli.prefix, 16, 37_500_000).unwrap(), 34);
+        let hosted = Cli::parse_from(["serve", "--prefix-cache-mark-mib", "0", "--host-cache-bytes", "auto"]);
+        assert_eq!(mark_slots(&hosted.prefix, 16, 37_500_000).unwrap(), 2);
         let disabled = Cli::parse_from(["serve", "--prefix-cache-entries", "0"]);
         assert_eq!(mark_slots(&disabled.prefix, 16, 37_500_000).unwrap(), 0);
         assert!(mark_slots(&cli.prefix, 65, 37_500_000).is_err());

@@ -127,6 +127,10 @@ fn fidelity(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
     doc.end();
     y += 22.0;
     let mut notes = Vec::new();
+    if let Some(precision) = v["decode"]["precision"].as_object().or_else(|| v["prefill"]["precision"].as_object())
+        .and_then(|p| serde_json::from_value::<crate::fidelity_precision::Precision>(Value::Object(p.clone())).ok()) {
+        notes.push(precision.label());
+    }
     if dataset["qualification"] == "reference" {
         notes.push("reference".to_string());
     }
@@ -785,6 +789,20 @@ fn startup(doc: &mut Doc, t: &Theme, v: &Value, w: f64) -> f64 {
 
 #[cfg(test)]
 mod context_load_tests {
+    #[test]
+    fn fidelity_panel_shows_recorded_precision_and_root_reason() {
+        let mut value = serde_json::json!({"decode":{}});
+        for root in [false, true] {
+            let p = crate::fidelity_precision::Precision::new(4.0, "test", root, "test").unwrap();
+            value["decode"]["precision"] = serde_json::json!(p);
+            let mut doc = super::Doc::new(900.0, 300.0);
+            super::fidelity(&mut doc, &super::super::theme::NORMAL, &value, 900.0);
+            let svg = doc.finish();
+            assert!(svg.contains("4.0 bpw"));
+            assert!(svg.contains(if root { "reference-root format" } else { "tier:" }));
+        }
+    }
+
     #[test]
     fn fidelity_card_labels_reference() {
         let value = serde_json::json!({"dataset":{"config":"dense-bf16","revision":"a".repeat(40),

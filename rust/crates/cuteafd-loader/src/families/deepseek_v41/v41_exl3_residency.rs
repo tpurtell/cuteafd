@@ -22,6 +22,8 @@ pub struct V41Exl3ResidentBuffer {
 #[derive(Debug, Serialize)]
 pub struct V41Exl3Load {
     pub tensor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expert: Option<usize>,
     pub bytes: usize,
     /// (Buffer index, byte offset). Rotations are read once and copied to each tier.
     pub destinations: Vec<(usize, usize)>,
@@ -38,11 +40,20 @@ pub struct V41Exl3Residency {
     pub tiers: Vec<usize>,
     /// Gate/up/down counts for each tier, passed unchanged to native launches.
     pub projection_counts: Vec<[usize; 3]>,
+    /// Present only for compact runtime-width storage; legacy even splits stay unchanged.
+    #[serde(skip)]
+    pub unit_map: Option<cuteafd_core::tp_units::RankUnits>,
     pub buffers: Vec<V41Exl3ResidentBuffer>,
     pub loads: Vec<V41Exl3Load>,
 }
 
 impl V41Exl3Residency {
+    /// Installed code follows the storage contract, not a directory-name guess.
+    pub fn aot_layout(&self) -> String {
+        let compact = if self.unit_map.is_some() { "-compact" } else { "" };
+        format!("tp{}{compact}-rank{}", self.world, self.rank)
+    }
+
     /// Pointer offsets and payload for the single CUDA arena used by loading.
     /// Rotation vectors are resident once per decoder tier; these buffers also
     /// include descriptors and unit maps absent from checkpoint tensor totals.
@@ -71,15 +82,13 @@ impl V41Exl3Residency {
 
     pub fn scratch_bytes(&self, catalog: &OfficialV41Catalog) -> Result<usize> {
         self.loads.iter().try_fold(0, |n, load| {
-            Ok(n.max(
-                catalog
-                    .exl3_tensor_slice(
-                        &load.tensor,
-                        self.world,
-                        self.rank,
-                    )?
-                    .scratch_bytes(),
-            ))
+            let scratch = if let Some(map) = &self.unit_map {
+                catalog.exl3_tensor_gather(&load.tensor, map,
+                    load.expert.context("compact EXL3 load lacks expert")?)?.scratch_bytes()
+            } else {
+                catalog.exl3_tensor_slice(&load.tensor, self.world, self.rank)?.scratch_bytes()
+            };
+            Ok(n.max(scratch))
         })
     }
 
@@ -111,13 +120,18 @@ impl V41Exl3Residency {
                 "unsupported EXL3 MCG multiplier for {prefix}"
             );
         }
-        let bytes = catalog.read_exl3_tensor_into(
-            &load.tensor,
-            self.world,
-            self.rank,
-            staging,
-            scratch,
-        )?;
+        let bytes = if let Some(map) = &self.unit_map {
+            ensure!(staging.len() >= load.bytes, "compact EXL3 staging too small");
+            let bytes = catalog.read_exl3_tensor_units_into(&load.tensor, map,
+                load.expert.context("compact EXL3 load lacks expert")?, staging, scratch)?;
+            ensure!(bytes <= load.bytes, "compact EXL3 source exceeds admitted load");
+            // Rotations retain the compiled maximum width, while compressed
+            // weights have no padding. Zero scales make missing H128 blocks inert.
+            staging[bytes..load.bytes].fill(0);
+            load.bytes
+        } else {
+            catalog.read_exl3_tensor_into(&load.tensor, self.world, self.rank, staging, scratch)?
+        };
         ensure!(bytes == load.bytes, "EXL3 residency/read size mismatch");
         if !load.tensor.ends_with(".trellis") {
             ensure!(
@@ -133,6 +147,88 @@ impl V41Exl3Residency {
 }
 
 impl V41Exl3Manifest {
+    /// Plan whole-unit balanced owned-byte storage.
+    /// Divisible geometry returns the legacy plan verbatim, including descriptors.
+    pub fn balanced_residency(&self, layer: V41Exl3Layer, world: usize, rank: usize) -> Result<V41Exl3Residency> {
+        use cuteafd_core::tp_units::RankUnits;
+        let mut plan = self.residency(layer, world, rank)?;
+        if self.experts.intermediate / 128 % world == 0 {
+            return Ok(plan);
+        }
+        ensure!(self.decoder_tiers.len() == 2, "compact EXL3 requires a qualified two-tier export");
+        let V41Exl3Layer::Backbone(index) = layer else {
+            anyhow::bail!("compact EXL3 draft placement is not qualified");
+        };
+        let map = RankUnits::new(cuteafd_core::tp_units::balanced_rule(128, self.experts.intermediate / 128, world),
+            plan.experts, self.experts.intermediate, 128, index, world, rank)?;
+        let widths: Vec<_> = map.experts.iter().map(|units| units.len() * 128).collect();
+        ensure!(widths.iter().all(|&width| width > 0), "compact EXL3 empty expert slice");
+        let width = *widths.iter().max().context("compact EXL3 lacks experts")?;
+        let stride = plan.experts * plan.tiers.len();
+        let mut sizes = vec![[0usize; 3]; plan.tiers.len()];
+        let mut offsets = vec![[0usize; 3]; plan.experts];
+        for projection in 0..3 {
+            for expert in 0..plan.experts {
+                let kind = [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up,
+                    V41Exl3ProjectionKind::Down][projection];
+                let p = &self.projections[&self.naming.projection(false, index, expert, kind)];
+                let tier = plan.tiers.binary_search(&p.bits).map_err(|_| anyhow::anyhow!("missing compact EXL3 tier"))?;
+                offsets[expert][projection] = sizes[tier][projection];
+                let bytes = self.experts.hidden.checked_mul(widths[expert])
+                    .and_then(|n| n.checked_mul(p.bits)).context("compact EXL3 payload overflow")? / 8;
+                sizes[tier][projection] = sizes[tier][projection].checked_add(bytes)
+                    .context("compact EXL3 tier size overflow")?;
+            }
+        }
+        let descriptor_bits = if plan.experts <= 512 { 9 } else { 10 };
+        let descriptor_index = plan.buffers.iter().position(|b| b.name == "descriptor_map").unwrap();
+        let mut descriptors = plan.buffers[descriptor_index].initial_words.clone();
+        descriptors.resize(7 * stride, -1);
+        for expert in 0..plan.experts {
+            descriptors[3 * stride + expert] = i32::try_from(widths[expert])?;
+            for projection in 0..3 {
+                let tier = (descriptors[projection * stride + expert] as usize) >> descriptor_bits;
+                if projection == 1 { offsets[expert][projection] += sizes[tier][0]; }
+                descriptors[(4 + projection) * stride + expert] = i32::try_from(offsets[expert][projection] / 4)
+                    .context("compact EXL3 offset exceeds int32 words")?;
+            }
+        }
+        for (tier, size) in sizes.iter().enumerate() {
+            plan.buffers.iter_mut().find(|b| b.name == format!("tier{tier}_w13")).unwrap().bytes = size[0] + size[1];
+            plan.buffers.iter_mut().find(|b| b.name == format!("tier{tier}_w2")).unwrap().bytes = size[2];
+        }
+        plan.buffers[descriptor_index].bytes = descriptors.len() * 4;
+        plan.buffers[descriptor_index].initial_words = descriptors;
+        plan.buffers.iter_mut().find(|b| b.name == "intermediate_rotations").unwrap().bytes = stride * width * 3 * 2;
+        for (expert, loads) in plan.loads.chunks_exact_mut(9).enumerate() {
+            for (projection, loads) in loads.chunks_exact_mut(3).enumerate() {
+                let kind = [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up,
+                    V41Exl3ProjectionKind::Down][projection];
+                let p = &self.projections[&self.naming.projection(false, index, expert, kind)];
+                for load in loads {
+                    load.expert = Some(expert);
+                    if load.tensor.ends_with(".trellis") {
+                        load.bytes = self.experts.hidden * widths[expert] * p.bits / 8;
+                        load.destinations[0].1 = offsets[expert][projection];
+                    } else {
+                        let hidden = (projection < 2 && load.tensor.ends_with(".suh"))
+                            || (projection == 2 && load.tensor.ends_with(".svh"));
+                        if !hidden {
+                            load.bytes = width * 2;
+                            for (copy, destination) in load.destinations.iter_mut().enumerate() {
+                                destination.1 = ((copy * plan.experts + expert) * 3 + projection) * width * 2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        plan.intermediate = width;
+        plan.intermediate_start = 0;
+        plan.unit_map = Some(map);
+        Ok(plan)
+    }
+
     pub fn residency(
         &self,
         layer: V41Exl3Layer,
@@ -253,6 +349,7 @@ impl V41Exl3Manifest {
                     locals[expert][projection] + if projection == 1 { counts[tier][0] } else { 0 };
                 loads.push(V41Exl3Load {
                     tensor: format!("{}.trellis", p.name),
+                    expert: None,
                     bytes: one,
                     destinations: vec![(
                         payload_buffers[tier][usize::from(projection == 2)],
@@ -282,6 +379,7 @@ impl V41Exl3Manifest {
                         .collect();
                     loads.push(V41Exl3Load {
                         tensor: format!("{}.{suffix}", p.name),
+                        expert: None,
                         bytes,
                         destinations,
                     });
@@ -297,6 +395,7 @@ impl V41Exl3Manifest {
             intermediate: width,
             tiers,
             projection_counts: counts,
+            unit_map: None,
             buffers,
             loads,
         })
@@ -308,6 +407,76 @@ mod tests {
     use super::*;
     use crate::{OfficialV41Config, V41Exl3Projection};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn compact_owned_payloads_match_offsets_and_even_layouts_are_unchanged() -> Result<()> {
+        for (hidden, intermediate, experts, tiers) in [
+            (5120, 2304, 384, [3, 4]), (6144, 2048, 256, [4, 5]),
+            (2560, 640, 512, [4, 5]),
+        ] {
+            for world in [2, 3, 4, 6].into_iter().filter(|&world| world <= intermediate / 128) {
+                let manifest = fixture_geometry(&tiers, hidden, intermediate, experts);
+                let units = intermediate / 128;
+                let mut total_weights = 0;
+                let mut resident_bytes = Vec::new();
+                let mut allocated_bytes = Vec::new();
+                for rank in 0..world {
+                    let old = manifest.residency(V41Exl3Layer::Backbone(0), world, rank)?;
+                    let plan = manifest.balanced_residency(V41Exl3Layer::Backbone(0), world,
+                        rank)?;
+                    if units % world == 0 {
+                        assert_eq!(serde_json::to_value(&plan)?, serde_json::to_value(&old)?);
+                        assert!(plan.unit_map.is_none());
+                        assert_eq!(plan.aot_layout(), format!("tp{world}-rank{rank}"));
+                    } else {
+                        assert_eq!(plan.aot_layout(), format!("tp{world}-compact-rank{rank}"));
+                        let map = plan.unit_map.as_ref().unwrap();
+                        let stride = plan.experts * plan.tiers.len();
+                        let descriptor = &plan.buffers.iter().find(|b| b.name == "descriptor_map").unwrap().initial_words;
+                        assert_eq!(descriptor.len(), 7 * stride);
+                        for (expert, loads) in plan.loads.chunks_exact(9).enumerate() {
+                            assert_eq!(descriptor[3 * stride + expert] as usize, map.experts[expert].len() * 128);
+                            for (projection, loads) in loads.chunks_exact(3).enumerate() {
+                                let load = &loads[0];
+                                assert_eq!(load.expert, Some(expert));
+                                assert_eq!(load.destinations[0].1, descriptor[(4 + projection) * stride + expert] as usize * 4);
+                                let tier = descriptor[projection * stride + expert] >> 9;
+                                assert_eq!(load.bytes, hidden * map.experts[expert].len() * 128 * plan.tiers[tier as usize] / 8);
+                            }
+                        }
+                    }
+                    for (buffer_id, buffer) in plan.buffers.iter().enumerate().filter(|(_, b)|
+                        b.name.ends_with("_w13") || b.name.ends_with("_w2")) {
+                        let mut spans: Vec<_> = plan.loads.iter().flat_map(|load| load.destinations.iter()
+                            .filter(move |(index, _)| *index == buffer_id)
+                            .map(move |(_, offset)| (*offset, *offset + load.bytes))).collect();
+                        spans.sort_unstable();
+                        let mut end = 0;
+                        for (start, next) in spans { assert_eq!(start, end); end = next; }
+                        assert_eq!(end, buffer.bytes);
+                        total_weights += buffer.bytes;
+                    }
+                    resident_bytes.push((old.bytes(), plan.bytes()));
+                    allocated_bytes.push((old.device_arena_layout()?.1, plan.device_arena_layout()?.1));
+                }
+                let source_weights: usize = manifest.projections.values().map(|p| p.trellis_bytes()).sum();
+                assert_eq!(total_weights, source_weights);
+                if units % world != 0 {
+                    // Balancing redistributes storage: small legacy ranks grow,
+                    // while the maximum rank (the admission bottleneck) shrinks.
+                    assert!(resident_bytes.iter().map(|(_, new)| new).max()
+                        < resident_bytes.iter().map(|(old, _)| old).max());
+                    assert!(allocated_bytes.iter().map(|(_, new)| new).max()
+                        < allocated_bytes.iter().map(|(old, _)| old).max());
+                } else {
+                    assert!(allocated_bytes.iter().all(|(old, new)| old == new));
+                }
+                eprintln!("EXL3 H{hidden}/I{intermediate}/E{experts} TP{world} payload bytes old/compact: {resident_bytes:?}");
+                eprintln!("EXL3 H{hidden}/I{intermediate}/E{experts} TP{world} allocated arena bytes old/compact: {allocated_bytes:?}");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn device_arena_preserves_pointer_alignment_and_bounds() {
@@ -326,11 +495,17 @@ mod tests {
     }
 
     fn fixture(tiers: &[usize]) -> V41Exl3Manifest {
-        let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json"),
-        )
-        .unwrap();
+        fixture_geometry(tiers, 5120, 2304, 384)
+    }
+
+    fn fixture_geometry(tiers: &[usize], hidden: usize, intermediate: usize, experts: usize) -> V41Exl3Manifest {
+        let config = OfficialV41Config::from_json(include_bytes!("official-v41-config.json")).unwrap();
+        let mut shape = crate::RoutedExpertShape::of_v41(&config);
+        shape.hidden = hidden;
+        shape.intermediate = intermediate;
+        shape.experts = experts;
         let mut projections = BTreeMap::new();
-        for expert in 0..384 {
+        for expert in 0..experts {
             for (index, (name, kind)) in [
                 ("w1", V41Exl3ProjectionKind::Gate),
                 ("w3", V41Exl3ProjectionKind::Up),
@@ -346,14 +521,14 @@ mod tests {
                         name,
                         kind,
                         bits: tiers[(expert + index) % tiers.len()],
-                        input_features: if index == 2 { 2304 } else { 5120 },
-                        output_features: if index == 2 { 5120 } else { 2304 },
+                        input_features: if index == 2 { intermediate } else { hidden },
+                        output_features: if index == 2 { hidden } else { intermediate },
                     },
                 );
             }
         }
         V41Exl3Manifest {
-            experts: crate::RoutedExpertShape::of_v41(&config),
+            experts: shape,
             config: Some(config),
             naming: crate::V41Exl3Naming::CheckpointNative,
             decoder_tiers: crate::families::deepseek_v41::v41_exl3::decoder_family(&projections).unwrap(),

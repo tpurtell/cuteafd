@@ -138,6 +138,58 @@ fn native_planner_uses_export_contract_and_exact_dense_allocations() {
 }
 
 #[test]
+fn dense_default_prefix_geometry_releases_retention_with_host() {
+    use cuteafd_core::prefix::{mark_slots_for, mark_slots_with_host};
+    use crate::placement::families::qwen3_5::NativeBuffers;
+    for (name, hidden, intermediate, heads, values, layers, expected_mark) in [
+        ("Qwen3.5-9B", 4096, 12288, 16, 32, 32, 51_511_296),
+        ("Qwen3.8-27B", 5120, 17408, 24, 48, 64, 153_944_064),
+    ] {
+        let cfg = Qwen35Config::from_hf(&config(hidden, intermediate, heads, values, layers)).unwrap();
+        let mark = NativeBuffers::new(&cfg, 0, 16, 0).unwrap().mark_bytes as u64;
+        assert_eq!(mark, expected_mark);
+        let old = mark_slots_for(16, 20, mark, 2 << 30);
+        let staged = mark_slots_with_host(16, 20, mark, 2 << 30, true);
+        assert_eq!((old, staged), (if layers == 32 { 41 } else { 34 }, 2));
+        println!("{name}: C16 entries=20 mark_bytes={mark} slots={old}->{staged} arena_GiB={:.6}->{:.6} freed_GiB={:.6}",
+            old as f64 * mark as f64 / (1u64 << 30) as f64,
+            staged as f64 * mark as f64 / (1u64 << 30) as f64,
+            (old - staged) as f64 * mark as f64 / (1u64 << 30) as f64);
+    }
+}
+
+#[test]
+fn native_planner_prefix_marks_follow_shared_host_rule() {
+    use cuteafd_core::{memory_layout::Category, prefix::mark_slots_with_host};
+    let (dir, mut options, buffers, _) = native_planner_fixture();
+    for host in [false, true] {
+        for entries in [0, 1, 20] {
+            for lanes in [1, 16, 64] {
+                let layout = options.layout.as_mut().unwrap();
+                layout.prefix_slots = None;
+                layout.concurrency = lanes;
+                layout.host_cache_bytes = if host { None } else { Some(0) };
+                layout.mimo_prefix_entries = entries;
+                let expected = mark_slots_with_host(lanes, entries, buffers.mark_bytes as u64,
+                    layout.mimo_prefix_mark_bytes, host);
+                let report = plan::plan(dir.path(), &options).unwrap();
+                let memory = report.memory_layout.unwrap();
+                let prefix = memory.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0);
+                assert_eq!(prefix, expected * buffers.mark_bytes as u64, "host={host}, entries={entries}, lanes={lanes}");
+            }
+        }
+    }
+    // Explicit arena overrides are unchanged by the automatic host-aware sizing.
+    for host in [false, true] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.host_cache_bytes = if host { None } else { Some(0) };
+        layout.prefix_slots = Some(7);
+        let memory = plan::plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+        assert_eq!(memory.devices[0].by_category()[&Category::Prefix], 7 * buffers.mark_bytes as u64);
+    }
+}
+
+#[test]
 fn native_text_admission_disables_automatic_bundled_vision() {
     use plan::{MediaMode, Status, spec::Component};
     let (dir, mut options, _, _) = native_planner_fixture();

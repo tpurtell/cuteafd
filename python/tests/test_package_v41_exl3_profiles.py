@@ -104,11 +104,12 @@ class PackageProfileTests(unittest.TestCase):
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
     def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='v41',
-                      capacities=(1, 80)):
+                      capacities=(1, 80), compact=False, profiles=()):
         args = argparse.Namespace(
             output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
             bits=list(bits), capacities=','.join(map(str, capacities)),
             require_layout=list(require), tile=list(tiles),
+            compact_companions=compact, profile=list(profiles),
             cxx='unused-cxx', cuda_include=root, cuda_libdir=root,
             cuda_driver=root / 'libcuda.so', runtime=root / 'libcute_dsl_runtime.so')
         args.runtime.write_bytes(b'runtime fixture')
@@ -143,8 +144,14 @@ class PackageProfileTests(unittest.TestCase):
                 (raw / f'{label}.o').write_bytes(image)
             # Preserve the policy's options in the fake export record.
             self.assertLessEqual(set(options), {'tile', 'blocks_per_sm', 'route_block',
-                                                'hidden', 'swiglu_limit', 'decode_schedule'},
+                                                'hidden', 'swiglu_limit', 'decode_schedule',
+                                                'compact_weights', 'token_major_rotation'},
                                  'unexpected option consumed by the fake export')
+            if options.get('compact_weights'):
+                self.assertEqual(len(tiers), 2)
+                meta.update(descriptor_rows=7, native_info_version=3)
+            if 'token_major_rotation' in options:
+                meta['token_major_rotation'] = options['token_major_rotation']
             if 'route_block' in options:
                 meta['route_block'] = options['route_block']
             if 'decode_schedule' in options:
@@ -205,6 +212,85 @@ class PackageProfileTests(unittest.TestCase):
         manifest = package.verify(args.output, pinned.REVISION, args.runtime, role)
         self.assertEqual(torch.cuda.empty_cache.call_count, exporter.export.call_count)
         return args.output, manifest, exporter.export.call_args_list, capacities
+
+    def test_compact_companions_only_follow_selected_uneven_worlds(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output, manifest, calls, capacities = self.build_fixture(
+                root, 'spark', (4, 5), geometry='glm', capacities=(1, 16),
+                compact=True, profiles=('tp6-width256',))
+            self.assertEqual(len(calls), 4)  # one fixed and one compact per capacity
+            compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
+            self.assertEqual(len(compact_calls), 2)
+            for call in compact_calls:
+                self.assertEqual(call.args[1], 384)
+                self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                self.assertNotIn('warp_specialized', call.kwargs)
+                self.assertNotIn('decode_schedule', call.kwargs)
+            self.assertEqual(manifest['requested_layouts'],
+                             [f'tp6-compact-rank{rank}' for rank in range(6)])
+            self.assertEqual(manifest['requested_capacities'], [1, 16])
+            self.assertEqual(len(manifest['variants']), 16)
+            for variant in manifest['variants']:
+                compact = '-compact-' in variant['directory']
+                self.assertEqual(variant.get('descriptor_rows'), 7 if compact else None)
+                self.assertEqual(variant.get('native_info_version'), 3 if compact else None)
+            # Re-sign the record: rejection must be semantic, not only a checksum.
+            variant = next(v for v in manifest['variants'] if '-compact-' in v['directory'])
+            path = output / variant['directory'] / 'v41_exl3.json'
+            meta = json.loads(path.read_text())
+            meta['descriptor_rows'] = 3
+            path.write_text(json.dumps(meta))
+            name = str(path.relative_to(output))
+            manifest['files'][name] = {'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+            (output / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'descriptor contract mismatch'):
+                package.verify(output)
+
+    def test_compact_prefill_keeps_cooperative_route_and_legacy_cache_keys(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (3, 4), capacities=(1, 16, 4096), compact=True,
+                profiles=('tp4-width512', 'tp4-width640'))
+            self.assertEqual(len(calls), 9)
+            self.assertEqual(len(manifest['variants']), 24)
+            for call in calls:
+                path = call.args[0].relative_to(root / 'build')
+                if call.kwargs.get('compact_weights'):
+                    self.assertEqual(path.parts[0], 'tp4-compact-width640+tile64-128-64-128')
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                elif call.args[3] == 16:
+                    self.assertIn('+tile', path.parts[0])
+                else:
+                    self.assertIn(path.parts[0], ('tp4-width512', 'tp4-width640'))
+                    self.assertNotIn('descriptor_rows', json.loads((call.args[0] / 'v41_exl3.json').read_text()))
+
+    def test_compact_even_control_preserves_legacy_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _output, manifest, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), geometry='glm', capacities=(1, 16),
+                compact=True, profiles=('tp2-width1024',))
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all(not call.kwargs.get('compact_weights') for call in calls))
+            self.assertNotIn('requested_layouts', manifest)
+            self.assertEqual({v['directory'].split('/')[0] for v in manifest['variants']},
+                             {'tp2-rank0', 'tp2-rank1'})
+
+    def test_compact_rejects_coordinator_and_non_two_tier_before_cuda(self):
+        for role, bits in [('coordinator', (4, 5)), ('spark', (2, 3, 4))]:
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as temporary:
+                with self.assertRaisesRegex(ValueError, 'two-tier Spark exports'):
+                    self.build_fixture(Path(temporary), role, bits, compact=True)
+
+    def test_compact_profile_inventory_uses_h128_ceil_only_when_uneven(self):
+        expected = {'v41': {4: 640}, 'glm': {3: 768, 6: 384},
+                    'qwen4': {2: 384, 3: 256, 4: 256}, 'dsv4p': {}}
+        for geometry, widths in expected.items():
+            profiles = package.build_profiles('spark', geometry)
+            companions = package.compact_profiles(geometry, profiles)
+            self.assertEqual({int(name.split('-')[0][2:]): width
+                              for name, width, *_ in companions}, widths)
 
     def assert_layouts(self, manifest, capacities, expected, bits):
         variants = {v['directory']: v for v in manifest['variants']}

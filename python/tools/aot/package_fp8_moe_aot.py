@@ -343,7 +343,7 @@ def layout_geometry(base, layout: str):
     g = base.with_tp(tp)
     if width:
         widths = exact_widths(base.intermediate, tp)
-        if base.weights == "mxfp4" and tp == 6:
+        if base.weights == "mxfp4" and tp in (3, 6) and base.intermediate // 128 % tp:
             widths += exact_widths(base.intermediate, tp, 32)
         if int(width) not in widths:
             raise SystemExit(f"{layout}: no rank of TP{tp} owns {width} rows of {base.intermediate} exactly")
@@ -396,7 +396,7 @@ def build(args: argparse.Namespace) -> None:
         # MXFP4 slices pad to 128 (MiMo V2.6 Pro: TP6 over all six Sparks, TP2 x EP3 shards).
         layouts = list(MXFP4_ROLE_LAYOUTS[args.role])
         if args.geometry == "mimof" and args.role == "spark":
-            layouts = ["tp2", "tp4"]
+            layouts = ["tp2", "tp3", "tp4"]
     elif base.weights == "nvfp4" and not args.layouts:
         layouts = [l for l in NVFP4_ROLE_LAYOUTS[args.role]
                    if base.intermediate // 16 >= int(l.removeprefix("tp"))]
@@ -430,9 +430,11 @@ def build(args: argparse.Namespace) -> None:
                 layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
     # Fine-unit MXFP4 programs coexist with the qualified H128 layouts while
     # balanced placement is gated. One width is selected for each rank/layer.
-    if args.exact_slices and base.weights == "mxfp4" and args.role == "spark" and "tp6" in layouts:
-        layouts += [f"tp6-w{width}" for width in sorted(set(exact_widths(base.intermediate, 6, 32)), reverse=True)
-                    if f"tp6-w{width}" not in layouts]
+    if args.exact_slices and base.weights == "mxfp4" and args.role == "spark":
+        for tp in (3, 6):
+            if f"tp{tp}" in layouts and base.intermediate // 128 % tp:
+                layouts += [f"tp{tp}-w{width}" for width in sorted(set(exact_widths(base.intermediate, tp, 32)), reverse=True)
+                            if f"tp{tp}-w{width}" not in layouts]
     wire = input_kind(args.role, base.weights, args.input) == "wire"
     if args.output.exists():
         raise SystemExit(f"{args.output} exists; remove it or choose another --output")

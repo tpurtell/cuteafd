@@ -286,7 +286,7 @@ fn update_sparks(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
     for device in devices {
         let bytes = if let Some(exl3) = catalog.exl3() {
             working.spark_layers.iter().try_fold(0u64, |sum, &layer| -> Result<u64> {
-                sum.checked_add(exl3.residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks,
+                sum.checked_add(exl3.balanced_residency(crate::V41Exl3Layer::Backbone(layer), working.spark_ranks,
                     device.index as usize)?.device_arena_layout()?.1 as u64).context("V4.1 Spark EXL3 residency overflow")
             })?
         } else {

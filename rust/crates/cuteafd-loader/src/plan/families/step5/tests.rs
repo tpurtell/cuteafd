@@ -736,6 +736,47 @@ fn routed_catalog_preserves_native_formats_activation_and_target_bounds() {
 }
 
 #[test]
+fn mixed_native_assignment_matches_each_worker_groups_exact_units() {
+    use crate::formats::fp8_experts::Slicing;
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+    let endpoints = [SparkEndpoint { capacity: 64, ingress: SparkIngress::Bf16 }];
+    let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    for kind in ["fp8", "nvfp4", "bf16"] {
+        let dir = snapshot(kind);
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let tensors = catalog.fp8().unwrap();
+        for world in [4, 6] {
+            let working = SparkWorkingSet { spark_layers: vec![3, 88, 89, 90],
+                spark_ranks: world, prefill_lanes: 1, ..Default::default() };
+            // Exercise either exact unit chosen from a mixed checkpoint's headers.
+            for block in [16, 128] {
+                for rank in 0..world {
+                    let assignment = SparkAssignment::from_catalog(&catalog, &working, rank,
+                        SparkResidentLayout::Fp8 { world, rank, slicing: Slicing::Blocks(block) },
+                        &endpoints, rings).unwrap();
+                    let mut resident = 0u64;
+                    for slice in &assignment.slices {
+                        let view = tensors.for_layer(slice.layer as usize).unwrap();
+                        let slicing = view.slicing_for_directory(std::path::Path::new(&format!("tp{world}")), world);
+                        assert_eq!(slicing, Slicing::Blocks(view.block()));
+                        let map = view.unit_map(world, rank, slicing).unwrap();
+                        assert_eq!(slice.unit_map, Some(map.fingerprint()),
+                            "{kind} TP{world} rank{rank} layer{} inputK{block}", slice.layer);
+                        let (first, width) = view.rank_range_with(world, rank, slicing).unwrap();
+                        assert_eq!((slice.first as usize, slice.width as usize, slice.stored_width as usize),
+                            (first, width, view.rank_width(world, rank, slicing).unwrap()));
+                        resident += (view.weight_read_bytes_with(world, rank, slicing).unwrap()
+                            * view.shape().experts) as u64;
+                    }
+                    assert_eq!(assignment.resident_bytes, resident);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn official_nvfp4_layer30_headers_keep_router_and_stacked_parameters_distinct() {
     use crate::formats::fp8_experts::{ExpertFormat, Fp8ExpertTensors};
     use crate::families::deepseek_v41::v41_catalog::RoutedExpertShape;

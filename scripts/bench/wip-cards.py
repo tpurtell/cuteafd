@@ -159,14 +159,10 @@ def shared_wip(arms, mappings, builds, parallel):
         if 'wip_instance' in arms[name]:
             raise ValueError('duplicate --arm-wip mapping')
         arms[name]['wip_instance'] = instance
-    slots = {}
-    for arm in arms.values():
-        if 'release' in arm:
-            continue
-        instance = arm.get('wip_instance', arm['instance'])
-        if instance in slots and slots[instance] != arm['slot']:
-            raise ValueError('shared WIP instance requires identical slots')
-        slots[instance] = arm['slot']
+    # Arms of one WIP instance may name different sealed slots (e.g. a base and a
+    # candidate source built in the same instance): launches stage per slot and
+    # serving instance (release_wip_serving_layout), and --arm-wip runs one arm
+    # at a time, so slots never swap files under each other.
 
 
 def load_cards(kit, names):

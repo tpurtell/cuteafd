@@ -13,6 +13,10 @@ pub(crate) mod paired_load;
 pub(crate) mod rtx;
 pub(crate) mod service;
 pub(crate) mod staging;
+#[cfg(test)]
+mod tp_gate;
+#[cfg(test)]
+mod tp_reference;
 
 /// Frozen compatibility set shared by native and EXL3 expert execution.
 /// Launch capacity may vary; every decode variant must match canonical m1 sums.

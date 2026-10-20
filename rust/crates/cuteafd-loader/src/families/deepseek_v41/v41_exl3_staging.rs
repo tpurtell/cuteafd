@@ -49,6 +49,98 @@ impl V41Exl3TensorSlice {
     }
 }
 
+/// Source windows for one expert's ascending H128 units. Gate/up trellis
+/// gathers columns of each packed K row; down trellis gathers whole K rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V41Exl3TensorGather {
+    rows: usize,
+    source_row_bytes: usize,
+    columns: Vec<std::ops::Range<usize>>,
+    selected_row_bytes: usize,
+}
+
+impl V41Exl3TensorGather {
+    pub fn bytes(&self) -> usize { self.rows * self.selected_row_bytes }
+
+    pub fn scratch_bytes(&self) -> usize {
+        if self.rows > 1 && self.selected_row_bytes != self.source_row_bytes {
+            self.source_row_bytes
+        } else { 0 }
+    }
+}
+
+fn tensor_gather(p: &V41Exl3Projection, suffix: &str,
+    map: &cuteafd_core::tp_units::RankUnits, expert: usize) -> Result<V41Exl3TensorGather> {
+    let down = p.kind == V41Exl3ProjectionKind::Down;
+    let intermediate = if down { p.input_features } else { p.output_features };
+    ensure!(map.unit_columns == 128 && map.units_per_expert.checked_mul(128) == Some(intermediate),
+        "EXL3 source gather requires matching whole-H128 units");
+    let units = map.experts.get(expert).context("EXL3 source gather expert out of range")?;
+    ensure!(!units.is_empty() && units.iter().all(|&unit| unit < map.units_per_expert)
+        && units.windows(2).all(|pair| pair[0] < pair[1]),
+        "EXL3 source gather units must be nonempty, sorted and unique");
+    let ranges = map.column_ranges(expert)?;
+    let (rows, source_row_bytes, columns) = match suffix {
+        "trellis" if !down => {
+            let tile_bytes = 32 * p.bits;
+            (p.input_features / 16, p.output_features / 16 * tile_bytes,
+                ranges.into_iter().map(|r| r.start / 16 * tile_bytes..r.end / 16 * tile_bytes).collect())
+        }
+        "trellis" => {
+            let row_bytes = p.output_features / 16 * 32 * p.bits;
+            (1, p.trellis_bytes(), ranges.into_iter()
+                .map(|r| r.start / 16 * row_bytes..r.end / 16 * row_bytes).collect())
+        }
+        "suh" if down => (1, p.input_features * 2,
+            ranges.into_iter().map(|r| r.start * 2..r.end * 2).collect()),
+        "svh" if !down => (1, p.output_features * 2,
+            ranges.into_iter().map(|r| r.start * 2..r.end * 2).collect()),
+        "suh" => (1, p.input_features * 2, vec![0..p.input_features * 2]),
+        "svh" => (1, p.output_features * 2, vec![0..p.output_features * 2]),
+        "mcg" => (1, 4, vec![0..4]),
+        _ => anyhow::bail!("unsupported EXL3 tensor suffix {suffix}"),
+    };
+    let selected_row_bytes = columns.iter().map(|r| r.end - r.start).sum();
+    Ok(V41Exl3TensorGather { rows, source_row_bytes, columns, selected_row_bytes })
+}
+
+fn read_gather(file: &File, offset: u64, gather: &V41Exl3TensorGather,
+    dst: &mut [u8], scratch: &mut [u8]) -> Result<()> {
+    ensure!(dst.len() >= gather.bytes() && scratch.len() >= gather.scratch_bytes(),
+        "EXL3 gather staging or scratch too small");
+    let source_offset = |row: usize, column: usize| {
+        row.checked_mul(gather.source_row_bytes).and_then(|r| r.checked_add(column))
+            .and_then(|r| u64::try_from(r).ok()).and_then(|r| offset.checked_add(r))
+            .context("EXL3 source gather offset overflow")
+    };
+    if gather.rows == 1 {
+        let mut cursor = 0;
+        for range in &gather.columns {
+            let bytes = range.end - range.start;
+            super::v41_catalog::projection_read(file, &mut dst[cursor..cursor + bytes], source_offset(0, range.start)?)?;
+            cursor += bytes;
+        }
+    } else if gather.selected_row_bytes == gather.source_row_bytes {
+        super::v41_catalog::projection_read(file, &mut dst[..gather.bytes()], offset)?;
+    } else {
+        let batch = scratch.len() / gather.source_row_bytes;
+        for start in (0..gather.rows).step_by(batch) {
+            let rows = batch.min(gather.rows - start);
+            super::v41_catalog::projection_read(file, &mut scratch[..rows * gather.source_row_bytes], source_offset(start, 0)?)?;
+            for row in 0..rows {
+                let mut cursor = (start + row) * gather.selected_row_bytes;
+                for range in &gather.columns {
+                    let bytes = range.end - range.start;
+                    let source = row * gather.source_row_bytes + range.start;
+                    dst[cursor..cursor + bytes].copy_from_slice(&scratch[source..source + bytes]);
+                    cursor += bytes;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn tensor_slice(
     p: &V41Exl3Projection,
     suffix: &str,
@@ -92,6 +184,26 @@ fn tensor_slice(
 }
 
 impl OfficialV41Catalog {
+    pub fn exl3_tensor_gather(&self, name: &str,
+        map: &cuteafd_core::tp_units::RankUnits, expert: usize) -> Result<V41Exl3TensorGather> {
+        let manifest = self.exl3().context("checkpoint is not routed EXL3")?;
+        let (prefix, suffix) = name.rsplit_once('.').context("missing EXL3 suffix")?;
+        let projection = manifest.projections.get(prefix).context("unknown EXL3 projection")?;
+        projection.validate_tensor(&self.tensor(name)?.metadata)?;
+        tensor_gather(projection, suffix, map, expert)
+    }
+
+    /// Preserve source trellis tiles and rotation bytes without dequantization.
+    pub fn read_exl3_tensor_units_into(&self, name: &str,
+        map: &cuteafd_core::tp_units::RankUnits, expert: usize,
+        dst: &mut [u8], scratch: &mut [u8]) -> Result<usize> {
+        let gather = self.exl3_tensor_gather(name, map, expert)?;
+        let tensor = self.tensor(name)?;
+        let file = File::open(self.snapshot().join(&tensor.shard))?;
+        read_gather(&file, tensor.metadata.byte_offset, &gather, dst, scratch)?;
+        Ok(gather.bytes())
+    }
+
     pub fn exl3_tensor_slice(
         &self,
         name: &str,
@@ -244,6 +356,81 @@ mod tests {
             }
         }
         println!("K3/K4 gate/up/down packed tensors and rotations reconstruct exactly for disjoint TP2/TP4");
+    }
+
+    #[test]
+    fn gathered_h128_units_preserve_source_bytes_and_reconstruct_every_projection() -> Result<()> {
+        use cuteafd_core::tp_units::RankUnits;
+        let dir = tempfile::tempdir()?;
+        let file = File::options().create_new(true).read(true).write(true).open(dir.path().join("gather"))?;
+        let offset = (1u64 << 31) + 64;
+        for intermediate in [2048, 2304] {
+            for world in [2, 3, 4, 6] {
+                for layer in [0, 3, 77] {
+                    for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
+                        for bits in 2..=5 {
+                            let down = kind == V41Exl3ProjectionKind::Down;
+                            let projection = V41Exl3Projection { name: "test".into(), kind, bits,
+                                input_features: if down { intermediate } else { 128 },
+                                output_features: if down { 128 } else { intermediate } };
+                            for suffix in ["trellis", "suh", "svh", "mcg"] {
+                                let full = tensor_slice(&projection, suffix, 1, 0)?;
+                                let source: Vec<_> = (0..full.bytes()).map(|i| ((i * 17 + i / 251) % 253) as u8).collect();
+                                file.write_all_at(&source, offset)?;
+                                let mut rebuilt = vec![0; source.len()];
+                                for rank in 0..world {
+                                    let rule = cuteafd_core::tp_units::balanced_rule(128, intermediate / 128, world);
+                                    let map = RankUnits::new(rule, 4, intermediate, 128, layer, world, rank)?;
+                                    let gather = tensor_gather(&projection, suffix, &map, 3)?;
+                                    let mut got = vec![0xa5; gather.bytes()];
+                                    read_gather(&file, offset, &gather, &mut got, &mut vec![0; gather.scratch_bytes() * 3])?;
+                                    let mut cursor = 0;
+                                    for row in 0..gather.rows {
+                                        for range in &gather.columns {
+                                            let first = row * gather.source_row_bytes + range.start;
+                                            let bytes = range.end - range.start;
+                                            assert_eq!(&got[cursor..cursor + bytes], &source[first..first + bytes]);
+                                            rebuilt[first..first + bytes].copy_from_slice(&got[cursor..cursor + bytes]);
+                                            cursor += bytes;
+                                        }
+                                    }
+                                    if intermediate / 128 % world == 0 {
+                                        let slice = tensor_slice(&projection, suffix, world, rank)?;
+                                        let mut legacy = vec![0; slice.bytes()];
+                                        read_slice(&file, offset, slice, &mut legacy, &mut vec![0; slice.scratch_bytes()])?;
+                                        assert_eq!(got, legacy);
+                                    }
+                                    if got.len() > 1 {
+                                        assert!(read_gather(&file, offset, &gather, &mut got[..1], &mut []).is_err());
+                                    }
+                                }
+                                assert_eq!(rebuilt, source);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gathered_units_reject_wrong_rotation_axis_and_noncanonical_order() -> Result<()> {
+        use cuteafd_core::tp_units::{RankUnits, UnitRule};
+        let projection = V41Exl3Projection { name: "test".into(), kind: V41Exl3ProjectionKind::Gate,
+            bits: 4, input_features: 128, output_features: 2048 };
+        let mut map = RankUnits::new(UnitRule::Rotated, 1, 2048, 128, 3, 6, 0)?;
+        assert!(tensor_gather(&projection, "trellis", &map, 0).is_ok());
+        map.experts[0].reverse();
+        assert!(tensor_gather(&projection, "trellis", &map, 0).is_err());
+        map.experts[0] = vec![0, 0];
+        assert!(tensor_gather(&projection, "suh", &map, 0).is_err());
+        map.experts[0] = vec![16];
+        assert!(tensor_gather(&projection, "svh", &map, 0).is_err());
+        map.experts[0] = vec![0];
+        map.unit_columns = 32;
+        assert!(tensor_gather(&projection, "trellis", &map, 0).is_err());
+        Ok(())
     }
 
     #[test]

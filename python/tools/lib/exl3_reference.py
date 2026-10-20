@@ -13,8 +13,8 @@ import numpy as np
 def decode_inner(trellis):
     """Decode checkpoint [K/16,N/16,16*bits] words to float64 [K,N]."""
     words = np.asarray(trellis).astype(np.uint16)
-    if words.ndim != 3 or words.shape[-1] not in (32, 48, 64):
-        raise ValueError('reference supports native K2/K3/K4 trellis tensors only')
+    if words.ndim != 3 or words.shape[-1] not in (32, 48, 64, 80):
+        raise ValueError('reference supports native K2/K3/K4/K5 trellis tensors only')
     bits = words.shape[-1] // 16
     words = words.reshape(*words.shape[:-1], -1, 2)[..., ::-1].reshape(words.shape)
     words = words.reshape(*words.shape[:-1], 16, bits).astype(np.uint32)

@@ -159,14 +159,19 @@ pub fn context_buffers(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64, d
             .iter().map(|&(_, bytes)| bytes.max(256)).sum() }
 }
 
-/// Prefix mark slots of the V4 arena (`MarkArena::slots_for` over every
-/// rank's mark), 0 without prefix entries.
+/// Replicated TP2 Heads snapshots cannot use the single-owner host copy path.
+/// Keep retention on device until host restore can restore both replicas.
+pub fn host_marks_enabled(gpus: usize, partitioned: bool, host: bool) -> bool {
+    host && (gpus == 1 || partitioned)
+}
+
+/// Prefix mark slots over every rank's mark, 0 without prefix entries.
 pub fn mark_slots(cfg: &DeepseekV4Config, gpus: usize, prefill_rows: u64, cache_stages: usize, sequences: u64,
-    entries: u64, budget_bytes: u64) -> Result<u64, PlacementError> {
+    entries: u64, budget_bytes: u64, host: bool) -> Result<u64, PlacementError> {
     let geometry = deepseek_v4_cache_geometry(cfg, gpus, prefill_rows, cache_stages)
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let mark: u64 = geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-    Ok(cuteafd_core::prefix::mark_slots_for(sequences, entries, mark, budget_bytes))
+    Ok(cuteafd_core::prefix::mark_slots_with_host(sequences, entries, mark, budget_bytes, host))
 }
 
 /// Owner-local route ring of the shared draft probe; pinned host bytes have the same extent.

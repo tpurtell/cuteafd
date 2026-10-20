@@ -695,20 +695,23 @@ mod tests {
             ..Default::default() };
         assert!(!crate::placement::inventory::image_lib(options.workspace_manifest.as_deref()).exists());
         let recipe = super::super::super::experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
-        assert_eq!(recipe.widths, [384, 384, 384, 384, 256, 256]);
-        assert_eq!(recipe.required_layouts, ["tp6-w384", "tp6-w256"]);
+        assert_eq!(recipe.widths, [352, 352, 352, 352, 320, 320]);
+        assert_eq!(recipe.required_layouts, ["tp6-w352", "tp6-w320"]);
         let mut sparks = (0..6).map(|rank| DeviceLayout {
             kind: DeviceKind::Spark, index: rank, capacity_bytes: 108 * GIB,
             items: vec![], kv_tokens: 0,
         }).collect::<Vec<_>>();
         spark_experts(&input, &options, &mut sparks, 0).unwrap();
         for spark in &sparks {
-            assert_eq!(spark.used_bytes(), expert_layer_bytes(tensors, 6, spark.index as usize,
-                recipe.slicing).unwrap());
+            assert_eq!(spark.used_bytes(), expert_layer_bytes(&tensors.for_layer_metadata(1).unwrap(),
+                6, spark.index as usize, recipe.slicing).unwrap());
         }
-        assert!(sparks[4].used_bytes() < sparks[0].used_bytes());
+        assert!(sparks[0].used_bytes() < sparks[4].used_bytes());
+        // Each down-scale row rounds its K32 group count up to four bytes.
+        let scale_padding = tensors.shape().hidden * tensors.shape().experts
+            * (4 * (12 - 11) + 2 * (12 - 10));
         assert_eq!(sparks.iter().map(DeviceLayout::used_bytes).sum::<u64>(),
-            expert_layer_bytes(tensors, 1, 0, Slicing::Padded).unwrap());
+            expert_layer_bytes(tensors, 1, 0, Slicing::Padded).unwrap() + scale_padding as u64);
     }
 
     #[test]

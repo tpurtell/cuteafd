@@ -24,7 +24,7 @@ from v41_launch_capture import CASES, FIXTURES, KIT_CARDS, ROOT, capture, parse_
 # comes from a shared helper in scripts/launch/run-family.sh:
 INTENDED = {
     "coordinator": {
-        "CUTEAFD_TP_PLACEMENT": "round-robin",
+
         # shared_coordinator_env_args (SPARK_INTAKE, CONSOLE_TEXT, ATTENTION_PLACEMENT,
         # FP8_EXPERT_PREFILL): the binary's own defaults, now explicit.
         "CUTEAFD_SPARK_INTAKE": "auto",
@@ -41,7 +41,7 @@ INTENDED = {
         "CUTEAFD_FIDELITY_CACHE": "/run/cuteafd/fidelity",
     },
     "worker": {
-        "CUTEAFD_TP_PLACEMENT": "round-robin",
+
         # shared_worker_env_args: FP8 prefill form and the worker's sampler.
         "CUTEAFD_FP8_EXPERT_PREFILL": "auto",
         "CUTEAFD_THERMAL": "on",

@@ -74,10 +74,14 @@ impl Shared {
 }
 
 fn planned(shared: &Shared, case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>) {
+    planned_with_host(shared, case, false)
+}
+
+fn planned_with_host(shared: &Shared, case: &Case<'_>, host: bool) -> (MemoryLayout, bool, Vec<String>) {
     let report = shared.input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
         layout: Some(LayoutOptions { rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
             // Retained measured fixtures and the direct EngineArgs default are C8.
-            concurrency: 8, host_cache_bytes: Some(0), workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
+            concurrency: 8, host_cache_bytes: if host { None } else { Some(0) }, workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
         attention_placement: case.attention, ..Default::default() }).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
@@ -96,6 +100,11 @@ fn runtime_with_tp1(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp1
 
 fn runtime_with_upload_check(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool,
     check_upload: bool) -> anyhow::Result<Placement> {
+    runtime_with_host(shared, case, layout, tp1_available, check_upload, false)
+}
+
+fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp1_available: bool,
+    check_upload: bool, host: bool) -> anyhow::Result<Placement> {
     let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(case.manifest)?)?;
     let catalog = shared.catalog(case.dspark)?;
     let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(case.snapshot, 1)?;
@@ -106,6 +115,7 @@ fn runtime_with_upload_check(shared: &Shared, case: &Case<'_>, layout: &MemoryLa
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
     if case.dspark { argv.push("--dspark".into()); }
+    if host { argv.extend(["--host-cache-bytes".into(), "auto".into()]); }
     if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
     let cli = Cli::try_parse_from(argv)?;
     // The selected model owns caches only for its retained dSpark stages.
@@ -240,6 +250,40 @@ fn synthetic_context(dir: &Path) -> PathBuf {
     }
     std::fs::write(&path, manifest.to_string()).unwrap();
     path
+}
+
+#[test]
+fn planner_equals_runtime_prefix_marks_with_host_and_replicated_heads() {
+    use cuteafd_loader::placement::{AttentionPlacement, families::deepseek_v4 as v4};
+    let dir = tempfile::tempdir().unwrap();
+    let manifest = synthetic_context(dir.path());
+    let shared = Shared::open(dir.path()).unwrap();
+    let cfg = cuteafd_loader::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
+    for host in [false, true] {
+        for rtx in [1, 2] {
+            for attention in [AttentionPlacement::Heads, AttentionPlacement::Context] {
+                if rtx == 1 && attention == AttentionPlacement::Context { continue; }
+                let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
+                    context: 1_048_576, budget: 24 << 30, onboard: None, dspark: false,
+                    exchange_f32: false, peer_budget: None, attention: Some(attention) };
+                let (layout, supported, hints) = planned_with_host(&shared, &case, host);
+                assert!(supported, "{hints:?}");
+                let runtime = runtime_with_host(&shared, &case, &layout, true, false, host).unwrap();
+                let geometry = cuteafd_loader::serving_capacity::deepseek_v4_cache_geometry(&cfg, rtx, 4096, 0).unwrap();
+                let mark = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes).sum();
+                // Heads replicas cannot both be restored through the single-owner host copy path.
+                let effective = v4::host_marks_enabled(rtx, attention == AttentionPlacement::Context, host);
+                assert_eq!(effective, host && (rtx == 1 || attention == AttentionPlacement::Context));
+                let slots = cuteafd_core::prefix::mark_slots_with_host(8, 20, mark, 2 << 30, effective);
+                for (gpu, rank) in geometry.ranks.iter().enumerate() {
+                    let planned: u64 = layout.devices[gpu].items.iter().filter(|i| i.category == Category::Prefix).map(|i| i.bytes).sum();
+                    let served: u64 = runtime.items[gpu].iter().filter(|i| i.category == Category::Prefix).map(|i| i.bytes).sum();
+                    assert_eq!((planned, served), (slots * rank.retained_mark_bytes, slots * rank.retained_mark_bytes),
+                        "host={host}, rtx={rtx}, attention={attention:?}, gpu={gpu}");
+                }
+            }
+        }
+    }
 }
 
 /// C4 token-split admission (#58): the planner and serve-dsv4 agree under `context`, auto resolves

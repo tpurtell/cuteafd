@@ -85,6 +85,22 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         for key in ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits'):
             if meta[key] != variant[key]:
                 raise ValueError(f'EXL3 variant metadata mismatch: {directory}/{key}')
+        compact = '-compact-' in directory.split('/')[0]
+        contract = (7, 3) if compact else (3, 2)
+        for record in (variant, meta):
+            if (record.get('descriptor_rows', 3), record.get('native_info_version', 2)) != contract:
+                raise ValueError(f'EXL3 variant descriptor contract mismatch: {directory}')
+        if compact:
+            geometry = manifest.get('geometry', 'v41')
+            companions = compact_profiles(geometry, profiles_for_role('spark', geometry))
+            widths = {dest: width for _, width, _, _, _, destinations in companions
+                      for dest in destinations}
+            if (manifest['role'] != 'spark'
+                    or widths.get(directory.split('/')[0]) != meta['intermediate']
+                    or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
+                    or meta.get('warp_specialized', False) or meta.get('decode_schedule') is not None
+                    or meta.get('input_format', 'bf16') != 'bf16'):
+                raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
             raise ValueError('EXL3 variant residency metadata mismatch')
         # A variant's tile is a claim about the geometry that was compiled, not a
@@ -533,7 +549,19 @@ def build_profiles(role: str, geometry: str, *, all_spark_counts: bool = False) 
     return [profile for profile in profiles if int(profile[0].split('-')[0][2:]) in worlds]
 
 
-def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41') -> list[str]:
+def compact_profiles(geometry: str, profiles: list[tuple]) -> list[tuple]:
+    """Own-maximum H128 pitch, shared by ranks of selected uneven worlds only."""
+    _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
+    units = intermediate // 128
+    worlds = sorted({int(entry[0].split('-')[0][2:]) for entry in profiles})
+    return [(f'tp{world}-compact-width{((units + world - 1) // world) * 128}',
+             ((units + world - 1) // world) * 128, experts, topk, 'bf16',
+             [f'tp{world}-compact-rank{rank}' for rank in range(world)])
+            for world in worlds if units % world]
+
+
+def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41',
+                            companions: list[tuple] = ()) -> list[str]:
     """`--require-layout tp3-rank0,tp3-rank1` (repeatable): layouts the package needs.
 
     Scoped to the role being built: a coordinator cannot produce Spark ranks, so
@@ -541,8 +569,8 @@ def parse_requested_layouts(values: list[str], role: str, geometry: str = 'v41')
     GPU compile.
     """
     requested: list[str] = []
-    known = {layout for _, _, _, _, _, destinations in profiles_for_role(role, geometry)
-             for layout in destinations}
+    known = {layout for _, _, _, _, _, destinations in
+             [*profiles_for_role(role, geometry), *companions] for layout in destinations}
     for value in values:
         for name in (part.strip() for part in value.split(',')):
             if not name:
@@ -725,7 +753,16 @@ def build(args: argparse.Namespace) -> None:
         if unknown:
             raise ValueError(f'unknown EXL3 profiles for {geometry} {args.role}: {sorted(unknown)}')
         profiles = [entry for entry in profiles if entry[0] in only]
-    requested_layouts = parse_requested_layouts(getattr(args, 'require_layout', []), args.role, geometry)
+    companions = []
+    if getattr(args, 'compact_companions', False):
+        if args.role != 'spark' or len(args.bits) != 2:
+            raise ValueError('--compact-companions requires two-tier Spark exports')
+        companions = compact_profiles(geometry, profiles)
+    requested_layouts = parse_requested_layouts(
+        getattr(args, 'require_layout', []), args.role, geometry, companions)
+    requested_layouts = sorted(set(requested_layouts) | {
+        destination for *_, destinations in companions for destination in destinations})
+    profiles += companions
     tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
@@ -746,9 +783,10 @@ def build(args: argparse.Namespace) -> None:
         variants = []
         pending = []
         for profile, width, experts, topk, dtype, destinations in profiles:
+            compact = '-compact-' in profile
             for capacity in capacities:
                 requested = tiles.get(profile, {}).get(capacity)
-                tile = requested
+                tile = (64, 128, 64, 128) if compact else requested
                 if tile is None:
                     # A decode capacity the B12x policy widens is pinned back to the
                     # canonical tile (an explicit override above still wins).
@@ -761,7 +799,7 @@ def build(args: argparse.Namespace) -> None:
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
-                options = {}
+                options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
                     options['activation'] = activation(geometry)
                 if tile is not None:
@@ -794,8 +832,8 @@ def build(args: argparse.Namespace) -> None:
                 # same options plus a schedule, content-keyed in the build tree and
                 # installed as m<capacity>-<schedule> beside m<capacity>.
                 exports = [(None, raw, options)]
-                for schedule, schedule_options in decode_schedule_variants(
-                        geometry, args.role, profile, capacity):
+                for schedule, schedule_options in ([] if compact else decode_schedule_variants(
+                        geometry, args.role, profile, capacity)):
                     exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
                                     / raw.name, {**options, **schedule_options}))
                 for schedule, raw, run_options in exports:
@@ -818,6 +856,9 @@ def build(args: argparse.Namespace) -> None:
                     shutil.copy2(raw / name, target)
                 variant = {'directory': directory, **{key: meta[key] for key in
                     ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
+                for key in ('descriptor_rows', 'native_info_version'):
+                    if key in meta:
+                        variant[key] = meta[key]
                 if 'tile' in meta:
                     # What the compiler actually resolved, always: the pinned
                     # policy varies per capacity (m16 is the known special case),
@@ -880,6 +921,8 @@ def main() -> None:
                         help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
     create.add_argument('--all-spark-counts', action='store_true',
                         help='Opt in to all nonempty H128 Spark TP profiles (1..6)')
+    create.add_argument('--compact-companions', action='store_true',
+                        help='Add compact two-tier exports for selected uneven Spark worlds only')
     create.add_argument('--profile', action='append', default=[],
                         help='Build only these profiles (repeatable), for bring-up; '
                              'without selection the legacy role profiles remain the default')

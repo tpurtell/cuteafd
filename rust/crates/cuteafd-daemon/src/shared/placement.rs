@@ -296,7 +296,7 @@ mod tests {
             fixture_model())?;
         assert_eq!(plan.selection.layers(), [1]);
         assert_eq!(plan.assignments.iter().map(|rank| rank.slices[0].stored_width).collect::<Vec<_>>(),
-            [384, 384, 384, 384, 256, 256]);
+            [256, 384, 384, 384, 384, 256]);
         for assignment in &plan.assignments {
             assert!(assignment.resident_bytes > 0 && assignment.io.mapped_rings > 0);
             assert_eq!(assignment.io.mapped_rings, fixture_model().ring_bytes(geometry)? as u64);
@@ -318,8 +318,10 @@ mod tests {
         assert_eq!(plan.selection.layers(), [0, 2]);
         for (rank, assignment) in plan.assignments.iter().enumerate() {
             assert_eq!(assignment.slices.iter().map(|slice| slice.layer).collect::<Vec<_>>(), [0, 2]);
-            let expected = catalog.exl3().unwrap().residency(cuteafd_loader::V41Exl3Layer::Backbone(0), 3, rank)?;
-            assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
+            let expected = catalog.exl3().unwrap().balanced_residency(cuteafd_loader::V41Exl3Layer::Backbone(0), 3, rank)?;
+            let other = catalog.exl3().unwrap().balanced_residency(cuteafd_loader::V41Exl3Layer::Backbone(2), 3, rank)?;
+            assert_eq!(assignment.resident_bytes,
+                (expected.device_arena_layout()?.1 + other.device_arena_layout()?.1) as u64);
             assert_eq!(assignment.slices[0].tiers, expected.tiers.iter().map(|&tier| tier as u32).collect::<Vec<_>>());
             assert!(!assignment.slices[0].projection_counts.is_empty());
         }
@@ -377,9 +379,11 @@ mod tests {
         let plan = SparkAdmission::plan(root.path(), ExpertGeometry::DEEPSEEK_V41, Some(&catalog),
             &working, 4, None, fixture_model())?;
         for (rank, assignment) in plan.assignments.iter().enumerate() {
-            let expected = catalog.exl3().unwrap().residency(
-                cuteafd_loader::V41Exl3Layer::Backbone(17), 4, rank)?;
-            assert_eq!(assignment.resident_bytes, 2 * expected.device_arena_layout()?.1 as u64);
+            let expected = [17, 39].into_iter().map(|layer| -> Result<u64> {
+                catalog.exl3().unwrap().balanced_residency(
+                    cuteafd_loader::V41Exl3Layer::Backbone(layer), 4, rank).and_then(|plan| Ok(plan.device_arena_layout()?.1 as u64))
+            }).collect::<Result<Vec<_>>>()?;
+            assert_eq!(assignment.resident_bytes, expected.iter().sum::<u64>());
         }
         check_reports(&plan)
     }

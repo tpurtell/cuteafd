@@ -401,14 +401,43 @@ fn native_layer3_same_quant() -> Result<()> {
 #[test]
 #[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
 fn native_prefill_lanes_byte_exact() -> Result<()> {
+    prefill_lanes_byte_exact(3072, 1024)
+}
+
+#[test]
+#[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
+fn native_prefill_lanes_long_byte_exact() -> Result<()> {
+    let lengths = std::env::var("CUTEAFD_EXLR8_LANE_LENGTHS").unwrap_or_else(|_| "10771,16384,32768".into());
+    for length in lengths.split(',') {
+        prefill_lanes_byte_exact(length.parse()?, 4096)?;
+    }
+    Ok(())
+}
+
+fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
     use clap::Parser;
     #[derive(Parser)]
     struct Args {
         #[command(flatten)]
         engine: crate::families::glm5::EngineArgs,
     }
-    const CHUNK: usize = 1024;
     const LANES: usize = 3;
+    let context = total.next_multiple_of(2 * PAGE_ROWS);
+    let mut shape = Vec::new();
+    let mut start = 0;
+    while start < total {
+        let batch = (total - start).min(chunk * LANES);
+        let count = LANES.min(batch / MIN_LANE_ROWS).max(1);
+        let per_lane = batch.div_ceil(count).next_multiple_of(PAGE_ROWS);
+        let mut first = 0;
+        while first < batch {
+            let rows = per_lane.min(batch - first);
+            shape.push((start + first, rows));
+            first += rows;
+        }
+        start += batch;
+    }
+    eprintln!("EXLR8 lane golden total={total} chunk={chunk} shape={shape:?}");
     let args = Args::try_parse_from([
         "exlr8-lanes".into(),
         "--snapshot".into(),
@@ -423,9 +452,9 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
         "--device".into(), "0".into(),
         "--split-device".into(), "1".into(),
         "--attention-placement".into(), "context".into(),
-        "--max-context".into(), "4096".into(),
-        "--pool-tokens".into(), "4096".into(),
-        "--prefill-rows".into(), CHUNK.to_string().into(),
+        "--max-context".into(), context.to_string().into(),
+        "--pool-tokens".into(), context.to_string().into(),
+        "--prefill-rows".into(), chunk.to_string().into(),
         "--rtx-expert-layers".into(), "0".into(),
         "--l2-prefetch".into(), "off".into(),
         "--peers".into(),
@@ -438,12 +467,12 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
         ensure!(engine.native_experts.len() == 2, "lane gate requires native shared owners");
         let transport = transport.context("lane gate needs real workers")?;
         let mut allocator = PageAllocator::new(engine);
-        let placement = allocator.admit(CHUNK * LANES)?;
-        let tokens: Vec<u32> = (0..CHUNK * LANES)
+        let placement = allocator.admit(total)?;
+        let tokens: Vec<u32> = (0..total)
             .map(|i| (17 + i * 7919) as u32 % engine.cfg.vocab_size as u32).collect();
-        let tables = (0..LANES).map(|lane|
-            engine.prefill_tables(&placement, lane * CHUNK, CHUNK)).collect::<Result<Vec<_>>>()?;
-        let chunks: Vec<_> = tokens.chunks_exact(CHUNK).collect();
+        let tables = shape.iter().map(|&(start, rows)|
+            engine.prefill_tables(&placement, start, rows)).collect::<Result<Vec<_>>>()?;
+        let chunks: Vec<_> = shape.iter().map(|&(start, rows)| &tokens[start..start + rows]).collect();
         let caches = |rank| -> Result<(&Vec<Dev<'_>>, &Vec<Option<Dev<'_>>>)> {
             if rank == 0 { Ok((&engine.kv, &engine.index)) }
             else { let peer = engine.peer()?; Ok((&peer.kv, &peer.index)) }
@@ -490,9 +519,10 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
             clear()?;
             let mut serial = None;
             for (lane, (tables, tokens)) in tables.iter().zip(&chunks).enumerate() {
-                let logits = engine.step(tables, tokens, usize::from(lane + 1 == LANES),
+                eprintln!("EXLR8 lane golden serial total={total} unit={lane} rows={}", tokens.len());
+                let logits = engine.step(tables, tokens, usize::from(lane + 1 == chunks.len()),
                     Some((&mut *transport, runtime)), None)?;
-                if lane + 1 == LANES {
+                if lane + 1 == chunks.len() {
                     serial = Some(logits.context("serial final logits")?.to_host(engine.library)?);
                 } else {
                     ensure!(logits.is_none(), "zero-row serial prefill returned logits");
@@ -500,8 +530,16 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
             }
             let serial_state = snapshot()?;
             clear()?;
-            let pipelined = engine.host_logits(engine.step_lanes(&tables, &chunks, 1)?)?
-                .context("pipelined final logits")?;
+            let mut pipelined = None;
+            for (batch, (tables, chunks)) in tables.chunks(LANES).zip(chunks.chunks(LANES)).enumerate() {
+                let last = (batch + 1) * LANES >= shape.len();
+                eprintln!("EXLR8 lane golden pipeline total={total} batch={batch} rows={:?}",
+                    chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>());
+                let logits = engine.host_logits(engine.step_lanes(tables, chunks, usize::from(last))?)?;
+                if last { pipelined = logits; }
+                else { ensure!(logits.is_none(), "zero-row pipeline prefill returned logits"); }
+            }
+            let pipelined = pipelined.context("pipelined final logits")?;
             let pipelined_state = snapshot()?;
             for (rank, (serial, pipelined)) in serial_state.iter().zip(&pipelined_state).enumerate() {
                 for (layer, (serial, pipelined)) in serial.iter().zip(pipelined).enumerate() {
@@ -512,7 +550,7 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
             ensure!(serial.len() == pipelined.len() && serial.iter().zip(&pipelined)
                 .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits()),
                 "fixed-chunk prefill final logits differ");
-            eprintln!("EXLR8 lanes exact: chunks={LANES} rows_per_chunk={CHUNK} ranks={} layers={} logits={}",
+            eprintln!("EXLR8 lanes exact: total={total} chunk={chunk} ranks={} layers={} logits={}",
                 engine.ranks(), engine.weights.layers.len(), serial.len());
             Ok(())
         })();

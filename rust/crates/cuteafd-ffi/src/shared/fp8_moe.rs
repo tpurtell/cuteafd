@@ -417,18 +417,20 @@ mod metadata_tests {
     #[test]
     fn exact_k32_slices_require_mxfp4_and_balanced_unit_widths() {
         for input in [1, 7] {
-            for width in [256, 320, 352, 384] {
+            for (tp, width) in [(6, 256), (6, 320), (6, 352), (6, 384),
+                (3, 640), (3, 672), (3, 704), (3, 768)] {
                 let mut w = words();
                 w[2] = width;
                 w[3] = 384;
-                w[6] = 6;
+                w[6] = tp;
                 w[7] = input;
                 assert_eq!(Fp8MoeInfo::from_words(w).unwrap().slice, width as usize);
             }
-            for width in [0, 288, 336, 368, 416] {
+            for (tp, width) in [(6, 0), (6, 288), (6, 336), (6, 368), (6, 416),
+                (3, 656), (3, 688), (3, 736)] {
                 let mut w = words();
                 w[2] = width;
-                w[6] = 6;
+                w[6] = tp;
                 w[7] = input;
                 assert!(Fp8MoeMetadata::from_words_and_scratch(w, |_| {
                     panic!("invalid slice must not query workspace")
@@ -436,11 +438,11 @@ mod metadata_tests {
             }
         }
         for format in [1, 4, 5] {
-            for width in [320, 352] {
+            for (tp, width) in [(6, 320), (6, 352), (3, 672), (3, 704)] {
                 let mut w = words();
                 w[0] = 5 | format << 8 | 1 << 16 | 1 << 24;
                 w[2] = width;
-                w[6] = 6;
+                w[6] = tp;
                 assert!(Fp8MoeInfo::from_words(w).is_err());
             }
         }

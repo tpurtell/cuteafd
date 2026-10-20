@@ -11,50 +11,33 @@ pub enum UnitRule {
     Rotated,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TpPlacement {
-    #[default]
-    RoundRobin,
-    Balanced,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnitMapError {
     #[error("TP unit geometry needs positive experts/unit, whole intermediate units, and nonempty contiguous ranks")]
     Geometry,
     #[error("TP unit, expert or rank is outside the geometry")]
     Index,
-    #[error("CUTEAFD_TP_PLACEMENT must be round-robin or balanced, found {0:?}")]
-    Policy(String),
 }
 
-impl TpPlacement {
-    pub fn active() -> Result<Self, UnitMapError> {
-        match std::env::var("CUTEAFD_TP_PLACEMENT") {
-            Ok(value) => value.parse(),
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(error) => Err(UnitMapError::Policy(error.to_string())),
-        }
-    }
-
-    pub fn rule(self, unit_columns: usize) -> UnitRule {
-        match self {
-            Self::RoundRobin => UnitRule::Contiguous,
-            Self::Balanced if unit_columns == 32 => UnitRule::LayerRotation,
-            Self::Balanced => UnitRule::Rotated,
-        }
+/// Exact-even ownership stays contiguous; uneven units balance across layers
+/// (native K32) or experts and layers (H128).
+pub fn balanced_rule(unit_columns: usize, units: usize, world: usize) -> UnitRule {
+    if world != 0 && units != 0 && units % world == 0 {
+        UnitRule::Contiguous
+    } else if unit_columns == 32 {
+        UnitRule::LayerRotation
+    } else {
+        UnitRule::Rotated
     }
 }
 
-impl std::str::FromStr for TpPlacement {
-    type Err = UnitMapError;
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "round-robin" => Ok(Self::RoundRobin),
-            "balanced" => Ok(Self::Balanced),
-            _ => Err(UnitMapError::Policy(value.into())),
-        }
+/// Fixed-width kernels keep one contiguous source range per layer. Exact-even
+/// native-unit splits do not rotate, preserving their original arithmetic.
+pub fn layer_rule(units: usize, world: usize) -> UnitRule {
+    if world != 0 && units != 0 && units % world == 0 {
+        UnitRule::Contiguous
+    } else {
+        UnitRule::LayerRotation
     }
 }
 
@@ -342,7 +325,31 @@ mod tests {
     }
 
     #[test]
-    fn invalid_geometry_and_policy_fail_closed() {
+    fn even_balanced_maps_are_identical_to_contiguous() {
+        for (intermediate, world) in [(2048, 2), (2048, 4), (2304, 3),
+            (2304, 6), (1536, 6), (3072, 6)] {
+            for unit in [32, 128] {
+                for layer in [0, 3, 40, 77] {
+                    for rank in 0..world {
+                        let expected = RankUnits::new(UnitRule::Contiguous, 8,
+                            intermediate, unit, layer, world, rank).unwrap();
+                        let rule = balanced_rule(unit, intermediate / unit, world);
+                        let actual = RankUnits::new(rule, 8, intermediate,
+                            unit, layer, world, rank).unwrap();
+                        assert_eq!(actual, expected);
+                        assert_eq!(actual.fingerprint(), expected.fingerprint());
+                        assert_eq!(actual.width_classes(), expected.width_classes());
+                        for expert in 0..8 {
+                            assert_eq!(actual.column_ranges(expert), expected.column_ranges(expert));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_geometry_fails_closed() {
         for (i, u, n, r) in [
             (0, 32, 6, 0),
             (2048, 0, 6, 0),
@@ -353,8 +360,7 @@ mod tests {
         ] {
             assert!(RankUnits::new(UnitRule::Contiguous, 384, i, u, 0, n, r).is_err());
         }
-        assert!("traffic-fitted".parse::<TpPlacement>().is_err());
-        assert_eq!(TpPlacement::Balanced.rule(32), UnitRule::LayerRotation);
-        assert_eq!(TpPlacement::Balanced.rule(128), UnitRule::Rotated);
+        assert_eq!(balanced_rule(32, 64, 6), UnitRule::LayerRotation);
+        assert_eq!(balanced_rule(128, 16, 6), UnitRule::Rotated);
     }
 }

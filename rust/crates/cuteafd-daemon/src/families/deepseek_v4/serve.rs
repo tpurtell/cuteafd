@@ -536,11 +536,11 @@ fn speculative_step(
     Ok(finished)
 }
 
-/// Mark slots of the prefix cache's arena: two per decoding sequence plus two,
-/// raised to the retained entries while they fit the mark budget.
+/// Host staging slots, or legacy retention when this layout cannot use the host tier.
 fn mark_slots(engine: &super::engine::Engine<'_>, args: &PrefixArgs, mark: usize) -> usize {
     let mut rule = args.mark_rule(engine.shape.sequences);
-    rule.host &= engine.ranks() == 1 || engine.context_kv();
+    rule.host = cuteafd_loader::placement::families::deepseek_v4::host_marks_enabled(
+        engine.ranks(), engine.context_kv(), rule.host);
     rule.slots(mark)
 }
 
@@ -557,7 +557,8 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     // (replicated) state on both GPUs, so it keeps device-resident snapshots only. Under context
     // each unit's C4 pages come from their owner and the replicated bytes from GPU0 (both GPUs'
     // pools and mark arenas registered, so every copy runs on its owner's copy streams).
-    let host = if engine.ranks() > 1 && !engine.context_kv() {
+    let host = if !cuteafd_loader::placement::families::deepseek_v4::host_marks_enabled(
+        engine.ranks(), engine.context_kv(), true) {
         if args.host_cache_bytes.enabled() && args.prefix_cache_entries > 0 {
             tracing::warn!("DeepSeek V4 head split: the prefix cache's host tier is off (device-resident snapshots only)");
         }

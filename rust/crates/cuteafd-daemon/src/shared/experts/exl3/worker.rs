@@ -166,6 +166,15 @@ impl<'a> Exl3Worker<'a> {
         Ok(())
     }
 
+    pub(crate) fn validate_planned_residency(directory: &Path, capacity: u32,
+        schedule: Exl3Schedule, layout: &cuteafd_loader::V41Exl3Residency,
+        geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
+        for c in Self::capacities(capacity)? {
+            Exl3Execution::validate_planned_residency(&schedule.directory(directory, c), layout, geometry)?;
+        }
+        Ok(())
+    }
+
     /// FP8 E4M3 wire row: hidden values then hidden/32 UE8M0 K32 scales.
     fn wire_row_bytes() -> usize {
         let hidden = cuteafd_core::expert_geometry().hidden as usize;

@@ -129,7 +129,7 @@ pub fn dual_expert_costs(catalog: &crate::OfficialV41Catalog, layers: usize)
             } else {
                 use crate::formats::fp8_experts::{Fp8Projection, Slicing};
                 let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs EXL3/FP8/NVFP4 tensors"))?
-                    .for_layer(layer)?;
+                    .for_layer(layer)?.for_coordinator();
                 tensors.validate_layer(layer)?;
                 let slicing = if world == 2 { Slicing::Blocks(128) } else { Slicing::Padded };
                 Fp8Projection::ALL.iter().try_fold(0u64, |total, &projection| {
@@ -156,7 +156,7 @@ pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path
         let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}"));
         Ok([0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}"))))
     } else {
-        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?;
+        let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?.for_coordinator();
         let root = root.join("fp8").join(tensors.format().package_name("qwen4"));
         let rank = |rank| -> anyhow::Result<_> {
             Ok(root.join(format!("tp2-w{}", tensors.rank_width(2, rank,
@@ -237,7 +237,7 @@ pub fn dual_expert_workspace(catalog: &crate::OfficialV41Catalog,
         let width = if let Some(exl3) = catalog.exl3() {
             exl3.residency(crate::V41Exl3Layer::Backbone(0), 2, rank)?.intermediate as u64
         } else {
-            catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 expert format is unsupported"))?
+            catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 expert format is unsupported"))?.for_coordinator()
                 .rank_width(2, rank, Slicing::Blocks(128))? as u64
         };
         let scratch = if catalog.exl3().is_some() {

@@ -13,7 +13,7 @@ REF = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(REF)
 
 
-@pytest.mark.parametrize('bits', [2, 3, 4])
+@pytest.mark.parametrize('bits', [2, 3, 4, 5])
 def test_tail_biting_unpack_matches_scalar_bitstream(bits):
     symbols = np.random.default_rng(270 + bits).integers(0, 1 << bits, 256)
     words = []
@@ -39,7 +39,7 @@ def test_tail_biting_unpack_matches_scalar_bitstream(bits):
     np.testing.assert_array_equal(actual, expected)
 
 
-@pytest.mark.parametrize('bits', [2, 3, 4])
+@pytest.mark.parametrize('bits', [2, 3, 4, 5])
 def test_effective_weight_includes_both_normalized_rotations(bits):
     packed = np.zeros((8, 8, 16 * bits), dtype=np.uint16)
     suh, svh = np.linspace(0.5, 1.5, 128), np.linspace(0.25, 1.25, 128)

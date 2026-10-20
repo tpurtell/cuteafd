@@ -146,7 +146,7 @@ fn retained_modules_are_measured_once_and_consumed_without_reload() -> Result<()
         buffers: specs.iter().map(|s| WeightBuffer { buffer: CuteafdDeviceBuffer { bytes:s.bytes, ..arena.buffer } }).collect(),
         _arena: arena,
         layout: V41Exl3Residency { layer:V41Exl3Layer::Backbone(0),world:2,rank:1,
-            intermediate_start:1152,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],buffers:specs,loads:vec![] },
+            intermediate_start:1152,experts:6,intermediate:1152,tiers:vec![3,4],projection_counts:vec![[0;3];2],unit_map:None,buffers:specs,loads:vec![] },
         budget: ExpertLoadBudget { resident_bytes:1024,device_staging_bytes:0,pinned_host_bytes:0,read_scratch_bytes:0 },
     }]);
     let mut executions = Vec::new();

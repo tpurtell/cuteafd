@@ -267,6 +267,7 @@ fn fidelity(run: &mut Run<'_>, check: &mut Check) -> Result<()> {
     check.set("quick_subset", "bench-v1:legacy,a00,a04,a08,a20,c00,d00,e00");
     check.set("per_window", json!(crate::panels::fidelity::window_summaries(&scored)));
     check.set("verdict", json!(verdict));
+    check.set("precision", json!(scored.precision));
     check.set("run", json!(scored));
     check.status = if verdict.pass { CheckStatus::Pass } else { CheckStatus::Fail };
     crate::quality::apply_fidelity(run.info, check);

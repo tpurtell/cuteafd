@@ -140,6 +140,23 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                 if architecture != '121':
                     self.assertNotIn('tp1-rank0', stamp)
 
+    def test_compact_companions_reach_selected_spark_worlds_only(self):
+        for architecture in ('120', '121'):
+            with self.subTest(architecture=architecture):
+                result, rules = self.configure(
+                    f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}',
+                    '-DCUTEAFD_EXPERT_FAMILIES=glm:exl3-k45',
+                    '-DCUTEAFD_GENERIC_SPARK_COUNTS=glm:exl3=6')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                commands = [line for line in rules.splitlines() if 'package_exl3_aot.py build' in line]
+                glm = next(line for line in commands if '--geometry glm ' in line)
+                if architecture == '121':
+                    self.assertTrue(all('--compact-companions' in line for line in commands))
+                    self.assertIn('--profile tp6-width384 --profile tp6-width256', glm)
+                    self.assertNotIn('--profile tp3-', glm)
+                else:
+                    self.assertNotIn('--compact-companions', rules)
+
     def test_kimi_only_declares_qualified_roles(self):
         for architecture, layouts in (('120', ['rtx-tp1']),
                                       ('121', [f'tp6-rank{i}' for i in range(6)])):

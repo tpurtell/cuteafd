@@ -32,8 +32,6 @@ def test_deployment_preserves_release_container_commands(entry: dict) -> None:
     assert [run["host"] for run in current["containers"]] == [run["host"] for run in golden]
     for old, new in zip(golden, current["containers"]):
         before, after = parse_run(old["argv"]), parse_run(new["argv"])
-        # MiMo Pro configs select balanced TP placement (#521); every other card stays round-robin.
-        before["env"]["CUTEAFD_TP_PLACEMENT"] = "balanced" if "mimo-v26-pro" in entry["config"] else "round-robin"
         if old["host"] == "coordinator":
             # capture() bounds readiness to 30s; admission now shares that deadline.
             before["env"]["CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS"] = "30"
@@ -206,21 +204,3 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     assert serve.count("--host-cache-bytes") == 1
     assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
-
-
-@pytest.mark.parametrize("policy", ["round-robin", "balanced"])
-def test_tp_placement_reaches_planner_coordinator_and_workers(policy: str) -> None:
-    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
-    entry["set"]["TP_PLACEMENT"] = policy
-    result = capture(ROOT, f"tp-placement-{policy}", release_entry=entry)
-    assert f"CUTEAFD_TP_PLACEMENT={policy}" in result["plans"][0]
-    assert len(result["containers"]) == 7
-    for container in result["containers"]:
-        assert parse_run(container["argv"])["env"]["CUTEAFD_TP_PLACEMENT"] == policy
-
-
-def test_tp_placement_rejects_unknown_policy_before_launch() -> None:
-    entry = release_entry(next(e for e in ENTRIES if e["name"] == "mimo-pro-max"))
-    entry["set"]["TP_PLACEMENT"] = "fitted"
-    with pytest.raises(RuntimeError, match="TP_PLACEMENT"):
-        capture(ROOT, "tp-placement-invalid", release_entry=entry)

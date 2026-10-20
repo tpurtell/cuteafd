@@ -925,7 +925,7 @@ mod budget_tests {
     fn placement_selection(layers: &[usize]) -> crate::worker_selection::WorkerSelection {
         let identity = serde_json::from_value(serde_json::json!({
             "checkpoint": "0".repeat(64), "geometry": [6144, 384, 8, 2048, 70],
-            "world": 2, "topology": [2, 1], "ownership_wire": false, "placement": "round-robin"
+            "world": 2, "topology": [2, 1], "ownership_wire": false
         })).unwrap();
         crate::worker_selection::WorkerSelection::new(identity, layers).unwrap()
     }

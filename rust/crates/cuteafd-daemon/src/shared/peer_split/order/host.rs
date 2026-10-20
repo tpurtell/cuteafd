@@ -276,6 +276,59 @@ pub(crate) mod glm {
         s
     }
 
+    /// Unit-local prefill: no future-unit peer work. FFN enqueue may block on
+    /// either device, so test each heavy region as a possible host sync too.
+    pub fn paired_prefill(lanes: usize, context: bool, local_end: usize) -> HostSchedule {
+        let mut s = HostSchedule::default();
+        for lane in 0..lanes {
+            s.push_to(0, "main", DIRECT, lane, format!("embedding lane{lane}"));
+        }
+        let mut pending = std::collections::VecDeque::new();
+        let post = |s: &mut HostSchedule, layer: usize, lane: usize, remote: bool| {
+            let ffn = slot(layer, true, lane);
+            if remote && layer + 1 < LAYERS {
+                s.push(0, "main", ffn, format!("rank0 routed sum L{layer} lane{lane}"));
+            }
+            if layer + 1 < LAYERS || layer < local_end {
+                s.wait(1, "main", ffn, format!("rank1 post L{layer} lane{lane}"));
+            }
+            s.wait(0, "main", ffn, format!("rank0 post L{layer} lane{lane}"));
+        };
+        for layer in 0..LAYERS {
+            for lane in 0..lanes {
+                while pending.iter().any(|&(_, k)| k == lane) {
+                    let (before, other) = pending.pop_front().unwrap();
+                    post(&mut s, before, other, true);
+                }
+                if layer == 0 {
+                    s.wait_for(1, "main", DIRECT, lane, format!("embedding received lane{lane}"));
+                }
+                attention(&mut s, 1, layer, lane, context);
+                attention(&mut s, 0, layer, lane, context);
+                // Treat arbitrary driver backpressure inside the FFN as a host
+                // sync: both streams must progress from already queued publications.
+                s.sync(1, format!("peer FFN enqueue L{layer} lane{lane}"));
+                if layer < FIRST_MOE || layer >= local_end {
+                    s.push(1, "main", slot(layer, true, lane), "peer FFN output");
+                }
+                s.sync(0, format!("rank0 FFN enqueue L{layer} lane{lane}"));
+                if layer < FIRST_MOE || layer < local_end {
+                    if layer >= FIRST_MOE {
+                        s.push(1, "main", slot(layer, true, lane), "local peer output");
+                    }
+                    s.push(0, "main", slot(layer, true, lane), "rank0 FFN output");
+                    post(&mut s, layer, lane, false);
+                } else {
+                    pending.push_back((layer, lane));
+                }
+            }
+        }
+        while let Some((layer, lane)) = pending.pop_front() {
+            post(&mut s, layer, lane, true);
+        }
+        s
+    }
+
     /// `step_lanes`: rank 1's layer-0 attention for every lane, then units layer-major;
     /// each MoE unit stages (GPU0 sync) and sends before rank 1's `peer_next`, and its
     /// wave lands (a host wait on the Sparks, no GPU flag) before the lane's next attention.
@@ -371,6 +424,34 @@ pub(crate) mod glm {
 mod glm_tests {
     use super::glm::{decode, prefill, Fault};
     use super::*;
+
+    #[test]
+    fn glm_paired_serial_and_lanes_allow_ffn_enqueue_backpressure() {
+        for context in [false, true] {
+            for lanes in 1..=4 {
+                for local_end in [3, 12, 78] {
+                    let schedule = glm::paired_prefill(lanes, context, local_end);
+                    assert_eq!(check_host(&schedule), Ok(()),
+                        "context={context} lanes={lanes} local_end={local_end}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glm_lookahead_flags_drain_but_wide_peer_ffn_enqueue_can_deadlock() {
+        for lanes in [1, 3] {
+            let mut schedule = prefill(lanes, Fault::None);
+            let at = schedule.ops.iter().position(|op| matches!(op,
+                HostOp::Queue { gpu: 1, label, .. } if label == "gpu1 ffn push L3 lane0")).unwrap();
+            schedule.ops.insert(at, HostOp::Sync { gpu: 1, label: "wide peer FFN enqueue".into() });
+            assert_eq!(check(&schedule.streams()), Ok(()));
+            let error = check_host(&schedule).unwrap_err();
+            assert_eq!(error.sync, "wide peer FFN enqueue");
+            let blocked = if lanes == 1 { "gpu1 attn wait L3 lane0" } else { "gpu1 attn wait L2 lane1" };
+            assert_eq!(error.blocked[1].as_deref(), Some(blocked));
+        }
+    }
 
     #[test]
     fn glm_decode_heads_and_context_drain_with_host_syncs() {

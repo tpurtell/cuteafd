@@ -106,9 +106,8 @@ for bf16_family in "${bf16_family_list[@]}"; do
   [[ ";$expert_families;" == *";$bf16_family:fp8;"* ]] ||
     { echo "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_family needs $bf16_family:fp8 in CUTEAFD_RELEASE_EXPERT_FAMILIES" >&2; exit 2; }
 done
-# v7 ships both EXL3 decoder families by default: the uniform K=2 raw
-# publication family (2,3) and the staged K3.25 family (3,4).
-exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4}"
+# Package each supported checkpoint decoder family, including K4/K5.
+exl3_bit_families="${CUTEAFD_RELEASE_EXL3_BIT_FAMILIES:-2,3;3,4;4,5}"
 [[ "$cuda_arch" =~ ^[0-9]+$ ]] || {
   echo "CUDA_ARCH must be numeric" >&2
   exit 2
