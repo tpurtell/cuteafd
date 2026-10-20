@@ -170,22 +170,47 @@ impl RankWeightLayout {
         Self::build(checkpoint, rank, ownership.ranks(), Some(ownership))
     }
 
+    /// MTP stages stay whole on their admitted owner. Matching head shapes
+    /// do not establish tied checkpoint storage or identical weights.
+    pub fn for_mtp(checkpoint: &Checkpoint, depth: usize) -> Result<Self> {
+        let model = Model::open(checkpoint)?;
+        ensure!(depth <= model.cfg.mtp, "Step-5 MTP depth exceeds checkpoint stages");
+        if depth == 0 {
+            return Ok(Self { rank: 0, ranks: 1, operands: vec![], resident_bytes: 0 });
+        }
+        let end = model.cfg.layers + depth;
+        let declarations = model.tensors.iter().filter(|(_, tensor)| {
+            tensor.role.component == Component::Speculator
+                && tensor.role.layer.is_some_and(|layer| layer < end)
+        }).map(|(name, tensor)| (name.clone(), tensor.shape.clone(), tensor.dtype.clone()));
+        let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
+        let mut layout = Self::from_native(&weights, 0, 1, None)?;
+        for operand in &mut layout.operands {
+            operand.slice = WeightSlice::Replicated;
+        }
+        Ok(layout)
+    }
+
     fn build(checkpoint: &Checkpoint, rank: usize, ranks: usize,
+        ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
+        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
+        Self::from_native(&contract.weights, rank, ranks, ownership)
+    }
+
+    fn from_native(weights: &NativeDenseLayout, rank: usize, ranks: usize,
         ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         ensure!(
             matches!(ranks, 1 | 2) && rank < ranks,
             "Step-5 coordinator rank geometry"
         );
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let sources: std::collections::BTreeMap<_, _> = contract
-            .weights
+        let sources: std::collections::BTreeMap<_, _> = weights
             .tensors
             .iter()
             .map(|t| (t.meta.name.as_str(), t))
             .collect();
         let mut operands = Vec::new();
         let mut resident_bytes = 0u64;
-        for source in &contract.weights.tensors {
+        for source in &weights.tensors {
             let name = &source.meta.name;
             let mut split_ranks = ranks;
             if let Some(ownership) = ownership {
@@ -577,6 +602,47 @@ mod tests {
         );
         for (rank, ranks) in [(0, 0), (0, 3), (2, 2), (1, 1)] {
             assert!(RankWeightLayout::from_checkpoint(&cp, rank, ranks).is_err());
+        }
+    }
+
+    #[test]
+    fn mtp_residency_charges_each_native_stage_and_head() {
+        for format in ["fp8", "nvfp4"] {
+            let dir = snapshot(format);
+            let cp = Checkpoint::open(dir.path()).unwrap();
+            let zero = RankWeightLayout::for_mtp(&cp, 0).unwrap();
+            assert!(zero.operands.is_empty());
+            assert_eq!(zero.resident_bytes, 0);
+            for depth in 1..=3 {
+                let layout = RankWeightLayout::for_mtp(&cp, depth).unwrap();
+                assert_eq!(layout.operands.len(), 16 * depth);
+                assert_eq!(layout.resident_bytes, 1_677_280_768 * depth as u64);
+                assert!(layout.operands.iter().all(|operand| operand.slice == WeightSlice::Replicated));
+                for stage in 92..92 + depth {
+                    let base = format!("model.layers.{stage}");
+                    for norm in ["enorm", "hnorm", "transformer.shared_head.norm"] {
+                        let norm = layout.operands.iter().find(|operand|
+                            operand.name == format!("{base}.{norm}.weight")).unwrap();
+                        assert_eq!(norm.dtype, DType::F32);
+                        assert_eq!(norm.shape, [4096]);
+                    }
+                    let head = layout.operands.iter().find(|operand|
+                        operand.name == format!("{base}.transformer.shared_head.output.weight")).unwrap();
+                    assert_eq!(head.shape, [128896, 4096]);
+                    assert_eq!(head.allocation_bytes, 128896 * 4096 * 2);
+                    let concat = layout.operands.iter().find(|operand|
+                        operand.name == format!("{base}.eh_proj.weight")).unwrap();
+                    assert_eq!(concat.shape, [4096, 8192]);
+                }
+                let exact = layout.resident_bytes;
+                assert_eq!(layout.check_budget(exact + 12, &[5, 7]).unwrap(), exact + 12);
+                assert!(layout.check_budget(exact + 11, &[5, 7]).is_err());
+            }
+            assert!(RankWeightLayout::for_mtp(&cp, 4).is_err());
+            let mut bad = Checkpoint::open(dir.path()).unwrap();
+            bad.tensors.iter_mut().find(|tensor|
+                tensor.meta.name == "model.layers.94.eh_proj.weight").unwrap().meta.byte_length -= 1;
+            assert!(RankWeightLayout::for_mtp(&bad, 3).is_err());
         }
     }
 
