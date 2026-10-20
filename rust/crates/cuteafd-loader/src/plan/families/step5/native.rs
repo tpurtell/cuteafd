@@ -124,6 +124,24 @@ pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
     Ok([rows * H * 2, rows * H * 2, rows * 128896 * 4, 4 << 20])
 }
 
+/// Conservative private predictor lane recipe for offline fit forecasts.
+/// Whole SWA/dense/head workspaces are retained per stage; no aliasing or
+/// recomputation saving is credited before a native owner proves it.
+pub fn mtp_forecast_workspace(rows: usize, depth: usize) -> Result<u64> {
+    ensure!(depth <= 3, "Step-5 predictor depth must be 0..=3");
+    let mut stage = 0u64;
+    for bytes in swa_planes(rows, 64)?.into_iter().chain(dense_planes(rows)?)
+        .chain(head_planes(rows)?) {
+        stage = stage.checked_add(bytes as u64).context("Step-5 MTP workspace overflow")?;
+    }
+    // Independent normalized inputs, concat, EH output and F32 residual;
+    // include source/position/length scratch rather than assuming reuse.
+    stage.checked_add((rows as u64).checked_mul((H * 16 + 64) as u64)
+        .context("Step-5 MTP input scratch overflow")?)
+        .and_then(|n| n.checked_mul(depth as u64))
+        .context("Step-5 MTP workspace overflow")
+}
+
 pub fn rank_admission(
     checkpoint: &Checkpoint,
     ownership: &ExecutionOwnership,

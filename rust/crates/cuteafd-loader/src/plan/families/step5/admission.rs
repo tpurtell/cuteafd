@@ -307,11 +307,44 @@ pub fn admit(checkpoint: &Checkpoint, inputs: &RuntimeInputs) -> Result<Admissio
     })
 }
 
+/// Offline capacity forecast, not permission to execute an unqualified draft.
+/// Includes native stage weights and private per-stage lane workspace, cache
+/// state, independent histories and the actual host-aware staging mark count.
+pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
+    let cfg = Config::parse(checkpoint)?;
+    let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
+    let workspace = super::native::mtp_forecast_workspace(inputs.rows, depth)?;
+    admit_depth_with(&cfg, inputs, depth, |ownership| {
+        (0..ownership.ranks()).map(|rank| {
+            let mut native = super::native::rank_admission(checkpoint, ownership, rank, inputs.rows)?;
+            if rank == usize::from(ownership.execution().spec().head_gpu) {
+                native.immutable = native.immutable.checked_add(weights)
+                    .context("Step-5 predictor weight forecast overflow")?;
+                native.workspace = native.workspace.checked_add(workspace)
+                    .context("Step-5 predictor workspace forecast overflow")?;
+            }
+            Ok(native)
+        }).collect()
+    })
+}
+
 pub fn admit_with(
     cfg: &Config,
     inputs: &RuntimeInputs,
     native: impl FnOnce(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
 ) -> Result<Admission> {
+    admit_depth_with(cfg, inputs, 0, native)
+}
+
+/// Fit-only predictor forecast. Live admission deliberately stays target-only.
+/// The caller must include every predictor's private immutable/workspace owner.
+fn admit_depth_with(
+    cfg: &Config,
+    inputs: &RuntimeInputs,
+    depth: usize,
+    native: impl FnOnce(&ExecutionOwnership) -> Result<Vec<RankAdmission>>,
+) -> Result<Admission> {
+    ensure!(depth <= cfg.mtp, "Step-5 forecast predictor depth exceeds checkpoint");
     inputs.validate(cfg)?;
     let ownership = inputs.ownership(cfg)?;
     let ranks = ownership.ranks();
@@ -340,7 +373,7 @@ pub fn admit_with(
         (initial, inputs.context.min(initial)),
         |tokens, &context| {
             let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, 0, inputs.rows as u64)?;
+                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64)?;
             let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();

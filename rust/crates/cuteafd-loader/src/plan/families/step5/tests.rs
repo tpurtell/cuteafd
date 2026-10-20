@@ -70,6 +70,69 @@ fn report_context(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, po
 }
 
 #[test]
+fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> anyhow::Result<()> {
+    use crate::placement::{inventory::{self, ArchContext}, *};
+    use super::admission::{self, MarkRule, RuntimeInputs};
+    let fixture = snapshot("fp8");
+    let checkpoint_path = std::env::var_os("CUTEAFD_STEP5_FORECAST_SNAPSHOT")
+        .map(std::path::PathBuf::from).unwrap_or_else(|| fixture.path().to_path_buf());
+    let cp = Checkpoint::open(&checkpoint_path)?;
+    let manifest_path = std::env::var_os("CUTEAFD_STEP5_FORECAST_MANIFEST")
+        .map(std::path::PathBuf::from).unwrap_or_else(|| native_manifest(fixture.path()));
+    let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+    let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
+    let capacity = inventory::PRO_TOTAL_BYTES;
+    let arch = ArchContext::coordinator(capacity, None);
+    let inputs = RuntimeInputs {
+        inventory: Inventory { gpus: vec![GpuBudget { capacity_bytes: capacity,
+            baseline: Baseline::Planned { context_bytes: arch.context_bytes, loaded_bytes: 0 },
+            headroom_bytes: 1 << 30 }; 2], spark_ranks: 6, peer_access: true },
+        rows: 256, sequences: 16, lanes: 2, context: 1_048_576,
+        requested_pool: Some(1_048_576),
+        marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
+        pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
+            "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
+        peer_diagnostics: false, startup: vec![],
+    };
+    let baseline = admission::forecast_mtp(&cp, &inputs, 0)?;
+    for depth in 0..=3 {
+        let admitted = admission::forecast_mtp(&cp, &inputs, depth)?;
+        assert_eq!(admitted.cache.context, 1_048_576);
+        assert_eq!(admitted.placement.pool_tokens, 1_048_576);
+        assert_eq!(admitted.marks, 2);
+        assert_eq!(admitted.cache.ranks[0].mtp_stage_hidden.len(), depth);
+        assert!(admitted.cache.ranks[1].mtp_stage_hidden.is_empty());
+        let weights = coordinator::RankWeightLayout::for_mtp(&cp, depth)?.resident_bytes;
+        let workspace = native::mtp_forecast_workspace(inputs.rows, depth)? * inputs.lanes as u64;
+        let charged = |a: &admission::Admission, rank: usize| a.placement.items[rank].iter()
+            .map(|item| item.bytes).sum::<u64>();
+        let active_delta = admitted.reservations[0].active - baseline.reservations[0].active;
+        let marks_delta = admitted.reservations[0].marks - baseline.reservations[0].marks;
+        assert_eq!(charged(&admitted, 0) - charged(&baseline, 0),
+            weights + workspace + active_delta as u64 + marks_delta as u64);
+        assert_eq!(charged(&admitted, 1), charged(&baseline, 1));
+        let by_category = (0..2).map(|rank| {
+            let mut categories = std::collections::BTreeMap::new();
+            for item in &admitted.placement.items[rank] {
+                *categories.entry(format!("{:?}", item.category)).or_insert(0u64) += item.bytes;
+            }
+            serde_json::json!({"rank": rank, "charged": charged(&admitted, rank),
+                "context": arch.context_bytes, "headroom": 1u64 << 30,
+                "remaining": capacity - arch.context_bytes - (1 << 30) - charged(&admitted, rank),
+                "categories": categories})
+        }).collect::<Vec<_>>();
+        eprintln!("Step-5 full-context forecast {}", serde_json::json!({
+            "depth": depth, "context": admitted.cache.context, "pool": admitted.placement.pool_tokens,
+            "sequences": inputs.sequences, "lanes": inputs.lanes, "rows": inputs.rows,
+            "marks": admitted.marks, "predictor_weights": weights,
+            "predictor_lane_workspace": workspace,
+            "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
+    }
+    assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
+    Ok(())
+}
+
+#[test]
 fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
     use crate::placement::{FfnMode, LayerMode};
     use crate::serving_capacity::{step5::Step5CacheLayout, KvPlacement};
