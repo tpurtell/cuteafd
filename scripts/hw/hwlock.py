@@ -194,7 +194,7 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
                 raise TimeoutError(f'no flocks for {",".join(locks)} after {wait:.0f} s inside a gate')
             time.sleep(POLL_S)
         try:
-            yield
+            yield held
         finally:
             for handle in held:
                 handle.close()
@@ -236,7 +236,7 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
         path.unlink(missing_ok=True)
         ticket.close()
     try:
-        yield
+        yield held
     finally:
         for handle in held:
             handle.close()

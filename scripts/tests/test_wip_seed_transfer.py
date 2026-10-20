@@ -222,7 +222,7 @@ def test_nest_distribution_writes_once_replicates_first_hop_then_fans_out():
 
 
 def test_native_nest_tier_is_bounded_and_wraps_the_host_store():
-    expert = WIP[WIP.index('build_expert() ('):WIP.index('\nwip_build_coordinator=0')]
+    expert = WIP[WIP.index('build_expert() ('):WIP.index('\n# Role builders end here.')]
     order = [expert.index(s) for s in (
         'native_store_nest "$seed_host" aarch64 "$seed_root" expert import',
         'native_store_sync "$seed_host" "$seed_root" aarch64 expert import',

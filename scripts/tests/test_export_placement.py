@@ -126,7 +126,7 @@ def _hold(tmp_path, held=(), env_held='', gpus='1,0'):
         probe = ('import fcntl,os,sys; g=os.environ["CUTEAFD_EXPORT_GPU"]; '
                  'print(g, os.environ.get("CUTEAFD_HW_LOCKS_HELD",""))')
         env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'CUTEAFD_HW_LOCKS_HELD': env_held}
-        return subprocess.run([sys.executable, str(SCRIPT), 'hold', '--gpus', gpus, '--', sys.executable, '-c', probe],
+        return subprocess.run([sys.executable, str(SCRIPT), 'hold', '--gpus', gpus, '--wait', '0', '--', sys.executable, '-c', probe],
                               capture_output=True, text=True, timeout=30, env=env)
     finally:
         for holder in holders:
@@ -141,18 +141,18 @@ def test_hold_uses_a_gpu_the_caller_already_holds_without_probing(tmp_path):
     assert result.stdout.split()[0] == '0' and 'already holds gpu0' in result.stderr
 
 
-def test_hold_probes_gpu1_then_gpu0_and_holds_the_one_it_gets(tmp_path):
+def test_hold_queues_for_first_gpu_and_honors_timeout(tmp_path):
     first = _hold(tmp_path)
     assert first.returncode == 0 and first.stdout.split() == ['1', 'gpu1']
     second = _hold(tmp_path, held=('1',))
-    assert second.returncode == 0 and second.stdout.split() == ['0', 'gpu0']
+    assert second.returncode == placement.NO_TURN and not second.stdout
 
 
 def test_hold_never_uses_a_gpu_someone_else_holds(tmp_path):
     # Both locks held (another job, or TJ's interactive gpu0): exit 75 so wip.sh
     # moves on to the export host or the fair queue.
     result = _hold(tmp_path, held=('1', '0'))
-    assert result.returncode == placement.NO_TURN and 'every candidate GPU lock is held' in result.stderr
+    assert result.returncode == placement.NO_TURN and 'no turn for gpu1' in result.stderr
 
 
 def test_reservations_share_baseline_and_cannot_double_admit(tmp_path):
@@ -295,3 +295,70 @@ def test_run_held_forwards_a_signal_that_arrives_before_the_child_exists(tmp_pat
     monkeypatch.setattr(placement.subprocess, 'Popen', popen_after_signal)
     assert placement.run_held(command, dict(os.environ)) == 0
     assert stopping.exists()
+
+
+def test_queued_export_releases_seed_and_build_locks_for_serving_ticket(tmp_path):
+    import time
+    locks = tmp_path / 'locks'
+    locks.mkdir()
+    ready, request_seed, served, exported = [tmp_path / name for name in ('ready', 'request-seed', 'served', 'exported')]
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'CUTEAFD_HW_LOCKS_HELD': ''}
+    serving_command = f"touch '{ready}'; until test -f '{request_seed}'; do sleep 0.01; done; flock -w 10 '{locks}/kakapo.lock' touch '{served}'"
+    serving = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'), '--locks', 'gpu0,gpu1',
+                                '--wait', '15', '--', 'bash', '-c', serving_command], env=env)
+    text = (ROOT / 'wip.sh').read_text()
+    flow = text.split('wip_build_selected_roles() {', 1)[1].split('\n}\n', 1)[0]
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        script = f"""set -euo pipefail
+role=both; wip_reused_coordinator=0; wip_reused_expert=0
+wip_retain_counterpart() {{ :; }}
+wip_build_resource_acquire() {{ exec {{seed_fd}}>'{locks}/kakapo.lock'; flock "$seed_fd"; }}
+build_expert() {{ touch '{request_seed}'; }}
+wip_build_resource_release() {{ exec {{seed_fd}}>&-; }}
+wip_distribute_sealed_expert() {{ :; }}
+build_coordinator() {{
+  if [[ $1 == rust ]]; then
+    flock -w 5 '{locks}/build.lock' true
+  else
+    flock -n '{locks}/build.lock' true
+    python3 '{SCRIPT}' hold --gpus 1,0 --wait 15 -- touch '{exported}'
+  fi
+}}
+{flow}
+"""
+        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, env=env, timeout=25)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert serving.wait(timeout=10) == 0
+        assert served.exists() and exported.exists()
+        assert not list((locks / 'hwq').glob('*.ticket'))
+    finally:
+        if serving.poll() is None:
+            serving.kill()
+            serving.wait()
+
+
+def test_queue_waits_when_both_gpus_are_busy_then_exports(tmp_path):
+    import time
+    ready = tmp_path / 'ready'
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path), 'CUTEAFD_HW_LOCKS_HELD': ''}
+    holder = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'), '--locks', 'gpu0,gpu1',
+                               '--wait', '5', '--', 'bash', '-c', f'touch "{ready}"; sleep 1'], env=env)
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        result = subprocess.run([sys.executable, str(SCRIPT), 'hold', '--gpus', '1,0', '--wait', '10',
+                                 '--', 'bash', '-c', 'echo "$CUTEAFD_EXPORT_GPU $CUTEAFD_HW_LOCKS_HELD"'],
+                                capture_output=True, text=True, env=env, timeout=15)
+        assert result.returncode == 0, result.stderr
+        assert 'queued for gpu1' in result.stderr and result.stdout.strip() == '1 gpu1'
+        assert holder.wait(timeout=5) == 0
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.wait()

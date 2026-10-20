@@ -1,37 +1,16 @@
 #!/usr/bin/env python3
-"""Admission, memory cap and SM check for a coordinator native/AOT export that
-runs without a fair GPU turn (wip.sh CUTEAFD_WIP_COORDINATOR_EXPORT).
+"""Memory admission/watchdog and fair-queued coordinator export placement.
 
-The coordinator exporters only compile: CuTe DSL and Triton targets come from
-device properties, and the live device hosts CUDA contexts (~550 MiB each) and
-the EXL3 buffer-sizing pass (<= 2 GiB per process). A cold export of the full
-release scope peaked at 8.7 GiB with ~15 exporters in parallel and 3 of 797
-one-second samples showed any SM activity (2026-10-13, raptor gpu1). So an
-export can share a GPU with serving, or with someone else's job, under a cap.
-
-  export-placement.py admit --smi SMI --gpu INDEX|UUID [--max-cap-mib N] [--headroom-mib N]
-      Read the HOST's nvidia-smi (on WSL2 /usr/lib/wsl/lib/nvidia-smi: a
-      container's cudaMemGetInfo cannot see the host's other processes) and
-      print `cap_mib jobs used_mib` when the export fits, else exit 75.
-  export-placement.py hold --gpus 1,0 -- CMD...
-      Take the first of those GPUs' hardware locks that is free right now
-      (non-blocking flock on ~/.cache/cuteafd/gpuN.lock, never a wait, so no
-      queued job is overtaken), run CMD holding it with CUTEAFD_EXPORT_GPU=N,
-      and release it after. A GPU named in CUTEAFD_HW_LOCKS_HELD (the caller
-      already holds it) is used without probing. Exit 75 when all are held:
-      a held lock means the GPU is not ours (TJ's interactive gpu0 use too).
-  export-placement.py watch --smi SMI --gpu G --cap-mib N (--cgroup ID | --baseline-mib N) -- CMD...
-      Run CMD; kill it and exit 75 as soon as the export's device memory goes
-      over the cap. --cgroup sums the processes in that container's cgroup
-      (per-process memory is reported natively); --baseline-mib watches
-      device-wide growth over the admission reading (WSL2 reports per-process
-      memory as N/A).
+`hold --gpus 1,0 --wait 14400 -- CMD` reuses a caller-held GPU, otherwise
+queues for the first configured GPU. Memory admission and watchdog limits apply
+inside that turn; a native-cache hit never calls this helper.
 """
 from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
 import fcntl
+import importlib.util
 import json
 import os
 import signal
@@ -233,28 +212,32 @@ def run_held(command, env, handle=None):
             signal.signal(signum, handler)
 
 
-def hold(gpus: list[str], command: list[str], lock_dir: Path) -> int:
+def hold(gpus: list[str], command: list[str], lock_dir: Path, wait: float = 14400) -> int:
+    if not gpus or any(gpu not in ('0', '1') for gpu in gpus):
+        raise ValueError('export GPUs must be a nonempty list of 0 or 1')
     held = held_by_caller()
     for gpu in gpus:
         if f'gpu{gpu}' in held:
             print(f'export-placement: caller already holds gpu{gpu}.lock', file=sys.stderr)
             return run_held(command, {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu})
-    for gpu in gpus:
-        handle = open(lock_dir / f'gpu{gpu}.lock', 'a')
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            handle.close()
-            continue
-        try:
+    # A seed/serving lock held by an outer caller cannot be released here.
+    if held:
+        raise ValueError('release other hardware locks before queueing an export')
+    spec = importlib.util.spec_from_file_location('export_hwlock', Path(__file__).parents[1] / 'hw/hwlock.py')
+    hwlock = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hwlock)
+    hwlock.LOCK_DIR = lock_dir
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    gpu = gpus[0]
+    try:
+        with hwlock.hold([f'gpu{gpu}'], wait, 'coordinator export',
+                         preflight='command -v bash >/dev/null') as handles:
             print(f'export-placement: holding gpu{gpu}.lock for the export', file=sys.stderr)
-            env = {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu,
-                   'CUTEAFD_HW_LOCKS_HELD': ','.join([*held, f'gpu{gpu}'])}
-            return run_held(command, env, handle)
-        finally:
-            handle.close()
-    print(f'export-placement: every candidate GPU lock is held ({",".join("gpu" + g for g in gpus)})', file=sys.stderr)
-    return NO_TURN
+            env = {**os.environ, 'CUTEAFD_EXPORT_GPU': gpu, 'CUTEAFD_HW_LOCKS_HELD': f'gpu{gpu}'}
+            return run_held(command, env, handles[0])
+    except TimeoutError as error:
+        print(f'export-placement: {error}', file=sys.stderr)
+        return NO_TURN
 
 
 def main(argv=None) -> int:
@@ -278,6 +261,7 @@ def main(argv=None) -> int:
     d.add_argument('--reservation', required=True)
     h = sub.add_parser('hold')
     h.add_argument('--gpus', default='1,0')
+    h.add_argument('--wait', type=float, default=14400)
     h.add_argument('command', nargs=argparse.REMAINDER)
     w = sub.add_parser('watch')
     w.add_argument('--smi', default='nvidia-smi')
@@ -317,7 +301,9 @@ def main(argv=None) -> int:
         parser.error(f'{args.action} needs a command')
     if args.action == 'hold':
         lock_dir = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
-        return hold([g for g in args.gpus.split(',') if g], args.command, lock_dir)
+        if not 0 <= args.wait < float('inf'):
+            parser.error('--wait must be finite and nonnegative')
+        return hold([g for g in args.gpus.split(',') if g], args.command, lock_dir, args.wait)
     return watch(args)
 
 

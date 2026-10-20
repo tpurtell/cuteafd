@@ -632,7 +632,7 @@ def _trace_tools(tmp_path, extra=None):
 
 
 def test_spark_leg_does_not_reacquire_its_parent_resource(tmp_path):
-    function = _wip_function('build_expert() (', '\nwip_build_coordinator=0') + '\nnative_store_has() { return 1; }\n'
+    function = _wip_function('build_expert() (', '\n# Role builders end here.') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     home = tmp_path / 'home'
     (home / '.cache/cuteafd').mkdir(parents=True)
@@ -656,7 +656,7 @@ CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
     assert not any(line.startswith('flock') for line in lines)
 
 
-def test_coordinator_export_probes_after_rust_without_queued_turn(tmp_path):
+def test_coordinator_export_follows_rust_with_memory_caps(tmp_path):
     function = _wip_function('build_coordinator() {', '\nbuild_expert() (') + '\nnative_store_has() { return 1; }\n'
     tools = _trace_tools(tmp_path)
     trace = tmp_path / 'trace'
@@ -1856,3 +1856,38 @@ def test_every_required_smoke_field_is_advertised_by_the_dry_run():
     line = next(text for text in dry_run.splitlines() if 'api_key_file={}' in text)
     advertised = set(re.findall(r'([a-z_0-9]+)=\{', line))
     assert required <= advertised, sorted(required - advertised)
+
+
+@pytest.mark.parametrize('damage', ['', 'revision', 'seal', 'instance', 'unsealed-revision', 'extra-slot'])
+def test_owner_marker_adopts_only_matching_sealed_retry_root(tmp_path, damage):
+    import hashlib
+    home = tmp_path / 'home'
+    root = home / '.cache/cuteafd/builds/wip-test'
+    role = root / 'slots/s/coordinator'
+    art = role / 'workspace/.cuteafd-wip'
+    art.mkdir(parents=True)
+    revision = 'a' * 40
+    raw_revision = (revision + '\n').encode()
+    (role / 'workspace/.cuteafd-source-revision').write_bytes(raw_revision)
+    source = (hashlib.sha256(raw_revision).hexdigest() + '  ./.cuteafd-source-revision\n').encode()
+    if damage == 'unsealed-revision':
+        source = b'not the source revision\n'
+    (role / 'SOURCE_SHA256SUMS').write_bytes(source)
+    (art / 'ARTIFACT_SHA256SUMS').write_bytes(b'fixture')
+    meta = dict(slot='s', role='coordinator', wip_instance='other' if damage == 'instance' else 'test',
+                source_manifest_sha256=hashlib.sha256(source).hexdigest(),
+                artifact_manifest_sha256=hashlib.sha256(b'fixture').hexdigest())
+    raw = json.dumps(meta).encode()
+    (role / 'META.json').write_bytes(raw)
+    (role / 'FINGERPRINT').write_text(hashlib.sha256(raw).hexdigest() if damage != 'seal' else 'bad')
+    if damage == 'extra-slot':
+        (root / 'slots/foreign').mkdir()
+    script = cards.owner_marker_script(root, 'task', 'test', 's', 'b' * 40 if damage == 'revision' else revision)
+    result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                            env={**os.environ, 'HOME': str(home)}, timeout=10)
+    marker = root / '.wip-card-owner.json'
+    if damage:
+        assert result.returncode and not marker.exists()
+    else:
+        assert result.returncode == 0, result.stderr
+        assert json.loads(marker.read_text()) == dict(task='task', instance='test')
