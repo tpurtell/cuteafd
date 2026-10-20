@@ -74,7 +74,8 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     if serving {
         expected.push("group_count");
     }
-    let scalars: &[u8] = if serving { b"ii" } else { b"iii" };
+    if grouped { expected.extend(["unit_count", "unit_map"]); }
+    let scalars: &[u8] = if serving && !grouped { b"ii" } else { b"iii" };
     if !spec.pointers.iter().map(String::as_str).eq(expected) || spec.scalar_kinds != scalars {
         return Err(invalid("pointer order or scalar ABI"));
     }
@@ -156,6 +157,10 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     ) {
         shapes.push("[1]".into());
         dtypes.push("int32");
+    }
+    if spec.name == "exlr8_a16_grouped" {
+        shapes.extend(["[E]".into(), format!("[E,{u}]")]);
+        dtypes.extend(["int32", "int32"]);
     }
     let pointers = entry["pointers"]
         .as_array()
@@ -435,8 +440,8 @@ mod tests {
             s.geometry["max_rows"] = serde_json::json!(4096);
             s.geometry["group_rows"] = serde_json::json!(tile);
             s.geometry["ctas_per_sm"] = serde_json::json!(2);
-            s.pointers.push("group_count".into());
-            s.scalar_kinds = b"ii".to_vec();
+            s.pointers.extend(["group_count", "unit_count", "unit_map"].map(String::from));
+            s.scalar_kinds = b"iii".to_vec();
             for bytes in s.scratch.values_mut() { *bytes *= tile / 16; }
             let mut e = entry();
             e["capacity_rows"] = serde_json::json!(4096);
@@ -446,8 +451,18 @@ mod tests {
             e["pointers"][9]["shape"] = serde_json::json!(format!("[512,{tile},6144]"));
             e["pointers"].as_array_mut().unwrap().push(serde_json::json!({
                 "name":"group_count", "shape":"[1]", "dtype":"int32", "role":"in"}));
+            for (name, shape) in [("unit_count", "[E]"), ("unit_map", "[E,16]")] {
+                e["pointers"].as_array_mut().unwrap().push(serde_json::json!({
+                    "name":name, "shape":shape, "dtype":"int32", "role":"in"}));
+            }
             e["scratch_bytes_at_capacity"] = serde_json::to_value(&s.scratch).unwrap();
             validate_entry(&s, &e).unwrap();
+            let mut legacy = s.clone();
+            legacy.scalar_kinds = b"ii".to_vec();
+            assert!(validate(&legacy).is_err());
+            legacy = s.clone();
+            legacy.pointers.truncate(13);
+            assert!(validate(&legacy).is_err());
             for (key, value) in [("max_rows",64), ("group_rows",8), ("units",i32::MAX as u64),
                 ("top_k",i32::MAX as u64), ("max_groups",i32::MAX as u64)] {
                 let mut bad = s.clone();

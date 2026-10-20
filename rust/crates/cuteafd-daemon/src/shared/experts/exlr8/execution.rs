@@ -31,6 +31,12 @@ const K1_POINTERS: &[&str] = &[
     "group_count",
 ];
 
+fn pointers(set: ExpertSet, rows: usize) -> Vec<&'static str> {
+    let mut names = K1_POINTERS.to_vec();
+    if set == ExpertSet::Routed && rows > 64 { names.extend(["unit_count", "unit_map"]); }
+    names
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RoutingIdentity {
     addresses: [usize; 5],
@@ -67,9 +73,11 @@ struct Workspace {
     max_groups: usize,
     hidden: usize,
     units: usize,
+    unit_limit: usize,
+    intermediate_bytes: usize,
 }
 impl Workspace {
-    fn plan(spec: &ProgramSpec, rows: usize, set: ExpertSet) -> Result<Self> {
+    fn plan(spec: &ProgramSpec, rows: usize, set: ExpertSet, unit_limit: usize) -> Result<Self> {
         cuteafd_ffi::exlr8::validate(spec)?;
         ensure!(
             spec.name == program_names(set, rows).0 && spec.geometry["abi_version"] == 3,
@@ -95,6 +103,16 @@ impl Workspace {
             usize::try_from(*spec.scratch.get(name).context("missing K1 scratch")?)
                 .context("K1 scratch exceeds address space")
         };
+        let compact = set == ExpertSet::Routed && rows > 64;
+        ensure!(!compact || (1..=units).contains(&unit_limit), "invalid compact unit limit");
+        let scratch = |name: &str| -> Result<usize> {
+            let bytes = scratch(name)?;
+            if compact && name != "fc2" {
+                ensure!(bytes % units == 0, "compact scratch must divide by global units");
+                (bytes / units).checked_mul(unit_limit).context("compact scratch overflow")
+            } else { Ok(bytes) }
+        };
+        let intermediate_bytes = scratch("intermediate")?;
         let (ranges, bytes) = cuteafd_loader::plan::exlr8::residency::execution_workspace_layout(
             rows, spec.capacity_rows as usize,
             spec.geometry["group_rows"].as_u64().unwrap_or(16) as usize,
@@ -108,6 +126,8 @@ impl Workspace {
             max_groups,
             hidden,
             units,
+            unit_limit: if compact { unit_limit } else { units },
+            intermediate_bytes,
         })
     }
 }
@@ -130,8 +150,14 @@ impl<'a> Exlr8Execution<'a> {
         rows: usize,
         set: ExpertSet,
     ) -> Result<usize> {
-        let k1 = programs.program(program_names(set, rows).0, K1_POINTERS)?;
-        Ok(Workspace::plan(k1.spec(), rows, set)?.bytes)
+        Self::workspace_bytes_with_limit(programs, rows, set, 16)
+    }
+
+    pub(crate) fn workspace_bytes_with_limit(
+        programs: &'a Programs<'a>, rows: usize, set: ExpertSet, unit_limit: usize,
+    ) -> Result<usize> {
+        let k1 = programs.program(program_names(set, rows).0, &pointers(set, rows))?;
+        Ok(Workspace::plan(k1.spec(), rows, set, unit_limit)?.bytes)
     }
 
     pub(crate) fn new(
@@ -141,8 +167,15 @@ impl<'a> Exlr8Execution<'a> {
         available: usize,
         set: ExpertSet,
     ) -> Result<Self> {
+        Self::new_with_limit(library, programs, rows, available, set, 16)
+    }
+
+    pub(crate) fn new_with_limit(
+        library: &'a NativeLibrary, programs: &'a Programs<'a>, rows: usize,
+        available: usize, set: ExpertSet, unit_limit: usize,
+    ) -> Result<Self> {
         let (k1_name, group_name) = program_names(set, rows);
-        let k1 = programs.program(k1_name, K1_POINTERS)?;
+        let k1 = programs.program(k1_name, &pointers(set, rows))?;
         let group = programs.program(
             group_name,
             &[
@@ -156,7 +189,7 @@ impl<'a> Exlr8Execution<'a> {
                 "activation",
             ],
         )?;
-        let layout = Workspace::plan(k1.spec(), rows, set)?;
+        let layout = Workspace::plan(k1.spec(), rows, set, unit_limit)?;
         ensure!(
             group.spec().geometry["abi_version"] == 2
                 && group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
@@ -177,7 +210,7 @@ impl<'a> Exlr8Execution<'a> {
             layout.bytes <= available,
             "EXLR8 workspace exceeds admitted device bytes"
         );
-        let intermediate_bytes = usize::try_from(k1.spec().scratch["intermediate"])?;
+        let intermediate_bytes = layout.intermediate_bytes;
         let sms = i32::try_from(library.sm_count()?)?;
         let limit = |spec: &ProgramSpec| -> Result<i32> {
             let ctas = i32::try_from(spec.geometry["ctas_per_sm"].as_u64().context("CTA hint")?)?;
@@ -279,6 +312,17 @@ impl<'a> Exlr8Execution<'a> {
             self.intermediate_bytes,
             buffers[9].bytes - self.intermediate_bytes,
         )?;
+        let compact = self.set == ExpertSet::Routed && self.layout.rows > 64;
+        ensure!(!compact || weights.layout.compact_unit_limit() <= self.layout.unit_limit,
+            "EXLR8 layer ownership exceeds compact arena stride");
+        let scalars = [Scalar::I32(rows as i32), Scalar::I32(self.cta_limit),
+            Scalar::I32(self.layout.unit_limit as i32)];
+        let mut operands = [p(10), weights.pointers()?.ptr, weights.bits()?.ptr,
+            p(4), p(5), p(6), p(2), p(8), intermediate.ptr, fc2.ptr,
+            weights.signs(true)?.ptr, p(3), p(7), std::ptr::null_mut(), std::ptr::null_mut()];
+        if compact {
+            operands[13..].copy_from_slice(&weights.compact()?.map(|buffer| buffer.ptr));
+        }
         // SAFETY: private admitted arena views retain the manifest's exact sizes;
         // weights own all referenced descriptors, and caller retains the stream.
         unsafe {
@@ -287,25 +331,8 @@ impl<'a> Exlr8Execution<'a> {
                 &[Scalar::I32(rows as i32), Scalar::I32(self.group_cta_limit)],
                 stream,
             )?;
-            self.k1.launch(
-                &[
-                    p(10),
-                    weights.pointers()?.ptr,
-                    weights.bits()?.ptr,
-                    p(4),
-                    p(5),
-                    p(6),
-                    p(2),
-                    p(8),
-                    intermediate.ptr,
-                    fc2.ptr,
-                    weights.signs(true)?.ptr,
-                    p(3),
-                    p(7),
-                ],
-                &[Scalar::I32(rows as i32), Scalar::I32(self.cta_limit)],
-                stream,
-            )?;
+            self.k1.launch(&operands[..if compact { 15 } else { 13 }],
+                &scalars[..if compact { 3 } else { 2 }], stream)?;
         }
         Ok(())
     }
@@ -341,8 +368,8 @@ mod tests {
     fn exlr8_shared_workspace_keeps_exact_aligned_admission() {
         for set in [ExpertSet::Routed, ExpertSet::Shared] {
             let spec = spec(set);
-            let wide = Workspace::plan(&spec, 64, set).unwrap();
-            let single = Workspace::plan(&spec, 1, set).unwrap();
+            let wide = Workspace::plan(&spec, 64, set, 16).unwrap();
+            let single = Workspace::plan(&spec, 1, set, 16).unwrap();
             for layout in [&single, &wide] {
                 let mut end = 0;
                 for (offset, bytes) in layout.ranges {
@@ -365,21 +392,21 @@ mod tests {
             });
             let mut stale = spec.clone();
             stale.geometry["abi_version"] = serde_json::json!(2);
-            assert!(Workspace::plan(&stale, 64, set).is_err());
-            assert!(Workspace::plan(&spec, 0, set).is_err());
-            assert!(Workspace::plan(&spec, 65, set).is_err());
+            assert!(Workspace::plan(&stale, 64, set, 16).is_err());
+            assert!(Workspace::plan(&spec, 0, set, 16).is_err());
+            assert!(Workspace::plan(&spec, 65, set, 16).is_err());
             let other = if set == ExpertSet::Shared {
                 ExpertSet::Routed
             } else {
                 ExpertSet::Shared
             };
-            assert!(Workspace::plan(&spec, 64, other).is_err());
+            assert!(Workspace::plan(&spec, 64, other, 16).is_err());
         }
         assert!(
-            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared)
+            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared, 16)
                 .unwrap()
                 .bytes
-                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed)
+                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed, 16)
                     .unwrap()
                     .bytes
         );
@@ -395,14 +422,23 @@ mod tests {
         grouped.geometry["ctas_per_sm"] = serde_json::json!(2);
         for bytes in grouped.scratch.values_mut() { *bytes *= 4; }
         for rows in [65, 128, 4095, 4096] {
-            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed).unwrap();
+            grouped.pointers = pointers(ExpertSet::Routed, rows).into_iter().map(String::from).collect();
+            grouped.scalar_kinds = b"iii".to_vec();
+            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, 16).unwrap();
+            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, 3).unwrap();
+            assert_eq!(compact.ranges[8].1 * 16, workspace.ranges[8].1 * 3);
+            assert_eq!(compact.intermediate_bytes * 16, workspace.intermediate_bytes * 3);
+            assert!(compact.bytes < workspace.bytes);
             assert_eq!(workspace.ranges[5].1, 512 * 64 * 4);
             assert_eq!(workspace.ranges[0].1, rows * 6336);
             assert_eq!(workspace.ranges[10].1, rows * 6144 * 2);
         }
-        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed).is_err());
-        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed).is_err());
-        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared).is_err());
+        for invalid in [0, 17, usize::MAX] {
+            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, invalid).is_err());
+        }
+        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, 16).is_err());
+        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, 16).is_err());
+        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, 16).is_err());
         assert_eq!(program_names(ExpertSet::Routed, 64).0, "exlr8_a16_serving");
         assert_eq!(program_names(ExpertSet::Shared, 64).0, "exlr8_shared_a16_serving");
     }

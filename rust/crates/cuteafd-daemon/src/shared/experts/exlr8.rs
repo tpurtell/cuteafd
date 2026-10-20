@@ -36,6 +36,10 @@ impl<'a> Exlr8Weights<'a> {
             .checked_mul(layout.units)
             .and_then(|n| n.checked_mul(3 * (3 * 8 + 4) * 2))
             .context("EXLR8 descriptor staging overflow")?;
+        let compact_bytes = if layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed {
+            layout.experts.checked_mul(layout.units.checked_add(1).context("compact unit overflow")?)
+                .and_then(|n| n.checked_mul(8)).context("compact descriptor overflow")?
+        } else { 0 };
         let descriptor_upload = layout.experts.checked_mul(layout.units)
             .and_then(|n| n.checked_mul(3 * 3 * 8))
             .context("EXLR8 descriptor upload overflow")?;
@@ -49,8 +53,8 @@ impl<'a> Exlr8Weights<'a> {
             resident_bytes: layout.resident_bytes,
             device_staging_bytes: 0,
             pinned_host_bytes: bank_bytes,
-            read_scratch_bytes: descriptor_bytes
-                .checked_add(layout.host_bytes())
+            read_scratch_bytes: descriptor_bytes.checked_add(compact_bytes)
+                .and_then(|n| n.checked_add(layout.host_bytes()))
                 .context("EXLR8 host residency overflow")?,
         })
     }
@@ -68,6 +72,12 @@ impl<'a> Exlr8Weights<'a> {
             self.layout.bits_offset,
             self.layout.experts * self.layout.units * 3 * 4,
         )
+    }
+    pub(crate) fn compact(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
+        ensure!(self.layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed,
+            "compact descriptors require routed weights");
+        Ok([view(self.arena.buffer, self.layout.compact_offsets[0], self.layout.experts * 4)?,
+            view(self.arena.buffer, self.layout.compact_offsets[1], self.layout.experts * self.layout.units * 4)?])
     }
     pub(crate) fn signs(&self, output: bool) -> Result<CuteafdDeviceBuffer> {
         view(
@@ -117,6 +127,13 @@ impl<'a> Exlr8Weights<'a> {
         )?;
         let bits: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
         library.copy_h2d(view(arena.buffer, layout.bits_offset, bits.len())?, &bits)?;
+        if layout.set == cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed {
+            let (counts, mapping, _) = layout.compact_descriptors()?;
+            for (offset, values) in layout.compact_offsets.into_iter().zip([counts, mapping]) {
+                let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+                library.copy_h2d(view(arena.buffer, offset, bytes.len())?, &bytes)?;
+            }
+        }
         let started = std::time::Instant::now();
         let mut uploaded_blocks = std::collections::BTreeSet::new();
         for (batch, first) in (0..layout.loads.len())
@@ -202,14 +219,14 @@ mod tests {
         let layout = Residency { layer: 3, world: 4, rank: 0, hidden: 6144,
             experts: 256, units: 16, set: ExpertSet::Routed, set_id: String::new(),
             manifest: String::new(), loads: vec![], signs: [vec![], vec![]],
-            signs_offsets: [0, 0], pointers_offset: 0, bits_offset: 0,
+            signs_offsets: [0, 0], pointers_offset: 0, bits_offset: 0, compact_offsets: [0; 2],
             resident_bytes: 4096, payload_bytes: 0, staging_bytes: 400_000 };
         assert_eq!((BANKS, EXPERT_READ_LANES), (2, 16));
         let budget = Exlr8Weights::plan(&layout).unwrap();
         let upload = 256 * 16 * 3 * 3 * 8;
         assert_eq!(budget.pinned_host_bytes, 2 * 16 * 400_000 + upload);
         assert_eq!(budget.read_scratch_bytes - layout.host_bytes(),
-            256 * 16 * 3 * (3 * 8 + 4) * 2);
+            256 * 16 * 3 * (3 * 8 + 4) * 2 + 256 * 17 * 8);
         // Each bank must drain its previous DMA before readers overwrite it;
         // the final drain precedes returning the arena and dropping both banks.
         let source = include_str!("exlr8.rs").split("#[cfg(test)]").next().unwrap();

@@ -106,6 +106,8 @@ pub struct Residency {
     /// K1 [E,U,3,3] int64 pointers and [E,U,3] int32 widths.
     pub pointers_offset: usize,
     pub bits_offset: usize,
+    /// Immutable routed compact counts [E] and ascending global unit map [E,U].
+    pub compact_offsets: [usize; 2],
     pub resident_bytes: usize,
     pub payload_bytes: usize,
     pub staging_bytes: usize,
@@ -316,6 +318,11 @@ impl Residency {
             &mut cursor,
             slots.checked_mul(4).context("bits table overflow")?,
         )?;
+        let compact_offsets = if set == ExpertSet::Routed {
+            [reserve(&mut cursor, experts.checked_mul(4).context("unit count overflow")?)?,
+             reserve(&mut cursor, experts.checked_mul(units).and_then(|n| n.checked_mul(4))
+                 .context("unit map overflow")?)?]
+        } else { [0; 2] };
         let mut blocks = BTreeMap::new();
         let mut weight_headers = BTreeMap::new();
         let mut loads = Vec::new();
@@ -502,10 +509,35 @@ impl Residency {
             signs_offsets,
             pointers_offset,
             bits_offset,
+            compact_offsets,
             resident_bytes: cursor,
             payload_bytes,
             staging_bytes,
         })
+    }
+
+    /// Same rotated ownership used by payload selection, built before allocation.
+    pub fn compact_descriptors(&self) -> anyhow::Result<(Vec<i32>, Vec<i32>, usize)> {
+        use cuteafd_core::tp_units::{unit_owner, UnitRule};
+        ensure!(self.set == ExpertSet::Routed && self.world > 0 && self.rank < self.world,
+            "compact EXLR8 descriptors require a routed rank");
+        let mut counts = vec![0i32; self.experts];
+        let mut mapping = vec![0i32; self.experts.checked_mul(self.units).context("unit map overflow")?];
+        let mut limit = 1;
+        for (expert, count) in counts.iter_mut().enumerate() {
+            for unit in 0..self.units {
+                if unit_owner(UnitRule::Rotated, self.units, expert, unit, self.layer, self.world)? == self.rank {
+                    mapping[expert * self.units + *count as usize] = i32::try_from(unit)?;
+                    *count += 1;
+                }
+            }
+            limit = limit.max(*count as usize);
+        }
+        Ok((counts, mapping, limit))
+    }
+
+    pub fn compact_unit_limit(&self) -> usize {
+        self.units.div_ceil(self.world).max(1)
     }
 
     /// Host payload retained by this plan, excluding allocator bookkeeping.
@@ -861,6 +893,29 @@ mod tests {
                                 assert_eq!(count as usize, plan.loads.iter().filter(|unit|
                                     unit.bits as u32 == *tier && unit.projection == projection).count());
                             }
+                        }
+                        if set == ExpertSet::Routed {
+                            let (counts, mapping, limit) = plan.compact_descriptors().unwrap();
+                            assert!(limit <= plan.compact_unit_limit());
+                            assert_eq!(counts.len(), plan.experts);
+                            assert_eq!(mapping.len(), plan.experts * plan.units);
+                            assert_eq!(counts.iter().sum::<i32>() as usize * 3, plan.loads.len());
+                            assert_eq!(plan.compact_offsets[0] % 256, 0);
+                            assert_eq!(plan.compact_offsets[1] % 256, 0);
+                            assert!(plan.compact_offsets[0] >= plan.bits_offset + plan.experts * plan.units * 3 * 4);
+                            assert!(plan.compact_offsets[1] >= plan.compact_offsets[0] + plan.experts * 4);
+                            assert!(plan.compact_offsets[1] + plan.experts * plan.units * 4 <= plan.resident_bytes);
+                            for (expert, &count) in counts.iter().enumerate() {
+                                let slots = &mapping[expert * plan.units..(expert + 1) * plan.units];
+                                let expected = (0..plan.units).filter(|&unit|
+                                    owner(plan.units, expert, unit, plan.layer, plan.world) == plan.rank)
+                                    .map(|unit| unit as i32).collect::<Vec<_>>();
+                                assert_eq!(&slots[..count as usize], expected);
+                                assert!(slots[count as usize..].iter().all(|&unit| unit == 0));
+                            }
+                        } else {
+                            assert_eq!(plan.compact_offsets, [0; 2]);
+                            assert!(plan.compact_descriptors().is_err());
                         }
                         let (ptrs, bits) = plan.descriptors(0x10000).unwrap();
                         assert_eq!(plan.resident_bytes % 256, 0);
