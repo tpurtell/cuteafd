@@ -251,7 +251,7 @@ def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(mo
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     calls = {name: build() for name, build in module.builders(heads, "projections").items()}
-    assert len(calls) == 12
+    assert len(calls) == 13
     for name, (width, outputs, dtype) in {
         "attn_q": (4096, heads * 192, "bf16"),
         "attn_kv": (4096, heads // 16 * 192, "bf16"),
@@ -265,6 +265,7 @@ def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(mo
         "dense_down": (13824, 4096, "bf16"),
         "shared_gate_up": (4096, 3072, "bf16"),
         "shared_down": (1536, 4096, "bf16"),
+        "mtp_eh": (8192, 4096, "bf16"),
     }.items():
         assert calls[name] == dict(width=width, outputs=outputs, output_dtype=dtype)
 
