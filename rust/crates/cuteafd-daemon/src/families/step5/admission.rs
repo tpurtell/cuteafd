@@ -5,6 +5,12 @@ use anyhow::{ensure, Result};
 use cuteafd_ffi::programs::Programs;
 use cuteafd_loader::plan::{checkpoint::Checkpoint, families::step5::admission};
 
+pub(super) fn prefix_marks(prefix: &crate::shared::prefix::PrefixArgs, sequences: usize) -> admission::MarkRule {
+    let rule = prefix.mark_rule(sequences);
+    admission::MarkRule { lanes: rule.lanes, entries: rule.entries,
+        budget_bytes: rule.budget_bytes, host: rule.host }
+}
+
 pub(super) fn admit<'a>(
     programs: &'a Programs<'a>,
     checkpoint: &'a Checkpoint,
@@ -122,16 +128,27 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
         let programs = ProgramSet::from_manifest(&manifest, &["step5", "step52"]);
         let checkpoint = Checkpoint::coordinator(dir.path(), false, false)?;
-        for (context, pool, launchable) in [
-            (262_144, Some(262_144), true),
-            (1_048_576, None, true),
-            (1_048_576, Some(262_144), false),
+        #[derive(clap::Parser)]
+        struct PrefixCli {
+            #[command(flatten)]
+            prefix: crate::shared::prefix::PrefixArgs,
+        }
+        for (context, pool, launchable, host, entries) in [
+            (262_144, Some(262_144), true, None, 20),
+            (1_048_576, None, true, None, 20),
+            (1_048_576, Some(262_144), false, None, 20),
+            (1_048_576, None, true, Some(0), 20),
+            (1_048_576, None, true, Some(1 << 30), 20),
+            (1_048_576, None, true, None, 0),
+            (1_048_576, None, true, Some(0), 0),
         ] {
             let opts = LayoutOptions {
                 rtx_bytes: vec![96 << 30; 2],
                 pool_tokens: pool,
                 context_tokens: context,
                 workspace_manifest: Some(path.clone()),
+                host_cache_bytes: host,
+                mimo_prefix_entries: entries,
                 ..Default::default()
             };
             let report = plan::plan(
@@ -183,11 +200,11 @@ mod tests {
                 lanes: 2,
                 context,
                 requested_pool: pool,
-                marks: admission::MarkRule {
-                    lanes: 16,
-                    entries: opts.mimo_prefix_entries as usize,
-                    budget_bytes: opts.mimo_prefix_mark_bytes,
-                },
+                marks: prefix_marks(&<PrefixCli as clap::Parser>::parse_from([
+                    "step5", "--host-cache-bytes", &host.map_or_else(|| "auto".into(), |n| n.to_string()),
+                    "--prefix-cache-entries", &entries.to_string(),
+                    "--prefix-cache-mark-mib", &(opts.mimo_prefix_mark_bytes >> 20).to_string(),
+                ]).prefix, 16),
                 peer_diagnostics: false,
                 pending_code: code,
                 startup: vec![],
@@ -201,6 +218,11 @@ mod tests {
                 continue;
             }
             let live = live?;
+            let mark_bytes = live.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+            let expected_slots = if entries == 0 { 0 } else if host != Some(0) { 2 } else {
+                cuteafd_core::prefix::mark_slots_for(16, entries, mark_bytes, opts.mimo_prefix_mark_bytes) as usize
+            };
+            assert_eq!(live.marks, expected_slots);
             assert_eq!(report.solver_placement.as_ref(), Some(&live.placement));
             assert!(live.cache.context >= 262_144 && live.cache.context <= 1_048_576);
             for (rank, reservation) in live.reservations.iter().enumerate() {

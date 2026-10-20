@@ -11,14 +11,16 @@ pub struct MarkRule {
     pub lanes: usize,
     pub entries: usize,
     pub budget_bytes: u64,
+    pub host: bool,
 }
 impl MarkRule {
     pub fn slots(self, bytes: usize) -> usize {
-        cuteafd_core::prefix::mark_slots_for(
+        cuteafd_core::prefix::mark_slots_with_host(
             self.lanes as u64,
             self.entries as u64,
             bytes as u64,
             self.budget_bytes,
+            self.host,
         ) as usize
     }
 }
@@ -628,6 +630,7 @@ mod tests {
                 lanes: 16,
                 entries: 16,
                 budget_bytes: 0,
+                host: false,
             },
             peer_diagnostics: false,
             pending_code: vec![1 << 20; ranks],
@@ -691,6 +694,29 @@ mod tests {
                     LayerMode::HeadSplit
                 );
                 assert_eq!(admission.ownership.execution().mode(7)?, WHOLE1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn host_retention_reserves_only_shared_staging_marks() -> Result<()> {
+        for ranks in [1, 2] {
+            let mut inputs = inputs(ranks);
+            inputs.context = EXTENT;
+            inputs.marks.host = true;
+            for entries in [0, 20, 200] {
+                inputs.marks.entries = entries;
+                for budget in [0, 2 << 30, 32 << 30] {
+                    inputs.marks.budget_bytes = budget;
+                    let admitted = run(&inputs)?;
+                    let slots = if entries == 0 { 0 } else { 2 };
+                    assert_eq!(admitted.marks, slots);
+                    for rank in 0..ranks {
+                        assert_eq!(admitted.reservations[rank].marks as u64,
+                            admitted.cache.ranks[rank].bytes * slots as u64);
+                    }
+                }
             }
         }
         Ok(())

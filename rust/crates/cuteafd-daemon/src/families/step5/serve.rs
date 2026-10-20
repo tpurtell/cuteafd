@@ -147,9 +147,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         .map(|(capacity_bytes, baseline)| GpuBudget { capacity_bytes, baseline, headroom_bytes: headroom }).collect(),
         spark_ranks: args.peers.len(), peer_access: ids.len() == 2 }, rows: args.prefill_rows as usize,
         sequences: usize::from(args.max_sequences), lanes: usize::from(args.execution_lanes), context: args.max_context,
-        requested_pool: args.pool_tokens, marks: cuteafd_loader::plan::families::step5::admission::MarkRule {
-            lanes: usize::from(args.max_sequences), entries: args.prefix.prefix_cache_entries,
-            budget_bytes: args.prefix.prefix_cache_mark_mib as u64 * (1 << 20) },
+        requested_pool: args.pool_tokens,
+        marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
     let admission = admission::admit(&programs, &checkpoint, &inputs)?;
     // Uploads convert on the host and copy synchronously. No transient device

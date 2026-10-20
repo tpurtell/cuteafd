@@ -179,6 +179,7 @@ pub(super) fn layout(
             lanes: sequences,
             entries: usize::try_from(opts.mimo_prefix_entries)?,
             budget_bytes: opts.mimo_prefix_mark_bytes,
+            host: opts.host_cache_bytes != Some(0),
         },
         peer_diagnostics: false,
         pending_code: code,
