@@ -186,7 +186,7 @@ impl<'a> CacheRank<'a> {
     pub fn component(&self, span: ByteSpan) -> Result<CuteafdDeviceBuffer> {
         let state = &self.layout.ranks[self.rank];
         let declared = span == state.length || span == state.next_length || state.mtp_hidden == Some(span)
-            || state.mtp_lengths.contains(&span)
+            || state.mtp_lengths.contains(&span) || state.mtp_stage_hidden.contains(&span)
             || state.sliding.iter().any(|s| s.key == span || s.value == span)
             || state.regions.iter().any(|r| r.pending_key == span || r.pending_z == span || r.next_key == span || r.next_z == span || r.summaries == Some(span));
         ensure!(declared, "Step-5 component is not part of this rank's cache layout");

@@ -381,6 +381,7 @@ mod tests {
         let components = |span: &cuteafd_loader::serving_capacity::step5::ByteSpan| {
             let state = &shape.ranks[0];
             std::iter::once(state.length).chain(state.mtp_lengths.iter().copied()).chain(state.mtp_hidden)
+                .chain(state.mtp_stage_hidden.iter().copied())
                 .chain(state.sliding.iter().flat_map(|r| [r.key, r.value]))
                 .chain(state.regions.iter().flat_map(|r| [Some(r.pending_key), Some(r.pending_z), r.summaries].into_iter().flatten()))
                 .find(|s| span.offset >= s.offset && span.offset + span.bytes <= s.offset + s.bytes).unwrap()

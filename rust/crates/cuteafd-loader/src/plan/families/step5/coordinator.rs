@@ -65,6 +65,30 @@ pub struct LayerContract {
     pub sliding: Option<SlidingWindow>,
 }
 
+impl LayerContract {
+    /// Target and predictor blocks share checkpoint geometry, not layer counts.
+    pub fn from_config(cfg: &Config, layer: usize) -> Result<Self> {
+        ensure!(layer < cfg.layers + cfg.mtp, "Step-5 layer contract out of range");
+        Ok(Self {
+            layer,
+            dense_activation: (!cfg.moe[layer]).then_some(cfg.activation[layer]),
+            shared_activation: cfg.moe[layer].then_some(cfg.shared_activation[layer]),
+            geometry: GqaGeometry {
+                query_heads: cfg.heads,
+                kv_heads: cfg.groups,
+                qk_dim: cfg.dim,
+                value_dim: cfg.dim,
+                rotary_dim: cfg.rotary[layer],
+            }.validate()?,
+            theta: cfg.theta[layer],
+            rope: cfg.rope_recipe(layer, false)?,
+            indexer_rope: cfg.full[layer].then(|| cfg.rope_recipe(layer, true)).transpose()?,
+            rotary_arithmetic: RotaryArithmetic::FusedImaginary,
+            sliding: (!cfg.full[layer]).then_some(SlidingWindow { window: cfg.window as u64 }),
+        })
+    }
+}
+
 impl CoordinatorContract {
     /// Requires every selected native target header. Routed experts, vision
     /// and independently owned MTP stages are not charged as target weights.
@@ -85,30 +109,7 @@ impl CoordinatorContract {
             .map(|(name, t)| (name.clone(), t.shape.clone(), t.dtype.clone()));
         let weights = NativeDenseLayout::from_headers(checkpoint, declarations)?;
         let layers = (0..cfg.layers)
-            .map(|layer| {
-                Ok(LayerContract {
-                    layer,
-                    dense_activation: (!cfg.moe[layer]).then_some(cfg.activation[layer]),
-                    shared_activation: cfg.moe[layer].then_some(cfg.shared_activation[layer]),
-                    geometry: GqaGeometry {
-                        query_heads: cfg.heads,
-                        kv_heads: cfg.groups,
-                        qk_dim: cfg.dim,
-                        value_dim: cfg.dim,
-                        rotary_dim: cfg.rotary[layer],
-                    }
-                    .validate()?,
-                    theta: cfg.theta[layer],
-                    rope: cfg.rope_recipe(layer, false)?,
-                    indexer_rope: cfg.full[layer]
-                        .then(|| cfg.rope_recipe(layer, true))
-                        .transpose()?,
-                    rotary_arithmetic: RotaryArithmetic::FusedImaginary,
-                    sliding: (!cfg.full[layer]).then_some(SlidingWindow {
-                        window: cfg.window as u64,
-                    }),
-                })
-            })
+            .map(|layer| LayerContract::from_config(cfg, layer))
             .collect::<Result<Vec<_>>>()?;
         ensure!(
             layers.len() == 92,
@@ -438,6 +439,29 @@ mod tests {
                 .resident_bytes,
             exact
         );
+    }
+
+    #[test]
+    fn predictor_layer_geometry_is_native_without_extending_the_target() {
+        for quant in ["fp8", "nvfp4"] {
+            let dir = snapshot(quant);
+            let cp = Checkpoint::open(dir.path()).unwrap();
+            let cfg = Config::parse(&cp).unwrap();
+            assert_eq!(CoordinatorContract::from_checkpoint(&cp).unwrap().layers.len(), 92);
+            for layer in 92..95 {
+                let contract = LayerContract::from_config(&cfg, layer).unwrap();
+                assert_eq!(contract.layer, layer);
+                assert_eq!(contract.geometry.query_heads, 64);
+                assert_eq!(contract.geometry.kv_heads, 4);
+                assert_eq!(contract.geometry.rotary_dim, 192);
+                assert_eq!(contract.sliding.unwrap().window, 512);
+                assert!(contract.indexer_rope.is_none());
+                assert!(contract.shared_activation.is_none());
+                assert_eq!(contract.dense_activation, Some(
+                    cuteafd_core::FfnActivation::SiluPostClampFp32Product { limit: 7.0 }));
+            }
+            assert!(LayerContract::from_config(&cfg, 95).is_err());
+        }
     }
 
     #[test]

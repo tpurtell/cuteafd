@@ -170,6 +170,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64).unwrap();
             for (rank, state) in mtp.ranks.iter().enumerate() {
                 assert_eq!(state.mtp_hidden.is_some(), rank == head as usize);
+                assert_eq!(state.mtp_stage_hidden.len(), if rank == head as usize { 3 } else { 0 });
                 assert_eq!(state.sliding.iter().filter(|s| s.mtp).count(), if rank == head as usize { 3 } else { 0 });
             }
         }
@@ -281,6 +282,50 @@ fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
 }
 
 #[test]
+fn predictor_histories_are_private_charged_and_snapshotted_with_append_slack() {
+    use crate::serving_capacity::step5::Step5CacheLayout;
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    for depth in 0..=3 {
+        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256).unwrap();
+        let state = &layout.ranks[0];
+        assert_eq!(state.mtp_stage_hidden.len(), depth);
+        assert!(layout.ranks[1].mtp_stage_hidden.is_empty());
+        if depth == 0 {
+            assert_eq!(layout.mtp_hidden_rows, 0);
+            assert!(state.mtp_hidden.is_none());
+            continue;
+        }
+        assert_eq!(layout.mtp_hidden_rows, 832);
+        let histories = state.mtp_stage_hidden.iter().copied().chain(state.mtp_hidden)
+            .collect::<Vec<_>>();
+        assert_eq!(histories.iter().map(|span| span.bytes).sum::<u64>(),
+            832 * 4096 * (4 * depth as u64 + 2));
+        for (index, span) in histories.iter().enumerate() {
+            assert!(histories[index + 1..].iter().all(|other|
+                span.offset + span.bytes <= other.offset || other.offset + other.bytes <= span.offset));
+            assert!(span.offset + span.bytes <= state.bytes);
+            for frontier in [0, 511, 512, 831, 832, 1 << 20] {
+                assert!(layout.snapshot_spans(0, frontier).unwrap().contains(span));
+                let copies = layout.snapshot_copies(0, frontier, 16, 15, 32, 31).unwrap();
+                assert!(copies.iter().any(|copy| copy.active.offset == span.offset * 16 + span.bytes * 15
+                    && copy.mark.offset == state.bytes * 31 + span.offset
+                    && copy.active.bytes == span.bytes && copy.mark.bytes == span.bytes));
+            }
+        }
+        // An entire proposed wave must not overwrite any history needed by
+        // the previous frontier, including all shifted teacher-forced inputs.
+        let retained = 512 + depth as u64 + 1;
+        for base in [retained, 831, 832, 2 * 832, 1 << 20] {
+            let old = (base - retained..base).map(|p| p % layout.mtp_hidden_rows)
+                .collect::<std::collections::BTreeSet<_>>();
+            assert!((base..base + 256).all(|p| !old.contains(&(p % layout.mtp_hidden_rows))));
+        }
+    }
+}
+
+#[test]
 fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     use crate::serving_capacity::step5::{Step5CacheLayout, PAGE_ROWS, REGION_ROWS};
     let dir = snapshot("fp8");
@@ -288,7 +333,9 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     let cfg = Model::open(&cp).unwrap().cfg;
     for ranks in [1, 2] {
         let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64).unwrap();
-        assert_eq!(layout.mtp_hidden_rows, 516);
+        assert_eq!(layout.mtp_hidden_rows, 640);
+        assert_eq!(layout.ranks[0].mtp_stage_hidden.len(), 3);
+        assert!(layout.ranks[0].mtp_stage_hidden.iter().all(|span| span.bytes == 640 * 4096 * 4));
         assert_eq!(layout.window(), 512);
         assert_eq!(layout.capture_reach(), 0);
         assert_eq!(layout.geometry.logical_unit_rows, PAGE_ROWS);

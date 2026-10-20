@@ -55,7 +55,10 @@ pub struct RankState {
     pub length: ByteSpan,
     pub next_length: ByteSpan,
     pub mtp_lengths: Vec<ByteSpan>,
+    /// Target BF16 rows consumed by the first predictor.
     pub mtp_hidden: Option<ByteSpan>,
+    /// Each predictor's own F32 residual history, never target-hidden aliases.
+    pub mtp_stage_hidden: Vec<ByteSpan>,
     pub bytes: u64,
 }
 
@@ -127,7 +130,14 @@ impl Step5CacheLayout {
         let window = cfg.window as u64;
         let ring = cuteafd_core::prefix::AppendRing::new(window, max_step, PAGE_ROWS)
             .ok_or_else(|| invalid("append-only ring step or extent"))?;
-        let mtp_hidden_rows = if mtp == 0 { 0 } else { window + mtp as u64 + 1 };
+        // Preserve the old frontier while appending a complete uncommitted wave,
+        // including the teacher shift through all predictor stages.
+        let mtp_hidden_rows = if mtp == 0 { 0 } else {
+            let history_window = window.checked_add(mtp as u64 + 1)
+                .ok_or(CacheGeometryError::Overflow("Step-5 MTP history window"))?;
+            cuteafd_core::prefix::AppendRing::new(history_window, max_step, PAGE_ROWS)
+                .ok_or_else(|| invalid("MTP append-only history extent"))?.rows
+        };
         let mut states = Vec::with_capacity(ranks);
         let mut costs = Vec::with_capacity(ranks);
         for rank in 0..ranks {
@@ -135,7 +145,8 @@ impl Step5CacheLayout {
                 sliding: Vec::new(), regions: Vec::new(),
                 length: ByteSpan { offset: 0, bytes: 0 },
                 next_length: ByteSpan { offset: 0, bytes: 0 },
-                mtp_lengths: Vec::new(), mtp_hidden: None, bytes: 0,
+                mtp_lengths: Vec::new(), mtp_hidden: None,
+                mtp_stage_hidden: Vec::new(), bytes: 0,
             };
             state.length = state.reserve(8)?;
             state.next_length = state.reserve(8)?;
@@ -170,6 +181,8 @@ impl Step5CacheLayout {
                         mul(&[ring.rows, cfg.groups as u64, cfg.dim as u64, 2])?)?;
                     let length = state.reserve(8)?;
                     state.mtp_lengths.push(length);
+                    let hidden = state.reserve(mul(&[mtp_hidden_rows, cfg.hidden as u64, 4])?)?;
+                    state.mtp_stage_hidden.push(hidden);
                 }
                 state.mtp_hidden = Some(state.reserve(mul(&[mtp_hidden_rows, cfg.hidden as u64, 2])?)?);
             }
@@ -237,7 +250,8 @@ impl Step5CacheLayout {
                 if bytes > 0 { parts.push((summary, 0, 0, bytes)); }
             }
         }
-        for component in state.mtp_lengths.iter().copied().chain(state.mtp_hidden) {
+        for component in state.mtp_lengths.iter().copied().chain(state.mtp_hidden)
+            .chain(state.mtp_stage_hidden.iter().copied()) {
             parts.push((component, 0, 0, component.bytes));
         }
         Ok(parts)
