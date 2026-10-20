@@ -212,6 +212,36 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn diagnostic_state(&self, placement: &Placement) -> Result<Vec<Vec<u8>>> {
+        self.state.retire();
+        let mut state = Vec::new();
+        for owner in &self.ranks {
+            let mut cache = owner.borrow_mut();
+            let slot = cache.slots().checked_sub(1).context("Step-5 diagnostic mark slot absent")?;
+            cache.capture(placement.sequence, slot, placement.committed as u64)?;
+            let device = cache.stream.device;
+            let read = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+                let mut bytes = vec![0; buffer.bytes];
+                device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+                Ok(bytes)
+            };
+            state.push(read(cache.mark_view(slot as u32)?)?);
+            for (logical, &physical) in placement.pages.iter().take(placement.committed.div_ceil(64)).enumerate() {
+                let rows = (placement.committed - logical * 64).min(64);
+                for plane in cache.page_views(physical)? {
+                    let mut bytes = read(plane)?;
+                    bytes.truncate(bytes.len() / 64 * rows);
+                    state.push(bytes);
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn diagnostic_abort_once(&self) { self.state.fail_verify_once.set(true); }
+
     fn execute(&self, lane: usize, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<(Evidence<'e, 'a>, DeviceLogits)> {
         self.execution.require_live()?;

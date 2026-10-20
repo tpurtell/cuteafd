@@ -104,8 +104,8 @@ fn text_media() -> cuteafd_engine::media::MediaAdmission<scheduler::Prompt, crat
         crate::shared::qwen::Encoder::Off, 16)
 }
 
-fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
-    stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>) -> Result<()> {
+fn with_backend<T>(args: &ServeArgs,
+    run: impl FnOnce(&Step5Backend<'_, '_>, usize) -> Result<T>) -> Result<T> {
     args.validate()?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
@@ -223,15 +223,22 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         usize::from(args.mtp), inputs.rows, available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, lane_inputs.iter().collect())?;
     let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
-    let drafts = if args.mtp == 0 { scheduler::Drafts::None }
-        else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
     library.cuda_set_device(args.device)?;
     tracing::info!(rows=inputs.rows, sequences=inputs.sequences, lanes=inputs.lanes, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
         "Step-5 admitted eager target and native predictor depth");
-    scheduler::schedule(&backend, &args.snapshot, receive, stats, inputs.sequences, drafts,
-        eos, args.decode_share, &args.prefix, args.token_io.token_select, &mut text_media(), None,
-        || initialized(backend.geometry().max_context))
+    run(&backend, inputs.sequences)
+}
+
+fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
+    stats: &Arc<Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>) -> Result<()> {
+    with_backend(args, |backend, sequences| {
+        let drafts = if args.mtp == 0 { scheduler::Drafts::None }
+            else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts,
+            eos, args.decode_share, &args.prefix, args.token_io.token_select, &mut text_media(), None,
+            || initialized(backend.geometry().max_context))
+    })
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
@@ -308,6 +315,108 @@ mod tests {
         args.peers[1] = args.peers[0];
         assert!(args.validate().is_err());
         Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires sealed native exports, full target weights and real Spark workers"]
+    fn live_mtp_target_abort_restore_and_fresh_marks_are_exact() -> Result<()> {
+        use crate::shared::qwen::scheduler::DraftState as _;
+        use cuteafd_engine::prefix::{After, PrefixFamily, SnapshotKind};
+        use super::super::prefix::Placement;
+        let mut args = args();
+        args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
+        args.native_lib = std::env::var("CUTEAFD_NATIVE_LIB")?.into();
+        args.manifest = std::env::var("CUTEAFD_PROGRAM_MANIFEST")?.into();
+        args.peers = std::env::var("CUTEAFD_GOLDEN_PEERS")?.split(',')
+            .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
+        args.split_device = Some(1);
+        args.prefill_rows = 64;
+        args.max_sequences = 3;
+        args.mtp = 3;
+        args.pool_tokens = Some(262_144);
+        args.prefix.prefix_cache_entries = 1;
+        args.prefix.prefix_cache_min_tokens = 1;
+        let windows: serde_json::Value = serde_json::from_slice(&std::fs::read(
+            std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?).join("windows.json"))?)?;
+        let tokens = windows["windows"][0]["tokens"].as_array().context("live exactness tokens")?
+            .iter().map(|v| v.as_u64().context("live token id").and_then(|n| Ok(u32::try_from(n)?)))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(tokens.len() > 577, "live exactness needs at least 578 real tokens");
+        with_backend(&args, |backend, _| {
+            backend.draft_geometry(&args.snapshot, 3)?;
+            let (family, mut pool) = backend.prefix_cache(&args.prefix, 3)?;
+            let prefill = |placement: &mut Placement, state: &mut super::super::mtp::DraftState,
+                start: usize, end: usize, pool: &cuteafd_engine::prefix::RefPagePool| -> Result<()> {
+                for at in (start..end).step_by(64) {
+                    let last = (at + 64).min(end);
+                    backend.prefill_device(placement, &tokens[at..last], 0, pool)?;
+                    backend.prefill_draft(placement, at, &tokens[at..last], tokens.get(last).copied(), state)?;
+                }
+                Ok(())
+            };
+            for frontier in [63usize, 64, 65, 575, 576] {
+                let mut source = pool.admit_cold(&family, frontier, frontier + 4,
+                    |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
+                let mut source_draft = super::super::mtp::DraftState::default();
+                backend.bind_request(&mut source, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
+                    &tokens, 0);
+                prefill(&mut source, &mut source_draft, 0, frontier, pool.pool())?;
+                source_draft.close(tokens[frontier]);
+                let expected = backend.diagnostic_state(&source)?;
+                ensure!(pool.capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
+                    "live exactness snapshot not retained");
+                let mut cold = pool.admit_cold(&family, frontier, frontier + 4,
+                    |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
+                let mut cold_draft = super::super::mtp::DraftState::default();
+                backend.bind_request(&mut cold, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
+                    &tokens, 0);
+                prefill(&mut cold, &mut cold_draft, 0, frontier, pool.pool())?;
+                ensure!(expected == backend.diagnostic_state(&cold)?, "live fresh mark differs at {frontier}");
+                let restored = pool.admit(&family, &tokens[..frontier + 1], frontier + 4, false,
+                    |pages| Placement { pages, sequence: 2, committed: 0 })?;
+                ensure!(restored.resume == frontier, "live exact prefix miss at {frontier}");
+                let mut restored = restored.placement;
+                let mut restored_draft = super::super::mtp::DraftState::default();
+                backend.bind_request(&mut restored, (), cuteafd_engine::media::RequestMedia::new(Vec::new(), 4096, frontier)?,
+                    &tokens, frontier);
+                ensure!(expected == backend.diagnostic_state(&restored)?, "live restore mark differs at {frontier}");
+                // Each independent continuation gets a private append lease,
+                // exactly as the scheduler's page ownership requires.
+                for placement in [&mut source, &mut cold, &mut restored] {
+                    let old = std::mem::take(&mut placement.pages);
+                    placement.pages = pool.fork_step(&family, &old, frontier, frontier + 4)?;
+                    pool.release(&family, &old)?;
+                }
+                let drafts = backend.draft(&mut [scheduler::DraftSeq { placement: &source,
+                    seq: &mut source_draft, depth: 3 }], &mut scheduler::DraftTiming::default())?.remove(0);
+                ensure!(drafts.len() == 3, "live MTP did not propose every admitted stage");
+                ensure!(expected == backend.diagnostic_state(&source)?, "draft mutated committed mark at {frontier}");
+                let rows = std::iter::once(tokens[frontier]).chain(drafts).collect::<Vec<_>>();
+                backend.diagnostic_abort_once();
+                ensure!(backend.verify_device(&mut [(&mut source, &rows)], true, pool.pool()).is_err(),
+                    "live abort injection did not fire");
+                ensure!(expected == backend.diagnostic_state(&source)?, "aborted target changed mark at {frontier}");
+                backend.verify_device(&mut [(&mut source, &rows)], true, pool.pool())?;
+                backend.accept(&mut [scheduler::Verified { placement: &mut source, seq: &mut source_draft,
+                    start: frontier, history: (), rows: &rows, first_row: 0,
+                    kept: Some((1, tokens[frontier + 1])), finished: true }], true, true)?;
+                for (placement, draft) in [(&mut cold, &mut cold_draft), (&mut restored, &mut restored_draft)] {
+                    backend.verify_device(&mut [(placement, &rows)], true, pool.pool())?;
+                    backend.accept(&mut [scheduler::Verified { placement, seq: draft, start: frontier,
+                        history: (), rows: &rows, first_row: 0, kept: Some((1, tokens[frontier + 1])),
+                        finished: true }], true, true)?;
+                }
+                let continued = backend.diagnostic_state(&source)?;
+                ensure!(continued == backend.diagnostic_state(&cold)?, "live replay/fresh continuation differs at {frontier}");
+                ensure!(continued == backend.diagnostic_state(&restored)?, "live restored continuation differs at {frontier}");
+                backend.require_live()?;
+                println!("Step-5 live exactness frontier={frontier} target_kv_csa=real predictor_stages=3 abort_replay=true restore=true fresh_marks=true byte_exact=true");
+                for placement in [&source, &cold, &restored] { pool.release(&family, &placement.pages)?; }
+                pool.clear(&family)?;
+            }
+            family.drain().map_err(|e| anyhow::anyhow!("live exactness drain: {e}"))?;
+            Ok(())
+        })
     }
 
     #[test]
