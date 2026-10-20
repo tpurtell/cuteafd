@@ -456,6 +456,14 @@ mod tests {
             device.run(|| library.copy_d2h(&mut data, slice(buffer, 0, bytes)?))?;
             Ok(data)
         };
+        let same_input = match std::env::var("CUTEAFD_STEP5_MTP_INPUT_MODE").as_deref() {
+            Ok("reference") => true,
+            Ok("chained") | Err(_) => false,
+            _ => anyhow::bail!("MTP input mode must be reference or chained"),
+        };
+        let dump = std::env::var_os("CUTEAFD_STEP5_MTP_TRACE_DIR").map(std::path::PathBuf::from);
+        let mut agreement = true;
+        eprintln!("MTP mode={}", if same_input { "reference" } else { "chained" });
         for pass in 0..2 {
             cache.reset_sequence(0)?;
             device.run(|| library.copy_h2d(cache.length(0, false)?, &target_end.to_le_bytes()))?;
@@ -477,7 +485,7 @@ mod tests {
                 };
                 let inputs = load("embedding.bin", rows * H * 2)?;
                 let reference_previous = load("previous.bin", rows * H * 4)?;
-                let previous = if let Some(previous) = preceding_native.as_ref() {
+                let previous = if let Some(previous) = preceding_native.as_ref().filter(|_| !same_input) {
                     ensure!(previous.len() == (rows + 1) * H * 4, "MTP preceding native history extent");
                     &previous[..rows * H * 4]
                 } else { &reference_previous };
@@ -490,6 +498,12 @@ mod tests {
                 let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
                     rope.clone(), u64::MAX, &[])?;
                 owner.bind_cache(&cache)?;
+                let mut boundaries: Vec<(&str, usize, Vec<u8>)> = [
+                    ("enorm", H), ("hnorm", H), ("concat", 2 * H), ("eh", H),
+                    ("input_norm", H), ("qraw", 64*192), ("kraw", 4*192),
+                    ("value", 4*192), ("query", 64*192), ("key", 4*192),
+                    ("attention", 64*192), ("gated", 64*192), ("attention_delta", H)]
+                    .into_iter().map(|(name, width)| (name, width, Vec::new())).collect();
                 let mut base = 0;
                 let mut actual = Vec::with_capacity(expected.len());
                 let mut logits = vec![Vec::new(); probes.len()];
@@ -514,6 +528,16 @@ mod tests {
                     let values = read(step.hidden(), count * H * 4)?;
                     ensure!(values == replay, "MTP same-shape abort/replay differs, stage {stage} base {base}");
                     actual.extend_from_slice(&values[..accepted * H * 4]);
+                    if pass == 0 && dump.is_some() {
+                        let input = &step.owner.input.planes;
+                        let planes = [("enorm", input[1].buffer, H), ("hnorm", input[2].buffer, H),
+                            ("concat", input[3].buffer, 2*H), ("eh", input[4].buffer, H)]
+                            .into_iter().chain(step.owner.attention.predictor_trace());
+                        for (name, buffer, width) in planes {
+                            let bytes = read(buffer, accepted * width * 2)?;
+                            boundaries.iter_mut().find(|(key, _, _)| *key == name).unwrap().2.extend(bytes);
+                        }
+                    }
                     if probes.iter().any(|&p| (base..base+accepted).contains(&p)) {
                         let result = step.logits()?;
                         for (i, &p) in probes.iter().enumerate().filter(|(_, p)| (base..base+accepted).contains(p)) {
@@ -522,6 +546,27 @@ mod tests {
                     }
                     step.publish(accepted)?;
                     base += accepted;
+                }
+                if pass == 0 {
+                    if let Some(directory) = &dump {
+                        let directory = directory.join(format!("stage{stage}"));
+                        std::fs::create_dir_all(&directory)?;
+                        std::fs::write(directory.join("hidden.bin"), &actual)?;
+                        for (name, width, bytes) in boundaries {
+                            let reference = load(&format!("{name}.bf16"), rows * width * 2)?;
+                            std::fs::write(directory.join(format!("{name}.bf16")), &bytes)?;
+                            let decode = |bytes: &[u8]| bytes.chunks_exact(2).map(|v|
+                                f32::from_bits((u16::from_le_bytes(v.try_into().unwrap()) as u32) << 16) as f64)
+                                .collect::<Vec<_>>();
+                            let (a,b) = (decode(&bytes), decode(&reference));
+                            let e = a.iter().zip(&b).map(|(a,b)| (a-b).powi(2)).sum::<f64>();
+                            let n = b.iter().map(|v| v*v).sum::<f64>().max(f64::MIN_POSITIVE);
+                            let different = bytes.chunks_exact(2).zip(reference.chunks_exact(2))
+                                .filter(|(a,b)| a != b).count();
+                            eprintln!("MTP boundary stage={stage} name={name} rel_l2={:.9e} different={different}/{}",
+                                (e/n).sqrt(), rows*width);
+                        }
+                    }
                 }
                 preceding_native = Some(actual.clone());
                 for (name, a, b) in [("hidden", actual, expected),
@@ -540,7 +585,7 @@ mod tests {
                         (e/n).sqrt()
                     }).fold(0f64, f64::max);
                     eprintln!("MTP pass={pass} stage={stage} {name} rel_l2={relative:.9e} max_abs={maximum:.9e} worst_row_rel_l2={worst:.9e}");
-                    ensure!(relative <= 0.01 && worst <= 0.01, "MTP {name} reference agreement, stage {stage}");
+                    agreement &= relative <= 0.01 && worst <= 0.01;
                 }
                 if pass == 0 {
                     // Deliberately dirty rejected slack after the committed end.
@@ -559,6 +604,7 @@ mod tests {
         ensure!(read(cache.mark_view(0)?, layout.ranks[0].bytes as usize)?
             == read(cache.mark_view(1)?, layout.ranks[0].bytes as usize)?,
             "MTP restored prefix differs byte-for-byte from fresh prefill");
+        ensure!(agreement, "MTP reference agreement exceeds unchanged 1% bar");
         Ok(())
     }
 

@@ -107,7 +107,15 @@ def test_mtp_concat_narrows_before_zero_centered_norm_embedding_first():
 def test_mtp_stage_chunking_rollback_window_and_own_head():
     torch, weights, embedding, hidden, positions, cos, sin, kwargs = _fixture()
     full = mtp.Stage(weights, **kwargs)
-    expected_hidden, expected_logits = full.forward(embedding, hidden, positions, cos, sin)
+    trace = {}
+    expected_hidden, expected_logits = full.forward(embedding, hidden, positions, cos, sin, trace=trace)
+    untraced = mtp.Stage(weights, **kwargs).forward(embedding, hidden, positions, cos, sin)
+    assert torch.equal(untraced[0], expected_hidden)
+    assert torch.equal(untraced[1], expected_logits)
+    assert set(trace) == {"enorm", "hnorm", "concat", "eh", "input_norm", "qraw", "kraw",
+                          "value", "query", "key", "attention", "gated", "attention_delta"}
+    assert all(torch.equal(value, value.bfloat16().float()) for value in trace.values())
+    assert torch.equal(trace["concat"], torch.cat((trace["enorm"], trace["hnorm"]), -1))
     chunks = mtp.Stage(weights, **kwargs)
     parts = [chunks.forward(embedding[i:i+1], hidden[i:i+1], positions[i:i+1], cos, sin)
              for i in range(len(positions))]

@@ -574,6 +574,14 @@ impl<'a> SwaLayer<'a> {
         Ok([self.planes[KPAGES].buffer, self.planes[VPAGES].buffer])
     }
 
+    #[cfg(test)]
+    pub(super) fn predictor_trace(&self) -> [(&'static str, CuteafdDeviceBuffer, usize); 9] {
+        [("input_norm", NORM, H), ("qraw", QRAW, Q), ("kraw", KRAW, KV),
+            ("value", VPAGES, KV), ("query", QUERY, Q), ("key", KPAGES, KV),
+            ("attention", ATTN, Q), ("gated", GATED, Q), ("attention_delta", DELTA, H)]
+            .map(|(name, plane, width)| (name, self.planes[plane].buffer, width))
+    }
+
     pub(super) fn predictor_finish_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
         self.predictor_projection()?;
         let (rows, stream) = (read.inputs.rows, read.inputs.stream);

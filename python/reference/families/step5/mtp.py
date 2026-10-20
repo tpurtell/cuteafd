@@ -148,7 +148,7 @@ class Stage:
                              value[..., 2 * pairs:]), -1)
         return _bf16(rotated)
 
-    def forward(self, embedding, previous_hidden, positions, cos, sin):
+    def forward(self, embedding, previous_hidden, positions, cos, sin, *, trace=None):
         import torch
         w = self.weights
         positions = positions.long()
@@ -156,14 +156,21 @@ class Stage:
             raise ValueError("Step-5 MTP positions geometry")
         if bool((positions < 0).any()) or bool((positions[1:] != positions[:-1] + 1).any()):
             raise ValueError("Step-5 MTP positions must be nonnegative and consecutive")
-        residual = self._linear(norm_concat(embedding, previous_hidden, w, self.epsilon),
-                                "eh_proj.weight")
+        concat = norm_concat(embedding, previous_hidden, w, self.epsilon)
+        residual = self._linear(concat, "eh_proj.weight")
+        if trace is not None:
+            trace.update(enorm=concat[:, :embedding.shape[1]],
+                         hnorm=concat[:, embedding.shape[1]:], concat=concat, eh=residual)
         x = norm(residual, w["input_layernorm.weight"], self.epsilon)
         q, k, v = (self._linear(x, f"self_attn.{name}_proj.weight").reshape(
             len(x), count, self.dim) for name, count in
             (("q", self.heads), ("k", self.groups), ("v", self.groups)))
+        if trace is not None:
+            trace.update(input_norm=x, qraw=q, kraw=k, value=v)
         q = self._rope(norm(q, w["self_attn.q_norm.weight"], self.epsilon), positions, cos, sin)
         k = self._rope(norm(k, w["self_attn.k_norm.weight"], self.epsilon), positions, cos, sin)
+        if trace is not None:
+            trace.update(query=q, key=k)
         if self.cache is None:
             all_positions, all_k, all_v = positions, k, v
         else:
@@ -182,9 +189,14 @@ class Stage:
             probabilities = torch.softmax(scores, -1)
             outputs.append(torch.einsum("hk,khd->hd", probabilities, values))
         attention = _bf16(torch.stack(outputs))
+        if trace is not None:
+            trace["attention"] = attention
         gate = _bf16(torch.sigmoid(self._linear(x, "self_attn.g_proj.weight")))
         attention = _bf16(attention * gate[..., None])
-        residual = residual + self._linear(attention.flatten(1), "self_attn.o_proj.weight")
+        delta = self._linear(attention.flatten(1), "self_attn.o_proj.weight")
+        residual = residual + delta
+        if trace is not None:
+            trace.update(gated=attention, attention_delta=delta)
         x = norm(residual, w["post_attention_layernorm.weight"], self.epsilon)
         gate = self._linear(x, "mlp.gate_proj.weight")
         up = self._linear(x, "mlp.up_proj.weight")
@@ -252,13 +264,15 @@ def export_native_fixture(snapshot, source_root, output, *, rows=603):
                 frequency = torch.where((wave >= high) & (wave <= low),
                     (1-smooth)*scaled/scaling["factor"] + smooth*scaled, scaled)
             angles = torch.arange(rows, device="cuda", dtype=torch.float32)[:, None] * frequency
+            trace = {}
             hidden, logits = model.forward(inputs, previous, positions,
-                angles.cos().bfloat16(), angles.sin().bfloat16())
+                angles.cos().bfloat16(), angles.sin().bfloat16(), trace=trace)
             directory = output / f"stage{stage}"
             directory.mkdir()
             selected = torch.tensor(probes, device="cuda")
             files = {"embedding.bin": inputs, "previous.bin": previous.float(),
                 "hidden.bin": hidden.float(), "logits.bin": logits[selected].float()}
+            files.update({f"{name}.bf16": value.bfloat16() for name, value in trace.items()})
             digests = {name: save(directory / name, value) for name, value in files.items()}
             cases.append({"stage": stage, "rows": len(inputs), "origin": stage+1,
                 "probes": probes, "sha256": digests})
