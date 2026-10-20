@@ -74,6 +74,18 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
             dtype = "f32" if params["features"] == 163840 else "bf16"
             assert params["output_dtype"] == dtype
             assert name == f"trellis_output_n{params['features']}_{dtype}"
+    for _, op, params, compile_program in programs:
+        assert compile_program() == params
+    names = {name for name, *_ in programs}
+    for policy in module["row_policies"]():
+        for field in ("native_program", "native_input", "wide_input", "dequant_program", "projection_program", "output_program"):
+            assert policy[field] in names
+    fixture = module["programs_for_shapes"]((("s1", 128, 256, 1), ("s2", 128, 256, 2)),
+        max_rows=64, include_chunk=False, f32_outputs=(256,))
+    assert {name for name, *_ in fixture} == {
+        "trellis_s1_mcg", "trellis_s1_mul1", "trellis_s2_mcg", "trellis_s2_mul1",
+        "trellis_input_k128_bf16", "trellis_output_n256_f32"}
+    assert all(params["max_rows"] == 64 for _, _, params, _ in fixture)
     imports = [node.module for node in ast.walk(ast.parse(EXPORTER.read_text()))
                if isinstance(node, ast.ImportFrom)]
     assert "b12x.gemm.trellis_linear" not in imports
