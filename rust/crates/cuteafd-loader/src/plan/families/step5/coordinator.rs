@@ -192,6 +192,20 @@ impl RankWeightLayout {
         Ok(layout)
     }
 
+    /// One whole predictor owner, with no target or earlier-stage operands.
+    pub fn for_mtp_stage(checkpoint: &Checkpoint, stage: usize) -> Result<Self> {
+        let cfg = Config::parse(checkpoint)?;
+        ensure!(stage < cfg.mtp, "Step-5 predictor stage outside checkpoint");
+        let prefix = format!("model.layers.{}.", cfg.layers + stage);
+        let mut layout = Self::for_mtp(checkpoint, stage + 1)?;
+        layout.operands.retain(|operand| operand.name.starts_with(&prefix));
+        layout.resident_bytes = layout.operands.iter().try_fold(0u64, |sum, operand|
+            sum.checked_add(operand.allocation_bytes))
+            .ok_or_else(|| anyhow::anyhow!("Step-5 stage weight size overflow"))?;
+        ensure!(layout.operands.len() == 16, "Step-5 predictor operand inventory");
+        Ok(layout)
+    }
+
     fn build(checkpoint: &Checkpoint, rank: usize, ranks: usize,
         ownership: Option<&super::ownership::ExecutionOwnership>) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
@@ -662,6 +676,19 @@ mod tests {
                 assert_eq!(layout.check_budget(exact + 12, &[5, 7]).unwrap(), exact + 12);
                 assert!(layout.check_budget(exact + 11, &[5, 7]).is_err());
             }
+            let mut stage_total = 0;
+            for stage in 0..3 {
+                let layout = RankWeightLayout::for_mtp_stage(&cp, stage).unwrap();
+                let prefix = format!("model.layers.{}.", 92 + stage);
+                assert_eq!(layout.resident_bytes, 1_677_280_768);
+                assert!(layout.operands.iter().all(|operand| operand.name.starts_with(&prefix)
+                    && operand.sources.iter().all(|source| source.meta.name.starts_with(&prefix))
+                    && operand.slice == WeightSlice::Replicated));
+                stage_total += layout.resident_bytes;
+            }
+            assert_eq!(stage_total, RankWeightLayout::for_mtp(&cp, 3).unwrap().resident_bytes);
+            assert!(RankWeightLayout::for_mtp_stage(&cp, 3).is_err());
+            assert!(RankWeightLayout::for_mtp_stage(&cp, usize::MAX).is_err());
             assert!(RankWeightLayout::for_mtp(&cp, 4).is_err());
             let mut bad = Checkpoint::open(dir.path()).unwrap();
             bad.tensors.iter_mut().find(|tensor|

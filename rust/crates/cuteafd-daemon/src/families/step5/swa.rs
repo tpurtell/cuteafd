@@ -14,7 +14,7 @@ use cuteafd_ffi::{
 };
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout},
+    families::step5::{Config, coordinator::{CoordinatorContract, LayerContract, RankWeightLayout}},
 };
 
 const H: usize = 4096;
@@ -146,7 +146,9 @@ const DEFS: [(&str, &[&str], &[u8]); 12] = [
 
 struct SwaWeights<'a> {
     rope: std::rc::Rc<TargetTables<'a>>,
+    attention_rope: std::rc::Rc<crate::shared::rope::Table<'a>>,
     layer: usize,
+    extent: usize,
     weights: Vec<Allocation<'a>>,
     programs: Vec<Program<'a>>,
     epsilon: f32,
@@ -204,6 +206,17 @@ impl<'a> SwaLayer<'a> {
             reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false)
     }
 
+    pub(super) fn for_mtp_stage(
+        device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        stage: usize, rows: usize, rope: std::rc::Rc<TargetTables<'a>>,
+        available: u64, reservations: &[u64],
+    ) -> Result<Self> {
+        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let cfg = Config::parse(checkpoint)?;
+        Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
+            Some(rope), available, reservations, layout, 64, true)
+    }
+
     fn load_layout(
         device: Device<'a>,
         programs: &'a Programs<'a>,
@@ -221,21 +234,17 @@ impl<'a> SwaLayer<'a> {
             else { full.to_owned() };
         let output = if heads == 32 { "step52_attn_out_partial" } else { "step5_attn_out" };
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer = contract
-            .layers
-            .get(layer_id)
-            .context("SWA layer outside target")?;
+        let cfg = Config::parse(checkpoint)?;
+        let layer = LayerContract::from_config(&cfg, layer_id)?;
         if let Some(rope) = &rope {
             ensure!(
                 rope.tables.plan == contract.rope_tables,
                 "SWA rotary plan mismatch"
             );
+            let table = rope.tables.get(layer.rope)?;
             ensure!(
-                rope.layers[layer_id].attention.cos.device.id == device.id
-                    && std::ptr::eq(
-                        rope.layers[layer_id].attention.cos.device.library,
-                        device.library
-                    ),
+                table.cos.device.id == device.id
+                    && std::ptr::eq(table.cos.device.library, device.library),
                 "SWA rotary device mismatch"
             );
         }
@@ -285,8 +294,14 @@ impl<'a> SwaLayer<'a> {
             );
         }
         let dense = layer.dense_activation.filter(|_| include_dense)
-            .map(|_| DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[]))
-            .transpose()?;
+            .map(|_| {
+                if layer_id < cfg.layers {
+                    DensePlan::prepare(programs, checkpoint, layer_id, rows, u64::MAX, &[])
+                } else {
+                    DensePlan::for_mtp_stage(programs, checkpoint, layer_id - cfg.layers,
+                        rows, u64::MAX, &[])
+                }
+            }).transpose()?;
         let admission = Admission::for_heads(
             rows,
             heads,
@@ -393,8 +408,10 @@ impl<'a> SwaLayer<'a> {
             .into_iter()
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
-        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { rope, layer: layer_id, weights,
-            programs: resolved, epsilon: contract.norms.input, heads }), ffn)
+        let attention_rope = rope.tables.get(layer.rope)?;
+        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { rope, attention_rope,
+            layer: layer_id, extent: contract.rope_tables.extent as usize, weights,
+            programs: resolved, epsilon: cfg.norm_eps, heads }), ffn)
     }
 
     /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
@@ -483,7 +500,7 @@ impl<'a> SwaLayer<'a> {
         let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         let scalars = [Scalar::I32(rows as i32)];
         let norm = [Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)];
-        let (cos, sin) = self.immutable.rope.layers[self.immutable.layer].attention.buffers();
+        let (cos, sin) = self.immutable.attention_rope.buffers();
         self.launch_on(
             stream,
             0,
@@ -647,7 +664,7 @@ impl<'a> SwaLayer<'a> {
             input.heads == self.immutable.heads
                 && input.stream.device.id == self.stream.device.id
                 && std::ptr::eq(input.stream.device.library, self.stream.device.library)
-                && input.extent <= self.immutable.rope.tables.plan.extent as usize,
+                && input.extent <= self.immutable.extent,
             "SWA owner device/head/rotary extent mismatch"
         );
         Ok(())
@@ -1043,7 +1060,7 @@ mod tests {
             {
                 let source = if stage == 4 { "qraw" } else { "kraw" };
                 device.run(|| library.copy_h2d(chain.planes[input].buffer, &load(source)?))?;
-                let (cos, sin) = chain.immutable.rope.layers[layer].attention.buffers();
+                let (cos, sin) = chain.immutable.attention_rope.buffers();
                 chain.launch(
                     stage,
                     &[

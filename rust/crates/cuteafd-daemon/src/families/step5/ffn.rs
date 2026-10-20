@@ -6,7 +6,7 @@ use cuteafd_core::{DType, FfnActivation};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout, WeightOperand},
+    families::step5::{Config, coordinator::{LayerContract, RankWeightLayout, WeightOperand}},
 };
 
 const HIDDEN: usize = 4096;
@@ -112,6 +112,16 @@ impl DensePlan {
             RankWeightLayout::for_execution(checkpoint, rank, ownership)?)
     }
 
+    pub(super) fn for_mtp_stage(
+        programs: &Programs<'_>, checkpoint: &Checkpoint, stage: usize, rows: usize,
+        available: u64, reservations: &[u64],
+    ) -> Result<Self> {
+        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let cfg = Config::parse(checkpoint)?;
+        Self::prepare_layout(programs, checkpoint, cfg.layers + stage, rows, available,
+            reservations, layout)
+    }
+
     fn prepare_layout(
         programs: &Programs<'_>,
         checkpoint: &Checkpoint,
@@ -121,15 +131,12 @@ impl DensePlan {
         reservations: &[u64],
         layout: RankWeightLayout,
     ) -> Result<Self> {
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let layer_contract = contract
-            .layers
-            .get(layer)
-            .context("dense target layer out of range")?;
+        let cfg = Config::parse(checkpoint)?;
+        let layer_contract = LayerContract::from_config(&cfg, layer)?;
         let Some(FfnActivation::SiluPostClampFp32Product { limit }) =
             layer_contract.dense_activation
         else {
-            anyhow::bail!("Step-5 dense chain requires a dense target layer");
+            anyhow::bail!("Step-5 dense chain requires a dense layer");
         };
         ensure!(
             limit == 7.0 || limit == 10.0,
@@ -222,7 +229,7 @@ impl DensePlan {
             weights,
             admission,
             activation,
-            epsilon: contract.norms.post_attention,
+            epsilon: cfg.norm_eps,
         })
     }
 }

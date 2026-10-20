@@ -12,7 +12,7 @@ use cuteafd_ffi::{
 };
 use cuteafd_loader::plan::{
     checkpoint::Checkpoint,
-    families::step5::coordinator::{CoordinatorContract, RankWeightLayout, WeightOperand},
+    families::step5::{Config, coordinator::{RankWeightLayout, WeightOperand}},
 };
 
 const H: usize = 4096;
@@ -26,6 +26,7 @@ pub(super) struct HeadPlan {
     rows: usize,
     epsilon: f32,
     bytes: u64,
+    predictor: bool,
 }
 
 impl HeadPlan {
@@ -35,20 +36,32 @@ impl HeadPlan {
     }
 
     pub fn prepare(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize) -> Result<Self> {
-        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?)
+        Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, None)
     }
 
     pub fn for_execution(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership) -> Result<Self> {
         Self::prepare_layout(programs, checkpoint, rows, RankWeightLayout::for_execution(checkpoint,
-            ownership.execution().spec().head_gpu as usize, ownership)?)
+            ownership.execution().spec().head_gpu as usize, ownership)?, None)
     }
 
-    fn prepare_layout(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize, layout: RankWeightLayout) -> Result<Self> {
+    pub(super) fn for_mtp_stage(programs: &Programs<'_>, checkpoint: &Checkpoint,
+        stage: usize, rows: usize) -> Result<Self> {
+        Self::prepare_layout(programs, checkpoint, rows,
+            RankWeightLayout::for_mtp_stage(checkpoint, stage)?, Some(stage))
+    }
+
+    fn prepare_layout(programs: &Programs<'_>, checkpoint: &Checkpoint, rows: usize,
+        layout: RankWeightLayout, stage: Option<usize>) -> Result<Self> {
         let planes = Self::plane_bytes(rows)?;
-        let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
-        let weights = [("model.norm.weight", DType::F32, vec![H]),
-            ("lm_head.weight", DType::Bf16, vec![V, H])]
+        let cfg = Config::parse(checkpoint)?;
+        let names = if let Some(stage) = stage {
+            let layer = cfg.layers + stage;
+            [format!("model.layers.{layer}.transformer.shared_head.norm.weight"),
+                format!("model.layers.{layer}.transformer.shared_head.output.weight")]
+        } else { ["model.norm.weight".into(), "lm_head.weight".into()] };
+        let weights = [(names[0].as_str(), DType::F32, vec![H]),
+            (names[1].as_str(), DType::Bf16, vec![V, H])]
             .into_iter().map(|(name, dtype, shape)| {
                 let weight = layout.operands.iter().find(|w| w.name == name)
                     .context("Step-5 final operand missing")?;
@@ -66,7 +79,8 @@ impl HeadPlan {
         let bytes = weights.iter().map(|w| w.allocation_bytes)
             .chain(planes.iter().map(|&n| n as u64))
             .try_fold(0u64, |n, v| n.checked_add(v)).context("Step-5 head byte overflow")?;
-        Ok(Self { layout, weights, planes, rows, epsilon: contract.norms.final_norm, bytes })
+        Ok(Self { layout, weights, planes, rows, epsilon: cfg.norm_eps, bytes,
+            predictor: stage.is_some() })
     }
 
     pub fn bytes(&self) -> u64 { self.bytes }
@@ -84,6 +98,7 @@ struct HeadWeights<'a> {
     norm: Program<'a>,
     weights: Vec<Allocation<'a>>,
     epsilon: f32,
+    predictor: bool,
 }
 
 pub(super) struct TargetHeadOwner<'a> {
@@ -106,7 +121,7 @@ impl<'a> TargetHeadOwner<'a> {
             let weights = plan.weights.iter().map(|w| load_operand(device, checkpoint, &plan.layout, w))
                 .collect::<Result<Vec<_>>>()?;
             Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
-                norm, weights, epsilon: plan.epsilon,
+                norm, weights, epsilon: plan.epsilon, predictor: plan.predictor,
             }))
         })
     }
@@ -156,8 +171,13 @@ impl<'a> TargetHeadOwner<'a> {
                 library.cuda_f32_to_bf16_async(input, self.planes[0].buffer, rows * H, stream.raw)?;
                 self.immutable.norm.launch(&[p[0], weight, weight, weight, weight, weight, p[1]],
                     &[Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)], stream.raw)?;
-                target_head::launch(TargetHead::configured(), &self.head, p[1],
-                    self.immutable.weights[1].buffer.ptr, p[2].cast(), rows, stream.raw)?;
+                if self.immutable.predictor {
+                    crate::shared::draft::launch_bf16_head(&self.head, p[1].cast(),
+                        self.immutable.weights[1].buffer.ptr.cast(), p[2].cast(), rows, stream.raw)?;
+                } else {
+                    target_head::launch(TargetHead::configured(), &self.head, p[1],
+                        self.immutable.weights[1].buffer.ptr, p[2].cast(), rows, stream.raw)?;
+                }
             }
             guard.complete = true;
             Ok(crate::shared::token_io::DeviceLogits { ptr: p[2].cast_const(), rows, vocab: V,
@@ -183,7 +203,7 @@ pub(super) mod tests {
         let planes = HeadPlan::plane_bytes(rows).unwrap();
         HeadPlan {
             layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], resident_bytes: 0 },
-            weights: vec![], planes, rows, epsilon: 1e-5,
+            weights: vec![], planes, rows, epsilon: 1e-5, predictor: false,
             bytes: ((H * 4 + V * H * 2) as u64) + planes.iter().map(|&n| n as u64).sum::<u64>(),
         }
     }
