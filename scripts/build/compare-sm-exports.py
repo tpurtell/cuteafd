@@ -61,7 +61,6 @@ def jobs(scope):
         for label, names in (("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")):
             result.append((f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
                            ["--geometry", geometry, "--only", names]))
-    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
         names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
@@ -84,6 +83,7 @@ def jobs(scope):
                    ["--geometry", "kimik3", "--only", "router_scores,expert_input_quant"]))
     if scope == "suspects":
         return result
+    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     result.extend((geometry, "export_b12x_dsv4_aot.py", ["--geometry", geometry])
                   for geometry in GEOMETRIES)
     for family in ("dsv4f", "dsv4p"):
