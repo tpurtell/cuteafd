@@ -56,6 +56,7 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
             "dense_down": (13824, 4096, torch.bfloat16),
             "shared_gate_up": (4096, 2 * 1536, torch.bfloat16),
             "shared_down": (1536, 4096, torch.bfloat16),
+            "mtp_eh": (8192, 4096, torch.bfloat16),
         }
         return {name: (lambda width=width, outputs=outputs, dtype=dtype:
                 p.compile_bf16_projection_aot(width=width, outputs=outputs, output_dtype=dtype))

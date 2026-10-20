@@ -14,6 +14,31 @@ golden = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(golden)
 
 
+def test_mtp_eh_export_has_native_bf16_input_output_boundaries(monkeypatch):
+    import sys
+    import types
+    path = ROOT / "python/tools/aot/export_b12x_step5_aot.py"
+    tree = ast.parse(path.read_text())
+    namespace = {}
+    fake_torch = types.ModuleType("torch")
+    fake_torch.bfloat16, fake_torch.float32 = "bfloat16", "float32"
+    fake_pointwise = types.ModuleType("b12x.integration.cuteafd.pointwise")
+    fake_pointwise.compile_bf16_projection_aot = lambda **kwargs: kwargs
+    fake_package = types.ModuleType("b12x.integration.cuteafd")
+    fake_package.pointwise = fake_pointwise
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd", fake_package)
+    monkeypatch.setitem(sys.modules, fake_pointwise.__name__, fake_pointwise)
+    builders = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                    and node.name == "builders")
+    exec(compile(ast.Module(body=[builders], type_ignores=[]), str(path), "exec"), namespace)
+    for heads in [32, 64]:
+        entries = namespace["builders"](heads, "projections")
+        assert entries["mtp_eh"]() == {
+            "width": 8192, "outputs": 4096, "output_dtype": "bfloat16"}
+        assert entries["attn_q"]()["outputs"] == heads * 192
+
+
 def test_step5_source_pin_fails_closed(tmp_path):
     snapshot = tmp_path / golden.REVISION
     folder = snapshot / "inference"

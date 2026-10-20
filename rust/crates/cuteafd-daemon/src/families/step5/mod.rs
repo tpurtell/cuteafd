@@ -10,6 +10,7 @@ mod execution;
 pub(crate) mod golden;
 pub(crate) mod serve;
 mod head;
+mod mtp;
 #[cfg(test)]
 mod norm_accuracy;
 mod prefix;
