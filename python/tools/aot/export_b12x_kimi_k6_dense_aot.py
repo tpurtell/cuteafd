@@ -36,16 +36,82 @@ TRELLIS_SHAPES = (
 )
 
 
-def programs():
-    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+CHUNK_WEIGHT_LIMIT_BYTES = 256 * 1024 * 1024
+
+
+def chunk_columns(k, n):
+    columns = min(n, CHUNK_WEIGHT_LIMIT_BYTES // (2 * k) // 128 * 128)
+    while columns and n % columns:
+        columns -= 128
+    if not columns:
+        raise ValueError("no H128 chunk fits the weight scratch limit")
+    return columns
+
+
+def row_policies():
     result = []
     for name, k, n, side in TRELLIS_SHAPES:
+        columns = chunk_columns(k, n)
+        for book in ("mcg", "mul1"):
+            result.append(dict(shape=name, input_features=k, output_features=n,
+                sharded_side=side, codebook=book, threshold_rows=64,
+                below="shared_native", at_or_above="chunk_dequant_bf16",
+                native_program=f"trellis_{name}_{book}",
+                native_input=f"trellis_input_k{k}_bf16",
+                wide_input=f"trellis_input_k{k}_bf16_rotated_bf16",
+                dequant_program=f"trellis_dequant_{name}_{book}",
+                projection_program=f"trellis_chunk_bf16_{name}_f32",
+                output_program=f"trellis_output_n{n}_{'f32' if n == 163840 else 'bf16'}",
+                chunk_columns=columns, weight_scratch_bytes=columns*k*2,
+                chunk_output_dtype="f32", chunk_output_scratch_bytes_per_row=columns*4,
+                stitch_before_output_transform=True))
+    return result
+
+
+def programs():
+    return programs_for_shapes(TRELLIS_SHAPES)
+
+
+def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_outputs=(163840,)):
+    """Explicit-shape hook for small native fixture packages; production uses the table."""
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import (
+        compile_trellis_input_aot, compile_trellis_output_aot,
+    )
+    import torch
+    from b12x.integration.cuteafd.trellis_dequant import compile_trellis_dequant_aot
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    result = []
+    for name, k, n, side in shapes:
+        columns = chunk_columns(k, n)
+        if include_chunk:
+            projection = dict(width=k, outputs=columns, output_dtype="f32")
+            result.append((f"trellis_chunk_bf16_{name}_f32", "bf16_projection", projection,
+                           partial(compile_bf16_projection_aot, width=k, outputs=columns, output_dtype=torch.float32)))
         for codebook in ("mcg", "mul1"):
             params = dict(input_features=k, output_features=n, bits=6,
                           codebook=codebook, sharded_side=side,
-                          rotation_count=1, max_rows=4096)
+                          rotation_count=1, max_rows=max_rows)
             result.append((f"trellis_{name}_{codebook}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
+            if include_chunk:
+                dequant = dict(input_features=k, output_features=n, chunk_columns=columns,
+                               codebook=codebook, sharded_side=side)
+                result.append((f"trellis_dequant_{name}_{codebook}", "trellis_dequant", dequant,
+                               partial(compile_trellis_dequant_aot, **dequant)))
+    for k in sorted({k for _, k, _, _ in shapes}):
+        params = dict(features=k, input_dtype="bf16", max_rows=max_rows)
+        result.append((f"trellis_input_k{k}_bf16", "trellis_input", params,
+                       partial(compile_trellis_input_aot, **params)))
+        if include_chunk:
+            wide_params = dict(params, output_dtype="bf16")
+            result.append((f"trellis_input_k{k}_bf16_rotated_bf16", "trellis_input", wide_params,
+                           partial(compile_trellis_input_aot, **wide_params)))
+    for n in sorted({n for _, _, n, _ in shapes}):
+        dtype = "f32" if n in f32_outputs else "bf16"
+        params = dict(features=n, output_dtype=dtype, max_rows=max_rows)
+        result.append((f"trellis_output_n{n}_{dtype}", "trellis_output", params,
+                       partial(compile_trellis_output_aot, **params)))
     return result
 
 

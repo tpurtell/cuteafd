@@ -799,8 +799,12 @@ def main() -> None:
     work = []
     for name in geometries:
         if name == "kimi_k6_dense":
-            from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs
-            manifest["families"][name] = {"abi_version": 1}
+            from export_b12x_kimi_k6_dense_aot import programs as kimi_dense_programs, row_policies
+            manifest["families"][name] = {
+                "abi_version": 1,
+                "row_policies": row_policies(),
+                "measured_not_exported": ["tiled_mcg"],
+            }
             work += [(name, *item) for item in kimi_dense_programs()]
             continue
         if name == "exlr8_dense":
