@@ -123,18 +123,16 @@ fn read_gather(file: &File, offset: u64, gather: &V41Exl3TensorGather,
     } else if gather.selected_row_bytes == gather.source_row_bytes {
         super::v41_catalog::projection_read(file, &mut dst[..gather.bytes()], offset)?;
     } else {
-        let batch = scratch.len() / gather.source_row_bytes;
-        for start in (0..gather.rows).step_by(batch) {
-            let rows = batch.min(gather.rows - start);
-            super::v41_catalog::projection_read(file, &mut scratch[..rows * gather.source_row_bytes], source_offset(start, 0)?)?;
-            for row in 0..rows {
-                let mut cursor = (start + row) * gather.selected_row_bytes;
-                for range in &gather.columns {
-                    let bytes = range.end - range.start;
-                    let source = row * gather.source_row_bytes + range.start;
-                    dst[cursor..cursor + bytes].copy_from_slice(&scratch[source..source + bytes]);
-                    cursor += bytes;
-                }
+        // Native [K/16, N/16, 16*bits] i16 tiles: H128 columns are
+        // contiguous within each K16 row, not across a batch of rows.
+        // column_ranges already coalesces adjacent owned H128 units.
+        for row in 0..gather.rows {
+            let mut cursor = row * gather.selected_row_bytes;
+            for range in &gather.columns {
+                let bytes = range.end - range.start;
+                super::v41_catalog::projection_read(file,
+                    &mut dst[cursor..cursor + bytes], source_offset(row, range.start)?)?;
+                cursor += bytes;
             }
         }
     }
@@ -265,21 +263,16 @@ fn read_slice(
         )?;
         return Ok(());
     }
-    let batch = scratch.len() / slice.source_row_bytes;
-    ensure!(batch > 0, "EXL3 scratch must hold a source row");
-    for start in (0..slice.rows).step_by(batch) {
-        let rows = batch.min(slice.rows - start);
-        let file_offset = (start as u64)
+    let _ = scratch;
+    for row in 0..slice.rows {
+        let file_offset = (row as u64)
             .checked_mul(slice.source_row_bytes as u64)
+            .and_then(|n| n.checked_add(slice.column_start_bytes as u64))
             .and_then(|n| offset.checked_add(n))
             .context("EXL3 row offset overflow")?;
-        super::v41_catalog::projection_read(file, &mut scratch[..rows * slice.source_row_bytes], file_offset)?;
-        for row in 0..rows {
-            let src = row * slice.source_row_bytes + slice.column_start_bytes;
-            let dest = (start + row) * slice.selected_row_bytes;
-            dst[dest..dest + slice.selected_row_bytes]
-                .copy_from_slice(&scratch[src..src + slice.selected_row_bytes]);
-        }
+        let dest = row * slice.selected_row_bytes;
+        super::v41_catalog::projection_read(file,
+            &mut dst[dest..dest + slice.selected_row_bytes], file_offset)?;
     }
     Ok(())
 }
@@ -287,6 +280,67 @@ fn read_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The previous 64-full-row read and CPU gather, kept as an independent oracle.
+    fn legacy_gather(file: &File, offset: u64, gather: &V41Exl3TensorGather) -> Result<Vec<u8>> {
+        let mut dst = vec![0; gather.bytes()];
+        let mut scratch = vec![0; 64 * gather.source_row_bytes];
+        for start in (0..gather.rows).step_by(64) {
+            let rows = 64.min(gather.rows - start);
+            file.read_exact_at(&mut scratch[..rows * gather.source_row_bytes],
+                offset + (start * gather.source_row_bytes) as u64)?;
+            for row in 0..rows {
+                let mut cursor = (start + row) * gather.selected_row_bytes;
+                for range in &gather.columns {
+                    let bytes = range.end - range.start;
+                    let source = row * gather.source_row_bytes + range.start;
+                    dst[cursor..cursor + bytes].copy_from_slice(&scratch[source..source + bytes]);
+                    cursor += bytes;
+                }
+            }
+        }
+        Ok(dst)
+    }
+
+    #[test]
+    #[ignore = "requires CUTEAFD_EXL3_SNAPSHOT pointing to the GLM 5.3 K4 snapshot"]
+    fn published_glm_tp6_owned_reads_match_legacy_gather() -> Result<()> {
+        use cuteafd_core::tp_units::RankUnits;
+        let path = std::env::var_os("CUTEAFD_EXL3_SNAPSHOT").context("CUTEAFD_EXL3_SNAPSHOT")?;
+        let catalog = crate::read_expert_catalog(std::path::Path::new(&path))?;
+        let mut checked = 0;
+        for expert in [0, 127, 255] {
+            for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up] {
+                let marker = format!(".layers.7.mlp.experts.{expert}.");
+                let p = catalog.exl3().unwrap().projections.values()
+                    .find(|p| p.kind == kind && p.name.contains(&marker))
+                    .context("missing GLM layer-7 expert projection")?;
+                ensure!(p.bits == 4 && p.input_features == 6144 && p.output_features == 2048,
+                    "expected GLM 5.3 K4 geometry");
+                let name = format!("{}.trellis", p.name);
+                let tensor = catalog.tensor(&name)?;
+                let file = File::open(catalog.snapshot().join(&tensor.shard))?;
+                for rank in 0..6 {
+                    let rule = cuteafd_core::tp_units::balanced_rule(128, 16, 6);
+                    let map = RankUnits::new(rule, 256, 2048, 128, 7, 6, rank)?;
+                    let gather = tensor_gather(p, "trellis", &map, expert)?;
+                    let expected = legacy_gather(&file, tensor.metadata.byte_offset, &gather)?;
+                    let mut actual = vec![0; gather.bytes()];
+                    let (_, read_bytes) = OfficialV41Catalog::count_storage_reads(|| {
+                        catalog.read_exl3_tensor_units_into(&name, &map, expert,
+                            &mut actual, &mut vec![0; gather.scratch_bytes() * 64])
+                    })?;
+                    assert_eq!(actual, expected, "{name} rank {rank}");
+                    assert_eq!(read_bytes, actual.len());
+                    println!("{name} rank={rank} old_read_bytes={} owned_read_bytes={read_bytes} byte_identical=true",
+                        gather.rows * gather.source_row_bytes);
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 36);
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires CUTEAFD_EXL3_SNAPSHOT pointing to a published local snapshot"]
@@ -383,7 +437,12 @@ mod tests {
                                     let map = RankUnits::new(rule, 4, intermediate, 128, layer, world, rank)?;
                                     let gather = tensor_gather(&projection, suffix, &map, 3)?;
                                     let mut got = vec![0xa5; gather.bytes()];
-                                    read_gather(&file, offset, &gather, &mut got, &mut vec![0; gather.scratch_bytes() * 3])?;
+                                    let (_, read_bytes) = OfficialV41Catalog::count_storage_reads(|| {
+                                        read_gather(&file, offset, &gather, &mut got,
+                                            &mut vec![0; gather.scratch_bytes() * 3])
+                                    })?;
+                                    assert_eq!(read_bytes, gather.bytes());
+                                    assert_eq!(got, legacy_gather(&file, offset, &gather)?);
                                     let mut cursor = 0;
                                     for row in 0..gather.rows {
                                         for range in &gather.columns {
