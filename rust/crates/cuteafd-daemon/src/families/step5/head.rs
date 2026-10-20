@@ -1,4 +1,5 @@
 //! Admitted final BF16 narrowing, zero-centered norm and shared vocabulary head.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
@@ -105,14 +106,25 @@ pub(super) struct TargetHeadOwner<'a> {
     // Drain before programs, library handles, weights and workspace retire.
     stream: Stream<'a>,
     head: VocabularyHead<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     rows: usize,
     immutable: std::rc::Rc<HeadWeights<'a>>,
 }
 
 impl<'a> TargetHeadOwner<'a> {
+    pub(super) fn device(&self) -> Device<'a> { self.stream.device }
+    pub(super) fn workspace_bytes(&self) -> u64 { HeadPlan::plane_bytes(self.rows).expect("admitted rows").iter().sum::<usize>() as u64 }
+    pub(super) fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
+        Self::workspace(self.stream.device, self.rows, self.immutable.clone(), Some((arena, 0)))
+    }
+
     pub fn load(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         plan: HeadPlan, available: u64, reservations: &[u64]) -> Result<Self> {
+        Self::load_in(device, programs, checkpoint, plan, available, reservations, None)
+    }
+
+    pub(super) fn load_in(device: Device<'a>, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        plan: HeadPlan, available: u64, reservations: &[u64], arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let total = reservations.iter().try_fold(plan.bytes, |n, v| n.checked_add(*v))
             .context("Step-5 final head reservation overflow")?;
         ensure!(total <= available, "Step-5 final head and reservations exceed admission");
@@ -122,20 +134,19 @@ impl<'a> TargetHeadOwner<'a> {
                 .collect::<Result<Vec<_>>>()?;
             Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
                 norm, weights, epsilon: plan.epsilon, predictor: plan.predictor,
-            }))
+            }), arena)
         })
     }
 
     /// Every lane has its own BLAS handle, stream, norm/logit planes and scratch.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.rows, self.immutable.clone())
+        Self::workspace(self.stream.device, self.rows, self.immutable.clone(), None)
     }
 
     fn workspace(device: Device<'a>, rows: usize,
-        immutable: std::rc::Rc<HeadWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<HeadWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         device.run(|| {
-            let planes = HeadPlan::plane_bytes(rows)?.iter().map(|&n| Allocation::new(device, n))
-                .collect::<Result<Vec<_>>>()?;
+            let planes = scratch::planes(device, &HeadPlan::plane_bytes(rows)?, arena)?;
             // SAFETY: private workspace survives the private handle on this device.
             let head = unsafe { device.library.vocabulary_head_rows(planes[3].buffer.ptr,
                 H as u32, rows as u32, V as u32)? };
@@ -165,6 +176,8 @@ impl<'a> TargetHeadOwner<'a> {
             let library = stream.device.library;
             let p = self.planes.iter().map(|p| p.buffer.ptr).collect::<Vec<_>>();
             let weight = self.immutable.weights[0].buffer.ptr;
+            // The shared target arena preserves the F32 residual until narrowing
+            // completes; only the later logits/scratch writes may alias that input.
             // SAFETY: admitted lane-private planes, head handle and input stay live
             // through the transaction drain; runtime rows never exceed capacity.
             unsafe {

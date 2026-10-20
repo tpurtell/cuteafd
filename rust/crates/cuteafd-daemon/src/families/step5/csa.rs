@@ -1,4 +1,5 @@
 //! Layer-selected CSA branch over transaction-owned pages and summaries.
+use super::scratch::{self, Arena, Plane};
 use super::{
     ffn::{DenseFfn, DensePlan},
     rope::TargetTables,
@@ -186,11 +187,16 @@ pub(super) struct CsaLayer<'a> {
     // Drain the complete staged branch before any pointer owner retires.
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<CsaWeights<'a>>,
 }
 impl<'a> CsaLayer<'a> {
+    pub(super) fn device(&self) -> Device<'a> { self.stream.device }
+    pub(super) fn rows(&self) -> usize { self.admission.rows }
+    pub(super) fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None, Some((arena, 0)))
+    }
 
     pub fn workspace_bytes(rows: usize) -> Result<u64> {
         Ok(Admission::new(rows, &[], 0, u64::MAX, &[])?.bytes)
@@ -207,7 +213,7 @@ impl<'a> CsaLayer<'a> {
         reservations: &[u64],
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None)
     }
 
     pub fn for_execution(
@@ -220,13 +226,14 @@ impl<'a> CsaLayer<'a> {
         available: u64,
         reservations: &[u64],
         rank: usize,
+        arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
     ) -> Result<Self> {
         let local = ownership.layer(layer, rank)?;
         ensure!(local.query_heads == 64 && local.kv_heads == 4,
             "Step-5 CSA needs a whole native attention owner");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false)
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false, Some((arena, 0)))
     }
 
     fn load_layout(
@@ -240,6 +247,7 @@ impl<'a> CsaLayer<'a> {
         reservations: &[u64],
         layout: RankWeightLayout,
         include_dense: bool,
+        arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer = contract
@@ -483,50 +491,51 @@ impl<'a> CsaLayer<'a> {
             .map(|w| load_operand(device, checkpoint, &layout, w))
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { rope, layer: layer_id, weights,
-            programs: resolved, residual, epsilon: contract.norms.input }), ffn)
+            programs: resolved, residual, epsilon: contract.norms.input }), ffn, arena)
     }
 
     /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
     pub(super) fn new_lane(&self) -> Result<Self> {
         let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn)
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<CsaWeights<'a>>, ffn: Option<DenseFfn<'a>>) -> Result<Self> {
-        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
-            .collect::<Result<Vec<_>>>()?;
+        immutable: std::rc::Rc<CsaWeights<'a>>, ffn: Option<DenseFfn<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
+        let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
         let rows = admission.rows;
         let owner = Self { stream, ffn, planes, admission, immutable };
-        for (plane, data) in [
-            (
-                POSITIONS,
-                (0..rows as i64)
-                    .flat_map(i64::to_le_bytes)
-                    .collect::<Vec<_>>(),
-            ),
-            (REQUESTS, vec![0; rows * 4]),
-            (
-                TABLE,
-                (0..owner.admission.pages as i32)
-                    .flat_map(i32::to_le_bytes)
-                    .collect(),
-            ),
-            (
-                STARTS,
-                (0..rows.div_ceil(8) as i32)
-                    .flat_map(|r| (r * 8).to_le_bytes())
-                    .collect(),
-            ),
-            (
-                COUNTS,
-                (0..rows.div_ceil(8))
-                    .flat_map(|_| 8i32.to_le_bytes())
-                    .collect(),
-            ),
-        ] {
-            device.run(|| device.library.copy_h2d(owner.planes[plane].buffer, &data))?;
+        if arena.is_none() {
+            for (plane, data) in [
+                (
+                    POSITIONS,
+                    (0..rows as i64)
+                        .flat_map(i64::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                ),
+                (REQUESTS, vec![0; rows * 4]),
+                (
+                    TABLE,
+                    (0..owner.admission.pages as i32)
+                        .flat_map(i32::to_le_bytes)
+                        .collect(),
+                ),
+                (
+                    STARTS,
+                    (0..rows.div_ceil(8) as i32)
+                        .flat_map(|r| (r * 8).to_le_bytes())
+                        .collect(),
+                ),
+                (
+                    COUNTS,
+                    (0..rows.div_ceil(8))
+                        .flat_map(|_| 8i32.to_le_bytes())
+                        .collect(),
+                ),
+            ] {
+                device.run(|| device.library.copy_h2d(owner.planes[plane].buffer, &data))?;
+            }
         }
         Ok(owner)
     }

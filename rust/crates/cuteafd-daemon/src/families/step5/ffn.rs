@@ -1,4 +1,5 @@
 //! Admitted post-attention dense FFN. This is not a serving executor.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
@@ -63,7 +64,7 @@ struct DenseWeights<'a> {
 pub(super) struct DenseFfn<'a> {
     // Fields drop in declaration order: drain before storage or programs retire.
     stream: Stream<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<DenseWeights<'a>>,
 }
@@ -82,7 +83,7 @@ impl DensePlan {
     }
 
     pub fn workspace_bytes(&self) -> u64 {
-        self.admission.planes.iter().map(|&n| n as u64).sum()
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
     }
 
     pub fn prepare(
@@ -235,6 +236,13 @@ impl DensePlan {
 }
 
 impl<'a> DenseFfn<'a> {
+    pub(super) fn workspace_bytes(&self) -> u64 {
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+    pub(super) fn new_lane_in(&self, arena: &Arena<'a>, offset: usize) -> Result<Self> {
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), Some((arena, offset)))
+    }
+
 
     pub fn load(
         device: Device<'a>,
@@ -258,6 +266,16 @@ impl<'a> DenseFfn<'a> {
         programs: &'a Programs<'a>,
         checkpoint: &'a Checkpoint,
         plan: DensePlan,
+    ) -> Result<Self> {
+        Self::load_plan_in(device, programs, checkpoint, plan, None)
+    }
+
+    pub(super) fn load_plan_in(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        plan: DensePlan,
+        arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
         let DensePlan {
             layout,
@@ -287,19 +305,18 @@ impl<'a> DenseFfn<'a> {
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, admission, std::rc::Rc::new(DenseWeights {
             weights: loaded, programs: resolved, epsilon,
-        }))
+        }), arena)
     }
 
     /// The caller admits all lanes together before creating any workspace.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<DenseWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<DenseWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_dense_workspace");
-        let planes = admission.planes.iter().map(|&bytes| Allocation::new(device, bytes))
-            .collect::<Result<Vec<_>>>()?;
+        let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
         Ok(Self { stream, planes, admission, immutable })
     }

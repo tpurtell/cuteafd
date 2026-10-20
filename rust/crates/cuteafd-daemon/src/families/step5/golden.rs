@@ -63,6 +63,9 @@ pub(crate) struct GoldenArgs {
     /// Explicit cold diagnostic lane count; not a serving/default qualification.
     #[arg(long, default_value_t = 1)]
     diagnostic_lanes: usize,
+    /// Poison reusable target scratch between layers; logits must remain byte-exact.
+    #[arg(long, requires = "split_device")]
+    poison_scratch: bool,
     /// Validate source, reference and routed-layer selection without CUDA.
     #[arg(long)]
     check_headers: bool,
@@ -880,6 +883,10 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     let execution = Execution::load_lanes_count(&programs, checkpoint, ownership, vec![&caches[0], &caches[1]],
         stages.iter().map(|stage| vec![&stage[0], &stage[1]]).collect(), rows,
         available.to_vec(), reservations.to_vec(), transports.into_iter().map(Vec::from).collect(), 92, 17)?;
+    if args.poison_scratch { execution.poison_scratch_between_layers(); }
+    let retained_layers = reference.hidden.iter().map(|(layer, _)| *layer).chain(args.dump_layers.iter().copied())
+        .collect::<Vec<_>>();
+    execution.retain_diagnostic_outputs(&retained_layers)?;
     let embeddings = embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?;
     let inputs = (0..lane_count).map(|_| {
         let input = Allocation::new(devices[0], rows * H * 4)?;
@@ -899,13 +906,11 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     for lane in 0..lane_count {
         let head = execution.lane_head(lane)?;
         for (layer, expected) in &reference.hidden {
-            let (device, output) = execution.lane_output(lane, *layer)?;
-            let bytes = read_buffer(device, output)?;
-            let actual = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            let actual = execution.diagnostic_output(lane, *layer)?;
             let (cosine, relative_l2) = hidden_metrics(&actual, expected)?;
             println!("Step-5 shared hidden rows={rows} lane={lane} layer={layer} cosine={cosine:.9} relative_l2={relative_l2:.9}");
         }
-        let (_, output) = execution.lane_output(lane, 91)?;
+        let (_, output) = execution.lane_terminal_output(lane)?;
         ensure!(output.device_id == devices[head_rank].id, "Step-5 shared final head owner");
         let actual = head.logits(output)?;
         if let Some(first) = &first_logits {
@@ -921,9 +926,7 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
         }
         save_diagnostics(&lane_args, &reference.tokens, &reference.positions, cfg.vocab,
             &actual, normalized.as_deref(), |layer| {
-                let (device, output) = execution.lane_output(lane, layer)?;
-                Ok(read_buffer(device, output)?.chunks_exact(4)
-                    .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+                execution.diagnostic_output(lane, layer)
             })?;
         if let Some(expected) = &reference.final_norm {
             let (cosine, relative_l2) = hidden_metrics(normalized.as_deref().context("final norm inspection")?, &expected)?;
@@ -1463,7 +1466,7 @@ mod tests {
             prefill: Some(1),
             device: 0,
             split_device: None,
-            diagnostic_lanes: 1,
+            diagnostic_lanes: 1, poison_scratch: false,
             check_headers: true,
             nll: false,
             prefix_state: false,
@@ -1516,7 +1519,7 @@ mod tests {
         std::fs::write(folder.join("logits.bin"), &logits)?;
         let mut args = GoldenArgs { snapshot: root.path().into(), native_lib: None,
             manifest: PathBuf::new(), golden: golden.clone(), window: "code-1".into(),
-            peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, diagnostic_lanes: 1, check_headers: true, nll: true, prefix_state: false,
+            peers: vec![], last_layer: 91, prefill: None, device: 0, split_device: None, diagnostic_lanes: 1, poison_scratch: false, check_headers: true, nll: true, prefix_state: false,
             fp8_diagnostic_reference: false, compare_layers: vec![], compare_final_norm: false,
             save_logits: None, dump_residuals: None, dump_layers: vec![], dump_layer0: None };
         let full = reference(&args, 3)?;

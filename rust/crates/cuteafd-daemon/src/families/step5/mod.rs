@@ -16,5 +16,6 @@ mod norm_accuracy;
 mod prefix;
 mod rope;
 mod swa;
+mod scratch;
 mod transaction;
 mod weights;

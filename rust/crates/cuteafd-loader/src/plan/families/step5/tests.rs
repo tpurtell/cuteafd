@@ -129,6 +129,11 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             "active_delta": active_delta, "mark_delta": marks_delta, "ranks": by_category }));
     }
     assert!(admission::forecast_mtp(&cp, &inputs, 4).is_err());
+    let mut narrow = inputs;
+    for depth in 1..=3 {
+        narrow.rows = depth;
+        assert!(admission::admit_mtp(&cp, &narrow, depth).is_err());
+    }
     Ok(())
 }
 
@@ -161,6 +166,18 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             assert_eq!(layout.geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(),
                 diagnostic.geometry.ranks[0].persistent_unit_bytes);
             let weights: Vec<_> = (0..ranks).map(|rank| RankWeightLayout::for_execution(&cp, rank, &owners).unwrap()).collect();
+            for rank in 0..ranks {
+                let rows = owners.execution().spec().rows as usize;
+                let layer_bytes = (0..cfg.layers).filter_map(|layer| {
+                    let local = owners.layer(layer, rank).unwrap();
+                    (local.query_heads > 0).then(|| native::layer_workspace(
+                        rows, cfg.full[layer], local.query_heads, cfg.moe[layer]).unwrap())
+                }).collect::<Vec<_>>();
+                let head_bytes = if rank == usize::from(head) { native::plane_bytes(&native::head_planes(rows).unwrap()).unwrap() } else { 0 };
+                let expected = layer_bytes.iter().copied().max().unwrap_or(0).max(head_bytes);
+                assert_eq!(native::rank_admission(&cp, &owners, rank, rows).unwrap().workspace, expected);
+                if layer_bytes.len() > 1 { assert!(expected < layer_bytes.iter().sum::<u64>() + head_bytes); }
+            }
             for (layer, &mode) in modes.iter().enumerate() {
                 let mut attention = Vec::new();
                 let mut ffns = Vec::new();

@@ -316,6 +316,7 @@ pub fn forecast_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usiz
 /// Includes native stage weights, private workspace, independent histories and
 /// the actual host-aware staging mark count before any live allocation.
 pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) -> Result<Admission> {
+    if depth == 0 { return admit(checkpoint, inputs); }
     let cfg = Config::parse(checkpoint)?;
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.rows > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");

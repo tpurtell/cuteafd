@@ -1,4 +1,5 @@
 //! Native router/shared expert bindings with transport-neutral wave boundaries.
+use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
@@ -88,7 +89,7 @@ impl RoutedPlan {
         self.admission.bytes
     }
     pub fn workspace_bytes(&self) -> u64 {
-        self.admission.planes.iter().map(|&n| n as u64).sum()
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
     }
 
     pub fn prepare(
@@ -259,11 +260,18 @@ struct RoutedWeights<'a> {
 
 pub(super) struct RoutedFfn<'a> {
     stream: Stream<'a>,
-    planes: Vec<Allocation<'a>>,
+    planes: Vec<Plane<'a>>,
     admission: Admission,
     immutable: std::rc::Rc<RoutedWeights<'a>>,
 }
 impl<'a> RoutedFfn<'a> {
+    pub(super) fn workspace_bytes(&self) -> u64 {
+        cuteafd_loader::plan::families::step5::native::plane_bytes(&self.admission.planes).expect("admitted planes")
+    }
+    pub(super) fn new_lane_in(&self, arena: &Arena<'a>, offset: usize) -> Result<Self> {
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), Some((arena, offset)))
+    }
+
 
     pub fn load(
         device: Device<'a>,
@@ -271,6 +279,17 @@ impl<'a> RoutedFfn<'a> {
         checkpoint: &'a Checkpoint,
         layer: usize,
         plan: RoutedPlan,
+    ) -> Result<Self> {
+        Self::load_in(device, programs, checkpoint, layer, plan, None)
+    }
+
+    pub(super) fn load_in(
+        device: Device<'a>,
+        programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint,
+        layer: usize,
+        plan: RoutedPlan,
+        arena: Option<(&Arena<'a>, usize)>,
     ) -> Result<Self> {
         ensure!(layer == plan.layer, "Step-5 routed plan layer mismatch");
         let resolved = definitions(&plan.activation)
@@ -284,26 +303,19 @@ impl<'a> RoutedFfn<'a> {
             .collect::<Result<Vec<_>>>()?;
         Self::workspace(device, plan.admission, std::rc::Rc::new(RoutedWeights {
             weights, programs: resolved, epsilon: plan.epsilon, layer,
-        }))
+        }), arena)
     }
 
     /// Share only native weights/programs; route, reduction and zero planes are private.
     pub(super) fn new_lane(&self) -> Result<Self> {
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone())
+        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), None)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
-        immutable: std::rc::Rc<RoutedWeights<'a>>) -> Result<Self> {
+        immutable: std::rc::Rc<RoutedWeights<'a>>, arena: Option<(&Arena<'a>, usize)>) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("step5_routed_workspace");
-        let planes = admission.planes.iter().map(|&n| Allocation::new(device, n))
-            .collect::<Result<Vec<_>>>()?;
+        let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
-        device.run(|| {
-            // SAFETY: private zero plane survives drainage and is never overwritten.
-            unsafe { device.library.cuda_zero_bytes_async(planes[ZERO].buffer,
-                planes[ZERO].buffer.bytes, stream.raw) }
-        })?;
-        stream.drain()?;
         Ok(Self { stream, planes, admission, immutable })
     }
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
@@ -449,6 +461,11 @@ impl<'a> RoutedFfn<'a> {
     pub fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         self.check_stream(rows, stream)?;
         let p = |i: usize| self.planes[i].buffer.ptr;
+        stream.device.run(|| {
+            // SAFETY: the reused zero plane is disjoint and ordered before its consumer.
+            unsafe { stream.device.library.cuda_zero_bytes_async(self.planes[ZERO].buffer,
+                rows * H * 4, stream.raw) }
+        })?;
         // Match residual + (float(routed) + float(shared)), not (residual + routed) + shared.
         self.launch(6, &[p(ZERO), p(ROUTED), p(WIDE)], rows, stream)?;
         self.launch(6, &[p(WIDE), p(SHARED), p(COMBINED)], rows, stream)?;

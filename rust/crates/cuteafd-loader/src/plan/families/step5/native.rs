@@ -174,35 +174,52 @@ pub fn rank_admission(
         })
         .context("Step-5 native rank immutable overflow")?;
     let mut workspace = 0u64;
-    let mut add = |planes: &[usize]| -> Result<()> {
-        for &bytes in planes {
-            workspace = workspace
-                .checked_add(bytes as u64)
-                .context("Step-5 native rank workspace overflow")?;
-        }
-        Ok(())
-    };
     for layer in 0..cfg.layers {
         let local = ownership.layer(layer, rank)?;
-        if local.query_heads == 0 {
-            continue;
-        }
-        if cfg.full[layer] {
-            add(&csa_planes(rows)?)?;
-        } else {
-            add(&swa_planes(rows, local.query_heads)?)?;
-        }
-        if cfg.moe[layer] {
-            add(&routed_planes(rows)?)?;
-        } else {
-            add(&dense_planes(rows)?)?;
-        }
+        if local.query_heads == 0 { continue; }
+        workspace = workspace.max(layer_workspace(rows, cfg.full[layer], local.query_heads, cfg.moe[layer])?);
     }
     if rank == ownership.execution().spec().head_gpu as usize {
-        add(&head_planes(rows)?)?;
+        workspace = workspace.max(plane_bytes(&head_planes(rows)?)?);
     }
     Ok(RankAdmission {
         immutable,
         workspace,
     })
+}
+
+pub fn plane_bytes(planes: &[usize]) -> Result<u64> {
+    planes.iter().try_fold(0u64, |sum, &bytes| {
+        let aligned = bytes.checked_add(15).context("Step-5 scratch alignment overflow")? / 16 * 16;
+        sum.checked_add(aligned as u64).context("Step-5 scratch size overflow")
+    })
+}
+
+pub fn layer_workspace(rows: usize, full: bool, heads: usize, routed: bool) -> Result<u64> {
+    let attention = if full { plane_bytes(&csa_planes(rows)?)? }
+        else { plane_bytes(&swa_planes(rows, heads)?)? };
+    let ffn = if routed { plane_bytes(&routed_planes(rows)?)? }
+        else { plane_bytes(&dense_planes(rows)?)? };
+    attention.checked_add(ffn).context("Step-5 layer scratch overflow")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn target_scratch_is_max_layer_not_layer_sum() -> Result<()> {
+        let rows = 256;
+        assert_eq!(layer_workspace(rows, false, 32, false)?, 62_213_376);
+        assert_eq!(layer_workspace(rows, false, 64, false)?, 73_305_344);
+        assert_eq!(layer_workspace(rows, false, 64, true)?, 69_848_320);
+        let largest = layer_workspace(rows, true, 64, true)?;
+        assert_eq!(largest, 381_211_392);
+        assert!(largest > plane_bytes(&head_planes(rows)?)?);
+        for rows in [1, 16, 64, 256, 4096] {
+            for heads in [32, 64] {
+                assert!(layer_workspace(rows, true, 64, true)? >= layer_workspace(rows, false, heads, true)?);
+            }
+        }
+        Ok(())
+    }
 }

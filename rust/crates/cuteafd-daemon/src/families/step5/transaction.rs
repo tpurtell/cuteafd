@@ -1,5 +1,6 @@
 //! Append-only target steps: mutable proposal rows never overlap the old frontier.
 use super::{
+    scratch::BufferOwner,
     cache::CacheRank,
     prefix::{Frontier, Placement, Step5Prefix},
 };
@@ -371,7 +372,7 @@ pub(super) struct Step<'e, 'a, E: CopyEngine> {
     base: usize,
     extent: usize,
     failed: bool,
-    inputs: Vec<&'e Allocation<'a>>,
+    inputs: Vec<&'e dyn BufferOwner>,
     submission: Rc<Cell<bool>>,
 }
 
@@ -672,9 +673,9 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         &mut self,
         rank: usize,
         layer: usize,
-        key: &'e Allocation<'a>,
-        value: &'e Allocation<'a>,
-        index: Option<(&'e Allocation<'a>, &'e Allocation<'a>)>,
+        key: &'e dyn BufferOwner,
+        value: &'e dyn BufferOwner,
+        index: Option<(&'e dyn BufferOwner, &'e dyn BufferOwner)>,
     ) -> Result<()> {
         ensure!(
             rank < self.ranks.len() && !self.complete[rank].contains(&layer),
@@ -686,8 +687,8 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
         if let Some((key, z)) = index {
             self.inputs.extend([key, z]);
         }
-        let (key, value) = (key.buffer, value.buffer);
-        let index = index.map(|(key, z)| (key.buffer, z.buffer));
+        let (key, value) = (key.buffer(), value.buffer());
+        let index = index.map(|(key, z)| (key.buffer(), z.buffer()));
         let cache = self.ranks[rank].borrow();
         let state = &cache.layout().ranks[rank];
         let stage = self.staging[rank];
@@ -1265,8 +1266,8 @@ pub(super) mod tests {
     pub(in crate::families::step5) fn stage_other_layers<'e, 'a>(
         step: &mut Step<'e, 'a, StubCopyEngine>,
         selected: usize,
-        key: &'e Allocation<'a>,
-        value: &'e Allocation<'a>,
+        key: &'e dyn BufferOwner,
+        value: &'e dyn BufferOwner,
         ik: &'e Allocation<'a>,
         iz: &'e Allocation<'a>,
     ) -> Result<()> {

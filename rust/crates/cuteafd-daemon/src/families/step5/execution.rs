@@ -1,5 +1,5 @@
 //! Shared immutable weights with private native execution lanes.
-use super::{cache::CacheRank, csa::CsaLayer, ffn::{DenseFfn, DensePlan},
+use super::{scratch::Arena, cache::CacheRank, csa::CsaLayer, ffn::{DenseFfn, DensePlan},
     rope::TargetTables, routed::{RoutedFfn, RoutedPlan}, swa::SwaLayer,
     transaction::{Staging, Step}};
 use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::RouteStaging},
@@ -46,8 +46,7 @@ impl RankAdmission {
         Ok(Self {
             immutable: self.immutable.checked_add(head.immutable_bytes())
                 .context("Step-5 native head weight overflow")?,
-            workspace: self.workspace.checked_add(head.workspace_bytes())
-                .context("Step-5 native head workspace overflow")?,
+            workspace: self.workspace.max(head.workspace_bytes()),
         })
     }
 }
@@ -56,14 +55,28 @@ enum Attention<'a> { Sliding(SwaLayer<'a>), Sparse(CsaLayer<'a>) }
 enum Ffn<'a> { Dense(DenseFfn<'a>), Routed(RoutedFfn<'a>) }
 struct Layer<'a> { attention: Attention<'a>, ffn: Ffn<'a> }
 impl<'a> Layer<'a> {
-    fn new_lane(&self) -> Result<Self> {
+    fn device(&self) -> Device<'a> {
+        match &self.attention { Attention::Sliding(owner) => owner.device(), Attention::Sparse(owner) => owner.device() }
+    }
+    fn attention_bytes(&self) -> Result<u64> {
+        match &self.attention { Attention::Sliding(owner) => cuteafd_loader::plan::families::step5::native::plane_bytes(
+                &cuteafd_loader::plan::families::step5::native::swa_planes(owner.rows(), owner.heads())?),
+            Attention::Sparse(owner) => cuteafd_loader::plan::families::step5::native::plane_bytes(
+                &cuteafd_loader::plan::families::step5::native::csa_planes(owner.rows())?) }
+    }
+    fn workspace_bytes(&self) -> Result<u64> {
+        self.attention_bytes()?.checked_add(match &self.ffn { Ffn::Dense(owner) => owner.workspace_bytes(),
+            Ffn::Routed(owner) => owner.workspace_bytes() }).context("Step-5 layer workspace overflow")
+    }
+    fn new_lane_in(&self, arena: &Arena<'a>) -> Result<Self> {
         let attention = match &self.attention {
-            Attention::Sliding(owner) => Attention::Sliding(owner.new_lane()?),
-            Attention::Sparse(owner) => Attention::Sparse(owner.new_lane()?),
+            Attention::Sliding(owner) => Attention::Sliding(owner.new_lane_in(arena)?),
+            Attention::Sparse(owner) => Attention::Sparse(owner.new_lane_in(arena)?),
         };
+        let offset = usize::try_from(self.attention_bytes()?)?;
         let ffn = match &self.ffn {
-            Ffn::Dense(owner) => Ffn::Dense(owner.new_lane()?),
-            Ffn::Routed(owner) => Ffn::Routed(owner.new_lane()?),
+            Ffn::Dense(owner) => Ffn::Dense(owner.new_lane_in(arena, offset)?),
+            Ffn::Routed(owner) => Ffn::Routed(owner.new_lane_in(arena, offset)?),
         };
         Ok(Self { attention, ffn })
     }
@@ -87,16 +100,26 @@ struct NativeLane<'a> {
     ranks: Vec<Vec<Option<Layer<'a>>>>,
     head: Option<super::head::TargetHeadOwner<'a>>,
     rope: Vec<Rc<TargetTables<'a>>>,
+    arenas: Vec<Arena<'a>>,
 }
 impl<'a> NativeLane<'a> {
     fn new_lane(&self) -> Result<Self> {
-        let mut ranks = (0..self.ranks.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-        for (destination, source) in ranks.iter_mut().zip(&self.ranks) {
-            *destination = source.iter().map(|layer| layer.as_ref().map(Layer::new_lane).transpose())
-                .collect::<Result<_>>()?;
+        let mut ranks = Vec::with_capacity(self.ranks.len());
+        let mut head = None;
+        let mut arenas = Vec::new();
+        for source in &self.ranks {
+            let device = source.iter().flatten().next().context("Step-5 empty native rank")?.device();
+            let mut bytes = 0;
+            for layer in source.iter().flatten() { bytes = bytes.max(layer.workspace_bytes()?); }
+            if let Some(owner) = self.head.as_ref().filter(|head| head.device().id == device.id) { bytes = bytes.max(owner.workspace_bytes()); }
+            let arena = Arena::new(device, usize::try_from(bytes)?)?;
+            let layers = source.iter().map(|layer| layer.as_ref().map(|layer| layer.new_lane_in(&arena)).transpose())
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(owner) = self.head.as_ref().filter(|head| head.device().id == device.id) { head = Some(owner.new_lane_in(&arena)?); }
+            ranks.push(layers);
+            arenas.push(arena);
         }
-        let head = self.head.as_ref().map(super::head::TargetHeadOwner::new_lane).transpose()?;
-        Ok(Self { ranks, head, rope: self.rope.clone() })
+        Ok(Self { ranks, head, rope: self.rope.clone(), arenas })
     }
 }
 
@@ -127,32 +150,41 @@ impl<'a> NativeLanes<'a> {
             let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
             let mut tables = Vec::with_capacity(ownership.ranks());
+            let mut arenas = Vec::with_capacity(ownership.ranks());
             for rank in 0..ownership.ranks() {
                 let device = devices[rank];
+                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)?)?;
                 let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
                 tables.push(rope.clone());
                 for layer in 0..count {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                     let attention = if contract.layers[layer].sliding.is_some() {
                         Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
-                            rows, Some(rope.clone()), available[rank], &[], rank, ownership)?)
+                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership)?)
                     } else {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
-                            rows, Some(rope.clone()), available[rank], &[], rank, ownership)?)
+                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership)?)
                     };
+                    let offset = usize::try_from(match &attention {
+                        Attention::Sliding(_) => cuteafd_loader::plan::families::step5::native::plane_bytes(
+                            &cuteafd_loader::plan::families::step5::native::swa_planes(rows, ownership.layer(layer, rank)?.query_heads)?)?,
+                        Attention::Sparse(_) => cuteafd_loader::plan::families::step5::native::plane_bytes(
+                            &cuteafd_loader::plan::families::step5::native::csa_planes(rows)?)?,
+                    })?;
                     let ffn = if contract.layers[layer].dense_activation.is_some() {
                         let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
-                        Ffn::Dense(DenseFfn::load_plan(device, programs, checkpoint, plan)?)
+                        Ffn::Dense(DenseFfn::load_plan_in(device, programs, checkpoint, plan, Some((&arena, offset)))?)
                     } else {
                         let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?;
-                        Ffn::Routed(RoutedFfn::load(device, programs, checkpoint, layer, plan)?)
+                        Ffn::Routed(RoutedFfn::load_in(device, programs, checkpoint, layer, plan, Some((&arena, offset)))?)
                     };
                     ranks[rank].push(Some(Layer { attention, ffn }));
                 }
+                arenas.push(arena);
             }
-            let head = head_plan.map(|plan| super::head::TargetHeadOwner::load(devices[head_rank],
-                programs, checkpoint, plan, available[head_rank], &[])).transpose()?;
-            let first = NativeLane { ranks, head, rope: tables };
+            let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
+                programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
+            let first = NativeLane { ranks, head, rope: tables, arenas };
             let mut owners = Vec::with_capacity(lanes);
             for _ in 1..lanes { owners.push(first.new_lane()?); }
             owners.insert(0, first);
@@ -194,6 +226,8 @@ struct LaneExecution<'e, 'a> {
     requests: Cell<u64>,
     placement_version: u64,
     terminal_output: Cell<Option<CuteafdDeviceBuffer>>,
+    poison_scratch: Cell<bool>,
+    diagnostic_outputs: RefCell<std::collections::BTreeMap<usize, Vec<u8>>>,
 }
 
 enum Exchange<'a> {
@@ -284,15 +318,17 @@ impl<'e, 'a> Execution<'e, 'a> {
         for layer in 0..count {
             if ownership.layer(layer, rank)?.query_heads == 0 { continue; }
             let attention = if contract.layers[layer].sliding.is_some() {
-                SwaLayer::workspace_for_heads(rows, ownership.layer(layer, rank)?.query_heads)? }
-                else { CsaLayer::workspace_bytes(rows)? };
+                cuteafd_loader::plan::families::step5::native::plane_bytes(
+                            &cuteafd_loader::plan::families::step5::native::swa_planes(rows, ownership.layer(layer, rank)?.query_heads)?)? }
+                else { cuteafd_loader::plan::families::step5::native::plane_bytes(
+                            &cuteafd_loader::plan::families::step5::native::csa_planes(rows)?)? };
             let ffn = if contract.layers[layer].dense_activation.is_some() {
                 DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?.workspace_bytes()
             } else {
                 RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?.workspace_bytes()
             };
-            workspace = workspace.checked_add(attention).and_then(|n| n.checked_add(ffn))
-                .context("Step-5 native rank workspace overflow")?;
+            workspace = workspace.max(attention.checked_add(ffn)
+                .context("Step-5 native rank workspace overflow")?);
         }
         Ok(RankAdmission { immutable, workspace })
     }
@@ -437,7 +473,8 @@ impl<'e, 'a> LaneExecution<'e, 'a> {
         let execution = Self { id, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(id)?), lanes: lanes.into_iter().map(RefCell::new).collect(),
             pinned, rows, inventory, requests: Cell::new(0), placement_version,
-            terminal_output: Cell::new(None) };
+            terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
+            diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
         if count == 92 { execution.validate_replications()?; }
         Ok(execution)
     }
@@ -617,6 +654,27 @@ impl<'e, 'a> Execution<'e, 'a> {
         self.lanes[0].native.rope[rank].clone()
     }
 
+    pub(super) fn poison_scratch_between_layers(&self) {
+        for lane in &self.lanes { lane.poison_scratch.set(true); }
+    }
+
+    pub(super) fn retain_diagnostic_outputs(&self, layers: &[usize]) -> Result<()> {
+        for lane in &self.lanes {
+            ensure!(layers.iter().all(|&layer| layer < lane.inventory.len()),
+                "Step-5 diagnostic layer outside loaded target");
+            *lane.diagnostic_outputs.borrow_mut() = layers.iter().map(|&layer| (layer, Vec::new())).collect();
+        }
+        Ok(())
+    }
+
+    pub(super) fn diagnostic_output(&self, lane: usize, layer: usize) -> Result<Vec<f32>> {
+        let lane = self.lanes.get(lane).context("Step-5 diagnostic lane")?;
+        let outputs = lane.diagnostic_outputs.borrow();
+        let bytes = outputs.get(&layer).filter(|bytes| !bytes.is_empty())
+            .context("Step-5 diagnostic residual was not retained before scratch reuse")?;
+        Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
+    }
+
     pub(super) fn lane_count(&self) -> usize { self.lanes.len() }
     pub(super) fn lane_stages(&self, lane: usize) -> Result<Vec<&'e Staging<'a>>> {
         Ok(self.lanes.get(lane).context("Step-5 staging lane")?.stages.clone())
@@ -627,13 +685,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(self.lanes.len() == 1, "Step-5 singleton diagnostic requires one lane");
         Ok(&self.lanes[0])
     }
-    pub fn output(&self, layer: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
-        self.only_lane()?.output(layer)
-    }
     pub(super) fn head(&self) -> Result<&super::head::TargetHeadOwner<'a>> { self.only_lane()?.head() }
-    pub(super) fn lane_output(&self, lane: usize, layer: usize) -> Result<(Device<'a>, CuteafdDeviceBuffer)> {
-        self.lanes.get(lane).context("Step-5 output lane outside admission")?.output(layer)
-    }
     pub(super) fn lane_head(&self, lane: usize) -> Result<&super::head::TargetHeadOwner<'a>> {
         self.lanes.get(lane).context("Step-5 head lane outside admission")?.head()
     }
@@ -754,6 +806,21 @@ struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     diagnostic: Option<&'s std::path::Path>,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
+    fn retain_diagnostic_output(&self, layer: usize) -> Result<()> {
+        if !self.execution.diagnostic_outputs.borrow().contains_key(&layer) { return Ok(()); }
+        let (device, output) = self.execution.output(layer)?;
+        let rank = match self.execution.ownership.execution().mode(layer)? {
+            LayerMode::Whole { gpu, .. } => gpu as usize,
+            LayerMode::HeadSplit => 0,
+            LayerMode::ContextSplit => anyhow::bail!("Step-5 context diagnostic unsupported"),
+        };
+        self.execution.stages[rank].stream.drain()?;
+        let mut bytes = vec![0; self.step.rows() * H * 4];
+        device.run(|| device.library.copy_d2h(&mut bytes, output))?;
+        self.execution.diagnostic_outputs.borrow_mut().insert(layer, bytes);
+        Ok(())
+    }
+
     fn copy(&mut self, rank: usize, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
         ensure!(destination.device_id == self.execution.device(rank)?.id
             && source.device_id == destination.device_id && !source.ptr.is_null() && !destination.ptr.is_null()
@@ -769,6 +836,10 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         let owner = self.execution.layer(rank, layer)?;
         let source = self.current[rank].unwrap_or(self.input);
         self.copy(rank, owner.input(), source)?;
+        if self.execution.poison_scratch.get() {
+            self.execution.stages[rank].stream.drain()?;
+            self.execution.native.arenas[rank].poison_after(self.step.rows() * H * 4)?;
+        }
         match &owner.attention {
             Attention::Sliding(owner) => owner.enqueue_attention_step(self.step, rank),
             Attention::Sparse(owner) => owner.enqueue_attention_step(self.step, rank),
@@ -885,7 +956,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     }
     fn finish_ffn(&mut self, layer: usize, ticket: Self::FfnTicket) -> Result<()> {
         let execution = self.execution;
-        let Some(rank) = ticket else { return Ok(()); };
+        let Some(rank) = ticket else { return self.retain_diagnostic_output(layer); };
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
         self.step.compose(rank, ffn, |ffn, meta| {
             let mut lane = execution.lanes[rank].borrow_mut();
@@ -917,7 +988,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                 ffn.finish_on(meta.rows, meta.stream)
             })?;
         }
-        Ok(())
+        self.retain_diagnostic_output(layer)
     }
 }
 
@@ -1216,12 +1287,12 @@ mod admission_tests {
         let head = super::super::head::tests::admission_plan(64);
         let base = RankAdmission { immutable: 1000, workspace: 2000 };
         let plan = base.with_head(&head)?;
-        assert_eq!(plan.bytes(1)?, base.bytes(1)? + head.bytes());
-        assert_eq!(plan.bytes(2)?, base.bytes(2)? + head.bytes() + head.workspace_bytes());
-        assert_eq!(plan.bytes(2)? - plan.bytes(1)?, 2000 + head.workspace_bytes());
+        assert_eq!(plan.bytes(1)?, base.immutable + head.immutable_bytes() + head.workspace_bytes());
+        assert_eq!(plan.bytes(2)?, base.immutable + head.immutable_bytes() + 2 * head.workspace_bytes());
+        assert_eq!(plan.bytes(2)? - plan.bytes(1)?, head.workspace_bytes());
         assert!(plan.check(2, plan.bytes(2)? - 1, &[]).is_err());
         assert!(RankAdmission { immutable: u64::MAX, workspace: 0 }.with_head(&head).is_err());
-        assert!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head).is_err());
+        assert_eq!(RankAdmission { immutable: 0, workspace: u64::MAX }.with_head(&head)?.workspace, u64::MAX);
         Ok(())
     }
 
