@@ -61,6 +61,7 @@ def jobs(scope):
         for label, names in (("decode", "kda_m64"), ("prefill", "kda_m4096"), ("commit", "kda_commit")):
             result.append((f"kda-{geometry}-{label}", "export_b12x_dsv4_aot.py",
                            ["--geometry", geometry, "--only", names]))
+    result.append(("kimi-split", "export_b12x_kimi_split_aot.py", []))
     for heads in (48, 96):
         suffix = "" if heads == 48 else "_h96"
         names = [f"{op}{suffix}_m{rows}" for rows in (64, 4096)
