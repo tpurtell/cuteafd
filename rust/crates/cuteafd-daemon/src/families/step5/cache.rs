@@ -22,6 +22,7 @@ pub(super) struct CacheRank<'a> {
     slots: u64,
     marks_at: Vec<Option<u64>>,
     pending_bank: Vec<Cell<bool>>,
+    predictor_evidence: Vec<Vec<Cell<u64>>>,
     pub(super) poisoned: Cell<bool>,
     pub(super) busy: Vec<Cell<bool>>,
     reservation: Reservation,
@@ -47,8 +48,11 @@ impl<'a> CacheRank<'a> {
         let marks = if reservation.marks > 0 { Some(Rc::new(Allocation::new(device, reservation.marks)?)) } else { None };
         let page_count = pages;
         let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
+        let predictor_evidence = (0..sequences).map(|_|
+            (0..layout.ranks[rank].mtp_lengths.len()).map(|_| Cell::new(0)).collect()).collect();
         let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), active, marks, pages, page_count, layout, rank, sequences, slots,
-            marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
+            marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], predictor_evidence,
+            poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
         device.run(|| {
             // SAFETY: the active allocation is live through completion on the owned stream.
@@ -105,6 +109,7 @@ impl<'a> CacheRank<'a> {
         }
         self.stream.drain()?;
         self.pending_bank[sequence as usize].set(false);
+        for stage in &self.predictor_evidence[sequence as usize] { stage.set(0); }
         guard.complete = true;
         Ok(())
     }
@@ -219,6 +224,20 @@ impl<'a> CacheRank<'a> {
         self.request_component(if bank { state.next_length } else { state.length }, sequence)
     }
 
+    /// Submission evidence only; the authoritative length remains in device state.
+    /// Restore refreshes this evidence once at the prefix boundary, never per step.
+    pub(super) fn predictor_frontier(&self, sequence: u64, stage: usize) -> Result<u64> {
+        self.validate_reset(sequence)?;
+        Ok(self.predictor_evidence[sequence as usize].get(stage)
+            .context("Step-5 predictor stage evidence missing")?.get())
+    }
+
+    pub(super) fn record_predictor_frontier(&self, sequence: u64, stage: usize, end: u64) -> Result<()> {
+        self.predictor_evidence.get(sequence as usize).and_then(|stages| stages.get(stage))
+            .context("Step-5 predictor publication evidence missing")?.set(end);
+        Ok(())
+    }
+
     fn predictor_frontiers(&self, sequence: u64, slot: Option<u64>) -> Result<Vec<u64>> {
         let mark = slot.map(|slot| self.mark_view(u32::try_from(slot)?)).transpose()?;
         self.layout.ranks[self.rank].mtp_lengths.iter().map(|&span| {
@@ -289,7 +308,11 @@ impl<'a> CacheRank<'a> {
         let copies = self.snapshot_copies(sequence, slot, frontier, &stages)?;
         ensure!(self.marks_at[usize::try_from(slot)?] == Some(frontier),
             "Step-5 mark is absent or belongs to a different frontier");
-        self.restore_copies(copies)
+        self.restore_copies(copies)?;
+        for (stage, end) in stages.into_iter().enumerate() {
+            self.record_predictor_frontier(sequence, stage, end)?;
+        }
+        Ok(())
     }
 
     /// Validate canonical bytes, not arena-local capture bookkeeping, before
@@ -315,7 +338,11 @@ impl<'a> CacheRank<'a> {
         self.drain()?;
         let stages = self.predictor_frontiers(sequence, Some(slot))?;
         let copies = self.snapshot_copies(sequence, slot, frontier, &stages)?;
-        self.restore_copies(copies)
+        self.restore_copies(copies)?;
+        for (stage, end) in stages.into_iter().enumerate() {
+            self.record_predictor_frontier(sequence, stage, end)?;
+        }
+        Ok(())
     }
 
     fn check_idle(&self, sequence: u64) -> Result<()> {

@@ -33,6 +33,8 @@ struct Job {
 
 enum Command {
     Wave(Job),
+    Bootstrap(ExpertProtocolV2Request,
+        mpsc::Sender<Result<Vec<crate::worker_selection::InstalledExpertGrouping>>>),
     Quiesce(mpsc::Sender<Result<()>>),
     Release(mpsc::Sender<Result<()>>),
 }
@@ -100,6 +102,11 @@ impl SparkExpertLane {
             let _ = ready_tx.send(Ok(transport.world_size()));
             while let Ok(command) = inbox.recv() {
                 let Job { build, sink } = match command {
+                    Command::Bootstrap(request, reply) => {
+                        let result = transport.bootstrap(&request).and_then(|()| transport.installed_grouping());
+                        let _ = reply.send(result);
+                        continue;
+                    }
                     Command::Quiesce(reply) => {
                         let _ = reply.send(transport.terminal_quiesce());
                         continue;
@@ -134,6 +141,17 @@ impl SparkExpertLane {
 
     pub fn world_size(&self) -> usize {
         self.world
+    }
+
+    /// Bootstraps the widest admitted wave and returns actual worker metadata.
+    /// This startup-only control never dispatches expert work.
+    pub fn bootstrap(&mut self, request: ExpertProtocolV2Request, timeout: Duration)
+        -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
+        ensure!(!self.pending && !self.quiesced, "RoCE lane bootstrap requires an idle live lane");
+        let (reply, result) = mpsc::channel();
+        self.jobs.as_ref().context("RoCE lane closed")?.send(Command::Bootstrap(request, reply))
+            .map_err(|_| anyhow!("RoCE lane thread exited during bootstrap"))?;
+        result.recv_timeout(timeout).context("RoCE lane bootstrap reply missing or timed out")?
     }
 
     /// Queues one wave: `build` runs, the request is posted to every rank
@@ -238,7 +256,7 @@ mod tests {
                         reply.send(result).unwrap();
                     }
                     Command::Release(reply) => { reply.send(Ok(())).unwrap(); break; }
-                    Command::Wave(_) => panic!("terminal lane dispatched a wave"),
+                    Command::Wave(_) | Command::Bootstrap(_, _) => panic!("terminal lane dispatched work"),
                 }
             }
         });
@@ -253,6 +271,38 @@ mod tests {
         assert!(lane.thread.is_none() && lane.jobs.is_none());
         lane.terminal_quiesce()?;
         lane.terminal_release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn bootstrap_metadata_is_bounded_and_requires_an_idle_live_lane() -> Result<()> {
+        let request = || ExpertProtocolV2Request::new(1, 1, 3, 4096, crate::ExpertV2Dtype::Bf16,
+            vec![crate::ExpertProtocolV2RowDescriptor { row_id: 0, source_kind: crate::ExpertV2SourceKind::Prefill,
+                source_request_id: 1, token_position: 0, route_offset: 0, route_count: 1 }],
+            vec![crate::ExpertProtocolV2RouteEntry { row_index: 0, expert_id: 0, gate_weight: 0. }], vec![0; 8192]);
+        let (jobs, inbox) = mpsc::channel();
+        let (_report, done) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            while let Ok(command) = inbox.recv() {
+                match command {
+                    Command::Bootstrap(request, reply) => {
+                        assert_eq!(request.header.row_count, 1);
+                        reply.send(Err(anyhow!("injected bootstrap failure"))).unwrap();
+                    }
+                    _ => panic!("metadata control dispatched work"),
+                }
+            }
+        });
+        let mut lane = SparkExpertLane { jobs: Some(jobs), done, world: 1,
+            pending: true, thread: Some(thread), quiesced: false };
+        let timeout = Duration::from_secs(1);
+        assert!(lane.bootstrap(request()?, timeout).is_err());
+        lane.pending = false;
+        lane.quiesced = true;
+        assert!(lane.bootstrap(request()?, timeout).is_err());
+        lane.quiesced = false;
+        assert!(lane.bootstrap(request()?, timeout).unwrap_err().to_string().contains("injected"));
+        assert!(!lane.pending && !lane.quiesced);
         Ok(())
     }
 

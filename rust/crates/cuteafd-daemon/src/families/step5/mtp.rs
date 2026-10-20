@@ -302,16 +302,118 @@ impl<'a> StageOwner<'a> {
         // Borrow all producers/consumers through the proposal's Drop drain.
         cache.busy[sequence as usize].set(true);
         let mut step = StageStep { owner: self, cache, sequence, coordinates,
-            components, inputs: [embedding, previous_hidden], complete: false, enqueued: false };
+            components, inputs: [embedding.buffer, previous_hidden.buffer], complete: false, enqueued: false };
         step.enqueue()?;
         Ok(step)
+    }
+
+    fn live_forward<'e>(&'e mut self, cache: &'e super::cache::CacheRank<'a>,
+        sequence: u64, base: u64, rows: usize) -> Result<StageStep<'e, 'a>> {
+        ensure!(rows <= self.rows && self.cache_owner.get() == Some(cache.identity()),
+            "Step-5 live predictor capacity/cache binding");
+        cache.validate_reset(sequence)?;
+        ensure!(cache.predictor_frontier(sequence, self.stage)? == base,
+            "Step-5 live predictor submission evidence differs from its frontier");
+        let coordinates = Coordinates::new(self.stage, base, rows,
+            cache.layout().context, cache.layout().ring)?;
+        let components = self.cache_components(cache, sequence)?;
+        let inputs = [self.input.planes[4].buffer, self.input.planes[5].buffer];
+        cache.busy[sequence as usize].set(true);
+        let mut step = StageStep { owner: self, cache, sequence, coordinates,
+            components, inputs, complete: false, enqueued: false };
+        step.enqueue()?;
+        Ok(step)
+    }
+
+    /// Gather the preceding stage's own F32 residual (BF16 target for stage zero).
+    /// The caller retains the cache and this lane through completion.
+    fn gather_history(&self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+        base: u64, rows: usize) -> Result<()> {
+        let state = &cache.layout().ranks[cache.rank()];
+        let span = if self.stage == 0 { state.mtp_hidden.context("Step-5 target history absent")? }
+            else { state.mtp_stage_hidden[self.stage - 1] };
+        let source = cache.request_component(span, sequence)?;
+        let element = if self.stage == 0 { 2 } else { 4 };
+        let target = self.input.planes[5].buffer;
+        let ring = cuteafd_core::prefix::AppendRing { window: cache.layout().mtp_hidden_rows
+            - cache.layout().ring.step, step: cache.layout().ring.step, rows: cache.layout().mtp_hidden_rows };
+        self.stream.device.run(|| {
+            for run in ring.runs(base, rows as u64).context("Step-5 predictor source history extent")? {
+                let input = slice(source, run.slot as usize * H * element, run.rows as usize * H * element)?;
+                let output = slice(target, run.offset as usize * H * 4, run.rows as usize * H * 4)?;
+                // SAFETY: all views belong to retained cache/lane allocations;
+                // the lane drains before either producer can be reused.
+                unsafe {
+                    if element == 2 {
+                        self.stream.device.library.cuda_zero_bytes_async(output, output.bytes, self.stream.raw)?;
+                        self.stream.device.library.cuda_accumulate_bf16_to_f32_async(input,
+                            output, run.rows as usize * H, self.stream.raw)?;
+                    } else {
+                        self.stream.device.library.copy_d2d_async(output, input, output.bytes, self.stream.raw)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn propose(&mut self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+        base: u64, anchor: u32, earlier: &[CuteafdDeviceBuffer],
+        embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<CuteafdDeviceBuffer> {
+        let rows = earlier.len() + 1;
+        ensure!(rows == self.stage + 1, "Step-5 triangular predictor proposal depth");
+        cache.drain()?;
+        let stream = self.stream.clone();
+        let mut guard = stream.cancellation_guard("Step-5 chained predictor borrow");
+        self.gather_history(cache, sequence, base, rows)?;
+        self.stream.device.run(|| {
+            let ids = self.metadata[2].buffer;
+            self.stream.device.library.copy_h2d(slice(ids, 0, 4)?, &anchor.to_le_bytes())?;
+            for (row, source) in earlier.iter().enumerate() {
+                // SAFETY: previous stages have drained, and all token planes
+                // remain owned by this runtime until the complete chain finishes.
+                unsafe { self.stream.device.library.copy_d2d_async(
+                    slice(ids, (row + 1) * 4, 4)?, slice(*source, 0, 4)?, 4, self.stream.raw)?; }
+            }
+            // SAFETY: admitted private ids and embedding output remain live
+            // through this stage's Drop drain; every id is ordered on this stream.
+            unsafe { embedding.embed_device_ids(ids, None, rows, 1, None,
+                self.input.planes[4].buffer, self.stream.raw) }
+        })?;
+        let step = self.live_forward(cache, sequence, base, rows)?;
+        let logits = step.logits()?;
+        let selected = step.owner.metadata[4].buffer;
+        stream.device.run(|| {
+            // SAFETY: the final active head row and disjoint id/status words
+            // are retained through the proposal's drain. No host token hop.
+            unsafe { stream.device.library.cuda_logits_greedy_f32_async(
+                logits.ptr.wrapping_byte_add((rows - 1) * logits.stride * 4), 1,
+                128896, logits.stride, selected.ptr, std::ptr::null_mut(),
+                selected.ptr.wrapping_byte_add(4), stream.raw) }
+        })?;
+        drop(step);
+        guard.complete = true;
+        Ok(selected)
+    }
+
+    pub(super) fn teacher(&mut self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+        base: u64, tokens: &[u32], embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
+        cache.drain()?;
+        let stream = self.stream.clone();
+        let mut guard = stream.cancellation_guard("Step-5 teacher history borrow");
+        self.gather_history(cache, sequence, base, tokens.len())?;
+        self.stream.device.run(|| embedding.embed(tokens, self.metadata[2].buffer,
+            1, self.input.planes[4].buffer, self.stream.raw))?;
+        self.live_forward(cache, sequence, base, tokens.len())?.publish(tokens.len())?;
+        guard.complete = true;
+        Ok(())
     }
 }
 impl Drop for StageOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("Step-5 predictor stage owner"); }
 }
 
-fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+pub(super) fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
     ensure!(offset.checked_add(bytes).is_some_and(|n| n <= buffer.bytes),
         "Step-5 predictor slice extent");
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes, ..buffer })
@@ -325,7 +427,7 @@ pub(super) struct StageStep<'e, 'a> {
     sequence: u64,
     coordinates: Coordinates,
     components: [CuteafdDeviceBuffer; 4],
-    inputs: [&'e Allocation<'a>; 2],
+    inputs: [CuteafdDeviceBuffer; 2],
     complete: bool,
     enqueued: bool,
 }
@@ -345,7 +447,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
                 unsafe { stream.device.library.copy_h2d_ordered(owner.metadata[plane].buffer, &bytes, stream.raw) }
             })?;
         }
-        let hidden = owner.input.enqueue(self.inputs[0].buffer, self.inputs[1].buffer, rows)?;
+        let hidden = owner.input.enqueue(self.inputs[0], self.inputs[1], rows)?;
         stream.device.run(|| {
             // SAFETY: disjoint admitted EH and SWA input planes survive the proposal.
             unsafe { stream.device.library.copy_d2d_async(owner.attention.input(), hidden, rows * H * 4, stream.raw) }
@@ -405,6 +507,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
             let length = self.coordinates.base + accepted as u64;
             self.cache.stream.device.run(|| self.cache.stream.device.library.copy_h2d(
                 self.components[2], &length.to_le_bytes())).inspect_err(|_| self.cache.poisoned.set(true))?;
+            self.cache.record_predictor_frontier(self.sequence, self.owner.stage, length)?;
         }
         self.complete = true;
         Ok(())
@@ -417,9 +520,165 @@ impl Drop for StageStep<'_, '_> {
     }
 }
 
+#[derive(Default)]
+pub(super) struct DraftState {
+    anchor: Option<u32>,
+    open: bool,
+}
+impl crate::shared::qwen::scheduler::DraftState for DraftState {
+    fn pending_rows(&self) -> usize { usize::from(self.open || self.anchor.is_some()) }
+    fn close(&mut self, token: u32) {
+        if self.open { self.anchor = Some(token); self.open = false; }
+    }
+}
+
+fn teacher_tokens(stage: usize, base: usize, start: usize, end: usize,
+    capacity: usize, known: &[(usize, u32)]) -> Result<Vec<u32>> {
+    ensure!(stage < 3 && start <= end && base == start.saturating_sub(stage + 1),
+        "Step-5 teacher requires the exact preceding canonical frontier");
+    let frontier = end.saturating_sub(stage + 1);
+    ensure!(frontier - base <= capacity, "Step-5 teacher rows exceed admitted workspace");
+    (base + stage + 1..end).map(|position| known.iter().find(|&&(p, _)| p == position)
+        .map(|&(_, token)| token).context("Step-5 teacher token missing from retained suffix"))
+        .collect()
+}
+
+/// The shared scheduler owns acceptance. This runtime only catches up canonical
+/// teacher rows and leaves the triangular draft tail uncommitted.
+pub(super) struct Runtime<'a> {
+    stages: std::cell::RefCell<Vec<StageOwner<'a>>>,
+    tokens: std::cell::RefCell<Vec<Vec<(usize, u32)>>>,
+    rank: usize,
+}
+impl<'a> Runtime<'a> {
+    pub(super) fn load(execution: &super::execution::Execution<'_, 'a>,
+        programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+        cache: &super::cache::CacheRank<'a>, depth: usize, rows: usize,
+        available: u64, reservations: &[u64]) -> Result<Self> {
+        ensure!((1..=3).contains(&depth) && rows > depth,
+            "Step-5 predictor runtime depth/row capacity");
+        let immutable = RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
+        let workspace = cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, depth)?;
+        let total = reservations.iter().try_fold(immutable.checked_add(workspace)
+            .context("Step-5 predictor runtime admission overflow")?, |n, bytes| n.checked_add(*bytes))
+            .context("Step-5 predictor runtime reservation overflow")?;
+        ensure!(total <= available && cache.layout().ranks[cache.rank()].mtp_lengths.len() == depth,
+            "Step-5 predictor runtime exceeds admitted owners/cache");
+        let mut stages = Vec::with_capacity(depth);
+        for stage in 0..depth {
+            let owner = StageOwner::load(cache.stream.device, programs, checkpoint, stage,
+                rows, execution.predictor_rope(), available, &[])?;
+            owner.bind_cache(cache)?;
+            stages.push(owner);
+        }
+        Ok(Self { stages: std::cell::RefCell::new(stages),
+            tokens: std::cell::RefCell::new(vec![Vec::new(); cache.sequences() as usize]), rank: cache.rank() })
+    }
+
+    pub(super) fn rank(&self) -> usize { self.rank }
+
+    pub(super) fn bind(&self, sequence: u64, tokens: &[u32], resume: usize) {
+        let mut retained = self.tokens.borrow_mut();
+        retained[sequence as usize] = tokens[..resume].iter().copied().enumerate()
+            .skip(resume.saturating_sub(4)).collect();
+    }
+
+    fn catch_up(&self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+        start: usize, tokens: &[u32], embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
+        let end = start.checked_add(tokens.len()).context("Step-5 teacher token extent")?;
+        let mut retained = self.tokens.borrow_mut();
+        let known = &mut retained[sequence as usize];
+        known.retain(|&(position, _)| position < start);
+        known.extend(tokens.iter().copied().enumerate().map(|(i, token)| (start + i, token)));
+        for (stage, owner) in self.stages.borrow_mut().iter_mut().enumerate() {
+            let base = cache.predictor_frontier(sequence, stage)? as usize;
+            let selected = teacher_tokens(stage, base, start, end, owner.rows, known)?;
+            if !selected.is_empty() { owner.teacher(cache, sequence, base as u64, &selected, embedding)?; }
+        }
+        known.retain(|&(position, _)| position >= end.saturating_sub(4));
+        Ok(())
+    }
+
+    pub(super) fn prefill(&self, cache: &super::cache::CacheRank<'a>, placement: &super::prefix::Placement,
+        start: usize, tokens: &[u32], state: &mut DraftState,
+        embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
+        self.catch_up(cache, placement.sequence, start, tokens, embedding)?;
+        state.anchor = None;
+        state.open = true;
+        Ok(())
+    }
+
+    pub(super) fn accept(&self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+        start: usize, tokens: &[u32], after: u32, state: &mut DraftState,
+        embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<()> {
+        self.catch_up(cache, sequence, start, tokens, embedding)?;
+        state.anchor = Some(after);
+        state.open = false;
+        Ok(())
+    }
+
+    pub(super) fn draft(&self, cache: &super::cache::CacheRank<'a>, sequence: u64,
+        frontier: usize, state: &DraftState, depth: usize,
+        embedding: &crate::shared::token_io::TokenEmbedding<'a>) -> Result<Vec<u32>> {
+        let Some(anchor) = state.anchor else { ensure!(depth == 0, "Step-5 draft anchor is open"); return Ok(Vec::new()); };
+        let mut stages = self.stages.borrow_mut();
+        ensure!(depth <= stages.len(), "Step-5 draft depth exceeds admission");
+        let depth = depth.min(frontier);
+        let mut selected = Vec::with_capacity(depth);
+        for (stage, owner) in stages.iter_mut().take(depth).enumerate() {
+            let base = frontier.checked_sub(stage + 1).context("Step-5 draft prefix too short")?;
+            selected.push(owner.propose(cache, sequence, base as u64, anchor, &selected, embedding)?);
+        }
+        selected.into_iter().map(|buffer| {
+            let mut bytes = [0; 8];
+            cache.stream.device.run(|| cache.stream.device.library.copy_d2h(&mut bytes, slice(buffer, 0, 8)?))?;
+            ensure!(u32::from_le_bytes(bytes[4..].try_into()?) == 0,
+                "Step-5 predictor logits contain a non-finite value");
+            Ok(u32::from_le_bytes(bytes[..4].try_into()?))
+        }).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn teacher_suffix_is_canonical_across_small_prefixes_and_full_chunks() -> Result<()> {
+        for stage in 0..3 {
+            for start in [0usize, 1, 2, 3, 63, 64, 511, 575, 576] {
+                for rows in [0, 1, 3, 64, 256] {
+                    let end = start + rows;
+                    let known = (start.saturating_sub(4)..end).map(|p| (p, p as u32)).collect::<Vec<_>>();
+                    let base = start.saturating_sub(stage + 1);
+                    let selected = teacher_tokens(stage, base, start, end, 256, &known)?;
+                    assert_eq!(selected.len(), end.saturating_sub(stage + 1) - base);
+                    assert_eq!(selected, (base + stage + 1..end).map(|p| p as u32).collect::<Vec<_>>());
+                    if base > 0 { assert!(teacher_tokens(stage, base - 1, start, end, 256, &known).is_err()); }
+                }
+            }
+        }
+        assert!(teacher_tokens(0, 7, 8, 10, 1, &[(8, 1), (9, 2)]).is_err());
+        assert!(teacher_tokens(1, 6, 8, 10, 4, &[(9, 2)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn draft_anchor_opens_only_at_prompt_end_or_accepted_target() {
+        use crate::shared::qwen::scheduler::DraftState as _;
+        let mut state = DraftState::default();
+        assert_eq!(state.pending_rows(), 0);
+        state.close(13);
+        assert_eq!(state.anchor, None);
+        state.open = true;
+        assert_eq!(state.pending_rows(), 1);
+        state.close(17);
+        assert_eq!(state.anchor, Some(17));
+        assert!(!state.open);
+        state.close(19);
+        assert_eq!(state.anchor, Some(17));
+    }
+
     #[test]
     #[ignore = "requires sealed SM120 exports, real Step-5 weights and pinned MTP fixtures"]
     fn native_predictors_match_reference_replay_and_fresh_prefix() -> Result<()> {

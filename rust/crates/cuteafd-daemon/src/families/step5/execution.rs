@@ -86,6 +86,7 @@ impl<'a> Layer<'a> {
 struct NativeLane<'a> {
     ranks: Vec<Vec<Option<Layer<'a>>>>,
     head: Option<super::head::TargetHeadOwner<'a>>,
+    rope: Vec<Rc<TargetTables<'a>>>,
 }
 impl<'a> NativeLane<'a> {
     fn new_lane(&self) -> Result<Self> {
@@ -95,7 +96,7 @@ impl<'a> NativeLane<'a> {
                 .collect::<Result<_>>()?;
         }
         let head = self.head.as_ref().map(super::head::TargetHeadOwner::new_lane).transpose()?;
-        Ok(Self { ranks, head })
+        Ok(Self { ranks, head, rope: self.rope.clone() })
     }
 }
 
@@ -125,9 +126,11 @@ impl<'a> NativeLanes<'a> {
         admit_native_lanes(&admission, lanes, available, reservations, || {
             let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
             let mut ranks: Vec<Vec<Option<Layer<'a>>>> = (0..ownership.ranks()).map(|_| Vec::new()).collect();
+            let mut tables = Vec::with_capacity(ownership.ranks());
             for rank in 0..ownership.ranks() {
                 let device = devices[rank];
                 let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
+                tables.push(rope.clone());
                 for layer in 0..count {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                     let attention = if contract.layers[layer].sliding.is_some() {
@@ -149,7 +152,7 @@ impl<'a> NativeLanes<'a> {
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load(devices[head_rank],
                 programs, checkpoint, plan, available[head_rank], &[])).transpose()?;
-            let first = NativeLane { ranks, head };
+            let first = NativeLane { ranks, head, rope: tables };
             let mut owners = Vec::with_capacity(lanes);
             for _ in 1..lanes { owners.push(first.new_lane()?); }
             owners.insert(0, first);
@@ -589,6 +592,31 @@ impl<'e, 'a> Execution<'e, 'a> {
         Ok(())
     }
 
+    pub(super) fn draft_geometry(&self, width: usize, rows: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        use crate::shared::draft::resource::{self, LayerHome};
+        let mut reports = Vec::new();
+        for execution in &self.lanes {
+            for lane in &execution.lanes {
+                let mut owner = lane.borrow_mut();
+                if let Some(owner) = owner.as_mut() {
+                    let request = bootstrap_request(execution.rows, execution.placement_version)?;
+                    reports.extend(owner.get_mut().lane.bootstrap(request, std::time::Duration::from_secs(300))?);
+                }
+            }
+        }
+        let homes = (0..92).map(|layer| {
+            if layer < 3 || layer == 91 { Ok(LayerHome::Dense) }
+            else { Ok(LayerHome::Remote { slice_bytes: resource::worker_weight_read_bytes(&reports, layer)? as f64 }) }
+        }).collect::<Result<Vec<_>>>()?;
+        resource::geometry_with_grouping(&homes, 352, 8, rows, width, 0,
+            |layer, rows| resource::worker_group_rows_for_input(&reports, layer, rows, true))
+    }
+
+    pub(super) fn predictor_rope(&self) -> Rc<TargetTables<'a>> {
+        let rank = self.ownership().execution().spec().head_gpu as usize;
+        self.lanes[0].native.rope[rank].clone()
+    }
+
     pub(super) fn lane_count(&self) -> usize { self.lanes.len() }
     pub(super) fn lane_stages(&self, lane: usize) -> Result<Vec<&'e Staging<'a>>> {
         Ok(self.lanes.get(lane).context("Step-5 staging lane")?.stages.clone())
@@ -694,6 +722,18 @@ fn expert_request(identity: u64, placement_version: u64, layer: usize,
         u32::try_from(layer)?, H as u32, ExpertV2Dtype::Bf16, rows, routes, wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
+}
+
+fn bootstrap_request(rows: usize, placement_version: u64) -> Result<ExpertProtocolV2Request> {
+    ensure!((1..=4096).contains(&rows), "Step-5 bootstrap row capacity");
+    let descriptors = (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
+        row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+        token_position: u64::from(row), route_offset: row * 8, route_count: 8,
+    }).collect();
+    let routes = (0..rows * 8).map(|i| ExpertProtocolV2RouteEntry {
+        row_index: (i / 8) as u32, expert_id: (i % 352) as u32, gate_weight: 0.,
+    }).collect();
+    expert_request(1, placement_version, 3, descriptors, routes, vec![0; rows * H * 2].into())
 }
 
 fn check_captures(startup: u64, current: u64) -> Result<()> {
@@ -1013,6 +1053,22 @@ mod tests {
         for (id, version, layer) in [(0, 812, 88), (39, 0, 88), (39, 812, 2), (39, 812, 91)] {
             assert!(expert_request(id, version, layer, rows.clone(), routes.clone(), wire.clone()).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_bootstrap_sizes_the_full_bf16_wave_without_fake_grouping() -> Result<()> {
+        for rows in [1, 64, 256, 4096] {
+            let request = bootstrap_request(rows, 92)?;
+            assert_eq!(request.header.row_count as usize, rows);
+            assert_eq!(request.header.placement_version, 92);
+            assert_eq!(request.rows.len(), rows);
+            assert_eq!(request.routes.len(), rows * 8);
+            assert!(request.routes.iter().all(|route| route.expert_id < 352));
+        }
+        assert!(bootstrap_request(0, 92).is_err());
+        assert!(bootstrap_request(4097, 92).is_err());
+        assert!(bootstrap_request(64, 0).is_err());
         Ok(())
     }
 

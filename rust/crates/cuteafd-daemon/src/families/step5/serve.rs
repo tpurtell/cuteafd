@@ -1,4 +1,4 @@
-//! Eager target-only serving over the native executor and shared scheduler.
+//! Eager native target and opt-in MTP over the shared scheduler.
 use super::{admission::{self, RuntimeInputs}, backend::{Inputs, Step5Backend}, cache::CacheRank,
     execution::Execution, transaction::Staging};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::Device,
@@ -35,6 +35,9 @@ pub(crate) struct ServeArgs {
     /// Native execution lanes, independent of scheduler sequence slots.
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     execution_lanes: u8,
+    /// Native predictor depth. Opt-in until live lossless and speed qualification.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=3))]
+    mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
     #[arg(long, default_value_t = 32768)]
@@ -66,6 +69,8 @@ impl ServeArgs {
         ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");
         ensure!(usize::from(self.max_sequences) <= self.prefill_rows as usize,
             "Step-5 sequence capacity exceeds row capacity");
+        ensure!(usize::from(self.mtp) < self.prefill_rows as usize,
+            "Step-5 predictor depth exceeds row capacity");
         ensure!(self.token_io.embed_placement == EmbedPlacement::Gpu,
             "Step-5 requires admitted GPU token embeddings");
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
@@ -150,7 +155,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
-    let admission = admission::admit(&programs, &checkpoint, &inputs)?;
+    let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     // Uploads convert on the host and copy synchronously. No transient device
     // conversion arena exists: each loading phase is bounded by retained owners.
     inputs.startup = admission.placement.items.iter().enumerate().map(|(rank, items)| {
@@ -159,7 +164,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         Ok(Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Workspace,
             "Step-5 retained loading peak", bytes, cuteafd_core::memory_layout::Basis::Exact))
     }).collect::<Result<Vec<_>>>()?;
-    let admission = admission::admit(&programs, &checkpoint, &inputs)?;
+    let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
     let endpoint = SparkEndpoint { capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
     let clients = admission.ownership.routed_endpoints()?;
@@ -178,6 +183,16 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
             .context("Step-5 solved allocation overflow")?;
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
+    let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
+    let predictor_budget = if args.mtp > 0 {
+        let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::for_mtp(
+            &checkpoint, usize::from(args.mtp))?.resident_bytes.checked_add(
+            cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(
+                inputs.rows, usize::from(args.mtp))?).context("Step-5 predictor budget overflow")?;
+        let total = admission.placement.items[head_rank].iter().try_fold(0u64, |sum, item| sum.checked_add(item.bytes))
+            .context("Step-5 solved predictor allocation overflow")?;
+        Some((available[head_rank], total.checked_sub(own).context("Step-5 predictor absent from ledger")?))
+    } else { None };
     let caches = devices.iter().enumerate().map(|(rank, &device)| Ok(RefCell::new(CacheRank::new(device,
         admission.cache.clone(), rank, inputs.sequences as u64, admission.marks as u64,
         admission.placement.pool_tokens / 64, admission.reservations[rank].total)?)))
@@ -203,12 +218,18 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         Execution::load_lanes_count(&programs, &checkpoint, admission.ownership,
             caches.iter().collect(), stages.iter().map(|rank| rank.iter().collect()).collect(), inputs.rows,
             available, reserves, transports, 92, 1))?;
+    let mtp = predictor_budget.map(|(available, reserved)| super::mtp::Runtime::load(
+        &execution, &programs, &checkpoint, &caches[head_rank].borrow(),
+        usize::from(args.mtp), inputs.rows, available, &[reserved])).transpose()?;
     let backend = Step5Backend::new(&execution, caches.iter().collect(), &embedding, lane_inputs.iter().collect())?;
+    let backend = if let Some(mtp) = &mtp { backend.with_mtp(mtp) } else { backend };
+    let drafts = if args.mtp == 0 { scheduler::Drafts::None }
+        else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
     library.cuda_set_device(args.device)?;
-    tracing::info!(rows=inputs.rows, sequences=inputs.sequences, lanes=inputs.lanes,
+    tracing::info!(rows=inputs.rows, sequences=inputs.sequences, lanes=inputs.lanes, mtp=args.mtp,
         context=backend.geometry().max_context, pool_tokens=admission.placement.pool_tokens,
-        "Step-5 admitted eager target; native MTP disabled");
-    scheduler::schedule(&backend, &args.snapshot, receive, stats, inputs.sequences, scheduler::Drafts::None,
+        "Step-5 admitted eager target and native predictor depth");
+    scheduler::schedule(&backend, &args.snapshot, receive, stats, inputs.sequences, drafts,
         eos, args.decode_share, &args.prefix, args.token_io.token_select, &mut text_media(), None,
         || initialized(backend.geometry().max_context))
 }

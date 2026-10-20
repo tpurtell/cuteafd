@@ -154,12 +154,7 @@ impl<'a> Inputs<'a> {
     }
 }
 
-#[derive(Default)]
-pub(super) struct NoDraft;
-impl scheduler::DraftState for NoDraft {
-    fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _token: u32) {}
-}
+type NoDraft = super::mtp::DraftState;
 
 pub(super) struct Step5Backend<'e, 'a> {
     // Retire the Step before any borrowed native or input owner can disappear.
@@ -173,6 +168,7 @@ pub(super) struct Step5Backend<'e, 'a> {
     context: usize,
     sequences: usize,
     library: &'a NativeLibrary,
+    mtp: Option<&'e super::mtp::Runtime<'a>>,
 }
 
 impl<'e, 'a> Step5Backend<'e, 'a> {
@@ -208,7 +204,12 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             _ => anyhow::bail!("CUTEAFD_DIAG_STEP5_FAIL_VERIFY_ONCE must be unset or 1"),
         };
         Ok(Self { state: BackendState::new(inputs.len(), fail_verify_once)?, execution, ranks, embedding, inputs,
-            profile: RefCell::new([0.0; 2]), rows, context, sequences, library })
+            profile: RefCell::new([0.0; 2]), rows, context, sequences, library, mtp: None })
+    }
+
+    pub(super) fn with_mtp(mut self, mtp: &'e super::mtp::Runtime<'a>) -> Self {
+        self.mtp = Some(mtp);
+        self
     }
 
     fn execute(&self, lane: usize, sequences: &[(&mut Placement, &[u32])], pool: &RefPagePool,
@@ -244,6 +245,29 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
         let head = self.execution.lane_head(lane)?;
         let logits = step.compose(head_rank, head, |head, meta| {
             ensure!(device.id == meta.stream.device.id, "Step-5 final output/head device mismatch");
+            let cache = self.ranks[head_rank].borrow();
+            if let Some(history) = cache.layout().ranks[head_rank].mtp_hidden {
+                let ring = cuteafd_core::prefix::AppendRing {
+                    window: cache.layout().mtp_hidden_rows - cache.layout().ring.step,
+                    step: cache.layout().ring.step, rows: cache.layout().mtp_hidden_rows,
+                };
+                for sequence in &descriptors {
+                    let target = cache.request_component(history, sequence.sequence)?;
+                    for run in ring.proposal(sequence.base as u64, sequence.rows as u64)
+                        .context("Step-5 target hidden proposal extent")? {
+                        let source = super::mtp::slice(output,
+                            (sequence.start + run.offset as usize) * H * 4, run.rows as usize * H * 4)?;
+                        let destination = super::mtp::slice(target,
+                            run.slot as usize * H * 2, run.rows as usize * H * 2)?;
+                        meta.stream.device.run(|| {
+                            // SAFETY: the Step retains target output and cache storage;
+                            // append-only slots stay invisible until target publication.
+                            unsafe { self.library.cuda_f32_to_bf16_async(source, destination,
+                                run.rows as usize * H, meta.stream.raw) }
+                        })?;
+                    }
+                }
+            }
             head.device_logits_on(output, meta.rows, meta.stream)
         })?;
         Ok((step, logits))
@@ -315,8 +339,11 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
     fn placement(&self, pages: Vec<u32>, slot: i32) -> Placement {
         Placement { pages, sequence: slot as u64, committed: 0 }
     }
-    fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia,
-        _tokens: &[u32], _resume: usize) { self.state.retire(); }
+    fn bind_request(&self, placement: &mut Placement, _coordinates: (), _media: RequestMedia,
+        tokens: &[u32], resume: usize) {
+        self.state.retire();
+        if let Some(mtp) = self.mtp { mtp.bind(placement.sequence, tokens, resume); }
+    }
     fn history(&self, _placement: &Placement) {}
     fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
@@ -349,21 +376,37 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
             "attention":"eager_per_sequence", "arithmetic":"eager"})
     }
-    fn draft_geometry(&self, _snapshot: &Path, _width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        anyhow::bail!("Step-5 native MTP layers 92..94 are not yet qualified")
+    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
+        self.execution.draft_geometry(width, self.geometry().decode_rows)
     }
-    fn arm_draft_probe(&self) -> Result<()> { anyhow::bail!("Step-5 MTP is not yet qualified") }
-    fn prefill_draft(&self, _placement: &Placement, _start: usize, _chunk: &[u32], _next: Option<u32>,
-        _draft: &mut NoDraft) -> Result<()> { anyhow::bail!("Step-5 MTP is not yet qualified") }
-    fn draft(&self, _sequences: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>],
-        _timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> { anyhow::bail!("Step-5 MTP is not yet qualified") }
+    fn arm_draft_probe(&self) -> Result<()> {
+        ensure!(self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
+        Ok(())
+    }
+    fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], _next: Option<u32>,
+        draft: &mut NoDraft) -> Result<()> {
+        let mtp = self.mtp.context("Step-5 MTP runtime is not admitted")?;
+        mtp.prefill(&self.ranks[mtp.rank()].borrow(), placement, start, chunk, draft, self.embedding)
+    }
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>],
+        timing: &mut scheduler::DraftTiming) -> Result<Vec<Vec<u32>>> {
+        let mtp = self.mtp.context("Step-5 MTP runtime is not admitted")?;
+        let started = std::time::Instant::now();
+        let cache = self.ranks[mtp.rank()].borrow();
+        let output = sequences.iter_mut().map(|sequence| mtp.draft(&cache, sequence.placement.sequence,
+            sequence.placement.committed, sequence.seq, sequence.depth, self.embedding)).collect();
+        timing.seconds += started.elapsed().as_secs_f64();
+        timing.steps += sequences.iter().map(|s| s.depth).sum::<usize>();
+        output
+    }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>],
         speculative: bool, draft: bool) -> Result<()> {
         let pending = self.state.take_pending();
-        ensure!(!draft, "Step-5 MTP is not yet qualified");
+        ensure!(!draft || self.mtp.is_some(), "Step-5 MTP runtime is not admitted");
         if let Some(step) = pending {
             let mut accepted = Vec::with_capacity(verified.len());
-            for sequence in verified {
+            for sequence in verified.iter_mut() {
                 let rows = sequence.kept.map_or(0, |(rows, _)| rows);
                 ensure!(rows <= sequence.rows.len(), "Step-5 accepted rows exceed proposal");
                 // A failed emission may advance the scheduler's logical length;
@@ -371,11 +414,24 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
                 if rows == 0 { sequence.placement.committed = sequence.start; }
                 accepted.push((&mut *sequence.placement, rows));
             }
-            step.publish_wave(&mut accepted)
+            step.publish_wave(&mut accepted)?;
         } else {
             ensure!(!speculative, "Step-5 speculative accept requires pending Step evidence");
-            self.state.immediate.accept(verified)
+            self.state.immediate.accept(verified)?;
         }
+        if draft {
+            let mtp = self.mtp.context("Step-5 MTP runtime is not admitted")?;
+            let cache = self.ranks[mtp.rank()].borrow();
+            // Finished turns can still publish prefix marks; catch up their
+            // accepted predictor state before the shared scheduler snapshots it.
+            for sequence in verified.iter_mut() {
+                if let Some((kept, after)) = sequence.kept {
+                    mtp.accept(&cache, sequence.placement.sequence, sequence.start,
+                        &sequence.rows[..kept], after, sequence.seq, self.embedding)?;
+                }
+            }
+        }
+        Ok(())
     }
     fn probe_begin(&self, _rows: usize) {}
     fn probe_end(&self) {}
@@ -407,7 +463,7 @@ mod tests {
             let tokens = [11, 13];
             *wave.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &tokens)]));
             placement.committed = 9;
-            let mut draft = NoDraft;
+            let mut draft = NoDraft::default();
             let mut actual = scheduler::Verified { placement: &mut placement, seq: &mut draft,
                 start: 7, history: (), rows: &tokens, first_row: 0, kept: Some((2, 17)), finished: false };
             match fault {
@@ -431,7 +487,7 @@ mod tests {
             let mut placement = Placement { pages: vec![3], sequence: 2, committed: 7 };
             *wave.0.borrow_mut() = Some(ImmediateWave::record(&[(&mut placement, &[11, 13])]));
             placement.committed = committed;
-            let mut draft = NoDraft;
+            let mut draft = NoDraft::default();
             let result = wave.accept(&[scheduler::Verified { placement: &mut placement, seq: &mut draft,
                 start: 7, history: (), rows: &[11, 13], first_row: 0, kept: None, finished: true }]);
             assert_eq!(result.is_ok(), (7..=9).contains(&committed));

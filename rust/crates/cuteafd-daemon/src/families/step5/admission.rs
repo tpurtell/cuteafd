@@ -16,7 +16,21 @@ pub(super) fn admit<'a>(
     checkpoint: &'a Checkpoint,
     inputs: &RuntimeInputs,
 ) -> Result<admission::Admission> {
-    let admitted = checkpoint_admission(checkpoint, inputs)?;
+    admit_mtp(programs, checkpoint, inputs, 0)
+}
+
+pub(super) fn admit_mtp<'a>(
+    programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
+    inputs: &RuntimeInputs, depth: usize,
+) -> Result<admission::Admission> {
+    measured(inputs)?;
+    let admitted = if depth == 0 { checkpoint_admission(checkpoint, inputs)? }
+        else { admission::admit_mtp(checkpoint, inputs, depth)? };
+    if depth > 0 {
+        for stage in 0..depth {
+            super::mtp::InputPlan::prepare(programs, checkpoint, stage, inputs.rows)?;
+        }
+    }
     let ownership = &admitted.ownership;
     for rank in 0..ownership.ranks() {
         let native =
