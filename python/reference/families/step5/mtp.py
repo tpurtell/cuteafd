@@ -200,3 +200,83 @@ class Stage:
         keep = all_positions > positions[-1] - self.window
         self.cache = tuple(value[keep].clone() for value in (all_positions, all_k, all_v))
         return hidden, logits
+
+
+def export_native_fixture(snapshot, source_root, output, *, rows=603):
+    """Small real-weight teacher chain, not an acceptance or serving benchmark."""
+    import json
+    import torch
+    from .golden import Weights
+    snapshot, output = Path(snapshot), Path(output)
+    identity = provenance(source_root)
+    if rows < 603 or rows > 1024:
+        raise ValueError("Step-5 native fixture needs a complete ring wrap")
+    output.mkdir(parents=True, exist_ok=False)
+    config = json.loads((snapshot / "config.json").read_text())
+    cfg = config.get("text_config", config)
+    torch.manual_seed(274)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    reader = Weights(snapshot)
+    embedding = reader.get("model.embed_tokens.weight").cuda()
+    tokens = torch.randint(0, cfg["vocab_size"], (rows,), device="cuda")
+    hidden = torch.randn((rows, cfg["hidden_size"]), device="cuda", dtype=torch.float32)
+    positions = torch.arange(rows, device="cuda")
+    probes = [0, 1, 63, 64, 511, 575, 576, 599]
+    cases = []
+    def save(path, value):
+        value = value.detach().contiguous().cpu()
+        data = value.view(torch.uint8).numpy().tobytes()
+        path.write_bytes(data)
+        return hashlib.sha256(data).hexdigest()
+    target_sha256 = save(output / "target_hidden.bin", hidden.bfloat16())
+    with torch.inference_mode():
+        for stage in range(3):
+            model = Stage.from_checkpoint(reader, config, stage, device="cuda")
+            tokens, previous, positions = teacher_inputs(tokens, hidden, positions)
+            inputs = embedding[tokens].bfloat16()
+            layer = 92 + stage
+            dim = round(cfg["head_dim"] * cfg["partial_rotary_factors"][layer])
+            theta = float(cfg["rope_theta"][layer])
+            frequency = 1.0 / (torch.tensor(theta, device="cuda", dtype=torch.float32)
+                ** (torch.arange(0, dim, 2, device="cuda", dtype=torch.float32) / dim))
+            scaling = cfg.get("rope_scaling")
+            types = cfg.get("yarn_only_types")
+            if scaling and (not types or "sliding_attention" in types):
+                wave = 2 * torch.pi / frequency
+                low = scaling["original_max_position_embeddings"] / scaling["low_freq_factor"]
+                high = scaling["original_max_position_embeddings"] / scaling["high_freq_factor"]
+                scaled = torch.where(wave > low, frequency / scaling["factor"], frequency)
+                smooth = ((scaling["original_max_position_embeddings"] / wave
+                    - scaling["low_freq_factor"]) / (scaling["high_freq_factor"] - scaling["low_freq_factor"]))
+                frequency = torch.where((wave >= high) & (wave <= low),
+                    (1-smooth)*scaled/scaling["factor"] + smooth*scaled, scaled)
+            angles = torch.arange(rows, device="cuda", dtype=torch.float32)[:, None] * frequency
+            hidden, logits = model.forward(inputs, previous, positions,
+                angles.cos().bfloat16(), angles.sin().bfloat16())
+            directory = output / f"stage{stage}"
+            directory.mkdir()
+            selected = torch.tensor(probes, device="cuda")
+            files = {"embedding.bin": inputs, "previous.bin": previous.float(),
+                "hidden.bin": hidden.float(), "logits.bin": logits[selected].float()}
+            digests = {name: save(directory / name, value) for name, value in files.items()}
+            cases.append({"stage": stage, "rows": len(inputs), "origin": stage+1,
+                "probes": probes, "sha256": digests})
+            del model, logits
+            reader.files.clear()
+            torch.cuda.empty_cache()
+    manifest = {"schema": 1, "seed": 274, "snapshot": snapshot.name,
+        "source": identity, "cases": cases, "row_capacity": 64,
+        "target_hidden_sha256": target_sha256, "target_rows": rows}
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2)+"\n")
+    print(json.dumps({"fixture": str(output), "cases": cases, "source": identity}), flush=True)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    export_native_fixture(args.snapshot, args.source_root, args.output)

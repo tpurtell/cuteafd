@@ -1,4 +1,4 @@
-//! Predictor input boundary only; no scheduler or cache frontier is advanced here.
+//! Predictor input and independent cache coordinates; no scheduler frontier advances here.
 use super::weights::load_operand;
 use crate::shared::memory::device::{Allocation, Device, Stream};
 use anyhow::{ensure, Context, Result};
@@ -162,9 +162,406 @@ impl Drop for InputOwner<'_> {
     fn drop(&mut self) { self.stream.drain_or_abort("Step-5 predictor input owner"); }
 }
 
+/// Teacher stage s starts at global s+1. KV rows are local to that stage;
+/// page-aligned rebasing bounds table storage without changing RoPE or key order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Coordinates {
+    global: Vec<i64>,
+    local: Vec<i64>,
+    table: Vec<i32>,
+    base: u64,
+    end: u64,
+}
+impl Coordinates {
+    fn new(stage: usize, base: u64, rows: usize, context: u64,
+        ring: cuteafd_core::prefix::AppendRing) -> Result<Self> {
+        ensure!(stage < 3 && (1..=4096).contains(&rows)
+            && ring.window == 512 && ring.rows > 0 && ring.rows % 64 == 0
+            && ring.step > 0 && ring.rows >= ring.window.saturating_add(ring.step),
+            "Step-5 predictor coordinate geometry");
+        let end = base.checked_add(rows as u64).context("Step-5 predictor frontier overflow")?;
+        let origin = stage as u64 + 1;
+        ensure!(rows as u64 <= ring.step && end.checked_add(origin).is_some_and(|n|
+            n <= context && n <= i64::MAX as u64), "Step-5 predictor context/step extent");
+        let shift = base.saturating_sub(ring.window) / 64 * 64;
+        let width = (end - shift).div_ceil(64);
+        let pages = ring.rows / 64;
+        let table = (0..width).map(|p| ((shift / 64 + p) % pages) as i32).collect();
+        Ok(Self { global: (base..end).map(|p| (p + origin) as i64).collect(),
+            local: (base..end).map(|p| (p - shift) as i64).collect(), table, base, end })
+    }
+}
+
+/// One stage's native owners and lane-private metadata. Never shares a stage
+/// head, F32 hidden plane or SWA workspace with a different predictor.
+pub(super) struct StageOwner<'a> {
+    stream: Rc<Stream<'a>>,
+    input: InputOwner<'a>,
+    attention: super::swa::SwaLayer<'a>,
+    head: super::head::TargetHeadOwner<'a>,
+    metadata: Vec<Allocation<'a>>,
+    stage: usize,
+    rows: usize,
+    immutable_bytes: u64,
+    workspace_bytes: u64,
+    cache_owner: std::cell::Cell<Option<usize>>,
+}
+impl<'a> StageOwner<'a> {
+    pub(super) fn load(device: Device<'a>, programs: &'a Programs<'a>,
+        checkpoint: &'a Checkpoint, stage: usize, rows: usize,
+        rope: Rc<super::rope::TargetTables<'a>>, available: u64, reservations: &[u64]) -> Result<Self> {
+        let input = InputPlan::prepare(programs, checkpoint, stage, rows)?;
+        let head = super::head::HeadPlan::for_mtp_stage(programs, checkpoint, stage, rows)?;
+        let immutable_bytes = RankWeightLayout::for_mtp_stage(checkpoint, stage)?.resident_bytes;
+        let metadata = cuteafd_loader::plan::families::step5::native::mtp_metadata_planes(rows)?;
+        let workspace_bytes = planes(rows)?.into_iter()
+            .chain(cuteafd_loader::plan::families::step5::native::swa_planes(rows, 64)?)
+            .chain(cuteafd_loader::plan::families::step5::native::dense_planes(rows)?)
+            .chain(cuteafd_loader::plan::families::step5::native::head_planes(rows)?)
+            .chain(metadata).try_fold(0u64, |n, bytes| n.checked_add(bytes as u64))
+            .context("Step-5 predictor owner workspace overflow")?;
+        let total = reservations.iter().copied().chain([immutable_bytes, workspace_bytes])
+            .try_fold(0u64, u64::checked_add).context("Step-5 predictor owner admission overflow")?;
+        ensure!(total <= available, "Step-5 predictor owner and reservations exceed admission");
+        let stream = Rc::new(Stream::new(device)?);
+        let input = InputOwner::load(device, programs, checkpoint, input, stream.clone(), available, &[])?;
+        let attention = super::swa::SwaLayer::for_mtp_stage(device, programs, checkpoint,
+            stage, rows, rope, available, &[])?;
+        let head = super::head::TargetHeadOwner::load(device, programs, checkpoint,
+            head, available, &[])?;
+        let metadata = metadata.into_iter().map(|n| Allocation::new(device, n))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { stream, input, attention, head, metadata, stage, rows,
+            immutable_bytes, workspace_bytes, cache_owner: std::cell::Cell::new(None) })
+    }
+
+    pub(super) fn new_lane(&self, available: u64, reservations: &[u64]) -> Result<Self> {
+        let total = reservations.iter().try_fold(self.workspace_bytes, |n, bytes| n.checked_add(*bytes))
+            .context("Step-5 predictor lane admission overflow")?;
+        ensure!(total <= available, "Step-5 predictor lane exceeds admission");
+        let stream = Rc::new(Stream::new(self.stream.device)?);
+        let input = self.input.new_lane(stream.clone())?;
+        let attention = self.attention.new_lane()?;
+        let head = self.head.new_lane()?;
+        let metadata = self.metadata.iter().map(|p| Allocation::new(stream.device, p.buffer.bytes))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { stream, input, attention, head, metadata, stage: self.stage, rows: self.rows,
+            immutable_bytes: self.immutable_bytes, workspace_bytes: self.workspace_bytes,
+            cache_owner: std::cell::Cell::new(None) })
+    }
+
+    /// Register once before any prefix capture or reset can observe this lane.
+    pub(super) fn bind_cache(&self, cache: &super::cache::CacheRank<'a>) -> Result<()> {
+        ensure!(self.cache_owner.get().is_none(), "Step-5 predictor lane already bound");
+        self.cache_components(cache, 0)?;
+        cache.register_lane(&self.stream)?;
+        self.cache_owner.set(Some(cache.identity()));
+        Ok(())
+    }
+
+    fn cache_components(&self, cache: &super::cache::CacheRank<'a>, sequence: u64)
+        -> Result<[CuteafdDeviceBuffer; 4]> {
+        ensure!(cache.stream.device.id == self.stream.device.id
+            && std::ptr::eq(cache.stream.device.library, self.stream.device.library),
+            "Step-5 predictor cache device mismatch");
+        let state = &cache.layout().ranks[cache.rank()];
+        let sliding = state.sliding.iter().find(|s| s.mtp && s.layer == 92 + self.stage)
+            .context("Step-5 predictor cache layer missing")?;
+        ensure!(sliding.query_heads == 64 && sliding.key.bytes == cache.layout().ring.rows * 4 * 192 * 2
+            && sliding.value.bytes == sliding.key.bytes,
+            "Step-5 predictor cache KV geometry");
+        let length = *state.mtp_lengths.get(self.stage).context("Step-5 predictor length missing")?;
+        let history = *state.mtp_stage_hidden.get(self.stage).context("Step-5 predictor history missing")?;
+        ensure!(length.bytes == 8 && history.bytes == cache.layout().mtp_hidden_rows * H as u64 * 4,
+            "Step-5 predictor cache history geometry");
+        [sliding.key, sliding.value, length, history].map(|span|
+            cache.request_component(span, sequence)).into_iter().collect::<Result<Vec<_>>>()?
+            .try_into().map_err(|_| anyhow::anyhow!("Step-5 predictor component inventory"))
+    }
+
+    /// Qualification path only: verify the restored frontier at this boundary.
+    /// Serving must retain stage cursor evidence rather than download lengths.
+    pub(super) fn forward<'e>(&'e mut self, cache: &'e super::cache::CacheRank<'a>,
+        sequence: u64, base: u64, embedding: &'e Allocation<'a>,
+        previous_hidden: &'e Allocation<'a>, rows: usize) -> Result<StageStep<'e, 'a>> {
+        ensure!(rows <= self.rows && self.cache_owner.get() == Some(cache.identity()),
+            "Step-5 predictor lane row capacity/cache binding");
+        cache.validate_reset(sequence)?;
+        let coordinates = Coordinates::new(self.stage, base, rows,
+            cache.layout().context, cache.layout().ring)?;
+        let components = self.cache_components(cache, sequence)?;
+        cache.drain()?;
+        let mut encoded = [0; 8];
+        cache.stream.device.run(|| cache.stream.device.library.copy_d2h(&mut encoded, components[2]))?;
+        ensure!(u64::from_le_bytes(encoded) == base, "Step-5 predictor frontier differs from committed cache");
+        for (buffer, bytes) in [(embedding.buffer, rows * H * 2),
+            (previous_hidden.buffer, rows * H * 4)] {
+            ensure!(!buffer.ptr.is_null() && buffer.bytes >= bytes && buffer.device_id == self.stream.device.id,
+                "Step-5 predictor input allocation extent/device");
+        }
+        // Borrow all producers/consumers through the proposal's Drop drain.
+        cache.busy[sequence as usize].set(true);
+        let mut step = StageStep { owner: self, cache, sequence, coordinates,
+            components, inputs: [embedding, previous_hidden], complete: false, enqueued: false };
+        step.enqueue()?;
+        Ok(step)
+    }
+}
+impl Drop for StageOwner<'_> {
+    fn drop(&mut self) { self.stream.drain_or_abort("Step-5 predictor stage owner"); }
+}
+
+fn slice(buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+    ensure!(offset.checked_add(bytes).is_some_and(|n| n <= buffer.bytes),
+        "Step-5 predictor slice extent");
+    Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.wrapping_byte_add(offset), bytes, ..buffer })
+}
+
+/// Appends only to speculative slack. Publication is independent from target
+/// acceptance; until coupled by the shared scheduler this is not a serving path.
+pub(super) struct StageStep<'e, 'a> {
+    owner: &'e mut StageOwner<'a>,
+    cache: &'e super::cache::CacheRank<'a>,
+    sequence: u64,
+    coordinates: Coordinates,
+    components: [CuteafdDeviceBuffer; 4],
+    inputs: [&'e Allocation<'a>; 2],
+    complete: bool,
+    enqueued: bool,
+}
+impl<'e, 'a> StageStep<'e, 'a> {
+    fn enqueue(&mut self) -> Result<()> {
+        let owner = &*self.owner;
+        let stream = &owner.stream;
+        let rows = self.coordinates.global.len();
+        let mut guard = stream.cancellation_guard("Step-5 predictor stage proposal");
+        for (plane, bytes) in [(0, self.coordinates.global.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>()),
+            (1, self.coordinates.local.iter().flat_map(|n| n.to_le_bytes()).collect()),
+            (2, vec![0; rows * 4]),
+            (3, self.coordinates.table.iter().flat_map(|n| n.to_le_bytes()).collect())] {
+            stream.device.run(|| {
+                // SAFETY: ordered upload retains source bytes; this proposal
+                // borrows every metadata allocation through stream drainage.
+                unsafe { stream.device.library.copy_h2d_ordered(owner.metadata[plane].buffer, &bytes, stream.raw) }
+            })?;
+        }
+        let hidden = owner.input.enqueue(self.inputs[0].buffer, self.inputs[1].buffer, rows)?;
+        stream.device.run(|| {
+            // SAFETY: disjoint admitted EH and SWA input planes survive the proposal.
+            unsafe { stream.device.library.copy_d2d_async(owner.attention.input(), hidden, rows * H * 4, stream.raw) }
+        })?;
+        owner.attention.project_on(rows, owner.metadata[0].buffer, stream)?;
+        let projected = owner.attention.predictor_projection()?;
+        for run in self.cache.layout().ring.proposal(self.coordinates.base, rows as u64)
+            .context("Step-5 predictor proposal ring")? {
+            for (target, source) in self.components[..2].iter().copied().zip(projected) {
+                let source = slice(source, run.offset as usize * 1536, run.rows as usize * 1536)?;
+                let target = slice(target, run.slot as usize * 1536, source.bytes)?;
+                stream.device.run(|| {
+                    // SAFETY: append-only proposal slots do not overlap committed
+                    // visible KV rows; all source and destination owners are retained.
+                    unsafe { stream.device.library.copy_d2d_async(target, source, source.bytes, stream.raw) }
+                })?;
+            }
+        }
+        owner.attention.predictor_finish_on(super::transaction::AttentionRead {
+            inputs: super::transaction::StepInputs { stream, positions: owner.metadata[1].buffer,
+                requests: owner.metadata[2].buffer, rows, base: self.coordinates.base as usize,
+                extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64 },
+            start: 0, key: self.components[0], value: self.components[1], summaries: None,
+            table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
+            pages: self.cache.layout().ring.rows as usize / 64,
+        })?;
+        let history_ring = cuteafd_core::prefix::AppendRing {
+            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().ring.step,
+            step: self.cache.layout().ring.step, rows: self.cache.layout().mtp_hidden_rows };
+        for run in history_ring.proposal(self.coordinates.base, rows as u64)
+            .context("Step-5 predictor own history ring")? {
+            let source = slice(owner.attention.output(), run.offset as usize * H * 4, run.rows as usize * H * 4)?;
+            let target = slice(self.components[3], run.slot as usize * H * 4, source.bytes)?;
+            stream.device.run(|| {
+                // SAFETY: append-safe F32 own-stage history and output are
+                // disjoint and retained until this proposal's stream drains.
+                unsafe { stream.device.library.copy_d2d_async(target, source, source.bytes, stream.raw) }
+            })?;
+        }
+        self.enqueued = true;
+        guard.complete = true;
+        Ok(())
+    }
+
+    pub(super) fn hidden(&self) -> CuteafdDeviceBuffer { self.owner.attention.output() }
+
+    pub(super) fn logits(&self) -> Result<crate::shared::token_io::DeviceLogits> {
+        ensure!(self.enqueued && !self.complete, "Step-5 predictor proposal unavailable");
+        self.owner.head.device_logits_on(self.hidden(), self.coordinates.global.len(), &self.owner.stream)
+    }
+
+    pub(super) fn publish(mut self, accepted: usize) -> Result<()> {
+        ensure!(self.enqueued && accepted <= self.coordinates.global.len(),
+            "Step-5 predictor accepted row extent");
+        self.owner.stream.drain()?;
+        if accepted > 0 {
+            let length = self.coordinates.base + accepted as u64;
+            self.cache.stream.device.run(|| self.cache.stream.device.library.copy_h2d(
+                self.components[2], &length.to_le_bytes())).inspect_err(|_| self.cache.poisoned.set(true))?;
+        }
+        self.complete = true;
+        Ok(())
+    }
+}
+impl Drop for StageStep<'_, '_> {
+    fn drop(&mut self) {
+        self.owner.stream.drain_or_abort("Step-5 predictor proposal retirement");
+        self.cache.busy[self.sequence as usize].set(false);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "requires sealed SM120 exports, real Step-5 weights and pinned MTP fixtures"]
+    fn native_predictors_match_reference_replay_and_fresh_prefix() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use super::super::{cache::CacheRank, rope::TargetTables};
+        use cuteafd_loader::plan::families::step5::coordinator::CoordinatorContract;
+        let root = std::path::PathBuf::from(std::env::var("CUTEAFD_STEP5_MTP_FIXTURE_DIR")?);
+        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join("manifest.json"))?)?;
+        ensure!(manifest["schema"] == 1 && manifest["seed"] == 274
+            && manifest["row_capacity"] == 64
+            && manifest["source"]["vllm_commit"] == "dde9aca41cd3ccceb1ffa902933b6678a09c83ce"
+            && manifest["source"]["head_dtype"] == "float32", "MTP fixture provenance");
+        // SAFETY: this explicit GPU qualification selects a sealed matching native ABI.
+        let library = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let device = crate::shared::memory::device::cache_test_device(&library)?;
+        let programs = library.programs()?.with_manifest(std::path::Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let checkpoint = Checkpoint::open(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        ensure!(checkpoint.snapshot.file_name().and_then(|s| s.to_str()) == manifest["snapshot"].as_str(),
+            "MTP fixture checkpoint identity");
+        let cfg = Config::parse(&checkpoint)?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64)?;
+        let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
+        let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
+        let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
+        let cases = manifest["cases"].as_array().context("MTP cases")?;
+        ensure!(cases.len() == 3, "MTP must qualify all three stages");
+        let target_end = cases[0]["rows"].as_u64().context("MTP rows")? + 1;
+        let target_hidden = std::fs::read(root.join("target_hidden.bin"))?;
+        ensure!(manifest["target_rows"] == target_end && target_hidden.len() == target_end as usize * H * 2
+            && manifest["target_hidden_sha256"].as_str()
+                == Some(format!("{:x}", Sha256::digest(&target_hidden)).as_str()), "MTP target history fixture");
+        let read = |buffer: CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
+            let mut data = vec![0; bytes];
+            device.run(|| library.copy_d2h(&mut data, slice(buffer, 0, bytes)?))?;
+            Ok(data)
+        };
+        for pass in 0..2 {
+            cache.reset_sequence(0)?;
+            device.run(|| library.copy_h2d(cache.length(0, false)?, &target_end.to_le_bytes()))?;
+            let history = cache.request_component(layout.ranks[0].mtp_hidden.context("MTP target history")?, 0)?;
+            for position in 0..target_end as usize {
+                let row = slice(history, position % layout.mtp_hidden_rows as usize * H * 2, H * 2)?;
+                device.run(|| library.copy_h2d(row, &target_hidden[position*H*2..(position+1)*H*2]))?;
+            }
+            let mut preceding_native: Option<Vec<u8>> = None;
+            for (stage, case) in cases.iter().enumerate() {
+                let rows = case["rows"].as_u64().context("MTP fixture rows")? as usize;
+                ensure!(case["stage"] == stage && case["origin"] == stage + 1 && rows >= 600,
+                    "MTP stage fixture geometry");
+                let load = |name: &str, bytes: usize| -> Result<Vec<u8>> {
+                    let data = std::fs::read(root.join(format!("stage{stage}/{name}")))?;
+                    ensure!(data.len() == bytes && case["sha256"][name].as_str()
+                        == Some(format!("{:x}", Sha256::digest(&data)).as_str()), "MTP fixture extent/hash: {name}");
+                    Ok(data)
+                };
+                let inputs = load("embedding.bin", rows * H * 2)?;
+                let reference_previous = load("previous.bin", rows * H * 4)?;
+                let previous = if let Some(previous) = preceding_native.as_ref() {
+                    ensure!(previous.len() == (rows + 1) * H * 4, "MTP preceding native history extent");
+                    &previous[..rows * H * 4]
+                } else { &reference_previous };
+                let expected = load("hidden.bin", rows * H * 4)?;
+                let probes = case["probes"].as_array().context("MTP probes")?.iter()
+                    .map(|p| p.as_u64().context("MTP probe").map(|p| p as usize)).collect::<Result<Vec<_>>>()?;
+                let expected_logits = load("logits.bin", probes.len() * 128896 * 4)?;
+                let embedding = Allocation::new(device, 64 * H * 2)?;
+                let hidden = Allocation::new(device, 64 * H * 4)?;
+                let mut owner = StageOwner::load(device, &programs, &checkpoint, stage, 64,
+                    rope.clone(), u64::MAX, &[])?;
+                owner.bind_cache(&cache)?;
+                let mut base = 0;
+                let mut actual = Vec::with_capacity(expected.len());
+                let mut logits = vec![Vec::new(); probes.len()];
+                while base < rows {
+                    let boundary = [64, 512, 576, 600, rows].into_iter()
+                        .filter(|&end| end > base).min().context("MTP next boundary")?;
+                    let count = (boundary - base).min(64);
+                    let accepted = if base == 0 { 32 } else { count };
+                    if base == 576 && pass == 0 {
+                        cache.capture(0, 1, target_end)?;
+                        cache.reset_sequence(0)?;
+                        cache.restore(0, 1, target_end)?;
+                    }
+                    device.run(|| library.copy_h2d(embedding.buffer, &inputs[base*H*2..(base+count)*H*2]))?;
+                    device.run(|| library.copy_h2d(hidden.buffer, &previous[base*H*4..(base+count)*H*4]))?;
+                    let first = owner.forward(&cache, 0, base as u64, &embedding, &hidden, count)?;
+                    first.owner.stream.drain()?;
+                    let replay = read(first.hidden(), count * H * 4)?;
+                    drop(first); // Aborted wave must not advance any committed frontier.
+                    let step = owner.forward(&cache, 0, base as u64, &embedding, &hidden, count)?;
+                    step.owner.stream.drain()?;
+                    let values = read(step.hidden(), count * H * 4)?;
+                    ensure!(values == replay, "MTP same-shape abort/replay differs, stage {stage} base {base}");
+                    actual.extend_from_slice(&values[..accepted * H * 4]);
+                    if probes.iter().any(|&p| (base..base+accepted).contains(&p)) {
+                        let result = step.logits()?;
+                        for (i, &p) in probes.iter().enumerate().filter(|(_, p)| (base..base+accepted).contains(p)) {
+                            logits[i] = result.row_host(&library, p-base)?.into_iter().flat_map(f32::to_le_bytes).collect();
+                        }
+                    }
+                    step.publish(accepted)?;
+                    base += accepted;
+                }
+                preceding_native = Some(actual.clone());
+                for (name, a, b) in [("hidden", actual, expected),
+                    ("logits", logits.into_iter().flatten().collect(), expected_logits)] {
+                    let a: Vec<_> = a.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64).collect();
+                    let b: Vec<_> = b.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap()) as f64).collect();
+                    ensure!(a.len() == b.len() && a.iter().chain(&b).all(|v| v.is_finite()), "MTP nonfinite/shape");
+                    let error = a.iter().zip(&b).map(|(a,b)| (a-b).powi(2)).sum::<f64>();
+                    let norm = b.iter().map(|b| b*b).sum::<f64>().max(f64::MIN_POSITIVE);
+                    let relative = (error/norm).sqrt();
+                    let maximum = a.iter().zip(&b).map(|(a,b)| (a-b).abs()).fold(0f64, f64::max);
+                    let width = if name == "hidden" { H } else { 128896 };
+                    let worst = a.chunks_exact(width).zip(b.chunks_exact(width)).map(|(a,b)| {
+                        let e = a.iter().zip(b).map(|(a,b)| (a-b).powi(2)).sum::<f64>();
+                        let n = b.iter().map(|v| v*v).sum::<f64>().max(f64::MIN_POSITIVE);
+                        (e/n).sqrt()
+                    }).fold(0f64, f64::max);
+                    eprintln!("MTP pass={pass} stage={stage} {name} rel_l2={relative:.9e} max_abs={maximum:.9e} worst_row_rel_l2={worst:.9e}");
+                    ensure!(relative <= 0.01 && worst <= 0.01, "MTP {name} reference agreement, stage {stage}");
+                }
+                if pass == 0 {
+                    // Deliberately dirty rejected slack after the committed end.
+                    let proposal = owner.forward(&cache, 0, rows as u64, &embedding, &hidden, 1)?;
+                    drop(proposal);
+                }
+            }
+            cache.capture(0, pass, target_end)?;
+            if pass == 0 {
+                cache.restore(0, 0, target_end)?;
+                cache.capture(0, 1, target_end)?;
+                ensure!(read(cache.mark_view(0)?, layout.ranks[0].bytes as usize)?
+                    == read(cache.mark_view(1)?, layout.ranks[0].bytes as usize)?, "MTP restore canonical bytes");
+            }
+        }
+        ensure!(read(cache.mark_view(0)?, layout.ranks[0].bytes as usize)?
+            == read(cache.mark_view(1)?, layout.ranks[0].bytes as usize)?,
+            "MTP restored prefix differs byte-for-byte from fresh prefill");
+        Ok(())
+    }
+
     fn specs() -> (ProgramSpec, ProgramSpec) {
         let spec = |name: &str, pointers: &[&str], scalars: &[u8], geometry| ProgramSpec {
             name: name.into(), pointers: pointers.iter().map(|s| (*s).into()).collect(),
@@ -176,6 +573,69 @@ mod tests {
             "bias": false, "rotary": 0, "epsilon": "runtime_float32"})),
         spec("step5_mtp_eh", EH_POINTERS, b"i", serde_json::json!({
             "width": 2 * H, "outputs": H, "output_dtype": "torch.bfloat16", "skinny_rows": 0})))
+    }
+
+    #[test]
+    fn predictor_coordinates_preserve_global_rope_and_exact_causal_keys() -> Result<()> {
+        for rows in [1, 16, 64, 256, 513, 4096] {
+            let ring = cuteafd_core::prefix::AppendRing::new(512, rows as u64, 64).unwrap();
+            for stage in 0..3 {
+                for base in [0, 1, 63, 64, 511, 512, 513, 575, 576, 767,
+                    ring.rows - 1, ring.rows, ring.rows + 1, 1_000_000] {
+                    let c = Coordinates::new(stage, base, rows, 1_048_576, ring)?;
+                    assert_eq!(c.global[0], (base + stage as u64 + 1) as i64);
+                    assert_eq!(c.end, base + rows as u64);
+                    assert!(c.table.len() * 4 <=
+                        cuteafd_loader::plan::families::step5::native::mtp_metadata_planes(rows)?[3]);
+                    let shift = base - c.local[0] as u64;
+                    for row in [0, rows / 2, rows - 1] {
+                        let query = base + row as u64;
+                        let mut actual = Vec::new();
+                        for selected in c.local[row] - 511..=c.local[row] {
+                            if selected < 0 { continue; }
+                            let selected = selected as u64;
+                            let logical = selected + shift;
+                            let physical = c.table[(selected / 64) as usize] as u64 * 64 + selected % 64;
+                            assert_eq!(physical, logical % ring.rows);
+                            actual.push(logical);
+                        }
+                        assert_eq!(actual, (query.saturating_sub(511)..=query).collect::<Vec<_>>());
+                    }
+                    let mut slots = vec![false; ring.rows as usize];
+                    for run in ring.visible(base) {
+                        slots[run.slot as usize..(run.slot + run.rows) as usize].fill(true);
+                    }
+                    for run in ring.proposal(base, rows as u64).unwrap() {
+                        assert!(slots[run.slot as usize..(run.slot + run.rows) as usize]
+                            .iter().all(|old| !old));
+                    }
+                }
+            }
+        }
+        let ring = cuteafd_core::prefix::AppendRing::new(512, 256, 64).unwrap();
+        for (stage, base, rows, context) in [(3, 0, 1, 1024), (0, 0, 0, 1024),
+            (0, 0, 257, 1024), (0, 1023, 1, 1024), (0, u64::MAX, 1, u64::MAX)] {
+            assert!(Coordinates::new(stage, base, rows, context, ring).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn predictor_metadata_is_charged_even_at_tiny_row_counts() -> Result<()> {
+        for rows in [1, 16, 64, 256, 4096] {
+            let metadata = cuteafd_loader::plan::families::step5::native::mtp_metadata_planes(rows)?;
+            assert!(metadata.iter().all(|n| *n >= 256));
+            let private = planes(rows)?.into_iter().sum::<usize>() as u64;
+            let blocks = cuteafd_loader::plan::families::step5::native::swa_planes(rows, 64)?
+                .into_iter().chain(cuteafd_loader::plan::families::step5::native::dense_planes(rows)?)
+                .chain(cuteafd_loader::plan::families::step5::native::head_planes(rows)?)
+                .sum::<usize>() as u64;
+            assert!(private + metadata.into_iter().sum::<usize>() as u64 + blocks <=
+                cuteafd_loader::plan::families::step5::native::mtp_forecast_workspace(rows, 1)?);
+        }
+        assert_eq!(cuteafd_loader::plan::families::step5::native::mtp_metadata_planes(256)?
+            .into_iter().sum::<usize>(), 5632);
+        Ok(())
     }
 
     #[test]

@@ -566,6 +566,22 @@ impl<'a> SwaLayer<'a> {
         Ok(())
     }
 
+    /// The predictor transaction retains this layer and its external stream
+    /// through drainage; target transactions never stage these planes as MTP.
+    pub(super) fn predictor_projection(&self) -> Result<[CuteafdDeviceBuffer; 2]> {
+        ensure!(self.immutable.layer >= 92 && self.immutable.heads == 64 && self.ffn.is_some(),
+            "Step-5 predictor requires an independent whole SWA/dense owner");
+        Ok([self.planes[KPAGES].buffer, self.planes[VPAGES].buffer])
+    }
+
+    pub(super) fn predictor_finish_on(&self, read: AttentionRead<'_, 'a>) -> Result<()> {
+        self.predictor_projection()?;
+        let (rows, stream) = (read.inputs.rows, read.inputs.stream);
+        self.read_attention_on(read)?;
+        self.finish_on(rows, stream)?;
+        self.dense_on(rows, stream)
+    }
+
     pub fn attention_output(&self) -> CuteafdDeviceBuffer {
         self.planes[POST].buffer
     }

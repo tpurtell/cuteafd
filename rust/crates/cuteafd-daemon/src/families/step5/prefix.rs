@@ -377,7 +377,7 @@ mod tests {
             }
         }
         for plane in owner.borrow().page_views(tail)? { set(plane, 0x29)?; }
-        let spans = shape.snapshot_spans(0, 65)?;
+        let spans = shape.snapshot_spans(0, 65, &[0; 3])?;
         let components = |span: &cuteafd_loader::serving_capacity::step5::ByteSpan| {
             let state = &shape.ranks[0];
             std::iter::once(state.length).chain(state.mtp_lengths.iter().copied()).chain(state.mtp_hidden)
@@ -391,6 +391,9 @@ mod tests {
             set(owner.borrow().component(full)?, 0x39)?;
         }
         device.run(|| library.copy_h2d(owner.borrow().length(0, false)?, &65u64.to_le_bytes()))?;
+        for &span in &shape.ranks[0].mtp_lengths {
+            device.run(|| library.copy_h2d(owner.borrow().request_component(span, 0)?, &0u64.to_le_bytes()))?;
+        }
         assert!(shared.capture(&family, SnapshotKind::Prompt, &tokens, &source, After::default())?);
         // Simulate host-tier promotion into a different arena slot: its bytes
         // and entry metadata are valid, but no local capture ever used slot 1.
@@ -448,6 +451,8 @@ mod tests {
             let retained = &bytes[stride + offset..stride + offset + span.bytes as usize];
             if *span == shape.ranks[0].length {
                 assert_eq!(retained, &65u64.to_le_bytes());
+            } else if shape.ranks[0].mtp_lengths.contains(span) {
+                assert_eq!(retained, &0u64.to_le_bytes());
             } else {
                 assert!(retained.iter().all(|b| *b == 0x39));
             }

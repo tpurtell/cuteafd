@@ -219,11 +219,11 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "model.embed_tokens.weight"), rank == 0);
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "lm_head.weight"), rank == head as usize);
                 for frontier in [0, 63, 64, 65, 575, 576, 1024] {
-                    let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                    let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                     let expected = 8 + state.sliding.iter().map(|s| 2 * frontier.min(512) * s.key.bytes / layout.ring.rows).sum::<u64>()
                         + state.regions.len() as u64 * (2 * 8 * 256 * 2 + frontier / 8 * 256);
                     assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
-                    let copies = layout.snapshot_copies(rank, frontier, 3, 2, 4, 3).unwrap();
+                    let copies = layout.snapshot_copies(rank, frontier, &[], 3, 2, 4, 3).unwrap();
                     assert_eq!(copies.iter().map(|s| s.active.bytes).sum::<u64>(), expected);
                     assert!(copies.iter().all(|c| c.active.offset + c.active.bytes <= state.bytes * 3
                         && c.mark.offset >= state.bytes * 3 && c.mark.offset + c.mark.bytes <= state.bytes * 4));
@@ -345,7 +345,7 @@ fn step5_routed_replication_bindings_are_single_wave_and_disjoint_from_heads() {
 }
 
 #[test]
-fn predictor_histories_are_private_charged_and_snapshotted_with_append_slack() {
+fn predictor_histories_are_private_charged_and_snapshotted_without_append_slack() {
     use crate::serving_capacity::step5::Step5CacheLayout;
     let dir = snapshot("fp8");
     let cp = Checkpoint::open(dir.path()).unwrap();
@@ -369,13 +369,19 @@ fn predictor_histories_are_private_charged_and_snapshotted_with_append_slack() {
             assert!(histories[index + 1..].iter().all(|other|
                 span.offset + span.bytes <= other.offset || other.offset + other.bytes <= span.offset));
             assert!(span.offset + span.bytes <= state.bytes);
-            for frontier in [0, 511, 512, 831, 832, 1 << 20] {
-                assert!(layout.snapshot_spans(0, frontier).unwrap().contains(span));
-                let copies = layout.snapshot_copies(0, frontier, 16, 15, 32, 31).unwrap();
-                assert!(copies.iter().any(|copy| copy.active.offset == span.offset * 16 + span.bytes * 15
-                    && copy.mark.offset == state.bytes * 31 + span.offset
-                    && copy.active.bytes == span.bytes && copy.mark.bytes == span.bytes));
+        }
+        for frontier in [0u64, 511, 512, 831, 832, 1 << 20] {
+            let stages: Vec<_> = (0..depth).map(|stage| frontier.saturating_sub(stage as u64 + 1)).collect();
+            let copies = layout.snapshot_copies(0, frontier, &stages, 16, 15, 32, 31).unwrap();
+            for (component, end) in std::iter::once((state.mtp_hidden.unwrap(), frontier))
+                .chain(state.mtp_stage_hidden.iter().copied().zip(stages.iter().copied())) {
+                let at = component.offset * 16 + component.bytes * 15;
+                let retained = copies.iter().filter(|c| c.active.offset >= at
+                    && c.active.offset < at + component.bytes).map(|c| c.active.bytes).sum::<u64>();
+                assert_eq!(retained, end.min(512 + depth as u64 + 1) * component.bytes / layout.mtp_hidden_rows);
+                assert!(retained < component.bytes, "proposal slack must not enter a mark");
             }
+            assert!(layout.snapshot_spans(0, frontier, &stages).is_ok());
         }
         // An entire proposed wave must not overwrite any history needed by
         // the previous frontier, including all shifted teacher-forced inputs.
@@ -385,6 +391,47 @@ fn predictor_histories_are_private_charged_and_snapshotted_with_append_slack() {
                 .collect::<std::collections::BTreeSet<_>>();
             assert!((base..base + 256).all(|p| !old.contains(&(p % layout.mtp_hidden_rows))));
         }
+    }
+}
+
+#[test]
+fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
+    use crate::serving_capacity::step5::Step5CacheLayout;
+    let dir = snapshot("fp8");
+    let cp = Checkpoint::open(dir.path()).unwrap();
+    let cfg = Config::parse(&cp).unwrap();
+    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64).unwrap();
+    let state = &layout.ranks[0];
+    for stages in [[600, 0, 0], [600, 598, 0], [600, 598, 597]] {
+        let copies = layout.snapshot_copies(0, 603, &stages, 1, 0, 1, 0).unwrap();
+        for (stage, &end) in stages.iter().enumerate() {
+            let ring = state.sliding.iter().find(|s| s.layer == 92 + stage).unwrap();
+            for (component, rows, keep) in [(ring.key, layout.ring.rows, 512),
+                (ring.value, layout.ring.rows, 512),
+                (state.mtp_stage_hidden[stage], layout.mtp_hidden_rows, 516)] {
+                let stride = component.bytes / rows;
+                let mut retained = Vec::new();
+                for copy in copies.iter().filter(|c| c.active.offset >= component.offset
+                    && c.active.offset < component.offset + component.bytes) {
+                    assert_eq!(copy.active.bytes % stride, 0);
+                    for row in 0..copy.active.bytes / stride {
+                        let source = (copy.active.offset - component.offset) / stride + row;
+                        let canonical = (copy.mark.offset - component.offset) / stride + row;
+                        retained.push((canonical, source));
+                    }
+                }
+                retained.sort_unstable();
+                let expected: Vec<_> = (end.saturating_sub(keep)..end).enumerate()
+                    .map(|(canonical, logical)| (canonical as u64, logical % rows)).collect();
+                assert_eq!(retained, expected);
+                let proposed: std::collections::BTreeSet<_> = (end..end + 64).map(|p| p % rows).collect();
+                assert!(retained.iter().all(|(_, source)| !proposed.contains(source)),
+                    "rejected rows may never enter a canonical mark");
+            }
+        }
+    }
+    for invalid in [vec![], vec![600], vec![603, 0, 0], vec![600, 601, 0], vec![600, 598, 599]] {
+        assert!(layout.snapshot_spans(0, 603, &invalid).is_err());
     }
 }
 
@@ -416,13 +463,15 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             assert_eq!(geometry.retained_mark_bytes, state.bytes);
             assert_eq!(geometry.active_state_per_sequence_bytes, state.bytes);
             for frontier in [0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1 << 20] {
-                let spans = layout.snapshot_spans(rank, frontier).unwrap();
+                let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                 assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
                 let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
-                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20).unwrap().iter().map(|s| s.bytes).sum();
+                let maximum: u64 = layout.snapshot_spans(rank, 1 << 20, &vec![0; state.mtp_lengths.len()]).unwrap().iter().map(|s| s.bytes).sum();
                 let missing_rings: u64 = state.sliding.iter().filter(|s| !s.mtp)
                     .map(|s| 2 * (512 - frontier.min(512)) * s.key.bytes / layout.ring.rows).sum();
-                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings;
+                let missing_history = state.mtp_hidden.map_or(0, |span|
+                    (516 - frontier.min(516)) * span.bytes / layout.mtp_hidden_rows);
+                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings - missing_history;
                 assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
                 assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
                     && spans.contains(&region.pending_z)));
@@ -430,7 +479,7 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
                     for component in [ring.key, ring.value] {
                         let retained: u64 = spans.iter().filter(|s| s.offset >= component.offset
                             && s.offset < component.offset + component.bytes).map(|s| s.bytes).sum();
-                        assert_eq!(retained, if ring.mtp { component.bytes }
+                        assert_eq!(retained, if ring.mtp { 0 }
                             else { frontier.min(512) * component.bytes / layout.ring.rows });
                     }
                 }
@@ -446,13 +495,13 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         assert!(arena.iter().sum::<u64>() > 2 << 30);
         assert_eq!(arena[0], slots * layout.ranks[0].bytes);
         assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
-        assert!(layout.snapshot_spans(ranks, 0).is_err());
-        assert!(layout.snapshot_spans(0, (1 << 20) + 1).is_err());
+        assert!(layout.snapshot_spans(ranks, 0, &[]).is_err());
+        assert!(layout.snapshot_spans(0, (1 << 20) + 1, &[0; 3]).is_err());
         assert!(layout.csa_tail_bytes(0, 65).is_err());
         let mut occupied = Vec::new();
         for sequence in 0..3 {
-            let copies = layout.snapshot_copies(0, 65, 3, sequence, 4, sequence).unwrap();
-            let spans = layout.snapshot_spans(0, 65).unwrap();
+            let copies = layout.snapshot_copies(0, 65, &[0; 3], 3, sequence, 4, sequence).unwrap();
+            let spans = layout.snapshot_spans(0, 65, &[0; 3]).unwrap();
             assert_eq!(copies.len(), spans.len());
             for (copy, span) in copies.iter().zip(spans) {
                 assert!(copy.mark.offset >= sequence * layout.ranks[0].bytes
@@ -468,9 +517,9 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         }
         occupied.sort_unstable();
         assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
-        assert!(layout.snapshot_copies(0, 0, 3, 3, 4, 0).is_err());
-        assert!(layout.snapshot_copies(0, 0, 3, 0, 4, 4).is_err());
-        assert!(layout.snapshot_copies(0, 0, u64::MAX, 0, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 3, 4, 0).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 0, 4, 4).is_err());
+        assert!(layout.snapshot_copies(0, 0, &[0; 3], u64::MAX, 0, 4, 0).is_err());
     }
     assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64).is_err());
     assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64).is_err());

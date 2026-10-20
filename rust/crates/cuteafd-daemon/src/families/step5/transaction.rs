@@ -1496,7 +1496,7 @@ pub(super) mod tests {
             // Seed arbitrary old visible bytes, including pending and summary state.
             for owner in &owners {
                 let cache = owner.borrow();
-                for span in layout.snapshot_spans(cache.rank(), base as u64)? {
+                for span in layout.snapshot_spans(cache.rank(), base as u64, &[])? {
                     let state = &layout.ranks[cache.rank()];
                     let component = std::iter::once(state.length)
                         .chain(state.sliding.iter().flat_map(|r| [r.key, r.value]))

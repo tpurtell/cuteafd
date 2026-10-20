@@ -215,29 +215,31 @@ impl Step5CacheLayout {
             .ok_or_else(|| invalid("attention layer is not owned on rank"))
     }
 
-    /// Canonical mark spans exclude target ring slack and the inactive pending
-    /// bank. MTP state is retained whole until its independent executor exists.
-    /// Only complete summaries are visible; unfinished K/V stays in CSA pages.
-    pub fn snapshot_spans(&self, rank: usize, frontier: u64) -> Result<Vec<ByteSpan>, CacheGeometryError> {
-        Ok(self.snapshot_parts(rank, frontier)?.into_iter().map(|(component, offset, _, bytes)|
+    /// Canonical marks contain only committed rows, never proposal slack.
+    /// Predictor frontiers are actual stage-local lengths, not inferred target shifts.
+    pub fn snapshot_spans(&self, rank: usize, frontier: u64, stages: &[u64]) -> Result<Vec<ByteSpan>, CacheGeometryError> {
+        Ok(self.snapshot_parts(rank, frontier, stages)?.into_iter().map(|(component, offset, _, bytes)|
             ByteSpan { offset: component.offset + offset, bytes }).collect())
     }
 
     // (component, physical offset, canonical mark offset, bytes).
-    fn snapshot_parts(&self, rank: usize, frontier: u64)
+    fn snapshot_parts(&self, rank: usize, frontier: u64, stages: &[u64])
         -> Result<Vec<(ByteSpan, u64, u64, u64)>, CacheGeometryError> {
         if frontier > self.context { return Err(invalid("snapshot frontier outside admitted context")); }
         let state = self.ranks.get(rank).ok_or_else(|| invalid("snapshot rank"))?;
+        if stages.len() != state.mtp_lengths.len() || stages.iter().enumerate().any(|(stage, &end)|
+            end > frontier.saturating_sub(stage as u64 + 1)
+                || (stage > 0 && end > stages[stage - 1])) {
+            return Err(invalid("snapshot predictor frontier is not committed"));
+        }
         let mut parts = vec![(state.length, 0, 0, state.length.bytes)];
         for ring in &state.sliding {
+            let end = if ring.mtp { *stages.get(ring.layer - 92)
+                .ok_or_else(|| invalid("snapshot predictor stage"))? } else { frontier };
             for component in [ring.key, ring.value] {
-                if ring.mtp {
-                    parts.push((component, 0, 0, component.bytes));
-                } else {
-                    let row = component.bytes / self.ring.rows;
-                    for run in self.ring.visible(frontier) {
-                        parts.push((component, run.slot * row, run.offset * row, run.rows * row));
-                    }
+                let row = component.bytes / self.ring.rows;
+                for run in self.ring.visible(end) {
+                    parts.push((component, run.slot * row, run.offset * row, run.rows * row));
                 }
             }
         }
@@ -250,16 +252,28 @@ impl Step5CacheLayout {
                 if bytes > 0 { parts.push((summary, 0, 0, bytes)); }
             }
         }
-        for component in state.mtp_lengths.iter().copied().chain(state.mtp_hidden)
-            .chain(state.mtp_stage_hidden.iter().copied()) {
+        for &component in &state.mtp_lengths {
             parts.push((component, 0, 0, component.bytes));
+        }
+        if let Some(target) = state.mtp_hidden {
+            let history = cuteafd_core::prefix::AppendRing {
+                window: self.window + stages.len() as u64 + 1,
+                step: self.ring.step, rows: self.mtp_hidden_rows,
+            };
+            for (component, end) in std::iter::once((target, frontier))
+                .chain(state.mtp_stage_hidden.iter().copied().zip(stages.iter().copied())) {
+                let row = component.bytes / history.rows;
+                for run in history.visible(end) {
+                    parts.push((component, run.slot * row, run.offset * row, run.rows * row));
+                }
+            }
         }
         Ok(parts)
     }
 
     /// Bind exact copies to active component-major request planes and slot-major
     /// marks. The kernel ABI has no sequence stride between a component's rows.
-    pub fn snapshot_copies(&self, rank: usize, frontier: u64, sequences: u64, sequence: u64,
+    pub fn snapshot_copies(&self, rank: usize, frontier: u64, stages: &[u64], sequences: u64, sequence: u64,
         slots: u64, slot: u64) -> Result<Vec<SnapshotCopy>, CacheGeometryError> {
         if sequences == 0 || sequence >= sequences || slot >= slots {
             return Err(invalid("snapshot sequence or mark slot"));
@@ -267,7 +281,7 @@ impl Step5CacheLayout {
         let state = self.ranks.get(rank).ok_or_else(|| invalid("snapshot rank"))?;
         let total_active = mul(&[state.bytes, sequences])?;
         let total_marks = mul(&[state.bytes, slots])?;
-        self.snapshot_parts(rank, frontier)?.into_iter().map(|(component, offset, canonical, bytes)| {
+        self.snapshot_parts(rank, frontier, stages)?.into_iter().map(|(component, offset, canonical, bytes)| {
             let active = mul(&[component.offset, sequences])?.checked_add(mul(&[sequence, component.bytes])?)
                 .and_then(|at| at.checked_add(offset))
                 .ok_or(CacheGeometryError::Overflow("Step-5 active copy offset"))?;

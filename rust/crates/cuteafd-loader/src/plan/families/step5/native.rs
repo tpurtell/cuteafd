@@ -124,6 +124,14 @@ pub fn head_planes(rows: usize) -> Result<[usize; 4]> {
     Ok([rows * H * 2, rows * H * 2, rows * 128896 * 4, 4 << 20])
 }
 
+/// Global RoPE positions, rebased KV positions, request ids, a bounded page
+/// table and publication scratch. All planes have the native 256-byte floor.
+pub fn mtp_metadata_planes(rows: usize) -> Result<[usize; 5]> {
+    ensure!((1..=4096).contains(&rows), "Step-5 predictor metadata rows");
+    let pages = (512 + 63 + rows).div_ceil(64);
+    Ok([rows * 8, rows * 8, rows * 4, pages * 4, 8].map(|n| n.max(256)))
+}
+
 /// Conservative private predictor lane recipe for offline fit forecasts.
 /// Whole SWA/dense/head workspaces are retained per stage; no aliasing or
 /// recomputation saving is credited before a native owner proves it.
@@ -136,9 +144,11 @@ pub fn mtp_forecast_workspace(rows: usize, depth: usize) -> Result<u64> {
     }
     // Independent normalized inputs, concat, EH output and F32 residual;
     // include source/position/length scratch rather than assuming reuse.
-    stage.checked_add((rows as u64).checked_mul((H * 16 + 64) as u64)
-        .context("Step-5 MTP input scratch overflow")?)
-        .and_then(|n| n.checked_mul(depth as u64))
+    let metadata = mtp_metadata_planes(rows)?.into_iter().sum::<usize>() as u64;
+    let input = (rows as u64).checked_mul((H * 16) as u64)
+        .and_then(|n| n.checked_add(metadata.max(rows as u64 * 64)))
+        .context("Step-5 MTP input scratch overflow")?;
+    stage.checked_add(input).and_then(|n| n.checked_mul(depth as u64))
         .context("Step-5 MTP workspace overflow")
 }
 
