@@ -704,6 +704,7 @@ mod tests {
         for ranks in [1, 2] {
             let mut inputs = inputs(ranks);
             inputs.context = EXTENT;
+            inputs.requested_pool = Some(EXTENT);
             inputs.marks.host = true;
             for entries in [0, 20, 200] {
                 inputs.marks.entries = entries;
