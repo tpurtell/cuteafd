@@ -178,3 +178,141 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
     }
     Ok(())
 }
+
+/// Dense operands recorded in host memory (a stand-in for a family's operand
+/// allocations): every planned byte must arrive, at its offset, before Done.
+struct HostDense {
+    image: Vec<u8>,
+    planned: Vec<(u64, u64)>,
+    delivered: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    device: i32,
+}
+
+impl crate::shared::memory::push_consumer::PushDestination for HostDense {
+    type Delivered = ();
+    fn belongs_to(&self, device: Device<'_>) -> bool { device.id == self.device }
+    fn logical_bytes(&self) -> usize { self.image.len() }
+    fn device_bytes(&self) -> usize { self.image.len() }
+    fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> {
+        anyhow::ensure!(self.planned.iter().any(|&(s, n)| offset >= s && offset + bytes <= s + n), "unplanned dense fragment");
+        Ok(())
+    }
+    fn destination(&self, offset: usize, bytes: usize) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        // The fake DSO copies host-to-"device" with memcpy, so a host pointer works here.
+        Ok(cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.image[offset..offset + bytes].as_ptr() as *mut _, bytes,
+            device_id: self.device, flags: 0 })
+    }
+    fn copy_validation(&mut self, _: u64, _: &[u8]) -> Result<()> { anyhow::bail!("dense has no host tail") }
+    fn copied(&mut self, _: u64, _: u64) -> Result<()> { Ok(()) }
+    fn done(self) -> Result<()> {
+        *self.delivered.lock().unwrap() = self.image.clone();
+        Ok(())
+    }
+}
+
+/// One GPU rank carrying dense operands in `[0, base)` and the TP2 halves from
+/// `base`: both land exactly, through one ring, in one group.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    fixture.configure_memory(&library, 0, 64 << 30)?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+        || tensor.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    for tensor in catalog.tensors() {
+        let image: Vec<u8> = if tensor.metadata.name.ends_with(".mcg") { 0xcbac1fedu32.to_le_bytes().to_vec() }
+            else if tensor.metadata.name.ends_with(".suh") || tensor.metadata.name.ends_with(".svh") {
+                [0u8, 0x3c].into_iter().cycle().take(tensor.metadata.byte_length as usize).collect()
+            } else { (0..tensor.metadata.byte_length).map(|i| (i as u8).wrapping_mul(13) ^ 0x5a).collect() };
+        File::options().write(true).open(root.path().join(&tensor.shard))?.write_all_at(&image, tensor.metadata.byte_offset)?;
+    }
+    // Dense part: two non-expert tensors landed whole, a gap between them.
+    let dense_names: Vec<String> = catalog.tensors().iter().filter(|t| !t.metadata.name.contains(".experts."))
+        .take(2).map(|t| t.metadata.name.clone()).collect();
+    let mut planned = Vec::new();
+    let mut cursor = 0u64;
+    for name in &dense_names {
+        let start = cursor.next_multiple_of(256);
+        let bytes = catalog.tensor(name)?.metadata.byte_length;
+        planned.push((start, bytes));
+        cursor = start + bytes + 1;
+    }
+    let base = cursor.next_multiple_of(256);
+    let (rank, world) = (6usize, 8usize);
+    let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], 0, usize::MAX)?;
+    let checked_tp2 = plan.checked(&catalog, root.path(), world, rank)?;
+    let mut arenas = vec![0; world];
+    arenas[rank] = base + plan.layout.logical_bytes() as u64;
+    let mut builder = Builder::new(root.path(), arenas);
+    for (name, &(start, bytes)) in dense_names.iter().zip(&planned) {
+        builder.contiguous(&Builder::v41_source(&catalog, name)?, 0, bytes,
+            cuteafd_loader::push_load::builder::Destination { rank: rank as u32, offset: start, bytes })?;
+    }
+    plan.append_at(&mut builder, &catalog, rank as u32, base)?;
+    let combined = builder.finish()?;
+    let socket = root.path().join("combined.sock").to_string_lossy().into_owned();
+    let listener = Listener::bind(&socket)?;
+    let packed = pack(&combined, root.path(), rank as u32, DEFAULT_SLOT_BYTES)?;
+    let (mut coordinator, mut worker) = control_pair()?;
+    let server = std::thread::spawn(move || -> Result<()> {
+        let conn = listener.accept()?;
+        conn.set_timeout(Some(Duration::from_secs(10)))?;
+        let (_, fd) = conn.next_request()?.context("rank did not join")?;
+        let file = File::from(fd.context("rank ring fd absent")?);
+        conn.send_event(&Event::Joined)?;
+        assert_eq!(read_control(&coordinator)?["message"], "joined");
+        for (index, bytes) in packed.into_iter().enumerate() {
+            let slot = index % 8;
+            file.write_all_at(&bytes, slot as u64 * DEFAULT_SLOT_BYTES as u64)?;
+            conn.send_event(&Event::Filled { slot: slot as u32, len: bytes.len() as u32 })?;
+            let (release, _) = conn.next_request()?.context("missing slot release")?;
+            assert!(matches!(release, Request::Release { slot: s } if s == slot as u32));
+        }
+        conn.send_event(&Event::Done)?;
+        assert_eq!(read_control(&coordinator)?["success"], true);
+        write_control(&mut coordinator, &serde_json::json!({"message":"commit", "success": true}))?;
+        Ok(())
+    });
+    let delivered = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let dense = HostDense { image: vec![0; cursor as usize], planned: planned.clone(), delivered: delivered.clone(), device: 0 };
+    let client = PushClient::at(socket, Duration::from_secs(10))?;
+    let device = Device { library: &library, id: 0 };
+    let weights = receive_rank(device, &catalog, plan, &checked_tp2, Some(DenseRank { destination: dense, base }),
+        rank, &client, &mut worker, (7, 11), 8, DEFAULT_SLOT_BYTES)?;
+    server.join().map_err(|_| anyhow::anyhow!("fake SparkNest panicked"))??;
+    let weights = weights.context("combined push fell back")?;
+    assert_eq!(weights.len(), 2);
+    let image = delivered.lock().unwrap().clone();
+    for (name, &(start, bytes)) in dense_names.iter().zip(&planned) {
+        let tensor = catalog.tensor(name)?;
+        let mut expected = vec![0; bytes as usize];
+        File::open(root.path().join(&tensor.shard))?.read_exact_at(&mut expected, tensor.metadata.byte_offset)?;
+        assert_eq!(&image[start as usize..(start + bytes) as usize], &expected[..], "dense {name}");
+    }
+    for weight in &weights {
+        let mut scratch = vec![0; weight.layout.scratch_bytes(&catalog)?];
+        for (index, load) in weight.layout.loads.iter().enumerate() {
+            let mut expected = vec![0; load.bytes];
+            weight.layout.read_into(&catalog, index, &mut expected, &mut scratch)?;
+            for &(buffer, offset) in &load.destinations {
+                let mut actual = vec![0; load.bytes];
+                let spec = &weight.layout.buffers[buffer];
+                let buffer = weight.buffer(&spec.name)?;
+                // SAFETY: the load's destination range lies inside this published buffer.
+                let view = cuteafd_ffi::CuteafdDeviceBuffer { bytes: load.bytes,
+                    ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, ..buffer };
+                library.copy_d2h(&mut actual, view)?;
+                assert_eq!(actual, expected, "TP2 {}", load.tensor);
+            }
+        }
+    }
+    Ok(())
+}
