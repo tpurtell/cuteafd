@@ -575,6 +575,12 @@ endif()
 
 enable_testing()
 add_test(NAME cuteafd_native_selftest COMMAND cuteafd_native_selftest)
+# Load-time FP8 quantization shared with the CUDA load kernels, against the
+# host rule's fixture (CPU only).
+add_executable(cuteafd_fp8_load_quant_selftest tests/fp8_load_quant_selftest.cc)
+target_compile_definitions(cuteafd_fp8_load_quant_selftest PRIVATE
+  "CUTEAFD_LOAD_QUANT_FIXTURE=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/fp8_load_quant.bin\"")
+add_test(NAME cuteafd_fp8_load_quant_selftest COMMAND cuteafd_fp8_load_quant_selftest)
 
 if(CUTEAFD_ENABLE_XGRAMMAR)
   add_executable(cuteafd_xgrammar_regular_selftest tests/xgrammar_regular_selftest.cc)
