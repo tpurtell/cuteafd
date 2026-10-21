@@ -127,52 +127,109 @@ CUTEAFD_LQ_FN double sq_error(float x, float s) {
 
 CUTEAFD_LQ_FN float amax_scale(float amax) { return amax > 0.0f ? fdiv(amax, 448.0f) : 1.0f; }
 
-// Rows [row0, row0 + rows) of `w` (row stride `cols`) quantized as one scale
-// unit: `rows` is 128 for Block, 1 for Row128/Channel. Writes `q` for those
-// rows (same stride) and the unit's `kb` scales (Channel repeats one value).
-// The float64 sums for Best run over the unit's rows (outer) then 128 columns
-// (inner), sequentially, as the host's iterator sums do.
-CUTEAFD_LQ_FN void quantize_unit(const uint16_t* w, uint8_t* q, float* scales, int64_t rows, int64_t cols,
-                                 int32_t layout, int32_t rule) {
-  const int64_t kb = cols / 128;
-  // Per-block amax over the unit's rows.
-  float row_amax = 0.0f;
-  for (int64_t b = 0; b < kb; ++b) {
-    float m = 0.0f;
-    for (int64_t r = 0; r < rows; ++r)
-      for (int64_t c = b * 128; c < (b + 1) * 128; ++c) m = fmax32(m, fabs32(bf16(w[r * cols + c])));
-    scales[b] = m;
-    row_amax = fmax32(row_amax, m);
+// A unit's BF16 source: contiguous, or the ordered fragments of host ring
+// slots that hold it (an element may straddle two fragments). `at(i)` is the
+// unit's i-th element, row-major over the unit's rows and `cols`.
+struct Contiguous {
+  const uint16_t* w;
+  CUTEAFD_LQ_FN float at(int64_t i) const { return bf16(w[i]); }
+};
+struct Segment {
+  uint64_t offset;  // byte offset of this fragment within the unit's source
+  const uint8_t* ptr;
+  uint64_t bytes;
+};
+struct Segmented {
+  const Segment* segments;
+  int32_t count;
+  CUTEAFD_LQ_FN uint8_t byte(uint64_t at) const {
+    int32_t lo = 0, hi = count - 1;
+    while (lo < hi) {  // last segment with offset <= at
+      const int32_t mid = (lo + hi + 1) / 2;
+      if (segments[mid].offset <= at) lo = mid; else hi = mid - 1;
+    }
+    return segments[lo].ptr[at - segments[lo].offset];
   }
-  if (layout == kChannel)
+  CUTEAFD_LQ_FN float at(int64_t i) const {
+    const uint64_t b = uint64_t(i) * 2;
+    return bf16(uint16_t(byte(b)) | uint16_t(uint16_t(byte(b + 1)) << 8));
+  }
+};
+
+// Scale-block amax over the unit's rows (order-independent).
+template <typename Src>
+CUTEAFD_LQ_FN float block_amax(const Src& src, int64_t rows, int64_t cols, int64_t b) {
+  float m = 0.0f;
+  for (int64_t r = 0; r < rows; ++r)
+    for (int64_t c = b * 128; c < (b + 1) * 128; ++c) m = fmax32(m, fabs32(src.at(r * cols + c)));
+  return m;
+}
+
+// One row's float64 error over block b's 128 columns, summed in column order.
+template <typename Src>
+CUTEAFD_LQ_FN double row_error(const Src& src, int64_t cols, int64_t r, int64_t b, float s) {
+  double e = 0.0;
+  for (int64_t c = b * 128; c < (b + 1) * 128; ++c) e = dadd(e, sq_error(src.at(r * cols + c), s));
+  return e;
+}
+
+// Whether Best keeps amax / 448 or takes the power of two for one block,
+// given each row's errors summed in row order (`ra`, `rp`: rows entries).
+CUTEAFD_LQ_FN float best_scale(float sa, float sp, const double* ra, const double* rp, int64_t rows) {
+  double ea = 0.0, ep = 0.0;
+  for (int64_t r = 0; r < rows; ++r) { ea = dadd(ea, ra[r]); ep = dadd(ep, rp[r]); }
+  return ep < ea ? sp : sa;
+}
+
+// Final scales from per-block amax `scales[kb]` (overwritten), sequentially.
+// `row_errors(b, sa, sp, ra, rp)` fills each row's two error sums for block b.
+template <typename Src>
+CUTEAFD_LQ_FN void select_scales(const Src& src, float* scales, int64_t rows, int64_t cols, int32_t layout,
+                                 int32_t rule, double* ra, double* rp) {
+  const int64_t kb = cols / 128;
+  if (layout == kChannel) {
+    float row_amax = 0.0f;
+    for (int64_t b = 0; b < kb; ++b) row_amax = fmax32(row_amax, scales[b]);
     for (int64_t b = 0; b < kb; ++b) scales[b] = row_amax;
-  // amax per block retained for the power-of-two candidate.
+  }
   for (int64_t b = 0; b < kb; ++b) {
     const float amax = scales[b];
     float s = rule == kPow2 ? pow2_scale(amax) : amax_scale(amax);
     if (rule == kBest && (layout != kChannel || b == 0)) {
-      const float sa = s, sp = pow2_scale(amax);
-      if (sp != sa) {
-        double ea = 0.0, ep = 0.0;
+      const float sp = pow2_scale(amax);
+      if (sp != s) {
         for (int64_t r = 0; r < rows; ++r) {
-          double ra = 0.0, rp = 0.0;
-          for (int64_t c = b * 128; c < (b + 1) * 128; ++c) {
-            const float x = bf16(w[r * cols + c]);
-            ra = dadd(ra, sq_error(x, sa));
-            rp = dadd(rp, sq_error(x, sp));
-          }
-          ea = dadd(ea, ra);
-          ep = dadd(ep, rp);
+          ra[r] = row_error(src, cols, r, b, s);
+          rp[r] = row_error(src, cols, r, b, sp);
         }
-        if (ep < ea) s = sp;
+        s = best_scale(s, sp, ra, rp, rows);
       }
     }
     scales[b] = s;
   }
   if (layout == kChannel && rule == kBest)
     for (int64_t b = 1; b < kb; ++b) scales[b] = scales[0];
-  for (int64_t r = 0; r < rows; ++r)
-    for (int64_t c = 0; c < cols; ++c) q[r * cols + c] = e4m3(fdiv(bf16(w[r * cols + c]), scales[c / 128]));
 }
+
+// The whole unit sequentially (CPU reference; the CUDA kernel runs the same
+// steps with the order-independent ones in parallel).
+template <typename Src>
+CUTEAFD_LQ_FN void quantize_unit_from(const Src& src, uint8_t* q, float* scales, int64_t rows, int64_t cols,
+                                      int32_t layout, int32_t rule, double* ra, double* rp) {
+  const int64_t kb = cols / 128;
+  for (int64_t b = 0; b < kb; ++b) scales[b] = block_amax(src, rows, cols, b);
+  select_scales(src, scales, rows, cols, layout, rule, ra, rp);
+  for (int64_t i = 0; i < rows * cols; ++i) q[i] = e4m3(fdiv(src.at(i), scales[(i % cols) / 128]));
+}
+
+#if !defined(__CUDA_ARCH__)
+// Rows [0, rows) of contiguous `w` as one scale unit: `rows` is 128 for Block,
+// 1 for Row128/Channel. Host convenience over quantize_unit_from.
+inline void quantize_unit(const uint16_t* w, uint8_t* q, float* scales, int64_t rows, int64_t cols,
+                          int32_t layout, int32_t rule) {
+  double ra[128], rp[128];
+  quantize_unit_from(Contiguous{w}, q, scales, rows, cols, layout, rule, ra, rp);
+}
+#endif
 
 }  // namespace cuteafd_load_quant

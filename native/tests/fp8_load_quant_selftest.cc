@@ -3,6 +3,7 @@
 // native_load_quant_fixture_matches_host_rule) must reproduce byte for byte.
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <iterator>
@@ -56,6 +57,29 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "case %u layout %d rule %d: first value mismatch at %zu\n", c, layout, rule, i);
       return 1;
     }
+    // The same units read through ring-slot fragments: arbitrary lengths,
+    // including odd ones that split a BF16 element across two fragments.
+    uint64_t state = 0x2545F4914F6CDD1DULL ^ c;
+    auto next = [&]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+    std::vector<uint8_t> qs(n);
+    std::vector<float> ss(scale_rows * kb);
+    double ra[128], rp[128];
+    for (size_t u = 0; u < scale_rows; ++u) {
+      const uint8_t* unit_bytes = reinterpret_cast<const uint8_t*>(w.data() + u * unit * cols);
+      const uint64_t total = uint64_t(unit) * cols * 2;
+      std::vector<lq::Segment> segments;
+      for (uint64_t at = 0; at < total;) {
+        const uint64_t len = std::min<uint64_t>(total - at, 1 + next() % 4099);
+        segments.push_back({at, unit_bytes + at, len});
+        at += len;
+      }
+      lq::quantize_unit_from(lq::Segmented{segments.data(), int32_t(segments.size())}, qs.data() + u * unit * cols,
+                             ss.data() + u * kb, unit, cols, layout, rule, ra, rp);
+    }
+    if (std::memcmp(qs.data(), expected_q, n) != 0 || std::memcmp(ss.data(), expected_s.data(), ss.size() * 4) != 0) {
+      std::fprintf(stderr, "case %u layout %d rule %d: segmented source differs\n", c, layout, rule);
+      return 1;
+    }
     if (rule == lq::kBest)
       for (size_t i = 0; i < s.size(); ++i) {
         const uint32_t b = lq::f32_bits(s[i]);
@@ -71,7 +95,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "Best cases picked pow2 %zu, amax %zu: both branches required\n", pow2_picked, amax_kept);
     return 1;
   }
-  std::printf("fp8 load quant: %u cases byte-exact; Best picked pow2 %zu, amax/448 %zu\n", cases, pow2_picked,
+  std::printf("fp8 load quant: %u cases byte-exact (contiguous and fragmented); Best picked pow2 %zu, amax/448 %zu\n", cases, pow2_picked,
               amax_kept);
   return 0;
 }
