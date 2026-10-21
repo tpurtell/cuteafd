@@ -175,9 +175,9 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
-    let sink = super::landing::PushSink::default();
+    let sink = std::rc::Rc::new(super::landing::PushSink::default());
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: Some(&sink) };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: Some(sink.clone()) };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let (records, deferred) = sink.take();
     let (sparks, world) = (6usize, 8usize);

@@ -34,19 +34,7 @@ impl RankLayout {
 
     /// Plan entries for group rank `rank`.
     pub fn append(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32) -> Result<()> {
-        for (start, _, bytes, lands) in &self.operands {
-            for land in lands {
-                let tensor = catalog.tensor(&land.tensor)?;
-                let source = Source { path: catalog.snapshot().join(&tensor.shard), offset: tensor.metadata.byte_offset,
-                    bytes: tensor.metadata.byte_length };
-                let (_, row_bytes) = super::landing::geometry(catalog, &land.tensor)?;
-                builder.rows(&source, (land.rows.start * row_bytes + land.cols.start) as u64,
-                    u32::try_from(land.rows.len())?, u32::try_from(land.width())?, row_bytes as u64, land.width() as u64,
-                    Destination { rank, offset: start + land.offset as u64, bytes: land.bytes() as u64 })?;
-            }
-            ensure!(lands.iter().all(|l| l.offset + l.bytes() <= *bytes), "landing past its operand");
-        }
-        Ok(())
+        (self.plan().append)(builder, catalog, rank)
     }
 
     /// This rank's checked entries alone, in a group of `world` ranks.
@@ -113,4 +101,43 @@ impl PushDestination for OperandArena<'_> {
         ensure!(self.expected.complete(&self.coverage), "rank Done before all planned operand bytes completed");
         Ok(())
     }
+}
+
+impl RankLayout {
+    /// The rank's entries as a device-free plan the group driver appends, and
+    /// where the TP2 arena starts after these operands.
+    pub fn plan(&self) -> crate::shared::experts::rtx::push::DensePlan {
+        let operands: Vec<(u64, Vec<super::landing::Land>)> =
+            self.operands.iter().map(|(start, _, _, lands)| (*start, lands.clone())).collect();
+        let base = self.bytes.next_multiple_of(256);
+        crate::shared::experts::rtx::push::DensePlan { base, append: Box::new(move |builder, catalog, rank| {
+            for (start, lands) in &operands {
+                for land in lands {
+                    let tensor = catalog.tensor(&land.tensor)?;
+                    let source = Source { path: catalog.snapshot().join(&tensor.shard),
+                        offset: tensor.metadata.byte_offset, bytes: tensor.metadata.byte_length };
+                    let (_, row_bytes) = super::landing::geometry(catalog, &land.tensor)?;
+                    builder.rows(&source, (land.rows.start * row_bytes + land.cols.start) as u64,
+                        u32::try_from(land.rows.len())?, u32::try_from(land.width())?, row_bytes as u64,
+                        land.width() as u64, Destination { rank, offset: start + land.offset as u64,
+                            bytes: land.bytes() as u64 })?;
+                }
+            }
+            Ok(())
+        }) }
+    }
+}
+
+/// Fills recorded class-2 operands through the mount (the whole push group
+/// fell back), on each operand's GPU.
+pub(crate) fn fill_by_mount(library: &cuteafd_ffi::NativeLibrary, catalog: &OfficialV41Catalog,
+    records: &[Record]) -> Result<()> {
+    for record in records {
+        let bytes = super::landing::read(catalog, &record.lands, record.bytes)?;
+        Device { library, id: record.device }.run(|| {
+            crate::shared::memory::load_timing::upload(bytes.len(), || library.copy_h2d(
+                CuteafdDeviceBuffer { bytes: record.bytes, ..record.buffer }, &bytes))
+        })?;
+    }
+    Ok(())
 }

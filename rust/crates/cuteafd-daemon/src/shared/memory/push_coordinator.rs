@@ -34,13 +34,21 @@ impl Tp2ExpertPlan {
 
     /// Entries for group rank `rank` (the coordinator GPU's rank in the group).
     pub fn append(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32) -> Result<()> {
+        self.append_at(builder, catalog, rank, 0)
+    }
+
+    /// As `append`, with this plan's logical space starting at `base` of the
+    /// rank's (the coordinator's dense operands come first).
+    pub fn append_at(&self, builder: &mut Builder, catalog: &OfficialV41Catalog, rank: u32, base: u64) -> Result<()> {
         for (index, residency) in self.residencies.iter().enumerate() {
             let range = self.layout.region(index)?;
             let (offsets, _) = residency.device_arena_layout()?;
             builder.exl3_residency(catalog, residency, &offsets, Destination {
-                rank, offset: range.start as u64, bytes: range.len() as u64 })?;
+                rank, offset: base + range.start as u64, bytes: range.len() as u64 })?;
         }
-        self.validation.append(builder, catalog, rank)
+        let validation = ValidationLayout::exl3(&self.residencies, base + self.layout.bytes() as u64, usize::MAX)?;
+        ensure!(validation.bytes() == self.validation.bytes(), "shifted validation differs");
+        validation.append(builder, catalog, rank)
     }
 
     /// This rank's checked entries alone, against a group of `world` ranks.

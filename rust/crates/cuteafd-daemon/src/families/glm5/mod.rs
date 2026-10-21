@@ -672,17 +672,48 @@ impl Opened {
             })
         };
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
-            let dense = || crate::shared::token_io::TokenEmbedding::load(&self.library, self.embed_source()?,
-                args.token_io.embed_placement, || { let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights"); loader.model(&self.cfg, layers, owners.as_deref(), native) });
-            let (pushed, loaded) = match coordinator_push.take() {
-                Some((push, sparks)) => {
-                    let (pushed, loaded) = push.receive(tp2_devices()?, &self.catalog, sparks, dense);
-                    (pushed?, loaded?)
+            let (embedding, (model, pushed)) = crate::shared::token_io::TokenEmbedding::load(&self.library,
+                self.embed_source()?, args.token_io.embed_placement, || {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+                let Some((push, sparks)) = coordinator_push.take() else {
+                    return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));
+                };
+                // The dense operands join the same ranks as the TP2 halves: allocate
+                // and plan them, receive both, then run the transforms of landed bytes.
+                let sink = std::rc::Rc::new(landing::PushSink::default());
+                let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
+                let model = planning.model(&self.cfg, layers, owners.as_deref(), native)?;
+                let (records, deferred) = sink.take();
+                let devices = tp2_devices()?;
+                let (root, _) = cuteafd_loader::push_load::namespace(&self.snapshot)?;
+                let world = sparks + 2;
+                let dense = devices.iter().enumerate().map(|(gpu, device)| -> Result<_> {
+                    let layout = push::RankLayout::new(&records, device.id)?;
+                    let checked = layout.checked(dense_catalog, &root, world, sparks + gpu)?;
+                    let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(
+                        &checked, u32::try_from(sparks + gpu)?)?;
+                    let plan = layout.plan();
+                    Ok((plan, push::OperandArena::new(*device, layout, expected)?))
+                }).collect::<Result<Vec<_>>>()?;
+                let [(left_plan, left), (right_plan, right)]: [_; 2] = dense.try_into()
+                    .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))?;
+                let (pushed, ()) = push.receive_with(devices, &self.catalog, sparks,
+                    Some(([left_plan, right_plan], [left, right])), || ());
+                let pushed = pushed?;
+                if pushed.is_none() {
+                    push::fill_by_mount(&self.library, dense_catalog, &records)?;
                 }
-                None => (None, dense()?),
-            };
+                for job in &deferred {
+                    crate::shared::memory::device::Device { library: &self.library, id: job.device }
+                        .run(|| job.run(&self.library, if job.device == args.device { stream }
+                            else { peer_stream.map_or(stream, |(_, s)| s) }))?;
+                }
+                tracing::info!(pushed = pushed.is_some(), operands = records.len(),
+                    "GLM coordinator dense operands landed");
+                Ok((model, pushed))
+            })?;
             let tp2 = tp2_range.clone().map(|range| tp2_weights(range, pushed)).transpose()?;
-            Ok((loaded.0, (loaded.1, tp2)))
+            Ok((embedding, (model, tp2)))
         })?;
         let native_owners = native_plans.into_iter().zip(&devices).map(|(plan, &device)| {
             self.library.cuda_set_device(device)?;

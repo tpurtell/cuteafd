@@ -79,6 +79,7 @@ pub(crate) struct GlmWeights<'a> {
     pub head: DeviceAllocation<'a>,
 }
 
+#[derive(Clone)]
 pub(crate) struct GlmLoader<'a> {
     pub library: &'a NativeLibrary,
     pub catalog: &'a OfficialV41Catalog,
@@ -89,7 +90,7 @@ pub(crate) struct GlmLoader<'a> {
     pub peers: Vec<crate::shared::peer_split::RankDevice>,
     /// Push mode: class-2 operands are allocated and recorded, filled later by
     /// the push group; transforms of their bytes wait for the commit.
-    pub push: Option<&'a super::landing::PushSink>,
+    pub push: Option<std::rc::Rc<super::landing::PushSink>>,
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -129,7 +130,7 @@ impl<'a> GlmLoader<'a> {
     /// One operand on this loader's current device filled from checkpoint
     /// rectangles that land unchanged (class 2).
     fn landed(&self, lands: &[Land], bytes: usize) -> Result<DeviceAllocation<'a>> {
-        if let Some(push) = self.push {
+        if let Some(push) = &self.push {
             let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
             push.record(self.library.cuda_get_device()?, allocation.buffer, lands, bytes)?;
             return Ok(allocation);
@@ -687,7 +688,7 @@ impl<'a> GlmLoader<'a> {
                 let kscale = DeviceAllocation::new(self.library, (rows * kb * 4).max(256))?;
                 let job = landing::Kmajor { device: self.library.cuda_get_device()?, grid: grid.buffer,
                     kmajor: kscale.buffer, rows, kb };
-                match self.push {
+                match &self.push {
                     // The grid is not delivered yet: widen after the group commits.
                     Some(push) => push.defer(job)?,
                     None => job.run(self.library, stream)?,
@@ -795,7 +796,7 @@ impl<'a> GlmLoader<'a> {
             let (device, stream) = if owner == 0 { (self.device, self.stream) }
                 else { let peer = self.peers.get(usize::from(owner) - 1).context("attention owner")?; (peer.device, peer.stream) };
             let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new(),
-                push: self.push };
+                push: self.push.clone() };
             let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer))?;
             ops[usize::from(owner)].extend(maps.pop().context("whole attention operands")?);
             None
