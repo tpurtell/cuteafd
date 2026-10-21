@@ -7,8 +7,8 @@ use std::{
     os::fd::{AsFd, BorrowedFd, FromRawFd, OwnedFd},
 };
 
-pub const DEFAULT_SLOT_BYTES: usize = 1024 * 1024;
-pub const DEFAULT_SLOTS: usize = 128;
+pub const DEFAULT_SLOT_BYTES: usize = 4 * 1024 * 1024;
+pub const DEFAULT_SLOTS: usize = 32;
 
 pub struct RegisteredRing<'a> {
     library: &'a NativeLibrary,
@@ -180,6 +180,13 @@ mod tests {
     use super::*;
     use crate::native_library_lifetime_fixture::Fixture;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn default_geometry_keeps_128_mib_with_uniform_4_mib_slots() {
+        assert_eq!(DEFAULT_SLOT_BYTES, 4 * 1024 * 1024);
+        assert_eq!(DEFAULT_SLOTS, 32);
+        assert_eq!(DEFAULT_SLOT_BYTES * DEFAULT_SLOTS, 128 * 1024 * 1024);
+    }
 
     #[test]
     #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
