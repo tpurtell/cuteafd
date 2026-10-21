@@ -74,7 +74,7 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     let cfg = GlmDsaConfig::read(root.path())?;
     let stream = std::ptr::null_mut();
     let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
-        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }] };
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: None };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
     let actual = digests(&library, &layers, &model.norm, &model.head)?;
@@ -86,6 +86,122 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
     assert_eq!(actual.keys().collect::<Vec<_>>(), golden.keys().collect::<Vec<_>>(), "operand inventory changed");
     for (key, digest) in &golden {
         assert_eq!(&actual[key], digest, "{key} differs from the mount golden");
+    }
+    Ok(())
+}
+
+/// A one-source fake SparkNest for one rank: packs the rank's planned runs
+/// into ring slots in plan order, Filled per slot (each written only after its
+/// previous use was released), then Done.
+struct FakeRank {
+    ring: std::fs::File,
+    slot_bytes: usize,
+    slots: Vec<Vec<u8>>,
+    next: std::cell::Cell<usize>,
+    released: std::cell::RefCell<std::collections::BTreeSet<u32>>,
+    capacity: usize,
+}
+
+impl FakeRank {
+    fn new(plan: &cuteafd_loader::push_load::builder::CheckedPlan, mount: &std::path::Path, rank: u32,
+        ring: &cuteafd_ffi::push_ring::RegisteredRing<'_>) -> Result<Self> {
+        use cuteafd_loader::push_load::slot;
+        let slot_bytes = ring.slot_bytes();
+        let sources = plan.plan.files.iter().map(|f| std::fs::read(mount.join(f))).collect::<std::io::Result<Vec<_>>>()?;
+        let (mut slots, mut packer) = (Vec::new(), slot::Packer::new(vec![0; slot_bytes]));
+        for entry in plan.plan.entries.iter().filter(|e| e.rank == rank) {
+            let pattern = &plan.plan.patterns[entry.pattern as usize];
+            for (src, dst) in pattern.runs() {
+                let start = (entry.src_base + src) as usize;
+                let mut bytes = &sources[entry.file as usize][start..start + pattern.run as usize];
+                let mut at = entry.dst_base + dst;
+                while !bytes.is_empty() {
+                    let n = packer.push(at, bytes);
+                    if n == 0 { slots.push(packer.finish().0); packer = slot::Packer::new(vec![0; slot_bytes]); continue; }
+                    at += n as u64;
+                    bytes = &bytes[n..];
+                }
+            }
+        }
+        if !packer.is_empty() { slots.push(packer.finish().0); }
+        use std::os::fd::AsFd;
+        Ok(Self { ring: std::fs::File::from(ring.fd().as_fd().try_clone_to_owned()?), slot_bytes, slots,
+            next: std::cell::Cell::new(0), released: Default::default(), capacity: ring.slots() })
+    }
+}
+
+impl crate::shared::memory::push_consumer::RankEvents for FakeRank {
+    fn next(&self) -> std::io::Result<cuteafd_loader::push_load::proto::Event> {
+        use cuteafd_loader::push_load::proto::Event;
+        let i = self.next.get();
+        let Some(bytes) = self.slots.get(i) else { return Ok(Event::Done) };
+        let slot = (i % self.capacity) as u32;
+        if i >= self.capacity && !self.released.borrow_mut().remove(&slot) {
+            return Err(std::io::Error::other("fake source reused an unreleased slot"));
+        }
+        self.ring.write_all_at(bytes, slot as u64 * self.slot_bytes as u64)?;
+        self.next.set(i + 1);
+        Ok(Event::Filled { slot, len: bytes.len() as u32 })
+    }
+    fn try_next(&self) -> std::io::Result<cuteafd_loader::push_load::Poll> {
+        // Slots fill only after releases: report empty while every slot is in flight.
+        let i = self.next.get();
+        if i < self.slots.len() && i >= self.capacity && !self.released.borrow().contains(&((i % self.capacity) as u32)) {
+            return Ok(cuteafd_loader::push_load::Poll::Empty);
+        }
+        self.next().map(cuteafd_loader::push_load::Poll::Ready)
+    }
+    fn release(&self, slot: u32) -> std::io::Result<()> {
+        self.released.borrow_mut().insert(slot);
+        Ok(())
+    }
+}
+
+/// The same operands pushed: the loader allocates and records class-2
+/// operands, each GPU's plan replays through a ring into them, and the
+/// deferred transforms run after delivery. Every operand matches the mount golden.
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
+    let fixture_dso = Fixture::build()?;
+    let library = fixture_dso.load()?;
+    for device in 0..2 { fixture_dso.configure_memory(&library, device, 64 << 30)?; }
+    let root = tempfile::tempdir_in(fixture_dso.directory())?;
+    let tensors = fixture::glm5_tensors(|name, n, k| (0..256).flat_map(|expert|
+        fixture::fp8(&name.replace(".experts.0.", &format!(".experts.{expert}.")), n, k, None)).collect());
+    fixture::write_snapshot(root.path(), &fixture::glm5_config(), &tensors, None);
+    fill(root.path())?;
+    let mut catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    let stream = std::ptr::null_mut();
+    let sink = super::landing::PushSink::default();
+    let loader = GlmLoader { library: &library, catalog: &catalog, stream, device: 0,
+        peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: Some(&sink) };
+    let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
+    let (records, deferred) = sink.take();
+    let (sparks, world) = (6usize, 8usize);
+    for gpu in 0..2 {
+        let device = crate::shared::memory::device::Device { library: &library, id: gpu };
+        let layout = crate::families::glm5::push::RankLayout::new(&records, gpu)?;
+        let checked = layout.checked(&catalog, root.path(), world, sparks + gpu as usize)?;
+        let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(&checked, (sparks + gpu as usize) as u32)?;
+        device.run(|| -> Result<()> {
+            let ring = cuteafd_ffi::push_ring::RegisteredRing::new(&library, 8, cuteafd_ffi::push_ring::DEFAULT_SLOT_BYTES)?;
+            let fake = FakeRank::new(&checked, root.path(), (sparks + gpu as usize) as u32, &ring)?;
+            let arena = crate::families::glm5::push::OperandArena::new(device, layout, expected)?;
+            crate::shared::memory::push_consumer::consume(device, arena, ring, fake, 8)
+        })?;
+    }
+    for job in &deferred {
+        crate::shared::memory::device::Device { library: &library, id: job.device }.run(|| job.run(&library, stream))?;
+    }
+    let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
+    let actual = digests(&library, &layers, &model.norm, &model.head)?;
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5/weights_golden.json");
+    let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&path)?)?;
+    for (key, digest) in &golden {
+        assert_eq!(&actual[key], digest, "pushed {key} differs from the mount golden");
     }
     Ok(())
 }

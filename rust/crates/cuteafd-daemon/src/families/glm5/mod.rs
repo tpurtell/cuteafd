@@ -5,6 +5,7 @@ pub(crate) mod engine;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod landing;
+pub(crate) mod push;
 pub(crate) mod weights;
 
 use anyhow::{ensure, Context, Result};
@@ -622,7 +623,7 @@ impl Opened {
         let started = Instant::now();
         let loader = weights::GlmLoader { library: &self.library, catalog: dense_catalog, stream, device: args.device,
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
-                .collect() };
+                .collect(), push: None };
         let tp2_range = placement.tp2.map(|p| p.first..p.first + p.layers);
         let max_rows = args.prefill_rows.max(engine::DECODE_ROWS);
         // The admitted TP2 expert halves are charged before the serving pool;

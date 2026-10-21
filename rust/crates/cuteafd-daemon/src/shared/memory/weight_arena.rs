@@ -69,13 +69,13 @@ mod real_tests;
 const MAX_COVERAGE_INTERVALS: usize = 1_000_000;
 
 #[derive(Default)]
-struct Coverage {
+pub(crate) struct Coverage {
     intervals: BTreeMap<u64, u64>,
     bytes: u64,
     peak: usize,
 }
 impl Coverage {
-    fn insert(&mut self, start: u64, bytes: u64) -> Result<()> {
+    pub(crate) fn insert(&mut self, start: u64, bytes: u64) -> Result<()> {
         self.insert_bounded(start, bytes, MAX_COVERAGE_INTERVALS)
     }
     fn insert_bounded(&mut self, start: u64, bytes: u64, cap: usize) -> Result<()> {
@@ -174,7 +174,12 @@ impl ExpectedCoverage {
         );
         Ok(expected)
     }
-    fn contains(&self, start: u64, bytes: u64) -> bool {
+    /// Delivered coverage equals this footprint exactly.
+    pub(crate) fn complete(&self, delivered: &Coverage) -> bool {
+        delivered.bytes == self.0.bytes && delivered.intervals == self.0.intervals
+    }
+    pub(crate) fn bytes(&self) -> u64 { self.0.bytes }
+    pub(crate) fn contains(&self, start: u64, bytes: u64) -> bool {
         start.checked_add(bytes).is_some_and(|end| {
             self.0
                 .intervals

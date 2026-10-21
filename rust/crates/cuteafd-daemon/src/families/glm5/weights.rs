@@ -87,6 +87,9 @@ pub(crate) struct GlmLoader<'a> {
     pub device: i32,
     /// The other GPU of a head split (rank 1), if any.
     pub peers: Vec<crate::shared::peer_split::RankDevice>,
+    /// Push mode: class-2 operands are allocated and recorded, filled later by
+    /// the push group; transforms of their bytes wait for the commit.
+    pub push: Option<&'a super::landing::PushSink>,
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -126,11 +129,20 @@ impl<'a> GlmLoader<'a> {
     /// One operand on this loader's current device filled from checkpoint
     /// rectangles that land unchanged (class 2).
     fn landed(&self, lands: &[Land], bytes: usize) -> Result<DeviceAllocation<'a>> {
+        if let Some(push) = self.push {
+            let allocation = DeviceAllocation::new(self.library, bytes.max(256))?;
+            push.record(self.library.cuda_get_device()?, allocation.buffer, lands, bytes)?;
+            return Ok(allocation);
+        }
         self.upload(&landing::read(self.catalog, lands, bytes)?)
     }
 
-    /// `lands` replicated on every rank (one read, rank 0 upload, peer copies).
+    /// `lands` replicated on every rank (one read, rank 0 upload, peer copies;
+    /// pushed, each rank receives its own copy).
     fn landed_all(&self, ranks: usize, lands: &[Land], bytes: usize) -> Result<Vec<DeviceAllocation<'a>>> {
+        if self.push.is_some() {
+            return (0..ranks).map(|rank| self.on_rank(rank, |_| self.landed(lands, bytes))).collect();
+        }
         self.upload_all(ranks, &landing::read(self.catalog, lands, bytes)?)
     }
 
@@ -673,11 +685,12 @@ impl<'a> GlmLoader<'a> {
             let (values, grid) = (self.landed_all(ranks, &values, values_bytes)?, self.landed_all(ranks, &grid, grid_bytes)?);
             let kscale = grid.iter().enumerate().map(|(rank, grid)| self.on_rank(rank, |stream| {
                 let kscale = DeviceAllocation::new(self.library, (rows * kb * 4).max(256))?;
-                // SAFETY: the grid holds ceil(rows/128) x kb FP32 scales and the destination
-                // kb x rows; both live on this rank, drained before return.
-                unsafe {
-                    self.library.fp8_grid_kmajor(grid.buffer.ptr, kscale.buffer.ptr, rows, kb, stream)?;
-                    self.library.cuda_stream_synchronize(stream)?;
+                let job = landing::Kmajor { device: self.library.cuda_get_device()?, grid: grid.buffer,
+                    kmajor: kscale.buffer, rows, kb };
+                match self.push {
+                    // The grid is not delivered yet: widen after the group commits.
+                    Some(push) => push.defer(job)?,
+                    None => job.run(self.library, stream)?,
                 }
                 Ok(kscale)
             })).collect::<Result<Vec<_>>>()?;
@@ -781,7 +794,8 @@ impl<'a> GlmLoader<'a> {
         let attention = if let Some(owner) = owner {
             let (device, stream) = if owner == 0 { (self.device, self.stream) }
                 else { let peer = self.peers.get(usize::from(owner) - 1).context("attention owner")?; (peer.device, peer.stream) };
-            let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new() };
+            let local = GlmLoader { library: self.library, catalog: self.catalog, device, stream, peers: Vec::new(),
+                push: self.push };
             let mut maps = self.on_rank(usize::from(owner), |_| local.attention_operands(cfg, layer))?;
             ops[usize::from(owner)].extend(maps.pop().context("whole attention operands")?);
             None

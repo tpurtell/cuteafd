@@ -116,3 +116,60 @@ pub(crate) fn col_share(catalog: &OfficialV41Catalog, name: &str, ranks: usize, 
     let bytes = land.bytes();
     Ok((land, bytes))
 }
+
+/// One class-2 operand allocation awaiting its pushed bytes.
+pub(crate) struct Record {
+    pub device: i32,
+    pub buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub lands: Vec<Land>,
+    pub bytes: usize,
+}
+
+/// A K-major widening of a landed grid, run once its grid is delivered.
+#[derive(Clone, Copy)]
+pub(crate) struct Kmajor {
+    pub device: i32,
+    pub grid: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub kmajor: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub rows: usize,
+    pub kb: usize,
+}
+
+impl Kmajor {
+    /// On the current device (`device`), drained before return.
+    pub fn run(&self, library: &cuteafd_ffi::NativeLibrary, stream: *mut std::ffi::c_void) -> Result<()> {
+        ensure!(self.grid.bytes >= self.rows.div_ceil(128) * self.kb * 4 && self.kmajor.bytes >= self.rows * self.kb * 4,
+            "K-major widening exceeds its operands");
+        // SAFETY: both buffers are live operand allocations on the current device
+        // sized as checked above; the stream drains before return.
+        unsafe {
+            library.fp8_grid_kmajor(self.grid.ptr, self.kmajor.ptr, self.rows, self.kb, stream)?;
+            library.cuda_stream_synchronize(stream)
+        }
+    }
+}
+
+/// Push-mode loader output: the class-2 allocations to fill and the
+/// transforms that read them, in loader order.
+#[derive(Default)]
+pub(crate) struct PushSink {
+    records: std::cell::RefCell<Vec<Record>>,
+    deferred: std::cell::RefCell<Vec<Kmajor>>,
+}
+
+impl PushSink {
+    pub fn record(&self, device: i32, buffer: cuteafd_ffi::CuteafdDeviceBuffer, lands: &[Land], bytes: usize) -> Result<()> {
+        ensure!(bytes <= buffer.bytes && lands.iter().all(|l| l.offset + l.bytes() <= bytes),
+            "pushed landing outside its operand");
+        self.records.borrow_mut().push(Record { device, buffer, lands: lands.to_vec(), bytes });
+        Ok(())
+    }
+    pub fn defer(&self, job: Kmajor) -> Result<()> {
+        self.deferred.borrow_mut().push(job);
+        Ok(())
+    }
+    /// The recorded operands and deferred transforms (leaves the sink empty).
+    pub fn take(&self) -> (Vec<Record>, Vec<Kmajor>) {
+        (self.records.take(), self.deferred.take())
+    }
+}
