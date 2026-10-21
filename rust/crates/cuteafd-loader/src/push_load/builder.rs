@@ -2,6 +2,8 @@
 //! slicing descriptors; transforms and device-address relocation happen later.
 
 #[cfg(test)]
+mod coordinator_tests;
+#[cfg(test)]
 mod native_tests;
 #[cfg(test)]
 mod tests;
