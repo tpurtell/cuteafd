@@ -14,6 +14,40 @@ use std::{
     ffi::c_void,
 };
 
+/// Where a rank's fragments land: a logical address space whose first
+/// `device_bytes` map to device memory and the rest to a host tail, with
+/// delivered coverage checked against the plan. `LoadingArena` is the Spark
+/// rank's single admitted arena; coordinator ranks may map it differently.
+pub(crate) trait PushDestination {
+    type Delivered;
+    fn belongs_to(&self, device: Device<'_>) -> bool;
+    fn logical_bytes(&self) -> usize;
+    fn device_bytes(&self) -> usize;
+    fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()>;
+    fn destination(&self, offset: usize, bytes: usize) -> Result<cuteafd_ffi::CuteafdDeviceBuffer>;
+    fn copy_validation(&mut self, offset: u64, bytes: &[u8]) -> Result<()>;
+    /// Called only after a fragment's copy completed, before its slot is released.
+    fn copied(&mut self, offset: u64, bytes: u64) -> Result<()>;
+    /// Rank Done observed and every copy drained.
+    fn done(self) -> Result<Self::Delivered>;
+}
+
+impl<'a> PushDestination for LoadingArena<'a> {
+    type Delivered = DeliveredArena<'a>;
+    fn belongs_to(&self, device: Device<'_>) -> bool { LoadingArena::belongs_to(self, device) }
+    fn logical_bytes(&self) -> usize { LoadingArena::logical_bytes(self) }
+    fn device_bytes(&self) -> usize { LoadingArena::device_bytes(self) }
+    fn check_fragment(&self, offset: u64, bytes: u64) -> Result<()> { LoadingArena::check_fragment(self, offset, bytes) }
+    fn destination(&self, offset: usize, bytes: usize) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        LoadingArena::destination(self, offset, bytes)
+    }
+    fn copy_validation(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
+        LoadingArena::copy_validation(self, offset, bytes)
+    }
+    fn copied(&mut self, offset: u64, bytes: u64) -> Result<()> { LoadingArena::copied(self, offset, bytes) }
+    fn done(self) -> Result<DeliveredArena<'a>> { LoadingArena::done(self) }
+}
+
 pub(crate) trait RankEvents {
     fn next(&self) -> std::io::Result<Event>;
     fn try_next(&self) -> std::io::Result<Poll>;
@@ -54,7 +88,7 @@ impl<'a> Copies<'a> {
             occupied: BTreeSet::new(),
         })
     }
-    fn complete(&mut self, arena: &mut LoadingArena<'_>, rank: &impl RankEvents) -> Result<()> {
+    fn complete(&mut self, arena: &mut impl PushDestination, rank: &impl RankEvents) -> Result<()> {
         let pending = self.pending.front().context("empty copy queue")?;
         // SAFETY: event belongs to this stream and follows every copy from its retained slot.
         self.device
@@ -98,13 +132,13 @@ impl Drop for Copies<'_> {
 
 /// Own ring and arena through cancellation. No partial load escapes this function.
 /// A queued slot has its own event; Empty waits on the oldest rather than spinning.
-pub(crate) fn consume<'a>(
+pub(crate) fn consume<'a, A: PushDestination>(
     device: Device<'a>,
-    mut arena: LoadingArena<'a>,
+    mut arena: A,
     ring: RegisteredRing<'a>,
     rank: impl RankEvents,
     window: usize,
-) -> Result<DeliveredArena<'a>> {
+) -> Result<A::Delivered> {
     ensure!(
         window > 0 && window <= ring.slots(),
         "invalid push copy window"
