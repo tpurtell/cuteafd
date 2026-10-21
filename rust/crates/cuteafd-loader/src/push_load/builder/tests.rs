@@ -24,6 +24,65 @@ pub(super) fn land(plan: &CheckedPlan, mount: &Path) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn checked_patterns_preserve_first_seen_ids_and_exact_plan() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("weights");
+    std::fs::write(&path, (0..32u8).collect::<Vec<_>>()).unwrap();
+    let source = Source { path, offset: 0, bytes: 32 };
+    let patterns = [Pattern { run: 4, dims: vec![] }, Pattern { run: 8, dims: vec![] }];
+    let mut builder = Builder::new(root.path(), vec![16]);
+    for (pattern, offset) in [(0, 0), (1, 4), (0, 12)] {
+        builder.entry(&source, Destination { rank: 0, offset, bytes: 16 - offset },
+            patterns[pattern].clone(), 0).unwrap();
+    }
+    assert_eq!(builder.checked_patterns.len(), 2);
+    let actual = builder.finish().unwrap();
+    let expected = Plan {
+        files: vec!["weights".into()],
+        patterns: patterns.to_vec(),
+        entries: vec![
+            Entry { file: 0, pattern: 0, src_base: 0, dst_base: 0, rank: 0 },
+            Entry { file: 0, pattern: 1, src_base: 0, dst_base: 4, rank: 0 },
+            Entry { file: 0, pattern: 0, src_base: 0, dst_base: 12, rank: 0 },
+        ],
+    };
+    assert_eq!(serde_json::to_vec(&actual.plan).unwrap(), serde_json::to_vec(&expected).unwrap());
+    assert_eq!(land(&actual, root.path())[0], [0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]);
+}
+
+#[test]
+fn pattern_hash_collisions_require_exact_equality_and_do_not_cache_invalid_patterns() {
+    let mut builder = Builder::new(Path::new("/"), vec![]);
+    let a = Pattern { run: 4, dims: vec![] };
+    let b = Pattern { run: 8, dims: vec![] };
+    assert_eq!(builder.checked_pattern_with_hash(&a, 0).unwrap(), 0);
+    assert_eq!(builder.checked_pattern_with_hash(&b, 0).unwrap(), 1);
+    assert_eq!(builder.checked_pattern_with_hash(&a, 0).unwrap(), 0);
+    assert_eq!(builder.checked_patterns.len(), 2);
+    assert!(builder.checked_pattern_with_hash(&Pattern { run: 0, dims: vec![] }, 0).is_err());
+    assert_eq!(builder.checked_patterns.len(), 2);
+    assert!(builder.plan.patterns.is_empty());
+}
+
+#[test]
+fn cached_patterns_still_validate_each_entry_view() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("weights");
+    std::fs::write(&path, [0u8; 16]).unwrap();
+    let source = Source { path, offset: 0, bytes: 16 };
+    let pattern = Pattern { run: 4, dims: vec![] };
+    let mut builder = Builder::new(root.path(), vec![16]);
+    let target = Destination { rank: 0, offset: 0, bytes: 4 };
+    builder.entry(&source, target, pattern.clone(), 0).unwrap();
+    assert!(builder.entry(&source, target, pattern.clone(), 13).is_err());
+    assert!(builder.entry(&source, Destination { bytes: 3, ..target }, pattern.clone(), 0).is_err());
+    assert!(builder.entry(&source, Destination { offset: 13, ..target }, pattern.clone(), 0).is_err());
+    assert!(builder.entry(&source, Destination { rank: 1, ..target }, pattern, 0).is_err());
+    assert_eq!(builder.plan.entries.len(), 1);
+    assert_eq!(builder.checked_patterns.len(), 1);
+}
+
+#[test]
 fn packed_balanced_columns_and_exact_scalars() {
     let root = TempDir::new().unwrap();
     let bytes = (0..192).map(|i| i as u8).collect::<Vec<_>>();

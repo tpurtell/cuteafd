@@ -6,9 +6,10 @@ mod native_tests;
 #[cfg(test)]
 mod tests;
 
-use nest_push::plan::{Dim, Entry, Pattern, Plan, Steps, Totals};
+use nest_push::plan::{Dim, Entry, Extent, Pattern, Plan, Steps, Totals};
 use std::{
-    collections::BTreeMap,
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap},
+    hash::{Hash, Hasher},
     ops::Range,
     path::{Component, Path, PathBuf},
 };
@@ -71,12 +72,42 @@ impl CheckedPlan {
     }
 }
 
+struct CheckedPattern {
+    pattern: Pattern,
+    extent: Extent,
+    fits_message: bool,
+    plan_id: Option<u32>,
+}
+
+fn pattern_hash(pattern: &Pattern) -> u64 {
+    let mut hash = DefaultHasher::new();
+    pattern.run.hash(&mut hash);
+    pattern.dims.len().hash(&mut hash);
+    for dim in &pattern.dims {
+        dim.src_stride.hash(&mut hash);
+        dim.dst_stride.hash(&mut hash);
+        match &dim.steps {
+            Steps::Count(count) => {
+                0u8.hash(&mut hash);
+                count.hash(&mut hash);
+            }
+            Steps::Indices(indices) => {
+                1u8.hash(&mut hash);
+                indices.hash(&mut hash);
+            }
+        }
+    }
+    hash.finish()
+}
+
 pub struct Builder {
     mount: PathBuf,
     plan: Plan,
     file_ids: BTreeMap<PathBuf, u32>,
     file_sizes: Vec<u64>,
     arenas: Vec<u64>,
+    checked_patterns: Vec<CheckedPattern>,
+    pattern_ids: HashMap<u64, Vec<usize>>,
 }
 
 impl Builder {
@@ -93,6 +124,8 @@ impl Builder {
             file_ids: BTreeMap::new(),
             file_sizes: vec![],
             arenas,
+            checked_patterns: vec![],
+            pattern_ids: HashMap::new(),
         }
     }
 
@@ -120,14 +153,39 @@ impl Builder {
         Ok(id)
     }
 
-    fn pattern(&mut self, pattern: Pattern) -> Result<u32> {
-        pattern.check().map_err(BuildError::Layout)?;
-        if let Some(id) = self.plan.patterns.iter().position(|p| p == &pattern) {
-            return u32::try_from(id).map_err(|_| invalid("too many patterns"));
+    fn checked_pattern(&mut self, pattern: &Pattern) -> Result<usize> {
+        self.checked_pattern_with_hash(pattern, pattern_hash(pattern))
+    }
+
+    fn checked_pattern_with_hash(&mut self, pattern: &Pattern, hash: u64) -> Result<usize> {
+        if let Some(ids) = self.pattern_ids.get(&hash) {
+            // Hashes only narrow the lookup; collisions never identify patterns.
+            if let Some(&id) = ids.iter().find(|&&id| self.checked_patterns[id].pattern == *pattern) {
+                return Ok(id);
+            }
+        }
+        let extent = pattern.check().map_err(BuildError::Layout)?;
+        let fits_message = nest_push::proto::encode(pattern).len() + 16 <= nest_push::proto::MAX_MSG;
+        let id = self.checked_patterns.len();
+        self.checked_patterns.push(CheckedPattern {
+            pattern: pattern.clone(),
+            extent,
+            fits_message,
+            plan_id: None,
+        });
+        self.pattern_ids.entry(hash).or_default().push(id);
+        Ok(id)
+    }
+
+    fn pattern(&mut self, checked: usize) -> Result<u32> {
+        let pattern = &mut self.checked_patterns[checked];
+        if let Some(id) = pattern.plan_id {
+            return Ok(id);
         }
         let id =
             u32::try_from(self.plan.patterns.len()).map_err(|_| invalid("too many patterns"))?;
-        self.plan.patterns.push(pattern);
+        self.plan.patterns.push(pattern.pattern.clone());
+        pattern.plan_id = Some(id);
         Ok(id)
     }
 
@@ -138,7 +196,8 @@ impl Builder {
         pattern: Pattern,
         relative: u64,
     ) -> Result<()> {
-        let extent = pattern.check().map_err(BuildError::Layout)?;
+        let checked = self.checked_pattern(&pattern)?;
+        let extent = self.checked_patterns[checked].extent;
         let arena = self
             .arenas
             .get(destination.rank as usize)
@@ -149,7 +208,7 @@ impl Builder {
         if add(relative, extent.src_len)? > source.bytes || extent.dst_len > destination.bytes {
             return Err(invalid("tensor image exceeds source or destination view"));
         }
-        if nest_push::proto::encode(&pattern).len() + 16 > nest_push::proto::MAX_MSG {
+        if !self.checked_patterns[checked].fits_message {
             let axis = pattern
                 .dims
                 .iter()
@@ -193,7 +252,7 @@ impl Builder {
             return Ok(());
         }
         let file = self.file(&source.path)?;
-        let pattern = self.pattern(pattern)?;
+        let pattern = self.pattern(checked)?;
         self.plan.entries.push(Entry {
             file,
             pattern,
