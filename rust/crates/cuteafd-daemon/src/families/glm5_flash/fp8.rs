@@ -136,6 +136,10 @@ fn bf16(bytes: &[u8], i: usize) -> f32 {
 /// Quantizes a BF16 `[n, k]` weight; returns E4M3 bytes and FP32 scales in
 /// `layout`, each block's scale by `rule`.
 pub(crate) fn quantize(weight: &[u8], n: usize, k: usize, layout: Layout, rule: Fp8Scales) -> (Vec<u8>, Vec<f32>) {
+    crate::shared::memory::load_timing::quantize(weight.len(), || quantize_inner(weight, n, k, layout, rule))
+}
+
+fn quantize_inner(weight: &[u8], n: usize, k: usize, layout: Layout, rule: Fp8Scales) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(weight.len(), n * k * 2);
     assert!(k % 128 == 0 && (layout != Layout::Block || n % 128 == 0));
     let kb = k / 128;
