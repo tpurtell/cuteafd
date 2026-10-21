@@ -6,10 +6,10 @@ mod native_tests;
 #[cfg(test)]
 mod tests;
 
-use nest_push::plan::{Dim, Entry, Extent, Pattern, Plan, Steps, Totals};
+use nest_push::plan::{Dim, Entry, Pattern, Plan, Steps, Totals};
 use std::{
-    collections::{hash_map::DefaultHasher, BTreeMap, HashMap},
-    hash::{Hash, Hasher},
+    collections::{BTreeMap, HashMap},
+    ffi::OsString,
     ops::Range,
     path::{Component, Path, PathBuf},
 };
@@ -72,42 +72,13 @@ impl CheckedPlan {
     }
 }
 
-struct CheckedPattern {
-    pattern: Pattern,
-    extent: Extent,
-    fits_message: bool,
-    plan_id: Option<u32>,
-}
-
-fn pattern_hash(pattern: &Pattern) -> u64 {
-    let mut hash = DefaultHasher::new();
-    pattern.run.hash(&mut hash);
-    pattern.dims.len().hash(&mut hash);
-    for dim in &pattern.dims {
-        dim.src_stride.hash(&mut hash);
-        dim.dst_stride.hash(&mut hash);
-        match &dim.steps {
-            Steps::Count(count) => {
-                0u8.hash(&mut hash);
-                count.hash(&mut hash);
-            }
-            Steps::Indices(indices) => {
-                1u8.hash(&mut hash);
-                indices.hash(&mut hash);
-            }
-        }
-    }
-    hash.finish()
-}
-
 pub struct Builder {
     mount: PathBuf,
     plan: Plan,
-    file_ids: BTreeMap<PathBuf, u32>,
+    file_ids: HashMap<OsString, u32>,
+    last_file: Option<(OsString, u32)>,
     file_sizes: Vec<u64>,
     arenas: Vec<u64>,
-    checked_patterns: Vec<CheckedPattern>,
-    pattern_ids: HashMap<u64, Vec<usize>>,
 }
 
 impl Builder {
@@ -121,16 +92,23 @@ impl Builder {
                 patterns: vec![],
                 entries: vec![],
             },
-            file_ids: BTreeMap::new(),
+            file_ids: HashMap::new(),
+            last_file: None,
             file_sizes: vec![],
             arenas,
-            checked_patterns: vec![],
-            pattern_ids: HashMap::new(),
         }
     }
 
     fn file(&mut self, path: &Path) -> Result<u32> {
-        if let Some(&id) = self.file_ids.get(path) {
+        // Tensor entries usually share a shard; avoid component-wise Path comparisons.
+        let key = path.as_os_str();
+        if let Some((last, id)) = &self.last_file {
+            if last == key {
+                return Ok(*id);
+            }
+        }
+        if let Some(&id) = self.file_ids.get(key) {
+            self.last_file = Some((key.to_owned(), id));
             return Ok(id);
         }
         let relative = path
@@ -149,43 +127,19 @@ impl Builder {
         let id = u32::try_from(self.plan.files.len()).map_err(|_| invalid("too many files"))?;
         self.file_sizes.push(std::fs::metadata(path)?.len());
         self.plan.files.push(name.into());
-        self.file_ids.insert(path.into(), id);
+        self.file_ids.insert(key.to_owned(), id);
+        self.last_file = Some((key.to_owned(), id));
         Ok(id)
     }
 
-    fn checked_pattern(&mut self, pattern: &Pattern) -> Result<usize> {
-        self.checked_pattern_with_hash(pattern, pattern_hash(pattern))
-    }
-
-    fn checked_pattern_with_hash(&mut self, pattern: &Pattern, hash: u64) -> Result<usize> {
-        if let Some(ids) = self.pattern_ids.get(&hash) {
-            // Hashes only narrow the lookup; collisions never identify patterns.
-            if let Some(&id) = ids.iter().find(|&&id| self.checked_patterns[id].pattern == *pattern) {
-                return Ok(id);
-            }
-        }
-        let extent = pattern.check().map_err(BuildError::Layout)?;
-        let fits_message = nest_push::proto::encode(pattern).len() + 16 <= nest_push::proto::MAX_MSG;
-        let id = self.checked_patterns.len();
-        self.checked_patterns.push(CheckedPattern {
-            pattern: pattern.clone(),
-            extent,
-            fits_message,
-            plan_id: None,
-        });
-        self.pattern_ids.entry(hash).or_default().push(id);
-        Ok(id)
-    }
-
-    fn pattern(&mut self, checked: usize) -> Result<u32> {
-        let pattern = &mut self.checked_patterns[checked];
-        if let Some(id) = pattern.plan_id {
-            return Ok(id);
+    fn pattern(&mut self, pattern: Pattern) -> Result<u32> {
+        pattern.check().map_err(BuildError::Layout)?;
+        if let Some(id) = self.plan.patterns.iter().position(|p| p == &pattern) {
+            return u32::try_from(id).map_err(|_| invalid("too many patterns"));
         }
         let id =
             u32::try_from(self.plan.patterns.len()).map_err(|_| invalid("too many patterns"))?;
-        self.plan.patterns.push(pattern.pattern.clone());
-        pattern.plan_id = Some(id);
+        self.plan.patterns.push(pattern);
         Ok(id)
     }
 
@@ -196,8 +150,7 @@ impl Builder {
         pattern: Pattern,
         relative: u64,
     ) -> Result<()> {
-        let checked = self.checked_pattern(&pattern)?;
-        let extent = self.checked_patterns[checked].extent;
+        let extent = pattern.check().map_err(BuildError::Layout)?;
         let arena = self
             .arenas
             .get(destination.rank as usize)
@@ -208,7 +161,7 @@ impl Builder {
         if add(relative, extent.src_len)? > source.bytes || extent.dst_len > destination.bytes {
             return Err(invalid("tensor image exceeds source or destination view"));
         }
-        if !self.checked_patterns[checked].fits_message {
+        if nest_push::proto::encode(&pattern).len() + 16 > nest_push::proto::MAX_MSG {
             let axis = pattern
                 .dims
                 .iter()
@@ -252,7 +205,7 @@ impl Builder {
             return Ok(());
         }
         let file = self.file(&source.path)?;
-        let pattern = self.pattern(checked)?;
+        let pattern = self.pattern(pattern)?;
         self.plan.entries.push(Entry {
             file,
             pattern,
@@ -522,6 +475,23 @@ impl Builder {
             }
         }
         for load in &residency.loads {
+            let tensor = catalog.tensor(&load.tensor)?;
+            let source = Source {
+                path: catalog.snapshot().join(&tensor.shard),
+                offset: tensor.metadata.byte_offset,
+                bytes: tensor.metadata.byte_length,
+            };
+            let (rows, source_pitch, columns) = if let Some(units) = &residency.unit_map {
+                let gather = catalog.exl3_tensor_gather_metadata(&tensor.metadata, units,
+                    load.expert.ok_or_else(|| invalid("EXL3 compact load lacks expert"))?)?;
+                (gather.rows, gather.source_row_bytes, gather.columns.iter()
+                    .map(|r| r.start as u64..r.end as u64).collect::<Vec<_>>())
+            } else {
+                let slice = catalog.exl3_tensor_slice_metadata(&tensor.metadata, residency.world, residency.rank)?;
+                let start = slice.column_start_bytes as u64;
+                (slice.rows, slice.source_row_bytes, vec![start..add(start, slice.selected_row_bytes as u64)?])
+            };
+            let rows = u32::try_from(rows).map_err(|_| invalid("too many EXL3 rows"))?;
             for &(buffer, relative) in &load.destinations {
                 let target_buffer = residency
                     .buffers
@@ -541,29 +511,7 @@ impl Builder {
                     )?,
                     bytes: load.bytes as u64,
                 };
-                if let Some(units) = &residency.unit_map {
-                    self.exl3(
-                        catalog,
-                        &load.tensor,
-                        units,
-                        load.expert
-                            .ok_or_else(|| invalid("EXL3 compact load lacks expert"))?,
-                        target,
-                    )?;
-                } else {
-                    let slice =
-                        catalog.exl3_tensor_slice(&load.tensor, residency.world, residency.rank)?;
-                    self.rows(
-                        &Self::v41_source(catalog, &load.tensor)?,
-                        slice.column_start_bytes as u64,
-                        u32::try_from(slice.rows).map_err(|_| invalid("too many EXL3 rows"))?,
-                        u32::try_from(slice.selected_row_bytes)
-                            .map_err(|_| invalid("EXL3 width exceeds u32"))?,
-                        slice.source_row_bytes as u64,
-                        slice.selected_row_bytes as u64,
-                        target,
-                    )?;
-                }
+                self.columns(&source, rows, source_pitch as u64, &columns, target)?;
             }
         }
         Ok(())

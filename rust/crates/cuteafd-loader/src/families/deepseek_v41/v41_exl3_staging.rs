@@ -187,10 +187,15 @@ fn tensor_slice(
 impl OfficialV41Catalog {
     pub fn exl3_tensor_gather(&self, name: &str,
         map: &cuteafd_core::tp_units::RankUnits, expert: usize) -> Result<V41Exl3TensorGather> {
+        self.exl3_tensor_gather_metadata(&self.tensor(name)?.metadata, map, expert)
+    }
+
+    pub(crate) fn exl3_tensor_gather_metadata(&self, tensor: &crate::SafetensorsTensorMetadata,
+        map: &cuteafd_core::tp_units::RankUnits, expert: usize) -> Result<V41Exl3TensorGather> {
         let manifest = self.exl3().context("checkpoint is not routed EXL3")?;
-        let (prefix, suffix) = name.rsplit_once('.').context("missing EXL3 suffix")?;
+        let (prefix, suffix) = tensor.name.rsplit_once('.').context("missing EXL3 suffix")?;
         let projection = manifest.projections.get(prefix).context("unknown EXL3 projection")?;
-        projection.validate_tensor(&self.tensor(name)?.metadata)?;
+        projection.validate_tensor(tensor)?;
         tensor_gather(projection, suffix, map, expert)
     }
 
@@ -211,13 +216,18 @@ impl OfficialV41Catalog {
         world: usize,
         rank: usize,
     ) -> Result<V41Exl3TensorSlice> {
+        self.exl3_tensor_slice_metadata(&self.tensor(name)?.metadata, world, rank)
+    }
+
+    pub(crate) fn exl3_tensor_slice_metadata(&self, tensor: &crate::SafetensorsTensorMetadata,
+        world: usize, rank: usize) -> Result<V41Exl3TensorSlice> {
         let manifest = self.exl3().context("checkpoint is not routed EXL3")?;
-        let (prefix, suffix) = name.rsplit_once('.').context("missing EXL3 suffix")?;
+        let (prefix, suffix) = tensor.name.rsplit_once('.').context("missing EXL3 suffix")?;
         let projection = manifest
             .projections
             .get(prefix)
             .context("unknown EXL3 projection")?;
-        projection.validate_tensor(&self.tensor(name)?.metadata)?;
+        projection.validate_tensor(tensor)?;
         tensor_slice(projection, suffix, world, rank)
     }
 
