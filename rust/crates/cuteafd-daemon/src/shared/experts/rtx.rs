@@ -26,6 +26,7 @@ pub(crate) mod fp8moe;
 pub(crate) mod landed;
 pub(crate) mod native;
 pub(crate) mod pair;
+pub(crate) mod push;
 pub(crate) mod routes;
 
 pub(crate) use combine::{Combine, ExchangeDtype, FusedCombine};
