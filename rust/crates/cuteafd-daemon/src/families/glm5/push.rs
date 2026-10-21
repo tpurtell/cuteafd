@@ -128,6 +128,24 @@ impl RankLayout {
     }
 }
 
+/// Both GPUs' dense plans and destinations, ranks `sparks` and `sparks + 1`.
+pub(crate) fn plan_ranks<'a>(catalog: &OfficialV41Catalog, snapshot: &std::path::Path, records: &[Record],
+    devices: [Device<'a>; 2], sparks: usize)
+    -> Result<([crate::shared::experts::rtx::push::DensePlan; 2], [OperandArena<'a>; 2])> {
+    let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+    let world = sparks + 2;
+    let dense = devices.iter().enumerate().map(|(gpu, device)| -> Result<_> {
+        let layout = RankLayout::new(records, device.id)?;
+        let checked = layout.checked(catalog, &root, world, sparks + gpu)?;
+        let expected = ExpectedCoverage::from_plan(&checked, u32::try_from(sparks + gpu)?)?;
+        let plan = layout.plan();
+        Ok((plan, OperandArena::new(*device, layout, expected)?))
+    }).collect::<Result<Vec<_>>>()?;
+    let [(left_plan, left), (right_plan, right)]: [_; 2] = dense.try_into()
+        .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))?;
+    Ok(([left_plan, right_plan], [left, right]))
+}
+
 /// Fills recorded class-2 operands through the mount (the whole push group
 /// fell back), on each operand's GPU.
 pub(crate) fn fill_by_mount(library: &cuteafd_ffi::NativeLibrary, catalog: &OfficialV41Catalog,

@@ -316,3 +316,70 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
     }
     Ok(())
 }
+
+/// A dense planning failure on the coordinator must not abort the load: both
+/// GPU ranks offer mount, so the group driver opens no group and sends every
+/// rank (a Spark included) the mount decision, and the coordinator returns
+/// `Ok(None)` (TP2 halves and dense operands then load through the mount).
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn dense_planning_error_sends_the_whole_group_to_mount() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    let root = tempfile::tempdir_in(fixture.directory())?;
+    let (tensors, _) = qwen4_exl3(2, 4);
+    let tensors: Vec<_> = tensors.into_iter().filter(|tensor| !tensor.0.contains(".experts.")
+        || tensor.0.contains(".experts.0.")).collect();
+    let mut config = qwen4_config(2);
+    config["text_config"]["num_experts"] = serde_json::json!(1);
+    config["text_config"]["num_experts_per_tok"] = serde_json::json!(1);
+    write_snapshot(root.path(), &config, &tensors, None);
+    // A SparkNest namespace (ADR-064 root identity, shards with hosts), so the
+    // TP2 plans alone would be offered: only the dense error can decline them.
+    let mark = |path: &std::path::Path, name: &std::ffi::CStr, value: &[u8]| -> Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        // SAFETY: both strings are NUL-terminated and live across the call; the
+        // value pointer and length describe one live buffer.
+        let status = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+        anyhow::ensure!(status == 0, "setxattr: {}", std::io::Error::last_os_error());
+        Ok(())
+    };
+    mark(root.path(), c"user.sparknest.cluster", br#"{"me":"coordinator"}"#)?;
+    for entry in std::fs::read_dir(root.path())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "safetensors") { mark(&path, c"user.sparknest.hosts", b"[]")?; }
+    }
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let sparks = 1;
+    for gpu in 0..2 {
+        let plan = Tp2ExpertPlan::new(&catalog, &[0, 1], gpu, usize::MAX)?;
+        let checked = plan.checked(&catalog, root.path(), sparks + 2, sparks + gpu)?;
+        assert!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.path().join(f))),
+            "without the dense error the TP2 halves would be offered");
+    }
+    let (push, coordinator_streams, _) = CoordinatorTp2Push::prepare(root.path(), &catalog, &[0, 1], [usize::MAX; 2])?;
+    // One Spark rank offering push, then the two coordinator ranks, in group order.
+    let (mut spark_driver, mut spark) = control_pair()?;
+    let spark_thread = std::thread::spawn(move || cuteafd_transport::worker_selection::push::offer(&mut spark,
+        Some(cuteafd_transport::worker_selection::push::Offer { rank: 0, host: "spark".into(), arena_bytes: 1,
+            placement: Vec::new() })));
+    let driver = std::thread::spawn(move || -> Result<bool> {
+        let mut streams = vec![spark_driver.try_clone()?];
+        streams.extend(coordinator_streams);
+        let mut prepared = false;
+        cuteafd_transport::worker_selection::push::coordinate(&mut streams, |_| {
+            prepared = true;
+            anyhow::bail!("no group may open after a declined coordinator rank")
+        })?;
+        drop(spark_driver.shutdown(std::net::Shutdown::Both));
+        Ok(prepared)
+    });
+    let devices = [Device { library: &library, id: 0 }, Device { library: &library, id: 1 }];
+    let dense: Option<Result<([DensePlan; 2], [NoDense; 2])>> = Some(Err(anyhow::anyhow!("injected dense planning error")));
+    let (pushed, ()) = push.receive_with(devices, &catalog, sparks, dense, || ());
+    assert!(pushed?.is_none(), "a declined dense plan must fall back to mount");
+    assert!(!driver.join().map_err(|_| anyhow::anyhow!("driver panicked"))??, "the group driver must not prepare a group");
+    assert_eq!(spark_thread.join().map_err(|_| anyhow::anyhow!("spark panicked"))??, None,
+        "the Spark rank receives the whole-group mount decision");
+    Ok(())
+}

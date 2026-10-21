@@ -685,20 +685,10 @@ impl Opened {
                 let model = planning.model(&self.cfg, layers, owners.as_deref(), native)?;
                 let (records, deferred) = sink.take();
                 let devices = tp2_devices()?;
-                let (root, _) = cuteafd_loader::push_load::namespace(&self.snapshot)?;
-                let world = sparks + 2;
-                let dense = devices.iter().enumerate().map(|(gpu, device)| -> Result<_> {
-                    let layout = push::RankLayout::new(&records, device.id)?;
-                    let checked = layout.checked(dense_catalog, &root, world, sparks + gpu)?;
-                    let expected = crate::shared::memory::weight_arena::ExpectedCoverage::from_plan(
-                        &checked, u32::try_from(sparks + gpu)?)?;
-                    let plan = layout.plan();
-                    Ok((plan, push::OperandArena::new(*device, layout, expected)?))
-                }).collect::<Result<Vec<_>>>()?;
-                let [(left_plan, left), (right_plan, right)]: [_; 2] = dense.try_into()
-                    .map_err(|_| anyhow::anyhow!("two coordinator GPUs"))?;
-                let (pushed, ()) = push.receive_with(devices, &self.catalog, sparks,
-                    Some(([left_plan, right_plan], [left, right])), || ());
+                // A planning failure here still answers the group: every
+                // coordinator rank offers mount and the whole group falls back.
+                let dense = push::plan_ranks(dense_catalog, &self.snapshot, &records, devices, sparks);
+                let (pushed, ()) = push.receive_with(devices, &self.catalog, sparks, Some(dense), || ());
                 let pushed = pushed?;
                 if pushed.is_none() {
                     push::fill_by_mount(&self.library, dense_catalog, &records)?;

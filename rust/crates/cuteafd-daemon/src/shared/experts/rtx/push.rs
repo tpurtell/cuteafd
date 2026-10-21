@@ -233,14 +233,23 @@ impl CoordinatorTp2Push {
     /// `dense` is each GPU's plan (published to the group driver before the
     /// offers) and destination (unaliased descriptors of operand allocations the
     /// caller keeps alive and unread until this returns and the group commits).
+    /// A dense planning error makes every coordinator GPU offer mount, so the
+    /// whole group (Sparks and TP2 halves too) loads through the mount.
     pub(crate) fn receive_with<'a, D: PushDestination<Delivered = ()>, U>(self,
         devices: [crate::shared::memory::device::Device<'a>; 2], catalog: &OfficialV41Catalog, sparks: usize,
-        dense: Option<([DensePlan; 2], [D; 2])>, beside: impl FnOnce() -> U)
+        dense: Option<Result<([DensePlan; 2], [D; 2])>>, beside: impl FnOnce() -> U)
         -> (Result<Option<[Vec<crate::shared::experts::exl3::Exl3Weights<'a>>; 2]>>, U) {
         use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
         let Self { plans, streams, host, snapshot, dense: slot } = self;
         let world = sparks + 2;
-        let (bases, destinations) = match dense {
+        let declined = match &dense {
+            Some(Err(error)) => {
+                tracing::info!(%error, "coordinator dense push planning failed; whole group uses mount");
+                true
+            }
+            _ => false,
+        };
+        let (bases, destinations) = match dense.and_then(Result::ok) {
             Some((plans, destinations)) => {
                 let bases = [plans[0].base, plans[1].base];
                 match slot.lock() {
@@ -269,6 +278,7 @@ impl CoordinatorTp2Push {
             let rank = group_rank(sparks, gpu);
             let base = bases[gpu];
             let planned = (|| -> Result<_> {
+                ensure!(!declined, "coordinator dense operands were not planned");
                 let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
                 let checked = plan.checked(catalog, &root, world, rank)?;
                 ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
