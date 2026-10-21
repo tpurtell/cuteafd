@@ -680,16 +680,26 @@ impl Opened {
                 };
                 // The dense operands join the same ranks as the TP2 halves: allocate
                 // and plan them, receive both, then run the transforms of landed bytes.
+                let devices = tp2_devices()?;
+                // A planning failure (allocation or plan) still answers the group:
+                // every coordinator rank offers mount and the whole group falls back.
                 let sink = std::rc::Rc::new(landing::PushSink::default());
                 let planning = weights::GlmLoader { push: Some(sink.clone()), ..loader.clone() };
-                let model = planning.model(&self.cfg, layers, owners.as_deref(), native)?;
-                let (records, deferred) = sink.take();
-                let devices = tp2_devices()?;
-                // A planning failure here still answers the group: every
-                // coordinator rank offers mount and the whole group falls back.
-                let dense = push::plan_ranks(dense_catalog, &self.snapshot, &records, devices, sparks);
+                let planned = planning.model(&self.cfg, layers, owners.as_deref(), native).and_then(|model| {
+                    let (records, deferred) = sink.take();
+                    let dense = push::plan_ranks(dense_catalog, &self.snapshot, &records, devices, sparks)?;
+                    Ok((model, records, deferred, dense))
+                });
+                let (planned, dense) = match planned {
+                    Ok((model, records, deferred, dense)) => (Some((model, records, deferred)), Ok(dense)),
+                    Err(error) => (None, Err(error)),
+                };
                 let (pushed, ()) = push.receive_with(devices, &self.catalog, sparks, Some(dense), || ());
                 let pushed = pushed?;
+                let Some((model, records, deferred)) = planned else {
+                    // Planning allocated nothing that survives; the mount loads as usual.
+                    return Ok((loader.model(&self.cfg, layers, owners.as_deref(), native)?, None));
+                };
                 if pushed.is_none() {
                     push::fill_by_mount(&self.library, dense_catalog, &records)?;
                 }
