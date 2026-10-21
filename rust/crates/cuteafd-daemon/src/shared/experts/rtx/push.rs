@@ -92,16 +92,15 @@ impl CoordinatorTp2Push {
         let [first, second]: [std::net::TcpStream; 2] = ranks.try_into().map_err(|_| anyhow::anyhow!("two loopback ranks"))?;
         // The driver re-derives each GPU's entries from headers alone, so the
         // closure owns no device state.
-        let (append_snapshot, append_layers, arenas) = (snapshot.to_path_buf(), layers.to_vec(), budgets);
+        let (append_layers, arenas) = (layers.to_vec(), budgets);
         let append = Box::new(move |builder: &mut cuteafd_loader::push_load::builder::Builder,
-            offers: &[cuteafd_transport::worker_selection::push::Offer]| -> Result<()> {
+            catalog: &OfficialV41Catalog, offers: &[cuteafd_transport::worker_selection::push::Offer]| -> Result<()> {
             ensure!(offers.len() == 2, "coordinator push needs two GPU offers");
-            let catalog = cuteafd_loader::read_expert_catalog(&append_snapshot)?;
             for (gpu, offer) in offers.iter().enumerate() {
-                let plan = Tp2ExpertPlan::new(&catalog, &append_layers, gpu, arenas[gpu])?;
+                let plan = Tp2ExpertPlan::new(catalog, &append_layers, gpu, arenas[gpu])?;
                 ensure!(offer.placement.is_empty() && offer.arena_bytes == plan.layout.logical_bytes() as u64,
                     "coordinator push offer differs from its admitted TP2 arena");
-                plan.append(builder, &catalog, u32::try_from(offer.rank)?)?;
+                plan.append(builder, catalog, u32::try_from(offer.rank)?)?;
             }
             Ok(())
         });

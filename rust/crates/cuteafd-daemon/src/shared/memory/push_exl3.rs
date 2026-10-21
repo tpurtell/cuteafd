@@ -106,7 +106,7 @@ pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[u
     // Only validated, worker-reported placements become source/destination plans.
     let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
     for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, u32::try_from(rank)?)?; }
-    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, &offers[sparks..])?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
     let appended = started.elapsed();
     let checked = builder.finish()?;
     let checked_at = started.elapsed();
@@ -130,7 +130,7 @@ pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[u
 /// In-process coordinator-GPU ranks of a Spark push group.
 pub(crate) struct CoordinatorRanks {
     pub ranks: usize,
-    pub append: Box<dyn Fn(&mut Builder, &[Offer]) -> Result<()> + Send>,
+    pub append: Box<dyn Fn(&mut Builder, &OfficialV41Catalog, &[Offer]) -> Result<()> + Send>,
 }
 
 pub(crate) fn validate_offer(offer: &Offer, rank: usize,
