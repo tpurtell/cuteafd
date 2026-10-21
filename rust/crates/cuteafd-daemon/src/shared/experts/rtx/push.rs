@@ -59,3 +59,95 @@ pub(crate) fn receive_tp2<'a>(
     tracing::info!(group, rank, "whole push group discarded; coordinator loads through mount");
     Ok(None)
 }
+
+/// The coordinator side of one Spark push group for the two coordinator GPUs'
+/// admitted TP2 expert halves: per-GPU plans, the in-process loopback streams,
+/// and the plan entries the group driver appends after the Spark ranks.
+pub(crate) struct CoordinatorTp2Push {
+    plans: [Tp2ExpertPlan; 2],
+    streams: [std::net::TcpStream; 2],
+    host: String,
+    snapshot: std::path::PathBuf,
+}
+
+/// Group rank of coordinator GPU `gpu` after `sparks` Spark ranks.
+fn group_rank(sparks: usize, gpu: usize) -> usize { sparks + gpu }
+
+impl CoordinatorTp2Push {
+    /// Metadata only: plans and loopback pairs, before any allocation.
+    /// `budgets` are the admitted per-GPU TP2 arenas (resident bytes only).
+    pub(crate) fn prepare(snapshot: &std::path::Path, catalog: &OfficialV41Catalog, layers: &[usize],
+        budgets: [usize; 2]) -> Result<(Self, Vec<std::net::TcpStream>, crate::shared::memory::push_exl3::CoordinatorRanks)> {
+        let (_, host) = cuteafd_loader::push_load::namespace(snapshot)?;
+        let plans = [Tp2ExpertPlan::new(catalog, layers, 0, budgets[0])?, Tp2ExpertPlan::new(catalog, layers, 1, budgets[1])?];
+        let mut driver = Vec::new();
+        let mut ranks = Vec::new();
+        for _ in 0..2 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let rank = std::net::TcpStream::connect(listener.local_addr()?)?;
+            let (accepted, _) = listener.accept()?;
+            driver.push(accepted);
+            ranks.push(rank);
+        }
+        let [first, second]: [std::net::TcpStream; 2] = ranks.try_into().map_err(|_| anyhow::anyhow!("two loopback ranks"))?;
+        // The driver re-derives each GPU's entries from headers alone, so the
+        // closure owns no device state.
+        let (append_snapshot, append_layers, arenas) = (snapshot.to_path_buf(), layers.to_vec(), budgets);
+        let append = Box::new(move |builder: &mut cuteafd_loader::push_load::builder::Builder,
+            offers: &[cuteafd_transport::worker_selection::push::Offer]| -> Result<()> {
+            ensure!(offers.len() == 2, "coordinator push needs two GPU offers");
+            let catalog = cuteafd_loader::read_expert_catalog(&append_snapshot)?;
+            for (gpu, offer) in offers.iter().enumerate() {
+                let plan = Tp2ExpertPlan::new(&catalog, &append_layers, gpu, arenas[gpu])?;
+                ensure!(offer.placement.is_empty() && offer.arena_bytes == plan.layout.logical_bytes() as u64,
+                    "coordinator push offer differs from its admitted TP2 arena");
+                plan.append(builder, &catalog, u32::try_from(offer.rank)?)?;
+            }
+            Ok(())
+        });
+        let ranks = crate::shared::memory::push_exl3::CoordinatorRanks { ranks: 2, append };
+        Ok((Self { plans, streams: [first, second], host, snapshot: snapshot.to_path_buf() }, driver, ranks))
+    }
+
+    /// Receives both GPUs (each on its own thread) while `beside` runs on this
+    /// thread. `Ok(None)`: the whole group fell back; nothing was published.
+    pub(crate) fn receive<'a, U>(self, devices: [crate::shared::memory::device::Device<'a>; 2],
+        catalog: &OfficialV41Catalog, sparks: usize, beside: impl FnOnce() -> U)
+        -> (Result<Option<[Vec<crate::shared::experts::exl3::Exl3Weights<'a>>; 2]>>, U) {
+        use cuteafd_ffi::push_ring::{DEFAULT_SLOTS, DEFAULT_SLOT_BYTES};
+        let Self { plans, streams, host, snapshot } = self;
+        let world = sparks + 2;
+        let slots: Vec<std::sync::Mutex<Option<(Tp2ExpertPlan, std::net::TcpStream)>>> = plans.into_iter().zip(streams)
+            .map(|job| std::sync::Mutex::new(Some(job))).collect();
+        let client = cuteafd_loader::push_load::PushClient::default();
+        let (snapshot, host) = (&snapshot, &host);
+        // SAFETY: each GPU result is a freshly committed, drained rank arena and
+        // its views, unaliased (every Rc clone stays inside that GPU's Vec); a
+        // fallback returns None after dropping and draining its arena.
+        let (pair, value) = unsafe { cuteafd_ffi::synchronized_load::load_pair_beside(|gpu| {
+            let (plan, mut stream) = slots[gpu].lock().map_err(|_| anyhow::anyhow!("coordinator push job poisoned"))?
+                .take().context("coordinator push job taken twice")?;
+            let rank = group_rank(sparks, gpu);
+            let planned = (|| -> Result<_> {
+                let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
+                let checked = plan.checked(catalog, &root, world, rank)?;
+                ensure!(checked.plan.files.iter().all(|f| cuteafd_loader::push_load::is_push_shard(&root.join(f))),
+                    "coordinator push source is not a SparkNest shard");
+                Ok(checked)
+            })();
+            if let Err(error) = &planned { tracing::info!(gpu, %error, "coordinator push unavailable; offering mount"); }
+            let offer = planned.as_ref().ok().map(|_| cuteafd_transport::worker_selection::push::Offer {
+                rank, host: host.clone(), arena_bytes: plan.layout.logical_bytes() as u64, placement: Vec::new() });
+            let credentials = cuteafd_transport::worker_selection::push::offer(&mut stream, offer)?;
+            let Some(credentials) = credentials else { return Ok(None) };
+            receive_tp2(devices[gpu], catalog, plan, &planned?, rank, &client, &mut stream, credentials,
+                DEFAULT_SLOTS, DEFAULT_SLOT_BYTES)
+        }, beside) };
+        let pushed = pair.and_then(|[left, right]| match (left, right) {
+            (Some(left), Some(right)) => Ok(Some([left, right])),
+            (None, None) => Ok(None),
+            _ => anyhow::bail!("coordinator push GPUs disagree on the group commit"),
+        });
+        (pushed, value)
+    }
+}
