@@ -503,7 +503,8 @@ def test_shared_startup_load_overlaps_admission_before_serving_allocation() -> N
         source = (ROOT / f"rust/crates/cuteafd-daemon/src/families/{family}/mod.rs").read_text()
         start = source.index("let admission = if")
         body = source[start:]
-        assert body.index(".start(&peers)?") < body.index("load_while_admitting(admission,")
+        start_call = ".start(&peers)?" if ".start(&peers)?" in body else ".start_with(&peers, ranks)?"
+        assert body.index(start_call) < body.index("load_while_admitting(admission,")
         assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
         assert body.index("TokenEmbedding::load(") < body.index(f"engine::{engine}::new(")
         assert ".select(&peers)?" not in body
@@ -518,7 +519,9 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("self.admit(") < body.index("admitted_spark_layers(") < body.index("SparkAdmission::plan(")
     assert body.index("SparkAdmission::plan(") < body.index("TokenEmbedding::load(") < body.index("self.experts_for_layers(")
     assert "args.experts_snapshot.as_deref().unwrap_or(&args.snapshot)" in body
-    assert "model)?.start(&peers)?)" in body
+    assert "&working, peers.len(), None, model)?;" in body and "admission.start_with(&peers, ranks)?" in body
+    # Coordinator TP2 halves join the Spark push group only when it pushes.
+    assert "if !tp2_layers.is_empty() && admission.pushes()" in body
     assert body.index("load_while_admitting(admission,") < body.index("TokenEmbedding::load(")
     assert body.index("TokenEmbedding::load(") < body.index("engine::GlmfEngine::new(")
     assert "let spark = !spark_layers.is_empty();" in body
@@ -532,7 +535,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     # Admitted TP2 expert weights land inside the Spark admission window;
     # execution binds after the engine exists and before step workspaces.
     window = body.split("load_while_admitting(admission,", 1)[1].split("probe(\"target-weights\")", 1)[0]
-    assert "tp2_weights()?" in window
+    assert "tp2_weights(pushed)?" in window and "push.receive(" in window
     assert body.index("engine::GlmfEngine::new(") < body.index("tp2.execution()?") < body.index("engine.install_tp2(ranks)?")
     assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]

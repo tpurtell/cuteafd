@@ -112,6 +112,17 @@ impl SparkAdmission {
     }
 
     pub(crate) fn start(self, peers: &[SocketAddr]) -> Result<PendingSparkAdmission> {
+        self.start_with(peers, None)
+    }
+
+    /// Whether this admission opens a push group (EXL3 Spark experts on SparkNest).
+    pub(crate) fn pushes(&self) -> bool { self.push_snapshot.is_some() }
+
+    /// `coordinator`: in-process coordinator-GPU ranks joining the Spark push
+    /// group (loopback streams in rank order, and their plan entries).
+    pub(crate) fn start_with(self, peers: &[SocketAddr],
+        coordinator: Option<(Vec<std::net::TcpStream>, super::memory::push_exl3::CoordinatorRanks)>)
+        -> Result<PendingSparkAdmission> {
         let value = std::env::var(ADMISSION_TIMEOUT_ENV).ok();
         let timeout = admission_timeout(value.as_deref())?;
         let pending = cuteafd_transport::worker_selection::start_model_admission(
@@ -121,18 +132,26 @@ impl SparkAdmission {
             let assignments = self.assignments.clone();
             let layers = self.selection.layers();
             let cancel = pending.cancellation_streams()?;
+            let (streams, ranks) = match coordinator {
+                Some((streams, ranks)) => (streams, Some(ranks)),
+                None => (Vec::new(), None),
+            };
             AdmissionWait::Push(PushAdmissionDriver { cancel, thread: Some(std::thread::spawn(move || {
                 let mut pending = pending;
-                pending.push_weights(|offers| {
+                pending.push_weights(streams, |offers| {
                     let started = std::time::Instant::now();
                     let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
                     tracing::info!(elapsed_ms = started.elapsed().as_millis(),
                         "Spark push admission catalog opened");
-                    super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers)
+                    super::memory::push_exl3::prepare(&snapshot, &catalog, &layers, &assignments, offers, ranks.as_ref())
                 })?;
                 pending.wait()
             })) })
-        } else { AdmissionWait::Mount(pending) };
+        } else {
+            // Callers add coordinator ranks only when this admission pushes.
+            ensure!(coordinator.is_none(), "coordinator push ranks without a Spark push group");
+            AdmissionWait::Mount(pending)
+        };
         Ok(PendingSparkAdmission { plan: self, pending, timeout })
     }
 

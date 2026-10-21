@@ -136,6 +136,10 @@ fn bf16(bytes: &[u8], i: usize) -> f32 {
 /// Quantizes a BF16 `[n, k]` weight; returns E4M3 bytes and FP32 scales in
 /// `layout`, each block's scale by `rule`.
 pub(crate) fn quantize(weight: &[u8], n: usize, k: usize, layout: Layout, rule: Fp8Scales) -> (Vec<u8>, Vec<f32>) {
+    crate::shared::memory::load_timing::quantize(weight.len(), || quantize_inner(weight, n, k, layout, rule))
+}
+
+fn quantize_inner(weight: &[u8], n: usize, k: usize, layout: Layout, rule: Fp8Scales) -> (Vec<u8>, Vec<f32>) {
     assert_eq!(weight.len(), n * k * 2);
     assert!(k % 128 == 0 && (layout != Layout::Block || n % 128 == 0));
     let kb = k / 128;
@@ -291,4 +295,70 @@ mod tests {
             }
         }
     }
+    /// Inputs that reach every branch of the host rule: zeros, subnormal and
+    /// saturating quotients, a block whose pow2 and amax/448 errors nearly tie,
+    /// exact E4M3 values, and a spread of magnitudes.
+    fn load_quant_cases() -> Vec<(Layout, Fp8Scales, usize, usize, Vec<u8>)> {
+        let mut cases = Vec::new();
+        let bf = |x: f32| ((x.to_bits() >> 16) as u16).to_le_bytes();
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || { state ^= state << 13; state ^= state >> 7; state ^= state << 17; state };
+        for (layout, rows) in [(Layout::Block, 256), (Layout::Row128, 6), (Layout::Channel, 6)] {
+            for rule in [Fp8Scales::Amax, Fp8Scales::Pow2, Fp8Scales::Best] {
+                let cols = 384;
+                let mut bytes = Vec::with_capacity(rows * cols * 2);
+                for r in 0..rows {
+                    for c in 0..cols {
+                        let block = (r / if layout == Layout::Block { 128 } else { 1 }, c / 128);
+                        let x = match (block.0 + block.1) % 6 {
+                            0 => 0.0,
+                            1 => ((next() % 2001) as f32 - 1000.0) * 1e-6,
+                            2 => ((next() % 2001) as f32 - 1000.0) * 3.7,
+                            // Values on the E4M3 grid times 2^-3: pow2 quantizes exactly.
+                            3 => e4m3_value((next() % 0x7E) as u8 | (((next() & 1) as u8) << 7)) * 0.125,
+                            4 => f32::from_bits(((next() % 30 + 110) as u32) << 23 | (next() as u32 & 0x7F_0000))
+                                * if next() & 1 == 1 { -1.0 } else { 1.0 },
+                            _ => ((next() % 65_536) as f32 - 32_768.0) / 1024.0,
+                        };
+                        bytes.extend(bf(x));
+                    }
+                }
+                cases.push((layout, rule, rows, cols, bytes));
+            }
+        }
+        cases
+    }
+
+    fn load_quant_fixture() -> Vec<u8> {
+        let cases = load_quant_cases();
+        let mut out = b"LQF1".to_vec();
+        out.extend((cases.len() as u32).to_le_bytes());
+        for (layout, rule, rows, cols, bytes) in cases {
+            let (q, scales) = quantize(&bytes, rows, cols, layout, rule);
+            let layout = match layout { Layout::Block => 0i32, Layout::Row128 => 1, Layout::Channel => 2 };
+            out.extend(layout.to_le_bytes());
+            out.extend(rule.code().to_le_bytes());
+            out.extend((rows as u32).to_le_bytes());
+            out.extend((cols as u32).to_le_bytes());
+            out.extend(&bytes);
+            out.extend(&q);
+            out.extend(scales.iter().flat_map(|s| s.to_le_bytes()));
+        }
+        out
+    }
+
+    /// The native load kernels' CPU self-test (native/tests/fp8_load_quant_selftest.cc)
+    /// compares against this fixture; it must equal today's host rule byte for byte.
+    /// Regenerate with CUTEAFD_WRITE_LOAD_QUANT_FIXTURE=1.
+    #[test]
+    fn native_load_quant_fixture_matches_host_rule() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../native/tests/fixtures/fp8_load_quant.bin");
+        let fixture = load_quant_fixture();
+        if std::env::var_os("CUTEAFD_WRITE_LOAD_QUANT_FIXTURE").is_some() {
+            std::fs::write(&path, &fixture).unwrap();
+        }
+        assert!(std::fs::read(&path).unwrap() == fixture, "native load-quant fixture differs from the host rule");
+    }
 }
+

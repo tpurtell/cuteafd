@@ -280,6 +280,38 @@ impl<'a> Exl3Tp2<'a> {
         budgets: [usize; 2],
         selection: RtxSelectionPolicy,
     ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
+        Self::pair_weights(devices, catalog, geometry, packages, layers, max_rows, budgets, selection, None)
+    }
+
+    /// As `load_pair_weights`, but publishing halves a committed push group
+    /// already landed (one rank arena per GPU), under the same admission checks.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pushed_pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Vec<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+        pushed: [Vec<Exl3Weights<'a>>; 2],
+    ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
+        Self::pair_weights(devices, catalog, geometry, packages, layers, max_rows, budgets, selection, Some(pushed))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pair_weights(
+        devices: [Device<'a>; 2],
+        catalog: &cuteafd_loader::OfficialV41Catalog,
+        geometry: ExpertGeometry,
+        packages: [&Path; 2],
+        layers: Vec<usize>,
+        max_rows: usize,
+        budgets: [usize; 2],
+        selection: RtxSelectionPolicy,
+        pushed: Option<[Vec<Exl3Weights<'a>>; 2]>,
+    ) -> Result<[Exl3Tp2Weights<'a>; 2]> {
         let started = std::time::Instant::now();
         let label = format!(
             "experts/TP2 expert layer halves {layers:?}"
@@ -348,7 +380,23 @@ impl<'a> Exl3Tp2<'a> {
             weights: Rc::new(weights),
         };
         let ranks = [make(0, left), make(1, right)];
-        let ranks = if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
+        let ranks = if let Some(pushed) = pushed {
+            let mut ranks = ranks;
+            for (rank, mut loaded) in pushed.into_iter().enumerate() {
+                ensure!(loaded.len() == layers.len() && loaded.iter().zip(&layers).all(|(weight, &layer)|
+                    matches!(weight.layout.layer, cuteafd_loader::V41Exl3Layer::Backbone(l) if l == layer)
+                    && weight.layout.rank == rank && weight.layout.world == 2),
+                    "pushed EXL3 TP2 rank {rank} differs from the admitted layers");
+                let resident = loaded.iter().map(|weight| weight.budget.resident_bytes).sum::<usize>();
+                ensure!(resident <= remaining[rank], "pushed EXL3 TP2 rank {rank} exceeds its admitted arena");
+                devices[rank].run(|| {
+                    Rc::get_mut(Rc::get_mut(&mut ranks[rank].weights).expect("unpublished device owner").get_mut())
+                        .expect("unpublished EXL3 rank").append(&mut loaded);
+                    Ok(())
+                })?;
+            }
+            ranks
+        } else if std::env::var("CUTEAFD_TP2_SHARED_READ").as_deref() == Ok("0") {
             let remaining = std::cell::RefCell::new(remaining);
             load_layer_pairs(
                 ranks,

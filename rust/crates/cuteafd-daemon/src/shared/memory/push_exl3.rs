@@ -92,15 +92,21 @@ fn rank_plans(catalog: &OfficialV41Catalog, layers: &[usize],
     Ok(plans)
 }
 
+/// Offers past the Spark assignments are coordinator ranks; `coordinator`
+/// appends their entries (it receives the group's root and those offers).
 pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[usize],
-    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer]) -> Result<PushGroup> {
+    assignments: &[cuteafd_loader::placement::SparkAssignment], offers: &[Offer],
+    coordinator: Option<&CoordinatorRanks>) -> Result<PushGroup> {
     let started = std::time::Instant::now();
     let (root, _) = cuteafd_loader::push_load::namespace(snapshot)?;
-    let plans = rank_plans(catalog, layers, assignments, offers)?;
+    let sparks = assignments.len();
+    ensure!(offers.len() == sparks + coordinator.map_or(0, |c| c.ranks), "push offer world differs from admission");
+    let plans = rank_plans(catalog, layers, assignments, &offers[..sparks])?;
     let planned = started.elapsed();
     // Only validated, worker-reported placements become source/destination plans.
     let mut builder = Builder::new(&root, offers.iter().map(|o| o.arena_bytes).collect());
     for (rank, plan) in plans.iter().enumerate() { plan.append(&mut builder, catalog, u32::try_from(rank)?)?; }
+    if let Some(coordinator) = coordinator { (coordinator.append)(&mut builder, catalog, &offers[sparks..])?; }
     let appended = started.elapsed();
     let checked = builder.finish()?;
     let checked_at = started.elapsed();
@@ -119,6 +125,12 @@ pub(crate) fn prepare(snapshot: &Path, catalog: &OfficialV41Catalog, layers: &[u
         create_ms = (created - source_checked).as_millis(), upload_ms = (started.elapsed() - created).as_millis(),
         "Spark EXL3 push group prepared");
     Ok(group)
+}
+
+/// In-process coordinator-GPU ranks of a Spark push group.
+pub(crate) struct CoordinatorRanks {
+    pub ranks: usize,
+    pub append: Box<dyn Fn(&mut Builder, &OfficialV41Catalog, &[Offer]) -> Result<()> + Send>,
 }
 
 pub(crate) fn validate_offer(offer: &Offer, rank: usize,

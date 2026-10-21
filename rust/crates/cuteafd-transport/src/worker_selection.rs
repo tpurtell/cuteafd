@@ -707,10 +707,14 @@ impl PendingModelAdmission {
     }
 
     /// Drive optional weight startup without publishing any model admission seal.
-    pub fn push_weights(&mut self,
+    /// `coordinator` are in-process coordinator-GPU ranks (loopback streams under
+    /// the same protocol), appended after the Spark ranks of the same group.
+    pub fn push_weights(&mut self, coordinator: Vec<TcpStream>,
         prepare: impl FnOnce(&[push::Offer]) -> Result<cuteafd_loader::push_load::PushGroup>) -> Result<()> {
         ensure!(self.selection.push_weights(), "push rendezvous was not admitted");
-        push::coordinate(&mut self.streams, prepare)
+        let mut streams = self.streams.iter().map(TcpStream::try_clone).collect::<std::io::Result<Vec<_>>>()?;
+        streams.extend(coordinator);
+        push::coordinate(&mut streams, prepare)
     }
 
     /// Await rank-ordered measurements and seal validated replies before links open.
