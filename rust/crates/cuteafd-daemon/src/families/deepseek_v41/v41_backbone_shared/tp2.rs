@@ -1,4 +1,5 @@
 //! Device-owned TP2 shared-expert weights and one rank's lane workspace.
+use crate::shared::decode_graph::{census, GraphBank, GraphOwner};
 use crate::shared::memory::{HostAllocation, device::{Allocation, Device, Event, PeerTransfer, Stream}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, Bf16Add, V41Fp8Plan, V41SharedSwiGlu};
@@ -122,8 +123,17 @@ impl<'a> Weights<'a> {
     }
 }
 
+/// Captured rank sequence: layer, live rows and the input rows it reads.
+type RankGraphKey = (usize, u32, usize);
+
 pub(crate) struct RankWave<'a> {
+    // Dropped first: the stream drains every queued replay before graphs go.
     pub stream: Stream<'a>,
+    /// Decode-band sequences (two quantized up/gate GEMMs, SwiGLU and the
+    /// quantized down GEMM). The producer wait stays outside, so a replay is
+    /// ordered exactly as the eager launches it records.
+    graphs: GraphBank<RankGraphKey, GraphOwner<'a, ()>>,
+    graphed: bool,
     ready: Event<'a>,
     weights: Rc<Vec<Weights<'a>>>,
     up_kernel: V41Fp8Plan<'a>,
@@ -164,12 +174,63 @@ impl<'a> RankWave<'a> {
         });
         let drained = stream.drain();
         initialized.and(drained)?;
-        Ok(Self { stream, ready: Event::new(device)?, weights, up_kernel, down_kernel,
+        Ok(Self { stream, graphs: GraphBank::new(None), graphed: true, ready: Event::new(device)?, weights, up_kernel, down_kernel,
             activation: device.library.v41_shared_tp2_swiglu()?, up_scratch, down_scratch, alpha,
             gate: Allocation::new(device, capacity as usize * 1152 * 2)?,
             up: Allocation::new(device, capacity as usize * 1152 * 2)?,
             intermediate: Allocation::new(device, capacity as usize * 1152 * 2)?,
             output: Allocation::new(device, capacity as usize * 5120 * 2)?, capacity })
+    }
+    /// Whether a sequence of `rows` replays from (or is captured into) the bank:
+    /// decode-band rows the target graph policy admits, unless the eager arm is forced.
+    fn graphs_rows(&self, rows: u32) -> bool {
+        self.graphed && rows <= crate::families::deepseek_v41::graph_policy::MAX_DECODE_ROWS
+            && crate::families::deepseek_v41::graph_policy::captures_shape(rows)
+            && !census::eager("layer_row")
+    }
+    #[cfg(test)]
+    fn graph_count(&self) -> usize { self.graphs.len() }
+    #[cfg(test)]
+    fn set_graphed(&mut self, graphed: bool) { self.graphed = graphed; }
+    /// # Safety
+    /// Every buffer is live and owned by this rank; the caller orders the launches.
+    unsafe fn launch(&self, layer: usize, rows: u32, input: CuteafdDeviceBuffer) -> Result<()> {
+        let device = self.output.device;
+        let matrices = &self.weights[layer].matrices;
+        for (matrix, output) in [(&matrices[0], &self.gate), (&matrices[1], &self.up)] {
+            unsafe { self.up_kernel.launch(input, matrix.weight.buffer, matrix.scales.buffer,
+                self.up_scratch.buffer, self.alpha.buffer, output.buffer, rows, self.stream.raw) }
+                .with_context(|| format!("shared TP2 up/gate on GPU {}", device.id))?;
+        }
+        unsafe { self.activation.launch(self.gate.buffer, self.up.buffer, self.intermediate.buffer, rows, self.stream.raw)?; }
+        unsafe { self.down_kernel.launch(self.intermediate.buffer, matrices[2].weight.buffer, matrices[2].scales.buffer,
+            self.down_scratch.buffer, self.alpha.buffer, self.output.buffer, rows, self.stream.raw) }
+            .with_context(|| format!("shared TP2 down on GPU {}", device.id))
+    }
+    /// Record the launches just executed eagerly. Capture enqueues no work, so
+    /// the eager result stands and the next use of this key replays.
+    /// # Safety
+    /// Same storage contract as `launch`; the stream is not already capturing.
+    unsafe fn capture(&mut self, key: RankGraphKey, input: CuteafdDeviceBuffer) -> Result<()> {
+        let device = self.output.device;
+        let library = device.library;
+        unsafe { library.cuda_graph_begin_capture(self.stream.raw)?; }
+        let launched = unsafe { self.launch(key.0, key.1, input) };
+        let captured = unsafe { library.cuda_graph_end_capture(self.stream.raw) };
+        let graph = match (launched, captured) {
+            (Ok(()), Ok(graph)) => graph,
+            (Err(error), Ok(graph)) => { unsafe { library.cuda_graph_exec_destroy(graph)?; } return Err(error); }
+            (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
+        };
+        // SAFETY: this rank owns every captured buffer and the Rc'd weights;
+        // the stream drains before the bank (or any retired entry) drops.
+        let owner = unsafe { GraphOwner::new(library, device.id, graph, ()) };
+        let owner = match owner { Ok(owner) => owner,
+            Err(error) => { unsafe { library.cuda_graph_exec_destroy(graph)?; } return Err(error); } };
+        self.graphs.insert(key, owner, None);
+        tracing::debug!(target: "cuteafd::graph_capture", site = "shared_tp2", layer = key.0, rows = key.1,
+            device = device.id, retained = self.graphs.len(), "shared TP2 rank graph captured");
+        Ok(())
     }
     /// # Safety
     /// Previous use has completed. Input writes are ordered on producer, and
@@ -181,18 +242,15 @@ impl<'a> RankWave<'a> {
             && input.device_id == device.id && input.bytes >= rows as usize * 5120 * 2,
             "invalid shared TP2 input or layer");
         self.ready.record(producer)?;
-        let matrices = &self.weights[layer].matrices;
+        let graphed = self.graphs_rows(rows);
+        let key = (layer, rows, input.ptr as usize);
+        let graph = if graphed { self.graphs.launch(&key).map(|owner| owner.raw) } else { None };
         let queued = device.run(|| unsafe {
             device.library.cuda_stream_wait_event(self.stream.raw, self.ready.raw)?;
-            for (matrix, output) in [(&matrices[0], &self.gate), (&matrices[1], &self.up)] {
-                self.up_kernel.launch(input, matrix.weight.buffer, matrix.scales.buffer,
-                    self.up_scratch.buffer, self.alpha.buffer, output.buffer, rows, self.stream.raw)
-                    .with_context(|| format!("shared TP2 up/gate on GPU {}", device.id))?;
-            }
-            self.activation.launch(self.gate.buffer, self.up.buffer, self.intermediate.buffer, rows, self.stream.raw)?;
-            self.down_kernel.launch(self.intermediate.buffer, matrices[2].weight.buffer, matrices[2].scales.buffer,
-                self.down_scratch.buffer, self.alpha.buffer, self.output.buffer, rows, self.stream.raw)
-                .with_context(|| format!("shared TP2 down on GPU {}", device.id))
+            census::dispatch(device.library, self.stream.raw, c"layer_row", rows as usize, graph,
+                || self.launch(layer, rows, input))?;
+            if graphed && graph.is_none() { self.capture(key, input)?; }
+            Ok(())
         });
         if let Err(error) = queued { self.stream.drain()?; return Err(error); }
         Ok(())
@@ -251,6 +309,70 @@ mod tests {
             assert_eq!(actual[0].chunks_exact(2).any(|v| u16::from_ne_bytes([v[0],v[1]]) & 0x7fff != 0), nonzero);
             assert_eq!(lib.cuda_get_device()?, 0);
         }
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires shared TP2 CUTEAFD_NATIVE_LIB, CUTEAFD_SNAPSHOT, two GPUs"]
+    fn real_shared_tp2_graphs_match_eager_bytes() -> Result<()> {
+        // Graphed and eager lanes over two layers: cold captures, warm replays,
+        // reordered rows and changed payloads must produce identical bytes for
+        // each rank's half and for the reduced sum on either destination.
+        let lib = unsafe { cuteafd_ffi::NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+        let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
+        lib.cuda_set_device(0)?;
+        let devices = [Device { library: &lib, id: 0 }, Device { library: &lib, id: 1 }];
+        let layers = 2;
+        let weights: [Rc<Vec<Weights<'_>>>; 2] = std::array::from_fn(|rank| Rc::new((0..layers)
+            .map(|layer| Weights::load(devices[rank], &catalog, layer, Weights::load_peak_device_bytes()))
+            .collect::<Result<Vec<_>>>().expect("shared TP2 fixture weights")));
+        let capacity = 64u32;
+        let mut graphed = Wave::new(weights.clone(), capacity)?;
+        let mut eager = Wave::new(weights, capacity)?;
+        for rank in &mut eager.ranks { rank.set_graphed(false); }
+        let inputs = [Allocation::new(devices[0], capacity as usize*10240)?, Allocation::new(devices[1], capacity as usize*10240)?];
+        let producers = [Stream::new(devices[0])?, Stream::new(devices[1])?];
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let read = |buffer: CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
+            let mut out = vec![0; bytes];
+            let mut view = buffer; view.bytes = bytes;
+            devices[buffer.device_id as usize].run(|| lib.copy_d2h(&mut out, view))?;
+            Ok(out)
+        };
+        let mut checked = 0;
+        let schedule = [1u32, 2, 6, 16, 33, 64, 1, 6, 64, 3, 16, 1];
+        for (step, &rows) in schedule.iter().enumerate() {
+            for layer in 0..layers {
+                let host: Vec<u8> = (0..capacity as usize*5120).flat_map(|i| {
+                    let value = ((i * 7 + step * 13 + layer * 5) % 61) as f32 / 16.0 - 1.9;
+                    ((value.to_bits() >> 16) as u16).to_ne_bytes()
+                }).collect();
+                for input in &inputs { input.device.run(|| lib.copy_h2d(input.buffer, &host))?; }
+                let destination = (step + layer) % 2;
+                let buffers = [inputs[0].buffer, inputs[1].buffer];
+                let bytes = rows as usize * 10240;
+                let actual = runtime.block_on(unsafe { graphed.execute(layer, rows, destination, buffers,
+                    [&producers[0], &producers[1]]) })?;
+                let actual = read(actual, bytes)?;
+                let halves: Vec<_> = (0..2).map(|r| read(graphed.ranks[r].output.buffer, bytes)).collect::<Result<_>>()?;
+                let expected = runtime.block_on(unsafe { eager.execute(layer, rows, destination, buffers,
+                    [&producers[0], &producers[1]]) })?;
+                let expected = read(expected, bytes)?;
+                for rank in 0..2 {
+                    assert_eq!(halves[rank], read(eager.ranks[rank].output.buffer, bytes)?,
+                        "shared TP2 rank {rank} half differs at layer {layer} rows {rows} step {step}");
+                }
+                assert_eq!(actual, expected, "shared TP2 sum differs at layer {layer} rows {rows} step {step}");
+                assert!(actual.chunks_exact(2).any(|v| u16::from_ne_bytes([v[0], v[1]]) & 0x7fff != 0));
+                checked += 1;
+            }
+        }
+        let distinct = schedule.iter().collect::<std::collections::BTreeSet<_>>().len() * layers;
+        for rank in 0..2 {
+            assert_eq!(graphed.ranks[rank].graph_count(), distinct, "rank {rank} captured every key once");
+            assert_eq!(eager.ranks[rank].graph_count(), 0, "eager rank {rank} captured");
+        }
+        assert_eq!(lib.cuda_get_device()?, 0);
+        eprintln!("PASS {checked} graphed/eager shared TP2 waves byte-identical (halves and sums, both destinations), {distinct} keys per rank");
         Ok(())
     }
     #[test]
