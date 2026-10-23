@@ -2953,7 +2953,8 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_t
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr
     assert "--context-tokens 131072" in preflight
-    assert "--prefill-rows 4096" in preflight
+    assert "--prefill-rows" not in shlex.split(preflight)
+    assert "--prefill-rows 4096" in launch
     assert "--expert-input fp8" in preflight
 
 
