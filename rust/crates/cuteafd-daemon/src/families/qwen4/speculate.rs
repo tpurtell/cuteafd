@@ -62,10 +62,13 @@ pub(crate) fn prefill_chunk(engine: &Qwen4Engine<'_>, placement: &Qwen4Placement
         return Ok(());
     }
     let tokens: Vec<u32> = (0..known).map(|i| chunk.get(i + 1).copied().or(next).unwrap_or_default()).collect();
-    let rows = (0..known).map(|i| MtpRow { position: start + i, token: tokens[i], source: i as i32 }).collect();
-    engine.mtp_step(false, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens),
-        MtpOut::Download { logits: false })?;
-    placement.mtp_frontier.set(start + known);
+    for first in (0..known).step_by(engine.mtp_prefill_rows()) {
+        let end = known.min(first + engine.mtp_prefill_rows());
+        let rows = (first..end).map(|i| MtpRow { position: start + i, token: tokens[i], source: i as i32 }).collect();
+        engine.mtp_step(false, &[MtpGroup { placement, rows }], MtpSource::Target, &[], MtpTokens::Host(&tokens[first..end]),
+            MtpOut::Download { logits: false })?;
+        placement.mtp_frontier.set(start + end);
+    }
     Ok(())
 }
 

@@ -53,9 +53,13 @@ pub struct LayoutOptions {
     pub full_prefill_logits: bool,
     /// Prefill lanes (GLM 5.3 Flash); 0 selects the family default.
     pub prefill_lanes: u64,
+<<<<<<< HEAD
     /// Family-resolved rows per wave, independent of the admitted span.
     pub prefill_unit_rows: Option<u64>,
     /// Continuous row-unit waves on one transport.
+=======
+    /// Continuous row-unit waves on one transport (Qwen).
+>>>>>>> db53024d1 (Bind Qwen Spark prefill units to shared hooks and admission)
     pub prefill_waves: u64,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
     /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
@@ -190,7 +194,10 @@ impl Default for LayoutOptions {
             prefill_rows: 0,
             full_prefill_logits: false,
             prefill_lanes: 0,
+<<<<<<< HEAD
             prefill_unit_rows: None,
+=======
+>>>>>>> db53024d1 (Bind Qwen Spark prefill units to shared hooks and admission)
             prefill_waves: 1,
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),

@@ -369,6 +369,8 @@ KV_CACHE
 QWEN_FP8_DECODE
 QWEN_FP8_HEAD
 QWEN_STARTUP_GRAPHS
+PREFILL_ROWS
+PREFILL_WAVES
 SPECULATOR_DEPTH
 SPECULATOR_FP8
 MEDIA_CACHE_BYTES
@@ -2041,6 +2043,8 @@ fi
 # MTP share. Unset keeps the engine defaults.
 if [[ $family == qwen4 ]]; then
   family_args+=(--kv-cache "$kv_cache")
+  [[ -z "$(get PREFILL_ROWS)" ]] || family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+  [[ -z "$(get PREFILL_WAVES)" ]] || family_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
     mode="$(get "QWEN_${key%%:*}")"
     case "$mode" in
@@ -2686,6 +2690,8 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == qwen4 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
       case "$(get "QWEN_${key%%:*}")" in
         on) plan_draft_args+=("${key#*:}" true) ;;

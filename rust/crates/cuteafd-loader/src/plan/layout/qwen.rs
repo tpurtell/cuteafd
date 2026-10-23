@@ -204,9 +204,18 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
+    let prefill_shape = if options.prefill_waves > 1 {
+        anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
+            "Qwen prefill waves require single-owner Spark experts");
+        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 2048 };
+        let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
+        anyhow::ensure!(units.slot_rows() <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
+        Some(units)
+    } else { None };
+    let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());
     let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
-            prefill_rows: shape.prefill_rows, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
+        admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
+            prefill_rows: span, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
@@ -216,6 +225,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         startup_graph_modes: Some((shape.concurrency.min(16) as usize, true)),
     };
     let placement = crate::placement::families::qwen4::placement(&inputs)?;
+    report.prefill_rows = Some(span);
     device.items.extend(placement.items[0].iter().cloned());
     device.kv_tokens = placement.pool_tokens;
     let pool_tokens = placement.pool_tokens;
@@ -347,7 +357,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let headroom = options.headroom_bytes.max(3 * GIB);
     let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
-        admission: QwenAdmissionInputs { cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
+        admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },

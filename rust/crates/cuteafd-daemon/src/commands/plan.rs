@@ -74,7 +74,12 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 context_tokens: args.context_tokens,
                 prefill_rows: args.prefill_rows,
                 full_prefill_logits: args.full_prefill_logits,
+<<<<<<< HEAD
                 prefill_lanes: args.prefill_waves,
+=======
+                prefill_lanes: args.prefill_lanes,
+                prefill_waves: args.prefill_waves,
+>>>>>>> db53024d1 (Bind Qwen Spark prefill units to shared hooks and admission)
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
                     kda_fp8: args.kda_fp8 != crate::families::glm5_flash::fp8::KdaFp8::Off,
@@ -847,7 +852,12 @@ mod tests {
             context_tokens: 262144,
             prefill_rows: 4096,
             full_prefill_logits: false,
+<<<<<<< HEAD
             prefill_waves: 0,
+=======
+            prefill_lanes: 0,
+            prefill_waves: 1,
+>>>>>>> db53024d1 (Bind Qwen Spark prefill units to shared hooks and admission)
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,

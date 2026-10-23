@@ -65,6 +65,12 @@ pub(crate) struct EngineArgs {
     pub slots: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Units in flight on the one Spark transport (one keeps the legacy path).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pub prefill_waves: u8,
+    /// Diagnostic unit cuts, including N=1, without changing the span size.
+    #[arg(long)]
+    pub prefill_units: Option<usize>,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -218,6 +224,19 @@ pub(crate) struct GoldenArgs {
     /// --resume-at attempts on fresh sequences per case (all must be byte-identical).
     #[arg(long, default_value_t = 1)]
     pub resume_repeat: usize,
+}
+
+impl EngineArgs {
+    fn prefill_shape(&self) -> Result<Option<cuteafd_loader::serving_capacity::PrefillShape>> {
+        if self.prefill_units.is_none() && self.prefill_waves == 1 { return Ok(None); }
+        ensure!(self.split_device.is_none(), "Qwen prefill units do not admit dual-owner hop slots");
+        ensure!(self.peers.is_some() || self.shared_only, "Qwen prefill units need Spark experts or shared-only diagnostics");
+        let shape = cuteafd_loader::serving_capacity::PrefillShape {
+            unit_rows: self.prefill_units.unwrap_or(self.prefill_rows) as u64, waves: u64::from(self.prefill_waves),
+        }.validate()?;
+        ensure!(shape.slot_rows() <= 4096 && self.prefill_rows <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
+        Ok(Some(shape))
+    }
 }
 
 /// The checkpoint and native library, opened on the calling thread.
@@ -431,6 +450,12 @@ impl Opened {
             1 + usize::from(args.split_device.is_some()), args.split_device.is_some())?;
         let automatic_context = args.max_context == 0;
         let mut context_args = args.clone();
+        let prefill_shape = args.prefill_shape()?;
+        if let Some(shape) = prefill_shape {
+            // Explicit diagnostic cuts retain the requested whole-step span.
+            if args.prefill_units.is_none() { context_args.prefill_rows = shape.slot_rows() as usize; }
+            context_args.prefill_units = Some(shape.unit_rows as usize);
+        }
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "qwen4", args.max_context)?;
         let args = &context_args;
@@ -588,6 +613,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new(&self.library, &programs, self.cfg.clone(), model, ple, stream,
             max_context, args.prefill_rows, pages, args.slots, args.kv_format, embedding)?;
+        engine.prefill_shape = prefill_shape;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
         if args.planner_graph_modes.is_some() { engine.enable_startup_graphs(); }
@@ -674,9 +700,12 @@ impl Opened {
         } else { None };
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
-        let mut transport = crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
+        let shape = args.prefill_shape()?;
+        let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
             u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
+                shape.map_or(1, |s| s.waves as usize),
+                u32::try_from(shape.map_or(args.prefill_rows, |s| s.unit_rows as usize).max(engine::DECODE_ROWS))?)?;
         transport.enable_terminal_ownership(self.library.clone())?;
         // Connect every rank and publish its installed expert grouping now, with
         // the widest wave this transport can carry: the draft planner prices the
@@ -854,9 +883,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
     while done < prefill {
         let n = engine.prefill_rows.min(prefill - done);
         let first = done;
-        let chunk = engine.prefill_forced(&mut placement, &tokens[done..done + n],
-            Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
-            args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), if args.nll { n } else { 1 })?;
+        let chunk = if engine.prefill_shape.is_some() {
+            ensure!(!args.teacher_force, "Qwen unit golden compares logits, not teacher-forced layer streams");
+            engine.prefill_forced(&mut placement, &tokens[done..done + n], None, None, if args.nll { n } else { 1 })?
+        } else {
+            engine.prefill_forced(&mut placement, &tokens[done..done + n],
+                Some(&mut |layer, streams| compare(layer, first, streams, &mut worst)),
+                args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>), if args.nll { n } else { 1 })?
+        };
         logits = match (logits, chunk) {
             (Some(mut all), Some(more)) if args.nll => {
                 all.extend(more);
