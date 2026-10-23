@@ -147,10 +147,13 @@ pub(crate) struct EngineArgs {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from
-    /// python/reference/families/qwen4/golden.py.
+    /// Directory with tokens.bin, optional layerNN.bin and logits.bin from
+    /// python/reference/families/qwen4/golden.py, or a published shared fidelity set.
     #[arg(long)]
     pub golden: PathBuf,
+    /// One window from the published shared fidelity quick subset (otherwise all eight).
+    #[arg(long, requires_all = ["nll", "save_logits"])]
+    pub window: Option<String>,
     /// Prefill only the first N tokens, then feed the rest through decode
     /// steps of --step-rows rows (teacher-forced), comparing their rows.
     #[arg(long)]
@@ -164,9 +167,9 @@ pub(crate) struct GoldenArgs {
     /// Score every prefill row's logits against the golden (mean NLL, top-1).
     #[arg(long)]
     pub nll: bool,
-    /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
-    /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
-    /// runs compare exactly the rows the decode path produced.
+    /// Save engine logits even without a reference logits.bin: with --nll every prefill row,
+    /// otherwise only decode/verify rows after --prefill N. Shared fidelity sets instead write
+    /// scored Probe rows, per-window metrics and fidelity.json to a new directory.
     #[arg(long)]
     pub save_logits: Option<PathBuf>,
     /// After the comparison, time this many greedy single-row decode steps.
@@ -808,9 +811,26 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     tokio::task::spawn_blocking(move || golden(args)).await?
 }
 
-fn golden(args: GoldenArgs) -> Result<()> {
+fn golden(mut args: GoldenArgs) -> Result<()> {
+    args.engine.full_prefill_logits |= args.nll;
+    ensure!(args.step_rows > 0, "Qwen golden --step-rows must be nonzero");
+    let windows = if args.golden.join("manifest.json").try_exists()? {
+        ensure!(args.nll && args.save_logits.is_some(), "shared Qwen fidelity needs --nll --save-logits DIR");
+        ensure!(args.prefill.is_none() && !args.teacher_force && args.spec_keep.is_none()
+            && args.mtp_oracle.is_none() && args.token_check.is_none() && args.spec_decode.is_none()
+            && args.resume_at.is_empty() && args.bench_prefill == 0 && args.bench_decode == 0,
+            "shared Qwen fidelity cannot be combined with legacy golden diagnostics");
+        let output = args.save_logits.as_deref().unwrap();
+        ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
+            "Qwen fidelity output needs an existing parent and a new directory");
+        Some(fidelity_windows(&args.golden, args.window.as_deref())?)
+    } else {
+        ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
+        None
+    };
     let opened = open(&args.engine)?;
     opened.with_engine(&args.engine, |engine| {
+        if let Some(windows) = &windows { return score_fidelity(&args, &opened, engine, windows); }
         if let Some(dir) = &args.mtp_oracle {
             return mtp_golden::mtp_oracle(&args, &opened, engine, dir);
         }
@@ -861,16 +881,121 @@ fn score(logits: &[f32], golden: &[f32], tokens: &[u32], first: usize, vocab: us
     (agree, next_ok, golden_next, nll, scored)
 }
 
+fn fidelity_windows(root: &std::path::Path, selected: Option<&str>) -> Result<Vec<cuteafd_bench::reference::Window>> {
+    use cuteafd_bench::fidelity_dataset;
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(root.join("manifest.json"))?;
+    ensure!(format!("{:x}", Sha256::digest(&bytes)) == fidelity_dataset::QWEN_MANIFEST_SHA256,
+        "Qwen fidelity manifest differs from immutable publication");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(manifest["config"] == fidelity_dataset::QWEN_CONFIG && manifest["vocab"] == 248320,
+        "Qwen fidelity config/vocabulary differs");
+    let reference = fidelity_dataset::load(root, &manifest)?;
+    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    if let Some(id) = selected {
+        windows.retain(|window| window.id == id);
+        ensure!(windows.len() == 1, "Qwen fidelity window must belong to the sealed quick subset");
+    }
+    ensure!(windows.iter().all(|window| window.media.is_empty() && window.tokens.len() <= 16384
+        && window.score_from > 0 && window.score_from < window.tokens.len()),
+        "Qwen fidelity requires text-only bounded causal windows");
+    Ok(windows)
+}
+
+fn fidelity_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!((2..=16384).contains(&tokens) && capacity > 0, "Qwen fidelity causal window/chunk extent differs");
+    let count = tokens - 1;
+    Ok((0..count).step_by(capacity).map(|first| first..(first + capacity).min(count)).collect())
+}
+
+fn score_fidelity(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>,
+    windows: &[cuteafd_bench::reference::Window]) -> Result<()> {
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_bench::{fidelity_dataset, fidelity_rows, reference::Fidelity};
+    ensure!(engine.weights.layers.len() == opened.cfg.layers && opened.cfg.vocab_size == 248320,
+        "Qwen fidelity needs every target layer and the published vocabulary");
+    let root = args.save_logits.as_deref().context("shared Qwen fidelity requires --save-logits")?;
+    std::fs::create_dir(root).context("Qwen fidelity output must be a new directory with an existing parent")?;
+    let provenance = serde_json::json!({"prefill_rows":engine.prefill_rows,
+        "prefill_shape":engine.prefill_shape.map(|shape| serde_json::json!({"unit_rows":shape.unit_rows,"waves":shape.waves})),
+        "kv_cache":args.engine.kv_format.to_string(), "fp8_decode":args.engine.fp8_decode,
+        "fp8_prefill_w8a8":args.engine.fp8_prefill_w8a8});
+    let mut allocator = engine::Allocator::new(engine.pages, engine.slots, &opened.cfg);
+    let mut records = Vec::new();
+    let vocab = opened.cfg.vocab_size;
+    for window in windows {
+        let mut placement = allocator.admit(window.tokens.len() - 1)?;
+        let dump = root.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|p| p.pos).collect()), top_k: 32,
+            want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("qwen4", &window.tokens, 0);
+        probe.selected_score_path("prefill");
+        probe.provenance(provenance.clone());
+        for chunk in fidelity_chunks(window.tokens.len(), engine.prefill_rows)? {
+            let logits = engine.prefill_forced(&mut placement, &window.tokens[chunk.clone()], None, None, chunk.len())?
+                .context("Qwen fidelity needs all target logits")?;
+            ensure!(logits.len() == chunk.len() * vocab, "Qwen fidelity logits shape differs");
+            for (row, logits) in logits.chunks_exact(vocab).enumerate() {
+                let position = chunk.start + row + 1;
+                if position >= window.score_from { probe.row(position, logits); }
+            }
+            probe.scored_prefill_chunk(chunk.start + 1, chunk.len());
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "Qwen fidelity row dump failed: {:?}", record.error);
+        let mut score = window.score(&record.rows);
+        ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(),
+            "Qwen fidelity did not cover every finite scored row");
+        fidelity_rows::score_compact(vocab, window, &dump, &mut score)?;
+        println!("Qwen window {}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
+            window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
+        serde_json::to_writer(file, &serde_json::json!({"probe":record,"score":score}))?;
+        records.extend(score.records);
+        engine.drain_state()?;
+        allocator.release(placement);
+    }
+    let score = Fidelity::from_records(records);
+    println!("Qwen prefill logits: rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
+        score.positions, score.top1 * 100.0, score.nll, score.kl);
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
+    serde_json::to_writer(file, &serde_json::json!({"schema":"cuteafd.qwen4.golden/1",
+        "reference_config":fidelity_dataset::QWEN_CONFIG,"reference_revision":fidelity_dataset::QWEN_REVISION,
+        "reference_manifest_sha256":fidelity_dataset::QWEN_MANIFEST_SHA256,
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":provenance,"score":score}))?;
+    Ok(())
+}
+
+fn golden_logits(root: &std::path::Path, dump_only: bool, expected: usize) -> Result<Option<Vec<f32>>> {
+    let bytes = match std::fs::read(root.join("logits.bin")) {
+        Ok(bytes) => bytes,
+        Err(error) if dump_only && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("Qwen golden logits; pass --save-logits for a pure engine dump"),
+    };
+    ensure!(bytes.len() == expected.checked_mul(4).context("Qwen golden logits extent overflow")?,
+        "Qwen golden logits shape differs");
+    let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+    ensure!(values.iter().all(|v| v.is_finite()), "Qwen golden logits are non-finite");
+    Ok(Some(values))
+}
+
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'_>) -> Result<()> {
     let cfg = &opened.cfg;
     let layers = engine.weights.layers.len();
-    let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
-        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let token_bytes = std::fs::read(args.golden.join("tokens.bin"))?;
+    ensure!(!token_bytes.is_empty() && token_bytes.len().is_multiple_of(4), "Qwen golden token extent differs");
+    let tokens: Vec<u32> = token_bytes.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    let reference_logits = golden_logits(&args.golden, args.save_logits.is_some(),
+        tokens.len().checked_mul(cfg.vocab_size).context("Qwen golden logits shape overflow")?)?;
+    if reference_logits.is_none() { println!("Qwen engine-only logits dump; no reference NLL/KL or agreement comparison"); }
     let mut allocator = engine::Allocator::new(engine.pages, engine.slots, cfg);
     let mut placement = allocator.admit(tokens.len() + args.bench_decode + usize::from(args.bench_decode > 0))?;
     let row = cfg.hidden * 2;
     let stream_row = row * 4;
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
+    ensure!(prefill > 0, "Qwen golden requires a nonempty prefill");
     // Rows [first, first + n) of layer `layer`'s golden streams.
     let compare = |layer: usize, first: usize, streams: &[u8], worst: &mut Vec<f64>| -> Result<()> {
         let path = args.golden.join(format!("layer{layer:02}.bin"));
@@ -961,10 +1086,6 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         println!("speculative verify: {spec_steps} steps of {} rows, each committing {} (GDN/PLE verify-by-replay)",
             args.step_rows, args.spec_keep.unwrap_or(0));
     }
-    let golden_logits = || -> Result<Vec<f32>> {
-        Ok(std::fs::read(args.golden.join("logits.bin"))?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
-    };
     let vocab = cfg.vocab_size;
     if prefill < tokens.len() {
         println!("decode: {} rows in steps of {} in {:.2} s; worst row-block cosine per layer {:?}",
@@ -975,13 +1096,14 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
             if let Ok(path) = std::env::var("CUTEAFD_DUMP_DECODE_LOGITS") {
                 std::fs::write(&path, decode_logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
             }
-            let golden = golden_logits()?;
-            let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, &golden, &tokens, prefill, vocab);
-            let rows = decode_logits.len() / vocab;
-            println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
-                100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
-                nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, &golden, prefill, vocab));
+            if let Some(golden) = &reference_logits {
+                let (agree, next_ok, golden_next, nll, scored) = score(&decode_logits, golden, &tokens, prefill, vocab);
+                let rows = decode_logits.len() / vocab;
+                println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
+                    golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * agree as f64 / rows as f64,
+                    100.0 * next_ok as f64 / scored.max(1) as f64, 100.0 * golden_next as f64 / scored.max(1) as f64,
+                    nll / scored.max(1) as f64, crate::families::glm5_flash::mean_kl(&decode_logits, golden, prefill, vocab));
+            }
         }
     }
     // Reference dumps for `scripts/bench/golden-run.py --compare-logits`: with --nll every
@@ -1074,9 +1196,9 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         if let Ok(path) = std::env::var("CUTEAFD_DUMP_PREFILL_LOGITS") {
             std::fs::write(&path, logits.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
-        let golden = golden_logits()?;
+        let Some(golden) = &reference_logits else { return Ok(()) };
         if args.nll {
-            let (agree, next_ok, golden_next, nll, scored) = score(&logits, &golden, &tokens, 0, vocab);
+            let (agree, next_ok, golden_next, nll, scored) = score(&logits, golden, &tokens, 0, vocab);
             let (_, _, _, golden_nll, _) = score(&golden[..prefill * vocab], &golden, &tokens, 0, vocab);
             println!("prefill logits: top-1 agreement {:.1}% over {prefill} rows | next-token accuracy engine {:.1}% \
                 golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * agree as f64 / prefill as f64,
@@ -1090,6 +1212,49 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(logits), argmax(last));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod golden_tests {
+    use super::{fidelity_chunks, fidelity_windows, golden_logits};
+
+    #[test]
+    fn causal_fidelity_chunks_cover_next_token_positions_once() {
+        for tokens in [513, 751, 4097, 8193, 10773] {
+            for capacity in [512, 2048, 4096, 16384] {
+                let chunks = fidelity_chunks(tokens, capacity).unwrap();
+                let predicted = chunks.iter().flat_map(|chunk| chunk.clone().map(|row| row + 1)).collect::<Vec<_>>();
+                assert_eq!(predicted, (1..tokens).collect::<Vec<_>>());
+                assert!(chunks.iter().all(|chunk| !chunk.is_empty() && chunk.len() <= capacity));
+            }
+        }
+        assert!(fidelity_chunks(1, 2048).is_err());
+        assert!(fidelity_chunks(513, 0).is_err());
+    }
+
+    #[test]
+    fn engine_only_logits_dump_requires_explicit_opt_in_and_rejects_bad_references() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(golden_logits(dir.path(), true, 4).unwrap().is_none());
+        assert!(golden_logits(dir.path(), false, 4).is_err());
+        let values = [0.0f32, 1.0, -1.0, 2.0];
+        let path = dir.path().join("logits.bin");
+        std::fs::write(&path, values.into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        assert_eq!(golden_logits(dir.path(), true, 4).unwrap().unwrap(), values);
+        assert!(golden_logits(dir.path(), true, 3).is_err());
+        std::fs::write(&path, f32::NAN.to_le_bytes()).unwrap();
+        assert!(golden_logits(dir.path(), true, 1).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(golden_logits(dir.path(), true, 1).is_err());
+    }
+
+    #[test]
+    fn shared_fidelity_rejects_an_unpublished_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("manifest.json"), b"{}").unwrap();
+        assert!(fidelity_windows(dir.path(), None).unwrap_err().to_string().contains("immutable publication"));
+    }
 }
 
 /// `--token-check N`: prefill the golden prompt, then [`crate::shared::token_io::gate`]

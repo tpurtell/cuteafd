@@ -23,6 +23,7 @@ pub const GLMF_REVISION: &str = "a7e7d1b4d82329acebe54ca88dc71d47d0d2056d";
 pub const GLMF_CONFIG: &str = "glm5_flash-v2_20261005_bf16root";
 pub const QWEN_REVISION: &str = "3e0ccef6cff461baf39ba838627edd93cb687be4";
 pub const QWEN_CONFIG: &str = "qwen4-v2_20261005_fp8";
+pub const QWEN_MANIFEST_SHA256: &str = "0d544ab679c2ff78383b3915cc453df912f8c5cfe3ffaa4ac245fd75e370a33b";
 pub const V4FLASH_REVISION: &str = "de92b14a7dabecd4d5dd4f7c799920842a5c3834";
 pub const V4FLASH_CONFIG: &str = "deepseek_v4-v2_20261005_v4flash";
 pub const GLM_REVISION: &str = "581cdf3b5ee5a63dd5a7726b9d33ea16cf105b0d";
