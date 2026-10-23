@@ -3,14 +3,10 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoints: usize)
-    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
-    use cuteafd_core::{SparkEndpoint, SparkIngress};
-    ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
-        "invalid V4.1 device endpoint set");
-    let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2];
-    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: capacity.min(80), ingress }, device_endpoints));
+fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, waves: u64,
+    device_endpoints: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    let endpoints = families::deepseek_v41::owners::spark_endpoints(
+        capacity, bf16, waves, device_endpoints)?;
     let model = cuteafd_transport::worker_selection::ModelAdmission {
         capacity, compiled_capacity, endpoints,
         rings: crate::shared::placement::spark_rings(64 << 20)?,
@@ -44,7 +40,8 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
-        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(), device_endpoints)?)?))
+        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(),
+            u64::from(args.prefill_waves.unwrap_or(1)), device_endpoints)?)?))
 }
 
 #[cfg(test)]
@@ -66,21 +63,34 @@ mod spark_tests {
     }
 
     #[test]
-    fn endpoint_contract_covers_both_regular_and_each_device_lane() -> Result<()> {
+    fn endpoint_contract_preserves_decode_and_admits_prefill_fifo() -> Result<()> {
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
-            for device in 0..=2 {
-                let model = spark_model(live, compiled, false, device)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));
-                assert_eq!(model.endpoints.len(), 2 + device);
-                assert!(model.endpoints[..2].iter().all(|e| e.capacity == live));
-                assert!(model.endpoints[2..].iter().all(|e| e.capacity == 80));
-                assert!(model.endpoints.iter().all(|e| e.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            for waves in [1, 2] {
+                for device in 0..=2 {
+                    let model = spark_model(live, compiled, false, waves, device)?;
+                    let proxies = 2 + usize::from(waves > 1);
+                    assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));
+                    assert_eq!(model.endpoints.len(), proxies + device);
+                    assert!(model.endpoints[..2].iter()
+                        .all(|e| e.capacity == live && e.ring_depth.is_none()));
+                    if waves > 1 {
+                        assert_eq!(model.endpoints[2].capacity, live);
+                        assert_eq!(model.endpoints[2].ring_depth, Some(2));
+                    }
+                    assert!(model.endpoints[proxies..].iter()
+                        .all(|e| e.capacity == 80 && e.ring_depth.is_none()));
+                    assert!(model.endpoints.iter()
+                        .all(|e| e.ingress == cuteafd_core::SparkIngress::Fp8K32));
+                }
+                assert!(spark_model(live, compiled, true, waves, 0)?.endpoints.iter()
+                    .all(|e| e.ingress == cuteafd_core::SparkIngress::Bf16));
+                assert!(spark_model(live, compiled, true, waves, 1).is_err());
             }
-            assert!(spark_model(live, compiled, true, 0)?.endpoints.iter()
-                .all(|e| e.ingress == cuteafd_core::SparkIngress::Bf16));
-            assert!(spark_model(live, compiled, true, 1).is_err());
         }
-        assert!(spark_model(4096, 2048, false, 0).is_err());
+        assert!(spark_model(4096, 2048, false, 2, 0).is_err());
+        for waves in [0, 3] {
+            assert!(spark_model(4096, 4096, false, waves, 0).is_err());
+        }
         Ok(())
     }
 }
