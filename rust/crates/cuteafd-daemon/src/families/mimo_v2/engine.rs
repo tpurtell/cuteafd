@@ -361,6 +361,7 @@ pub(crate) struct Peer<'a> {
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
+    unit_done: Vec<crate::shared::memory::device::Event<'a>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
 }
 
@@ -467,7 +468,6 @@ struct UnitHooks<'h, 'a> {
     all_logits: bool,
     output: &'h Workspace<'a>,
     last: usize,
-    peer_done: Vec<crate::shared::memory::device::Event<'a>>,
 }
 
 impl UnitHooks<'_, '_> {
@@ -513,7 +513,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         if unit.index >= e.prefill_waves() && self.peer_work.is_some() {
             // SAFETY: the slot's prior peer readers precede its recorded event;
             // the cross-device wait orders rank 0's entry copy after them.
-            unsafe { e.library.cuda_stream_wait_event(e.stream, self.peer_done[unit.slot].raw)?; }
+            unsafe { e.library.cuda_stream_wait_event(e.stream, e.peer.as_ref().context("MiMo peer")?.unit_done[unit.slot].raw)?; }
         }
         for (rank, w) in std::iter::once(&self.work[unit.index])
             .chain(self.peer_work.map(|p| &p[unit.index])).enumerate() {
@@ -542,6 +542,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
     fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let e = self.engine;
         let w = &self.work[unit.index];
+        e.unit_index.set(Some(unit.index));
         let rows = Scalar::I32(unit.rows.len() as i32);
         let tables = &self.tables[unit.index];
         let bytes = unit.rows.len() * e.cfg.hidden * 2;
@@ -612,7 +613,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
         if self.peer_work.is_some() {
             // SAFETY: the event and peer stream belong to this engine and all
             // slot readers are queued before the next slot owner's entry copy.
-            e.on(1, || unsafe { e.library.cuda_event_record(self.peer_done[unit.slot].raw, e.stream_of(1)) })?;
+            e.on(1, || unsafe { e.library.cuda_event_record(e.peer.as_ref().context("MiMo peer")?.unit_done[unit.slot].raw, e.stream_of(1)) })?;
         }
         Ok(())
     }
@@ -637,6 +638,7 @@ pub(crate) struct MimoEngine<'a> {
     pub prefill_unit_waves: usize,
     request_id: Cell<u64>,
     unit_position: Cell<usize>,
+    unit_index: Cell<Option<usize>>,
     prefill_output: MimoPrefillOutput,
     pub pages: usize,
     pub rings: usize,
@@ -771,7 +773,7 @@ impl<'a> MimoEngine<'a> {
         let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
-            max_context, prefill_rows, prefill_unit_waves: 1, request_id: Cell::new(0), unit_position: Cell::new(0), prefill_output, pages, rings, family, device,
+            max_context, prefill_rows, prefill_unit_waves: 1, request_id: Cell::new(0), unit_position: Cell::new(0), unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
@@ -979,7 +981,9 @@ impl<'a> MimoEngine<'a> {
                 })
             }).collect::<Result<Vec<_>>>()?;
             Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
-                prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+                prefill_kv_wide: RefCell::new(None), unit_done: (0..self.prefill_waves()).map(|_|
+                    crate::shared::memory::device::Event::new(Device { library, id: device })).collect::<Result<Vec<_>>>()?,
+                decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -1300,11 +1304,11 @@ impl<'a> MimoEngine<'a> {
         self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
     }
 
-    fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
+    fn download(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
+        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
         Ok(out)
     }
 
@@ -1389,8 +1393,7 @@ impl<'a> MimoEngine<'a> {
         self.prepare_scoring_prefill()?;
         let waves = self.prefill_waves();
         let units = sequence_units(tokens.len(), self.prefill_rows, waves, self.weights.layers.len())?;
-        self.prepare_tp2_route_step(&(0..waves).map(|slot| units.iter().filter(|u| u.slot == slot)
-            .map(|u| u.rows.len()).max().unwrap_or(1)).collect::<Vec<_>>())?;
+        self.prepare_tp2_route_step(&units.iter().map(|u| u.rows.len()).collect::<Vec<_>>())?;
         let owned = self.workspace.borrow();
         let base = owned.as_ref().context("prefill workspace")?;
         let peer_owned = self.peer.as_ref().map(|p| p.workspace.borrow());
@@ -1406,11 +1409,10 @@ impl<'a> MimoEngine<'a> {
             self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim)).collect::<Result<Vec<_>>>()).transpose()?;
         let mut hooks = UnitHooks { engine: self, tokens, tables: &tables, work: &work,
             peer_work: peer_work.as_deref(), media, all_logits, output: base, last: units.len() - 1,
-            peer_done: if let Some(peer) = &self.peer { (0..waves).map(|_|
-                crate::shared::memory::device::Event::new(Device { library: self.library, id: peer.device }))
-                .collect::<Result<Vec<_>>>()? } else { Vec::new() } };
+        };
         let result = run_prefill_units(&mut hooks, &units, waves);
         self.unit_position.set(0);
+        self.unit_index.set(None);
         result?;
         self.finish_tp2_route_step()?;
         Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(base,
@@ -1610,7 +1612,7 @@ impl<'a> MimoEngine<'a> {
                 self.mtp_tap(mtp, w, tables)?;
             }
             if let Some(on_layer) = on_layer.as_mut() {
-                on_layer(index, &self.download(&w.h, t * h * 2)?)?;
+                on_layer(index, &self.download(w.h.buffer, t * h * 2)?)?;
             }
             if let Some(rows_forced) = forced.and_then(|f| f(index)) {
                 ensure!(rows_forced.len() == t * h * 2, "teacher-forced rows of the wrong size");
@@ -1663,7 +1665,7 @@ impl<'a> MimoEngine<'a> {
         // SAFETY: the logits rows and the select buffer are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
-                std::ptr::null_mut(), Self::region(&w.select, rows * 4, rows * 4).ptr, self.stream)
+                std::ptr::null_mut(), Self::region(w.select.buffer, rows * 4, rows * 4).ptr, self.stream)
         }
     }
 
@@ -1672,7 +1674,7 @@ impl<'a> MimoEngine<'a> {
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
         let vocab = self.cfg.vocab_size;
         DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
-            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(w.select.buffer, rows * 4, rows * 4).ptr
                 .cast_const())) }
     }
 
@@ -2269,7 +2271,7 @@ impl<'a> MimoEngine<'a> {
         if stages == 0 {
             return Ok(vec![Vec::new(); seqs.len()]);
         }
-        let bytes = self.download(&mtp.ids, (1 + stages) * DECODE_ROWS * 4)?;
+        let bytes = self.download(mtp.ids.buffer, (1 + stages) * DECODE_ROWS * 4)?;
         let word = |at: usize| u32::from_le_bytes(bytes[at * 4..at * 4 + 4].try_into().unwrap());
         Ok((0..seqs.len()).map(|i| (0..stages).map(|k| word((1 + k) * DECODE_ROWS + i)).collect()).collect())
     }
@@ -2404,19 +2406,19 @@ impl<'a> MimoEngine<'a> {
         let Some(members) = members else { return Ok(()) };
         ensure!(members.len() == groups.len(), "a member per drafting group");
         self.launch_head(w, t, t, true)?;
-        let region = |dev: &Dev<'_>, offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
+        let region = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, offset: usize, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer {
             // SAFETY: callers pass offsets inside the allocation.
-            ptr: unsafe { dev.buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..dev.buffer };
+            ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..buffer };
         // SAFETY: the logits rows, the select buffer (ids, then statuses) and the
         // drafts region are live buffers of these shapes; stream-ordered.
         unsafe {
             self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, t, vocab, vocab, w.select.buffer.ptr,
-                std::ptr::null_mut(), region(&w.select, t * 4, t * 4).ptr, self.stream)?;
+                std::ptr::null_mut(), region(w.select.buffer, t * 4, t * 4).ptr, self.stream)?;
             let mut end = 0;
             for ((_, _, tokens), &member) in groups.iter().zip(members) {
                 end += tokens.len();
-                self.library.copy_d2d_async(region(&mtp.ids, ((1 + k) * DECODE_ROWS + member) * 4, 4),
-                    region(&w.select, (end - 1) * 4, 4), 4, self.stream)?;
+                self.library.copy_d2d_async(region(mtp.ids.buffer, ((1 + k) * DECODE_ROWS + member) * 4, 4),
+                    region(w.select.buffer, (end - 1) * 4, 4), 4, self.stream)?;
             }
         }
         Ok(())

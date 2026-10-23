@@ -305,7 +305,7 @@ pub(super) fn preflight(
         .map(|costs| costs.iter().map(|r| r.bytes).sum::<u64>())
         .collect::<Vec<_>>();
     let transport_lanes = resolve_prefill_waves(backend == ExpertBackend::Spark, cfg.program_family()?,
-        Some(&args.prefill_waves.to_string()))?;
+        (args.prefill_waves > 0).then(|| args.prefill_waves.to_string()).as_deref())?;
     let spark_ranks = match args
         .peers
         .as_deref()
@@ -826,7 +826,7 @@ mod tests {
 
     #[test]
     fn prefill_wave_default_and_explicit_overrides() {
-        for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimof", 2), ("mimof2", 2), ("mimop", 2), ("mimop2", 2)] {
+        for (family, default) in [("mimo", 2), ("mimo2", 2), ("mimof", 2), ("mimof2", 2), ("mimop", 3), ("mimop2", 3)] {
             assert_eq!(super::resolve_prefill_waves(true, family, None).unwrap(), default);
             for lanes in 1..=4 {
                 let configured = lanes.to_string();

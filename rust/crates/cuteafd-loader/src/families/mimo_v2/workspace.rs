@@ -226,7 +226,9 @@ impl MimoWorkspaceLayout {
             step_slots: bytes("MiMo identity slots", &[live, 8])?,
             ring_slots: bytes("MiMo ring slots", &[live, 8])?,
             seq_first: bytes("MiMo sequence starts", &[live, 4])?,
-            page_table: bytes("MiMo page table", &[page_table_rows, options.pool_pages, 4])?,
+            page_table: if options.decode { bytes("MiMo page table", &[page_table_rows, options.pool_pages, 4])? }
+                else { bytes("MiMo unit page table", &[options.pool_pages, 4])?
+                    .checked_mul(options.waves).ok_or(CacheGeometryError::Overflow("MiMo unit page tables"))? },
             scratch: options.native_scratch_bytes.max(256),
             logits: if options.with_head {
                 bytes("MiMo logits", &[logits_rows, cfg.vocab_size as u64, 4])?
@@ -303,6 +305,23 @@ mod tests {
     }
 
     #[test]
+    fn unit_slots_multiply_only_live_planes_and_keep_page_tables_aligned() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        let single = MimoWorkspaceLayout::new(&cfg, options()).unwrap();
+        for waves in [2, 3, 4] {
+            let multi = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, ..options() }).unwrap();
+            for ((name, one), (other, many)) in single.device_buffers().zip(multi.device_buffers()) {
+                assert_eq!(name, other);
+                let owned = matches!(name, "h" | "x" | "delta" | "step_inputs" | "slots" | "step_slots"
+                    | "ring_slots" | "seq_first" | "page_table" | "ids");
+                assert_eq!(many, one * if owned { waves } else { 1 }, "{name}");
+            }
+            let tiny = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, pool_pages: 1, ..options() }).unwrap();
+            assert_eq!(tiny.page_table, waves * 256);
+        }
+    }
+
+    #[test]
     fn rope_windows_charge_rows_not_compiled_context() {
         let cfg = MimoV2Config::from_hf(&mimo_flash_config()).unwrap();
         let before = MimoWorkspaceOptions { max_context: 1 << 16, ..options() };
@@ -348,9 +367,9 @@ mod tests {
         let last = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
             prefill_output: MimoPrefillOutput::LastRow, ..options()
         }).unwrap();
-        assert_eq!((full.logits_rows, last.logits_rows), (4096, 1));
+        assert_eq!((full.logits_rows, last.logits_rows), (16384, 1));
         assert_eq!(last.logits, 152576 * 4);
-        let saved = 4095 * 152576 * 4;
+        let saved = 16383 * 152576 * 4;
         assert_eq!(full.logits - last.logits, saved);
         assert_eq!(full.device_bytes().unwrap() - last.device_bytes().unwrap(), saved);
         for ((name, before), (after_name, after)) in full.device_buffers().zip(last.device_buffers()) {

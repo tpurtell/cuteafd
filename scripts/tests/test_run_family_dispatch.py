@@ -800,6 +800,8 @@ explicit = "--spark-tp" in args or family == "deepseek_v41" and ranks not in (0,
 peers = value("--deployment-peers", "").split(",")[:ranks] if ranks else []
 report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
+if family == "mimo_v2":
+    report["prefill_lanes"] = int(value("--prefill-lanes", "3" if config.get("hidden_size") == 6144 else "2"))
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3"}

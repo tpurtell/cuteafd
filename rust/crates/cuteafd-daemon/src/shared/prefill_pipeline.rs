@@ -554,6 +554,32 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn mimo_continuous_units_preserve_routes_slots_and_spark_occupancy() -> anyhow::Result<()> {
+        for layers in [48, 78] {
+            for onboard in [0, 4, 12] {
+                let routes = (0..layers).map(|layer| if layer < 1 + onboard {
+                    FfnRoute::Local
+                } else { FfnRoute::Spark }).collect::<Vec<_>>();
+                let serial_units = sequence_units(65536 + 127, 4096, 1, layers)?;
+                let serial = prefill_schedule(&routes, &serial_units, 1)?;
+                let (serial_time, _) = simulate(&routes, &serial, 1.0, 0.5, 0.5, 20.0);
+                for waves in [2, 3] {
+                    let units = sequence_units(65536 + 127, 4096, waves, layers)?;
+                    let steps = prefill_schedule(&routes, &units, waves)?;
+                    check_schedule(&routes, &units, waves, &steps);
+                    assert!(units.len() > waves);
+                    let (time, idle) = simulate(&routes, &steps, 1.0, 0.5, 0.5, 20.0);
+                    let lead = (2 * (1 + onboard) + 1) as f64 + 1.0;
+                    let bound = (units.len() - waves) as f64 * (lead - 20.0).max(0.0);
+                    assert!(idle <= bound + 1e-9, "layers={layers} onboard={onboard} waves={waves}: idle={idle}, bound={bound}");
+                    assert!(time < serial_time);
+                }
+            }
+        }
+        Ok(())
+    }
+
     struct Recorder { routes: Vec<FfnRoute>, log: Vec<Step>, fail_at: Option<usize>, tickets: usize }
     impl Recorder {
         fn record(&mut self, step: Step) -> anyhow::Result<()> {

@@ -3,9 +3,9 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::serving_capacity::MemoryReservation;
 use super::{MimoV2Config, MimoKvFormats, MimoPrefillOutput};
 
-pub fn resolve_prefill_waves(spark: bool, _family: &str, configured: Option<&str>) -> Result<usize> {
+pub fn resolve_prefill_waves(spark: bool, family: &str, configured: Option<&str>) -> Result<usize> {
     if !spark { return Ok(1); }
-    let waves = configured.map(str::parse::<usize>).transpose()?.unwrap_or(2);
+    let waves = configured.map(str::parse::<usize>).transpose()?.unwrap_or(if matches!(family, "mimop" | "mimop2") { 3 } else { 2 });
     ensure!((1..=4).contains(&waves), "MiMo prefill waves must be 1 to 4");
     Ok(waves)
 }

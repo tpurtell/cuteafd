@@ -74,8 +74,8 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
-    /// Outstanding unit waves on one Spark transport.
-    #[arg(long, default_value_t = 2)]
+    /// Outstanding unit waves on one Spark transport (0: Pro 3, Flash 2).
+    #[arg(long, default_value_t = 0)]
     pub prefill_waves: usize,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]

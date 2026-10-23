@@ -154,7 +154,7 @@ impl<'a> MimoEngine<'a> {
         let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
         if !tp2.checking.get() { return Ok(()); }
         let checks = tp2.checks.borrow();
-        let check = checks.get(&(layer, lane)).context("MiMo route diagnostics were not admitted")?;
+        let check = checks.get(&(layer, self.unit_index.get().unwrap_or(lane))).context("MiMo route diagnostics were not admitted")?;
         ensure!(rows == check.rows, "MiMo route diagnostic shape changed");
         let host = &check.ranks[rank];
         let bytes = rows * self.cfg.topk * 4;

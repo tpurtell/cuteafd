@@ -138,6 +138,8 @@ if tool == "docker":
                 span = int(value("--prefill-span-rows", "0")) or 16384
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             report = dict(response)
+            if family == "mimo_v2":
+                report["prefill_lanes"] = int(value("--prefill-lanes", "3" if "Pro" in os.environ.get("CAPTURE_SERVED_MODEL", "") else "2"))
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
             response.update(version=1, family=family, executable=True, wip_launchable=True,

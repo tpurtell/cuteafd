@@ -50,8 +50,6 @@
       "-e",
       "CUTEAFD_CONSOLE_TEXT=true",
       "-e",
-      "CUTEAFD_MIMO_PREFILL_LANES=3",
-      "-e",
       "CUTEAFD_THERMAL=on",
       "-v",
       "/run/gpu-powerd:/run/gpu-powerd:ro",
@@ -116,7 +114,11 @@
       "on",
       "--enable-bench",
       "--draft",
-      "/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b"
+      "/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
+      "--prefill-rows",
+      "4096",
+      "--prefill-waves",
+      "3"
     ]
   },
   {
