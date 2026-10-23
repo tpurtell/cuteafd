@@ -87,6 +87,9 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
   else()
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8")
   endif()
+  if(CUTEAFD_EXLR8_ROLE STREQUAL "coordinator")
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},exlr8_dense,glm_stage,glm2_stage")
+  endif()
 endif()
 set(CUTEAFD_DSV4_DIR "${CMAKE_CURRENT_BINARY_DIR}/dsv4_programs")
 string(TOLOWER "${CUTEAFD_CONTEXT_SPLIT_AOT}" context_split_aot)
@@ -118,6 +121,7 @@ add_custom_command(
   DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_dsv4_aot.py" "${stamp}"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_step5_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_aot.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_exlr8_dense_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_k6_dense_aot.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_kimi_split_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

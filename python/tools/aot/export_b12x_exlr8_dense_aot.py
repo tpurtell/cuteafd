@@ -40,6 +40,14 @@ def programs():
     from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
     from b12x.integration.cuteafd.scaled_linear import compile_scaled_linear_aot
     from b12x.integration.cuteafd.fp8_row_embedding import compile_fp8_row_embedding_aot
+    from b12x.integration.cuteafd.trellis_unpack import compile_trellis_unpack_e4m3_aot
+    from b12x.integration.cuteafd.trellis_transform import (
+        compile_trellis_input_aot, compile_trellis_output_aot)
+    from b12x.integration.cuteafd.native_dense import (
+        compile_trellis_fp8_prefill_aot, compile_swiglu_split_aot,
+        compile_f32_narrow_pack_aot)
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+    import torch
     result = []
     for name, k, n, side in TRELLIS_SHAPES:
         params = dict(input_features=k, output_features=n, bits=4,
@@ -55,6 +63,35 @@ def programs():
     params = dict(hidden=6144, vocabulary=154880, max_rows=4096)
     result.append(("fp8_row_embedding", "fp8_row_embedding", params,
                    partial(compile_fp8_row_embedding_aot, **params)))
+    for name, k, n, side in TRELLIS_SHAPES:
+        params = dict(input_features=k, output_features=n, sharded_side=side)
+        result.append((f"unpack_{name}", "trellis_unpack_e4m3", params,
+                       partial(compile_trellis_unpack_e4m3_aot, **params)))
+        params = dict(input_features=k, output_features=n, max_rows=4096)
+        result.append((f"prefill_{name}", "trellis_fp8_prefill", params,
+                       partial(compile_trellis_fp8_prefill_aot, **params)))
+    for k in (2048, 6144, 8192, 12288, 16384):
+        for dtype in ("f16", "bf16"):
+            params = dict(features=k, max_rows=4096, output_dtype=dtype)
+            result.append((f"trellis_input_k{k}_{dtype}", "trellis_input", params,
+                           partial(compile_trellis_input_aot, **params)))
+    for n in (6144, 8192, 12288, 16384):
+        params = dict(features=n, max_rows=4096)
+        result.append((f"trellis_output_n{n}", "trellis_output", params,
+                       partial(compile_trellis_output_aot, **params)))
+    for inter in (12288, 6144):
+        params = dict(inter=inter)
+        result.append((f"swiglu_split_i{inter}", "swiglu_split", params,
+                       partial(compile_swiglu_split_aot, **params)))
+    for width, pitch in ((2048, 2624), (576, 2624), (128, 160), (32, 160)):
+        params = dict(width=width, pitch=pitch)
+        result.append((f"f32_narrow_pack_n{width}_p{pitch}", "f32_narrow_pack", params,
+                       partial(compile_f32_narrow_pack_aot, **params)))
+    # This small indexer operand is BF16 in the checkpoint, not a conversion.
+    params = dict(width=6144, outputs=32, output_dtype=torch.float32)
+    result.append(("bf16_index_weights", "bf16_projection",
+                   dict(width=6144, outputs=32, output_dtype="torch.float32"),
+                   partial(compile_bf16_projection_aot, **params)))
     return result
 
 
