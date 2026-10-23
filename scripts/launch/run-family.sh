@@ -227,6 +227,7 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
+  [[ "$1" == mimo_v2 ]] || printf '%s\n' PREFILL_BATCH_TOKENS
   cat <<'EOF'
 VISION_REPLICAS
 RDMA_BOND_BALANCE
@@ -242,7 +243,6 @@ EXPERT_PORT
 SPARK_DEVICE_BUDGET_BYTES
 COORDINATOR_SPLIT_GPU
 MAX_CONTEXT_TOKENS
-PREFILL_BATCH_TOKENS
 RTX_EXPERT_LAYERS
 PROBE_DUMP_ROOT
 DRAFT_SURVIVAL_LENGTHS
@@ -351,6 +351,7 @@ MIMO_PREFIX_DRAFT
 MIMO_SNAPSHOT_WAIT
 MIMO_HOST_CACHE
 MIMO_PREFILL_CHUNK_S
+PREFILL_ROWS
 PREFILL_WAVES
 PREFIX_CACHE_MARK_MIB
 PREFIX_PARTIAL
@@ -2615,7 +2616,8 @@ audio_encoder_hash=""
     plan_draft_args+=(--mimo-swa-kv-cache "$mimo_swa_kv")
     plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
       --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
-      --prefill-rows 4096 --expert-input "${expert_input:-fp8}")
+      --expert-input "${expert_input:-fp8}")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
     [[ "$(get DECODE_GRAPHS off)" != on ]] || plan_draft_args+=(--mimo-decode-graphs)
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
@@ -2704,7 +2706,9 @@ audio_encoder_hash=""
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
     'MAX_CONTEXT_TOKENS:--context-tokens' 'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
-    key_name="${pair%%:*}"; flag="${pair#*:}"; value="$(get "$key_name")"
+    key_name="${pair%%:*}"; flag="${pair#*:}"
+    [[ "$family:$key_name" != mimo_v2:PREFILL_BATCH_TOKENS ]] || continue
+    value="$(get "$key_name")"
     if [[ -n "$value" && "$value" != auto && " ${plan_draft_args[*]} " != *" $flag "* ]]; then
       plan_draft_args+=("$flag" "$value")
     fi

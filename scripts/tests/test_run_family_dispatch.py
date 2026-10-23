@@ -914,17 +914,39 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
 def test_mimo_prefill_launcher_forwards_exact_unit_wave_and_span(tmp_path, unit, waves, span):
     result = _family_launch_result(tmp_path,
         {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
-        "test/mimo", f"SPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_BATCH_TOKENS={unit}\nPREFILL_WAVES={waves}\n",
+        "test/mimo", f"SPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_ROWS={unit}\nPREFILL_WAVES={waves}\n",
         deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves, "prefill_span_rows": span})
     assert result.returncode == 0, result.stderr
     plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
     serve = next(shlex.split(line) for line in result.stderr.splitlines() if "docker run -d" in line and "serve-mimo" in line)
+    assert plan.count("--prefill-rows") == 1
+    assert plan[plan.index("--prefill-rows") + 1] == str(unit)
     assert plan[plan.index("--prefill-waves") + 1] == str(waves)
     assert "--prefill-lanes" not in plan
     for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
         assert serve.count(flag) == 1
         assert serve[serve.index(flag) + 1] == str(value)
     assert f"PREFILL_SPAN_ROWS={span}" in result.stdout
+
+
+@pytest.mark.parametrize("keys", ["", "PREFILL_ROWS=1024\n"])
+def test_mimo_prefill_launcher_rejects_legacy_batch_key(tmp_path, keys):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "test/mimo", "SPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_BATCH_TOKENS=2048\n" + keys)
+    assert result.returncode == 2, result.stderr
+    assert "unused configuration key: PREFILL_BATCH_TOKENS" in result.stderr
+    assert "cuteafd plan" not in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_mimo_prefill_launcher_leaves_unset_unit_to_planner(tmp_path):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "test/mimo", "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
+    assert "--prefill-rows" not in plan
 
 
 @pytest.mark.parametrize("family_config", [
