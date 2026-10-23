@@ -157,32 +157,33 @@ mod draft_prefix_tests {
 
     #[test]
     fn admission_halves_units_without_changing_wave_count_and_stops_at_first_fit() {
-        use cuteafd_loader::serving_capacity::PrefillShape;
+        use cuteafd_loader::serving_capacity::{select_prefill_shape, PrefillShape};
         use cuteafd_core::serving_capacity::CapacityError;
         for waves in [1, 2, 3] {
             let mut tried = Vec::new();
-            let (rows, _) = admit_prefill_shape(PrefillShape { unit_rows: 4096, waves }, |rows| {
+            let (selected, _) = select_prefill_shape(PrefillShape { unit_rows: 4096, waves }, false, |shape| {
+                let rows = shape.unit_rows;
                 tried.push(rows);
                 if rows > 1024 { return Err(CapacityError::ReservationsExceeded {
-                    device: 0, reserved: rows as u64, budget: 1024,
+                    device: 0, reserved: rows, budget: 1024,
                 }.into()); }
                 Ok(())
-            }).unwrap();
-            assert_eq!(rows, 1024);
+            }, |_| 0, prefill_fit_error).unwrap();
+            assert_eq!(selected, PrefillShape { unit_rows: 1024, waves });
             assert_eq!(tried, [4096, 2048, 1024]);
         }
         let mut tried = Vec::new();
-        let result = admit_prefill_shape(PrefillShape { unit_rows: 4096, waves: 3 }, |rows| {
-            tried.push(rows);
+        let result = select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 3 }, false, |shape| {
+            tried.push(shape.unit_rows);
             Err::<(), _>(anyhow::anyhow!("missing program metadata"))
-        });
+        }, |_| 0, prefill_fit_error);
         assert!(result.unwrap_err().to_string().contains("missing program metadata"));
         assert_eq!(tried, [4096]);
         let mut tried = Vec::new();
-        assert!(admit_prefill_shape(PrefillShape { unit_rows: 4096, waves: 2 }, |rows| {
-            tried.push(rows);
+        assert!(select_prefill_shape(PrefillShape { unit_rows: 4096, waves: 2 }, false, |shape| {
+            tried.push(shape.unit_rows);
             Err::<(), _>(CapacityError::PoolExceeded { requested: 4096, feasible: 0 }.into())
-        }).is_err());
+        }, |_| 0, prefill_fit_error).is_err());
         assert_eq!(tried, [4096, 2048, 1024, 512]);
     }
 
@@ -228,38 +229,24 @@ pub(super) fn preflight(
     let shape = cuteafd_loader::serving_capacity::PrefillShape {
         unit_rows: args.prefill_rows as u64, waves: args.prefill_waves.max(1) as u64,
     }.validate()?;
-    let (_, result) = admit_prefill_shape(shape, |rows| {
-        let mut selected = args.clone();
-        selected.prefill_rows = rows;
-        preflight_shape(opened, &selected, programs, split_device, serving,
-            prefill_output, prefix_draft, automatic_context)
-    })?;
+    let (_, result) = cuteafd_loader::serving_capacity::select_prefill_shape(shape,
+        automatic_context && args.pool_tokens == 0, |candidate| {
+            let mut selected = args.clone();
+            selected.prefill_rows = usize::try_from(candidate.unit_rows)?;
+            preflight_shape(opened, &selected, programs, split_device, serving,
+                prefill_output, prefix_draft, automatic_context)
+        }, |result| result.capacity.allocated_gpu_kv_tokens, prefill_fit_error)?;
     Ok(result)
 }
 
-fn admit_prefill_shape<T>(shape: cuteafd_loader::serving_capacity::PrefillShape,
-    mut admit: impl FnMut(usize) -> Result<T>) -> Result<(usize, T)> {
+fn prefill_fit_error(error: &anyhow::Error) -> bool {
     use cuteafd_core::serving_capacity::CapacityError;
     use cuteafd_loader::serving_capacity::CacheGeometryError;
-    let mut failure = None;
-    for candidate in shape.ladder() {
-        let rows = usize::try_from(candidate.unit_rows)?;
-        match admit(rows) {
-            Ok(result) => return Ok((rows, result)),
-            Err(error) => {
-                let fit_error = matches!(error.downcast_ref::<CapacityError>(),
-                    Some(CapacityError::GpuBudgetExceeded { .. } | CapacityError::ReservationsExceeded { .. }
-                        | CapacityError::PoolExceeded { .. }))
-                    || matches!(error.downcast_ref::<CacheGeometryError>(),
-                        Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement");
-                if !fit_error { return Err(error); }
-                tracing::info!(unit_rows = rows, waves = candidate.waves, %error,
-                    "MiMo prefill shape did not admit; trying the next shared ladder unit");
-                failure = Some(error);
-            }
-        }
-    }
-    Err(failure.context("MiMo prefill admission ladder is empty")?)
+    matches!(error.downcast_ref::<CapacityError>(),
+        Some(CapacityError::GpuBudgetExceeded { .. } | CapacityError::ReservationsExceeded { .. }
+            | CapacityError::PoolExceeded { .. }))
+        || matches!(error.downcast_ref::<CacheGeometryError>(),
+            Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement")
 }
 
 fn preflight_shape(
