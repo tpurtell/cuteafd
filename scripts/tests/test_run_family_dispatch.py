@@ -867,6 +867,9 @@ print(json.dumps(deployment))
       "moe_layer_list": list(range(3, 91))}}, "test/Step-5", "PREFILL_BATCH_TOKENS", 2, 6),
     ({"model_type": "kimi_k3", "text_config": {"model_type": "kimi_linear", "num_hidden_layers": 93,
       "first_k_dense_replace": 1, "moe_layer_freq": 1}}, "test/Kimi-K3", "PREFILL_ROWS", 2, 6),
+    ({"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
+      "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
+     "test/Qwen4", "PREFILL_ROWS", 1, 4),
 ])
 @pytest.mark.parametrize("explicit", [False, True])
 def test_shared_prefill_launcher_forwards_resolved_units_without_span(
@@ -891,7 +894,8 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
         assert plan[plan.index("--prefill-rows") + 1] == str(unit)
         assert plan[plan.index("--prefill-waves") + 1] == str(waves)
     assert "--prefill-lanes" not in plan
-    command_name = "serve-kimi" if family_config["model_type"] == "kimi_k3" else "serve-step5"
+    command_name = {"kimi_k3": "serve-kimi", "qwen4_exp": "serve-qwen4"}.get(
+        family_config["model_type"], "serve-step5")
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and command_name in line)
     assert serve.count("--prefill-rows") == serve.count("--prefill-waves") == 1
@@ -903,8 +907,6 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
 
 
 @pytest.mark.parametrize("family_config", [
-    {"model_type": "qwen4_exp", "text_config": {"num_hidden_layers": 2,
-     "mtp_num_hidden_layers": 1, "layer_types": ["linear_attention", "full_attention"]}},
     {"model_type": "deepseek_v4", "num_hidden_layers": 61},
     {"model_type": "glm_moe_dsa", "num_hidden_layers": 4, "first_k_dense_replace": 3},
     {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
@@ -2365,7 +2367,7 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
         assert "--rtx-expert-layers all" in preflight
 
 
-@pytest.mark.parametrize("rows,waves", [(512, 1), (1024, 2), (2048, 2)])
+@pytest.mark.parametrize("rows,waves", [(512, 1), (1024, 2), (2048, 2), (4096, 2)])
 def test_qwen_prefill_shape_reaches_plan_and_server(tmp_path, rows, waves):
     keys = ("RTX_GPUS=1\nSPARK_COUNT=4\nSPECULATOR=off\n"
             f"PREFILL_ROWS={rows}\nPREFILL_WAVES={waves}\n")

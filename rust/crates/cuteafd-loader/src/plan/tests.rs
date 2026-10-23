@@ -124,6 +124,27 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
 }
 
 #[test]
+fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
+    let config = qwen4_config(4);
+    let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
+    for (unit, waves) in [(512, 1), (1024, 2), (4096, 2)] {
+        let report = plan(dir.path(), &PlanOptions {
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30],
+                prefill_rows: unit, prefill_lanes: waves, context_tokens: 32768,
+                prefix_slots: Some(0), host_cache_bytes: Some(0),
+                host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+            ..sparks(4)
+        }).unwrap();
+        assert!(report.solver_placement.is_some(), "{}", render(&report));
+        assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows,
+            report.prefill_transports), (Some(unit), Some(waves), Some(unit * waves), Some(1)));
+        let host = report.host_ledger.as_ref().unwrap();
+        let intake = host.items.iter().find(|item| item.group == "spark-intake").unwrap();
+        assert_eq!(intake.bytes, unit * waves * 2560 * 2 * 4);
+    }
+}
+
+#[test]
 fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();

@@ -13,11 +13,14 @@ const SPARK_HOST_BYTES: u64 = 13 * GIB;
 /// (`dual_layout`); every other layout serves on rtx0 (`single_layout`).
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    if options.prefill_lanes > 0 { options.prefill_waves = options.prefill_lanes; }
     let shape = Shape::resolve(report, model, options, ShapePolicy::manifest_bounded());
     if options.rtx_bytes.len() == 2 && options.head_split && report.placement == ExpertPlacement::Local {
         return dual_layout(report, model, input, options, shape.prefill_rows, shape.concurrency,
             shape.context_tokens, shape.native_layers > 0, shape.manifest.as_ref());
     }
+    options.prefill_unit_rows = Some(shape.prefill_rows);
+    report.prefill_transports = Some(1);
     single_layout(report, model, input, options, shape)
 }
 
@@ -225,7 +228,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         startup_graph_modes: Some((shape.concurrency.min(16) as usize, true)),
     };
     let placement = crate::placement::families::qwen4::placement(&inputs)?;
-    report.prefill_rows = Some(span);
+    report.prefill_span_rows = Some(span);
     device.items.extend(placement.items[0].iter().cloned());
     device.kv_tokens = placement.pool_tokens;
     let pool_tokens = placement.pool_tokens;

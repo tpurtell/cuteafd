@@ -383,7 +383,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3) echo units ;;
+    step5|kimi_k3|qwen4) echo units ;;
     *) echo legacy ;;
   esac
 }
@@ -2043,8 +2043,6 @@ fi
 # MTP share. Unset keeps the engine defaults.
 if [[ $family == qwen4 ]]; then
   family_args+=(--kv-cache "$kv_cache")
-  [[ -z "$(get PREFILL_ROWS)" ]] || family_args+=(--prefill-rows "$(get PREFILL_ROWS)")
-  [[ -z "$(get PREFILL_WAVES)" ]] || family_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   for key in FP8_DECODE:--fp8-decode FP8_HEAD:--mtp-fp8-head; do
     mode="$(get "QWEN_${key%%:*}")"
     case "$mode" in
