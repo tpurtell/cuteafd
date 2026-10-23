@@ -84,8 +84,16 @@ pub(crate) struct NativeScratch<'a> {
     values: Dev<'a>,
 }
 
-/// One GPU's prefill weight staging: the largest trellis payload of any
-/// native layer unpacked to E4M3 `[N, K]`, and the all-ones 128x128 grid.
+/// One GPU's prefill workspace for the trellis unpack baseline: the largest
+/// trellis payload of any native layer unpacked to E4M3 `[N, K]` (transient,
+/// rewritten by every projection) and the all-ones 128x128 grid.
+///
+/// This owner is the per-GPU prefill route slot. A tensor-core MXFP8 route
+/// replaces it: it holds instead one shared MXFP8 activation record
+/// ([`mx8_activation_bytes`] at the largest K a projection reads), reused by
+/// gate/up and every projection that shares an input, beside the per-lane
+/// F16/BF16 rotated inputs in [`NativeScratch`]. Admission charges whichever
+/// route is active (`GlmInputs::native_dense`).
 pub(crate) struct Unpacked<'a> {
     weight: Dev<'a>,
     ones: Dev<'a>,
@@ -102,6 +110,14 @@ pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows
         rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
         rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
         .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
+}
+
+/// Bytes of one MXFP8 activation record of `rows` rows over `k` input
+/// features: E4M3 values plus one UE8M0 scale per 32 (the MX8 prefill route's
+/// per-GPU workspace; not allocated by the unpack baseline).
+#[allow(dead_code)]
+pub(crate) fn mx8_activation_bytes(rows: usize, k: usize) -> usize {
+    rows * k + rows * k.div_ceil(32)
 }
 
 pub(crate) fn unpacked_bytes(n: usize, k: usize) -> usize {
