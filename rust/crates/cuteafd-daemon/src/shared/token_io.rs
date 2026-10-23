@@ -103,6 +103,10 @@ pub(crate) struct TokenEmbedding<'a> {
     /// than the row reads.
     file: std::fs::File,
     table: ResidentWeight<'a>,
+    /// An EXLR8 checkpoint's row-FP8 table (the rank-0 vocabulary owner, shared
+    /// with its head): gathers decode `bf16(e4m3 * scale)` per row and
+    /// `table` is an unused 256-byte placeholder.
+    row_fp8: Option<std::rc::Rc<native::NativeVocabulary<'a>>>,
 }
 
 impl<'a> TokenEmbedding<'a> {
@@ -139,7 +143,19 @@ impl<'a> TokenEmbedding<'a> {
         tracing::info!(vocab = source.vocab, hidden = source.hidden, gib = source.bytes() as f64 / (1u64 << 30) as f64,
             ?placement, device_bytes = table.device_bytes(), pinned_bytes = if table.is_host() { source.bytes() } else { 0 },
             elapsed_ms = started.elapsed().as_millis() as u64, "token embedding placement (single residency)");
-        Ok((Self { library, source, file, table }, result))
+        Ok((Self { library, source, file, table, row_fp8: None }, result))
+    }
+
+    /// The row-FP8 table of an EXLR8 checkpoint's vocabulary owner (`source`
+    /// names the payload `embed_tokens.fp8`; its scales follow the owner).
+    pub fn row_fp8(library: &'a NativeLibrary, source: EmbedSource,
+        owner: std::rc::Rc<native::NativeVocabulary<'a>>) -> Result<Self> {
+        let file = std::fs::File::open(&source.path).with_context(|| format!("opening {}", source.path.display()))?;
+        ensure!(owner.embedding.payload().bytes == source.vocab * source.hidden,
+            "row-FP8 embedding payload differs from [{}, {}]", source.vocab, source.hidden);
+        let table = ResidentWeight::new(library, 256, false)?;
+        tracing::info!(vocab = source.vocab, hidden = source.hidden, "token embedding: checkpoint row-FP8 (single residency)");
+        Ok(Self { library, source, file, table, row_fp8: Some(owner) })
     }
 
     pub fn placement(&self) -> EmbedPlacement {
@@ -151,7 +167,8 @@ impl<'a> TokenEmbedding<'a> {
         crate::shared::memory::device::Device { library: self.library, id: self.table.buffer().device_id }
     }
 
-    pub(crate) fn device_bytes(&self) -> usize { self.table.device_bytes() }
+    /// Table bytes this embedding charges (a row-FP8 table is charged by its owner's head).
+    pub(crate) fn device_bytes(&self) -> usize { if self.row_fp8.is_some() { 0 } else { self.table.device_bytes() } }
 
     pub fn device_gather(&self) -> bool { true }
 
@@ -176,6 +193,28 @@ impl<'a> TokenEmbedding<'a> {
         self.check(tokens)?;
         let row = self.source.hidden * 2;
         let mut out = vec![0u8; tokens.len() * row];
+        if let Some(owner) = &self.row_fp8 {
+            // The gather's exact rule: bf16(f32(e4m3) * scale), round to nearest even.
+            let hidden = self.source.hidden;
+            let mut bytes = vec![0u8; hidden];
+            let mut scale = [0u8; 4];
+            for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
+                let token = token as usize;
+                let payload = owner.embedding.payload();
+                let scales = owner.embedding.scales();
+                self.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: hidden,
+                    // SAFETY: row `token` lies inside the [vocab, hidden] payload.
+                    ptr: unsafe { payload.ptr.cast::<u8>().add(token * hidden) }.cast(), ..payload })?;
+                self.library.copy_d2h(&mut scale, CuteafdDeviceBuffer { bytes: 4,
+                    // SAFETY: entry `token` lies inside the [vocab] scales.
+                    ptr: unsafe { scales.ptr.cast::<u8>().add(token * 4) }.cast(), ..scales })?;
+                let scale = f32::from_le_bytes(scale);
+                for (out, &b) in slot.chunks_exact_mut(2).zip(&bytes) {
+                    out.copy_from_slice(&bf16_rne(e4m3_to_f32(b) * scale).to_le_bytes());
+                }
+            }
+            return Ok(out);
+        }
         for (slot, &token) in out.chunks_exact_mut(row).zip(tokens) {
             match &self.table {
                 ResidentWeight::Host { storage, .. } => slot.copy_from_slice(&storage.bytes()[token as usize * row..(token as usize + 1) * row]),
@@ -230,6 +269,12 @@ impl<'a> TokenEmbedding<'a> {
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gather(&self, ids: *const c_void, index: *const c_void, rows: usize, copies: usize,
         fallback: *const c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        if let Some(owner) = &self.row_fp8 {
+            ensure!(index.is_null() && fallback.is_null() && copies == 1,
+                "the row-FP8 embedding gathers plain ids (no index, fallback or copies)");
+            // SAFETY: the caller's contract; u32 ids below vocab are the gather's I32 ids.
+            return unsafe { owner.embed(ids.cast_mut(), out, rows, stream) };
+        }
         let table = self.table.buffer();
         // SAFETY: the caller's contract; the table is a live [vocab, hidden] BF16 buffer.
         unsafe { self.library.cuda_embed_gather_bf16_async(table.ptr, self.source.vocab, self.source.hidden,
@@ -255,6 +300,7 @@ impl<'a> TokenEmbedding<'a> {
     /// Compares every byte of the resident table with the shard (the
     /// embedding gate); returns the bytes compared.
     pub fn verify_resident(&self) -> Result<usize> {
+        ensure!(self.row_fp8.is_none(), "the row-FP8 table is verified by its owner's checksummed load");
         let table = self.table.buffer();
         let chunk = 64usize << 20;
         let (mut host, mut device) = (vec![0u8; chunk], vec![0u8; chunk]);
@@ -271,6 +317,21 @@ impl<'a> TokenEmbedding<'a> {
         }
         Ok(total)
     }
+}
+
+/// E4M3 byte to F32 (finite codes; NaN for 0x7f/0xff).
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = ((b >> 3) & 0xf, b & 7);
+    if e == 15 && m == 7 { return f32::NAN; }
+    sign * if e == 0 { f32::from(m) / 8.0 * 2f32.powi(-6) } else { (1.0 + f32::from(m) / 8.0) * 2f32.powi(i32::from(e) - 7) }
+}
+
+/// F32 to BF16 bits, round to nearest even (NaN quieted).
+fn bf16_rne(value: f32) -> u16 {
+    let bits = value.to_bits();
+    if value.is_nan() { return ((bits >> 16) | 0x40) as u16; }
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
 }
 
 /// Reads the shard's table into the device allocation at `address` through
@@ -867,5 +928,21 @@ mod tests {
         let logits = [1.0f32, 2.0, 3.0, f32::NEG_INFINITY];
         let z: f64 = [1.0f64, 2.0, 3.0].iter().map(|v| (v - 3.0f64).exp()).sum();
         assert!((host_logprob(&logits, 2) - (-(z.ln()) as f32)).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod row_fp8_rule_tests {
+    #[test]
+    fn e4m3_decode_and_bf16_rounding() {
+        assert_eq!(super::e4m3_to_f32(0x38), 1.0);
+        assert_eq!(super::e4m3_to_f32(0xb8), -1.0);
+        assert_eq!(super::e4m3_to_f32(0x7e), 448.0);
+        assert_eq!(super::e4m3_to_f32(0x01), 2f32.powi(-9));
+        assert!(super::e4m3_to_f32(0x7f).is_nan());
+        assert_eq!(super::bf16_rne(1.0), 0x3f80);
+        // Ties to even: 1 + 2^-8 sits halfway between 0x3f80 and 0x3f81.
+        assert_eq!(super::bf16_rne(1.0 + 2f32.powi(-8)), 0x3f80);
+        assert_eq!(super::bf16_rne(1.0 + 3.0 * 2f32.powi(-8)), 0x3f82);
     }
 }

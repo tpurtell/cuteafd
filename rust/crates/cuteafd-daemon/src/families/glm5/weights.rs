@@ -94,7 +94,8 @@ pub(crate) struct GlmWeights<'a> {
 /// tensor-core route), or an EXLR8 checkpoint's row-FP8 head (its own program).
 pub(crate) enum GlmHead<'a> {
     Bf16(DeviceAllocation<'a>),
-    RowFp8(crate::shared::token_io::native::NativeVocabulary<'a>),
+    /// Shared with the token embedding (one rank-0 owner of both tables).
+    RowFp8(std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>),
 }
 
 impl<'a> GlmHead<'a> {
