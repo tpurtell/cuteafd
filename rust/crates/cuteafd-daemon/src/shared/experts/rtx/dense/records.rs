@@ -104,6 +104,14 @@ pub(crate) enum Job {
     /// MXFP4 expert packed from its fused raw image at staged `at..at + bytes`
     /// (plane 0: up rows then gate rows, each padded) into `dst`.
     NativePlane { intermediate: u32, plane: u32, at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
+    /// The staged FP8 `kv_b` rows of `heads` heads (E4M3 at `at..`, the first
+    /// at checkpoint row `row0`) and the whole tensor's FP32 128x128 grid (at
+    /// `grid_at..`, `grid_bytes`) split into the GLM FP8 programs' `uk`/`uk_scale`
+    /// and `uv`/`uv_scale`: bytes unchanged, one grid entry per 64-wide tile
+    /// (the mount loader's host rule).
+    AbsorbFp8 { at: usize, grid_at: usize, grid_bytes: usize, row0: usize, heads: usize, nope: usize, v: usize,
+        lat: usize, uk: CuteafdDeviceBuffer, uk_scale: CuteafdDeviceBuffer, uv: CuteafdDeviceBuffer,
+        uv_scale: CuteafdDeviceBuffer },
     /// Staged BF16 rows `[rows, cols]` quantized to E4M3 with per-row x 128-K
     /// FP32 scales by the row kernel (`cuteafd_fp8_row_quant_rule`, `rule`)
     /// into `q` [rows, cols] and `scale` [rows, cols / 128].
@@ -271,6 +279,22 @@ impl Step {
                 Job::Absorb { heads, nope, v, lat, uk, uv } => {
                     load_timing::quantize(heads * (nope + v) * lat * 2, || kernels.absorb_from(staged, heads, 0,
                         heads, nope, v, lat, uk, uv, stream))?;
+                }
+                Job::AbsorbFp8 { at, grid_at, grid_bytes, row0, heads, nope, v, lat, uk, uk_scale, uv, uv_scale } => {
+                    let rows = heads * (nope + v);
+                    ensure!(heads > 0 && nope % 64 == 0 && lat % 128 == 0 && at + rows * lat <= staged.len()
+                        && grid_at + grid_bytes <= staged.len()
+                        && grid_bytes >= (row0 + rows).div_ceil(128) * (lat / 128) * 4
+                        && uk.bytes >= heads * lat * nope && uk_scale.bytes >= heads * lat * (nope / 64) * 4
+                        && uv.bytes >= heads * v * lat && uv_scale.bytes >= heads * v * (lat / 64) * 4,
+                        "FP8 kv_b split outside its step or operands");
+                    // SAFETY: `staged` is pinned, device-mapped memory the caller keeps
+                    // alive until the drain below; the four operands hold `heads` heads.
+                    load_timing::quantize(rows * lat, || unsafe {
+                        library.load_kvb_split_fp8(staged[at..].as_ptr().cast(), staged[grid_at..].as_ptr().cast(),
+                            uk.ptr, uk_scale.ptr, uv.ptr, uv_scale.ptr, row0, heads, nope, v, lat, stream)?;
+                        library.cuda_stream_synchronize(stream)
+                    })?;
                 }
                 Job::ALog { heads } => {
                     cuteafd_loader::kda::narrow_a_log(&staged[..self.bytes()], heads)?;
@@ -740,6 +764,68 @@ mod window_tests {
         let out = windows(&[a, b], 128)?;
         assert!(out.iter().all(|(_, rows)| rows.len() % 128 == 0));
         assert_eq!(out.iter().map(|(_, r)| r.len()).sum::<usize>(), 256);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod absorb_fp8_tests {
+    use super::*;
+    use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
+
+    /// GLM 5.3 head geometry (448 rows per head spans 3.5 grid blocks), the
+    /// second of two ranks, staged through the mount: every byte and scale
+    /// matches the loader's host rule (`weights::GlmLoader::kv_b`).
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn fp8_kv_b_step_matches_the_host_split() -> Result<()> {
+        let fixture = Fixture::build()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        let (heads, nope, v, lat) = (8usize, 192usize, 256usize, 512usize);
+        let rows = heads * (nope + v);
+        let kb = lat / 128;
+        let grid_rows = rows.div_ceil(128);
+        let kv_b: Vec<u8> = (0..rows * lat).map(|i| (i as u32).wrapping_mul(2654435761).rotate_right(13) as u8).collect();
+        let grid: Vec<f32> = (0..grid_rows * kb).map(|i| 1.0 + i as f32 * 0.25).collect();
+        let dir = tempfile::tempdir_in(fixture.directory())?;
+        let path = dir.path().join("kv_b.bin");
+        let grid_bytes: Vec<u8> = grid.iter().flat_map(|g| g.to_le_bytes()).collect();
+        std::fs::write(&path, [kv_b.as_slice(), grid_bytes.as_slice()].concat())?;
+        let (share, rank) = (heads / 2, 1usize);
+        let first = rank * share * (nope + v);
+        let alloc = |bytes: usize| crate::shared::memory::DeviceAllocation::new(&library, bytes);
+        let (uk, uk_s) = (alloc(share * lat * nope)?, alloc(share * lat * (nope / 64) * 4)?);
+        let (uv, uv_s) = (alloc(share * v * lat)?, alloc(share * v * (lat / 64) * 4)?);
+        let values = Rect { name: "kv_b".into(), path: path.clone(), base: 0, row_bytes: lat,
+            rows: first..first + share * (nope + v), cols: 0..lat };
+        let scales = Rect { name: "kv_b.grid".into(), path, base: (rows * lat) as u64, row_bytes: kb * 4,
+            rows: 0..grid_rows, cols: 0..kb * 4 };
+        let step = Step { device: 0, jobs: vec![Job::AbsorbFp8 { at: 0, grid_at: values.bytes(),
+            grid_bytes: scales.bytes(), row0: first, heads: share, nope, v, lat, uk: uk.buffer,
+            uk_scale: uk_s.buffer, uv: uv.buffer, uv_scale: uv_s.buffer }], rects: vec![values, scales] };
+        fill_by_mount(&library, &[], &[step], |_| std::ptr::null_mut())?;
+        let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
+            let mut out = vec![0u8; buffer.bytes];
+            library.copy_d2h(&mut out, buffer)?;
+            Ok(out)
+        };
+        let floats = |bytes: Vec<u8>| -> Vec<f32> {
+            bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
+        };
+        let (k, ks, w, ws) = (read(uk.buffer)?, floats(read(uk_s.buffer)?), read(uv.buffer)?, floats(read(uv_s.buffer)?));
+        let scale = |row: usize, col: usize| grid[(row / 128) * kb + col / 128];
+        for h in 0..share {
+            let base = (rank * share + h) * (nope + v);
+            for c in 0..lat {
+                for d in 0..nope { assert_eq!(k[(h * lat + c) * nope + d], kv_b[(base + d) * lat + c], "uk h{h} c{c} d{d}"); }
+                for t in 0..nope / 64 { assert_eq!(ks[(h * lat + c) * (nope / 64) + t], scale(base + t * 64, c)); }
+            }
+            for r in 0..v {
+                assert_eq!(&w[(h * v + r) * lat..][..lat], &kv_b[(base + nope + r) * lat..][..lat], "uv h{h} r{r}");
+                for t in 0..lat / 64 { assert_eq!(ws[(h * v + r) * (lat / 64) + t], scale(base + nope + r, t * 64)); }
+            }
+        }
         Ok(())
     }
 }

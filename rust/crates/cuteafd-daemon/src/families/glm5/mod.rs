@@ -5,6 +5,7 @@ pub(crate) mod engine;
 pub(crate) mod prefix;
 pub(crate) mod serve;
 pub(crate) mod landing;
+pub(crate) mod native_dense;
 pub(crate) mod push;
 pub(crate) mod weights;
 

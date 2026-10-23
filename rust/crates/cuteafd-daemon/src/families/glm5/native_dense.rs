@@ -1,0 +1,101 @@
+//! GLM 5.3 coordinator dense weights from an EXLR8 checkpoint's own records
+//! (`dense/`, `exlr8-vocab.safetensors`): every operand is the checkpoint's
+//! bytes landing unchanged on its rank (trellis payload and suh/svh, MXFP8
+//! bytes and UE8M0 scales, int4 nibbles and F16 group scales, BF16 norms and
+//! router), except `kv_b`, which is staged and split per head into the FP8
+//! programs' `w_uk`/`w_uv` operands on the GPU. Placement follows the official
+//! head split: q_b and gate/up by output rows, o and down by input columns,
+//! q_a/kv_a/indexer replicated, router and vocabulary on rank 0.
+//!
+//! Operand keys are `n.{projection}.{component}` (`n.q_b.trellis`,
+//! `n.q_a.e8m0`, ...); the native executor binds them.
+use anyhow::{ensure, Context, Result};
+use cuteafd_loader::plan::exlr8::dense::{DenseComponent, DenseEncoding, DensePlan, DenseRecord, DenseSlice, ShardSide};
+use std::collections::HashMap;
+
+/// The checkpoint projection of each native operand stem.
+pub(crate) const PROJECTIONS: [(&str, &str); 10] = [
+    ("q_a", "self_attn.q_a_proj"),
+    ("kv_a", "self_attn.kv_a_proj_with_mqa"),
+    ("q_b", "self_attn.q_b_proj"),
+    ("o", "self_attn.o_proj"),
+    ("index_q", "self_attn.indexer.wq_b"),
+    ("index_k", "self_attn.indexer.wk"),
+    ("index_w", "self_attn.indexer.weights_proj"),
+    ("gate", "mlp.gate_proj"),
+    ("up", "mlp.up_proj"),
+    ("down", "mlp.down_proj"),
+];
+
+/// How one native projection runs: its encoding and this rank's slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NativeProjection {
+    pub encoding: DenseEncoding,
+    /// Logical `[output, input]` of this rank's slice.
+    pub shape: [usize; 2],
+    pub side: ShardSide,
+    pub rotation_id: usize,
+}
+
+/// One layer's native dense slices on one rank, in record order.
+pub(crate) struct LayerRecords {
+    pub layer: usize,
+    pub projections: HashMap<&'static str, (NativeProjection, DenseSlice)>,
+    /// `kv_b` (block FP8, whole tensor; split per head at load).
+    pub kv_b: DenseRecord,
+    /// Plain tensors (norms, router bias) by logical tensor name.
+    pub plain: HashMap<String, DenseComponent>,
+}
+
+/// The EXLR8 checkpoint's dense records for one rank of `world` coordinators.
+pub(crate) struct NativeDenseRecords {
+    pub layers: Vec<LayerRecords>,
+    pub norm: DenseComponent,
+    pub plan: DensePlan,
+}
+
+impl NativeDenseRecords {
+    pub(crate) fn new(snapshot: &std::path::Path, layers: usize, world: usize, rank: usize) -> Result<Self> {
+        let records = DenseRecord::inventory(snapshot)?;
+        // The vocabulary owner (#569) holds embedding and head; the official
+        // head split decides every other projection's slice here.
+        let kept: Vec<DenseRecord> = records.iter().filter(|r| !matches!(r.tensor.as_str(),
+            "model.embed_tokens.weight" | "lm_head.weight")).cloned().collect();
+        let plan = DensePlan::for_rank(&kept, world, rank)?;
+        let by_name: HashMap<&str, &DenseSlice> = plan.tensors.iter().map(|s| (s.tensor.as_str(), s)).collect();
+        let record = |name: &str| records.iter().find(|r| r.tensor == name);
+        let mut out = Vec::with_capacity(layers);
+        for layer in 0..layers {
+            let prefix = format!("model.layers.{layer}");
+            let mut projections = HashMap::new();
+            for (stem, path) in PROJECTIONS {
+                let tensor = format!("{prefix}.{path}.weight");
+                let Some(full) = record(&tensor) else { continue };
+                let slice = by_name.get(tensor.as_str()).with_context(|| format!("{tensor}: no rank-{rank} slice"))?;
+                let channels = slice.channels;
+                let shape = match full.side {
+                    ShardSide::Input => [full.shape[0], channels],
+                    _ => [channels, full.shape[1]],
+                };
+                projections.insert(stem, (NativeProjection { encoding: full.encoding, shape, side: full.side,
+                    rotation_id: full.rotation_id }, (*slice).clone()));
+            }
+            let kv_b_name = format!("{prefix}.self_attn.kv_b_proj.weight");
+            let kv_b = record(&kv_b_name).with_context(|| format!("{kv_b_name}: missing"))?.clone();
+            ensure!(kv_b.encoding == DenseEncoding::BlockFp8, "{kv_b_name}: native GLM kv_b is block FP8");
+            let plain = plan.tensors.iter().filter(|s| s.tensor.starts_with(&format!("{prefix}."))
+                && s.units.is_empty()).map(|s| (s.tensor.clone(), s.components[0].clone())).collect();
+            out.push(LayerRecords { layer, projections, kv_b, plain });
+        }
+        let norm = plan.tensors.iter().find(|s| s.tensor == "model.norm.weight")
+            .map(|s| s.components[0].clone());
+        // Rank 1 holds no final norm (rank 0 runs the head).
+        let norm = match (norm, rank) {
+            (Some(n), _) => n,
+            (None, 0) => anyhow::bail!("EXLR8 dense records have no model.norm.weight"),
+            (None, _) => records.iter().find(|r| r.tensor == "model.norm.weight").context("final norm")?
+                .components[0].clone(),
+        };
+        Ok(Self { layers: out, norm, plan })
+    }
+}

@@ -289,6 +289,29 @@ CUTEAFD_LQ_FN uint16_t absorb_uv(const uint16_t* kv_b, int64_t h0, int64_t nope,
   return kv_b[(h * (nope + v) + nope + r) * lat + c];
 }
 
+// FP8 kv_b rows of `heads` heads (E4M3 bytes, the first at kv_b row `row0`)
+// with the whole tensor's FP32 128x128 grid [ceil(rows / 128), lat / 128] split per head into the GLM FP8 programs'
+// operands (the mount loader's host rule): uk [heads][lat][nope] bytes with one
+// scale per (lat row, 64-wide nope tile), uv [heads][v][lat] bytes with one scale
+// per (v row, 64-wide lat tile). Values move unchanged; scales are grid entries.
+CUTEAFD_LQ_FN uint8_t absorb_uk_fp8(const uint8_t* kv_b, int64_t h0, int64_t nope, int64_t v, int64_t lat, int64_t i) {
+  const int64_t h = h0 + i / (lat * nope), c = (i / nope) % lat, d = i % nope;
+  return kv_b[(h * (nope + v) + d) * lat + c];
+}
+CUTEAFD_LQ_FN uint8_t absorb_uv_fp8(const uint8_t* kv_b, int64_t h0, int64_t nope, int64_t v, int64_t lat, int64_t i) {
+  const int64_t h = h0 + i / (v * lat), r = (i / lat) % v, c = i % lat;
+  return kv_b[(h * (nope + v) + nope + r) * lat + c];
+}
+// Scales index the grid by absolute kv_b row: `row0` is the first staged row.
+CUTEAFD_LQ_FN float absorb_uk_scale(const float* grid, int64_t row0, int64_t nope, int64_t v, int64_t lat, int64_t i) {
+  const int64_t tiles = nope / 64, h = i / (lat * tiles), c = (i / tiles) % lat, t = i % tiles;
+  return grid[((row0 + h * (nope + v) + t * 64) / 128) * (lat / 128) + c / 128];
+}
+CUTEAFD_LQ_FN float absorb_uv_scale(const float* grid, int64_t row0, int64_t nope, int64_t v, int64_t lat, int64_t i) {
+  const int64_t tiles = lat / 64, h = i / (v * tiles), r = (i / tiles) % v, t = i % tiles;
+  return grid[((row0 + h * (nope + v) + nope + r) / 128) * (lat / 128) + (t * 64) / 128];
+}
+
 #if !defined(__CUDA_ARCH__)
 // One job sequentially (the CPU fake DSO's load kernel and the self-test oracle).
 inline void run_job(const Job& job) {

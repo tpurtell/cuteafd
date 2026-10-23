@@ -26,7 +26,7 @@ pub(crate) fn run(args: ProgramsCheckArgs) -> Result<()> {
     let library = unsafe { NativeLibrary::load(&args.native_lib)? };
     let programs = library.programs()?.with_manifest(&args.manifest)?;
     let names: BTreeSet<&str> = programs.names().collect();
-    let exlr8: BTreeSet<&str> = names.iter().copied().filter(|n| n.starts_with("exlr8_")).collect();
+    let exlr8 = expert_programs(names.iter().copied());
     if let Some(role) = &args.exlr8_role {
         let text = std::fs::read_to_string(&args.manifest)?;
         let manifest: serde_json::Value = serde_json::from_str(&text)?;
@@ -41,4 +41,22 @@ pub(crate) fn run(args: ProgramsCheckArgs) -> Result<()> {
     println!("programs-check: {} programs ({} EXLR8: {}) validated against {}", names.len(), exlr8.len(),
         exlr8.iter().copied().collect::<Vec<_>>().join(","), args.manifest.display());
     Ok(())
+}
+
+/// The routed/shared EXLR8 expert programs among `names`: `exlr8_*` except the
+/// checkpoint-native dense operands (`exlr8_dense_*`), which validate under
+/// their own ABI and are not recorded in `families.exlr8`.
+fn expert_programs<'a>(names: impl Iterator<Item = &'a str>) -> BTreeSet<&'a str> {
+    names.filter(|n| n.starts_with("exlr8_") && !n.starts_with("exlr8_dense_")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn native_dense_programs_are_not_expert_programs() {
+        let names = ["exlr8_a16_serving", "exlr8_shared_group", "exlr8_dense_trellis_o_tp2",
+            "exlr8_dense_fp8_row_lm_head", "glm_norm"];
+        let experts: Vec<_> = super::expert_programs(names.into_iter()).into_iter().collect();
+        assert_eq!(experts, ["exlr8_a16_serving", "exlr8_shared_group"]);
+    }
 }

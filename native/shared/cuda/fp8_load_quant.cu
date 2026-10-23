@@ -98,6 +98,18 @@ __global__ void absorb_kernel(const uint16_t* kv_b, uint16_t* uk, uint16_t* uv, 
     else uv[i - nk] = lq::absorb_uv(kv_b, h0, nope, v, lat, i - nk);
   }
 }
+__global__ void absorb_fp8_kernel(const uint8_t* kv_b, const float* grid, uint8_t* uk, float* uk_s, uint8_t* uv,
+                                  float* uv_s, int64_t row0, int64_t heads, int64_t nope, int64_t v, int64_t lat) {
+  const int64_t nk = heads * lat * nope, nv = heads * v * lat;
+  const int64_t sk = heads * lat * (nope / 64), sv = heads * v * (lat / 64);
+  for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < nk + nv + sk + sv;
+       i += int64_t(gridDim.x) * blockDim.x) {
+    if (i < nk) uk[i] = lq::absorb_uk_fp8(kv_b, 0, nope, v, lat, i);
+    else if (i < nk + nv) uv[i - nk] = lq::absorb_uv_fp8(kv_b, 0, nope, v, lat, i - nk);
+    else if (i < nk + nv + sk) uk_s[i - nk - nv] = lq::absorb_uk_scale(grid, row0, nope, v, lat, i - nk - nv);
+    else uv_s[i - nk - nv - sk] = lq::absorb_uv_scale(grid, row0, nope, v, lat, i - nk - nv - sk);
+  }
+}
 __global__ void product_kernel(const uint16_t* a, const uint16_t* b, uint32_t* dst, int64_t n) {
   for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n; i += int64_t(gridDim.x) * blockDim.x)
     dst[i] = lq::product_bf16_f32(a[i], b[i]);
@@ -141,6 +153,21 @@ extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv,
   absorb_kernel<<<grid_for(heads * (nope + v) * lat), 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint16_t*>(kv_b), static_cast<uint16_t*>(uk), static_cast<uint16_t*>(uv), h0, heads, nope,
       v, lat);
+  return cudaGetLastError();
+}
+
+// FP8 kv_b rows of `heads` heads (the first at kv_b row `row0`) and the whole
+// 128x128 grid split into the GLM FP8 uk/uv operands (see fp8_load_quant.h);
+// nope a whole number of 64-wide tiles, lat of 128-wide grid blocks.
+extern "C" int32_t cuteafd_load_kvb_split_fp8(const void* kv_b, const void* grid, void* uk, void* uk_scale, void* uv,
+                                              void* uv_scale, int64_t row0, int64_t heads, int64_t nope, int64_t v,
+                                              int64_t lat, void* stream) {
+  if (heads < 1 || nope < 64 || v < 1 || lat < 128 || row0 < 0 || nope % 64 != 0 || lat % 128 != 0)
+    return cudaErrorInvalidValue;
+  const int64_t n = heads * ((nope + v) * lat + lat * (nope / 64) + v * (lat / 64));
+  absorb_fp8_kernel<<<grid_for(n), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(kv_b), static_cast<const float*>(grid), static_cast<uint8_t*>(uk),
+      static_cast<float*>(uk_scale), static_cast<uint8_t*>(uv), static_cast<float*>(uv_scale), row0, heads, nope, v, lat);
   return cudaGetLastError();
 }
 

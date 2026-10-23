@@ -44,6 +44,22 @@ extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv,
   return 0;
 }
 
+extern "C" int32_t cuteafd_load_kvb_split_fp8(const void* kv_b, const void* grid, void* uk, void* uk_scale, void* uv,
+                                              void* uv_scale, int64_t row0, int64_t heads, int64_t nope, int64_t v,
+                                              int64_t lat, void* stream) {
+  (void)stream;
+  namespace lq = cuteafd_load_quant;
+  const auto* q = static_cast<const uint8_t*>(kv_b);
+  const auto* g = static_cast<const float*>(grid);
+  for (int64_t i = 0; i < heads * lat * nope; ++i) static_cast<uint8_t*>(uk)[i] = lq::absorb_uk_fp8(q, 0, nope, v, lat, i);
+  for (int64_t i = 0; i < heads * v * lat; ++i) static_cast<uint8_t*>(uv)[i] = lq::absorb_uv_fp8(q, 0, nope, v, lat, i);
+  for (int64_t i = 0; i < heads * lat * (nope / 64); ++i)
+    static_cast<float*>(uk_scale)[i] = lq::absorb_uk_scale(g, row0, nope, v, lat, i);
+  for (int64_t i = 0; i < heads * v * (lat / 64); ++i)
+    static_cast<float*>(uv_scale)[i] = lq::absorb_uv_scale(g, row0, nope, v, lat, i);
+  return 0;
+}
+
 extern "C" int32_t cuteafd_load_bf16_product_f32(const void* a, const void* b, void* dst, int64_t n, void* stream) {
   (void)stream;
   for (int64_t i = 0; i < n; ++i)

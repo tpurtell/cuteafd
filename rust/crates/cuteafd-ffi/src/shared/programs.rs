@@ -627,6 +627,29 @@ impl NativeLibrary {
         Ok(())
     }
 
+    /// FP8 MLA `kv_b` rows of `heads` heads (E4M3 `[heads * (nope + v), lat]`, the
+    /// first at kv_b row `row0`) with the whole tensor's FP32 128x128 `grid` (both
+    /// device-visible) split per head into the GLM FP8 programs' `uk`
+    /// `[heads][lat][nope]` + `uk_scale` `[heads][lat][nope / 64]` and `uv`
+    /// `[heads][v][lat]` + `uv_scale` `[heads][v][lat / 64]`: bytes unchanged,
+    /// scales the grid entry of each 64-wide tile.
+    ///
+    /// # Safety
+    /// `kv_b` holds the staged heads' rows and `grid` the whole grid; the four outputs hold `heads`
+    /// heads on the stream's device; all live until the stream drains.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn load_kvb_split_fp8(&self, kv_b: *const c_void, grid: *const c_void, uk: *mut c_void,
+        uk_scale: *mut c_void, uv: *mut c_void, uv_scale: *mut c_void, row0: usize, heads: usize, nope: usize,
+        v: usize, lat: usize, stream: *mut c_void) -> Result<()> {
+        type Split = unsafe extern "C" fn(*const c_void, *const c_void, *mut c_void, *mut c_void, *mut c_void,
+            *mut c_void, i64, i64, i64, i64, i64, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<Split>(b"cuteafd_load_kvb_split_fp8") }?;
+        let status = unsafe { f(kv_b, grid, uk, uk_scale, uv, uv_scale, i64::try_from(row0)?, i64::try_from(heads)?,
+            i64::try_from(nope)?, i64::try_from(v)?, i64::try_from(lat)?, stream) };
+        ensure!(status == 0, "FP8 kv_b split failed with {status}");
+        Ok(())
+    }
+
     /// The load-quantization `Job` ABI: (job bytes, segment bytes, max columns).
     pub fn fp8_load_quant_abi(&self) -> Result<(u64, u64, u64)> {
         type Abi = unsafe extern "C" fn(*mut u64, *mut u64, *mut u64) -> i32;

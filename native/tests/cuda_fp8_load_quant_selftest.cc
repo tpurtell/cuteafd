@@ -19,6 +19,9 @@ extern "C" int32_t cuteafd_fp8_load_quant_abi(uint64_t* job_bytes, uint64_t* seg
 extern "C" int32_t cuteafd_load_widen_bf16_f32(const void* src, void* dst, int64_t n, void* stream);
 extern "C" int32_t cuteafd_load_kvb_absorb(const void* kv_b, void* uk, void* uv, int64_t h0, int64_t heads,
                                            int64_t nope, int64_t v, int64_t lat, void* stream);
+extern "C" int32_t cuteafd_load_kvb_split_fp8(const void* kv_b, const void* grid, void* uk, void* uk_scale, void* uv,
+                                              void* uv_scale, int64_t row0, int64_t heads, int64_t nope, int64_t v,
+                                              int64_t lat, void* stream);
 
 namespace lq = cuteafd_load_quant;
 
@@ -41,6 +44,8 @@ T take(const std::vector<uint8_t>& bytes, size_t& at) {
       return 1;                                                                           \
     }                                                                                     \
   } while (0)
+
+int split_fp8();
 
 // BF16 widening and kv_b absorption from mapped host memory against the
 // header's host definitions (every BF16 bit pattern; a two-rank head split).
@@ -85,6 +90,59 @@ int transforms() {
   }
   cudaFree(uk); cudaFree(uv); cudaFree(wide); cudaFreeHost(kv_b); cudaFreeHost(src);
   std::printf("GPU load widen + kv_b absorb exact\n");
+  return split_fp8();
+}
+
+// FP8 kv_b split at the GLM 5.3 geometry (448 rows per head: heads span 3.5
+// grid blocks) over a two-rank head split, against the header rule and an
+// independent restatement of the mount loader's host transpose.
+int split_fp8() {
+  const int64_t heads = 8, nope = 192, v = 256, lat = 512, rows = heads * (nope + v);
+  const int64_t kb = lat / 128, grid_rows = (rows + 127) / 128;
+  uint8_t* kv_b = nullptr;
+  float* grid = nullptr;
+  CHECK(cudaHostAlloc(&kv_b, rows * lat, cudaHostAllocPortable | cudaHostAllocMapped));
+  CHECK(cudaHostAlloc(&grid, grid_rows * kb * 4, cudaHostAllocPortable | cudaHostAllocMapped));
+  for (int64_t i = 0; i < rows * lat; ++i) kv_b[i] = uint8_t(i * 2654435761u >> 13);
+  for (int64_t i = 0; i < grid_rows * kb; ++i) grid[i] = 1.0f + float(i) * 0.25f;
+  const int64_t share = heads / 2;
+  uint8_t *uk = nullptr, *uv = nullptr;
+  float *uk_s = nullptr, *uv_s = nullptr;
+  CHECK(cudaMalloc(&uk, share * lat * nope));
+  CHECK(cudaMalloc(&uv, share * v * lat));
+  CHECK(cudaMalloc(&uk_s, share * lat * (nope / 64) * 4));
+  CHECK(cudaMalloc(&uv_s, share * v * (lat / 64) * 4));
+  for (int64_t rank = 0; rank < 2; ++rank) {
+    const int64_t h0 = rank * share;
+    // The staged rows begin at this rank's first head; scales still index the whole grid.
+    CHECK(cudaError_t(cuteafd_load_kvb_split_fp8(kv_b + h0 * (nope + v) * lat, grid, uk, uk_s, uv, uv_s,
+                                                 h0 * (nope + v), share, nope, v, lat, nullptr)));
+    CHECK(cudaDeviceSynchronize());
+    std::vector<uint8_t> k(share * lat * nope), w(share * v * lat);
+    std::vector<float> ks(share * lat * (nope / 64)), ws(share * v * (lat / 64));
+    CHECK(cudaMemcpy(k.data(), uk, k.size(), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(w.data(), uv, w.size(), cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(ks.data(), uk_s, ks.size() * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(ws.data(), uv_s, ws.size() * 4, cudaMemcpyDeviceToHost));
+    auto scale = [&](int64_t row, int64_t col) { return grid[(row / 128) * kb + col / 128]; };
+    for (int64_t h = 0; h < share; ++h) {
+      const int64_t base = (h0 + h) * (nope + v);
+      for (int64_t c = 0; c < lat; ++c) {
+        for (int64_t d = 0; d < nope; ++d)
+          if (k[(h * lat + c) * nope + d] != kv_b[(base + d) * lat + c]) { std::fprintf(stderr, "fp8 uk differs\n"); return 1; }
+        for (int64_t t = 0; t < nope / 64; ++t)
+          if (ks[(h * lat + c) * (nope / 64) + t] != scale(base + t * 64, c)) { std::fprintf(stderr, "uk scale differs\n"); return 1; }
+      }
+      for (int64_t r = 0; r < v; ++r) {
+        for (int64_t c = 0; c < lat; ++c)
+          if (w[(h * v + r) * lat + c] != kv_b[(base + nope + r) * lat + c]) { std::fprintf(stderr, "fp8 uv differs\n"); return 1; }
+        for (int64_t t = 0; t < lat / 64; ++t)
+          if (ws[(h * v + r) * (lat / 64) + t] != scale(base + nope + r, t * 64)) { std::fprintf(stderr, "uv scale differs\n"); return 1; }
+      }
+    }
+  }
+  cudaFree(uk); cudaFree(uv); cudaFree(uk_s); cudaFree(uv_s); cudaFreeHost(kv_b); cudaFreeHost(grid);
+  std::printf("GPU FP8 kv_b split exact\n");
   return 0;
 }
 }  // namespace
