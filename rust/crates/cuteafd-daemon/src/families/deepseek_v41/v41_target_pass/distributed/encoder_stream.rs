@@ -46,11 +46,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>,
         keep_running: &dyn Fn() -> bool,
     ) -> Result<()> {
-        if super::super::encoder_units::enabled()? {
-            let [transport, _] = transports;
-            // SAFETY: use one retained owner without changing decode ownership.
-            return unsafe { self.execute_encoder_units(requests, lease, chunks,
-                transport, suffix, keep_running, &|| Ok(())).await };
+        if let Some(waves) = super::super::encoder_units::waves()? {
+            // SAFETY: slots retain their independent device and FFN owners through landing.
+            return unsafe { self.execute_encoder_units(other, requests, lease, chunks,
+                transports, suffix, keep_running, &|| Ok(()), waves).await };
         }
         self.set_attention_decode(false);
         other.set_attention_decode(false);

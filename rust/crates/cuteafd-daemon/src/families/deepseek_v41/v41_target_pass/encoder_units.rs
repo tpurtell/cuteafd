@@ -1,4 +1,4 @@
-//! Opt-in single-owner encoder units. Decode keeps its independent owners.
+//! Slot-owned encoder units. Decode keeps its independent owners and fixed links.
 use super::*;
 use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
 use crate::families::deepseek_v41::v41_backbone_execution::{UnitPendingLayer, UnitPreparedLayer};
@@ -7,15 +7,18 @@ use crate::shared::prefill_pipeline::{run_prefill_units_async, AsyncPrefillHooks
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
 
-pub(in crate::families::deepseek_v41) fn enabled() -> Result<bool> {
-    match std::env::var("CUTEAFD_PREFILL_WAVES").as_deref() {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Ok("1") => Ok(true),
-        _ => {
-            anyhow::bail!("V4.1 currently supports PREFILL_WAVES=1; omit it for the existing path")
-        }
+pub(in crate::families::deepseek_v41) fn waves() -> Result<Option<usize>> {
+    parse_waves(std::env::var("CUTEAFD_PREFILL_WAVES").ok().as_deref())
+}
+fn parse_waves(value: Option<&str>) -> Result<Option<usize>> {
+    match value {
+        None => Ok(None),
+        Some("1") => Ok(Some(1)),
+        Some("2") => Ok(Some(2)),
+        _ => anyhow::bail!("V4.1 supports PREFILL_WAVES=1 or 2; omit it for the existing path"),
     }
 }
+pub(in crate::families::deepseek_v41) fn enabled() -> Result<bool> { Ok(waves()?.is_some()) }
 
 pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
     ensure!(!chunks.is_empty(), "empty encoder unit span");
@@ -48,25 +51,30 @@ pub(in crate::families::deepseek_v41) fn decoder_unit(index: usize, rows: std::o
     Ok(Unit { index, sequence: 0, rows, layers: 20..40, slot: 0, barrier: true })
 }
 
-struct UnitHooks<'s, 'r, 'w, 'a> {
+struct UnitSlot<'s, 'w, 'a> {
     pass: &'s mut TargetPass<'w, 'a>,
-    requests: RefCell<&'r mut Requests<'a>>,
-    lease: CacheLease,
-    chunks: &'s [&'s [u32]],
     transport: &'s mut NativeTp4Wave<'a>,
-    suffix: &'s mut EncoderSuffix<'a>,
-    keep_running: &'s dyn Fn() -> bool,
-    before_unit: &'s dyn Fn() -> Result<()>,
     batch: Option<RequestBatch>,
     prepared: Option<UnitPreparedLayer>,
     started: Instant,
 }
+struct UnitHooks<'s, 'r, 'w, 'a> {
+    slots: Vec<UnitSlot<'s, 'w, 'a>>,
+    requests: RefCell<&'r mut Requests<'a>>,
+    lease: CacheLease,
+    chunks: &'s [&'s [u32]],
+    suffix: &'s mut EncoderSuffix<'a>,
+    keep_running: &'s dyn Fn() -> bool,
+    before_unit: &'s dyn Fn() -> Result<()>,
+}
 impl Drop for UnitHooks<'_, '_, '_, '_> {
     fn drop(&mut self) {
-        if let Some(mut batch) = self.batch.take() {
-            self.requests.borrow_mut().revoke_batch(&mut batch);
-            if let Err(error) = self.pass.discard(&mut batch) {
-                tracing::error!(%error, "discarding cancelled encoder unit");
+        for slot in &mut self.slots {
+            if let Some(mut batch) = slot.batch.take() {
+                self.requests.borrow_mut().revoke_batch(&mut batch);
+                if let Err(error) = slot.pass.discard(&mut batch) {
+                    tracing::error!(%error, "discarding cancelled encoder unit");
+                }
             }
         }
     }
@@ -74,22 +82,23 @@ impl Drop for UnitHooks<'_, '_, '_, '_> {
 impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     type Ticket = UnitPendingLayer;
     fn route(&self, layer: usize) -> FfnRoute {
-        if self.transport.has_local_layer(layer) {
+        if self.slots[0].transport.has_local_layer(layer) {
             FfnRoute::Local
         } else {
             FfnRoute::Spark
         }
     }
     async fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
+        let slot = &mut self.slots[unit.slot];
         ensure!(
-            unit.slot == 0 && self.batch.is_none() && self.prepared.is_none(),
-            "serial encoder unit slot occupied"
+            slot.batch.is_none() && slot.prepared.is_none(),
+            "encoder unit slot occupied"
         );
         ensure!((self.keep_running)(), "client disconnected");
         (self.before_unit)()?;
-        self.started = Instant::now();
+        slot.started = Instant::now();
         let chunk = self.chunks[unit.index];
-        self.batch = Some(
+        slot.batch = Some(
             self.requests
                 .borrow_mut()
                 .reserve_encoder(&[RequestTokens {
@@ -99,32 +108,33 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
                     kind: ExpertV2SourceKind::Prefill,
                 }])?,
         );
-        let batch = self.batch.as_mut().context("encoder unit batch absent")?;
-        self.pass.state.begin()?;
-        self.pass
+        let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
+        slot.pass.state.begin()?;
+        slot.pass
             .resources
             .execution
             .restart_for(CacheStage::Encoder);
-        self.pass.resources.lane.restart()?;
-        self.pass.resources.index.restart()?;
-        self.pass.resources.taps.reset();
+        slot.pass.resources.lane.restart()?;
+        slot.pass.resources.index.restart()?;
+        slot.pass.resources.taps.reset();
         // SAFETY: the unit exclusively owns its batch and the pass's input storage.
         unsafe {
             self.requests.borrow_mut().begin_input(
                 batch,
-                &mut self.pass.resources.embedding,
-                &mut self.pass.resources.lane,
+                &mut slot.pass.resources.embedding,
+                &mut slot.pass.resources.lane,
             )?;
         }
         Ok(())
     }
-    async fn attention(&mut self, layer: usize, _unit: &Unit) -> Result<()> {
+    async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
+        let slot = &mut self.slots[unit.slot];
         ensure!((self.keep_running)(), "client disconnected");
-        ensure!(self.prepared.is_none(), "encoder attention still pending");
-        let batch = self.batch.as_mut().context("encoder unit batch absent")?;
+        ensure!(slot.prepared.is_none(), "encoder attention still pending");
+        let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         // SAFETY: the preceding hook has consumed the previous layer's output.
         unsafe {
-            self.pass
+            slot.pass
                 .prepare_encoder_query(&self.requests, batch, layer)
                 .await?;
         }
@@ -132,23 +142,24 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         let prepared = unsafe {
             self.requests.borrow_mut().prepare_encoder_layer(
                 batch,
-                &mut self.pass.resources.execution,
-                &mut self.pass.resources.lane,
-                &mut self.pass.resources.index,
+                &mut slot.pass.resources.execution,
+                &mut slot.pass.resources.lane,
+                &mut slot.pass.resources.index,
             )?
         };
-        self.prepared = Some(prepared.into_unit().await?);
+        slot.prepared = Some(prepared.into_unit().await?);
         Ok(())
     }
-    async fn local_ffn(&mut self, _layer: usize, _unit: &Unit) -> Result<()> {
-        let prepared = self.prepared.take().context("encoder attention absent")?;
-        let batch = self.batch.as_ref().context("encoder unit batch absent")?;
+    async fn local_ffn(&mut self, _layer: usize, unit: &Unit) -> Result<()> {
+        let slot = &mut self.slots[unit.slot];
+        let prepared = slot.prepared.take().context("encoder attention absent")?;
+        let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
         // SAFETY: the original bound input remains in the exclusive unit slot.
         let completed = unsafe {
             prepared
                 .execute(
-                    &mut self.pass.resources.lane,
-                    self.transport,
+                    &mut slot.pass.resources.lane,
+                    slot.transport,
                     0,
                     batch.image_mask(),
                 )
@@ -156,23 +167,24 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         };
         // SAFETY: the transport result and original unit binding remain live.
         unsafe {
-            self.pass.resources.execution.complete_layer(
+            slot.pass.resources.execution.complete_layer(
                 batch.cache()?,
-                &mut self.pass.resources.lane,
+                &mut slot.pass.resources.lane,
                 completed,
             )?;
         }
         Ok(())
     }
-    async fn send_experts(&mut self, _layer: usize, _unit: &Unit) -> Result<Self::Ticket> {
-        let prepared = self.prepared.take().context("encoder attention absent")?;
-        let batch = self.batch.as_ref().context("encoder unit batch absent")?;
+    async fn send_experts(&mut self, _layer: usize, unit: &Unit) -> Result<Self::Ticket> {
+        let slot = &mut self.slots[unit.slot];
+        let prepared = slot.prepared.take().context("encoder attention absent")?;
+        let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
         // SAFETY: the slot is retained until the matching FIFO landing hook.
         unsafe {
             prepared
                 .send(
-                    &mut self.pass.resources.lane,
-                    self.transport,
+                    &mut slot.pass.resources.lane,
+                    slot.transport,
                     0,
                     batch.image_mask(),
                 )
@@ -182,51 +194,54 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     async fn land_experts(
         &mut self,
         _layer: usize,
-        _unit: &Unit,
+        unit: &Unit,
         ticket: Self::Ticket,
     ) -> Result<()> {
-        let batch = self.batch.as_ref().context("encoder unit batch absent")?;
-        // SAFETY: no other unit can overwrite this serial slot's shared values.
+        let slot = &mut self.slots[unit.slot];
+        let batch = slot.batch.as_ref().context("encoder unit batch absent")?;
+        // SAFETY: no other unit can overwrite this original slot's shared values.
         let completed = unsafe {
             ticket
-                .land(&mut self.pass.resources.lane, self.transport)
+                .land(&mut slot.pass.resources.lane, slot.transport)
                 .await?
         };
         // SAFETY: result and batch belong to the original prepared layer.
         unsafe {
-            self.pass.resources.execution.complete_layer(
+            slot.pass.resources.execution.complete_layer(
                 batch.cache()?,
-                &mut self.pass.resources.lane,
+                &mut slot.pass.resources.lane,
                 completed,
             )?;
         }
         Ok(())
     }
-    async fn end_unit(&mut self, _unit: &Unit) -> Result<()> {
+    async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
+        let slot = &mut self.slots[unit.slot];
         ensure!((self.keep_running)(), "client disconnected");
-        let batch = self.batch.as_mut().context("encoder unit batch absent")?;
-        self.suffix.capture(&self.pass.resources.lane.output()?)?;
-        self.pass.resources.lane.advance()?;
+        let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
+        self.suffix.capture(&slot.pass.resources.lane.output()?)?;
+        slot.pass.resources.lane.advance()?;
         // SAFETY: encoder output is complete and this batch owns its source-20 proposal.
         unsafe {
-            self.pass.resources.lane.begin_prepared()?;
+            slot.pass.resources.lane.begin_prepared()?;
             self.requests.borrow_mut().publish_encoder_boundary(
                 batch,
-                &mut self.pass.resources.execution,
-                &self.pass.resources.lane,
+                &mut slot.pass.resources.execution,
+                &slot.pass.resources.lane,
             )?;
         }
-        self.pass.state = State::Encoded(batch.cache()?.identity());
+        slot.pass.state = State::Encoded(batch.cache()?.identity());
         Ok(())
     }
     async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
-        let batch = self.batch.as_mut().context("encoder unit batch absent")?;
-        self.pass.commit(
+        let slot = &mut self.slots[unit.slot];
+        let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
+        slot.pass.commit(
             &mut self.requests.borrow_mut(),
             batch,
             &[unit.rows.len() as u32],
         )?;
-        self.batch = None;
+        slot.batch = None;
         crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(unit.rows.len());
         crate::families::deepseek_v41::v41_native_serve::console::Prefill::done(
             crate::families::deepseek_v41::v41_native_serve::console::PrefillKind::Chunk,
@@ -234,41 +249,39 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
             unit.index,
             self.chunks.len(),
             unit.rows.len(),
-            self.started,
+            slot.started,
         );
         Ok(())
     }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
     /// # Safety
-    /// The single pass and transport share a CUDA owner and retain all unit
-    /// storage until completion or drained cancellation. Decode owners are idle.
+    /// Both slots retain their independent lane/TP2/shared/output storage until
+    /// completion or drained cancellation. Decode is idle during this span.
     pub(super) async unsafe fn execute_encoder_units(
-        &mut self,
-        requests: &mut Requests<'a>,
-        lease: CacheLease,
-        chunks: &[&[u32]],
-        transport: &mut NativeTp4Wave<'a>,
-        suffix: &mut EncoderSuffix<'a>,
-        keep_running: &dyn Fn() -> bool,
-        before_unit: &dyn Fn() -> Result<()>,
+        &mut self, other: &mut Self, requests: &mut Requests<'a>, lease: CacheLease,
+        chunks: &[&[u32]], transports: [&mut NativeTp4Wave<'a>; 2],
+        suffix: &mut EncoderSuffix<'a>, keep_running: &dyn Fn() -> bool,
+        before_unit: &dyn Fn() -> Result<()>, waves: usize,
     ) -> Result<()> {
+        ensure!((1..=2).contains(&waves), "encoder unit owner count differs");
         self.set_attention_decode(false);
-        let units = encoder_units(chunks)?;
+        other.set_attention_decode(false);
+        let mut units = encoder_units(chunks)?;
+        for unit in &mut units { unit.slot = unit.index % waves; }
+        let [first, second] = transports;
+        for layer in 0..20 {
+            ensure!(first.has_local_layer(layer) == second.has_local_layer(layer),
+                "encoder slot expert placement differs");
+        }
         let mut hooks = UnitHooks {
-            pass: self,
-            requests: RefCell::new(requests),
-            lease,
-            chunks,
-            transport,
-            suffix,
-            keep_running,
-            before_unit,
-            batch: None,
-            prepared: None,
-            started: Instant::now(),
+            slots: vec![
+                UnitSlot { pass: self, transport: first, batch: None, prepared: None, started: Instant::now() },
+                UnitSlot { pass: other, transport: second, batch: None, prepared: None, started: Instant::now() },
+            ],
+            requests: RefCell::new(requests), lease, chunks, suffix, keep_running, before_unit,
         };
-        run_prefill_units_async(&mut hooks, &units, 1).await
+        run_prefill_units_async(&mut hooks, &units, waves).await
     }
 }
 

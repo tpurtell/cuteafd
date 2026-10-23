@@ -257,6 +257,22 @@ fn spark_transport(
         peers, capacity, config)
 }
 
+fn prefill_link<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
+    world: cuteafd_transport::expert::SparkWorld, capacity: u32)
+    -> Result<Option<std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>>> {
+    let waves = crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1);
+    if waves == 1 { return Ok(None); }
+    let link = crate::shared::spark_intake::SparkLink::new_waves(lib, world, &args.peers,
+        capacity, TcpTransportConfig { timing: protocol_v2_timing(), timeout: Duration::from_secs(120),
+            max_frame_bytes: 64 << 20 }, cuteafd_transport::expert::V41_PARTIAL_ROW_BYTES as usize,
+        waves, capacity)?;
+    tracing::info!(waves, rows=capacity, ranks=args.peers.len(),
+        device_bytes=cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
+            u64::from(capacity), args.peers.len(), waves as u64)?,
+        "V4.1 separate prefill link; fixed decode intakes unchanged");
+    Ok(Some(std::rc::Rc::new(std::cell::RefCell::new(link))))
+}
+
 fn worker(
     mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
@@ -522,7 +538,10 @@ fn worker(
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
+    let prefill_bytes = cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
+        u64::from(capacity), args.peers.len(),
+        crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1) as u64)?;
+    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[prefill_bytes], 0, None)?;
     pass.bind_execution_plan(&pool.placement)?;
     prefill_pass.bind_execution_plan(&pool.placement)?;
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
@@ -609,6 +628,10 @@ fn worker(
         .enable_all()
         .build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
+    if let Some(link) = prefill_link(&lib, &args, spark_world, capacity)? {
+        transport.install_prefill_link(link.clone())?;
+        prefill_transport.install_prefill_link(link)?;
+    }
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;

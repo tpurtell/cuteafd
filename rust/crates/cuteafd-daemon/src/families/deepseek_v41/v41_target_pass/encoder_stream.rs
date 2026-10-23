@@ -52,11 +52,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         transports: [&mut NativeTp4Wave<'a>; 2], suffix: &mut EncoderSuffix<'a>,
         keep_running: &dyn Fn() -> bool, before_chunk: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        if super::encoder_units::enabled()? {
-            let [transport, _] = transports;
-            // SAFETY: the opt-in path retains the same single-owner contract.
-            return unsafe { self.execute_encoder_units(requests, lease, chunks, transport,
-                suffix, keep_running, before_chunk).await };
+        if let Some(waves) = super::encoder_units::waves()? {
+            // SAFETY: each slot retains its pass and FFN arena until its FIFO ticket lands.
+            return unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports,
+                suffix, keep_running, before_chunk, waves).await };
         }
         self.set_attention_decode(false);
         other.set_attention_decode(false);

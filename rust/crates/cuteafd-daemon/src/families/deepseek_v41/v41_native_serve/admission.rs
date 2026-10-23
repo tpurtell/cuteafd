@@ -173,7 +173,9 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
+        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?
+            + owners::prefill_transport_bytes(u64::from(capacity), args.peers.len(),
+                crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1) as u64)?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(

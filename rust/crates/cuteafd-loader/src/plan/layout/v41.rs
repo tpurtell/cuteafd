@@ -27,7 +27,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    if options.prefill_waves == 1 && !explicit_unit { options.prefill_unit_rows = Some(rows); }
+    let waves = match std::env::var("CUTEAFD_PREFILL_WAVES").ok().as_deref() {
+        None => options.prefill_waves,
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => anyhow::bail!("V4.1 supports PREFILL_WAVES=1 or 2"),
+    };
+    ensure!((1..=2).contains(&waves), "V4.1 prefill waves must be 1 or 2");
+    options.prefill_waves = waves;
+    if !explicit_unit { options.prefill_unit_rows = Some(rows); }
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
     ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
         "V4.1 prefix slots must be zero or 2 * retained turns + 2 (at most 258)");
@@ -73,7 +81,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         }
     }
     let spark_ranks = report.placement.spark_ranks();
-    let transport = if spark_ranks > 0 { 2 * v41::owners::transport_bytes(rows, spark_ranks)? } else { 0 };
+    let prefill_transport = if spark_ranks > 0 {
+        v41::owners::prefill_transport_bytes(rows, spark_ranks, waves)?
+    } else { 0 };
+    let transport = if spark_ranks > 0 {
+        2 * v41::owners::transport_bytes(rows, spark_ranks)? + prefill_transport
+    } else { 0 };
+    if prefill_transport > 0 {
+        notes.push(format!("V4.1 prefill-only link: {waves} BF16 return slots, {prefill_transport} extra device bytes; both fixed decode intakes retained."));
+    }
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",

@@ -563,11 +563,10 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
         suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
         before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
-        if crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()? {
-            let [transport, _] = transports;
-            // SAFETY: one retained pass owns every unit until its in-order commit.
-            unsafe { self.execute_encoder_units(requests, lease, chunks, transport,
-                suffix, keep_running, before_chunk).await }
+        if let Some(waves) = crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()? {
+            // SAFETY: slots retain independent owners until FIFO landing and in-order commit.
+            unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports,
+                suffix, keep_running, before_chunk, waves).await }
         } else {
             self.encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await
         }

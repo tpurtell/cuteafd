@@ -313,8 +313,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let spark_ranks = args.peers.len();
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
+    let prefill_bytes = cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
+        u64::from(capacity), spark_ranks,
+        crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1) as u64)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, (2 * wave_bytes) as u64)?;
+        2, (2 * wave_bytes) as u64 + prefill_bytes)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -457,6 +460,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
+    if let Some(link) = devices[1].run(|| super::prefill_link(&lib, &args, spark_world, capacity))? {
+        transport.install_prefill_link(link.clone())?;
+        second_transport.install_prefill_link(link)?;
+    }
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;

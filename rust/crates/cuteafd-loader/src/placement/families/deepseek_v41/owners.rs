@@ -38,6 +38,16 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
     Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
 }
 
+/// Extra return slots on the prefill-only link. Both fixed decode links stay live.
+/// One-wave opt-in uses the existing serial link without any extra allocation.
+pub fn prefill_transport_bytes(rows: u64, ranks: usize, waves: u64) -> Result<u64> {
+    ensure!((1..=4096).contains(&rows) && (1..=8).contains(&ranks)
+        && (1..=2).contains(&waves), "invalid V4.1 prefill transport geometry");
+    if waves == 1 { return Ok(0); }
+    rows.checked_mul(ranks as u64).and_then(|n| n.checked_mul(waves))
+        .and_then(|n| n.checked_mul(10240)).context("V4.1 prefill return slots overflow")
+}
+
 /// Full vocabulary packing peak above the pre-weight sample. The first lane's
 /// backbone/cache/index/embedding/Engram owners already exist; heads, taps,
 /// transports, the second lane, draft, vision and marks do not.
@@ -313,6 +323,31 @@ mod tests {
 
     fn owner(demands: &[Demand], rank: u8, group: &str) -> u64 {
         demands.iter().find(|d| d.gpu == rank && d.group == group).unwrap().bytes
+    }
+
+    #[test]
+    fn prefill_slots_are_extra_bf16_returns_on_the_reduction_gpu() -> Result<()> {
+        for rows in [256, 512, 1024, 2048, 4096] {
+            for ranks in 1..=8 {
+                assert_eq!(prefill_transport_bytes(rows, ranks, 1)?, 0);
+                assert_eq!(prefill_transport_bytes(rows, ranks, 2)?, rows * ranks as u64 * 2 * 10240);
+            }
+        }
+        assert_eq!(prefill_transport_bytes(4096, 4, 2)?, 335_544_320);
+        assert_eq!(prefill_transport_bytes(4096, 6, 2)?, 503_316_480);
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            let fixed = 2 * transport_bytes(4096, ranks)?;
+            let extra = prefill_transport_bytes(4096, ranks, 2)?;
+            let owners = deferred_owners(gpus, fixed + extra)?;
+            let transport = owners.iter().find(|d| d.category == Category::Transport).unwrap();
+            assert_eq!(transport.gpu, (gpus - 1) as u8);
+            assert_eq!(transport.bytes, fixed + extra);
+        }
+        for (rows, ranks, waves) in [(0, 4, 2), (4097, 4, 2), (4096, 0, 2),
+            (4096, 9, 2), (4096, 4, 0), (4096, 4, 3)] {
+            assert!(prefill_transport_bytes(rows, ranks, waves).is_err());
+        }
+        Ok(())
     }
 
     #[test]
