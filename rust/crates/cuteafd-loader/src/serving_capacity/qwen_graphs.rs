@@ -378,7 +378,7 @@ mod tests {
         use crate::serving_capacity::PrefillShape;
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
         let h = cfg.hidden as u64;
-        for rows in [512, 1024, 2048] {
+        for rows in [512, 1024, 2048, 4096] {
             let one = PrefillShape { unit_rows: rows, waves: 1 };
             let two = PrefillShape { unit_rows: rows, waves: 2 };
             let base = qwen_workspace_bytes(&cfg, rows, false, 1, 0, Some(160), 12345, 6789);

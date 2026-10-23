@@ -2135,7 +2135,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         self.last_stream_offset.set(0);
         let (t, start) = (tokens.len(), placement.len);
-        ensure!(t > 0 && t <= self.prefill_rows && start + t <= self.max_context, "prefill of {t} rows at {start}");
+        ensure!(t > 0 && t <= self.prefill_rows.min(4096) && start + t <= self.max_context, "prefill of {t} rows at {start}");
         if start == 0 {
             self.start(placement)?;
         }
@@ -3717,8 +3717,8 @@ mod prefill_unit_tests {
 
     #[test]
     fn unit_tables_keep_absolute_addresses_and_reset_sequence_rows() -> Result<()> {
-        for start in [0usize, 63, 255, 1023, 2047, 4093] {
-            let count = 4096;
+        for (start, count) in [0usize, 63, 255, 1023, 2047, 4093].into_iter()
+            .flat_map(|start| [4096, 8192].map(|count| (start, count))) {
             let ple_rows = 16;
             let mut whole = StepTables { page_table: vec![9, 4, 7, 2], pool_table: vec![3, 8],
                 page_width: 4, pool_width: 2, ..Default::default() };
@@ -3734,7 +3734,7 @@ mod prefill_unit_tests {
                 whole.cache_lengths.push(((position + 1) / BLOCK) as i32);
                 whole.ple_ids.extend((0..ple_rows).map(|head| (position * ple_rows + head) as i64));
             }
-            for width in [512, 1024, 2048] {
+            for width in [512, 1024, 2048, 4096] {
                 for unit in sequence_units(count, width, 1, 48)? {
                     let rows = unit.rows;
                     let local = whole.unit(rows.clone(), ple_rows, 2051);
@@ -3821,7 +3821,8 @@ mod prefill_unit_tests {
 
     #[test]
     fn real_schedule_preserves_all_qwen_live_planes_and_catches_shared_rows() -> Result<()> {
-        for (span, width) in [(1, 512), (513, 512), (4096, 512), (4096, 2048), (3971, 1024)] {
+        for (span, width) in [(1, 512), (513, 512), (4096, 512), (4096, 2048), (3971, 1024),
+            (8192, 4096), (8192, 2048)] {
             for waves in [1, 2] {
                 assert_eq!(replay(span, width, waves, None, false)?, None, "{span}/{width}/{waves}");
             }

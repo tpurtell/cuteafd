@@ -195,10 +195,9 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let prefill_shape = if options.prefill_waves > 1 {
         anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
             "Qwen prefill waves require single-owner Spark experts");
-        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 2048 };
+        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 4096 };
         let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
         anyhow::ensure!(units.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
-        anyhow::ensure!(units.slot_rows() <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
         Some(units)
     } else { None };
     let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());

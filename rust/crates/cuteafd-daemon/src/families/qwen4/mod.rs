@@ -238,8 +238,13 @@ impl EngineArgs {
             unit_rows: self.prefill_units.unwrap_or(self.prefill_rows) as u64, waves: u64::from(self.prefill_waves),
         }.validate()?;
         ensure!(shape.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
-        ensure!(shape.slot_rows() <= 4096 && self.prefill_rows <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
+        ensure!(self.prefill_rows <= 8192, "Qwen prefill span exceeds 8192 rows");
         Ok(Some(shape))
+    }
+
+    /// Per-wave tables, PLE gathers and Spark workers never hold the whole span.
+    fn prefill_wave_rows(&self) -> usize {
+        self.prefill_units.unwrap_or(self.prefill_rows).max(engine::DECODE_ROWS)
     }
 }
 
@@ -263,7 +268,7 @@ fn required_fp8_programs(args: &EngineArgs) -> Vec<String> {
     let mut required = Vec::new();
     if args.fp8_decode {
         let suffix = if args.kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
-        for cap in ["m64".to_string(), format!("m{}", args.prefill_rows)] {
+        for cap in ["m64", "m4096"] {
             required.extend([format!("qwen4_gdn_w8_{cap}"),
                 format!("qwen4_attn_producer_w8{suffix}_{cap}"), format!("qwen4_attn_o_w8_{cap}")]);
         }
@@ -318,7 +323,7 @@ mod weight_representation_tests {
     #[test]
     fn prefill_units_validate_owner_slots_and_preserve_explicit_geometry() -> Result<()> {
         assert_eq!(args(&[])?.prefill_shape()?, None);
-        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2)] {
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
@@ -329,6 +334,8 @@ mod weight_representation_tests {
         for extra in [
             vec!["--prefill-waves", "2"],
             vec!["--shared-only", "--prefill-units", "511"],
+            vec!["--shared-only", "--prefill-units", "8192"],
+            vec!["--shared-only", "--prefill-rows", "16384", "--prefill-units", "4096"],
             vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
             vec!["--shared-only", "--prefill-units", "512", "--prefill-waves", "3"],
             vec!["--local-experts", "--split-device", "1", "--prefill-units", "2048"],
@@ -337,6 +344,21 @@ mod weight_representation_tests {
         }
         let shape = args(&["--peers", "localhost:9870", "--prefill-rows", "2048", "--prefill-waves", "2"])?.prefill_shape()?.unwrap();
         assert_eq!((shape.unit_rows, shape.slot_rows()), (2048, 4096));
+        let mut parsed = args(&["--peers", "localhost:9870", "--prefill-waves", "2"])?;
+        let shape = parsed.prefill_shape()?.unwrap();
+        assert_eq!((shape.unit_rows, shape.slot_rows()), (4096, 8192));
+        parsed.prefill_rows = shape.slot_rows() as usize;
+        parsed.prefill_units = Some(shape.unit_rows as usize);
+        assert_eq!(parsed.prefill_shape()?, Some(shape));
+        assert_eq!(parsed.prefill_wave_rows(), 4096);
+        let worker = admission::spark_model(parsed.prefill_wave_rows(), false)?;
+        assert_eq!((worker.capacity, worker.compiled_capacity), (4096, 4096));
+        let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
+        let admission = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
+        assert_eq!(admission.prefill_rows, 8192);
+        assert_eq!(admission.prefill_shape, Some(shape));
+        assert!(required_fp8_programs(&EngineArgs { fp8_decode: true, ..parsed })
+            .iter().all(|name| !name.contains("m8192")));
         Ok(())
     }
 
@@ -522,7 +544,7 @@ impl Opened {
             let source = args.experts_snapshot.as_deref().unwrap_or(&args.snapshot);
             crate::shared::placement::SparkAdmission::plan(source, cuteafd_core::ExpertGeometry::QWEN4,
                 self.experts.as_ref(), &working, peers.len(), None,
-                admission::spark_model(args.prefill_rows, self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
+                admission::spark_model(args.prefill_wave_rows(), self.checkpoint.spark_input_is_bf16())?)?.select(&peers)?;
         }
         let mut manifest_json: Option<serde_json::Value> = std::fs::read(&args.manifest).ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
@@ -604,7 +626,7 @@ impl Opened {
             "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
-                layer, &args.table, args.prefill_rows.max(engine::DECODE_ROWS))?),
+                layer, &args.table, args.prefill_wave_rows())?),
             _ => None,
         };
         // Establish expert ownership before admission. EXL3 keeps its existing
@@ -731,7 +753,7 @@ impl Opened {
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let shape = args.prefill_shape()?;
         let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
-            u32::try_from(args.prefill_rows)?, cuteafd_transport::TcpTransportConfig { timing: false,
+            u32::try_from(args.prefill_wave_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
                 shape.map_or(1, |s| s.waves as usize),
                 u32::try_from(shape.map_or(args.prefill_rows, |s| s.unit_rows as usize).max(engine::DECODE_ROWS))?)?;
@@ -740,7 +762,7 @@ impl Opened {
         // the widest wave this transport can carry: the draft planner prices the
         // workers before any serving step opens a session, and the sessions this
         // opens are the ones every step after it reuses.
-        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_rows,
+        transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_wave_rows(),
             self.checkpoint.spark_input_is_bf16())?)?;
         crate::shared::memory_report::release_load_staging(&self.library);
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
@@ -760,7 +782,7 @@ impl Opened {
         let started = Instant::now();
         let mtp = if catalog.exl3().is_some() {
             let experts = crate::families::deepseek_v4::local::LocalExperts::load(&self.library,
-                &args.native_lib, catalog, 1, &[], args.prefill_rows, budget, stream)?
+                &args.native_lib, catalog, 1, &[], args.prefill_wave_rows(), budget, stream)?
                 .context("coordinator-local MTP needs exl3-qwen4-k45/rtx-tp1/m* packages")?;
             ensure!(experts.layers().is_empty() && experts.stages() == 1,
                 "local draft executor must keep exactly the MTP expert layer, no backbone layers");
@@ -770,7 +792,7 @@ impl Opened {
             let draft = tensors.for_layer(layer)?;
             let directory = crate::shared::experts::fp8::package_directory(&args.native_lib, 1, draft.format());
             let experts = crate::shared::experts::fp8::Fp8Experts::load(&self.library, &draft, &directory,
-                &[layer], 1, 0, args.prefill_rows, budget)?;
+                &[layer], 1, 0, args.prefill_wave_rows(), budget)?;
             ensure!(!experts.wire_input(), "coordinator-local MTP FP8 package must take BF16 rows");
             engine::MtpExperts::Fp8(experts)
         };

@@ -1022,17 +1022,20 @@ mod tests {
     fn spark_intake_is_charged_once_across_planned_and_measured_baselines() {
         let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
         let (total, context_bytes, loaded_bytes) = (32_u64 << 30, 1_u64 << 30, 23_u64 << 30);
-        for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 })] {
+        for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 }),
+            Some(crate::serving_capacity::PrefillShape { unit_rows: 4096, waves: 2 })] {
             let inputs = |baseline| QwenInputs { automatic_context: false,
                 admission: QwenAdmissionInputs { prefill_shape: shape, cfg: &cfg, layers: 48, mtp: false,
-                    kv_format: Qwen4KvCache::Fp8, manifest: None, prefill_rows: 4096, slots: 16,
+                    kv_format: Qwen4KvCache::Fp8, manifest: None,
+                    prefill_rows: shape.map_or(4096, |s| s.slot_rows()), slots: 16,
                     mark_bytes: 0, full_prefill_logits: 0, ple: Some((160, true)),
                     future_expert_bytes: 0, headroom: 0 },
                 capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: 1048576,
                 requested_pool: None, spark_ranks: 4, startup_graph_modes: None };
             let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
             let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
-            assert_eq!(intake.bytes, 80 << 20); // The checkpoint's hidden width is 2560, not 2048.
+            // The checkpoint's hidden width is 2560, not 2048.
+            assert_eq!(intake.bytes, shape.map_or(80 << 20, |s| s.slot_rows() * 4 * 2560 * 2));
             let measured = inputs(Baseline::Measured {
                 free_bytes: total - context_bytes - loaded_bytes - intake.bytes });
             let runtime = request(&measured, 0).unwrap();
