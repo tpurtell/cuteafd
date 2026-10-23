@@ -309,10 +309,17 @@ impl<'a> NativeTp4Wave<'a> {
     pub fn begin_request(&mut self) {
         self.ready_rows = None;
     }
-    pub fn reset_connections(&mut self) {
+    pub fn reset_connections(&mut self) -> Result<()> {
         self.ready_rows = None;
-        self.link.transport.reset_connections();
-        if let Some(link) = &self.prefill_link { link.borrow_mut().transport.reset_connections(); }
+        // Dropped execution futures drain their producers; fence any reduction
+        // not yet covered by an intake consumed event before resetting its phase.
+        self.synchronize()?;
+        self.link.reset_connections()?;
+        if let Some(link) = &self.prefill_link {
+            link.try_borrow_mut().context("prefill intake still borrowed during reset")?
+                .reset_connections()?;
+        }
+        Ok(())
     }
     /// Legacy TP4 upper-bound reservation (four rank planes), also sufficient
     /// for a legacy TP2 transport.

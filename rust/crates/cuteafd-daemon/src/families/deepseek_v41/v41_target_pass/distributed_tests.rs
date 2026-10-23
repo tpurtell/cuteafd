@@ -192,7 +192,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             assert!(requests.validate(&second).is_err());
             assert!(requests.cache().request_id(lease).is_err());
             pass.discard(&mut first)?; other.discard(&mut second)?;
-            transport.reset_connections(); second_transport.reset_connections();
+            transport.reset_connections()?; second_transport.reset_connections()?;
             eprintln!("PASS cancelled independent encoder: both batches revoked before owner reuse");
         }
         for (left, right, tail) in [(65usize, 65usize, 0usize), (79, 1, 0), (65, 65, 1), (64, 64, 27)] {
@@ -270,7 +270,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             assert!(requests.cache().request_id(lease).is_err());
             assert_eq!(pass.state, State::Idle);
             assert_eq!(other.state, State::Idle);
-            transport.reset_connections(); second_transport.reset_connections();
+            transport.reset_connections()?; second_transport.reset_connections()?;
             eprintln!("PASS cancelled encoder stream revoked admission and reset both owners");
         }
         let mut expected = None;
