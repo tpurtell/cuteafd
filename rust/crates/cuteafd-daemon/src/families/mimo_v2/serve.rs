@@ -431,8 +431,8 @@ impl Active<'_> {
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
 pub(super) fn prefix_cache<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, concurrency: usize)
     -> Result<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
-    let args = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
+    let rows = if engine.full_prefill_logits() { engine.prefill_capacity() } else { 64 };
+    let args = args.with_scoring(rows, rows, engine.cfg.vocab_size)?;
     prefix_cache_with(engine, &args, concurrency, |layout| args.host_config(layout, engine.max_context, concurrency))
 }
 
@@ -446,8 +446,8 @@ fn prefix_cache_with<'e, 'a>(engine: &'e MimoEngine<'a>, args: &PrefixArgs, conc
     let layout = family.layout();
     // Serving consumes the quota resolved before loading; diagnostics may
     // resolve it here. Register all pools/mark arenas on their actual GPUs.
-    let scoring = args.with_scoring(if engine.full_prefill_logits() { engine.prefill_rows } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
+    let rows = if engine.full_prefill_logits() { engine.prefill_capacity() } else { 64 };
+    let scoring = args.with_scoring(rows, rows, engine.cfg.vocab_size)?;
     let host = host_config(layout)?.map(|config| {
         // Preflight resolved the quota before loading. Re-admit with all pinned
         // engine and transport owners now resident, without charging them twice.

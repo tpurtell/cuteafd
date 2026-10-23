@@ -72,7 +72,7 @@ impl<'a> Dev<'a> {
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
 
-fn prefill_span_rows(configured: Option<&str>, unit_rows: usize) -> Result<usize> {
+pub(super) fn prefill_span_rows(configured: Option<&str>, unit_rows: usize) -> Result<usize> {
     let rows = configured.map(str::parse::<usize>).transpose()?.unwrap_or(16384);
     ensure!(rows >= unit_rows && rows <= 16384 && rows % PAGE_ROWS == 0,
         "MiMo prefill span must be page-aligned, at least one unit, and at most 16384 rows");
@@ -2868,7 +2868,7 @@ mod terminal_fault_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, expert_capacity, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+    use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
 
     #[test]
     fn attention_bindings_keep_absolute_positions_and_independent_kv_slots() {

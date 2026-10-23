@@ -17,6 +17,7 @@ pub(super) struct Preflight {
     pub placement: cuteafd_loader::placement::Placement,
     pub expert_directory: Option<std::path::PathBuf>,
     pub working_set: cuteafd_loader::placement::SparkWorkingSet,
+    pub prefill_rows: usize,
 }
 
 fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize, ranks: usize)
@@ -155,6 +156,37 @@ mod draft_prefix_tests {
     }
 
     #[test]
+    fn admission_halves_units_without_changing_wave_count_and_stops_at_first_fit() {
+        use cuteafd_loader::serving_capacity::PrefillShape;
+        use cuteafd_core::serving_capacity::CapacityError;
+        for waves in [1, 2, 3] {
+            let mut tried = Vec::new();
+            let (rows, _) = admit_prefill_shape(PrefillShape { unit_rows: 4096, waves }, |rows| {
+                tried.push(rows);
+                if rows > 1024 { return Err(CapacityError::ReservationsExceeded {
+                    device: 0, reserved: rows as u64, budget: 1024,
+                }.into()); }
+                Ok(())
+            }).unwrap();
+            assert_eq!(rows, 1024);
+            assert_eq!(tried, [4096, 2048, 1024]);
+        }
+        let mut tried = Vec::new();
+        let result = admit_prefill_shape(PrefillShape { unit_rows: 4096, waves: 3 }, |rows| {
+            tried.push(rows);
+            Err::<(), _>(anyhow::anyhow!("missing program metadata"))
+        });
+        assert!(result.unwrap_err().to_string().contains("missing program metadata"));
+        assert_eq!(tried, [4096]);
+        let mut tried = Vec::new();
+        assert!(admit_prefill_shape(PrefillShape { unit_rows: 4096, waves: 2 }, |rows| {
+            tried.push(rows);
+            Err::<(), _>(CapacityError::PoolExceeded { requested: 4096, feasible: 0 }.into())
+        }).is_err());
+        assert_eq!(tried, [4096, 2048, 1024, 512]);
+    }
+
+    #[test]
     fn shared_sampler_contract_matches_allocator() {
         for vocab in [64, 152576, 153600] {
             assert_eq!(cuteafd_loader::families::mimo_v2::admission::sampling_wave_bytes(64, vocab),
@@ -184,6 +216,53 @@ mod draft_prefix_tests {
 /// The same profile can be serialized by a planner; explicit benchmark pool
 /// and context arguments are always preserved.
 pub(super) fn preflight(
+    opened: &super::Opened,
+    args: &super::EngineArgs,
+    programs: &Programs<'_>,
+    split_device: Option<i32>,
+    serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>,
+    prefill_output: MimoPrefillOutput,
+    prefix_draft: bool,
+    automatic_context: bool,
+) -> Result<Preflight> {
+    let shape = cuteafd_loader::serving_capacity::PrefillShape {
+        unit_rows: args.prefill_rows as u64, waves: args.prefill_waves.max(1) as u64,
+    }.validate()?;
+    let (_, result) = admit_prefill_shape(shape, |rows| {
+        let mut selected = args.clone();
+        selected.prefill_rows = rows;
+        preflight_shape(opened, &selected, programs, split_device, serving,
+            prefill_output, prefix_draft, automatic_context)
+    })?;
+    Ok(result)
+}
+
+fn admit_prefill_shape<T>(shape: cuteafd_loader::serving_capacity::PrefillShape,
+    mut admit: impl FnMut(usize) -> Result<T>) -> Result<(usize, T)> {
+    use cuteafd_core::serving_capacity::CapacityError;
+    use cuteafd_loader::serving_capacity::CacheGeometryError;
+    let mut failure = None;
+    for candidate in shape.ladder() {
+        let rows = usize::try_from(candidate.unit_rows)?;
+        match admit(rows) {
+            Ok(result) => return Ok((rows, result)),
+            Err(error) => {
+                let fit_error = matches!(error.downcast_ref::<CapacityError>(),
+                    Some(CapacityError::GpuBudgetExceeded { .. } | CapacityError::ReservationsExceeded { .. }
+                        | CapacityError::PoolExceeded { .. }))
+                    || matches!(error.downcast_ref::<CacheGeometryError>(),
+                        Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement");
+                if !fit_error { return Err(error); }
+                tracing::info!(unit_rows = rows, waves = candidate.waves, %error,
+                    "MiMo prefill shape did not admit; trying the next shared ladder unit");
+                failure = Some(error);
+            }
+        }
+    }
+    Err(failure.context("MiMo prefill admission ladder is empty")?)
+}
+
+fn preflight_shape(
     opened: &super::Opened,
     args: &super::EngineArgs,
     programs: &Programs<'_>,
@@ -263,8 +342,11 @@ pub(super) fn preflight(
                 mark_store: cuteafd_engine::prefix::MarkStore::Arena,
                 page_owners: Default::default(),
             };
-            prefix.with_scoring(if args.full_prefill_logits { args.prefill_rows } else { 64 },
-                args.prefill_rows, cfg.vocab_size)?.host_config(layout, args.max_context, concurrency)?
+            let scoring_rows = if args.full_prefill_logits {
+                super::engine::prefill_span_rows(std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().as_deref(), args.prefill_rows)?
+            } else { 64 };
+            prefix.with_scoring(scoring_rows, scoring_rows.max(64), cfg.vocab_size)?
+                .host_config(layout, args.max_context, concurrency)?
         }
         None => None,
     };
@@ -560,6 +642,7 @@ pub(super) fn preflight(
         host_config,
         local_expert_budget: usize::try_from(local_expert_budget)?,
         placement, expert_directory, working_set: solution.working_set,
+        prefill_rows: args.prefill_rows,
     })
 }
 
