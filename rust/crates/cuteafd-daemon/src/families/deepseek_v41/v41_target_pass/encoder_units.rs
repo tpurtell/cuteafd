@@ -112,10 +112,12 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
                 }])?,
         );
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
-        let positions = batch.cache()?.positions();
-        tracing::debug!(target: "cuteafd::timing", unit = unit.index, slot = unit.slot,
-            first = positions.first().copied(), last = positions.last().copied(), rows = positions.len(),
-            "V4.1 encoder unit cut");
+        if tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG) {
+            let positions = batch.cache()?.positions();
+            tracing::debug!(target: "cuteafd::timing", unit = unit.index, slot = unit.slot,
+                first = positions.first().copied(), last = positions.last().copied(), rows = positions.len(),
+                "V4.1 encoder unit cut");
+        }
         slot.pass.state.begin()?;
         slot.pass
             .resources

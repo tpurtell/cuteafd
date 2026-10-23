@@ -35,9 +35,31 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?
         .try_into()
         .map_err(|_| anyhow::anyhow!("four test peers required"))?;
+    // SAFETY: the runner supplies the sealed library and keeps its slot mounted.
     let lib = unsafe { NativeLibrary::load(path)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model),
-    )?;
+    let snapshot = std::path::Path::new(&model);
+    let catalog = cuteafd_loader::read_official_v41_catalog(snapshot)?;
+    let encoder_pair = std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some();
+    let decode_lanes = std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some();
+    let shared_prefill = encoder_pair && !decode_lanes;
+    let geometry = catalog.routed_experts().geometry()?;
+    let layers: Vec<_> = (0..geometry.layers as usize).collect();
+    if let Ok(selected) = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS") {
+        let selected = selected.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<usize>, _>>()?;
+        ensure!(selected == layers, "target-pass fixture exercises every backbone expert layer");
+    }
+    let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(120),
+        max_frame_bytes: 2 << 20 };
+    let pending_sparks = crate::shared::placement::SparkAdmission::plan(snapshot, geometry,
+        Some(&catalog), &cuteafd_loader::placement::SparkWorkingSet {
+            spark_layers: layers, rtx_layers: vec![], spark_ranks: peers.len(), prefill_lanes: 2,
+        }, peers.len(), None, cuteafd_transport::worker_selection::ModelAdmission {
+            capacity: 80, compiled_capacity: 80,
+            endpoints: cuteafd_loader::placement::families::deepseek_v41::owners::spark_endpoints(
+                80, catalog.nvfp4().is_some(), if shared_prefill { 2 } else { 1 }, 0)?,
+            rings: crate::shared::placement::spark_rings(config.max_frame_bytes)?,
+        })?.start(&peers)?;
     let start = Instant::now();
     let weights = BackboneLaneWeights::load(
         &lib,
@@ -135,13 +157,12 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         )?,
         Duration::from_secs(120),
     )?;
-    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-            timeout: Duration::from_secs(120),
-            max_frame_bytes: 2 * 1024 * 1024,
-        })?;
+    pending_sparks.wait()?;
+    let mut roce = SparkExperts::new_world(
+        cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
+    roce.bind_model_endpoint(0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
-    if std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some()
-        || std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
+    if encoder_pair || decode_lanes {
         let mut other = TargetPass::new(
             TargetEmbeddingWave::new(&lib, &table, 80, TargetEmbeddingWave::device_bytes(80)?)?,
             BackboneLane::new(&weights, 80, BackboneLane::workspace_bytes(&lib, 80)?.into_iter().sum())?,
@@ -154,12 +175,13 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             TargetTapWave::new(&lib, 80, TargetTapWave::device_bytes(80)?)?,
             Duration::from_secs(120),
         )?;
-        let mut second_transport = NativeTp4Wave::new(&lib,
-            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-                timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
-            })?, NativeTp4Wave::device_bytes(80)?)?;
+        let mut second_roce = SparkExperts::new_world(
+            cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
+        second_roce.bind_model_endpoint(1)?;
+        let mut second_transport = NativeTp4Wave::new(
+            &lib, second_roce, NativeTp4Wave::device_bytes(80)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        if std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
+        if decode_lanes {
             let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(
                 &lib, &catalog, 80, 1, 32 * 1024 * 1024 * 1024, 16 * 1024 * 1024)?;
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::new(
@@ -303,11 +325,11 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.release(lease)?;
         }
         eprintln!("PASS five-chunk stream: serial-exact suffix and ordered decoder replay");
-        let shared = std::rc::Rc::new(std::cell::RefCell::new(
-            crate::shared::spark_intake::SparkLink::new_waves(&lib,
-                cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80,
-                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120),
-                    max_frame_bytes: 2 << 20 }, 10240, 2, 80)?));
+        let mut shared_link = crate::shared::spark_intake::SparkLink::new_waves(&lib,
+            cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80,
+            config, 10240, 2, 80)?;
+        shared_link.transport.bind_model_endpoint(2)?;
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(shared_link));
         transport.install_prefill_link(shared.clone())?;
         second_transport.install_prefill_link(shared.clone())?;
         {
