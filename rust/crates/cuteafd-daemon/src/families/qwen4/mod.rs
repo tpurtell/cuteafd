@@ -681,6 +681,7 @@ impl Opened {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
+        engine.prepare_prefill_units()?;
         let result = body(&engine);
         drop(engine);
         // SAFETY: the engine that used the stream is gone.

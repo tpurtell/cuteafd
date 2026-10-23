@@ -719,6 +719,15 @@ impl Workspace<'_> {
     }
     fn unit_offset(slot: usize, unit_rows: usize) -> usize { slot * unit_rows }
 
+    fn ordered_prefill_tables(&self, ple_ids: bool)
+        -> impl Iterator<Item = cuteafd_ffi::CuteafdDeviceBuffer> + '_ {
+        [&self.positions, &self.rope_positions, &self.block_rope_positions,
+            &self.kv_slots, &self.slots, &self.seq_first, &self.pool_slots,
+            &self.cache_lengths, &self.page_table, &self.pool_table, &self.ids]
+            .into_iter().chain(ple_ids.then_some(&self.ple_ids))
+            .map(|table| table.buffer).filter(|buffer| buffer.bytes > 0)
+    }
+
     fn live_buffer(&self, buffer: &Dev<'_>, stride: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
         let offset = self.row_offset.get() * stride;
         assert!(offset < buffer.buffer.bytes);
@@ -1296,6 +1305,28 @@ impl<'a> Qwen4Engine<'a> {
             routed.exchange.abort_word(1)?.context("Qwen rank one abort word")?])?;
         self.hops = Some(link);
         self.experts = Some(Experts::Tp2 { routed: RefCell::new(routed), mtp });
+        Ok(())
+    }
+
+    /// Size every unit-table upload before a request can queue prefill work.
+    pub(crate) fn prepare_prefill_units(&self) -> Result<()> {
+        let Some(shape) = self.prefill_shape else { return Ok(()) };
+        let shape = shape.validate()?;
+        if self.workspace.borrow().is_none() {
+            *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
+                if self.full_prefill_logits { self.prefill_rows } else { 1 }, shape.slot_rows() as usize,
+                if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?);
+        }
+        let workspace = self.workspace.borrow();
+        self.reserve_prefill_tables(workspace.as_ref().context("Qwen prefill workspace")?)
+    }
+
+    fn reserve_prefill_tables(&self, workspace: &Workspace<'_>) -> Result<()> {
+        let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
+        for destination in workspace.ordered_prefill_tables(ple_ids) {
+            // SAFETY: the engine retains each full table and its stream through completion.
+            unsafe { self.library.reserve_h2d_ordered(destination, self.execution_stream())?; }
+        }
         Ok(())
     }
 
@@ -2176,6 +2207,7 @@ impl<'a> Qwen4Engine<'a> {
             *self.workspace.borrow_mut() = Some(self.workspace_rows(shape.unit_rows as usize, false,
                 if self.full_prefill_logits { self.prefill_rows } else { logit_rows }, shape.slot_rows() as usize,
                 if self.weights.mtp.is_some() { self.prefill_rows } else { 0 })?);
+            self.prepare_prefill_units()?;
         }
         let workspace = self.workspace.borrow();
         let w = workspace.as_ref().context("Qwen prefill workspace")?;

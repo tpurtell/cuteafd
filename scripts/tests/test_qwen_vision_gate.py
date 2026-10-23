@@ -200,6 +200,39 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
 
 
+def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    family = (root / "mod.rs").read_text()
+    startup = family[family.index("pub fn with_engine<T>"):family.index("    fn experts<'s>")]
+    assert startup.index("engine.prepare_scoring_prefill()?") < startup.index("engine.prepare_prefill_units()?")
+    assert startup.index("engine.prepare_prefill_units()?") < startup.index("let result = body(&engine);")
+
+    prepare = engine[engine.index("    pub(crate) fn prepare_prefill_units("):engine.index("    fn reserve_prefill_tables(")]
+    assert "let Some(shape) = self.prefill_shape else { return Ok(()) };" in prepare
+    assert "self.workspace_rows(shape.unit_rows as usize, false," in prepare
+    assert "shape.slot_rows() as usize" in prepare
+    assert "if self.full_prefill_logits { self.prefill_rows } else { 1 }" in prepare
+    assert prepare.index("self.workspace_rows(") < prepare.index("self.reserve_prefill_tables(")
+
+    destinations = engine[engine.index("    fn ordered_prefill_tables("):engine.index("    fn live_buffer(")]
+    stage = engine[engine.index("    fn stage_step_tables("):engine.index("    /// Unfused ownership transitions:")]
+    embedding = engine[engine.index("    fn stage_embedding("):engine.index("    /// Queues `bytes`")]
+    uploads = set(re.findall(r"self\.stage_table\(w, &w\.(\w+),", stage + embedding))
+    assert set(re.findall(r"&self\.(\w+)", destinations)) == uploads
+    assert "ple_ids.then_some(&self.ple_ids)" in destinations
+    assert ".map(|table| table.buffer)" in destinations
+    assert ".filter(|buffer| buffer.bytes > 0)" in destinations
+    assert "live_buffer" not in destinations and "region(" not in destinations
+    reserve = engine[engine.index("    fn reserve_prefill_tables("):engine.index("    /// Pre-capture every reachable")]
+    assert "self.ple.as_ref().map(|ple| ple.mapped()).is_none()" in reserve
+    assert "workspace.ordered_prefill_tables(ple_ids)" in reserve
+    assert "self.library.reserve_h2d_ordered(destination, self.execution_stream())?" in reserve
+
+    units = engine[engine.index("    fn prefill_units("):engine.index("    pub(crate) fn mtp_prefill_rows(")]
+    assert units.index("self.prepare_prefill_units()?") < units.index("run_prefill_units(&mut hooks")
+
+
 def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
