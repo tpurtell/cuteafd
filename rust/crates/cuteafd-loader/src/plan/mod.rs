@@ -1103,7 +1103,6 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
             return Ok(report);
         }
         let rows = candidate.layout.as_ref().unwrap().prefill_rows;
-        report.prefill_span_rows = Some(if rows == 0 { 2048 } else { rows });
         if rows != 0 {
             if !report.executable() {
                 report.hints.push(Hint {
@@ -1121,7 +1120,6 @@ fn plan_spark_count_of(input: &PlanInput, options: &PlanOptions, available: usiz
                 layout.prefill_rows = rows;
                 layout.spark_capacity_rows = rows;
                 let mut smaller = input.plan(&candidate)?;
-                smaller.prefill_span_rows = Some(rows);
                 if smaller.executable() {
                     smaller.prefill_selection = Some(format!(
                         "V4.1 automatic prefill selected {rows} rows (2048 refused: {reason})"));

@@ -3186,6 +3186,32 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
 }
 
 #[test]
+fn v41_spark_count_preserves_family_resolved_prefill_span() {
+    let dir = strict_v41_snapshot(false);
+    for (ranks, gpus) in [(4, 1), (6, 2)] {
+        for rows in [0, 4096] {
+            for (waves, span) in [(1, None), (1, Some(8192)), (2, None), (2, Some(8192))] {
+                let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                    host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; gpus], workspace_manifest: v41_workspace(dir.path()),
+                    pool_tokens: Some(262_144), prefill_rows: rows, prefill_waves: waves,
+                    prefill_span_rows: span, ..Default::default()
+                }), ..sparks(ranks) };
+                let direct = plan(dir.path(), &options).unwrap();
+                let counted = plan_spark_count(dir.path(), &options, 6, Some(ranks)).unwrap();
+                assert!(counted.executable(), "{}", render(&counted));
+                let expected = span.unwrap_or(if waves > 1 { 16384 } else if rows == 0 { 2048 } else { rows });
+                assert_eq!(counted.prefill_span_rows, Some(expected));
+                assert_eq!(counted.prefill_span_rows, direct.prefill_span_rows);
+                assert_eq!(counted.prefill_unit_rows, direct.prefill_unit_rows);
+                assert_eq!(counted.prefill_waves, direct.prefill_waves);
+                assert_eq!(counted.memory_layout, direct.memory_layout);
+            }
+        }
+    }
+}
+
+#[test]
 fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
@@ -3209,6 +3235,14 @@ fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     assert!(refused.prefill_selection.is_none());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")));
     assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));
+    let continuous = PlanOptions { layout: Some(layout::LayoutOptions {
+        prefill_rows: 0, prefill_span_rows: Some(16384), ..explicit.layout.unwrap()
+    }), ..sparks(4) };
+    let selected = plan_spark_count(dir.path(), &continuous, 6, Some(4)).unwrap();
+    assert!(selected.executable(), "{}", render(&selected));
+    assert_eq!(selected.prefill_unit_rows, Some(1024));
+    assert_eq!(selected.prefill_span_rows, Some(16384));
+    assert!(selected.prefill_selection.as_ref().unwrap().contains("selected 1024"));
 }
 
 #[test]
