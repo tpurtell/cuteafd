@@ -396,7 +396,9 @@ mod tests {
     fn unit_mtp_scratch_and_page_tables_are_admitted_separately() {
         use super::{qwen_admission, qwen_workspace_bytes, QwenAdmissionInputs};
         use crate::serving_capacity::PrefillShape;
-        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let mut config = crate::plan::testing::qwen4_config(48);
+        config["text_config"]["mtp_num_hidden_layers"] = serde_json::json!(1);
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&config).unwrap();
         let mut inputs = QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: true, kv_format: Qwen4KvCache::Fp8,
             manifest: None, prefill_rows: 4096, prefill_shape: None, slots: 8, mark_bytes: 0,
             full_prefill_logits: 0, ple: Some((160, true)), future_expert_bytes: 0, headroom: 0 };
