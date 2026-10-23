@@ -635,8 +635,24 @@ mod tests {
                             cost.whole.resident, runtime_request.expert_workspace);
                         if pro {
                             match sliding {
-                                MimoKvCache::Bf16 => assert!(remaining < cost.whole.resident,
-                                    "BF16 Pro min cannot fit one TP1 layer even with zero scratch"),
+                                MimoKvCache::Bf16 => {
+                                    let (_, options) = workspace_options(&cfg, ranks, 0, 4096, context as usize,
+                                        lanes, true, opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow,
+                                        true, |_| Ok(0)).unwrap().remove(0);
+                                    let current = MimoWorkspaceLayout::new(&cfg, options).unwrap().device_bytes().unwrap();
+                                    let legacy: u64 = (0..lanes).map(|lane| MimoWorkspaceLayout::new(&cfg,
+                                        MimoWorkspaceOptions { waves: 1, with_head: lane < 2, ..options })
+                                        .unwrap().device_bytes().unwrap()).sum();
+                                    let old_remaining = remaining - (legacy - current);
+                                    println!("BF16 Pro TP1 free before -> after: {old_remaining} -> {remaining}; complete layer threshold {}",
+                                        cost.whole.resident + runtime_request.expert_workspace);
+                                    assert!(old_remaining < cost.whole.resident,
+                                        "legacy duplicate workspaces did not fit even weights alone");
+                                    assert!(remaining >= cost.whole.resident,
+                                        "unit workspaces now admit weights alone, not the complete expert allocation");
+                                    assert!(remaining < cost.whole.resident + runtime_request.expert_workspace,
+                                        "BF16 Pro min cannot fit one complete TP1 layer including scratch");
+                                },
                                 MimoKvCache::Int8 | MimoKvCache::Fp8 => assert!(
                                     remaining >= cost.whole.resident + runtime_request.expert_workspace,
                                     "compact Pro min fits one TP1 layer including scratch"),

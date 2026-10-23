@@ -338,6 +338,18 @@ mod draft_storage_tests {
     }
 
     #[test]
+    fn token_only_golden_is_allowed_only_for_an_explicit_logits_dump() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_golden_logits(dir.path(), true).unwrap().is_none());
+        assert!(read_golden_logits(dir.path(), false).is_err());
+        std::fs::write(dir.path().join("logits.bin"), [0u8; 3]).unwrap();
+        assert!(read_golden_logits(dir.path(), true).is_err());
+        std::fs::write(dir.path().join("logits.bin"), 1.0f32.to_le_bytes()).unwrap();
+        assert_eq!(read_golden_logits(dir.path(), true).unwrap(), Some(vec![1.0]));
+        assert_eq!(read_golden_logits(dir.path(), false).unwrap(), Some(vec![1.0]));
+    }
+
+    #[test]
     fn context_slots_do_not_widen_the_admitted_draft_batch() {
         use cuteafd_loader::families::qwen4::Qwen4KvCache;
         for (format, kv_cache) in [("bf16", Qwen4KvCache::Bf16), ("fp8", Qwen4KvCache::Fp8)] {
@@ -1383,6 +1395,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
     result
 }
 
+fn read_golden_logits(dir: &std::path::Path, allow_missing: bool) -> Result<Option<Vec<f32>>> {
+    let bytes = match std::fs::read(dir.join("logits.bin")) {
+        Ok(bytes) => bytes,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(bytes.len() % 4 == 0, "MiMo golden logits are not complete FP32 values");
+    Ok(Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+}
+
 fn save_golden_logits(dir: &std::path::Path, tokens: &[u32], vocab: usize,
     prefill: &[f32], decode: &[f32]) -> Result<()> {
     use std::io::Write;
@@ -1528,10 +1550,11 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         println!("decode steps of {}: warm median {:.3} ms, first {:.3} ms", args.step_rows, 1e3 * warm[warm.len() / 2],
             1e3 * step_times[0]);
     }
-    let golden_logits = || -> Result<Vec<f32>> {
-        Ok(std::fs::read(args.golden.join("logits.bin"))?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
-    };
+    let reference = read_golden_logits(&args.golden, args.save_logits.is_some())?;
+    if let Some(golden) = &reference {
+        ensure!(tokens.len().checked_mul(cfg.vocab_size) == Some(golden.len())
+            && golden.iter().all(|v| v.is_finite()), "MiMo golden logits shape/finite mismatch");
+    }
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     // Rows of `ours` are the logits of positions `first..`: top-1 agreement
     // with the golden, next-token accuracy and mean NLL of the next tokens.
@@ -1540,7 +1563,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         if let (true, Ok(path)) = (label == "decode", std::env::var("CUTEAFD_DUMP_DECODE_LOGITS")) {
             std::fs::write(&path, ours_all.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
-        let golden = golden_logits()?;
+        let Some(golden) = reference.as_ref() else { return Ok(()); };
         let vocab = cfg.vocab_size;
         let (mut agree, mut next_ok, mut golden_next, mut nll, mut kl) = (0usize, 0usize, 0usize, 0f64, 0f64);
         let rows = ours_all.len() / vocab;
@@ -1579,8 +1602,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         score("decode", &decode_logits, prefill)?;
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
-    if let Some(logits) = logits {
-        let golden = golden_logits()?;
+    if let (Some(logits), Some(golden)) = (logits, reference.as_ref()) {
         let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
         let (cosine, _) = similarity(&logits, last);
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));

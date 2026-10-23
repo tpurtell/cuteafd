@@ -473,7 +473,7 @@ mod tests {
                     changed += 1;
                     assert_eq!(rank, 0);
                     assert_eq!(a.name, "prefill.logits");
-                    assert_eq!(a.bytes - b.bytes, (4096 - 1) * cfg.vocab_size as u64 * 4);
+                    assert_eq!(a.bytes - b.bytes, (16384 - 1) * cfg.vocab_size as u64 * 4);
                     assert_eq!(b.bytes, cfg.vocab_size as u64 * 4);
                 }
             }

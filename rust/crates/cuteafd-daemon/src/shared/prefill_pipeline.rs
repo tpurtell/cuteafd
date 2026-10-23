@@ -571,7 +571,9 @@ mod tests {
                     assert!(units.len() > waves);
                     let (time, idle) = simulate(&routes, &steps, 1.0, 0.5, 0.5, 20.0);
                     let lead = (2 * (1 + onboard) + 1) as f64 + 1.0;
-                    let bound = (units.len() - waves) as f64 * (lead - 20.0).max(0.0);
+                    // Every unit after the first can pay a GPU-only lead,
+                    // including initially queued slots and the final drain.
+                    let bound = (units.len() - 1) as f64 * (lead - 20.0).max(0.0);
                     assert!(idle <= bound + 1e-9, "layers={layers} onboard={onboard} waves={waves}: idle={idle}, bound={bound}");
                     assert!(time < serial_time);
                 }
