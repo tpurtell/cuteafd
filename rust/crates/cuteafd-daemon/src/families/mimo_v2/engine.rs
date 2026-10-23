@@ -130,7 +130,7 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
+    Spark { decode: RefCell<SparkLink<'a>>, prefill: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
 }
 
 /// A dispatched Spark wave and its send-side host phases (seconds).
@@ -596,7 +596,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
     fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<SentWave> {
         let e = self.engine;
         let w = &self.work[unit.index];
-        let Some(Experts::Spark { transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
+        let Some(Experts::Spark { prefill: transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
         let bf16 = e.expert_input.bf16(false);
         e.moe_front(w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
         e.unit_position.set(self.tables[unit.index].positions[0] as usize);
@@ -604,7 +604,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
     }
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: SentWave) -> Result<()> {
         let e = self.engine;
-        let Some(Experts::Spark { transport, runtime }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
+        let Some(Experts::Spark { prefill: transport, runtime, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
         let forward = (self.peer_work.is_some() && layer + 1 < e.weights.layers.len())
             .then_some(unit_slot(layer, true, unit.slot));
         e.spark_land(&self.work[unit.index], layer, unit.rows.len(), &mut transport.borrow_mut(), runtime, ticket, forward, false)?;
@@ -848,7 +848,7 @@ impl<'a> MimoEngine<'a> {
     pub(crate) fn draft_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let reports = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            Some(Experts::Spark { decode: transport, .. }) => transport.borrow().transport.installed_grouping()?,
             _ => Vec::new(),
         };
         let homes = self.weights.layers.iter().enumerate().map(|(index, layer)| {
@@ -1125,10 +1125,12 @@ impl<'a> MimoEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
         let mut failures=Vec::new();
-        if let Some(Experts::Spark { transport,.. })=&self.experts {
-            let result=transport.try_borrow_mut().map_err(anyhow::Error::from)
-                .and_then(|mut link|action(&mut link));
-            if let Err(error)=result { failures.push(format!("{error:#}")); }
+        if let Some(Experts::Spark { decode, prefill, .. }) = &self.experts {
+            for transport in [decode, prefill] {
+                let result = transport.try_borrow_mut().map_err(anyhow::Error::from)
+                    .and_then(|mut link| action(&mut link));
+                if let Err(error) = result { failures.push(format!("{error:#}")); }
+            }
         }
         ensure!(failures.is_empty(),"{}",failures.join("; "));
         Ok(())
@@ -1727,7 +1729,7 @@ impl<'a> MimoEngine<'a> {
         if self.tp2_layer(before) { return Previous::Tp2; }
         if self.rtx_local_layer(before) { return Previous::Delta; }
         match &self.experts {
-            Some(Experts::Spark { transport, .. }) => Previous::Planes(transport.borrow().world_size()),
+            Some(Experts::Spark { decode: transport, .. }) => Previous::Planes(transport.borrow().world_size()),
             _ => Previous::Delta,
         }
     }
@@ -1753,7 +1755,7 @@ impl<'a> MimoEngine<'a> {
         gather: bool, head: bool, launch: bool) -> Result<()> {
         let layers = &self.weights.layers;
         let planes = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().intake.pointers(),
+            Some(Experts::Spark { decode: transport, .. }) => transport.borrow().intake.pointers(),
             _ => [std::ptr::null(); MAX_RANKS],
         };
         let bf16_input = self.expert_bf16_input(true);
@@ -1763,7 +1765,7 @@ impl<'a> MimoEngine<'a> {
             let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
             self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
                 planes, bf16_input))?;
-            if let (true, Previous::Planes(_), Some(Experts::Spark { transport, .. })) = (launch, previous, &self.experts) {
+            if let (true, Previous::Planes(_), Some(Experts::Spark { decode: transport, .. })) = (launch, previous, &self.experts) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
                 transport.borrow().intake.consumed(self.stream)?;
             }
@@ -1789,7 +1791,7 @@ impl<'a> MimoEngine<'a> {
                 continue;
             }
             match self.experts.as_ref() {
-                Some(Experts::Spark { transport, runtime, .. }) => {
+                Some(Experts::Spark { decode: transport, runtime, .. }) => {
                     let mut transport = transport.borrow_mut();
                     let mut sent = self.spark_send(w, index, t, true, bf16_input, true, &mut transport)?;
                     let receive = self.spark_receive(t, &mut transport, runtime, &mut sent)?;
@@ -2654,7 +2656,8 @@ impl<'a> MimoEngine<'a> {
         let bf16_input = self.expert_bf16_input(decode);
         self.moe_front(w, layer, t, bf16_input)?;
         match experts {
-            Experts::Spark { transport, runtime, .. } => {
+            Experts::Spark { decode: decode_link, prefill, runtime } => {
+                let transport = if decode { decode_link } else { prefill };
                 self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
             }
             _ => self.moe_run(w, index, t, decode),

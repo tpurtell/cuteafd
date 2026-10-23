@@ -130,13 +130,30 @@ const SPARK_WAVE_BYTES: u64 = gib(51);
 /// format (`--expert-input`), beside the non-I/O wave residual.
 fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, options: &LayoutOptions,
     working: &crate::placement::SparkWorkingSet, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) {
-    let rings = spark_ring_geometry(spark_endpoints("mimo_v2", working.prefill_lanes));
+    let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+        slot_bytes: 8 << 20, alignment: 4096 };
     for device in sparks {
-        let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
-            .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
-                .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
-                .and_then(|capacity| charge_spark_io(device, working, geometry, capacity,
-                    options.mimo_expert_input.bf16(false), rings, SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)));
+        let io = (|| -> Result<(), crate::placement::PlacementError> {
+            let geometry = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))?;
+            let capacity = u32::try_from(options.spark_capacity_rows)
+                .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))?;
+            let endpoints = crate::families::mimo_v2::admission::spark_endpoints(capacity as usize, options.mimo_expert_input)
+                .map_err(|_| crate::placement::PlacementError::Inventory("MiMo Spark endpoint geometry"))?;
+            charge_spark_io(device, working, geometry, capacity, options.mimo_expert_input.bf16(false),
+                spark_ring_geometry(1), SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)?;
+            let exact = working.rank_endpoints_io(device.index as usize, geometry, &endpoints, rings)?;
+            for item in &mut device.items {
+                match item.group.as_str() {
+                    "expert intake" => item.bytes = exact.intake,
+                    "host expert exchange" => item.bytes = exact.host_exchange,
+                    "expert row indices" => item.bytes = exact.row_indices,
+                    "rdma rings" => item.bytes = exact.mapped_rings,
+                    "endpoint response prefixes" => item.bytes = exact.endpoint_staging,
+                    _ => {},
+                }
+            }
+            Ok(())
+        })();
         if let Err(error) = io {
             report.placement_supported = false;
             notes.push(format!("{} I/O admission: {error}", device.name()));

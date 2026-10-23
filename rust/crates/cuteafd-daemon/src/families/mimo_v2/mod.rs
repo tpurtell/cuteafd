@@ -263,6 +263,20 @@ mod draft_storage_tests {
     }
 
     #[test]
+    fn decode_and_prefill_links_bind_distinct_admitted_endpoints() {
+        let source = include_str!("mod.rs");
+        // Keep these joined so the assertions cannot match their own text.
+        assert!(source.contains(&["let mut decode = link", "(0, 1, &decode_warm)?;"].concat()));
+        assert!(source.contains(&["let mut prefill = link", "(1, lanes, &prefill_warm)?;"].concat()));
+        assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
+        assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "spark_endpoints("].concat()));
+        let engine = include_str!("engine.rs");
+        assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. }", " = &e.experts"].concat()));
+        assert!(engine.contains(&["Experts::Spark { decode: transport, .. }) => transport.borrow().intake", ".pointers()"].concat()));
+        assert!(engine.contains(&["for transport in [decode, prefill]", " {"].concat()));
+    }
+
+    #[test]
     fn absent_conversion_options_leave_selection_to_metadata_policy() {
         let args = args(&[]);
         assert_eq!(args.weight_policy, WeightPolicyArg::Auto);
@@ -1003,13 +1017,10 @@ impl Opened {
                 experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
                 intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
             let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
-            let ingress = if args.expert_input.bf16(false) { cuteafd_core::SparkIngress::Bf16 }
-                else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
-                    rows: u32::try_from(engine::DECODE_ROWS)? } }
-                else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
+                endpoints: cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
+                    args.prefill_rows, args.expert_input.into())?.to_vec(),
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
@@ -1284,11 +1295,8 @@ impl Opened {
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let timing = cuteafd_transport::protocol_v2_timing_from_env();
-        // The widest wave this family dispatches, built before the links so each
-        // can be bootstrapped with it (see `link` below). The first request
-        // sizes the registered rings: the widest one is `warmups[0]` (BF16 rows
-        // when prefill sends them), then a one-row BF16 request when decode
-        // does, so a rank without the BF16 package fails here.
+        // Bootstrap each endpoint with its own widest dtype/row shape so ring
+        // admission and BF16 package validation finish before serving starts.
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let warm = |rows: usize, bf16: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
@@ -1307,32 +1315,33 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
-        let mut warmups = vec![warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?];
-        if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
-            warmups.push(warm(1, true)?);
-        }
-        let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
-            let mut link=crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
-            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2, lanes,
-                u32::try_from(engine::expert_capacity(args.prefill_rows))?)?;
+        let endpoints = cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
+            args.prefill_rows, args.expert_input.into())?;
+        let decode_warm = warm(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
+        let prefill_warm = warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
+        let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::ExpertProtocolV2Request|
+            -> Result<crate::shared::spark_intake::SparkLink<'_>> {
+            let capacity = endpoints[endpoint as usize].capacity;
+            let mut link = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
+                capacity, cuteafd_transport::TcpTransportConfig { timing,
+                    timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                self.cfg.hidden * 2, waves, capacity)?;
+            link.transport.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
-            // Connect every rank now and publish its installed expert grouping
-            // with the widest wave (the warm-up's own request, so the sessions
-            // it opens are the ones every later wave reuses).
-            link.bootstrap(&warmups[0])?;
+            // Bootstrap with this endpoint's widest request, never prefill on decode.
+            link.bootstrap(&request)?;
             Ok(link)
         };
         crate::shared::memory_report::release_load_staging(&self.library);
-        let mut transport = link()?;
+        // Decode keeps fixed graph-safe planes and the probed landing path;
+        // only prefill owns overlapping waves and rotating pinned return slots.
+        let mut decode = link(0, 1, &decode_warm)?;
+        let mut prefill = link(1, lanes, &prefill_warm)?;
         tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        // Connect every rank and register full-size buffers now: the first
-        // request otherwise pays seconds of connection setup.
         let started = Instant::now();
-        // Drained and destroyed on every way out, before the transports drop.
         let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
-        for request in &warmups {
+        for (transport, request) in [(&mut decode, &decode_warm), (&mut prefill, &prefill_warm)] {
             runtime.block_on(async {
                 let wave = transport.dispatch(request)?;
                 transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
@@ -1340,8 +1349,8 @@ impl Opened {
         }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            runtime }))
+        Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
+            prefill: std::cell::RefCell::new(prefill), runtime }))
     }
 }
 

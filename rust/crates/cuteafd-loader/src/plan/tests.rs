@@ -80,6 +80,45 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
 }
 
 #[test]
+fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
+    use crate::families::mimo_v2::{admission, MimoExpertInput, MimoKvFormats, MimoPrefillOutput};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+    let geometry = ExpertGeometry { hidden: cfg.hidden as u32, experts: cfg.experts as u32,
+        topk: cfg.topk as u32, intermediate: cfg.moe_intermediate as u32, layers: cfg.layers as u32 };
+    for rows in [64usize, 2048, 4096] {
+        for waves in [1usize, 2, 3] {
+            for input in [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode] {
+                let host = admission::future_host_workspaces(&cfg, rows, waves, 2, 0, 4096, 6,
+                    input, MimoKvFormats::default(), MimoPrefillOutput::LastRow, true, 0, 0).unwrap();
+                let bytes = |name: &str| host.iter().find(|(n, _)| n == name).unwrap().1;
+                let ingress = match input { MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
+                    MimoExpertInput::Bf16 => SparkIngress::Bf16,
+                    MimoExpertInput::Bf16Decode => SparkIngress::Fp8K32 };
+                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None };
+                let decode = SparkEndpoint { capacity: 64, ingress: if input.bf16(true) { SparkIngress::Bf16 }
+                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1) };
+                assert_eq!(admission::spark_endpoints(rows, input).unwrap(), [decode, endpoint]);
+                let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+                assert_eq!(layout::spark_endpoints("mimo_v2", waves as u64), 2);
+                assert_eq!(bytes("mimo/transport/rdma-rings"), (endpoint.ring_bytes(geometry, rings).unwrap() + decode.ring_bytes(geometry, rings).unwrap()) as u64 * 6);
+                assert_eq!(bytes("mimo/transport/response-prefix"), (endpoint.response_prefix_bytes().unwrap() + decode.response_prefix_bytes().unwrap()) as u64 * 6);
+                let plane = rows as u64 * cfg.hidden as u64 * 2;
+                assert_eq!(bytes("mimo/spark-intake-upper-bound"), (plane * waves as u64 + 64 * cfg.hidden as u64 * 2) * 6);
+                assert_eq!(bytes("mimo/transport/egress-upper-bound"), 64 * cfg.hidden as u64 * 2 + if waves == 1 { plane } else { 0 });
+                let device = admission::transport_reservations(&cfg, 2, 0, rows, waves, 6).unwrap();
+                let intake = device.iter().find(|item| item.name == "transport.spark_intake_planes").unwrap();
+                assert_eq!(intake.bytes, (rows.max(128) as u64 * waves as u64 + 64) * cfg.hidden as u64 * 2 * 6);
+                let peer = admission::transport_reservations(&cfg, 2, 1, rows, waves, 6).unwrap();
+                assert!(!peer.iter().any(|item| item.name == "transport.spark_intake_planes"));
+            }
+        }
+    }
+}
+
+#[test]
 fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());

@@ -349,6 +349,17 @@ pub fn workspace_options(cfg: &MimoV2Config, ranks: usize, rank: usize, rows: us
         }))).collect()
 }
 
+/// Immutable endpoints: decode is one sequential m64 wave; prefill keeps the
+/// selected unit capacity and the shared transport's full ring depth.
+pub fn spark_endpoints(rows: usize, input: super::MimoExpertInput) -> Result<[cuteafd_core::SparkEndpoint; 2]> {
+    use cuteafd_core::{SparkEndpoint, SparkIngress};
+    let decode = u32::try_from(super::decode_graph::MIMO_DECODE_ROWS)?;
+    let decode_ingress = if input.bf16(true) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    let prefill_ingress = if input.bf16(false) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1) },
+        SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None }])
+}
+
 pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
     rows: usize, lanes: usize, spark_ranks: usize) -> Result<Vec<MemoryReservation>> {
     let mut costs = Vec::new();
@@ -359,7 +370,9 @@ pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
     }
     if rank == 0 && spark_ranks > 0 {
         costs.push(MemoryReservation { name: "transport.spark_intake_planes".into(),
-            bytes: tensor_bytes("MiMo intake planes", &[lanes, spark_ranks, rows.max(128), cfg.hidden, 2])? });
+            bytes: tensor_bytes("MiMo prefill intake planes", &[lanes, spark_ranks, rows.max(128), cfg.hidden, 2])?
+                .checked_add(tensor_bytes("MiMo decode intake planes", &[super::decode_graph::MIMO_DECODE_ROWS, spark_ranks, cfg.hidden, 2])?)
+                .context("MiMo intake planes overflow")? });
     }
     Ok(costs)
 }
@@ -428,25 +441,31 @@ pub fn future_host_workspaces(cfg: &MimoV2Config, rows: usize, waves: usize, ran
             .context("MiMo sampling host overflow")?));
     }
     if spark_ranks > 0 {
-        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
-        let capacity = u32::try_from(rows.max(64))?;
+        use cuteafd_core::{ExpertGeometry, SparkRings};
         let geometry = ExpertGeometry { hidden: u32::try_from(cfg.hidden)?, experts: u32::try_from(cfg.experts)?,
             topk: u32::try_from(cfg.topk)?, intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
-        let ingress = match expert_input { super::MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
-            super::MimoExpertInput::Bf16 => SparkIngress::Bf16,
-            super::MimoExpertInput::Bf16Decode => SparkIngress::Bf16Decode { rows: 64 } };
-        let endpoint = SparkEndpoint { capacity, ingress, ring_depth: None };
-        let (request, response) = endpoint.wire_bytes(geometry).context("MiMo host wire overflow")?;
-        let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response), depth: 8,
-            slot_bytes: 8 << 20, alignment: 4096 };
-        let ring = endpoint.ring_bytes(geometry, rings).context("MiMo host rings overflow")?;
-        demands.push(("mimo/transport/rdma-rings".into(), tensor_bytes("MiMo coordinator rings", &[ring, spark_ranks])?));
-        demands.push(("mimo/transport/response-prefix".into(), tensor_bytes("MiMo response metadata",
-            &[endpoint.response_prefix_bytes().context("MiMo response prefix")?, spark_ranks])?));
-        demands.push(("mimo/spark-intake-upper-bound".into(), tensor_bytes("MiMo host intake", &[rows.max(64), cfg.hidden, 2, spark_ranks])?));
-        if waves == 1 {
-            demands.push(("mimo/transport/egress-upper-bound".into(), tensor_bytes("MiMo registered egress", &[rows.max(64), cfg.hidden, 2])?));
+        let endpoints = spark_endpoints(rows, expert_input)?;
+        let mut ring = 0usize;
+        let mut prefix = 0usize;
+        for endpoint in endpoints {
+            let (request, response) = endpoint.wire_bytes(geometry).context("MiMo host wire overflow")?;
+            let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response), depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 };
+            ring = ring.checked_add(endpoint.ring_bytes(geometry, rings).context("MiMo host rings overflow")?)
+                .context("MiMo host rings overflow")?;
+            prefix = prefix.checked_add(endpoint.response_prefix_bytes().context("MiMo response prefix")?)
+                .context("MiMo response prefixes overflow")?;
         }
+        demands.push(("mimo/transport/rdma-rings".into(), tensor_bytes("MiMo coordinator rings", &[ring, spark_ranks])?));
+        demands.push(("mimo/transport/response-prefix".into(), tensor_bytes("MiMo response metadata", &[prefix, spark_ranks])?));
+        let decode_rows = endpoints[0].capacity as usize;
+        let prefill_rows = endpoints[1].capacity as usize;
+        let intake_rows = prefill_rows.checked_mul(waves).and_then(|n| n.checked_add(decode_rows))
+            .context("MiMo host intake rows overflow")?;
+        demands.push(("mimo/spark-intake-upper-bound".into(), tensor_bytes("MiMo host intake", &[intake_rows, cfg.hidden, 2, spark_ranks])?));
+        let egress_rows = decode_rows.checked_add(if waves == 1 { prefill_rows } else { 0 })
+            .context("MiMo host egress rows overflow")?;
+        demands.push(("mimo/transport/egress-upper-bound".into(), tensor_bytes("MiMo registered egress", &[egress_rows, cfg.hidden, 2])?));
     }
     Ok(demands)
 }

@@ -330,14 +330,14 @@ mod scoring_workspace_tests {
 /// Ring endpoints a family's coordinator opens to each selected Spark rank,
 /// given its prefill lanes (V4/V4.1: two fixed; GLM 5.3: one decode endpoint
 /// plus one per lane when lanes run in parallel; GLM Flash: one per lane;
-/// MiMo/Qwen: one).
+/// MiMo: one decode plus one prefill endpoint; Qwen: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
-        "mimo_v2" => 1,
+        "mimo_v2" => 2,
         "qwen4" => 1,
         _ => 0,
     }
@@ -392,7 +392,6 @@ mod selected_spark_io_tests {
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
             // Decode link + one prefill link (formerly one endpoint per lane: 2459697152).
             ("glm5", ExpertGeometry::GLM5, 3, 1229848576),
-            ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 614924288),
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
                 prefill_lanes: lanes, ..Default::default() };
@@ -410,6 +409,19 @@ mod selected_spark_io_tests {
             assert_eq!(residual.lifetime, cuteafd_core::memory_layout::ItemLifetime::ReadyResident);
             assert!(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_SOURCE.contains("0a6fc7b1"));
         }
+    }
+
+    #[test]
+    fn mimo_decode_endpoint_has_one_small_ring_slot() {
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+            prefill_lanes: 2, ..Default::default() };
+        let endpoints = crate::families::mimo_v2::admission::spark_endpoints(4096,
+            crate::families::mimo_v2::MimoExpertInput::Fp8).unwrap();
+        let io = working.rank_endpoints_io(0, ExpertGeometry::MIMO_V26_PRO, &endpoints,
+            cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 }).unwrap();
+        assert_eq!(io.mapped_rings, 614924288 + (16 << 20));
+        assert_eq!(io.endpoint_staging, (4096 * 4 + 128) + (64 * 4 + 128));
     }
 
     #[test]
