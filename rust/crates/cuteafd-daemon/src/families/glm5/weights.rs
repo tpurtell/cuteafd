@@ -80,6 +80,15 @@ impl GlmLayer<'_> {
         Ok(self.native.get(key).with_context(|| format!("layer has no native operand {key}"))?.buffer)
     }
 
+    /// The native encoding of `projection` (from its stored components).
+    pub fn native_encoding(&self, projection: &str) -> Result<cuteafd_loader::plan::exlr8::dense::DenseEncoding> {
+        use cuteafd_loader::plan::exlr8::dense::DenseEncoding;
+        let has = |c: &str| self.native.contains_key(&super::native_dense::key(projection, c));
+        Ok(if has("trellis") { DenseEncoding::Trellis { bits: 4 } } else if has("q4") { DenseEncoding::Int4G32 }
+            else if has("e8m0") { DenseEncoding::Mxfp8 } else if has("bf16") { DenseEncoding::Bf16 }
+            else { anyhow::bail!("layer has no native {projection}") })
+    }
+
     /// Whether the layer runs the checkpoint's native dense operands.
     pub fn is_native(&self) -> bool { !self.native.is_empty() }
 }

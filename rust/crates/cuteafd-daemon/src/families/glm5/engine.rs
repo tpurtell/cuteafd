@@ -36,6 +36,8 @@ use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, PartialDtype,
 mod context;
 mod tp2;
 mod layers;
+#[path = "engine/native_dense.rs"]
+pub(crate) mod native_dense;
 pub(crate) mod exlr8;
 pub(crate) use cuteafd_loader::placement::families::glm5::GlmContext;
 
@@ -212,6 +214,8 @@ struct Workspace<'a> {
     shared: Dev<'a>,
     /// Decode and each prefill lane own an arena; weights remain shared per GPU.
     native_shared: Option<crate::shared::experts::exlr8::Exlr8Execution<'a>>,
+    /// Native dense scratch (EXLR8 checkpoint dense operands), when the layers run natively.
+    native_dense: Option<native_dense::NativeScratch<'a>>,
     payload: Option<Dev<'a>>,
     router_host: RefCell<HostAllocation<'a>>,
     /// The step's token ids (U32, gathered from the device embedding table).
@@ -273,6 +277,10 @@ enum StepLogits {
 
 pub(crate) struct GlmEngine<'a> {
     pub(crate) spark_bf16: bool,
+    /// Per rank: bound native dense programs and the prefill unpack staging
+    /// (EXLR8 checkpoint dense operands); empty on the official path.
+    pub(crate) native_dense: Vec<Option<native_dense::NativePrograms<'a>>>,
+    pub(crate) native_unpacked: Vec<native_dense::Unpacked<'a>>,
     pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -396,7 +404,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, native_experts: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { quantize_grid, device, native_experts: Vec::new(), native_dense: Vec::new(), native_unpacked: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes,
@@ -667,6 +675,12 @@ impl<'a> GlmEngine<'a> {
             shared: self.alloc(t * h * 2)?,
             native_shared: self.native_experts.get(rank)
                 .map(|native| native.execution(self.library, self.programs)).transpose()?,
+            native_dense: if self.weights.layers.iter().any(|l| l.is_native()) {
+                let split = self.weights.layers.first().is_some_and(|l| l.split);
+                let attention_split = self.weights.layers.first().is_some_and(|l| l.attention_split);
+                Some(native_dense::NativeScratch::new(self, self.cfg.heads / if attention_split { 2 } else { 1 },
+                    self.cfg.dense_intermediate / if split { 2 } else { 1 }, t)?)
+            } else { None },
             payload: self.tp2.as_ref().map(|tp2| self.alloc(tp2.combine.payload_bytes(t, h))).transpose()?,
             router_host: RefCell::new(HostAllocation::new(self.library, lead_only(t * (self.cfg.topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 })))?),
             ids: self.alloc(t * 4)?,
@@ -2026,6 +2040,10 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
         kv: cuteafd_ffi::CuteafdDeviceBuffer, query: *mut c_void) -> Result<()> {
+        if layer.is_native() {
+            let context = self.context.is_some() && query != w.query.buffer.ptr;
+            return self.native_producer(rank, w, layer, scalar_rows(rows)?, cap, kv, query, context);
+        }
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let bf16 = layer.range("w_q_b").is_some();
         let variant = if bf16 { format!("glm_producer_bf16_{cap}") } else { format!("glm_producer_{cap}") };
@@ -2045,6 +2063,9 @@ impl<'a> GlmEngine<'a> {
     /// the FP8 index query and head weights into the workspace.
     fn index_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
         index_cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if layer.is_native() {
+            return self.native_index_producer(rank, w, layer, scalar_rows(rows)?, cap, index_cache);
+        }
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let bf16 = layer.range("w_iq").is_some();
         let mut pointers = vec![("x", w.x.buffer.ptr), ("q_resid", w.q_resid.buffer.ptr),
@@ -2062,6 +2083,9 @@ impl<'a> GlmEngine<'a> {
 
     /// W_UV + o_proj of this rank's heads over `attn` into `delta` (a partial sum under a split).
     fn o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, cap: &str, rows: Scalar) -> Result<()> {
+        if layer.is_native() {
+            return self.native_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
+        }
         let bf16 = layer.range("w_o").is_some();
         let mut o = vec![("attn", w.attn.buffer.ptr)];
         o.extend(weight(layer, "w_uv", cap)?);
@@ -2093,6 +2117,12 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, intermediate: usize, cap: &str,
         out: *mut c_void, rows: Scalar) -> Result<()> {
+        if layer.is_native() && layer.dense {
+            let rows = scalar_rows(rows)?;
+            let out = cuteafd_ffi::CuteafdDeviceBuffer { ptr: out, bytes: rows * self.cfg.hidden * 2,
+                device_id: self.exchange_device(rank)?, flags: 0 };
+            return self.native_ffn(rank, w, layer, rows, out);
+        }
         let intermediate = intermediate / if layer.split { 2 } else { 1 };
         let declared_w8a8 = layer.mlp_numerics == cuteafd_loader::plan::checkpoint::ModuleNumerics::W8A8;
         if declared_w8a8 || (cap != "m64" && self.prefill_w8a8 && tensor_fp8_prefill()
@@ -2115,6 +2145,23 @@ impl<'a> GlmEngine<'a> {
         }
         self.run_on(rank, &Self::program(layer, &format!("glm_ffn_i{intermediate}_{cap}")), &pointers,
             &self.projection_scalars(rows, cap))
+    }
+}
+
+/// The live row count a program scalar carries.
+fn scalar_rows(rows: Scalar) -> Result<usize> {
+    match rows { Scalar::I32(n) if n > 0 => Ok(n as usize), other => anyhow::bail!("row scalar {other:?}") }
+}
+
+impl<'a> GlmEngine<'a> {
+    /// Rank `rank`'s device id.
+    fn exchange_device(&self, rank: usize) -> Result<i32> {
+        Ok(if rank == 0 { self.device } else { self.peer()?.device })
+    }
+
+    /// Rank `rank`'s prefill unpack staging.
+    fn native_unpacked(&self, rank: usize) -> Result<&native_dense::Unpacked<'a>> {
+        self.native_unpacked.get(rank).context("native dense prefill staging on this rank")
     }
 }
 
