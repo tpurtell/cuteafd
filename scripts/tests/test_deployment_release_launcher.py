@@ -50,6 +50,8 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 anchor = "--kv-cache" if "--kv-cache" in before["command"] else "--prefix-partial"
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--swa-kv-cache", swa_kv or "int8"]
+                position = before["command"].index("--prefill-waves") + 2
+                before["command"][position:position] = ["--prefill-span-rows", "16384"]
             if entry["family"] == "qwen4":
                 # Local/dual still execute their whole-step default, now explicit in the plan.
                 position = before["command"].index("--console-secret-file")

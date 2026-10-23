@@ -74,6 +74,12 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Rows one prefill call streams through its continuous units.
+    #[arg(long, default_value_t = 16384)]
+    pub prefill_span_rows: usize,
+    /// Outstanding unit waves on one Spark transport (0: Pro 3, Flash 2).
+    #[arg(long, default_value_t = 0)]
+    pub prefill_waves: usize,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -257,6 +263,20 @@ mod draft_storage_tests {
     }
 
     #[test]
+    fn decode_and_prefill_links_bind_distinct_admitted_endpoints() {
+        let source = include_str!("mod.rs");
+        // Keep these joined so the assertions cannot match their own text.
+        assert!(source.contains(&["let mut decode = link", "(0, 1, &decode_warm)?;"].concat()));
+        assert!(source.contains(&["let mut prefill = link", "(1, lanes, &prefill_warm)?;"].concat()));
+        assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
+        assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "spark_endpoints("].concat()));
+        let engine = include_str!("engine.rs");
+        assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. })", " = &e.experts"].concat()));
+        assert!(engine.contains(&["Experts::Spark { decode: transport, .. }) => transport.borrow().intake", ".pointers()"].concat()));
+        assert!(engine.contains(&["for transport in [decode, prefill]", " {"].concat()));
+    }
+
+    #[test]
     fn absent_conversion_options_leave_selection_to_metadata_policy() {
         let args = args(&[]);
         assert_eq!(args.weight_policy, WeightPolicyArg::Auto);
@@ -294,11 +314,59 @@ mod draft_storage_tests {
         let automatic = args(&[]);
         assert_eq!(automatic.max_context, 0);
         assert_eq!(automatic.pool_tokens, 0);
+        assert_eq!(automatic.prefill_span_rows, 16384);
         assert_eq!(automatic.token_io.embed_placement, None);
         let explicit = args(&["--max-context", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
         assert_eq!(explicit.max_context, 32768);
         assert_eq!(explicit.pool_tokens, 131072);
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
+        let span = args(&["--prefill-rows", "1024", "--prefill-span-rows", "6144"]);
+        assert_eq!((span.prefill_rows, span.prefill_span_rows), (1024, 6144));
+    }
+
+    #[test]
+    fn golden_logit_dump_requires_unforced_complete_row_scoring() {
+        #[derive(Parser)]
+        struct GoldenCommand {
+            #[command(flatten)]
+            golden: GoldenArgs,
+        }
+        let parse = |extra: &[&str]| GoldenCommand::try_parse_from([
+            "mimo-golden", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so",
+            "--golden", "/missing/golden", "--save-logits", "/missing/output",
+        ].into_iter().chain(extra.iter().copied()));
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--nll"]).unwrap().golden.save_logits.is_some());
+        for conflict in ["--timing", "--teacher-force"] {
+            assert!(parse(&["--nll", conflict]).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("rows");
+        let tokens = [0, 1, 0];
+        let prefill = [1.0, -0.0, 2.0, 3.0];
+        let decode = [4.0, 5.0];
+        save_golden_logits(&dir, &tokens, 2, &prefill, &decode).unwrap();
+        assert_eq!(std::fs::read(dir.join("logits.bin")).unwrap(),
+            prefill.iter().chain(&decode).flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        assert_eq!(std::fs::read(dir.join("tokens.bin")).unwrap(),
+            tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        assert!(save_golden_logits(&dir, &tokens, 2, &prefill, &decode).is_err());
+        let bad = root.path().join("invalid");
+        assert!(save_golden_logits(&bad, &tokens, 2, &prefill, &[]).is_err());
+        assert!(save_golden_logits(&bad, &tokens, 2, &[f32::NAN; 6], &[]).is_err());
+        assert!(!bad.exists());
+    }
+
+    #[test]
+    fn token_only_golden_is_allowed_only_for_an_explicit_logits_dump() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_golden_logits(dir.path(), true).unwrap().is_none());
+        assert!(read_golden_logits(dir.path(), false).is_err());
+        std::fs::write(dir.path().join("logits.bin"), [0u8; 3]).unwrap();
+        assert!(read_golden_logits(dir.path(), true).is_err());
+        std::fs::write(dir.path().join("logits.bin"), 1.0f32.to_le_bytes()).unwrap();
+        assert_eq!(read_golden_logits(dir.path(), true).unwrap(), Some(vec![1.0]));
+        assert_eq!(read_golden_logits(dir.path(), false).unwrap(), Some(vec![1.0]));
     }
 
     #[test]
@@ -616,6 +684,11 @@ pub(crate) struct GoldenArgs {
     /// golden's `mean_nll`).
     #[arg(long)]
     pub nll: bool,
+    /// Write tokens.bin and complete FP32 logits.bin rows from the served unit
+    /// executor to a new directory for same-cut byte-identity qualification.
+    #[arg(long, requires = "nll", conflicts_with_all = ["timing", "teacher_force", "resume_at",
+        "token_check", "greedy_digest", "draft_oracle", "draft_replay", "mtp_oracle"])]
+    pub save_logits: Option<PathBuf>,
     /// Skip the per-layer comparison (each layer's rows are otherwise copied
     /// back), so prefill and decode times are the engine's.
     #[arg(long)]
@@ -835,6 +908,7 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
         let automatic_context = args.max_context == 0;
+        engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?;
         let mut resolved = args.clone();
         if resolved.max_context == 0 {
             resolved.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&self.checkpoint.config)?
@@ -907,6 +981,8 @@ impl Opened {
         }
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
+        resolved.prefill_rows = preflight.prefill_rows;
+        resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
@@ -941,14 +1017,10 @@ impl Opened {
                 experts: u32::try_from(self.cfg.experts)?, topk: u32::try_from(self.cfg.topk)?,
                 intermediate: u32::try_from(self.cfg.moe_intermediate)?, layers: u32::try_from(self.cfg.layers)? };
             let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
-            let ingress = if args.expert_input.bf16(false) { cuteafd_core::SparkIngress::Bf16 }
-                else if args.expert_input.bf16(true) { cuteafd_core::SparkIngress::Bf16Decode {
-                    rows: u32::try_from(engine::DECODE_ROWS)? } }
-                else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress };
-                    usize::try_from(preflight.working_set.prefill_lanes)?],
+                endpoints: cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
+                    args.prefill_rows, args.expert_input.into())?.to_vec(),
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
@@ -1048,7 +1120,8 @@ impl Opened {
             "MiMo coordinator weights resident after Spark admission (elapsed includes wait)");
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
+            args.max_context, args.prefill_rows, args.prefill_span_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
+        engine.prefill_unit_waves = args.prefill_waves;
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
         let result = (|| -> Result<T> {
@@ -1117,7 +1190,6 @@ impl Opened {
                     range.peak_bytes as usize)?;
                 engine.set_rtx_local(local);
             }
-            engine.prepare_prefill_pair()?;
             if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
             if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
@@ -1223,11 +1295,8 @@ impl Opened {
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let timing = cuteafd_transport::protocol_v2_timing_from_env();
-        // The widest wave this family dispatches, built before the links so each
-        // can be bootstrapped with it (see `link` below). The first request
-        // sizes the registered rings: the widest one is `warmups[0]` (BF16 rows
-        // when prefill sends them), then a one-row BF16 request when decode
-        // does, so a rank without the BF16 package fails here.
+        // Bootstrap each endpoint with its own widest dtype/row shape so ring
+        // admission and BF16 package validation finish before serving starts.
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let warm = |rows: usize, bf16: bool| -> Result<cuteafd_transport::ExpertProtocolV2Request> {
             let routes = (0..rows * topk).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
@@ -1246,51 +1315,42 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
-        let mut warmups = vec![warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?];
-        if args.expert_input.bf16(true) && !args.expert_input.bf16(false) {
-            warmups.push(warm(1, true)?);
-        }
-        let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
-            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
-            u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+        let endpoints = cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
+            args.prefill_rows, args.expert_input.into())?;
+        let decode_warm = warm(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
+        let prefill_warm = warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
+        let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::ExpertProtocolV2Request|
+            -> Result<crate::shared::spark_intake::SparkLink<'_>> {
+            let capacity = endpoints[endpoint as usize].capacity;
+            let mut link = crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
+                capacity, cuteafd_transport::TcpTransportConfig { timing,
+                    timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                self.cfg.hidden * 2, waves, capacity)?;
+            link.transport.bind_model_endpoint(endpoint)?;
             link.enable_terminal_ownership(self.library.clone())?;
-            // Connect every rank now and publish its installed expert grouping
-            // with the widest wave (the warm-up's own request, so the sessions
-            // it opens are the ones every later wave reuses).
-            link.bootstrap(&warmups[0])?;
+            // Bootstrap with this endpoint's widest request, never prefill on decode.
+            link.bootstrap(&request)?;
             Ok(link)
         };
         crate::shared::memory_report::release_load_staging(&self.library);
-        let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, Flash 2 / Pro 3 by default,
-        // 1 keeps it serial):
-        // one more transport per earlier row lane.
-        ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
-        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
-        tracing::info!(lanes, "MiMo prefill lanes");
+        // Decode keeps fixed graph-safe planes and the probed landing path;
+        // only prefill owns overlapping waves and rotating pinned return slots.
+        let mut decode = link(0, 1, &decode_warm)?;
+        let mut prefill = link(1, lanes, &prefill_warm)?;
+        tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        // Connect every rank and register full-size buffers now: the first
-        // request otherwise pays seconds of connection setup.
         let started = Instant::now();
-        // Drained and destroyed on every way out, before the transports drop.
         let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
-        for request in &warmups {
+        for (transport, request) in [(&mut decode, &decode_warm), (&mut prefill, &prefill_warm)] {
             runtime.block_on(async {
                 let wave = transport.dispatch(request)?;
                 transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
             })?;
         }
-        for lane in &mut lane_links {
-            runtime.block_on(async {
-                let wave = lane.dispatch(&warmups[0])?;
-                lane.receive(wave, warmups[0].header.row_count as usize, warm_stream.raw()).await
-            })?;
-        }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))
+        Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
+            prefill: std::cell::RefCell::new(prefill), runtime }))
     }
 }
 
@@ -1326,6 +1386,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    if let Some(dir) = &args.save_logits {
+        ensure!(!dir.try_exists()? && dir.parent().is_some_and(std::path::Path::is_dir),
+            "--save-logits needs an existing parent and a new output directory");
+    }
     args.engine.validate_draft_replay(args.draft_replay.is_some())?;
     let opened = open_checked(&args.engine, args.draft_replay.is_some())?;
     ensure!(args.draft_replay.is_none() || opened.weight_formats.head == MimoProjectionRepresentation::Bf16,
@@ -1345,6 +1409,31 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         println!("decode graphs captured after startup: {}", engine.late_captures());
     }
     result
+}
+
+fn read_golden_logits(dir: &std::path::Path, allow_missing: bool) -> Result<Option<Vec<f32>>> {
+    let bytes = match std::fs::read(dir.join("logits.bin")) {
+        Ok(bytes) => bytes,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(bytes.len() % 4 == 0, "MiMo golden logits are not complete FP32 values");
+    Ok(Some(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()))
+}
+
+fn save_golden_logits(dir: &std::path::Path, tokens: &[u32], vocab: usize,
+    prefill: &[f32], decode: &[f32]) -> Result<()> {
+    use std::io::Write;
+    ensure!(!tokens.is_empty() && vocab > 0 && tokens.iter().all(|&t| (t as usize) < vocab)
+        && tokens.len().checked_mul(vocab) == prefill.len().checked_add(decode.len())
+        && prefill.len() % vocab == 0 && decode.len() % vocab == 0
+        && prefill.iter().chain(decode).all(|v| v.is_finite()), "MiMo logits dump shape/finite mismatch");
+    std::fs::create_dir(dir).context("MiMo logits output must be a new directory")?;
+    let mut output = std::io::BufWriter::new(std::fs::File::create(dir.join("logits.bin"))?);
+    for value in prefill.iter().chain(decode) { output.write_all(&value.to_le_bytes())?; }
+    output.flush()?;
+    std::fs::write(dir.join("tokens.bin"), tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+    Ok(())
 }
 
 fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_>) -> Result<()> {
@@ -1423,7 +1512,9 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     let forced = |layer: usize| -> Option<Vec<u8>> {
         std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * row].to_vec())
     };
-    let chunk = args.prefill_chunk.unwrap_or(prefill).clamp(1, engine.prefill_rows);
+    let unit_execution = args.timing || args.decode_nll || args.save_logits.is_some();
+    let capacity = if unit_execution { engine.prefill_capacity() } else { engine.prefill_rows };
+    let chunk = args.prefill_chunk.unwrap_or(prefill).clamp(1, capacity);
     ensure!(!args.teacher_force || chunk >= prefill, "--teacher-force needs a single prefill chunk");
     let mut logits = None;
     let mut prefill_logits: Vec<f32> = Vec::new();
@@ -1431,7 +1522,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         let n = chunk.min(prefill - first);
         let mut prefill_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut worst);
         logits = engine.prefill_forced(&mut placement, &tokens[first..first + n], args.nll,
-            (!args.timing && !args.decode_nll).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
+            (!unit_execution).then_some(&mut prefill_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>),
             args.teacher_force.then_some(&forced as &dyn Fn(usize) -> Option<Vec<u8>>))?;
         if args.nll {
             prefill_logits.extend(logits.as_deref().unwrap_or_default());
@@ -1456,7 +1547,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         let first = position;
         let mut step_compare = |layer: usize, stream: &[u8]| compare(layer, first, stream, &mut decode_worst);
         if let Some(logits) = engine.verify(&mut [(&mut placement, n)], &tokens[position..position + n],
-            (!args.timing && !args.decode_nll).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
+            (!unit_execution).then_some(&mut step_compare as &mut dyn FnMut(usize, &[u8]) -> Result<()>))? {
             // --timing: step times without the scoring copy of every row's logits.
             if !args.timing {
                 decode_logits.extend(logits);
@@ -1475,10 +1566,11 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         println!("decode steps of {}: warm median {:.3} ms, first {:.3} ms", args.step_rows, 1e3 * warm[warm.len() / 2],
             1e3 * step_times[0]);
     }
-    let golden_logits = || -> Result<Vec<f32>> {
-        Ok(std::fs::read(args.golden.join("logits.bin"))?
-            .chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
-    };
+    let reference = read_golden_logits(&args.golden, args.save_logits.is_some())?;
+    if let Some(golden) = &reference {
+        ensure!(tokens.len().checked_mul(cfg.vocab_size) == Some(golden.len())
+            && golden.iter().all(|v| v.is_finite()), "MiMo golden logits shape/finite mismatch");
+    }
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     // Rows of `ours` are the logits of positions `first..`: top-1 agreement
     // with the golden, next-token accuracy and mean NLL of the next tokens.
@@ -1487,7 +1579,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         if let (true, Ok(path)) = (label == "decode", std::env::var("CUTEAFD_DUMP_DECODE_LOGITS")) {
             std::fs::write(&path, ours_all.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
         }
-        let golden = golden_logits()?;
+        let Some(golden) = reference.as_ref() else { return Ok(()); };
         let vocab = cfg.vocab_size;
         let (mut agree, mut next_ok, mut golden_next, mut nll, mut kl) = (0usize, 0usize, 0usize, 0f64, 0f64);
         let rows = ours_all.len() / vocab;
@@ -1516,6 +1608,9 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
             100.0 * next_ok as f64 / scored, 100.0 * golden_next as f64 / scored, nll / scored, kl / rows as f64);
         Ok(())
     };
+    if let Some(dir) = &args.save_logits {
+        save_golden_logits(dir, &tokens, cfg.vocab_size, &prefill_logits, &decode_logits)?;
+    }
     if !prefill_logits.is_empty() {
         score("prefill", &prefill_logits, 0)?;
     }
@@ -1523,8 +1618,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
         score("decode", &decode_logits, prefill)?;
     }
     println!("prefill: {prefill} tokens through {layers} layers in {prefill_seconds:.2} s");
-    if let Some(logits) = logits {
-        let golden = golden_logits()?;
+    if let (Some(logits), Some(golden)) = (logits, reference.as_ref()) {
         let last = &golden[(prefill - 1) * cfg.vocab_size..][..cfg.vocab_size];
         let (cosine, _) = similarity(&logits, last);
         println!("last-row logits: argmax engine {} golden {} cosine {cosine:.6}", argmax(&logits), argmax(last));

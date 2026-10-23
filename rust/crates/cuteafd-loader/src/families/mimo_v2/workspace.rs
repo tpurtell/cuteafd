@@ -49,6 +49,8 @@ pub enum MimoAttentionWorkspace {
 #[derive(Debug, Clone, Copy)]
 pub struct MimoWorkspaceOptions {
     pub rows: u64,
+    /// Slot-owned rows; scratch remains one unit wide.
+    pub waves: u64,
     pub decode: bool,
     pub lead: bool,
     pub with_head: bool,
@@ -154,11 +156,23 @@ fn bytes(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
 }
 
 impl MimoWorkspaceLayout {
+    /// Base paths and slot zero share pointer keys. Nonzero slots have their
+    /// own pinned source; the base extent must cover diagnostic whole-buffer use.
+    pub fn ordered_host_bytes(&self, waves: u64) -> Result<u64, CacheGeometryError> {
+        if waves == 0 { return Err(CacheGeometryError::Overflow("MiMo ordered slot count")); }
+        [self.step_inputs, self.slots, self.ring_slots, self.seq_first, self.page_table, self.ids]
+            .into_iter().try_fold(0u64, |sum, bytes| {
+                bytes.checked_div(waves)?.checked_mul(waves - 1)?.checked_add(bytes)?.checked_add(sum)
+            }).ok_or(CacheGeometryError::Overflow("MiMo ordered host tables"))
+    }
+
     pub fn new(
         cfg: &MimoV2Config,
         options: MimoWorkspaceOptions,
     ) -> Result<Self, CacheGeometryError> {
         if options.rows == 0
+            || options.waves == 0
+            || options.decode && options.waves != 1
             || options.max_context == 0
             || options.with_head && !options.lead
             || options.with_head && options.head_workspace_bytes == 0
@@ -183,16 +197,19 @@ impl MimoWorkspaceLayout {
             }
         };
         let (t, h) = (options.rows, cfg.hidden as u64);
+        let live = t.checked_mul(options.waves).ok_or(CacheGeometryError::Overflow("MiMo unit rows"))?;
         let record = attention
             .record_bytes(MimoAttention::Sliding, options.kv_cache)
             .max(attention.record_bytes(MimoAttention::Full, options.kv_cache))
             as u64;
-        let page_table_rows = if options.decode { t } else { 1 };
-        let logits_rows = options.prefill_output.logits_rows(t, options.decode, options.with_head);
+        let page_table_rows = if options.decode { t } else { options.waves };
+        let logits_rows = options.prefill_output.logits_rows(
+            if options.decode { t } else if options.prefill_output == MimoPrefillOutput::AllRows { t.max(16384) } else { t },
+            options.decode, options.with_head);
         let layout = Self {
             logits_rows,
-            h: bytes("MiMo hidden rows", &[t, h, 2])?,
-            x: bytes("MiMo normalized rows", &[t, h, 2])?,
+            h: bytes("MiMo hidden rows", &[live, h, 2])?,
+            x: bytes("MiMo normalized rows", &[live, h, 2])?,
             query: bytes(
                 "MiMo query",
                 &[t, attention.heads as u64, attention.head_dim as u64, 2],
@@ -201,7 +218,7 @@ impl MimoWorkspaceLayout {
                 "MiMo attention",
                 &[t, attention.heads as u64, attention.v_head_dim as u64, 2],
             )?,
-            delta: bytes("MiMo layer delta", &[t, h, 2])?,
+            delta: bytes("MiMo layer delta", &[live, h, 2])?,
             kv_step: bytes("MiMo KV step", &[t, record])?,
             kv_wide: if options.decode || options.kv_cache.full == MimoKvCache::Bf16 {
                 256
@@ -214,12 +231,14 @@ impl MimoWorkspaceLayout {
                     ],
                 )?
             },
-            step_inputs: bytes("MiMo positions and full/SWA RoPE windows", &[t, 8 + 2 * cfg.rope_dim as u64 * 4])?,
-            slots: bytes("MiMo KV slots", &[t, 8])?,
-            step_slots: bytes("MiMo identity slots", &[t, 8])?,
-            ring_slots: bytes("MiMo ring slots", &[t, 8])?,
-            seq_first: bytes("MiMo sequence starts", &[t, 4])?,
-            page_table: bytes("MiMo page table", &[page_table_rows, options.pool_pages, 4])?,
+            step_inputs: bytes("MiMo positions and full/SWA RoPE windows", &[live, 8 + 2 * cfg.rope_dim as u64 * 4])?,
+            slots: bytes("MiMo KV slots", &[live, 8])?,
+            step_slots: bytes("MiMo identity slots", &[live, 8])?,
+            ring_slots: bytes("MiMo ring slots", &[live, 8])?,
+            seq_first: bytes("MiMo sequence starts", &[live, 4])?,
+            page_table: if options.decode { bytes("MiMo page table", &[page_table_rows, options.pool_pages, 4])? }
+                else { bytes("MiMo unit page table", &[options.pool_pages, 4])?
+                    .checked_mul(options.waves).ok_or(CacheGeometryError::Overflow("MiMo unit page tables"))? },
             scratch: options.native_scratch_bytes.max(256),
             logits: if options.with_head {
                 bytes("MiMo logits", &[logits_rows, cfg.vocab_size as u64, 4])?
@@ -258,7 +277,7 @@ impl MimoWorkspaceLayout {
             } else {
                 256
             },
-            ids: bytes("MiMo token ids", &[t, 4])?,
+            ids: bytes("MiMo token ids", &[live, 4])?,
             select: bytes("MiMo greedy ids/statuses", &[t, 8])?,
             head_workspace: if options.with_head {
                 options.head_workspace_bytes.max(256)
@@ -279,6 +298,7 @@ mod tests {
     fn options() -> MimoWorkspaceOptions {
         MimoWorkspaceOptions {
             rows: 4096,
+            waves: 1,
             decode: false,
             lead: true,
             with_head: true,
@@ -292,6 +312,50 @@ mod tests {
             native_scratch_bytes: 16 << 20,
             head_workspace_bytes: 32 << 20,
         }
+    }
+
+    #[test]
+    fn unit_slots_multiply_only_live_planes_and_keep_page_tables_aligned() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        let single = MimoWorkspaceLayout::new(&cfg, options()).unwrap();
+        for waves in [2, 3, 4] {
+            let multi = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, ..options() }).unwrap();
+            for ((name, one), (other, many)) in single.device_buffers().zip(multi.device_buffers()) {
+                assert_eq!(name, other);
+                let owned = matches!(name, "h" | "x" | "delta" | "step_inputs" | "slots" | "step_slots"
+                    | "ring_slots" | "seq_first" | "page_table" | "ids");
+                assert_eq!(many, one * if owned { waves } else { 1 }, "{name}");
+            }
+            let tiny = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, pool_pages: 1, ..options() }).unwrap();
+            assert_eq!(tiny.page_table, waves * 256);
+        }
+    }
+
+    #[test]
+    fn ordered_host_staging_covers_base_and_nonzero_slot_pointer_keys() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        for waves in 1..=4 {
+            let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, ..options() }).unwrap();
+            let base = layout.step_inputs + layout.slots + layout.ring_slots + layout.seq_first
+                + layout.page_table + layout.ids;
+            assert_eq!(layout.ordered_host_bytes(waves).unwrap(), base + base / waves * (waves - 1));
+        }
+        let one = super::super::admission::future_host_workspaces(&cfg, 4096, 2, 1, 1 << 20,
+            1 << 20, 6, MimoExpertInput::Fp8, MimoKvFormats::default(), MimoPrefillOutput::LastRow,
+            true, 256, 0).unwrap();
+        let two = super::super::admission::future_host_workspaces(&cfg, 4096, 2, 2, 1 << 20,
+            1 << 20, 6, MimoExpertInput::Fp8, MimoKvFormats::default(), MimoPrefillOutput::LastRow,
+            true, 256, 0).unwrap();
+        for kind in ["prefill/ordered-tables", "decode/ordered-tables"] {
+            let sum = |demands: &[(String, u64)]| demands.iter().filter(|(name, _)| name.ends_with(kind))
+                .map(|(_, bytes)| bytes).sum::<u64>();
+            assert_eq!(sum(&two), 2 * sum(&one));
+        }
+        assert!(two.iter().any(|(name, bytes)| name == "mimo/owner-1/decode/ordered-tables" && *bytes > 0));
+        assert!(two.iter().any(|(name, bytes)| name == "mimo/transport/rdma-rings" && *bytes > 0));
+        assert!(super::super::admission::future_host_workspaces(&cfg, usize::MAX, 4, 2, u64::MAX,
+            1 << 20, 6, MimoExpertInput::Fp8, MimoKvFormats::default(), MimoPrefillOutput::LastRow,
+            true, 256, 0).is_err());
     }
 
     #[test]
@@ -340,9 +404,9 @@ mod tests {
         let last = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions {
             prefill_output: MimoPrefillOutput::LastRow, ..options()
         }).unwrap();
-        assert_eq!((full.logits_rows, last.logits_rows), (4096, 1));
+        assert_eq!((full.logits_rows, last.logits_rows), (16384, 1));
         assert_eq!(last.logits, 152576 * 4);
-        let saved = 4095 * 152576 * 4;
+        let saved = 16383 * 152576 * 4;
         assert_eq!(full.logits - last.logits, saved);
         assert_eq!(full.device_bytes().unwrap() - last.device_bytes().unwrap(), saved);
         for ((name, before), (after_name, after)) in full.device_buffers().zip(last.device_buffers()) {

@@ -12,7 +12,7 @@ impl<'a> MimoEngine<'a> {
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: self.peer.as_ref().context("MiMo peer")?.device, stream: self.stream_of(1) }],
-            2 * self.transport_lanes(), route_bytes)?;
+            2 * self.prefill_waves(), route_bytes)?;
         let combine = FusedCombine::new(self.library, ExchangeDtype::Bf16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|value| value.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
@@ -106,13 +106,13 @@ impl<'a> MimoEngine<'a> {
                 self.library.copy_d2d_async(w.delta.buffer, cuteafd_ffi::CuteafdDeviceBuffer {
                     ptr: experts.output(), bytes, ..w.delta.buffer }, bytes, stream)?;
             }
-            self.push(rank, lane_slot(index, true, lane), w.delta.buffer.ptr, bytes)
+            self.push(rank, unit_slot(index, true, lane), w.delta.buffer.ptr, bytes)
         })
     }
 
     pub(super) fn tp2_post(&self, rank: usize, index: usize, lane: usize,
         w: &Workspace<'_>, rows: usize) -> Result<()> {
-        let slot = lane_slot(index, true, lane);
+        let slot = unit_slot(index, true, lane);
         self.wait(rank, slot)?;
         let received = self.recv(rank, slot);
         let (rank0, rank1) = if rank == 0 { (w.delta.buffer.ptr, received) } else { (received, w.delta.buffer.ptr) };
@@ -154,7 +154,7 @@ impl<'a> MimoEngine<'a> {
         let tp2 = self.tp2.as_ref().context("MiMo TP2")?;
         if !tp2.checking.get() { return Ok(()); }
         let checks = tp2.checks.borrow();
-        let check = checks.get(&(layer, lane)).context("MiMo route diagnostics were not admitted")?;
+        let check = checks.get(&(layer, self.unit_index.get().unwrap_or(lane))).context("MiMo route diagnostics were not admitted")?;
         ensure!(rows == check.rows, "MiMo route diagnostic shape changed");
         let host = &check.ranks[rank];
         let bytes = rows * self.cfg.topk * 4;
@@ -228,7 +228,7 @@ mod tests {
     enum Home { Dense, Tp2, Spark }
 
     fn attention(s: &mut Schedule, rank: usize, layer: usize, lane: usize) {
-        let slot = lane_slot(layer, false, lane);
+        let slot = unit_slot(layer, false, lane);
         s.push(rank, "main", slot, format!("attention push {rank}/{layer}/{lane}"));
         s.wait(rank, "main", slot, format!("attention wait {rank}/{layer}/{lane}"));
     }
@@ -239,11 +239,11 @@ mod tests {
             if rank == 0 { s.push(0, "routes", slot, "canonical routes"); }
             else { s.wait(1, "routes", slot, "canonical routes"); }
         }
-        s.push(rank, "main", lane_slot(layer, true, lane), "TP2 partial");
+        s.push(rank, "main", unit_slot(layer, true, lane), "TP2 partial");
     }
 
     fn post(s: &mut Schedule, rank: usize, layer: usize, lane: usize) {
-        s.wait(rank, "main", lane_slot(layer, true, lane), "FFN combine");
+        s.wait(rank, "main", unit_slot(layer, true, lane), "FFN combine");
     }
 
     // Mirror eager peer_layer lookahead and the lane producer/post split.
@@ -253,7 +253,7 @@ mod tests {
         let peer = |s: &mut Schedule, layer: usize, lane| {
             attention(s, 1, layer, lane);
             match homes[layer] {
-                Home::Dense => s.push(1, "main", lane_slot(layer, true, lane), "dense partial"),
+                Home::Dense => s.push(1, "main", unit_slot(layer, true, lane), "dense partial"),
                 Home::Tp2 => experts(s, 1, layer, lane, broadcast),
                 Home::Spark => {},
             }
@@ -266,10 +266,10 @@ mod tests {
                 attention(s, 0, layer, lane);
                 if ahead && layer + 1 < homes.len() { peer(s, layer + 1, lane); }
                 match home {
-                    Home::Dense => s.push(0, "main", lane_slot(layer, true, lane), "dense partial"),
+                    Home::Dense => s.push(0, "main", unit_slot(layer, true, lane), "dense partial"),
                     Home::Tp2 => experts(s, 0, layer, lane, broadcast),
                     Home::Spark if layer + 1 < homes.len() =>
-                        s.push(0, "main", lane_slot(layer, true, lane), "landed Spark sum"),
+                        s.push(0, "main", unit_slot(layer, true, lane), "landed Spark sum"),
                     Home::Spark => {},
                 }
                 if !ahead && (*home != Home::Spark || layer + 1 < homes.len()) { post(s, 1, layer, lane); }

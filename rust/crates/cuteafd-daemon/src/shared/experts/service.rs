@@ -491,7 +491,7 @@ mod tests {
     /// The planner's Spark I/O (`plan --layout`) against the worker's own
     /// sample: the expert service's selected rank I/O (per-endpoint rings,
     /// shared intake/exchange/indices) for the typed admission the
-    /// coordinator sends it: capacity, one endpoint per MiMo prefill lane,
+    /// coordinator sends it: a bounded decode endpoint and an N-wave prefill endpoint,
     /// and the wire format. MiMo Flash/Pro on their natural minimum
     /// Spark counts, FP8 and BF16 wires.
     #[test]
@@ -513,20 +513,20 @@ mod tests {
                         onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
                 let layout = report.memory_layout.unwrap();
-                let lanes = cuteafd_loader::families::mimo_v2::admission::resolve_transport_lanes(true,
-                    if pro { "mimop" } else { "mimo" }, None).unwrap();
                 let sparks = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
                 assert_eq!(sparks.len(), ranks, "pro={pro} {input:?}: {}", layout.render());
                 for device in sparks {
                     let planned = |group: &str| device.items.iter().find(|i| i.group == group)
                         .unwrap_or_else(|| panic!("pro={pro} {input:?} {}: no {group}", device.name())).bytes;
-                    // The worker's typed admission as the coordinator selects it: one endpoint per
-                    // MiMo prefill lane (the runtime's own lane resolution), at its wire format.
+                    // Match the coordinator's heterogeneous decode/prefill endpoint admission.
                     let mut worker = config(ranks, device.index as usize, None);
                     worker.capacity = 4096;
-                    worker.rdma_endpoints = lanes;
+                    worker.rdma_endpoints = 2;
                     worker.bf16_ingress = input.bf16(false);
-                    set_model(&mut worker, 4096, input.bf16(false), lanes);
+                    set_model(&mut worker, 4096, input.bf16(false), 2);
+                    worker.model_admission.as_mut().unwrap().endpoints =
+                        cuteafd_loader::families::mimo_v2::admission::spark_endpoints(4096, input)
+                            .unwrap().to_vec();
                     let rings = worker_ring_geometry(&worker).unwrap();
                     let sample = selected_spark_io(&worker, geometry, rings).unwrap();
                     assert_eq!(planned("rdma rings"), sample.mapped_rings, "pro={pro} {input:?} {}", device.name());

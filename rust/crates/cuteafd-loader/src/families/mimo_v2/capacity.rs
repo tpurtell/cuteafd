@@ -232,7 +232,7 @@ pub fn mimo_capacity_profiles(
             // The allocator uses max(256, pages * table_rows * 4). Reserving
             // the fixed minimum plus its linear term is safe at every pool
             // size, overcounting by at most 256 bytes per workspace.
-            let table_rows = if workspace.decode { workspace.rows } else { 1 };
+            let table_rows = if workspace.decode { workspace.rows } else { workspace.waves };
             unit_bytes = add(
                 "MiMo workspace pool tables",
                 unit_bytes,
@@ -320,6 +320,7 @@ mod tests {
                                 name.into(),
                                 MimoWorkspaceOptions {
                                     rows,
+                                    waves: 1,
                                     decode,
                                     lead: rank == 0,
                                     with_head: rank == 0,
@@ -472,7 +473,7 @@ mod tests {
                     changed += 1;
                     assert_eq!(rank, 0);
                     assert_eq!(a.name, "prefill.logits");
-                    assert_eq!(a.bytes - b.bytes, (4096 - 1) * cfg.vocab_size as u64 * 4);
+                    assert_eq!(a.bytes - b.bytes, (16384 - 1) * cfg.vocab_size as u64 * 4);
                     assert_eq!(b.bytes, cfg.vocab_size as u64 * 4);
                 }
             }
