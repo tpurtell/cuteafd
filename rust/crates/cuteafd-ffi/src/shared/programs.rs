@@ -216,7 +216,13 @@ impl<'a> Programs<'a> {
             if name.starts_with("glm_stage_") || name.starts_with("glm2_stage_") {
                 super::glm_stage::validate_entry(spec, entry)?;
             } else if name.starts_with("exlr8_dense_") {
-                super::native_dense::validate_entry(spec, entry)?;
+                // Companions (transforms, unpack, prefill GEMM, glue) by their op; the
+                // ABI-v1 linears and the embedding gather by name.
+                if super::native_dense_glue::op_of(entry)?.is_some() {
+                    super::native_dense_glue::validate_entry(spec, entry)?;
+                } else {
+                    super::native_dense::validate_entry(spec, entry)?;
+                }
             } else if name.starts_with("exlr8_") {
                 super::exlr8::validate_entry(spec, entry)?;
                 let expected: &[(&str, &str)] = match name {
