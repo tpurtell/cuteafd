@@ -188,6 +188,25 @@ def jobs(scope):
          ["--geometry", "exlr8_dense", "--only", "int4_q_b_tp2,int4_o_tp2"]),
         ("exlr8-dense-fp8-row", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only", "fp8_row_lm_head,fp8_row_embedding"]),
+        ("exlr8-dense-unpack", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"unpack_{name}{tp}" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-prefill", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             f"prefill_{name}{tp}" for tp in ("", "_tp2")
+             for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-transforms", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"trellis_input_k{k}_{dt}" for k in (2048, 6144, 8192, 12288, 16384)
+              for dt in ("f16", "bf16")]
+             + [f"trellis_output_n{n}" for n in (6144, 8192, 12288, 16384)])]),
+        ("exlr8-dense-glue", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"swiglu_split_i{i}" for i in (12288, 6144)]
+             + [f"f32_narrow_pack_n{n}_p{p}" for n, p in
+                ((2048, 2624), (576, 2624), (128, 160), (32, 160))]
+             + ["bf16_index_weights"])]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
         ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
     ])
