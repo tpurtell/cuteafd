@@ -260,7 +260,8 @@ fn spark_transport(
 fn prefill_link<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     world: cuteafd_transport::expert::SparkWorld, capacity: u32)
     -> Result<Option<std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>>> {
-    let waves = crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1);
+    let waves = usize::from(args.prefill_waves.unwrap_or(1));
+    args.prefill_units()?;
     if waves == 1 { return Ok(None); }
     let link = crate::shared::spark_intake::SparkLink::new_waves(lib, world, &args.peers,
         capacity, TcpTransportConfig { timing: protocol_v2_timing(), timeout: Duration::from_secs(120),
@@ -279,6 +280,7 @@ fn worker(
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
+    let prefill_units = args.prefill_units()?;
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
@@ -460,6 +462,7 @@ fn worker(
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
     let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
+    transport.configure_prefill_units(prefill_units);
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     let mut prefill_pass = TargetPass::new(
@@ -478,6 +481,7 @@ fn worker(
     admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?;
     let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
+    prefill_transport.configure_prefill_units(prefill_units);
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
@@ -540,7 +544,7 @@ fn worker(
     let (free, _) = memory[0];
     let prefill_bytes = cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
         u64::from(capacity), args.peers.len(),
-        crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1) as u64)?;
+        args.prefill_waves.unwrap_or(1) as u64)?;
     let pool = admission::resolve(&args, &memory, experts, local_workspace, &[prefill_bytes], 0, None)?;
     pass.bind_execution_plan(&pool.placement)?;
     prefill_pass.bind_execution_plan(&pool.placement)?;

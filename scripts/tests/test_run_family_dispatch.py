@@ -3664,7 +3664,8 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
     ("PREFILL_WAVES=1\nPREFILL_ROWS=4096\nPREFILL_SPAN_ROWS=16384\n", None),
     ("PREFILL_WAVES=1\n", None),
     ("", None),
-    ("PREFILL_WAVES=2\n", "currently supports PREFILL_WAVES=1"),
+    ("PREFILL_WAVES=2\n", None),
+    ("PREFILL_WAVES=3\n", "supports PREFILL_WAVES=1 or 2"),
     ("PREFILL_ROWS=4096\n", "require PREFILL_WAVES"),
     ("PREFILL_WAVES=1\nPREFILL_ROWS=257\n", "PREFILL_ROWS must be"),
     ("PREFILL_WAVES=1\nPREFILL_SPAN_ROWS=512\n", "PREFILL_SPAN_ROWS must be"),
@@ -3682,14 +3683,17 @@ def test_v41_shared_prefill_unit_keys_are_opt_in(tmp_path, settings, expected_er
     assert result.returncode == 0, result.stderr
     serving = next(line for line in result.stderr.splitlines() if "serve-native --snapshot" in line)
     if settings:
-        assert "CUTEAFD_PREFILL_WAVES=1" in serving
-        assert "CUTEAFD_PREFILL_SPAN_ROWS=16384" in serving
+        waves = 2 if "PREFILL_WAVES=2" in settings else 1
+        assert f"--prefill-waves {waves}" in serving
+        assert "--prefill-span-rows 16384" in serving
         assert "--prefill-batch-tokens 4096" in serving
         plans = [line for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line]
         assert plans and all("--prefill-rows 4096" in line for line in plans)
     else:
-        assert "CUTEAFD_PREFILL_WAVES=" not in serving
-        assert "CUTEAFD_PREFILL_SPAN_ROWS=" not in serving
+        assert "--prefill-waves" not in serving
+        assert "--prefill-span-rows" not in serving
+    assert "CUTEAFD_PREFILL_WAVES=" not in serving
+    assert "CUTEAFD_PREFILL_SPAN_ROWS=" not in serving
 
 
 @pytest.mark.parametrize("restart", [False, True])

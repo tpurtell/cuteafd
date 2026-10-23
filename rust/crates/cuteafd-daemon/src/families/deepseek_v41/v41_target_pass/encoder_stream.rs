@@ -52,7 +52,10 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         transports: [&mut NativeTp4Wave<'a>; 2], suffix: &mut EncoderSuffix<'a>,
         keep_running: &dyn Fn() -> bool, before_chunk: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
-        if let Some(waves) = super::encoder_units::waves()? {
+        ensure!(transports[0].prefill_units() == transports[1].prefill_units(),
+            "encoder transport unit configuration differs");
+        if let Some(config) = transports[0].prefill_units() {
+            let waves = config.waves;
             // SAFETY: each slot retains its pass and FFN arena until its FIFO ticket lands.
             return unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports,
                 suffix, keep_running, before_chunk, waves).await };

@@ -915,6 +915,29 @@ mod tests {
     }
 
     #[test]
+    fn native_prefill_units_require_explicit_typed_opt_in() {
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/lib.so"];
+        let parse = |extra: &[&str]| Cli::try_parse_from(base.into_iter().chain(extra.iter().copied()));
+        let Commands::ServeNative(args) = parse(&[]).unwrap().command else { panic!("serve-native") };
+        assert!(args.prefill_units().unwrap().is_none());
+        for waves in ["1", "2"] {
+            let Commands::ServeNative(args) = parse(&["--prefill-batch-tokens", "4096",
+                "--prefill-waves", waves]).unwrap().command else { panic!("serve-native") };
+            let config = args.prefill_units().unwrap().unwrap();
+            assert_eq!(config.waves, waves.parse::<usize>().unwrap());
+            assert_eq!(config.span_rows, 16384);
+        }
+        let Commands::ServeNative(args) = parse(&["--prefill-batch-tokens", "1024",
+            "--prefill-waves", "2", "--prefill-span-rows", "8192"]).unwrap().command else { panic!("serve-native") };
+        assert_eq!(args.prefill_units().unwrap().unwrap().span_rows, 8192);
+        assert!(parse(&["--prefill-span-rows", "16384"]).is_err());
+        for waves in ["0", "3"] { assert!(parse(&["--prefill-waves", waves]).is_err()); }
+        let Commands::ServeNative(args) = parse(&["--prefill-batch-tokens", "257",
+            "--prefill-waves", "2"]).unwrap().command else { panic!("serve-native") };
+        assert!(args.prefill_units().is_err());
+    }
+
+    #[test]
     fn plan_prefill_wave_option_has_no_lane_alias() {
         let Commands::Plan(args) = Cli::try_parse_from([
             "cuteafd", "plan", "model", "--prefill-waves", "2"]).unwrap().command else {
@@ -1068,6 +1091,14 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 80, value_parser = clap::value_parser!(u32).range(80..=4096))]
     pub prefill_batch_tokens: u32,
 
+    /// Opt into the shared row-unit prefill executor; decode links stay independent.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub prefill_waves: Option<u8>,
+
+    /// Bounded row span of the shared executor (default 16384 when opted in).
+    #[arg(long, requires = "prefill_waves")]
+    pub prefill_span_rows: Option<usize>,
+
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
     pub max_context_tokens: u32,
@@ -1215,6 +1246,13 @@ fn plan_decode_rows(value: &str) -> Result<u64, String> {
 }
 
 impl NativeServeArgs {
+    pub(crate) fn prefill_units(&self) -> anyhow::Result<Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>> {
+        self.prefill_waves.map(|waves|
+            crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig::new(
+                self.prefill_batch_tokens as usize, usize::from(waves),
+                self.prefill_span_rows.unwrap_or(16384))).transpose()
+    }
+
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && !self.dspark_fixed
     }

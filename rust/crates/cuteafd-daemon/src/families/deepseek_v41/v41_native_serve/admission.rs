@@ -175,7 +175,7 @@ pub(super) fn admit_startup(
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
         2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?
             + owners::prefill_transport_bytes(u64::from(capacity), args.peers.len(),
-                crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1) as u64)?, slots)?;
+                args.prefill_waves.unwrap_or(1) as u64)?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(

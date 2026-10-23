@@ -315,7 +315,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let memory=admission::admission_memory(&lib,&inventory)?;
     let prefill_bytes = cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
         u64::from(capacity), spark_ranks,
-        crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()?.unwrap_or(1) as u64)?;
+        args.prefill_waves.unwrap_or(1) as u64)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
         2, (2 * wave_bytes) as u64 + prefill_bytes)?;
     // The dSpark load phase is its experts plus their transient staging above
@@ -419,7 +419,9 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
             let roce = super::spark_transport(&args.peers, capacity, timing, spark_world)?;
-            NativeTp4Wave::new(&lib, roce, wave_bytes)
+            let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
+            transport.configure_prefill_units(args.prefill_units()?);
+            Ok(transport)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
         if device_exchange {

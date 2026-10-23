@@ -125,13 +125,9 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
     fn encoder_unit(&self, next: usize, replay_end: usize, streamed: bool,
         budget: ChunkBudget) -> Result<V41Unit> {
-        if crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()?
-            && next >= replay_end && next < self.tokens.len() {
-            let span = std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok()
-                .map(|value| value.parse::<usize>()).transpose()
-                .context("PREFILL_SPAN_ROWS must be a row count")?.unwrap_or(16384);
-            ensure!(span >= self.chunk_rows && span <= 1048576 && span % 256 == 0,
-                "PREFILL_SPAN_ROWS must be a 256-row multiple between unit rows and 1048576");
+        if let Some(config) = P::prefill_units(self.transport).filter(|_|
+            next >= replay_end && next < self.tokens.len()) {
+            let span = config.span_rows;
             let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
             let mut ranges = Vec::new();
             let mut start = next;
@@ -252,7 +248,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let hold = RefCell::new(&mut *self.hold);
                 let before_chunk = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
                 // Preserve alternating lane ownership after a bounded singleton stream.
-                let odd = !crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()?
+                let odd = P::prefill_units(self.transport).is_none()
                     && (*next - *replay_end) / self.chunk_rows % 2 != 0;
                 let (first, second, a, b) = if odd {
                     (&mut *self.other, &mut *self.pass, &mut *self.other_transport, &mut *self.transport)
@@ -269,7 +265,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
             }
             (V41Unit::DecoderReplay, PrefillState::Replay { suffix } | PrefillState::Encoder { suffix, .. }) => {
                 ensure!(!self.job.events.is_closed(), "client disconnected");
-                let unit_replay = crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()?;
+                let unit_replay = P::prefill_units(self.transport).is_some();
                 let start = self.requests.begin_decoder_replay(self.lease)?;
                 let rows = (self.tokens.len() as u64 - start) as u32;
                 let mut batch = self.requests.prepare_replay(&[CacheWork { lease: self.lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
@@ -462,6 +458,8 @@ async unsafe fn replay_unit<'w, 'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
 }
 
 pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + ReplayTarget<'a> + Sized {
+    fn prefill_units(transport: &Self::Transport)
+        -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
@@ -499,6 +497,10 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + ReplayTarget<'a> + 
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()>;
 }
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
+    fn prefill_units(transport: &Self::Transport)
+        -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig> {
+        transport.prefill_units()
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -544,6 +546,10 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     }
 }
 impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
+    fn prefill_units(transport: &Self::Transport)
+        -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig> {
+        transport.prefill_units()
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
     }
@@ -563,7 +569,10 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
         suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
         before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
-        if let Some(waves) = crate::families::deepseek_v41::v41_target_pass::encoder_units::waves()? {
+        ensure!(transports[0].prefill_units() == transports[1].prefill_units(),
+            "encoder transport unit configuration differs");
+        if let Some(config) = transports[0].prefill_units() {
+            let waves = config.waves;
             // SAFETY: slots retain independent owners until FIFO landing and in-order commit.
             unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports,
                 suffix, keep_running, before_chunk, waves).await }

@@ -170,6 +170,7 @@ pub(crate) struct NativeTp4Wave<'a> {
     link: crate::shared::spark_intake::SparkLink<'a>,
     // Unit traffic shares one FIFO; decode keeps each lane's fixed intake.
     prefill_link: Option<std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>>,
+    prefill_units: Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>,
     // Drop drains the stream before fields release any GPU allocations.
     stream: LoadStream<'a>,
     shared: DeviceAllocation<'a>,
@@ -214,6 +215,13 @@ fn device_request(context: &DeviceContext, layer: u32, rows: usize,
 }
 impl<'a> NativeTp4Wave<'a> {
     pub(crate) fn spark_world(&self) -> usize { self.link.transport.world_size() }
+    pub(crate) fn prefill_units(&self) -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig> {
+        self.prefill_units
+    }
+    pub(crate) fn configure_prefill_units(&mut self,
+        config: Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>) {
+        self.prefill_units = config;
+    }
     pub(crate) fn install_prefill_link(&mut self,
         link: std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>) -> Result<()> {
         ensure!(self.prefill_link.is_none(), "prefill link already installed");
@@ -360,6 +368,7 @@ impl<'a> NativeTp4Wave<'a> {
             link: crate::shared::spark_intake::SparkLink::from_transport(library, transport,
                 V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Pinned)?,
             prefill_link: None,
+            prefill_units: None,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,

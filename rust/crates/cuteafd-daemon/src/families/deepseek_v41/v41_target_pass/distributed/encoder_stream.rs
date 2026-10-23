@@ -46,7 +46,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>,
         keep_running: &dyn Fn() -> bool,
     ) -> Result<()> {
-        if let Some(waves) = super::super::encoder_units::waves()? {
+        ensure!(transports[0].prefill_units() == transports[1].prefill_units(),
+            "encoder transport unit configuration differs");
+        if let Some(config) = transports[0].prefill_units() {
+            let waves = config.waves;
             // SAFETY: slots retain their independent device and FFN owners through landing.
             return unsafe { self.execute_encoder_units(other, requests, lease, chunks,
                 transports, suffix, keep_running, &|| Ok(()), waves).await };

@@ -27,12 +27,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    let waves = match std::env::var("CUTEAFD_PREFILL_WAVES").ok().as_deref() {
-        None => options.prefill_waves,
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => anyhow::bail!("V4.1 supports PREFILL_WAVES=1 or 2"),
-    };
+    let waves = options.prefill_waves;
     ensure!((1..=2).contains(&waves), "V4.1 prefill waves must be 1 or 2");
     options.prefill_waves = waves;
     if !explicit_unit { options.prefill_unit_rows = Some(rows); }

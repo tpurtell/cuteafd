@@ -842,8 +842,8 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 v41_prefill_span="$(get PREFILL_SPAN_ROWS)"
 [[ -z "$v41_prefill_rows$v41_prefill_span" || -n "$v41_prefill_waves" ]] ||
   release_die "PREFILL_ROWS and PREFILL_SPAN_ROWS require PREFILL_WAVES for V4.1"
-[[ -z "$v41_prefill_waves" || "$v41_prefill_waves" == 1 ]] ||
-  release_die "V4.1 currently supports PREFILL_WAVES=1"
+[[ -z "$v41_prefill_waves" || "$v41_prefill_waves" == 1 || "$v41_prefill_waves" == 2 ]] ||
+  release_die "V4.1 supports PREFILL_WAVES=1 or 2"
 if [[ -n "$v41_prefill_waves" ]]; then
   v41_prefill_rows="${v41_prefill_rows:-4096}"
   [[ "$v41_prefill_rows" =~ ^[0-9]+$ ]] && ((v41_prefill_rows >= 256 && v41_prefill_rows <= 4096 && v41_prefill_rows % 256 == 0)) ||
@@ -1385,10 +1385,6 @@ for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_DEVICE C
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
 done
 rdma_env_args+=(${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"})
-if [[ -n "$v41_prefill_waves" ]]; then
-  rdma_env_args+=(-e "CUTEAFD_PREFILL_WAVES=$v41_prefill_waves"
-    -e "CUTEAFD_PREFILL_SPAN_ROWS=$v41_prefill_span")
-fi
 # RDMA_BOND_BALANCE (off, labels or probe): the coordinator's RoCE flow labels on a
 # bonded port; see the generic launch below.
 case "${RDMA_BOND_BALANCE:-off}" in
@@ -1441,6 +1437,9 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+if [[ -n "$v41_prefill_waves" ]]; then
+  args+=(--prefill-waves "$v41_prefill_waves" --prefill-span-rows "$v41_prefill_span")
+fi
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")

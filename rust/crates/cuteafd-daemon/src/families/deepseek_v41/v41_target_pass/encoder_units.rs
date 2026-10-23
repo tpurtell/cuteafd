@@ -7,18 +7,21 @@ use crate::shared::prefill_pipeline::{run_prefill_units_async, AsyncPrefillHooks
 use cuteafd_transport::ExpertV2SourceKind;
 use std::cell::RefCell;
 
-pub(in crate::families::deepseek_v41) fn waves() -> Result<Option<usize>> {
-    parse_waves(std::env::var("CUTEAFD_PREFILL_WAVES").ok().as_deref())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnitConfig {
+    pub waves: usize,
+    pub span_rows: usize,
 }
-fn parse_waves(value: Option<&str>) -> Result<Option<usize>> {
-    match value {
-        None => Ok(None),
-        Some("1") => Ok(Some(1)),
-        Some("2") => Ok(Some(2)),
-        _ => anyhow::bail!("V4.1 supports PREFILL_WAVES=1 or 2; omit it for the existing path"),
+impl UnitConfig {
+    pub fn new(unit_rows: usize, waves: usize, span_rows: usize) -> Result<Self> {
+        ensure!((256..=4096).contains(&unit_rows) && unit_rows % 256 == 0,
+            "V4.1 unit rows must be a 256-row multiple in 256..4096");
+        ensure!((1..=2).contains(&waves), "V4.1 prefill waves must be 1 or 2");
+        ensure!((unit_rows..=1048576).contains(&span_rows) && span_rows % 256 == 0,
+            "V4.1 span rows must be a 256-row multiple between unit rows and 1048576");
+        Ok(Self { waves, span_rows })
     }
 }
-pub(in crate::families::deepseek_v41) fn enabled() -> Result<bool> { Ok(waves()?.is_some()) }
 
 pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
     ensure!(!chunks.is_empty(), "empty encoder unit span");
@@ -364,6 +367,27 @@ impl<'a> crate::families::deepseek_v41::v41_native_serve::prefill_target::Replay
 mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, Step};
+
+    #[test]
+    fn typed_unit_configuration_bounds_rows_waves_and_spans() -> Result<()> {
+        for rows in [256, 512, 1024, 2048, 4096] {
+            for waves in [1, 2] {
+                for span in [rows, 16384, 1048576] {
+                    assert_eq!(UnitConfig::new(rows, waves, span)?, UnitConfig { waves, span_rows: span });
+                }
+            }
+        }
+        for rows in [0, 80, 255, 257, 4097] {
+            assert!(UnitConfig::new(rows, 1, 16384).is_err());
+        }
+        for waves in [0, 3, usize::MAX] {
+            assert!(UnitConfig::new(4096, waves, 16384).is_err());
+        }
+        for span in [0, 512, 4095, 16385, 1048577] {
+            assert!(UnitConfig::new(4096, 2, span).is_err());
+        }
+        Ok(())
+    }
 
     #[test]
     fn suffix_replay_waits_for_every_encoder_commit() -> Result<()> {
