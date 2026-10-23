@@ -366,8 +366,12 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Compact profiles retain the cooperative kernel until qualified."""
-    return False
+    """Measured Qwen compact H128/H256 ownership: M32/N128 prefill only.
+
+    All four TP4 ownerships are exact for rows 1..4096; recorded-route
+    m2688/m4096 improves 1.31-1.39x. Wider compact and other families stay off.
+    """
+    return geometry == 'qwen4' and role == 'spark' and width == 256 and capacity >= 256
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
