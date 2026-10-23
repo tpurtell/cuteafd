@@ -726,7 +726,7 @@ impl LocalVerbsExpertConnection {
             post_recv_ms = elapsed_ms_optional(post_recv_started);
             if timing_enabled {
                 eprintln!(
-                "protocol_v2_verbs_persistent_server_roundtrip_timing execution_lane={} request_id={} layer_id={} rows={} routes={} request_wire_bytes={} response_frames={} direct_device_response_frames={} response_wire_bytes={} executor={} poll_recv_ms={:.3} copy_header_ms={:.3} resize_ms={:.3} copy_request_ms={:.3} post_recv_ms={:.3} parse_ms={:.3} execute_ms={:.3} encode_ms={:.3} send_ms={:.3} poll_send_ms={:.3} total_ms={:.3}",
+                "protocol_v2_verbs_persistent_server_roundtrip_timing execution_lane={} request_id={} layer_id={} rows={} routes={} request_wire_bytes={} response_frames={} direct_device_response_frames={} response_wire_bytes={} executor={} poll_recv_ms={:.3} copy_header_ms={:.3} resize_ms={:.3} copy_request_ms={:.3} post_recv_ms={:.3} parse_ms={:.3} execute_ms={:.3} encode_ms={:.3} send_ms={:.3} poll_send_ms={:.3} total_ms={:.3} end_epoch_us={}",
                 start.execution_lane,
                 request_id,
                 layer_id,
@@ -747,7 +747,10 @@ impl LocalVerbsExpertConnection {
                 encode_ms,
                 send_ms,
                 poll_send_ms,
-                elapsed_ms_optional(total_started)
+                elapsed_ms_optional(total_started),
+                // Wall-clock end, so per-rank busy intervals and idle gaps can be
+                // rebuilt across requests: [end - (total - poll_recv), end].
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros())
             );
             }
             Ok(())
