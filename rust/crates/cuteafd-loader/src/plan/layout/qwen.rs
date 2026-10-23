@@ -192,7 +192,17 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let mark = geometry.ranks[0].retained_mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
         options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
-    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", shape.prefill_rows,
+    let prefill_shape = if options.prefill_waves > 1 {
+        anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
+            "Qwen prefill waves require single-owner Spark experts");
+        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 2048 };
+        let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
+        anyhow::ensure!(units.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
+        anyhow::ensure!(units.slot_rows() <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
+        Some(units)
+    } else { None };
+    let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());
+    let logits = if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", span,
         cfg.vocab_size as u64) } else { 0 };
     // The PLE n-gram table is mapped (each step's rows uploaded): row width ple_dim / ple_rows, one byte
     // per value in E4M3, two in BF16 (`ple::PleTable::load`).
@@ -204,15 +214,6 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
         device.items.push(Item::new(Category::Experts, "package scratch", package, bytes, Basis::Formula));
     }
     let loaded_bytes = device.used_bytes();
-    let prefill_shape = if options.prefill_waves > 1 {
-        anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
-            "Qwen prefill waves require single-owner Spark experts");
-        let unit = if options.prefill_rows > 0 { options.prefill_rows } else { 2048 };
-        let units = crate::serving_capacity::PrefillShape { unit_rows: unit, waves: options.prefill_waves }.validate()?;
-        anyhow::ensure!(units.slot_rows() <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
-        Some(units)
-    } else { None };
-    let span = prefill_shape.map_or(shape.prefill_rows, |s| s.slot_rows());
     let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
             prefill_rows: span, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,

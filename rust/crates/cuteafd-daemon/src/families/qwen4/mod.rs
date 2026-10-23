@@ -234,6 +234,7 @@ impl EngineArgs {
         let shape = cuteafd_loader::serving_capacity::PrefillShape {
             unit_rows: self.prefill_units.unwrap_or(self.prefill_rows) as u64, waves: u64::from(self.prefill_waves),
         }.validate()?;
+        ensure!(shape.waves <= 2, "Qwen mapped PLE gathers admit at most two prefill waves");
         ensure!(shape.slot_rows() <= 4096 && self.prefill_rows <= 4096, "Qwen prefill span exceeds compiled 4096 rows");
         Ok(Some(shape))
     }
@@ -308,6 +309,31 @@ mod weight_representation_tests {
             assert!(manifest.residency(cuteafd_loader::V41Exl3Layer::Backbone(layer), 3, 0)?
                 .device_arena_layout()?.1 > 0);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_units_validate_owner_slots_and_preserve_explicit_geometry() -> Result<()> {
+        assert_eq!(args(&[])?.prefill_shape()?, None);
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2)] {
+            let rows_arg = rows.to_string();
+            let waves_arg = waves.to_string();
+            let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
+            let shape = parsed.prefill_shape()?.unwrap();
+            assert_eq!((shape.unit_rows, shape.waves), (rows, waves));
+            assert_eq!(parsed.prefill_rows, 4096);
+        }
+        for extra in [
+            vec!["--prefill-waves", "2"],
+            vec!["--shared-only", "--prefill-units", "511"],
+            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
+            vec!["--shared-only", "--prefill-units", "512", "--prefill-waves", "3"],
+            vec!["--local-experts", "--split-device", "1", "--prefill-units", "2048"],
+        ] {
+            assert!(args(&extra)?.prefill_shape().is_err(), "{extra:?}");
+        }
+        let shape = args(&["--peers", "localhost:9870", "--prefill-rows", "2048", "--prefill-waves", "2"])?.prefill_shape()?.unwrap();
+        assert_eq!((shape.unit_rows, shape.slot_rows()), (2048, 4096));
         Ok(())
     }
 

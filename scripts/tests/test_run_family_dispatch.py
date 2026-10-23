@@ -2365,6 +2365,20 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
         assert "--rtx-expert-layers all" in preflight
 
 
+@pytest.mark.parametrize("rows,waves", [(512, 1), (1024, 2), (2048, 2)])
+def test_qwen_prefill_shape_reaches_plan_and_server(tmp_path, rows, waves):
+    keys = ("RTX_GPUS=1\nSPARK_COUNT=4\nSPECULATOR=off\n"
+            f"PREFILL_ROWS={rows}\nPREFILL_WAVES={waves}\n")
+    result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model", keys)
+    assert result.returncode == 0, result.stderr
+    planner = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    server = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
+    for command in (planner, server):
+        assert f"--prefill-rows {rows}" in command
+        assert f"--prefill-waves {waves}" in command
+    assert "--split-device" not in server
+
+
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
 def test_qwen_explicit_spark_free_dual_passes_both_owners(tmp_path: Path, keys: str) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["qwen4"], "test/model",

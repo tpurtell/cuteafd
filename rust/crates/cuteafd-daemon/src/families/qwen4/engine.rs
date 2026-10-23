@@ -689,6 +689,7 @@ struct Workspace<'a> {
     logit_offset: Cell<usize>,
     /// Terminal target rows retained until the span's canonical MTP hand-off.
     terminal_streams: Option<Dev<'a>>,
+    terminal_valid: Cell<bool>,
     router_logits: Dev<'a>,
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
@@ -716,6 +717,8 @@ impl Workspace<'_> {
     fn live(&self, buffer: &Dev<'_>, stride: usize) -> *mut c_void {
         self.live_buffer(buffer, stride).ptr
     }
+    fn unit_offset(slot: usize, unit_rows: usize) -> usize { slot * unit_rows }
+
     fn live_buffer(&self, buffer: &Dev<'_>, stride: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
         let offset = self.row_offset.get() * stride;
         assert!(offset < buffer.buffer.bytes);
@@ -1964,6 +1967,7 @@ impl<'a> Qwen4Engine<'a> {
             logits: self.alloc(logit_rows * self.cfg.vocab_size * 4)?,
             logit_rows, logit_offset: Cell::new(0),
             terminal_streams: (terminal_rows > 0).then(|| self.alloc(terminal_rows * HC * h * 2)).transpose()?,
+            terminal_valid: Cell::new(false),
             router_logits: self.alloc(t * self.cfg.experts * 4)?,
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
@@ -2175,6 +2179,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let workspace = self.workspace.borrow();
         let w = workspace.as_ref().context("Qwen prefill workspace")?;
+        w.terminal_valid.set(false);
         w.units.set(true);
         let mut hooks = UnitHooks { engine: self, w, placement, tokens,
             tables: units.iter().map(|unit| tables.unit(unit.rows.clone(), if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect(),
@@ -2184,6 +2189,7 @@ impl<'a> Qwen4Engine<'a> {
         w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
         self.last_stream_offset.set(0);
         result?;
+        w.terminal_valid.set(w.terminal_streams.is_some());
         placement.len += t;
         placement.state_len = placement.len;
         tracing::debug!(rows = t, unit_rows = shape.unit_rows, waves, units = units.len(), "Qwen prefill units");
@@ -2347,7 +2353,9 @@ impl<'a> Qwen4Engine<'a> {
                 continue;
             }
             let dst = Self::region(pending, (slot * MTP_PENDING_ROWS + at) * row, count * row);
-            let source = if !decode { w.terminal_streams.as_ref().unwrap_or(&w.streams[cur]) } else { &w.streams[cur] };
+            let source = if !decode && w.terminal_valid.get() {
+                w.terminal_streams.as_ref().context("missing terminal target rows")?
+            } else { &w.streams[cur] };
             let src = Self::region(source, first * row, count * row);
             // SAFETY: both regions lie inside live buffers; the stream orders the copy.
             unsafe { self.library.copy_d2d_async(dst, src, count * row, self.execution_stream())? };
@@ -2448,7 +2456,9 @@ impl<'a> Qwen4Engine<'a> {
                 if separate {
                     let target = self.workspace.borrow();
                     let target = target.as_ref().context("no target prefill ran")?;
-                    let source = target.terminal_streams.as_ref().unwrap_or(&target.streams[cur]);
+                    let source = if target.terminal_valid.get() {
+                        target.terminal_streams.as_ref().context("missing terminal target rows")?
+                    } else { &target.streams[cur] };
                     (source.buffer.ptr, 0)
                 } else { (w.streams[cur].buffer.ptr, cur ^ 1) }
             }
@@ -2597,6 +2607,7 @@ impl<'a> Qwen4Engine<'a> {
         self.last_stream_offset.set(0);
         if let Some(w) = self.workspace.borrow().as_ref() {
             w.row_offset.set(0); w.logit_offset.set(0); w.units.set(false);
+            w.terminal_valid.set(false);
         }
         ensure!(self.gdn_banks.len() == 1 || self.hops.is_some(),
             "Qwen dual owner execution needs TP2 exchange and owner graph admission");
@@ -2614,6 +2625,7 @@ impl<'a> Qwen4Engine<'a> {
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
+        w.position.set(tables.positions.first().copied().unwrap_or(0) as usize);
         ensure!(t <= w.rows && logit_rows <= t, "step exceeds the workspace");
         self.begin_staging(w)?;
         self.stage_table(w, &w.positions, &tables.positions)?;
@@ -3580,7 +3592,7 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a> {
 impl UnitHooks<'_, '_, '_, '_, '_> {
     fn select(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
-        self.w.row_offset.set(unit.slot * shape.unit_rows as usize);
+        self.w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
         self.w.position.set(self.tables[unit.index].positions[0] as usize);
         self.engine.stage_step_tables(self.w, &self.tables[unit.index])
     }
@@ -3693,6 +3705,132 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
 
     fn commit_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         // State is causal per layer; terminal rows retain the exact span for MTP.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod prefill_unit_tests {
+    use super::*;
+    use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+    use std::ops::Range;
+
+    #[test]
+    fn unit_tables_keep_absolute_addresses_and_reset_sequence_rows() -> Result<()> {
+        for start in [0usize, 63, 255, 1023, 2047, 4093] {
+            let count = 4096;
+            let ple_rows = 16;
+            let mut whole = StepTables { page_table: vec![9, 4, 7, 2], pool_table: vec![3, 8],
+                page_width: 4, pool_width: 2, ..Default::default() };
+            for row in 0..count {
+                let position = start + row;
+                whole.positions.push(position as i64);
+                whole.rope_positions.push([position as i32, 2 * position as i32, 3 * position as i32]);
+                whole.block_rope_positions.push([(position / BLOCK * BLOCK) as i32; 3]);
+                whole.kv_slots.push((700 + position) as i64);
+                whole.pool_slots.push(if position % BLOCK == BLOCK - 1 { (position / BLOCK) as i64 } else { -1 });
+                whole.slots.push(5);
+                whole.seq_first.push(0);
+                whole.cache_lengths.push(((position + 1) / BLOCK) as i32);
+                whole.ple_ids.extend((0..ple_rows).map(|head| (position * ple_rows + head) as i64));
+            }
+            for width in [512, 1024, 2048] {
+                for unit in sequence_units(count, width, 1, 48)? {
+                    let rows = unit.rows;
+                    let local = whole.unit(rows.clone(), ple_rows, 2051);
+                    assert_eq!(local.positions, whole.positions[rows.clone()]);
+                    assert_eq!(local.rope_positions, whole.rope_positions[rows.clone()]);
+                    assert_eq!(local.block_rope_positions, whole.block_rope_positions[rows.clone()]);
+                    assert_eq!(local.kv_slots, whole.kv_slots[rows.clone()]);
+                    assert_eq!(local.pool_slots, whole.pool_slots[rows.clone()]);
+                    assert_eq!(local.slots, whole.slots[rows.clone()]);
+                    assert_eq!(local.cache_lengths, whole.cache_lengths[rows.clone()]);
+                    assert_eq!(local.ple_ids, whole.ple_ids[rows.start * ple_rows..rows.end * ple_rows]);
+                    assert_eq!(local.page_table, whole.page_table);
+                    assert_eq!(local.pool_table, whole.pool_table);
+                    assert_eq!((local.page_width, local.pool_width), (whole.page_width, whole.pool_width));
+                    assert_eq!((local.page_stride, local.pool_stride), (0, 0));
+                    assert_eq!(local.long, local.positions.iter().any(|&p| p + 1 > 2051));
+                    assert_eq!(local.seq_first, vec![0; rows.len()]);
+                    // A whole-step view would leave negative first-row indices
+                    // at every nonzero cut; GDN/PLE must see a new local row 0.
+                    if rows.start > 0 { assert_ne!(local.seq_first[0], whole.seq_first[rows.start] - rows.start as i32); }
+                    assert!(!local.decode && !local.spec);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    const LIVE: [&str; 6] = ["streams0", "streams1", "inject", "x", "delta", "shared"];
+
+    /// Replay the executor's actual order with Qwen's post/pre writes in
+    /// landing, including its next-layer x surviving another unit's hooks.
+    fn replay(span: usize, width: usize, waves: usize, zero_plane: Option<&str>, scratch_alias: bool)
+        -> Result<Option<String>> {
+        let mut units = sequence_units(span, width, 1, 48)?;
+        for unit in &mut units { unit.slot = unit.index % waves; }
+        let routes = vec![FfnRoute::Spark; 48];
+        let mut current = vec![0usize; units.len()];
+        let mut entered = vec![false; units.len()];
+        let mut live = Vec::<(usize, &'static str, Range<usize>)>::new();
+        for step in prefill_schedule(&routes, &units, waves)? {
+            let (index, mut writes) = match step {
+                Step::Begin { unit } => (unit, vec!["streams0"]),
+                Step::Attention { unit, .. } => {
+                    let mut writes = vec!["delta"];
+                    if !entered[unit] { writes.extend(["inject", "x"]); }
+                    current[unit] ^= 1;
+                    writes.extend([LIVE[current[unit]], "inject", "x"]);
+                    (unit, writes)
+                }
+                Step::Send { unit, .. } => (unit, vec!["shared"]),
+                Step::Land { unit, layer } => {
+                    current[unit] ^= 1;
+                    entered[unit] = true;
+                    let mut writes = vec!["delta", LIVE[current[unit]]];
+                    if layer + 1 < 48 { writes.extend(["inject", "x"]); }
+                    (unit, writes)
+                }
+                Step::End { unit } => (unit, vec!["x"]),
+                Step::Commit { unit } => { live.retain(|(owner, _, _)| *owner != unit); continue; }
+                Step::Local { .. } => unreachable!(),
+            };
+            // Hook-local tables, query/gate/index/attn, routes/wire and scratch
+            // stay separate from all six live planes, at row zero.
+            writes.extend(["tables", "query", "gate", "index_q", "attn", "blocks", "indices",
+                "lengths", "scratch", "topk_scratch", "router_logits", "route_ids", "route_weights", "wire"]);
+            for plane in writes {
+                let (plane, first) = if plane == "scratch" && scratch_alias { ("x", 0) }
+                    else { (plane, if LIVE.contains(&plane) && zero_plane != Some(plane) {
+                        Workspace::unit_offset(units[index].slot, width)
+                    } else { 0 }) };
+                let range = first..first + units[index].rows.len();
+                if let Some((owner, _, _)) = live.iter().find(|(owner, held, rows)| *owner != index
+                    && *held == plane && rows.start < range.end && range.start < rows.end) {
+                    return Ok(Some(format!("{step:?} overwrites unit {owner} {plane}")));
+                }
+                if LIVE.contains(&plane) {
+                    live.retain(|(owner, held, _)| *owner != index || *held != plane);
+                    live.push((index, plane, range));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    #[test]
+    fn real_schedule_preserves_all_qwen_live_planes_and_catches_shared_rows() -> Result<()> {
+        for (span, width) in [(1, 512), (513, 512), (4096, 512), (4096, 2048), (3971, 1024)] {
+            for waves in [1, 2] {
+                assert_eq!(replay(span, width, waves, None, false)?, None, "{span}/{width}/{waves}");
+            }
+        }
+        for plane in LIVE {
+            let hazard = replay(4096, 1024, 2, Some(plane), false)?.expect("row-zero negative control");
+            assert!(hazard.contains(plane), "{hazard}");
+        }
+        assert!(replay(4096, 1024, 2, None, true)?.unwrap().contains("x"));
         Ok(())
     }
 }

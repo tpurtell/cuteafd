@@ -1087,6 +1087,10 @@ mod warm_stream_tests {
     #[test]
     fn every_spark_family_bootstraps_its_transport_with_a_wave_request() {
         // The needles are joined here, so this file's own text does not match them.
+<<<<<<< HEAD
+=======
+        let links = [["SparkLink::", "new("].concat(), ["SparkLink::", "new_waves("].concat()];
+>>>>>>> c1602b441 (Test Qwen prefill row ownership and harden terminal stream handoff)
         let open = [".boot", "strap(&"].concat();
         for (family, source) in [
             ("deepseek_v4", include_str!("../families/deepseek_v4/mod.rs")),
@@ -1097,7 +1101,11 @@ mod warm_stream_tests {
             ("step5", include_str!("../families/step5/serve.rs")),
             ("step5 golden", include_str!("../families/step5/golden.rs")),
         ] {
+<<<<<<< HEAD
             let transport = spark_transport_constructor(source)
+=======
+            let transport = links.iter().filter_map(|link| source.find(link.as_str())).min()
+>>>>>>> c1602b441 (Test Qwen prefill row ownership and harden terminal stream handoff)
                 .unwrap_or_else(|| panic!("{family}: no Spark transport"));
             let bootstrap = source.find(&open)
                 .unwrap_or_else(|| panic!("{family}: the Spark transport is never bootstrapped"));

@@ -373,6 +373,51 @@ mod tests {
     use crate::families::qwen4::Qwen4KvCache;
 
     #[test]
+    fn unit_workspace_scales_only_live_planes_and_retained_terminal_rows() {
+        use super::{qwen_unit_workspace_bytes, qwen_workspace_bytes};
+        use crate::serving_capacity::PrefillShape;
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let h = cfg.hidden as u64;
+        for rows in [512, 1024, 2048] {
+            let one = PrefillShape { unit_rows: rows, waves: 1 };
+            let two = PrefillShape { unit_rows: rows, waves: 2 };
+            let base = qwen_workspace_bytes(&cfg, rows, false, 1, 0, Some(160), 12345, 6789);
+            assert_eq!(qwen_unit_workspace_bytes(&cfg, one, 0, 1, Some(160), 12345, 6789), base);
+            let extra_slot = rows * (2 * 4 * h * 2 + 4 * 2 + 3 * h * 2);
+            let slot_bytes = qwen_unit_workspace_bytes(&cfg, two, 0, 1, Some(160), 12345, 6789);
+            assert_eq!(slot_bytes, base + extra_slot);
+            assert_eq!(qwen_unit_workspace_bytes(&cfg, two, 4096, 1, Some(160), 12345, 6789),
+                slot_bytes + 4096 * 4 * h * 2);
+        }
+        assert_eq!(crate::serving_capacity::prefill_return_bytes(2, 2048, 4, 2048), 64 << 20);
+    }
+
+    #[test]
+    fn unit_mtp_scratch_and_page_tables_are_admitted_separately() {
+        use super::{qwen_admission, qwen_workspace_bytes, QwenAdmissionInputs};
+        use crate::serving_capacity::PrefillShape;
+        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let mut inputs = QwenAdmissionInputs { cfg: &cfg, layers: 48, mtp: true, kv_format: Qwen4KvCache::Fp8,
+            manifest: None, prefill_rows: 4096, prefill_shape: None, slots: 8, mark_bytes: 0,
+            full_prefill_logits: 0, ple: Some((160, true)), future_expert_bytes: 0, headroom: 0 };
+        let legacy = qwen_admission(&inputs).unwrap();
+        inputs.prefill_shape = Some(PrefillShape { unit_rows: 2048, waves: 2 });
+        let units = qwen_admission(&inputs).unwrap();
+        let bytes = |name| units.items.iter().find(|item| item.1 == name).unwrap().2;
+        assert_eq!(bytes("prefill MTP step"), qwen_workspace_bytes(&cfg, 2048, false, 1, 0, Some(160), 0, 0));
+        let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, 48, true, Qwen4KvCache::Fp8).unwrap();
+        let rank = &geometry.ranks[0];
+        let pool_bytes = rank.persistent_unit_bytes + rank.pool_metadata_unit_bytes;
+        assert_eq!(legacy.per_token, (pool_bytes + 65 * 5 * 4).div_ceil(geometry.logical_unit_rows));
+        assert_eq!(units.per_token, (pool_bytes + 66 * 5 * 4).div_ceil(geometry.logical_unit_rows));
+        inputs.mtp = false;
+        let no_mtp = qwen_admission(&inputs).unwrap();
+        assert!(!no_mtp.items.iter().any(|item| item.1 == "prefill MTP step"));
+        assert_eq!(bytes("prefill step") - no_mtp.items.iter().find(|item| item.1 == "prefill step").unwrap().2,
+            4096 * 4 * cfg.hidden as u64 * 2);
+    }
+
+    #[test]
     fn scratch_admission_selects_the_kv_format_and_capacity() {
         let mut programs = Vec::new();
         for (cap, factor) in [("m64", 1_u64), ("m4096", 10)] {
