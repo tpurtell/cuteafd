@@ -63,9 +63,9 @@ pub fn request(inputs: &QwenInputs<'_>, graph_bytes: u64) -> anyhow::Result<Plac
     let mut fixed = admission.items.iter().map(|&(category, group, bytes)|
         Demand::new(0, category, group, bytes, Basis::Formula)).collect::<Vec<_>>();
     fixed.push(Demand::new(0, Category::Runtime, "startup graphs", graph_bytes, Basis::Formula));
-    if inputs.spark_ranks > 0 {
-        // The Spark intake's BF16 partial planes, one per rank at prefill width
-        // (SparkLink::new), allocated on this GPU before serving.
+    if inputs.spark_ranks > 0 && matches!(inputs.baseline, Baseline::Planned { .. }) {
+        // Runtime creates SparkLink before sampling free memory. Only the
+        // header-only planner still needs to reserve its BF16 return planes.
         fixed.push(Demand::new(0, Category::Transport, "Spark intake planes",
             inputs.admission.prefill_shape.map_or_else(|| crate::serving_capacity::spark_intake_bytes(1,
                 inputs.spark_ranks as u64, inputs.admission.prefill_rows.max(64), inputs.admission.cfg.hidden as u64),
@@ -1015,6 +1015,41 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn spark_intake_is_charged_once_across_planned_and_measured_baselines() {
+        let cfg = Qwen4Config::from_hf(&crate::plan::testing::qwen4_config(48)).unwrap();
+        let (total, context_bytes, loaded_bytes) = (32_u64 << 30, 1_u64 << 30, 23_u64 << 30);
+        for shape in [None, Some(crate::serving_capacity::PrefillShape { unit_rows: 2048, waves: 2 })] {
+            let inputs = |baseline| QwenInputs { automatic_context: false,
+                admission: QwenAdmissionInputs { prefill_shape: shape, cfg: &cfg, layers: 48, mtp: false,
+                    kv_format: Qwen4KvCache::Fp8, manifest: None, prefill_rows: 4096, slots: 16,
+                    mark_bytes: 0, full_prefill_logits: 0, ple: Some((160, true)),
+                    future_expert_bytes: 0, headroom: 0 },
+                capacity_bytes: total, baseline, pending_code_bytes: 0, max_context: 1048576,
+                requested_pool: None, spark_ranks: 4, startup_graph_modes: None };
+            let planned = request(&inputs(Baseline::Planned { context_bytes, loaded_bytes }), 0).unwrap();
+            let intake = planned.fixed.iter().find(|d| d.group == "Spark intake planes").unwrap().clone();
+            assert_eq!(intake.bytes, 80 << 20); // The checkpoint's hidden width is 2560, not 2048.
+            let measured = inputs(Baseline::Measured {
+                free_bytes: total - context_bytes - loaded_bytes - intake.bytes });
+            let runtime = request(&measured, 0).unwrap();
+            assert!(!runtime.fixed.iter().any(|d| d.group == "Spark intake planes"));
+            let (p, r) = (solve(&planned).unwrap(), solve(&runtime).unwrap());
+            assert_eq!(p.pool_tokens, r.pool_tokens);
+            assert!(r.pool_tokens < runtime.pool.target, "fixture must be memory limited");
+            let mut double_charged = runtime;
+            double_charged.fixed.push(intake.clone());
+            let old = solve(&double_charged).unwrap();
+            let delta = r.pool_tokens - old.pool_tokens;
+            let per_token = qwen_admission(&measured.admission).unwrap().per_token;
+            assert!(delta > 0);
+            assert!((delta * per_token).abs_diff(intake.bytes) < 256 * per_token,
+                "only one pool allocation unit may be lost to rounding");
+            println!("Qwen Spark intake {:?}: {} bytes, pool {} -> {} (+{delta} tokens)",
+                shape, intake.bytes, old.pool_tokens, r.pool_tokens);
         }
     }
 
