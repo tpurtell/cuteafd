@@ -39,6 +39,9 @@ pub(crate) struct GlmLayer<'a> {
     /// Whole attention and its cache exist only on this rank when present.
     pub attention_owner: Option<u8>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
+    /// The EXLR8 checkpoint's own dense operands (`native_dense::key`), when
+    /// the layer runs natively; empty on the official path.
+    pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
 }
 
 /// The `{w}_fp8` / `{w}_scale` operand names of an FP8 weight, and its
@@ -69,8 +72,16 @@ impl GlmLayer<'_> {
 
     /// Device bytes of the layer's operands.
     pub fn bytes(&self) -> usize {
-        self.operands.values().map(|a| a.buffer.bytes).sum()
+        self.operands.values().chain(self.native.values()).map(|a| a.buffer.bytes).sum()
     }
+
+    /// A native operand's device buffer.
+    pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
+        Ok(self.native.get(key).with_context(|| format!("layer has no native operand {key}"))?.buffer)
+    }
+
+    /// Whether the layer runs the checkpoint's native dense operands.
+    pub fn is_native(&self) -> bool { !self.native.is_empty() }
 }
 
 pub(crate) struct GlmWeights<'a> {
@@ -840,7 +851,8 @@ impl<'a> GlmLoader<'a> {
                 && operands.contains_key("w_down_tscale")),
                 "{mlp}: declared W8A8 needs native per-tensor activation scales");
         }
-        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands }).collect())
+        Ok(ops.into_iter().map(|operands| GlmLayer { dense, full_indexer, mlp_numerics, split: ranks > 1, attention_split: ranks > 1 && owner.is_none(), attention_owner: owner, operands,
+            native: HashMap::new() }).collect())
     }
 
     /// Layers `0..layers` (all of them unless the caller stops early): rank 0's

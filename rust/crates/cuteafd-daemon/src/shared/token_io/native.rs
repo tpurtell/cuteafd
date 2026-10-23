@@ -200,6 +200,41 @@ impl<'a> NativeVocabulary<'a> {
     }
 }
 
+impl NativeVocabulary<'_> {
+    /// F32 logits `[rows, vocabulary]` of BF16 rows `x [rows, hidden]` through
+    /// the checkpoint's row-FP8 head.
+    ///
+    /// # Safety
+    /// `x` and `logits` are live device buffers of these shapes on `stream`'s
+    /// device (this owner's) until the stream drains.
+    pub(crate) unsafe fn head_logits(&self, x: *const std::ffi::c_void, logits: *mut f32, rows: usize,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: the caller's contract; the head operands are this owner's.
+        unsafe { self.linear.launch(x.cast_mut(), self.head.payload().ptr, self.head.scales().ptr,
+            std::ptr::null_mut(), 0, logits.cast(), u32::try_from(rows)?, 0, stream) }?;
+        Ok(())
+    }
+
+    /// BF16 rows `[rows, hidden]` gathered from the row-FP8 embedding for I32 `ids`.
+    ///
+    /// # Safety
+    /// `ids` and `output` are live device buffers of these shapes on `stream`'s
+    /// device until the stream drains.
+    pub(crate) unsafe fn embed(&self, ids: *mut std::ffi::c_void, output: *mut std::ffi::c_void, rows: usize,
+        stream: *mut std::ffi::c_void) -> Result<()> {
+        // SAFETY: the caller's contract; the embedding operands are this owner's.
+        unsafe { self.gather.launch(ids, self.embedding.payload().ptr, self.embedding.scales().ptr, output,
+            u32::try_from(rows)?, stream) }?;
+        Ok(())
+    }
+
+    /// Device bytes of the payloads and scales.
+    pub(crate) fn bytes(&self) -> usize {
+        [self.embedding.payload(), self.embedding.scales(), self.head.payload(), self.head.scales()]
+            .iter().map(|b| b.bytes).sum()
+    }
+}
+
 /// Source order is payload then scales. Read the whole block before any upload.
 /// The callback is blocking, so staging is reusable and partial owners can drop safely.
 fn stream_rows(

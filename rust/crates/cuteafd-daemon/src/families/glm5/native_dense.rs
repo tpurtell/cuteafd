@@ -99,3 +99,83 @@ impl NativeDenseRecords {
         Ok(Self { layers: out, norm, plan })
     }
 }
+
+use crate::shared::experts::rtx::dense::{DenseLoad, Job, Operand, Rect, Step, STEP_BYTES};
+use crate::shared::memory::DeviceAllocation;
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
+
+/// One checkpoint byte range as a single-row rectangle landing whole.
+fn rect(name: &str, range: &cuteafd_loader::plan::exlr8::dense::DenseRange) -> Rect {
+    Rect { name: name.into(), path: range.path.clone(), base: range.offset, row_bytes: range.bytes,
+        rows: 0..1, cols: 0..range.bytes }
+}
+
+/// The component's bytes on the current device: its own allocation, filled
+/// through the mount or recorded for the push group.
+fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, component: &DenseComponent)
+    -> Result<DeviceAllocation<'a>> {
+    let bytes = component.source.bytes;
+    let allocation = DeviceAllocation::new(library, bytes.max(256))?;
+    load.operand(Operand { device: library.cuda_get_device()?, buffer: allocation.buffer,
+        lands: vec![(rect(name, &component.source), 0)], bytes })?;
+    Ok(allocation)
+}
+
+/// Operand key of a native projection component.
+pub(crate) fn key(projection: &str, component: &str) -> String { format!("n.{projection}.{component}") }
+
+/// A layer's native operands on the current device (this rank's slices), keyed
+/// [`key`]; `kv_b` split per head for heads `h0..h0 + heads` into the FP8
+/// programs' `w_uk_fp8`/`w_uk_scale`/`w_uv_fp8`/`w_uv_scale`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
+    heads_total: usize, h0: usize, heads: usize, nope: usize, v: usize, lat: usize, stream: *mut std::ffi::c_void)
+    -> Result<HashMap<String, DeviceAllocation<'a>>> {
+    let mut out = HashMap::new();
+    for (stem, (projection, slice)) in &records.projections {
+        ensure!(!matches!(projection.encoding, DenseEncoding::F32 | DenseEncoding::F16 | DenseEncoding::RowFp8),
+            "{}: no native GLM dense kernel for {:?}", slice.tensor, projection.encoding);
+        for component in &slice.components {
+            let name = format!("{}.{}", slice.tensor, component.suffix);
+            out.insert(key(stem, &component.suffix), landed(library, load, &name, component)?);
+        }
+    }
+    for (tensor, component) in &records.plain {
+        out.insert(tensor.clone(), landed(library, load, tensor, component)?);
+    }
+    // kv_b: whole heads per step, staged rows and the whole grid.
+    let kv_b = &records.kv_b;
+    ensure!(kv_b.shape == [heads_total * (nope + v), lat] && h0 + heads <= heads_total
+        && kv_b.components.len() == 2 && kv_b.components[0].suffix == "fp8" && kv_b.components[1].suffix == "scale",
+        "{}: native kv_b layout", kv_b.tensor);
+    let (values, grid) = (&kv_b.components[0].source, &kv_b.components[1].source);
+    let alloc = |bytes: usize| DeviceAllocation::new(library, bytes.max(256));
+    let (uk, uk_scale) = (alloc(heads * lat * nope)?, alloc(heads * lat * (nope / 64) * 4)?);
+    let (uv, uv_scale) = (alloc(heads * v * lat)?, alloc(heads * v * (lat / 64) * 4)?);
+    let per = ((STEP_BYTES - grid.bytes) / ((nope + v) * lat)).max(1);
+    let device = library.cuda_get_device()?;
+    let at = |buffer: CuteafdDeviceBuffer, offset: usize, bytes: usize| CuteafdDeviceBuffer {
+        // SAFETY: offset + bytes lie inside the head-major operand (checked by the job).
+        ptr: unsafe { buffer.ptr.cast::<u8>().add(offset) }.cast(), bytes, ..buffer };
+    let mut h = 0;
+    while h < heads {
+        let count = per.min(heads - h);
+        let row0 = (h0 + h) * (nope + v);
+        let rows = count * (nope + v);
+        let staged = Rect { name: format!("{}.fp8", kv_b.tensor), path: values.path.clone(), base: values.offset,
+            row_bytes: lat, rows: row0..row0 + rows, cols: 0..lat };
+        let whole_grid = rect(&format!("{}.scale", kv_b.tensor), grid);
+        let job = Job::AbsorbFp8 { at: 0, grid_at: rows * lat, grid_bytes: grid.bytes, row0, heads: count, nope, v, lat,
+            uk: at(uk.buffer, h * lat * nope, count * lat * nope),
+            uk_scale: at(uk_scale.buffer, h * lat * (nope / 64) * 4, count * lat * (nope / 64) * 4),
+            uv: at(uv.buffer, h * v * lat, count * v * lat),
+            uv_scale: at(uv_scale.buffer, h * v * (lat / 64) * 4, count * v * (lat / 64) * 4) };
+        load.step(Step { device, rects: vec![staged, whole_grid], jobs: vec![job] }, stream)?;
+        h += count;
+    }
+    out.insert("w_uk_fp8".into(), uk);
+    out.insert("w_uk_scale".into(), uk_scale);
+    out.insert("w_uv_fp8".into(), uv);
+    out.insert("w_uv_scale".into(), uv_scale);
+    Ok(out)
+}
