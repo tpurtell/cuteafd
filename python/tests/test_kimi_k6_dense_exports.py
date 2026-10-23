@@ -49,9 +49,11 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
         monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
     programs = module["programs"]()
     assert len(programs) == 123
+    # Native program-info exposes a NUL-terminated 64-byte name buffer.
+    assert all(len(f"kimi_k6_dense_{name}".encode("ascii")) < 64 for name, *_ in programs)
     experiments = [item for item in programs if item[2].get("experiment_e4m3")]
     assert len(experiments) == 26
-    assert all(name.endswith("_experiment_w8") for name, *_ in experiments)
+    assert all(name.endswith("_exp_w8") for name, *_ in experiments)
     qdq = [item for item in programs if item[1] == "experiment_mxfp8_qdq"]
     assert len(qdq) == 6
     assert {params["features"] for _, _, params, _ in qdq} == {1536, 3072, 3584, 6144, 7168, 12288}

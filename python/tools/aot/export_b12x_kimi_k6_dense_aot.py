@@ -119,7 +119,7 @@ def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_output
                 result.append((f"trellis_dequant_{name}_{codebook}", "trellis_dequant", dequant,
                                partial(compile_trellis_dequant_aot, **dequant)))
                 experiment = dict(dequant, experiment_e4m3=True)
-                result.append((f"trellis_dequant_{name}_{codebook}_experiment_w8", "trellis_dequant", experiment,
+                result.append((f"trellis_dequant_{name}_{codebook}_exp_w8", "trellis_dequant", experiment,
                                partial(compile_trellis_dequant_aot, **experiment)))
     for k in sorted({k for _, k, _, _ in shapes}):
         params = dict(features=k, input_dtype="bf16", max_rows=max_rows)

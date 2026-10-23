@@ -386,7 +386,7 @@ impl<'a> DenseTrellisDispatch<'a> {
                 input_dtype:TrellisDType::Bf16,output_dtype},&policy.codebook)?;
         let (w8, a8)=experiment_mode(&std::env::var("CUTEAFD_EXPERIMENT_KIMI_K6_FP8")
             .unwrap_or_else(|_| "off".into()))?;
-        let dequant_name=if w8 {format!("{}_experiment_w8",policy.dequant)} else {policy.dequant.clone()};
+        let dequant_name=if w8 {format!("{}_exp_w8",policy.dequant)} else {policy.dequant.clone()};
         let experiment_qdq=if a8 {
             let name=format!("kimi_k6_dense_trellis_experiment_mxfp8_qdq_k{}",policy.input);
             let spec=programs.spec(&name)?;
