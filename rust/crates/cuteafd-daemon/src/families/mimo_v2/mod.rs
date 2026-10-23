@@ -271,7 +271,7 @@ mod draft_storage_tests {
         assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
         assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "spark_endpoints("].concat()));
         let engine = include_str!("engine.rs");
-        assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. }", " = &e.experts"].concat()));
+        assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. })", " = &e.experts"].concat()));
         assert!(engine.contains(&["Experts::Spark { decode: transport, .. }) => transport.borrow().intake", ".pointers()"].concat()));
         assert!(engine.contains(&["for transport in [decode, prefill]", " {"].concat()));
     }

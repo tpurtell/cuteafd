@@ -1222,7 +1222,7 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/mimo_v2/mod.rs").read_text()
     timing = "let timing = cuteafd_transport::protocol_v2_timing_from_env();"
     start = source.index(timing)
-    link = source.index("let link = ||", start)
+    link = source.index("let link = |endpoint: u32, waves: usize, request:", start)
     end = source.index("crate::shared::memory_report::release_load_staging", link)
     assert start < link
     assert source.count(timing) == 1
