@@ -398,6 +398,8 @@ pub(crate) struct Opened {
     pub snapshot: PathBuf,
     pub catalog: cuteafd_loader::OfficialV41Catalog,
     dense_catalog: Option<cuteafd_loader::OfficialV41Catalog>,
+    /// An EXLR8 checkpoint: its own dense records run natively.
+    pub native: bool,
     pub cfg: GlmDsaConfig,
     pub library: std::sync::Arc<NativeLibrary>,
 }
@@ -411,26 +413,20 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     let native = catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8;
     let dense_catalog = if native {
         ensure!(args.exlr8_manifest.is_some(), "native EXLR8 requires --exlr8-manifest");
-        let dense = args.exlr8_dense_from.as_deref()
-            .context("native EXLR8 dense execution is not qualified; pass --exlr8-dense-from with the official snapshot")?;
-        cuteafd_loader::plan::exlr8::validate_dense_source(&args.snapshot, dense)?;
         native_activation(args, cfg.first_moe_layer, cfg.layers, false)?;
-        let dense_config: serde_json::Value = serde_json::from_slice(&std::fs::read(dense.join("config.json"))?)?;
-        native_dense_format(&dense_config)?;
-        Some(cuteafd_loader::read_expert_catalog(dense)?)
+        None
     } else {
-        ensure!(args.exlr8_manifest.is_none() && args.exlr8_dense_from.is_none(),
-            "EXLR8 options require a native EXLR8 checkpoint");
+        ensure!(args.exlr8_manifest.is_none(), "EXLR8 options require a native EXLR8 checkpoint");
         None
     };
     if let Some(snapshot) = &args.draft {
-        dflash::check_snapshot_target_bf16_head(args.exlr8_dense_from.as_deref().unwrap_or(&args.snapshot),
-            cfg.hidden, cfg.vocab_size, false)?;
+        // A native EXLR8 target lends its row-FP8 head through a launcher.
+        if !native { dflash::check_snapshot_target_bf16_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?; }
         dflash::check_checkpoint(snapshot, args.draft_fp8, args.draft_context_slots, args.draft_sequences)?;
     }
     let library = std::sync::Arc::new(unsafe { NativeLibrary::load(&args.native_lib) }?);
     library.cuda_set_device(args.device)?;
-    Ok(Opened { snapshot: args.snapshot.clone(), catalog, dense_catalog, cfg, library })
+    Ok(Opened { snapshot: args.snapshot.clone(), catalog, dense_catalog, native, cfg, library })
 }
 
 impl Opened {
@@ -444,7 +440,7 @@ impl Opened {
         context_args.max_context = crate::shared::context::checkpoint_context(
             &args.snapshot, &args.manifest, "glm5", args.max_context)?;
         let args = &context_args;
-        let native = self.dense_catalog.is_some();
+        let native = self.native;
         let dense_catalog = self.dense_catalog.as_ref().unwrap_or(&self.catalog);
         ensure!(!args.skip_routed_experts || args.peers.is_none(),
             "--skip-routed-experts is a coordinator-only diagnostic; do not pass --peers");
@@ -496,7 +492,8 @@ impl Opened {
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         let inventory = crate::shared::inventory::RuntimeInventory::measure(&self.library, &devices, crate::shared::inventory::InventoryPhase::PreWeight, |_| {
             let (loaded, skipped) = programs.load_matching(|name| selected.contains(name)
-                || (native && matches!(name, "exlr8_shared_a16_serving" | "exlr8_shared_group")))?;
+                || (native && (matches!(name, "exlr8_shared_a16_serving" | "exlr8_shared_group")
+                    || name.starts_with("exlr8_dense_") || name.starts_with("glm_stage_") || name.starts_with("glm2_stage_"))))?;
             tracing::info!(loaded, skipped, "GLM programs loaded");
             Ok(())
         })?;
@@ -509,7 +506,14 @@ impl Opened {
         let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
             .then(|| cuteafd_loader::placement::families::glm5::attention_owners(&self.cfg, layers)).transpose()?;
         use cuteafd_loader::placement::{families::glm5 as glm, Baseline};
-        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(dense_catalog.snapshot(), false, false)?;
+        let checkpoint = (!native).then(|| cuteafd_loader::plan::Checkpoint::coordinator(dense_catalog.snapshot(), false, false))
+            .transpose()?;
+        // The EXLR8 checkpoint's own dense records, per coordinator rank.
+        let native_records = if native {
+            ensure!(owners.is_none(), "EXLR8 native dense runs head or context attention, not whole-layer owners");
+            let records = cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&self.snapshot)?;
+            Some(records)
+        } else { None };
         let native_plans = if native {
             (0..devices.len()).map(|rank| engine::exlr8::NativePlan::new(&self.snapshot,
                 args.exlr8_manifest.as_deref().context("EXLR8 manifest")?,
@@ -519,9 +523,18 @@ impl Opened {
         for plan in &native_plans { plan.admit_host()?; }
         let native_workspace = native_plans.iter().map(|plan| plan.workspace as u64).max().unwrap_or(0);
         let host_embedding = args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Host;
-        if host_embedding { checkpoint.require_untied_embedding("model.embed_tokens.weight")?; }
-        let mut reserved_weights = cuteafd_loader::plan::layout::glm5::resident_owned(
-            &checkpoint, devices.len(), layers, owners.as_deref())?.into_iter().map(|groups|
+        ensure!(!native || !host_embedding, "the EXLR8 row-FP8 embedding is device-resident (its owner holds the head too)");
+        let groups = match (&checkpoint, &native_records) {
+            (Some(checkpoint), _) => {
+                if host_embedding { checkpoint.require_untied_embedding("model.embed_tokens.weight")?; }
+                cuteafd_loader::plan::layout::glm5::resident_owned(checkpoint, devices.len(), layers, owners.as_deref())?
+            }
+            (None, Some(records)) => (0..devices.len()).map(|rank| cuteafd_loader::plan::exlr8::dense::resident_native(
+                records, devices.len(), rank, layers, self.cfg.heads, self.cfg.qk_nope_head_dim, self.cfg.v_head_dim,
+                self.cfg.kv_lora_rank).map_err(anyhow::Error::from)).collect::<Result<Vec<_>>>()?,
+            (None, None) => anyhow::bail!("GLM coordinator operands need a checkpoint"),
+        };
+        let mut reserved_weights = groups.into_iter().map(|groups|
                 groups.into_iter().filter(|(group, _, _)| (!host_embedding || group != "embedding")
                     && (!native || group != "shared_expert"))
                     .try_fold(0u64, |sum, (_, _, bytes)| sum.checked_add(bytes)
@@ -530,7 +543,20 @@ impl Opened {
         for (reserved, plan) in reserved_weights.iter_mut().zip(&native_plans) {
             *reserved = reserved.checked_add(plan.resident).context("EXLR8 coordinator reservation overflow")?;
         }
-        let spark_bf16 = !native && checkpoint.spark_input_is_bf16();
+        let spark_bf16 = checkpoint.as_ref().is_some_and(|c| c.spark_input_is_bf16());
+        // Native dense: decode plus every prefill lane's scratch, and the prefill unpack staging.
+        let native_dense_charge: Vec<u64> = if native {
+            let split = devices.len() == 2;
+            let heads = self.cfg.heads / if split { 2 } else { 1 };
+            let inter = self.cfg.dense_intermediate / if split { 2 } else { 1 };
+            let lanes = glm::prefill_lanes(args.peers.as_deref().map_or(0, |p| p.split(',').count()),
+                engine::configured_lanes() as u64) as usize;
+            let staging = engine::native_dense::trellis_geometries(split).iter()
+                .map(|(_, g)| engine::native_dense::unpacked_bytes(g.output, g.input)).max().unwrap_or(0);
+            let per_gpu = engine::native_dense::scratch_bytes(&self.cfg, heads, inter, engine::DECODE_ROWS)
+                + lanes * engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows) + staging;
+            vec![per_gpu as u64; devices.len()]
+        } else { Vec::new() };
         let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
             let free_bytes = gpu.free_bytes.checked_sub(bytes)
                 .context("GLM coordinator header-derived weights exceed pre-weight free memory")?;
@@ -554,7 +580,7 @@ impl Opened {
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2, "glm", "*",
                 &cuteafd_loader::placement::ProgramSet::from_names(
-                    if native { &["glm", "glm2", "exlr8"] } else { &["glm", "glm2"] },
+                    if native { &["glm", "glm2", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage"] } else { &["glm", "glm2"] },
                     programs.names())))
             .collect::<Result<Vec<_>>>()?;
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
@@ -601,7 +627,7 @@ impl Opened {
         let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&self.cfg,
             args.prefill_rows as u64, 1, exchange_f32));
         let inputs = glm::GlmInputs { cfg: &self.cfg, layers, gpus, headroom_bytes: 2 << 30,
-            spark_ranks, native_experts: native, native_workspace, skip_routed_experts: args.skip_routed_experts,
+            spark_ranks, native_experts: native, native_workspace, native_dense: native_dense_charge.clone(), skip_routed_experts: args.skip_routed_experts,
             prefill_rows: args.prefill_rows as u64,
             prefill_lanes: prefill_lanes as u64,
             max_context: args.max_context as u64, automatic_context, scratch: Some([scratch(true)?, scratch(false)?]),
@@ -632,6 +658,7 @@ impl Opened {
             peers: peer_stream.iter().map(|&(device, stream)| crate::shared::peer_split::RankDevice { device, stream })
                 .collect(), push: None };
         let mut coordinator_push = None;
+        let mut native_push = None;
         let admission = if let Some(peers) = args.peers.as_deref() {
             let peers = peers.split(',').map(str::parse)
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
@@ -670,6 +697,17 @@ impl Opened {
                 coordinator_push = Some((push, peers.len(), planned));
                 (streams, ranks)
             });
+            // An EXLR8 checkpoint's own dense operands join the group as dense-only
+            // coordinator ranks (no local experts); planning failure loads by mount.
+            let ranks = match (ranks, &native_records) {
+                (None, Some(_)) if admission.coordinator_pushes() => (|| -> Result<_> {
+                    let (push, streams, ranks) = crate::shared::experts::rtx::push::CoordinatorPush::prepare(
+                        &self.snapshot, Some(&self.catalog), devices.len(), None)?;
+                    Ok((push, streams, ranks))
+                })().map_err(|error| tracing::info!(%error, "native dense coordinator push unavailable; mount")).ok()
+                    .map(|(push, streams, ranks)| { native_push = Some((push, peers.len())); (streams, ranks) }),
+                (ranks, _) => ranks,
+            };
             Some(admission.start_with(&peers, ranks)?)
         } else { None };
         let started = Instant::now();
@@ -695,6 +733,11 @@ impl Opened {
             })
         };
         let (embedding, ((model, mut shares), tp2)) = crate::shared::placement::load_while_admitting(admission, || {
+            if let Some(records) = &native_records {
+                let loaded = self.load_native(args, records, layers, &programs, &manifest, &loader, &devices, stream,
+                    peer_stream, native_push.take())?;
+                return Ok((loaded.0, (loaded.1, None)));
+            }
             let (embedding, (model, pushed)) = crate::shared::token_io::TokenEmbedding::load(&self.library,
                 self.embed_source()?, args.token_io.embed_placement, || {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
@@ -732,7 +775,7 @@ impl Opened {
         self.library.cuda_set_device(args.device)?;
         let bytes = model.layers.iter().map(|layer| layer.bytes()).sum::<usize>()
             + model.norm.buffer.bytes + model.head.bytes();
-        let embedding_bytes = if host_embedding { 0 } else { embedding.vocab() * embedding.hidden() * 2 };
+        let embedding_bytes = if host_embedding || native { 0 } else { embedding.vocab() * embedding.hidden() * 2 };
         let actual_weights = std::iter::once((bytes + embedding_bytes) as u64)
             .chain(shares.iter().map(|rank| rank.iter().map(|layer| layer.bytes() as u64).sum()))
             .enumerate().map(|(rank, bytes)| bytes
@@ -787,6 +830,19 @@ impl Opened {
             engine.attach_peer(device, stream, peer_layers)?;
         }
         if owners.is_some() { engine.bind_layer_execution(&placement)?; }
+        if native {
+            // Native dense programs bound per GPU (runtime SM count) and one prefill
+            // unpack staging each, before any capture; admission charged both.
+            let split = engine.ranks() == 2;
+            let (n, k) = engine::native_dense::trellis_geometries(split).iter()
+                .map(|(_, g)| (g.output, g.input)).max_by_key(|(n, k)| n * k).context("trellis geometries")?;
+            for rank in 0..engine.ranks() {
+                let bound = engine.on(rank, || engine::native_dense::NativePrograms::bind(&programs, &manifest))?;
+                let staged = engine.on(rank, || engine::native_dense::Unpacked::new(&engine, n, k))?;
+                engine.native_dense.push(Some(bound));
+                engine.native_unpacked.push(staged);
+            }
+        }
         if let Some(tp2) = tp2 {
             let local = local.as_ref().context("TP2 placement without local package inventory")?;
             let ranks = tp2.execution()?;
@@ -909,6 +965,68 @@ impl Opened {
 
 
 impl Opened {
+    /// An EXLR8 checkpoint's own dense operands on every coordinator rank: the
+    /// rank-0 row-FP8 vocabulary owner (head and embedding), then each layer's
+    /// native operands through the dense push ranks when the group offered them
+    /// (`push`), else the mount.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn load_native<'s>(&'s self, args: &EngineArgs, records: &[cuteafd_loader::plan::exlr8::dense::DenseRecord],
+        layers: usize, programs: &'s cuteafd_ffi::programs::Programs<'s>, _manifest: &serde_json::Value,
+        loader: &weights::GlmLoader<'s>, devices: &[i32], stream: *mut c_void, peer_stream: Option<(i32, *mut c_void)>,
+        push: Option<(crate::shared::experts::rtx::push::CoordinatorPush, usize)>)
+        -> Result<(crate::shared::token_io::TokenEmbedding<'s>, (weights::GlmWeights<'s>, Vec<Vec<weights::GlmLayer<'s>>>))> {
+        use crate::shared::token_io::native::{NativeVocabulary, VocabularyPlan};
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("weights");
+        let world = devices.len();
+        let started = Instant::now();
+        self.library.cuda_set_device(devices[0])?;
+        let available = engine::exlr8::host_available()?;
+        let vocabulary = NativeVocabulary::load(&self.library, programs,
+            VocabularyPlan::new(records, world, 0, self.cfg.hidden, self.cfg.vocab_size)?, available, 0, 0)?
+            .context("rank 0 owns the native vocabulary")?;
+        let vocabulary = std::rc::Rc::new(vocabulary);
+        let source = self.native_embed_source()?;
+        let embedding = crate::shared::token_io::TokenEmbedding::row_fp8(&self.library, source, vocabulary.clone())?;
+        let per_rank = (0..world).map(|rank| native_dense::NativeDenseRecords::new(&self.snapshot, layers, world, rank))
+            .collect::<Result<Vec<_>>>()?;
+        let rank_stream = |device: i32| if device == args.device { stream } else { peer_stream.map_or(stream, |(_, s)| s) };
+        let (model, shares) = match push {
+            Some((push, sparks)) => {
+                let load = crate::shared::experts::rtx::dense::DenseLoad::push(&self.library);
+                let model = loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?;
+                let records = load.sink.as_ref().context("push sink")?.take_all();
+                let dense_devices: Vec<_> = devices.iter().map(|&id| crate::shared::memory::device::Device {
+                    library: &self.library, id }).collect();
+                let planned = crate::shared::experts::rtx::dense::plan_records(&self.snapshot, records.clone(),
+                    &dense_devices, sparks);
+                let (pushed, ()) = push.receive_with(dense_devices, Some(&self.catalog), sparks, Some(planned), || ());
+                let pushed = pushed?.is_some();
+                if !pushed {
+                    crate::shared::experts::rtx::dense::fill_records_by_mount(&self.library, &records, rank_stream)?;
+                }
+                tracing::info!(pushed, operands = records.operands.len(), steps = records.steps.len(),
+                    "GLM native dense operands landed");
+                model
+            }
+            None => {
+                let load = crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library);
+                loader.native_model(&self.cfg, layers, &per_rank, &load, vocabulary.clone())?
+            }
+        };
+        self.library.cuda_set_device(args.device)?;
+        tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "GLM native dense weights resident");
+        Ok((embedding, (model, shares)))
+    }
+
+    /// The row-FP8 embedding's identity (vocabulary file, payload offset).
+    fn native_embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
+        let records = cuteafd_loader::plan::exlr8::dense::DenseRecord::inventory(&self.snapshot)?;
+        let record = records.iter().find(|r| r.tensor == "model.embed_tokens.weight").context("native embedding")?;
+        let payload = record.components.iter().find(|c| c.suffix == "fp8").context("native embedding payload")?;
+        Ok(crate::shared::token_io::EmbedSource { path: payload.source.path.clone(), offset: payload.source.offset,
+            vocab: record.shape[0], hidden: record.shape[1], snapshot: None, tensor_name: record.tensor.clone() })
+    }
+
     /// The checkpoint's `model.embed_tokens.weight` (BF16 [vocab, hidden]).
     fn embed_source(&self) -> Result<crate::shared::token_io::EmbedSource> {
         let catalog = self.dense_catalog.as_ref().unwrap_or(&self.catalog);

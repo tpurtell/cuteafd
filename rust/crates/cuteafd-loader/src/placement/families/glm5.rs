@@ -191,6 +191,9 @@ pub struct GlmInputs<'a> {
     /// Native FP8 K32 ingress, BF16 partials and bounded per-step shared execution.
     pub native_experts: bool,
     pub native_workspace: u64,
+    /// Per GPU: an EXLR8 checkpoint's native dense scratch (decode plus every
+    /// prefill lane) and prefill unpack staging; zero on the official path.
+    pub native_dense: Vec<u64>,
     /// Coordinator-only diagnostics replace routed FFNs with zero intake planes.
     pub skip_routed_experts: bool,
     pub prefill_rows: u64,
@@ -304,6 +307,10 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 .ok_or(PlacementError::Overflow("GLM native workspaces"))?
         } else { steps };
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace, "steps", steps, basis)));
+        if let Some(&bytes) = inputs.native_dense.get(rank).filter(|&&bytes| bytes > 0) {
+            rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Workspace,
+                "native dense scratch and prefill staging", bytes, Basis::Formula)));
+        }
         rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "decode graph allowance", graphs, Basis::Estimated)));
         if let Some(&bytes) = inputs.pending_code.get(rank).filter(|&&bytes| bytes > 0) {
             rows.push(GlmBufferRow::new(GlmComponent::Always, Demand::new(gpu, Category::Runtime, "pending loaded code", bytes, Basis::Formula)));
@@ -890,7 +897,7 @@ mod tests {
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
         GlmInputs { cfg, layers: cfg.layers, gpus: cards.iter().enumerate().map(|(rank, &total)| (total,
             Baseline::Planned { context_bytes: GIB, loaded_bytes: if rank == 0 { 14 * GIB } else { 12 * GIB } })).collect(),
-            headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
+            headroom_bytes: 2 * GIB, spark_ranks: 4, native_experts: false, native_workspace: 0, native_dense: Vec::new(), skip_routed_experts: false, prefill_rows: 4096, prefill_lanes: 3,
             max_context: 1 << 20, automatic_context: true, scratch: Some([GlmScratch { programs: 16 << 20, topk: 1 << 20 }; 2]),
             drafter_bytes: 3 * GIB, drafter_staging: 0, pending_code: vec![],
             experts: (cfg.first_moe_layer..cfg.layers).map(|_| ExpertCost {

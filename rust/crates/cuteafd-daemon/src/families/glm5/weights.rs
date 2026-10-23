@@ -931,6 +931,71 @@ impl<'a> GlmLoader<'a> {
         split.log("glm5 dense");
         Ok((weights, shares.collect()))
     }
+
+    /// An EXLR8 checkpoint's own dense operands (no official snapshot):
+    /// `records[rank]` for each head-split rank, filled through `load` (mount
+    /// now, or recorded for the push group), the final norm on rank 0 and the
+    /// row-FP8 `vocabulary` owner (shared with the token embedding) as the head.
+    /// Routed experts and the shared expert stay on their native owners.
+    #[allow(clippy::type_complexity)]
+    pub fn native_model(&self, cfg: &GlmDsaConfig, layers: usize,
+        records: &[super::native_dense::NativeDenseRecords], load: &crate::shared::experts::rtx::dense::DenseLoad<'a>,
+        vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
+        -> Result<(GlmWeights<'a>, Vec<Vec<GlmLayer<'a>>>)> {
+        let ranks = self.ranks();
+        ensure!(records.len() == ranks && cfg.heads % ranks == 0, "native GLM records per coordinator rank");
+        let split = crate::shared::memory::load_timing::Split::start();
+        let heads = cfg.heads / ranks;
+        let mut shares: Vec<Vec<GlmLayer<'a>>> = (0..ranks).map(|_| Vec::new()).collect();
+        for layer in 0..layers.min(cfg.layers) {
+            for (rank, share) in shares.iter_mut().enumerate() {
+                let layer_records = records[rank].layers.get(layer).context("native layer records")?;
+                let part = self.on_rank(rank, |stream| -> Result<GlmLayer<'a>> {
+                    let _memory_format = cuteafd_ffi::memory_ledger::format("native");
+                    let mut native = super::native_dense::load_layer(self.library, load, layer_records, cfg.heads,
+                        rank * heads, heads, cfg.qk_nope_head_dim, cfg.v_head_dim, cfg.kv_lora_rank, stream)?;
+                    let p = format!("model.layers.{layer}");
+                    let mut operands: HashMap<&'static str, DeviceAllocation<'a>> = HashMap::new();
+                    for (key, name) in [("w_uk_fp8", "w_uk_fp8"), ("w_uk_scale", "w_uk_scale"), ("w_uv_fp8", "w_uv_fp8"),
+                        ("w_uv_scale", "w_uv_scale")] {
+                        operands.insert(key, native.remove(name).context("native kv_b split")?);
+                    }
+                    for (key, tensor) in [("input_norm", "input_layernorm.weight"), ("post_norm", "post_attention_layernorm.weight"),
+                        ("q_a_norm", "self_attn.q_a_layernorm.weight"), ("kv_a_norm", "self_attn.kv_a_layernorm.weight"),
+                        ("k_norm_w", "self_attn.indexer.k_norm.weight"), ("k_norm_b", "self_attn.indexer.k_norm.bias"),
+                        ("gate.bias", "mlp.gate.e_score_correction_bias")] {
+                        if let Some(allocation) = native.remove(&format!("{p}.{tensor}")) { operands.insert(key, allocation); }
+                    }
+                    // The router (BF16 record) on rank 0, as on the official path.
+                    if let Some(gate) = native.remove(&super::native_dense::key("router", "bf16")) {
+                        operands.insert("gate", gate);
+                    }
+                    let dense = layer < cfg.first_moe_layer;
+                    ensure!(operands.contains_key("input_norm") && operands.contains_key("post_norm")
+                        && (dense || rank != 0 || (operands.contains_key("gate") && operands.contains_key("gate.bias"))),
+                        "{p}: native layer operands incomplete on rank {rank}");
+                    Ok(GlmLayer { dense, full_indexer: cfg.indexers[layer] == GlmIndexer::Full,
+                        mlp_numerics: cuteafd_loader::plan::checkpoint::ModuleNumerics::CheckpointPrecision,
+                        split: ranks > 1, attention_split: ranks > 1, attention_owner: None, operands, native })
+                })?;
+                share.push(part);
+            }
+        }
+        let norm = {
+            let component = &records[0].norm;
+            let allocation = DeviceAllocation::new(self.library, component.source.bytes.max(256))?;
+            load.operand(crate::shared::experts::rtx::dense::Operand { device: self.library.cuda_get_device()?,
+                buffer: allocation.buffer, bytes: component.source.bytes,
+                lands: vec![(crate::shared::experts::rtx::dense::Rect { name: "model.norm.weight".into(),
+                    path: component.source.path.clone(), base: component.source.offset, row_bytes: component.source.bytes,
+                    rows: 0..1, cols: 0..component.source.bytes }, 0)] })?;
+            allocation
+        };
+        let mut shares = shares.into_iter();
+        let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary) };
+        split.log("glm5 native dense");
+        Ok((weights, shares.collect()))
+    }
 }
 
 /// BF16 checkpoint weights (nvidia/GLM-5.3-NVFP4's attention, indexer and shared experts) run

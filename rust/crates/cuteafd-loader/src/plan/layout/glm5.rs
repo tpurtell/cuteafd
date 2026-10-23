@@ -308,7 +308,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
     let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-        headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0, skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
+        headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), skip_routed_experts: false, prefill_rows: rows, prefill_lanes: lanes,
         max_context: context, automatic_context: options.context_tokens == 0, scratch, drafter_bytes: draft, drafter_staging: draft_staging, pending_code: Vec::new(),
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
@@ -368,7 +368,7 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
         gpus: devices.iter().zip(&options.rtx_bytes).map(|(device, &capacity)| (capacity,
             Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() })).collect(),
         headroom_bytes: options.headroom_bytes, spark_ranks, native_experts: true,
-        native_workspace: workspace, skip_routed_experts: false, prefill_rows: rows,
+        native_workspace: workspace, native_dense: Vec::new(), skip_routed_experts: false, prefill_rows: rows,
         prefill_lanes: glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
             else { glm_prefill_lanes(std::env::var("CUTEAFD_GLM_PREFILL_LANES").ok().as_deref()) as u64 }),
         max_context: context, automatic_context: false, scratch: Some(scratch), drafter_bytes: draft,

@@ -725,7 +725,7 @@ fn glm5_layout_matches_runtime_request_from_header_baseline() {
             }).collect::<Vec<_>>();
             assert_eq!(pre_weight, gpus);
             let inputs = glm::GlmInputs { cfg: &cfg, layers: cfg.layers, gpus,
-                headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, skip_routed_experts: false,
+                headroom_bytes: options.headroom_bytes, spark_ranks: report.spark_ranks, native_experts: false, native_workspace: 0, native_dense: Vec::new(), skip_routed_experts: false,
                 prefill_rows: 4096,
                 prefill_lanes: 3, max_context: 65536, automatic_context: options.context_tokens == 0, scratch: None, drafter_bytes: 0,
                 drafter_staging: 0, pending_code: vec![], experts: vec![], expert_workspace: 0,

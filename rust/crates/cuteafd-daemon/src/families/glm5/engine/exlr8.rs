@@ -81,6 +81,16 @@ impl NativePlan {
     }
 }
 
+/// Host bytes this process may still allocate: `MemAvailable` within the cgroup's headroom.
+pub(crate) fn host_available() -> Result<usize> {
+    let text = std::fs::read_to_string("/proc/meminfo")?;
+    let available = text.lines().find_map(|line| line.strip_prefix("MemAvailable:"))
+        .context("EXLR8 host admission needs MemAvailable")?.split_whitespace().next()
+        .context("EXLR8 host memory value")?.parse::<usize>()?.checked_mul(1024)
+        .context("EXLR8 host memory overflow")?;
+    Ok(cuteafd_ffi::cgroup_memory_headroom(available)?)
+}
+
 pub(crate) struct NativeExperts<'a> {
     workspace: usize,
     weights: Vec<Exlr8Weights<'a>>,

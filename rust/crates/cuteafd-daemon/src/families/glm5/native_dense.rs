@@ -14,7 +14,7 @@ use cuteafd_loader::plan::exlr8::dense::{DenseComponent, DenseEncoding, DensePla
 use std::collections::HashMap;
 
 /// The checkpoint projection of each native operand stem.
-pub(crate) const PROJECTIONS: [(&str, &str); 10] = [
+pub(crate) const PROJECTIONS: [(&str, &str); 11] = [
     ("q_a", "self_attn.q_a_proj"),
     ("kv_a", "self_attn.kv_a_proj_with_mqa"),
     ("q_b", "self_attn.q_b_proj"),
@@ -25,6 +25,7 @@ pub(crate) const PROJECTIONS: [(&str, &str); 10] = [
     ("gate", "mlp.gate_proj"),
     ("up", "mlp.up_proj"),
     ("down", "mlp.down_proj"),
+    ("router", "mlp.gate"),
 ];
 
 /// How one native projection runs: its encoding and this rank's slice.
@@ -71,7 +72,11 @@ impl NativeDenseRecords {
             for (stem, path) in PROJECTIONS {
                 let tensor = format!("{prefix}.{path}.weight");
                 let Some(full) = record(&tensor) else { continue };
-                let slice = by_name.get(tensor.as_str()).with_context(|| format!("{tensor}: no rank-{rank} slice"))?;
+                // Rank-0-only records (the router) have no slice on other ranks.
+                let Some(slice) = by_name.get(tensor.as_str()) else {
+                    ensure!(rank != 0, "{tensor}: no rank-0 slice");
+                    continue;
+                };
                 let channels = slice.channels;
                 let shape = match full.side {
                     ShardSide::Input => [full.shape[0], channels],
