@@ -19,7 +19,7 @@
 use super::*;
 use cuteafd_ffi::dense_trellis::{DenseTrellisGeometry, TrellisDType};
 use cuteafd_ffi::native_dense::DenseLinear;
-use cuteafd_ffi::native_dense_glue::{Companion, Op};
+use cuteafd_ffi::native_dense_glue::Companion;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::plan::exlr8::dense::DenseEncoding;
 use std::collections::HashMap;
@@ -339,7 +339,7 @@ pub(super) enum NativeOut {
     /// F32 `[rows, n]` in the lane accumulator (MXFP8 / int4).
     F32 { n: usize },
     /// BF16 `[rows, n]` in the caller's output (trellis after its output transform).
-    Bf16 { n: usize },
+    Bf16 { #[allow(dead_code)] n: usize },
 }
 
 /// Trellis geometries a GLM rank's native layers use (for admission and binding checks).

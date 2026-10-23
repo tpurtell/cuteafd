@@ -40,6 +40,7 @@ pub(crate) struct NativeProjection {
 
 /// One layer's native dense slices on one rank, in record order.
 pub(crate) struct LayerRecords {
+    #[allow(dead_code)]
     pub layer: usize,
     pub projections: HashMap<&'static str, (NativeProjection, DenseSlice)>,
     /// `kv_b` (block FP8, whole tensor; split per head at load).
