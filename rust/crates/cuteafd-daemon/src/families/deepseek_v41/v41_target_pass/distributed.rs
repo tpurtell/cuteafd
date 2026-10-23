@@ -2,6 +2,7 @@
 use super::*;
 use crate::families::deepseek_v41::v41_target_head::distributed_target::{DistributedTargetHead, DistributedTargetLogits};
 mod encoder_stream;
+mod encoder_units;
 use crate::families::deepseek_v41::v41_backbone_cache::CachePlacement;
 use crate::families::deepseek_v41::v41_backbone_execution::DistributedExecution;
 use crate::shared::peer_split::hop::DirectInputHop;

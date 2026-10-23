@@ -46,6 +46,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         suffix: &mut DeviceOwner<'a, EncoderSuffix<'a>>,
         keep_running: &dyn Fn() -> bool,
     ) -> Result<()> {
+        if super::super::encoder_units::enabled()? {
+            let [transport, _] = transports;
+            // SAFETY: use one retained owner without changing decode ownership.
+            return unsafe { self.execute_encoder_units(requests, lease, chunks,
+                transport, suffix, keep_running, &|| Ok(())).await };
+        }
         self.set_attention_decode(false);
         other.set_attention_decode(false);
         ensure!(

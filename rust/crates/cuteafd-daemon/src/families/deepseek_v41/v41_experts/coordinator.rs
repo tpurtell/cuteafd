@@ -564,6 +564,47 @@ impl<'a> NativeTp4Wave<'a> {
         })
     }
 
+    /// Dispatch without retaining a mutable transport borrow across unit hooks.
+    pub(crate) async fn dispatch_unit(&mut self,
+        request: crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest)
+        -> Result<NativeUnitFfn> {
+        self.ready_rows = None;
+        self.stream.require_complete()?;
+        let header = &request.request().header;
+        ensure!(header.layer_id as usize == request.binding().layer()
+            && header.row_count > 0 && header.row_count <= self.link.transport.capacity(),
+            "unit FFN dispatch identity or rows differ");
+        let pending = self.link.dispatch(request.request())?;
+        Ok(NativeUnitFfn { pending, request, owner: self.output.buffer.ptr as usize })
+    }
+    /// # Safety
+    /// Input remains in its unit slot until collection. Shared workspace is not
+    /// reused before that unit's reduction has drained.
+    pub(crate) async unsafe fn unit_shared(&mut self,
+        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<CuteafdDeviceBuffer> {
+        unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
+            .execute_shared_on(input.layer, input.tokens.len() as u32, input.values,
+                self.output.buffer.device_id as usize).await }
+    }
+    /// # Safety
+    /// Shared values are complete for this ticket's exact input and remain
+    /// immutable until collection finishes, including cancellation drain.
+    pub(crate) async unsafe fn collect_unit<'w>(&'w mut self, ticket: NativeUnitFfn,
+        shared: CuteafdDeviceBuffer, destination: i32) -> Result<NativeFfnOutput<'w>> {
+        ensure!(ticket.owner == self.output.buffer.ptr as usize,
+            "unit FFN ticket belongs to another transport");
+        self.stream.require_complete()?;
+        let NativeUnitFfn { pending, request, .. } = ticket;
+        let work = NativePendingFfn { pending, request: &request,
+            capacity: self.link.transport.capacity(), library: self.library,
+            stream: &self.stream, link: &mut self.link, shared: self.shared.buffer,
+            output: self.output.buffer, ready_rows: &mut self.ready_rows,
+            tp2: self.tp2.as_deref_mut() };
+        let device = crate::shared::memory::device::Device { library: self.library,
+            id: self.output.buffer.device_id };
+        device.future(unsafe { work.finish_values(shared, true, Some(destination)) }).await
+    }
+
     async fn execute_prepared(
         &mut self,
         request: &ExpertProtocolV2Request,
@@ -636,6 +677,14 @@ fn validate_shared(
     );
     Ok(())
 }
+/// Owned FIFO ticket. The request retains host routes and wire rows until
+/// receive; dropping an unread wave leaves transport recovery to SparkExperts.
+pub(crate) struct NativeUnitFfn {
+    pending: SparkExpertWave,
+    request: crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
+    owner: usize,
+}
+
 /// Borrows every mutable reduction buffer and owns all unread response sockets.
 /// Dropping before completion leaves the wave unpublished and closes the sockets.
 pub(crate) struct NativePendingFfn<'w, 'a, 'r> {

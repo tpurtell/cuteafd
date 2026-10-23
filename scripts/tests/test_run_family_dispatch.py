@@ -3660,6 +3660,38 @@ def test_launcher_plans_against_cuda_total_not_nvml_total(tmp_path, family, budg
     assert expected < 97887 / 1024
 
 
+@pytest.mark.parametrize("settings,expected_error", [
+    ("PREFILL_WAVES=1\nPREFILL_ROWS=4096\nPREFILL_SPAN_ROWS=16384\n", None),
+    ("PREFILL_WAVES=1\n", None),
+    ("", None),
+    ("PREFILL_WAVES=2\n", "currently supports PREFILL_WAVES=1"),
+    ("PREFILL_ROWS=4096\n", "require PREFILL_WAVES"),
+    ("PREFILL_WAVES=1\nPREFILL_ROWS=257\n", "PREFILL_ROWS must be"),
+    ("PREFILL_WAVES=1\nPREFILL_SPAN_ROWS=512\n", "PREFILL_SPAN_ROWS must be"),
+    ("PREFILL_WAVES=1\nPREFILL_ROWS=4096\nPREFILL_BATCH_TOKENS=2048\n", "conflicts with"),
+])
+def test_v41_shared_prefill_unit_keys_are_opt_in(tmp_path, settings, expected_error):
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "MODEL_REVISION=\nRTX_GPUS=1\nRTX_EXPERT_LAYERS=0\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+        "SPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n" + settings)
+    if expected_error:
+        assert result.returncode != 0
+        assert expected_error in result.stderr
+        return
+    assert result.returncode == 0, result.stderr
+    serving = next(line for line in result.stderr.splitlines() if "serve-native --snapshot" in line)
+    if settings:
+        assert "CUTEAFD_PREFILL_WAVES=1" in serving
+        assert "CUTEAFD_PREFILL_SPAN_ROWS=16384" in serving
+        assert "--prefill-batch-tokens 4096" in serving
+        plans = [line for line in result.stderr.splitlines() if " plan " in line and "--deployment" in line]
+        assert plans and all("--prefill-rows 4096" in line for line in plans)
+    else:
+        assert "CUTEAFD_PREFILL_WAVES=" not in serving
+        assert "CUTEAFD_PREFILL_SPAN_ROWS=" not in serving
+
+
 @pytest.mark.parametrize("restart", [False, True])
 def test_qwen_external_occupancy_is_nvml_used_subtracted_from_cuda_capacity(tmp_path, restart):
     total = 101_973_491_712

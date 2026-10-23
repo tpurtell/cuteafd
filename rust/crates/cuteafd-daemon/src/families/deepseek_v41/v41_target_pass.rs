@@ -37,6 +37,7 @@ mod verification;
 pub(crate) use verification::VerificationTarget;
 mod encoder_pair;
 mod encoder_stream;
+pub(super) mod encoder_units;
 pub(crate) use taps::{TargetTapWave, TargetTaps};
 
 /// Target cache publication used by the independent scheduler's queued dSpark

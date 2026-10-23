@@ -136,6 +136,7 @@ enum Phase {
     Prepared,
     Query,
     Ffn,
+    UnitPending,
     SharedReady,
     Complete,
     Invalid,
@@ -302,6 +303,20 @@ pub(crate) struct LaneFfn<'s, 'w, 'a> {
     ffn_split: Option<&'s mut FfnSplit>,
     /// This pass prefetches the next layer during Spark exchanges (`--l2-prefetch`).
     l2: Option<&'s LaneL2<'a>>,
+}
+
+/// All cross-hook metadata is owned; the shared device values remain in the
+/// unit's storage until `land_unit` completes their reduction.
+pub(crate) struct LaneUnitFfn {
+    ticket: crate::families::deepseek_v41::v41_experts::coordinator::NativeUnitFfn,
+    binding: QueryBinding,
+    shared: CuteafdDeviceBuffer,
+    destination: i32,
+    started: std::time::Instant,
+    routed_us: u64,
+    dispatched_us: u64,
+    shared_us: u64,
+    tp2_shared: bool,
 }
 
 /// Host-clock split of a captured pass's FFN stages, summed over its layers.
@@ -536,6 +551,50 @@ impl LaneFfn<'_, '_, '_> {
         })
         .await;
         output
+    }
+    /// # Safety
+    /// The caller retains this unit's normalized and shared output storage
+    /// unchanged until its owned ticket is landed. This path uses host routing.
+    pub(crate) async unsafe fn send_unit(&mut self, transport: &mut NativeTp4Wave<'_>,
+        placement: u64, image_mask: &[u8], rows: &[ExpertRow]) -> Result<LaneUnitFfn> {
+        let prior = std::mem::replace(self.phase, Phase::Invalid);
+        ensure!(prior == Phase::Ffn && !transport.has_local_layer(self.input.layer),
+            "unit remote FFN phase or route differs");
+        if crate::shared::memory::chain::deferred() {
+            crate::shared::memory::chain::fence_mark(self.library, self.input.layer % 2)?;
+        }
+        let started = std::time::Instant::now();
+        self.router.set_local_mode(false)?;
+        let routed = unsafe { if self.cooperative {
+            self.router.execute_ffn_cooperative(&self.input, image_mask).await?
+        } else { self.router.execute_ffn(&self.input, image_mask)? } };
+        let mut request = unsafe { routed.expert_request(self.library, placement, rows)? };
+        if let Some(capture) = self.route_capture.as_deref_mut() {
+            let output = &mut capture[self.input.layer];
+            output.clear();
+            output.extend(request.request().routes.chunks_exact(6)
+                .map(|routes| std::array::from_fn(|i| routes[i].expert_id)));
+        }
+        let routed_us = started.elapsed().as_micros() as u64;
+        transport.prepare_remote_request(&mut request)?;
+        let ticket = transport.dispatch_unit(request).await?;
+        let dispatched_us = started.elapsed().as_micros() as u64;
+        let tp2_shared = transport.has_tp2_shared_layer(self.input.layer);
+        let shared = if tp2_shared {
+            unsafe { transport.unit_shared(&self.input).await? }
+        } else {
+            let shared = self.shared.as_mut().context("unit shared workspace absent")?;
+            let contribution = unsafe { if self.cooperative {
+                shared.execute_ffn_cooperative(&self.input).await?
+            } else { shared.execute_ffn(&self.input)? } };
+            contribution.values
+        };
+        let shared_us = started.elapsed().as_micros() as u64;
+        if let Some(l2) = self.l2 { l2.issue(self.input.layer)?; }
+        *self.phase = Phase::UnitPending;
+        Ok(LaneUnitFfn { ticket, binding: self.input.binding(), shared,
+            destination: self.input.values.device_id, started, routed_us,
+            dispatched_us, shared_us, tp2_shared })
     }
     /// # Safety
     /// No external writes race the preserved FFN input or shared workspace.
@@ -838,6 +897,44 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.enter(Phase::Prepared)?;
         let result = unsafe { self.block.begin_prepared_attention(&mut self.query)? };
         self.phase = Phase::Query;
+        Ok(result)
+    }
+    /// Reborrow only the prepared FFN views; no reference survives a unit hook.
+    pub(crate) fn prepared_ffn(&mut self, binding: QueryBinding, cooperative: bool)
+        -> Result<LaneFfn<'_, 'w, 'a>> {
+        ensure!(self.phase == Phase::Ffn, "backbone lane FFN unavailable");
+        let input = self.block.ffn_input(binding)?;
+        Ok(LaneFfn {
+            input, cooperative, shared: &mut self.shared, router: &mut self.router,
+            library: self.weights.library, phase: &mut self.phase,
+            route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
+            ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
+            l2: self.l2.as_ref().filter(|l2| l2.decode && l2.solo),
+        })
+    }
+    /// # Safety
+    /// This unit's shared/output storage has not been reused since dispatch.
+    pub(crate) async unsafe fn land_unit<'t>(&mut self, transport: &'t mut NativeTp4Wave<'_>,
+        pending: LaneUnitFfn) -> Result<NativeFfnOutput<'t>> {
+        self.enter(Phase::UnitPending)?;
+        self.block.ffn_input(pending.binding)?;
+        let result = unsafe { transport.collect_unit(pending.ticket, pending.shared,
+            pending.destination).await? };
+        ensure!(result.binding() == pending.binding, "unit FFN result binding differs");
+        if self.capture_timing {
+            let split = &mut self.ffn_split;
+            split.remote_layers += 1;
+            split.remote_routed_us += pending.routed_us;
+            split.remote_dispatch_us += pending.dispatched_us - pending.routed_us;
+            split.remote_shared_us += pending.shared_us - pending.dispatched_us;
+            split.remote_collect_us += pending.started.elapsed().as_micros() as u64 - pending.shared_us;
+        }
+        tracing::debug!(target: "cuteafd::timing", layer=self.layer,
+            routed_us=pending.routed_us, dispatch_us=pending.dispatched_us-pending.routed_us,
+            shared_us=pending.shared_us-pending.dispatched_us,
+            collect_us=pending.started.elapsed().as_micros() as u64-pending.shared_us,
+            tp2_shared=pending.tp2_shared, "target unit experts");
+        self.phase = Phase::SharedReady;
         Ok(result)
     }
     pub fn query_output(&self) -> Result<AttentionQueryOutput<'_>> {

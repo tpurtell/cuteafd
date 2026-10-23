@@ -52,6 +52,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         transports: [&mut NativeTp4Wave<'a>; 2], suffix: &mut EncoderSuffix<'a>,
         keep_running: &dyn Fn() -> bool, before_chunk: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
+        if super::encoder_units::enabled()? {
+            let [transport, _] = transports;
+            // SAFETY: the opt-in path retains the same single-owner contract.
+            return unsafe { self.execute_encoder_units(requests, lease, chunks, transport,
+                suffix, keep_running, before_chunk).await };
+        }
         self.set_attention_decode(false);
         other.set_attention_decode(false);
         ensure!(!chunks.is_empty(), "empty encoder stream");

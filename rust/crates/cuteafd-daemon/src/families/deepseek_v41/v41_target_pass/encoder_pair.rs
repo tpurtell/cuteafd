@@ -113,7 +113,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
 
     /// Prepare a chunk's next query only when its execution lane is available.
-    async unsafe fn prepare_encoder_query(&mut self, requests: &RefCell<&mut Requests<'a>>,
+    pub(super) async unsafe fn prepare_encoder_query(&mut self, requests: &RefCell<&mut Requests<'a>>,
         batch: &mut RequestBatch, layer: usize) -> Result<()> {
         if layer == 0 { return Ok(()); }
         self.resources.lane.advance()?;

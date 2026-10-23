@@ -124,8 +124,30 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
 
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
     fn encoder_unit(&self, next: usize, replay_end: usize, streamed: bool,
-        budget: ChunkBudget) -> V41Unit {
-        self.times.encoder_unit(self.tokens.len(), self.chunk_rows, next, replay_end, streamed, budget)
+        budget: ChunkBudget) -> Result<V41Unit> {
+        if crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()?
+            && next >= replay_end && next < self.tokens.len() {
+            let span = std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok()
+                .map(|value| value.parse::<usize>()).transpose()
+                .context("PREFILL_SPAN_ROWS must be a row count")?.unwrap_or(16384);
+            ensure!(span >= self.chunk_rows && span <= 1048576 && span % 256 == 0,
+                "PREFILL_SPAN_ROWS must be a 256-row multiple between unit rows and 1048576");
+            let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
+            let mut ranges = Vec::new();
+            let mut start = next;
+            while start < self.tokens.len() {
+                let end = (start + self.chunk_rows).min(self.tokens.len());
+                let rows = end - next;
+                if !ranges.is_empty() && (rows > span || (!whole && (rows > budget.row_cap
+                    || budget.target.is_some_and(|target| self.times.estimate(2, rows) > target)))) {
+                    break;
+                }
+                ranges.push(start..end);
+                start = end;
+            }
+            return Ok(V41Unit::Stream(ranges));
+        }
+        Ok(self.times.encoder_unit(self.tokens.len(), self.chunk_rows, next, replay_end, streamed, budget))
     }
 
     fn initialize(&mut self, cursor: &mut V41Prefill<P::Suffix>) -> Result<()> {
@@ -174,11 +196,11 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                         self.requests.cache().history_end(self.lease)? as usize
                     } else { cached };
                     self.encoder_unit(next, cached,
-                        self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1, budget)
+                        self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1, budget)?
                 }
             }
             PrefillState::Encoder { next, replay_end, streamed, .. } =>
-                self.encoder_unit(*next, *replay_end, *streamed, budget),
+                self.encoder_unit(*next, *replay_end, *streamed, budget)?,
             PrefillState::Replay { .. } => V41Unit::DecoderReplay,
             PrefillState::Continuation { next } => continuation(*next),
             PrefillState::Done => anyhow::bail!("prefill already finished"),
@@ -230,7 +252,8 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let hold = RefCell::new(&mut *self.hold);
                 let before_chunk = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
                 // Preserve alternating lane ownership after a bounded singleton stream.
-                let odd = (*next - *replay_end) / self.chunk_rows % 2 != 0;
+                let odd = !crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()?
+                    && (*next - *replay_end) / self.chunk_rows % 2 != 0;
                 let (first, second, a, b) = if odd {
                     (&mut *self.other, &mut *self.pass, &mut *self.other_transport, &mut *self.transport)
                 } else {
@@ -396,6 +419,19 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         self.set_attention_decode(false);
         other.set_attention_decode(false);
         unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
+    }
+    async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
+        lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
+        suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
+        before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
+        if crate::families::deepseek_v41::v41_target_pass::encoder_units::enabled()? {
+            let [transport, _] = transports;
+            // SAFETY: one retained pass owns every unit until its in-order commit.
+            unsafe { self.execute_encoder_units(requests, lease, chunks, transport,
+                suffix, keep_running, before_chunk).await }
+        } else {
+            self.encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await
+        }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],
