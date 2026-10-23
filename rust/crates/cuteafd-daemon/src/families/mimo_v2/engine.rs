@@ -2902,7 +2902,7 @@ mod tests {
                 let later = fixture.events()?;
                 assert_eq!(later.matches('A').count(), first.matches('A').count());
                 assert!(!later[first.len()..].contains('F'), "no pinned free under queued work");
-                library.release_ordered_h2d_staging()?;
+                fixture.finish_ordered_uploads(&library)?;
                 // SAFETY: the CPU fixture completed both copies into this live allocation.
                 unsafe { assert_eq!(std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), extent), vec![7; extent]); }
                 library.free_device_buffer(&mut buffer)?;

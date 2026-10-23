@@ -105,7 +105,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 layout::charge_host(&mut report, &options, input.checkpoint(), native).unwrap();
                 assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
-                let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
+                let bytes = |name: &str| host.items.iter().find(|i| i.group == name).unwrap().bytes;
                 if family == "mimo_v2" {
                     let cfg = MimoV2Config::from_hf(&input.checkpoint().config).unwrap();
                     let expected = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
