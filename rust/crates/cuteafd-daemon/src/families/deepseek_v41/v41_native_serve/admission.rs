@@ -67,6 +67,11 @@ mod spark_tests {
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
             for waves in [1, 2] {
                 for device in 0..=2 {
+                    if waves > 1 && device > 0 {
+                        let error = spark_model(live, compiled, false, waves, device).unwrap_err();
+                        assert!(error.to_string().contains("device exchange and N2 prefill are not supported together"));
+                        continue;
+                    }
                     let model = spark_model(live, compiled, false, waves, device)?;
                     let proxies = 2 + usize::from(waves > 1);
                     assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));

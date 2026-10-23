@@ -47,6 +47,8 @@ pub fn spark_endpoints(capacity: u32, bf16: bool, waves: u64, device_endpoints: 
         "invalid V4.1 Spark endpoint geometry");
     ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
         "invalid V4.1 device endpoint set");
+    ensure!(waves == 1 || device_endpoints == 0,
+        "device exchange and N2 prefill are not supported together");
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
     let decode = SparkEndpoint { capacity, ingress, ring_depth: None };
     let mut endpoints = vec![decode; 2];
@@ -57,6 +59,18 @@ pub fn spark_endpoints(capacity: u32, bf16: bool, waves: u64, device_endpoints: 
         capacity: capacity.min(80), ..decode
     }, device_endpoints));
     Ok(endpoints)
+}
+
+/// Coordinator registrations for the same immutable endpoint contract the
+/// workers admit. Lazy connections allocate these rings only on first use.
+pub fn host_ring_bytes(endpoints: &[cuteafd_core::SparkEndpoint], ranks: usize,
+    rings: cuteafd_core::SparkRings) -> Result<u64> {
+    ensure!((1..=8).contains(&ranks), "invalid V4.1 host transport rank count");
+    endpoints.iter().try_fold(0u64, |sum, endpoint| {
+        let bytes = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::DEEPSEEK_V41, rings)
+            .context("invalid V4.1 endpoint rings")? as u64;
+        sum.checked_add(bytes).context("V4.1 host rings overflow")
+    })?.checked_mul(ranks as u64).context("V4.1 host rings overflow")
 }
 
 /// Extra return slots on the prefill-only link. Both fixed decode links stay live.
@@ -382,6 +396,11 @@ mod tests {
             for capacity in [256, 1024, 2048, 4096] {
                 for proxies in 0..=if bf16 { 0 } else { 2 } {
                     let serial = spark_endpoints(capacity, bf16, 1, proxies)?;
+                    if proxies > 0 {
+                        let error = spark_endpoints(capacity, bf16, 2, proxies).unwrap_err();
+                        assert!(error.to_string().contains("device exchange and N2 prefill are not supported together"));
+                        continue;
+                    }
                     let pipelined = spark_endpoints(capacity, bf16, 2, proxies)?;
                     assert_eq!(&pipelined[..2], &serial[..2]);
                     assert_eq!(&pipelined[3..], &serial[2..]);
@@ -391,6 +410,10 @@ mod tests {
                         .map(|endpoint| endpoint.ring_bytes(geometry, rings).unwrap()).sum::<usize>();
                     let extra = pipelined[2].ring_bytes(geometry, rings).unwrap();
                     assert_eq!(bytes(&pipelined) - bytes(&serial), extra);
+                    for ranks in [4, 6] {
+                        assert_eq!(host_ring_bytes(&pipelined, ranks, rings)?
+                            - host_ring_bytes(&serial, ranks, rings)?, extra as u64 * ranks as u64);
+                    }
                     if capacity == 4096 {
                         assert_eq!(extra, if bf16 { 168_738_816 } else { 128_106_496 });
                     }
