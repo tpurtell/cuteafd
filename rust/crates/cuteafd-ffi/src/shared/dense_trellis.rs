@@ -359,6 +359,16 @@ impl DenseTrellisPolicy {
 pub struct DenseTrellisDispatch<'a> {
     native: DenseTrellis<'a>, wide_input: Program<'a>, dequant: Program<'a>, projection: Program<'a>,
     stitch: crate::V41PeerCopy<'a>, policy: DenseTrellisPolicy,
+    experiment_qdq: Option<Program<'a>>,
+}
+
+fn experiment_mode(value: &str) -> Result<(bool, bool)> {
+    match value {
+        "off" => Ok((false, false)),
+        "w8" => Ok((true, false)),
+        "w8a8" => Ok((true, true)),
+        _ => Err(DenseTrellisError::Invalid("CUTEAFD_EXPERIMENT_KIMI_K6_FP8 must be off/w8/w8a8")),
+    }
 }
 #[derive(Debug, Clone, Copy)]
 pub struct DenseTrellisBuffers {
@@ -374,8 +384,24 @@ impl<'a> DenseTrellisDispatch<'a> {
         let native=DenseTrellis::load(programs,[&policy.native_input,&policy.native,&policy.output_program],
             DenseTrellisGeometry{input:policy.input,output:policy.output,bits:6,side:policy.side,rows,
                 input_dtype:TrellisDType::Bf16,output_dtype},&policy.codebook)?;
+        let (w8, a8)=experiment_mode(&std::env::var("CUTEAFD_EXPERIMENT_KIMI_K6_FP8")
+            .unwrap_or_else(|_| "off".into()))?;
+        let dequant_name=if w8 {format!("{}_experiment_w8",policy.dequant)} else {policy.dequant.clone()};
+        let experiment_qdq=if a8 {
+            let name=format!("kimi_k6_dense_trellis_experiment_mxfp8_qdq_k{}",policy.input);
+            let spec=programs.spec(&name)?;
+            if spec.capacity_rows<rows as u32 || spec.scalar_kinds!=b"i" || !spec.scratch.is_empty()
+                || spec.geometry["features"].as_u64()!=Some(policy.input as u64)
+                || spec.geometry["experiment_mxfp8_qdq"].as_bool()!=Some(true) {
+                return Err(DenseTrellisError::Invalid("experiment MXFP8 QDQ ABI"));
+            }
+            Some(programs.program(&name,&["values"])?)
+        } else {None};
         let wide=programs.spec(&policy.wide_input)?;
-        let dequant=programs.spec(&policy.dequant)?;
+        let dequant=programs.spec(&dequant_name)?;
+        if w8 && dequant.geometry["experiment_e4m3"].as_bool()!=Some(true) {
+            return Err(DenseTrellisError::Invalid("experiment E4M3 dequant ABI"));
+        }
         let projection=programs.spec(&policy.projection)?;
         if wide.capacity_rows<rows as u32 || wide.scalar_kinds!=b"ii" || !wide.scratch.is_empty()
             || wide.geometry["features"].as_u64()!=Some(policy.input as u64)
@@ -391,9 +417,9 @@ impl<'a> DenseTrellisDispatch<'a> {
             return Err(DenseTrellisError::Invalid("wide-route program geometry/ABI"));
         }
         Ok(Self {wide_input:programs.program(&policy.wide_input,INPUT)?,
-            dequant:programs.program(&policy.dequant,&["payload","scales","output"])?,
+            dequant:programs.program(&dequant_name,&["payload","scales","output"])?,
             projection:programs.program(&policy.projection,&["x","w","out"])?,
-            stitch:programs.library().v41_peer_copy()?,native,policy})
+            stitch:programs.library().v41_peer_copy()?,native,policy,experiment_qdq})
     }
     pub fn workspace(&self) -> DenseTrellisWorkspace { self.native.workspace() }
     pub fn policy(&self) -> &DenseTrellisPolicy { &self.policy }
@@ -419,6 +445,9 @@ impl<'a> DenseTrellisDispatch<'a> {
         unsafe {
             self.wide_input.launch(&[b.input.ptr,b.suh.ptr,b.rotated.ptr,b.scales.ptr],
                 &[Scalar::I32(rows as i32),Scalar::I32(self.native.ctas)],stream)?;
+            if let Some(qdq)=&self.experiment_qdq {
+                qdq.launch(&[b.rotated.ptr],&[Scalar::I32(rows as i32)],stream)?;
+            }
             for first in (0..p.output).step_by(p.chunk_columns) {
                 self.dequant.launch(&[b.payload.ptr,b.scales.ptr,b.chunk_weights.ptr],&[Scalar::I32(first as i32)],stream)?;
                 self.projection.launch(&[b.rotated.ptr,b.chunk_weights.ptr,b.chunk_output.ptr],&[Scalar::I32(rows as i32)],stream)?;
@@ -436,6 +465,17 @@ impl<'a> DenseTrellisDispatch<'a> {
 #[cfg(test)]
 mod policy_tests {
     use super::*;
+    #[test]
+    fn experiment_modes_are_explicit_and_preserve_decode_route() {
+        assert_eq!(experiment_mode("off").unwrap(), (false,false));
+        assert_eq!(experiment_mode("w8").unwrap(), (true,false));
+        assert_eq!(experiment_mode("w8a8").unwrap(), (true,true));
+        assert!(experiment_mode("").is_err());
+        assert!(experiment_mode("on").is_err());
+        let p=DenseTrellisPolicy::parse(&policy()).unwrap();
+        for rows in [1,8,16,32,63] {assert_eq!(p.route(rows).unwrap(),DenseTrellisRoute::Native);}
+        for rows in [64,65,4096] {assert_eq!(p.route(rows).unwrap(),DenseTrellisRoute::Chunk);}
+    }
     fn policy() -> serde_json::Value {
         serde_json::json!({"shape":"test","input_features":128,"output_features":256,"sharded_side":2,
             "codebook":"mcg","threshold_rows":64,"below":"shared_native","at_or_above":"chunk_dequant_bf16",

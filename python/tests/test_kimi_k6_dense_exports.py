@@ -40,6 +40,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
     dequant = ModuleType("b12x.integration.cuteafd.trellis_dequant")
     dequant.compile_trellis_dequant_aot = lambda **params: params
+    dequant.compile_experiment_mxfp8_qdq_aot = lambda **params: params
     projection = ModuleType("b12x.integration.cuteafd.pointwise")
     projection.compile_bf16_projection_aot = lambda **params: params
     torch = ModuleType("torch")
@@ -47,7 +48,13 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     for fake_module in (dequant, projection, torch):
         monkeypatch.setitem(sys.modules, fake_module.__name__, fake_module)
     programs = module["programs"]()
-    assert len(programs) == 91
+    assert len(programs) == 123
+    experiments = [item for item in programs if item[2].get("experiment_e4m3")]
+    assert len(experiments) == 26
+    assert all(name.endswith("_experiment_w8") for name, *_ in experiments)
+    qdq = [item for item in programs if item[1] == "experiment_mxfp8_qdq"]
+    assert len(qdq) == 6
+    assert {params["features"] for _, _, params, _ in qdq} == {1536, 3072, 3584, 6144, 7168, 12288}
     assert len({name for name, *_ in programs}) == len(programs)
     grouped = [item for item in programs if item[2].get("groups")]
     assert {name for name, *_ in grouped} == {
@@ -113,7 +120,7 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
 def test_comparison_group_is_opt_in():
     groups = runpy.run_path(str(ROOT / "scripts/build/compare-sm-exports.py"))["jobs"]("all")
     group = next(row for row in groups if row[0] == "kimi-k6-dense")
-    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense"])
+    assert group[1:] == ("export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"])
 
 
 def test_chunk_route_policy_and_scratch(monkeypatch):

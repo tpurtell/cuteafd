@@ -96,7 +96,9 @@ def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_output
         compile_trellis_input_aot, compile_trellis_output_aot,
     )
     import torch
-    from b12x.integration.cuteafd.trellis_dequant import compile_trellis_dequant_aot
+    from b12x.integration.cuteafd.trellis_dequant import (
+        compile_trellis_dequant_aot, compile_experiment_mxfp8_qdq_aot,
+    )
     from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
     result = []
     for name, k, n, side in shapes:
@@ -116,6 +118,9 @@ def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_output
                                codebook=codebook, sharded_side=side)
                 result.append((f"trellis_dequant_{name}_{codebook}", "trellis_dequant", dequant,
                                partial(compile_trellis_dequant_aot, **dequant)))
+                experiment = dict(dequant, experiment_e4m3=True)
+                result.append((f"trellis_dequant_{name}_{codebook}_experiment_w8", "trellis_dequant", experiment,
+                               partial(compile_trellis_dequant_aot, **experiment)))
     for k in sorted({k for _, k, _, _ in shapes}):
         params = dict(features=k, input_dtype="bf16", max_rows=max_rows)
         result.append((f"trellis_input_k{k}_bf16", "trellis_input", params,
@@ -124,6 +129,9 @@ def programs_for_shapes(shapes, *, max_rows=4096, include_chunk=True, f32_output
             wide_params = dict(params, output_dtype="bf16")
             result.append((f"trellis_input_k{k}_bf16_rotated_bf16", "trellis_input", wide_params,
                            partial(compile_trellis_input_aot, **wide_params)))
+            qdq = dict(features=k, max_rows=max_rows)
+            result.append((f"trellis_experiment_mxfp8_qdq_k{k}", "experiment_mxfp8_qdq", qdq,
+                           partial(compile_experiment_mxfp8_qdq_aot, **qdq)))
     for n in sorted({n for _, _, n, _ in shapes}):
         dtype = "f32" if n in f32_outputs else "bf16"
         params = dict(features=n, output_dtype=dtype, max_rows=max_rows)
