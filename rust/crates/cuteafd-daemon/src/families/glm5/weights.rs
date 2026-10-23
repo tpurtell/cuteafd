@@ -87,7 +87,47 @@ impl GlmLayer<'_> {
 pub(crate) struct GlmWeights<'a> {
     pub layers: Vec<GlmLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
-    pub head: DeviceAllocation<'a>,
+    pub head: GlmHead<'a>,
+}
+
+/// The vocabulary head rank 0 owns: the checkpoint's BF16 head (the shared
+/// tensor-core route), or an EXLR8 checkpoint's row-FP8 head (its own program).
+pub(crate) enum GlmHead<'a> {
+    Bf16(DeviceAllocation<'a>),
+    RowFp8(crate::shared::token_io::native::NativeVocabulary<'a>),
+}
+
+impl<'a> GlmHead<'a> {
+    /// Device bytes of the head (and, for row-FP8, the embedding the same owner holds).
+    pub fn bytes(&self) -> usize {
+        match self { Self::Bf16(head) => head.buffer.bytes, Self::RowFp8(owner) => owner.bytes() }
+    }
+
+    /// The device range the L2 prefetch reads after the last layer.
+    pub fn range(&self) -> crate::shared::l2_prefetch::Range {
+        match self {
+            Self::Bf16(head) => (head.buffer.ptr.cast_const(), head.buffer.bytes),
+            Self::RowFp8(owner) => (owner.head.payload().ptr.cast_const(), owner.head.payload().bytes),
+        }
+    }
+
+    /// The BF16 head, for diagnostics that read it directly.
+    pub fn bf16(&self) -> Result<&DeviceAllocation<'a>> {
+        match self { Self::Bf16(head) => Ok(head),
+            Self::RowFp8(_) => anyhow::bail!("this diagnostic reads a BF16 head; the EXLR8 checkpoint's head is row-FP8") }
+    }
+
+    /// The head the DFlash2 drafter borrows (its only resident copy).
+    pub fn target(&self) -> crate::shared::speculation::dflash::TargetHead<'_> {
+        use crate::shared::speculation::dflash::TargetHead;
+        match self {
+            Self::Bf16(head) => TargetHead::Bf16(head),
+            // SAFETY (inside): the drafter passes its live normed rows and logits on its stream.
+            Self::RowFp8(owner) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| unsafe {
+                owner.head_logits(x, logits, rows, stream)
+            })),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -875,7 +915,7 @@ impl<'a> GlmLoader<'a> {
         let weights = GlmWeights {
             layers: shares.next().context("rank 0")?,
             norm: self.one("model.norm.weight")?,
-            head: self.one("lm_head.weight")?,
+            head: GlmHead::Bf16(self.one("lm_head.weight")?),
         };
         crate::shared::memory::staging::release_staging();
         split.log("glm5 dense");

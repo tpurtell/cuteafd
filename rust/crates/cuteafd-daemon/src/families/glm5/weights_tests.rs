@@ -77,7 +77,7 @@ fn head_split_operands_match_the_mount_golden() -> Result<()> {
         peers: vec![crate::shared::peer_split::RankDevice { device: 1, stream }], push: None };
     let (model, shares) = loader.model(&cfg, cfg.layers, None, false)?;
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
-    let actual = digests(&library, &layers, &model.norm, &model.head)?;
+    let actual = digests(&library, &layers, &model.norm, model.head.bf16()?)?;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5/weights_golden.json");
     if std::env::var_os("CUTEAFD_WRITE_GLM5_OPERAND_GOLDEN").is_some() {
         std::fs::write(&path, serde_json::to_vec_pretty(&actual)?)?;
@@ -131,7 +131,7 @@ fn pushed_head_split_operands_match_the_mount_golden() -> Result<()> {
         crate::shared::memory::device::Device { library: &library, id: job.device }.run(|| job.run(&library, stream))?;
     }
     let layers: Vec<Vec<GlmLayer<'_>>> = std::iter::once(model.layers).chain(shares).collect();
-    let actual = digests(&library, &layers, &model.norm, &model.head)?;
+    let actual = digests(&library, &layers, &model.norm, model.head.bf16()?)?;
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/glm5/weights_golden.json");
     let golden: std::collections::BTreeMap<String, String> = serde_json::from_slice(&std::fs::read(&path)?)?;
     for (key, digest) in &golden {

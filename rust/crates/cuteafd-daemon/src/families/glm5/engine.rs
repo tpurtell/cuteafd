@@ -1080,9 +1080,13 @@ impl<'a> GlmEngine<'a> {
         let h = self.cfg.hidden;
         // SAFETY: the final norm's output and the head operands are live buffers of these shapes.
         unsafe {
-            crate::shared::target_head::launch(crate::shared::target_head::TargetHead::configured(),
-                w.head.as_ref().context("LM head")?, w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast(),
-                self.weights.head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), n, self.stream)
+            let x = w.x.buffer.ptr.cast::<u8>().add((t - n) * h * 2).cast::<std::ffi::c_void>();
+            match &self.weights.head {
+                super::weights::GlmHead::Bf16(head) => crate::shared::target_head::launch(
+                    crate::shared::target_head::TargetHead::configured(), w.head.as_ref().context("LM head")?,
+                    x, head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), n, self.stream),
+                super::weights::GlmHead::RowFp8(owner) => owner.head_logits(x, w.logits.buffer.ptr.cast(), n, self.stream),
+            }
         }
     }
 
@@ -1454,8 +1458,8 @@ impl<'a> GlmEngine<'a> {
                 "gate.bias", "w_gate_up", "w_down"],
                 |n| next.range(n)),
             None if rank == 1 => Vec::new(),
-            None => [&self.weights.norm, &self.weights.head].iter()
-                .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect(),
+            None => vec![(self.weights.norm.buffer.ptr.cast_const(), self.weights.norm.buffer.bytes),
+                self.weights.head.range()],
         }).collect()
     }
 

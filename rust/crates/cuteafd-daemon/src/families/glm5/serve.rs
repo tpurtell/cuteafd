@@ -793,7 +793,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     .collect();
                 drafted_requests = seqs.len();
                 let drafts = round_clock.draft(|| drafter.draft_device(&seqs.iter().map(|(_, s)| *s).collect::<Vec<_>>(), &engine.embedding,
-                    crate::shared::speculation::dflash::TargetHead::Bf16(&engine.weights.head)));
+                    engine.weights.head.target()));
                 drafted_width = drafter.cfg.drafts();
 
                 let mut out = vec![None; active.len()];
