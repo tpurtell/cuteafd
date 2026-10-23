@@ -330,7 +330,7 @@ fn preflight_shape(
                 page_owners: Default::default(),
             };
             let scoring_rows = if args.full_prefill_logits {
-                super::engine::prefill_span_rows(std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().as_deref(), args.prefill_rows)?
+                super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
             } else { 64 };
             prefix.with_scoring(scoring_rows, scoring_rows.max(64), cfg.vocab_size)?
                 .host_config(layout, args.max_context, concurrency)?

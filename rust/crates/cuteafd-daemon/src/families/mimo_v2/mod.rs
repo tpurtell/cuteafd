@@ -74,6 +74,9 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Rows one prefill call streams through its continuous units.
+    #[arg(long, default_value_t = 16384)]
+    pub prefill_span_rows: usize,
     /// Outstanding unit waves on one Spark transport (0: Pro 3, Flash 2).
     #[arg(long, default_value_t = 0)]
     pub prefill_waves: usize,
@@ -297,11 +300,14 @@ mod draft_storage_tests {
         let automatic = args(&[]);
         assert_eq!(automatic.max_context, 0);
         assert_eq!(automatic.pool_tokens, 0);
+        assert_eq!(automatic.prefill_span_rows, 16384);
         assert_eq!(automatic.token_io.embed_placement, None);
         let explicit = args(&["--max-context", "32768", "--pool-tokens", "131072", "--embed-placement", "gpu"]);
         assert_eq!(explicit.max_context, 32768);
         assert_eq!(explicit.pool_tokens, 131072);
         assert_eq!(explicit.token_io.embed_placement, Some(crate::shared::token_io::EmbedPlacement::Gpu));
+        let span = args(&["--prefill-rows", "1024", "--prefill-span-rows", "6144"]);
+        assert_eq!((span.prefill_rows, span.prefill_span_rows), (1024, 6144));
     }
 
     #[test]
@@ -888,6 +894,7 @@ impl Opened {
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize)>, prefill_output: MimoPrefillOutput,
         body: impl FnOnce(&engine::MimoEngine<'_>, Option<cuteafd_hostcache::config::Config>) -> Result<T>) -> Result<T> {
         let automatic_context = args.max_context == 0;
+        engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?;
         let mut resolved = args.clone();
         if resolved.max_context == 0 {
             resolved.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&self.checkpoint.config)?
@@ -1102,7 +1109,7 @@ impl Opened {
             "MiMo coordinator weights resident after Spark admission (elapsed includes wait)");
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
-            args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
+            args.max_context, args.prefill_rows, args.prefill_span_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
         engine.prefill_unit_waves = args.prefill_waves;
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.

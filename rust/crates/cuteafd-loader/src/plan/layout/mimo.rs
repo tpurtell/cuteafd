@@ -640,9 +640,13 @@ mod tests {
                                         lanes, true, opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow,
                                         true, |_| Ok(0)).unwrap().remove(0);
                                     let current = MimoWorkspaceLayout::new(&cfg, options).unwrap().device_bytes().unwrap();
-                                    let legacy: u64 = (0..lanes).map(|lane| MimoWorkspaceLayout::new(&cfg,
-                                        MimoWorkspaceOptions { waves: 1, with_head: lane < 2, ..options })
-                                        .unwrap().device_bytes().unwrap()).sum();
+                                    let mut shadow = crate::families::mimo_v2::workspace::MimoPrefillKvShadowPlan::default();
+                                    let legacy = (0..lanes).map(|lane| {
+                                        let options = MimoWorkspaceOptions { waves: 1, with_head: lane < 2, ..options };
+                                        let layout = MimoWorkspaceLayout::new(&cfg, options).unwrap();
+                                        shadow.workspace_reservations(&format!("legacy{lane}"), &layout, options)
+                                            .unwrap().iter().map(|r| r.bytes).sum::<u64>()
+                                    }).sum::<u64>() + shadow.reservation().map_or(0, |r| r.bytes);
                                     let old_remaining = remaining - (legacy - current);
                                     println!("BF16 Pro TP1 free before -> after: {old_remaining} -> {remaining}; complete layer threshold {}",
                                         cost.whole.resident + runtime_request.expert_workspace);

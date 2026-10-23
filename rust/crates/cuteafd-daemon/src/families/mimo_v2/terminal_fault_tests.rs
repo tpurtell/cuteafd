@@ -87,6 +87,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         lead.raw,
         64,
         64,
+        16384,
         1,
         1,
         embedding,

@@ -72,8 +72,7 @@ impl<'a> Dev<'a> {
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
 
-pub(super) fn prefill_span_rows(configured: Option<&str>, unit_rows: usize) -> Result<usize> {
-    let rows = configured.map(str::parse::<usize>).transpose()?.unwrap_or(16384);
+pub(super) fn prefill_span_rows(rows: usize, unit_rows: usize) -> Result<usize> {
     ensure!(rows >= unit_rows && rows <= 16384 && rows % PAGE_ROWS == 0,
         "MiMo prefill span must be page-aligned, at least one unit, and at most 16384 rows");
     Ok(rows)
@@ -751,11 +750,11 @@ fn kind(attention: MimoAttention) -> &'static str {
 impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
-        weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
+        weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_span: usize, pages: usize,
         rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvFormats,
         prefill_output: MimoPrefillOutput) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
-        let prefill_span_rows = prefill_span_rows(std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().as_deref(), prefill_rows)?;
+        let prefill_span_rows = prefill_span_rows(prefill_span, prefill_rows)?;
         let family = cfg.program_family()?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
@@ -3022,14 +3021,14 @@ mod tests {
     #[test]
     fn continuous_span_supports_same_cuts_at_one_two_and_three_waves() {
         use crate::shared::prefill_pipeline::sequence_units;
-        let span = prefill_span_rows(Some("6144"), 1024).unwrap();
+        let span = prefill_span_rows(6144, 1024).unwrap();
         let cuts = sequence_units(span, 1024, 1, 70).unwrap().into_iter().map(|u| u.rows).collect::<Vec<_>>();
         for waves in [2, 3] {
             assert_eq!(sequence_units(span, 1024, waves, 70).unwrap().into_iter().map(|u| u.rows).collect::<Vec<_>>(), cuts);
         }
-        assert_eq!(prefill_span_rows(None, 4096).unwrap(), 16384);
-        for invalid in ["0", "513", "819", "32768", "oops"] {
-            assert!(prefill_span_rows(Some(invalid), 1024).is_err());
+        assert_eq!(prefill_span_rows(16384, 4096).unwrap(), 16384);
+        for invalid in [0, 512, 513, 819, 32768] {
+            assert!(prefill_span_rows(invalid, 1024).is_err());
         }
     }
 
