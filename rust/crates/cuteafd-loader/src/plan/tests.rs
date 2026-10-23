@@ -42,7 +42,7 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
 
 #[test]
 fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
-    use cuteafd_core::{ExpertGeometry, SparkRings};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
     use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout, ItemLifetime};
     let dir = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let input = PlanInput::open(dir.path()).unwrap();
