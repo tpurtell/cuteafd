@@ -237,7 +237,7 @@ int main() {
 
 
 @pytest.mark.parametrize("options", [
-    dict(bits=(3, 4, 5)), dict(warp_specialized=True), dict(decode_schedule="gb10"),
+    dict(bits=(3, 4, 5)), dict(decode_schedule="gb10"),
 ])
 def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatch, tmp_path, options):
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
@@ -247,7 +247,7 @@ def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatc
     spec.loader.exec_module(exporter)
     kwargs = dict(bits=(3, 4), routing="packed", compact_weights=True)
     kwargs.update(options)
-    with pytest.raises(ValueError, match="compact weights require cooperative two-tier"):
+    with pytest.raises(ValueError, match="compact weights require two-tier"):
         exporter.export(tmp_path, 384, 256, 16, **kwargs)
 
 

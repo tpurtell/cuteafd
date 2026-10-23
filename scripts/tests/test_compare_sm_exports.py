@@ -150,9 +150,11 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
         assert values[4] == tuple(map(int, bits))
         assert options["compile_only"] and options["compact_weights"]
         assert options["tile"] == (64, 128, 64, 128)
-        assert not options.get("warp_specialized") and not options.get("wire_input")
         rows = values[3]
-        assert options.get("route_block", 8) == package.route_block(geometry, rows)
+        ws = package.compact_warp_specialized(geometry, "spark", values[1], rows)
+        assert bool(options.get("warp_specialized")) == ws
+        assert not options.get("wire_input")
+        assert options.get("route_block", 8) == (32 if ws else package.route_block(geometry, rows))
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else

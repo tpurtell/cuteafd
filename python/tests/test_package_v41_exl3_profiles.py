@@ -267,6 +267,37 @@ class PackageProfileTests(unittest.TestCase):
                     self.assertIn(path.parts[0], ('tp4-width512', 'tp4-width640'))
                     self.assertNotIn('descriptor_rows', json.loads((call.args[0] / 'v41_exl3.json').read_text()))
 
+    def test_qwen_compact_prefill_selects_m32_ws_with_separate_cache(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _output, _manifest, calls, _ = self.build_fixture(
+                root, 'spark', (4, 5), geometry='qwen4',
+                capacities=(1, 80, 256, 1024, 4096), compact=True)
+            selected = []
+            for call in calls:
+                compact = call.kwargs.get('compact_weights', False)
+                width, capacity = call.args[1], call.args[3]
+                expected = compact and width == 256 and capacity >= 256
+                self.assertEqual(call.kwargs.get('warp_specialized', False), expected)
+                cache = call.args[0].relative_to(root / 'build').parts[0]
+                self.assertEqual(cache.endswith('+ws-m32'), expected)
+                if expected:
+                    selected.append((width, capacity))
+                    self.assertEqual(call.kwargs['route_block'], 32)
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                    self.assertNotIn('token_major_rotation', call.kwargs)
+            self.assertEqual(len(selected), 6)  # TP3/TP4, three prefill capacities.
+
+    def test_compact_ws_policy_excludes_unmeasured_widths_and_families(self):
+        for geometry in package.GEOMETRIES:
+            for role in ('spark', 'coordinator'):
+                for width in (128, 256, 384, 512):
+                    for capacity in (1, 80, 256, 4096):
+                        self.assertEqual(
+                            package.compact_warp_specialized(geometry, role, width, capacity),
+                            geometry == 'qwen4' and role == 'spark'
+                            and width == 256 and capacity >= 256)
+
     def test_compact_even_control_preserves_legacy_package(self):
         with tempfile.TemporaryDirectory() as temporary:
             _output, manifest, calls, _ = self.build_fixture(
