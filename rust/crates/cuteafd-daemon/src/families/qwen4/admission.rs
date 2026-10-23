@@ -628,11 +628,10 @@ mod tests {
         assert_eq!(spark.code_key(), "none");
         // The selected transport's actual world, not the configured two peers.
         assert_eq!(input(&with_peers, spark, 0)?.spark_ranks, 4);
-        // Spark serving charges the intake's per-rank BF16 planes at prefill width.
+        // Runtime's measured baseline already includes the selected transport.
         let request = qwen4::request(&input(&with_peers, spark, 0)?, 0)?;
-        let intake = request.fixed.iter().find(|d| d.group == "Spark intake planes").expect("intake charge");
-        assert_eq!(intake.bytes, cuteafd_loader::serving_capacity::spark_intake_bytes(4, 1, 1, 1)
-            * with_peers.prefill_rows.max(64) as u64 * cfg.hidden as u64);
+        assert!(matches!(request.inventory.gpus[0].baseline, cuteafd_loader::placement::Baseline::Measured { .. }));
+        assert!(request.fixed.iter().all(|d| d.group != "Spark intake planes"));
         assert!(qwen4::request(&input(&local, ExpertSource::LocalExl3, 0)?, 0)?.fixed.iter()
             .all(|d| d.group != "Spark intake planes"));
         assert_eq!(ExpertSource::selected(None)?, ExpertSource::None);
