@@ -18,7 +18,7 @@
 //! shared trellis ABI permits ("transform each rank then reduce BF16 outputs").
 use super::*;
 use cuteafd_ffi::dense_trellis::{DenseTrellisGeometry, TrellisDType};
-use cuteafd_ffi::native_dense::{DenseLinear, Encoding};
+use cuteafd_ffi::native_dense::DenseLinear;
 use cuteafd_ffi::native_dense_glue::{Companion, Op};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::plan::exlr8::dense::DenseEncoding;
@@ -74,7 +74,6 @@ pub(crate) struct NativeScratch<'a> {
     block_scales: Dev<'a>,
     partial: Dev<'a>,
     acc: Dev<'a>,
-    acc2: Dev<'a>,
     qkv: Dev<'a>,
     q: Dev<'a>,
     gate: Dev<'a>,
@@ -99,7 +98,7 @@ pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows
     let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
     let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
     let splits = max_k.div_ceil(1024);
-    [rows * max_k * 2, 64, max_k / 128 * 2, rows * splits * max_n * 4, rows * max_n * 4, rows * max_n * 4,
+    [rows * max_k * 2, 64, max_k / 128 * 2, rows * splits * max_n * 4, rows * max_n * 4,
         rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
         rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
         .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
@@ -118,7 +117,7 @@ impl<'a> NativeScratch<'a> {
         let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
         let a = |bytes: usize| engine.alloc(bytes);
         let scratch = Self { rotated: a(rows * max_k * 2)?, table: a(64)?, block_scales: a(max_k / 128 * 2)?,
-            partial: a(rows * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?, acc2: a(rows * max_n * 4)?,
+            partial: a(rows * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?,
             qkv: a(rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2)?, q: a(rows * heads * 256 * 2)?,
             gate: a(rows * inter * 2)?, up: a(rows * inter * 2)?, hidden: a(rows * inter * 2)?,
             kw: a(rows * (128 + ih) * 2)?, iq: a(rows * ih * 128 * 2)?, values: a(rows * heads * cfg.v_head_dim * 2)? };
@@ -354,6 +353,3 @@ pub(crate) fn trellis_geometries(split: bool) -> Vec<(&'static str, DenseTrellis
         vec![("q_b", g(2048, 16384, 1)), ("o", g(16384, 6144, 2)), ("gate_up", g(6144, 12288, 1)), ("down", g(12288, 6144, 2))]
     }
 }
-
-#[allow(dead_code)]
-fn _encodings_are_native(e: Encoding) -> bool { matches!(e, Encoding::Trellis | Encoding::Int4G32 | Encoding::Mxfp8) }
