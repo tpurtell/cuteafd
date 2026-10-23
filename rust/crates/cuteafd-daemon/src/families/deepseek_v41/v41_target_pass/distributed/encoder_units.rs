@@ -69,7 +69,8 @@ impl AsyncPrefillHooks for UnitHooks<'_, '_, '_, '_> {
             .execution
             .restart_for(CacheStage::Encoder);
         for index in self.pass.resources.indices.iter_mut().flatten() {
-            index.device.run(|| index.restart())?;
+            let device = index.device;
+            device.run(|| index.restart())?;
         }
         let gpu = self.pass.resources.map.attention(0)?;
         let device = self.pass.resources.lanes[gpu].device;
