@@ -951,8 +951,7 @@ impl Opened {
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress };
-                    usize::try_from(preflight.working_set.prefill_lanes)?],
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
@@ -1417,7 +1416,8 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     let forced = |layer: usize| -> Option<Vec<u8>> {
         std::fs::read(args.golden.join(format!("layer{layer:02}.bin"))).ok().map(|rows| rows[..prefill * row].to_vec())
     };
-    let chunk = args.prefill_chunk.unwrap_or(prefill).clamp(1, engine.prefill_rows);
+    let capacity = if args.timing || args.decode_nll { engine.prefill_capacity() } else { engine.prefill_rows };
+    let chunk = args.prefill_chunk.unwrap_or(prefill).clamp(1, capacity);
     ensure!(!args.teacher_force || chunk >= prefill, "--teacher-force needs a single prefill chunk");
     let mut logits = None;
     let mut prefill_logits: Vec<f32> = Vec::new();

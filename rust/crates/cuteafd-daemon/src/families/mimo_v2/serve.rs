@@ -1,6 +1,6 @@
 //! OpenAI-compatible API over the MiMo V2 engine: continuous batching with
-//! independent prefill chunks paired when their existing single-lane shapes
-//! fit, and one decode-shaped step for every active sequence, verifying drafts.
+//! continuous unit-pipelined prefill spans and one decode-shaped step for every
+//! active sequence, verifying drafts.
 //!
 //! MiMo keeps no recurrent state: full layers write paged records and SWA
 //! layers a 256-slot ring that outlives the 128-token window by more than a
@@ -308,7 +308,6 @@ struct Prefill<'a> {
     plan: cuteafd_engine::prefix::PointPlan,
     /// Chunks prefilled so far.
     chunks: usize,
-    paired_chunks: usize,
     /// The client left mid-prefill: its prefilled rows are parked as a prompt snapshot.
     cancelled: bool,
     placement: super::engine::MimoPlacement,
@@ -700,7 +699,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let mut placement = admitted.placement;
                 let scored = probe::score(engine.library, &job.probe, &tokens, from,
-                    if engine.full_prefill_logits() { engine.prefill_rows } else { engine.prefill_capacity() },
+                    engine.prefill_capacity(),
                     DECODE_ROWS, probe::verify_rows(&job.probe), engine.full_prefill_logits(), &mut placement,
                     |placement, chunk, rows| Ok(engine.prefill_media_device(placement, chunk, rows > 1, None, None, Some(&request_media))?
                         .map(probe::ScoreLogits::Device)),
@@ -743,7 +742,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     chunks: probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new(),
                 }
             } else if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
-            prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, paired_chunks: 0, cancelled: false,
+            prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 phases: [0.0; 2], ticket });
         }
@@ -809,7 +808,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let logits = p.logits.clone();
                 if resume < p.tokens.len() {
                     tracing::info!(tokens = p.tokens.len(), cached = resume,
-                        paired_chunks = p.paired_chunks,
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64,
                         tok_s = (p.tokens.len() - resume) as f64 / p.busy, gpu_wait_ms = (1e3 * p.phases[0]) as u64,
                         experts_ms = (1e3 * p.phases[1]) as u64, "prefill");

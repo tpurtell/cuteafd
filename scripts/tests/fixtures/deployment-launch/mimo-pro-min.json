@@ -106,6 +106,10 @@
       "0",
       "--prefix-partial",
       "off",
+      "--prefill-rows",
+      "4096",
+      "--prefill-waves",
+      "3",
       "--console-secret-file",
       "/run/cuteafd-console-secret",
       "--usage-dir",
@@ -114,11 +118,7 @@
       "on",
       "--enable-bench",
       "--draft",
-      "/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b",
-      "--prefill-rows",
-      "4096",
-      "--prefill-waves",
-      "3"
+      "/hf/hub/models--XiaomiMiMo--MiMo-V2.6-Pro-MOPD/snapshots/adea8e2c5373181e5a973fa1ecb343cb31af214b"
     ]
   },
   {

@@ -71,6 +71,13 @@ impl<'a> Dev<'a> {
 
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
+
+fn prefill_span_rows(configured: Option<&str>, unit_rows: usize) -> Result<usize> {
+    let rows = configured.map(str::parse::<usize>).transpose()?.unwrap_or(16384);
+    ensure!(rows >= unit_rows && rows <= 16384 && rows % PAGE_ROWS == 0,
+        "MiMo prefill span must be page-aligned, at least one unit, and at most 16384 rows");
+    Ok(rows)
+}
 /// Rows of the decode-route programs (`_m64`).
 pub(crate) const DECODE_ROWS: usize = cuteafd_loader::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS;
 /// Expert scratch and transport must fit every decode/verify row shape even
@@ -234,11 +241,11 @@ impl MimoPlacement {
     }
 
     fn prefill_tables(&self, rows: usize, max_context: usize) -> Result<StepTables> {
-        let end = self.len.checked_add(rows).context("paired prefill context overflow")?;
+        let end = self.len.checked_add(rows).context("unit prefill context overflow")?;
         ensure!(rows > 0 && end <= max_context && self.ring >= 0,
-            "paired prefill exceeds context capacity or has no request ring");
+            "unit prefill exceeds context capacity or has no request ring");
         let pages = self.pages.get(..end.div_ceil(PAGE_ROWS))
-            .context("paired prefill exceeds the request's admitted pages")?;
+            .context("unit prefill exceeds the request's admitted pages")?;
         Ok(StepTables {
             decode: false,
             positions: (self.len..end).map(|p| p as i64).collect(),
@@ -373,7 +380,7 @@ fn slot(index: usize, ffn: bool) -> usize {
     unit_slot(index, ffn, 0)
 }
 
-/// Each prefill lane retains its own receive rows until that lane consumes them.
+/// Each unit slot retains its receive rows until that unit consumes them.
 fn unit_slot(index: usize, ffn: bool, lane: usize) -> usize {
     4 * lane + 2 * (index % 2) + usize::from(ffn)
 }
@@ -510,7 +517,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
     fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let e = self.engine;
         let tables = &self.tables[unit.index];
-        if unit.index >= e.prefill_waves() && self.peer_work.is_some() {
+        if self.peer_work.is_some() {
             // SAFETY: the slot's prior peer readers precede its recorded event;
             // the cross-device wait orders rank 0's entry copy after them.
             unsafe { e.library.cuda_stream_wait_event(e.stream, e.peer.as_ref().context("MiMo peer")?.unit_done[unit.slot].raw)?; }
@@ -607,7 +614,8 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
     }
     fn commit_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let e = self.engine;
-        if let (Some(mtp), true) = (&e.mtp, e.weights.layers.len() == e.cfg.layers) {
+        if let (Some(mtp), true) = (&e.mtp, e.weights.layers.len() == e.cfg.layers
+            && unit.rows.end > self.tokens.len().saturating_sub(super::mtp::HIDDEN_ROWS)) {
             e.mtp_tap(mtp, &self.work[unit.index], &self.tables[unit.index])?;
         }
         if self.peer_work.is_some() {
@@ -636,6 +644,7 @@ pub(crate) struct MimoEngine<'a> {
     pub max_context: usize,
     pub prefill_rows: usize,
     pub prefill_unit_waves: usize,
+    prefill_span_rows: usize,
     request_id: Cell<u64>,
     unit_position: Cell<usize>,
     unit_index: Cell<Option<usize>>,
@@ -746,6 +755,7 @@ impl<'a> MimoEngine<'a> {
         rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvFormats,
         prefill_output: MimoPrefillOutput) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
+        let prefill_span_rows = prefill_span_rows(std::env::var("CUTEAFD_PREFILL_SPAN_ROWS").ok().as_deref(), prefill_rows)?;
         let family = cfg.program_family()?;
         // Layers loaded as head-split shares carry half the heads (see `attach_peer`).
         let ranks = if weights.layers.iter().any(|l| l.split) { 2 } else { 1 };
@@ -773,7 +783,7 @@ impl<'a> MimoEngine<'a> {
         let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
-            max_context, prefill_rows, prefill_unit_waves: 1, request_id: Cell::new(0), unit_position: Cell::new(0), unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
+            max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, request_id: Cell::new(0), unit_position: Cell::new(0), unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
@@ -1289,13 +1299,14 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// Replace the existing positions upload with one packed positions/RoPE copy.
-    /// Pointers stay fixed across graph replay; each prefill lane owns its window.
+    /// Pointers stay fixed across graph replay; each prefill slot owns its window.
     fn put_step_inputs(&self, rank: usize, w: &Workspace<'_>, positions: &[i64]) -> Result<()> {
         let mut bytes = w.step_host.borrow_mut();
         self.rope.fill(positions, w.rows, self.max_context, &mut bytes)?;
         // SAFETY: workspace and stream belong to this rank; all readers follow
         // this upload on that stream, outside capture. FFI retains pinned staging.
-        unsafe { self.library.copy_h2d_ordered(w.step_inputs.buffer, &bytes, self.stream_of(rank)) }
+        unsafe { self.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer {
+            bytes: bytes.len(), ..w.step_inputs.buffer }, &bytes, self.stream_of(rank)) }
     }
 
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
@@ -1366,7 +1377,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     /// A continuous span reuses unit slots without draining at a wave boundary.
-    pub fn prefill_capacity(&self) -> usize { 16384.max(self.prefill_rows) }
+    pub fn prefill_capacity(&self) -> usize { self.prefill_span_rows }
 
     fn prefill_waves(&self) -> usize { self.prefill_unit_waves }
 
@@ -1665,7 +1676,7 @@ impl<'a> MimoEngine<'a> {
         // SAFETY: the logits rows and the select buffer are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
-                std::ptr::null_mut(), Self::region(w.select.buffer, rows * 4, rows * 4).ptr, self.stream)
+                std::ptr::null_mut(), Self::region(&w.select, rows * 4, rows * 4).ptr, self.stream)
         }
     }
 
@@ -1674,7 +1685,7 @@ impl<'a> MimoEngine<'a> {
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
         let vocab = self.cfg.vocab_size;
         DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
-            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(w.select.buffer, rows * 4, rows * 4).ptr
+            greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
                 .cast_const())) }
     }
 
@@ -3006,6 +3017,20 @@ mod tests {
         assert_eq!(attention_workspace_geometry(0, 2, false, false), global);
         assert_eq!(attention_workspace_geometry(0, 1, false, true), global);
         assert_eq!(attention_workspace_geometry(0, 1, true, true), global);
+    }
+
+    #[test]
+    fn continuous_span_supports_same_cuts_at_one_two_and_three_waves() {
+        use crate::shared::prefill_pipeline::sequence_units;
+        let span = prefill_span_rows(Some("6144"), 1024).unwrap();
+        let cuts = sequence_units(span, 1024, 1, 70).unwrap().into_iter().map(|u| u.rows).collect::<Vec<_>>();
+        for waves in [2, 3] {
+            assert_eq!(sequence_units(span, 1024, waves, 70).unwrap().into_iter().map(|u| u.rows).collect::<Vec<_>>(), cuts);
+        }
+        assert_eq!(prefill_span_rows(None, 4096).unwrap(), 16384);
+        for invalid in ["0", "513", "819", "32768", "oops"] {
+            assert!(prefill_span_rows(Some(invalid), 1024).is_err());
+        }
     }
 
     #[test]

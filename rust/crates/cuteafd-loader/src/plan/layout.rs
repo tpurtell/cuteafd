@@ -329,8 +329,8 @@ mod scoring_workspace_tests {
 
 /// Ring endpoints a family's coordinator opens to each selected Spark rank,
 /// given its prefill lanes (V4/V4.1: two fixed; GLM 5.3: one decode endpoint
-/// plus one per lane when lanes run in parallel; GLM Flash/MiMo: one per lane;
-/// Qwen: one).
+/// plus one per lane when lanes run in parallel; GLM Flash: one per lane;
+/// MiMo/Qwen: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     match family {
         "deepseek_v41" | "deepseek_v4" => 2,
@@ -392,7 +392,7 @@ mod selected_spark_io_tests {
             ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2, 1431699456),
             // Decode link + one prefill link (formerly one endpoint per lane: 2459697152).
             ("glm5", ExpertGeometry::GLM5, 3, 1229848576),
-            ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 1844772864),
+            ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3, 614924288),
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
                 prefill_lanes: lanes, ..Default::default() };

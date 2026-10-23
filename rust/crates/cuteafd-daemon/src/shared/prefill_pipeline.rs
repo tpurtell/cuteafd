@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn mimo_continuous_units_preserve_routes_slots_and_spark_occupancy() -> anyhow::Result<()> {
-        for layers in [48, 78] {
+        for layers in [48, 70] {
             for onboard in [0, 4, 12] {
                 let routes = (0..layers).map(|layer| if layer < 1 + onboard {
                     FfnRoute::Local
