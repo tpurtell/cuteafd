@@ -513,7 +513,7 @@ mod tests {
                         onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), ..Default::default() }),
                     ..Default::default() }).unwrap();
                 let layout = report.memory_layout.unwrap();
-                let lanes = cuteafd_loader::families::mimo_v2::admission::resolve_transport_lanes(true,
+                let lanes = cuteafd_loader::families::mimo_v2::admission::resolve_prefill_waves(true,
                     if pro { "mimop" } else { "mimo" }, None).unwrap();
                 let sparks = layout.devices.iter().filter(|d| d.kind == DeviceKind::Spark).collect::<Vec<_>>();
                 assert_eq!(sparks.len(), ranks, "pro={pro} {input:?}: {}", layout.render());

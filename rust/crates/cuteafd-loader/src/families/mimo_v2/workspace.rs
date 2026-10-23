@@ -49,6 +49,8 @@ pub enum MimoAttentionWorkspace {
 #[derive(Debug, Clone, Copy)]
 pub struct MimoWorkspaceOptions {
     pub rows: u64,
+    /// Slot-owned rows; scratch remains one unit wide.
+    pub waves: u64,
     pub decode: bool,
     pub lead: bool,
     pub with_head: bool,
@@ -159,6 +161,8 @@ impl MimoWorkspaceLayout {
         options: MimoWorkspaceOptions,
     ) -> Result<Self, CacheGeometryError> {
         if options.rows == 0
+            || options.waves == 0
+            || options.decode && options.waves != 1
             || options.max_context == 0
             || options.with_head && !options.lead
             || options.with_head && options.head_workspace_bytes == 0
@@ -183,16 +187,19 @@ impl MimoWorkspaceLayout {
             }
         };
         let (t, h) = (options.rows, cfg.hidden as u64);
+        let live = t.checked_mul(options.waves).ok_or(CacheGeometryError::Overflow("MiMo unit rows"))?;
         let record = attention
             .record_bytes(MimoAttention::Sliding, options.kv_cache)
             .max(attention.record_bytes(MimoAttention::Full, options.kv_cache))
             as u64;
-        let page_table_rows = if options.decode { t } else { 1 };
-        let logits_rows = options.prefill_output.logits_rows(t, options.decode, options.with_head);
+        let page_table_rows = if options.decode { t } else { options.waves };
+        let logits_rows = options.prefill_output.logits_rows(
+            if options.decode { t } else if options.prefill_output == MimoPrefillOutput::AllRows { t.max(16384) } else { t },
+            options.decode, options.with_head);
         let layout = Self {
             logits_rows,
-            h: bytes("MiMo hidden rows", &[t, h, 2])?,
-            x: bytes("MiMo normalized rows", &[t, h, 2])?,
+            h: bytes("MiMo hidden rows", &[live, h, 2])?,
+            x: bytes("MiMo normalized rows", &[live, h, 2])?,
             query: bytes(
                 "MiMo query",
                 &[t, attention.heads as u64, attention.head_dim as u64, 2],
@@ -201,7 +208,7 @@ impl MimoWorkspaceLayout {
                 "MiMo attention",
                 &[t, attention.heads as u64, attention.v_head_dim as u64, 2],
             )?,
-            delta: bytes("MiMo layer delta", &[t, h, 2])?,
+            delta: bytes("MiMo layer delta", &[live, h, 2])?,
             kv_step: bytes("MiMo KV step", &[t, record])?,
             kv_wide: if options.decode || options.kv_cache.full == MimoKvCache::Bf16 {
                 256
@@ -214,11 +221,11 @@ impl MimoWorkspaceLayout {
                     ],
                 )?
             },
-            step_inputs: bytes("MiMo positions and full/SWA RoPE windows", &[t, 8 + 2 * cfg.rope_dim as u64 * 4])?,
-            slots: bytes("MiMo KV slots", &[t, 8])?,
-            step_slots: bytes("MiMo identity slots", &[t, 8])?,
-            ring_slots: bytes("MiMo ring slots", &[t, 8])?,
-            seq_first: bytes("MiMo sequence starts", &[t, 4])?,
+            step_inputs: bytes("MiMo positions and full/SWA RoPE windows", &[live, 8 + 2 * cfg.rope_dim as u64 * 4])?,
+            slots: bytes("MiMo KV slots", &[live, 8])?,
+            step_slots: bytes("MiMo identity slots", &[live, 8])?,
+            ring_slots: bytes("MiMo ring slots", &[live, 8])?,
+            seq_first: bytes("MiMo sequence starts", &[live, 4])?,
             page_table: bytes("MiMo page table", &[page_table_rows, options.pool_pages, 4])?,
             scratch: options.native_scratch_bytes.max(256),
             logits: if options.with_head {
@@ -258,7 +265,7 @@ impl MimoWorkspaceLayout {
             } else {
                 256
             },
-            ids: bytes("MiMo token ids", &[t, 4])?,
+            ids: bytes("MiMo token ids", &[live, 4])?,
             select: bytes("MiMo greedy ids/statuses", &[t, 8])?,
             head_workspace: if options.with_head {
                 options.head_workspace_bytes.max(256)
@@ -279,6 +286,7 @@ mod tests {
     fn options() -> MimoWorkspaceOptions {
         MimoWorkspaceOptions {
             rows: 4096,
+            waves: 1,
             decode: false,
             lead: true,
             with_head: true,

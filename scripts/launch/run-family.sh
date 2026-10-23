@@ -351,6 +351,7 @@ MIMO_PREFIX_DRAFT
 MIMO_SNAPSHOT_WAIT
 MIMO_HOST_CACHE
 MIMO_PREFILL_CHUNK_S
+PREFILL_WAVES
 PREFIX_CACHE_MARK_MIB
 PREFIX_PARTIAL
 KV_CACHE
@@ -2554,12 +2555,7 @@ case "$family" in
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
   qwen4|qwen3_5|kimi_k3|step5) ;;
-  mimo_v2)
-    hidden="$(python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); t=c.get("text_config", c); print(t.get("hidden_size", 4096 if t.get("model_type") == "mimo_v2_flash" else 6144))' "$root/snapshots/$revision/config.json")"
-    selected_lanes="${CUTEAFD_MIMO_PREFILL_LANES:-$([[ "$hidden" == 4096 ]] && printf 2 || printf 3)}"
-    [[ "$selected_lanes" =~ ^[1-4]$ ]] || { echo "CUTEAFD_MIMO_PREFILL_LANES must be 1 to 4" >&2; exit 2; }
-    lane_env_args+=(-e "CUTEAFD_MIMO_PREFILL_LANES=$selected_lanes")
-;;
+  mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then

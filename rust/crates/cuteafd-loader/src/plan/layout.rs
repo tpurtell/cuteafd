@@ -337,7 +337,7 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
-        "mimo_v2" => lanes as usize,
+        "mimo_v2" => 1,
         "qwen4" => 1,
         _ => 0,
     }
@@ -1220,8 +1220,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             "mimo_v2" => {
                 let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
                 let configured = if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-                    else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() };
-                crate::families::mimo_v2::admission::resolve_transport_lanes(ranks > 0,
+                    else { None };
+                crate::families::mimo_v2::admission::resolve_prefill_waves(ranks > 0,
                     cfg.program_family()?, configured.as_deref())? as u64
             }
             _ => 1,

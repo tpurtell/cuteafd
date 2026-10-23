@@ -1198,9 +1198,9 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     ({"model_type": "glm5_next"}, "", {}, 1),
     ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
-    ({"model_type": "mimo_v2_flash"}, "", {}, 2),
-    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
-    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {"CUTEAFD_MIMO_PREFILL_LANES": "4"}, 4),
+    ({"model_type": "mimo_v2_flash"}, "", {}, 1),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 1),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "PREFILL_WAVES=4\n", {}, 1),
 ])
 def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, config, keys, env, endpoints):
     dense_layers = config.get("first_k_dense_replace", 0)

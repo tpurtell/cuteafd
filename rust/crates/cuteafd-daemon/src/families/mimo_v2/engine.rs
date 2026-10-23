@@ -54,7 +54,20 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-type Dev<'a> = DeviceAllocation<'a>;
+#[derive(Clone)]
+struct Dev<'a> {
+    buffer: cuteafd_ffi::CuteafdDeviceBuffer,
+    _owner: Rc<DeviceAllocation<'a>>,
+}
+impl<'a> Dev<'a> {
+    fn view(&self, offset: usize, bytes: usize) -> Result<Self> {
+        ensure!(offset.checked_add(bytes).is_some_and(|end| end <= self.buffer.bytes),
+            "MiMo unit view exceeds its allocation");
+        Ok(Self { buffer: cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: self.buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..self.buffer },
+            _owner: Rc::clone(&self._owner) })
+    }
+}
 
 pub(crate) const PAGE_ROWS: usize = 64;
 pub(crate) const RING_ROWS: usize = 256;
@@ -111,10 +124,7 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    /// `lanes`: further transports to the same ranks for the earlier row lanes
-    /// of a pipelined prefill ([`MimoEngine::prefill_capacity`]; `transport`
-    /// carries the last lane); empty keeps prefill serial.
-    Spark { transport: RefCell<SparkLink<'a>>, lanes: Vec<RefCell<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
+    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
 }
 
 /// A dispatched Spark wave and its send-side host phases (seconds).
@@ -128,40 +138,6 @@ struct SentWave {
 }
 
 pub(crate) use crate::shared::experts::rtx::pair::TerminalStepError;
-
-/// Fewest rows per lane of a pipelined prefill: at least the DFlash tap ring
-/// (1024 rows) and the MTP hidden ring, which the last lane alone feeds.
-const MIN_LANE_ROWS: usize = 1024;
-
-/// A serving chunk may end at any row, including a short prompt tail. Do not
-/// advertise twice the workspace when a tail larger than one workspace could
-/// still be too short for the two-lane path's tap window.
-fn lane_prefill_capacity(rows: usize, lanes: usize) -> usize {
-    if lanes >= 2 && rows >= 2 * MIN_LANE_ROWS { lanes * rows } else { rows }
-}
-
-/// Row lanes of a `t`-row pipelined prefill step with `lanes` transports of
-/// `rows`-row workspaces: as many as keep every lane at least
-/// [`MIN_LANE_ROWS`] (and enough that none exceeds `rows`); 1 is serial.
-fn prefill_lane_count(t: usize, rows: usize, lanes: usize) -> usize {
-    if lanes < 2 || t < 2 * MIN_LANE_ROWS {
-        return 1;
-    }
-    let mut n = (t / MIN_LANE_ROWS).min(lanes).max(2);
-    // The engine splits ceil(t / n) rows per lane; the last one keeps the rest.
-    while n > 2 && n > t.div_ceil(rows) && t - (n - 1) * t.div_ceil(n) < MIN_LANE_ROWS {
-        n -= 1;
-    }
-    n
-}
-
-fn independent_prefill_rows(capacity: usize, lanes: bool, output: MimoPrefillOutput, mtp: bool,
-    rows: [usize; 2]) -> bool {
-    // Larger single-request chunks already split across the old row lanes.
-    // Preserve those exact row partitions instead of silently joining them.
-    lanes && !mtp && output == MimoPrefillOutput::LastRow
-        && rows.into_iter().all(|n| n > 0 && n <= capacity && n < 2 * MIN_LANE_ROWS)
-}
 
 /// Only attention geometry changes under a head split. Rank 1 runs split
 /// target layers exclusively; rank 0 also runs unsplit MTP attention in its
@@ -334,8 +310,10 @@ struct PendingRouteCheck<'a> {
     ranks: [HostAllocation<'a>; 2],
 }
 
+#[derive(Clone)]
 struct Workspace<'a> {
     rows: usize,
+    slot_count: usize,
     logits_rows: usize,
     h: Dev<'a>,
     x: Dev<'a>,
@@ -361,13 +339,13 @@ struct Workspace<'a> {
     /// Spark exchange: rank partial planes, a zero shared-expert plane (MiMo
     /// has none), and pinned staging for routes, wire rows and partials.
     zero_plane: Dev<'a>,
-    router_host: RefCell<HostAllocation<'a>>,
+    router_host: Rc<RefCell<HostAllocation<'a>>>,
     /// The step's token ids (U32), gathered from the device embedding table.
     ids: Dev<'a>,
     /// Greedy selection of logits rows (MTP drafts): U32 ids, then U32 statuses.
     select: Dev<'a>,
     /// The cuBLAS LM head (rank 0 only).
-    head: Option<VocabularyHead<'a>>,
+    head: Option<Rc<VocabularyHead<'a>>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -382,8 +360,6 @@ pub(crate) struct Peer<'a> {
     pub layers: Vec<MimoLayer<'a>>,
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
-    /// The earlier prefill lanes' workspaces (see [`MimoEngine::step_lanes`]).
-    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
 }
@@ -393,11 +369,11 @@ pub(crate) struct Peer<'a> {
 /// never lands on rows the other GPU may still read (it consumed layer `l - 2`'s
 /// before it sent layer `l - 1`'s attention partial, which this GPU waited for).
 fn slot(index: usize, ffn: bool) -> usize {
-    lane_slot(index, ffn, 0)
+    unit_slot(index, ffn, 0)
 }
 
 /// Each prefill lane retains its own receive rows until that lane consumes them.
-fn lane_slot(index: usize, ffn: bool, lane: usize) -> usize {
+fn unit_slot(index: usize, ffn: bool, lane: usize) -> usize {
     4 * lane + 2 * (index % 2) + usize::from(ffn)
 }
 
@@ -464,6 +440,184 @@ impl Workspace<'_> {
     }
 }
 
+impl<'a> Workspace<'a> {
+    fn unit_view(&self, slot: usize, rows: usize, hidden: usize, rope: usize) -> Result<Self> {
+        let mut view = self.clone();
+        for (plane, stride) in [(&mut view.h, hidden * 2), (&mut view.x, hidden * 2),
+            (&mut view.delta, hidden * 2), (&mut view.step_inputs, 8 + 2 * rope * 4),
+            (&mut view.slots, 8), (&mut view.step_slots, 8), (&mut view.ring_slots, 8),
+            (&mut view.seq_first, 4), (&mut view.ids, 4)] {
+            *plane = plane.view(slot * rows * stride, rows * stride)?;
+        }
+        // One page table per slot; scratch and routing staging are hook-local.
+        let bytes = self.page_table.buffer.bytes / self.slot_count;
+        view.page_table = self.page_table.view(slot * bytes, bytes)?;
+        view.step_host = RefCell::new(vec![0; rows * (8 + 2 * rope * 4)]);
+        Ok(view)
+    }
+}
+
+struct UnitHooks<'h, 'a> {
+    engine: &'h MimoEngine<'a>,
+    tokens: &'h [u32],
+    tables: &'h [StepTables],
+    work: &'h [Workspace<'a>],
+    peer_work: Option<&'h [Workspace<'a>]>,
+    media: Option<&'h cuteafd_engine::media::RequestMedia>,
+    all_logits: bool,
+    output: &'h Workspace<'a>,
+    last: usize,
+    peer_done: Vec<crate::shared::memory::device::Event<'a>>,
+}
+
+impl UnitHooks<'_, '_> {
+    fn after_ffn(&self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let e = self.engine;
+        let w = &self.work[unit.index];
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        if let Some(peer) = self.peer_work {
+            e.peer_unit_post(layer, unit.slot, &peer[unit.index], rows)?;
+        }
+        if e.tp2_layer(layer) { e.tp2_post(0, layer, unit.slot, w, unit.rows.len())?; }
+        let dense_split = self.peer_work.is_some() && e.weights.layers[layer].dense;
+        let ffn = unit_slot(layer, true, unit.slot);
+        if dense_split { e.wait(0, ffn)?; }
+        let weight = e.weights.layers.get(layer + 1).map(|l| l.ptr("input_norm"))
+            .transpose()?.unwrap_or(e.weights.norm.buffer.ptr);
+        e.norm_on(0, w, weight, if dense_split { 2 } else { 1 }, rows,
+            if dense_split { e.recv(0, ffn) } else { w.delta.buffer.ptr })?;
+        if let Some(drafter) = &e.drafter {
+            let tail = self.tokens.len().saturating_sub(super::dflash::TAP_ROWS);
+            let first = unit.rows.start.max(tail);
+            if first < unit.rows.end {
+                drafter.tap_at(layer, w.h.buffer.ptr, first - unit.rows.start,
+                    first - tail, unit.rows.end - first)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
+    type Ticket = SentWave;
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        use crate::shared::prefill_pipeline::FfnRoute;
+        let e = self.engine;
+        if e.weights.layers[layer].dense || e.tp2_layer(layer) || e.rtx_local_layer(layer)
+            || !matches!(e.experts, Some(Experts::Spark { .. })) { FfnRoute::Local }
+        else { FfnRoute::Spark }
+    }
+    fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let e = self.engine;
+        let tables = &self.tables[unit.index];
+        if unit.index >= e.prefill_waves() && self.peer_work.is_some() {
+            // SAFETY: the slot's prior peer readers precede its recorded event;
+            // the cross-device wait orders rank 0's entry copy after them.
+            unsafe { e.library.cuda_stream_wait_event(e.stream, self.peer_done[unit.slot].raw)?; }
+        }
+        for (rank, w) in std::iter::once(&self.work[unit.index])
+            .chain(self.peer_work.map(|p| &p[unit.index])).enumerate() {
+            e.on(rank, || {
+                e.put_step_inputs(rank, w, &tables.positions)?;
+                for (plane, bytes) in [(&w.slots, bytes_of(&tables.slots)),
+                    (&w.ring_slots, bytes_of(&tables.ring_slots)), (&w.seq_first, bytes_of(&tables.seq_first)),
+                    (&w.page_table, bytes_of(&tables.page_table))] {
+                    ensure!(bytes.len() <= plane.buffer.bytes, "MiMo unit table exceeds storage");
+                    // SAFETY: slot-owned tables are rewritten in their consumer stream's order.
+                    unsafe { e.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer {
+                        bytes: bytes.len(), ..plane.buffer }, bytes, e.stream_of(rank))?; }
+                }
+                Ok(())
+            })?;
+        }
+        let w = &self.work[unit.index];
+        e.embedding.embed(&self.tokens[unit.rows.clone()], w.ids.buffer, 1, w.h.buffer, e.stream)?;
+        e.inject_media(w, tables, self.media)?;
+        if let Some(peer) = self.peer_work {
+            e.exchange()?.push_to(0, unit_slot(0, false, unit.slot), w.h.buffer.ptr,
+                peer[unit.index].h.buffer.ptr, unit.rows.len() * e.cfg.hidden * 2)?;
+        }
+        e.norm(w, e.weights.layers[0].ptr("input_norm")?, 0, Scalar::I32(unit.rows.len() as i32))
+    }
+    fn attention(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let e = self.engine;
+        let w = &self.work[unit.index];
+        let rows = Scalar::I32(unit.rows.len() as i32);
+        let tables = &self.tables[unit.index];
+        let bytes = unit.rows.len() * e.cfg.hidden * 2;
+        if let Some(peer) = self.peer_work {
+            e.peer_unit_attention(layer, unit.slot, &peer[unit.index], rows, tables, bytes)?;
+        }
+        e.attention_on(0, w, e.kv[layer].buffer.ptr, &e.weights.layers[layer], rows, "m4096", tables)?;
+        if self.peer_work.is_some() {
+            let slot = unit_slot(layer, false, unit.slot);
+            e.push(0, slot, w.delta.buffer.ptr, bytes)?;
+            e.wait(0, slot)?;
+            e.norm_on(0, w, e.weights.layers[layer].ptr("post_norm")?, 2, rows, e.recv(0, slot))
+        } else { e.norm(w, e.weights.layers[layer].ptr("post_norm")?, 1, rows) }
+    }
+    fn local_ffn(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let e = self.engine;
+        let w = &self.work[unit.index];
+        let t = unit.rows.len();
+        let weight = &e.weights.layers[layer];
+        if weight.dense {
+            e.dense_ffn(0, w, weight, Scalar::I32(t as i32), "m4096", false)?;
+            if self.peer_work.is_some() { e.push(0, unit_slot(layer, true, unit.slot), w.delta.buffer.ptr, t * e.cfg.hidden * 2)?; }
+        } else {
+            e.moe_front(w, weight, t, e.expert_bf16_input(false))?;
+            if e.tp2_layer(layer) { e.tp2_experts(0, layer, unit.slot, w, t)?; }
+            else {
+                e.moe_run(w, layer, t, false)?;
+                if self.peer_work.is_some() && layer + 1 < e.weights.layers.len() {
+                    e.push(0, unit_slot(layer, true, unit.slot), w.delta.buffer.ptr, t * e.cfg.hidden * 2)?;
+                }
+            }
+        }
+        self.after_ffn(layer, unit)
+    }
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<SentWave> {
+        let e = self.engine;
+        let w = &self.work[unit.index];
+        let Some(Experts::Spark { transport, .. }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
+        let bf16 = e.expert_input.bf16(false);
+        e.moe_front(w, &e.weights.layers[layer], unit.rows.len(), bf16)?;
+        e.unit_position.set(self.tables[unit.index].positions[0] as usize);
+        e.spark_send(w, layer, unit.rows.len(), false, bf16, false, &mut transport.borrow_mut())
+    }
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: SentWave) -> Result<()> {
+        let e = self.engine;
+        let Some(Experts::Spark { transport, runtime }) = &e.experts else { anyhow::bail!("MiMo Spark wave has no transport") };
+        let forward = (self.peer_work.is_some() && layer + 1 < e.weights.layers.len())
+            .then_some(unit_slot(layer, true, unit.slot));
+        e.spark_land(&self.work[unit.index], layer, unit.rows.len(), &mut transport.borrow_mut(), runtime, ticket, forward, false)?;
+        self.after_ffn(layer, unit)
+    }
+    fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let e = self.engine;
+        if e.weights.layers.len() != e.cfg.layers { return Ok(()); }
+        let w = &self.work[unit.index];
+        if self.all_logits {
+            let bytes = unit.rows.len() * e.cfg.vocab_size * 4;
+            let output = self.output.logits.view(unit.rows.start * e.cfg.vocab_size * 4, bytes)?;
+            e.head().launch(w.head.as_deref(), w.x.buffer, output.buffer, unit.rows.len(), e.stream)?;
+        } else if unit.index == self.last { e.launch_head(w, unit.rows.len(), 1, false)?; }
+        Ok(())
+    }
+    fn commit_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let e = self.engine;
+        if let (Some(mtp), true) = (&e.mtp, e.weights.layers.len() == e.cfg.layers) {
+            e.mtp_tap(mtp, &self.work[unit.index], &self.tables[unit.index])?;
+        }
+        if self.peer_work.is_some() {
+            // SAFETY: the event and peer stream belong to this engine and all
+            // slot readers are queued before the next slot owner's entry copy.
+            e.on(1, || unsafe { e.library.cuda_event_record(self.peer_done[unit.slot].raw, e.stream_of(1)) })?;
+        }
+        Ok(())
+    }
+}
+
 pub(crate) struct MimoEngine<'a> {
     /// Drop captured nodes before expert, exchange and workspace storage.
     graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
@@ -480,6 +634,9 @@ pub(crate) struct MimoEngine<'a> {
     pub stream: *mut c_void,
     pub max_context: usize,
     pub prefill_rows: usize,
+    pub prefill_unit_waves: usize,
+    request_id: Cell<u64>,
+    unit_position: Cell<usize>,
     prefill_output: MimoPrefillOutput,
     pub pages: usize,
     pub rings: usize,
@@ -497,9 +654,6 @@ pub(crate) struct MimoEngine<'a> {
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
-    /// The earlier prefill lanes (the last one uses `workspace`); the first
-    /// admits its own last-row head output for independent request pairs.
-    lane_workspaces: RefCell<Vec<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
     tp2: Option<Tp2<'a>>,
@@ -617,9 +771,9 @@ impl<'a> MimoEngine<'a> {
         let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
-            max_context, prefill_rows, prefill_output, pages, rings, family, device,
+            max_context, prefill_rows, prefill_unit_waves: 1, request_id: Cell::new(0), unit_position: Cell::new(0), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
-            lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
+            prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
@@ -825,7 +979,7 @@ impl<'a> MimoEngine<'a> {
                 })
             }).collect::<Result<Vec<_>>>()?;
             Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
-                lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+                prefill_kv_wide: RefCell::new(None), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         })?;
         self.peer = Some(peer);
         self.exchange = Some(exchange);
@@ -948,12 +1102,10 @@ impl<'a> MimoEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
         let mut failures=Vec::new();
-        if let Some(Experts::Spark { transport,lanes,.. })=&self.experts {
-            for (index,link) in std::iter::once(transport).chain(lanes.iter()).enumerate() {
-                let result=link.try_borrow_mut().map_err(anyhow::Error::from)
-                    .and_then(|mut link|action(&mut link));
-                if let Err(error)=result { failures.push(format!("lane {index}: {error:#}")); }
-            }
+        if let Some(Experts::Spark { transport,.. })=&self.experts {
+            let result=transport.try_borrow_mut().map_err(anyhow::Error::from)
+                .and_then(|mut link|action(&mut link));
+            if let Err(error)=result { failures.push(format!("{error:#}")); }
         }
         ensure!(failures.is_empty(),"{}",failures.join("; "));
         Ok(())
@@ -1004,7 +1156,8 @@ impl<'a> MimoEngine<'a> {
     }
 
     fn alloc(&self, bytes: usize) -> Result<Dev<'a>> {
-        DeviceAllocation::new(self.library, bytes.max(256))
+        { let owner = Rc::new(DeviceAllocation::new(self.library, bytes.max(256))?);
+          Ok(Dev { buffer: owner.buffer, _owner: owner }) }
     }
 
     /// `mimo_*` program names of this checkpoint's program family (`mimo` for
@@ -1074,7 +1227,7 @@ impl<'a> MimoEngine<'a> {
         let attention = attention_workspace_geometry(rank, self.ranks(), decode,
             self.weights.layers.iter().all(|layer| layer.split));
         let options = MimoWorkspaceOptions {
-            rows: t as u64, decode, lead, with_head, spark, max_context: self.max_context as u64,
+            rows: t as u64, waves: if decode { 1 } else { self.prefill_waves() as u64 }, decode, lead, with_head, spark, max_context: self.max_context as u64,
             expert_input: self.expert_input.into(),
             pool_pages: self.pages as u64, kv_cache: self.kv_cache,
             attention, prefill_output: self.prefill_output, native_scratch_bytes: scratch,
@@ -1083,11 +1236,12 @@ impl<'a> MimoEngine<'a> {
         let layout = MimoWorkspaceLayout::new(&self.cfg, options)?;
         let size = |bytes| usize::try_from(bytes).context("MiMo workspace size does not fit this process");
         let head_workspace = self.alloc(size(layout.head_workspace)?)?;
-        let identity: Vec<i64> = (0..t as i64).collect();
+        let identity: Vec<i64> = (0..if decode { 1 } else { self.prefill_waves() }).flat_map(|_| 0..t as i64).collect();
         let step_slots = self.alloc(size(layout.step_slots)?)?;
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
         Ok(Workspace {
             rows: t,
+            slot_count: if decode { 1 } else { self.prefill_waves() },
             logits_rows: size(layout.logits_rows)?,
             h: self.alloc(size(layout.h)?)?,
             x: self.alloc(size(layout.x)?)?,
@@ -1099,7 +1253,7 @@ impl<'a> MimoEngine<'a> {
                 self.shared_prefill_kv_wide(rank, size(layout.kv_wide)?)?
             } else { Rc::new(self.alloc(size(layout.kv_wide)?)?) },
             step_inputs: self.alloc(size(layout.step_inputs)?)?,
-            step_host: RefCell::new(vec![0; size(layout.step_inputs)?]),
+            step_host: RefCell::new(vec![0; t * (8 + 2 * self.cfg.rope_dim * 4)]),
             slots: self.alloc(size(layout.slots)?)?,
             step_slots,
             ring_slots: self.alloc(size(layout.ring_slots)?)?,
@@ -1116,13 +1270,13 @@ impl<'a> MimoEngine<'a> {
                 self.library.cuda_zero_bytes(zero.buffer, zero.buffer.bytes)?;
                 zero
             },
-            router_host: RefCell::new(HostAllocation::new(self.library, size(layout.router_host)?)?),
+            router_host: Rc::new(RefCell::new(HostAllocation::new(self.library, size(layout.router_host)?)?)),
             ids: self.alloc(size(layout.ids)?)?,
             select: self.alloc(size(layout.select)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: if with_head {
-                Some(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, size(layout.logits_rows)? as u32,
-                    self.cfg.vocab_size as u32)? })
+                Some(Rc::new(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, size(layout.logits_rows)? as u32,
+                    self.cfg.vocab_size as u32)? }))
             } else {
                 None
             },
@@ -1194,68 +1348,23 @@ impl<'a> MimoEngine<'a> {
         ensure!(!all_logits || self.prefill_output == MimoPrefillOutput::AllRows,
             "this MiMo engine admits last-row prefill logits; load an AllRows diagnostic engine for all_logits");
         let (t, start) = (tokens.len(), placement.len);
-        let lanes = if self.lanes_ready() && !all_logits && on_layer.is_none() && forced.is_none() {
-            prefill_lane_count(t, self.prefill_rows, self.transport_lanes())
+        ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
+            "prefill of {t} rows at {start}");
+        let logits = if on_layer.is_some() || forced.is_some() {
+            ensure!(t <= self.prefill_rows, "teacher-forced prefill is one unit");
+            let tables = placement.prefill_tables(t, self.max_context)?;
+            self.step(&tables, tokens, if all_logits { t } else { 1 }, on_layer, forced, media)?
         } else {
-            1
-        };
-        let limit = lanes * self.prefill_rows;
-        ensure!(t > 0 && t <= limit && start + t <= self.max_context, "prefill of {t} rows at {start}");
-        let used = (start + t).div_ceil(PAGE_ROWS);
-        let tables = |first: usize, end: usize| -> Result<StepTables> {
-            Ok(StepTables {
-                decode: false,
-                positions: (first..end).map(|p| p as i64).collect(),
-                slots: (first..end).map(|p| placement.slot(p)).collect::<Result<_>>()?,
-                ring_slots: (first..end).map(|p| placement.ring_slot(p)).collect(),
-                seq_first: vec![0; end - first],
-                page_table: placement.pages[..used].iter().map(|&page| page as i32).collect(),
-                table_stride: 0,
-            })
-        };
-        let logits = if lanes > 1 {
-            // Row lanes, each as a consecutive chunk would see the cache.
-            let split = t.div_ceil(lanes);
-            let bounds: Vec<(usize, usize)> = (0..lanes).map(|i| (i * split, ((i + 1) * split).min(t))).collect();
-            let lane_tables = bounds.iter().map(|&(a, b)| tables(start + a, start + b)).collect::<Result<Vec<_>>>()?;
-            let steps: Vec<(&StepTables, &[u32])> = lane_tables.iter().zip(&bounds)
-                .map(|(tables, &(a, b))| (tables, &tokens[a..b])).collect();
-            self.step_lanes(&steps, media)?
-        } else {
-            self.step(&tables(start, start + t)?, tokens, if all_logits { t } else { 1 }, on_layer, forced, media)?
+            self.submit(|| self.step_units(placement, tokens, all_logits, media))?
         };
         placement.len += t;
         Ok(logits)
     }
 
-    /// Rows one prefill step takes: the programs' rows per lane when prefill
-    /// runs pipelined in row lanes ([`Self::step_lanes`]).
-    pub fn prefill_capacity(&self) -> usize {
-        lane_prefill_capacity(self.prefill_rows, self.transport_lanes())
-    }
+    /// A continuous span reuses unit slots without draining at a wave boundary.
+    pub fn prefill_capacity(&self) -> usize { 16384.max(self.prefill_rows) }
 
-    /// Spark transports, one per prefill row lane (1: serial prefill).
-    fn transport_lanes(&self) -> usize {
-        match &self.experts {
-            Some(Experts::Spark { lanes, .. }) => 1 + lanes.len(),
-            _ => 1,
-        }
-    }
-
-    /// Pipelined prefill is available with a second Spark lane transport,
-    /// including when attention heads are split over both coordinator GPUs.
-    fn lanes_ready(&self) -> bool {
-        self.prefill_capacity() > self.prefill_rows
-    }
-
-    /// Pairing reuses the admitted Spark lanes for two chunks below 2048 rows,
-    /// preserving each request's existing single-lane arithmetic. Larger chunks
-    /// and MTP engines keep their original path. Attention tables stay separate.
-    pub fn can_prefill_pair(&self, rows: [usize; 2]) -> bool {
-        // MTP keeps its existing route until independent request pairing has
-        // its own hidden-ring/catch-up qualification.
-        independent_prefill_rows(self.prefill_rows, self.lanes_ready(), self.prefill_output, self.mtp.is_some(), rows)
-    }
+    fn prefill_waves(&self) -> usize { self.prefill_unit_waves }
 
     pub fn full_prefill_logits(&self) -> bool {
         self.prefill_output == MimoPrefillOutput::AllRows
@@ -1274,236 +1383,38 @@ impl<'a> MimoEngine<'a> {
         Ok(())
     }
 
-    pub fn prepare_prefill_pair(&mut self) -> Result<()> {
-        if self.can_prefill_pair([1, 1]) {
-            if let Some(drafter) = &mut self.drafter {
-                drafter.prepare_prefill_lanes()?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Two independent prefill chunks. Both output pointers remain valid until
-    /// the next prefill call; consume both before reusing either workspace.
-    /// DFlash taps are separate banks, consumed with `update_lane(0/1)`.
-    pub fn prefill_pair_device(&self, requests: [(&mut MimoPlacement, &[u32]); 2])
-        -> Result<[Option<DeviceLogits>; 2]> {
-        self.prefill_pair_media_device(requests, [None, None])
-    }
-
-    pub fn prefill_pair_media_device(&self, requests: [(&mut MimoPlacement, &[u32]); 2],
-        media: [Option<&cuteafd_engine::media::RequestMedia>; 2]) -> Result<[Option<DeviceLogits>; 2]> {
-        let [(first, first_tokens), (second, second_tokens)] = requests;
-        ensure!(self.can_prefill_pair([first_tokens.len(), second_tokens.len()]),
-            "independent prefill pair exceeds the admitted lanes");
-        ensure!(first.ring != second.ring, "independent prefill requests must own distinct rings");
-        let tables = [first.prefill_tables(first_tokens.len(), self.max_context)?,
-            second.prefill_tables(second_tokens.len(), self.max_context)?];
-        let logits = self.submit(|| self.step_lanes_inner(&[
-            (&tables[0], first_tokens), (&tables[1], second_tokens)], true, &media))?;
-        let logits: [Option<DeviceLogits>; 2] = logits.try_into()
-            .map_err(|_| anyhow::anyhow!("an independent prefill pair returns two outputs"))?;
-        first.len += first_tokens.len();
-        second.len += second_tokens.len();
-        Ok(logits)
-    }
-
-    /// A prefill step in two row lanes, layer by layer: lane `i` lands its
-    /// previous layer's experts, then queues this layer's attention and router
-    /// and sends its wave, so the GPU works on one lane while the other's
-    /// wave is out. Each lane is exactly a consecutive prefill chunk (lane 0
-    /// writes its KV before lane 1 reads it at every layer). Returns the last
-    /// row's logits.
-    fn step_lanes(&self, lanes: &[(&StepTables, &[u32])], media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
-        let media = vec![media; lanes.len()];
-        self.submit(|| self.step_lanes_inner(lanes, false, &media).map(|mut logits| logits.pop().flatten()))
-    }
-
-    fn step_lanes_inner(&self, lanes: &[(&StepTables, &[u32])], independent: bool,
-        media: &[Option<&cuteafd_engine::media::RequestMedia>])
-        -> Result<Vec<Option<DeviceLogits>>> {
-        let Some(Experts::Spark { transport, lanes: links, runtime }) = &self.experts else {
-            anyhow::bail!("pipelined prefill needs Spark experts with lane transports");
-        };
-        let n = lanes.len();
-        self.prepare_tp2_route_step(&lanes.iter().map(|lane| lane.1.len()).collect::<Vec<_>>())?;
-        ensure!(n >= 2 && n <= links.len() + 1, "{n} prefill lanes need {} lane transports", n.saturating_sub(1));
-        let last = n - 1;
-        // The first earlier lane admits a last-row head for independent pairs.
-        let first_head = self.prefill_output == MimoPrefillOutput::LastRow && self.mtp.is_none();
-        while self.lane_workspaces.borrow().len() < last {
-            let head = first_head && self.lane_workspaces.borrow().is_empty();
-            let workspace = self.on(0, || self.workspace_here(0, self.prefill_rows, false, head))?;
-            self.lane_workspaces.borrow_mut().push(workspace);
-        }
-        if self.workspace.borrow().is_none() {
-            *self.workspace.borrow_mut() = Some(self.on(0, || self.workspace_here(0, self.prefill_rows, false, true))?);
-        }
-        let (earlier, main) = (self.lane_workspaces.borrow(), self.workspace.borrow());
-        let w: Vec<&Workspace<'_>> = earlier[..last].iter()
-            .chain(std::iter::once(main.as_ref().context("workspace")?)).collect();
-        let t: Vec<usize> = lanes.iter().map(|lane| lane.1.len()).collect();
-        ensure!(t.iter().zip(&w).all(|(&t, w)| t <= w.rows), "prefill lanes exceed their workspaces");
-        let rows: Vec<Scalar> = t.iter().map(|&t| Scalar::I32(t as i32)).collect();
-        // SAFETY: the engine owns this stream; the previous step must be done reading the tables.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        for (i, (tables, tokens)) in lanes.iter().enumerate() {
-            self.put_step_inputs(0, w[i], &tables.positions)?;
-            self.put(&w[i].slots, &tables.slots)?;
-            self.put(&w[i].ring_slots, &tables.ring_slots)?;
-            self.put(&w[i].seq_first, &tables.seq_first)?;
-            self.put(&w[i].page_table, &tables.page_table)?;
-            self.embedding.embed(tokens, w[i].ids.buffer, 1, w[i].h.buffer, self.stream)?;
-            self.inject_media(w[i], tables, media.get(i).copied().flatten())?;
-        }
-        let peer_workspaces = match &self.peer {
-            Some(peer) => {
-                while peer.lane_workspaces.borrow().len() < last {
-                    let workspace = self.workspace(1, self.prefill_rows, false)?;
-                    peer.lane_workspaces.borrow_mut().push(workspace);
-                }
-                if peer.workspace.borrow().is_none() {
-                    *peer.workspace.borrow_mut() = Some(self.workspace(1, self.prefill_rows, false)?);
-                }
-                Some((peer.lane_workspaces.borrow(), peer.workspace.borrow()))
-            }
-            None => None,
-        };
-        let w1: Option<Vec<&Workspace<'_>>> = match &peer_workspaces {
-            Some((earlier, main)) => Some(earlier[..last].iter()
-                .chain(std::iter::once(main.as_ref().context("peer workspace")?)).collect()),
-            None => None,
-        };
-        let w1 = w1.as_deref();
-        if let Some(peers) = w1 {
-            // SAFETY: the peer stream belongs to this engine; all previous waits have
-            // matching pushes, and its old tables must drain before being overwritten.
-            self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            for (i, (tables, _)) in lanes.iter().enumerate() {
-                self.on(1, || {
-                    self.put_step_inputs(1, peers[i], &tables.positions)?;
-                    self.put(&peers[i].slots, &tables.slots)?;
-                    self.put(&peers[i].ring_slots, &tables.ring_slots)?;
-                    self.put(&peers[i].seq_first, &tables.seq_first)?;
-                    self.put(&peers[i].page_table, &tables.page_table)
-                })?;
-                self.exchange()?.push_to(0, DIRECT, w[i].h.buffer.ptr, peers[i].h.buffer.ptr,
-                    t[i] * self.cfg.hidden * 2)?;
-            }
-        }
-        let layers = &self.weights.layers;
-        let bf16_input = self.expert_input.bf16(false);
-        let mut transports: Vec<_> = links[..last].iter().map(RefCell::borrow_mut)
-            .chain(std::iter::once(transport.borrow_mut())).collect();
-        let mut inflight: Vec<Option<(usize, SentWave)>> = (0..n).map(|_| None).collect();
-        // After a lane's FFN output is in its `delta`: both GPUs' next input
-        // norms, then each independent request's drafter taps on rank 0.
-        // Consecutive chunks of one request keep the historical last-lane taps.
-        let after_ffn = |i: usize, index: usize| -> Result<()> {
-            let weight = match layers.get(index + 1) {
-                Some(next) => next.ptr("input_norm")?,
-                None => self.weights.norm.buffer.ptr,
-            };
-            if let Some(peers) = w1 {
-                self.peer_lane_post(index, i, peers[i], rows[i])?;
-            }
-            if self.tp2_layer(index) { self.tp2_post(0, index, i, w[i], t[i])?; }
-            let dense_split = w1.is_some() && layers[index].dense;
-            let ffn = lane_slot(index, true, i);
-            if dense_split {
-                self.wait(0, ffn)?;
-            }
-            self.norm_on(0, w[i], weight, if dense_split { 2 } else { 1 }, rows[i],
-                if dense_split { self.recv(0, ffn) } else { w[i].delta.buffer.ptr })?;
-            if independent || i == last {
-                if let Some(drafter) = &self.drafter {
-                    let n = t[i].min(super::dflash::TAP_ROWS);
-                    if independent {
-                        drafter.tap_lane(i, index, w[i].h.buffer.ptr, t[i] - n, n)?;
-                    } else {
-                        drafter.tap(index, w[i].h.buffer.ptr, t[i] - n, n)?;
-                    }
-                }
-            }
-            // Independent MTP pairing is excluded; preserve the old single-
-            // request path's final-lane hidden ring and catch-up semantics.
-            if let (Some(mtp), true) = (&self.mtp, i == last && index + 1 == self.cfg.layers) {
-                self.mtp_tap(mtp, w[last], lanes[last].0)?;
-            }
-            Ok(())
-        };
-        for i in 0..n {
-            self.norm(w[i], layers[0].ptr("input_norm")?, 0, rows[i])?;
-        }
-        for (index, layer) in layers.iter().enumerate() {
-            for i in 0..n {
-                if let Some((previous, sent)) = inflight[i].take() {
-                    let forward = (w1.is_some() && previous + 1 < layers.len())
-                        .then_some(lane_slot(previous, true, i));
-                    self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, forward, false)?;
-                    after_ffn(i, previous)?;
-                }
-                if let Some(peers) = w1 {
-                    // Both ranks queue (layer, lane) in the same order: lane 0's KV
-                    // writes and SWA ring commit precede lane 1's reads. A peer's
-                    // attention is queued only when its rank-0 partner can also be
-                    // queued, so failed Spark dispatches leave no future peer wait.
-                    self.peer_lane_attention(index, i, peers[i], rows[i], lanes[i].0,
-                        t[i] * self.cfg.hidden * 2)?;
-                }
-                self.attention_on(0, w[i], self.kv[index].buffer.ptr, layer, rows[i], "m4096", lanes[i].0)?;
-                if w1.is_some() {
-                    let attended = lane_slot(index, false, i);
-                    self.push(0, attended, w[i].delta.buffer.ptr, t[i] * self.cfg.hidden * 2)?;
-                    self.wait(0, attended)?;
-                    self.norm_on(0, w[i], layer.ptr("post_norm")?, 2, rows[i], self.recv(0, attended))?;
-                } else {
-                    self.norm(w[i], layer.ptr("post_norm")?, 1, rows[i])?;
-                }
-                if layer.dense {
-                    self.dense_ffn(0, w[i], layer, rows[i], "m4096", false)?;
-                    if w1.is_some() {
-                        self.push(0, lane_slot(index, true, i), w[i].delta.buffer.ptr,
-                            t[i] * self.cfg.hidden * 2)?;
-                    }
-                    after_ffn(i, index)?;
-                } else if self.tp2_layer(index) {
-                    self.moe_front(w[i], layer, t[i], true)?;
-                    self.tp2_experts(0, index, i, w[i], t[i])?;
-                    after_ffn(i, index)?;
-                } else if self.rtx_local_layer(index) {
-                    self.moe_front(w[i], layer, t[i], true)?;
-                    self.moe_run(w[i], index, t[i], false)?;
-                    after_ffn(i, index)?;
-                } else {
-                    self.moe_front(w[i], layer, t[i], bf16_input)?;
-                    inflight[i] = Some((index, self.spark_send(w[i], index, t[i], false, bf16_input, false, &mut transports[i])?));
-                }
-            }
-        }
-        for i in 0..n {
-            if let Some((previous, sent)) = inflight[i].take() {
-                let forward = (w1.is_some() && previous + 1 < layers.len())
-                    .then_some(lane_slot(previous, true, i));
-                self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, forward, false)?;
-                after_ffn(i, previous)?;
-            }
-        }
+    fn step_units(&self, placement: &MimoPlacement, tokens: &[u32], all_logits: bool,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        use crate::shared::prefill_pipeline::{sequence_units, run_prefill_units};
+        self.prepare_scoring_prefill()?;
+        let waves = self.prefill_waves();
+        let units = sequence_units(tokens.len(), self.prefill_rows, waves, self.weights.layers.len())?;
+        self.prepare_tp2_route_step(&(0..waves).map(|slot| units.iter().filter(|u| u.slot == slot)
+            .map(|u| u.rows.len()).max().unwrap_or(1)).collect::<Vec<_>>())?;
+        let owned = self.workspace.borrow();
+        let base = owned.as_ref().context("prefill workspace")?;
+        let peer_owned = self.peer.as_ref().map(|p| p.workspace.borrow());
+        let peer_base = peer_owned.as_ref().and_then(|p| p.as_ref());
+        let tables = units.iter().map(|unit| {
+            let mut at = placement.clone();
+            at.len += unit.rows.start;
+            at.prefill_tables(unit.rows.len(), self.max_context)
+        }).collect::<Result<Vec<_>>>()?;
+        let work = units.iter().map(|unit| base.unit_view(unit.slot, self.prefill_rows, self.cfg.hidden,
+            self.cfg.rope_dim)).collect::<Result<Vec<_>>>()?;
+        let peer_work = peer_base.map(|base| units.iter().map(|unit| base.unit_view(unit.slot,
+            self.prefill_rows, self.cfg.hidden, self.cfg.rope_dim)).collect::<Result<Vec<_>>>()).transpose()?;
+        let mut hooks = UnitHooks { engine: self, tokens, tables: &tables, work: &work,
+            peer_work: peer_work.as_deref(), media, all_logits, output: base, last: units.len() - 1,
+            peer_done: if let Some(peer) = &self.peer { (0..waves).map(|_|
+                crate::shared::memory::device::Event::new(Device { library: self.library, id: peer.device }))
+                .collect::<Result<Vec<_>>>()? } else { Vec::new() } };
+        let result = run_prefill_units(&mut hooks, &units, waves);
+        self.unit_position.set(0);
+        result?;
         self.finish_tp2_route_step()?;
-        if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns both streams; every queued wait has a matching push.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            if w1.is_some() {
-                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            }
-            return Ok((0..n).map(|_| None).collect());
-        }
-        let mut logits: Vec<Option<DeviceLogits>> = (0..n).map(|_| None).collect();
-        for i in if independent { 0..n } else { last..n } {
-            self.launch_head(w[i], t[i], 1, false)?;
-            logits[i] = Some(self.device_logits(w[i], 1, false));
-        }
-        Ok(logits)
+        Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(base,
+            if all_logits { tokens.len() } else { 1 }, false)))
     }
 
     /// Appends each sequence's tokens (one for decode, several for a
@@ -1732,7 +1643,7 @@ impl<'a> MimoEngine<'a> {
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize, _decode: bool) -> Result<()> {
         ensure!(n <= t && n <= w.logits_rows, "head exceeds admitted logits rows");
         let x = Self::region(&w.x, (t - n) *self.cfg.hidden *2, n *self.cfg.hidden *2);
-        self.head().launch(w.head.as_ref(), x, w.logits.buffer, n, self.stream)
+        self.head().launch(w.head.as_deref(), x, w.logits.buffer, n, self.stream)
     }
 
     /// `bytes` at `offset` inside `dev`.
@@ -2173,23 +2084,23 @@ impl<'a> MimoEngine<'a> {
 
     /// Rank 1's attention and dense-FFN producer for one prefill lane. The
     /// FFN wait is queued separately, only once rank 0 has queued its dense
-    /// partial or landed the routed sum (see [`Self::peer_lane_post`]).
-    fn peer_lane_attention(&self, index: usize, lane: usize, w: &Workspace<'_>, rows: Scalar,
+    /// partial or landed the routed sum (see [`Self::peer_unit_post`]).
+    fn peer_unit_attention(&self, index: usize, lane: usize, w: &Workspace<'_>, rows: Scalar,
         tables: &StepTables, bytes: usize) -> Result<()> {
         let peer = self.peer.as_ref().context("no head-split peer")?;
         let layer = &peer.layers[index];
         if index == 0 {
-            self.wait(1, DIRECT)?;
+            self.wait(1, unit_slot(0, false, lane))?;
             self.norm_on(1, w, layer.ptr("input_norm")?, 0, rows, w.delta.buffer.ptr)?;
         }
         self.attention_on(1, w, peer.kv[index].buffer.ptr, layer, rows, "m4096", tables)?;
-        let attended = lane_slot(index, false, lane);
+        let attended = unit_slot(index, false, lane);
         self.push(1, attended, w.delta.buffer.ptr, bytes)?;
         self.wait(1, attended)?;
         self.norm_on(1, w, layer.ptr("post_norm")?, 2, rows, self.recv(1, attended))?;
         if layer.dense {
             self.dense_ffn(1, w, layer, rows, "m4096", false)?;
-            self.push(1, lane_slot(index, true, lane), w.delta.buffer.ptr, bytes)?;
+            self.push(1, unit_slot(index, true, lane), w.delta.buffer.ptr, bytes)?;
         } else if self.tp2_layer(index) {
             self.moe_front_on(1, w, layer, tables.positions.len(), true)?;
             self.tp2_experts(1, index, lane, w, tables.positions.len())?;
@@ -2199,11 +2110,11 @@ impl<'a> MimoEngine<'a> {
 
     /// Finish rank 1's FFN for a lane, keeping its residual stream identical
     /// to rank 0's, and prepare its next layer's normalized input.
-    fn peer_lane_post(&self, index: usize, lane: usize, w: &Workspace<'_>, rows: Scalar) -> Result<()> {
+    fn peer_unit_post(&self, index: usize, lane: usize, w: &Workspace<'_>, rows: Scalar) -> Result<()> {
         let peer = self.peer.as_ref().context("no head-split peer")?;
         let dense = peer.layers[index].dense;
         let next = peer.layers.get(index + 1);
-        let ffn = lane_slot(index, true, lane);
+        let ffn = unit_slot(index, true, lane);
         let tp2 = self.tp2_layer(index);
         if tp2 {
             let Scalar::I32(t) = rows else { anyhow::bail!("MiMo row scalar must be i32") };
@@ -2824,8 +2735,10 @@ impl<'a> MimoEngine<'a> {
                 l2.issue(self.library, index, self.stream)?;
                 crate::shared::l2_prefetch::reached(self.library, mark)?;
             }
-            // SAFETY: the engine owns this stream.
-            None => unsafe { self.library.cuda_stream_synchronize(self.stream)? },
+            None => {
+                let mark = crate::shared::l2_prefetch::mark(self.library, self.stream)?;
+                crate::shared::l2_prefetch::reached(self.library, mark)?;
+            },
         }
         let gpu_wait = timer.elapsed().as_secs_f64();
         self.profile.borrow_mut()[0] += gpu_wait;
@@ -2843,10 +2756,12 @@ impl<'a> MimoEngine<'a> {
             None => staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec().into(),
         };
         drop(staging);
-        let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
+        let request_id = self.request_id.get().wrapping_add(1);
+        self.request_id.set(request_id);
+        let mut request = ExpertProtocolV2Request::new_bytes(request_id, 17, index as u32, h as u32, dtype,
             (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
                 row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+                token_position: (self.unit_position.get() + row as usize) as u64, route_offset: row * topk as u32, route_count: topk as u32,
             }).collect(),
             routes, wire)?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
@@ -2940,8 +2855,7 @@ mod terminal_fault_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::{attention_workspace_geometry, expert_capacity, independent_prefill_rows, lane_prefill_capacity, prefill_lane_count,
-        scale_operand, MimoAttentionWorkspace, MimoPlacement, MimoPrefillOutput, DECODE_ROWS, MIN_LANE_ROWS, PAGE_ROWS};
+    use super::{attention_workspace_geometry, expert_capacity, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
 
     #[test]
     fn attention_bindings_keep_absolute_positions_and_independent_kv_slots() {
@@ -3090,47 +3004,6 @@ mod tests {
         assert_eq!(attention_workspace_geometry(0, 2, false, false), global);
         assert_eq!(attention_workspace_geometry(0, 1, false, true), global);
         assert_eq!(attention_workspace_geometry(0, 1, true, true), global);
-    }
-
-    #[test]
-    fn advertised_prefill_capacity_accepts_every_prompt_tail() {
-        for rows in [1, 512, 1024, 1536, 2047, 2048, 4096] {
-            assert_eq!(lane_prefill_capacity(rows, 1), rows);
-            for lanes in 2..=4 {
-                let capacity = lane_prefill_capacity(rows, lanes);
-                for tokens in 1..=capacity {
-                    let n = prefill_lane_count(tokens, rows, lanes);
-                    assert!((1..=lanes).contains(&n));
-                    if tokens > rows {
-                        assert!(n >= 2, "{tokens}-row tail exceeds its {rows}-row workspace but cannot use lanes");
-                    }
-                    if n > 1 {
-                        // The engine's split: every lane fits its workspace and keeps the tap window.
-                        let split = tokens.div_ceil(n);
-                        for i in 0..n {
-                            let lane = ((i + 1) * split).min(tokens) - i * split;
-                            assert!(lane <= rows && lane >= MIN_LANE_ROWS, "{tokens} rows, {n} lanes of {rows}: {lane}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn independent_short_prompts_fit_without_changing_single_prompt_split_threshold() {
-        let last = MimoPrefillOutput::LastRow;
-        for rows in [[1, 1], [17, 1463], [1023, 1025], [1464, 1463], [2047, 1], [2047, 2047]] {
-            assert!(independent_prefill_rows(4096, true, last, false, rows));
-            assert!(!independent_prefill_rows(4096, false, last, false, rows));
-            assert!(!independent_prefill_rows(4096, true, last, true, rows));
-            assert!(!independent_prefill_rows(4096, true, MimoPrefillOutput::AllRows, false, rows));
-        }
-        for rows in [[0, 1463], [1463, 0], [2048, 1], [1, 4096], [4097, 1463], [1463, 8192]] {
-            assert!(!independent_prefill_rows(4096, true, last, false, rows));
-        }
-        assert_eq!(MIN_LANE_ROWS, 1024);
-        assert_eq!(lane_prefill_capacity(1024, 2), 1024);
     }
 
     #[test]

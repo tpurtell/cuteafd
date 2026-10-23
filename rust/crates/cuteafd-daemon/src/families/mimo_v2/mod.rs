@@ -74,6 +74,9 @@ pub(crate) struct EngineArgs {
     pub rings: usize,
     #[arg(long, default_value_t = 4096)]
     pub prefill_rows: usize,
+    /// Outstanding unit waves on one Spark transport.
+    #[arg(long, default_value_t = 2)]
+    pub prefill_waves: usize,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -907,6 +910,7 @@ impl Opened {
         }
         let preflight = admission::preflight(self, args, &programs, split_device, serving, prefill_output, prefix_draft, automatic_context)?;
         resolved.max_context = usize::try_from(preflight.capacity.effective_max_context_tokens)?;
+        resolved.prefill_waves = usize::try_from(preflight.working_set.prefill_lanes)?;
         let args = &resolved;
         let draft_dir = args.draft.as_deref().map(dflash::drafter_dir);
         let draft_file = draft_dir.as_deref().map(dflash::prefetch);
@@ -1049,6 +1053,7 @@ impl Opened {
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
+        engine.prefill_unit_waves = args.prefill_waves;
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
         let result = (|| -> Result<T> {
@@ -1117,7 +1122,6 @@ impl Opened {
                     range.peak_bytes as usize)?;
                 engine.set_rtx_local(local);
             }
-            engine.prepare_prefill_pair()?;
             if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
             if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
                 engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
@@ -1251,9 +1255,10 @@ impl Opened {
             warmups.push(warm(1, true)?);
         }
         let link = || -> Result<crate::shared::spark_intake::SparkLink<'_>> {
-            let mut link=crate::shared::spark_intake::SparkLink::new(&self.library, spark_world, &peers,
+            let mut link=crate::shared::spark_intake::SparkLink::new_waves(&self.library, spark_world, &peers,
             u32::try_from(engine::expert_capacity(args.prefill_rows))?, cuteafd_transport::TcpTransportConfig { timing,
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2)?;
+                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2, lanes,
+                u32::try_from(engine::expert_capacity(args.prefill_rows))?)?;
             link.enable_terminal_ownership(self.library.clone())?;
             // Connect every rank now and publish its installed expert grouping
             // with the widest wave (the warm-up's own request, so the sessions
@@ -1263,12 +1268,7 @@ impl Opened {
         };
         crate::shared::memory_report::release_load_staging(&self.library);
         let mut transport = link()?;
-        // Pipelined prefill (CUTEAFD_MIMO_PREFILL_LANES, Flash 2 / Pro 3 by default,
-        // 1 keeps it serial):
-        // one more transport per earlier row lane.
-        ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
-        let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
-        tracing::info!(lanes, "MiMo prefill lanes");
+        tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
@@ -1281,16 +1281,10 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
             })?;
         }
-        for lane in &mut lane_links {
-            runtime.block_on(async {
-                let wave = lane.dispatch(&warmups[0])?;
-                lane.receive(wave, warmups[0].header.row_count as usize, warm_stream.raw()).await
-            })?;
-        }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))
+            runtime }))
     }
 }
 

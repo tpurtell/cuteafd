@@ -3,34 +3,16 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::serving_capacity::MemoryReservation;
 use super::{MimoV2Config, MimoKvFormats, MimoPrefillOutput};
 
-pub fn resolve_transport_lanes(spark: bool, family: &str, configured: Option<&str>) -> Result<usize> {
-    if !spark {
-        return Ok(1);
-    }
-    match configured {
-        Some("1") => Ok(1),
-        Some("2") => Ok(2),
-        // Three lanes: 1 RTX 8K prefill 2951 -> 2745 ms, 2 RTX equal, C4 code
-        // 219 -> 247 tok/s (MiMo V2.6 Pro TP6).
-        Some("3") => Ok(3),
-        Some("4") => Ok(4),
-        // Flash TP4 prefill is faster with two larger waves; the Pro TP6
-        // measurement above does not apply to its smaller expert geometry.
-        None => Ok(if matches!(family, "mimo" | "mimo2" | "mimof" | "mimof2") { 2 } else { 3 }),
-        Some(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
-    }
+pub fn resolve_prefill_waves(spark: bool, _family: &str, configured: Option<&str>) -> Result<usize> {
+    if !spark { return Ok(1); }
+    let waves = configured.map(str::parse::<usize>).transpose()?.unwrap_or(2);
+    ensure!((1..=4).contains(&waves), "MiMo prefill waves must be 1 to 4");
+    Ok(waves)
 }
 
-pub fn workspace_shapes(rows: usize, lead: bool, spark: bool, lanes: usize, output: MimoPrefillOutput, mtp: usize)
+pub fn workspace_shapes(rows: usize, lead: bool, _spark: bool, _waves: usize, _output: MimoPrefillOutput, _mtp: usize)
     -> Vec<(&'static str, bool, usize, bool)> {
-    let mut shapes = vec![("prefill", false, rows, lead), ("decode", true, 64, lead)];
-    if spark && lanes >= 2 && rows >= 2048 {
-        shapes.push(("prefill_first_lane", false, rows, lead && mtp == 0 && output == MimoPrefillOutput::LastRow));
-        for name in ["prefill_second_lane", "prefill_third_lane"].into_iter().take(lanes - 2) {
-            shapes.push((name, false, rows, false));
-        }
-    }
-    shapes
+    vec![("prefill", false, rows, lead), ("decode", true, 64, lead)]
 }
 
 pub fn tensor_bytes(label: &str, dimensions: &[usize]) -> Result<u64> {
@@ -345,10 +327,6 @@ pub fn spark_intake_probe_bytes(spark: bool, configured: Option<&str>) -> Result
     }
 }
 
-pub fn prefill_lane_taps(lanes: usize, rows: usize, mtp: usize, output: MimoPrefillOutput) -> bool {
-    lanes >= 2 && rows >= 2048 && mtp == 0 && output == MimoPrefillOutput::LastRow
-}
-
 pub fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bool,
     all_target_layers_split: bool) -> super::MimoAttentionWorkspace {
     match (rank, ranks, decode, all_target_layers_split) {
@@ -363,7 +341,7 @@ pub fn workspace_options(cfg: &MimoV2Config, ranks: usize, rank: usize, rows: us
     mut query: impl FnMut(&str) -> Result<u64>) -> Result<Vec<(String, super::MimoWorkspaceOptions)>> {
     workspace_shapes(rows, rank == 0, spark, lanes, output, mtp).into_iter()
         .map(|(name, decode, rows, with_head)| Ok((name.into(), super::MimoWorkspaceOptions {
-            rows: rows as u64, decode, lead: rank == 0, with_head, spark: spark && rank == 0, expert_input,
+            rows: rows as u64, waves: if decode { 1 } else { lanes as u64 }, decode, lead: rank == 0, with_head, spark: spark && rank == 0, expert_input,
             max_context: context as u64, pool_pages: 0, kv_cache: kv,
             attention: attention_workspace_geometry(rank, ranks, decode, true), prefill_output: output,
             native_scratch_bytes: workspace_scratch(cfg, ranks, rank, decode, kv, fp8_output, &mut query)?,

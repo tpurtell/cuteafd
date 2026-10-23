@@ -208,9 +208,9 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         source(&name).map(|r| (name, r))
     }).collect();
     let fp8_output = output_formats.values().any(|&r| r == R::Fp8);
-    let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
+    let lanes = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-        else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
+        else { None }.as_deref())?;
     let rings = options.mimo_rings.max(concurrency);
     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     let dir = checkpoint.snapshot.join("dflash");
@@ -247,10 +247,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                     |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
                         crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
                 additional.extend(costs.steady);
-                if prefill_lane_taps(lanes, rows as usize, 0, output) {
-                    additional.push(cuteafd_core::serving_capacity::MemoryReservation {
-                        name: "draft.prefill_first_lane_taps".into(), bytes: draft.prefill_lane_tap_bytes()? as u64 });
-                }
+
             }
             additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
         }
@@ -370,9 +367,9 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
     let ranks = devices.len();
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
-    let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
+    let lanes = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-        else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
+        else { None }.as_deref())?;
     let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
         cfg: &cfg, profile: &profiles.steady, layers: cfg.layers,
         kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,
@@ -454,7 +451,7 @@ mod tests {
                             pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
                             mimo_expert_input: expert_input, ..Default::default() };
                         let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
-                        let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
+                        let lanes = resolve_prefill_waves(true, cfg.program_family().unwrap(), None).unwrap();
                         let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
                         let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                         let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
@@ -612,7 +609,7 @@ mod tests {
                     let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
                     let (experts, expert_workspace, tp2_workspace, onboard) =
                         expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
-                    let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
+                    let lanes = resolve_prefill_waves(true, cfg.program_family().unwrap(), None).unwrap();
                     let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
                         kv, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                             (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
@@ -781,8 +778,8 @@ mod tests {
 
     #[test]
     fn backend_slots_and_scope_categories_match_allocators() {
-        assert_eq!(peer_slots(resolve_transport_lanes(false, "mimop", None).unwrap()), 8);
-        assert_eq!(peer_slots(resolve_transport_lanes(true, "mimop", None).unwrap()), 12);
+        assert_eq!(peer_slots(resolve_prefill_waves(false, "mimop", None).unwrap()), 8);
+        assert_eq!(peer_slots(resolve_prefill_waves(true, "mimop", None).unwrap()), 8);
         assert_eq!(reservation_category("prefill.step_inputs"), Category::Workspace);
         assert_eq!(reservation_category("state.prefill_kv_wide"), Category::Workspace);
         assert_eq!(reservation_category("prefill_first_lane.scratch"), Category::Workspace);
