@@ -21,7 +21,7 @@ fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
         assert_eq!(report.host_budget_bytes, expected << 30);
         assert_eq!(host.host_budget_bytes, report.host_budget_bytes);
         assert!(host.items.iter().all(|i| i.lifetime == ItemLifetime::PostReadyReserve));
-        for owner in ["workspace/router", "staging/tables-and-sync", "scoring/full-logits"] {
+        for owner in ["mimo/owner-0/prefill/router", "mimo/owner-0/prefill/ordered-tables", "scoring/full-logits"] {
             assert!(host.items.iter().any(|i| i.group == owner && i.bytes > 0), "{owner}");
         }
         assert!(host.host_budget_bytes + host.deferred_bytes + host.reserve_bytes <= host.total_bytes);
@@ -106,6 +106,16 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
                 let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
+                if family == "mimo_v2" {
+                    let cfg = MimoV2Config::from_hf(&input.checkpoint().config).unwrap();
+                    let expected = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
+                        unit as usize, waves as usize, 1, 0, options.context_tokens.max(1) as usize,
+                        4, options.mimo_expert_input, crate::families::mimo_v2::MimoKvFormats::default(),
+                        crate::families::mimo_v2::MimoPrefillOutput::AllRows, true, unit.min(256) as usize, 0).unwrap();
+                    for (name, expected) in expected { assert_eq!(bytes(&name), expected, "{name}"); }
+                    assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
+                    continue;
+                }
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
                 let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Fp8K32 };
                 let (request, response) = endpoint.wire_bytes(geometry).unwrap();

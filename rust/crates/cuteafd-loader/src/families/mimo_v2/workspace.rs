@@ -156,6 +156,16 @@ fn bytes(label: &'static str, dims: &[u64]) -> Result<u64, CacheGeometryError> {
 }
 
 impl MimoWorkspaceLayout {
+    /// Base paths and slot zero share pointer keys. Nonzero slots have their
+    /// own pinned source; the base extent must cover diagnostic whole-buffer use.
+    pub fn ordered_host_bytes(&self, waves: u64) -> Result<u64, CacheGeometryError> {
+        if waves == 0 { return Err(CacheGeometryError::Overflow("MiMo ordered slot count")); }
+        [self.step_inputs, self.slots, self.ring_slots, self.seq_first, self.page_table, self.ids]
+            .into_iter().try_fold(0u64, |sum, bytes| {
+                bytes.checked_div(waves)?.checked_mul(waves - 1)?.checked_add(bytes)?.checked_add(sum)
+            }).ok_or(CacheGeometryError::Overflow("MiMo ordered host tables"))
+    }
+
     pub fn new(
         cfg: &MimoV2Config,
         options: MimoWorkspaceOptions,
@@ -319,6 +329,33 @@ mod tests {
             let tiny = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, pool_pages: 1, ..options() }).unwrap();
             assert_eq!(tiny.page_table, waves * 256);
         }
+    }
+
+    #[test]
+    fn ordered_host_staging_covers_base_and_nonzero_slot_pointer_keys() {
+        let cfg = MimoV2Config::from_hf(&mimo_pro_config()).unwrap();
+        for waves in 1..=4 {
+            let layout = MimoWorkspaceLayout::new(&cfg, MimoWorkspaceOptions { waves, ..options() }).unwrap();
+            let base = layout.step_inputs + layout.slots + layout.ring_slots + layout.seq_first
+                + layout.page_table + layout.ids;
+            assert_eq!(layout.ordered_host_bytes(waves).unwrap(), base + base / waves * (waves - 1));
+        }
+        let one = super::super::admission::future_host_workspaces(&cfg, 4096, 2, 1, 1 << 20,
+            1 << 20, 6, MimoExpertInput::Fp8, MimoKvFormats::default(), MimoPrefillOutput::LastRow,
+            true, 256, 0).unwrap();
+        let two = super::super::admission::future_host_workspaces(&cfg, 4096, 2, 2, 1 << 20,
+            1 << 20, 6, MimoExpertInput::Fp8, MimoKvFormats::default(), MimoPrefillOutput::LastRow,
+            true, 256, 0).unwrap();
+        for kind in ["prefill/ordered-tables", "decode/ordered-tables"] {
+            let sum = |demands: &[(String, u64)]| demands.iter().filter(|(name, _)| name.ends_with(kind))
+                .map(|(_, bytes)| bytes).sum::<u64>();
+            assert_eq!(sum(&two), 2 * sum(&one));
+        }
+        assert!(two.iter().any(|(name, bytes)| name == "mimo/owner-1/decode/ordered-tables" && *bytes > 0));
+        assert!(two.iter().any(|(name, bytes)| name == "mimo/transport/rdma-rings" && *bytes > 0));
+        assert!(super::super::admission::future_host_workspaces(&cfg, usize::MAX, 4, 2, u64::MAX,
+            1 << 20, 6, MimoExpertInput::Fp8, MimoKvFormats::default(), MimoPrefillOutput::LastRow,
+            true, 256, 0).is_err());
     }
 
     #[test]

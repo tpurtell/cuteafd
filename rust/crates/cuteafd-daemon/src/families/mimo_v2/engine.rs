@@ -440,7 +440,18 @@ fn step_input_bindings(inputs: *mut c_void, identity: *mut c_void, slots: *mut c
     }
 }
 
+fn ordered_table_upload(library: &NativeLibrary, destination: cuteafd_ffi::CuteafdDeviceBuffer,
+    source: &[u8], stream: *mut c_void) -> Result<()> {
+    // SAFETY: callers own the whole admitted destination and order all consumers on stream.
+    unsafe { library.copy_h2d_ordered(destination, source, stream) }
+}
+
 impl Workspace<'_> {
+    fn ordered_tables(&self) -> [cuteafd_ffi::CuteafdDeviceBuffer; 6] {
+        [self.step_inputs.buffer, self.slots.buffer, self.ring_slots.buffer,
+            self.seq_first.buffer, self.page_table.buffer, self.ids.buffer]
+    }
+
     fn attention_bindings(&self, dim: usize, attention: MimoAttention) -> StepInputBindings {
         step_input_bindings(self.step_inputs.buffer.ptr, self.step_slots.buffer.ptr,
             self.slots.buffer.ptr, self.rows, dim, attention)
@@ -530,8 +541,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_> {
                     (&w.page_table, bytes_of(&tables.page_table))] {
                     ensure!(bytes.len() <= plane.buffer.bytes, "MiMo unit table exceeds storage");
                     // SAFETY: slot-owned tables are rewritten in their consumer stream's order.
-                    unsafe { e.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer {
-                        bytes: bytes.len(), ..plane.buffer }, bytes, e.stream_of(rank))?; }
+                    ordered_table_upload(e.library, plane.buffer, bytes, e.stream_of(rank))?;
                 }
                 Ok(())
             })?;
@@ -1252,7 +1262,7 @@ impl<'a> MimoEngine<'a> {
         let identity: Vec<i64> = (0..if decode { 1 } else { self.prefill_waves() }).flat_map(|_| 0..t as i64).collect();
         let step_slots = self.alloc(size(layout.step_slots)?)?;
         self.library.copy_h2d(step_slots.buffer, bytes_of(&identity))?;
-        Ok(Workspace {
+        let workspace = Workspace {
             rows: t,
             slot_count: if decode { 1 } else { self.prefill_waves() },
             logits_rows: size(layout.logits_rows)?,
@@ -1294,7 +1304,15 @@ impl<'a> MimoEngine<'a> {
                 None
             },
             _head_workspace: head_workspace,
-        })
+        };
+        // Allocate every ordered source before this workspace can queue peer waits.
+        for destination in workspace.ordered_tables().into_iter().chain(
+            (1..workspace.slot_count).map(|slot| workspace.unit_view(slot, t, h, self.cfg.rope_dim))
+                .collect::<Result<Vec<_>>>()?.iter().flat_map(Workspace::ordered_tables)) {
+            // SAFETY: admitted workspace storage and its rank stream outlive every upload.
+            unsafe { self.library.reserve_h2d_ordered(destination, self.stream_of(rank))?; }
+        }
+        Ok(workspace)
     }
 
     /// Replace the existing positions upload with one packed positions/RoPE copy.
@@ -1304,8 +1322,7 @@ impl<'a> MimoEngine<'a> {
         self.rope.fill(positions, w.rows, self.max_context, &mut bytes)?;
         // SAFETY: workspace and stream belong to this rank; all readers follow
         // this upload on that stream, outside capture. FFI retains pinned staging.
-        unsafe { self.library.copy_h2d_ordered(cuteafd_ffi::CuteafdDeviceBuffer {
-            bytes: bytes.len(), ..w.step_inputs.buffer }, &bytes, self.stream_of(rank)) }
+        ordered_table_upload(self.library, w.step_inputs.buffer, &bytes, self.stream_of(rank))
     }
 
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
@@ -2868,6 +2885,31 @@ mod terminal_fault_tests;
 #[cfg(test)]
 mod tests {
     use super::{attention_workspace_geometry, expert_capacity, prefill_span_rows, scale_operand, MimoAttentionWorkspace, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
+
+    #[test]
+    #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+    fn mimo_ordered_tables_short_first_then_full_never_resize_pinned_sources() -> anyhow::Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build()?;
+        let library = fixture.load()?;
+        for rank in 0..2 {
+            library.cuda_set_device(rank)?;
+            let stream = (rank as usize + 1) as *mut std::ffi::c_void;
+            for extent in [8192, 4096, 2048, 1024, 256] {
+                let mut buffer = library.alloc_device_buffer(extent)?;
+                super::ordered_table_upload(&library, buffer, &[3; 16], stream)?;
+                let first = fixture.events()?;
+                super::ordered_table_upload(&library, buffer, &vec![7; extent], stream)?;
+                let later = fixture.events()?;
+                assert_eq!(later.matches('A').count(), first.matches('A').count());
+                assert!(!later[first.len()..].contains('F'), "no pinned free under queued work");
+                library.release_ordered_h2d_staging()?;
+                // SAFETY: the CPU fixture completed both copies into this live allocation.
+                unsafe { assert_eq!(std::slice::from_raw_parts(buffer.ptr.cast::<u8>(), extent), vec![7; extent]); }
+                library.free_device_buffer(&mut buffer)?;
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn attention_bindings_keep_absolute_positions_and_independent_kv_slots() {

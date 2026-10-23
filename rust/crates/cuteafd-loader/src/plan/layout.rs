@@ -1235,57 +1235,72 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         items.push(Item::new(category, group, format, bytes, basis)
             .with_lifetime(ItemLifetime::PostReadyReserve));
     };
-    if ranks > 0 {
-        let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
-            experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
-            topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
-            layers: u32::try_from(spec.layers.len())? };
-        let endpoints = spark_endpoints(family, lanes);
-        let bf16 = native || matches!(family, "glm5" | "qwen4");
-        let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
-            else { SparkIngress::Fp8K32 };
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
-        let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
-        let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
-            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-        let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
-            .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
-            .context("coordinator host rings overflow")?;
-        push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
-        // Host-mode intake is the upper bound; auto/GPU landing can use less.
-        let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
-            .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
-            .context("coordinator intake overflow")?;
-        push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
-    }
-    let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
-    let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
-        .context("host routing stride overflow")?).context("host routing workspace overflow")?;
-    push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
-    let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
-        .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
-    if family == "qwen4" {
-        // A local owner has workspace tables even without a Spark transport.
-        let lanes = lanes.max(1);
-        let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64))
-            .context("Qwen host workspace rows overflow")?;
-        let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
+    if family == "mimo_v2" {
+        let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
         let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
-        // Decode owns a table per row; prefill owns one. Charge the full
-        // record and compressed-pool tables, even on partitioned owners.
-        let tables = pool.div_ceil(64).checked_add(pool.div_ceil(64 * 4))
-            .and_then(|n| n.checked_mul(64 + lanes)).and_then(|n| n.checked_mul(4))
-            .context("Qwen host page tables overflow")?;
-        let stride = (cfg.ple_rows() as u64).checked_mul(8)
-            .and_then(|n| n.checked_add(64))
-            .and_then(|n| hidden.checked_mul(10).and_then(|h| n.checked_add(h)))
-            .context("Qwen host row metadata overflow")?;
-        staging = work_rows.checked_mul(stride).and_then(|n| n.checked_add(tables))
-            .and_then(|n| n.checked_add(256 * (lanes + 1)))
-            .and_then(|n| n.checked_mul(options.rtx_bytes.len() as u64))
-            .context("Qwen host staging overflow")?;
+        let local_ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
+        let demands = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
+            usize::try_from(unit_rows)?, usize::try_from(options.prefill_waves)?, local_ranks,
+            pool, usize::try_from(options.context_tokens.max(1))?, ranks, options.mimo_expert_input,
+            crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
+            if options.full_prefill_logits { crate::families::mimo_v2::MimoPrefillOutput::AllRows }
+                else { crate::families::mimo_v2::MimoPrefillOutput::LastRow }, true,
+            usize::try_from(unit_rows.min(256))?, report.solver_placement.as_ref()
+                .and_then(|p| p.tp2).map_or(0, |tp2| tp2.layers))?;
+        for (name, bytes) in demands { push(Category::Staging, &name, "pinned", bytes, Basis::Formula); }
+    } else {
+        if ranks > 0 {
+            let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
+                experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
+                topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
+                layers: u32::try_from(spec.layers.len())? };
+            let endpoints = spark_endpoints(family, lanes);
+            let bf16 = native || matches!(family, "glm5" | "qwen4");
+            let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
+                else { SparkIngress::Fp8K32 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
+            let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
+            let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
+                .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
+                .context("coordinator host rings overflow")?;
+            push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
+            // Host-mode intake is the upper bound; auto/GPU landing can use less.
+            let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+                .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
+                .context("coordinator intake overflow")?;
+            push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
+        }
+        let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;
+        let router = work_rows.checked_mul(hidden.checked_mul(2).and_then(|n| n.checked_add(topk * 8))
+            .context("host routing stride overflow")?).context("host routing workspace overflow")?;
+        push(Category::Workspace, "workspace/router", "BF16 upper bound", router, Basis::Estimated);
+        let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
+            .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
+        if family == "qwen4" {
+            // A local owner has workspace tables even without a Spark transport.
+            let lanes = lanes.max(1);
+            let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64))
+                .context("Qwen host workspace rows overflow")?;
+            let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
+            let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
+            // Decode owns a table per row; prefill owns one. Charge the full
+            // record and compressed-pool tables, even on partitioned owners.
+            let tables = pool.div_ceil(64).checked_add(pool.div_ceil(64 * 4))
+                .and_then(|n| n.checked_mul(64 + lanes)).and_then(|n| n.checked_mul(4))
+                .context("Qwen host page tables overflow")?;
+            let stride = (cfg.ple_rows() as u64).checked_mul(8)
+                .and_then(|n| n.checked_add(64))
+                .and_then(|n| hidden.checked_mul(10).and_then(|h| n.checked_add(h)))
+                .context("Qwen host row metadata overflow")?;
+            staging = work_rows.checked_mul(stride).and_then(|n| n.checked_add(tables))
+                .and_then(|n| n.checked_add(256 * (lanes + 1)))
+                .and_then(|n| n.checked_mul(options.rtx_bytes.len() as u64))
+                .context("Qwen host staging overflow")?;
+        }
+        push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
     }
-    push(Category::Staging, "staging/tables-and-sync", "row metadata", staging, Basis::Estimated);
     if family == "qwen4" && ranks > 0 && options.prefill_waves > 1 {
         use crate::families::qwen4::{Qwen4Config, StepTableBytes};
         use crate::serving_capacity::qwen_graphs::{qwen_pool_pages, QWEN_UNIT_PAGES};

@@ -397,6 +397,60 @@ pub fn draft_scratch_bytes(shape: DraftScratch, sm_count: usize) -> Result<usize
     })
 }
 
+/// Still-lazy coordinator host owners, shared by live and offline admission.
+/// Intake/egress and synchronous staging are safe upper bounds; table extents
+/// and router allocations are the same checked layouts the engine allocates.
+pub fn future_host_workspaces(cfg: &MimoV2Config, rows: usize, waves: usize, ranks: usize,
+    pool_tokens: u64, context: usize, spark_ranks: usize, expert_input: super::MimoExpertInput,
+    kv: MimoKvFormats, output: MimoPrefillOutput, serving: bool,
+    diagnostic_rows: usize, diagnostic_layers: usize) -> Result<Vec<(String, u64)>> {
+    let mut demands = vec![("mimo/mtp-staging".into(), 1 << 20)];
+    let mut sync = 64u64 << 20; // embedding loader's pinned chunk / synchronous copy upper bound
+    for rank in 0..ranks {
+        for (name, mut options) in workspace_options(cfg, ranks, rank, rows, context, waves,
+            spark_ranks > 0, expert_input, kv, 0, output, false, |_| Ok(0))? {
+            options.pool_pages = pool_tokens.div_ceil(64);
+            let layout = super::MimoWorkspaceLayout::new(cfg, options)?;
+            let label = format!("mimo/owner-{rank}/{name}");
+            demands.push((format!("{label}/ordered-tables"), layout.ordered_host_bytes(options.waves)?));
+            demands.push((format!("{label}/router"), layout.router_host));
+            sync = sync.max(layout.page_table).max(layout.step_inputs).max(layout.ids);
+        }
+    }
+    demands.push(("mimo/staging/sync-h2d-upper-bound".into(), sync));
+    if diagnostic_layers > 0 {
+        demands.push(("mimo/router-diagnostics".into(), tensor_bytes("MiMo route checks",
+            &[diagnostic_rows.max(1), cfg.topk, 8, ranks, diagnostic_layers])?));
+    }
+    if serving {
+        let mask = allocation_bytes("MiMo sampling mask", &[64, cfg.vocab_size.div_ceil(32), 4])?;
+        demands.push(("mimo/sampling".into(), mask.checked_add(64 * (64 + 5 * 4 + 12))
+            .context("MiMo sampling host overflow")?));
+    }
+    if spark_ranks > 0 {
+        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+        let capacity = u32::try_from(rows.max(64))?;
+        let geometry = ExpertGeometry { hidden: u32::try_from(cfg.hidden)?, experts: u32::try_from(cfg.experts)?,
+            topk: u32::try_from(cfg.topk)?, intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
+        let ingress = match expert_input { super::MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
+            super::MimoExpertInput::Bf16 => SparkIngress::Bf16,
+            super::MimoExpertInput::Bf16Decode => SparkIngress::Bf16Decode { rows: 64 } };
+        let endpoint = SparkEndpoint { capacity, ingress, ring_depth: None };
+        let (request, response) = endpoint.wire_bytes(geometry).context("MiMo host wire overflow")?;
+        let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response), depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        let ring = endpoint.ring_bytes(geometry, rings).context("MiMo host rings overflow")?;
+        demands.push(("mimo/transport/rdma-rings".into(), tensor_bytes("MiMo coordinator rings", &[ring, spark_ranks])?));
+        demands.push(("mimo/transport/response-prefix".into(), tensor_bytes("MiMo response metadata",
+            &[endpoint.response_prefix_bytes().context("MiMo response prefix")?, spark_ranks])?));
+        demands.push(("mimo/spark-intake-upper-bound".into(), tensor_bytes("MiMo host intake", &[rows.max(64), cfg.hidden, 2, spark_ranks])?));
+        if waves == 1 {
+            demands.push(("mimo/transport/egress-upper-bound".into(), tensor_bytes("MiMo registered egress", &[rows.max(64), cfg.hidden, 2])?));
+        }
+    }
+    Ok(demands)
+}
+
 pub fn sampling_wave_bytes(capacity: usize, vocab: usize) -> usize {
     capacity * (64 + 64 + 2 * vocab.div_ceil(32) * 4 + 2048 * 4 + 256 * 12 + 8 * 4)
 }

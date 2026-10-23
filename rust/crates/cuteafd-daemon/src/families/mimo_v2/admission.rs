@@ -333,7 +333,7 @@ fn preflight_shape(
                 super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
             } else { 64 };
             prefix.with_scoring(scoring_rows, scoring_rows.max(64), cfg.vocab_size)?
-                .host_config(layout, args.max_context, concurrency)?
+                .resolve_host_config(layout, args.max_context, concurrency)?
         }
         None => None,
     };
@@ -566,6 +566,26 @@ fn preflight_shape(
     tracing::info!(pool_tokens, context_tokens=args.max_context, full_context_sequences=pool_tokens / args.max_context as u64,
         slots=concurrency, shortfall_tokens, "MiMo full-context pool admission before allocation");
     resolve_pool_context(&mut capacity, automatic_context, profiles.steady.pool_unit_rows)?;
+    let diagnostic_rows = if std::env::var("CUTEAFD_ROUTE_CHECK").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(0) > 0 {
+        super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?.max(64)
+    } else { args.prefill_rows.min(256) };
+    let diagnostic_layers = placement.tp2.map_or(0, |tp2| tp2.layers);
+    let mut tables = cuteafd_loader::families::mimo_v2::admission::future_host_workspaces(cfg,
+        args.prefill_rows, solution.working_set.prefill_lanes as usize, ranks, pool_tokens,
+        usize::try_from(capacity.effective_max_context_tokens)?, solution.working_set.spark_ranks,
+        args.expert_input.into(), kv, prefill_output, serving.is_some(), diagnostic_rows, diagnostic_layers)?;
+    if args.token_io.embed_placement == Some(crate::shared::token_io::EmbedPlacement::Host) {
+        tables.push(("mimo/embedding".into(), tensor_bytes("MiMo host embedding", &[cfg.vocab_size, cfg.hidden, 2])?));
+    }
+    let score_rows = if args.full_prefill_logits {
+        super::engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?
+    } else { 64 };
+    let scoring = cuteafd_core::memory_layout::host_logits_bytes(score_rows as u64,
+        score_rows.max(64) as u64, cfg.vocab_size as u64).context("MiMo host scoring overflow")?;
+    let views = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect::<Vec<_>>();
+    crate::shared::memory::budget::admit_host_memory(host_bytes, &views, scoring,
+        serving.map_or(0, |(prefix, _)| prefix.host_cache_headroom_bytes))?;
     if !draft_packing.is_empty() {
         let units = capacity.allocated_gpu_kv_tokens / profiles.steady.pool_unit_rows;
         for (rank, phase) in profiles.post_target_kv.iter().enumerate() {
