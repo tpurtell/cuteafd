@@ -1256,6 +1256,10 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     let mut staging = work_rows.checked_mul(hidden).and_then(|n| n.checked_mul(8))
         .and_then(|n| n.checked_add(2 << 20)).context("host staging overflow")?;
     if family == "qwen4" {
+        // A local owner has workspace tables even without a Spark transport.
+        let lanes = lanes.max(1);
+        let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64))
+            .context("Qwen host workspace rows overflow")?;
         let cfg = crate::families::qwen4::Qwen4Config::from_hf(&checkpoint.config)?;
         let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
         // Decode owns a table per row; prefill owns one. Charge the full

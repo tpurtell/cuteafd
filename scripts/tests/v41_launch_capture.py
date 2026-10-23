@@ -118,8 +118,9 @@ if tool == "docker":
             ranks = args[args.index("--spark-ranks") + 1]
         rows = args[args.index("--prefill-rows") + 1] if "--prefill-rows" in args else "0"
         family = os.environ.get("CAPTURE_FAMILY", "deepseek_v41")
-        response = {"spark_ranks": int(ranks), "prefill_unit_rows": int(rows) or 2048,
-                    "prefill_waves": 1, "prefill_span_rows": int(rows) or 2048,
+        default_rows = 4096 if family == "qwen4" else 2048
+        response = {"spark_ranks": int(ranks), "prefill_unit_rows": int(rows) or default_rows,
+                    "prefill_waves": 1, "prefill_span_rows": int(rows) or default_rows,
                     "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []},
                     "encoder_plan_hash": "ab" * 32, "placement_supported": True, "fits": True}
         if "--deployment" in args:

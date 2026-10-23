@@ -323,6 +323,13 @@ mod weight_representation_tests {
     #[test]
     fn prefill_units_validate_owner_slots_and_preserve_explicit_geometry() -> Result<()> {
         assert_eq!(args(&[])?.prefill_shape()?, None);
+        for owners in [vec!["--local-experts"], vec!["--local-experts", "--split-device", "1"]] {
+            let mut explicit = owners;
+            explicit.extend(["--prefill-rows", "4096", "--prefill-waves", "1"]);
+            let parsed = args(&explicit)?;
+            assert_eq!(parsed.prefill_shape()?, None);
+            assert_eq!(parsed.prefill_wave_rows(), 4096);
+        }
         for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (4096, 2)] {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();

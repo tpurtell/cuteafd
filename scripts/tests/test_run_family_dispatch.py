@@ -2360,6 +2360,8 @@ def test_qwen_default_matches_spark_free_coordinator_layout(tmp_path: Path, keys
     assert ("--split-device" in launch) == dual
     assert ("CUTEAFD_ATTENTION_PLACEMENT=layers" in launch) == dual
     assert ("--local-experts" in launch) == (ranks == 0)
+    assert "--prefill-rows 4096" in launch
+    assert "--prefill-waves 1" in launch
     if dual:
         assert "--rtx-expert-layers all" in launch
         preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)

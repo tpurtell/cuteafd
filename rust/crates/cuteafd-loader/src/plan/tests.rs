@@ -145,6 +145,35 @@ fn qwen_prefill_publishes_unit_waves_and_span_before_host_admission() {
 }
 
 #[test]
+fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
+    let config = qwen4_config(4);
+    let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
+    let manifest = dir.path().join("programs.json");
+    std::fs::write(&manifest, r#"{"capacities":{"prefill_rows":2048}}"#).unwrap();
+    for gpus in [1, 2] {
+        for (requested, expected) in [(0, 4096), (1024, 1024), (4096, 4096)] {
+            let report = plan(dir.path(), &PlanOptions {
+                layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                    workspace_manifest: Some(manifest.clone()), prefill_rows: requested,
+                    context_tokens: 32768, prefix_slots: Some(0), host_cache_bytes: Some(0),
+                    host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+                placement: ExpertPlacement::Local, ..Default::default()
+            }).unwrap();
+            assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows,
+                report.prefill_transports), (Some(expected), Some(1), Some(expected), Some(0)), "{}", render(&report));
+        }
+        let report = plan(dir.path(), &PlanOptions {
+            layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
+                prefill_waves: 2, context_tokens: 32768, prefix_slots: Some(0),
+                host_cache_bytes: Some(0), host_memory: Some((128 << 30, 128 << 30)), ..Default::default() }),
+            placement: ExpertPlacement::Local, ..Default::default()
+        }).unwrap();
+        assert!(!report.placement_supported);
+        assert!(report.hints.iter().any(|hint| hint.what.contains("one whole-step wave")));
+    }
+}
+
+#[test]
 fn spark_host_layout_requires_explicit_family_unit_even_for_one_wave() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
