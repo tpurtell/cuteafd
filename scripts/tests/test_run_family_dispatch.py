@@ -910,9 +910,25 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
     assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves}" in result.stdout
 
 
+@pytest.mark.parametrize("unit,waves,span", [(4096, 2, 16384), (1024, 3, 6144)])
+def test_mimo_prefill_launcher_forwards_exact_unit_wave_and_span(tmp_path, unit, waves, span):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "test/mimo", f"SPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_BATCH_TOKENS={unit}\nPREFILL_WAVES={waves}\n",
+        deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves, "prefill_span_rows": span})
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "docker run -d" in line and "serve-mimo" in line)
+    assert plan[plan.index("--prefill-waves") + 1] == str(waves)
+    assert "--prefill-lanes" not in plan
+    for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
+        assert serve.count(flag) == 1
+        assert serve[serve.index(flag) + 1] == str(value)
+    assert f"PREFILL_SPAN_ROWS={span}" in result.stdout
+
+
 @pytest.mark.parametrize("family_config", [
     {"model_type": "deepseek_v4", "num_hidden_layers": 61},
-    {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
 ])
 def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
     result = _family_launch_result(tmp_path, family_config, "test/model",

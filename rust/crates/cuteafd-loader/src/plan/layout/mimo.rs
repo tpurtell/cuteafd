@@ -50,7 +50,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // solve. An explicit POOL_TOKENS stays strict.
         media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
-        match apply_selected(input, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
+        match select_and_apply(input, &mut media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
             Ok((placement, working)) => {
                 if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
@@ -87,8 +87,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     let mut pool_tokens = 0;
     let mut waste = Vec::new();
-    match apply_selected(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
+    match select_and_apply(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
         Ok((placement, working)) => {
+            report.prefill_span_rows = Some(16384);
+            report.prefill_transports = Some(1);
             spark_io(report, model, options, &working, &mut sparks, &mut notes);
             waste = replicated_weights(&placement);
             report.solver_placement = Some(placement.clone());
@@ -341,6 +343,40 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     Ok((costs, workspace, tp2_workspace, onboard))
 }
 
+/// Retry every candidate from the same pre-admission inventory. Failed solves
+/// publish refusal reservations, so reusing their devices would double-charge.
+#[allow(clippy::too_many_arguments)]
+fn select_and_apply(input: &super::super::PlanInput, options: &mut LayoutOptions,
+    devices: &mut Vec<DeviceLayout>, spark_ranks: usize, rows: u64, concurrency: u64,
+    context: u64, manifest: Option<&serde_json::Value>)
+    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet)> {
+    use crate::serving_capacity::{select_prefill_shape, CacheGeometryError, PrefillShape};
+    let cfg = MimoV2Config::from_hf(&input.checkpoint().config)?;
+    let waves = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
+        (options.prefill_lanes > 0).then(|| options.prefill_lanes.to_string()).as_deref())? as u64;
+    let initial = devices.clone();
+    let (shape, (placement, working, admitted)) = select_prefill_shape(
+        PrefillShape { unit_rows: rows, waves }, options.context_tokens == 0 && options.pool_tokens.is_none(),
+        |candidate| {
+            let mut trial = initial.clone();
+            let mut selected = options.clone();
+            selected.prefill_lanes = candidate.waves;
+            let result = apply_selected(input, &selected, &mut trial, spark_ranks,
+                candidate.unit_rows, concurrency, context, manifest);
+            match result {
+                Ok((placement, working)) => Ok((placement, working, trial)),
+                Err(error) => { *devices = trial; Err(error) }
+            }
+        }, |(placement, _, _)| placement.pool_tokens,
+        |error| matches!(error.downcast_ref::<CacheGeometryError>(),
+            Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement"))?;
+    options.prefill_unit_rows = Some(shape.unit_rows);
+    options.prefill_waves = working.prefill_lanes;
+    options.prefill_lanes = working.prefill_lanes;
+    *devices = admitted;
+    Ok((placement, working))
+}
+
 #[cfg(test)]
 fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
@@ -501,6 +537,30 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn selected_shape_preserves_explicit_pool_and_publishes_exact_units() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+        let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path()).unwrap());
+        for waves in [1, 2, 3] {
+            let mut options = LayoutOptions { rtx_bytes: vec![95 * GIB], pool_tokens: Some(32768),
+                prefill_lanes: waves, concurrency: 4, ..Default::default() };
+            let initial = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
+                capacity_bytes: 95 * GIB, items: vec![], kv_tokens: 0 }];
+            let mut expected = initial.clone();
+            let (placement, working) = apply_selected(&input, &options, &mut expected,
+                4, 4096, 4, 32768, None).unwrap();
+            let mut actual = initial;
+            let selected = select_and_apply(&input, &mut options, &mut actual,
+                4, 4096, 4, 32768, None).unwrap();
+            assert_eq!(selected.0, placement);
+            assert_eq!(selected.1, working);
+            assert_eq!((options.prefill_unit_rows, options.prefill_waves), (Some(4096), waves));
+            assert_eq!(actual[0].used_bytes(), expected[0].used_bytes());
+            assert_eq!(actual[0].kv_tokens, 32768);
         }
     }
 

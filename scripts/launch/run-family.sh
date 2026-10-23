@@ -387,7 +387,7 @@ EOF
 family_prefill_mode() {
   case "$1" in
     step5|kimi_k3|qwen4) echo units ;;
-    glm5) echo units-span ;;
+    glm5|mimo_v2) echo units-span ;;
     *) echo legacy ;;
   esac
 }
@@ -2693,8 +2693,10 @@ audio_encoder_hash=""
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
   fi
-  if [[ "$family" == step5 ]]; then
+  if [[ "$family" == step5 || "$family" == mimo_v2 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+  fi
+  if [[ "$family" == step5 ]]; then
     plan_mtp_depth=0
     [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
     plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache")
