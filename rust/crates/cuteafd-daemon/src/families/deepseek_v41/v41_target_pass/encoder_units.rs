@@ -43,6 +43,11 @@ pub(super) fn encoder_units(chunks: &[&[u32]]) -> Result<Vec<Unit>> {
         .collect()
 }
 
+pub(in crate::families::deepseek_v41) fn decoder_unit(index: usize, rows: std::ops::Range<usize>) -> Result<Unit> {
+    ensure!(!rows.is_empty() && rows.len() <= 128, "decoder replay suffix capacity differs");
+    Ok(Unit { index, sequence: 0, rows, layers: 20..40, slot: 0, barrier: true })
+}
+
 struct UnitHooks<'s, 'r, 'w, 'a> {
     pass: &'s mut TargetPass<'w, 'a>,
     requests: RefCell<&'r mut Requests<'a>>,
@@ -267,10 +272,133 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     }
 }
 
+impl<'a> crate::families::deepseek_v41::v41_native_serve::prefill_target::ReplayTarget<'a>
+    for TargetPass<'_, 'a> {
+    type Suffix = EncoderSuffix<'a>;
+    async unsafe fn begin_replay_unit(&mut self, requests: &Requests<'a>,
+        batch: &RequestBatch, suffix: &Self::Suffix) -> Result<()> {
+        requests.validate(batch)?;
+        ensure!(batch.cache()?.stage() == CacheStage::Replay, "decoder replay stage differs");
+        let encoder = suffix.output()?;
+        ensure!(encoder.tokens == batch.cache()?.positions(), "encoder suffix/replay row order differs");
+        self.set_attention_decode(false);
+        self.resources.lane.set_l2_prefetch(std::mem::replace(&mut self.l2_solo, true));
+        self.state.begin()?;
+        self.sampled = None;
+        self.resources.taps.begin(batch.cache()?)?;
+        self.resources.execution.restart_for(CacheStage::Replay);
+        self.resources.lane.restart_decoder(&encoder)?;
+        self.resources.index.restart_decoder()?;
+        // SAFETY: retain the original suffix and prepared lane through every replay hook.
+        unsafe { self.resources.lane.begin_prepared()?; }
+        Ok(())
+    }
+    async unsafe fn replay_attention(&mut self, requests: &Requests<'a>,
+        batch: &RequestBatch, layer: usize) -> Result<UnitPreparedLayer> {
+        ensure!((20..40).contains(&layer), "decoder replay layer differs");
+        if layer != 20 {
+            self.resources.lane.advance()?;
+            if layer >= 37 {
+                // SAFETY: the previous layer completed and its output is immutable until preparation.
+                unsafe { self.resources.taps.capture(batch.cache()?, &self.resources.lane.prepared_input()?)?; }
+            }
+            // SAFETY: the previous layer's output is retained until its query completes.
+            unsafe { self.resources.lane.begin_prepared()?; }
+        }
+        // SAFETY: preserve the ordinary replay's synchronous producer/index/attention route.
+        let prepared = unsafe { self.resources.execution.prepare_layer(requests.cache(), batch.cache()?,
+            &mut self.resources.lane, &mut self.resources.index)? };
+        prepared.into_unit().await
+    }
+    async unsafe fn replay_local_ffn(&mut self, batch: &RequestBatch,
+        transport: &mut NativeTp4Wave<'a>, _layer: usize, prepared: UnitPreparedLayer) -> Result<()> {
+        // SAFETY: this barrier exclusively owns the original query and FFN result storage.
+        let completed = unsafe { prepared.execute(&mut self.resources.lane, transport, 0, batch.image_mask()).await? };
+        // SAFETY: the completed FFN carries this replay batch's binding.
+        unsafe { self.resources.execution.complete_layer(batch.cache()?, &mut self.resources.lane, completed) }
+    }
+    async unsafe fn send_replay_experts(&mut self, batch: &RequestBatch,
+        transport: &mut NativeTp4Wave<'a>, _layer: usize, prepared: UnitPreparedLayer)
+        -> Result<UnitPendingLayer> {
+        // SAFETY: retain this lane's shared/input values until the matching landing hook.
+        unsafe { prepared.send(&mut self.resources.lane, transport, 0, batch.image_mask()).await }
+    }
+    async unsafe fn land_replay_experts(&mut self, batch: &RequestBatch,
+        transport: &mut NativeTp4Wave<'a>, _layer: usize, ticket: UnitPendingLayer) -> Result<()> {
+        // SAFETY: FIFO transport and lane storage remain owned by this one barrier unit.
+        let completed = unsafe { ticket.land(&mut self.resources.lane, transport).await? };
+        // SAFETY: complete the original bound query without changing the replay's arithmetic order.
+        unsafe { self.resources.execution.complete_layer(batch.cache()?, &mut self.resources.lane, completed) }
+    }
+    fn replay_route(&self, transport: &NativeTp4Wave<'a>, layer: usize) -> FfnRoute {
+        if transport.has_local_layer(layer) { FfnRoute::Local } else { FfnRoute::Spark }
+    }
+    async unsafe fn end_replay_unit(&mut self, lib: &'a cuteafd_ffi::NativeLibrary,
+        batch: &RequestBatch, selected: &[usize]) -> Result<Vec<u8>> {
+        self.resources.taps.output(batch.cache()?)?;
+        let output = self.resources.lane.output()?;
+        // SAFETY: this is the ordinary replay head terminal on the same completed final output.
+        unsafe { self.resources.head.execute_block(&output, selected)?; }
+        self.state = State::Ready(batch.cache()?.identity());
+        let logits = self.resources.head.output()?;
+        let mut bytes = vec![0; logits.logits.bytes];
+        lib.copy_d2h(&mut bytes, logits.logits)?;
+        Ok(bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shared::prefill_pipeline::{prefill_schedule, Step};
+
+    #[test]
+    fn suffix_replay_waits_for_every_encoder_commit() -> Result<()> {
+        let full = vec![0; 4096];
+        let tail = vec![0; 257];
+        for waves in 1..=3 {
+            let mut units = encoder_units(&[&full, &full, &full, &tail])?;
+            for unit in &mut units { unit.slot = unit.index % waves; }
+            let replay = units.len();
+            units.push(decoder_unit(replay, 12417..12545)?);
+            for mask in [0, (1u64 << 40) - 1, 0x5555555555, 0xaaaaaaaaaa, (1u64 << 20) - 1] {
+                let routes = (0..40).map(|layer| if mask & (1 << layer) == 0 {
+                    FfnRoute::Spark
+                } else { FfnRoute::Local }).collect::<Vec<_>>();
+                let schedule = prefill_schedule(&routes, &units, waves)?;
+                let mut committed = 0;
+                let mut pending = std::collections::VecDeque::new();
+                let mut replay_layers = Vec::new();
+                for step in schedule {
+                    match step {
+                        Step::Begin { unit } if unit == replay => {
+                            assert_eq!(committed, replay, "replay entered before all encoder/source commits");
+                            assert!(pending.is_empty());
+                        }
+                        Step::Attention { unit, layer } if unit == replay => replay_layers.push(layer),
+                        Step::Send { unit, layer } => {
+                            pending.push_back((unit, layer));
+                            assert!(pending.len() <= waves);
+                        }
+                        Step::Land { unit, layer } => assert_eq!(pending.pop_front(), Some((unit, layer))),
+                        Step::End { unit } if unit == replay => {
+                            assert_eq!(replay_layers, (20..40).collect::<Vec<_>>());
+                            assert!(pending.is_empty());
+                        }
+                        Step::Commit { unit } => {
+                            assert_eq!(unit, committed);
+                            committed += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                assert_eq!(committed, units.len());
+            }
+        }
+        assert!(decoder_unit(0, 0..0).is_err());
+        assert!(decoder_unit(0, 0..129).is_err());
+        Ok(())
+    }
 
     #[test]
     fn encoder_units_preserve_cuts_and_ced_layer_barrier() -> Result<()> {
