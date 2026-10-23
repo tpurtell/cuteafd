@@ -54,6 +54,19 @@ pub(crate) struct Qwen4Prefix<'e, 'a> {
 }
 
 impl<'e, 'a> Qwen4Prefix<'e, 'a> {
+    /// Resolve the real owner geometry without allocating the mark arenas.
+    pub(super) fn geometry(engine: &Qwen4Engine<'_>) -> Result<FamilyLayout> {
+        let paged = engine.paged_buffers();
+        ensure!(!paged.is_empty(), "Qwen 3.8 Flash Next without a full-attention layer");
+        let regions = engine.snapshot_regions(0);
+        let mark = MarkLayout::new(&regions.iter().map(|r| (r.device_id, r.bytes)).collect::<Vec<_>>())?;
+        ensure!(mark.bytes > 0, "Qwen 3.8 Flash Next without GDN state");
+        Ok(FamilyLayout { page_rows: UNIT_ROWS, pages: engine.pool_pages,
+            page_bytes: paged.len() * (UNIT_ROWS * (engine.kv_record_bytes + KEY_BYTES) + POOL_PAGE_BYTES),
+            mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
+            mark_store: MarkStore::Arena, page_owners: Default::default() })
+    }
+
     /// The family over `engine`'s buffers with a device arena of `slots(mark_bytes)` marks.
     pub fn new(engine: &'e Qwen4Engine<'a>, slots: impl FnOnce(usize) -> usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");

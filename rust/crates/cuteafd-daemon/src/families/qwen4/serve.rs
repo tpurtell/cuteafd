@@ -190,6 +190,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
         let slots = prefix.mark_rule(max_sequences).slots(mark);
         args.planner_prefix_bytes = Some(slots as u64 * mark as u64);
     }
+    args.planner_host_prefix = Some((prefix.clone(), max_sequences.min(DECODE_ROWS)));
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine| {
         anyhow::ensure!(engine.weights.layers.len() == engine.cfg.layers, "serve-qwen4 needs every layer");
@@ -231,12 +232,10 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
 /// its mark arena sized for `lanes` decoding sequences.
 fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: usize)
     -> Result<(Qwen4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>, super::prefix::Frontier>)> {
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_rows } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     anyhow::ensure!(args.prefix_partial == Toggle::Off, "Qwen 3.8 Flash Next restores exact snapshots only (GDN state)");
     let family = Qwen4Prefix::new(engine, |mark| args.mark_rule(lanes).slots(mark))?;
-    let host = args.host_config(family.layout(), engine.max_context, lanes)?.map(|config|
+    let host = engine.host_prefix_config.clone().map(|config|
         CudaCopyEngine::registered_owned(engine.library, family.snapshot_owners()).map(|copy| (config, copy)))
         .transpose()?;
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);

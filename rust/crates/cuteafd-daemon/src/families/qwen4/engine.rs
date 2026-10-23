@@ -1022,6 +1022,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub max_context: usize,
     pub prefill_rows: usize,
     pub(super) prefill_shape: Option<cuteafd_loader::serving_capacity::PrefillShape>,
+    pub(super) host_prefix_config: Option<cuteafd_hostcache::config::Config>,
+    host_memory_admitted: bool,
     request_id: Cell<u64>,
     pub pages: usize,
     pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -1252,7 +1254,7 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
@@ -1306,6 +1308,60 @@ impl<'a> Qwen4Engine<'a> {
         self.hops = Some(link);
         self.experts = Some(Experts::Tp2 { routed: RefCell::new(routed), mtp });
         Ok(())
+    }
+
+    /// Admit all still-lazy host consumers, including a frozen serving cache quota.
+    pub(super) fn admit_host_memory(&mut self, args: &super::EngineArgs) -> Result<()> {
+        ensure!(!self.host_memory_admitted, "Qwen host memory was already admitted");
+        let (config, scoring, headroom) = match &args.planner_host_prefix {
+            Some((prefix, lanes)) => {
+                let prefix = prefix.with_scoring(if args.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS },
+                    self.prefill_rows, self.cfg.vocab_size)?;
+                let layout = super::prefix::Qwen4Prefix::geometry(self)?;
+                (prefix.resolve_host_config(layout, self.max_context, *lanes)?, prefix.scoring_host_bytes,
+                    prefix.host_cache_headroom_bytes)
+            }
+            None => (None, cuteafd_core::memory_layout::host_logits_bytes(
+                if args.full_prefill_logits { self.prefill_rows } else { DECODE_ROWS } as u64,
+                self.prefill_rows as u64, self.cfg.vocab_size as u64).context("Qwen host scoring overflow")?, 0),
+        };
+        let tables = self.future_host_workspaces(args.full_prefill_logits)?;
+        let views: Vec<_> = tables.iter().map(|(name, bytes)| (name.as_str(), *bytes)).collect();
+        crate::shared::memory::budget::admit_host_memory(config.as_ref().map_or(0, |c| c.bytes),
+            &views, scoring, headroom)?;
+        self.host_prefix_config = config;
+        self.host_memory_admitted = true;
+        Ok(())
+    }
+
+    fn future_host_workspaces(&self, full_logits: bool) -> Result<Vec<(String, u64)>> {
+        use super::admission::HostWorkspaceBytes;
+        let mut demands = Vec::new();
+        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
+        let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
+        for owner in 0..self.gdn_banks.len() {
+            for decode in [false, true] {
+                if self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }
+                let rows = if decode { DECODE_ROWS } else { self.prefill_shape
+                    .map_or(self.prefill_rows, |shape| shape.unit_rows as usize) };
+                let logits = if decode { DECODE_ROWS } else if full_logits { self.prefill_rows } else { 1 };
+                let host = HostWorkspaceBytes::new(&self.cfg, rows, decode, self.pages, self.pool_pages,
+                    spark, self.spark_bf16, !decode && self.prefill_shape.is_some(), ple_ids, logits)?;
+                let label = format!("qwen4/owner-{owner}/{}", if decode { "decode" } else { "prefill" });
+                for (kind, bytes) in [("router", host.router), ("staging", host.staging),
+                    ("ordered-tables", host.ordered), ("pinned-logits", host.logits)] {
+                    if bytes > 0 { demands.push((format!("{label}/{kind}"), bytes)); }
+                }
+            }
+        }
+        if self.prefill_shape.is_some() && self.weights.mtp.is_some() && self.mtp_prefill_workspace.borrow().is_none() {
+            let host = HostWorkspaceBytes::new(&self.cfg, self.mtp_prefill_rows(), false,
+                self.pages, self.pool_pages, spark, self.spark_bf16, false, ple_ids, 1)?;
+            for (kind, bytes) in [("router", host.router), ("staging", host.staging), ("pinned-logits", host.logits)] {
+                demands.push((format!("qwen4/owner-0/mtp-prefill/{kind}"), bytes));
+            }
+        }
+        Ok(demands)
     }
 
     /// Size every unit-table upload before a request can queue prefill work.
@@ -1950,9 +2006,11 @@ impl<'a> Qwen4Engine<'a> {
         }
         let topk_scratch = self.scratch(&format!("qwen4_index_topk_{cap}")).unwrap_or(0);
         let blocks = self.cfg.index_budget / BLOCK;
-        let table_rows = if decode { t } else { 1 };
         let head_workspace = self.alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let spark = matches!(self.experts, Some(Experts::Spark { .. }));
+        let tables = super::admission::StepTableBytes::new(t, decode, self.pages, self.pool_pages, self.cfg.ple_rows())?;
+        let host = super::admission::HostWorkspaceBytes::new(&self.cfg, t, decode, self.pages, self.pool_pages,
+            spark, self.spark_bf16, false, false, logit_rows)?;
         let (topk, heads, hd) = (self.cfg.topk, self.cfg.heads, self.cfg.head_dim);
         Ok(Workspace {
             rows: t, slot_rows: span, row_offset: Cell::new(0), position: Cell::new(0), units: Cell::new(false),
@@ -1962,17 +2020,17 @@ impl<'a> Qwen4Engine<'a> {
             delta: self.alloc(span * h * 2)?,
             shared: self.alloc(span * h * 2)?,
             routed: self.alloc(t * h * 2)?,
-            positions: self.alloc(t * 8)?,
-            rope_positions: self.alloc(t * 12)?,
-            block_rope_positions: self.alloc(t * 12)?,
-            kv_slots: self.alloc(t * 8)?,
-            slots: self.alloc(t * 4)?,
-            seq_first: self.alloc(t * 4)?,
-            pool_slots: self.alloc(t * 8)?,
-            cache_lengths: self.alloc(t * 4)?,
-            page_table: self.alloc(table_rows * self.pages * 4)?,
-            pool_table: self.alloc(table_rows * self.pool_pages * 4)?,
-            ple_ids: self.alloc(t * self.cfg.ple_rows() * 8)?,
+            positions: self.alloc(tables.positions)?,
+            rope_positions: self.alloc(tables.rope_positions)?,
+            block_rope_positions: self.alloc(tables.block_rope_positions)?,
+            kv_slots: self.alloc(tables.kv_slots)?,
+            slots: self.alloc(tables.slots)?,
+            seq_first: self.alloc(tables.seq_first)?,
+            pool_slots: self.alloc(tables.pool_slots)?,
+            cache_lengths: self.alloc(tables.cache_lengths)?,
+            page_table: self.alloc(tables.page_table)?,
+            pool_table: self.alloc(tables.pool_table)?,
+            ple_ids: self.alloc(tables.ple_ids)?,
             ple_rows: match self.ple.as_ref() {
                 Some(ple) => {
                     let n = t * self.cfg.ple_rows();
@@ -2003,16 +2061,13 @@ impl<'a> Qwen4Engine<'a> {
             route_ids: self.alloc(t * topk * 4)?,
             route_weights: self.alloc(t * topk * 4)?,
             wire: self.alloc(t * (h + h / 32))?,
-            router_host: RefCell::new(HostAllocation::new(self.library,
-                if spark { t * (topk * 8 + if self.spark_bf16 { h * 2 } else { h + h / 32 }) } else { 256 })?),
+            router_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.router)?)?),
             hidden_rows: self.alloc(t * 4)?,
             argmax: self.alloc(logit_rows * 8)?,
-            ids: self.alloc(t * 4)?,
+            ids: self.alloc(tables.ids)?,
             select: self.alloc(logit_rows * 8)?,
-            logits_host: RefCell::new(HostAllocation::new(self.library, logit_rows * self.cfg.vocab_size * 4)?),
-            staging: RefCell::new((HostAllocation::new(self.library, 16 * 16
-                + t * (8 * 3 + 4 * 4 + 24 + self.cfg.ple_rows() * 8 + (HC + 1) * h * 2)
-                + table_rows * (self.pages + self.pool_pages) * 4)?, 0)),
+            logits_host: RefCell::new(HostAllocation::new(self.library, usize::try_from(host.logits)?)?),
+            staging: RefCell::new((HostAllocation::new(self.library, usize::try_from(host.staging)?)?, 0)),
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, logit_rows as u32,
                 self.cfg.vocab_size as u32)? },

@@ -60,6 +60,9 @@ pub(crate) struct EngineArgs {
     /// Serving graph modes, set before weight/KV admission; diagnostics stay lazy.
     #[arg(skip)]
     pub planner_graph_modes: Option<(usize, bool)>,
+    /// Resolve the serving host quota once the final pool and context are known.
+    #[arg(skip)]
+    pub planner_host_prefix: Option<(crate::shared::prefix::PrefixArgs, usize)>,
     /// Sequences with GDN/PLE state (about 115 MiB each).
     #[arg(long, default_value_t = 8)]
     pub slots: usize,
@@ -687,6 +690,7 @@ impl Opened {
         if let Some(budget) = args.l2.budget(&self.library, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
             engine.l2 = Some(crate::shared::l2_prefetch::L2Prefetch::new(&self.library, budget, &engine.decode_read_order())?);
         }
+        engine.admit_host_memory(args)?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.prepare_prefill_units()?;
         let result = body(&engine);

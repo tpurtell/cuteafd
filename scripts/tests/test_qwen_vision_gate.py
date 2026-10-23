@@ -233,6 +233,42 @@ def test_qwen_unit_table_uploads_are_reserved_at_full_extent_before_startup_body
     assert units.index("self.prepare_prefill_units()?") < units.index("run_prefill_units(&mut hooks")
 
 
+def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
+    root = ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4"
+    engine = (root / "engine.rs").read_text()
+    for filename in ["mod.rs", "dual.rs"]:
+        startup = (root / filename).read_text()
+        assert startup.count("engine.admit_host_memory(args)?;") == 1
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("engine.prepare_scoring_prefill()?")
+        assert startup.index("engine.admit_host_memory(args)?;") < startup.index("let result = body(&engine);")
+
+    admit = engine[engine.index("    pub(super) fn admit_host_memory("):engine.index("    fn future_host_workspaces(")]
+    assert "!self.host_memory_admitted" in admit
+    assert "prefix.resolve_host_config(layout, self.max_context, *lanes)?" in admit
+    assert admit.index("self.future_host_workspaces(") < admit.index("budget::admit_host_memory(")
+    assert "config.as_ref().map_or(0, |c| c.bytes)" in admit
+    assert admit.index("budget::admit_host_memory(") < admit.index("self.host_prefix_config = config;")
+    assert "self.host_memory_admitted = true;" in admit
+
+    future = engine[engine.index("    fn future_host_workspaces("):engine.index("    /// Size every unit-table upload")]
+    assert "for owner in 0..self.gdn_banks.len()" in future
+    assert "for decode in [false, true]" in future
+    assert "self.workspace_slot(owner, decode)?.borrow().is_some() { continue; }" in future
+    for field in ["host.router", "host.staging", "host.ordered", "host.logits"]:
+        assert field in future
+    assert "self.mtp_prefill_workspace.borrow().is_none()" in future
+    assert "self.mtp_prefill_rows()" in future
+    assert "ple.mapped()" in future
+    assert "HostAllocation::new" not in future
+
+    serve = (root / "serve.rs").read_text()
+    assert "args.planner_host_prefix = Some((prefix.clone(), max_sequences.min(DECODE_ROWS)));" in serve
+    cache = serve[serve.index("fn prefix_cache"):]
+    assert "engine.host_prefix_config.clone().map(|config|" in cache
+    assert ".host_config(" not in cache and ".resolve_host_config(" not in cache
+    assert ".with_scoring(" not in cache
+
+
 def test_qwen_graph_stats_are_published_before_ready_and_on_every_update():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
