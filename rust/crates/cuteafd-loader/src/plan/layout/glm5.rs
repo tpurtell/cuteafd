@@ -66,8 +66,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &working,
-        spark_endpoints("glm5", lanes), &mut waste, &mut notes);
+    let mut sparks = spark_devices(report, model, options, SPARK, &working,
+        &spark_endpoints("glm5", lanes, options.spark_capacity_rows as u32, checkpoint.spark_input_is_bf16()), &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
     match placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(), shape.prefill_rows,
@@ -118,7 +118,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
     report.prefill_transports = Some(working.prefill_lanes);
     // Reapply after admission has selected its executable suffix and lane count.
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &working, spark_endpoints("glm5", working.prefill_lanes),
+    charge_spark_devices(report, model, options, SPARK, &working, &spark_endpoints("glm5", working.prefill_lanes, options.spark_capacity_rows as u32, checkpoint.spark_input_is_bf16()),
         &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));
     if report.encoder.is_none() {
         resolve_encoder(report, &Towers::checkpoint(report), &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);

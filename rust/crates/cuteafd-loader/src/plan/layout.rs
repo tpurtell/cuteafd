@@ -5,6 +5,7 @@
 //! same placement request its runtime admits.
 use super::{Component, ExpertPlacement, Owner, PlanReport, Status};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout, Waste};
+use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
 
 pub(crate) mod deepseek_v4;
 pub(crate) mod glm5_flash;
@@ -327,12 +328,10 @@ mod scoring_workspace_tests {
     }
 }
 
-/// Ring endpoints a family's coordinator opens to each selected Spark rank,
-/// given its prefill lanes (V4/V4.1: two fixed; GLM 5.3: one decode endpoint
-/// plus one per lane when lanes run in parallel; GLM Flash/MiMo: one per lane;
-/// Qwen: one).
-pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
-    match family {
+/// Existing homogeneous endpoint contracts. Families with mixed capacities or
+/// ring depths supply their own endpoint list to the same accounting path.
+pub fn spark_endpoints(family: &str, lanes: u64, capacity: u32, bf16: bool) -> Vec<SparkEndpoint> {
+    let count = match family {
         "deepseek_v41" | "deepseek_v4" => 2,
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 1 + usize::from(lanes > 1),
@@ -340,7 +339,9 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         "mimo_v2" => lanes as usize,
         "qwen4" => 1,
         _ => 0,
-    }
+    };
+    vec![SparkEndpoint { capacity, ring_depth: None,
+        ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 } }; count]
 }
 
 /// The selected ring geometry for `endpoints` coordinator endpoints per rank.
@@ -353,12 +354,15 @@ pub fn spark_ring_geometry(endpoints: usize) -> crate::placement::SparkRingGeome
 /// selected rank's explicit allocations. BF16 replaces input bytes; it is not
 /// a second wire buffer or an RTX/world-size side subtraction.
 pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placement::SparkWorkingSet,
-    geometry: cuteafd_core::ExpertGeometry, capacity: u32, bf16: bool,
-    rings: crate::placement::SparkRingGeometry, wave_allowance: u64)
+    geometry: cuteafd_core::ExpertGeometry, endpoints: &[SparkEndpoint],
+    rings: SparkRings, wave_allowance: u64)
     -> Result<(), crate::placement::PlacementError> {
     let rank = device.index as usize;
-    let io = working.rank_io(rank, geometry, capacity, bf16, rings)?;
-    let legacy = working.rank_io(rank, geometry, capacity, false, rings)?;
+    let io = working.rank_endpoints_io(rank, geometry, endpoints, rings)?;
+    let legacy_endpoints = endpoints.iter().map(|endpoint| SparkEndpoint {
+        ingress: SparkIngress::Fp8K32, ..*endpoint
+    }).collect::<Vec<_>>();
+    let legacy = working.rank_endpoints_io(rank, geometry, &legacy_endpoints, rings)?;
     let legacy_io = legacy.intake.checked_add(legacy.host_exchange)
         .and_then(|bytes| bytes.checked_add(legacy.row_indices))
         .ok_or(crate::placement::PlacementError::Overflow("Spark legacy I/O"))?;
@@ -369,7 +373,10 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
         device.items.push(cuteafd_core::memory_layout::spark_runtime_residual());
         device.items.push(Item::new(Category::Workspace, "expert waves", "non-I/O residual",
             wave_allowance.saturating_sub(legacy_io), Basis::Calibrated));
-        device.items.push(Item::new(Category::Workspace, "expert intake", if bf16 { "BF16" } else { "FP8 K32" },
+        let format = if endpoints.iter().all(|e| e.ingress == SparkIngress::Bf16) { "BF16" }
+            else if endpoints.iter().all(|e| e.ingress == SparkIngress::Fp8K32) { "FP8 K32" }
+            else { "mixed endpoint ingress" };
+        device.items.push(Item::new(Category::Workspace, "expert intake", format,
             io.intake, Basis::Formula));
         device.items.push(Item::new(Category::Workspace, "host expert exchange", "", io.host_exchange, Basis::Formula));
         device.items.push(Item::new(Category::Workspace, "expert row indices", "", io.row_indices, Basis::Formula));
@@ -396,12 +403,13 @@ mod selected_spark_io_tests {
         ] {
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
                 prefill_lanes: lanes, ..Default::default() };
-            let rings = spark_ring_geometry(spark_endpoints(family, lanes));
-            let io = working.rank_io(0, geometry, 4096, false, rings).unwrap();
+            let endpoints = spark_endpoints(family, lanes, 4096, false);
+            let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            let io = working.rank_endpoints_io(0, geometry, &endpoints, rings).unwrap();
             assert_eq!(io.mapped_rings, expected);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
                 capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
-            charge_spark_io(&mut device, &working, geometry, 4096, false, rings, GIB).unwrap();
+            charge_spark_io(&mut device, &working, geometry, &endpoints, rings, GIB).unwrap();
             assert_eq!(device.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes, expected);
             let residual = device.items.iter().find(|item|
                 item.group == cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_GROUP).unwrap();
@@ -413,29 +421,94 @@ mod selected_spark_io_tests {
     }
 
     #[test]
+    fn homogeneous_endpoint_items_are_byte_identical_to_legacy_charges() {
+        for (family, geometry, lanes) in [
+            ("deepseek_v41", ExpertGeometry::DEEPSEEK_V41, 2),
+            ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_FLASH, 2),
+            ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 2),
+            ("glm5", ExpertGeometry::GLM5, 3),
+            ("glm5_flash", ExpertGeometry::GLM5_FLASH, 2),
+            ("mimo_v2", ExpertGeometry::MIMO_V26_PRO, 3),
+            ("qwen4", ExpertGeometry::QWEN4, 1),
+            ("qwen4", ExpertGeometry::KIMI_K3, 1),
+        ] {
+            for capacity in [256, 2048, 4096] {
+                for bf16 in [false, true] {
+                    let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
+                        prefill_lanes: lanes, ..Default::default() };
+                    let endpoints = spark_endpoints(family, lanes, capacity, bf16);
+                    let old_rings = spark_ring_geometry(endpoints.len());
+                    let io = working.rank_io(0, geometry, capacity, bf16, old_rings).unwrap();
+                    let legacy = working.rank_io(0, geometry, capacity, false, old_rings).unwrap();
+                    let expected = vec![cuteafd_core::memory_layout::spark_runtime_residual(),
+                        Item::new(Category::Workspace, "expert waves", "non-I/O residual",
+                            GIB.saturating_sub(legacy.intake + legacy.host_exchange + legacy.row_indices), Basis::Calibrated),
+                        Item::new(Category::Workspace, "expert intake", if bf16 { "BF16" } else { "FP8 K32" }, io.intake, Basis::Formula),
+                        Item::new(Category::Workspace, "host expert exchange", "", io.host_exchange, Basis::Formula),
+                        Item::new(Category::Workspace, "expert row indices", "", io.row_indices, Basis::Formula),
+                        Item::new(Category::Transport, "endpoint response prefixes", "", io.endpoint_staging, Basis::Formula),
+                        Item::new(Category::Transport, "rdma rings", "", io.mapped_rings, Basis::Formula)];
+                    let rings = SparkRings { max_frame_bytes: old_rings.max_frame_bytes, depth: old_rings.depth,
+                        slot_bytes: old_rings.slot_bytes, alignment: old_rings.alignment };
+                    assert_eq!(working.rank_endpoints_io(0, geometry, &endpoints, rings).unwrap(), io);
+                    let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+                        capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+                    charge_spark_io(&mut device, &working, geometry, &endpoints, rings, GIB).unwrap();
+                    assert_eq!(serde_json::to_vec(&device.items).unwrap(), serde_json::to_vec(&expected).unwrap(),
+                        "{family} {capacity} BF16={bf16}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_v41_depths_charge_one_shared_intake_and_independent_rings() {
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
+            prefill_lanes: 2, ..Default::default() };
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        for bf16 in [false, true] {
+            let endpoints = crate::placement::families::deepseek_v41::owners::spark_endpoints(4096, bf16, 2, 0).unwrap();
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0,
+                capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
+            charge_spark_io(&mut device, &working, geometry, &endpoints, rings, GIB).unwrap();
+            let bytes = |name| device.items.iter().find(|item| item.group == name).unwrap().bytes;
+            let fixed = working.rank_endpoints_io(0, geometry, &endpoints[..2], rings).unwrap();
+            assert_eq!(bytes("expert intake"), fixed.intake);
+            assert_eq!(bytes("host expert exchange"), fixed.host_exchange);
+            assert_eq!(bytes("rdma rings") - fixed.mapped_rings,
+                endpoints[2].ring_bytes(geometry, rings).unwrap() as u64);
+            assert_eq!(bytes("endpoint response prefixes") - fixed.endpoint_staging,
+                endpoints[2].response_prefix_bytes().unwrap() as u64);
+        }
+    }
+
+    #[test]
     fn bf16_replaces_selected_rank_intake_and_empty_selection_has_no_io() {
         for (family, geometry, lanes) in [("deepseek_v41", ExpertGeometry::DEEPSEEK_V41, 1),
             ("glm5", ExpertGeometry::GLM5, 3), ("glm5_flash", ExpertGeometry::GLM5_FLASH, 2),
             ("qwen4", ExpertGeometry::QWEN4, 1)] {
             let mut working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 6,
                 prefill_lanes: lanes, ..Default::default() };
-            let rings = spark_ring_geometry(spark_endpoints(family, lanes));
+            let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+            let endpoints = spark_endpoints(family, lanes, 4096, false);
+            let bf16_endpoints = spark_endpoints(family, lanes, 4096, true);
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 5,
                 capacity_bytes: 121 * GIB, items: vec![], kv_tokens: 0 };
             let wave = GIB;
-            charge_spark_io(&mut device, &working, geometry, 4096, false, rings, wave).unwrap();
+            charge_spark_io(&mut device, &working, geometry, &endpoints, rings, wave).unwrap();
             let wire = device.items.iter().find(|item| item.group == "expert intake").unwrap().bytes;
-            charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
+            charge_spark_io(&mut device, &working, geometry, &bf16_endpoints, rings, wave).unwrap();
             let bf16 = device.items.iter().find(|item| item.group == "expert intake").unwrap().bytes;
             assert_eq!(bf16 - wire, 4096 * (geometry.hidden as u64 - geometry.hidden as u64 / 32));
             assert_eq!(device.items.iter().filter(|item| item.group == "rdma rings").count(), 1);
             working.spark_layers.clear();
-            charge_spark_io(&mut device, &working, geometry, 4096, true, rings, wave).unwrap();
+            charge_spark_io(&mut device, &working, geometry, &bf16_endpoints, rings, wave).unwrap();
             assert!(device.items.is_empty());
         }
         let glm = crate::placement::families::glm5::prefill_lanes(4, glm_prefill_lanes(None) as u64);
-        assert_eq!(spark_endpoints("glm5", glm), 2);
-        assert_eq!(spark_endpoints("glm5", crate::placement::families::glm5::prefill_lanes(0, 3)), 1);
+        assert_eq!(spark_endpoints("glm5", glm, 4096, false).len(), 2);
+        assert_eq!(spark_endpoints("glm5", crate::placement::families::glm5::prefill_lanes(0, 3), 4096, false).len(), 1);
     }
 }
 
@@ -747,8 +820,8 @@ pub(crate) fn spark_geometry(model: &dyn super::FamilyModel) -> Option<cuteafd_c
 /// The Spark ranks of `report.placement`: host footprint, routed slices and
 /// worker runtime, then the selected rank I/O for `working`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
-    options: &LayoutOptions, charges: SparkCharges, working: &crate::placement::SparkWorkingSet, endpoints: usize,
+pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel,
+    options: &LayoutOptions, charges: SparkCharges, working: &crate::placement::SparkWorkingSet, endpoints: &[SparkEndpoint],
     waste: &mut Vec<Waste>, notes: &mut Vec<String>) -> Vec<DeviceLayout> {
     let ExpertPlacement::Sparks { ranks } = report.placement else { return Vec::new() };
     let routed: u64 = report.components.iter().filter(|c| c.owner == Owner::SparkSliced
@@ -767,7 +840,7 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
         device
     }).collect::<Vec<_>>();
     for device in &mut devices {
-        charge_spark_devices(report, model, checkpoint, options, charges, working, endpoints,
+        charge_spark_devices(report, model, options, charges, working, endpoints,
             std::slice::from_mut(device), notes, |device| format!("Spark rank {} I/O admission", device.index));
         device.items.push(Item::new(Category::Runtime, "context+modules", "", 512 * MIB, charges.basis));
     }
@@ -778,15 +851,15 @@ pub(crate) fn spark_devices(report: &mut PlanReport, model: &dyn super::FamilyMo
 /// (Re)charges each Spark rank's selected I/O for `working`, after family
 /// admission has selected its Spark layers and lanes.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel, checkpoint: &super::Checkpoint,
-    options: &LayoutOptions, charges: SparkCharges, working: &crate::placement::SparkWorkingSet, endpoints: usize,
+pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::FamilyModel,
+    options: &LayoutOptions, charges: SparkCharges, working: &crate::placement::SparkWorkingSet, endpoints: &[SparkEndpoint],
     devices: &mut [DeviceLayout], notes: &mut Vec<String>, what: impl Fn(&DeviceLayout) -> String) {
     for device in devices {
         let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
             .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
                 .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
-                .and_then(|capacity| charge_spark_io(device, working, geometry, capacity,
-                    checkpoint.spark_input_is_bf16(), spark_ring_geometry(endpoints),
+                .and_then(|_| charge_spark_io(device, working, geometry, endpoints,
+                    SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
                     charges.wave_bytes * options.spark_capacity_rows / 4096)));
         if let Err(error) = io {
             report.placement_supported = false;
@@ -1181,7 +1254,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
 /// ledger. The OS sample excludes external consumers, not this unstarted server.
 pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
-    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+    use cuteafd_core::ExpertGeometry;
     use cuteafd_core::memory_layout::{HostLayout, ItemLifetime, host_logits_bytes};
     let Some(spec) = report.spec.as_ref() else { return Ok(()) };
     let family = report.family.as_deref().unwrap_or("");
@@ -1240,22 +1313,33 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
             topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,
             layers: u32::try_from(spec.layers.len())? };
-        let endpoints = spark_endpoints(family, lanes);
-        let bf16 = native || matches!(family, "glm5" | "qwen4");
-        let ingress = if native { SparkIngress::Fp8K32 } else if bf16 { SparkIngress::Bf16 }
-            else { SparkIngress::Fp8K32 };
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows)?, ingress };
-        let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
-        let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
-            depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-        let bytes = (endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64)
-            .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
-            .context("coordinator host rings overflow")?;
+        let bf16 = if family == "deepseek_v41" { checkpoint.spark_input_is_bf16() }
+            else { !native && matches!(family, "glm5" | "qwen4") };
+        let endpoints = if family == "deepseek_v41" {
+            crate::placement::families::deepseek_v41::owners::spark_endpoints(
+                u32::try_from(unit_rows)?, bf16, options.prefill_waves, 0)?
+        } else { spark_endpoints(family, lanes, u32::try_from(unit_rows)?, bf16) };
+        let max_frame_bytes = endpoints.iter().try_fold(64 << 20, |max, endpoint| {
+            let (request, response) = endpoint.wire_bytes(geometry).context("host wire size overflow")?;
+            Ok::<_, anyhow::Error>(max.max(request).max(response))
+        })?;
+        let rings = SparkRings { max_frame_bytes, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let bytes = endpoints.iter().try_fold(0u64, |sum, endpoint| {
+            let bytes = endpoint.ring_bytes(geometry, rings).context("host ring geometry overflow")? as u64;
+            sum.checked_add(bytes).context("coordinator host rings overflow")
+        })?.checked_mul(ranks as u64).context("coordinator host rings overflow")?;
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.
-        let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
-            .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))
-            .context("coordinator intake overflow")?;
+        // V4.1 keeps two fixed single-wave intakes and adds one N-wave FIFO.
+        // Its pinned upload staging is one rank plane, shared by the wave slots.
+        let intake = if family == "deepseek_v41" {
+            let owners = 2 + u64::from(options.prefill_waves > 1);
+            unit_rows.checked_mul(hidden).and_then(|n| n.checked_mul(2))
+                .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(owners))
+        } else {
+            intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
+                .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints.len() as u64))
+        }.context("coordinator intake overflow")?;
         push(Category::Transport, "spark-intake", "host-mode upper bound", intake, Basis::Estimated);
     }
     let work_rows = unit_rows.checked_mul(lanes).and_then(|n| n.checked_add(64)).context("host workspace rows overflow")?;

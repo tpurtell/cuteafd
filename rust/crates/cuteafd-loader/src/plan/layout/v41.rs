@@ -30,6 +30,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let waves = options.prefill_waves;
     ensure!((1..=2).contains(&waves), "V4.1 prefill waves must be 1 or 2");
     options.prefill_waves = waves;
+    report.prefill_transports = Some(2);
+    if waves > 1 || options.prefill_span_rows.is_some() {
+        report.prefill_span_rows = Some(options.prefill_span_rows.unwrap_or(16384));
+    }
     if !explicit_unit { options.prefill_unit_rows = Some(rows); }
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
     ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
@@ -142,8 +146,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     v41::cache_demands(&mut request, &checkpoint.config, shape.concurrency, turns, false)?;
     let mut placement = solve_with_weight_limit(&request, draft.as_ref(), options.weight_budget_bytes)?;
     let mut working = SparkWorkingSet { rtx_layers: (0..placement.onboard_layers).collect(),
-        spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: 1 };
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &working, 2, &mut waste, &mut notes);
+        spark_layers: (placement.onboard_layers..40).collect(), spark_ranks, prefill_lanes: 2 };
+    let endpoints = v41::owners::spark_endpoints(u32::try_from(rows)?, checkpoint.spark_input_is_bf16(), waves, 0)?;
+    let mut sparks = spark_devices(report, model, options, SPARK, &working, &endpoints, &mut waste, &mut notes);
     update_sparks(catalog, &working, &mut sparks)?;
     // A mandatory encoder displaces an optional expert prefix, not the pool.
     // Resolve its policy against only compulsory experts, then admit its owners.
@@ -175,8 +180,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     working.spark_layers = (placement.onboard_layers..40).collect();
     if working.spark_layers.is_empty() { sparks.clear(); }
     update_sparks(catalog, &working, &mut sparks)?;
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &working,
-        spark_endpoints("deepseek_v41", working.prefill_lanes), &mut sparks, &mut notes,
+    charge_spark_devices(report, model, options, SPARK, &working,
+        &endpoints, &mut sparks, &mut notes,
         |d| format!("Spark rank {} I/O admission", d.index));
     for spark in &mut sparks {
         for item in &mut spark.items {

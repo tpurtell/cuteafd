@@ -128,13 +128,13 @@ const SPARK_WAVE_BYTES: u64 = gib(51);
 /// format (`--expert-input`), beside the non-I/O wave residual.
 fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, options: &LayoutOptions,
     working: &crate::placement::SparkWorkingSet, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) {
-    let rings = spark_ring_geometry(spark_endpoints("mimo_v2", working.prefill_lanes));
+    let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     for device in sparks {
         let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
             .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
                 .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
-                .and_then(|capacity| charge_spark_io(device, working, geometry, capacity,
-                    options.mimo_expert_input.bf16(false), rings, SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)));
+                .and_then(|capacity| charge_spark_io(device, working, geometry,
+                    &spark_endpoints("mimo_v2", working.prefill_lanes, capacity, options.mimo_expert_input.bf16(false)), rings, SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)));
         if let Err(error) = io {
             report.placement_supported = false;
             notes.push(format!("{} I/O admission: {error}", device.name()));

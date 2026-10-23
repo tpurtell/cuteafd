@@ -242,8 +242,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                         intermediate: moe.intermediate as u32, layers: model.spec().layers.len() as u32 };
                     u32::try_from(options.spark_capacity_rows)
                         .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
-                        .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,
-                            checkpoint.spark_input_is_bf16(), spark_ring_geometry(spark_endpoints("glm5_flash", working.prefill_lanes)),
+                        .and_then(|capacity| charge_spark_io(&mut device, &working, geometry,
+                            &spark_endpoints("glm5_flash", working.prefill_lanes, capacity, checkpoint.spark_input_is_bf16()),
+                            SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
                             gib(56) * options.spark_capacity_rows / 4096))
                 });
             if let Err(error) = io {
