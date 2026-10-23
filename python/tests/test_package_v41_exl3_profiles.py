@@ -151,6 +151,8 @@ class PackageProfileTests(unittest.TestCase):
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
                 meta.update(descriptor_rows=7, native_info_version=3)
+            if 'warp_specialized' in options:
+                meta['warp_specialized'] = options['warp_specialized']
             if 'token_major_rotation' in options:
                 meta['token_major_rotation'] = options['token_major_rotation']
             if 'route_block' in options:
@@ -287,6 +289,34 @@ class PackageProfileTests(unittest.TestCase):
                     self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
                     self.assertNotIn('token_major_rotation', call.kwargs)
             self.assertEqual(len(selected), 6)  # TP3/TP4, three prefill capacities.
+
+    def test_compact_ws_verifier_rejects_unqualified_execution_contracts(self):
+        cases = [
+            ('qwen4', 256, 256, {'route_block': 64}),
+            ('qwen4', 256, 256, {'token_major_rotation': True}),
+            ('qwen4', 256, 256, {'fused_input_rotation': True}),
+            ('qwen4', 256, 80, {}),
+            ('qwen4', 384, 256, {}),
+            ('v41', 640, 256, {}),
+        ]
+        for geometry, width, capacity, overrides in cases:
+            with self.subTest(geometry=geometry, width=width, capacity=capacity,
+                              overrides=overrides), tempfile.TemporaryDirectory() as temporary:
+                output, manifest, _, _ = self.build_fixture(
+                    Path(temporary), 'spark', (4, 5), geometry=geometry,
+                    capacities=(capacity,), compact=True)
+                variant = next(v for v in manifest['variants']
+                               if '-compact-' in v['directory'] and v['intermediate'] == width)
+                path = output / variant['directory'] / 'v41_exl3.json'
+                meta = json.loads(path.read_text())
+                meta.update(warp_specialized=True, route_block=32)
+                meta.update(overrides)
+                path.write_text(json.dumps(meta))
+                manifest['files'][str(path.relative_to(output))] = {
+                    'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+                (output / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'invalid compact geometry or execution contract'):
+                    package.verify(output)
 
     def test_compact_ws_policy_excludes_unmeasured_widths_and_families(self):
         for geometry in package.GEOMETRIES:

@@ -98,7 +98,13 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
                     or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
-                    or meta.get('warp_specialized', False) or meta.get('decode_schedule') is not None
+                    or (meta.get('warp_specialized', False) and (
+                        not compact_warp_specialized(geometry, manifest['role'],
+                                                     meta['intermediate'], meta['capacity'])
+                        or meta.get('route_block', 8) != 32
+                        or meta.get('token_major_rotation', False)
+                        or meta.get('fused_input_rotation', False)))
+                    or meta.get('decode_schedule') is not None
                     or meta.get('input_format', 'bf16') != 'bf16'):
                 raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
