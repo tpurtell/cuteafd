@@ -300,6 +300,23 @@ struct StepTables {
     ple_ids: Vec<i64>,
 }
 
+impl StepTables {
+    fn unit(&self, rows: std::ops::Range<usize>, ple_rows: usize, dense_context: usize) -> Self {
+        let n = rows.len();
+        let positions = self.positions[rows.clone()].to_vec();
+        Self { long: positions.iter().any(|&p| p as usize + 1 > dense_context), positions,
+            rope_positions: self.rope_positions[rows.clone()].to_vec(),
+            block_rope_positions: self.block_rope_positions[rows.clone()].to_vec(),
+            kv_slots: self.kv_slots[rows.clone()].to_vec(), slots: self.slots[rows.clone()].to_vec(),
+            seq_first: vec![0; n], pool_slots: self.pool_slots[rows.clone()].to_vec(),
+            cache_lengths: self.cache_lengths[rows.clone()].to_vec(),
+            page_table: self.page_table.clone(), pool_table: self.pool_table.clone(),
+            page_width: self.page_width, pool_width: self.pool_width,
+            ple_ids: self.ple_ids[rows.start * ple_rows..rows.end * ple_rows].to_vec(),
+            ..Default::default() }
+    }
+}
+
 /// A sequence's allocation units (and the record and pool pages they expand to), its GDN/PLE
 /// state slot, its length, the rows its state holds and its n-gram history.
 #[derive(Debug, Clone)]
@@ -634,6 +651,10 @@ impl Allocator {
 
 struct Workspace<'a> {
     rows: usize,
+    slot_rows: usize,
+    row_offset: Cell<usize>,
+    position: Cell<usize>,
+    units: Cell<bool>,
     streams: [Dev<'a>; 2],
     inject: Dev<'a>,
     x: Dev<'a>,
@@ -686,6 +707,18 @@ struct Workspace<'a> {
     logits_host: RefCell<HostAllocation<'a>>,
     head: VocabularyHead<'a>,
     _head_workspace: Dev<'a>,
+}
+
+impl Workspace<'_> {
+    fn live(&self, buffer: &Dev<'_>, stride: usize) -> *mut c_void {
+        self.live_buffer(buffer, stride).ptr
+    }
+    fn live_buffer(&self, buffer: &Dev<'_>, stride: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        let offset = self.row_offset.get() * stride;
+        assert!(offset < buffer.buffer.bytes);
+        cuteafd_ffi::CuteafdDeviceBuffer { ptr: buffer.buffer.ptr.wrapping_byte_add(offset),
+            bytes: buffer.buffer.bytes - offset, ..buffer.buffer }
+    }
 }
 
 /// One MTP row: the pair (target or draft pre-mixer streams at `position`,
@@ -973,6 +1006,8 @@ pub(crate) struct Qwen4Engine<'a> {
     pub stream: *mut c_void,
     pub max_context: usize,
     pub prefill_rows: usize,
+    pub(super) prefill_shape: Option<cuteafd_loader::serving_capacity::PrefillShape>,
+    request_id: Cell<u64>,
     pub pages: usize,
     pub kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     pub kv_record_bytes: usize,
@@ -995,6 +1030,7 @@ pub(crate) struct Qwen4Engine<'a> {
     mtp_pending: Option<Dev<'a>>,
     /// Where the last step left its final streams (decode, stream buffer).
     last_streams: std::cell::Cell<(bool, usize)>,
+    last_stream_offset: Cell<usize>,
     /// Where the last MTP step left its output streams (decode, stream buffer).
     mtp_streams: std::cell::Cell<(bool, usize)>,
     /// Logical page of each pool-cache page within its sequence, and its host copy (a shared
@@ -1200,9 +1236,9 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let pool_logical = zeroed(pool_pages * 4)?;
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
-            last_streams: std::cell::Cell::new((false, 0)), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
+            last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)), pool_logical,
             pool_logical_host: RefCell::new(vec![0; pool_pages]), pool_pages, workspace: RefCell::new(None),
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
             peer_decode_workspace: RefCell::new(None), experts: None, hops: None, profile: RefCell::new([0.0; 2]), draft_probes: RefCell::new(Vec::new()),
@@ -2331,12 +2367,12 @@ impl<'a> Qwen4Engine<'a> {
             MtpSource::Chain => {
                 let (d, cur) = self.mtp_streams.get();
                 ensure!(d == decode, "an MTP chain step follows an MTP step in the same workspace");
-                (w.streams[cur].buffer.ptr, cur ^ 1)
+                (w.live(&w.streams[cur], HC * self.cfg.hidden * 2), cur ^ 1)
             }
             MtpSource::Target => {
                 let (d, cur) = self.last_streams.get();
                 ensure!(d == decode, "the MTP reads the last target step of the same workspace");
-                (w.streams[cur].buffer.ptr, cur ^ 1)
+                (w.live(&w.streams[cur], HC * self.cfg.hidden * 2), cur ^ 1)
             }
         };
         // Staged bytes (16-byte aligned tables, then the embedding rows at most).
@@ -2364,7 +2400,7 @@ impl<'a> Qwen4Engine<'a> {
                 // SAFETY: the drafts of `step` and the staged indices are ordered on this
                 // stream before the gather; `x` holds t rows.
                 unsafe { self.embedding.embed_device_ids(drafts, Some((w.ids.buffer.ptr.cast_const(), index)), t, 1,
-                    None, w.x.buffer, self.execution_stream())? };
+                    None, w.live_buffer(&w.x, self.cfg.hidden * 2), self.execution_stream())? };
             }
         }
         if matches!(tokens, MtpTokens::Host(_)) && groups.iter().any(|group| group.placement.media.as_ref()
@@ -2375,10 +2411,10 @@ impl<'a> Qwen4Engine<'a> {
         let rows = Scalar::I32(t as i32);
         let cap = if decode { "m64" } else { "m4096" };
         self.run("qwen4_mtp_feedback", &[("hidden", src), ("hidden_rows", w.hidden_rows.buffer.ptr),
-            ("embed", w.x.buffer.ptr), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
+            ("embed", w.live(&w.x, self.cfg.hidden * 2)), ("norm_hidden", mtp.norm_hidden.buffer.ptr),
             ("norm_embed", mtp.norm_embed.buffer.ptr), ("fc_hidden", mtp.fc_hidden.buffer.ptr),
-            ("fc_embed", mtp.fc_embed.buffer.ptr), ("streams", w.streams[dst].buffer.ptr),
-            ("delta", w.delta.buffer.ptr), ("inject", w.inject.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            ("fc_embed", mtp.fc_embed.buffer.ptr), ("streams", w.live(&w.streams[dst], HC * self.cfg.hidden * 2)),
+            ("delta", w.live(&w.delta, self.cfg.hidden * 2)), ("inject", w.live(&w.inject, HC * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])?;
         // The embedding branch joins every stream (unit injection), then the attention site.
         self.post_pre(w, dst, &mtp.layer, "attn", rows)?;
@@ -2392,8 +2428,8 @@ impl<'a> Qwen4Engine<'a> {
             return Ok((Vec::new(), None));
         }
         let [norm, down, up] = &mtp.mixer;
-        self.run("qwen4_head", &[("streams", w.streams[out].buffer.ptr), ("norm", norm.buffer.ptr),
-            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.x.buffer.ptr),
+        self.run("qwen4_head", &[("streams", w.live(&w.streams[out], HC * self.cfg.hidden * 2)), ("norm", norm.buffer.ptr),
+            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.live(&w.x, self.cfg.hidden * 2)),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         // The head rows, gathered contiguously into `delta`.
         let row = h * 2;
@@ -2408,7 +2444,7 @@ impl<'a> Qwen4Engine<'a> {
         let n = heads.len();
         ensure!(n <= DECODE_ROWS, "{n} MTP head rows");
         // The target's head (one representation shared with the drafts).
-        self.logits(w, w.delta.buffer.ptr, n)?;
+        self.logits(w, w.live(&w.delta, self.cfg.hidden * 2), n)?;
         // SAFETY: the logits and the argmax outputs are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_argmax_checked_f32_async(
@@ -2457,7 +2493,7 @@ impl<'a> Qwen4Engine<'a> {
         // Scratch is consumed before norm/feedback; injection drains before the
         // reused sequence table is restored. Graph storage stays unchanged.
         self.library.embedding_injection()?.inject_host(&media.features, &media.indices,
-            w.delta.buffer, w.seq_first.buffer, out.buffer, rows, self.cfg.hidden, copies, self.execution_stream())?;
+            w.live_buffer(&w.delta, self.cfg.hidden * 2), w.seq_first.buffer, out.buffer, rows, self.cfg.hidden, copies, self.execution_stream())?;
         self.put(&w.seq_first, seq_first)
     }
 
@@ -2755,7 +2791,7 @@ impl<'a> Qwen4Engine<'a> {
                     if index == 0 && self.embedding.device_gather() {
                         // SAFETY: staged token ids and persistent root streams cover this graph bucket.
                         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC,
-                            std::ptr::null(), w.streams[0].buffer.ptr, self.execution_stream())?; }
+                            std::ptr::null(), w.live(&w.streams[0], HC * self.cfg.hidden * 2), self.execution_stream())?; }
                     }
                     if index == 0 || boundary {
                         self.enter(w, &mut c, None, layer, index, rows, tables.spec)?;
@@ -2823,12 +2859,12 @@ impl<'a> Qwen4Engine<'a> {
     fn head(&self, w: &Workspace<'_>, streams: &Dev<'_>, t: usize, rows: Scalar, logit_rows: usize) -> Result<()> {
         let h = self.cfg.hidden;
         let [norm, down, up] = &self.weights.mixer;
-        self.run("qwen4_head", &[("streams", streams.buffer.ptr), ("norm", norm.buffer.ptr),
-            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.x.buffer.ptr),
+        self.run("qwen4_head", &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("norm", norm.buffer.ptr),
+            ("w_down", down.buffer.ptr), ("w_up", up.buffer.ptr), ("out", w.live(&w.x, self.cfg.hidden * 2)),
             ("scratch", w.scratch.buffer.ptr)], &[rows])?;
         ensure!(logit_rows <= t, "{logit_rows} logits rows of a {t}-row step");
         // SAFETY: row t - logit_rows of the [t, H] mixer output lies inside `x`.
-        let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
+        let x = unsafe { w.live(&w.x, self.cfg.hidden * 2).cast::<u8>().add((t - logit_rows) * h * 2) }.cast();
         self.logits(w, x, logit_rows)
     }
 
@@ -2933,7 +2969,7 @@ impl<'a> Qwen4Engine<'a> {
                 if index == 0 && gather {
                     // SAFETY: the step's ids are staged before the replay; the streams hold its rows.
                     unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-                        w.streams[0].buffer.ptr, self.execution_stream())? };
+                        w.live(&w.streams[0], HC * self.cfg.hidden * 2), self.execution_stream())? };
                 }
                 if index == 0 {
                     self.enter(w, &mut c, None, layer, index, rows, spec)?;
@@ -3035,8 +3071,8 @@ impl<'a> Qwen4Engine<'a> {
         if self.cfg.ple_layers.contains(&index) {
             self.ple(w, &w.streams[*cur], layer, rows, spec)?;
         }
-        self.run("qwen4_hc_pre", &[("residual", w.streams[*cur].buffer.ptr), ("norm", norm), ("w_di", di),
-            ("w_up", up), ("y", w.x.buffer.ptr), ("inject", w.inject.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+        self.run("qwen4_hc_pre", &[("residual", w.live(&w.streams[*cur], HC * self.cfg.hidden * 2)), ("norm", norm), ("w_di", di),
+            ("w_up", up), ("y", w.live(&w.x, self.cfg.hidden * 2)), ("inject", w.live(&w.inject, HC * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
     }
 
@@ -3044,16 +3080,16 @@ impl<'a> Qwen4Engine<'a> {
     /// to the other buffer), then `site`'s input from them.
     fn post_pre(&self, w: &Workspace<'_>, cur: usize, layer: &Qwen4Layer<'_>, site: &str, rows: Scalar) -> Result<()> {
         let [norm, di, up] = Self::site(layer, site)?;
-        self.run("qwen4_hc_post_pre", &[("x", w.delta.buffer.ptr), ("residual", w.streams[cur].buffer.ptr),
-            ("inject", w.inject.buffer.ptr), ("norm", norm), ("w_di", di), ("w_up", up),
-            ("residual_out", w.streams[cur ^ 1].buffer.ptr), ("y", w.x.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+        self.run("qwen4_hc_post_pre", &[("x", w.live(&w.delta, self.cfg.hidden * 2)), ("residual", w.live(&w.streams[cur], HC * self.cfg.hidden * 2)),
+            ("inject", w.live(&w.inject, HC * 2)), ("norm", norm), ("w_di", di), ("w_up", up),
+            ("residual_out", w.live(&w.streams[cur ^ 1], HC * self.cfg.hidden * 2)), ("y", w.live(&w.x, self.cfg.hidden * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
     }
 
     /// `delta` into streams `cur` alone (written to the other buffer).
     fn post(&self, w: &Workspace<'_>, cur: &mut usize, rows: Scalar) -> Result<()> {
-        self.run("qwen4_hc_post", &[("x", w.delta.buffer.ptr), ("residual", w.streams[*cur].buffer.ptr),
-            ("inject", w.inject.buffer.ptr), ("out", w.streams[*cur ^ 1].buffer.ptr)], &[rows])?;
+        self.run("qwen4_hc_post", &[("x", w.live(&w.delta, self.cfg.hidden * 2)), ("residual", w.live(&w.streams[*cur], HC * self.cfg.hidden * 2)),
+            ("inject", w.live(&w.inject, HC * 2)), ("out", w.live(&w.streams[*cur ^ 1], HC * self.cfg.hidden * 2))], &[rows])?;
         *cur ^= 1;
         Ok(())
     }
@@ -3079,7 +3115,7 @@ impl<'a> Qwen4Engine<'a> {
         // Mapped: the step's rows were gathered in id order, so identity ids read them.
         let (gathered, local) = w.ple_rows.as_ref().context("PLE layer without gathered-row workspace")?;
         let (ids, gathered) = (local.buffer.ptr, gathered.buffer.ptr);
-        self.run(name, &[("streams", streams.buffer.ptr), ("ids", ids), ("table", gathered),
+        self.run(name, &[("streams", w.live(streams, HC * self.cfg.hidden * 2)), ("ids", ids), ("table", gathered),
             ("scale", table.scale.buffer.ptr), ("w_kv", layer.ptr("ple.w_kv")?),
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
@@ -3130,13 +3166,13 @@ impl<'a> Qwen4Engine<'a> {
     fn gdn(&self, w: &Workspace<'_>, index: usize, layer: &Qwen4Layer<'_>, rows: Scalar, cap: &str, spec: bool)
         -> Result<()> {
         let [conv, state, replay] = self.gdn_pools(index)?;
-        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        let mut pointers = vec![("x", w.live(&w.x, self.cfg.hidden * 2))];
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("conv_w", layer.ptr("conv_w")?), ("a_log", layer.ptr("a_log")?),
             ("dt_bias", layer.ptr("dt_bias")?), ("norm_w", layer.ptr("norm_w")?)]);
         pointers.extend(Self::projection(layer, "w_out")?);
         pointers.extend([("conv_state", conv), ("state", state), ("slots", w.slots.buffer.ptr),
-            ("seq_first", w.seq_first.buffer.ptr), ("out", w.delta.buffer.ptr)]);
+            ("seq_first", w.seq_first.buffer.ptr), ("out", w.live(&w.delta, self.cfg.hidden * 2))]);
         // Decode capacities record speculative replay inputs (spec) or advance the state.
         let decode = cap == "m64";
         if decode {
@@ -3164,7 +3200,7 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn attend(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, cache: *mut c_void, keys: *mut c_void,
         blocks: *mut c_void, rows: Scalar, cap: &str, tables: &StepTables) -> Result<()> {
-        let mut pointers = vec![("x", w.x.buffer.ptr)];
+        let mut pointers = vec![("x", w.live(&w.x, self.cfg.hidden * 2))];
         pointers.extend(Self::projection(layer, "w_in")?);
         pointers.extend([("q_norm", layer.ptr("q_norm")?), ("k_norm", layer.ptr("k_norm")?),
             ("iq_norm", layer.ptr("iq_norm")?), ("ik_norm", layer.ptr("ik_norm")?),
@@ -3189,7 +3225,7 @@ impl<'a> Qwen4Engine<'a> {
                 Scalar::I32(self.attention_plan.rows() as i32)])?;
         let mut pointers = vec![("attn", w.attn.buffer.ptr), ("gate", w.gate.buffer.ptr)];
         pointers.extend(Self::projection(layer, "w_o")?);
-        pointers.extend([("out", w.delta.buffer.ptr), ("scratch", w.scratch.buffer.ptr)]);
+        pointers.extend([("out", w.live(&w.delta, self.cfg.hidden * 2)), ("scratch", w.scratch.buffer.ptr)]);
         self.run(&Self::program(layer, "attn_o", cap), &pointers, &self.w8_scalars(layer, rows, cap))
     }
 
@@ -3207,7 +3243,7 @@ impl<'a> Qwen4Engine<'a> {
         let h = self.cfg.hidden;
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} needs routed experts: pass --local-experts, Spark --peers or --shared-only"))?;
-        self.run("qwen4_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
+        self.run("qwen4_router_scores", &[("x", w.live(&w.x, self.cfg.hidden * 2)), ("w", layer.ptr("gate")?),
             ("logits", w.router_logits.buffer.ptr)], &[rows])?;
         // SAFETY: logits and route outputs are live buffers of `t` rows.
         unsafe {
@@ -3228,17 +3264,17 @@ impl<'a> Qwen4Engine<'a> {
             && !(self.spark_bf16 && index < self.cfg.layers);
         if tp2_wire || spark_wire {
             let grid = self.quantize_grids[self.active_owner.get()].blocks(t, h);
-            self.run("qwen4_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+            self.run("qwen4_expert_input_quant", &[("source_ptr", w.live(&w.x, self.cfg.hidden * 2)), ("values_ptr", w.wire.buffer.ptr),
                 // SAFETY: the scale rows follow the payload inside each wire row.
                 ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
-                ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])?;
+                ("scale_mma_ptr", w.live(&w.delta, self.cfg.hidden * 2))], &[rows, Scalar::I32(grid as i32)])?;
         }
         Ok(())
     }
 
     fn shared(&self, w: &Workspace<'_>, layer: &Qwen4Layer<'_>, rows: Scalar) -> Result<()> {
-        self.run("qwen4_shared", &[("x", w.x.buffer.ptr), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
-            ("w_down", layer.ptr("shared.w_down")?), ("out", w.shared.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+        self.run("qwen4_shared", &[("x", w.live(&w.x, self.cfg.hidden * 2)), ("w_gate_up", layer.ptr("shared.w_gate_up")?),
+            ("w_down", layer.ptr("shared.w_down")?), ("out", w.live(&w.shared, self.cfg.hidden * 2)), ("scratch", w.scratch.buffer.ptr)],
             &[rows])
     }
 
@@ -3250,17 +3286,17 @@ impl<'a> Qwen4Engine<'a> {
             Experts::Tp2 { routed, mtp } => {
                 if index < self.cfg.layers {
                     let mut routed = routed.borrow_mut();
-                    let input = if routed.wire { w.wire.buffer.ptr } else { w.x.buffer.ptr };
+                    let input = if routed.wire { w.wire.buffer.ptr } else { w.live(&w.x, self.cfg.hidden * 2) };
                     // SAFETY: all owner buffers persist and were produced on this layer's stream.
                     return unsafe { routed.enqueue(self.active_owner.get(), index, t, input,
                         crate::shared::experts::rtx::Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr },
-                        w.shared.buffer.ptr, w.delta.buffer.ptr) };
+                        w.live(&w.shared, self.cfg.hidden * 2), w.live(&w.delta, self.cfg.hidden * 2)) };
                 }
                 match mtp.as_ref().context("Qwen TP2 MTP experts missing")? {
                     MtpExperts::Fp8(experts) => {
                         let resident = experts.index_of(index)?;
                         // SAFETY: MTP owner-zero buffers and resident package persist on this stream.
-                        unsafe { experts.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr,
+                        unsafe { experts.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr,
                             w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.execution_stream())?; }
                     }
                     MtpExperts::Exl3(experts) => {
@@ -3269,8 +3305,8 @@ impl<'a> Qwen4Engine<'a> {
                         unsafe {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                                w.shared.buffer.ptr, self.execution_stream())?;
-                            self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.execution_stream())?;
+                                w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
+                            self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
@@ -3292,7 +3328,7 @@ impl<'a> Qwen4Engine<'a> {
                 // SAFETY: input rows, route ids, weights and the output are live
                 // buffers of `t` rows on this engine's stream.
                 unsafe {
-                    fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
+                    fp8.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
                         w.routed.buffer.ptr, self.execution_stream())?;
                 }
                 if local.window.is_some() {
@@ -3315,8 +3351,8 @@ impl<'a> Qwen4Engine<'a> {
                 // stream order; the output is copied before the window can change.
                 unsafe {
                     experts.run(layer, t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.execution_stream())?;
-                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.execution_stream())?;
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
+                    self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                 }
                 return Ok(());
             }
@@ -3329,7 +3365,7 @@ impl<'a> Qwen4Engine<'a> {
                     MtpExperts::Fp8(experts) => {
                         let resident = experts.index_of(index)?;
                         // SAFETY: MTP input/routes and its output are live on this stream.
-                        unsafe { experts.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr,
+                        unsafe { experts.run(resident, t, w.live(&w.x, self.cfg.hidden * 2), w.route_ids.buffer.ptr,
                             w.route_weights.buffer.ptr, w.routed.buffer.ptr, self.execution_stream())? };
                     }
                     MtpExperts::Exl3(experts) => {
@@ -3339,8 +3375,8 @@ impl<'a> Qwen4Engine<'a> {
                         unsafe {
                             experts.run(crate::families::deepseek_v4::local::LocalLayer::Stage(0), t,
                                 w.wire.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                                w.shared.buffer.ptr, self.execution_stream())?;
-                            self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.execution_stream())?;
+                                w.live(&w.shared, self.cfg.hidden * 2), self.execution_stream())?;
+                            self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), experts.output.buffer, t * h * 2, self.execution_stream())?;
                         }
                         return Ok(());
                     }
@@ -3348,11 +3384,11 @@ impl<'a> Qwen4Engine<'a> {
             }
             Experts::SharedOnly => {
                 // SAFETY: both are live [t, H] BF16 buffers ordered on the stream.
-                unsafe { self.library.copy_d2d_async(w.delta.buffer, w.shared.buffer, t * h * 2, self.execution_stream())? };
+                unsafe { self.library.copy_d2d_async(w.live_buffer(&w.delta, self.cfg.hidden * 2), w.live_buffer(&w.shared, self.cfg.hidden * 2), t * h * 2, self.execution_stream())? };
                 return Ok(());
             }
         }
-        self.run("qwen4_add", &[("a", w.routed.buffer.ptr), ("b", w.shared.buffer.ptr), ("out", w.delta.buffer.ptr)],
+        self.run("qwen4_add", &[("a", w.routed.buffer.ptr), ("b", w.live(&w.shared, self.cfg.hidden * 2)), ("out", w.live(&w.delta, self.cfg.hidden * 2))],
             &[rows])
     }
 
@@ -3389,7 +3425,7 @@ impl<'a> Qwen4Engine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.execution_stream())?;
             self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.execution_stream())?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.x.buffer } else { w.wire.buffer }, wire_bytes, self.execution_stream())?;
+            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.live_buffer(&w.x, self.cfg.hidden * 2) } else { w.wire.buffer }, wire_bytes, self.execution_stream())?;
             self.library.cuda_event_record(self.routes_ready, self.execution_stream())?;
         }
         // The shared expert queues behind the copies and runs during the
@@ -3432,7 +3468,7 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the intake planes are ordered after the wave by `receive`.
         unsafe {
-            transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.execution_stream())?;
+            transport.reduce(w.live(&w.shared, self.cfg.hidden * 2).cast(), w.live(&w.delta, self.cfg.hidden * 2).cast(), t, self.execution_stream())?;
             self.library.cuda_stream_synchronize(self.execution_stream())
         }
     }
