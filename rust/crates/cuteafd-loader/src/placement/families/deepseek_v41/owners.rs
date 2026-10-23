@@ -38,6 +38,51 @@ pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
     Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
 }
 
+/// Immutable endpoint order: two fixed decode links, optional prefill FIFO,
+/// then the independent device-exchange proxies. Reconnects keep these identities.
+pub fn spark_endpoints(capacity: u32, bf16: bool, waves: u64, device_endpoints: usize)
+    -> Result<Vec<cuteafd_core::SparkEndpoint>> {
+    use cuteafd_core::{SparkEndpoint, SparkIngress};
+    ensure!((1..=4096).contains(&capacity) && (1..=2).contains(&waves),
+        "invalid V4.1 Spark endpoint geometry");
+    ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
+        "invalid V4.1 device endpoint set");
+    ensure!(waves == 1 || device_endpoints == 0,
+        "device exchange and N2 prefill are not supported together");
+    let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    let decode = SparkEndpoint { capacity, ingress, ring_depth: None };
+    let mut endpoints = vec![decode; 2];
+    if waves > 1 {
+        endpoints.push(SparkEndpoint { ring_depth: Some(waves as usize), ..decode });
+    }
+    endpoints.extend(std::iter::repeat_n(SparkEndpoint {
+        capacity: capacity.min(80), ..decode
+    }, device_endpoints));
+    Ok(endpoints)
+}
+
+/// Coordinator registrations for the same immutable endpoint contract the
+/// workers admit. Lazy connections allocate these rings only on first use.
+pub fn host_ring_bytes(endpoints: &[cuteafd_core::SparkEndpoint], ranks: usize,
+    rings: cuteafd_core::SparkRings) -> Result<u64> {
+    ensure!((1..=8).contains(&ranks), "invalid V4.1 host transport rank count");
+    endpoints.iter().try_fold(0u64, |sum, endpoint| {
+        let bytes = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::DEEPSEEK_V41, rings)
+            .context("invalid V4.1 endpoint rings")? as u64;
+        sum.checked_add(bytes).context("V4.1 host rings overflow")
+    })?.checked_mul(ranks as u64).context("V4.1 host rings overflow")
+}
+
+/// Extra return slots on the prefill-only link. Both fixed decode links stay live.
+/// One-wave opt-in uses the existing serial link without any extra allocation.
+pub fn prefill_transport_bytes(rows: u64, ranks: usize, waves: u64) -> Result<u64> {
+    ensure!((1..=4096).contains(&rows) && (1..=8).contains(&ranks)
+        && (1..=2).contains(&waves), "invalid V4.1 prefill transport geometry");
+    if waves == 1 { return Ok(0); }
+    rows.checked_mul(ranks as u64).and_then(|n| n.checked_mul(waves))
+        .and_then(|n| n.checked_mul(10240)).context("V4.1 prefill return slots overflow")
+}
+
 /// Full vocabulary packing peak above the pre-weight sample. The first lane's
 /// backbone/cache/index/embedding/Engram owners already exist; heads, taps,
 /// transports, the second lane, draft, vision and marks do not.
@@ -313,6 +358,75 @@ mod tests {
 
     fn owner(demands: &[Demand], rank: u8, group: &str) -> u64 {
         demands.iter().find(|d| d.gpu == rank && d.group == group).unwrap().bytes
+    }
+
+    #[test]
+    fn prefill_slots_are_extra_bf16_returns_on_the_reduction_gpu() -> Result<()> {
+        for rows in [256, 512, 1024, 2048, 4096] {
+            for ranks in 1..=8 {
+                assert_eq!(prefill_transport_bytes(rows, ranks, 1)?, 0);
+                assert_eq!(prefill_transport_bytes(rows, ranks, 2)?, rows * ranks as u64 * 2 * 10240);
+            }
+        }
+        assert_eq!(prefill_transport_bytes(4096, 4, 2)?, 335_544_320);
+        assert_eq!(prefill_transport_bytes(4096, 6, 2)?, 503_316_480);
+        for (gpus, ranks) in [(1, 4), (2, 6)] {
+            let fixed = 2 * transport_bytes(4096, ranks)?;
+            let extra = prefill_transport_bytes(4096, ranks, 2)?;
+            let owners = deferred_owners(gpus, fixed + extra)?;
+            let transport = owners.iter().find(|d| d.category == Category::Transport).unwrap();
+            assert_eq!(transport.gpu, (gpus - 1) as u8);
+            assert_eq!(transport.bytes, fixed + extra);
+        }
+        for (rows, ranks, waves) in [(0, 4, 2), (4097, 4, 2), (4096, 0, 2),
+            (4096, 9, 2), (4096, 4, 0), (4096, 4, 3)] {
+            assert!(prefill_transport_bytes(rows, ranks, waves).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_endpoint_ring_depth_is_independent_of_decode_and_proxies() -> Result<()> {
+        use cuteafd_core::{ExpertGeometry, SparkIngress, SparkRings};
+        let geometry = ExpertGeometry::DEEPSEEK_V41;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+            slot_bytes: 8 << 20, alignment: 4096 };
+        for bf16 in [false, true] {
+            let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+            for capacity in [256, 1024, 2048, 4096] {
+                for proxies in 0..=if bf16 { 0 } else { 2 } {
+                    let serial = spark_endpoints(capacity, bf16, 1, proxies)?;
+                    if proxies > 0 {
+                        let error = spark_endpoints(capacity, bf16, 2, proxies).unwrap_err();
+                        assert!(error.to_string().contains("device exchange and N2 prefill are not supported together"));
+                        continue;
+                    }
+                    let pipelined = spark_endpoints(capacity, bf16, 2, proxies)?;
+                    assert_eq!(&pipelined[..2], &serial[..2]);
+                    assert_eq!(&pipelined[3..], &serial[2..]);
+                    assert_eq!(pipelined[2], cuteafd_core::SparkEndpoint {
+                        capacity, ingress, ring_depth: Some(2) });
+                    let bytes = |endpoints: &[cuteafd_core::SparkEndpoint]| endpoints.iter()
+                        .map(|endpoint| endpoint.ring_bytes(geometry, rings).unwrap()).sum::<usize>();
+                    let extra = pipelined[2].ring_bytes(geometry, rings).unwrap();
+                    assert_eq!(bytes(&pipelined) - bytes(&serial), extra);
+                    for ranks in [4, 6] {
+                        assert_eq!(host_ring_bytes(&pipelined, ranks, rings)?
+                            - host_ring_bytes(&serial, ranks, rings)?, extra as u64 * ranks as u64);
+                    }
+                    if capacity == 4096 {
+                        assert_eq!(extra, if bf16 { 168_738_816 } else { 128_106_496 });
+                    }
+                    let overridden = SparkRings { depth: 4, ..rings };
+                    assert_eq!(pipelined[2].ring_bytes(geometry, overridden), Some(extra));
+                }
+            }
+        }
+        for (capacity, waves, proxies, bf16) in [(0, 2, 0, false), (4097, 2, 0, false),
+            (4096, 0, 0, false), (4096, 3, 0, false), (4096, 2, 3, false), (4096, 2, 1, true)] {
+            assert!(spark_endpoints(capacity, bf16, waves, proxies).is_err());
+        }
+        Ok(())
     }
 
     #[test]

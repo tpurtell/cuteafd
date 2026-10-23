@@ -313,8 +313,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let spark_ranks = args.peers.len();
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, spark_ranks)?;
     let memory=admission::admission_memory(&lib,&inventory)?;
+    let prefill_bytes = cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
+        u64::from(capacity), spark_ranks,
+        args.prefill_waves.unwrap_or(1) as u64)?;
     let deferred = cuteafd_loader::placement::families::deepseek_v41::owners::deferred_owners(
-        2, (2 * wave_bytes) as u64)?;
+        2, (2 * wave_bytes) as u64 + prefill_bytes)?;
     // The dSpark load phase is its experts plus their transient staging above
     // this sample; nothing else is allocated until it drains.
     let draft_load = dspark_inventory.as_ref().map(|draft| draft.load_phase(2)).transpose()?.unwrap_or_default();
@@ -412,11 +415,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
-    let mut make_transport = || {
+    let mut make_transport = |endpoint| {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
-            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world)?;
-            NativeTp4Wave::new(&lib, roce, wave_bytes)
+            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world,
+                args.prefill_units()?.filter(|config| config.waves > 1).map(|_| endpoint))?;
+            let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
+            transport.configure_prefill_units(args.prefill_units()?);
+            Ok(transport)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
         if device_exchange {
@@ -427,8 +433,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         }
         Ok::<_, anyhow::Error>(transport)
     };
-    let mut transport = make_transport()?;
-    let mut second_transport = make_transport()?;
+    let mut transport = make_transport(0)?;
+    let mut second_transport = make_transport(1)?;
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     // Allocation must consume exactly the admitted pages; do not run a second
@@ -456,7 +462,14 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
+    let deferred_host = devices[1].run(|| admission::deferred_host_consumers(
+        &lib, &args, catalog.nvfp4().is_some()))?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas,
+        draft.is_some(), &deferred_host)?;
+    if let Some(link) = devices[1].run(|| super::prefill_link(&lib, &args, spark_world, capacity))? {
+        transport.install_prefill_link(link.clone())?;
+        second_transport.install_prefill_link(link)?;
+    }
     scheduler::publish_capacity(&requests, &prefixes);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;

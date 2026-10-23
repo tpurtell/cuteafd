@@ -34,6 +34,24 @@ pub(crate) struct PreparedLayer<'l, 'w, 'a> {
     indexed_us: u64,
     attended_us: u64,
 }
+/// Completed attention with no borrowed lane storage. Re-entry validates the
+/// original query binding before exposing any slot-owned FFN input.
+pub(crate) struct UnitPreparedLayer {
+    binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
+    cooperative: bool,
+    rows: Vec<ExpertRow>,
+    batch: u64,
+    layer: usize,
+    started: std::time::Instant,
+    produced_us: u64,
+    indexed_us: u64,
+    attended_us: u64,
+}
+pub(crate) struct UnitPendingLayer {
+    prepared: UnitPreparedLayer,
+    pending: crate::families::deepseek_v41::v41_backbone_lane::LaneUnitFfn,
+    shared_tp: usize,
+}
 pub(crate) struct CompletedLayer<'t> {
     result: NativeFfnOutput<'t>,
     batch: u64,
@@ -73,7 +91,62 @@ impl CompletedLayer<'_> {
             finish_us=total_us-self.experts_us, total_us, "verification layer cost");
     }
 }
+impl UnitPendingLayer {
+    /// # Safety
+    /// Preserve the original unit's buffers until this FIFO ticket completes.
+    pub async unsafe fn land<'t>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'_>) -> Result<CompletedLayer<'t>> {
+        let result = unsafe { lane.land_unit(transport, self.pending).await? };
+        let prepared = self.prepared;
+        Ok(CompletedLayer { result, batch: prepared.batch, layer: prepared.layer,
+            rows: prepared.rows.len(), routed_backend: "spark_tp4", shared_tp: self.shared_tp,
+            started: prepared.started, produced_us: prepared.produced_us,
+            indexed_us: prepared.indexed_us, attended_us: prepared.attended_us,
+            experts_us: prepared.started.elapsed().as_micros() as u64 })
+    }
+}
+impl UnitPreparedLayer {
+    /// # Safety
+    /// The original lane's input and shared result remain in this unit's slot
+    /// until `UnitPendingLayer::land` finishes or the pass is discarded.
+    pub async unsafe fn send(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &mut NativeTp4Wave<'_>, placement: u64, image_mask: &[u8])
+        -> Result<UnitPendingLayer> {
+        let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
+        let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
+        let pending = unsafe { ffn.send_unit(transport, placement, image_mask, &self.rows).await? };
+        Ok(UnitPendingLayer { prepared: self, pending, shared_tp })
+    }
+    /// # Safety
+    /// The original lane retains this unit's storage unchanged between hooks.
+    pub async unsafe fn execute<'t>(self, lane: &mut BackboneLane<'_, '_>,
+        transport: &'t mut NativeTp4Wave<'_>, placement: u64, image_mask: &[u8])
+        -> Result<CompletedLayer<'t>> {
+        let mut ffn = lane.prepared_ffn(self.binding, self.cooperative)?;
+        let routed_backend = if transport.has_tp2_layer(self.layer) { "rtx_tp2" }
+            else if transport.has_local_layer(self.layer) { "rtx_local" } else { "spark_tp4" };
+        let shared_tp = if transport.has_tp2_shared_layer(self.layer) { 2 } else { 1 };
+        let result = unsafe { ffn.execute_tp4(transport, placement, image_mask, &self.rows).await? };
+        Ok(CompletedLayer { result, batch: self.batch, layer: self.layer, rows: self.rows.len(),
+            routed_backend, shared_tp, started: self.started, produced_us: self.produced_us,
+            indexed_us: self.indexed_us, attended_us: self.attended_us,
+            experts_us: self.started.elapsed().as_micros() as u64 })
+    }
+}
 impl PreparedLayer<'_, '_, '_> {
+    /// Finish the attention chain before releasing its borrow to the executor.
+    pub async fn into_unit(self) -> Result<UnitPreparedLayer> {
+        let (binding, cooperative, attended_us) = match self.ffn {
+            PreparedFfn::Ready(ffn) => (ffn.input.binding(), false, self.attended_us),
+            PreparedFfn::Pending(pending) => {
+                let ffn = pending.complete().await?;
+                (ffn.input.binding(), true, self.started.elapsed().as_micros() as u64)
+            }
+        };
+        Ok(UnitPreparedLayer { binding, cooperative, rows: self.rows, batch: self.batch,
+            layer: self.layer, started: self.started, produced_us: self.produced_us,
+            indexed_us: self.indexed_us, attended_us })
+    }
     #[cfg(test)]
     pub async unsafe fn trace_ffn_input(mut self, library: &cuteafd_ffi::NativeLibrary,
         destination: cuteafd_ffi::CuteafdDeviceBuffer, stream: *mut std::ffi::c_void)

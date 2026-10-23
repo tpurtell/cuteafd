@@ -188,6 +188,21 @@ pub(crate) trait PrefillHooks {
     fn commit_unit(&mut self, unit: &Unit) -> anyhow::Result<()>;
 }
 
+/// Async owners follow the same schedule and storage contract as
+/// [`PrefillHooks`]. Hooks are polled on the CUDA-owning thread, not spawned:
+/// their futures need not be `Send` and may retain device-owner borrows.
+pub(crate) trait AsyncPrefillHooks {
+    type Ticket;
+    fn route(&self, layer: usize) -> FfnRoute;
+    async fn begin_unit(&mut self, unit: &Unit) -> anyhow::Result<()>;
+    async fn attention(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<()>;
+    async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<()>;
+    async fn send_experts(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<Self::Ticket>;
+    async fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> anyhow::Result<()>;
+    async fn end_unit(&mut self, unit: &Unit) -> anyhow::Result<()>;
+    async fn commit_unit(&mut self, unit: &Unit) -> anyhow::Result<()>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     Begin { unit: usize },
@@ -299,38 +314,54 @@ pub(crate) fn prefill_schedule(routes: &[FfnRoute], units: &[Unit], waves: usize
     Ok(steps)
 }
 
+// Expand only the hook calls' await syntax so both drivers use one step walk
+// and exactly the same ticket, admission, FIFO and error handling.
+macro_rules! drive_prefill_units {
+    ($hooks:ident, $units:ident, $waves:ident $(, $await:tt)?) => {{
+        let layers = $units.iter().map(|unit| unit.layers.end).max().unwrap_or(0);
+        let routes = (0..layers).map(|layer| $hooks.route(layer)).collect::<Vec<_>>();
+        let steps = prefill_schedule(&routes, $units, $waves)?;
+        let mut tickets: Vec<Option<(usize, H::Ticket)>> = (0..$units.len()).map(|_| None).collect();
+        let mut outstanding = std::collections::VecDeque::new();
+        for step in steps {
+            match step {
+                Step::Begin { unit } => $hooks.begin_unit(&$units[unit])$(.$await)??,
+                Step::Attention { layer, unit } => $hooks.attention(layer, &$units[unit])$(.$await)??,
+                Step::Local { layer, unit } => $hooks.local_ffn(layer, &$units[unit])$(.$await)??,
+                Step::Send { layer, unit } => {
+                    anyhow::ensure!(outstanding.len() < $waves, "prefill wave admission exceeded");
+                    tickets[unit] = Some((layer, $hooks.send_experts(layer, &$units[unit])$(.$await)??));
+                    outstanding.push_back(unit);
+                }
+                Step::Land { layer, unit } => {
+                    anyhow::ensure!(outstanding.pop_front() == Some(unit), "prefill waves land out of order");
+                    let (sent, ticket) = tickets[unit].take().ok_or_else(|| anyhow::anyhow!("prefill wave missing"))?;
+                    anyhow::ensure!(sent == layer, "prefill wave layer differs");
+                    $hooks.land_experts(layer, &$units[unit], ticket)$(.$await)??;
+                }
+                Step::End { unit } => $hooks.end_unit(&$units[unit])$(.$await)??,
+                Step::Commit { unit } => $hooks.commit_unit(&$units[unit])$(.$await)??,
+            }
+        }
+        anyhow::ensure!(outstanding.is_empty(), "prefill finished with waves outstanding");
+        Ok(())
+    }};
+}
+
 /// Runs `units` through `hooks` in [`prefill_schedule`] order. Errors return
 /// immediately; the family's submission guard aborts in-flight waves and
 /// drains before storage is released (the executor holds no owners).
 pub(crate) fn run_prefill_units<H: PrefillHooks>(hooks: &mut H, units: &[Unit], waves: usize)
     -> anyhow::Result<()> {
-    let layers = units.iter().map(|unit| unit.layers.end).max().unwrap_or(0);
-    let routes = (0..layers).map(|layer| hooks.route(layer)).collect::<Vec<_>>();
-    let steps = prefill_schedule(&routes, units, waves)?;
-    let mut tickets: Vec<Option<(usize, H::Ticket)>> = (0..units.len()).map(|_| None).collect();
-    let mut outstanding = std::collections::VecDeque::new();
-    for step in steps {
-        match step {
-            Step::Begin { unit } => hooks.begin_unit(&units[unit])?,
-            Step::Attention { layer, unit } => hooks.attention(layer, &units[unit])?,
-            Step::Local { layer, unit } => hooks.local_ffn(layer, &units[unit])?,
-            Step::Send { layer, unit } => {
-                anyhow::ensure!(outstanding.len() < waves, "prefill wave admission exceeded");
-                tickets[unit] = Some((layer, hooks.send_experts(layer, &units[unit])?));
-                outstanding.push_back(unit);
-            }
-            Step::Land { layer, unit } => {
-                anyhow::ensure!(outstanding.pop_front() == Some(unit), "prefill waves land out of order");
-                let (sent, ticket) = tickets[unit].take().ok_or_else(|| anyhow::anyhow!("prefill wave missing"))?;
-                anyhow::ensure!(sent == layer, "prefill wave layer differs");
-                hooks.land_experts(layer, &units[unit], ticket)?;
-            }
-            Step::End { unit } => hooks.end_unit(&units[unit])?,
-            Step::Commit { unit } => hooks.commit_unit(&units[unit])?,
-        }
-    }
-    anyhow::ensure!(outstanding.is_empty(), "prefill finished with waves outstanding");
-    Ok(())
+    drive_prefill_units!(hooks, units, waves)
+}
+
+/// The async counterpart of [`run_prefill_units`], using its exact step walk.
+/// Cancellation drops tickets; the family's submission guard must abort and
+/// drain every queued device operation before releasing its owners.
+pub(crate) async fn run_prefill_units_async<H: AsyncPrefillHooks>(hooks: &mut H, units: &[Unit], waves: usize)
+    -> anyhow::Result<()> {
+    drive_prefill_units!(hooks, units, waves, await)
 }
 
 #[cfg(test)]
@@ -438,8 +469,8 @@ mod tests {
         }).collect()
     }
 
-    #[test]
-    fn unit_schedule_keeps_every_contract_rule() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "current_thread")]
+    async fn unit_schedule_keeps_every_contract_rule() -> anyhow::Result<()> {
         let mut seed = 7;
         for case in 0..3000 {
             let layers = 1 + (lcg(&mut seed) % 24) as usize;
@@ -449,12 +480,13 @@ mod tests {
             let steps = prefill_schedule(&routes, &units, waves)
                 .map_err(|error| anyhow::anyhow!("case {case}: {error}"))?;
             check_schedule(&routes, &units, waves, &steps);
+            check_drivers(&routes, &units, waves, &steps).await?;
         }
         Ok(())
     }
 
-    #[test]
-    fn one_wave_is_the_plain_serial_order() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_wave_is_the_plain_serial_order() -> anyhow::Result<()> {
         let routes = [FfnRoute::Local, FfnRoute::Spark, FfnRoute::Spark, FfnRoute::Local];
         let units = sequence_units(4096, 2048, 1, 4)?;
         let steps = prefill_schedule(&routes, &units, 1)?;
@@ -471,6 +503,7 @@ mod tests {
             expected.push(Step::Commit { unit });
         }
         assert_eq!(steps, expected);
+        check_drivers(&routes, &units, 1, &expected).await?;
         Ok(())
     }
 
@@ -524,13 +557,14 @@ mod tests {
         (gpu, idle)
     }
 
-    #[test]
-    fn two_waves_keep_the_sparks_busy_whenever_the_gpu_keeps_up() -> anyhow::Result<()> {
+    #[tokio::test(flavor = "current_thread")]
+    async fn two_waves_keep_the_sparks_busy_whenever_the_gpu_keeps_up() -> anyhow::Result<()> {
         let units = sequence_units(16384, 2048, 2, 60)?;
         for dense in [0usize, 1, 3] {
             let routes = (0..60).map(|l| if l < dense { FfnRoute::Local } else { FfnRoute::Spark }).collect::<Vec<_>>();
             let serial = prefill_schedule(&routes, &sequence_units(16384, 2048, 1, 60)?, 1)?;
             let two = prefill_schedule(&routes, &units, 2)?;
+            check_drivers(&routes, &units, 2, &two).await?;
             // GPU time per unit-layer (land + attention + send) below the
             // Sparks' time per wave: within a unit the Sparks never wait. When
             // a unit ends, its successor starts with GPU-only work (dense
@@ -585,18 +619,62 @@ mod tests {
         fn commit_unit(&mut self, unit: &Unit) -> anyhow::Result<()> { self.record(Step::Commit { unit: unit.index }) }
     }
 
-    #[test]
-    fn executor_runs_the_schedule_and_stops_at_the_first_error() -> anyhow::Result<()> {
+    impl AsyncPrefillHooks for Recorder {
+        type Ticket = usize;
+        fn route(&self, layer: usize) -> FfnRoute { PrefillHooks::route(self, layer) }
+        async fn begin_unit(&mut self, unit: &Unit) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            PrefillHooks::begin_unit(self, unit)
+        }
+        async fn attention(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            PrefillHooks::attention(self, layer, unit)
+        }
+        async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            PrefillHooks::local_ffn(self, layer, unit)
+        }
+        async fn send_experts(&mut self, layer: usize, unit: &Unit) -> anyhow::Result<usize> {
+            tokio::task::yield_now().await;
+            PrefillHooks::send_experts(self, layer, unit)
+        }
+        async fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: usize) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            PrefillHooks::land_experts(self, layer, unit, ticket)
+        }
+        async fn end_unit(&mut self, unit: &Unit) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            PrefillHooks::end_unit(self, unit)
+        }
+        async fn commit_unit(&mut self, unit: &Unit) -> anyhow::Result<()> {
+            tokio::task::yield_now().await;
+            PrefillHooks::commit_unit(self, unit)
+        }
+    }
+
+    async fn check_drivers(routes: &[FfnRoute], units: &[Unit], waves: usize, expected: &[Step]) -> anyhow::Result<()> {
+        let mut sync = Recorder { routes: routes.to_vec(), log: Vec::new(), fail_at: None, tickets: 0 };
+        let mut asynchronous = Recorder { routes: routes.to_vec(), log: Vec::new(), fail_at: None, tickets: 0 };
+        run_prefill_units(&mut sync, units, waves)?;
+        run_prefill_units_async(&mut asynchronous, units, waves).await?;
+        assert_eq!(sync.log, expected);
+        assert_eq!(asynchronous.log, expected);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn executor_runs_the_schedule_and_stops_at_the_first_error() -> anyhow::Result<()> {
         let routes = vec![FfnRoute::Local, FfnRoute::Spark, FfnRoute::Spark, FfnRoute::Local, FfnRoute::Spark];
         let units = sequence_units(6000, 2048, 2, routes.len())?;
         let expected = prefill_schedule(&routes, &units, 2)?;
-        let mut hooks = Recorder { routes: routes.clone(), log: Vec::new(), fail_at: None, tickets: 0 };
-        run_prefill_units(&mut hooks, &units, 2)?;
-        assert_eq!(hooks.log, expected);
+        check_drivers(&routes, &units, 2, &expected).await?;
         for fail in 0..expected.len() {
-            let mut hooks = Recorder { routes: routes.clone(), log: Vec::new(), fail_at: Some(fail), tickets: 0 };
-            assert!(run_prefill_units(&mut hooks, &units, 2).is_err());
-            assert_eq!(hooks.log, expected[..fail], "hooks ran after the failure at step {fail}");
+            let mut sync = Recorder { routes: routes.clone(), log: Vec::new(), fail_at: Some(fail), tickets: 0 };
+            let mut asynchronous = Recorder { routes: routes.clone(), log: Vec::new(), fail_at: Some(fail), tickets: 0 };
+            assert!(run_prefill_units(&mut sync, &units, 2).is_err());
+            assert!(run_prefill_units_async(&mut asynchronous, &units, 2).await.is_err());
+            assert_eq!(sync.log, expected[..fail], "sync hooks ran after the failure at step {fail}");
+            assert_eq!(asynchronous.log, expected[..fail], "async hooks ran after the failure at step {fail}");
         }
         Ok(())
     }

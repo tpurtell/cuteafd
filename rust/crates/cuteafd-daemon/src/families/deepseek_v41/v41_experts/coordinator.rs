@@ -168,6 +168,9 @@ impl ReplicatedGroupPlanner {
 
 pub(crate) struct NativeTp4Wave<'a> {
     link: crate::shared::spark_intake::SparkLink<'a>,
+    // Unit traffic shares one FIFO; decode keeps each lane's fixed intake.
+    prefill_link: Option<std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>>,
+    prefill_units: Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>,
     // Drop drains the stream before fields release any GPU allocations.
     stream: LoadStream<'a>,
     shared: DeviceAllocation<'a>,
@@ -212,6 +215,25 @@ fn device_request(context: &DeviceContext, layer: u32, rows: usize,
 }
 impl<'a> NativeTp4Wave<'a> {
     pub(crate) fn spark_world(&self) -> usize { self.link.transport.world_size() }
+    pub(crate) fn prefill_units(&self) -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig> {
+        self.prefill_units
+    }
+    pub(crate) fn configure_prefill_units(&mut self,
+        config: Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>) {
+        self.prefill_units = config;
+    }
+    pub(crate) fn install_prefill_link(&mut self,
+        link: std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>) -> Result<()> {
+        ensure!(self.prefill_link.is_none(), "prefill link already installed");
+        {
+            let prefill = link.borrow();
+            ensure!(prefill.transport.world() == self.link.transport.world()
+                && prefill.transport.capacity() == self.link.transport.capacity(),
+                "prefill/decode transport geometry differs");
+        }
+        self.prefill_link = Some(link);
+        Ok(())
+    }
     /// Explicit replicated topology of this lane, or `None` for the legacy path.
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> {
         self.native.as_ref().map(ReplicatedGroupPlanner::topology)
@@ -287,9 +309,17 @@ impl<'a> NativeTp4Wave<'a> {
     pub fn begin_request(&mut self) {
         self.ready_rows = None;
     }
-    pub fn reset_connections(&mut self) {
+    pub fn reset_connections(&mut self) -> Result<()> {
         self.ready_rows = None;
-        self.link.transport.reset_connections();
+        // Dropped execution futures drain their producers; fence any reduction
+        // not yet covered by an intake consumed event before resetting its phase.
+        self.synchronize()?;
+        self.link.reset_connections()?;
+        if let Some(link) = &self.prefill_link {
+            link.try_borrow_mut().context("prefill intake still borrowed during reset")?
+                .reset_connections()?;
+        }
+        Ok(())
     }
     /// Legacy TP4 upper-bound reservation (four rank planes), also sufficient
     /// for a legacy TP2 transport.
@@ -344,6 +374,8 @@ impl<'a> NativeTp4Wave<'a> {
         Ok(Self {
             link: crate::shared::spark_intake::SparkLink::from_transport(library, transport,
                 V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Pinned)?,
+            prefill_link: None,
+            prefill_units: None,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
@@ -537,7 +569,7 @@ impl<'a> NativeTp4Wave<'a> {
     pub async fn dispatch_ffn<'w, 'r>(
         &'w mut self,
         request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
-    ) -> Result<NativePendingFfn<'w, 'a, 'r>> {
+    ) -> Result<NativePendingFfn<'w, 'w, 'a, 'r>> {
         self.ready_rows = None;
         // Previous output or cancellation cleanup completed this wave.
         self.stream.require_complete()?;
@@ -562,6 +594,54 @@ impl<'a> NativeTp4Wave<'a> {
             ready_rows: &mut self.ready_rows,
             tp2: self.tp2.as_deref_mut(),
         })
+    }
+
+    /// Dispatch without retaining a mutable transport borrow across unit hooks.
+    pub(crate) async fn dispatch_unit(&mut self,
+        request: crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest)
+        -> Result<NativeUnitFfn> {
+        self.ready_rows = None;
+        self.stream.require_complete()?;
+        let header = &request.request().header;
+        ensure!(header.layer_id as usize == request.binding().layer()
+            && header.row_count > 0 && header.row_count <= self.link.transport.capacity(),
+            "unit FFN dispatch identity or rows differ");
+        let mut prefill = self.prefill_link.as_ref().map(|link| link.borrow_mut());
+        let link = prefill.as_deref_mut().unwrap_or(&mut self.link);
+        let intake = std::rc::Rc::as_ptr(&link.intake) as usize;
+        let pending = link.dispatch(request.request())?;
+        Ok(NativeUnitFfn { pending, request, owner: self.output.buffer.ptr as usize, intake })
+    }
+    /// # Safety
+    /// Input remains in its unit slot until collection. Shared workspace is not
+    /// reused before that unit's reduction has drained.
+    pub(crate) async unsafe fn unit_shared(&mut self,
+        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<CuteafdDeviceBuffer> {
+        unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
+            .execute_shared_on(input.layer, input.tokens.len() as u32, input.values,
+                self.output.buffer.device_id as usize).await }
+    }
+    /// # Safety
+    /// Shared values are complete for this ticket's exact input and remain
+    /// immutable until collection finishes, including cancellation drain.
+    pub(crate) async unsafe fn collect_unit<'w>(&'w mut self, ticket: NativeUnitFfn,
+        shared: CuteafdDeviceBuffer, destination: i32) -> Result<NativeFfnOutput<'w>> {
+        ensure!(ticket.owner == self.output.buffer.ptr as usize,
+            "unit FFN ticket belongs to another transport");
+        self.stream.require_complete()?;
+        let mut prefill = self.prefill_link.as_ref().map(|link| link.borrow_mut());
+        let link = prefill.as_deref_mut().unwrap_or(&mut self.link);
+        ensure!(ticket.intake == std::rc::Rc::as_ptr(&link.intake) as usize,
+            "unit FFN ticket belongs to another intake");
+        let NativeUnitFfn { pending, request, .. } = ticket;
+        let work = NativePendingFfn { pending, request: &request,
+            capacity: link.transport.capacity(), library: self.library,
+            stream: &self.stream, link, shared: self.shared.buffer,
+            output: self.output.buffer, ready_rows: &mut self.ready_rows,
+            tp2: self.tp2.as_deref_mut() };
+        let device = crate::shared::memory::device::Device { library: self.library,
+            id: self.output.buffer.device_id };
+        device.future(unsafe { work.finish_values(shared, true, Some(destination)) }).await
     }
 
     async fn execute_prepared(
@@ -636,21 +716,30 @@ fn validate_shared(
     );
     Ok(())
 }
+/// Owned FIFO ticket. The request retains host routes and wire rows until
+/// receive; dropping an unread wave leaves transport recovery to SparkExperts.
+pub(crate) struct NativeUnitFfn {
+    pending: SparkExpertWave,
+    request: crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
+    owner: usize,
+    intake: usize,
+}
+
 /// Borrows every mutable reduction buffer and owns all unread response sockets.
 /// Dropping before completion leaves the wave unpublished and closes the sockets.
-pub(crate) struct NativePendingFfn<'w, 'a, 'r> {
+pub(crate) struct NativePendingFfn<'w, 'l, 'a, 'r> {
     pending: SparkExpertWave,
     request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
     capacity: u32,
     library: &'a NativeLibrary,
     stream: &'w LoadStream<'a>,
-    link: &'w mut crate::shared::spark_intake::SparkLink<'a>,
+    link: &'l mut crate::shared::spark_intake::SparkLink<'a>,
     shared: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer,
     ready_rows: &'w mut Option<u32>,
     tp2: Option<&'w mut super::tp2_ffn::Wave<'a>>,
 }
-impl<'w> NativePendingFfn<'w, '_, '_> {
+impl<'w> NativePendingFfn<'w, '_, '_, '_> {
     /// # Safety
     /// Shared values hold the completed contribution for this exact request and
     /// remain immutable until the final reduction drains. Producers must be drained.

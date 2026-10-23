@@ -376,14 +376,16 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
     // Sparks: resident slices of the routed layers left on them, plus the
     // shared runtime residual, latent-width (3584) I/O and EXL3 workspace.
     let working = SparkWorkingSet { rtx_layers: Vec::new(), spark_layers: spark_budget.layers[onboarded..].to_vec(), spark_ranks: ranks, prefill_lanes: LANES };
-    let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
+    let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: opts.spark_capacity_rows as u32,
+        ingress: cuteafd_core::SparkIngress::Fp8K32 }; LANES as usize];
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (TP6 width 512, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,
-            opts.spark_capacity_rows as u32, false, rings, 0) {
+            &endpoints, rings, 0) {
             refusal(report, format!("Kimi K3 Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
         }
         device.items.push(Item::new(Category::Workspace, "EXL3 expert workspace", "kimik3:exl3-k23", SPARK_EXL3_WORKSPACE, Basis::Estimated));

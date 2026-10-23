@@ -501,6 +501,19 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         let mut incoming_pre = self.ffn.inputs()[1]; incoming_pre.bytes = rows * 16;
         Ok(FfnInput { residual, incoming_pre, values, layer: self.layer, tokens: &self.tokens, binding })
     }
+    /// Reborrow a completed attention tail without extending the original lane
+    /// borrow across executor hooks. The binding rejects stale continuations.
+    pub fn ffn_input(&self, binding: QueryBinding) -> Result<FfnInput<'_>> {
+        let Phase::Ffn(expected, rows) = self.phase else {
+            anyhow::bail!("block has no prepared FFN input");
+        };
+        ensure!(binding == expected && binding.layer() == self.layer
+            && rows == self.tokens.len(), "prepared FFN binding differs");
+        let mut residual = self.ffn.inputs()[0]; residual.bytes = rows * 40960;
+        let mut incoming_pre = self.ffn.inputs()[1]; incoming_pre.bytes = rows * 16;
+        Ok(FfnInput { residual, incoming_pre, values: self.ffn.normalized_storage(rows),
+            layer: self.layer, tokens: &self.tokens, binding })
+    }
     /// # Safety
     /// Result is the finite completed shared+routed FFN output for the returned
     /// FfnInput binding, in its token order, on this device. It stays immutable

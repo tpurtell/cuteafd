@@ -104,6 +104,8 @@ shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
 v41_l2_prefetch=
+v41_prefill_waves=
+v41_prefill_span=
 '''
             if encoder is not None:
                 setup+='\nVISION=auto\ncount_plan="$ENCODER_PLAN"\n'
@@ -211,6 +213,7 @@ v41_l2_prefetch=
         """The former --tp2-* flags are configuration keys: run.sh --set reaches the
         loader as the file would, and the loader rejects a bad value."""
         source=(ROOT/'scripts/launch/run-family.sh').read_text()
+        config_scope=source[source.index('# Plain KEY=VALUE lines;'):source.index('# Refused before anything starts:')]
         block=source[source.index('# The release loader validates every key'):source.index('release_validate_tp2_options\n')]
         finish='\nprintf "%s\\n" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS"\n'
         with tempfile.TemporaryDirectory() as directory:
@@ -218,11 +221,11 @@ v41_l2_prefetch=
             config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_ATTENTION=on\nTP2_DSPARK_EXPERTS=on\n'
                               '\n# run.sh --set\nTP2_ATTENTION=off\nTP2_DSPARK_EXPERTS=off\nTP2_QUERY_PROJECTION=on\n')
             setup='set -euo pipefail; source scripts/lib/release-common.sh; config="$1"; wip_slot=\n'
-            result=subprocess.run(['bash','-c',setup+block+finish,'test',str(config)],capture_output=True,text=True,cwd=ROOT)
+            result=subprocess.run(['bash','-c',setup+config_scope+block+finish,'test',str(config)],capture_output=True,text=True,cwd=ROOT)
             self.assertEqual(result.returncode,0,result.stderr)
             self.assertEqual(result.stdout.splitlines(),['off','on','off','off'])
             config.write_text((ROOT/'cuteafd.config').read_text()+'\nTP2_OUTPUT_PROJECTION=invalid\n')
-            result=subprocess.run(['bash','-c',setup+block+finish,'test',str(config)],capture_output=True,text=True,cwd=ROOT)
+            result=subprocess.run(['bash','-c',setup+config_scope+block+finish,'test',str(config)],capture_output=True,text=True,cwd=ROOT)
             self.assertNotEqual(result.returncode,0)
             self.assertIn('TP2_OUTPUT_PROJECTION must be on or off',result.stderr)
         # The removed flags name the key that replaced them.

@@ -106,15 +106,22 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 assert_eq!(report.prefill_span_rows, Some(span));
                 let host = report.host_ledger.as_ref().unwrap();
                 let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
-                let endpoints = layout::spark_endpoints(family, 1) as u64;
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Fp8K32 };
-                let (request, response) = endpoint.wire_bytes(geometry).unwrap();
-                let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-                assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(geometry, rings).unwrap() as u64
-                    * endpoints * 4, "{family} {unit}x{waves}");
-                assert_eq!(bytes("spark-intake"), unit * waves * geometry.hidden as u64
-                    * if native { 4 } else { 2 } * endpoints * 4);
+                let endpoints = if family == "deepseek_v41" {
+                    crate::placement::families::deepseek_v41::owners::spark_endpoints(unit as u32, false, waves, 0).unwrap()
+                } else { layout::spark_endpoints(family, 1, unit as u32, false) };
+                let max_frame_bytes = endpoints.iter().map(|endpoint| {
+                    let (request, response) = endpoint.wire_bytes(geometry).unwrap();
+                    request.max(response)
+                }).max().unwrap().max(64 << 20);
+                let rings = SparkRings { max_frame_bytes, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+                assert_eq!(bytes("transport/rdma-rings"), endpoints.iter().map(|endpoint|
+                    endpoint.ring_bytes(geometry, rings).unwrap() as u64).sum::<u64>() * 4,
+                    "{family} {unit}x{waves}");
+                let intake = if family == "deepseek_v41" {
+                    unit * geometry.hidden as u64 * 2 * (2 + u64::from(waves > 1)) * 4
+                } else { unit * waves * geometry.hidden as u64
+                    * if native { 4 } else { 2 } * endpoints.len() as u64 * 4 };
+                assert_eq!(bytes("spark-intake"), intake);
                 assert_eq!(bytes("workspace/router"), (unit + 64)
                     * (geometry.hidden as u64 * 2 + geometry.topk as u64 * 8));
                 assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
@@ -596,14 +603,24 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     for nvfp4 in [false, true] {
         let dir = strict_v41_snapshot(nvfp4);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        for (ranks, gpus) in [(3, 1), (6, 2)] {
+        for (ranks, gpus, waves) in [(3, 1, 1), (3, 1, 2), (6, 2, 1), (6, 2, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
-                workspace_manifest: v41_workspace(dir.path()),
+                workspace_manifest: v41_workspace(dir.path()), prefill_waves: waves,
                 pool_tokens: Some(2_097_152), ..Default::default()
             }), ..sparks(ranks) };
             let report = plan(dir.path(), &options).unwrap();
             assert!(report.placement_supported, "{}", render(&report));
+            assert_eq!(report.prefill_transports, Some(2));
+            assert_eq!(report.prefill_waves, Some(waves));
+            if waves > 1 { assert_eq!(report.prefill_span_rows, Some(16384)); }
+            let host = report.host_ledger.as_ref().unwrap();
+            let endpoints = crate::placement::families::deepseek_v41::owners::spark_endpoints(
+                report.prefill_unit_rows.unwrap() as u32, nvfp4, waves, 0).unwrap();
+            let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 };
+            assert_eq!(host.items.iter().find(|item| item.group == "transport/rdma-rings").unwrap().bytes,
+                crate::placement::families::deepseek_v41::owners::host_ring_bytes(&endpoints, ranks, rings).unwrap());
             let memory = report.memory_layout.as_ref().unwrap();
             let experts = report.experts.as_ref().unwrap();
             assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
@@ -626,10 +643,9 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                         let rings = device.items.iter().find(|item| item.group == "rdma rings").unwrap();
                         let ingress = if nvfp4 { cuteafd_core::SparkIngress::Bf16 }
                             else { cuteafd_core::SparkIngress::Fp8K32 };
-                        let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
-                            capacity: options.layout.as_ref().unwrap().spark_capacity_rows as u32,
-                            ingress,
-                        }; 2];
+                        let endpoints = crate::placement::families::deepseek_v41::owners::spark_endpoints(
+                            report.prefill_unit_rows.unwrap() as u32, ingress == cuteafd_core::SparkIngress::Bf16,
+                            report.prefill_waves.unwrap(), 0).unwrap();
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {
                                 max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20,
@@ -3170,6 +3186,32 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
 }
 
 #[test]
+fn v41_spark_count_preserves_family_resolved_prefill_span() {
+    let dir = strict_v41_snapshot(false);
+    for (ranks, gpus) in [(4, 1), (6, 2)] {
+        for rows in [0, 4096] {
+            for (waves, span) in [(1, None), (1, Some(8192)), (2, None), (2, Some(8192))] {
+                let options = PlanOptions { layout: Some(layout::LayoutOptions {
+                    host_memory: Some((128 << 30, 128 << 30)),
+                    rtx_bytes: vec![96 << 30; gpus], workspace_manifest: v41_workspace(dir.path()),
+                    pool_tokens: Some(262_144), prefill_rows: rows, prefill_waves: waves,
+                    prefill_span_rows: span, ..Default::default()
+                }), ..sparks(ranks) };
+                let direct = plan(dir.path(), &options).unwrap();
+                let counted = plan_spark_count(dir.path(), &options, 6, Some(ranks)).unwrap();
+                assert!(counted.executable(), "{}", render(&counted));
+                let expected = span.unwrap_or(if waves > 1 { 16384 } else if rows == 0 { 2048 } else { rows });
+                assert_eq!(counted.prefill_span_rows, Some(expected));
+                assert_eq!(counted.prefill_span_rows, direct.prefill_span_rows);
+                assert_eq!(counted.prefill_unit_rows, direct.prefill_unit_rows);
+                assert_eq!(counted.prefill_waves, direct.prefill_waves);
+                assert_eq!(counted.memory_layout, direct.memory_layout);
+            }
+        }
+    }
+}
+
+#[test]
 fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     let dir = strict_v41_snapshot(false);
     let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
@@ -3193,6 +3235,14 @@ fn v41_32gib_mxfp4_default_prefill_solves_1024_and_exact_2048_refuses() {
     assert!(refused.prefill_selection.is_none());
     assert!(refused.hints.iter().any(|hint| hint.what.contains("native placement refused")));
     assert!(refused.hints.iter().any(|hint| hint.what.contains("explicit V4.1 prefill capacity 2048 refused")));
+    let continuous = PlanOptions { layout: Some(layout::LayoutOptions {
+        prefill_rows: 0, prefill_span_rows: Some(16384), ..explicit.layout.unwrap()
+    }), ..sparks(4) };
+    let selected = plan_spark_count(dir.path(), &continuous, 6, Some(4)).unwrap();
+    assert!(selected.executable(), "{}", render(&selected));
+    assert_eq!(selected.prefill_unit_rows, Some(1024));
+    assert_eq!(selected.prefill_span_rows, Some(16384));
+    assert!(selected.prefill_selection.as_ref().unwrap().contains("selected 1024"));
 }
 
 #[test]

@@ -251,10 +251,30 @@ fn spark_transport(
     capacity: u32,
     timing: bool,
     world: cuteafd_transport::expert::SparkWorld,
+    endpoint: Option<u32>,
 ) -> Result<SparkExperts> {
     let config = TcpTransportConfig { timing, timeout: Duration::from_secs(120), max_frame_bytes: 64 * 1024 * 1024 };
-    SparkExperts::new_world(world,
-        peers, capacity, config)
+    let mut transport = SparkExperts::new_world(world, peers, capacity, config)?;
+    if let Some(endpoint) = endpoint { transport.bind_model_endpoint(endpoint)?; }
+    Ok(transport)
+}
+
+fn prefill_link<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
+    world: cuteafd_transport::expert::SparkWorld, capacity: u32)
+    -> Result<Option<std::rc::Rc<std::cell::RefCell<crate::shared::spark_intake::SparkLink<'a>>>>> {
+    let waves = usize::from(args.prefill_waves.unwrap_or(1));
+    args.prefill_units()?;
+    if waves == 1 { return Ok(None); }
+    let mut link = crate::shared::spark_intake::SparkLink::new_waves(lib, world, &args.peers,
+        capacity, TcpTransportConfig { timing: protocol_v2_timing(), timeout: Duration::from_secs(120),
+            max_frame_bytes: 64 << 20 }, cuteafd_transport::expert::V41_PARTIAL_ROW_BYTES as usize,
+        waves, capacity)?;
+    link.transport.bind_model_endpoint(2)?;
+    tracing::info!(waves, rows=capacity, ranks=args.peers.len(),
+        device_bytes=cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
+            u64::from(capacity), args.peers.len(), waves as u64)?,
+        "V4.1 separate prefill link; fixed decode intakes unchanged");
+    Ok(Some(std::rc::Rc::new(std::cell::RefCell::new(link))))
 }
 
 fn worker(
@@ -263,6 +283,10 @@ fn worker(
     ready: &mut Option<oneshot::Sender<std::result::Result<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>, String>>>,
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
+    let prefill_units = args.prefill_units()?;
+    ensure!(!prefill_units.is_some_and(|config| config.waves > 1)
+        || !crate::shared::memory::chain::device_exchange_enabled(),
+        "device exchange and N2 prefill are not supported together");
     ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
         "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
@@ -442,8 +466,10 @@ fn worker(
     // Every replicated layout reserves its exact physical rank plane count; the
     // legacy 4-rank forecast is no longer reused for six ranks.
     let wave_bytes = NativeTp4Wave::device_bytes_for(capacity, args.peers.len())?;
-    let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
+    let roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world,
+        prefill_units.filter(|config| config.waves > 1).map(|_| 0))?;
     let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
+    transport.configure_prefill_units(prefill_units);
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     let mut prefill_pass = TargetPass::new(
@@ -460,8 +486,10 @@ fn worker(
     )?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/workspace:prefill-pass");
     admission::startup_phase(&lib, "v41/workspace:prefill-pass", device_total)?;
-    let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world)?;
+    let prefill_roce = spark_transport(&args.peers, capacity, protocol_v2_timing, spark_world,
+        prefill_units.filter(|config| config.waves > 1).map(|_| 1))?;
     let mut prefill_transport = NativeTp4Wave::new(&lib, prefill_roce, wave_bytes)?;
+    prefill_transport.configure_prefill_units(prefill_units);
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
@@ -522,7 +550,10 @@ fn worker(
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
-    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[0], 0, None)?;
+    let prefill_bytes = cuteafd_loader::placement::families::deepseek_v41::owners::prefill_transport_bytes(
+        u64::from(capacity), args.peers.len(),
+        args.prefill_waves.unwrap_or(1) as u64)?;
+    let pool = admission::resolve(&args, &memory, experts, local_workspace, &[prefill_bytes], 0, None)?;
     pass.bind_execution_plan(&pool.placement)?;
     prefill_pass.bind_execution_plan(&pool.placement)?;
     tracing::info!(source_pages=?pool.pages,global_bytes=pool.global_bytes,cache_bytes=?pool.cache_bytes,
@@ -608,7 +639,13 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
+    let deferred_host = admission::deferred_host_consumers(&lib, &args, catalog.nvfp4().is_some())?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas,
+        draft.is_some(), &deferred_host)?;
+    if let Some(link) = prefill_link(&lib, &args, spark_world, capacity)? {
+        transport.install_prefill_link(link.clone())?;
+        prefill_transport.install_prefill_link(link)?;
+    }
     scheduler::publish_capacity(&requests, &prefixes);
     vision.connect()?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;

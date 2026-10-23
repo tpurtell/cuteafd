@@ -3,14 +3,10 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoints: usize)
-    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
-    use cuteafd_core::{SparkEndpoint, SparkIngress};
-    ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
-        "invalid V4.1 device endpoint set");
-    let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2];
-    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: capacity.min(80), ingress }, device_endpoints));
+fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, waves: u64,
+    device_endpoints: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    let endpoints = families::deepseek_v41::owners::spark_endpoints(
+        capacity, bf16, waves, device_endpoints)?;
     let model = cuteafd_transport::worker_selection::ModelAdmission {
         capacity, compiled_capacity, endpoints,
         rings: crate::shared::placement::spark_rings(64 << 20)?,
@@ -44,7 +40,36 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         rtx_layers: (0..local_layers).collect(), spark_ranks: args.peers.len(), prefill_lanes: 2 };
     Ok(Some(crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, Some(catalog),
         &working, args.peers.len(), topology,
-        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(), device_endpoints)?)?))
+        spark_model(capacity, compiled_capacity, catalog.nvfp4().is_some(),
+            u64::from(args.prefill_waves.unwrap_or(1)), device_endpoints)?)?))
+}
+
+/// Fixed decode links are still lazy at this point. Their intake is already
+/// resident; the optional prefill intake and all lazy ring registrations are not.
+pub(super) fn deferred_host_consumers(lib: &cuteafd_ffi::NativeLibrary,
+    args: &crate::cli::NativeServeArgs, bf16: bool) -> Result<Vec<(&'static str, u64)>> {
+    use crate::shared::spark_intake::{choose_preferred_mode, IntakeMode, IntakePreference};
+    use families::deepseek_v41::owners;
+    let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+        .context("invalid V4.1 host transport capacity")?;
+    let waves = u64::from(args.prefill_waves.unwrap_or(1));
+    let mut demands = Vec::new();
+    if !args.peers.is_empty() {
+        let endpoints = owners::spark_endpoints(rows, bf16, waves, 0)?;
+        demands.push(("transport/lazy-rdma-rings", owners::host_ring_bytes(&endpoints,
+            args.peers.len(), crate::shared::placement::spark_rings(64 << 20)?)?));
+        if waves > 1 {
+            let plane_bytes = args.peers.len() as u64 * u64::from(rows) * 10240;
+            let (mode, _) = choose_preferred_mode(lib, IntakePreference::Pinned)?.mode_for(plane_bytes as usize);
+            let staging = match mode {
+                IntakeMode::Host => plane_bytes,
+                IntakeMode::Pinned => plane_bytes.min(1 << 20).max(256),
+                IntakeMode::Gpu => anyhow::bail!("N2 prefill requires pinned or host Spark intake"),
+            };
+            demands.push(("prefill/intake-staging", staging));
+        }
+    }
+    Ok(demands)
 }
 
 #[cfg(test)]
@@ -66,21 +91,39 @@ mod spark_tests {
     }
 
     #[test]
-    fn endpoint_contract_covers_both_regular_and_each_device_lane() -> Result<()> {
+    fn endpoint_contract_preserves_decode_and_admits_prefill_fifo() -> Result<()> {
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
-            for device in 0..=2 {
-                let model = spark_model(live, compiled, false, device)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));
-                assert_eq!(model.endpoints.len(), 2 + device);
-                assert!(model.endpoints[..2].iter().all(|e| e.capacity == live));
-                assert!(model.endpoints[2..].iter().all(|e| e.capacity == 80));
-                assert!(model.endpoints.iter().all(|e| e.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            for waves in [1, 2] {
+                for device in 0..=2 {
+                    if waves > 1 && device > 0 {
+                        let error = spark_model(live, compiled, false, waves, device).unwrap_err();
+                        assert!(error.to_string().contains("device exchange and N2 prefill are not supported together"));
+                        continue;
+                    }
+                    let model = spark_model(live, compiled, false, waves, device)?;
+                    let proxies = 2 + usize::from(waves > 1);
+                    assert_eq!((model.capacity, model.compiled_capacity), (live, compiled));
+                    assert_eq!(model.endpoints.len(), proxies + device);
+                    assert!(model.endpoints[..2].iter()
+                        .all(|e| e.capacity == live && e.ring_depth.is_none()));
+                    if waves > 1 {
+                        assert_eq!(model.endpoints[2].capacity, live);
+                        assert_eq!(model.endpoints[2].ring_depth, Some(2));
+                    }
+                    assert!(model.endpoints[proxies..].iter()
+                        .all(|e| e.capacity == 80 && e.ring_depth.is_none()));
+                    assert!(model.endpoints.iter()
+                        .all(|e| e.ingress == cuteafd_core::SparkIngress::Fp8K32));
+                }
+                assert!(spark_model(live, compiled, true, waves, 0)?.endpoints.iter()
+                    .all(|e| e.ingress == cuteafd_core::SparkIngress::Bf16));
+                assert!(spark_model(live, compiled, true, waves, 1).is_err());
             }
-            assert!(spark_model(live, compiled, true, 0)?.endpoints.iter()
-                .all(|e| e.ingress == cuteafd_core::SparkIngress::Bf16));
-            assert!(spark_model(live, compiled, true, 1).is_err());
         }
-        assert!(spark_model(4096, 2048, false, 0).is_err());
+        assert!(spark_model(4096, 2048, false, 2, 0).is_err());
+        for waves in [0, 3] {
+            assert!(spark_model(4096, 4096, false, waves, 0).is_err());
+        }
         Ok(())
     }
 }
@@ -173,7 +216,9 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?, slots)?;
+        2 * owners::transport_bytes(u64::from(capacity), args.peers.len())?
+            + owners::prefill_transport_bytes(u64::from(capacity), args.peers.len(),
+                args.prefill_waves.unwrap_or(1) as u64)?, slots)?;
     let draft = if args.dspark {
         let tiers = catalog.exl3().map(|m| m.decoder_tiers()).unwrap_or(&[]);
         let directory = crate::families::deepseek_v41::v41_experts::exl3::aot_layout_directory(

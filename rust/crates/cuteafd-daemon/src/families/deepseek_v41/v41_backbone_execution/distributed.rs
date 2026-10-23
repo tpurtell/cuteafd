@@ -66,6 +66,10 @@ impl PlacedPreparedLayer<'_, '_, '_> {
         self.prepared = Some(prepared);
         Ok((self, record))
     }
+    /// Complete on the layer's CUDA owner before releasing its lane borrow.
+    pub async fn into_unit(mut self) -> Result<UnitPreparedLayer> {
+        self.device.future(self.prepared.take().expect("prepared layer present").into_unit()).await
+    }
     /// # Safety
     /// Retain this batch's producers/index, lane, transport and modality mask
     /// through completion or drained cancellation, as for PreparedLayer::execute.
@@ -300,6 +304,21 @@ impl<'w, 'a> DistributedExecution<'w, 'a> {
             }
         }
         Ok(())
+    }
+    /// Publish the completed attention's window before another unit can attend
+    /// this layer. The FFN continuation remains bound to the same unit.
+    /// # Safety
+    /// Attention has drained; retain bank and producer owners until publication.
+    pub unsafe fn enqueue_encoder_attention_publication(&mut self,
+        bank: &BackboneCache<'_>, batch: &CacheBatch, layer: usize) -> Result<()> {
+        ensure!(batch.is_reserved() && batch.stage() == CacheStage::Encoder
+            && self.publication.is_none() && self.progress.invalid
+            && self.progress.batch == Some(batch.identity()) && layer < 20
+            && self.progress.next == layer,
+            "encoder publication requires this prepared attention");
+        self.publication = Some((batch.identity(), layer));
+        // SAFETY: the caller has completed every attention reader of this proposal.
+        unsafe { bank.enqueue_encoder_window(batch, layer, &mut self.producers.windows[layer]) }
     }
     pub fn poll_encoder_publication(&self) -> Result<bool> {
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWave;

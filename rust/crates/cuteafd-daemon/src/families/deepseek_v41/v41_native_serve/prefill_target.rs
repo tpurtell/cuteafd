@@ -124,8 +124,26 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
 
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
     fn encoder_unit(&self, next: usize, replay_end: usize, streamed: bool,
-        budget: ChunkBudget) -> V41Unit {
-        self.times.encoder_unit(self.tokens.len(), self.chunk_rows, next, replay_end, streamed, budget)
+        budget: ChunkBudget) -> Result<V41Unit> {
+        if let Some(config) = P::prefill_units(self.transport).filter(|_|
+            next >= replay_end && next < self.tokens.len()) {
+            let span = config.span_rows;
+            let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
+            let mut ranges = Vec::new();
+            let mut start = next;
+            while start < self.tokens.len() {
+                let end = (start + self.chunk_rows).min(self.tokens.len());
+                let rows = end - next;
+                if !ranges.is_empty() && (rows > span || (!whole && (rows > budget.row_cap
+                    || budget.target.is_some_and(|target| self.times.estimate(2, rows) > target)))) {
+                    break;
+                }
+                ranges.push(start..end);
+                start = end;
+            }
+            return Ok(V41Unit::Stream(ranges));
+        }
+        Ok(self.times.encoder_unit(self.tokens.len(), self.chunk_rows, next, replay_end, streamed, budget))
     }
 
     fn initialize(&mut self, cursor: &mut V41Prefill<P::Suffix>) -> Result<()> {
@@ -174,11 +192,11 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                         self.requests.cache().history_end(self.lease)? as usize
                     } else { cached };
                     self.encoder_unit(next, cached,
-                        self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1, budget)
+                        self.tokens.len().saturating_sub(cached).div_ceil(self.chunk_rows) > 1, budget)?
                 }
             }
             PrefillState::Encoder { next, replay_end, streamed, .. } =>
-                self.encoder_unit(*next, *replay_end, *streamed, budget),
+                self.encoder_unit(*next, *replay_end, *streamed, budget)?,
             PrefillState::Replay { .. } => V41Unit::DecoderReplay,
             PrefillState::Continuation { next } => continuation(*next),
             PrefillState::Done => anyhow::bail!("prefill already finished"),
@@ -230,7 +248,8 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                 let hold = RefCell::new(&mut *self.hold);
                 let before_chunk = || -> Result<()> { prefill_hold(&mut *hold.borrow_mut()); Ok(()) };
                 // Preserve alternating lane ownership after a bounded singleton stream.
-                let odd = (*next - *replay_end) / self.chunk_rows % 2 != 0;
+                let odd = P::prefill_units(self.transport).is_none()
+                    && (*next - *replay_end) / self.chunk_rows % 2 != 0;
                 let (first, second, a, b) = if odd {
                     (&mut *self.other, &mut *self.pass, &mut *self.other_transport, &mut *self.transport)
                 } else {
@@ -246,11 +265,18 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
             }
             (V41Unit::DecoderReplay, PrefillState::Replay { suffix } | PrefillState::Encoder { suffix, .. }) => {
                 ensure!(!self.job.events.is_closed(), "client disconnected");
+                let unit_replay = P::prefill_units(self.transport).is_some();
                 let start = self.requests.begin_decoder_replay(self.lease)?;
                 let rows = (self.tokens.len() as u64 - start) as u32;
                 let mut batch = self.requests.prepare_replay(&[CacheWork { lease: self.lease, tokens: rows, kind: ExpertV2SourceKind::Prefill }])?;
                 let started = Instant::now();
                 let result = (|| -> Result<RetainedScores> {
+                    if unit_replay {
+                        // SAFETY: the cache transition above enforces the encoder/source barrier.
+                        return self.runtime.block_on(unsafe { replay_unit(self.lib, self.pass,
+                            self.requests, &mut batch, self.transport, suffix,
+                            self.draft.as_deref_mut(), &|| !self.job.events.is_closed()) });
+                    }
                     // SAFETY: all encoder rows committed and the retained suffix matches this replay.
                     let bytes = self.runtime.block_on(unsafe { self.pass.prefill_logits(self.lib, self.requests,
                         &mut batch, self.transport, &[rows as usize - 1], Some(suffix)) })?;
@@ -259,7 +285,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                     self.runtime.block_on(self.pass.commit_prefill(self.requests, &mut batch, self.draft.as_deref_mut(), rows))?;
                     Ok(scores)
                 })();
-                if result.is_err() { self.pass.discard(&mut batch)?; }
+                if result.is_err() && !unit_replay { self.pass.discard(&mut batch)?; }
                 console::Prefill::done(console::PrefillKind::Replay, 0, 0, 1, rows as usize, started);
                 tracing::debug!(target: "cuteafd::timing", rows, total_us=started.elapsed().as_micros() as u64, "target decoder replay");
                 let scores = result?;
@@ -296,8 +322,144 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 }
 
-pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
+/// Static layout dispatch for the existing suffix replay's layer arithmetic.
+/// The shared executor owns its barrier, transport order and final commit.
+#[allow(async_fn_in_trait)]
+pub(crate) trait ReplayTarget<'a>: VerificationTarget<'a> {
     type Suffix;
+    /// # Safety
+    /// Replay cache, retained suffix and every device owner describe this batch;
+    /// retain them until execution or cancellation has drained.
+    async unsafe fn begin_replay_unit(&mut self, requests: &Requests<'a>,
+        batch: &RequestBatch, suffix: &Self::Suffix) -> Result<()>;
+    /// # Safety
+    /// All earlier layers completed on this replay's lane and producer owners.
+    async unsafe fn replay_attention(&mut self, requests: &Requests<'a>,
+        batch: &RequestBatch, layer: usize)
+        -> Result<crate::families::deepseek_v41::v41_backbone_execution::UnitPreparedLayer>;
+    /// # Safety
+    /// Prepared attention, batch and transport retain this unit's original storage.
+    async unsafe fn replay_local_ffn(&mut self, batch: &RequestBatch,
+        transport: &mut Self::Transport, layer: usize,
+        prepared: crate::families::deepseek_v41::v41_backbone_execution::UnitPreparedLayer) -> Result<()>;
+    /// # Safety
+    /// Preserve this unit's lane/shared storage until the returned ticket lands.
+    async unsafe fn send_replay_experts(&mut self, batch: &RequestBatch,
+        transport: &mut Self::Transport, layer: usize,
+        prepared: crate::families::deepseek_v41::v41_backbone_execution::UnitPreparedLayer)
+        -> Result<crate::families::deepseek_v41::v41_backbone_execution::UnitPendingLayer>;
+    /// # Safety
+    /// The ticket's original lane/shared values are unchanged since dispatch.
+    async unsafe fn land_replay_experts(&mut self, batch: &RequestBatch,
+        transport: &mut Self::Transport, layer: usize,
+        ticket: crate::families::deepseek_v41::v41_backbone_execution::UnitPendingLayer) -> Result<()>;
+    fn replay_route(&self, transport: &Self::Transport, layer: usize)
+        -> crate::shared::prefill_pipeline::FfnRoute;
+    /// # Safety
+    /// All replay layers completed, and the selected rows belong to this batch.
+    async unsafe fn end_replay_unit(&mut self, lib: &'a NativeLibrary,
+        batch: &RequestBatch, selected: &[usize]) -> Result<Vec<u8>>;
+}
+
+struct ReplayHooks<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain<'a>> {
+    lib: &'a NativeLibrary,
+    pass: &'s mut P,
+    requests: &'s mut Requests<'a>,
+    batch: &'s mut RequestBatch,
+    transport: &'s mut P::Transport,
+    suffix: &'s P::Suffix,
+    draft: Option<&'s mut DraftRuntime<'w, 'a, C>>,
+    keep_running: &'s dyn Fn() -> bool,
+    prepared: Option<crate::families::deepseek_v41::v41_backbone_execution::UnitPreparedLayer>,
+    scores: Option<RetainedScores>,
+    complete: bool,
+}
+impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> Drop for ReplayHooks<'_, '_, 'a, P, C> {
+    fn drop(&mut self) {
+        if !self.complete {
+            self.prepared = None;
+            if let Err(error) = self.pass.abort_cache_commit(self.requests) {
+                tracing::error!(%error, "aborting cancelled decoder replay commit");
+            }
+            if let Err(error) = self.pass.discard(self.batch) {
+                tracing::error!(%error, "discarding cancelled decoder replay unit");
+            }
+        }
+    }
+}
+impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> crate::shared::prefill_pipeline::AsyncPrefillHooks
+    for ReplayHooks<'_, '_, 'a, P, C> {
+    type Ticket = crate::families::deepseek_v41::v41_backbone_execution::UnitPendingLayer;
+    fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
+        self.pass.replay_route(self.transport, layer)
+    }
+    async fn begin_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        ensure!(unit.barrier && unit.layers == (20..40) && unit.slot == 0
+            && self.batch.cache()?.stage() == CacheStage::Replay
+            && unit.rows.len() == self.batch.cache()?.positions().len(),
+            "decoder replay unit differs");
+        ensure!((self.keep_running)(), "client disconnected");
+        // SAFETY: begin_decoder_replay checked every encoder/source commit before this reservation.
+        unsafe { self.pass.begin_replay_unit(self.requests, self.batch, self.suffix).await }
+    }
+    async fn attention(&mut self, layer: usize, _unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        ensure!((self.keep_running)(), "client disconnected");
+        ensure!(self.prepared.is_none(), "decoder replay attention pending");
+        // SAFETY: the preceding executor hook completed the previous layer's FFN.
+        self.prepared = Some(unsafe { self.pass.replay_attention(self.requests, self.batch, layer).await? });
+        Ok(())
+    }
+    async fn local_ffn(&mut self, layer: usize, _unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        let prepared = self.prepared.take().context("decoder replay attention absent")?;
+        // SAFETY: the barrier's exclusive slot retains the original prepared input.
+        unsafe { self.pass.replay_local_ffn(self.batch, self.transport, layer, prepared).await }
+    }
+    async fn send_experts(&mut self, layer: usize, _unit: &crate::shared::prefill_pipeline::Unit)
+        -> Result<Self::Ticket> {
+        let prepared = self.prepared.take().context("decoder replay attention absent")?;
+        // SAFETY: the ticket retains its binding and this hook retains lane/shared owners.
+        unsafe { self.pass.send_replay_experts(self.batch, self.transport, layer, prepared).await }
+    }
+    async fn land_experts(&mut self, layer: usize, _unit: &crate::shared::prefill_pipeline::Unit,
+        ticket: Self::Ticket) -> Result<()> {
+        // SAFETY: executor FIFO order matches this replay's retained transport ticket.
+        unsafe { self.pass.land_replay_experts(self.batch, self.transport, layer, ticket).await }
+    }
+    async fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        ensure!((self.keep_running)(), "client disconnected");
+        // SAFETY: all layers have completed and serving needs only the prompt-end row.
+        let bytes = unsafe { self.pass.end_replay_unit(self.lib, self.batch,
+            &[unit.rows.len() - 1]).await? };
+        self.scores = Some(RetainedScores::new(scores::VOCAB, bytes)?);
+        Ok(())
+    }
+    async fn commit_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
+        ensure!((self.keep_running)(), "client disconnected");
+        self.pass.commit_prefill(self.requests, self.batch, self.draft.as_deref_mut(),
+            u32::try_from(unit.rows.len())?).await?;
+        self.complete = true;
+        Ok(())
+    }
+}
+
+async unsafe fn replay_unit<'w, 'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
+    lib: &'a NativeLibrary, pass: &mut P, requests: &mut Requests<'a>,
+    batch: &mut RequestBatch, transport: &mut P::Transport, suffix: &P::Suffix,
+    draft: Option<&mut DraftRuntime<'w, 'a, C>>, keep_running: &dyn Fn() -> bool,
+) -> Result<RetainedScores> {
+    let positions = batch.cache()?.positions();
+    let first = usize::try_from(*positions.first().context("empty decoder replay")?)?;
+    let unit = crate::families::deepseek_v41::v41_target_pass::encoder_units::decoder_unit(
+        0, first..first.checked_add(positions.len()).context("decoder replay extent overflow")?)?;
+    let mut hooks = ReplayHooks { lib, pass, requests, batch, transport, suffix, draft,
+        keep_running, prepared: None, scores: None, complete: false };
+    crate::shared::prefill_pipeline::run_prefill_units_async(&mut hooks, &[unit], 1).await?;
+    hooks.scores.take().context("decoder replay scores absent")
+}
+
+pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + ReplayTarget<'a> + Sized {
+    fn prefill_units(transport: &Self::Transport)
+        -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig>;
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
@@ -335,7 +497,10 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
         draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: u32) -> Result<()>;
 }
 impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
-    type Suffix = EncoderSuffix<'a>;
+    fn prefill_units(transport: &Self::Transport)
+        -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig> {
+        transport.prefill_units()
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
@@ -381,7 +546,10 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
     }
 }
 impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
-    type Suffix = DeviceOwner<'a, EncoderSuffix<'a>>;
+    fn prefill_units(transport: &Self::Transport)
+        -> Option<crate::families::deepseek_v41::v41_target_pass::encoder_units::UnitConfig> {
+        transport.prefill_units()
+    }
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
     }
@@ -396,6 +564,21 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         self.set_attention_decode(false);
         other.set_attention_decode(false);
         unsafe { self.execute_encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await }
+    }
+    async unsafe fn execute_encoder_stream_held(&mut self, other: &mut Self, requests: &mut Requests<'a>,
+        lease: CacheLease, chunks: &[&[u32]], transports: [&mut Self::Transport; 2],
+        suffix: &mut Self::Suffix, keep_running: &dyn Fn() -> bool,
+        before_chunk: &dyn Fn() -> Result<()>) -> Result<()> {
+        ensure!(transports[0].prefill_units() == transports[1].prefill_units(),
+            "encoder transport unit configuration differs");
+        if let Some(config) = transports[0].prefill_units() {
+            let waves = config.waves;
+            // SAFETY: slots retain independent owners until FIFO landing and in-order commit.
+            unsafe { self.execute_encoder_units(other, requests, lease, chunks, transports,
+                suffix, keep_running, before_chunk, waves).await }
+        } else {
+            self.encoder_stream(other, requests, lease, chunks, transports, suffix, keep_running).await
+        }
     }
     async unsafe fn prefill_logits(&mut self, _lib: &'a NativeLibrary, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, selected: &[usize],

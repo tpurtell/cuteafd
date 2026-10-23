@@ -460,6 +460,9 @@ MODEL_REVISION
 MODEL_VARIANT
 POOL_TOKENS
 PREFILL_BATCH_TOKENS
+PREFILL_ROWS
+PREFILL_WAVES
+PREFILL_SPAN_ROWS
 PREFIX_CACHE_ENTRIES
 PROBE_DUMP_ROOT
 PROFILE
@@ -834,6 +837,25 @@ case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "G
 launch_deepseek_v41() {
 # The release loader validates every key (run.sh --set overrides are in $config).
 release_load_config "$config"
+v41_prefill_rows="$(get PREFILL_ROWS)"
+v41_prefill_waves="$(get PREFILL_WAVES)"
+v41_prefill_span="$(get PREFILL_SPAN_ROWS)"
+[[ -z "$v41_prefill_rows$v41_prefill_span" || -n "$v41_prefill_waves" ]] ||
+  release_die "PREFILL_ROWS and PREFILL_SPAN_ROWS require PREFILL_WAVES for V4.1"
+[[ -z "$v41_prefill_waves" || "$v41_prefill_waves" == 1 || "$v41_prefill_waves" == 2 ]] ||
+  release_die "V4.1 supports PREFILL_WAVES=1 or 2"
+if [[ -n "$v41_prefill_waves" ]]; then
+  v41_prefill_rows="${v41_prefill_rows:-4096}"
+  [[ "$v41_prefill_rows" =~ ^[0-9]+$ ]] && ((v41_prefill_rows >= 256 && v41_prefill_rows <= 4096 && v41_prefill_rows % 256 == 0)) ||
+    release_die "PREFILL_ROWS must be a 256-row multiple in 256..4096 for V4.1"
+  [[ "$RELEASE_PREFILL_EXPLICIT" == 0 || "$PREFILL_BATCH_TOKENS" == "$v41_prefill_rows" ]] ||
+    release_die "PREFILL_ROWS conflicts with PREFILL_BATCH_TOKENS"
+  v41_prefill_span="${v41_prefill_span:-16384}"
+  [[ "$v41_prefill_span" =~ ^[0-9]+$ ]] && ((v41_prefill_span >= v41_prefill_rows && v41_prefill_span <= 1048576 && v41_prefill_span % 256 == 0)) ||
+    release_die "PREFILL_SPAN_ROWS must be a 256-row multiple between PREFILL_ROWS and 1048576"
+  PREFILL_BATCH_TOKENS="$v41_prefill_rows"
+  RELEASE_PREFILL_EXPLICIT=1
+fi
 # V4.1 serves its established ranges until its runtime consumes solver placement.
 attention_placement="${ATTENTION_PLACEMENT:-auto}"
 case "$attention_placement" in
@@ -1415,6 +1437,9 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+if [[ -n "$v41_prefill_waves" ]]; then
+  args+=(--prefill-waves "$v41_prefill_waves" --prefill-span-rows "$v41_prefill_span")
+fi
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")

@@ -35,9 +35,31 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         .collect::<std::result::Result<Vec<_>, _>>()?
         .try_into()
         .map_err(|_| anyhow::anyhow!("four test peers required"))?;
+    // SAFETY: the runner supplies the sealed library and keeps its slot mounted.
     let lib = unsafe { NativeLibrary::load(path)? };
-    let catalog = cuteafd_loader::read_official_v41_catalog(std::path::Path::new(&model),
-    )?;
+    let snapshot = std::path::Path::new(&model);
+    let catalog = cuteafd_loader::read_official_v41_catalog(snapshot)?;
+    let encoder_pair = std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some();
+    let decode_lanes = std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some();
+    let shared_prefill = encoder_pair && !decode_lanes;
+    let geometry = catalog.routed_experts().geometry()?;
+    let layers: Vec<_> = (0..geometry.layers as usize).collect();
+    if let Ok(selected) = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS") {
+        let selected = selected.split(',').map(str::parse)
+            .collect::<std::result::Result<Vec<usize>, _>>()?;
+        ensure!(selected == layers, "target-pass fixture exercises every backbone expert layer");
+    }
+    let config = TcpTransportConfig { timing: false, timeout: Duration::from_secs(120),
+        max_frame_bytes: 2 << 20 };
+    let pending_sparks = crate::shared::placement::SparkAdmission::plan(snapshot, geometry,
+        Some(&catalog), &cuteafd_loader::placement::SparkWorkingSet {
+            spark_layers: layers, rtx_layers: vec![], spark_ranks: peers.len(), prefill_lanes: 2,
+        }, peers.len(), None, cuteafd_transport::worker_selection::ModelAdmission {
+            capacity: 80, compiled_capacity: 80,
+            endpoints: cuteafd_loader::placement::families::deepseek_v41::owners::spark_endpoints(
+                80, catalog.nvfp4().is_some(), if shared_prefill { 2 } else { 1 }, 0)?,
+            rings: crate::shared::placement::spark_rings(config.max_frame_bytes)?,
+        })?.start(&peers)?;
     let start = Instant::now();
     let weights = BackboneLaneWeights::load(
         &lib,
@@ -135,13 +157,12 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
         )?,
         Duration::from_secs(120),
     )?;
-    let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-            timeout: Duration::from_secs(120),
-            max_frame_bytes: 2 * 1024 * 1024,
-        })?;
+    pending_sparks.wait()?;
+    let mut roce = SparkExperts::new_world(
+        cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
+    roce.bind_model_endpoint(0)?;
     let mut transport = NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(80)?)?;
-    if std::env::var_os("CUTEAFD_TARGET_PASS_ENCODER_PAIR").is_some()
-        || std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
+    if encoder_pair || decode_lanes {
         let mut other = TargetPass::new(
             TargetEmbeddingWave::new(&lib, &table, 80, TargetEmbeddingWave::device_bytes(80)?)?,
             BackboneLane::new(&weights, 80, BackboneLane::workspace_bytes(&lib, 80)?.into_iter().sum())?,
@@ -154,12 +175,13 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             TargetTapWave::new(&lib, 80, TargetTapWave::device_bytes(80)?)?,
             Duration::from_secs(120),
         )?;
-        let mut second_transport = NativeTp4Wave::new(&lib,
-            SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, TcpTransportConfig { timing: false,
-                timeout: Duration::from_secs(120), max_frame_bytes: 2 * 1024 * 1024,
-            })?, NativeTp4Wave::device_bytes(80)?)?;
+        let mut second_roce = SparkExperts::new_world(
+            cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80, config.clone())?;
+        second_roce.bind_model_endpoint(1)?;
+        let mut second_transport = NativeTp4Wave::new(
+            &lib, second_roce, NativeTp4Wave::device_bytes(80)?)?;
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        if std::env::var_os("CUTEAFD_TARGET_PASS_DECODE_LANES").is_some() {
+        if decode_lanes {
             let draft_weights = crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load(
                 &lib, &catalog, 80, 1, 32 * 1024 * 1024 * 1024, 16 * 1024 * 1024)?;
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::new(
@@ -192,7 +214,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             assert!(requests.validate(&second).is_err());
             assert!(requests.cache().request_id(lease).is_err());
             pass.discard(&mut first)?; other.discard(&mut second)?;
-            transport.reset_connections(); second_transport.reset_connections();
+            transport.reset_connections()?; second_transport.reset_connections()?;
             eprintln!("PASS cancelled independent encoder: both batches revoked before owner reuse");
         }
         for (left, right, tail) in [(65usize, 65usize, 0usize), (79, 1, 0), (65, 65, 1), (64, 64, 27)] {
@@ -270,7 +292,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             assert!(requests.cache().request_id(lease).is_err());
             assert_eq!(pass.state, State::Idle);
             assert_eq!(other.state, State::Idle);
-            transport.reset_connections(); second_transport.reset_connections();
+            transport.reset_connections()?; second_transport.reset_connections()?;
             eprintln!("PASS cancelled encoder stream revoked admission and reset both owners");
         }
         let mut expected = None;
@@ -303,6 +325,57 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.release(lease)?;
         }
         eprintln!("PASS five-chunk stream: serial-exact suffix and ordered decoder replay");
+        let mut shared_link = crate::shared::spark_intake::SparkLink::new_waves(&lib,
+            cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80,
+            config, 10240, 2, 80)?;
+        shared_link.transport.bind_model_endpoint(2)?;
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(shared_link));
+        transport.install_prefill_link(shared.clone())?;
+        second_transport.install_prefill_link(shared.clone())?;
+        {
+            use std::future::Future;
+            let lease = requests.admit(0, 7200)?;
+            requests.begin_encoder(lease, 175)?;
+            let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
+            {
+                // SAFETY: both passes and the shared FIFO outlive the cancelled future.
+                let mut pending = Box::pin(unsafe { pass.execute_encoder_units(&mut other,
+                    &mut requests, lease, &chunks, [&mut transport, &mut second_transport],
+                    &mut suffix, &|| true, &|| Ok(()), 2) });
+                runtime.block_on(std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                }));
+            }
+            assert!(requests.cache().request_id(lease).is_err());
+            assert_eq!(pass.state, State::Idle);
+            assert_eq!(other.state, State::Idle);
+            transport.reset_connections()?;
+            second_transport.reset_connections()?;
+            assert_eq!(shared.borrow().transport.open_waves(), 0);
+        }
+        for waves in [1, 2] {
+            let lease = requests.admit(0, 7200 + waves as u64)?;
+            requests.begin_encoder(lease, 175)?;
+            let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
+            // SAFETY: each slot retains its independent pass, with one shared FIFO.
+            runtime.block_on(unsafe { pass.execute_encoder_units(&mut other, &mut requests,
+                lease, &chunks, [&mut transport, &mut second_transport], &mut suffix,
+                &|| true, &|| Ok(()), waves) })?;
+            let output = suffix.output()?;
+            let mut bytes = Vec::new();
+            for buffer in [output.residual, output.pre] {
+                let mut value = vec![0; buffer.bytes];
+                lib.copy_d2h(&mut value, buffer)?;
+                bytes.extend_from_slice(&value);
+            }
+            assert_eq!(Some(&bytes), expected.as_ref(), "N{waves} encoder units differ from serial");
+            assert_eq!(shared.borrow().transport.open_waves(), 0);
+            assert_eq!(requests.cache().committed_end(lease)?, 175);
+            assert_eq!(requests.begin_decoder_replay(lease)?, 47);
+            requests.release(lease)?;
+        }
+        eprintln!("PASS shared FIFO N1/N2: serial-exact suffix, ordered commits, cancellation/reset reuse");
         return Ok(());
     }
     let dspark_weights = if std::env::var_os("CUTEAFD_TARGET_PASS_DSPARK").is_some() {

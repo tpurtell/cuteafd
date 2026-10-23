@@ -22,7 +22,7 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for TargetPass<'_, 'a> {
         transport.begin_request(); Ok(())
     }
     fn reset_connections(transport: &mut Self::Transport) -> Result<()> {
-        transport.reset_connections(); Ok(())
+        transport.reset_connections()
     }
     fn decode_round(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,
@@ -51,7 +51,7 @@ impl<'w, 'a: 'w> ServingTarget<'w, 'a> for DistributedTargetPass<'_, 'a> {
     }
     fn reset_connections(transport: &mut Self::Transport) -> Result<()> {
         let device = transport.device;
-        device.run(|| { transport.reset_connections(); Ok(()) })
+        device.run(|| transport.reset_connections())
     }
     fn decode_round(_lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
         first: &mut Self, second: &mut Self, requests: &mut Requests<'a>,

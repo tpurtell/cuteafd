@@ -84,8 +84,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
         prefill_lanes: v4::PREFILL_LANES,
     };
-    let endpoints = spark_endpoints("deepseek_v4", v4::PREFILL_LANES);
-    let mut sparks = spark_devices(report, model, checkpoint, options, SPARK, &spark_working, endpoints,
+    let endpoints = spark_endpoints("deepseek_v4", v4::PREFILL_LANES, options.spark_capacity_rows as u32,
+        checkpoint.spark_input_is_bf16());
+    let mut sparks = spark_devices(report, model, options, SPARK, &spark_working, &endpoints,
         &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
@@ -144,7 +145,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
     // Reapply after admission: rank-local I/O never belongs to the coordinator KV budget.
-    charge_spark_devices(report, model, checkpoint, options, SPARK, &spark_working, endpoints, &mut sparks,
+    charge_spark_devices(report, model, options, SPARK, &spark_working, &endpoints, &mut sparks,
         &mut notes, |device| format!("{} I/O admission", device.name()));
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
