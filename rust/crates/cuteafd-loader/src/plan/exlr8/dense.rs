@@ -696,6 +696,50 @@ impl DensePlan {
     }
 }
 
+/// Coordinator resident bytes of a native GLM rank, grouped as the official
+/// `layout::glm5::resident_owned` groups them (group, format, bytes): every
+/// component its own allocation of at least 256 bytes (the loader's sizes), `kv_b` split per head into
+/// E4M3 `w_uk`/`w_uv` with one F32 scale per row and 64-wide tile, router on
+/// rank 0, vocabulary (embedding + head, one row-FP8 owner) on rank 0.
+pub fn resident_native(records: &[DenseRecord], world: usize, rank: usize, layers: usize, heads: usize,
+    nope: usize, v: usize, lat: usize) -> Result<Vec<(String, String, u64)>> {
+    (|| -> anyhow::Result<_> {
+        ensure!(heads % world == 0, "GLM heads do not split over {world} coordinators");
+        let plan = DensePlan::for_rank(records, world, rank)?;
+        let mut groups = std::collections::BTreeMap::<(String, String), u64>::new();
+        let mut put = |group: &str, format: &str, bytes: usize| -> anyhow::Result<()> {
+            ensure!(bytes > 0, "empty native dense allocation in {group}");
+            *groups.entry((group.into(), format.into())).or_default() += bytes.max(256) as u64;
+            Ok(())
+        };
+        for slice in &plan.tensors {
+            let Some(rest) = slice.tensor.strip_prefix("model.layers.") else {
+                let group = match slice.tensor.as_str() {
+                    "model.embed_tokens.weight" => "embedding", "lm_head.weight" => "lm_head", _ => "norm" };
+                for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.source.bytes)?; }
+                continue;
+            };
+            let layer: usize = rest.split('.').next().context("layer index")?.parse()?;
+            if layer >= layers { continue; }
+            // kv_b lands as its split operands (below), not as a record.
+            if slice.tensor.ends_with(".self_attn.kv_b_proj.weight") { continue; }
+            let group = if slice.tensor.contains(".self_attn.indexer.") { "indexer" }
+                else if slice.tensor.contains(".self_attn.") { "attention" }
+                else if slice.tensor.ends_with(".mlp.gate.weight") || slice.tensor.ends_with(".mlp.gate.e_score_correction_bias") { "router" }
+                else if slice.tensor.contains(".mlp.") { "dense" } else { "norm" };
+            for c in &slice.components { put(group, &c.dtype.to_lowercase(), c.source.bytes)?; }
+        }
+        let local = heads / world;
+        for _ in 0..layers {
+            put("attention", "fp8", local * lat * nope)?;
+            put("attention", "fp8-scale", local * lat * (nope / 64) * 4)?;
+            put("attention", "fp8", local * v * lat)?;
+            put("attention", "fp8-scale", local * v * (lat / 64) * 4)?;
+        }
+        Ok(groups.into_iter().map(|((g, f), b)| (g, f, b)).collect())
+    })().map_err(Into::into)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,5 +1108,25 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    /// The real checkpoint's native coordinator residency: TP2 ranks sum to the
+    /// census plus the kv_b split's scales (embedding/head on rank 0 only).
+    /// Set CUTEAFD_EXLR8_SNAPSHOT to the EXLR8 GLM 5.3 snapshot.
+    #[test]
+    #[ignore = "requires the EXLR8 GLM 5.3 checkpoint"]
+    fn real_checkpoint_native_residency() {
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_EXLR8_SNAPSHOT").expect("snapshot"));
+        let records = DenseRecord::inventory(&snapshot).unwrap();
+        let total = |groups: &[(String, String, u64)]| groups.iter().map(|g| g.2).sum::<u64>();
+        let one = super::resident_native(&records, 1, 0, 78, 64, 192, 256, 512).unwrap();
+        let ranks: Vec<_> = (0..2).map(|r| super::resident_native(&records, 2, r, 78, 64, 192, 256, 512).unwrap()).collect();
+        assert!(ranks[1].iter().all(|(g, _, _)| g != "embedding" && g != "lm_head" && g != "router"));
+        let (whole, r0, r1) = (total(&one), total(&ranks[0]), total(&ranks[1]));
+        eprintln!("native resident bytes: TP1 {whole}, TP2 {r0} + {r1}");
+        // Replicated q_a/kv_a/indexer/norms make the pair larger than one GPU.
+        assert!(r0 + r1 > whole && r0 > r1);
+        // Census 9.68 GiB logical (kv_b E4M3 bytes identical once split) plus split scales.
+        assert!((10_000_000_000..12_500_000_000).contains(&whole), "{whole}");
     }
 }
