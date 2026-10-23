@@ -303,6 +303,57 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             requests.release(lease)?;
         }
         eprintln!("PASS five-chunk stream: serial-exact suffix and ordered decoder replay");
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::shared::spark_intake::SparkLink::new_waves(&lib,
+                cuteafd_transport::expert::SparkWorld::canonical(peers.len())?, &peers, 80,
+                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120),
+                    max_frame_bytes: 2 << 20 }, 10240, 2, 80)?));
+        transport.install_prefill_link(shared.clone())?;
+        second_transport.install_prefill_link(shared.clone())?;
+        {
+            use std::future::Future;
+            let lease = requests.admit(0, 7200)?;
+            requests.begin_encoder(lease, 175)?;
+            let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
+            {
+                // SAFETY: both passes and the shared FIFO outlive the cancelled future.
+                let mut pending = Box::pin(unsafe { pass.execute_encoder_units(&mut other,
+                    &mut requests, lease, &chunks, [&mut transport, &mut second_transport],
+                    &mut suffix, &|| true, &|| Ok(()), 2) });
+                runtime.block_on(std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                }));
+            }
+            assert!(requests.cache().request_id(lease).is_err());
+            assert_eq!(pass.state, State::Idle);
+            assert_eq!(other.state, State::Idle);
+            transport.reset_connections()?;
+            second_transport.reset_connections()?;
+            assert_eq!(shared.borrow().transport.open_waves(), 0);
+        }
+        for waves in [1, 2] {
+            let lease = requests.admit(0, 7200 + waves as u64)?;
+            requests.begin_encoder(lease, 175)?;
+            let mut suffix = EncoderSuffix::new(&lib, 175, EncoderSuffix::device_bytes(175)?)?;
+            // SAFETY: each slot retains its independent pass, with one shared FIFO.
+            runtime.block_on(unsafe { pass.execute_encoder_units(&mut other, &mut requests,
+                lease, &chunks, [&mut transport, &mut second_transport], &mut suffix,
+                &|| true, &|| Ok(()), waves) })?;
+            let output = suffix.output()?;
+            let mut bytes = Vec::new();
+            for buffer in [output.residual, output.pre] {
+                let mut value = vec![0; buffer.bytes];
+                lib.copy_d2h(&mut value, buffer)?;
+                bytes.extend_from_slice(&value);
+            }
+            assert_eq!(Some(&bytes), expected.as_ref(), "N{waves} encoder units differ from serial");
+            assert_eq!(shared.borrow().transport.open_waves(), 0);
+            assert_eq!(requests.cache().committed_end(lease)?, 175);
+            assert_eq!(requests.begin_decoder_replay(lease)?, 47);
+            requests.release(lease)?;
+        }
+        eprintln!("PASS shared FIFO N1/N2: serial-exact suffix, ordered commits, cancellation/reset reuse");
         return Ok(());
     }
     let dspark_weights = if std::env::var_os("CUTEAFD_TARGET_PASS_DSPARK").is_some() {

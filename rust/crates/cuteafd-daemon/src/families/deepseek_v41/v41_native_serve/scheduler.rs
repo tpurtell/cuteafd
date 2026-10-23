@@ -165,7 +165,8 @@ fn retire_request<'a, C: DraftChain<'a>>(mut request: Active<'a>, requests: &mut
 /// cache configuration or allocation failure must fail startup, not leave a
 /// healthy-looking front door whose worker has already exited.
 pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
-    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool) -> Result<PrefixCache<'a>> {
+    requests: &Requests<'a>, arenas: super::prefix::Arenas<'a>, draft: bool,
+    deferred: &[(&str, u64)]) -> Result<PrefixCache<'a>> {
     let units = requests.cache().unit_capacity();
     let layout = super::prefix::layout(units, draft, true);
     let mut config = args.host_cache_config()?;
@@ -194,13 +195,15 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         tracing::warn!(conversations_50k, desired = args.concurrency + 4,
             "host prefix quota holds fewer 50K conversations than concurrency plus four");
     }
-    let host = if config.enabled() && args.prefix_cache_entries > 0 {
-        let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
-            .context("invalid V4.1 prefill capacity for host logits")?;
-        let logits = cuteafd_core::memory_layout::host_logits_bytes(
-            u64::from(rows), u64::from(rows),
-            super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
-        crate::shared::prefix::budget::admit(config.bytes, logits, 8 << 30)?;
+    let host_enabled = config.enabled() && args.prefix_cache_entries > 0;
+    let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+        .context("invalid V4.1 prefill capacity for host logits")?;
+    let logits = cuteafd_core::memory_layout::host_logits_bytes(
+        u64::from(rows), u64::from(rows),
+        super::scores::VOCAB as u64).context("V4.1 host logits reservation overflow")?;
+    crate::shared::memory::budget::admit_host_memory(
+        if host_enabled { config.bytes } else { 0 }, deferred, logits, 8 << 30)?;
+    let host = if host_enabled {
         let engine = crate::shared::prefix::CudaCopyEngine::registered_with_owners(lib,
             &requests.cache().source_buffers(), arenas.owners())?;
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");

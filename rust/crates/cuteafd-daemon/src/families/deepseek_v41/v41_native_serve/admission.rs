@@ -44,6 +44,34 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
             u64::from(args.prefill_waves.unwrap_or(1)), device_endpoints)?)?))
 }
 
+/// Fixed decode links are still lazy at this point. Their intake is already
+/// resident; the optional prefill intake and all lazy ring registrations are not.
+pub(super) fn deferred_host_consumers(lib: &cuteafd_ffi::NativeLibrary,
+    args: &crate::cli::NativeServeArgs, bf16: bool) -> Result<Vec<(&'static str, u64)>> {
+    use crate::shared::spark_intake::{choose_preferred_mode, IntakeMode, IntakePreference};
+    use families::deepseek_v41::owners;
+    let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
+        .context("invalid V4.1 host transport capacity")?;
+    let waves = u64::from(args.prefill_waves.unwrap_or(1));
+    let mut demands = Vec::new();
+    if !args.peers.is_empty() {
+        let endpoints = owners::spark_endpoints(rows, bf16, waves, 0)?;
+        demands.push(("transport/lazy-rdma-rings", owners::host_ring_bytes(&endpoints,
+            args.peers.len(), crate::shared::placement::spark_rings(64 << 20)?)?));
+        if waves > 1 {
+            let plane_bytes = args.peers.len() as u64 * u64::from(rows) * 10240;
+            let (mode, _) = choose_preferred_mode(lib, IntakePreference::Pinned)?.mode_for(plane_bytes as usize);
+            let staging = match mode {
+                IntakeMode::Host => plane_bytes,
+                IntakeMode::Pinned => plane_bytes.min(1 << 20).max(256),
+                IntakeMode::Gpu => anyhow::bail!("N2 prefill requires pinned or host Spark intake"),
+            };
+            demands.push(("prefill/intake-staging", staging));
+        }
+    }
+    Ok(demands)
+}
+
 #[cfg(test)]
 mod spark_tests {
     use super::*;

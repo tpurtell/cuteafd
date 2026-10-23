@@ -415,10 +415,11 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
-    let mut make_transport = || {
+    let mut make_transport = |endpoint| {
         let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let mut transport = devices[1].own(|| {
-            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world)?;
+            let roce = super::spark_transport(&args.peers, capacity, timing, spark_world,
+                args.prefill_units()?.filter(|config| config.waves > 1).map(|_| endpoint))?;
             let mut transport = NativeTp4Wave::new(&lib, roce, wave_bytes)?;
             transport.configure_prefill_units(args.prefill_units()?);
             Ok(transport)
@@ -432,8 +433,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         }
         Ok::<_, anyhow::Error>(transport)
     };
-    let mut transport = make_transport()?;
-    let mut second_transport = make_transport()?;
+    let mut transport = make_transport(0)?;
+    let mut second_transport = make_transport(1)?;
     memory_checkpoint("TP2 transports")?;
     if let Some(draft) = &mut draft { draft.configure_policy(&transport, catalog.nvfp4().is_some())?; }
     // Allocation must consume exactly the admitted pages; do not run a second
@@ -461,7 +462,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     memory_checkpoint("allocated KV cache")?;
     crate::shared::memory_report::release_load_staging(&lib);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
+    let deferred_host = devices[1].run(|| admission::deferred_host_consumers(
+        &lib, &args, catalog.nvfp4().is_some()))?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas,
+        draft.is_some(), &deferred_host)?;
     if let Some(link) = devices[1].run(|| super::prefill_link(&lib, &args, spark_world, capacity))? {
         transport.install_prefill_link(link.clone())?;
         second_transport.install_prefill_link(link)?;
