@@ -106,7 +106,7 @@ pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows
     let max_k = [h, q, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
     let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
     let splits = max_k.div_ceil(1024);
-    [rows * max_k * 2, 64, max_k / 128 * 2, rows * splits * max_n * 4, rows * max_n * 4,
+    [rows * max_k * 2, 64, max_k / 128 * 2, rows.min(NATIVE_DECODE_ROWS) * splits * max_n * 4, rows * max_n * 4,
         rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2, rows * heads * 256 * 2, rows * inter * 2,
         rows * inter * 2, rows * inter * 2, rows * (128 + ih) * 2, rows * ih * 128 * 2, rows * heads * cfg.v_head_dim * 2]
         .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
@@ -133,7 +133,9 @@ impl<'a> NativeScratch<'a> {
         let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
         let a = |bytes: usize| engine.alloc(bytes);
         let scratch = Self { rotated: a(rows * max_k * 2)?, table: a(64)?, block_scales: a(max_k / 128 * 2)?,
-            partial: a(rows * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?,
+            // Split-K partials serve only the trellis decode core (<= 64 rows); prefill
+            // trellis takes the unpack route and the scaled linears use no partials.
+            partial: a(rows.min(NATIVE_DECODE_ROWS) * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?,
             qkv: a(rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2)?, q: a(rows * heads * 256 * 2)?,
             gate: a(rows * inter * 2)?, up: a(rows * inter * 2)?, hidden: a(rows * inter * 2)?,
             kw: a(rows * (128 + ih) * 2)?, iq: a(rows * ih * 128 * 2)?, values: a(rows * heads * cfg.v_head_dim * 2)? };
@@ -367,5 +369,29 @@ pub(crate) fn trellis_geometries(split: bool) -> Vec<(&'static str, DenseTrellis
             ("down_tp2", g(6144, 6144, 2))]
     } else {
         vec![("q_b", g(2048, 16384, 1)), ("o", g(16384, 6144, 2)), ("gate_up", g(6144, 12288, 1)), ("down", g(12288, 6144, 2))]
+    }
+}
+
+#[cfg(test)]
+mod charge_tests {
+    use super::*;
+
+    /// GLM 5.3 head split: the split-K partials are decode-sized at every lane
+    /// width, so a 4096-row prefill lane charges no gigabyte-class partials.
+    #[test]
+    fn prefill_lane_scratch_charges_decode_sized_partials() {
+        use cuteafd_loader::families::glm5::GlmIndexer;
+        let cfg = GlmDsaConfig { vocab_size: 154880, hidden: 6144, layers: 78, heads: 64, q_lora_rank: 2048,
+            kv_lora_rank: 512, qk_nope_head_dim: 192, qk_rope_head_dim: 64, v_head_dim: 256,
+            index_heads: 32, index_head_dim: 128, index_topk: 2048, indexers: vec![GlmIndexer::Full; 78],
+            first_moe_layer: 3, dense_intermediate: 12288, experts: 256, topk: 8, moe_intermediate: 2048,
+            shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
+            mtp_layers: 1, eos_tokens: vec![154820] };
+        let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
+        let decode = scratch_bytes(&cfg, heads, inter, NATIVE_DECODE_ROWS);
+        let prefill = scratch_bytes(&cfg, heads, inter, 4096);
+        // Rows-proportional terms only: no 1 GiB (4096 x 8 x 8192 x 4) partial.
+        assert!(prefill < 640 << 20, "prefill lane scratch {prefill}");
+        assert!(decode < 32 << 20, "decode scratch {decode}");
     }
 }
