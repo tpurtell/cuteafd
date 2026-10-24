@@ -641,6 +641,57 @@ fn placement(name: &str) -> V41TensorPlacement {
 }
 
 /// Header-only inspection: never reads or eagerly allocates checkpoint tensor payloads.
+/// Shard names of an EXL3 publication: the `model-{i:05}-of-{n:05}` backbone
+/// shards plus the `ple-{layer}-{i:05}-of-{n:05}` files of Engram layers that
+/// ship their quantized PLE weights in the same index (V4.1 EXL3 K3.25 has
+/// Engram layers 1 and 14). The backbone set must be exactly 1..=n, so a
+/// partial index is still rejected; the fixed 48-shard official and NVFP4
+/// contract is unchanged.
+fn official_exl3_shards<'a>(shards: impl Iterator<Item = &'a String>) -> Result<BTreeSet<String>> {
+    fn numbered(text: &str) -> Option<(u32, u32)> {
+        let (index, count) = text.split_once("-of-")?;
+        let digits = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+        if !digits(index) || !digits(count) {
+            return None;
+        }
+        Some((index.parse().ok()?, count.parse().ok()?))
+    }
+    let mut total = None;
+    let mut indexes = BTreeSet::new();
+    let mut allowed = BTreeSet::new();
+    for shard in shards {
+        if !allowed.insert(shard.clone()) {
+            continue;
+        }
+        if let Some(rest) = shard.strip_prefix("model-") {
+            let (index, count) = rest
+                .strip_suffix(".safetensors")
+                .and_then(numbered)
+                .with_context(|| format!("unsupported checkpoint shard {shard}"))?;
+            ensure!(
+                *total.get_or_insert(count) == count,
+                "checkpoint shards mix total counts"
+            );
+            ensure!(index != 0 && index <= count, "unsupported checkpoint shard {shard}");
+            indexes.insert(index);
+        } else {
+            let ple = shard.strip_prefix("ple-").and_then(|rest| {
+                let (layer, tail) = rest.split_once('-')?;
+                let (index, count) = numbered(tail.strip_suffix(".safetensors")?)?;
+                (layer.bytes().all(|b| b.is_ascii_digit()) && index != 0 && index <= count)
+                    .then_some(())
+            });
+            ensure!(ple.is_some(), "unsupported checkpoint shard {shard}");
+        }
+    }
+    let total = total.context("checkpoint index names no backbone shards")?;
+    ensure!(
+        indexes.len() as u32 == total,
+        "checkpoint requires all {total} shards"
+    );
+    Ok(allowed)
+}
+
 pub fn read_official_v41_catalog(snapshot: &Path) -> Result<OfficialV41Catalog> {
     read_official_v41_role_catalog(snapshot, "full catalog", |_| true)
 }
@@ -723,12 +774,14 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
         expected.len(),
         index.weight_map.len()
     );
-    let shard_count = if exl3.is_some() {
-        index.weight_map.values().collect::<BTreeSet<_>>().len()
-    } else { 48 };
-    let allowed_shards: BTreeSet<_> = (1..=shard_count)
-        .map(|i| format!("model-{i:05}-of-{shard_count:05}.safetensors"))
-        .collect();
+    let allowed_shards: BTreeSet<String> = if exl3.is_some() {
+        official_exl3_shards(index.weight_map.values())?
+    } else {
+        (1..=48u32)
+            .map(|i| format!("model-{i:05}-of-00048.safetensors"))
+            .collect()
+    };
+    let shard_count = allowed_shards.len();
     let mut shards: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (name, shard) in &index.weight_map {
         ensure!(
@@ -1422,6 +1475,33 @@ fn apply_nvfp4_expert_contract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exl3_shard_names_accept_engram_ple_files() -> Result<()> {
+        let backbone: Vec<String> = (1..=4u32)
+            .map(|i| format!("model-{i:05}-of-00004.safetensors"))
+            .collect();
+        let names: Vec<String> = backbone
+            .iter()
+            .cloned()
+            .chain(["ple-1-00001-of-00002.safetensors".to_string(),
+                    "ple-1-00002-of-00002.safetensors".to_string()])
+            .collect();
+        let allowed = official_exl3_shards(names.iter())?;
+        assert_eq!(allowed.len(), 6);
+        assert!(allowed.contains("ple-1-00002-of-00002.safetensors"));
+        // A partial backbone index still fails, and unknown files stay rejected.
+        let partial = [backbone[0].clone(), backbone[1].clone()];
+        assert!(official_exl3_shards(partial.iter()).is_err());
+        let unknown = [backbone[0].clone(), "draft-00001-of-00002.safetensors".to_string()];
+        assert!(format!("{:#}", official_exl3_shards(unknown.iter()).unwrap_err())
+            .contains("unsupported checkpoint shard"));
+        let mixed = ["model-00001-of-00004.safetensors".to_string(),
+                     "model-00001-of-00005.safetensors".to_string()];
+        assert!(format!("{:#}", official_exl3_shards(mixed.iter()).unwrap_err())
+            .contains("mix total counts"));
+        Ok(())
+    }
     pub(super) fn official_config() -> OfficialV41Config {
         OfficialV41Config::from_json(include_bytes!("official-v41-config.json"))
             .unwrap()
