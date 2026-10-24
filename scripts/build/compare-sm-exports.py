@@ -26,10 +26,20 @@ ROOT = Path(os.environ.get("CUTEAFD_SOURCE_ROOT", Path(__file__).resolve().paren
 GEOMETRIES = ("flash", "pro", "flash2", "pro2", "glm", "glm2", "glmf", "glmf2",
               "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "step5", "step52")
 CAPACITIES = "1,16,80,256,1024,4096"
+GLM_EXL3_CAPACITIES = "1,16,80,256,1024,2752,4096"
+KIMI_EXL3_CAPACITIES = "1,80,256,1024,4096"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
 EXL3_GEOMETRIES = ("v41", "dsv4f", "dsv4p", "glm", "glmf", "qwen4")
+
+
+def exl3_capacities(geometry):
+    if geometry in ("glm", "glmf"):
+        return GLM_EXL3_CAPACITIES
+    if geometry == "kimik3":
+        return KIMI_EXL3_CAPACITIES
+    return CAPACITIES
 
 
 def load_file(name, path):
@@ -148,26 +158,26 @@ def jobs(scope):
     for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
                            ("dsv4f", "2,3"), ("v41", "2,3"), ("v41", "3,4"), ("v41", "4,5")):
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
-                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits,
+                       ["--geometry", geometry, "--capacities", exl3_capacities(geometry), "--bits", bits,
                         "--compact-companions"]))
     result.extend((f"exl3-{geometry}", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES])
+                   ["--geometry", geometry, "--capacities", exl3_capacities(geometry)])
                   for geometry in EXL3_GEOMETRIES)
     result.extend((f"exl3-{geometry}-k23", "package_exl3_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", "2,3"])
+                   ["--geometry", geometry, "--capacities", exl3_capacities(geometry), "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
     result.append(("exl3-kimik3-k23", "package_exl3_aot.py",
-                   ["--geometry", "kimik3", "--capacities", CAPACITIES, "--bits", "2,3"]))
+                   ["--geometry", "kimik3", "--capacities", exl3_capacities("kimik3"), "--bits", "2,3"]))
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"),
                            ("qwen4", "3,4,5"), ("qwen4", "2,3,4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
-                       ["--geometry", geometry, "--capacities", CAPACITIES, "--bits", bits]))
+                       ["--geometry", geometry, "--capacities", exl3_capacities(geometry), "--bits", bits]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
     result.extend((f"exl3-routes-{geometry}", "export_b12x_exl3_routes_aot.py",
-                   ["--geometry", geometry, "--capacities", CAPACITIES])
-                  for geometry in EXL3_GEOMETRIES)
+                   ["--geometry", geometry, "--capacities", exl3_capacities(geometry)])
+                  for geometry in (*EXL3_GEOMETRIES, "kimik3"))
     result.extend([
         ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "kimi_k6_dense,kimi_split"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
@@ -312,7 +322,8 @@ def _export_exl3(extra, output):
                 geometry, role, width, rows)
             ws = compact_ws or (len(bits) == 2 and tile is None
                                 and (role != "coordinator"
-                                     or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
+                                     or (geometry, bits) in (
+                                         ("glm", (4, 5)), ("glmf", (3, 4)), ("kimik3", (2, 3))))
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
                 block = 32 if compact_ws else 64
