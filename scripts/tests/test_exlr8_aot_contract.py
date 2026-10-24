@@ -75,6 +75,13 @@ def test_serving_and_glue_export_inventory():
     assert grouped64["grouped"] is True and grouped64["group_rows"] == 16
     assert grouped64["grouped_rows"] == 64 and grouped64["fc2_partials"] == "f32"
     assert grouped64["max_groups"] == 512
+    # Routed decode is the compact-unit routed serving core, declared by
+    # variant, so a stale export cannot pass for it.
+    assert dict(spark[0][2]) == {"max_rows": 64, "serving_variant": "k1_reg_pair_b2"}
+    routed = spark[0][3]()
+    assert routed["device_count"] is True
+    assert routed["serving_variant"] == "k1_reg_pair_b2"
+    assert not routed.get("shared_expert") and not routed.get("grouped")
     assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
     with pytest.raises(ValueError):
         inventory("unknown")
