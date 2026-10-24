@@ -12,13 +12,16 @@ fn decode_lane_policy_preserves_fixed_family_defaults_and_mimo_c1() {
         ("glm5_flash", 1), ("deepseek_v4", 1), ("qwen4", 1), ("qwen3_5", 1), ("kimi_k3", 1), ("step5", 1)] {
         assert_eq!(resolve_decode_lanes(family, None, 16).unwrap(), default);
         for lanes in [1, 2] {
-            let supported = if family == "deepseek_v41" { lanes == 2 } else { family == "mimo_v2" || lanes == 1 };
+            let supported = if family == "deepseek_v41" { lanes == 2 } else { lanes == 1 };
             let result = resolve_decode_lanes(family, Some(lanes), 16);
             if supported { assert_eq!(result.unwrap(), lanes); }
             else { assert!(matches!(result, Err(PlanError::UnsupportedOption { option: "--decode-lanes", value, .. }) if value == lanes)); }
         }
     }
-    assert_eq!(resolve_decode_lanes("mimo_v2", Some(2), 1).unwrap(), 1);
+    for concurrency in [1, 16] {
+        assert!(matches!(resolve_decode_lanes("mimo_v2", Some(2), concurrency),
+            Err(PlanError::UnsupportedOption { option: "--decode-lanes", value: 2, .. })));
+    }
     assert_eq!(resolve_decode_lanes("deepseek_v41", Some(2), 1).unwrap(), 2);
     for lanes in [0, 3, 255] {
         assert!(matches!(resolve_decode_lanes("mimo_v2", Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
@@ -37,7 +40,12 @@ fn planner_rejects_unsupported_decode_views_before_family_layout() {
         assert!(error.to_string().contains("unsupported --decode-lanes"));
     }
     let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
-    for (requested, concurrency, expected) in [(None, 16, 1), (Some(2), 16, 2), (Some(2), 1, 1)] {
+    for concurrency in [1, 16] {
+        let options = PlanOptions { decode_lanes: Some(2),
+            layout: Some(layout::LayoutOptions { concurrency, ..Default::default() }), ..Default::default() };
+        assert!(matches!(plan(mimo.path(), &options), Err(PlanError::UnsupportedOption { value: 2, .. })));
+    }
+    for (requested, concurrency, expected) in [(None, 16, 1), (Some(1), 16, 1), (Some(1), 1, 1)] {
         let options = PlanOptions { decode_lanes: requested,
             layout: Some(layout::LayoutOptions { concurrency, host_memory: Some((128 << 30, 128 << 30)),
                 ..Default::default() }), ..Default::default() };

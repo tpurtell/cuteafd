@@ -32,7 +32,7 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
-    /// Independent decode views. The second is admitted before readiness, not on demand.
+    /// Independent decode views. Only one is supported until second-view admission lands.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
     /// Shared GQA drafter-ring storage (independent of weight precision).
@@ -257,6 +257,17 @@ mod draft_storage_tests {
     fn args(extra: &[&str]) -> EngineArgs {
         Command::try_parse_from(["mimo", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
             .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn second_decode_view_is_refused_before_checkpoint_or_native_loading() {
+        let args = args(&["--decode-lanes", "2"]);
+        let error = match open(&args) {
+            Ok(_) => panic!("second decode view was admitted without runtime owners"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
+            Some(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes", value: 2, .. })));
     }
 
     #[test]
@@ -784,6 +795,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
+    cuteafd_loader::plan::resolve_decode_lanes("mimo_v2", Some(args.decode_lanes), args.rings as u64)?;
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;

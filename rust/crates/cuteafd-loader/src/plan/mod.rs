@@ -166,7 +166,8 @@ pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u6
     }
     let reason = match (family, lanes) {
         ("deepseek_v41", 1) => Some("the V4.1 executor has a fixed pair of decode views"),
-        ("deepseek_v41" | "mimo_v2", _) | (_, 1) => None,
+        ("mimo_v2", 2) => Some("second-lane runtime owners and admission charges are not installed"),
+        ("deepseek_v41", _) | (_, 1) => None,
         (_, 2) => Some("this family has no independent second decode view"),
         _ => unreachable!(),
     };
