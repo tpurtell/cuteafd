@@ -29,6 +29,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::ops::Deref;
 
 type Dev<'a> = DeviceAllocation<'a>;
 
@@ -131,36 +133,43 @@ pub(crate) struct Draft {
     pub features: Vec<[f32; 4]>,
 }
 
-pub(crate) struct MimoDrafter<'a> {
+/// Weights and request-indexed context rings shared by execution views.
+/// Request ownership keeps writes to a slot on exactly one lane at a time.
+pub(crate) struct DraftStorage<'a> {
     pub(crate) kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    library: &'a NativeLibrary,
-    timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
-    stream: *mut c_void,
-    /// Ring slots (sequences with a drafter context).
     pub slots: usize,
-    max_sequences: usize,
     fc: DraftWeight<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
     layers: Vec<DraftLayer<'a>>,
-    /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
+    mask_row: Vec<u8>,
+    mask_device: Dev<'a>,
+    representation: MimoDraftRepresentation,
+    confidence_directory: std::path::PathBuf,
+    confidence_scales: fp8_linear::Fp8Scales,
+}
+
+pub(crate) struct MimoDrafter<'a> {
+    storage: Rc<DraftStorage<'a>>,
+    library: &'a NativeLibrary,
+    timing: crate::shared::draft::timing::DraftTiming<'a>,
+    stream: *mut c_void,
+    max_sequences: usize,
+    /// [TAP_ROWS, taps * hidden] BF16: this view's last target step.
     pub taps: Dev<'a>,
     fused: Dev<'a>,
     fused_norm: Dev<'a>,
     context_kv: Dev<'a>,
     context_positions: Dev<'a>,
     context_slots: Dev<'a>,
-    /// The mask token's (trained) embedding row, and its device copy (the
-    /// gather's fallback row for the mask id).
-    mask_row: Vec<u8>,
-    mask_device: Dev<'a>,
     workspace: RefCell<Option<Workspace<'a>>>,
-    representation: MimoDraftRepresentation,
     fp8_workspace: Option<Dev<'a>>,
+}
 
-    confidence_directory: std::path::PathBuf,
-    confidence_scales: fp8_linear::Fp8Scales,
+impl<'a> Deref for MimoDrafter<'a> {
+    type Target = DraftStorage<'a>;
+    fn deref(&self) -> &Self::Target { &self.storage }
 }
 
 /// The block rows' mask id: past every table, so the gather takes the mask row.
@@ -356,6 +365,25 @@ mod mask_tests {
 }
 
 impl<'a> MimoDrafter<'a> {
+    /// Construct before readiness: only weights and request rings are shared.
+    /// Taps, context-update staging, timing and draft scratch are view-local.
+    pub(super) fn execution_view(&self) -> Result<Self> {
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/lane1");
+        let alloc = |source: &Dev<'a>| DeviceAllocation::new(self.library, source.buffer.bytes);
+        let mut view = Self {
+            storage: Rc::clone(&self.storage), library: self.library, stream: self.stream,
+            max_sequences: self.max_sequences,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(self.library, "mimo-dflash-lane1")?,
+            taps: alloc(&self.taps)?, fused: alloc(&self.fused)?, fused_norm: alloc(&self.fused_norm)?,
+            context_kv: alloc(&self.context_kv)?, context_positions: alloc(&self.context_positions)?,
+            context_slots: alloc(&self.context_slots)?, workspace: RefCell::new(None),
+            fp8_workspace: self.fp8_workspace.as_ref().map(alloc).transpose()?,
+        };
+        let workspace = view.workspace(view.max_sequences)?;
+        *view.workspace.get_mut() = Some(workspace);
+        Ok(view)
+    }
+
     pub fn confidence_prior(&self, head: &str) -> Result<crate::shared::draft_confidence::SelectorFit> {
         let (storage, rows) = match self.representation {
             MimoDraftRepresentation::Bf16Only => ("bf16", "bf16-linear"),
@@ -460,31 +488,25 @@ impl<'a> MimoDrafter<'a> {
         tracing::info!(?representation, own_weight_bytes = weight_layout.resident_bytes()?,
             max_load_staging = weight_layout.max_load_staging, slots, max_sequences,
             "DFlash immutable weight storage");
-        Ok(Self {
-            kv_cache,
-            library,
-            stream,
-            slots,
-            max_sequences,
+        let storage = Rc::new(DraftStorage {
+            kv_cache, slots,
             fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps, true)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
-            layers,
+            layers, mask_device: upload(&mask_row)?, mask_row, representation,
+            confidence_directory: dir.into(), confidence_scales: scales, cfg,
+        });
+        Ok(Self {
+            storage, library, stream, max_sequences,
             taps: zeroed(TAP_ROWS * taps * 2)?,
             fused: zeroed(TAP_ROWS * h * 2)?,
             fused_norm: zeroed(TAP_ROWS * h * 2)?,
             context_kv: zeroed(TAP_ROWS * 2 * kv * 2)?,
             context_positions: zeroed(TAP_ROWS * 8)?,
             context_slots: zeroed(TAP_ROWS * 4)?,
-            mask_device: upload(&mask_row)?,
-            mask_row,
             workspace: RefCell::new(None),
-            representation,
-            confidence_directory: dir.into(),
-            confidence_scales: scales,
             fp8_workspace,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mimo-dflash")?,
-            cfg,
         })
     }
 

@@ -272,7 +272,7 @@ mod draft_storage_tests {
         assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "spark_endpoints("].concat()));
         let engine = include_str!("engine.rs");
         assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. })", " = &e.experts"].concat()));
-        assert!(engine.contains(&["Experts::Spark { decode: transport, .. }) => transport.borrow().intake", ".pointers()"].concat()));
+        assert!(engine.contains(&["Experts::Spark { decode, .. }) => decode.borrow().intake", ".pointers()"].concat()));
         assert!(engine.contains(&["for transport in [decode, prefill]", " {"].concat()));
     }
 
@@ -1349,8 +1349,8 @@ impl Opened {
         }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
-            prefill: std::cell::RefCell::new(prefill), runtime }))
+        Ok(Some(engine::Experts::Spark { decode: std::rc::Rc::new(std::cell::RefCell::new(decode)),
+            prefill: std::rc::Rc::new(std::cell::RefCell::new(prefill)), runtime: std::rc::Rc::new(runtime) }))
     }
 }
 

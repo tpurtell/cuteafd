@@ -130,7 +130,7 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    Spark { decode: RefCell<SparkLink<'a>>, prefill: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime },
+    Spark { decode: Rc<RefCell<SparkLink<'a>>>, prefill: Rc<RefCell<SparkLink<'a>>>, runtime: Rc<tokio::runtime::Runtime> },
 }
 
 /// A dispatched Spark wave and its send-side host phases (seconds).
@@ -300,7 +300,7 @@ impl Allocator {
 
 struct Tp2<'a> {
     layers: Vec<usize>,
-    ranks: [RefCell<Fp8MoeTp2<'a>>; 2],
+    ranks: Rc<[RefCell<Fp8MoeTp2<'a>>; 2]>,
     combine: FusedCombine<'a>,
     routes: PeerExchange<'a>,
     source: Cell<RouteSource>,
@@ -363,7 +363,7 @@ pub(crate) struct Peer<'a> {
     graphs: RefCell<HashMap<GraphKey, GraphExec<'a>>>,
     pub device: i32,
     pub stream: *mut c_void,
-    pub layers: Vec<MimoLayer<'a>>,
+    pub layers: Rc<Vec<MimoLayer<'a>>>,
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
@@ -648,7 +648,7 @@ pub(crate) struct MimoEngine<'a> {
     pub library: &'a NativeLibrary,
     pub programs: &'a Programs<'a>,
     pub cfg: MimoV2Config,
-    pub weights: MimoWeights<'a>,
+    pub weights: Rc<MimoWeights<'a>>,
     pub stream: *mut c_void,
     pub max_context: usize,
     pub prefill_rows: usize,
@@ -677,7 +677,7 @@ pub(crate) struct MimoEngine<'a> {
     prefill_kv_wide: RefCell<Option<Rc<Dev<'a>>>>,
     experts: Option<Experts<'a>>,
     tp2: Option<Tp2<'a>>,
-    rtx_local: Option<Fp8Experts<'a>>,
+    rtx_local: Option<Rc<Fp8Experts<'a>>>,
     pub expert_input: ExpertInput,
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
@@ -692,7 +692,7 @@ pub(crate) struct MimoEngine<'a> {
     /// The native MTP drafter: every step taps the last layer's rows.
     pub mtp: Option<super::mtp::MtpDrafter<'a>>,
     /// The token embedding table (resident on this GPU or read from its shard).
-    pub embedding: TokenEmbedding<'a>,
+    pub embedding: Rc<TokenEmbedding<'a>>,
     /// Pinned staging of queued MTP passes' tables (async uploads) and its fill level.
     mtp_staging: RefCell<(HostAllocation<'a>, usize)>,
     /// Prefill qkv and dense-FFN projections run W8A8 (E4M3 activations per
@@ -791,17 +791,75 @@ impl<'a> MimoEngine<'a> {
         }).collect::<Result<Vec<_>>>()?;
         let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
         Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
-            submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
+            submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights: Rc::new(weights), stream,
             max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, request_id: Cell::new(0), unit_position: Cell::new(0), unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
-            wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
+            wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding: Rc::new(embedding),
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
             graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
+    }
+
+    /// A decode-only view shares model/KV and serialized RTX package owners,
+    /// but never graph operands, peer slots, route checks or draft scratch.
+    /// The enclosing lane owner must retire all views together.
+    pub(super) fn decode_view(&self, decode: SparkLink<'a>) -> Result<Self> {
+        ensure!(self.mtp.is_none(), "independent MiMo decode views require DFlash or no drafter");
+        let Some(Experts::Spark { prefill, runtime, .. }) = &self.experts else {
+            anyhow::bail!("independent MiMo decode views require Spark experts");
+        };
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("decode/lane1");
+        let peer = self.peer.as_ref().map(|peer| -> Result<_> {
+            Ok(Peer { device: peer.device, stream: peer.stream, layers: Rc::clone(&peer.layers),
+                kv: peer.kv.clone(), workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None),
+                unit_done: Vec::new(), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
+        }).transpose()?;
+        let devices = || -> Result<_> { Ok([
+            RankDevice { device: self.device, stream: self.stream },
+            RankDevice { device: self.peer.as_ref().context("MiMo decode peer")?.device, stream: self.stream_of(1) },
+        ]) };
+        let exchange = self.exchange.as_ref().map(|_| PeerExchange::new_abortable(self.library,
+            devices()?, cuteafd_loader::families::mimo_v2::admission::peer_slots(1),
+            DECODE_ROWS * self.cfg.hidden * 2)).transpose()?;
+        let tp2 = self.tp2.as_ref().map(|tp2| -> Result<_> {
+            Ok(Tp2 { layers: tp2.layers.clone(), ranks: Rc::clone(&tp2.ranks),
+                combine: FusedCombine::new(self.library, ExchangeDtype::Bf16)?,
+                routes: PeerExchange::new_abortable(self.library, devices()?, 2,
+                    (DECODE_ROWS * self.cfg.topk * 4).next_multiple_of(16) * 2)?,
+                source: Cell::new(tp2.source.get()), checking: Cell::new(false), interval: tp2.interval,
+                steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()) })
+        }).transpose()?;
+        let view = Self {
+            graphs: RefCell::new(HashMap::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
+            submission_failed: Cell::new(false), quantize_grid: self.quantize_grid,
+            rope: RopeWindow::new(self.cfg.rope_dim, self.cfg.full_rope_theta, self.cfg.swa_rope_theta),
+            library: self.library, programs: self.programs, cfg: self.cfg.clone(), weights: Rc::clone(&self.weights),
+            stream: self.stream, max_context: self.max_context, prefill_rows: DECODE_ROWS,
+            prefill_unit_waves: 1, prefill_span_rows: DECODE_ROWS, request_id: Cell::new(0),
+            unit_position: Cell::new(0), unit_index: Cell::new(None), prefill_output: self.prefill_output,
+            pages: self.pages, rings: self.rings, family: self.family, device: self.device,
+            split_family: self.split_family, peer, exchange, kv: self.kv.clone(),
+            workspace: RefCell::new(None), decode_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None),
+            experts: Some(Experts::Spark { decode: Rc::new(RefCell::new(decode)),
+                prefill: Rc::clone(prefill), runtime: Rc::clone(runtime) }), tp2, rtx_local: self.rtx_local.clone(),
+            expert_input: self.expert_input, profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
+            wave_timing: self.wave_timing, drafter: self.drafter.as_ref().map(|draft| draft.execution_view()).transpose()?,
+            l2: None, mtp: None, embedding: Rc::clone(&self.embedding),
+            mtp_staging: RefCell::new((HostAllocation::new(self.library, 256)?, 0)),
+            prefill_w8a8: self.prefill_w8a8, output_fp8_decode: self.output_fp8_decode, kv_cache: self.kv_cache,
+            decode_graphs: self.decode_graphs, graph_storage_plan: self.graph_storage_plan.clone(),
+            graph_storage_bound_bytes: self.graph_storage_bound_bytes.clone(),
+            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0),
+        };
+        *view.decode_workspace.borrow_mut() = Some(view.workspace(0, DECODE_ROWS, true)?);
+        if let Some(peer) = &view.peer {
+            *peer.decode_workspace.borrow_mut() = Some(view.workspace(1, DECODE_ROWS, true)?);
+        }
+        Ok(view)
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -814,8 +872,8 @@ impl<'a> MimoEngine<'a> {
     /// [`Self::kv_layer`] of rank `rank`'s share (0: this GPU, 1: the head split's peer).
     pub(crate) fn kv_layer_on(&self, rank: usize, layer: usize) -> (MimoAttention, cuteafd_ffi::CuteafdDeviceBuffer, usize) {
         let (layers, kv) = match (rank, &self.peer) {
-            (1, Some(peer)) => (&peer.layers, &peer.kv),
-            _ => (&self.weights.layers, &self.kv),
+            (1, Some(peer)) => (peer.layers.as_slice(), &peer.kv),
+            _ => (self.weights.layers.as_slice(), &self.kv),
         };
         let attention = layers[layer].attention;
         (attention, kv[layer].buffer, self.record_bytes(&layers[layer]))
@@ -943,8 +1001,8 @@ impl<'a> MimoEngine<'a> {
         let mut owners = Vec::new();
         for rank in 0..self.ranks() {
             let (layers, kv) = match (rank, &self.peer) {
-                (1, Some(peer)) => (&peer.layers, &peer.kv),
-                _ => (&self.weights.layers, &self.kv),
+                (1, Some(peer)) => (peer.layers.as_slice(), &peer.kv),
+                _ => (self.weights.layers.as_slice(), &self.kv),
             };
             owners.extend(layers.iter().zip(kv).filter(|(layer, _)| layer.attention == MimoAttention::Full)
                 .map(|(_, owner)| Rc::clone(owner)));
@@ -999,7 +1057,7 @@ impl<'a> MimoEngine<'a> {
                     MimoAttention::Sliding => self.rings * RING_ROWS * record,
                 })
             }).collect::<Result<Vec<_>>>()?;
-            Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
+            Ok(Peer { device, stream, kv, layers: Rc::new(layers), workspace: RefCell::new(None),
                 prefill_kv_wide: RefCell::new(None), unit_done: (0..self.prefill_waves()).map(|_|
                     crate::shared::memory::device::Event::new(Device { library, id: device })).collect::<Result<Vec<_>>>()?,
                 decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
@@ -1075,14 +1133,21 @@ impl<'a> MimoEngine<'a> {
     /// release its pinned/landing owners until all compute and copy streams
     /// drain. Publication failure skips potentially blocked compute drains.
     pub(crate) fn terminal_shutdown(&self) -> Result<()> {
-        use crate::shared::peer_split::{TerminalPeerError,TerminalState};
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
         match self.terminal.get() {
-            TerminalState::Drained=>return Ok(()),
-            TerminalState::Active=>self.terminal.set(TerminalState::Aborting),
-            state=>return Err(TerminalPeerError::Closed(state).into()),
+            TerminalState::Drained => return Ok(()),
+            TerminalState::Active => self.terminal.set(TerminalState::Aborting),
+            state => return Err(TerminalPeerError::Closed(state).into()),
         }
-        use crate::shared::experts::rtx::pair::{teardown, Teardown};
-        teardown(&mut Teardown {
+        let mut owners = self.terminal_owners();
+        super::teardown::retire_views(&mut [&mut owners])
+            .map_err(|error| TerminalPeerError::Retain(format!("{error:#}")).into())
+    }
+
+    fn terminal_owners(&self) -> impl crate::shared::experts::rtx::pair::SubmissionOwners + '_ + use<'_, 'a> {
+        use crate::shared::experts::rtx::pair::Teardown;
+        use crate::shared::peer_split::TerminalState;
+        Teardown {
             abort: || {
                 let mut failures = Vec::new();
                 for exchange in self.exchange.iter().chain(self.tp2.iter().map(|tp2| &tp2.routes)) {
@@ -1120,7 +1185,29 @@ impl<'a> MimoEngine<'a> {
                     exchange.finish_terminal(drained);
                 }
             },
-        }).map_err(|error| TerminalPeerError::Retain(format!("{error:#}")).into())
+        }
+    }
+
+    /// Shared rank streams can contain waits from either view. Publish every
+    /// abort first; an unsuccessful proof quarantines both complete views.
+    pub(super) fn terminal_shutdown_views(&self, peer: Option<&Self>) -> Result<()> {
+        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+        let Some(peer) = peer else { return self.terminal_shutdown() };
+        let mut views = Vec::new();
+        for view in [self, peer] {
+            match view.terminal.get() {
+                TerminalState::Drained => {},
+                TerminalState::Active | TerminalState::Aborting => {
+                    view.terminal.set(TerminalState::Aborting);
+                    views.push(view.terminal_owners());
+                },
+                state => return Err(TerminalPeerError::Closed(state).into()),
+            }
+        }
+        let mut owners: Vec<&mut dyn crate::shared::experts::rtx::pair::SubmissionOwners> =
+            views.iter_mut().map(|view| view as &mut dyn crate::shared::experts::rtx::pair::SubmissionOwners).collect();
+        super::teardown::retire_views(&mut owners)
+            .map_err(|error| TerminalPeerError::Retain(format!("{error:#}")).into())
     }
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
@@ -1162,7 +1249,7 @@ impl<'a> MimoEngine<'a> {
     }
 
     pub fn set_rtx_local(&mut self, local: Fp8Experts<'a>) {
-        self.rtx_local = Some(local);
+        self.rtx_local = Some(Rc::new(local));
     }
 
     fn rtx_local_layer(&self, index: usize) -> bool {
@@ -1495,6 +1582,58 @@ impl<'a> MimoEngine<'a> {
         Ok(logits)
     }
 
+    /// Lane-local verifier. Its enclosing LaneSet drains both futures and then
+    /// retires both views on failure; never run a one-view shutdown here.
+    pub(super) async fn verify_device_async(&self, sequences: &mut [(&mut MimoPlacement, usize)],
+        tokens: &[u32]) -> Result<Option<DeviceLogits>> {
+        self.require_live()?;
+        ensure!(self.decode_graphs && self.graphable(), "independent MiMo verification needs startup decode graphs");
+        let rows: usize = sequences.iter().map(|(_, count)| count).sum();
+        ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
+        let stride = self.decode_stride();
+        let mut tables = StepTables { decode: true, positions: Vec::new(), slots: Vec::new(), ring_slots: Vec::new(),
+            seq_first: Vec::new(), page_table: Vec::new(), table_stride: stride };
+        for (placement, count) in sequences.iter() {
+            let first = tables.positions.len() as i32;
+            for position in placement.len..placement.len + count {
+                ensure!(position < self.max_context, "decode at {position} past the context");
+                tables.positions.push(position as i64);
+                tables.slots.push(placement.slot(position)?);
+                tables.ring_slots.push(placement.ring_slot(position));
+                tables.seq_first.push(first);
+                let mut pages: Vec<i32> = placement.pages.iter().map(|&page| page as i32).collect();
+                ensure!(pages.len() <= stride, "decode page table exceeds captured stride");
+                pages.resize(stride, 0);
+                tables.page_table.extend(pages);
+            }
+        }
+        self.prepare_tp2_route_step(&[rows])?;
+        let owned = self.decode_workspace.borrow();
+        let w = owned.as_ref().context("decode workspace must be constructed before readiness")?;
+        let peer_owned = self.peer.as_ref().map(|peer| peer.decode_workspace.borrow());
+        let w1 = peer_owned.as_ref().map(|owned| owned.as_ref().context("peer decode workspace before readiness")).transpose()?;
+        // At a yield boundary both rank streams contain only matched waits.
+        // The preceding use of this view's input tables must finish before upload.
+        for (rank, work) in std::iter::once(w).chain(w1).enumerate() {
+            self.on(rank, || {
+                // SAFETY: both views retain all operands on the serialized rank stream.
+                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank))?; }
+                self.put_step_inputs(rank, work, &tables.positions)?;
+                self.put(&work.slots, &tables.slots)?;
+                self.put(&work.ring_slots, &tables.ring_slots)?;
+                self.put(&work.seq_first, &tables.seq_first)?;
+                self.put(&work.page_table, &tables.page_table)
+            })?;
+        }
+        let gather = self.embedding.device_gather();
+        if gather { self.embedding.check(tokens)?; self.put(&w.ids, tokens)?; }
+        else { self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?; }
+        self.decode_layers_async(w, w1, &tables, rows, gather, true).await?;
+        self.finish_tp2_route_step()?;
+        for (placement, count) in sequences.iter_mut() { placement.len += *count; }
+        Ok(Some(self.device_logits(w, rows, true)))
+    }
+
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
@@ -1753,57 +1892,86 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
         gather: bool, head: bool, launch: bool) -> Result<()> {
-        let layers = &self.weights.layers;
-        let planes = match &self.experts {
-            Some(Experts::Spark { decode: transport, .. }) => transport.borrow().intake.pointers(),
-            _ => [std::ptr::null(); MAX_RANKS],
-        };
-        let bf16_input = self.expert_bf16_input(true);
-        for index in 0..=layers.len() {
-            let previous = self.previous(index);
-            let last = index == layers.len();
-            let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
-            self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
-                planes, bf16_input))?;
-            if let (true, Previous::Planes(_), Some(Experts::Spark { decode: transport, .. })) = (launch, previous, &self.experts) {
-                // The planes are free for the next wave once the stream passes this segment's reduce.
-                transport.borrow().intake.consumed(self.stream)?;
+        for index in 0..=self.weights.layers.len() {
+            if let Some(mut sent) = self.decode_layer(index, w, w1, tables, t, gather, head, launch)? {
+                let Some(Experts::Spark { decode, runtime, .. }) = &self.experts else { unreachable!() };
+                let receive = self.spark_receive(t, &mut decode.borrow_mut(), runtime, &mut sent)?;
+                self.wave_line(index, t, &sent, receive, 0.0);
+                self.decode_layer_received(index)?;
             }
-            if let Some(w1) = w1 {
-                // Queue the matching peer attention before any host-driven
-                // Spark wait or routed package launch in this layer.
-                if index < layers.len() { self.peer_segment(index, w1, tables, t, launch)?; }
-            }
-            if last || !launch { continue; }
-            if layers[index].dense { self.probe_mark(index)?; continue; }
-            if self.tp2_layer(index) { self.probe_ring(w, index, t)?; }
-            if self.tp2_layer(index) {
-                self.tp2_experts(0, index, 0, w, t)?;
-                let peer = w1.context("MiMo TP2 decode workspace")?;
-                self.tp2_experts(1, index, 0, peer, t)?;
-                if index + 1 == layers.len() { self.tp2_post(1, index, 0, peer, t)?; }
-                self.probe_mark(index)?;
-                continue;
-            }
-            if self.rtx_local_layer(index) {
-                self.moe_run(w, index, t, true)?;
-                self.probe_mark(index)?;
-                continue;
-            }
-            match self.experts.as_ref() {
-                Some(Experts::Spark { decode: transport, runtime, .. }) => {
-                    let mut transport = transport.borrow_mut();
-                    let mut sent = self.spark_send(w, index, t, true, bf16_input, true, &mut transport)?;
-                    let receive = self.spark_receive(t, &mut transport, runtime, &mut sent)?;
-                    self.wave_line(index, t, &sent, receive, 0.0);
-                }
-                Some(_) => self.moe_run(w, index, t, true)?,
-                None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
-            }
-            crate::shared::console::layer_mark(index);
-            self.probe_mark(index)?;
         }
         Ok(())
+    }
+
+    /// Same launches as the serial path; only the Spark wait yields to a peer.
+    async fn decode_layers_async(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
+        tables: &StepTables, t: usize, gather: bool, head: bool) -> Result<()> {
+        for index in 0..=self.weights.layers.len() {
+            if let Some(mut sent) = self.decode_layer(index, w, w1, tables, t, gather, head, true)? {
+                let Some(Experts::Spark { decode, .. }) = &self.experts else { unreachable!() };
+                let waited = std::time::Instant::now();
+                let wave = sent.wave.take().context("wave already received")?;
+                // Only this view's fixed transport is borrowed across its wait;
+                // request banks and the serialized RTX package are not borrowed.
+                decode.borrow_mut().receive(wave, t, self.stream).await?;
+                self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
+                self.wave_line(index, t, &sent, waited.elapsed().as_secs_f64(), 0.0);
+                self.decode_layer_received(index)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_layer(&self, index: usize, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
+        tables: &StepTables, t: usize, gather: bool, head: bool, launch: bool) -> Result<Option<SentWave>> {
+        let layers = &self.weights.layers;
+        let planes = match &self.experts {
+            Some(Experts::Spark { decode, .. }) => decode.borrow().intake.pointers(),
+            _ => [std::ptr::null(); MAX_RANKS],
+        };
+        let previous = self.previous(index);
+        let last = index == layers.len();
+        let bf16_input = self.expert_bf16_input(true);
+        let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
+        self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
+            planes, bf16_input))?;
+        if let (true, Previous::Planes(_), Some(Experts::Spark { decode, .. })) = (launch, previous, &self.experts) {
+            decode.borrow().intake.consumed(self.stream)?;
+        }
+        // Match the current layer's peer waits before yielding to another view.
+        if let Some(w1) = w1.filter(|_| !last) { self.peer_segment(index, w1, tables, t, launch)?; }
+        if last || !launch { return Ok(None); }
+        if layers[index].dense { self.probe_mark(index)?; return Ok(None); }
+        if self.tp2_layer(index) {
+            self.probe_ring(w, index, t)?;
+            self.tp2_experts(0, index, 0, w, t)?;
+            let peer = w1.context("MiMo TP2 decode workspace")?;
+            self.tp2_experts(1, index, 0, peer, t)?;
+            if index + 1 == layers.len() { self.tp2_post(1, index, 0, peer, t)?; }
+            self.probe_mark(index)?;
+            return Ok(None);
+        }
+        if self.rtx_local_layer(index) {
+            self.moe_run(w, index, t, true)?;
+            self.probe_mark(index)?;
+            return Ok(None);
+        }
+        match self.experts.as_ref() {
+            Some(Experts::Spark { decode, .. }) =>
+                self.spark_send(w, index, t, true, bf16_input, true, &mut decode.borrow_mut()).map(Some),
+            Some(_) => {
+                self.moe_run(w, index, t, true)?;
+                self.decode_layer_received(index)?;
+                Ok(None)
+            },
+            None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
+        }
+    }
+
+    fn decode_layer_received(&self, index: usize) -> Result<()> {
+        crate::shared::console::layer_mark(index);
+        self.probe_mark(index)
     }
 
     /// Rank 0's decode segment `index` (see [`Self::decode_layers`]).

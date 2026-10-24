@@ -17,7 +17,7 @@ impl<'a> MimoEngine<'a> {
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|value| value.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
             .transpose()?.unwrap_or(0);
-        self.tp2 = Some(Tp2 { layers, ranks: ranks.map(RefCell::new), combine, routes,
+        self.tp2 = Some(Tp2 { layers, ranks: Rc::new(ranks.map(RefCell::new)), combine, routes,
             source: Cell::new(RouteSource::Broadcast), checking: Cell::new(false), interval,
             steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()) });
         if self.prefill_rows >= DECODE_ROWS { self.prepare_scoring_prefill()?; }
