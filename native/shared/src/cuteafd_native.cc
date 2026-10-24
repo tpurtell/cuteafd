@@ -1,6 +1,7 @@
 #include "cuteafd_native.h"
 #include "graph_census_path.h"
 #include "rdma_endpoint_destroy.h"
+#include "rdma_landing_slots.h"
 
 #include <algorithm>
 #include <atomic>
@@ -455,6 +456,7 @@ struct CuteafdRdmaRcEndpointHandle {
   unsigned char* landing_ptr = nullptr;
   size_t landing_bytes = 0;
   size_t landing_header_bytes = 0;
+  cuteafd::RdmaLandingSlots landing_slots;
   // Host ranges sends may gather from (`cuteafd_rdma_rc_endpoint_register_region`).
   std::vector<ibv_mr*> regions;
   // Device range a peer RDMA-writes into (`cuteafd_rdma_rc_endpoint_expose_device`).
@@ -3711,8 +3713,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(
   if (endpoint->landing_mr != nullptr) {
     // Header to the host slot, payload straight into device memory.
     recv_sge[0].length = static_cast<uint32_t>(std::min(bytes, endpoint->landing_header_bytes));
-    recv_sge[1].addr = reinterpret_cast<uintptr_t>(endpoint->landing_ptr);
-    recv_sge[1].length = static_cast<uint32_t>(endpoint->landing_bytes);
+    recv_sge[1].addr = reinterpret_cast<uintptr_t>(endpoint->landing_ptr + endpoint->landing_slots.offset());
+    recv_sge[1].length = static_cast<uint32_t>(endpoint->landing_slots.bytes);
     recv_sge[1].lkey = endpoint->landing_mr->lkey;
     recv_wr.num_sge = 2;
   }
@@ -3720,6 +3722,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(
   if (ibv_post_recv(endpoint->qp, &recv_wr, &bad_recv) != 0) {
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_post_recv failed for RC endpoint");
   }
+  if (endpoint->landing_mr != nullptr) { endpoint->landing_slots.posted(); }
   return ok();
 #else
   (void)offset_bytes;
@@ -3796,7 +3799,7 @@ cuteafd_status_t register_device_dmabuf_current(ibv_pd* pd, void* ptr, size_t by
 #endif
 
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
-    void* handle, void* device_ptr, size_t bytes, size_t header_bytes) {
+    void* handle, void* device_ptr, size_t bytes, size_t header_bytes, size_t slot_bytes) {
   if (handle == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC endpoint handle is null");
   }
@@ -3813,7 +3816,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
     return ok();
   }
   if (bytes > std::numeric_limits<uint32_t>::max() || header_bytes == 0 ||
-      header_bytes > endpoint->recv_frame_bytes) {
+      header_bytes > endpoint->recv_frame_bytes || slot_bytes == 0 || bytes % slot_bytes != 0 ||
+      bytes / slot_bytes > 4) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing extent is invalid");
   }
   ibv_mr* mr = nullptr;
@@ -3825,11 +3829,13 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
   endpoint->landing_ptr = static_cast<unsigned char*>(device_ptr);
   endpoint->landing_bytes = bytes;
   endpoint->landing_header_bytes = header_bytes;
+  endpoint->landing_slots = {slot_bytes, bytes / slot_bytes, 0};
   return ok();
 #else
   (void)device_ptr;
   (void)bytes;
   (void)header_bytes;
+  (void)slot_bytes;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
               "GPU landing requires CUTEAFD_ENABLE_RDMA=ON and CUDA");
 #endif

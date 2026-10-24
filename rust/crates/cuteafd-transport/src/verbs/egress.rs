@@ -14,7 +14,8 @@ pub(crate) struct EgressBuffer {
     host: CuteafdHostBuffer,
     /// Cloned into every payload view; the buffer may be rewritten only when
     /// no view is left ([`Self::writable`]).
-    views: Arc<()>,
+    views: Vec<Arc<()>>,
+    slot_bytes: usize,
 }
 
 // The allocation is owned here and only read through views (or written by the
@@ -24,11 +25,13 @@ unsafe impl Send for EgressBuffer {}
 unsafe impl Sync for EgressBuffer {}
 
 impl EgressBuffer {
-    pub(crate) fn new(bytes: usize) -> Result<Arc<Self>> {
+    pub(crate) fn new(slot_bytes: usize, slots: usize) -> Result<Arc<Self>> {
+        anyhow::ensure!(slots > 0, "empty egress slot ring");
+        let bytes = slot_bytes.checked_mul(slots).context("egress slot extent overflow")?;
         anyhow::ensure!(bytes > 0, "empty egress buffer");
         let library = load_verbs_host_native_library()?;
         let host = library.alloc_host_buffer(bytes)?;
-        Ok(Arc::new(Self { library, host, views: Arc::new(()) }))
+        Ok(Arc::new(Self { library, host, views: (0..slots).map(|_| Arc::new(())).collect(), slot_bytes }))
     }
 
     pub(crate) fn host(&self) -> CuteafdHostBuffer {
@@ -42,17 +45,29 @@ impl EgressBuffer {
         (start >= base && start + payload.len() <= base + self.host.bytes).then(|| start - base)
     }
 
-    /// No payload view is alive (requests holding one have been dropped).
-    pub(crate) fn writable(&self) -> bool {
-        views_writable(&self.views)
+    /// The slot is writable only after its last request owner has gone.
+    pub(crate) fn writable(&self, slot: usize) -> bool {
+        self.views.get(slot).is_some_and(views_writable)
     }
 
-    /// The first `len` bytes as a request payload.
-    pub(crate) fn payload(self: &Arc<Self>, len: usize) -> Result<Bytes> {
-        anyhow::ensure!(len <= self.host.bytes, "egress payload of {len} bytes exceeds the {}-byte buffer",
-            self.host.bytes);
-        Ok(Bytes::from_owner(EgressView { buffer: Arc::clone(self), _view: Arc::clone(&self.views), len }))
+    pub(crate) fn target(&self, slot: usize) -> Result<CuteafdHostBuffer> {
+        anyhow::ensure!(slot < self.views.len(), "egress slot outside its ring");
+        Ok(CuteafdHostBuffer {
+            // SAFETY: every slot is a disjoint region of the owned allocation.
+            ptr: unsafe { self.host.ptr.cast::<u8>().add(slot * self.slot_bytes) }.cast(),
+            bytes: self.slot_bytes,
+            ..self.host
+        })
     }
+
+    /// A payload view retains only its slot, not every slot in the allocation.
+    pub(crate) fn payload(self: &Arc<Self>, slot: usize, len: usize) -> Result<Bytes> {
+        anyhow::ensure!(slot < self.views.len() && len <= self.slot_bytes,
+            "egress payload exceeds its slot");
+        Ok(Bytes::from_owner(EgressView { buffer: Arc::clone(self), _view: Arc::clone(&self.views[slot]),
+            offset: slot * self.slot_bytes, len }))
+    }
+
 }
 
 fn views_writable(views: &Arc<()>) -> bool {
@@ -86,6 +101,27 @@ mod tests {
         drop(pending);
         assert!(views_writable(&views));
     }
+    #[test]
+    fn depth_two_and_three_payload_slots_rotate_without_releasing_neighbors() {
+        for depth in [2, 3] {
+            let views: Vec<_> = (0..depth).map(|_| Arc::new(())).collect();
+            let mut requests: Vec<Option<Bytes>> = (0..depth).map(|_| None).collect();
+            for sequence in 0..4096 {
+                let slot = sequence % depth;
+                drop(requests[slot].take());
+                assert!(views_writable(&views[slot]));
+                let bytes = vec![(sequence % 251) as u8; 16];
+                requests[slot] = Some(Bytes::from_owner(Payload { bytes, _view: views[slot].clone() }));
+                for (other, pending) in requests.iter().enumerate() {
+                    assert_eq!(views_writable(&views[other]), pending.is_none());
+                }
+                assert_eq!(requests[slot].as_ref().unwrap()[0], (sequence % 251) as u8);
+            }
+            drop(requests);
+            assert!(views.iter().all(views_writable));
+        }
+    }
+
 }
 
 impl Drop for EgressBuffer {
@@ -97,6 +133,7 @@ impl Drop for EgressBuffer {
 struct EgressView {
     buffer: Arc<EgressBuffer>,
     _view: Arc<()>,
+    offset: usize,
     len: usize,
 }
 
@@ -105,6 +142,6 @@ impl AsRef<[u8]> for EgressView {
         // SAFETY: the allocation lives as long as `buffer`; the engine writes
         // it only while no view exists (`EgressBuffer::writable`), so the
         // bytes are not mutated while this shared view is alive.
-        unsafe { std::slice::from_raw_parts(self.buffer.host.ptr.cast::<u8>(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.buffer.host.ptr.cast::<u8>().add(self.offset), self.len) }
     }
 }
