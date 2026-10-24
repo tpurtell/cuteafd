@@ -1,6 +1,7 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
+pub mod decode_lanes;
 pub mod deployment;
 pub mod experts;
 pub mod exlr8;
@@ -157,24 +158,10 @@ pub enum PlanError {
     Checkpoint(#[from] anyhow::Error),
 }
 
-/// Resolve the executable lane contract before layout or CUDA allocation.
-/// V4.1 keeps its fixed pair; only MiMo can omit a second decode view.
+/// Resolve the decode-lane count before layout or CUDA allocation
+/// ([`decode_lanes::resolve`]).
 pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
-    let lanes = requested.unwrap_or(if family == "deepseek_v41" { 2 } else { 1 });
-    if !(1..=2).contains(&lanes) {
-        return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
-    }
-    let reason = match (family, lanes) {
-        ("deepseek_v41", 1) => Some("the V4.1 executor has a fixed pair of decode views"),
-        ("mimo_v2", 2) => Some("second-lane runtime owners and admission charges are not installed"),
-        ("deepseek_v41", _) | (_, 1) => None,
-        (_, 2) => Some("this family has no independent second decode view"),
-        _ => unreachable!(),
-    };
-    if let Some(reason) = reason {
-        return Err(PlanError::UnsupportedOption { option: "--decode-lanes", value: lanes, family: family.into(), reason });
-    }
-    Ok(if family == "mimo_v2" && concurrency == 1 { 1 } else { lanes })
+    decode_lanes::resolve(family, requested, concurrency)
 }
 
 #[derive(Debug, Clone, Serialize)]
