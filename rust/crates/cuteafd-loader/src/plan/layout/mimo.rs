@@ -141,6 +141,8 @@ fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, opti
                 .map_err(|_| crate::placement::PlacementError::Inventory("MiMo Spark endpoint geometry"))?;
             charge_spark_io(device, working, geometry, capacity, options.mimo_expert_input.bf16(false),
                 spark_ring_geometry(1), SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)?;
+            charge_spark_slots(device, working, "mimo_v2",
+                spark_execution_slots("mimo_v2", working.prefill_lanes, options.decode_lanes), options.spark_capacity_rows);
             let exact = working.rank_endpoints_io(device.index as usize, geometry, &endpoints, rings)?;
             for item in &mut device.items {
                 match item.group.as_str() {
