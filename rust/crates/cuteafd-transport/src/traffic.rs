@@ -177,6 +177,16 @@ pub(crate) fn written_total() -> u64 {
     registry().lock().unwrap().counters.iter().map(|c| c.bytes.written.load(Ordering::Relaxed)).sum()
 }
 
+/// (sent, received, written) totals over every QP in this process. In a
+/// loopback every SEND byte is counted once sent and once received and every
+/// WRITE byte once sent (as written): received == sent - written.
+#[cfg(test)]
+pub(crate) fn totals() -> (u64, u64, u64) {
+    registry().lock().unwrap().counters.iter().fold((0, 0, 0), |(s, r, w), c| (
+        s + c.bytes.sent.load(Ordering::Relaxed), r + c.bytes.received.load(Ordering::Relaxed),
+        w + c.bytes.written.load(Ordering::Relaxed)))
+}
+
 /// Called during transport setup, not while dispatching requests.
 pub fn observe_peers(peers: &[SocketAddr]) {
     registry().lock().unwrap().peers.extend(peers.iter().copied());

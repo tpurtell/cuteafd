@@ -593,6 +593,9 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_request_target(void* handle, uint64_t*
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_request_part(
     void* handle, size_t slot_offset, size_t prefix_bytes, uint32_t region, size_t region_offset,
     size_t frame_offset, size_t bytes, uint64_t remote, uint32_t rkey, uint64_t wr_id);
+// Cumulative bytes SENT into this endpoint's receives (completion byte_len),
+// excluding one-sided WRITEs; read on the endpoint's polling thread.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_recv_send_bytes(void* handle, uint64_t* bytes);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle);
 // Stop all QP DMA without releasing registrations or any host/device landing
 // storage. Success is idempotent; failure leaves all ownership unchanged.

@@ -4894,6 +4894,19 @@ impl NativeLibrary {
         Ok((address, rkey))
     }
 
+    /// Cumulative bytes SENT into this endpoint's receives (completion
+    /// `byte_len`), excluding one-sided WRITEs.
+    pub fn rdma_rc_endpoint_recv_send_bytes(&self, handle: *mut c_void) -> Result<u64> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut u64) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_recv_send_bytes")? };
+        let mut bytes = 0;
+        // SAFETY: the caller owns the live endpoint handle; the output is a local.
+        let status = unsafe { f(handle, &mut bytes) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_recv_send_bytes", status)?;
+        Ok(bytes)
+    }
+
     /// Exposes the endpoint's GPU landing range for remote reply-tail WRITEs
     /// and returns its address and rkey.
     pub fn rdma_rc_endpoint_recv_landing_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {

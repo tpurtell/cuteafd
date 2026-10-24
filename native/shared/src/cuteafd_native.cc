@@ -475,6 +475,9 @@ struct CuteafdRdmaRcEndpointHandle {
   uint32_t flag_cursor = 0;
   uint32_t pending_send_completions = 0;
   uint32_t pending_recv_completions = 0;
+  // Bytes delivered by SEND into this endpoint's receives (sum of byte_len of
+  // successful receive completions). One-sided WRITE tails are not included.
+  uint64_t recv_send_bytes = 0;
   std::chrono::steady_clock::time_point busy_poll_until = {};
 };
 
@@ -4379,6 +4382,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_poll_with_timeout(
                   std::string("RDMA RC endpoint ") + cq_name +
                       " CQ completion had unexpected opcode");
     }
+    if (wc.opcode == IBV_WC_RECV) endpoint->recv_send_bytes += wc.byte_len;
     *completions += 1;
     mark_recent_activity();
     return ok();
@@ -4603,6 +4607,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_try_poll(
                     std::string("RDMA RC endpoint ") + cq_name +
                         " CQ completion had unexpected opcode");
       }
+      if (wc.opcode == IBV_WC_RECV) endpoint->recv_send_bytes += wc.byte_len;
       *completed += 1;
     }
     return ok();
@@ -4845,6 +4850,17 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_request_part(
   (void)slot_offset; (void)prefix_bytes; (void)region; (void)region_offset;
   (void)frame_offset; (void)rkey; (void)wr_id;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request parts require RDMA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_recv_send_bytes(void* handle, uint64_t* bytes) {
+  if (handle == nullptr || bytes == nullptr)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid receive byte counter output");
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  *bytes = static_cast<CuteafdRdmaRcEndpointHandle*>(handle)->recv_send_bytes;
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "receive byte counter requires RDMA");
 #endif
 }
 

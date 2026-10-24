@@ -192,6 +192,8 @@ void test_rdma_abi() {
   uint32_t request_rkey = 0;
   assert(cuteafd_rdma_rc_endpoint_request_target(nullptr, &request_address, &request_rkey) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_recv_send_bytes(nullptr, &request_address) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_recv_landing_target(nullptr, &request_address, &request_rkey) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_post_request_part(nullptr, 0, 0, UINT32_MAX, 0, 0, 1, 1, 1, 1) ==

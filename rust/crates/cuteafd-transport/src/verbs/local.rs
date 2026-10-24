@@ -689,9 +689,9 @@ impl LocalVerbsExpertConnection {
             )?;
             let resize_ms = 0.0_f64;
             let copy_request_ms = 0.0_f64;
-            // The head SEND only: the client counts its WRITE tail as written
+            // SEND bytes only: the client counts its WRITE tail as written
             // bytes, which the fabric report adds for a `receives_writes` QP.
-            endpoint.traffic.received(request_wire_bytes.min(request_write::CHUNK_BYTES));
+            endpoint.account_received()?;
             let mut post_recv_ms = 0.0_f64;
             let parse_started = timing_enabled.then(Instant::now);
             let request =
@@ -1000,6 +1000,7 @@ impl LocalVerbsExpertConnection {
         // The response goes into send slot `response_send_sequence + held`;
         // drain send completions until that slot (and every earlier deferred
         // request's) is free, exactly as the emit path does for one.
+        self.endpoint.account_received()?;
         observe_watermark(&mut self.reply_watermark, &storage[..wire_bytes], request.header.flags)?;
         ReplyPoster { endpoint: &self.endpoint, sends: &mut self.response_sends, target: self.reply_target,
             watermark: self.reply_watermark, capacity: self.start.response_capacity_wire_bytes,

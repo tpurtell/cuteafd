@@ -801,6 +801,7 @@ mod tests {
                     // The first dispatch is full-capacity, so it sizes the rings
                     // for every later wave, as serving's warm-up does.
                     let written_before = crate::traffic::written_total();
+                    let totals_before = crate::traffic::totals();
                     let mut large = 0usize;
                     let mut request_tails = 0u64;
                     // Small (one SEND each way), then large frames: 21 rows is
@@ -852,6 +853,14 @@ mod tests {
                             request.header.request_id);
                     }
                     let written = crate::traffic::written_total() - written_before;
+                    // Engine accounting: SEND bytes counted once each side, WRITE
+                    // tails only as written. A receiver counting whole frames would
+                    // double-count every tail in the fabric's wire/engine ratio.
+                    let (sent, received, written_all) = crate::traffic::totals();
+                    let (sent, received, written_all) = (sent - totals_before.0, received - totals_before.1,
+                        written_all - totals_before.2);
+                    anyhow::ensure!(received == sent - written_all,
+                        "engine receive accounting: received {received} != sent {sent} - written {written_all}");
                     // Request tails are exact; everything above them is reply tails.
                     let reply_tails = written.checked_sub(request_tails).context("request tails not all written")?;
                     anyhow::ensure!(large > 0 && reply_tails > 0, "no reply tail was written");

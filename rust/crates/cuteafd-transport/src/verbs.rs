@@ -2494,7 +2494,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     .min(config.max_frame_bytes)
             );
         }
-        self.endpoint.traffic.received(response_wire_bytes);
+        self.endpoint.account_received()?;
         let retained = match &mut self.retained_response_ring {
             Some(ring) => ring.try_retain_final(&self.endpoint, self.response_ring,
                                               self.response_recv_sequence, response_wire_bytes)?,
@@ -2697,7 +2697,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                         .min(config.max_frame_bytes)
                 );
             }
-            self.endpoint.traffic.received(response_wire_bytes);
+            self.endpoint.account_received()?;
             let mut response_frame = self.take_response_frame(response_wire_bytes, streaming)?;
             self.endpoint.copy_recv_at(
                 response_frame.as_mut(),
@@ -3414,6 +3414,8 @@ struct NativeRdmaEndpoint {
     /// Receives successfully posted on this QP. The coordinator stamps it into
     /// every request as the reply watermark (`request_write::stamp_watermark`).
     recvs_posted: std::sync::atomic::AtomicU64,
+    /// Native SEND-received byte counter already added to `traffic`.
+    recv_bytes_counted: std::sync::atomic::AtomicU64,
 }
 
 impl NativeRdmaEndpoint {
@@ -3538,7 +3540,7 @@ impl NativeRdmaEndpoint {
         anyhow::ensure!(info.max_send_wr >= send_depth,
             "RDMA endpoint send queue {} is below the {send_depth} WRs a full ring of chunked frames posts",
             info.max_send_wr);
-        Ok(Self { library, info, terminal_owner: None, credits: EndpointCredits::default(), recvs_posted: Default::default(),
+        Ok(Self { library, info, terminal_owner: None, credits: EndpointCredits::default(), recvs_posted: Default::default(), recv_bytes_counted: Default::default(),
             traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex), info.active_mtu) })
     }
 
@@ -3620,6 +3622,18 @@ impl NativeRdmaEndpoint {
 
     fn post_recv(&self, bytes: usize) -> Result<()> {
         self.post_recv_at(0, bytes, VERBS_HOST_RECV_WR_ID)
+    }
+
+    /// Adds the bytes SENT into this endpoint since the last call to its
+    /// received counter. A frame whose tail was RDMA-written arrives here as
+    /// its head SEND only; the fabric report adds the sender's written bytes
+    /// for a `receives_writes` QP, so counting the whole frame would count
+    /// the tail twice. Called on the polling thread after receive completions.
+    fn account_received(&self) -> Result<()> {
+        let total = self.library.rdma_rc_endpoint_recv_send_bytes(self.info.handle)?;
+        let before = self.recv_bytes_counted.swap(total, Ordering::Relaxed);
+        self.traffic.received(usize::try_from(total.saturating_sub(before))?);
+        Ok(())
     }
 
     fn post_recv_at(&self, offset_bytes: usize, bytes: usize, wr_id: u64) -> Result<()> {
