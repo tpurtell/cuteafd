@@ -444,6 +444,7 @@ fn preflight_shape(
                     opened.weight_formats.draft,
                     args.draft_capacity(draft.block)?,
                 )?;
+                if args.decode_lanes == 2 { additional.extend(reservations.execution_view()); }
                 additional.extend(reservations.steady);
                 additional.extend(draft_prefix_reservations(prefix_draft, draft_mark_bytes, mark_slots,
                     args.rings as u64)?);
@@ -478,12 +479,21 @@ fn preflight_shape(
         let mut selected_runtime = runtime.clone();
         for (rank, costs) in selected_runtime.iter_mut().enumerate() {
             costs.additional.retain(|cost| !cost.name.starts_with("transport.")
+                && !cost.name.starts_with("runtime.lane1.")
+                && (selected_spark_ranks > 0 || !cost.name.starts_with("draft.lane1."))
                 && cost.name != "draft.prefill_first_lane_taps");
             costs.additional.extend(cuteafd_loader::families::mimo_v2::admission::transport_reservations(
                 cfg, ranks, rank, args.prefill_rows, lanes, selected_spark_ranks)?);
             costs.workspaces = workspace_options(cfg, args, programs, ranks, rank, lanes,
                 selected_spark_ranks > 0, VOCABULARY_HEAD_WORKSPACE as u64, prefill_output,
                 opened.weight_formats.any_fp8_output())?;
+            if args.decode_lanes == 2 && selected_spark_ranks > 0 {
+                costs.additional.extend(cuteafd_loader::families::mimo_v2::admission::decode_view_reservations(
+                    cfg, ranks, rank, selected_spark_ranks, &graph_plan, graph_exec_bytes, graph_driver_margin)?);
+                let decode = costs.workspaces.iter().find(|(_, workspace)| workspace.decode)
+                    .context("MiMo lane1 requires decode workspace geometry")?.1;
+                costs.workspaces.push(("decode.lane1".into(), decode));
+            }
         }
         Ok(mimo_capacity_profiles(
         &opened.checkpoint,
@@ -537,7 +547,7 @@ fn preflight_shape(
         headroom_floor: 0, spark_ranks, startup_probe_bytes: intake_probe_bytes,
         context: args.max_context as u64, requested_pool: policy.pool_tokens, pool_ceiling_at_target: false,
         onboard: args.onboard, experts: expert_costs, expert_workspace, tp2_workspace,
-        rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64,
+        rows: args.prefill_rows.max(64) as u64, lanes: transport_lanes as u64, decode_lanes: args.decode_lanes,
     };
     let solution = solve_working_set(&inputs, &no_spark_profiles.steady)
         .with_context(|| format!("MiMo shared placement; configured-Spark reservation contract {report}"))?;
@@ -575,6 +585,11 @@ fn preflight_shape(
         args.prefill_rows, solution.working_set.prefill_lanes as usize, ranks, pool_tokens,
         usize::try_from(capacity.effective_max_context_tokens)?, solution.working_set.spark_ranks,
         args.expert_input.into(), kv, prefill_output, serving.is_some(), diagnostic_rows, diagnostic_layers)?;
+    if args.decode_lanes == 2 && solution.working_set.spark_ranks > 0 {
+        tables.extend(cuteafd_loader::families::mimo_v2::admission::decode_view_host_workspaces(cfg,
+            ranks, pool_tokens, usize::try_from(capacity.effective_max_context_tokens)?,
+            solution.working_set.spark_ranks, args.expert_input.into(), kv, diagnostic_layers)?);
+    }
     if args.token_io.embed_placement == Some(crate::shared::token_io::EmbedPlacement::Host) {
         tables.push(("mimo/embedding".into(), tensor_bytes("MiMo host embedding", &[cfg.vocab_size, cfg.hidden, 2])?));
     }

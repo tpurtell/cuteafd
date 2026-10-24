@@ -137,7 +137,7 @@ fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, opti
             let geometry = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))?;
             let capacity = u32::try_from(options.spark_capacity_rows)
                 .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))?;
-            let endpoints = crate::families::mimo_v2::admission::spark_endpoints(capacity as usize, options.mimo_expert_input)
+            let endpoints = crate::families::mimo_v2::admission::decode_spark_endpoints(capacity as usize, options.mimo_expert_input, options.decode_lanes)
                 .map_err(|_| crate::placement::PlacementError::Inventory("MiMo Spark endpoint geometry"))?;
             charge_spark_io(device, working, geometry, capacity, options.mimo_expert_input.bf16(false),
                 spark_ring_geometry(1), SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)?;
@@ -265,12 +265,13 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                         else { draft_representation::MimoDraftRepresentation::Fp8Only }, capacity,
                     |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
                         crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
+                if options.decode_lanes == 2 && spark_ranks > 0 { additional.extend(costs.execution_view()); }
                 additional.extend(costs.steady);
 
             }
             additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
         }
-        let workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
+        let mut workspaces = workspace_options(&cfg, ranks, rank, rows as usize, context as usize,
             lanes, spark_ranks > 0, options.mimo_expert_input, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0,
             if options.full_prefill_logits { MimoPrefillOutput::AllRows } else { MimoPrefillOutput::LastRow },
             fp8_output, |name| {
@@ -285,6 +286,13 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         debug_assert_eq!(graphs.graph_set(decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES,
             decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES).bytes(rank), additional.iter()
                 .filter(|r| r.name.starts_with("runtime.decode_graph")).map(|r| r.bytes).sum::<u64>());
+        if options.decode_lanes == 2 && spark_ranks > 0 {
+            additional.extend(decode_view_reservations(&cfg, ranks, rank, spark_ranks, &graphs,
+                decode_graph::MIMO_GRAPH_EXEC_BOUND_BYTES, decode_graph::MIMO_GRAPH_DRIVER_MARGIN_BYTES)?);
+            let decode = workspaces.iter().find(|(_, workspace)| workspace.decode)
+                .context("MiMo lane1 requires decode workspace geometry")?.1;
+            workspaces.push(("decode.lane1".into(), decode));
+        }
         runtime.push(MimoRankRuntime { device: rank as u32, workspaces,
             loading_additional: Vec::new(), additional });
     }
@@ -432,7 +440,7 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
         headroom_floor: options.headroom_bytes, spark_ranks, startup_probe_bytes: probe,
         context, requested_pool: options.pool_tokens,
         pool_ceiling_at_target: options.pool_ceiling_at_target, onboard,
-        experts, expert_workspace, tp2_workspace, rows, lanes: lanes as u64,
+        experts, expert_workspace, tp2_workspace, rows, lanes: lanes as u64, decode_lanes: options.decode_lanes,
     };
     let solution = match crate::placement::families::mimo_v2::solve_working_set(&inputs, &no_spark.steady) {
         Ok(solution) => solution,
@@ -482,6 +490,45 @@ use crate::placement::families::mimo_v2::reservation_category;
 mod tests {
     use super::*;
     use crate::plan::{checkpoint::Checkpoint, testing::*, PlanInput};
+
+    #[test]
+    fn second_decode_view_charges_only_private_storage_and_page_indices() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = mimo_pro_config();
+        write_snapshot(dir.path(), &config, &mimo_pro_tensors(), Some(8));
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let options = LayoutOptions { rtx_bytes: vec![95 * GIB; 2], mimo_decode_graphs: true, ..Default::default() };
+        let first = profile(&checkpoint, &options, 2, 6, 4096, 16, 131072, None).unwrap();
+        let second = profile(&checkpoint, &LayoutOptions { decode_lanes: 2, ..options.clone() },
+            2, 6, 4096, 16, 131072, None).unwrap();
+        assert_eq!(first.loading.iter().map(|rank| &rank.reservations).collect::<Vec<_>>(),
+            second.loading.iter().map(|rank| &rank.reservations).collect::<Vec<_>>());
+        assert_eq!(first.post_target_kv.iter().map(|rank| &rank.reservations).collect::<Vec<_>>(),
+            second.post_target_kv.iter().map(|rank| &rank.reservations).collect::<Vec<_>>());
+        for (one, two) in first.steady.devices.iter().zip(&second.steady.devices) {
+            assert_eq!(two.pool_unit_bytes - one.pool_unit_bytes, 64 * 4);
+            let shared = |rank: &cuteafd_core::serving_capacity::DeviceCosts| rank.reservations.iter()
+                .filter(|cost| !cost.name.contains("lane1")).cloned().collect::<Vec<_>>();
+            assert_eq!(shared(one), shared(two));
+            assert!(two.reservations.iter().any(|cost| cost.name == "decode.lane1.h"));
+            assert!(two.reservations.iter().any(|cost| cost.name.starts_with("runtime.lane1.decode_graph")));
+            assert!(two.reservations.iter().any(|cost| cost.name == "transport.lane1.peer_receive_slots"));
+            // Route weights and ring-slot indices are private execution tables,
+            // not immutable checkpoint weights or request-indexed KV rings.
+            assert!(two.reservations.iter().filter(|cost| cost.name.contains("lane1")).all(|cost|
+                !cost.name.starts_with("draft.lane1.weights.") && !cost.name.ends_with("_ring")));
+        }
+        let [decode, prefill] = crate::families::mimo_v2::admission::spark_endpoints(4096, MimoExpertInput::Fp8).unwrap();
+        assert_eq!(decode_spark_endpoints(4096, MimoExpertInput::Fp8, 2).unwrap(), vec![decode, prefill, decode]);
+        assert_eq!(decode_spark_endpoints(4096, MimoExpertInput::Fp8, 1).unwrap(), vec![decode, prefill]);
+        let costs = DraftReservations { steady: ["draft.weights.bf16_values", "draft.layer0.k_ring",
+            "draft.layer0.v_ring", "draft.fp8_scratch", "draft.taps", "draft.workspace.logits"]
+            .into_iter().map(|name| cuteafd_core::serving_capacity::MemoryReservation { name: name.into(), bytes: 256 }).collect(),
+            packing: Vec::new() };
+        let private = costs.execution_view();
+        assert_eq!(private.len(), 3);
+        assert!(private.iter().all(|cost| cost.name.starts_with("draft.lane1.") && cost.bytes == 256));
+    }
 
     #[test]
     fn planner_equals_runtime_admission_flash_pro_one_two_rtx() {
@@ -692,7 +739,7 @@ mod tests {
                             (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
                         headroom_floor: opts.headroom_bytes, spark_ranks: sparks, startup_probe_bytes: 64 << 20,
                         context, requested_pool: opts.pool_tokens, pool_ceiling_at_target: false, onboard, experts, expert_workspace,
-                        tp2_workspace, rows: 4096, lanes: lanes as u64 };
+                        tp2_workspace, rows: 4096, lanes: lanes as u64, decode_lanes: opts.decode_lanes };
                     let no_spark = profile(&checkpoint, &opts, ranks, 0, 4096, 16, context, None).unwrap();
                     let solution = solve_working_set(&inputs, &no_spark.steady).unwrap();
                     let selected = inputs.selected(&no_spark.steady, &solution.working_set);

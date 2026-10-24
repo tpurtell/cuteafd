@@ -272,11 +272,22 @@ mod draft_storage_tests {
         assert!(source.contains(&["let mut decode = link", "(0, 1, &decode_warm)?;"].concat()));
         assert!(source.contains(&["let mut prefill = link", "(1, lanes, &prefill_warm)?;"].concat()));
         assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
-        assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "spark_endpoints("].concat()));
+        assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "decode_spark_endpoints("].concat()));
         let engine = include_str!("engine.rs");
         assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. })", " = &e.experts"].concat()));
         assert!(engine.contains(&["Experts::Spark { decode, .. }) => decode.borrow().intake", ".pointers()"].concat()));
         assert!(engine.contains(&["for transport in [decode, prefill]", " {"].concat()));
+    }
+
+    #[test]
+    fn second_decode_view_is_refused_before_checkpoint_or_native_loading() {
+        let args = args(&["--decode-lanes", "2"]);
+        let error = match open(&args) {
+            Ok(_) => panic!("second decode view was admitted without runtime scheduling"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
+            Some(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes", value: 2, .. })));
     }
 
     #[test]
@@ -857,6 +868,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
+    if args.decode_lanes != 1 {
+        return Err(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes",
+            value: args.decode_lanes, family: "mimo_v2".into(),
+            reason: "second-lane readiness capture and scheduler are not installed" }.into());
+    }
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
@@ -1022,8 +1038,8 @@ impl Opened {
             let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
-                    args.prefill_rows, args.expert_input.into())?.to_vec(),
+                endpoints: cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(
+                    args.prefill_rows, args.expert_input.into(), args.decode_lanes)?,
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
