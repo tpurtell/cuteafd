@@ -681,9 +681,10 @@ impl<'a> MimoDrafter<'a> {
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
     pub fn draft_rows(&self, sequences: &[DraftSeq], anchor_rows: &[u8], head: *const c_void) -> Result<Vec<Draft>> {
         self.draft_from(sequences, Anchors::Rows(anchor_rows), |plan, x, out, rows| {
+            let plan = plan.context("BF16 replay head workspace")?;
             // SAFETY: ReplayDrafter's caller retains a complete BF16 target
             // head. FP8-only targets reject that diagnostic before loading.
-            unsafe { plan.context("BF16 replay head workspace")?.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
+            unsafe { plan.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
         })
     }
 
