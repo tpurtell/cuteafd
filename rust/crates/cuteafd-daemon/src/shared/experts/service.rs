@@ -61,6 +61,12 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
             topology.ep()
         );
     }
+    if args.exlr8_manifest.is_none() {
+        ensure!(
+            args.exlr8_prefill_activations == crate::shared::experts::exlr8::Exlr8PrefillActivations::A16,
+            "EXLR8 options require --exlr8-manifest"
+        );
+    }
     let config = NativeExpertServiceConfig {
         library: args.native_lib,
         exl3_aot_dir: args.exl3_aot_dir,
@@ -68,6 +74,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         fp8_package: args.fp8_package,
         snapshot: args.snapshot,
         exlr8_manifest: args.exlr8_manifest,
+        exlr8_prefill_activations: args.exlr8_prefill_activations,
         rank: args.rank as usize,
         world: args.world as usize,
         model_admission: None,
@@ -99,6 +106,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub fp8_package: Option<PathBuf>,
     pub snapshot: PathBuf,
     pub exlr8_manifest: Option<String>,
+    pub exlr8_prefill_activations: crate::shared::experts::exlr8::Exlr8PrefillActivations,
     pub rank: usize,
     pub world: usize,
     model_admission: Option<cuteafd_transport::worker_selection::ModelAdmission>,
@@ -546,6 +554,7 @@ mod tests {
             fp8_package: None,
             snapshot: PathBuf::from("/model"),
             exlr8_manifest: None,
+            exlr8_prefill_activations: Default::default(),
             rank,
             world,
             model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {
@@ -1255,6 +1264,12 @@ fn validate_topology(config: &NativeExpertServiceConfig, catalog: &OfficialV41Ca
     crate::shared::spark_topology::require_world(world, catalog, &layers)?;
     ensure!(config.world == world.topology().world_size() && config.rank < config.world,
         "Spark worker rank/world differs from its declared topology");
+    if catalog.format() != cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        ensure!(
+            config.exlr8_prefill_activations == crate::shared::experts::exlr8::Exlr8PrefillActivations::A16,
+            "EXLR8 prefill activations require an EXLR8 checkpoint"
+        );
+    }
     Ok(())
 }
 

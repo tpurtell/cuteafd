@@ -18,12 +18,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub(crate) enum Exlr8PrefillActivations {
-    #[default]
-    A16,
-    A8,
-}
+pub(crate) use crate::shared::experts::exlr8::Exlr8PrefillActivations;
 
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
@@ -212,6 +207,19 @@ mod draft_cli_tests {
         assert_eq!(parse(&["--exlr8-prefill-activations", "a16"]).unwrap(), Exlr8PrefillActivations::A16);
         assert_eq!(parse(&["--exlr8-prefill-activations", "a8"]).unwrap(), Exlr8PrefillActivations::A8);
         assert!(parse(&["--exlr8-prefill-activations", "fp8"]).is_err());
+
+        #[derive(Parser)]
+        struct ExpertDaemon { #[command(flatten)] args: crate::cli::NativeExpertDaemonArgs }
+        let parse_expertd = |extra: &[&str]| {
+            let mut argv = vec!["test", "--snapshot", "/native", "--native-lib", "/library",
+                "--rank", "0", "--device-budget-bytes", "1"];
+            argv.extend_from_slice(extra);
+            ExpertDaemon::try_parse_from(argv).map(|p| p.args.exlr8_prefill_activations)
+        };
+        assert_eq!(parse_expertd(&[]).unwrap(), Exlr8PrefillActivations::A16);
+        assert_eq!(parse_expertd(&["--exlr8-prefill-activations", "a16"]).unwrap(), Exlr8PrefillActivations::A16);
+        assert_eq!(parse_expertd(&["--exlr8-prefill-activations", "a8"]).unwrap(), Exlr8PrefillActivations::A8);
+        assert!(parse_expertd(&["--exlr8-prefill-activations", "fp8"]).is_err());
     }
 
     #[test]

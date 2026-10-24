@@ -54,13 +54,19 @@ def test_serving_and_glue_export_inventory():
         assert shared["shared_expert"] is True
         assert shared["top_k"] == 1 and shared["max_groups"] == 4
     assert shared["experts"] == 1
-    namespace = {"compile_exlr8_group_aot": lambda **kwargs: None}
+    namespace = {"compile_exlr8_group_aot": lambda **kwargs: kwargs, "compile_exlr8_a16_aot": lambda **kwargs: kwargs}
     # Drop the local CUDA-dependent import; constructing the lambdas compiles nothing.
     builder.body = [node for node in builder.body if not isinstance(node, ast.ImportFrom)]
     exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
     inventory = namespace["exlr8_export_programs"]
-    assert [p[0] for p in inventory("spark")] == [
-        "a16_serving", "group", "a16_grouped", "grouped_group"]
+    spark = inventory("spark")
+    assert [p[0] for p in spark] == [
+        "a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group"]
+    a16_grouped = dict(spark[2][2])
+    a8_grouped = dict(spark[3][2])
+    assert a16_grouped == {"max_rows": 4096} and a8_grouped == {"max_rows": 4096, "activations": "a8"}
+    assert spark[2][3]()["grouped"] is True and "activations" not in spark[2][3]()
+    assert spark[3][3]() == {**spark[2][3](), "activations": "a8"}
     assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
     with pytest.raises(ValueError):
         inventory("unknown")

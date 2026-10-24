@@ -1,5 +1,5 @@
 //! Admitted K1 workspace: graph-visible routing storage never moves.
-use super::{view, Exlr8Weights};
+use super::{view, Exlr8PrefillActivations, Exlr8Weights};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, ProgramSpec, Programs, Scalar};
@@ -7,9 +7,19 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 use std::ffi::c_void;
 
-fn program_names(set: ExpertSet, rows: usize) -> (&'static str, &'static str) {
+fn program_names(
+    set: ExpertSet,
+    rows: usize,
+    activations: Exlr8PrefillActivations,
+) -> (&'static str, &'static str) {
     match set {
-        ExpertSet::Routed if rows > 64 => ("exlr8_a16_grouped", "exlr8_grouped_group"),
+        ExpertSet::Routed if rows > 64 => (
+            match activations {
+                Exlr8PrefillActivations::A16 => "exlr8_a16_grouped",
+                Exlr8PrefillActivations::A8 => "exlr8_a8_grouped",
+            },
+            "exlr8_grouped_group",
+        ),
         ExpertSet::Routed => ("exlr8_a16_serving", "exlr8_group"),
         ExpertSet::Shared => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
     }
@@ -77,10 +87,16 @@ struct Workspace {
     intermediate_bytes: usize,
 }
 impl Workspace {
-    fn plan(spec: &ProgramSpec, rows: usize, set: ExpertSet, unit_limit: usize) -> Result<Self> {
+    fn plan(
+        spec: &ProgramSpec,
+        rows: usize,
+        set: ExpertSet,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
+    ) -> Result<Self> {
         cuteafd_ffi::exlr8::validate(spec)?;
         ensure!(
-            spec.name == program_names(set, rows).0 && spec.geometry["abi_version"] == 3,
+            spec.name == program_names(set, rows, activations).0 && spec.geometry["abi_version"] == 3,
             "EXLR8 execution requires fused rotation ABI v3"
         );
         ensure!(
@@ -150,14 +166,18 @@ impl<'a> Exlr8Execution<'a> {
         rows: usize,
         set: ExpertSet,
     ) -> Result<usize> {
-        Self::workspace_bytes_with_limit(programs, rows, set, 16)
+        Self::workspace_bytes_with_limit(programs, rows, set, 16, Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn workspace_bytes_with_limit(
-        programs: &'a Programs<'a>, rows: usize, set: ExpertSet, unit_limit: usize,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        set: ExpertSet,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
     ) -> Result<usize> {
-        let k1 = programs.program(program_names(set, rows).0, &pointers(set, rows))?;
-        Ok(Workspace::plan(k1.spec(), rows, set, unit_limit)?.bytes)
+        let k1 = programs.program(program_names(set, rows, activations).0, &pointers(set, rows))?;
+        Ok(Workspace::plan(k1.spec(), rows, set, unit_limit, activations)?.bytes)
     }
 
     pub(crate) fn new(
@@ -167,14 +187,19 @@ impl<'a> Exlr8Execution<'a> {
         available: usize,
         set: ExpertSet,
     ) -> Result<Self> {
-        Self::new_with_limit(library, programs, rows, available, set, 16)
+        Self::new_with_limit(library, programs, rows, available, set, 16, Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn new_with_limit(
-        library: &'a NativeLibrary, programs: &'a Programs<'a>, rows: usize,
-        available: usize, set: ExpertSet, unit_limit: usize,
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+        set: ExpertSet,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
-        let (k1_name, group_name) = program_names(set, rows);
+        let (k1_name, group_name) = program_names(set, rows, activations);
         let k1 = programs.program(k1_name, &pointers(set, rows))?;
         let group = programs.program(
             group_name,
@@ -189,7 +214,7 @@ impl<'a> Exlr8Execution<'a> {
                 "activation",
             ],
         )?;
-        let layout = Workspace::plan(k1.spec(), rows, set, unit_limit)?;
+        let layout = Workspace::plan(k1.spec(), rows, set, unit_limit, activations)?;
         ensure!(
             group.spec().geometry["abi_version"] == 2
                 && group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
@@ -348,7 +373,7 @@ mod tests {
             ExpertSet::Shared => (1, 4),
         };
         ProgramSpec {
-            name: program_names(set, 64).0.into(),
+            name: program_names(set, 64, Exlr8PrefillActivations::A16).0.into(),
             pointers: K1_POINTERS.iter().map(|name| (*name).into()).collect(),
             scalar_kinds: b"ii".to_vec(),
             scratch: [
@@ -368,8 +393,8 @@ mod tests {
     fn exlr8_shared_workspace_keeps_exact_aligned_admission() {
         for set in [ExpertSet::Routed, ExpertSet::Shared] {
             let spec = spec(set);
-            let wide = Workspace::plan(&spec, 64, set, 16).unwrap();
-            let single = Workspace::plan(&spec, 1, set, 16).unwrap();
+            let wide = Workspace::plan(&spec, 64, set, 16, Exlr8PrefillActivations::A16).unwrap();
+            let single = Workspace::plan(&spec, 1, set, 16, Exlr8PrefillActivations::A16).unwrap();
             for layout in [&single, &wide] {
                 let mut end = 0;
                 for (offset, bytes) in layout.ranges {
@@ -392,21 +417,21 @@ mod tests {
             });
             let mut stale = spec.clone();
             stale.geometry["abi_version"] = serde_json::json!(2);
-            assert!(Workspace::plan(&stale, 64, set, 16).is_err());
-            assert!(Workspace::plan(&spec, 0, set, 16).is_err());
-            assert!(Workspace::plan(&spec, 65, set, 16).is_err());
+            assert!(Workspace::plan(&stale, 64, set, 16, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&spec, 0, set, 16, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&spec, 65, set, 16, Exlr8PrefillActivations::A16).is_err());
             let other = if set == ExpertSet::Shared {
                 ExpertSet::Routed
             } else {
                 ExpertSet::Shared
             };
-            assert!(Workspace::plan(&spec, 64, other, 16).is_err());
+            assert!(Workspace::plan(&spec, 64, other, 16, Exlr8PrefillActivations::A16).is_err());
         }
         assert!(
-            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared, 16)
+            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared, 16, Exlr8PrefillActivations::A16)
                 .unwrap()
                 .bytes
-                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed, 16)
+                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16)
                     .unwrap()
                     .bytes
         );
@@ -415,7 +440,7 @@ mod tests {
     #[test]
     fn grouped_workspace_uses_wide_route_slots_without_changing_decode() {
         let mut grouped = spec(ExpertSet::Routed);
-        grouped.name = program_names(ExpertSet::Routed, 65).0.into();
+        grouped.name = program_names(ExpertSet::Routed, 65, Exlr8PrefillActivations::A16).0.into();
         grouped.capacity_rows = 4096;
         grouped.geometry["max_rows"] = serde_json::json!(4096);
         grouped.geometry["group_rows"] = serde_json::json!(64);
@@ -424,23 +449,34 @@ mod tests {
         for rows in [65, 128, 4095, 4096] {
             grouped.pointers = pointers(ExpertSet::Routed, rows).into_iter().map(String::from).collect();
             grouped.scalar_kinds = b"iii".to_vec();
-            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, 16).unwrap();
-            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, 3).unwrap();
+            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).unwrap();
+            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, 3, Exlr8PrefillActivations::A16).unwrap();
             assert_eq!(compact.ranges[8].1 * 16, workspace.ranges[8].1 * 3);
             assert_eq!(compact.intermediate_bytes * 16, workspace.intermediate_bytes * 3);
             assert!(compact.bytes < workspace.bytes);
             assert_eq!(workspace.ranges[5].1, 512 * 64 * 4);
             assert_eq!(workspace.ranges[0].1, rows * 6336);
             assert_eq!(workspace.ranges[10].1, rows * 6144 * 2);
+            assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A8).is_err());
+            let mut grouped_a8 = grouped.clone();
+            grouped_a8.name = program_names(ExpertSet::Routed, rows, Exlr8PrefillActivations::A8).0.into();
+            grouped_a8.geometry["activations"] = serde_json::json!("a8");
+            let workspace_a8 = Workspace::plan(&grouped_a8, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A8).unwrap();
+            assert_eq!(workspace_a8.bytes, workspace.bytes);
+            assert!(Workspace::plan(&grouped_a8, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).is_err());
         }
         for invalid in [0, 17, usize::MAX] {
-            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, invalid).is_err());
+            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, invalid, Exlr8PrefillActivations::A16).is_err());
         }
-        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, 16).is_err());
-        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, 16).is_err());
-        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, 16).is_err());
-        assert_eq!(program_names(ExpertSet::Routed, 64).0, "exlr8_a16_serving");
-        assert_eq!(program_names(ExpertSet::Shared, 64).0, "exlr8_shared_a16_serving");
+        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, 16, Exlr8PrefillActivations::A16).is_err());
+        for activations in [Exlr8PrefillActivations::A16, Exlr8PrefillActivations::A8] {
+            assert_eq!(program_names(ExpertSet::Routed, 64, activations).0, "exlr8_a16_serving");
+            assert_eq!(program_names(ExpertSet::Shared, 64, activations).0, "exlr8_shared_a16_serving");
+        }
+        assert_eq!(program_names(ExpertSet::Routed, 65, Exlr8PrefillActivations::A16).0, "exlr8_a16_grouped");
+        assert_eq!(program_names(ExpertSet::Routed, 65, Exlr8PrefillActivations::A8).0, "exlr8_a8_grouped");
     }
 
     #[test]

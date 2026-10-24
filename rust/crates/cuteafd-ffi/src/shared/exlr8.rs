@@ -18,8 +18,15 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
             .ok_or_else(|| invalid(format!("missing or invalid geometry.{name}")))
     };
     let shared = spec.name == "exlr8_shared_a16_serving";
-    let grouped = spec.name == "exlr8_a16_grouped";
+    let grouped_a8 = spec.name == "exlr8_a8_grouped";
+    let grouped = spec.name == "exlr8_a16_grouped" || grouped_a8;
     let serving = shared || grouped || spec.name == "exlr8_a16_serving";
+    let activations = spec.geometry.get("activations").and_then(|v| v.as_str());
+    if (grouped_a8 && activations != Some("a8"))
+        || (!grouped_a8 && activations.is_some_and(|v| v != "a16"))
+    {
+        return Err(invalid("grouped activation mode mismatch"));
+    }
     let max_rows = if grouped { 4096 } else { 64 };
     let group_rows = if grouped {
         let rows = field("group_rows")?;
@@ -153,12 +160,15 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
     ];
     if matches!(
         spec.name.as_str(),
-        "exlr8_a16_serving" | "exlr8_shared_a16_serving" | "exlr8_a16_grouped"
+        "exlr8_a16_serving"
+            | "exlr8_shared_a16_serving"
+            | "exlr8_a16_grouped"
+            | "exlr8_a8_grouped"
     ) {
         shapes.push("[1]".into());
         dtypes.push("int32");
     }
-    if spec.name == "exlr8_a16_grouped" {
+    if matches!(spec.name.as_str(), "exlr8_a16_grouped" | "exlr8_a8_grouped") {
         shapes.extend(["[E]".into(), format!("[E,{u}]")]);
         dtypes.extend(["int32", "int32"]);
     }
@@ -457,6 +467,14 @@ mod tests {
             }
             e["scratch_bytes_at_capacity"] = serde_json::to_value(&s.scratch).unwrap();
             validate_entry(&s, &e).unwrap();
+            let mut a8 = s.clone();
+            a8.name = "exlr8_a8_grouped".into();
+            assert!(validate(&a8).is_err());
+            a8.geometry["activations"] = serde_json::json!("a8");
+            validate_entry(&a8, &e).unwrap();
+            let mut bad_a16 = s.clone();
+            bad_a16.geometry["activations"] = serde_json::json!("a8");
+            assert!(validate(&bad_a16).is_err());
             let mut legacy = s.clone();
             legacy.scalar_kinds = b"ii".to_vec();
             assert!(validate(&legacy).is_err());

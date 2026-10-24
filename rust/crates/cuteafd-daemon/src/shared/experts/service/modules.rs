@@ -82,8 +82,9 @@ impl<'a> WarmModules<'a> {
                 cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
             programs.program("exlr8_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
             if config.capacity as usize > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS {
-                crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes(programs,
-                    config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
+                crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes_with_limit(programs,
+                    config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed, 16,
+                    config.exlr8_prefill_activations)?;
                 programs.program("exlr8_grouped_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
             }
             return Ok(Self::Exlr8(programs));

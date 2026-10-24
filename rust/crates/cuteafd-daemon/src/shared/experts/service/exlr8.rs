@@ -16,11 +16,12 @@ fn chunks(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..rows).step_by(capacity).map(move |first| (first, (rows - first).min(capacity)))
 }
 
-fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize) -> Result<usize> {
+fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize,
+    activations: crate::shared::experts::exlr8::Exlr8PrefillActivations) -> Result<usize> {
     ensure!((1..=PREFILL_ROWS).contains(&capacity), "EXLR8 capacity must be 1..4096");
     let decode = Exlr8Execution::workspace_bytes(programs, capacity.min(K1_ROWS), ExpertSet::Routed)?;
     let prefill = if capacity > K1_ROWS {
-        Exlr8Execution::workspace_bytes_with_limit(programs, capacity, ExpertSet::Routed, unit_limit)?
+        Exlr8Execution::workspace_bytes_with_limit(programs, capacity, ExpertSet::Routed, unit_limit, activations)?
     } else { 0 };
     decode.checked_add(prefill).context("EXLR8 retained execution workspace overflow")
 }
@@ -65,7 +66,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             config.rank, ExpertSet::Routed).map_err(anyhow::Error::from))
         .collect::<Result<Vec<_>>>()?;
     let unit_limit = plans.iter().map(Residency::compact_unit_limit).max().context("EXLR8 has no resident plans")?;
-    let k1_workspace_bytes = execution_bytes(programs, rows, unit_limit)?;
+    let k1_workspace_bytes = execution_bytes(programs, rows, unit_limit, config.exlr8_prefill_activations)?;
     let workspace = k1_workspace_bytes.checked_add(fallback_staging)
         .context("EXLR8 workspace admission overflow")?;
     let budgets = plans.iter().map(Exlr8Weights::plan).collect::<Result<Vec<_>>>()?;
@@ -111,14 +112,14 @@ impl<'w, 'a> Worker<'w, 'a> {
         let capacity = config.capacity as usize;
         let unit_limit = weights.iter().map(|weight| weight.layout.compact_unit_limit()).max()
             .context("EXLR8 has no resident layers")?;
-        let workspace = execution_bytes(programs, capacity, unit_limit)?;
+        let workspace = execution_bytes(programs, capacity, unit_limit, config.exlr8_prefill_activations)?;
         ensure!(workspace <= remaining, "EXLR8 retained arenas exceed admitted bytes");
         let decode_bytes = Exlr8Execution::workspace_bytes(programs, capacity.min(K1_ROWS), ExpertSet::Routed)?;
         let execution = Exlr8Execution::new(library, programs,
             capacity.min(K1_ROWS), decode_bytes, ExpertSet::Routed)?;
         let prefill = if capacity > K1_ROWS {
             Some(Exlr8Execution::new_with_limit(library, programs, capacity,
-                workspace - decode_bytes, ExpertSet::Routed, unit_limit)?)
+                workspace - decode_bytes, ExpertSet::Routed, unit_limit, config.exlr8_prefill_activations)?)
         } else { None };
         let stream = LoadStream { library, raw: library.cuda_stream_create()? };
         let timing = super::super::execution::timing::WorkerTiming::from_env(library, config.rank)?;
