@@ -424,24 +424,25 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     """Whether a compact profile exports the warp-specialized prefill kernel.
 
     Compact ownership shipped the cooperative kernel. On GB10 the same
-    FC1-N128/FC2-N256 warp-specialized export with 64-row blocks and dynamic
-    tile claims is bit-identical to it and much faster at the served GLM 5.3
-    K4 TP6 compact width 384: actual rotated H128 ownership, layer-7 recorded
-    histograms plus uniform top-8, kernel + top-k sum, median of three
-    interleaved rounds of twenty graph replays, ms (cooperative -> ship,
-    uniform top-8 / recorded): m4096 24.19 -> 12.94 / 24.56 -> 13.19;
-    m2752 18.98 -> 9.73 / 17.86 -> 9.53; m1024 8.32 -> 4.87 / 8.73 -> 4.99;
-    m256 5.29 -> 3.81 / 5.30 -> 3.81. Every graph replay is bitwise equal to
-    the cooperative oracle, including three replays over poisoned workspaces.
+    FC1-N128/FC2-N256 warp-specialized export with 64-row route blocks and
+    dynamic tile claims is bit-identical to it and much faster at the served
+    GLM 5.3 K4 TP6 compact width 384: actual rotated H128 ownership, layer-7
+    recorded histograms plus uniform top-8, kernel + top-k sum, median of
+    three interleaved rounds of twenty graph replays, ms (cooperative -> ship,
+    uniform top-8 / recorded): m4096 24.08 -> 12.95 / 24.39 -> 13.16;
+    m2752 18.88 -> 9.60 / 17.83 -> 9.42; m1024 8.17 -> 4.79 / 8.66 -> 4.92;
+    m256 5.43 -> 3.78 / 5.44 -> 3.78 (32-row blocks there). Every graph
+    replay is bitwise equal to the cooperative oracle, including three
+    replays over poisoned workspaces.
     Wire input loses here (0.706 at m4096), so it stays off; the three
     input stages ride with it and have no separate arm.
 
     Against the ordinary contiguous TP6 width-384 export (warp-specialized,
     direct wire input, `TILE_384`, 64-row blocks, three input stages) this
     compact arm is at parity at every capacity in the same session, ms
-    (compact / ordinary, uniform top-8 / recorded): m4096 12.99 / 13.18 vs
-    12.97 / 13.17; m2752 9.69 / 9.49 vs 9.72 / 9.47; m1024 4.86 / 4.93 vs
-    4.84 / 4.96; m256 3.80 / 3.80 vs 3.88 / 3.88. So the compact layout
+    (compact / ordinary, uniform top-8 / recorded): m4096 12.95 / 13.16 vs
+    12.95 / 13.16; m2752 9.60 / 9.42 vs 9.72 / 9.47; m1024 4.79 / 4.92 vs
+    4.84 / 4.96; m256 3.78 / 3.78 vs 3.88 / 3.88. So the compact layout
     recovers what the October 20 rotation moved off warp specialization.
     Qualification is the measured capacity set only; every other width,
     family and capacity stays cooperative. `compact_ws_export` adds the
@@ -469,9 +470,10 @@ def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) 
     """Route block of a compact warp-specialized export, or None when off.
 
     Measured per capacity (see `compact_warp_specialized`): a 64-row block
-    beats 32 from m1024 up (m1024 4.97 vs 5.74 ms); at m256, with dynamic
-    tile claims, the two tie (3.81 vs 3.81), so the small capacity keeps the
-    32-row block and larger ones take 64.
+    beats 32 from m1024 up (m1024 4.79 vs 5.76 ms); at m256, with dynamic
+    tile claims, 32 is 1.2% faster (3.78 vs 3.82), so the small capacity
+    keeps the 32-row block and larger ones take 64. Gemini's S1 round
+    measured the same arm set independently and splits the same way.
     """
     if not compact_warp_specialized(geometry, role, width, capacity):
         return None
