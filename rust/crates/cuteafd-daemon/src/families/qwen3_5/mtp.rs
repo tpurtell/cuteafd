@@ -147,8 +147,7 @@ impl<'a> Mtp<'a> {
             let pages = self.pool.page_table(reservation)?;
             self.pairs_device(engine, hidden, tokens, start, kv, pages)
         })();
-        // No provisional destination is recycled before all producer reads/writes retire.
-        engine.stream.drain()?;
+        // Recycled destinations are reused only by later work on this one stream.
         self.pool.commit(reservation, if result.is_ok() { rows } else { 0 })?;
         result
     }
@@ -197,15 +196,14 @@ impl<'a> Mtp<'a> {
     }
 
     /// A target frontier P reserves P rows, but KV(P-1) waits for token(P).
-    fn pending(&mut self, engine: &DenseEngine<'_>, hidden: CuteafdDeviceBuffer, frontier: usize) -> Result<()> {
+    fn pending(&mut self, hidden: CuteafdDeviceBuffer, frontier: usize) -> Result<()> {
         ensure!(frontier > 0 && self.pool.frontier(self.binding)?.1 == frontier - 1,
             "dense MTP pending row differs from target frontier");
         let row = self.pool.reserve(self.binding, frontier - 1, 1)?;
         self.pool.commit(row, 1)?;
         let destination = self.tail_hidden(frontier)?;
-        // SAFETY: admitted sidecar and target hidden survive the producer-stream drain.
-        unsafe { self.library.copy_d2d_async(destination, hidden, self.layout.hidden_bytes, self.stream)?; }
-        engine.stream.drain()
+        // SAFETY: the admitted sidecar and target hidden are read and rewritten only on this stream.
+        unsafe { self.library.copy_d2d_async(destination, hidden, self.layout.hidden_bytes, self.stream) }
     }
 
     fn resolve_pending(&self, engine: &mut DenseEngine<'_>, token: u32, frontier: usize) -> Result<Vec<f32>> {
@@ -252,8 +250,7 @@ impl<'a> Mtp<'a> {
             Ok(tokens)
         })();
         // Recursive feedback is not canonical target hidden, even when its token is accepted.
-        // Retire every producer before recycling the provisional suffix; update() recomputes it.
-        engine.stream.drain()?;
+        // Recycle the provisional suffix; update() recomputes it later on this same stream.
         if let Some(reservation) = reservation { self.pool.commit(reservation, 0)?; }
         result
     }
@@ -329,7 +326,7 @@ impl<'a> MtpCache<'a> {
         }
         let tail = crate::shared::prefix::view(mtp.hidden.buffer, (tokens.len() - 1) * mtp.layout.hidden_bytes,
             mtp.layout.hidden_bytes)?;
-        mtp.pending(engine, tail, start + tokens.len())
+        mtp.pending(tail, start + tokens.len())
     }
 
     pub(crate) fn capture_hidden(&self, source: CuteafdDeviceBuffer, rows: usize) -> Result<()> {
@@ -682,7 +679,7 @@ mod tests {
                 let known = if end == frontier { end - first - 1 } else { end - first };
                 if known > 0 { mtp.step(&mut target, input.buffer, &tokens[first + 1..first + known + 1], first)?; }
                 if end == frontier {
-                    mtp.pending(&target, crate::shared::prefix::view(input.buffer, (end - first - 1) * layout.hidden_bytes,
+                    mtp.pending(crate::shared::prefix::view(input.buffer, (end - first - 1) * layout.hidden_bytes,
                         layout.hidden_bytes)?, frontier)?;
                 }
             }
@@ -734,7 +731,7 @@ mod tests {
                     Ok(())
                 })?.to_host(&library)?;
                 mtp.norm(&target, input.buffer, target.weights.norm.buffer, input.buffer, 1)?;
-                mtp.pending(&target, input.buffer, frontier + 1)?;
+                mtp.pending(input.buffer, frontier + 1)?;
                 let second = mtp.resolve_pending(&mut target, argmax(&logits), frontier + 1)?;
                 Ok((first, logits, second))
             };

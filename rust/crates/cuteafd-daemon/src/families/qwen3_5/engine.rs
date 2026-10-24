@@ -273,7 +273,8 @@ impl<'a> DenseEngine<'a> {
             "dense page binding changes a live KV prefix");
         ensure!(pages.iter().enumerate().all(|(index, page)| !pages[..index].contains(page)),
             "dense page binding aliases physical pages");
-        self.stream.drain()?;
+        // Host metadata only: the page table reaches the device through an ordered
+        // upload on the one target stream, after every queued reader of the old one.
         self.verification.invalidate()?;
         self.slots[slot].pages = pages.to_vec();
         Ok(())
@@ -324,7 +325,8 @@ impl<'a> DenseEngine<'a> {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let table = rows::Rows { tokens: Vec::new(), physical: Vec::new(), groups: Vec::new(),
             slots: vec![i32::try_from(slot)?; tokens.len()], first: vec![0; tokens.len()], positions, kv, pages, stride: 0 };
-        self.stream.drain()?;
+        // Target, MTP and drafter share this one stream: tables, planes and state
+        // are reused in stream order, so prefill queues behind earlier work.
         self.verification.invalidate()?;
         self.healthy = false;
         self.row_tables(&table)?;
@@ -351,7 +353,7 @@ impl<'a> DenseEngine<'a> {
                 &[Scalar::I32(i32::try_from(logit_rows)?)], self.stream.raw)?; }
             self.target_head(self.planes.norm, self.logits.buffer, logit_rows)?
         };
-        self.stream.drain()?;
+        // The returned logits carry this stream; selection waits on it.
         self.slots[slot].position = end;
         self.position = self.slots[0].position;
         self.healthy = true;

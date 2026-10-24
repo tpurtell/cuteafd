@@ -571,14 +571,10 @@ impl<'a> MimoDrafter<'a> {
     }
 
     /// Consume independent request banks in lane order. The context projection
-    /// scratch is reused; drain before overwriting its synchronous table uploads.
+    /// scratch and table uploads are reused in stream order (ordered uploads).
     /// No captured graph or persistent target tap pointer changes here.
     pub fn update_lane(&self, lane: usize, rows: &[ContextRow]) -> Result<()> {
-        let taps = self.lane_taps(lane)?;
-        // SAFETY: the engine owns this stream and both tap banks through its
-        // terminal guard; no pending peer wait remains after paired prefill.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        self.update_from(taps, rows)
+        self.update_from(self.lane_taps(lane)?, rows)
     }
 
     fn update_from(&self, taps: &Dev<'_>, rows: &[ContextRow]) -> Result<()> {
@@ -622,7 +618,9 @@ impl<'a> MimoDrafter<'a> {
 
     fn put(&self, dev: &Dev<'_>, bytes: &[u8]) -> Result<()> {
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        // SAFETY: every reader of the drafter's tables, inputs and taps runs on its
+        // stream outside capture; the ordered copy follows them and keeps its source.
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream) }
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
@@ -726,7 +724,7 @@ impl<'a> MimoDrafter<'a> {
                     .flat_map(|seq| std::iter::once(seq.anchor).chain(std::iter::repeat_n(MASK_ID, block - 1))).collect();
                 embedding.check(&sequences.iter().map(|seq| seq.anchor).collect::<Vec<_>>())?;
                 self.put(&w.ids, bytes_of(&ids))?;
-                // SAFETY: the ids are up (synchronous copy); `h` holds the block rows; the
+                // SAFETY: the ids are up (ordered on this stream); `h` holds the block rows; the
                 // mask row is a live [hidden] BF16 buffer.
                 unsafe { embedding.embed_device_ids(w.ids.buffer, None, rows, 1,
                     Some((self.mask_device.buffer.ptr.cast_const(), &self.mask_row)), w.h.buffer, self.stream)? };

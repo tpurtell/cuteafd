@@ -265,6 +265,14 @@ pub(crate) enum Experts<'a> {
     SharedOnly,
 }
 
+/// Appends one row's page list padded with zeros (or cut) to `stride` entries,
+/// without a per-row allocation.
+fn extend_padded(table: &mut Vec<i32>, pages: &[i32], stride: usize) {
+    let kept = pages.len().min(stride);
+    table.extend_from_slice(&pages[..kept]);
+    table.resize(table.len() + stride - kept, 0);
+}
+
 /// Host tables of one step.
 #[derive(Default)]
 struct StepTables {
@@ -402,6 +410,17 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn padded_page_rows_match_clone_and_resize() {
+        for (pages, stride) in [(vec![3, 1], 4), (vec![7, 8, 9], 3), (vec![5, 6, 7], 2), (vec![], 2)] {
+            let mut table = vec![-1];
+            super::extend_padded(&mut table, &pages, stride);
+            let mut expected = pages.clone();
+            expected.resize(stride, 0);
+            assert_eq!(table[1..], expected[..]);
+        }
+    }
 
     #[test]
     fn startup_graphs_default_on_but_respect_both_explicit_opt_outs() {
@@ -2342,12 +2361,8 @@ impl<'a> Qwen4Engine<'a> {
             let first = tables.kv_slots.len() as i32;
             self.rows(placement, tokens, first, &mut tables)?;
             for _ in 0..tokens.len() {
-                let mut pages = placement.pages.clone();
-                pages.resize(page_stride, 0);
-                tables.page_table.extend(pages);
-                let mut pools = placement.pool_pages.clone();
-                pools.resize(pool_stride, 0);
-                tables.pool_table.extend(pools);
+                extend_padded(&mut tables.page_table, &placement.pages, page_stride);
+                extend_padded(&mut tables.pool_table, &placement.pool_pages, pool_stride);
             }
         }
         tables.pool_width = tables.pool_width.next_power_of_two().min(pool_stride);
@@ -2389,8 +2404,8 @@ impl<'a> Qwen4Engine<'a> {
                 "commit of rows {first}+{keep} in slot {slot}");
             (table[i], table[n + i], table[2 * n + i]) = (slot, i32::try_from(first)?, i32::try_from(keep)?);
         }
-        // SAFETY: the engine owns this stream; the previous commit's table is consumed.
-        unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+        // Each bank uploads its commit table in order on its own stream (GdnBank::commit),
+        // behind that owner's verify work and the previous commit's readers.
         let i32s = |v: usize| -> Result<Scalar> { Ok(Scalar::I32(i32::try_from(v)?)) };
         for bank in &self.gdn_banks {
             bank.device.run(|| bank.commit(&table, n))?;
@@ -2508,12 +2523,8 @@ impl<'a> Qwen4Engine<'a> {
                     _ => row.source,
                 });
                 if decode {
-                    let mut pages = placement.pages.clone();
-                    pages.resize(tables.page_stride, 0);
-                    tables.page_table.extend(pages);
-                    let mut pools = placement.pool_pages.clone();
-                    pools.resize(tables.pool_stride, 0);
-                    tables.pool_table.extend(pools);
+                    extend_padded(&mut tables.page_table, &placement.pages, tables.page_stride);
+                    extend_padded(&mut tables.pool_table, &placement.pool_pages, tables.pool_stride);
                 }
             }
         }

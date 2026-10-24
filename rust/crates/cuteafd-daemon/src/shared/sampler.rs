@@ -515,10 +515,16 @@ impl<'a> TargetSamplingWave<'a> {
                 );
                 let source = slot * self.mask_words;
                 let target = target_row * self.mask_words;
-                let mut words = mask_staging[source..source + self.mask_words].to_vec();
-                cuteafd_ffi::cuteafd_sampler_clear_remainder(&mut words, self.vocab);
-                staging[target * 4..(target + self.mask_words) * 4]
-                    .copy_from_slice(bytemuck_slice(&words));
+                // Copy straight into the pinned row, then clear its tail bits in place.
+                let pinned = &mut staging[target * 4..(target + self.mask_words) * 4];
+                pinned.copy_from_slice(bytemuck_slice(&mask_staging[source..source + self.mask_words]));
+                let remainder = self.vocab % 32;
+                if remainder != 0 {
+                    let last = &mut pinned[((self.vocab - 1) / 32) * 4..][..4];
+                    let word = u32::from_ne_bytes(last.try_into().expect("four mask bytes"))
+                        & ((1u32 << remainder) - 1);
+                    last.copy_from_slice(&word.to_ne_bytes());
+                }
                 mask_rows = mask_rows.max(target_row + 1);
             }
         }

@@ -301,7 +301,11 @@ impl<'a> GlmfEngine<'a> {
             };
         }
         complete?;
-        if logit_rows == 0 || self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
+        // Partial layer sets are diagnostics read on the host. A chunk without logits
+        // stays queued: the next call's boundary drain (above) or the next reader
+        // (selection, prefix capture) waits for it.
+        if self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
+        if logit_rows == 0 { return Ok(None); }
         Ok(Some(if device { StepLogits::Device(hooks.result.context("last-unit logits")?) }
             else { StepLogits::Host(hooks.logits) }))
     }

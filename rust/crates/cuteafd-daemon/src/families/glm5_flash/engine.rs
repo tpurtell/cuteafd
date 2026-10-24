@@ -2951,7 +2951,10 @@ impl<'a> GlmfEngine<'a> {
         ensure!(slot < self.slots, "KDA slot {slot} out of range");
         for rank in 0..self.ranks() {
             for region in self.slot_regions_on(rank, slot) {
-                self.on(rank, || self.library.cuda_zero_bytes(region, region.bytes))?;
+                // SAFETY: the slot's state regions are live and read or written only on
+                // this rank's stream, so the clear queues behind the previous sequence's
+                // readers and before the new sequence's first step.
+                self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(region, region.bytes, self.stream_of(rank)) })?;
             }
         }
         Ok(())
