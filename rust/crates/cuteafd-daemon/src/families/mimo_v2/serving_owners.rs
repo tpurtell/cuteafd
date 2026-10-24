@@ -6,11 +6,12 @@ use anyhow::Result;
 use cuteafd_engine::prefix::{PrefixCache, PrefixFamily};
 use cuteafd_hostcache::copy::Stream;
 
-/// Unlike request/grammar metadata, these owners contain CUDA allocations or
-/// pinned storage addressed by asynchronous compute and host-copy queues.
+/// Keep request media and grammar owners with the CUDA and pinned storage
+/// addressed by asynchronous compute and host-copy queues.
 struct Buffers<'e, 'a> {
     prefix: Option<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)>,
     selector: Option<TokenSelector<'a>>,
+    active: Vec<super::serve::Active<'a>>,
 }
 
 /// Installed before the first serving-owned GPU buffer is created. This also
@@ -22,7 +23,7 @@ pub(super) struct ServingOwners<'e, 'a> {
 
 impl<'e, 'a> ServingOwners<'e, 'a> {
     pub(super) fn new(engine: &'e MimoEngine<'a>) -> Self {
-        Self { engine, buffers: Some(Buffers { prefix: None, selector: None }) }
+        Self { engine, buffers: Some(Buffers { prefix: None, selector: None, active: Vec::new() }) }
     }
 
     pub(super) fn prefix(&mut self, family: MimoPrefix<'e, 'a>, cache: PrefixCache<CudaCopyEngine<'a>>) {
@@ -38,6 +39,14 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
         let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
         let selector = buffers.selector.as_mut().expect("initialized serving selector");
         (family, cache, selector)
+    }
+
+    pub(super) fn scheduler_parts(&mut self) -> (&MimoPrefix<'e, 'a>,
+        &mut PrefixCache<CudaCopyEngine<'a>>, &mut TokenSelector<'a>, &mut Vec<super::serve::Active<'a>>) {
+        let buffers = self.buffers.as_mut().expect("live serving owners");
+        let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
+        let selector = buffers.selector.as_mut().expect("initialized serving selector");
+        (family, cache, selector, &mut buffers.active)
     }
 }
 

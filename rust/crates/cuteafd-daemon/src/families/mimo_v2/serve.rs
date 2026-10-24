@@ -325,7 +325,7 @@ struct Prefill<'a> {
     ticket: console::Ticket,
 }
 
-struct Active<'a> {
+pub(super) struct Active<'a> {
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
@@ -492,9 +492,9 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
 }
 
 #[allow(clippy::too_many_arguments)]
-fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
+fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
+    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, 'a>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
     let drafter = engine.drafter.as_ref();
@@ -519,15 +519,14 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let (mut observed_rounds, mut skipped_rounds) = (0u64, 0u64);
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
-    let (family, cache, selector) = owners.parts();
+    let (family, cache, selector, active) = owners.scheduler_parts();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;
     let mut free_rings: Vec<i32> = (0..engine.rings as i32).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
-        &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
+        engine.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-    let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     // Verify steps since the last completed request, and host seconds in
     // them (engine) and in token selection + streaming.
