@@ -268,10 +268,15 @@ impl DraftReservations {
     pub fn execution_view(&self) -> Vec<MemoryReservation> {
         self.steady.iter().filter(|cost| !cost.name.starts_with("draft.weights.")
             && !(cost.name.starts_with("draft.layer") && cost.name.ends_with("_ring")))
-            .map(|cost| MemoryReservation { name: format!("draft.lane1.{}", cost.name.strip_prefix("draft.").unwrap()),
+            .map(|cost| MemoryReservation { name: crate::plan::decode_lanes::lane_name(&cost.name, 1),
                 bytes: cost.bytes }).collect()
     }
 }
+
+/// Lane one's untracked driver objects on the lead and peer GPU
+/// ([`decode_view_reservations`]).
+pub const LANE1_DRIVER_OBJECTS_LEAD: u64 = 10_722_048;
+pub const LANE1_DRIVER_OBJECTS_PEER: u64 = 6_836_992;
 
 /// A second decode view owns no prefill state, weights, KV or request rings.
 /// Pool-dependent page indices remain in the workspace's linear pool term.
@@ -280,8 +285,17 @@ pub fn decode_view_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
     bytes_per_exec: u64, driver_margin: u64) -> Result<Vec<MemoryReservation>> {
     ensure!((1..=2).contains(&ranks) && rank < ranks && spark_ranks > 0,
         "independent MiMo decode admission requires Spark experts and a valid coordinator rank");
+    use crate::plan::decode_lanes::lane_name;
     let mut costs = graphs.reservations(rank, bytes_per_exec, driver_margin)?;
-    for cost in &mut costs { cost.name = cost.name.replacen("runtime.", "runtime.lane1.", 1); }
+    for cost in &mut costs { cost.name = lane_name(&cost.name, 1); }
+    // Driver objects lane one creates outside the allocation ledger: on each
+    // GPU a terminal-abort publisher stream per abortable peer exchange (the
+    // head split's and the TP2 route exchange), and on the lead the Spark
+    // intake copy stream, its ordering events and the round probe's layer
+    // events. Calibrated against the ready ledger delta (lane two minus lane
+    // one, MiMo Pro max, 7363d8b9e: untracked 10,722,048 / 6,836,992 B).
+    costs.push(MemoryReservation { name: "runtime.lane1.driver_objects".into(),
+        bytes: if rank == 0 { LANE1_DRIVER_OBJECTS_LEAD } else { LANE1_DRIVER_OBJECTS_PEER } });
     if ranks == 2 {
         costs.push(MemoryReservation { name: "transport.lane1.peer_receive_slots".into(),
             bytes: tensor_bytes("MiMo lane1 peer slots", &[peer_slots(1), super::decode_graph::MIMO_DECODE_ROWS, cfg.hidden, 2])? });
@@ -292,7 +306,7 @@ pub fn decode_view_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
         costs.push(MemoryReservation { name: "diagnostics.lane1.draft_route_arena".into(),
             bytes: allocation_bytes("MiMo lane1 draft routes", &[cfg.layers, super::decode_graph::MIMO_DECODE_ROWS, cfg.topk, 4])? });
         costs.extend(sampling_reservations(cfg.vocab_size)?.into_iter().map(|cost|
-            MemoryReservation { name: cost.name.replacen("sampling.", "sampling.lane1.", 1), bytes: cost.bytes }));
+            MemoryReservation { name: lane_name(&cost.name, 1), bytes: cost.bytes }));
         costs.push(MemoryReservation { name: "transport.lane1.spark_intake_planes".into(),
             bytes: tensor_bytes("MiMo lane1 intake planes", &[super::decode_graph::MIMO_DECODE_ROWS, spark_ranks, cfg.hidden, 2])? });
     }

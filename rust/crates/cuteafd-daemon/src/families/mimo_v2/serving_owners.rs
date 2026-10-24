@@ -31,7 +31,7 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
 
     pub(super) fn with_lanes(engine: &'e MimoEngine<'a>, second: Option<MimoEngine<'a>>) -> Self {
         Self { engine, buffers: Some(Buffers { prefix: None, selector: None,
-            second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new(), rounds: RoundBank::from_requests(Vec::new()) }) }
+            second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new(), rounds: RoundBank::default() }) }
     }
 
     pub(super) fn install_second(&mut self, second: Option<MimoEngine<'a>>) {
