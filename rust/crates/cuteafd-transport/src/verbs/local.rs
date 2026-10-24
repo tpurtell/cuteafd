@@ -104,6 +104,7 @@ pub struct LocalVerbsExpertConnection {
     response_send_view: CuteafdRdmaRcEndpointBufferView,
     response_frame: ExpertProtocolV2FrameBuffer,
     request_recv_sequence: usize,
+    request_epoch: u64,
     response_send_sequence: usize,
     response_send_in_flight: usize,
     response_copy_stream: Option<VerbsHostCudaStream>,
@@ -381,7 +382,17 @@ impl LocalVerbsExpertConnection {
             response_ring.depth,
         )?;
         endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
+        let request_write_target = if start.request_write {
+            anyhow::ensure!(start.write_target.is_none() && request_ring.depth <= 64,
+                "request WRITE requires SEND replies and at most 64 slots");
+            let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
+            Some(request_write::Target { address, rkey, epoch: request_write::next_epoch()? })
+        } else { None };
         for slot in 0..request_ring.depth {
+            if start.request_write {
+                library.rdma_rc_endpoint_request_recv(endpoint.info.handle, slot, VERBS_HOST_RECV_WR_ID + slot as u64)?;
+                continue;
+            }
             endpoint.post_recv_at(
                 request_ring.slot_offset(slot),
                 request_ring.slot_capacity_bytes,
@@ -407,6 +418,7 @@ impl LocalVerbsExpertConnection {
             start.client_native_endpoint.status
         );
         }
+        let request_epoch = request_write_target.map_or(0, |target| target.epoch);
         write_control(
             &mut stream,
             &VerbsHostProtocolV2PersistentReady {
@@ -415,6 +427,7 @@ impl LocalVerbsExpertConnection {
                 expert_grouping: grouping.cloned(),
                 server_endpoint,
                 server_native_endpoint: endpoint.native_descriptor(),
+                request_write_target,
                 flow_label: start.flow_label,
             },
         )?;
@@ -430,6 +443,7 @@ impl LocalVerbsExpertConnection {
             response_send_view,
             response_frame,
             request_recv_sequence: 0,
+            request_epoch,
             response_send_sequence: 0,
             response_send_in_flight: 0,
             response_copy_stream: None,
@@ -512,6 +526,11 @@ impl LocalVerbsExpertConnection {
                 )
             };
             let copy_header_ms = 0.0_f64;
+            let written_bell = if start.request_write {
+                let raw = library.rdma_rc_endpoint_request_read_doorbell(endpoint.info.handle, request_recv_slot.slot_index)?;
+                Some(request_write::validate_doorbell(&raw, self.request_epoch,
+                    request_recv_sequence as u64, start.request_capacity_wire_bytes)?)
+            } else { None };
             let request_wire_bytes = persistent_protocol_v2_request_wire_bytes_from_header(
                 &request_storage[..EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN],
                 start.request_capacity_wire_bytes,
@@ -524,6 +543,10 @@ impl LocalVerbsExpertConnection {
             let request =
                 ExpertProtocolV2RequestView::parse(&request_storage[..request_wire_bytes])
                     .context("parsing persistent verbs-host ProtocolV2 request frame")?;
+            if let Some((id, bytes)) = written_bell {
+                anyhow::ensure!(id == request.header.request_id && bytes == request_wire_bytes,
+                    "request WRITE frame disagrees with doorbell");
+            }
             if let Some(admitted) = &endpoint.credits.endpoint {
                 admitted.validate_request(&request.header)?;
             }
@@ -576,6 +599,9 @@ impl LocalVerbsExpertConnection {
                 start.execution_lane,
             )?;
             let execute_started = timing_enabled.then(Instant::now);
+            let mut deferred_final: Option<(usize, usize, u64)> = None;
+            let mut final_credit = request_write::FinalCredit::default();
+            let mut final_ready = None;
             execute(&request, device_payload, &mut |response| {
                 if final_response_emitted {
                     bail!(
@@ -624,12 +650,19 @@ impl LocalVerbsExpertConnection {
                             start.response_capacity_wire_bytes
                         );
                         let send_started = timing_enabled.then(Instant::now);
-                        endpoint.send_parts_at(
-                            response_prefix,
-                            response.partial_output_payload,
-                            response_send_offset,
-                            VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                        )?;
+                        if start.request_write && !response_has_more {
+                            let slot = mapped_ring_slot(response_send_view, response_ring, response_send_sequence as u64)?;
+                            // SAFETY: response slot is reserved and its previous SEND completed.
+                            let dst = unsafe { std::slice::from_raw_parts_mut(slot.host_ptr, wire_bytes) };
+                            dst[..response_prefix.len()].copy_from_slice(response_prefix);
+                            dst[response_prefix.len()..].copy_from_slice(response.partial_output_payload);
+                            final_credit.ready()?;
+                            deferred_final = Some((response_send_offset, wire_bytes, VERBS_HOST_SEND_WR_ID + response_send_slot as u64));
+                            final_ready = timing_enabled.then(Instant::now);
+                        } else {
+                            endpoint.send_parts_at(response_prefix, response.partial_output_payload,
+                                response_send_offset, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                        }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
@@ -695,11 +728,13 @@ impl LocalVerbsExpertConnection {
                                         response.partial_output_payload.bytes },
                                     flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
                             }
-                            None => endpoint.post_send_at(
-                                response_send_offset,
-                                wire_bytes,
-                                VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                            )?,
+                            None if start.request_write && !response_has_more => {
+                                final_credit.ready()?;
+                                deferred_final = Some((response_send_offset, wire_bytes, VERBS_HOST_SEND_WR_ID + response_send_slot as u64));
+                                final_ready = timing_enabled.then(Instant::now);
+                            }
+                            None => endpoint.post_send_at(response_send_offset, wire_bytes,
+                                VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?,
                         }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
@@ -714,16 +749,29 @@ impl LocalVerbsExpertConnection {
                 final_response_emitted = !response_has_more;
                 Ok(())
             })?;
+            final_credit.drained();
             let execute_ms = elapsed_ms_optional(execute_started);
             if response_frames == 0 || !final_response_emitted {
                 bail!("persistent verbs-host executor did not emit a final response chunk");
             }
             let post_recv_started = timing_enabled.then(Instant::now);
-            endpoint.post_recv_at(
-                request_ring.slot_offset(request_recv_sequence),
-                request_ring.slot_capacity_bytes,
-                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64,
-            )?;
+            if start.request_write {
+                // execute has returned: all host staging/GPU request consumers
+                // drained. Repost before the final reply grants the next lease.
+                library.rdma_rc_endpoint_request_recv(endpoint.info.handle, request_recv_slot.slot_index,
+                    VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64)?;
+                final_credit.reposted();
+                final_credit.publish()?;
+                let (offset, bytes, wr) = deferred_final.context("request WRITE missing deferred final response")?;
+                endpoint.post_send_at(offset, bytes, wr)?;
+                if let Some(ready) = final_ready {
+                    eprintln!("protocol_v2_request_write_credit request_id={} final_ready_to_send_us={}",
+                        request_id, ready.elapsed().as_micros());
+                }
+            } else {
+                endpoint.post_recv_at(request_ring.slot_offset(request_recv_sequence), request_ring.slot_capacity_bytes,
+                    VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64)?;
+            }
             request_recv_sequence = request_recv_sequence.wrapping_add(1);
             post_recv_ms = elapsed_ms_optional(post_recv_started);
             if timing_enabled {
@@ -993,7 +1041,7 @@ mod budget_tests {
             "request_capacity_wire_bytes": 4096, "response_capacity_wire_bytes": 4096,
             "request_registered_span_bytes": 32768, "response_registered_span_bytes": 32768,
             "ring_depth": 8, "request_slot_stride_bytes": 4096, "response_slot_stride_bytes": 4096,
-            "client_endpoint": endpoint, "client_native_endpoint": native
+            "client_endpoint": endpoint, "client_native_endpoint": native, "request_write": false
         });
         if let Some(digest) = digest { start["worker_selection_digest"] = digest.into(); }
         start

@@ -3394,6 +3394,43 @@ def test_rdma_bond_balance_reaches_only_the_coordinator(tmp_path, keys, mode):
     assert workers and not any("CUTEAFD_RDMA_BOND_BALANCE" in line for line in workers)
 
 
+@pytest.mark.parametrize("keys,expected", [
+    ("", None),
+    ("SPARK_REQUEST_WRITE=off\n", None),
+    ("SPARK_REQUEST_WRITE=on\n", (262144, "off", "off")),
+    ("SPARK_REQUEST_WRITE=on\nSPARK_REQUEST_CHUNK_BYTES=131072\n"
+     "SPARK_REQUEST_DESTINATION_BYTES=524288\nSPARK_REQUEST_AGGREGATE_BYTES=2097152\n",
+     (131072, 524288, 2097152)),
+    ("SPARK_REQUEST_WRITE=on\nSPARK_REQUEST_DESTINATION_BYTES=524288\n",
+     (262144, 524288, "off")),
+    ("SPARK_REQUEST_WRITE=on\nSPARK_REQUEST_AGGREGATE_BYTES=2097152\n",
+     (262144, "off", 2097152)),
+])
+def test_request_write_launch_is_coordinator_only(tmp_path, keys, expected):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", keys)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    coordinator = next(line for line in lines if "cuteafd serve-glmf" in line)
+    workers = [line for line in lines if "docker run -d --name cuteafd-spark-expert-" in line]
+    assert ("CUTEAFD_SPARK_REQUEST_WRITE=on" in coordinator) == (expected is not None)
+    assert workers and not any("CUTEAFD_SPARK_REQUEST_" in line for line in workers)
+    if expected:
+        for key, value in zip(("CHUNK", "DESTINATION", "AGGREGATE"), expected):
+            assert f"CUTEAFD_SPARK_REQUEST_{key}_BYTES={value}" in coordinator
+
+
+@pytest.mark.parametrize("keys", [
+    "SPARK_REQUEST_WRITE=yes\n",
+    "SPARK_REQUEST_WRITE=on\nSPARK_REQUEST_CHUNK_BYTES=0\n",
+    "SPARK_REQUEST_WRITE=on\nSPARK_REQUEST_CHUNK_BYTES=4294967296\n",
+    "SPARK_REQUEST_WRITE=on\nSPARK_REQUEST_AGGREGATE_BYTES=1\n",
+])
+def test_request_write_bad_window_fails_before_launch(tmp_path, keys):
+    result = _family_launch_result(tmp_path, _GLMF, "test/glmf", keys)
+    assert result.returncode == 2, result.stderr
+    assert not any(line.startswith(("docker ", "ssh ", "nest ")) for line in result.stderr.splitlines())
+
+
 def test_rdma_bond_balance_rejects_unknown_modes_before_launch(tmp_path):
     result = _family_launch_result(tmp_path, _GLMF, "test/glmf",
                                    "RDMA_BOND_BALANCE=yes\n")

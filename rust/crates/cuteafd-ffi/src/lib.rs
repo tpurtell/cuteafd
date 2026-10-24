@@ -4880,6 +4880,53 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_slot_region", status)
     }
 
+    pub fn rdma_rc_endpoint_request_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
+        // SAFETY: the endpoint owner controls its lifetime; ABI is resolved by name.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_target")? };
+        let (mut address, mut rkey) = (0, 0);
+        let status = unsafe { f(handle, &mut address, &mut rkey) };
+        self.status_to_result("request WRITE target", status)?;
+        Ok((address, rkey))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn rdma_rc_endpoint_request_write(&self, handle: *mut c_void, slot: usize, prefix: usize,
+        region: Option<(u32, usize)>, offset: usize, bytes: usize, remote: u64, rkey: u32, wr: u64) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, usize, u64, u32, u64) -> CuteafdStatus;
+        // SAFETY: source regions remain owned by the transport until CQ/quiesce.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_write")? };
+        let (region, region_offset) = region.unwrap_or((u32::MAX, 0));
+        let status = unsafe { f(handle, slot, prefix, region, region_offset, offset, bytes, remote, rkey, wr) };
+        self.status_to_result("request WRITE post", status)
+    }
+
+    pub fn rdma_rc_endpoint_request_doorbell(&self, handle: *mut c_void, slot: usize, bell: &[u8; 40], wr: u64) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut c_void, usize, *const u8, u64) -> CuteafdStatus;
+        // SAFETY: native copies the fixed-size bell into registered endpoint storage.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_doorbell")? };
+        let status = unsafe { f(handle, slot, bell.as_ptr(), wr) };
+        self.status_to_result("request WRITE doorbell", status)
+    }
+
+    pub fn rdma_rc_endpoint_request_recv(&self, handle: *mut c_void, slot: usize, wr: u64) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut c_void, usize, u64) -> CuteafdStatus;
+        // SAFETY: the endpoint owns each registered receive slot until quiescence.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_recv")? };
+        let status = unsafe { f(handle, slot, wr) };
+        self.status_to_result("request WRITE receive", status)
+    }
+
+    pub fn rdma_rc_endpoint_request_read_doorbell(&self, handle: *mut c_void, slot: usize) -> Result<[u8; 40]> {
+        type F = unsafe extern "C" fn(*mut c_void, usize, *mut u8) -> CuteafdStatus;
+        // SAFETY: called after receive completion; native acquire precedes copy.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_read_doorbell")? };
+        let mut bell = [0; 40];
+        let status = unsafe { f(handle, slot, bell.as_mut_ptr()) };
+        self.status_to_result("request WRITE doorbell read", status)?;
+        Ok(bell)
+    }
+
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: Symbol<RdmaRcEndpointDestroyFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_destroy")? };

@@ -36,10 +36,12 @@ pub(crate) struct LocalTp4Client {
     /// previous rank's send completed) rather than all at once.
     stagger: bool,
     egress_slot: usize,
+    request_write: Option<(request_write::Settings, Arc<Mutex<request_write::Window>>)>,
     /// Optional terminal contract. A failed temporary/persistent endpoint
     /// publishes into this witness before its external landing owner drops.
     terminal_owner: Option<Arc<AtomicBool>>,
     terminal_failed: bool,
+    request_write_source: Option<ExpertProtocolV2Request>,
     terminal_quiesced: bool,
     terminal_released: bool,
     /// Each rank's RoCE flow label for this transport's sessions
@@ -73,8 +75,10 @@ impl LocalTp4Client {
             egress: None,
             stagger: false,
             egress_slot: 0,
+            request_write: None,
             terminal_owner: None,
             terminal_failed: false,
+            request_write_source: None,
             terminal_quiesced: false,
             terminal_released: false,
         }
@@ -95,6 +99,12 @@ impl LocalTp4Client {
         anyhow::ensure!(self.waves.is_empty(), "cannot change wave admission with waves in flight");
         anyhow::ensure!(self.egress.is_none() && self.sessions.iter().all(Option::is_none),
             "wave admission must precede egress allocation and bootstrap");
+        if waves > 1 {
+            if let Some(settings) = request_write::Settings::from_env()? {
+                tracing::info!(?settings, "chunked request WRITE transport (experimental)");
+                self.request_write = Some((settings, Arc::new(Mutex::new(request_write::Window::new(settings, self.peers.len())))));
+            }
+        }
         self.max_waves = waves;
         Ok(())
     }
@@ -138,6 +148,8 @@ impl LocalTp4Client {
     /// and retains the grouping its bootstrap reported.
     fn open_session(&mut self, rank: usize, request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
         egress: bool) -> Result<()> {
+        anyhow::ensure!(self.request_write.is_none() || self.write[rank].is_none(),
+            "request WRITE requires unchanged SEND replies");
         let flow_label = self.flows.label(rank, self.peers[rank])?;
         // Only the compact-BF16 wire caps a session's rings by capacity; every
         // other family's rings are the request's own wire extents.
@@ -146,7 +158,14 @@ impl LocalTp4Client {
         self.sessions[rank] = Some(VerbsHostProtocolV2PersistentClientSession::connect_local(
             self.peers[rank], &self.config, request, landing,
             if egress { self.egress.as_ref() } else { None },
-            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint)?);
+            self.write[rank], self.terminal_owner.clone(), flow_label, capacity, self.model_endpoint, self.request_write.is_some())?);
+        if let Some((settings, window)) = &self.request_write {
+            let session = self.sessions[rank].as_mut().unwrap();
+            anyhow::ensure!(!session.write_mode, "request WRITE does not support write-mode replies");
+            session.request_write = Some(request_write::State { settings: *settings,
+                target: session.request_write_target.context("missing request WRITE target")?, rank, window: window.clone(),
+                leases: request_write::Leases::new(session.request_ring.depth), completions: VecDeque::new() });
+        }
         self.retain_grouping(rank)
     }
 
@@ -239,6 +258,8 @@ impl LocalTp4Client {
     /// RDMA-written into its target (no receives); drops current sessions.
     pub(crate) fn set_write_targets(&mut self, write: Vec<Option<DeviceWriteTarget>>) -> Result<()> {
         anyhow::ensure!(write.len() == self.peers.len(), "one write target entry per rank");
+        anyhow::ensure!(self.request_write.is_none() || write.iter().all(Option::is_none),
+            "request WRITE requires unchanged SEND replies");
         self.reset();
         self.write = write;
         Ok(())
@@ -279,7 +300,26 @@ impl LocalTp4Client {
         self.reset_storage();
     }
     fn reset_storage(&mut self) {
+        if self.request_write.is_some() && self.sessions.iter().any(Option::is_some) {
+            for session in self.sessions.iter_mut().flatten() {
+                if let Some(state) = &mut session.request_write { state.poison(); }
+            }
+            if let Err(error) = quiesce_all(&self.sessions, |session| session.endpoint.terminal_quiesce()) {
+                self.terminal_failed = true;
+                self.retirement_error = Some(format!("request WRITE quiesce failed: {error:#}"));
+                // Preserve payloads and registrations even without terminal GPU
+                // ownership; live DMA must never outlive its source owners.
+                std::mem::forget(std::mem::take(&mut self.sessions));
+                std::mem::forget(std::mem::take(&mut self.pending));
+                std::mem::forget(std::mem::take(&mut self.waves));
+                std::mem::forget(self.egress.take());
+                std::mem::forget(self.request_write_source.take());
+                return;
+            }
+            self.terminal_failed = true;
+        }
         // Drop queued payloads before sessions unregister their receive rings.
+        self.request_write_source = None;
         self.waves.clear();
         self.egress_slot = 0;
         for pending in &mut self.pending {
@@ -318,7 +358,7 @@ impl LocalTp4Client {
                 .transpose()?
                 == Some(false)
             {
-                anyhow::ensure!(self.terminal_owner.is_none() && self.waves.is_empty(),
+                anyhow::ensure!(self.request_write.is_none() && self.terminal_owner.is_none() && self.waves.is_empty(),
                     "Spark request exceeds its prewarmed session capacity; reconnect is unsupported here");
                 self.retire_session(rank)?;
             }
@@ -329,10 +369,46 @@ impl LocalTp4Client {
         }
         if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
         // Every rank's bootstrap is validated before any request enters a QP.
+        if self.request_write.is_some() { self.request_write_source = Some(request.clone()); }
+        let mut uploads = if self.request_write.is_some() {
+            Some(self.sessions.iter_mut().map(|session| session.as_mut().unwrap()
+                .prepare_written_request(request, &self.config)).collect::<Result<Vec<_>>>()?)
+        } else { None };
+        if let Some(uploads) = &mut uploads {
+            let mut sent = vec![false; uploads.len()];
+            let deadline = Instant::now() + self.config.timeout;
+            while sent.iter().any(|sent| !sent) {
+                anyhow::ensure!(Instant::now() < deadline, "request WRITE upload deadline expired");
+                let mut progressed = false;
+                for rank in 0..uploads.len() {
+                    let session = self.sessions[rank].as_mut().unwrap();
+                    let stats = session.endpoint.try_poll(session.request_send_in_flight as u32, 0)?;
+                    if let Some(state) = &mut session.request_write { state.complete(stats.send_completions as usize)?; }
+                    session.request_send_in_flight -= stats.send_completions as usize;
+                    if !sent[rank] {
+                        let before = uploads[rank].posted;
+                        sent[rank] = session.post_written_chunk(&mut uploads[rank])?;
+                        progressed |= sent[rank] || before != uploads[rank].posted;
+                    }
+                }
+                if !progressed && sent.iter().any(|sent| !sent) {
+                    // No spin while windows are full: one bounded CQ-event wait
+                    // returns capacity shared by all ranks and all open waves.
+                    if let Some(session) = self.sessions.iter_mut().flatten().find(|s| s.request_send_in_flight > 0) {
+                        let stats = session.endpoint.wait_stats(1, 0, deadline.saturating_duration_since(Instant::now()))?;
+                        session.request_write.as_mut().unwrap().complete(stats.send_completions as usize)?;
+                        session.request_send_in_flight -= stats.send_completions as usize;
+                    }
+                }
+            }
+        }
         for rank in 0..self.peers.len() {
             let session = self.sessions[rank].as_mut().unwrap();
-            let timing = session.post_chunk_request(request, &self.config)?;
-            if drain_after_rank(self.stagger, session.sends_from_egress(request), rank, self.peers.len()) {
+            let timing = if let Some(uploads) = &mut uploads {
+                std::mem::replace(&mut uploads[rank].timing, VerbsHostProtocolV2ChunkSubmissionTiming {
+                    total_started: None, encode_ms: 0.0, expected_response_ms: 0.0, send_ms: 0.0 })
+            } else { session.post_chunk_request(request, &self.config)? };
+            if self.request_write.is_none() && drain_after_rank(self.stagger, session.sends_from_egress(request), rank, self.peers.len()) {
                 // The next rank's request goes out once this one has left: each
                 // rank gets the whole link in turn and starts computing as early
                 // as it can, so the ranks finish, and their partials land,
@@ -357,6 +433,7 @@ impl LocalTp4Client {
         // Each wave's deadline counts from when it becomes the oldest, so a
         // queued wave is not charged for the waves ahead of it.
         self.waves.push_back(OpenWave { chunks: rx, done, deadline: None });
+        self.request_write_source = None;
         self.egress_slot = (self.egress_slot + 1) % self.max_waves;
         Ok(())
     }
@@ -473,6 +550,7 @@ fn quiesce_all<T>(owners: &[Option<T>], mut quiesce: impl FnMut(&T)->Result<()>)
 
 impl Drop for LocalTp4Client {
     fn drop(&mut self) {
+        if self.request_write.is_some() && !self.terminal_owned() { self.reset_storage(); }
         if self.terminal_owned() && !self.terminal_released {
             if let Err(error)=self.terminal_quiesce() {
                 // Keep native registrations, retained chunks, external egress
@@ -482,6 +560,7 @@ impl Drop for LocalTp4Client {
                 std::mem::forget(std::mem::take(&mut self.pending));
                 std::mem::forget(std::mem::take(&mut self.waves));
                 std::mem::forget(self.egress.take());
+                std::mem::forget(self.request_write_source.take());
                 tracing::error!(%error,"retaining terminal Spark client owners");
             }
         }
