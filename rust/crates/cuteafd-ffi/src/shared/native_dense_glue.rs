@@ -81,7 +81,8 @@ pub fn op_of(entry: &serde_json::Value) -> Result<Option<Op>> {
         Some("dense_mxfp8_quant") => {
             let features = u32_of(g, "input_features")?;
             if ![2048, 6144, 8192, 12288, 16384].contains(&features)
-                || g["input_dtype"] != "f16" || g["rotation_count"] != 4 || g["max_rows"] != 4096 {
+                || g["input_dtype"] != "f16" || g["rotation_count"] != 4 || g["max_rows"] != 4096
+                || g["abi_version"] != 2 {
                 return Err(invalid("MX8 quant geometry"));
             }
             Op::Mx8Quant { features }
@@ -207,7 +208,7 @@ mod tests {
     #[test]
     fn native_mx8_quant_contract_rejects_geometry_and_abi_mutations() {
         let quant = entry("dense_mxfp8_quant",
-            json!({"input_features":2048,"input_dtype":"f16","rotation_count":4,"max_rows":4096}),
+            json!({"input_features":2048,"input_dtype":"f16","rotation_count":4,"max_rows":4096,"abi_version":2}),
             json!([{"name":"rotated_inputs","dtype":"int64","shape":"[4]","role":"in"},
                 {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"out"}]),
             &["rows", "rotation_id", "cta_limit"]);
@@ -218,7 +219,8 @@ mod tests {
                 Op::Mx8Quant { features });
         }
         for (field, value) in [("input_features", json!(4096)), ("input_dtype", json!("bf16")),
-            ("rotation_count", json!(1)), ("max_rows", json!(64))] {
+            ("rotation_count", json!(1)), ("max_rows", json!(64)),
+            ("abi_version", json!(1)), ("abi_version", json!(null))] {
             let mut bad = quant.clone();
             bad["geometry"][field] = value;
             assert!(validate_entry(&spec("q", &bad, 4096), &bad).is_err(), "{field}");

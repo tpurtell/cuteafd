@@ -78,7 +78,7 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         }
         Ok(())
     };
-    if !a8 { field("abi_version", 1)?; }
+    field("abi_version", if a8 { 2 } else { 1 })?;
     field("max_rows", 4096)?;
     if spec.capacity_rows != 4096 {
         return Err(invalid(
@@ -93,6 +93,7 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         field("input_features", k)?;
         field("output_features", n)?;
         field("sharded_side", side)?;
+        // MX8 uses runtime cta_limit and on-chip reduction, not A16 split-K metadata.
         if !a8 { field("ctas_per_sm", 4)?; }
         if matches!(encoding, Encoding::Trellis | Encoding::TrellisA8) {
             let expected_dtype = if bf16_input { "bf16" } else { "f16" };
@@ -528,7 +529,7 @@ mod tests {
         spec.name.push_str("_a8");
         spec.geometry = json!({"input_features":2048,"output_features":8192,
             "encoding":"trellis","sharded_side":1,"input_dtype":"f16",
-            "bits":4,"codebook":"e4m3","rotation_count":4,"max_rows":4096});
+            "bits":4,"codebook":"e4m3","rotation_count":4,"max_rows":4096,"abi_version":2});
         spec.scratch.clear();
         spec.pointers[2] = "scales".into();
         spec.pointers[3] = "records".into();
@@ -539,7 +540,8 @@ mod tests {
         assert_eq!(g.launch_scratch_bytes(4096).unwrap(), 256 * 64 * 528);
         assert_eq!(g.launch_scratch_bytes(17).unwrap(), 2 * 64 * 528);
         for (field, value) in [("input_dtype", json!("bf16")), ("encoding", json!("mxfp8")),
-            ("rotation_count", json!(1)), ("bits", json!(3))] {
+            ("rotation_count", json!(1)), ("bits", json!(3)),
+            ("abi_version", json!(1)), ("abi_version", json!(null))] {
             let mut bad = spec.clone();
             bad.geometry[field] = value;
             assert!(validate_entry(&bad, &entry).is_err(), "{field}");
