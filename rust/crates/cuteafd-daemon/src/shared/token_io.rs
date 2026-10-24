@@ -383,36 +383,17 @@ impl DeviceLogits {
     }
 
     fn rows_host(&self, library: &NativeLibrary, first: usize, n: usize) -> Result<Vec<f32>> {
-        if self.stride == self.vocab {
-            return self.download(library, &[(first, n)]);
+        // SAFETY: the producing engine's stream; the logits are complete once it drains.
+        unsafe { library.cuda_stream_synchronize(self.stream)? };
+        let mut out = vec![0f32; n * self.vocab];
+        for (i, dst) in out.chunks_exact_mut(self.vocab).enumerate() {
+            // SAFETY: row first + i lies inside the logits rows.
+            let ptr = unsafe { self.ptr.cast::<f32>().add((first + i) * self.stride) }.cast_mut().cast();
+            // SAFETY: f32 has no invalid bit patterns; the slice is the row's bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), self.vocab * 4) };
+            library.copy_d2h(bytes, CuteafdDeviceBuffer { ptr, bytes: self.vocab * 4, device_id: library.cuda_get_device()?,
+                ..CuteafdDeviceBuffer::default() })?;
         }
-        self.download(library, &(first..first + n).map(|row| (row, 1)).collect::<Vec<_>>())
-    }
-
-    /// Rows `[row, row + count)` of each span, concatenated. Every copy queues on
-    /// the producing stream behind the logits, so one drain completes them all.
-    fn download(&self, library: &NativeLibrary, spans: &[(usize, usize)]) -> Result<Vec<f32>> {
-        let total: usize = spans.iter().map(|&(_, count)| count).sum();
-        ensure!(spans.iter().all(|&(row, count)| row + count <= self.rows && (count == 1 || self.stride == self.vocab)),
-            "logits download outside {} rows", self.rows);
-        let mut out = vec![0f32; total * self.vocab];
-        let device_id = library.cuda_get_device()?;
-        let mut rest = out.as_mut_slice();
-        let queued = spans.iter().try_for_each(|&(row, count)| {
-            let (dst, tail) = std::mem::take(&mut rest).split_at_mut(count * self.vocab);
-            rest = tail;
-            // SAFETY: row `row` lies inside the logits rows.
-            let ptr = unsafe { self.ptr.cast::<f32>().add(row * self.stride) }.cast_mut().cast();
-            // SAFETY: f32 has no invalid bit patterns; the slice is `dst`'s bytes.
-            let bytes = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr().cast::<u8>(), dst.len() * 4) };
-            // SAFETY: `out` outlives the drain below; the source rows are live logits of this stream.
-            unsafe { library.copy_d2h_async(bytes, CuteafdDeviceBuffer { ptr, bytes: bytes.len(), device_id,
-                ..CuteafdDeviceBuffer::default() }, self.stream) }
-        });
-        // SAFETY: the producing engine's stream; the queued copies complete before `out`
-        // is read or, after a failed enqueue, dropped.
-        let drained = unsafe { library.cuda_stream_synchronize(self.stream) };
-        queued.and(drained)?;
         Ok(out)
     }
 }
@@ -617,17 +598,10 @@ impl<'a> TokenSelector<'a> {
         Ok(Selected { token, logprob: row.logprob.then(|| host_logprob(logits, token)) })
     }
 
-    /// Downloads every row in `pending` with one drain and selects each on the host.
-    fn host_rows(&mut self, logits: &DeviceLogits, rows: &[RowSelect], pending: &[usize],
-        out: &mut [Option<RowResult>]) -> Result<()> {
-        if pending.is_empty() { return Ok(()); }
-        self.counts[2] += pending.len() as u64;
-        let spans: Vec<_> = pending.iter().map(|&i| (i, 1)).collect();
-        let host = logits.download(self.library, &spans)?;
-        for (k, &i) in pending.iter().enumerate() {
-            out[i] = Some(Self::host_select(&host[k * self.vocab..][..self.vocab], &rows[i]));
-        }
-        Ok(())
+    /// Downloads row `i` and selects it on the host.
+    fn host_row(&mut self, logits: &DeviceLogits, i: usize, row: &RowSelect) -> Result<RowResult> {
+        self.counts[2] += 1;
+        Ok(Self::host_select(&logits.row_host(self.library, i)?, row))
     }
 
     fn greedy(&mut self, logits: &DeviceLogits, rows: &[RowSelect]) -> Result<Vec<RowResult>> {
@@ -666,22 +640,19 @@ impl<'a> TokenSelector<'a> {
             self.library.cuda_stream_synchronize(logits.stream)?;
         }
         self.counts[0] += n as u64;
-        let landing = self.landing.bytes();
+        let landing = self.landing.bytes().to_vec();
         let word = |offset: usize| u32::from_le_bytes(landing[offset..offset + 4].try_into().unwrap());
         let mut out = Vec::with_capacity(n);
-        let mut pending = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             if word(4 * self.capacity + 4 * i) != 0 {
                 // A non-finite logit: the host reports exactly what it would have.
-                pending.push(i);
-                out.push(None);
+                out.push(self.host_row(logits, i, row)?);
                 continue;
             }
             let logprob = row.logprob.then(|| f32::from_bits(word(8 * self.capacity + 4 * i)));
-            out.push(Some(Ok(Selected { token: word(4 * i), logprob })));
+            out.push(Ok(Selected { token: word(4 * i), logprob }));
         }
-        self.host_rows(logits, rows, &pending, &mut out)?;
-        Ok(out.into_iter().map(|row| row.expect("every row selected")).collect())
+        Ok(out)
     }
 
     fn sampled(&mut self, logits: &DeviceLogits, rows: &[RowSelect], routes: &[Route]) -> Result<Vec<RowResult>> {
@@ -716,21 +687,18 @@ impl<'a> TokenSelector<'a> {
         let sampled = wave.output(buffer, n)?;
         self.counts[1] += n as u64;
         let mut out = Vec::with_capacity(n);
-        let mut pending = Vec::new();
         for (i, row) in rows.iter().enumerate() {
             let status = sampled.status[i];
             let device = status == cuteafd_ffi::CUTEAFD_V41_SAMPLER_STATUS_OK && routes[i] != Route::Host;
             if !device || row.logprob {
                 // Host routes, device statuses (the host reports the same
                 // error, or selects what the device could not) and logprobs.
-                pending.push(i);
-                out.push(None);
+                out.push(self.host_row(logits, i, row)?);
                 continue;
             }
-            out.push(Some(Ok(Selected { token: sampled.ids[i], logprob: None })));
+            out.push(Ok(Selected { token: sampled.ids[i], logprob: None }));
         }
-        self.host_rows(logits, rows, &pending, &mut out)?;
-        Ok(out.into_iter().map(|row| row.expect("every row selected")).collect())
+        Ok(out)
     }
 }
 
