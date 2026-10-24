@@ -272,6 +272,8 @@ mod draft_storage_tests {
         assert!(source.contains(&["let mut decode = link", "(0, 1, &decode_warm)?;"].concat()));
         assert!(source.contains(&["let mut prefill = link", "(1, lanes, &prefill_warm)?;"].concat()));
         assert!(source.contains(&["Some(link", "(2, 1, &decode_warm)?)"].concat()));
+        assert!(source.contains(&["let endpoints = cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(",
+            "\n            args.prefill_rows, args.expert_input.into(), args.decode_lanes)?;"].concat()));
         assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
         assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "decode_spark_endpoints("].concat()));
         let engine = include_str!("engine.rs");
@@ -1337,8 +1339,8 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
-        let endpoints = cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
-            args.prefill_rows, args.expert_input.into())?;
+        let endpoints = cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(
+            args.prefill_rows, args.expert_input.into(), args.decode_lanes)?;
         let decode_warm = warm(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
         let prefill_warm = warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
         let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::ExpertProtocolV2Request|
