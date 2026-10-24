@@ -196,7 +196,7 @@ impl<'a> Weights<'a> {
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
-                    Some(modules.take_exl3()?),
+                    modules.take_exl3()?,
                 )?;
                 execution.install_topology(config.spark_world()?.ownership_topology())?;
                 Execution::Exl3(execution)
