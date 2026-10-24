@@ -603,7 +603,7 @@ mod tests {
                 compiled_capacity: u32::try_from(compiled)?,
                 endpoints: vec![SparkEndpoint { ring_depth: None,
                     capacity: 64,
-                    ingress: SparkIngress::Bf16,
+                    ingress: SparkIngress::Bf16, execution_lane: 0 
                 }],
                 rings: spark_rings(config.max_frame_bytes)?,
             },

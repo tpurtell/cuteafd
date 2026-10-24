@@ -114,7 +114,7 @@ impl SparkWorkingSet {
             row_indices: multiply(4)?,
             mapped_rings: mapped as u64,
             endpoint_staging: cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
-                ingress: cuteafd_core::SparkIngress::Bf16 }.response_prefix_bytes()
+                ingress: cuteafd_core::SparkIngress::Bf16, execution_lane: 0 }.response_prefix_bytes()
                 .and_then(|bytes| bytes.checked_mul(rings.endpoints))
                 .ok_or(PlacementError::Overflow("Spark endpoint staging"))? as u64,
         })
@@ -374,7 +374,7 @@ mod tests {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
             let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
                 prefill_lanes: 1, ..Default::default() };
-            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 }];
+            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32, execution_lane: 0 }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
             for stored_width in [576, 640] {
                 let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
@@ -421,7 +421,7 @@ mod tests {
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
         let working = SparkWorkingSet { spark_layers: vec![0], spark_ranks: 4,
             prefill_lanes: 1, ..Default::default() };
-        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 }];
+        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32, execution_lane: 0 }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
             SparkResidentLayout::Exl3 { world: 4, rank: 3 },
@@ -457,7 +457,7 @@ mod tests {
             let catalog = crate::read_expert_catalog(dir.path()).unwrap();
             let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: 6,
                 prefill_lanes: 1, ..Default::default() };
-            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 }];
+            let endpoints = [SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, execution_lane: 0 }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
             let exact = SparkAssignment::from_catalog(&catalog, &working, 5,
                 SparkResidentLayout::Fp8 { world: 6, rank: 5, slicing: Slicing::Blocks(128) }, &endpoints, rings).unwrap();
@@ -499,7 +499,7 @@ mod tests {
         }
         write_snapshot(dir.path(), &config, &tensors, None);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16 }];
+        let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16, execution_lane: 0 }];
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         for world in [4, 6] {
             for rank in 0..world {
@@ -572,7 +572,7 @@ mod tests {
         let set = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
             ..Default::default() };
         let geometry = ExpertGeometry::GLM5;
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Fp8K32 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Fp8K32, execution_lane: 0 };
         let rings = SparkRings { max_frame_bytes: 4 << 20, depth: 2,
             slot_bytes: 1 << 20, alignment: 4096 };
         let io = set.rank_endpoints_io(0, geometry, &[endpoint], rings).unwrap();
@@ -602,8 +602,8 @@ mod tests {
         let geometry = ExpertGeometry::MIMO_V26_PRO;
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
-        let main = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 } };
-        let lane = SparkEndpoint { ring_depth: None, capacity: 1024, ingress: SparkIngress::Fp8K32 };
+        let main = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Bf16Decode { rows: 80 }, execution_lane: 0 };
+        let lane = SparkEndpoint { ring_depth: None, capacity: 1024, ingress: SparkIngress::Fp8K32, execution_lane: 0 };
         let io = set.rank_endpoints_io(0, geometry, &[main, lane], rings).unwrap();
         assert_eq!(io.mapped_rings, (main.ring_bytes(geometry, rings).unwrap()
             + lane.ring_bytes(geometry, rings).unwrap()) as u64);

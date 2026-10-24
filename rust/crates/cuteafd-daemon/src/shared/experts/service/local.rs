@@ -1,6 +1,7 @@
 //! The GPU owner polls admitted QPs and sends results without work queues.
 use super::*;
 use cuteafd_transport::{LocalVerbsExpertConnection, ProtocolV2ExecutorResponseRef};
+use super::backend::{Execution, Weights};
 use std::{
     net::TcpListener,
     sync::{
@@ -57,7 +58,7 @@ mod selection_tests {
             rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission { capacity: 80, compiled_capacity: 80,
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
-                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
+                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 }, execution_lane: 0 }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
                 slot_bytes: 1 << 20, alignment: 4096 } };
         let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap()
@@ -315,12 +316,30 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let released = library.release_sync_h2d_staging()?;
     tracing::info!(released_bytes = released, "released load-time pinned upload staging");
     census.sample("before_retained_arenas", Some(&library))?;
-    let allocated = {
-        let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
-        weights.execution(&library, &config, remaining, &mut modules)
-    };
-    let mut execution = match allocated {
-        Ok(execution) => execution,
+    // One execution per Spark execution lane the admitted endpoints name:
+    // each owns its stream and scratch over the shared resident weights.
+    let lanes = execution_lanes(config.model_admission.as_ref());
+    let allocated = (|| -> Result<Vec<Execution<'_, '_>>> {
+        let device = library.cuda_get_device()?;
+        let mut executions = Vec::with_capacity(lanes);
+        let mut budget = remaining;
+        for lane in 0..lanes {
+            let before = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
+            let mut execution = {
+                let _memory_scope = cuteafd_ffi::memory_ledger::scope(
+                    if lane == 0 { "experts/workspace" } else { "experts/workspace/lane1" });
+                weights.execution(&library, &config, budget, &mut modules)?
+            };
+            if lanes > 1 { execution.defer()?; }
+            let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
+                .saturating_sub(before);
+            budget = budget.checked_sub(used).context("Spark execution lanes exceed the admitted workspace")?;
+            executions.push(execution);
+        }
+        Ok(executions)
+    })();
+    let mut executions = match allocated {
+        Ok(executions) => executions,
         Err(error) => {
             let _ = cuteafd_transport::worker_selection::reject_worker_selection(&mut stream, &error);
             return Err(error);
@@ -400,7 +419,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     ensure!(resident == config.resident_layers(geometry.layers as usize)?, "loaded worker IDs differ from selected IDs");
     ensure!(weights.len() == resident.len(), "worker loaded range differs from grouping report");
     let loaded = worker_selection.selection().clone();
-    let expert_grouping = execution.installed_grouping(loaded, worker_rank)?;
+    let expert_grouping = executions[0].installed_grouping(loaded, worker_rank)?;
     thread::Builder::new()
         .name("v41-roce-bootstrap".into())
         .spawn(move || {
@@ -527,81 +546,60 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut execution_failed = false;
             let mut executed = false;
             let wait = (wait_index == Some(index)).then_some(idle_wait);
-            let result = connections[index].poll(wait, |view, mapped, emit| {
-                // The wire parser has validated framing and identities. Reject
-                // oversize work with a final response, not an unanswered peer drop.
-                if view.header.row_count > config.capacity {
-                    let response = cuteafd_transport::protocol_v2::ExpertProtocolV2ResponseRef::row_capacity_error(
-                        &view.header, config.capacity, executor_id)?;
-                    tracing::warn!(rows = view.header.row_count, capacity = config.capacity,
-                        request_id = view.header.request_id, "native expert request rejected");
-                    return emit(ProtocolV2ExecutorResponseRef::Host(response));
-                }
-                // A topology-bound worker admits only the ownership-aware
-                // request contract; every other family is a protocol mismatch,
-                // not a silent fallback.
-                let request = match spark_world.ownership_topology() {
-                    Some(topology) => BackboneRequest::parse_native_group(
-                        view.frame_bytes(),
-                        config.capacity,
-                        topology,
-                    )?,
-                    None => BackboneRequest::parse(view.frame_bytes(), config.capacity)?,
-                };
-                if pending_steady_log {
-                    tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
-                        capacity = config.capacity, "Spark endpoint ingress geometry");
-                }
-                if skip_compute {
-                    if let Some(slot) = mapped.response_slot {
-                        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
-                        let bytes = request.plane_bytes()?;
-                        if request.permits_device_response() && slot.bytes >= prefix + bytes {
-                            let output = cuteafd_ffi::CuteafdDeviceBuffer {
-                                // SAFETY: the payload follows the header inside the mapped slot.
-                                ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(), bytes, ..slot
-                            };
-                            return emit(ProtocolV2ExecutorResponseRef::Device(
-                                request.response_device(executor_id, output)?));
-                        }
+            let mut serve = Serve { config: &config, executor_id, spark_world: &spark_world, resident: &resident,
+                weights: &weights, exchange: &mut exchange, row_indices: &mut row_indices, skip_compute,
+                log_ingress: pending_steady_log };
+            let result = if lanes == 1 {
+                // One execution lane: serve each request to completion in the poll.
+                connections[index].poll(wait, |view, mapped, emit| {
+                    let served = serve.request(&mut executions[0], view, mapped, emit);
+                    execution_failed = served.as_ref().is_err_and(|failure| failure.execution);
+                    executed = served.as_ref().is_ok_and(|served| served.executed);
+                    served.map(|_| ()).map_err(|failure| failure.error)
+                })
+            } else {
+                let lane = usize::from(connections[index].execution_lane());
+                let step = lane_step(connections[index].deferred(),
+                    connections.iter().any(|other| other.deferred() && usize::from(other.execution_lane()) == lane));
+                if step == LaneStep::Finish {
+                    // Emit once this lane's queued work drained; the transport
+                    // held both slots until now.
+                    match executions[lane].stream_idle() {
+                        Ok(true) => connections[index].finish_deferred(|view, mapped, emit| {
+                            let response = Serve::device_response(view, mapped, executor_id, &config, &spark_world)?;
+                            emit(ProtocolV2ExecutorResponseRef::Device(response))
+                        }).map(|()| { executed = true; true }),
+                        Ok(false) => Ok(false),
+                        Err(error) => { execution_failed = true; Err(error) }
+                    }
+                } else if step == LaneStep::Busy {
+                    // This lane's execution is busy with a peer connection's request.
+                    Ok(false)
+                } else {
+                    // Launch on this lane; a request that cannot be answered from
+                    // the device (host chunks, rejection) is served now instead.
+                    let mut launch_failed = false;
+                    let launched = connections[index].begin_deferred(wait, |view, mapped| {
+                        serve.launch(&mut executions[lane], view, mapped).map_err(|failure| {
+                            launch_failed = failure.execution;
+                            failure.error
+                        })
+                    });
+                    match launched {
+                        Ok(Some(true)) => Ok(true),
+                        Ok(Some(false)) => connections[index].finish_deferred(|view, mapped, emit| {
+                            let served = serve.request(&mut executions[lane], view, mapped, emit);
+                            execution_failed = served.as_ref().is_err_and(|failure| failure.execution);
+                            executed = served.as_ref().is_ok_and(|served| served.executed);
+                            served.map(|_| ()).map_err(|failure| failure.error)
+                        }).map(|()| true),
+                        Ok(None) => Ok(false),
+                        // A GPU launch failure is fatal; a request the wire or the
+                        // resident layers reject queued nothing and drops its peer.
+                        Err(error) => { execution_failed = launch_failed; Err(error) }
                     }
                 }
-                let layer = resident.binary_search(&(request.layer() as usize))
-                    .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
-                execution.bind_layer(&weights, layer)?;
-                if mapped.response_slot.is_some() {
-                    // The mapped frame's hidden rows are device-visible, so the
-                    // worker copies them on its stream instead of uploading.
-                    // SAFETY: the transport retains the mapped slots through execution and emission.
-                    let response = unsafe { execution.execute_mapped(&request,
-                        executor_id, &mut exchange, mapped) };
-                    let response = match response {
-                        Ok(response) => response,
-                        Err(error) => { execution_failed = true; return Err(error); }
-                    };
-                    if let Some(response) = response {
-                        emit(ProtocolV2ExecutorResponseRef::Device(response))?;
-                        executed = request.rows() > 0;
-                        return Ok(());
-                    }
-                }
-                let mut emit_failed = false;
-                let result = execution.execute_host_chunks(
-                    &request,
-                    executor_id,
-                    &mut exchange,
-                    &mut row_indices,
-                    config.max_frame_bytes,
-                    |response| {
-                        let result = emit(ProtocolV2ExecutorResponseRef::Host(response));
-                        emit_failed |= result.is_err();
-                        result
-                    },
-                );
-                execution_failed = result.is_err() && !emit_failed;
-                executed = result.is_ok() && request.rows() > 0;
-                result
-            });
+            };
             match result {
                 Ok(processed) => {
                     progressed |= processed;
@@ -629,6 +627,14 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                     if execution_failed {
                         return Err(error).context("native GPU execution failed");
                     }
+                    if connections[index].deferred() {
+                        // Its lane's queued work still addresses this
+                        // connection's slots: drain before releasing them.
+                        let lane = usize::from(connections[index].execution_lane());
+                        while !executions[lane].stream_idle().context("draining a removed peer's lane")? {
+                            std::hint::spin_loop();
+                        }
+                    }
                     tracing::warn!(%error, "native RoCE peer removed");
                     connections.swap_remove(index);
                 }
@@ -642,5 +648,211 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         } else {
             std::hint::spin_loop();
         }
+    }
+}
+
+/// How many Spark execution lanes the admitted endpoints name (one without
+/// typed admission or when every endpoint shares lane zero).
+fn execution_lanes(model: Option<&cuteafd_transport::worker_selection::ModelAdmission>) -> usize {
+    model.and_then(|model| model.endpoints.iter().map(|endpoint| usize::from(endpoint.execution_lane)).max())
+        .map_or(1, |lane| lane + 1)
+}
+
+/// What the owner does with one connection on a multi-lane rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneStep {
+    /// Its launched request may be emitted once its lane's stream is idle.
+    Finish,
+    /// Its lane is executing another connection's request.
+    Busy,
+    /// Receive and launch on its (idle) lane.
+    Launch,
+}
+
+/// One request in flight per execution lane; a lane's request finishes before
+/// that lane launches another, so its workspace and staging are never reused
+/// under queued work. Lanes advance independently.
+fn lane_step(deferred: bool, lane_deferred: bool) -> LaneStep {
+    if deferred { LaneStep::Finish } else if lane_deferred { LaneStep::Busy } else { LaneStep::Launch }
+}
+
+/// A request served synchronously: whether it ran the experts.
+struct Served { executed: bool }
+
+/// A failed request: whether the GPU execution itself failed (fatal) rather
+/// than the peer or the wire.
+struct ServeFailure { error: anyhow::Error, execution: bool }
+
+impl From<anyhow::Error> for ServeFailure {
+    fn from(error: anyhow::Error) -> Self { Self { error, execution: false } }
+}
+
+/// Everything one request needs from the GPU owner besides its execution lane.
+struct Serve<'s, 'w, 'a> {
+    config: &'s NativeExpertServiceConfig,
+    executor_id: u64,
+    spark_world: &'s SparkWorld,
+    resident: &'s [usize],
+    weights: &'w Weights<'a>,
+    exchange: &'s mut HostExpertExchange,
+    row_indices: &'s mut Vec<u32>,
+    skip_compute: bool,
+    log_ingress: bool,
+}
+
+impl<'w, 'a> Serve<'_, 'w, 'a> {
+    fn parse<'v>(view: &'v cuteafd_transport::ExpertProtocolV2RequestView<'_>, config: &NativeExpertServiceConfig,
+        spark_world: &SparkWorld) -> Result<BackboneRequest<'v>> {
+        // A topology-bound worker admits only the ownership-aware request
+        // contract; every other family is a protocol mismatch, not a fallback.
+        match spark_world.ownership_topology() {
+            Some(topology) => BackboneRequest::parse_native_group(view.frame_bytes(), config.capacity, topology),
+            None => BackboneRequest::parse(view.frame_bytes(), config.capacity),
+        }
+    }
+
+    /// The device response a launched request writes into its send slot.
+    fn device_response(view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
+        mapped: cuteafd_transport::ProtocolV2RequestDevicePayload, executor_id: u64,
+        config: &NativeExpertServiceConfig, spark_world: &SparkWorld)
+        -> Result<cuteafd_transport::ExpertProtocolV2DeviceResponseRef<'static>> {
+        let request = Self::parse(view, config, spark_world)?;
+        let slot = mapped.response_slot.context("deferred request lost its response slot")?;
+        let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+        let bytes = request.plane_bytes()?;
+        ensure!(request.permits_device_response() && slot.bytes >= prefix + bytes,
+            "deferred request does not fit its response slot");
+        // SAFETY: the payload follows the header inside the mapped send slot.
+        let output = cuteafd_ffi::CuteafdDeviceBuffer { ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(),
+            bytes, ..slot };
+        request.response_device(executor_id, output)
+    }
+
+    /// Queue a device-answerable request on `execution` without waiting
+    /// (`true`); `false` when it must be served synchronously instead.
+    fn launch(&mut self, execution: &mut Execution<'w, 'a>,
+        view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
+        mapped: cuteafd_transport::ProtocolV2RequestDevicePayload) -> std::result::Result<bool, ServeFailure> {
+        if view.header.row_count > self.config.capacity || self.skip_compute || mapped.response_slot.is_none() {
+            return Ok(false);
+        }
+        let request = Self::parse(view, self.config, self.spark_world)?;
+        if !request.permits_device_response() { return Ok(false); }
+        let layer = self.resident.binary_search(&(request.layer() as usize))
+            .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
+        execution.bind_layer(self.weights, layer)?;
+        // SAFETY: the transport holds the request and response slots until
+        // finish_deferred, which runs only after this lane's stream drained.
+        let response = unsafe { execution.execute_mapped(&request, self.executor_id, self.exchange, mapped) }
+            .map_err(|error| ServeFailure { error, execution: true })?;
+        Ok(response.is_some())
+    }
+
+    /// Serve one request to completion, emitting its response.
+    fn request(&mut self, execution: &mut Execution<'w, 'a>,
+        view: &cuteafd_transport::ExpertProtocolV2RequestView<'_>,
+        mapped: cuteafd_transport::ProtocolV2RequestDevicePayload,
+        emit: &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>)
+        -> std::result::Result<Served, ServeFailure> {
+        let (config, executor_id) = (self.config, self.executor_id);
+        // The wire parser has validated framing and identities. Reject
+        // oversize work with a final response, not an unanswered peer drop.
+        if view.header.row_count > config.capacity {
+            let response = cuteafd_transport::protocol_v2::ExpertProtocolV2ResponseRef::row_capacity_error(
+                &view.header, config.capacity, executor_id)?;
+            tracing::warn!(rows = view.header.row_count, capacity = config.capacity,
+                request_id = view.header.request_id, "native expert request rejected");
+            emit(ProtocolV2ExecutorResponseRef::Host(response))?;
+            return Ok(Served { executed: false });
+        }
+        let request = Self::parse(view, config, self.spark_world)?;
+        if self.log_ingress {
+            tracing::info!(rank = config.rank, ingress_dtype = ?view.header.hidden_dtype,
+                capacity = config.capacity, "Spark endpoint ingress geometry");
+        }
+        if self.skip_compute {
+            if let Some(slot) = mapped.response_slot {
+                let prefix = cuteafd_transport::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+                let bytes = request.plane_bytes()?;
+                if request.permits_device_response() && slot.bytes >= prefix + bytes {
+                    let output = cuteafd_ffi::CuteafdDeviceBuffer {
+                        // SAFETY: the payload follows the header inside the mapped slot.
+                        ptr: unsafe { slot.ptr.cast::<u8>().add(prefix) }.cast(), bytes, ..slot
+                    };
+                    emit(ProtocolV2ExecutorResponseRef::Device(request.response_device(executor_id, output)?))?;
+                    return Ok(Served { executed: false });
+                }
+            }
+        }
+        let layer = self.resident.binary_search(&(request.layer() as usize))
+            .map_err(|_| anyhow::anyhow!("requested expert layer is not resident on this Spark"))?;
+        execution.bind_layer(self.weights, layer)?;
+        if mapped.response_slot.is_some() {
+            // The mapped frame's hidden rows are device-visible, so the
+            // worker copies them on its stream instead of uploading.
+            // SAFETY: the transport retains the mapped slots through execution and emission.
+            let response = unsafe { execution.execute_mapped(&request, executor_id, self.exchange, mapped) }
+                .map_err(|error| ServeFailure { error, execution: true })?;
+            if let Some(response) = response {
+                emit(ProtocolV2ExecutorResponseRef::Device(response))?;
+                return Ok(Served { executed: request.rows() > 0 });
+            }
+        }
+        let mut emit_failed = false;
+        let result = execution.execute_host_chunks(&request, executor_id, self.exchange, self.row_indices,
+            config.max_frame_bytes, |response| {
+                let result = emit(ProtocolV2ExecutorResponseRef::Host(response));
+                emit_failed |= result.is_err();
+                result
+            });
+        match result {
+            Ok(()) => Ok(Served { executed: request.rows() > 0 }),
+            Err(error) => Err(ServeFailure { error, execution: !emit_failed }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod lane_tests {
+    use super::execution_lanes;
+    use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
+
+    /// The owner's per-connection rule: two connections on distinct lanes both
+    /// have a request in flight; two on one lane take turns.
+    #[test]
+    fn lanes_overlap_and_one_lane_serializes() {
+        use super::{lane_step, LaneStep};
+        // (lane, deferred) per connection; simulate one owner pass.
+        let pass = |connections: &mut [(usize, bool)], idle: &[bool]| {
+            for index in 0..connections.len() {
+                let (lane, deferred) = connections[index];
+                let lane_deferred = connections.iter().any(|&(other, d)| d && other == lane);
+                match lane_step(deferred, lane_deferred) {
+                    LaneStep::Finish => if idle[lane] { connections[index].1 = false },
+                    LaneStep::Busy => {}
+                    LaneStep::Launch => connections[index].1 = true,
+                }
+            }
+        };
+        let mut two = [(0, false), (1, false)];
+        pass(&mut two, &[false, false]);
+        assert_eq!(two, [(0, true), (1, true)], "both lanes in flight at once");
+        let mut one = [(0, false), (0, false)];
+        pass(&mut one, &[false]);
+        assert_eq!(one, [(0, true), (0, false)], "a lane runs one request at a time");
+        pass(&mut one, &[true]);
+        assert_eq!(one, [(0, false), (0, true)], "the next request launches once the first emitted");
+    }
+
+    #[test]
+    fn execution_lanes_follow_the_admitted_endpoints() {
+        let endpoint = |execution_lane| SparkEndpoint { capacity: 64, ingress: SparkIngress::Fp8K32,
+            ring_depth: Some(1), execution_lane };
+        let model = |lanes: &[u8]| cuteafd_transport::worker_selection::ModelAdmission { capacity: 64,
+            compiled_capacity: 64, endpoints: lanes.iter().map(|&lane| endpoint(lane)).collect(),
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 } };
+        assert_eq!(execution_lanes(None), 1);
+        assert_eq!(execution_lanes(Some(&model(&[0, 0]))), 1);
+        assert_eq!(execution_lanes(Some(&model(&[0, 0, 1]))), 2);
     }
 }

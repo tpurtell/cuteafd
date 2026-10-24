@@ -111,6 +111,9 @@ pub struct LocalVerbsExpertConnection {
     liveness_polls: u8,
     /// Startup-resolved diagnostics flag; see `protocol_v2_timing_from_env`.
     timing: bool,
+    /// A request received by `begin_deferred` and not yet finished: its
+    /// receive start time (timing only). Holds the request and response slots.
+    deferred: Option<Option<Instant>>,
     // EOF acknowledges teardown only after native rings and their credit are released.
     stream: TcpStream,
 }
@@ -187,6 +190,12 @@ impl LocalVerbsExpertConnection {
             verbs_host_native_library_path().context("native RoCE library not configured")?;
         let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
         Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping, Some((reservation, endpoint)))
+    }
+
+    /// The Spark execution lane serving this connection, from its admitted
+    /// endpoint (lane zero without typed admission). The client cannot choose it.
+    pub fn execution_lane(&self) -> u8 {
+        self.endpoint.credits.endpoint.as_ref().map_or(0, |endpoint| endpoint.contract().0.execution_lane)
     }
 
     /// Negotiated wire ring geometry from the persistent handshake, as
@@ -435,6 +444,7 @@ impl LocalVerbsExpertConnection {
             response_copy_stream: None,
             next_liveness: Instant::now(),
             liveness_polls: 0,
+            deferred: None,
             timing,
         })
     }
@@ -448,7 +458,7 @@ impl LocalVerbsExpertConnection {
     /// QP event rather than polled. `timeout` is the whole wait (`wait_stats`):
     /// it is not raised to the 30 s floor of an exchange in flight, because the
     /// owner has other connections to sweep when it ends.
-    pub fn poll<F>(&mut self, wait: Option<Duration>, mut execute: F) -> Result<bool>
+    pub fn poll<F>(&mut self, wait: Option<Duration>, execute: F) -> Result<bool>
     where
         F: FnMut(
             &ExpertProtocolV2RequestView<'_>,
@@ -483,6 +493,21 @@ impl LocalVerbsExpertConnection {
             }
             return Ok(false);
         }
+        self.serve_received(poll_recv_started, total_started, execute).map(|()| true)
+    }
+
+    /// Serve the request whose receive completion was just consumed (or was
+    /// held by [`Self::begin_deferred`]): execute, emit, then repost its slot.
+    fn serve_received<F>(&mut self, poll_recv_started: Option<Instant>, total_started: Option<Instant>,
+        mut execute: F) -> Result<()>
+    where
+        F: FnMut(
+            &ExpertProtocolV2RequestView<'_>,
+            ProtocolV2RequestDevicePayload,
+            &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
+        ) -> Result<()>,
+    {
+        let timing_enabled = self.timing;
         // Execution can take much longer than a poll; check promptly when it returns.
         self.liveness_polls = 0;
         let endpoint = &self.endpoint;
@@ -760,7 +785,82 @@ impl LocalVerbsExpertConnection {
         self.request_recv_sequence = request_recv_sequence;
         self.response_send_sequence = response_send_sequence;
         self.response_send_in_flight = response_send_in_flight;
-        result.map(|()| true)
+        result
+    }
+
+    /// Whether a request launched by [`Self::begin_deferred`] awaits
+    /// [`Self::finish_deferred`]. Its request and response slots stay held.
+    pub fn deferred(&self) -> bool { self.deferred.is_some() }
+
+    /// Receive at most one request and hand it to `launch`, which may leave GPU
+    /// work queued on the mapped request and response slots. The request slot
+    /// is not reposted and no response is sent until [`Self::finish_deferred`],
+    /// so both slots stay owned by the queued work. With a request already
+    /// deferred on this connection, nothing is received.
+    pub fn begin_deferred<T, F>(&mut self, wait: Option<Duration>, launch: F) -> Result<Option<T>>
+    where
+        F: FnOnce(&ExpertProtocolV2RequestView<'_>, ProtocolV2RequestDevicePayload) -> Result<T>,
+    {
+        if self.deferred.is_some() { return Ok(None); }
+        if self.liveness_polls == 0 || wait.is_some() {
+            check_peer_liveness(&self.stream, &mut self.next_liveness)?;
+        }
+        self.liveness_polls = self.liveness_polls.wrapping_add(1);
+        let started = self.timing.then(Instant::now);
+        let stats = match wait {
+            Some(timeout) => match self.endpoint.wait_stats(0, 1, timeout) {
+                Ok(stats) => stats,
+                Err(error) if is_verbs_host_rdma_poll_timeout(&error) => CuteafdRdmaRcCompletionStats::default(),
+                Err(error) => return Err(error),
+            },
+            None => self.endpoint.try_poll(0, 1)?,
+        };
+        if stats.recv_completions == 0 {
+            if wait.is_some() { check_peer_liveness(&self.stream, &mut self.next_liveness)?; }
+            return Ok(None);
+        }
+        self.liveness_polls = 0;
+        // The completion is consumed: from here the request is owned by this
+        // connection until finish_deferred reposts it, even if launch fails.
+        self.deferred = Some(started);
+        let request_slot = mapped_ring_slot(self.request_recv_view, self.request_ring,
+            self.request_recv_sequence as u64)?;
+        // SAFETY: the received slot lies inside this endpoint's mapped receive
+        // ring and is not reposted until finish_deferred.
+        let storage = unsafe { std::slice::from_raw_parts(request_slot.host_ptr.cast_const(),
+            request_slot.capacity_bytes) };
+        let wire_bytes = persistent_protocol_v2_request_wire_bytes_from_header(
+            &storage[..EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN], self.start.request_capacity_wire_bytes)?;
+        let request = ExpertProtocolV2RequestView::parse(&storage[..wire_bytes])
+            .context("parsing deferred verbs-host ProtocolV2 request frame")?;
+        if let Some(admitted) = &self.endpoint.credits.endpoint { admitted.validate_request(&request.header)?; }
+        // The response is written into the next send slot; drain one send
+        // completion first if the ring is full, exactly as the emit path does.
+        if self.response_send_in_flight == self.response_ring.depth {
+            self.endpoint.poll(1, 0, default_control_timeout())?;
+            self.response_send_in_flight -= 1;
+        }
+        let response_slot = mapped_ring_slot(self.response_send_view, self.response_ring,
+            self.response_send_sequence as u64)?;
+        let payload = protocol_v2_request_device_payload(&storage[..wire_bytes], &request,
+            request_slot.device_buffer, Some(response_slot.device_buffer), self.start.execution_lane)?;
+        launch(&request, payload).map(Some)
+    }
+
+    /// Complete the request [`Self::begin_deferred`] launched: `complete`
+    /// receives the same request and payload, waits for nothing it did not
+    /// queue (callers poll their own completion first), and emits the
+    /// response; the request slot is then reposted.
+    pub fn finish_deferred<F>(&mut self, mut complete: F) -> Result<()>
+    where
+        F: FnMut(
+            &ExpertProtocolV2RequestView<'_>,
+            ProtocolV2RequestDevicePayload,
+            &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
+        ) -> Result<()>,
+    {
+        let started = self.deferred.take().context("no deferred request to finish")?;
+        self.serve_received(started, started, &mut complete)
     }
 }
 
@@ -800,7 +900,7 @@ mod budget_tests {
         let selection = placement_selection(&[13]).with_model(ModelAdmission {
             capacity: 80, compiled_capacity: 80,
             endpoints: depths.iter().map(|&ring_depth| SparkEndpoint {
-                capacity: 80, ingress: SparkIngress::Bf16, ring_depth }).collect(),
+                capacity: 80, ingress: SparkIngress::Bf16, ring_depth, execution_lane: 0 }).collect(),
             rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
         })?;
         let report = ModelAdmissionResponse {

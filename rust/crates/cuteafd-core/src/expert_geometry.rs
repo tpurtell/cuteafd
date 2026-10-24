@@ -17,7 +17,17 @@ pub struct SparkEndpoint {
     /// Overrides only this connection's depth; other endpoints keep the model default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring_depth: Option<usize>,
+    /// The Spark execution lane serving this endpoint: endpoints on distinct
+    /// lanes run on separate streams and scratch and overlap on the rank;
+    /// endpoints sharing a lane are served one request at a time.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub execution_lane: u8,
 }
+
+fn is_zero(lane: &u8) -> bool { *lane == 0 }
+
+/// Most Spark execution lanes one rank runs.
+pub const MAX_SPARK_EXECUTION_LANES: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -384,7 +394,7 @@ mod tests {
 
     #[test]
     fn endpoint_ring_depth_resolves_default_and_rejects_invalid_depths() {
-        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None };
+        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None, execution_lane: 0 };
         let geometry = ExpertGeometry::DEEPSEEK_V41;
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
@@ -413,7 +423,7 @@ mod tests {
     #[test]
     fn endpoint_response_prefix_is_bounded_by_admitted_rows() {
         for capacity in [0, 1, 640, 4096, 4097, u32::MAX] {
-            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16, execution_lane: 0 };
             assert_eq!(endpoint.response_prefix_bytes(), if (1..=4096).contains(&capacity) {
                 Some(128 + capacity as usize * 4)
             } else { None });

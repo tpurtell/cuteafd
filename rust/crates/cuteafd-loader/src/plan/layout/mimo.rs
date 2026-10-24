@@ -522,7 +522,8 @@ mod tests {
                 !cost.name.starts_with("draft.lane1.weights.") && !cost.name.ends_with("_ring")));
         }
         let [decode, prefill] = crate::families::mimo_v2::admission::spark_endpoints(4096, MimoExpertInput::Fp8).unwrap();
-        assert_eq!(decode_spark_endpoints(4096, MimoExpertInput::Fp8, 2).unwrap(), vec![decode, prefill, decode]);
+        assert_eq!(decode_spark_endpoints(4096, MimoExpertInput::Fp8, 2).unwrap(),
+            vec![decode, prefill, cuteafd_core::SparkEndpoint { execution_lane: 1, ..decode }]);
         assert_eq!(decode_spark_endpoints(4096, MimoExpertInput::Fp8, 1).unwrap(), vec![decode, prefill]);
         let costs = DraftReservations { steady: ["draft.weights.bf16_values", "draft.layer0.k_ring",
             "draft.layer0.v_ring", "draft.fp8_scratch", "draft.taps", "draft.workspace.logits"]

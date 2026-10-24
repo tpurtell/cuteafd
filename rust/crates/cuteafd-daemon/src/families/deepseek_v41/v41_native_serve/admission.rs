@@ -9,8 +9,11 @@ fn spark_model(capacity: u32, compiled_capacity: u32, bf16: bool, device_endpoin
     ensure!(device_endpoints <= 2 && (!bf16 || device_endpoints == 0),
         "invalid V4.1 device endpoint set");
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity, ingress }; 2];
-    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: capacity.min(80), ingress }, device_endpoints));
+    // The two lanes' transports run on separate Spark execution lanes, so one
+    // lane's expert work overlaps the other's on every rank.
+    let mut endpoints: Vec<_> = (0..2).map(|execution_lane| SparkEndpoint { ring_depth: None, capacity, ingress,
+        execution_lane }).collect();
+    endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: capacity.min(80), ingress, execution_lane: 0 }, device_endpoints));
     let model = cuteafd_transport::worker_selection::ModelAdmission {
         capacity, compiled_capacity, endpoints,
         rings: crate::shared::placement::spark_rings(64 << 20)?,

@@ -492,12 +492,12 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         args.peers.len(),
         None,
         ModelAdmission::for_clients(ExpertGeometry::STEP5,
-            SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16 },
+            SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16, execution_lane: 0 },
             compiled as u32, spark_rings(config.max_frame_bytes)?, 1)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16 }, 1)?;
+        SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Bf16, execution_lane: 0 }, 1)?;
     Ok((world, config))
 }
 

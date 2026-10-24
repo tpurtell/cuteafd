@@ -23,6 +23,10 @@ pub(crate) struct Fp8Worker<'a> {
     layer: usize,
     executor_id: u64,
     timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
+    /// Lane-owned execution on a rank serving several execution lanes: a
+    /// mapped request returns with its work queued; the owner emits it once
+    /// [`Self::stream_idle`] reports this stream drained.
+    deferred: bool,
 }
 
 fn validate_worker_layers(layers: &[usize]) -> Result<()> {
@@ -68,12 +72,22 @@ impl<'a> Fp8Worker<'a> {
             layer: 0,
             executor_id,
             timing,
+            deferred: false,
         })
     }
 
     pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
         self.experts.installed_grouping(loaded, rank, self.capacity)
+    }
+
+    /// Leave mapped requests queued at return (see `deferred`).
+    pub(crate) fn defer(&mut self) { self.deferred = true; }
+
+    /// Whether every request queued on this execution's stream has completed.
+    pub(crate) fn stream_idle(&self) -> Result<bool> {
+        // SAFETY: the owned stream is live for the worker's lifetime.
+        unsafe { self.library.cuda_stream_query(self.stream.raw) }
     }
 
     pub(crate) fn bind_layer(&mut self, layer: usize) -> Result<()> {
@@ -142,6 +156,9 @@ impl<'a> Fp8Worker<'a> {
                     self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
             }
             if let Some(timing) = &self.timing { timing.record(1, self.stream.raw)?; }
+            // A deferred mapped request completes when the owner observes the
+            // stream idle; the transport holds both slots until then.
+            if self.deferred && destination.is_some() { return Ok(output); }
             self.library.cuda_stream_synchronize(self.stream.raw)?;
         }
         if let Some(timing) = &mut self.timing {

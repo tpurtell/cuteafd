@@ -128,7 +128,7 @@ impl<'a> Engine<'a> {
             && std::ptr::eq(devices[0].library, library.as_ref()),
             "Kimi startup programs differ from exchange devices/library");
         let rows = u32::try_from(plan.spec().rows)?;
-        let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32 };
+        let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32, execution_lane: 0 };
             plan.spec().lanes as usize];
         let model = ModelAdmission { capacity: rows, compiled_capacity: compiled_rows,
             endpoints, rings: spark_rings(config.max_frame_bytes)? };

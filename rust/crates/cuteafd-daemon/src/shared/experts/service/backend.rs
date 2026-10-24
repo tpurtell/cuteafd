@@ -280,6 +280,10 @@ impl<'a> Fp8Groups<'a> {
         where F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()> {
         self.workers[self.selected].execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
     }
+    fn stream_idle(&self) -> Result<bool> {
+        for worker in &self.workers { if !worker.stream_idle()? { return Ok(false); } }
+        Ok(true)
+    }
 }
 
 pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -327,6 +331,27 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
+        }
+    }
+    /// Lane-owned mode on a multi-lane rank: mapped requests return with their
+    /// work queued; the owner emits once [`Self::stream_idle`] holds. EXLR8
+    /// has no deferred path and is served on lane zero only.
+    pub(super) fn defer(&mut self) -> Result<()> {
+        match self {
+            Self::Full(execution) => execution.defer(),
+            Self::Exl3(execution) => execution.defer(),
+            Self::Fp8(groups) => groups.workers.iter_mut().for_each(Fp8Worker::defer),
+            Self::Exlr8(_) => anyhow::bail!("EXLR8 Spark workers have one execution lane"),
+        }
+        Ok(())
+    }
+    /// Whether every request this execution queued has completed.
+    pub(super) fn stream_idle(&self) -> Result<bool> {
+        match self {
+            Self::Full(execution) => execution.stream_idle(),
+            Self::Exl3(execution) => execution.stream_idle(),
+            Self::Fp8(groups) => groups.stream_idle(),
+            Self::Exlr8(_) => Ok(true),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
@@ -429,7 +454,7 @@ mod admission_tests {
     fn mixed_ingress_requires_both_backends_even_at_full_decode_extent() {
         use cuteafd_core::{SparkEndpoint, SparkIngress};
         for rows in [16, 80] {
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Bf16Decode { rows }, execution_lane: 0 };
             for (fp8, bf16) in [(false, false), (false, true), (true, false), (true, true)] {
                 assert_eq!(super::supports_ingress(endpoint.ingress, fp8, bf16), fp8 && bf16);
             }

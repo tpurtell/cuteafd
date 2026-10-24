@@ -55,10 +55,10 @@ mod spark_tests {
 pub(crate) fn spark_model(decode_rows: usize, device_exchange: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 };
+    let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, execution_lane: 0 };
         super::engine::PREFILL_LANES];
     if device_exchange {
-        endpoints.push(SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 });
+        endpoints.push(SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32, execution_lane: 0 });
     }
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity: 4096, compiled_capacity: 4096, endpoints,
