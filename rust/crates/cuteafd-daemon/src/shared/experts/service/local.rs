@@ -334,7 +334,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             let mut execution = {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope(
                     if slot == 0 { "experts/workspace" } else { "experts/workspace/slot" });
-                weights.execution(&library, &config, budget, &mut modules)?
+                weights.execution(&library, &config, budget, &mut modules, slot)?
             };
             if slots > 1 { execution.defer()?; }
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
