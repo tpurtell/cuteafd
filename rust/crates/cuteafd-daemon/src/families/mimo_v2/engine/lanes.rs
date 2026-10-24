@@ -59,6 +59,31 @@ impl<'e, 'a> DecodeLanes<'e, 'a> {
         Self { first, second, failed: Cell::new(false), stop: Cell::new(false) }
     }
 
+    /// Capture every admitted view before readiness, including a lane that is
+    /// idle at runtime C1. No serving operation can capture a new shape.
+    pub(in super::super) fn prepare(&self, probe: bool) -> Result<usize> {
+        self.operation(|| {
+            let mut graphs = 0;
+            for view in std::iter::once(self.first).chain(self.second.as_ref()) {
+                graphs += view.capture_decode_graphs(super::DECODE_ROWS)?;
+                view.check_tp2_routers()?;
+                if probe { view.arm_draft_probe()?; }
+            }
+            Ok(graphs)
+        })
+    }
+
+    pub(in super::super) fn has_second(&self) -> bool { self.second.is_some() }
+
+    pub(in super::super) fn retire(&self) -> Result<()> {
+        self.first.terminal_shutdown_views(self.second.as_ref())
+    }
+
+    pub(in super::super) fn retain(&self) {
+        self.first.retain_serving_storage();
+        if let Some(second) = &self.second { second.retain_serving_storage(); }
+    }
+
     fn abort(&self) -> Result<()> {
         use crate::shared::{experts::rtx::pair::SubmissionOwners, peer_split::TerminalState};
         let mut errors = Vec::new();

@@ -27,7 +27,7 @@ use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixC
 use crate::shared::draft_policy::DraftHistory;
 use crate::shared::draft::{resource, clock::RoundClock, evidence::{Censor, DraftSource}};
 use super::{open, Opened};
-use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
+use crate::shared::token_io::{SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::qwen4::QwenEncoding;
@@ -273,19 +273,21 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         // Every decode/verify shape the scheduler can step (1..=64 rows) is captured before
         // the server is ready: serving replays them without capturing.
         let started = std::time::Instant::now();
-        let graphs = engine.capture_decode_graphs(DECODE_ROWS)?;
+        let mut owners = super::serving_owners::ServingOwners::new(engine);
+        let (family, cache) = prefix_cache_with(engine, &prefix, max_sequences, |_| Ok(host_config))?;
+        owners.prefix(family, cache);
+        let graphs = owners.prepare(args.token_io.token_select, engine.drafter.is_some() || engine.mtp.is_some())?;
         if graphs > 0 {
             tracing::info!(graphs, rows = DECODE_ROWS, elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo decode graphs captured");
         }
-        engine.check_tp2_routers()?;
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
         }
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select, host_config, &mut media, preparer.as_deref())
+        schedule_inner(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
+            &mut owners, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| (args.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -478,20 +480,6 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 }
 
 #[allow(clippy::too_many_arguments)]
-fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
-    receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
-    host_config: Option<cuteafd_hostcache::config::Config>,
-    media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
-    let mut owners = super::serving_owners::ServingOwners::new(engine);
-    let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
-    owners.prefix(family, cache);
-    owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
-    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer)
-}
-
-#[allow(clippy::too_many_arguments)]
 fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
     policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
@@ -512,7 +500,6 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
             engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
         shared.policy.set_native_confidence_positions(width)?;
-        engine.arm_draft_probe()?;
         resource::publish(&shared.policy, 0, 0, None);
         Some(shared)
     } else { None };
