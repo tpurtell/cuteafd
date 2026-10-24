@@ -183,6 +183,11 @@ def jobs(scope):
          ["--geometry", "exlr8_dense", "--only", ",".join(
              f"trellis_{name}{tp}_bf16" for tp in ("", "_tp2")
              for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-a8", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"trellis_{name}{tp}_a8" for tp in ("", "_tp2")
+              for name in ("q_b", "o", "gate_up", "down")]
+             + [f"quant_k{k}_a8" for k in (2048, 6144, 8192, 12288, 16384)])]),
         ("exlr8-dense-mxfp8", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "mxfp8_q_a,mxfp8_kv_a,mxfp8_index_q,mxfp8_index_k"]),

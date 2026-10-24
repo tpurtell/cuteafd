@@ -18,6 +18,13 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum Exlr8PrefillActivations {
+    #[default]
+    A16,
+    A8,
+}
+
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
@@ -30,6 +37,9 @@ pub(crate) struct EngineArgs {
     /// Published native EXLR8 expert manifest (for example, up1).
     #[arg(long)]
     pub exlr8_manifest: Option<String>,
+    /// Native EXLR8 trellis prefill activations; decode/verify always keep A16.
+    #[arg(long, value_enum, default_value_t = Exlr8PrefillActivations::A16)]
+    pub exlr8_prefill_activations: Exlr8PrefillActivations,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")]
@@ -189,6 +199,19 @@ mod draft_cli_tests {
         }
         assert!(spark_model(0, false, false).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn native_prefill_activation_cli_defaults_to_a16() {
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["test", "--snapshot", "/native", "--native-lib", "/library"];
+            argv.extend_from_slice(extra);
+            Parse::try_parse_from(argv).map(|p| p.engine.exlr8_prefill_activations)
+        };
+        assert_eq!(parse(&[]).unwrap(), Exlr8PrefillActivations::A16);
+        assert_eq!(parse(&["--exlr8-prefill-activations", "a16"]).unwrap(), Exlr8PrefillActivations::A16);
+        assert_eq!(parse(&["--exlr8-prefill-activations", "a8"]).unwrap(), Exlr8PrefillActivations::A8);
+        assert!(parse(&["--exlr8-prefill-activations", "fp8"]).is_err());
     }
 
     #[test]
@@ -406,7 +429,9 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
         ensure!(args.exlr8_manifest.is_some(), "native EXLR8 requires --exlr8-manifest");
         native_activation(args, cfg.first_moe_layer, cfg.layers, false)?;
     } else {
-        ensure!(args.exlr8_manifest.is_none(), "EXLR8 options require a native EXLR8 checkpoint");
+        ensure!(args.exlr8_manifest.is_none()
+            && args.exlr8_prefill_activations == Exlr8PrefillActivations::A16,
+            "EXLR8 options require a native EXLR8 checkpoint");
     }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
@@ -533,7 +558,7 @@ impl Opened {
             *reserved = reserved.checked_add(plan.resident).context("EXLR8 coordinator reservation overflow")?;
         }
         let spark_bf16 = checkpoint.as_ref().is_some_and(|c| c.spark_input_is_bf16());
-        // Native dense: decode plus every prefill lane's scratch; no unpack or A8 records.
+        // Native dense: decode plus every prefill lane's scratch and opt-in A8 records.
         let native_dense_charge: Vec<u64> = if native {
             let split = devices.len() == 2;
             let heads = self.cfg.heads / if split { 2 } else { 1 };
@@ -541,7 +566,10 @@ impl Opened {
             let lanes = glm::prefill_lanes(args.peers.as_deref().map_or(0, |p| p.split(',').count()),
                 u64::from(args.prefill_waves)) as usize;
             let per_gpu = engine::native_dense::scratch_bytes(&self.cfg, heads, inter, engine::DECODE_ROWS)
-                + lanes * engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows);
+                + lanes * (engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows)
+                    + if args.exlr8_prefill_activations == Exlr8PrefillActivations::A8 {
+                        cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&self.cfg, heads, inter, args.prefill_rows)
+                    } else { 0 });
             vec![per_gpu as u64; devices.len()]
         } else { Vec::new() };
         let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
@@ -804,6 +832,7 @@ impl Opened {
         } else { None };
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, prefill_lanes, context.filter(|_| context_kv))?;
+        engine.exlr8_prefill_activations = args.exlr8_prefill_activations;
         engine.native_experts = native_owners;
         engine.spark_bf16 = spark_bf16;
         engine.full_prefill_logits = args.full_prefill_logits;

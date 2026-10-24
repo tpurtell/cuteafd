@@ -213,6 +213,13 @@ pub fn scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, in
         .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
 }
 
+/// Opt-in MX8 records are per prefill lane, never retained by decode lanes.
+pub fn a8_scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
+    if rows <= 64 { return 0; }
+    let max_k = [cfg.hidden, cfg.q_lora_rank, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
+    (4096usize.div_ceil(16) * (max_k / 32) * 528).next_multiple_of(256)
+}
+
 /// Read headers and tiny record tables only. The official checkpoint is not an input.
 impl DenseRecord {
     pub fn inventory(snapshot: &Path) -> Result<Vec<Self>> {

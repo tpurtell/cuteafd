@@ -8,7 +8,7 @@
 //!
 //! Trellis dense prefill uses BF16 activations/MMA over exact E4M3 weights;
 //! MXFP8 and int4 retain their native BF16-activation kernels. No activation
-//! quantization records or unpacked weight staging are admitted.
+//! quantization records are admitted unless A8 prefill is explicitly selected.
 //!
 //! Trellis transforms: `rotated = H128(x * suh)` before the core, `H128(acc) *
 //! svh` after. Split projections apply svh per rank (o by input columns, down
@@ -70,6 +70,7 @@ pub(crate) struct NativeScratch<'a> {
     table: Dev<'a>,
     block_scales: Dev<'a>,
     partial: Dev<'a>,
+    records: Option<Dev<'a>>,
     acc: Dev<'a>,
     qkv: Dev<'a>,
     q: Dev<'a>,
@@ -95,6 +96,9 @@ impl<'a> NativeScratch<'a> {
         let max_n = [heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), h, inter, ih * 128].into_iter().max().unwrap_or(0);
         let a = |bytes: usize| engine.alloc(bytes);
         let scratch = Self { rotated: a(rows * max_k * 2)?, table: a(64)?, block_scales: a(max_k / 128 * 2)?,
+            records: if engine.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8 && rows > NATIVE_DECODE_ROWS {
+                Some(a(cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(cfg, heads, inter, rows))?)
+            } else { None },
             // Exact trellis prefill and native scaled linears do not use partials.
             partial: a(rows.min(NATIVE_DECODE_ROWS) * max_k.div_ceil(1024) * max_n * 4)?, acc: a(rows * max_n * 4)?,
             qkv: a(rows * (q + cfg.kv_lora_rank + cfg.qk_rope_head_dim) * 2)?, q: a(rows * heads * 256 * 2)?,
@@ -156,8 +160,9 @@ impl<'a> GlmEngine<'a> {
             }
             DenseEncoding::Trellis { bits: 4 } => {
                 let stem = shape_name(projection, split);
-                let dtype = if rows > NATIVE_DECODE_ROWS { "bf16" } else { "f16" };
-                let suffix = if dtype == "bf16" { "_bf16" } else { "" };
+                let a8 = self.exlr8_prefill_activations == super::super::Exlr8PrefillActivations::A8 && rows > NATIVE_DECODE_ROWS;
+                let dtype = if rows > NATIVE_DECODE_ROWS && !a8 { "bf16" } else { "f16" };
+                let suffix = if a8 { "_a8" } else if dtype == "bf16" { "_bf16" } else { "" };
                 let core = programs.linear(&format!("exlr8_dense_trellis_{stem}{suffix}"))?;
                 let (k, n) = (core.geometry().input_features as usize, core.geometry().output_features as usize);
                 let (payload, suh, svh) = (key("trellis")?, key("suh")?, key("svh")?);
@@ -168,8 +173,16 @@ impl<'a> GlmEngine<'a> {
                 // contracts at `rows`; this rank's stream orders them.
                 self.on(rank, || unsafe {
                     input.launch(&[x.ptr, suh.ptr, rotated.ptr, s.block_scales.buffer.ptr], rows as u32, 0, stream)?;
-                    core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, s.partial.buffer.ptr,
-                        s.partial.buffer.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
+                    if a8 {
+                        let records = s.records.as_ref().context("A8 prefill lane records")?.buffer;
+                        programs.companion(&format!("exlr8_dense_quant_k{k}_a8"))?
+                            .launch(&[s.table.buffer.ptr, records.ptr], rows as u32, 0, stream)?;
+                        core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, records.ptr,
+                            records.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
+                    } else {
+                        core.launch(s.table.buffer.ptr, payload.ptr, s.block_scales.buffer.ptr, s.partial.buffer.ptr,
+                            s.partial.buffer.bytes as u64, s.acc.buffer.ptr, rows as u32, 0, stream)?;
+                    }
                     output.launch(&[s.acc.buffer.ptr, svh.ptr, head(bf16_out, rows * n * 2)?.ptr], rows as u32, 0, stream)?;
                     Ok::<_, anyhow::Error>(())
                 })?;
@@ -324,5 +337,9 @@ mod charge_tests {
         // Rows-proportional terms only: no 1 GiB (4096 x 8 x 8192 x 4) partial.
         assert!(prefill < 640 << 20, "prefill lane scratch {prefill}");
         assert!(decode < 32 << 20, "decode scratch {decode}");
+        let a8 = cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&cfg, heads, inter, 4096);
+        assert_eq!(a8, 256 * (8192 / 32) * 528);
+        assert_eq!(cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&cfg, heads, inter, 64), 0);
+        assert!(prefill + a8 < 640 << 20);
     }
 }

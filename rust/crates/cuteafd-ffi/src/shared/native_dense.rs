@@ -16,6 +16,7 @@ fn invalid(message: impl Into<String>) -> DenseError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Encoding {
     Trellis,
+    TrellisA8,
     Int4G32,
     Mxfp8,
     RowFp8,
@@ -37,7 +38,8 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         .strip_prefix("exlr8_dense_")
         .ok_or_else(|| invalid("program is not a native dense operand"))?;
     let bf16_input = name.ends_with("_bf16");
-    let shape = name.strip_suffix("_bf16").unwrap_or(name);
+    let a8 = name.ends_with("_a8");
+    let shape = name.strip_suffix("_a8").or_else(|| name.strip_suffix("_bf16")).unwrap_or(name);
     let (encoding, k, n, side) = match shape {
         "trellis_q_b" => (Encoding::Trellis, 2048, 16384, 1),
         "trellis_o" => (Encoding::Trellis, 16384, 6144, 2),
@@ -67,6 +69,8 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
     if bf16_input && encoding != Encoding::Trellis {
         return Err(invalid("BF16 core suffix requires trellis encoding"));
     }
+    let encoding = if a8 && encoding == Encoding::Trellis { Encoding::TrellisA8 }
+        else if a8 { return Err(invalid("A8 core suffix requires trellis encoding")); } else { encoding };
     let g = &spec.geometry;
     let field = |key: &str, expected| -> Result<()> {
         if g[key].as_u64() != Some(expected) {
@@ -74,7 +78,7 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         }
         Ok(())
     };
-    field("abi_version", 1)?;
+    if !a8 { field("abi_version", 1)?; }
     field("max_rows", 4096)?;
     if spec.capacity_rows != 4096 {
         return Err(invalid(
@@ -89,16 +93,20 @@ fn geometry(spec: &ProgramSpec) -> Result<DenseGeometry> {
         field("input_features", k)?;
         field("output_features", n)?;
         field("sharded_side", side)?;
-        field("ctas_per_sm", 4)?;
-        if encoding == Encoding::Trellis {
+        if !a8 { field("ctas_per_sm", 4)?; }
+        if matches!(encoding, Encoding::Trellis | Encoding::TrellisA8) {
             let expected_dtype = if bf16_input { "bf16" } else { "f16" };
             if g["input_dtype"].as_str().unwrap_or("f16") != expected_dtype {
                 return Err(invalid("native trellis input dtype disagrees with program name"));
             }
             field("bits", 4)?;
             field("rotation_count", 4)?;
-            field("split_k_blocks", 8)?;
-            field("splits", k.div_ceil(1024))?;
+            if a8 {
+                if g["encoding"].as_str() != Some("trellis") { return Err(invalid("A8 requires trellis weights")); }
+            } else {
+                field("split_k_blocks", 8)?;
+                field("splits", k.div_ceil(1024))?;
+            }
             if g["codebook"].as_str() != Some("e4m3") {
                 return Err(invalid("native trellis requires checkpoint E4M3 codebook"));
             }
@@ -141,7 +149,9 @@ impl DenseGeometry {
         if rows == 0 || rows > self.max_rows {
             return Err(invalid("rows outside compiled native dense capacity"));
         }
-        Ok(if self.encoding == Encoding::Trellis {
+        Ok(if self.encoding == Encoding::TrellisA8 {
+            u64::from(rows).div_ceil(16) * (self.input_features / 32) * 528
+        } else if self.encoding == Encoding::Trellis {
             u64::from(rows) * self.input_features.div_ceil(1024) * self.output_features * 4
         } else {
             0
@@ -164,6 +174,7 @@ impl DenseGeometry {
                 "partial",
                 "output",
             ],
+            Encoding::TrellisA8 => &["rotated_inputs", "payload", "scales", "records", "output"],
             Encoding::Embedding => &["ids", "payload", "scales", "output"],
             _ => &["x", "payload", "scales", "partial", "output"],
         }
@@ -172,12 +183,12 @@ impl DenseGeometry {
 
 fn validate_spec(spec: &ProgramSpec) -> Result<DenseGeometry> {
     let g = geometry(spec)?;
-    let kinds: &[u8] = if g.encoding == Encoding::Trellis {
+    let kinds: &[u8] = if matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8) {
         b"iii"
     } else {
         b"ii"
     };
-    let scratch = if g.encoding == Encoding::Embedding {
+    let scratch = if matches!(g.encoding, Encoding::Embedding | Encoding::TrellisA8) {
         std::collections::HashMap::new()
     } else {
         std::collections::HashMap::from([("partial".to_string(), g.scratch_bytes(g.max_rows)?)])
@@ -200,7 +211,8 @@ fn validate_spec(spec: &ProgramSpec) -> Result<DenseGeometry> {
 /// Validate the exported contract without loading kernels or allocating GPU storage.
 pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<DenseGeometry> {
     let g = validate_spec(spec)?;
-    let trellis = g.encoding == Encoding::Trellis;
+    let a8 = g.encoding == Encoding::TrellisA8;
+    let trellis = matches!(g.encoding, Encoding::Trellis | Encoding::TrellisA8);
     let embedding = g.encoding == Encoding::Embedding;
     let scalar_names: &[&str] = if trellis {
         &["rows", "rotation_id", "cta_limit"]
@@ -221,7 +233,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<D
     let k = g.input_features;
     let n = g.output_features;
     let scale_type = match g.encoding {
-        Encoding::Trellis | Encoding::Int4G32 => "float16",
+        Encoding::Trellis | Encoding::TrellisA8 | Encoding::Int4G32 => "float16",
         Encoding::Mxfp8 => "uint8",
         _ => "float32",
     };
@@ -255,7 +267,7 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<D
                 if trellis { "int64" } else { "bfloat16" },
                 "uint8",
                 scale_type,
-                "float32",
+                if a8 { "uint8" } else { "float32" },
                 "float32",
             ],
             vec![
@@ -266,14 +278,16 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<D
                 },
                 format!("[{bytes}]"),
                 format!("[{scales}]"),
-                if trellis {
+                if a8 {
+                    "[record_bytes]".into()
+                } else if trellis {
                     format!("[rows,{},{n}]", k.div_ceil(1024))
                 } else {
                     "[0]".into()
                 },
                 format!("[rows,{n}]"),
             ],
-            vec!["in", "in", "in", "scratch", "out"],
+            vec!["in", "in", "in", if a8 { "in" } else { "scratch" }, "out"],
         )
     };
     let pointers = entry["pointers"]
@@ -347,7 +361,7 @@ impl<'a> DenseLinear<'a> {
         stream: *mut c_void,
     ) -> Result<()> {
         let required = self.geometry.launch_scratch_bytes(rows)?;
-        let trellis = self.geometry.encoding == Encoding::Trellis;
+        let trellis = matches!(self.geometry.encoding, Encoding::Trellis | Encoding::TrellisA8);
         if partial_bytes < required
             || (required > 0 && partial.is_null())
             || input.is_null()
@@ -506,6 +520,32 @@ mod tests {
         assert!(g.scratch_bytes(4097).is_err());
         // Dense ABI v1 is deliberately not the routed expert ABI.
         assert!(super::super::exlr8::validate_entry(&spec, &entry).is_err());
+    }
+
+    #[test]
+    fn native_dense_a8_manifest_uses_caller_owned_records() {
+        let (mut spec, mut entry) = trellis();
+        spec.name.push_str("_a8");
+        spec.geometry = json!({"input_features":2048,"output_features":8192,
+            "encoding":"trellis","sharded_side":1,"input_dtype":"f16",
+            "bits":4,"codebook":"e4m3","rotation_count":4,"max_rows":4096});
+        spec.scratch.clear();
+        spec.pointers[2] = "scales".into();
+        spec.pointers[3] = "records".into();
+        entry["pointers"][2]["name"] = json!("scales");
+        entry["pointers"][3] = json!({"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"in"});
+        let g = validate_entry(&spec, &entry).unwrap();
+        assert_eq!(g.encoding, Encoding::TrellisA8);
+        assert_eq!(g.launch_scratch_bytes(4096).unwrap(), 256 * 64 * 528);
+        assert_eq!(g.launch_scratch_bytes(17).unwrap(), 2 * 64 * 528);
+        for (field, value) in [("input_dtype", json!("bf16")), ("encoding", json!("mxfp8")),
+            ("rotation_count", json!(1)), ("bits", json!(3))] {
+            let mut bad = spec.clone();
+            bad.geometry[field] = value;
+            assert!(validate_entry(&bad, &entry).is_err(), "{field}");
+        }
+        entry["pointers"][3]["role"] = json!("scratch");
+        assert!(validate_entry(&spec, &entry).is_err());
     }
 
     #[test]
