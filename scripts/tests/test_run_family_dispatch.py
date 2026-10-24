@@ -825,7 +825,7 @@ unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
 waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
 span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
 decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
-if (family == "deepseek_v41" and decode_lanes != 2) or (family not in {"mimo_v2", "deepseek_v41"} and decode_lanes != 1):
+if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41" and decode_lanes != 1):
     sys.exit("unsupported --decode-lanes for " + family)
 if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
