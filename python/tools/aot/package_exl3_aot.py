@@ -411,13 +411,26 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
 
 
-# Compact capacity set with a measured warp-specialized win (see
-# `compact_warp_specialized`); the packaged compact profile carries 256, 1024
-# and 4096, and 2752 is the planner's intermediate prefill unit.
-COMPACT_GLM_WS_CAPACITIES = (256, 1024, 2752, 4096)
-# Measured tier families of the compact WS cell; a different tier pair is a
+# Measured compact warp-specialized cells on GB10 (SM121), keyed by
+# (geometry, width) with the route block of each qualified capacity (see
+# `compact_warp_specialized`). The packaged compact profile carries 256, 1024
+# and 4096, and 2752 is the planner's intermediate prefill unit. A cell that
+# is not listed here stays cooperative.
+COMPACT_WS_CELLS = {
+    ('glm', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+    ('glm', 768): {256: 64, 1024: 64, 2752: 64, 4096: 64},
+    ('v41', 640): {256: 32, 1024: 32, 2752: 64, 4096: 64},
+    ('qwen4', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+    # TP3 and TP4 compact share width 256; one table entry serves both and
+    # takes 64 everywhere (TP3 m256 1.279x vs its 32-row arm 1.282x, TP4
+    # m256 1.334x vs 1.327x).
+    ('qwen4', 256): {256: 64, 1024: 64, 2752: 64, 4096: 64},
+    ('glmf', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+    ('glmf', 768): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+}
+# Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
-COMPACT_WS_BITS = {('glm', (4, 5))}
+COMPACT_WS_BITS = {('glm', (4, 5)), ('glmf', (3, 4)), ('v41', (3, 4)), ('qwen4', (4, 5))}
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -444,14 +457,50 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     12.95 / 13.16; m2752 9.60 / 9.42 vs 9.72 / 9.47; m1024 4.79 / 4.92 vs
     4.84 / 4.96; m256 3.78 / 3.78 vs 3.88 / 3.88. So the compact layout
     recovers what the October 20 rotation moved off warp specialization.
-    Qualification is the measured capacity set only; every other width,
-    family and capacity stays cooperative. `compact_ws_export` adds the
-    measured tier family (`COMPACT_WS_BITS`: GLM 5.3 K4/K5 only), so the
-    same geometry with another tier pair (GLM 5.3 K3/K4) stays cooperative
-    until that cell is measured.
+
+    GLM 5.3 K4 TP3 compact width 768 is the same arm on the planner's rotated
+    ownership at world 3 (live widths 640/768), layer-7 recorded histograms,
+    kernel + top-k sum, median of three interleaved rounds of twenty graph
+    replays, ms (cooperative -> warp-specialized, kernel reduction): m4096
+    31.30 -> 21.66 (-30.8%); m2752 23.26 -> 15.61 (-32.9%); m1024 11.34 ->
+    8.18 (-27.9%); m256 7.42 -> 6.53 (-12.0%). A 64-row block ties 32 at
+    m256 here and wins from m1024 up (m4096 21.66 vs 27.29), so every
+    qualified capacity takes 64. Every prefix row count in the gate, arm
+    output and three replays over poisoned workspaces are bitwise equal to
+    the cooperative oracle.
+
+    V4.1 K3/K4 TP4 compact width 640 follows the same ranking on uniform
+    top-6 routes: cooperative -> best arm, ms, at m4096 21.51 -> 13.40
+    (1.61x, 64-row), m2752 16.78 -> 9.64 (1.74x, 64-row), m1024 8.43 ->
+    6.46 (1.31x, 32-row), m256 6.38 -> 5.53 (1.15x, 32-row). Qwen4 K4/K5
+    TP2 compact width 384 on layer-23 recorded histograms: m4096 11.54 ->
+    7.52 (1.53x, 64-row), m2752 8.48 -> 5.57 (1.52x), m1024 4.39 -> 3.15
+    (1.39x), m256 2.33 -> 1.93 (1.21x, 32-row). Qwen4 TP3 and TP4 compact
+    width 256 both take 64-row blocks at every capacity (TP4 m4096 9.02 ->
+    4.79, 1.88x; TP3 m4096 10.14 -> 5.75, 1.76x).
+
+    GLM Flash K3/K4 (H4096/E288/top8) TP6 compact width 384 on uniform
+    top-8 routes: m4096 14.39 -> 8.37 (1.72x), m2752 9.98 -> 6.43 (1.55x),
+    m1024 4.88 -> 3.20 (1.50x, 64-row against 1.45x at 32), m256 2.82 ->
+    2.17 (1.30x, 32-row). Its layer-7 histogram fixture does not exist, so
+    the timing is labelled uniform. TP3 compact width 768 on the same
+    uniform routes: m4096 20.25 -> 14.45 (1.40x), m2752 14.30 -> 11.05
+    (1.29x), m1024 6.74 -> 5.63 (1.20x, 64-row against 1.15x at 32),
+    m256 4.79 -> 4.13 (1.16x, 32-row against 1.15x at 64).
+
+    Arm tuning on GLM 5.3 TP3 width 768 found no knob better than the
+    shipped shape: static tile claims cost 6-7% at m1024 and above, FC2
+    N128 costs 4% at m4096, four input stages cost 6%, and resolved
+    (three) stages tie the default ring within 0.3% at every capacity.
+
+    Qualification is the measured capacity set of each listed cell only;
+    every other width, family and capacity stays cooperative.
+    `compact_ws_export` adds the measured tier family (`COMPACT_WS_BITS`:
+    GLM 5.3 K4/K5, GLM Flash K3/K4, V4.1 K3/K4, Qwen K4/K5), so the same
+    geometry with another tier pair (GLM 5.3 K3/K4) stays cooperative until
+    that cell is measured.
     """
-    return (geometry == 'glm' and role == 'spark' and width == 384
-            and capacity in COMPACT_GLM_WS_CAPACITIES)
+    return role == 'spark' and capacity in COMPACT_WS_CELLS.get((geometry, width), ())
 
 
 def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
@@ -469,15 +518,15 @@ def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
 def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int | None:
     """Route block of a compact warp-specialized export, or None when off.
 
-    Measured per capacity (see `compact_warp_specialized`): a 64-row block
-    beats 32 from m1024 up (m1024 4.79 vs 5.76 ms); at m256, with dynamic
-    tile claims, 32 is 1.2% faster (3.78 vs 3.82), so the small capacity
-    keeps the 32-row block and larger ones take 64. Gemini's S1 round
-    measured the same arm set independently and splits the same way.
+    Measured per capacity (see `compact_warp_specialized`). Width 384: a
+    64-row block beats 32 from m1024 up (m1024 4.79 vs 5.76 ms); at m256,
+    with dynamic tile claims, 32 is 1.2% faster (3.78 vs 3.82), so the small
+    capacity keeps the 32-row block and larger ones take 64. Gemini's S1
+    round measured the same arm set independently and splits the same way.
+    Width 768 takes 64 at every capacity (m256 6.53 vs 6.52, m4096 21.66 vs
+    27.29). `COMPACT_WS_CELLS` holds both tables.
     """
-    if not compact_warp_specialized(geometry, role, width, capacity):
-        return None
-    return 32 if capacity < 1024 else 64
+    return COMPACT_WS_CELLS.get((geometry, width), {}).get(capacity) if role == 'spark' else None
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
