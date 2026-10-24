@@ -824,11 +824,16 @@ glm = family == "glm5"
 unit = int(value("--prefill-rows", "0")) or (2048 if shared else 4096)
 waves = 1 if glm and ranks == 0 else int(value("--prefill-waves", "0")) or (2 if shared or glm or family == "deepseek_v4" else 1)
 span = int(value("--prefill-span-rows", "0")) or 16384 if glm or family == "deepseek_v4" else unit * waves
-report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=1)
+decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
+if (family == "deepseek_v41" and decode_lanes != 2) or (family not in {"mimo_v2", "deepseek_v41"} and decode_lanes != 1):
+    sys.exit("unsupported --decode-lanes for " + family)
+if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
+    decode_lanes = 1
+report.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, prefill_transports=1, decode_lanes=decode_lanes)
 deployment = dict(version=1, family=family, executable=family != "qwen3_5" and placement_ready, wip_launchable=placement_ready, rtx_gpus=gpus, spark_ranks=ranks,
     topology=dict(tp=tp, ep=ep,
                   wire="native_ownership" if explicit else "canonical"), peers=peers,
-    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span,
+    speculator=value("--speculator", "off"), prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span, decode_lanes=decode_lanes,
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),

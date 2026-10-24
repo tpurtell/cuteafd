@@ -126,6 +126,12 @@ if tool == "docker":
         if "--deployment" in args:
             def value(flag, default=None):
                 return args[args.index(flag) + 1] if flag in args else default
+            decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
+            if (family == "deepseek_v41" and decode_lanes != 2) or (family not in {"mimo_v2", "deepseek_v41"} and decode_lanes != 1):
+                sys.exit("unsupported --decode-lanes for " + family)
+            if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
+                decode_lanes = 1
+            response["decode_lanes"] = decode_lanes
             tp = int(value("--spark-tp", ranks))
             ep = int(value("--spark-ep", "1"))
             if family in {"step5", "kimi_k3"}:
