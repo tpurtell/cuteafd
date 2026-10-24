@@ -23,6 +23,13 @@ pub(crate) struct Fp8Worker<'a> {
     layer: usize,
     executor_id: u64,
     timing: Option<super::super::execution::timing::WorkerTiming<'a>>,
+    /// Lane-owned execution on a rank serving several execution lanes: a
+    /// mapped request returns with its work queued; the owner emits it once
+    /// [`Self::stream_idle`] reports this stream drained.
+    deferred: bool,
+    /// This execution slot's own package scratch (`None`: the first slot, on
+    /// the shared experts' scratch). Concurrent slots never share scratch.
+    scratch: Option<DeviceAllocation<'a>>,
 }
 
 fn validate_worker_layers(layers: &[usize]) -> Result<()> {
@@ -41,6 +48,13 @@ impl<'a> Fp8Worker<'a> {
     }
 
     pub(crate) fn new(library: &'a NativeLibrary, experts: Rc<Fp8Experts<'a>>, capacity: u32) -> Result<Self> {
+        Self::for_slot(library, experts, capacity, 0)
+    }
+
+    /// The worker of execution slot `slot`: slots beyond the first allocate
+    /// their own package scratch over the shared resident weights.
+    pub(crate) fn for_slot(library: &'a NativeLibrary, experts: Rc<Fp8Experts<'a>>, capacity: u32, slot: usize)
+        -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("experts/workspace");
         let geometry = cuteafd_core::expert_geometry();
         let (hidden, topk, capacity) = (geometry.hidden as usize, geometry.topk as usize, capacity as usize);
@@ -58,6 +72,8 @@ impl<'a> Fp8Worker<'a> {
         let output = DeviceAllocation::new(library, capacity * hidden * 2)?;
         let executor_id = cuteafd_transport::expert::SparkWorld::canonical(experts.tp)?.topology().executor_id(experts.rank)?;
         let timing = super::super::execution::timing::WorkerTiming::from_env(library, experts.rank)?;
+        let scratch = (slot > 0).then(|| DeviceAllocation::new(library, experts.lane_scratch_bytes(capacity)?))
+            .transpose()?;
         Ok(Self {
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
             experts,
@@ -68,12 +84,23 @@ impl<'a> Fp8Worker<'a> {
             layer: 0,
             executor_id,
             timing,
+            deferred: false,
+            scratch,
         })
     }
 
     pub(crate) fn installed_grouping(&self, loaded: cuteafd_transport::worker_selection::WorkerSelection,
         rank: usize) -> Result<cuteafd_transport::worker_selection::InstalledExpertGrouping> {
         self.experts.installed_grouping(loaded, rank, self.capacity)
+    }
+
+    /// Leave mapped requests queued at return (see `deferred`).
+    pub(crate) fn defer(&mut self) { self.deferred = true; }
+
+    /// Whether every request queued on this execution's stream has completed.
+    pub(crate) fn stream_idle(&self) -> Result<bool> {
+        // SAFETY: the owned stream is live for the worker's lifetime.
+        unsafe { self.library.cuda_stream_query(self.stream.raw) }
     }
 
     pub(crate) fn bind_layer(&mut self, layer: usize) -> Result<()> {
@@ -135,13 +162,26 @@ impl<'a> Fp8Worker<'a> {
         unsafe {
             if let Some(timing) = &self.timing { timing.record(0, self.stream.raw)?; }
             if bf16 {
-                self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
-                    self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
+                match &self.scratch {
+                    Some(scratch) => self.experts.run_bf16_lane(self.layer, rows, self.inputs[0].buffer.ptr,
+                        self.inputs[1].buffer.ptr, self.inputs[2].buffer.ptr, output.ptr, scratch.buffer.ptr,
+                        self.stream.raw)?,
+                    None => self.experts.run_bf16(self.layer, rows, self.inputs[0].buffer.ptr,
+                        self.inputs[1].buffer.ptr, self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?,
+                }
             } else {
-                self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr, self.inputs[1].buffer.ptr,
-                    self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?;
+                match &self.scratch {
+                    Some(scratch) => self.experts.run_lane(self.layer, rows, self.inputs[0].buffer.ptr,
+                        self.inputs[1].buffer.ptr, self.inputs[2].buffer.ptr, output.ptr, scratch.buffer.ptr,
+                        self.stream.raw)?,
+                    None => self.experts.run(self.layer, rows, self.inputs[0].buffer.ptr,
+                        self.inputs[1].buffer.ptr, self.inputs[2].buffer.ptr, output.ptr, self.stream.raw)?,
+                }
             }
             if let Some(timing) = &self.timing { timing.record(1, self.stream.raw)?; }
+            // A deferred mapped request completes when the owner observes the
+            // stream idle; the transport holds both slots until then.
+            if self.deferred && destination.is_some() { return Ok(output); }
             self.library.cuda_stream_synchronize(self.stream.raw)?;
         }
         if let Some(timing) = &mut self.timing {
@@ -194,6 +234,21 @@ impl<'a> Fp8Worker<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// Concurrent Spark execution slots on one rank share the resident
+    /// weights but never one package scratch: the first slot uses the shared
+    /// experts' scratch, every later slot launches on its own (both input
+    /// formats), so two slots' kernels cannot overwrite each other.
+    #[test]
+    fn later_execution_slots_launch_on_their_own_scratch() {
+        let source = include_str!("worker.rs").split("#[cfg(test)]").next().unwrap();
+        let ctor = source.split("pub(crate) fn for_slot(").nth(1).unwrap();
+        assert!(ctor.contains("(slot > 0).then(|| DeviceAllocation::new(library, experts.lane_scratch_bytes(capacity)?))"));
+        let execute = source.split("fn execute(").nth(1).unwrap();
+        for lane in ["self.experts.run_bf16_lane(", "self.experts.run_lane("] {
+            assert!(execute.contains(lane), "{lane} missing");
+        }
+        assert_eq!(execute.matches("match &self.scratch {").count(), 2);
+    }
     #[test]
     fn width_group_accepts_sparse_layers_but_not_empty_or_duplicate_ids() {
         for layers in [&[3][..], &[3, 4, 5][..], &[3, 6, 7, 8, 9, 12][..]] {

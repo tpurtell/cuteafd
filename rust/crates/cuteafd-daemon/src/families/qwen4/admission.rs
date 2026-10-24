@@ -16,7 +16,7 @@ pub(super) fn spark_model(rows: usize, bf16: bool)
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity, compiled_capacity: capacity,
         endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
+        rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
     })
 }
 

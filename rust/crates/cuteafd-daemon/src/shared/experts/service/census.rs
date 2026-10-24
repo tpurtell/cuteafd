@@ -303,7 +303,11 @@ mod tests {
         let tail = &source[gate..];
         assert!(tail.find("cuda_device_synchronize()?").unwrap()
             < tail.find("census.sample(\"steady_after_first_expert_request\"").unwrap());
-        assert!(source.find("if skip_compute").unwrap() < source.find("executed = request.rows() > 0").unwrap());
+        // Skip-compute answers before any expert execution and is not counted as executed.
+        let serve = &source[source.find("fn request(&mut self").unwrap()..];
+        assert!(serve.find("if self.skip_compute").unwrap() < serve.find("Served { executed: request.rows() > 0 }").unwrap());
+        assert!(serve[serve.find("if self.skip_compute").unwrap()..].find("Served { executed: false }").unwrap()
+            < serve.find("Served { executed: request.rows() > 0 }").unwrap());
     }
     #[test]
     fn process_snapshot_requires_explicit_fields_and_units() {

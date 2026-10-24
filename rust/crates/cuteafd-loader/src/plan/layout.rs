@@ -346,6 +346,40 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
     }
 }
 
+/// Execution slots each Spark rank runs for a family: the most requests the
+/// coordinator keeps in flight to one rank. Prefill waves and decode lanes
+/// never share a rank at once (each family's scheduler stops decode for
+/// admission), so the bound is the larger of the two, not their sum.
+pub fn spark_execution_slots(family: &str, prefill_waves: u64, decode_lanes: u8) -> u8 {
+    let prefill = match family {
+        // V4.1's two transports carry both prefill encoder streams at once.
+        "deepseek_v41" => 2,
+        "glm5" | "glm5_flash" | "mimo_v2" | "kimi_k3" => prefill_waves.max(1),
+        _ => 1,
+    };
+    let decode = u64::from(decode_lanes.max(1));
+    u8::try_from(prefill.max(decode).min(u64::from(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS)))
+        .unwrap_or(cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS)
+}
+
+/// Device bytes of one Spark execution slot (stream, scratch, inputs and
+/// staging at the family's unit capacity), calibrated against the workers'
+/// `experts/workspace*` ledger on the shipped cards (2026-10-24): MiMo Pro max
+/// FP8 146 MiB, GLM 5.3 EXL3 max 1001 MiB, GLM Flash EXL3 569 MiB, V4.1 Flash
+/// max 208 MiB, Kimi K3 EXL3-K2 1175 MiB. Scaled by unit rows over 4096.
+pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
+    const MIB: u64 = 1 << 20;
+    let at_4096 = match family {
+        "mimo_v2" => 146 * MIB,
+        "glm5" => 1001 * MIB,
+        "glm5_flash" => 569 * MIB,
+        "deepseek_v41" | "deepseek_v4" => 208 * MIB,
+        "kimi_k3" => 1175 * MIB,
+        _ => 0,
+    };
+    at_4096.saturating_mul(unit_rows.max(1)).div_ceil(4096)
+}
+
 /// The selected ring geometry for `endpoints` coordinator endpoints per rank.
 pub fn spark_ring_geometry(endpoints: usize) -> crate::placement::SparkRingGeometry {
     crate::placement::SparkRingGeometry { max_frame_bytes: 64 << 20, depth: 8,
@@ -380,6 +414,17 @@ pub(crate) fn charge_spark_io(device: &mut DeviceLayout, working: &crate::placem
         device.items.push(Item::new(Category::Transport, "rdma rings", "", io.mapped_rings, Basis::Formula));
     }
     Ok(())
+}
+
+/// Charges each selected Spark rank's execution slots beyond the first (the
+/// first is inside the family's wave allowance): `(slots - 1)` slot workspaces.
+pub(crate) fn charge_spark_slots(device: &mut DeviceLayout, working: &crate::placement::SparkWorkingSet,
+    family: &str, slots: u8, unit_rows: u64) {
+    device.items.retain(|item| item.group != "execution slots");
+    if working.selected_ranks().contains(&(device.index as usize)) && slots > 1 {
+        device.items.push(Item::new(Category::Workspace, "execution slots", format!("{} more", slots - 1),
+            spark_slot_bytes(family, unit_rows) * u64::from(slots - 1), Basis::Calibrated));
+    }
 }
 
 #[cfg(test)]
@@ -425,6 +470,29 @@ mod selected_spark_io_tests {
                 slot_bytes: 8 << 20, alignment: 4096 }).unwrap();
         assert_eq!(io.mapped_rings, 614924288 + (16 << 20));
         assert_eq!(io.endpoint_staging, (4096 * 4 + 128) + (64 * 4 + 128));
+    }
+
+    #[test]
+    fn execution_slots_follow_admitted_waves_and_lanes_and_charge_their_unit_size() {
+        assert_eq!(spark_execution_slots("glm5", 2, 1), 2);
+        assert_eq!(spark_execution_slots("glm5", 4, 1), 4);
+        assert_eq!(spark_execution_slots("mimo_v2", 3, 2), 3);
+        assert_eq!(spark_execution_slots("mimo_v2", 1, 2), 2);
+        assert_eq!(spark_execution_slots("deepseek_v41", 1, 2), 2);
+        assert_eq!(spark_execution_slots("qwen4", 1, 1), 1);
+        assert_eq!(spark_execution_slots("glm5", 9, 1), cuteafd_core::expert_geometry::MAX_SPARK_EXECUTION_SLOTS);
+        // A smaller unit with more waves costs more, smaller slots (no hard-wired 4096 x 2).
+        assert_eq!(spark_slot_bytes("glm5", 2048) * 2, spark_slot_bytes("glm5", 4096));
+        let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4, prefill_lanes: 2, ..Default::default() };
+        let charged = |slots, rows| {
+            let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
+                items: vec![], kv_tokens: 0 };
+            charge_spark_slots(&mut device, &working, "glm5", slots, rows);
+            device.items.iter().filter(|item| item.group == "execution slots").map(|item| item.bytes).sum::<u64>()
+        };
+        assert_eq!(charged(1, 4096), 0);
+        assert_eq!(charged(2, 4096), spark_slot_bytes("glm5", 4096));
+        assert_eq!(charged(4, 2048), 3 * spark_slot_bytes("glm5", 2048));
     }
 
     #[test]
@@ -807,6 +875,11 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
             report.placement_supported = false;
             notes.push(format!("{}: {error}", what(device)));
         }
+        let family = report.family.as_deref().unwrap_or_default();
+        // The native EXLR8 Spark backend serves one execution slot.
+        let slots = if crate::plan::exlr8::recognizes(&checkpoint.snapshot).unwrap_or(false) { 1 }
+            else { spark_execution_slots(family, working.prefill_lanes, options.decode_lanes) };
+        charge_spark_slots(device, working, family, slots, options.spark_capacity_rows);
     }
 }
 

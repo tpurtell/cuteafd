@@ -65,8 +65,16 @@ fn routed_costs(opened: &super::Opened, args: &super::EngineArgs, layers: usize,
             ensure!(scratch(&plan.directory)? == plan.scratch_bytes as u64,
                 "MiMo expert manifest scratch differs from native package ABI");
         }
+        // A second decode lane owns its own TP2 arena per rank (package scratch
+        // and BF16 output at the decode rows), charged with the TP2 workspace.
+        let lane_bytes = |rank: usize| -> Result<u64> {
+            if args.decode_lanes != 2 || args.peers.is_none() { return Ok(0); }
+            let decode = Fp8MoeTp2::plan(tensors, &directory, rank, super::engine::DECODE_ROWS)?;
+            Ok((decode.scratch_bytes + decode.output_bytes) as u64)
+        };
+        let lanes = [lane_bytes(0)?, lane_bytes(1)?];
         (plans.each_ref().map(|plan| Bytes2 { resident: plan.resident_layer_bytes as u64, staging: plan.staging_bytes as u64 }),
-            0, plans.each_ref().map(|plan| plan.workspace_bytes as u64))
+            0, [plans[0].workspace_bytes as u64 + lanes[0], plans[1].workspace_bytes as u64 + lanes[1]])
     } else {
         // SAFETY: this reads only the trusted generated package's static ABI.
         let metadata = unsafe { cuteafd_ffi::fp8_moe::Fp8MoeMetadata::read(&directory) }?;

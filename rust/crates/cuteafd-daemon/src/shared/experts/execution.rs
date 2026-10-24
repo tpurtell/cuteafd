@@ -138,6 +138,10 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     /// explicit `TP×EP` topology, `None` for every legacy path. The group is
     /// independent of the resident layer, so rebinding a layer never changes it.
     native_group: Option<u8>,
+    /// Lane-owned execution on a rank serving several execution lanes: a
+    /// mapped request returns with its work queued; the owner emits it once
+    /// [`Self::stream_idle`] reports this stream drained.
+    deferred: bool,
     live_capacity: u32,
     budget: ExpertExecutionBudget,
 }
@@ -298,6 +302,7 @@ impl<'library> ExpertWeights<'library> {
             output,
             shared,
             slots,
+            deferred: false,
             graph: None,
             native_group: None,
             live_capacity: live,
@@ -446,6 +451,15 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
                 "native installed grouping differs from actual selector at rows {rows}");
         }
         Ok(report)
+    }
+
+    /// Leave mapped requests queued at return (see `deferred`).
+    pub(crate) fn defer(&mut self) { self.deferred = true; }
+
+    /// Whether every request queued on this execution's stream has completed.
+    pub(crate) fn stream_idle(&self) -> Result<bool> {
+        // SAFETY: the owned stream is live for the worker's lifetime.
+        unsafe { self.library.cuda_stream_query(self.stream.raw) }
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -772,6 +786,9 @@ impl ExpertExecution<'_, '_> {
         unsafe {
             if let Some(timing) = &self.worker_timing { timing.record(1, self.stream.raw)?; }
         }
+        // A deferred mapped request completes when the owner observes the
+        // stream idle; the transport holds both slots until then.
+        if self.deferred && destination.is_some() { return Ok(()); }
         self.synchronize()?;
         if let Some(timing) = &mut self.worker_timing {
             // SAFETY: synchronize completed both event records.

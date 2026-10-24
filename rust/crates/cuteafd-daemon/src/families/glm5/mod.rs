@@ -151,6 +151,11 @@ fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transpo
         capacity: 4096, compiled_capacity: 4096,
         endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress }; endpoints],
         rings: crate::shared::placement::spark_rings(if native { cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, 4096)? } else { 64 << 20 })?,
+        // One execution slot per prefill wave in flight; decode runs alone
+        // (prefill and decode never share a rank at once). The native EXLR8
+        // Spark backend serves one request at a time.
+        execution_slots: if native { 1 } else {
+            cuteafd_loader::plan::layout::spark_execution_slots("glm5", lanes as u64, 1) }
     })
 }
 
