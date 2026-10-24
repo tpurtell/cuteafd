@@ -124,20 +124,21 @@ def validate_rows(rows, provenance):
         seen.add(row["id"])
 
 
-def tokenize_rows(rows, tokenizer):
+def tokenize_rows(rows, tokenizer, *, chat_kwargs=None):
     """Use the checkpoint encoder directly, preserving user/control separation."""
+    chat_kwargs = CHAT_KWARGS if chat_kwargs is None else chat_kwargs
     flat, offsets, records = array("q"), [0], []
     stream = hashlib.sha256()
     vocabulary_size = len(tokenizer)
     for row in rows:
         messages = [dict(role="user", content=row["prompt"])]
-        ids = tokenizer.apply_chat_template(messages, **CHAT_KWARGS)
+        ids = tokenizer.apply_chat_template(messages, **chat_kwargs)
         if (not isinstance(ids, list) or not ids
                 or any(type(token) is not int or not 0 <= token < vocabulary_size for token in ids)):
             raise ValueError(f"invalid tokenizer output: {row['id']}")
         # Text is a diagnostic only. Re-encoding this string would erase the
         # renderer's special-token permissions for user text and attributes.
-        rendered = tokenizer.apply_chat_template(messages, **{**CHAT_KWARGS, "tokenize": False})
+        rendered = tokenizer.apply_chat_template(messages, **{**chat_kwargs, "tokenize": False})
         if not isinstance(rendered, str):
             raise ValueError("tokenizer did not render a string")
         flat.extend(ids)
@@ -166,14 +167,15 @@ def software_identity():
     return dict(packages=versions, python=sys.version)
 
 
-def tokenizer_probes(tokenizer):
+def tokenizer_probes(tokenizer, *, chat_kwargs=None):
     """Retain exact boundary witnesses alongside the hashed full panel stream."""
+    chat_kwargs = CHAT_KWARGS if chat_kwargs is None else chat_kwargs
     result = []
     for text in ("Hello, world!", "你好。日本語 한국어 العربية", "literal <|open|> and [BOS]",
                  "🙂é\u0301\u0000", "x = 1\n    return x\n"):
         messages = [dict(role="user", content=text)]
-        ids = tokenizer.apply_chat_template(messages, **CHAT_KWARGS)
-        rendered = tokenizer.apply_chat_template(messages, **{**CHAT_KWARGS, "tokenize": False})
+        ids = tokenizer.apply_chat_template(messages, **chat_kwargs)
+        rendered = tokenizer.apply_chat_template(messages, **{**chat_kwargs, "tokenize": False})
         result.append(dict(raw_text=text, rendered_text=rendered, input_ids=ids,
                            attention_mask=[1] * len(ids)))
     return result
@@ -240,7 +242,7 @@ def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
     return manifest
 
 
-def load_token_records(root, split="calibration"):
+def load_token_records(root, split="calibration", *, schema=SCHEMA, contract=CONTRACT):
     """Verify a prepared split and return ordered IDs without re-tokenizing."""
     import torch
     from safetensors.torch import load_file
@@ -249,8 +251,8 @@ def load_token_records(root, split="calibration"):
         raise ValueError(f"unknown split: {split}")
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text())
-    if (manifest.get("schema") != SCHEMA or manifest.get("status") != "passed"
-            or manifest.get("contract") != CONTRACT
+    if (manifest.get("schema") != schema or manifest.get("status") != "passed"
+            or manifest.get("contract") != contract
             or manifest.get("dataset") != dict(repo_id=REPO_ID, revision=REVISION, files=PAYLOAD_SHA256)):
         raise ValueError("prepared corpus contract differs")
     report = manifest["splits"][split]
@@ -286,10 +288,10 @@ def load_token_records(root, split="calibration"):
     return result
 
 
-def load_token_batches(root, split="calibration"):
+def load_token_batches(root, split="calibration", *, schema=SCHEMA, contract=CONTRACT):
     """Yield GPTQModel calibration dictionaries, one unpadded CPU batch each."""
     import torch
-    for row in load_token_records(root, split):
+    for row in load_token_records(root, split, schema=schema, contract=contract):
         ids = torch.tensor([row["input_ids"]], dtype=torch.int64)
         yield dict(input_ids=ids, attention_mask=torch.ones_like(ids))
 

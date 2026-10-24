@@ -5847,3 +5847,118 @@ Independent focused validation passed 64 CPU cases and 24 RTX CUDA cases,
 covering FP16/BF16/FP32 inputs, bias and batches 1/33. The production native
 loader already supported this geometry. Recovery of the completed producer
 uses its recorded commit; a new producer pin requires fresh admission evidence.
+
+## GLM 5.3 BF16 to EXL3 K4 / Core K6 (Oliver, 2026-10-24)
+
+User brief: `~/glm53-k4-core-k6-quant.md`. Work is isolated in
+`~/Developer/cuteafd-glm53-core-k6` on `quant/glm53-k4-core-k6`, based on
+`2000d0826298dcdae14a8d1631300b8489d17651`. Push only the task branch;
+the orchestrator reviews and merges. Step 1 is the bounded format pilot and
+recipe report; stop for TJ's recipe decision before the full quantization.
+Publication also has the explicit confirmation point stated in the brief.
+Only Oliver's RTX is used for quantization and correctness, with no serving
+performance measurements. Raptor qualification and engine work are separate.
+
+Source: `zai-org/GLM-5.3-BF16` at
+`9d2398f478cab2de883137db3a36ad2c96205e24`. All 282 headers match the exact
+59,585-tensor inventory (1,506,659,919,872 payload bytes). The proposed recipe
+in `quantization/glm5/core_k6/recipe.py` selects 547 target core matrices at
+K6, eight MTP core matrices at K4 and 58,368 routed expert matrices at K4.
+All selected formats use standard MCG, seed 787 and sigma 0.025. Retain the
+662 other tensors byte-for-byte, including the F32 router correction biases.
+Expected output: 236,354 tensors, 385,362,552,236 payload bytes (358.90 GiB).
+Non-expert payload is 16.01 GiB; the head-split weight estimate is 10.00 GiB
+on rank 0 and 7.34 GiB on rank 1, with MTP eh_proj replicated and excluding
+runtime overhead. The native 576-output kv_a uses standard stored width 640.
+
+`quantization/glm5/prepare_corpus.py` reuses the Kimi panel attestation and
+flat-token format, with native GLM thinking/max-effort rendering. Same pinned
+panel revision as Kimi; 1,426 calibration prompts yield 1,097,737 GLM tokens.
+Native and Tokenicer boundary probes match exactly. Heldout has 88 prompts,
+68,286 tokens and maximum length 1,049, so it cannot qualify long-context
+sparse-token selection. Only calibration prompt cal-1304 exceeds 2,048
+tokens (2,205); the pilot includes it as a native replay correctness witness.
+
+The bounded pilot uses fixed BF16 source predecessors for fair format
+comparison, 35,229 calibration tokens and 4,691 heldout tokens on layers 1
+and 6. It compares serialized MCG K6/K5/K4, block-128 FP8 RTN and BF16,
+using heldout activation-weighted NMSE and scale-inclusive TP2 storage.
+Candidate weights never affect this reference replay. The head comparison
+is deferred because its true normalized input requires all 78 source layers.
+Capture includes exact shared DSA top-k state in each rolling frontier;
+candidate/Hessian receipts and immutable input/code hashes permit explicit
+recovery. The run reuses Kimi's bounded container, hardware admission,
+container guard and detached supervisor, with a one-hour limit and 50 GiB
+container memory cap. Logs/receipts/results live under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/pilot-v1/`;
+research/header evidence under `~/.cache/cuteafd/builds/glm53-core-k6/research/`.
+
+The approved production ordering is one interleaved causal pass: finish each
+core stage and K4 experts, replay the finished block, then calibrate the next.
+Dense core uses natural observations only; newly quantized cold experts need
+the explicit GLM recovery recipe, not Kimi's router-rank window. MTP requires
+a qualified shifted embedding/target-state input contract, not ordinary
+layer-78 replay. Wait for Oliver's local BF16 copy before full production.
+
+Engine gaps are report-only in this task. Existing GLM native trellis support
+is K4-only and EXLR8-record based; K6 standard-HF discovery, BF16 kv_b/indexer,
+head/shared-FFN execution, padded output handling, DFlash2 head borrowing and
+MTP need scheduling before claiming this checkpoint is served by cuteafd.
+
+Step 1 completed on 2026-10-24: [results and engine audit](https://github.com/tpurtell/cuteafd/issues/713),
+[draft implementation](https://github.com/tpurtell/cuteafd/pull/711), reviewed recipe
+`~/glm53-core-quant.md`. All 110 measurements are durable: K6 selected-core
+heldout projection NMSE is 5.18–66.89 times lower than the block-128 FP8 RTN
+control on the same BF16 weights. This does not compare full-model quality
+against the vendor checkpoint. K5 dense-FFN NMSE is about 3.7 times K6 for
+only 81 MiB saved across the three dense layers; recommend the original K6
+scope. Head K6/K8 and independent long-context quality remain unmeasured.
+
+All native/staged boundaries through layers 0–6, including cal-1304, were
+byte-exact. The capture attempt completed both splits, then stopped on the
+reused E4M3 pilot helper's unsupported optional codebook keyword against the
+pinned MCG codec. Scoring-only recovery uses that codec's standard MCG default,
+requires identical inputs/dependencies and unchanged capture AST, verifies
+all Hessian receipts, and retains the original immutable capture plan. Final
+63 CPU checks pass; successful attempt `1792844246867467726` exits zero.
+Results are under `pilot-v2-score/`, capture evidence under `pilot-v1/`.
+Peak CUDA allocations were 22.02 GiB for native capture and 11.52 GiB for
+scoring, host RSS 3.71 GiB. Both containers are stopped, GPU ownership is
+released, and all rolling activation frontiers are retired. Oliver's complete
+sealed BF16 source replica is now ready. Full production awaits the explicit
+recipe decision required by the brief; the source checkpoint and final K4/K6
+payload together fit the root disk with room for bounded rolling state.
+
+TJ approved the reviewed recipe with "Go" on 2026-10-24. Full production
+started at 22:06 Taipei, attempt `1792850759329904317`, under
+`~/.cache/cuteafd/quantization/glm53-k4-core-k6/production/`; output is
+`~/.cache/huggingface/cuteafd-exports/GLM-5.3-EXL3-K4-Core-K6/`.
+Use `quantization/glm5/core_k6/launch.py` with source/tokens/root/export;
+explicit recovery adds `--resume`. Publication is a later explicit
+`--publish-only` invocation after the brief's confirmation point. The GPU
+job does not upload automatically. It holds the bounded local gpu1 queue
+admission, uses the architecture-matched container with a 60 GiB memory cap,
+and releases its container before exit. Monitor every 30 minutes after
+stable startup. Full calibration is 1,097,737 rows; MTP uses the 1,096,311
+valid within-prompt shifted pairs.
+
+Fork main and the matching pin/tree lock are pushed at
+`a196a448fb3f76774c31e02b42523997f05385e3`. New core/MTP helpers passed
+50 focused CPU tests, ten K4/K6 CUDA cases and six source-native MTP CUDA
+cases. Coordinator/export/publication/compatibility gates pass 115 CPU cases.
+The real-weight smoke quantized all core matrices in target layers 0–3,
+all 256 experts of layer 3 and MTP EH/KV (798 projections), using unchanged
+cal-1304. Native/staged target boundaries and DSA state were byte-exact at
+2,205 tokens; real MTP and shared-head norm were byte-exact at 2,204 valid
+pairs. Peak GPU allocation was 27.06 GiB. Its final log call duplicated a
+memory keyword after the successful numerical report; the logging fix and
+independent completed-proof audit retain that report's original identity,
+verify all four shard checksums and 798 calibrated evidence records, and
+exit successfully without repeating numerical work. Evidence and audit
+markers remain in `~/.cache/cuteafd/builds/glm53-core-k6/`.
+
+Do not change the producer, fork pin or prepared data during the run: the
+production plan binds numerical code and packages. Documentation, status
+and a future publication-only compatibility fix are separate from that
+numerical identity. CPU-only publication requires the matching durable
+completion marker, exact 80-shard inventory and remote checksum audit.
