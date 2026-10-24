@@ -20,6 +20,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
     let mut options = PlanOptions {
+        decode_lanes: args.decode_lanes,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
         mapped_scale_host_budget_bytes: None,
         draft_ownership: None,
@@ -855,7 +856,7 @@ mod tests {
             context_tokens: 262144,
             prefill_rows: 4096,
             full_prefill_logits: false,
-            prefill_waves: 0, prefill_span_rows: 0,
+            prefill_waves: 0, prefill_span_rows: 0, decode_lanes: None,
             decode_rows: 64,
             index_cache: crate::families::glm5_flash::engine::IndexCache::Keys,
             headroom_gib: 2.0,

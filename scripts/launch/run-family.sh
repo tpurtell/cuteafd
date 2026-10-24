@@ -148,6 +148,7 @@ EMBEDDING
 COORDINATOR_GPUS
 COORDINATOR_GPU
 CONCURRENCY
+DECODE_LANES
 DECODE_SHARE
 SERVED_MODEL_ID
 ADDR
@@ -426,6 +427,7 @@ ATTENTION_PLACEMENT
 ATTENTION_PLAN_ROWS
 AUDIO
 CONCURRENCY
+DECODE_LANES
 CONSOLE_ASSETS
 CONSOLE_TEXT
 COORDINATOR_DOCKER_DEV
@@ -1053,6 +1055,9 @@ fi
 
 # Select and admit the count before touching any serving container or Spark.
 count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+v41_decode_lanes="$(get DECODE_LANES)"
+[[ -z "$v41_decode_lanes" || "$v41_decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
+[[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
 count_mounts=(-e "HF_HOME=$namespace_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} -v "$namespace_root:$namespace_root:ro")
@@ -1089,6 +1094,8 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
   --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
 release_validate_deployment "$count_plan" deepseek_v41
+resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
+  release_die "DeepSeek V4.1 deployment requires two decode lanes"
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"
@@ -1418,6 +1425,7 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+[[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")
 args+=("${api_args[@]}")
@@ -1877,6 +1885,10 @@ fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
 ((qualifying == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
+decode_lanes="$(get DECODE_LANES)"
+if [[ -n "$decode_lanes" ]]; then
+  [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
+fi
 family_args=(--embedding-placement "$embedding" "${exlr8_plan_args[@]}")
 chat_template_mounts=()
 # Vision-only override: no template inference and no changes to text-only prompts.
@@ -2601,6 +2613,7 @@ audio_encoder_hash=""
     plan_gib="$(python3 -c 'import sys;f,t,b=map(float,sys.argv[1:]);print(max(0,b-(t-f)/1024))' "$free_mib" "$total_mib" "$profile_gib")"
   fi
   plan_draft_args=(--concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+  [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
   if [[ "$family:$speculator" == qwen3_5:dspark ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
@@ -2752,6 +2765,13 @@ audio_encoder_hash=""
   deployment_json="$plan_json"
   plan_json="$(jq -c '.report' <<<"$deployment_json")"
   release_prefill_shape "$deployment_json" "$family"
+  resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$deployment_json")" ||
+    release_die "deployment does not name a supported decode lane count"
+  if [[ -n "$decode_lanes" ]]; then
+    case "$family" in
+      deepseek_v41|mimo_v2) family_args+=(--decode-lanes "$resolved_decode_lanes") ;;
+    esac
+  fi
   case "$(family_prefill_mode "$family")" in
     units|units-span) family_args+=(--prefill-rows "$PREFILL_ROWS" --prefill-waves "$PREFILL_WAVES") ;;
   esac
