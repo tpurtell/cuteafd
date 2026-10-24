@@ -426,6 +426,7 @@ COMPACT_WS_CELLS = {
     # m256 1.334x vs 1.327x).
     ('qwen4', 256): {256: 64, 1024: 64, 2752: 64, 4096: 64},
     ('glmf', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+    ('glmf', 768): {256: 32, 1024: 64, 2752: 64, 4096: 64},
 }
 # Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
@@ -482,8 +483,10 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     top-8 routes: m4096 14.39 -> 8.37 (1.72x), m2752 9.98 -> 6.43 (1.55x),
     m1024 4.88 -> 3.20 (1.50x, 64-row against 1.45x at 32), m256 2.82 ->
     2.17 (1.30x, 32-row). Its layer-7 histogram fixture does not exist, so
-    the timing is labelled uniform and TP3 width 768 stays cooperative
-    until measured.
+    the timing is labelled uniform. TP3 compact width 768 on the same
+    uniform routes: m4096 20.25 -> 14.45 (1.40x), m2752 14.30 -> 11.05
+    (1.29x), m1024 6.74 -> 5.63 (1.20x, 64-row against 1.15x at 32),
+    m256 4.79 -> 4.13 (1.16x, 32-row against 1.15x at 64).
 
     Arm tuning on GLM 5.3 TP3 width 768 found no knob better than the
     shipped shape: static tile claims cost 6-7% at m1024 and above, FC2

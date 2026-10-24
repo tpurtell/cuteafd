@@ -277,7 +277,7 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities], [None] * 3 + [64] * 4)
         for geometry in ('dsv4p', 'kimik3', 'dsv4f', 'glmf'):
             for width in (384, 768):
-                if (geometry, width) == ('glmf', 384):
+                if geometry == 'glmf' and width in (384, 768):
                     continue  # measured by test_compact_ws_qualifies_v41_and_qwen_cells
                 self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', width, c)
                                      for c in capacities))
@@ -357,19 +357,20 @@ class PackageProfileTests(unittest.TestCase):
         self.assertFalse(package.compact_ws_export('v41', 'spark', 640, 4096, (4, 5)))
         self.assertFalse(package.compact_ws_export('qwen4', 'spark', 384, 4096, (3, 4)))
         self.assertFalse(package.compact_ws_export('qwen4', 'spark', 256, 4096, (3, 4)))
-        # GLM Flash K3/K4 TP6 compact width 384; TP3 width 768 stays
-        # cooperative until it is measured.
-        self.assertEqual([package.compact_warp_specialized('glmf', 'spark', 384, c)
-                          for c in capacities], [False] * 3 + [True] * 4)
-        self.assertEqual([package.compact_ws_route_block('glmf', 'spark', 384, c)
-                          for c in capacities], [None] * 3 + [32, 64, 64, 64])
-        self.assertFalse(any(package.compact_warp_specialized('glmf', 'spark', 768, c)
+        # GLM Flash K3/K4: TP6 compact width 384 and TP3 compact width 768
+        # both take 32-row blocks at m256 and 64 above.
+        for width in (384, 768):
+            self.assertEqual([package.compact_warp_specialized('glmf', 'spark', width, c)
+                              for c in capacities], [False] * 3 + [True] * 4)
+            self.assertEqual([package.compact_ws_route_block('glmf', 'spark', width, c)
+                              for c in capacities], [None] * 3 + [32, 64, 64, 64])
+            self.assertEqual(package.ws_tile('glmf', 'spark', width, 4096, compact=True),
+                             package.TILE_384_COMPACT)
+            self.assertTrue(package.compact_ws_export('glmf', 'spark', width, 4096, (3, 4)))
+            self.assertFalse(package.compact_ws_export('glmf', 'spark', width, 4096, (4, 5)))
+        # TP5 compact width 512 was never measured.
+        self.assertFalse(any(package.compact_warp_specialized('glmf', 'spark', 512, c)
                              for c in capacities))
-        self.assertEqual(package.ws_tile('glmf', 'spark', 384, 4096, compact=True),
-                         package.TILE_384_COMPACT)
-        self.assertTrue(package.compact_ws_export('glmf', 'spark', 384, 4096, (3, 4)))
-        self.assertFalse(package.compact_ws_export('glmf', 'spark', 384, 4096, (4, 5)))
-        self.assertFalse(package.compact_ws_export('glmf', 'spark', 768, 4096, (3, 4)))
 
     def test_compact_glm_ws_prefill_export_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -515,8 +516,11 @@ class PackageProfileTests(unittest.TestCase):
     def test_unmeasured_compact_cell_keeps_the_cooperative_export(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            # Every GLM/GLM Flash/V4.1/Qwen compact cell is now measured or
+            # null; the two V4 Flash compact worlds stay cooperative because
+            # no EXL3 checkpoint exists to derive their ownership.
             _output, _manifest, calls, _ = self.build_fixture(
-                root, 'spark', (3, 4), geometry='glmf', capacities=(16, 4096),
+                root, 'spark', (2, 3), geometry='dsv4f', capacities=(16, 4096),
                 compact=True, profiles=('tp3-width768',))
             compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
             self.assertTrue(compact_calls)
