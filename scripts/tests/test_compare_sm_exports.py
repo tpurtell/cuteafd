@@ -149,10 +149,20 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
     for values, options in recorded:
         assert values[4] == tuple(map(int, bits))
         assert options["compile_only"] and options["compact_weights"]
-        assert options["tile"] == (64, 128, 64, 128)
-        assert not options.get("warp_specialized") and not options.get("wire_input")
-        rows = values[3]
-        assert options.get("route_block", 8) == package.route_block(geometry, rows)
+        assert not options.get("wire_input")
+        width, rows = values[1], values[3]
+        # The gate must export exactly the cell the packager claims: FC2 N128
+        # cooperative, or FC2 N256 with dynamic claims on a measured compact
+        # warp-specialized cell (GLM K4/K5 width 384 at 256/1024/2752/4096).
+        ws = package.compact_ws_export(geometry, "spark", width, rows, tuple(map(int, bits)))
+        assert bool(options.get("warp_specialized")) == ws
+        assert bool(options.get("ws_dynamic_tiles")) == ws
+        assert options["tile"] == (
+            package.ws_tile(geometry, "spark", width, rows, compact=True) if ws
+            else (64, 128, 64, 128))
+        assert options.get("route_block", 8) == (
+            package.compact_ws_route_block(geometry, "spark", width, rows) if ws
+            else package.route_block(geometry, rows))
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else

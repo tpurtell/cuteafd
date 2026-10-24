@@ -60,7 +60,7 @@ def test_serving_and_glue_export_inventory():
     exec(compile(ast.Module(body=[builder], type_ignores=[]), "exlr8_inventory", "exec"), namespace)
     inventory = namespace["exlr8_export_programs"]
     assert [p[0] for p in inventory("spark")] == [
-        "a16_serving", "group", "a16_grouped", "grouped_group"]
+        "a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group"]
     assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
     with pytest.raises(ValueError):
         inventory("unknown")

@@ -236,10 +236,15 @@ int main() {
         subprocess.run([str(directory / "test")], check=True, timeout=30)
 
 
-@pytest.mark.parametrize("options", [
-    dict(bits=(3, 4, 5)), dict(warp_specialized=True),
+@pytest.mark.parametrize("options,message", [
+    (dict(bits=(3, 4, 5)), "compact weights require a disjoint two-tier export"),
+    # Compact warp specialization is a measured Spark prefill cell, so the
+    # remaining rejection is a contract the kernel cannot run (8-row blocks).
+    (dict(warp_specialized=True, route_block=8),
+     "warp-specialized prefill requires a disjoint two-tier export"),
 ])
-def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatch, tmp_path, options):
+def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(
+        monkeypatch, tmp_path, options, message):
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
     spec = importlib.util.spec_from_file_location(
         "compact_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
@@ -247,7 +252,7 @@ def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatc
     spec.loader.exec_module(exporter)
     kwargs = dict(bits=(3, 4), routing="packed", compact_weights=True)
     kwargs.update(options)
-    with pytest.raises(ValueError, match="compact weights require cooperative two-tier"):
+    with pytest.raises(ValueError, match=message):
         exporter.export(tmp_path, 384, 256, 16, **kwargs)
 
 
