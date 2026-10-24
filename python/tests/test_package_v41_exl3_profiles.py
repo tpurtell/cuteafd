@@ -292,13 +292,15 @@ class PackageProfileTests(unittest.TestCase):
                 stem = call.args[0].parent.name
                 if width == 384 and capacity >= 256:
                     expected_block = 64 if capacity >= 1024 else 32
+                    expected_tile = (64, 192, 64, 256) if capacity >= 1024 else (64, 128, 64, 256)
                     self.assertTrue(call.kwargs.get('warp_specialized'))
                     self.assertTrue(call.kwargs.get('ws_dynamic_tiles'))
                     self.assertNotIn('wire_input', call.kwargs)
-                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 256))
+                    self.assertEqual(call.kwargs['tile'], expected_tile)
                     self.assertEqual(call.kwargs['route_block'], expected_block)
                     self.assertEqual(
-                        stem, f'tp6-compact-width384+tile64-128-64-256+ws-m{expected_block}-dynamic')
+                        stem,
+                        f"tp6-compact-width384+tile{'-'.join(map(str, expected_tile))}+ws-m{expected_block}-dynamic")
                 else:
                     self.assertNotIn('warp_specialized', call.kwargs)
                     self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))

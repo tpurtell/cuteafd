@@ -64,8 +64,14 @@ class GlmExl3PackageTest(unittest.TestCase):
             [tool.compact_warp_specialized('glm', 'spark', 384, c) for c in (1, 80, 256, 1024, 4096)],
             [False, False, True, True, True])
         self.assertEqual(
+            [tool.compact_ws_tile('glm', 'spark', 384, c) for c in (256, 1024, 4096)],
+            [(64, 128, 64, 256), (64, 192, 64, 256), (64, 192, 64, 256)])
+        self.assertEqual(
             [tool.compact_warp_specialized('qwen4', 'spark', 256, c) for c in (1, 80, 256, 1024, 4096)],
             [False, False, True, True, True])
+        self.assertEqual(
+            [tool.compact_ws_tile('qwen4', 'spark', 256, c) for c in (256, 1024, 4096)],
+            [(64, 128, 64, 256), (64, 128, 64, 256), (64, 128, 64, 256)])
         self.assertFalse(tool.compact_warp_specialized('glm', 'spark', 768, 4096))
         self.assertFalse(tool.compact_warp_specialized('qwen4', 'spark', 384, 4096))
 

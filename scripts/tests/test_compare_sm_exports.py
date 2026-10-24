@@ -152,7 +152,8 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
         width = values[1]
         rows = values[3]
         compact_ws = package.compact_warp_specialized(geometry, "spark", width, rows)
-        assert options["tile"] == (package.COMPACT_WS_TILE if compact_ws else (64, 128, 64, 128))
+        assert options["tile"] == (package.compact_ws_tile(geometry, "spark", width, rows)
+                                   if compact_ws else (64, 128, 64, 128))
         assert bool(options.get("warp_specialized")) == compact_ws
         assert bool(options.get("ws_dynamic_tiles")) == compact_ws
         assert not options.get("wire_input")

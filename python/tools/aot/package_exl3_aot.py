@@ -97,7 +97,8 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
                       for dest in destinations}
             compact_ws = compact_warp_specialized(
                 geometry, manifest['role'], meta['intermediate'], meta['capacity'])
-            expected_tile = list(COMPACT_WS_TILE) if compact_ws else [64, 128, 64, 128]
+            expected_tile = (list(compact_ws_tile(geometry, manifest['role'], meta['intermediate'], meta['capacity']))
+                             if compact_ws else [64, 128, 64, 128])
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
                     or len(meta['bits']) != 2 or meta.get('tile') != expected_tile
@@ -403,9 +404,11 @@ COMPACT_WS_TILE = (64, 128, 64, 256)
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
     """Qualified compact Spark prefill exports (GB10 SM121, 1..4096 bitwise-exact,
     poisoned graph replays):
-    - GLM 5.3 K4/K5 TP6 compact width-384: M4096 coop 24.11 ms random / 24.45 ms
-      recorded layer-7 -> M64 FC2-N256 dynamic 13.15 ms (0.545x, 1.834x) /
-      13.52 ms (0.554x, 1.804x); M256 uses M32 FC2-N256 dynamic (1.445x).
+    - GLM 5.3 K4/K5 TP6 compact width-384: M4096 coop 24.16 ms random / 24.41 ms
+      recorded layer-7 -> M64 TILE_384 (64,192,64,256) dynamic 12.91 ms (0.534x,
+      1.872x) / 13.04 ms (0.534x, 1.872x); M1024 8.19 / 8.72 ms -> 4.82 / 4.91 ms
+      (0.589x / 0.565x); M256 uses M32 FC2-N256 (64,128,64,256) dynamic (3.77 /
+      3.78 ms vs 5.40 / 5.43 ms coop, 0.698x / 0.696x).
     - Qwen 3.8 K4/K5 TP4 compact width-256: M32 FC2-N256 dynamic 1.341x (m256),
       1.454x (m512), 1.549x (m1024), 1.577x (m2048), 1.588x (m4096, 8.805 -> 5.545 ms).
     Other geometries, widths, roles and decode capacities stay cooperative.
@@ -413,6 +416,16 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     if role != 'spark' or capacity < 256:
         return False
     return (geometry, width) in (('glm', 384), ('qwen4', 256))
+
+
+def compact_ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, int, int, int]:
+    """Compact WS tile: GLM TP6 width-384 at m1024+ takes TILE_384 (64,192,64,256)
+    with half-unit tail masking on 256-wide experts; m256 and Qwen TP4 width-256
+    keep (64,128,64,256).
+    """
+    if geometry == 'glm' and role == 'spark' and width == 384 and capacity >= 1024:
+        return TILE_384
+    return COMPACT_WS_TILE
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
@@ -878,7 +891,8 @@ def build(args: argparse.Namespace) -> None:
                 requested = tiles.get(profile, {}).get(capacity)
                 compact_ws = compact and len(args.bits) == 2 and compact_warp_specialized(
                     geometry, args.role, width, capacity)
-                tile = ((COMPACT_WS_TILE if compact_ws else (64, 128, 64, 128))
+                tile = ((compact_ws_tile(geometry, args.role, width, capacity)
+                         if compact_ws else (64, 128, 64, 128))
                         if compact else requested)
                 if tile is None:
                     # A decode capacity the B12x policy widens is pinned back to the

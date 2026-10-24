@@ -302,7 +302,8 @@ def _export_exl3(extra, output):
                 options["compact_weights"] = True
             compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
                 geometry, role, width, rows)
-            tile = ((package.COMPACT_WS_TILE if compact_ws else (64, 128, 64, 128))
+            tile = ((package.compact_ws_tile(geometry, role, width, rows)
+                     if compact_ws else (64, 128, 64, 128))
                     if compact else package.decode_tile(geometry, width, rows))
             if tile is not None:
                 options["tile"] = tile
