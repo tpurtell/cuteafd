@@ -119,6 +119,21 @@ pub struct LocalVerbsExpertConnection {
 // from its bootstrap thread to the GPU owner, but is never shared concurrently.
 unsafe impl Send for LocalVerbsExpertConnection {}
 
+/// A request's final response, posted after the request slot is reposted.
+enum FinalReply {
+    Send { offset: usize, bytes: usize, wr_id: u64 },
+    Written { target: VerbsHostWriteTarget, offset: usize, bytes: usize, flag: u64, wr_id: u64 },
+}
+impl FinalReply {
+    fn post(self, endpoint: &NativeRdmaEndpoint) -> Result<()> {
+        match self {
+            Self::Send { offset, bytes, wr_id } => endpoint.post_send_at(offset, bytes, wr_id),
+            Self::Written { target, offset, bytes, flag, wr_id } =>
+                endpoint.post_write_flagged(&target, offset, bytes, flag, wr_id),
+        }
+    }
+}
+
 impl LocalVerbsExpertConnection {
     /// An opt-in placement worker rejects unsealed or different later lanes
     /// before any mapped ring/native endpoint allocation.
@@ -381,6 +396,12 @@ impl LocalVerbsExpertConnection {
             response_ring.depth,
         )?;
         endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
+        // Frames above one chunk arrive as WRITE tails into the request ring.
+        let request_target = if request_write::needs_target(start.request_capacity_wire_bytes) {
+            endpoint.traffic.receives_writes();
+            let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
+            Some(request_write::Target { address, rkey })
+        } else { None };
         for slot in 0..request_ring.depth {
             endpoint.post_recv_at(
                 request_ring.slot_offset(slot),
@@ -415,6 +436,7 @@ impl LocalVerbsExpertConnection {
                 expert_grouping: grouping.cloned(),
                 server_endpoint,
                 server_native_endpoint: endpoint.native_descriptor(),
+                request_target,
                 flow_label: start.flow_label,
             },
         )?;
@@ -518,7 +540,9 @@ impl LocalVerbsExpertConnection {
             )?;
             let resize_ms = 0.0_f64;
             let copy_request_ms = 0.0_f64;
-            endpoint.traffic.received(request_wire_bytes);
+            // The head SEND only: the client counts its WRITE tail as written
+            // bytes, which the fabric report adds for a `receives_writes` QP.
+            endpoint.traffic.received(request_wire_bytes.min(request_write::CHUNK_BYTES));
             let mut post_recv_ms = 0.0_f64;
             let parse_started = timing_enabled.then(Instant::now);
             let request =
@@ -576,6 +600,10 @@ impl LocalVerbsExpertConnection {
                 start.execution_lane,
             )?;
             let execute_started = timing_enabled.then(Instant::now);
+            // The final reply is the client's credit to WRITE into this request
+            // slot again, so it is posted only after execute has returned and
+            // the slot's receive is reposted (below).
+            let mut deferred_final: Option<FinalReply> = None;
             execute(&request, device_payload, &mut |response| {
                 if final_response_emitted {
                     bail!(
@@ -605,8 +633,10 @@ impl LocalVerbsExpertConnection {
                             bytes); }
                         let flag = written_response_flag(&response.header, response_has_more || response.row_indices.is_some());
                         let send_started = timing_enabled.then(Instant::now);
-                        endpoint.post_write_flagged(&target, response_send_offset, if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0
-                            { 0 } else { bytes }, flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                        let reply = FinalReply::Written { target, offset: response_send_offset,
+                            bytes: if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else { bytes }, flag,
+                            wr_id: VERBS_HOST_SEND_WR_ID + response_send_slot as u64 };
+                        if response_has_more { reply.post(endpoint)? } else { deferred_final = Some(reply) }
                         send_ms += elapsed_ms_optional(send_started);
                         bytes
                     }
@@ -624,12 +654,23 @@ impl LocalVerbsExpertConnection {
                             start.response_capacity_wire_bytes
                         );
                         let send_started = timing_enabled.then(Instant::now);
-                        endpoint.send_parts_at(
-                            response_prefix,
-                            response.partial_output_payload,
-                            response_send_offset,
-                            VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                        )?;
+                        if response_has_more {
+                            endpoint.send_parts_at(response_prefix, response.partial_output_payload,
+                                response_send_offset, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                        } else {
+                            // Staged now (the borrowed payload ends with this
+                            // callback), posted once the request slot is free.
+                            let slot = mapped_ring_slot(response_send_view, response_ring, response_send_sequence as u64)?;
+                            anyhow::ensure!(wire_bytes <= slot.capacity_bytes, "final response exceeds its send slot");
+                            // SAFETY: the range lies in this endpoint's mapped send
+                            // ring (capacity checked above) and its previous send
+                            // completed (the in-flight check above).
+                            let dst = unsafe { std::slice::from_raw_parts_mut(slot.host_ptr, wire_bytes) };
+                            dst[..response_prefix.len()].copy_from_slice(response_prefix);
+                            dst[response_prefix.len()..].copy_from_slice(response.partial_output_payload);
+                            deferred_final = Some(FinalReply::Send { offset: response_send_offset, bytes: wire_bytes,
+                                wr_id: VERBS_HOST_SEND_WR_ID + response_send_slot as u64 });
+                        }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
@@ -686,21 +727,18 @@ impl LocalVerbsExpertConnection {
                                 library.cuda_stream_synchronize(copy_stream)?;
                             }
                         }
-                        match write_target {
+                        let wr_id = VERBS_HOST_SEND_WR_ID + response_send_slot as u64;
+                        let reply = match write_target {
                             Some(target) => {
                                 // Write mode: rows to the client's plane, then the flag.
                                 let flag = written_response_flag(&response.header, response_has_more);
-                                endpoint.post_write_flagged(&target, response_send_offset + response_prefix.len(),
-                                    if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
-                                        response.partial_output_payload.bytes },
-                                    flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                                FinalReply::Written { target, offset: response_send_offset + response_prefix.len(),
+                                    bytes: if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
+                                        response.partial_output_payload.bytes }, flag, wr_id }
                             }
-                            None => endpoint.post_send_at(
-                                response_send_offset,
-                                wire_bytes,
-                                VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                            )?,
-                        }
+                            None => FinalReply::Send { offset: response_send_offset, bytes: wire_bytes, wr_id },
+                        };
+                        if response_has_more { reply.post(endpoint)? } else { deferred_final = Some(reply) }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
@@ -719,11 +757,11 @@ impl LocalVerbsExpertConnection {
                 bail!("persistent verbs-host executor did not emit a final response chunk");
             }
             let post_recv_started = timing_enabled.then(Instant::now);
-            endpoint.post_recv_at(
-                request_ring.slot_offset(request_recv_sequence),
-                request_ring.slot_capacity_bytes,
-                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64,
-            )?;
+            // execute has returned, so every host and GPU consumer of the request
+            // slot is done: repost it, then grant it back with the final reply.
+            endpoint.post_recv_at(request_ring.slot_offset(request_recv_sequence), request_ring.slot_capacity_bytes,
+                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64)?;
+            deferred_final.context("persistent verbs-host final response was not staged")?.post(endpoint)?;
             request_recv_sequence = request_recv_sequence.wrapping_add(1);
             post_recv_ms = elapsed_ms_optional(post_recv_started);
             if timing_enabled {

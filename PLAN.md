@@ -5474,10 +5474,9 @@ Every family that sends experts to Sparks prefills the same way.
   expert batches and never drain the Sparks at chunk ends.
 - **Gates per family:** byte-identical logits and KV at N=1 vs N, exact
   prefix cache, and an A/B card against work/p0 with the same config.
-  - Run every N=1 and N arm on the same Spark intake and egress mode
-    (`CUTEAFD_SPARK_INTAKE=pinned`, copied egress): `SparkLink::new_waves`
-    picks probed intake at N=1 and pinned at N>1, so unpinned arms compare
-    different exchange paths.
+  - Run every N=1 and N arm on the same Spark intake
+    (`CUTEAFD_SPARK_INTAKE=pinned`) when isolating the executor: probed
+    intake is a separate transport arm.
   - Families whose Spark exports accumulate FP32 with atomics at capacity
     ≥256 (V4, V4.1: `--atomic-min-capacity 256`; see "Cold prefill is not
     bit-reproducible") can't be byte-identical in prefill. Gate their N=1
@@ -5542,7 +5541,23 @@ outstanding waves on one link:
 - `SparkIntake` has one return slot per wave, each with its own consumed event;
 - retained receive slots repost in consumption order.
 
-Several waves take the pinned intake (GPU landing has one range per rank).
+Several waves use the same probed intake as one wave. Each rank registers one
+contiguous N-slot landing allocation; successful receive posts rotate slots in
+FIFO order, and consumed events fence replacement requests. Registered request
+egress likewise owns N independent slots, charged from the widest bootstrap
+request geometry before allocation. Pinned intake remains an explicit mode.
+
+Request frames (every Spark link, decode and prefill): a frame of at most
+256 KiB is one RC SEND. A larger frame WRITEs every byte past its first
+256 KiB, in 256 KiB WRITEs round-robin across the wave's rank QPs, into the
+worker's request slot for that sequence, then SENDs its header-bearing first
+256 KiB on the same QP into the receive posted there; RC ordering completes
+that receive after every WRITE. The worker posts a request's final reply only
+after execute returns and the slot's receive is reposted, so a final reply
+is the client's credit to WRITE into that slot again. One large SEND per rank
+let RC go-back-N replay most of a 26.5 MB frame per loss (MiMo request
+wire/engine 1.04-3.2x); chunked WRITE measured 1.015x. Replies are still one
+large SEND per rank per wave.
 
 Context-split staging (GLM 5.3 port; GLM Flash and V4 have the same shape):
 today only the first lane gathers each layer's history into that layer
