@@ -275,8 +275,10 @@ class PackageProfileTests(unittest.TestCase):
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('glm', 'spark', 768, c)
                           for c in capacities], [None] * 3 + [64] * 4)
-        for geometry in ('glmf', 'dsv4p', 'kimik3'):
+        for geometry in ('dsv4p', 'kimik3', 'dsv4f', 'glmf'):
             for width in (384, 768):
+                if (geometry, width) == ('glmf', 384):
+                    continue  # measured by test_compact_ws_qualifies_v41_and_qwen_cells
                 self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', width, c)
                                      for c in capacities))
         self.assertFalse(any(package.compact_warp_specialized('v41', 'spark', 768, c)
@@ -355,6 +357,19 @@ class PackageProfileTests(unittest.TestCase):
         self.assertFalse(package.compact_ws_export('v41', 'spark', 640, 4096, (4, 5)))
         self.assertFalse(package.compact_ws_export('qwen4', 'spark', 384, 4096, (3, 4)))
         self.assertFalse(package.compact_ws_export('qwen4', 'spark', 256, 4096, (3, 4)))
+        # GLM Flash K3/K4 TP6 compact width 384; TP3 width 768 stays
+        # cooperative until it is measured.
+        self.assertEqual([package.compact_warp_specialized('glmf', 'spark', 384, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('glmf', 'spark', 384, c)
+                          for c in capacities], [None] * 3 + [32, 64, 64, 64])
+        self.assertFalse(any(package.compact_warp_specialized('glmf', 'spark', 768, c)
+                             for c in capacities))
+        self.assertEqual(package.ws_tile('glmf', 'spark', 384, 4096, compact=True),
+                         package.TILE_384_COMPACT)
+        self.assertTrue(package.compact_ws_export('glmf', 'spark', 384, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('glmf', 'spark', 384, 4096, (4, 5)))
+        self.assertFalse(package.compact_ws_export('glmf', 'spark', 768, 4096, (3, 4)))
 
     def test_compact_glm_ws_prefill_export_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:

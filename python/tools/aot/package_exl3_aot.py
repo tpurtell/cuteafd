@@ -425,10 +425,11 @@ COMPACT_WS_CELLS = {
     # takes 64 everywhere (TP3 m256 1.279x vs its 32-row arm 1.282x, TP4
     # m256 1.334x vs 1.327x).
     ('qwen4', 256): {256: 64, 1024: 64, 2752: 64, 4096: 64},
+    ('glmf', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
 }
 # Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
-COMPACT_WS_BITS = {('glm', (4, 5)), ('v41', (3, 4)), ('qwen4', (4, 5))}
+COMPACT_WS_BITS = {('glm', (4, 5)), ('glmf', (3, 4)), ('v41', (3, 4)), ('qwen4', (4, 5))}
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -477,12 +478,24 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     width 256 both take 64-row blocks at every capacity (TP4 m4096 9.02 ->
     4.79, 1.88x; TP3 m4096 10.14 -> 5.75, 1.76x).
 
+    GLM Flash K3/K4 (H4096/E288/top8) TP6 compact width 384 on uniform
+    top-8 routes: m4096 14.39 -> 8.37 (1.72x), m2752 9.98 -> 6.43 (1.55x),
+    m1024 4.88 -> 3.20 (1.50x, 64-row against 1.45x at 32), m256 2.82 ->
+    2.17 (1.30x, 32-row). Its layer-7 histogram fixture does not exist, so
+    the timing is labelled uniform and TP3 width 768 stays cooperative
+    until measured.
+
+    Arm tuning on GLM 5.3 TP3 width 768 found no knob better than the
+    shipped shape: static tile claims cost 6-7% at m1024 and above, FC2
+    N128 costs 4% at m4096, four input stages cost 6%, and resolved
+    (three) stages tie the default ring within 0.3% at every capacity.
+
     Qualification is the measured capacity set of each listed cell only;
     every other width, family and capacity stays cooperative.
     `compact_ws_export` adds the measured tier family (`COMPACT_WS_BITS`:
-    GLM 5.3 K4/K5, V4.1 K3/K4, Qwen K4/K5), so the same geometry with
-    another tier pair (GLM 5.3 K3/K4) stays cooperative until that cell is
-    measured.
+    GLM 5.3 K4/K5, GLM Flash K3/K4, V4.1 K3/K4, Qwen K4/K5), so the same
+    geometry with another tier pair (GLM 5.3 K3/K4) stays cooperative until
+    that cell is measured.
     """
     return role == 'spark' and capacity in COMPACT_WS_CELLS.get((geometry, width), ())
 
