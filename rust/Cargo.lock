@@ -861,6 +861,7 @@ dependencies = [
  "cuteafd-ffi",
  "cuteafd-loader",
  "futures",
+ "rayon",
  "serde",
  "serde_json",
  "sha2",

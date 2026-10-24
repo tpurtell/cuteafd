@@ -517,7 +517,8 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 attention::replicate_terminal(self.exchange.peer()?, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
                 let mut binding = Bindings { execution: self, step, scope,
                     current: vec![None, Some(self.layer(1, 0)?.input())], input: input.buffer,
-                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory), units: false };
+                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory), units: false,
+                    waves: None, worker_waves: Default::default() };
                 binding.heads(0)?;
                 binding.ffn(0, None)?;
                 for stage in &self.stages { stage.stream.drain()?; }
@@ -670,7 +671,8 @@ impl<'e, 'a> Execution<'e, 'a> {
         pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
             step.compose(main.ownership.execution().spec().entry_gpu as usize, input, |_, _| Ok(()))?;
             let mut binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
-                input: input.buffer, kind, layer: 0, diagnostic: None, units: false };
+                input: input.buffer, kind, layer: 0, diagnostic: None, units: false,
+                waves: None, worker_waves: Default::default() };
             let rows = binding.step.rows();
             attention::layer_pipeline_with(scope, main.ownership.execution(), &main.exchange,
                 LaneOrder::Independent, &[rows], std::slice::from_mut(&mut binding))?;
@@ -709,14 +711,31 @@ impl<'e, 'a> Execution<'e, 'a> {
             sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(), "Step-5 prefill units");
         pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
             step.compose(entry, input, |_, _| Ok(()))?;
-            let binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
-                input: input.buffer, kind, layer: 0, diagnostic: None, units: true };
-            let mut hooks = UnitHooks { binding, span: input.buffer,
-                current: units.iter().map(|_| vec![None; main.ownership.ranks()]).collect(),
-                consumed: vec![vec![0; main.ownership.execution().hops().len()]; units.len()] };
-            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
-            ensure!(hooks.consumed.iter().flatten().all(|&count| count == 1), "Step-5 unit hop inventory");
-            hooks.binding.step.finish_units();
+            let run = |step: &mut Step<'s, 'a, E>, stage: Option<&mut crate::shared::spark_waves::Waves<'_, '_>>| {
+                let binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
+                    input: input.buffer, kind, layer: 0, diagnostic: None, units: true, waves: stage,
+                    worker_waves: Default::default() };
+                let mut hooks = UnitHooks { binding, span: input.buffer,
+                    current: units.iter().map(|_| vec![None; main.ownership.ranks()]).collect(),
+                    consumed: vec![vec![0; main.ownership.execution().hops().len()]; units.len()] };
+                crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
+                ensure!(hooks.consumed.iter().flatten().all(|&count| count == 1), "Step-5 unit hop inventory");
+                ensure!(hooks.binding.worker_waves.is_empty(), "Step-5 prefill ended with worker waves outstanding");
+                hooks.binding.step.finish_units();
+                Ok(())
+            };
+            // Routed waves build, post and land on the main link's transport
+            // worker while this thread queues GPU work.
+            let mut transport = main.transport.borrow_mut();
+            match transport.as_mut() {
+                Some(link) => {
+                    let device = link.device;
+                    let staging = RouteStaging::new(units.iter().map(|unit| unit.rows.len()).max().unwrap_or(1), 8, H * 2)?.bytes;
+                    device.run(|| link.get_mut().with_waves(staging, |stage| run(step, Some(stage))))?
+                }
+                None => run(step, None)?,
+            }
+            drop(transport);
             main.reset_units()?;
             main.terminal_output.set(Some(input.buffer));
             collect_lane_results(main.stages.iter().map(|stage| stage.stream.drain()))
@@ -728,14 +747,14 @@ impl<'e, 'a> Execution<'e, 'a> {
 /// entry routed reply, plus one hop lane and one Spark return slot. Its
 /// residual pointer per rank is kept here between hooks. Attention and FFN
 /// scratch are hook-local and rewritten inside each hook.
-struct UnitHooks<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
-    binding: Bindings<'s, 'b, 'e, 'a, 'g, E>,
+struct UnitHooks<'s, 'b, 'e, 'a, 'g, 'w, 'x, 'l, E: CopyEngine> {
+    binding: Bindings<'s, 'b, 'e, 'a, 'g, 'w, 'x, 'l, E>,
     span: CuteafdDeviceBuffer,
     current: Vec<Vec<Option<CuteafdDeviceBuffer>>>,
     consumed: Vec<Vec<usize>>,
 }
 
-impl<E: CopyEngine> UnitHooks<'_, '_, '_, '_, '_, E> {
+impl<E: CopyEngine> UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_, E> {
     fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         self.binding.step.select_unit(unit.index)?;
         let offset = unit.rows.start * H * 4;
@@ -749,7 +768,7 @@ impl<E: CopyEngine> UnitHooks<'_, '_, '_, '_, '_, E> {
     }
 }
 
-impl<E: CopyEngine> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, E> {
+impl<E: CopyEngine> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_, E> {
     type Ticket = Option<usize>;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         let routed = (0..self.binding.execution.ownership.ranks()).any(|rank|
@@ -853,15 +872,20 @@ fn request_identity(ordinal: u64) -> Result<u64> {
     ordinal.checked_add(1).context("Step-5 request namespace exhausted")
 }
 
-struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
+struct Bindings<'s, 'b, 'e, 'a, 'g, 'w, 'x, 'l, E: CopyEngine> {
     execution: &'s MainExecution<'e, 'a>, step: &'b mut Step<'s, 'a, E>,
     scope: &'g SubmissionScope<'g>, current: Vec<Option<CuteafdDeviceBuffer>>,
     input: CuteafdDeviceBuffer, kind: ExpertV2SourceKind, layer: usize,
     diagnostic: Option<&'s std::path::Path>,
     /// Prefill units: residuals and hop landings are slot-owned per unit.
     units: bool,
+    /// A prefill call's transport worker on the main link: routed waves send
+    /// and land through it instead of inline.
+    waves: Option<&'w mut crate::shared::spark_waves::Waves<'x, 'l>>,
+    /// Worker tickets in dispatch order.
+    worker_waves: std::collections::VecDeque<crate::shared::spark_waves::WaveTicket>,
 }
-impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
+impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, '_, '_, '_, E> {
     /// Rows of the selected unit: every hook runs these, never the span.
     fn rows(&self) -> usize { self.step.unit_rows().len() }
 
@@ -928,7 +952,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         }
     }
 }
-impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
+impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, '_, '_, '_, E> {
     fn pack(&mut self, hop: Hop) -> Result<*const c_void> {
         Ok(self.current[hop.from as usize].unwrap_or(self.input).ptr.cast_const())
     }
@@ -983,7 +1007,7 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
     }
 }
 
-impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
+impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, '_, '_, '_, E> {
     type FfnTicket = Option<usize>;
     fn state_owners(&self, layer: usize) -> Result<AttentionStateOwners<'_>> {
         let state = self.execution.inventory.get(layer).context("Step-5 live state inventory")?;
@@ -1008,7 +1032,29 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
                         else { ffn.normalize_on(meta.rows, meta.stream) }
                     })?;
-                    if dispatch {
+                    if dispatch && self.waves.is_some() {
+                        ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
+                        let layout = RouteStaging::new(self.rows(), 8, H * 2)?;
+                        let descriptors = self.step.expert_rows(self.kind)?;
+                        let ordinal = execution.requests.get();
+                        let identity = request_identity(ordinal)?;
+                        execution.requests.set(identity);
+                        let placement_version = execution.placement_version;
+                        let rows = self.rows();
+                        let stage = self.waves.as_deref_mut().expect("worker stage");
+                        let ticket = self.step.compose(rank, ffn, |ffn, meta| meta.stream.device.run(|| {
+                            let [ids, weights, input] = ffn.wave_inputs();
+                            // SAFETY: the routed front end wrote these rows on
+                            // this lane stream; the copies read them in order.
+                            unsafe { stage.send(rows, layout, [ids, weights, input], meta.stream.raw,
+                                Box::new(move |routes, wire| expert_request(identity, placement_version, layer,
+                                    descriptors, routes, wire))) }
+                        }))?;
+                        // The shared expert runs while the worker sends and the Sparks compute.
+                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+                        self.worker_waves.push_back(ticket);
+                        wave = Some(rank);
+                    } else if dispatch {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
                         let layout = RouteStaging::new(self.rows(), 8, H * 2)?;
                         let host = execution.pinned[rank].borrow();
@@ -1059,25 +1105,37 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         let execution = self.execution;
         let Some(rank) = ticket else { return self.retain_diagnostic_output(layer); };
         self.select_ffn(layer)?;
-        // Waves land in dispatch order: the executor lands the oldest first.
-        let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
         let entry = usize::from(execution.ownership.execution().spec().entry_gpu);
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
         let split = execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit;
         let output = if rank == entry { ffn.routed_output() } else { self.routed_reply()? };
-        self.step.compose(entry, &execution.routed_reply, |_, meta| {
-            let mut transport = execution.transport.borrow_mut();
-            let link = transport.as_mut().context("Step-5 main transport missing")?;
-            let device = link.device;
-            device.run(|| execution.runtime.block_on(link.get_mut().receive(wave, meta.rows, meta.stream.raw)))?;
-            device.run(|| {
-                // SAFETY: intake planes and the admitted BF16 reply owner are
-                // disjoint; the submission retains both through their consumers.
-                unsafe { device.library.v41_compact_reducer()?.reduce_planes(link.intake.pointers(),
-                    link.world_size() as u32, std::ptr::null(), output.ptr.cast(), meta.rows as u32, meta.stream.raw) }
+        if let Some(stage) = self.waves.as_deref_mut() {
+            // Waves land in dispatch order: the executor lands the oldest first.
+            let wave = self.worker_waves.pop_front().context("Step-5 worker wave absent")?;
+            self.step.compose(entry, &execution.routed_reply, |_, meta| meta.stream.device.run(|| {
+                let slot = wave.slot();
+                stage.land(wave, meta.stream.raw)?;
+                // SAFETY: the slot's planes and the admitted BF16 reply owner are
+                // disjoint; `land` ordered the planes on this lane stream.
+                unsafe { stage.reduce(slot, std::ptr::null(), output.ptr.cast(), meta.rows, meta.stream.raw) }
+            }))?;
+        } else {
+            // Waves land in dispatch order: the executor lands the oldest first.
+            let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
+            self.step.compose(entry, &execution.routed_reply, |_, meta| {
+                let mut transport = execution.transport.borrow_mut();
+                let link = transport.as_mut().context("Step-5 main transport missing")?;
+                let device = link.device;
+                device.run(|| execution.runtime.block_on(link.get_mut().receive(wave, meta.rows, meta.stream.raw)))?;
+                device.run(|| {
+                    // SAFETY: intake planes and the admitted BF16 reply owner are
+                    // disjoint; the submission retains both through their consumers.
+                    unsafe { device.library.v41_compact_reducer()?.reduce_planes(link.intake.pointers(),
+                        link.world_size() as u32, std::ptr::null(), output.ptr.cast(), meta.rows as u32, meta.stream.raw) }
+                })?;
+                device.run(|| link.intake.consumed(meta.stream.raw))
             })?;
-            device.run(|| link.intake.consumed(meta.stream.raw))
-        })?;
+        }
         if split || rank != entry {
             let destination_rank = 1 - entry;
             let Ffn::Routed(destination) = &execution.layer(destination_rank, layer)?.ffn else { anyhow::bail!("Step-5 routed receive owner"); };
@@ -1094,7 +1152,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     }
 }
 
-impl<E: CopyEngine> HeadKernels for Bindings<'_, '_, '_, '_, '_, E> {
+impl<E: CopyEngine> HeadKernels for Bindings<'_, '_, '_, '_, '_, '_, '_, '_, E> {
     fn project(&mut self, rank: usize) -> Result<HeadProjection> {
         // heads() has queued both projections through the cache transaction.
         let layer = self.layer;

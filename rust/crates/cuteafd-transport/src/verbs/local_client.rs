@@ -95,6 +95,7 @@ impl LocalTp4Client {
         Ok(())
     }
     pub(crate) fn max_waves(&self) -> usize { self.max_waves }
+    pub(crate) fn timeout(&self) -> Duration { self.config.timeout }
     pub(crate) fn open_waves(&self) -> usize { self.waves.len() }
 
     pub(crate) fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
@@ -214,6 +215,10 @@ impl LocalTp4Client {
             session.drain_request_sends(&self.config)?;
         }
         Ok(host)
+    }
+    /// The registered request buffer as a staging arena (zero-copy sends).
+    pub(crate) fn egress_arena(&self) -> Option<super::StagingArena> {
+        self.egress.as_ref().map(super::StagingArena::of)
     }
     /// The first `len` bytes of the egress buffer as a request payload.
     pub(crate) fn egress_payload(&self, len: usize) -> Result<bytes::Bytes> {

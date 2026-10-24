@@ -107,21 +107,34 @@ impl<'a> Execution<'a> {
         sequence: &super::device::SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool,
         draft: Option<&super::draft::NativeDraft<'a>>) -> Result<CuteafdDeviceBuffer> {
         let protocol = self.protocol(peer, hops)?;
-        let mut binding = Bindings::new(local, routed, experts, self, peer, hops, scope, 0,
-            units[0].rows.len(), false)?;
-        binding.draft = draft;
-        binding.defer_publication = true;
         tracing::info!(start = sequence.start, rows = sequence.rows, units = units.len(), waves,
             sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(),
             "Kimi prefill units");
-        let mut hooks = UnitHooks { binding, protocol: &protocol, sequence, pool,
-            state: units.iter().map(|_| UnitState::default()).collect(), consumed:
-                vec![vec![0; self.plan.hops().len()]; units.len()] };
-        crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
-        let UnitHooks { mut binding, consumed, .. } = hooks;
-        ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi unit hop inventory");
-        for local in binding.local.iter_mut() { local.select_subwave(None)?; }
-        binding.local[1].buffer("normalized")
+        // Spark waves build, post and land on the routed link's transport
+        // worker while this thread queues GPU work.
+        let spark = routed.has_link();
+        let mut run = |routed: &mut RoutedLane<'a>, waves_stage: Option<&mut crate::shared::spark_waves::Waves<'_, 'a>>|
+            -> Result<CuteafdDeviceBuffer> {
+            let mut binding = Bindings::new(local, routed, experts, self, peer, hops, scope, 0,
+                units[0].rows.len(), false)?;
+            binding.draft = draft;
+            binding.defer_publication = true;
+            binding.waves = waves_stage;
+            let mut hooks = UnitHooks { binding, protocol: &protocol, sequence, pool,
+                state: units.iter().map(|_| UnitState::default()).collect(), consumed:
+                    vec![vec![0; self.plan.hops().len()]; units.len()] };
+            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
+            let UnitHooks { binding, consumed, .. } = hooks;
+            ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi unit hop inventory");
+            ensure!(binding.worker_tickets.is_empty(), "Kimi prefill ended with worker waves outstanding");
+            for local in binding.local.iter_mut() { local.select_subwave(None)?; }
+            binding.local[1].buffer("normalized")
+        };
+        if spark {
+            routed.with_waves_mut(|routed, stage| run(routed, Some(stage)))
+        } else {
+            run(routed, None)
+        }
     }
 
     /// Accepted replay writes every KDA layer on this lane. Publish those exact
@@ -318,10 +331,13 @@ mod tests {
 
 /// The shared pipeline owns layer/lane ordering; this binding supplies only
 /// arithmetic and the exact payload at each planned boundary.
-pub(crate) struct Bindings<'e, 'a, 's> {
+pub(crate) struct Bindings<'e, 'a, 's, 'w, 'x, 'l> {
     scope: &'e SubmissionScope<'s>,
     local: &'e mut [LocalLane<'a>; 2],
     routed: &'e mut RoutedLane<'a>,
+    /// A prefill call's transport worker on the routed lane's link: Spark
+    /// waves send and land through it instead of inline.
+    waves: Option<&'w mut crate::shared::spark_waves::Waves<'x, 'l>>,
     experts: &'e mut [Option<Exl3Tp2<'a>>; 2],
     protocol: Protocol<'e, 'a>,
     lane: usize,
@@ -334,12 +350,18 @@ pub(crate) struct Bindings<'e, 'a, 's> {
     probe: Option<&'e DraftProbe<'a>>,
     tap_first: usize,
     defer_publication: bool,
+    /// Worker tickets in dispatch order (each FFN ticket names its sequence).
+    worker_tickets: std::collections::VecDeque<(u64, crate::shared::spark_waves::WaveTicket)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FfnTicket { layer: usize, spark: Option<super::spark::Ticket>, rtx: Option<usize> }
+pub(crate) struct FfnTicket { layer: usize, spark: Option<Spark>, rtx: Option<usize> }
 
-impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
+/// A Spark wave of one FFN: inline (decode, verify) or on the prefill worker.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Spark { Inline(super::spark::Ticket), Worker { sequence: u64 } }
+
+impl<'e, 'a, 's, 'w, 'x, 'l> Bindings<'e, 'a, 's, 'w, 'x, 'l> {
     pub(crate) fn new(local: &'e mut [LocalLane<'a>; 2], routed: &'e mut RoutedLane<'a>,
         experts: &'e mut [Option<Exl3Tp2<'a>>; 2], execution: &'e Execution<'a>, peer: &'e PeerExchange<'a>, hops: &'e HopLink<'a>,
         scope: &'e SubmissionScope<'s>, lane: usize, rows: usize, speculative: bool) -> Result<Self> {
@@ -372,7 +394,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         }
         for rank in 0..2 { peer.recv(rank, lane)?; }
         ensure!(peer.slot_bytes() >= rows * 7168 * 2, "Kimi peer slot shorter than hidden rows");
-        Ok(Self { scope, local, routed, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false })
+        Ok(Self { scope, local, routed, waves: None, experts, protocol, lane, rows, speculative, owners, completed: 0, pending: None, draft: None, probe: None, tap_first: 0, defer_publication: false, worker_tickets: std::collections::VecDeque::new() })
     }
 
     fn with_probe(&self, work: impl FnOnce(&mut crate::shared::draft::probe::RoundProbe<'a>) -> Result<()>) -> Result<()> {
@@ -498,7 +520,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     }
 }
 
-impl LayerKernels for Bindings<'_, '_, '_> {
+impl LayerKernels for Bindings<'_, '_, '_, '_, '_, '_> {
     fn pack(&mut self, hop: Hop) -> Result<*const c_void> {
         ensure!(matches!(hop.at, HopPoint::Entry | HopPoint::AfterAttention(_)),
             "Kimi split-FFN plan cannot move a residual history arena");
@@ -546,7 +568,7 @@ impl LayerKernels for Bindings<'_, '_, '_> {
     }
 }
 
-impl PipelineKernels for Bindings<'_, '_, '_> {
+impl PipelineKernels for Bindings<'_, '_, '_, '_, '_, '_> {
     type FfnTicket = FfnTicket;
     fn state_owners(&self, layer: usize) -> Result<AttentionStateOwners<'_>> {
         let owners = self.owners.get(layer).context("Kimi layer census outside inventory")?;
@@ -622,11 +644,21 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 let routes = cuteafd_ffi::KimiRoutes {
                     ids: self.local[1].buffer("route ids")?, weights: self.local[1].buffer("route weights")? };
                 let wire = self.local[1].buffer("expert wire")?;
-                let mut probe = self.probe.map(|probe| probe.borrow_mut());
-                let ticket = self.routed.begin(&mut self.local[1], layer, self.rows, kind, routes, wire,
-                    probe.as_mut().and_then(|p| p.as_mut()).map(|p| p.get_mut()))?;
+                let spark = match self.waves.as_deref_mut() {
+                    Some(waves) => {
+                        let ticket = self.routed.begin_wave(waves, &mut self.local[1], layer, self.rows, kind, routes, wire)?;
+                        let sequence = self.worker_tickets.back().map_or(0, |(s, _)| s + 1);
+                        self.worker_tickets.push_back((sequence, ticket));
+                        Spark::Worker { sequence }
+                    }
+                    None => {
+                        let mut probe = self.probe.map(|probe| probe.borrow_mut());
+                        Spark::Inline(self.routed.begin(&mut self.local[1], layer, self.rows, kind, routes, wire,
+                            probe.as_mut().and_then(|p| p.as_mut()).map(|p| p.get_mut()))?)
+                    }
+                };
                 self.local[0].ffn(layer, self.rows)?;
-                Some(ticket)
+                Some(spark)
             }
         };
         if !self.defer_publication { self.publish_ffn(layer)?; }
@@ -642,7 +674,20 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             else {self.meet("ffn output", "shared output")?;}
             let rank = super::weights::routed_owner(self.local[0].config(), layer)?;
             if let Some(spark) = ticket.spark {
-                self.routed.finish(&self.local[1], spark)?;
+                match spark {
+                    Spark::Inline(spark) => self.routed.finish(&self.local[1], spark)?,
+                    Spark::Worker { sequence } => {
+                        let (front, wave) = self.worker_tickets.pop_front().context("Kimi worker wave missing")?;
+                        ensure!(front == sequence, "Kimi worker waves land out of dispatch order");
+                        let waves = self.waves.as_deref_mut().context("Kimi worker wave without its transport")?;
+                        let slot = wave.slot();
+                        self.routed.finish_wave(waves, &self.local[1], wave)?;
+                        let mut probe = self.probe.map(|probe| probe.borrow_mut());
+                        if let Some(probe) = probe.as_mut().and_then(|p| p.as_mut()).map(|p| p.get_mut()) {
+                            probe.staged(layer, waves.staged_ids(slot)?);
+                        }
+                    }
+                }
                 if rank == 0 { self.transfer(1, "expert combined", self.rows * 3584 * 2)?; }
             }
             let output = self.local[rank].latent_up(layer, self.rows)?;
@@ -681,8 +726,8 @@ struct UnitState { completed: usize }
 /// every row plane (residual arena, delta, outputs, router/wire, K6 partials)
 /// at its rows, so another unit's hooks never touch them. Attention metadata
 /// and the phase arena are restaged or rewritten inside each hook.
-struct UnitHooks<'h, 'e, 'a, 's, 'p> {
-    binding: Bindings<'e, 'a, 's>,
+struct UnitHooks<'h, 'e, 'a, 's, 'p, 'w, 'x, 'l> {
+    binding: Bindings<'e, 'a, 's, 'w, 'x, 'l>,
     protocol: &'h Protocol<'e, 'a>,
     sequence: &'h super::device::SequenceRows<'p>,
     pool: &'h cuteafd_engine::prefix::RefPagePool,
@@ -690,7 +735,7 @@ struct UnitHooks<'h, 'e, 'a, 's, 'p> {
     consumed: Vec<Vec<usize>>,
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_> {
+impl UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_> {
     fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         for local in self.binding.local.iter_mut() { local.select_subwave(Some(unit.rows.clone()))?; }
         self.binding.rows = unit.rows.len();
@@ -700,7 +745,7 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
     }
 }
 
-impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
+impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_> {
     type Ticket = FfnTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         // Dense and RTX-resident layers complete inside one hook; the Spark

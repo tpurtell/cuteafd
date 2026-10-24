@@ -322,6 +322,9 @@ cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
 // Retains a timestamp-producing event node inside captured profiling graphs.
 cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
+// Returns immediately: ready=0 means the event's work is pending; asynchronous
+// errors remain errors. Safe from any host thread on the event's device.
+cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
 // Opt-in census spans never synchronize. Completed device timings are drained
 // at later span calls; the bounded pending queue drops samples under overload.

@@ -1408,6 +1408,25 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event,
 #endif
 }
 
+extern "C" cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready) {
+  if (cuda_event == nullptr || ready == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "cuteafd_cuda_event_query requires a non-null event and output");
+  }
+  *ready = 0;
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  const cudaError_t err = cudaEventQuery(reinterpret_cast<cudaEvent_t>(cuda_event));
+  if (err == cudaErrorNotReady) return ok();
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaEventQuery failed", err);
+  }
+  *ready = 1;
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "CUDA event query is unavailable in this build");
+#endif
+}
+
 extern "C" cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event) {
   if (cuda_event == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,

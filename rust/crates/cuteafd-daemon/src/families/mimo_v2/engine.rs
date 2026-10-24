@@ -1322,7 +1322,7 @@ impl<'a> MimoEngine<'a> {
     fn step_lanes_inner(&self, lanes: &[(&StepTables, &[u32])], independent: bool,
         media: &[Option<&cuteafd_engine::media::RequestMedia>])
         -> Result<Vec<Option<DeviceLogits>>> {
-        let Some(Experts::Spark { transport, lanes: links, runtime }) = &self.experts else {
+        let Some(Experts::Spark { transport, lanes: links, .. }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts with lane transports");
         };
         let n = lanes.len();
@@ -1395,7 +1395,32 @@ impl<'a> MimoEngine<'a> {
         let bf16_input = self.expert_input.bf16(false);
         let mut transports: Vec<_> = links[..last].iter().map(RefCell::borrow_mut)
             .chain(std::iter::once(transport.borrow_mut())).collect();
-        let mut inflight: Vec<Option<(usize, SentWave)>> = (0..n).map(|_| None).collect();
+        let mut transports: Vec<&mut SparkLink<'_>> = transports.iter_mut().map(|link| &mut **link).collect();
+        // One transport worker per lane link builds, posts and lands that
+        // lane's waves while this thread queues the lanes' GPU work.
+        crate::shared::spark_waves::with_link_waves(&mut transports, self.wave_staging_bytes(bf16_input)?,
+            |transports| self.lane_layers(transports, &w, w1, &t, &rows, lanes, independent, bf16_input, last))?;
+        self.finish_tp2_route_step()?;
+        if layers.len() < self.cfg.layers {
+            // SAFETY: the engine owns both streams; every queued wait has a matching push.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            if w1.is_some() {
+                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
+            }
+            return Ok((0..n).map(|_| None).collect());
+        }
+        self.lane_heads(&w, &t, independent, n, last)
+    }
+
+    /// The lane layer loop of [`Self::step_lanes_inner`]: lane `i`'s waves go
+    /// out on `transports[i]`'s worker.
+    #[allow(clippy::too_many_arguments)]
+    fn lane_layers(&self, transports: &mut [crate::shared::spark_waves::Waves<'_, '_>], w: &[&Workspace<'_>],
+        w1: Option<&[&Workspace<'_>]>, t: &[usize], rows: &[Scalar], lanes: &[(&StepTables, &[u32])],
+        independent: bool, bf16_input: bool, last: usize) -> Result<()> {
+        let n = lanes.len();
+        let layers = &self.weights.layers;
+        let mut inflight: Vec<Option<(usize, crate::shared::spark_waves::WaveTicket)>> = (0..n).map(|_| None).collect();
         // After a lane's FFN output is in its `delta`: both GPUs' next input
         // norms, then each independent request's drafter taps on rank 0.
         // Consecutive chunks of one request keep the historical last-lane taps.
@@ -1440,7 +1465,7 @@ impl<'a> MimoEngine<'a> {
                 if let Some((previous, sent)) = inflight[i].take() {
                     let forward = (w1.is_some() && previous + 1 < layers.len())
                         .then_some(lane_slot(previous, true, i));
-                    self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, forward, false)?;
+                    self.wave_land(w[i], previous, t[i], &mut transports[i], sent, forward)?;
                     after_ffn(i, previous)?;
                 }
                 if let Some(peers) = w1 {
@@ -1477,7 +1502,7 @@ impl<'a> MimoEngine<'a> {
                     after_ffn(i, index)?;
                 } else {
                     self.moe_front(w[i], layer, t[i], bf16_input)?;
-                    inflight[i] = Some((index, self.spark_send(w[i], index, t[i], false, bf16_input, false, &mut transports[i])?));
+                    inflight[i] = Some((index, self.wave_send(w[i], index, t[i], bf16_input, &mut transports[i])?));
                 }
             }
         }
@@ -1485,19 +1510,16 @@ impl<'a> MimoEngine<'a> {
             if let Some((previous, sent)) = inflight[i].take() {
                 let forward = (w1.is_some() && previous + 1 < layers.len())
                     .then_some(lane_slot(previous, true, i));
-                self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, forward, false)?;
+                self.wave_land(w[i], previous, t[i], &mut transports[i], sent, forward)?;
                 after_ffn(i, previous)?;
             }
         }
-        self.finish_tp2_route_step()?;
-        if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns both streams; every queued wait has a matching push.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            if w1.is_some() {
-                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            }
-            return Ok((0..n).map(|_| None).collect());
-        }
+        Ok(())
+    }
+
+    /// Each lane's last-row head after [`Self::lane_layers`].
+    fn lane_heads(&self, w: &[&Workspace<'_>], t: &[usize], independent: bool, n: usize, last: usize)
+        -> Result<Vec<Option<DeviceLogits>>> {
         let mut logits: Vec<Option<DeviceLogits>> = (0..n).map(|_| None).collect();
         for i in if independent { 0..n } else { last..n } {
             self.launch_head(w[i], t[i], 1, false)?;
@@ -2850,12 +2872,69 @@ impl<'a> MimoEngine<'a> {
             }).collect(),
             routes, wire)?;
         request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+
         let ranks = transport.world_size();
         ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
         let build = built.elapsed().as_secs_f64();
         let timer = std::time::Instant::now();
         let wave = transport.dispatch(&request)?;
         Ok(SentWave { wave: Some(wave), gpu_wait, build, dispatch: timer.elapsed().as_secs_f64(), sent: timer })
+    }
+
+    /// A prefill lane's wave on its link's transport worker: routes and wire
+    /// rows copy into the wave slot's pinned staging on the stream, and the
+    /// worker builds and posts the request once they complete. This thread
+    /// does not wait for the GPU.
+    fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, bf16_input: bool,
+        transport: &mut crate::shared::spark_waves::Waves<'_, '_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+            if bf16_input { h * 2 } else { h + h / 32 })?;
+        let input = if bf16_input { &w.x } else { &w.wire };
+        ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
+        // SAFETY: ids, weights and input rows hold this lane's `t` rows in
+        // stream order; the copies read them before later stream work.
+        unsafe {
+            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
+                Box::new(move |routes, wire| mimo_request(routes, wire, index, t, h, topk, bf16_input)))
+        }
+    }
+
+    /// The land half of [`Self::wave_send`]: orders the stream after the
+    /// wave's planes and queues their sum into `delta` (forwarded to the head
+    /// split's second GPU when `forward`).
+    fn wave_land(&self, w: &Workspace<'_>, index: usize, t: usize,
+        transport: &mut crate::shared::spark_waves::Waves<'_, '_>, sent: crate::shared::spark_waves::WaveTicket,
+        forward: Option<usize>) -> Result<()> {
+        let slot = sent.slot();
+        let timer = std::time::Instant::now();
+        let times = transport.land(sent, self.stream)?;
+        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            probe.staged(index, transport.staged_ids(slot)?);
+        }
+        let reduced = std::time::Instant::now();
+        // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
+        // slot's planes are ordered after the wave by `land`.
+        unsafe {
+            transport.reduce(slot, w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?;
+        }
+        if let Some(slot) = forward {
+            self.push(0, slot, w.delta.buffer.ptr, t * self.cfg.hidden * 2)?;
+        }
+        if self.wave_timing {
+            eprintln!("mimo_wave layer={index} rows={t} staged_ms={:.3} post_ms={:.3} receive_ms={:.3} \
+                land_wait_ms={:.3} reduce_ms={:.3}", times.staged * 1e3, times.posted * 1e3, times.received * 1e3,
+                times.waited * 1e3, reduced.elapsed().as_secs_f64() * 1e3);
+        }
+        Ok(())
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and input rows).
+    fn wave_staging_bytes(&self, bf16_input: bool) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.topk,
+            if bf16_input { h * 2 } else { h + h / 32 })?.bytes)
     }
 
     /// `offset` bytes into the pinned router staging.
@@ -2932,6 +3011,21 @@ impl<'a> MimoEngine<'a> {
                 receive * 1e3, reduce * 1e3);
         }
     }
+}
+
+/// A prefill wave's request from its route entries and input rows (`wire`
+/// views the wave slot's pinned staging).
+fn mimo_request(routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes, index: usize, t: usize, h: usize,
+    topk: usize, bf16_input: bool) -> Result<ExpertProtocolV2Request> {
+    let dtype = if bf16_input { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+    let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
+        (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+        }).collect(),
+        routes, wire)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
 }
 
 #[cfg(test)]

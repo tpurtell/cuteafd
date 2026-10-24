@@ -1172,6 +1172,7 @@ type CudaEventDestroyFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> Cutea
 type CudaEventRecordFn =
     unsafe extern "C" fn(cuda_event: *mut c_void, cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaEventSynchronizeFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> CuteafdStatus;
+type CudaEventQueryFn = unsafe extern "C" fn(cuda_event: *mut c_void, ready: *mut i32) -> CuteafdStatus;
 type CudaEventElapsedMsFn = unsafe extern "C" fn(
     start_event: *mut c_void,
     end_event: *mut c_void,
@@ -2465,6 +2466,21 @@ impl NativeLibrary {
             unsafe { self.lib.get(b"cuteafd_cuda_event_synchronize")? };
         let status = unsafe { synchronize_fn(cuda_event) };
         self.status_to_result("cuteafd_cuda_event_synchronize", status)
+    }
+
+    /// Whether `cuda_event`'s recorded work completed, without blocking; a
+    /// never-recorded event is complete. Any host thread may call it once
+    /// the event's device is current on that thread.
+    ///
+    /// # Safety
+    /// `cuda_event` is a live event created by this library.
+    pub unsafe fn cuda_event_query(&self, cuda_event: *mut c_void) -> Result<bool> {
+        let query_fn: Symbol<CudaEventQueryFn> = unsafe { self.lib.get(b"cuteafd_cuda_event_query")? };
+        let mut ready = 0;
+        let status = unsafe { query_fn(cuda_event, &mut ready) };
+        self.status_to_result("cuteafd_cuda_event_query", status)?;
+        anyhow::ensure!(ready == 0 || ready == 1, "invalid CUDA event query result");
+        Ok(ready == 1)
     }
 
     pub unsafe fn cuda_event_elapsed_ms(

@@ -4,8 +4,7 @@ use crate::shared::prefill_pipeline::{self, FfnRoute, PrefillHooks, Unit};
 
 impl<'a> Engine<'a> {
     pub(super) fn prefill_units(
-        &self, placement: &Placement, tokens: &[u32], transports: &mut [SparkLink<'_>],
-        runtime: &tokio::runtime::Runtime, logit_rows: usize,
+        &self, placement: &Placement, tokens: &[u32], transports: &mut [SparkLink<'_>], logit_rows: usize,
         on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>, download: bool,
     ) -> Result<Logits> {
         let transports = RefCell::new(transports);
@@ -36,11 +35,15 @@ impl<'a> Engine<'a> {
                 // Diagnostics own rows by slot too; a slot is reused only after its unit commits.
                 self.prepare_route_checks(&units.iter().map(|u| u.rows.len()).collect::<Vec<_>>())?;
                 let mut links = transports.borrow_mut();
-                let mut hooks = UnitHooks { engine: self, placement, tokens, tables: &tables, w, w1,
-                    transport: links.get_mut(1), runtime, logit_rows, download, on_layer,
-                    logits: Vec::new(), landed: 0,
-                    context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
-                prefill_pipeline::run_prefill_units(&mut hooks, &units, waves)?;
+                // Waves build, post and land on the prefill link's transport
+                // worker while this thread queues GPU work.
+                let staging = self.wave_staging_bytes()?;
+                let (logits, landed) = match links.get_mut(1) {
+                    Some(link) => link.with_waves(staging, |transport| self.run_units(placement, tokens, &tables, w,
+                        w1, Some(transport), logit_rows, download, on_layer, &units, waves))?,
+                    None => self.run_units(placement, tokens, &tables, w, w1, None, logit_rows, download, on_layer,
+                        &units, waves)?,
+                };
                 self.finish_route_step()?;
                 // No unit cursor survives into decode/verify: all geometry is selected by hook.
                 self.context_units.borrow_mut().clear();
@@ -48,23 +51,36 @@ impl<'a> Engine<'a> {
                     self.sync()?;
                     Ok(if download { Logits::Host(Vec::new()) } else { Logits::Device(None) })
                 } else if download {
-                    Ok(Logits::Host(hooks.logits))
+                    Ok(Logits::Host(logits))
                 } else {
-                    Ok(Logits::Device(Some(self.device_logits(w, hooks.landed))))
+                    Ok(Logits::Device(Some(self.device_logits(w, landed))))
                 }
             })
     }
 }
 
-struct UnitHooks<'h, 'a, 't, 'l, 'c> {
+impl<'a> Engine<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn run_units(&self, placement: &Placement, tokens: &[u32], tables: &[StepTables], w: &Workspace<'a>,
+        w1: Option<&Workspace<'a>>, transport: Option<&mut crate::shared::spark_waves::Waves<'_, '_>>,
+        logit_rows: usize, download: bool, on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
+        units: &[Unit], waves: usize) -> Result<(Vec<f32>, usize)> {
+        let mut hooks = UnitHooks { engine: self, placement, tokens, tables, w, w1, transport, logit_rows, download,
+            on_layer, logits: Vec::new(), landed: 0,
+            context_plans: vec![Default::default(); self.prefill_waves], staging_owner: [None; 2] };
+        prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
+        Ok((hooks.logits, hooks.landed))
+    }
+}
+
+struct UnitHooks<'h, 'a, 't, 'l, 'c, 'n> {
     engine: &'h Engine<'a>,
     placement: &'h Placement,
     tokens: &'h [u32],
     tables: &'h [StepTables],
     w: &'h Workspace<'a>,
     w1: Option<&'h Workspace<'a>>,
-    transport: Option<&'t mut SparkLink<'l>>,
-    runtime: &'h tokio::runtime::Runtime,
+    transport: Option<&'t mut crate::shared::spark_waves::Waves<'l, 'n>>,
     logit_rows: usize,
     download: bool,
     on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
@@ -82,19 +98,21 @@ fn reuse_context(owner: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_> {
-    fn post(&mut self, layer: usize, unit: &Unit, ranks: usize) -> Result<()> {
+impl UnitHooks<'_, '_, '_, '_, '_, '_> {
+    fn post(&mut self, layer: usize, unit: &Unit, ranks: usize, slot: Option<usize>) -> Result<()> {
         let e = self.engine;
         let rows = Scalar::I32(unit.rows.len() as i32);
-        let planes = self.transport.as_ref().map(|t| t.intake.pointers())
-            .unwrap_or([std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS]);
+        let planes = match (self.transport.as_ref(), slot) {
+            (Some(transport), Some(slot)) => transport.planes(slot),
+            _ => [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS],
+        };
         e.post_layer(self.w, &self.w.slots[unit.slot], unit.slot, ranks, planes, rows, layer)?;
         if let Some(w1) = self.w1 {
             e.peer_post(layer, &w1.slots[unit.slot], unit.slot, w1, rows)?;
         }
         e.tap(self.w, &self.w.slots[unit.slot], layer, unit.rows.len())?;
-        if ranks != LOCAL_EXPERTS && ranks != SKIPPED_EXPERTS {
-            self.transport.as_ref().context("Spark link")?.intake.consumed(e.stream)?;
+        if let Some(slot) = slot {
+            self.transport.as_mut().context("Spark link")?.consumed(slot, e.stream)?;
         }
         if let Some(callback) = self.on_layer.as_mut() {
             callback(layer, &e.download(&self.w.slots[unit.slot].stream_a,
@@ -104,8 +122,8 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
-    type Ticket = SparkExpertWave;
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_> {
+    type Ticket = crate::shared::spark_waves::WaveTicket;
 
     fn route(&self, layer: usize) -> FfnRoute {
         if self.engine.skip_routed || layer < self.engine.local_layers() { FfnRoute::Local }
@@ -180,26 +198,23 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
             LOCAL_EXPERTS
         };
         // The local output is hook-local and consumed before the next unit runs.
-        self.post(layer, unit, ranks)
+        self.post(layer, unit, ranks, None)
     }
 
-    fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<SparkExpertWave> {
+    fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
         let e = self.engine;
         let transport = self.transport.as_mut().context("no prefill Spark link")?;
-        let mut request = e.stage_request(layer, unit.rows.len(), self.w, ExpertV2SourceKind::Prefill, transport)?;
-        for row in &mut request.rows {
-            row.token_position += (self.placement.len + unit.rows.start) as u64;
-        }
-        let wave = transport.dispatch(&request)?;
+        let wave = e.wave_send(layer, unit.rows.len(), self.w, (self.placement.len + unit.rows.start) as u64, transport)?;
         e.shared_ffn(layer, self.w, &self.w.slots[unit.slot], Scalar::I32(unit.rows.len() as i32),
             e.prefill_rows, &e.weights.layers[layer])?;
         Ok(wave)
     }
 
-    fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: SparkExpertWave) -> Result<()> {
+    fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
         let transport = self.transport.as_mut().context("no prefill Spark link")?;
-        let ranks = self.runtime.block_on(self.engine.land(transport, ticket, unit.rows.len(), self.w))?;
-        self.post(layer, unit, ranks)
+        let slot = ticket.slot();
+        let ranks = self.engine.wave_land(layer, transport, ticket)?;
+        self.post(layer, unit, ranks, Some(slot))
     }
 
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {

@@ -88,7 +88,7 @@ pub use synthetic::{
 };
 pub use verbs::{
     DeviceLanding, DeviceWriteTarget, FlowProbesOnly, GpuLandingProbe, LocalVerbsExpertConnection,
-    RingBudget, RingReservation, VERBS_HOST_WRITE_FLAG_ERROR, VerbsHostMappedRdmaPollStats,
+    RingBudget, RingReservation, StagingArena, copy_pool_parallel, VERBS_HOST_WRITE_FLAG_ERROR, VerbsHostMappedRdmaPollStats,
     VerbsHostMappedRdmaRing, VerbsHostMappedRdmaRingConfig, VerbsHostMappedRdmaSlot,
     VerbsHostNativeEndpointDescriptor, VerbsHostProtocolV2EndpointPlan,
     VerbsHostProtocolV2HandshakeContract, VerbsHostProtocolV2HandshakeValidation,

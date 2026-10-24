@@ -3,6 +3,7 @@ mod landing;
 pub use landing::{gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
 mod egress;
+pub use egress::StagingArena;
 mod flows;
 mod local;
 mod local_client;
@@ -46,12 +47,27 @@ const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
 /// cut, 0.953 / 0.962 of p8); MiMo V2.6 Pro's 26 MB waves still gain.
 const PARALLEL_REQUEST_COPY_BYTES: usize = 16 << 20;
 
-/// `dst.copy_from_slice(src)` split over eight threads.
+/// `dst.copy_from_slice(src)` split over eight pieces on the persistent
+/// copy pool ([`copy_pool`]): no thread is spawned per copy.
 fn copy_threads(dst: &mut [u8], src: &[u8]) {
-    let chunk = src.len().div_ceil(8).next_multiple_of(4096);
-    thread::scope(|scope| {
+    copy_pool_parallel(dst, src, 8);
+}
+
+/// Eight long-lived threads for large pinned copies, made on first use.
+pub fn copy_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new().num_threads(8)
+        .thread_name(|index| format!("pinned-copy-{index}")).build()
+        .expect("building the pinned copy pool"))
+}
+
+/// `dst.copy_from_slice(src)` in `pieces` page-aligned pieces on [`copy_pool`].
+pub fn copy_pool_parallel(dst: &mut [u8], src: &[u8], pieces: usize) {
+    assert_eq!(dst.len(), src.len(), "copy extents differ");
+    let chunk = src.len().div_ceil(pieces.max(1)).next_multiple_of(4096).max(4096);
+    copy_pool().scope(|scope| {
         for (d, s) in dst.chunks_mut(chunk).zip(src.chunks(chunk)) {
-            scope.spawn(move || d.copy_from_slice(s));
+            scope.spawn(move |_| d.copy_from_slice(s));
         }
     });
 }
@@ -3488,6 +3504,17 @@ struct NativeRdmaEndpoint {
     traffic: Arc<crate::traffic::WireCounter>,
     credits: EndpointCredits,
 }
+
+// SAFETY: the endpoint is a native RC QP/CQ/MR handle set. ibverbs objects
+// are thread-safe and carry no thread affinity; every mutating operation goes
+// through the owning session (`&mut`), so one thread drives a QP at a time.
+// Shared `Arc` owners (retained response frames) only keep the handle alive
+// and never operate on it. This lets a prefill transport worker own a link's
+// sessions for a call while the engine thread queues GPU work.
+unsafe impl Send for NativeRdmaEndpoint {}
+// SAFETY: as above; `&NativeRdmaEndpoint` exposes no operation that mutates
+// QP state concurrently with the owning session.
+unsafe impl Sync for NativeRdmaEndpoint {}
 
 impl NativeRdmaEndpoint {
     #[allow(clippy::too_many_arguments)]

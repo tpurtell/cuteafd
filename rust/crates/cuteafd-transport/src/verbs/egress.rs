@@ -51,7 +51,45 @@ impl EgressBuffer {
     pub(crate) fn payload(self: &Arc<Self>, len: usize) -> Result<Bytes> {
         anyhow::ensure!(len <= self.host.bytes, "egress payload of {len} bytes exceeds the {}-byte buffer",
             self.host.bytes);
-        Ok(Bytes::from_owner(EgressView { buffer: Arc::clone(self), _view: Arc::clone(&self.views), len }))
+        self.payload_at(0, len)
+    }
+
+    /// `len` bytes at `offset` as a request payload.
+    pub(crate) fn payload_at(self: &Arc<Self>, offset: usize, len: usize) -> Result<Bytes> {
+        anyhow::ensure!(offset.checked_add(len).is_some_and(|end| end <= self.host.bytes),
+            "payload of {len} bytes at {offset} exceeds the {}-byte buffer", self.host.bytes);
+        Ok(Bytes::from_owner(EgressView { buffer: Arc::clone(self), _view: Arc::clone(&self.views), offset, len }))
+    }
+}
+
+/// A pinned, device-mapped host arena one prefill wave slot stages into: the
+/// engine's stream copies the wave's routes and expert input rows here, and
+/// the slot's transport worker builds the request from it, the hidden
+/// payload a view of the arena (no host copy). The arena may be rewritten
+/// only once no request views it ([`Self::writable`]).
+#[derive(Clone)]
+pub struct StagingArena(Arc<EgressBuffer>);
+
+impl StagingArena {
+    pub fn new(bytes: usize) -> Result<Self> {
+        EgressBuffer::new(bytes).map(Self)
+    }
+    pub(crate) fn of(buffer: &Arc<EgressBuffer>) -> Self { Self(Arc::clone(buffer)) }
+    pub fn host(&self) -> CuteafdHostBuffer { self.0.host() }
+    pub fn bytes(&self) -> usize { self.0.host.bytes }
+    /// No request payload views the arena.
+    pub fn writable(&self) -> bool { self.0.writable() }
+    /// `len` bytes at `offset` as a request payload that keeps the arena alive.
+    pub fn payload(&self, offset: usize, len: usize) -> Result<Bytes> { self.0.payload_at(offset, len) }
+    /// The arena's first `len` bytes.
+    ///
+    /// # Safety
+    /// The stream copies that wrote them completed and nothing writes the
+    /// arena while the slice lives.
+    pub unsafe fn read(&self, len: usize) -> Result<&[u8]> {
+        anyhow::ensure!(len <= self.bytes(), "arena read of {len} bytes exceeds the {}-byte arena", self.bytes());
+        // SAFETY: in bounds (checked); quiescence is the caller's contract.
+        Ok(unsafe { std::slice::from_raw_parts(self.0.host.ptr.cast::<u8>(), len) })
     }
 }
 
@@ -97,6 +135,7 @@ impl Drop for EgressBuffer {
 struct EgressView {
     buffer: Arc<EgressBuffer>,
     _view: Arc<()>,
+    offset: usize,
     len: usize,
 }
 
@@ -105,6 +144,6 @@ impl AsRef<[u8]> for EgressView {
         // SAFETY: the allocation lives as long as `buffer`; the engine writes
         // it only while no view exists (`EgressBuffer::writable`), so the
         // bytes are not mutated while this shared view is alive.
-        unsafe { std::slice::from_raw_parts(self.buffer.host.ptr.cast::<u8>(), self.len) }
+        unsafe { std::slice::from_raw_parts(self.buffer.host.ptr.cast::<u8>().add(self.offset), self.len) }
     }
 }

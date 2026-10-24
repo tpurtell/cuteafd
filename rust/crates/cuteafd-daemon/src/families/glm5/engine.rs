@@ -14,7 +14,7 @@ use super::weights::{GlmLayer, GlmWeights};
 use crate::shared::launch_grid::Fp8QuantizeGrid;
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use crate::shared::token_io::{DeviceLogits, TokenEmbedding};
-use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLane, SparkLink};
+use crate::shared::spark_intake::{copy_parallel, IntakeMode, SparkIntake, SparkLink};
 use cuteafd_transport::expert::{
     SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16,
 };
@@ -323,8 +323,6 @@ pub(crate) struct GlmEngine<'a> {
     context_reuse: Cell<bool>,
     /// The prefill unit whose attention runs next (its context gather/commit plan).
     context_unit: Cell<usize>,
-    /// Legacy per-lane transport threads; prefill no longer creates them.
-    pub lanes: RefCell<Vec<SparkLane<'a>>>,
     /// The one prefill transport: every unit's waves, up to `prefill_lanes`
     /// outstanding, each landing in its own return slot. Decode keeps its own
     /// link (its captured graphs bake one intake's planes).
@@ -439,7 +437,7 @@ impl<'a> GlmEngine<'a> {
             prefill_lanes, staged: Cell::new(library.cuda_event_create_ordering()?),
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
-            lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
@@ -1669,6 +1667,67 @@ impl<'a> GlmEngine<'a> {
         self.shared_on(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
     }
 
+    /// A prefill unit's wave on the link's transport worker: the routes and
+    /// wire rows copy into the wave slot's pinned staging on the stream, the
+    /// shared expert queues behind them, and the worker builds and posts the
+    /// request once the copies complete. This thread never waits for the GPU.
+    fn moe_wave(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
+        transport: &mut crate::shared::spark_waves::Waves<'_, '_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
+        self.route_sample(w, index, t, cap)?;
+        // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let ticket = unsafe {
+            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream,
+                Box::new(move |routes, wire| expert_request_parts(routes, wire, index, t, h, topk, false, bf16)))?
+        };
+        // The shared expert runs on the GPU while the worker sends and the Sparks compute.
+        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
+        Ok(ticket)
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?.bytes)
+    }
+
+    /// PROFILE=expert-routes only: this layer-step's MoE input rows (BF16 `x`)
+    /// into their own pinned buffer, saved once their copy completes.
+    fn route_sample(&self, w: &Workspace<'_>, index: usize, t: usize, cap: &str) -> Result<()> {
+        let Some(ordinal) = cuteafd_transport::route_log::input_sample() else { return Ok(()) };
+        let h = self.cfg.hidden;
+        let rows = t.min(cuteafd_transport::route_log::SAMPLE_ROWS);
+        let pinned = HostAllocation::new(self.library, rows * h * 2)?;
+        let ids = HostAllocation::new(self.library, rows * self.cfg.topk * 8)?;
+        // SAFETY: `x`, ids and weights hold this layer-step's rows in stream
+        // order; the event below completes the copies (diagnostic only).
+        unsafe {
+            self.library.copy_d2h_host_buffer_async(pinned.buffer, w.x.buffer, rows * h * 2, self.stream)?;
+            let half = cuteafd_ffi::CuteafdHostBuffer { ptr: ids.buffer.ptr.cast::<u8>().add(rows * self.cfg.topk * 4).cast(),
+                bytes: rows * self.cfg.topk * 4, ..ids.buffer };
+            self.library.copy_d2h_host_buffer_async(ids.buffer, w.route_ids.buffer, rows * self.cfg.topk * 4, self.stream)?;
+            self.library.copy_d2h_host_buffer_async(half, w.route_weights.buffer, rows * self.cfg.topk * 4, self.stream)?;
+            self.library.cuda_event_record(self.staged.get(), self.stream)?;
+            self.library.cuda_event_synchronize(self.staged.get())?;
+        }
+        let staged = ids.bytes();
+        let topk = self.cfg.topk;
+        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
+        cuteafd_transport::route_log::save_sample(cuteafd_transport::route_log::InputSample {
+            ordinal, layer: index as u32, wave_rows: t as u32, hidden: h as u32, topk: topk as u32,
+            kind: if cap == "m64" { cuteafd_transport::ExpertV2SourceKind::Decode } else { cuteafd_transport::ExpertV2SourceKind::Prefill },
+            x_bf16: pinned.bytes()[..rows * h * 2].to_vec(),
+            ids: (0..rows * topk).map(|i| word(0, i) as i32).collect(),
+            weights: (0..rows * topk).map(|i| f32::from_bits(word(rows * topk * 4, i))).collect(),
+            step: None,
+        });
+        Ok(())
+    }
+
     /// One request to every Spark rank from the staged routes and wire rows
     /// ([`Self::moe_stage`]); complete it with [`Self::moe_land`].
     fn moe_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, transport: &mut SparkLink<'_>)
@@ -1687,45 +1746,6 @@ impl<'a> GlmEngine<'a> {
         self.exchange_host.borrow_mut()[3] += post.elapsed().as_secs_f64();
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         Ok(wave)
-    }
-
-    /// Hands a prefill unit's wave to its lane thread: the request is built
-    /// from the staged routes and wire rows ([`Self::moe_stage`]), posted, and
-    /// its rank partials gathered into the lane's intake, all off this
-    /// thread; [`Self::lane_land`] waits for it.
-    fn lane_send(&self, w: &Workspace<'_>, index: usize, t: usize, lane: &mut SparkLane<'_>) -> Result<()> {
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let ranks = lane.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let bf16 = self.spark_bf16;
-        let staged_bytes = t * topk * 8 + t * (if bf16 { h * 2 } else { h + h / 32 });
-        let staged = w.router_host.borrow().buffer;
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-            let bytes = w.router_host.borrow();
-            probe.staged(index, &bytes.bytes()[..t * self.cfg.topk * 4]);
-        }
-        ensure!(staged_bytes <= staged.bytes, "lane wave exceeds its staging");
-        // The address crosses to the lane thread as an integer; see the SAFETY note below.
-        let staged = staged.ptr as usize;
-        let build = Box::new(move || {
-            // SAFETY: the pinned router staging holds this unit's routes and
-            // wire rows (the stage synchronized their copies) and nothing
-            // writes it until this lane's next stage, which follows the wait
-            // for this wave.
-            let staged = unsafe { std::slice::from_raw_parts(staged as *const u8, staged_bytes) };
-            expert_request(staged, index, t, h, topk, false, bf16)
-        });
-        lane.submit(t, build)
-    }
-
-    /// Waits for a lane's wave and orders the stream after its intake;
-    /// returns the rank count the reduce needs.
-    fn lane_land(&self, t: usize, lane: &mut SparkLane<'_>) -> Result<usize> {
-        let timer = std::time::Instant::now();
-        let times = lane.wait(t, std::time::Duration::from_secs(120), self.stream)?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
-        self.exchange_host.borrow_mut()[0] += times.build_post;
-        Ok(lane.world_size())
     }
 
     /// Receives `wave`'s BF16 rank partials into the transport's intake
@@ -1945,13 +1965,17 @@ impl<'a> GlmEngine<'a> {
         }).collect();
         let peers: Vec<Option<&Workspace<'_>>> = (0..waves).map(|slot| peer_workspaces.as_ref()
             .map(|p| p.get(slot)).transpose()).collect::<Result<_>>()?;
-        let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
-            begin: &begin, attention: &attention, post: &post, link, runtime, cap, waves };
         // TP2 route diagnostics: every unit checks its own rows on its own slot
         // (slot storage exists before any peer wait); the span always closes,
         // also before an executor error propagates.
         if let Some(pair) = &self.tp2 { pair.start_checks(self.force_route_check.get())?; }
-        let ran = crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves);
+        // Each wave's request build, post, polling and partial uploads run on
+        // the link's transport worker while this thread queues GPU work.
+        let ran = link.with_waves(self.wave_staging_bytes()?, |transport| {
+            let mut hooks = UnitHooks { engine: self, workspaces: &workspaces, peers: &peers, layers, counts: &counts,
+                begin: &begin, attention: &attention, post: &post, transport, cap, waves };
+            crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &unit_list, waves)
+        });
         if let Some(pair) = &self.tp2 { ran.and(pair.finish_span())?; } else { ran?; }
         // The last unit's workspace holds the call's last rows.
         let last = lanes.len() - 1;
@@ -2338,8 +2362,7 @@ struct UnitHooks<'h, 'e, 'a, 'l, 'r, B, A, P> {
     begin: &'h B,
     attention: &'h A,
     post: &'h P,
-    link: &'h mut SparkLink<'l>,
-    runtime: &'r tokio::runtime::Runtime,
+    transport: &'h mut crate::shared::spark_waves::Waves<'l, 'r>,
     cap: &'static str,
     waves: usize,
 }
@@ -2348,7 +2371,7 @@ impl<B, A, P> crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_
 where B: Fn(usize) -> Result<()>,
       A: Fn(usize, usize) -> Result<()>,
       P: Fn(usize, usize, Option<([*const u16; MAX_RANKS], usize)>) -> Result<()> {
-    type Ticket = SparkExpertWave;
+    type Ticket = crate::shared::spark_waves::WaveTicket;
     fn route(&self, layer: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         if self.layers[layer].dense || self.engine.tp2_layer(layer) {
             crate::shared::prefill_pipeline::FfnRoute::Local
@@ -2370,19 +2393,26 @@ where B: Fn(usize) -> Result<()>,
         }
         (self.post)(layer, unit.index, None)
     }
-    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit) -> Result<SparkExpertWave> {
+    fn send_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit)
+        -> Result<crate::shared::spark_waves::WaveTicket> {
         let w = self.workspaces[unit.index % self.waves];
         let rows = self.counts[unit.index];
-        self.engine.moe_stage(w, layer, &self.layers[layer], rows, self.cap)?;
-        self.engine.moe_send(w, layer, rows, false, self.link)
+        self.engine.moe_wave(w, layer, &self.layers[layer], rows, self.cap, self.transport)
     }
-    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, wave: SparkExpertWave)
-        -> Result<()> {
-        let ranks = self.runtime.block_on(self.engine.moe_land(self.counts[unit.index], self.link, wave))?;
-        // The reduce reads the return slot this wave just landed in; the slot is
-        // reused (dispatch waits on this) only after that reduce.
-        (self.post)(layer, unit.index, Some((self.link.intake.pointers(), ranks)))?;
-        self.link.intake.consumed(self.engine.stream)
+    fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit,
+        wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
+        let slot = wave.slot();
+        let timer = std::time::Instant::now();
+        let times = self.transport.land(wave, self.engine.stream)?;
+        self.engine.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+        self.engine.exchange_host.borrow_mut()[0] += times.posted;
+        if let Some(probe) = self.engine.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            probe.staged(layer, self.transport.staged_ids(slot)?);
+        }
+        // The reduce reads the return slot this wave just landed in; the slot
+        // takes its next wave only after that reduce.
+        (self.post)(layer, unit.index, Some((self.transport.planes(slot), self.transport.ranks())))?;
+        self.transport.consumed(slot, self.engine.stream)
     }
     fn end_unit(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         // Drains (diagnostics only) and compares this unit's routes before its slot is reused.
@@ -2402,13 +2432,21 @@ pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = cuteafd_loader::plan::layout
 #[allow(clippy::too_many_arguments)]
 fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool,
     bf16: bool) -> Result<ExpertProtocolV2Request> {
-    let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
     let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
         if bf16 { h * 2 } else { h + h / 32 })?;
     let routes = layout.routes(staged)?;
     let mut wire = vec![0u8; layout.wire_bytes];
     copy_parallel(&mut wire, layout.wire(staged)?);
-    let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
+    expert_request_parts(routes, wire.into(), index, t, h, topk, decode, bf16)
+}
+
+/// The expert request of `t` rows from its route entries and wire rows
+/// (`wire` is shared, e.g. a view of a wave slot's pinned staging).
+#[allow(clippy::too_many_arguments)]
+fn expert_request_parts(routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, wire: bytes::Bytes,
+    index: usize, t: usize, h: usize, topk: usize, decode: bool, bf16: bool) -> Result<ExpertProtocolV2Request> {
+    let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+    let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32,
         if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,
@@ -2537,7 +2575,7 @@ mod long_graph_tests {
 
 impl Drop for GlmEngine<'_> {
     fn drop(&mut self) {
-        if self.tp2.is_some() || self.layer_execution.is_some() || !self.lanes.borrow().is_empty()
+        if self.tp2.is_some() || self.layer_execution.is_some()
             || (!self.native_experts.is_empty() && self.peer.is_some()) {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }

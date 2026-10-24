@@ -142,6 +142,8 @@ impl SparkExperts {
         self.clients.set_max_waves(waves)
     }
     pub fn max_waves(&self) -> usize { self.clients.max_waves() }
+    /// The response deadline every wave is held to.
+    pub fn timeout(&self) -> std::time::Duration { self.clients.timeout() }
     pub fn open_waves(&self) -> usize { self.open_waves.len() }
     /// Immutable metadata returned by the workers' completed persistent bootstrap.
     pub fn installed_grouping(&self) -> Result<Vec<crate::worker_selection::InstalledExpertGrouping>> {
@@ -372,27 +374,9 @@ impl SparkExperts {
         let mut quantum = std::time::Instant::now();
         let mut first_wait = true;
         let result = loop {
-            let polled = self.clients.poll(|chunk| {
-                if chunk.landed {
-                    let rank = wave.receiver.push_landed(&chunk)?;
-                    ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
-                    receipt.landed |= 1 << rank;
-                    return Ok(());
-                }
-                let mut location = None;
-                wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
-                    ensure!(rank == chunk.stream_id,
-                        "native executor identity does not match its RoCE peer");
-                    location = Some((rank, start));
-                    Ok(())
-                })?;
-                let (rank, start) = location.expect("validated chunk has a location");
-                sink(rank, start, chunk.partial_output_payload)
-            });
-            match polled {
+            match self.poll_once(&mut wave, &mut receipt, &mut sink) {
                 Err(error) => break Err(error),
-                Ok(true) => break if wave.receiver.complete() { Ok(receipt) }
-                    else { Err(anyhow::anyhow!("native TP RoCE response coverage is incomplete")) },
+                Ok(true) => break Ok(receipt),
                 Ok(false) => {}
             }
             // Let another lane run at the first wait; later polls keep this
@@ -405,14 +389,84 @@ impl SparkExperts {
                 std::hint::spin_loop();
             }
         };
-        if let Err(error) = &result {
+        self.finish_receive(&result);
+        result
+    }
+
+    /// One non-blocking progress pass over `wave`, the oldest outstanding
+    /// wave: completed chunks go to `sink`, landed ranks into `receipt`.
+    /// `Ok(true)` once every rank's rows arrived; the wave is then retired.
+    /// An error resets the transport as [`Self::receive_wave_owned`] does.
+    /// A prefill transport worker interleaves these passes with posting the
+    /// next waves, so it never blocks inside one receive.
+    pub fn poll_wave<F>(&mut self, wave: &mut SparkExpertWave, receipt: &mut WaveReceipt, mut sink: F)
+        -> Result<bool>
+    where
+        F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
+    {
+        let result = (|| {
+            ensure!(self.open_waves.front() == Some(&wave.sequence),
+                "Spark waves must be received in dispatch order");
+            self.poll_once(wave, receipt, &mut sink)
+        })();
+        match result {
+            Ok(false) => Ok(false),
+            Ok(true) => { self.finish_receive(&Ok(())); Ok(true) }
+            Err(error) => { let failed = Err(error); self.finish_receive(&failed); failed.map(|()| false) }
+        }
+    }
+
+    fn poll_once<F>(&mut self, wave: &mut SparkExpertWave, receipt: &mut WaveReceipt, sink: &mut F) -> Result<bool>
+    where
+        F: FnMut(usize, u32, VerbsHostProtocolV2ResponsePayload) -> Result<()>,
+    {
+        let polled = self.clients.poll(|chunk| {
+            if chunk.landed {
+                let rank = wave.receiver.push_landed(&chunk)?;
+                ensure!(rank == chunk.stream_id, "native executor identity does not match its RoCE peer");
+                receipt.landed |= 1 << rank;
+                return Ok(());
+            }
+            let mut location = None;
+            wave.receiver.push_rdma(&chunk, |rank, start, _bytes| {
+                ensure!(rank == chunk.stream_id,
+                    "native executor identity does not match its RoCE peer");
+                location = Some((rank, start));
+                Ok(())
+            })?;
+            let (rank, start) = location.expect("validated chunk has a location");
+            sink(rank, start, chunk.partial_output_payload)
+        })?;
+        ensure!(!polled || wave.receiver.complete(), "native TP RoCE response coverage is incomplete");
+        Ok(polled)
+    }
+
+    fn finish_receive<T>(&mut self, result: &Result<T>) {
+        if let Err(error) = result {
             crate::health::record_failure(format!("expert receive failed: {error:#}"));
             self.open_waves.clear();
             self.reset_connections();
         } else {
             self.open_waves.pop_front();
         }
-        result
+    }
+
+    /// Gives up every outstanding wave (their tickets were dropped unread):
+    /// records the failure and resets the QPs exactly as a failed receive
+    /// does. A terminal-owned transport keeps its owners for quiescence.
+    pub fn abandon_waves(&mut self, reason: &str) {
+        if self.open_waves.is_empty() { return; }
+        crate::health::record_failure(format!("expert waves abandoned: {reason}"));
+        self.open_waves.clear();
+        self.reset_connections();
+    }
+
+    /// The registered zero-copy request buffer as a prefill wave's staging
+    /// arena: requests whose payload views it go out without a per-rank copy.
+    /// A wave rewrites it only once the previous wave's replies landed (every
+    /// rank had received that request by then) and no request views it.
+    pub fn egress_arena(&self) -> Option<crate::StagingArena> {
+        self.clients.egress_arena()
     }
 
     fn post(&mut self, request: &ExpertProtocolV2Request) -> Result<V41Tp4ChunkReceiver> {

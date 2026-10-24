@@ -630,7 +630,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "self.weights.layers.len() == self.cfg.layers" in pipeline
     units = (ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash/engine/units.rs").read_text()
     assert "run_prefill_units(&mut hooks, &units, waves)" in units
-    assert "spark_land_unit(" in units and "unit_ffn_finish(" in units
+    assert "wave_land(" in units and "with_waves(" in units and "unit_ffn_finish(" in units
     begin = units.split("    fn begin_unit(", 1)[1].split("    fn attention(", 1)[0]
     attention = units.split("    fn attention(", 1)[1].split("    fn local_ffn(", 1)[0]
     assert "exchange_direct(" not in begin

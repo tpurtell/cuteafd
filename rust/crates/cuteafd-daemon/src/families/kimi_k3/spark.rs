@@ -54,7 +54,7 @@ pub(crate) struct RoutedLane<'a> {
     /// Most outstanding waves; each holds one intake return slot of `unit` rows.
     waves: usize,
     unit: usize,
-    sequence: u64,
+    sequence: std::cell::Cell<u64>,
     /// Dispatched waves in dispatch order, received oldest first.
     outstanding: std::collections::VecDeque<Outstanding>,
 }
@@ -102,7 +102,7 @@ impl<'a> RoutedLane<'a> {
                 "Kimi bootstrap requires installed grouping from all six ranks");
         }
         Ok(Self { stream, link: Some(link), runtime, library_owner: Arc::clone(library_owner),
-            terminal: false, staging, ready, capacity: unit, waves, unit, sequence: 0,
+            terminal: false, staging, ready, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
             outstanding: std::collections::VecDeque::new() })
     }
 
@@ -157,7 +157,7 @@ impl<'a> RoutedLane<'a> {
         self.check(local, rows)?;
         ensure!(self.outstanding.len() < self.waves, "Kimi main link already has {} outstanding waves", self.waves);
         ensure!(rows <= self.unit, "Kimi wave of {rows} rows exceeds its {}-row return slot", self.unit);
-        let sequence = self.sequence.checked_add(1).context("Kimi Spark request sequence overflow")?;
+        let sequence = self.sequence.get().checked_add(1).context("Kimi Spark request sequence overflow")?;
         let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
         self.stream.device.run(|| {
             // SAFETY: LocalLane and this engine-retained staging owner survive
@@ -176,12 +176,66 @@ impl<'a> RoutedLane<'a> {
         if let Some(probe) = probe { probe.staged(layer, &self.staging.bytes()[..layout.route_bytes]); }
         let request = request(layer, rows, sequence, kind, &layout, self.staging.bytes())?;
         let ticket = Ticket { layer, rows, sequence };
-        self.sequence = sequence;
+        self.sequence.set(sequence);
         let output = local.buffer("expert combined")?;
         let link = self.link.as_mut().context("Kimi Spark lane retired")?;
         let wave = self.stream.device.run(|| link.dispatch(&request))?;
         self.outstanding.push_back(Outstanding { ticket, wave, output });
         Ok(ticket)
+    }
+
+    pub(crate) fn has_link(&self) -> bool { self.link.is_some() }
+
+    /// Runs `body` with this lane's link driven by a transport worker (a
+    /// prefill call): [`Self::begin_wave`] and [`Self::finish_wave`] then send
+    /// and land through it, never waiting for the GPU on this thread. The
+    /// link is lent to the worker for the call and restored after it (also
+    /// on error, so terminal teardown still finds it).
+    pub(crate) fn with_waves_mut<T>(&mut self,
+        body: impl FnOnce(&mut Self, &mut crate::shared::spark_waves::Waves<'_, 'a>) -> Result<T>) -> Result<T> {
+        ensure!(self.outstanding.is_empty() && !self.terminal, "Kimi prefill transport needs an idle lane");
+        let mut link = self.link.take().context("Kimi Spark lane retired")?;
+        let bytes = RouteStaging::new(self.unit, TOPK, KimiExpertInput::ROW_BYTES)?.bytes;
+        let device = self.stream.device;
+        let result = device.run(|| link.with_waves(bytes, |waves| body(self, waves)));
+        self.link = Some(link);
+        result
+    }
+
+    /// [`Self::begin`] for a prefill wave on the link's transport worker: the
+    /// route copies queue into the wave slot's staging ahead of the shared
+    /// FFN; the worker builds and posts once they complete.
+    pub(crate) fn begin_wave(&self, waves: &mut crate::shared::spark_waves::Waves<'_, '_>, local: &mut LocalLane<'a>,
+        layer: usize, rows: usize, kind: ExpertV2SourceKind, routes: cuteafd_ffi::KimiRoutes,
+        wire: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<crate::shared::spark_waves::WaveTicket> {
+        ensure!(Rc::ptr_eq(&self.stream, local.stream()) && (1..=self.unit).contains(&rows),
+            "Kimi Spark wave differs from retained lane stream or unit");
+        ensure!((1..93).contains(&layer), "Kimi Spark request geometry");
+        let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
+        let sequence = self.sequence.get().checked_add(1).context("Kimi Spark request sequence overflow")?;
+        let ticket = self.stream.device.run(|| {
+            // SAFETY: LocalLane retains these operands through whole-submission
+            // teardown; the copies read them in stream order.
+            unsafe { waves.send(rows, layout, [routes.ids, routes.weights, wire], self.stream.raw,
+                Box::new(move |routes, wire| request_parts(layer, rows, sequence, kind, routes, wire))) }
+        })?;
+        self.sequence.set(sequence);
+        local.ffn(layer, rows)?;
+        Ok(ticket)
+    }
+
+    /// [`Self::finish`] for a prefill wave: the lane stream waits for the
+    /// wave's planes and reduces them into the latent output rows.
+    pub(crate) fn finish_wave(&self, waves: &mut crate::shared::spark_waves::Waves<'_, '_>, local: &LocalLane<'a>,
+        ticket: crate::shared::spark_waves::WaveTicket) -> Result<()> {
+        let output = local.buffer("expert combined")?;
+        let (slot, rows) = (ticket.slot(), ticket.rows());
+        self.stream.device.run(|| {
+            waves.land(ticket, self.stream.raw)?;
+            // SAFETY: `land` orders all six live planes before this exact lane
+            // stream; the output is a disjoint admitted latent allocation.
+            unsafe { waves.reduce(slot, std::ptr::null(), output.ptr.cast(), rows, self.stream.raw) }
+        })
     }
 
     /// All six latent partials are reduced once with FP32 accumulation and one
@@ -222,18 +276,22 @@ fn bootstrap_request(layer: usize, rows: usize) -> Result<ExpertProtocolV2Reques
 
 fn request(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
     layout: &RouteStaging, bytes: &[u8]) -> Result<ExpertProtocolV2Request> {
+    request_parts(layer, rows, sequence, kind, layout.routes(bytes)?, layout.wire(bytes)?.to_vec().into())
+}
+
+fn request_parts(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
+    routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
     ensure!((1..93).contains(&layer) && (1..=4096).contains(&rows) && sequence > 0,
         "Kimi Spark request geometry or sequence");
-    let routes = layout.routes(bytes)?;
     ensure!(routes.len() == rows * TOPK && routes.iter().all(|route|
         route.expert_id < 896 && route.gate_weight.is_finite() && route.gate_weight >= 0.0),
         "Kimi Spark route outside E896/K16 or invalid gate weight");
-    let mut request = ExpertProtocolV2Request::new(sequence, 17, layer as u32, LATENT as u32,
+    let mut request = ExpertProtocolV2Request::new_bytes(sequence, 17, layer as u32, LATENT as u32,
         ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row as u64,
             source_kind: kind, source_request_id: sequence, token_position: row as u64,
             route_offset: (row * TOPK) as u32, route_count: TOPK as u32 }).collect(),
-        routes, layout.wire(bytes)?.to_vec())?;
+        routes, wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
 }
