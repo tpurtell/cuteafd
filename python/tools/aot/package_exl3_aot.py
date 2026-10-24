@@ -281,7 +281,7 @@ def route_block(geometry: str, capacity: int) -> int:
         return int(override[str(capacity)])
     if geometry == 'qwen4':
         return qwen4_route_block(capacity)
-    if geometry in ('glm', 'glmf'):
+    if geometry in ('glm', 'glmf', 'kimik3'):
         return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
@@ -296,6 +296,9 @@ def glm_route_block(capacity: int) -> int:
     m4096 32/64 = 13820/11790 (64 with token-major rotation 11470). m256
     keeps 8 rows (16 is 1.9% faster on the RTX, but its Spark TP3 width-640
     kernel resolves a residency the native bridge does not take).
+    Kimi K3 (896 experts, top-16, capacity / 56 rows per expert on average)
+    follows the same boundary on SM120 coordinator packages (m256 keeps 8 rows;
+    m1024 and m4096 use 64-row blocks, see `warp_specialized`).
     """
     return 8 if capacity <= 256 else 64
 
@@ -316,8 +319,10 @@ def token_major_rotation(geometry: str, capacity: int) -> bool:
     Bit-identical to per-route rotation. It pays where the rotation phase is
     large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
     """
-    if geometry in ('glm', 'glmf', 'qwen4'):
+    if geometry in ('glm', 'glmf', 'qwen4', 'kimik3'):
         # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
+        # Kimi K3 top-16 (SM120): m1024 width1536 8756.86 -> 4909.73 us (1.784x),
+        # width3072 17200.77 -> 9633.41 us (1.786x).
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
 
@@ -377,13 +382,28 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     stay cooperative, as does width2048 (m256 3120.77 vs 3022.50 us
     inside round spread; m1024/m2752/m4096 cooperative 2817.63/6270.43/
     7966.37 vs WS 2912.93/6357.66/8128.13 us).
+    Kimi K3 (H3584/E896/top16, situ, K2 weights with K3 slots, k5_experts=0,
+    random top-16 routes, five interleaved rounds of five graph replays):
+    m256 stays on 8-row cooperative per-route rotation at both widths
+    (width1536 3429.02 us vs WS 3768.99 us / tok_b64 3888.80 us; width3072
+    7056.03 us vs coop_b64 8195.74 us / WS 8576.67 us). m1024 uses 64-row
+    cooperative token-major rotation (width1536 8756.86 -> 4909.73 us,
+    1.784x, overlapping ws_b32 4882.02 us and beating ws_b64 5013.12 us;
+    width3072 17200.77 -> 9633.41 us, 1.786x, beating ws_b32 9823.87 us and
+    ws_b64_dyn 10087.01 us). m4096 uses BF16 WS with dynamic tiles (resolved
+    3 input stages, 8 weight stages, 1 CTA/SM): width1536 30688.93 ->
+    12151.55 us (2.526x vs coop, 1.060x vs tok_b64 12885.66 us, 1.038x vs
+    static WS 12610.62 us); width3072 60103.29 -> 24238.72 us (2.480x vs
+    coop, 1.019x vs tok_b64 24700.54 us, 1.035x vs static WS 25099.10 us).
     Other tier pairs, widths, families and unmeasured capacities stay off.
     """
     if role == 'coordinator':
         if geometry == 'glm':
             return ((width == 1024 and capacity in (256, 1024, 2752))
                     or (width == 2048 and capacity == 256))
-        return geometry == 'glmf' and width == 1024 and capacity in (256, 2752)
+        if geometry == 'glmf':
+            return width == 1024 and capacity in (256, 2752)
+        return geometry == 'kimik3' and width in (1536, 3072) and capacity == 4096
     if role != 'spark':
         return False
     if geometry == 'kimik3':
@@ -433,13 +453,17 @@ def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int 
 
 
 def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Whether Spark warp-specialized exports claim tiles dynamically. With the
+    """Whether warp-specialized exports claim tiles dynamically. With the
     static round-robin an expert's route blocks start on different CTAs at
-    different times and each streams the expert's weights from LPDDR5X (ncu,
+    different times and each streams the expert's weights from memory (ncu,
     width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
-    Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
+    Bit-identical; used on GLM 5.3 wire exports and Kimi K3 SM120 coordinator
+    m4096 exports (see `wire_input` and `warp_specialized`).
     """
-    return wire_input(geometry, role, width, capacity)
+    return wire_input(geometry, role, width, capacity) or (
+        role == 'coordinator' and geometry == 'kimik3'
+        and warp_specialized(geometry, role, width, capacity)
+    )
 
 
 def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
@@ -886,13 +910,15 @@ def build(args: argparse.Namespace) -> None:
                 block = route_block(geometry, capacity)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
                                     and (args.role != 'coordinator'
-                                         or (geometry, tuple(args.bits)) in (('glm', (4, 5)), ('glmf', (3, 4))))
+                                         or (geometry, tuple(args.bits)) in (
+                                             ('glm', (4, 5)), ('glmf', (3, 4)), ('kimik3', (2, 3))))
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 32 if compact_ws else 64
                     if geometry == 'kimik3' or args.role == 'coordinator':
                         # Existing policy-keyed directories contain cooperative exports.
                         suffix = ('-wire-s3-dynamic' if wire_input(geometry, args.role, width, capacity)
+                                  else '-bf16-dynamic' if ws_dynamic_tiles(geometry, args.role, width, capacity)
                                   else '-bf16-static' if args.role == 'coordinator' else '')
                         profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}{suffix}')
                         raw = profile_dir / f'm{capacity}'

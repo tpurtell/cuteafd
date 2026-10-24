@@ -632,6 +632,11 @@ class PackageProfileTests(unittest.TestCase):
                                  for c in capacities))
         self.assertFalse(any(package.warp_specialized('kimik3', 'coordinator', 512, c)
                              for c in capacities))
+        for width in (1536, 3072):
+            self.assertEqual([package.warp_specialized('kimik3', 'coordinator', width, c)
+                              for c in capacities], [False] * 6 + [True])
+            self.assertEqual([package.ws_dynamic_tiles('kimik3', 'coordinator', width, c)
+                              for c in capacities], [False] * 6 + [True])
         self.assertFalse(any(package.compact_warp_specialized('kimik3', 'spark', 512, c)
                              for c in capacities))
         with tempfile.TemporaryDirectory() as temporary:
@@ -645,9 +650,36 @@ class PackageProfileTests(unittest.TestCase):
                     self.assertTrue(call.kwargs['warp_specialized'])
                     self.assertEqual(call.kwargs['route_block'], 64)
                     self.assertIn('+ws-m64/', str(call.args[0]))
+                    self.assertNotIn('ws_dynamic_tiles', call.kwargs)
+                    self.assertNotIn('token_major_rotation', call.kwargs)
                 else:
                     self.assertNotIn('warp_specialized', call.kwargs)
                     self.assertNotIn('+ws-', str(call.args[0]))
+        for bits in ((2, 3), (3, 4), (2, 3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='kimik3',
+                    capacities=(80, 256, 1024, 4096))
+                for call in calls:
+                    width, capacity = call.args[1], call.args[3]
+                    ws = bits == (2, 3) and width in (1536, 3072) and capacity == 4096
+                    self.assertEqual(call.kwargs['activation'], 'situ')
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), ws)
+                    self.assertFalse(call.kwargs.get('wire_input', False))
+                    self.assertIsNone(call.kwargs.get('ws_input_stages'))
+                    if capacity <= 256:
+                        self.assertNotIn('route_block', call.kwargs)
+                        self.assertNotIn('token_major_rotation', call.kwargs)
+                        self.assertNotIn('+ws-', str(call.args[0]))
+                    elif ws:
+                        self.assertEqual(call.kwargs['route_block'], 64)
+                        self.assertNotIn('token_major_rotation', call.kwargs)
+                        self.assertIn('+ws-m64-bf16-dynamic/', str(call.args[0]))
+                    else:
+                        self.assertEqual(call.kwargs['route_block'], 64)
+                        self.assertEqual(call.kwargs.get('token_major_rotation', False), len(bits) == 2)
+                        self.assertNotIn('+ws-', str(call.args[0]))
 
     def test_decode_capacities_ship_the_canonical_tile(self):
         """A decode capacity the B12x planner widens is pinned to m1's tile (#309).

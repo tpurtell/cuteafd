@@ -26,8 +26,9 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(spark["tp6-width512"],
                          (512, 896, 16, "bf16", [f"tp6-rank{i}" for i in range(6)]))
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role("coordinator", "kimik3")}
-        self.assertEqual(set(coordinator), {"rtx-tp1"})
+        self.assertEqual(set(coordinator), {"rtx-tp1", "rtx-tp2"})
         self.assertEqual(coordinator["rtx-tp1"], (3072, 896, 16, "fp32", ["rtx-tp1"]))
+        self.assertEqual(coordinator["rtx-tp2"], (1536, 896, 16, "fp32", ["rtx-tp2"]))
         for geometry in set(tool.GEOMETRIES) - {"kimik3"}:
             self.assertEqual(tool.activation(geometry), "silu")
 
@@ -39,10 +40,19 @@ class GlmExl3PackageTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 tool.package_capacities('kimik3', invalid)
         for capacity in (1, 80, 256, 1024, 4096):
-            self.assertEqual(tool.route_block('kimik3', capacity), 8)
-            for width in (512, 3072):
+            self.assertEqual(tool.route_block('kimik3', capacity), 8 if capacity <= 256 else 64)
+            self.assertEqual(tool.token_major_rotation('kimik3', capacity), capacity > 256)
+            for width in (512, 1536, 3072):
                 self.assertIsNone(tool.decode_tile('kimik3', width, capacity))
-                self.assertFalse(tool.warp_specialized('kimik3', 'spark', width, capacity))
+                self.assertEqual(tool.warp_specialized('kimik3', 'spark', width, capacity),
+                                 width == 512 and capacity >= 1024)
+                self.assertEqual(tool.warp_specialized('kimik3', 'coordinator', width, capacity),
+                                 width in (1536, 3072) and capacity == 4096)
+                self.assertEqual(tool.ws_dynamic_tiles('kimik3', 'coordinator', width, capacity),
+                                 width in (1536, 3072) and capacity == 4096)
+                self.assertFalse(tool.ws_dynamic_tiles('kimik3', 'spark', width, capacity))
+                self.assertFalse(tool.wire_input('kimik3', 'coordinator', width, capacity))
+                self.assertIsNone(tool.ws_input_stages('kimik3', 'coordinator', width, capacity))
 
     def test_profiles(self):
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role('coordinator', 'glm')}
