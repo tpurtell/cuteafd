@@ -418,6 +418,21 @@ def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
     -> wire/stage3/dynamic 1516.48 us (1.146x random, 1.204x median paired
     across 72 histograms), conditions in `warp_specialized`. At m1024 wire
     loses on random (0.927x); wider coordinator profiles keep BF16 input.
+
+    SM121 GB10 (cassowary, 48 SMs), 2026-10-24, GLM 5.3 Flash (`glmf`, H4096,
+    E288, top-8, 216 K3 + 72 K4 per projection, random top-8 routes, 3
+    interleaved rounds of 20 graph replays, ms, all bit-exact):
+    width1024 (TP2) m256/m1024/m2752/m4096 shipped `ws_base` (BF16, default
+    stages=(3,6), static) 6.052 / 6.981 / 13.177 / 15.861 vs `served`
+    (wire/stage3/dynamic) 6.014 (1.006x) / 6.961 (1.003x) / 12.717 (1.036x) /
+    16.149 (0.982x) and `wire4` (wire/stage4/dynamic) 6.011 / 6.940 / 12.806 /
+    16.267 (0.975x); width512 (TP4) `ws_base` 3.139 / 3.824 / 7.490 / 9.059 vs
+    `served` 3.122 (1.005x) / 3.828 (0.999x) / 7.198 (1.041x) / 9.288 (0.975x)
+    and `wire4` 3.108 / 3.805 / 7.191 / 9.154 (0.990x). Direct wire regresses
+    at m4096 at both widths; BF16 + dynamic (`bf16_dyn` / `bf16_s4_dyn`) reaches
+    15.724 / 15.597 ms at width1024 m4096 (1.009x / 1.017x, ~1.5% of the
+    17.20 ms worker budget vs the 15% stop bar), so `glmf` Spark stays on
+    shipped `ws_base`.
     """
     return (geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
             and (role == 'spark' or (width == 1024 and capacity == 256)))

@@ -623,6 +623,28 @@ class PackageProfileTests(unittest.TestCase):
             self.assertFalse(package.warp_specialized('glmf', 'coordinator', 2048, capacity))
         self.assertFalse(package.warp_specialized('glmf', 'coordinator', 1024, 1024))
 
+    def test_glmf_spark_ws_retains_bf16_static_policy(self):
+        for width in (512, 1024):
+            for capacity in (256, 1024, 2752, 4096):
+                self.assertTrue(package.warp_specialized('glmf', 'spark', width, capacity))
+                self.assertFalse(package.wire_input('glmf', 'spark', width, capacity))
+                self.assertIsNone(package.ws_input_stages('glmf', 'spark', width, capacity))
+                self.assertFalse(package.ws_dynamic_tiles('glmf', 'spark', width, capacity))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (3, 4), geometry='glmf',
+                capacities=(80, 256, 1024, 2752, 4096))
+            for call in calls:
+                capacity = call.args[3]
+                ws = capacity >= 256
+                self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                self.assertFalse(call.kwargs.get('wire_input', False))
+                self.assertIsNone(call.kwargs.get('ws_input_stages'))
+                self.assertFalse(call.kwargs.get('ws_dynamic_tiles', False))
+                if ws:
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                    self.assertNotIn('token_major_rotation', call.kwargs)
+
     def test_kimi_ws64_only_for_qualified_ordinary_tp6_prefill(self):
         capacities = (1, 16, 80, 256, 1024, 2048, 4096)
         self.assertEqual([package.warp_specialized('kimik3', 'spark', 512, c)
