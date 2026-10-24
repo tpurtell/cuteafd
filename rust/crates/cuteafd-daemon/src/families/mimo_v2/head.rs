@@ -6,6 +6,11 @@ use std::ffi::c_void;
 
 pub(crate) const FP8_HEAD_ROWS: usize = 16;
 
+/// FP8 execution views use AOT kernels, not an opaque BF16 BLAS plan.
+pub(super) fn workspace_bf16_head<T>(fp8: bool, create: impl FnOnce() -> Result<T>) -> Result<Option<T>> {
+    if fp8 { Ok(None) } else { create().map(Some) }
+}
+
 fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)> {
     (0..rows).step_by(FP8_HEAD_ROWS).map(move |first| (first, FP8_HEAD_ROWS.min(rows -first)))
 }
@@ -98,6 +103,20 @@ impl BorrowedHead<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fp8_target_workspace_constructs_no_bf16_handles() {
+        let head = workspace_bf16_head::<()>(true, || panic!("FP8 must not create a BF16 handle"))
+            .unwrap();
+        assert!(head.is_none());
+        let calls = std::cell::Cell::new(0);
+        let head = workspace_bf16_head(false, || {
+            calls.set(calls.get() + 1);
+            Ok(17)
+        }).unwrap();
+        assert_eq!(head, Some(17));
+        assert_eq!(calls.get(), 1);
+    }
+
     #[test]
     fn every_target_and_drafter_tail_is_covered_without_a_fallback() {
         for rows in 1..=4096 {

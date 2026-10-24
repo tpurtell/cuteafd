@@ -860,7 +860,8 @@ impl<'a> MimoEngine<'a> {
             experts: Some(Experts::Spark { decode,
                 prefill: Rc::clone(prefill), second: RefCell::new(None), runtime: Rc::clone(runtime) }), tp2, rtx_local: self.rtx_local.clone(),
             expert_input: self.expert_input, profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
-            wave_timing: self.wave_timing, drafter: self.drafter.as_ref().map(|draft| draft.execution_view()).transpose()?,
+            wave_timing: self.wave_timing, drafter: self.drafter.as_ref().map(|draft|
+                draft.execution_view(matches!(self.weights.head, super::head::MimoHead::Fp8 { .. }))).transpose()?,
             l2: None, mtp: None, embedding: Rc::clone(&self.embedding),
             mtp_staging: RefCell::new((HostAllocation::new(self.library, 256)?, 0)),
             prefill_w8a8: self.prefill_w8a8, output_fp8_decode: self.output_fp8_decode, kv_cache: self.kv_cache,
@@ -868,7 +869,10 @@ impl<'a> MimoEngine<'a> {
             graph_storage_bound_bytes: self.graph_storage_bound_bytes.clone(),
             graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0),
         };
-        *view.decode_workspace.borrow_mut() = Some(view.workspace(0, DECODE_ROWS, true)?);
+        let fp8_head = matches!(view.weights.head, super::head::MimoHead::Fp8 { .. });
+        // Keep the original lane unchanged; only this FP8 view omits unused BLAS plans.
+        *view.decode_workspace.borrow_mut() = Some(view.on(0, ||
+            view.workspace_here(0, DECODE_ROWS, true, true, fp8_head))?);
         if let Some(peer) = &view.peer {
             *peer.decode_workspace.borrow_mut() = Some(view.workspace(1, DECODE_ROWS, true)?);
         }
@@ -1311,7 +1315,7 @@ impl<'a> MimoEngine<'a> {
     /// Rank `rank`'s workspace for steps of up to `t` rows (rank 1 holds the
     /// attention-side buffers only); allocated on that rank's GPU.
     fn workspace(&self, rank: usize, t: usize, decode: bool) -> Result<Workspace<'a>> {
-        self.on(rank, || self.workspace_here(rank, t, decode, true))
+        self.on(rank, || self.workspace_here(rank, t, decode, true, false))
     }
 
     /// All consumers use this rank's compute stream. A lane's next widen is
@@ -1333,7 +1337,7 @@ impl<'a> MimoEngine<'a> {
 
     /// `head`: the LM head and its logits (only the first row lane of a
     /// pipelined prefill skips them).
-    fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool) -> Result<Workspace<'a>> {
+    fn workspace_here(&self, rank: usize, t: usize, decode: bool, head: bool, fp8_head: bool) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("workspace");
         let h = self.cfg.hidden;
         let lead = rank == 0;
@@ -1392,8 +1396,10 @@ impl<'a> MimoEngine<'a> {
             select: self.alloc(size(layout.select)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
             head: if with_head {
-                Some(Rc::new(unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32, size(layout.logits_rows)? as u32,
-                    self.cfg.vocab_size as u32)? }))
+                super::head::workspace_bf16_head(fp8_head, || Ok(Rc::new(unsafe {
+                    self.library.vocabulary_head_rows(head_workspace.buffer.ptr, h as u32,
+                        size(layout.logits_rows)? as u32, self.cfg.vocab_size as u32)?
+                })))?
             } else {
                 None
             },

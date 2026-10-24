@@ -98,7 +98,7 @@ struct Workspace<'a> {
     ids: Dev<'a>,
     attention_workspace: Dev<'a>,
     topk_workspace: Dev<'a>,
-    head: VocabularyHead<'a>,
+    head: Option<VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
 }
 
@@ -367,7 +367,9 @@ mod mask_tests {
 impl<'a> MimoDrafter<'a> {
     /// Construct before readiness: only weights and request rings are shared.
     /// Taps, context-update staging, timing and draft scratch are view-local.
-    pub(super) fn execution_view(&self) -> Result<Self> {
+    /// BF16 heads are constructed here, never on a request or inside capture;
+    /// FP8 target heads need no BLAS handle.
+    pub(super) fn execution_view(&self, fp8_head: bool) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/lane1");
         let alloc = |source: &Dev<'a>| DeviceAllocation::new(self.library, source.buffer.bytes);
         let mut view = Self {
@@ -379,7 +381,7 @@ impl<'a> MimoDrafter<'a> {
             context_slots: alloc(&self.context_slots)?, workspace: RefCell::new(None),
             fp8_workspace: self.fp8_workspace.as_ref().map(alloc).transpose()?,
         };
-        let workspace = view.workspace(view.max_sequences)?;
+        let workspace = view.workspace_with_head(view.max_sequences, fp8_head)?;
         *view.workspace.get_mut() = Some(workspace);
         Ok(view)
     }
@@ -624,6 +626,10 @@ impl<'a> MimoDrafter<'a> {
     }
 
     fn workspace(&self, sequences: usize) -> Result<Workspace<'a>> {
+        self.workspace_with_head(sequences, false)
+    }
+
+    fn workspace_with_head(&self, sequences: usize, fp8_head: bool) -> Result<Workspace<'a>> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter/workspace");
         let c = &self.cfg;
         let rows = sequences * c.block;
@@ -652,8 +658,10 @@ impl<'a> MimoDrafter<'a> {
                 c.block, RING + c.block)?)?,
             topk_workspace: alloc(self.library.glm_dflash_topk_workspace(drafted)?)?,
             // SAFETY: the workspace buffer lives in the same struct and drops after the head.
-            head: unsafe { self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
-                rows as u32, c.vocab as u32)? },
+            head: super::head::workspace_bf16_head(fp8_head, || unsafe {
+                self.library.vocabulary_head_rows(head_workspace.buffer.ptr, c.hidden as u32,
+                    rows as u32, c.vocab as u32)
+            })?,
             _head_workspace: head_workspace,
         })
     }
@@ -667,7 +675,7 @@ impl<'a> MimoDrafter<'a> {
         ensure!(head.hidden == self.cfg.hidden && head.vocab == self.cfg.vocab,
             "DFlash borrowed target head geometry differs from its checkpoint");
         self.draft_from(sequences, Anchors::Tokens(embedding), |plan, x, out, rows|
-            head.launch_draft(Some(plan), x, out, rows, self.stream))
+            head.launch_draft(plan, x, out, rows, self.stream))
     }
 
     /// [`Self::draft`] from the anchors' embedding rows (oracles and replays).
@@ -675,12 +683,12 @@ impl<'a> MimoDrafter<'a> {
         self.draft_from(sequences, Anchors::Rows(anchor_rows), |plan, x, out, rows| {
             // SAFETY: ReplayDrafter's caller retains a complete BF16 target
             // head. FP8-only targets reject that diagnostic before loading.
-            unsafe { plan.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
+            unsafe { plan.context("BF16 replay head workspace")?.launch(x.ptr.cast(), head.cast(), out.ptr.cast(), rows as u32, self.stream) }
         })
     }
 
     fn draft_from(&self, sequences: &[DraftSeq], anchors: Anchors<'_>,
-        head: impl FnOnce(&VocabularyHead<'_>, CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<Vec<Draft>> {
+        head: impl FnOnce(Option<&VocabularyHead<'_>>, CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize) -> Result<()>) -> Result<Vec<Draft>> {
         let c = &self.cfg;
         let (s_count, block, h) = (sequences.len(), c.block, c.hidden);
         let anchors_fit = match anchors {
@@ -766,7 +774,7 @@ impl<'a> MimoDrafter<'a> {
             }
             self.timing.end(forward_span, s)?;
             let head_span = self.timing.begin("head_topk", None, rows, s)?;
-            head(&w.head, w.n.buffer, w.logits.buffer, rows)?;
+            head(w.head.as_ref(), w.n.buffer, w.logits.buffer, rows)?;
             l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
                 w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
             self.timing.end(head_span, s)?;
