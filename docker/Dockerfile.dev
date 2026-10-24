@@ -21,8 +21,8 @@ RUN apt-get update && \
     mkdir -p /opt/cuteafd && dpkg -l > /opt/cuteafd/dpkg-packages.txt && \
     rm -rf /var/lib/apt/lists/*
 
-# Pinned toolchain: a release at least two weeks old, so builds do not move under us.
-ARG RUST_TOOLCHAIN=1.98.1
+# Current pinned toolchain, explicitly approved for the CUDA 13.4 qualification.
+ARG RUST_TOOLCHAIN=1.99.1
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain ${RUST_TOOLCHAIN} && \
     rustup component add rustfmt
 
@@ -46,18 +46,18 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
       "huggingface-hub==1.14.0" \
       "tokenizers==0.23.1" && \
     uv pip install --system --break-system-packages \
-      "nvidia-cutlass-dsl[cu13]==4.6.2" \
-      "apache-tvm-ffi==0.1.12" \
-      "cuda-tile==1.5.0" \
-      "nvidia-cudnn-frontend==1.26.0" \
+      "nvidia-cutlass-dsl[cu13]==4.8.1" \
+      "apache-tvm-ffi==0.1.15.post0" \
+      "cuda-tile==1.7.0" \
+      "nvidia-cudnn-frontend==1.31.0" \
       "einops==0.8.2" \
       "ninja==1.13.0" \
       "nvidia-ml-py==13.610.43" \
       "pillow==12.2.0" \
       "tabulate==0.10.0" \
       "rich==15.0.0" && \
-    uv pip install --system --break-system-packages --no-deps \
-      "flashinfer-python==0.6.14"
+    uv pip install --system --break-system-packages \
+      "flashinfer-python==0.7.2.post1"
 
 # Toolchain only: kernels and their lock come from the mounted checkout.
 RUN uv pip check
@@ -69,7 +69,7 @@ LABEL org.opencontainers.image.source="https://github.com/tpurtell/cuteafd" \
       org.opencontainers.image.description="CuteAFD build toolchain; mount the checkout for SparkInfer kernels" \
       io.cuteafd.base.digest=${BASE_IMAGE} \
       io.cuteafd.rust.version=${RUST_TOOLCHAIN} \
-      io.cuteafd.cutlass-dsl.version="4.6.2" \
+      io.cuteafd.cutlass-dsl.version="4.8.1" \
       io.cuteafd.kache.version=${KACHE_VERSION} \
       io.cuteafd.sccache.version=${SCCACHE_VERSION} \
       io.cuteafd.toolchain.hash=${CUTEAFD_TOOLCHAIN_HASH}

@@ -264,5 +264,5 @@ def test_identity_excludes_kernel_pin_and_includes_tool_versions(tmp_path):
     (repo / 'third_party/sparkinfer.lock.json').write_text('new pin')
     assert TOOLCHAIN.identity(repo) == before
     dockerfile = repo / 'docker/Dockerfile.dev'
-    dockerfile.write_text(dockerfile.read_text().replace('1.98.1', '1.98.2'))
+    dockerfile.write_text(dockerfile.read_text().replace('1.99.1', '1.99.2'))
     assert TOOLCHAIN.identity(repo) != before
