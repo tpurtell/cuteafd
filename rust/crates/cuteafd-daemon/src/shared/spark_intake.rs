@@ -1465,14 +1465,24 @@ impl<'a> SparkLink<'a> {
     /// ordered on `stream` before this call.
     pub(crate) unsafe fn reduce(&self, shared: *const u16, output: *mut u16, t: usize, stream: *mut c_void)
         -> Result<()> {
+        // SAFETY: the caller supplies the same live operands to the shared implementation.
+        unsafe { self.reduce_with_drain(shared, output, t, stream, true) }
+    }
+
+    /// Aggregate callers retain operands and drain both views after joining.
+    ///
+    /// # Safety
+    /// Same operand and stream requirements as `reduce`.
+    pub(crate) unsafe fn reduce_with_drain(&self, shared: *const u16, output: *mut u16,
+        t: usize, stream: *mut c_void, local_drain: bool) -> Result<()> {
         let library = self.intake.library;
-        let drain = ReceiveDrain(Some(|| {
+        let drain = ReceiveDrain::when(local_drain, || {
             // SAFETY: the borrowed inputs outlive this call, including a partial
             // kernel launch or a failed consumption-event publication.
             crate::shared::decode_graph::fatal_drain(unsafe {
                 self.intake.terminal_drain_copies().and_then(|()| library.cuda_stream_synchronize(stream))
             }, "failed Spark intake reduction");
-        }));
+        });
         // SAFETY: the planes hold this wave's `t` rows once `stream` reaches
         // this point (see `receive`); the caller vouches for the rest.
         unsafe {

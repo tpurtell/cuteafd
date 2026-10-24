@@ -1599,7 +1599,7 @@ impl<'a> MimoEngine<'a> {
     async fn verify_device_async(&self, sequences: &mut [(&mut MimoPlacement, usize)],
         tokens: &[u32]) -> Result<Option<DeviceLogits>> {
         self.require_live()?;
-        ensure!(self.decode_graphs && self.graphable(), "independent MiMo verification needs startup decode graphs");
+        ensure!(self.graphable(), "independent MiMo verification needs every target layer");
         let rows: usize = sequences.iter().map(|(_, count)| count).sum();
         ensure!(rows > 0 && rows <= DECODE_ROWS && tokens.len() == rows, "decode step of {rows} rows");
         let stride = self.decode_stride();
@@ -1620,30 +1620,10 @@ impl<'a> MimoEngine<'a> {
             }
         }
         self.prepare_tp2_route_step(&[rows])?;
-        let owned = self.decode_workspace.borrow();
-        let w = owned.as_ref().context("decode workspace must be constructed before readiness")?;
-        let peer_owned = self.peer.as_ref().map(|peer| peer.decode_workspace.borrow());
-        let w1 = peer_owned.as_ref().map(|owned| owned.as_ref().context("peer decode workspace before readiness")).transpose()?;
-        // At a yield boundary both rank streams contain only matched waits.
-        // The preceding use of this view's input tables must finish before upload.
-        for (rank, work) in std::iter::once(w).chain(w1).enumerate() {
-            self.on(rank, || {
-                // SAFETY: both views retain all operands on the serialized rank stream.
-                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank))?; }
-                self.put_step_inputs(rank, work, &tables.positions)?;
-                self.put(&work.slots, &tables.slots)?;
-                self.put(&work.ring_slots, &tables.ring_slots)?;
-                self.put(&work.seq_first, &tables.seq_first)?;
-                self.put(&work.page_table, &tables.page_table)
-            })?;
-        }
-        let gather = self.embedding.device_gather();
-        if gather { self.embedding.check(tokens)?; self.put(&w.ids, tokens)?; }
-        else { self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?; }
-        self.decode_layers_async(w, w1, &tables, rows, gather, true).await?;
+        let logits = self.step_inner(&tables, tokens, rows, None, None, None, true).await?;
         self.finish_tp2_route_step()?;
         for (placement, count) in sequences.iter_mut() { placement.len += *count; }
-        Ok(Some(self.device_logits(w, rows, true)))
+        Ok(logits)
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
@@ -1651,15 +1631,23 @@ impl<'a> MimoEngine<'a> {
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         self.submit(|| {
             self.prepare_tp2_route_step(&[tokens.len()])?;
-            let result = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media)?;
+            // Serial receives block on their Spark executor, so the future
+            // completes on its first poll without entering another runtime.
+            let mut step = std::pin::pin!(self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, false));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let result = match std::future::Future::poll(step.as_mut(), &mut cx) {
+                std::task::Poll::Ready(result) => result?,
+                std::task::Poll::Pending => anyhow::bail!("serial MiMo step unexpectedly yielded"),
+            };
             self.finish_tp2_route_step()?;
             Ok(result)
         })
     }
 
-    fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
+    async fn step_inner(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
         mut on_layer: Option<&mut dyn FnMut(usize, &[u8]) -> Result<()>>,
-        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>,
+        aggregate: bool) -> Result<Option<DeviceLogits>> {
         let (h, t) = (self.cfg.hidden, tables.positions.len());
         let (cell, capacity) = if tables.decode { (&self.decode_workspace, DECODE_ROWS) } else { (&self.workspace, self.prefill_rows) };
         if cell.borrow().is_none() {
@@ -1714,7 +1702,11 @@ impl<'a> MimoEngine<'a> {
                 self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
             let head = logit_rows == t;
-            self.decode_layers(w, split.map(|(_, w1)| w1), tables, t, gather, head, true)?;
+            if aggregate {
+                self.decode_layers_async(w, split.map(|(_, w1)| w1), tables, t, gather, head).await?;
+            } else {
+                self.decode_layers(w, split.map(|(_, w1)| w1), tables, t, gather, head, true)?;
+            }
             if let Some(mtp) = &self.mtp {
                 self.mtp_tap(mtp, w, tables)?;
             }
@@ -1734,17 +1726,26 @@ impl<'a> MimoEngine<'a> {
         // mid-step) its next layer is queued before rank 0 blocks in the Spark exchange:
         // once rank 0 forwards the routed sum, rank 1 runs on without waiting for the
         // host to queue its work.
-        let ahead = forced.is_none();
+        let ahead = forced.is_none() && !aggregate;
         if let Some((_, w1)) = split {
             // The embedded rows to the second GPU's residual stream.
-            self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
-            self.peer_layer(0, w1, rows, cap, tables, bytes)?;
+            let entry = if aggregate { slot(0, false) } else { DIRECT };
+            self.exchange()?.push_to(0, entry, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
+            if !aggregate { self.peer_layer(0, w1, rows, cap, tables, bytes)?; }
         }
         self.norm(w, layers[0].ptr("input_norm")?, 0, rows)?;
         for (index, layer) in layers.iter().enumerate() {
+            if aggregate { self.require_live()?; }
             let last = index + 1 == layers.len();
-            if let (Some((_, w1)), false, true) = (split, ahead, index > 0) {
-                self.peer_layer(index, w1, rows, cap, tables, bytes)?;
+            if let Some((_, w1)) = split {
+                if aggregate {
+                    // Queue only the peer producer before yielding. Its FFN
+                    // wait must follow the matching push, or lane B's shared
+                    // rank stream would block behind lane A's Spark reply.
+                    self.peer_unit_attention(index, 0, w1, rows, tables, bytes)?;
+                } else if !ahead && index > 0 {
+                    self.peer_layer(index, w1, rows, cap, tables, bytes)?;
+                }
             }
             // h += attention; x = post_attention_layernorm(h); under a head split both
             // GPUs add both partials in the same order (identical residual streams).
@@ -1772,8 +1773,11 @@ impl<'a> MimoEngine<'a> {
             } else {
                 // The routed experts' sum also goes to the second GPU (not after the last layer).
                 let forward = (split.is_some() && !last).then_some(ffn);
-                self.moe(w, index, layer, t, tables.decode, forward)?;
+                self.moe(w, index, layer, t, tables.decode, forward, aggregate).await?;
                 if self.tp2_layer(index) { self.tp2_post(0, index, 0, w, t)?; }
+            }
+            if let (true, Some((_, w1))) = (aggregate, split) {
+                self.peer_unit_post(index, 0, w1, rows)?;
             }
             // h += ffn; x = next input_layernorm(h) (or the final norm).
             let weight = match layers.get(index + 1) {
@@ -2306,13 +2310,14 @@ impl<'a> MimoEngine<'a> {
             self.wait(1, unit_slot(0, false, lane))?;
             self.norm_on(1, w, layer.ptr("input_norm")?, 0, rows, w.delta.buffer.ptr)?;
         }
-        self.attention_on(1, w, peer.kv[index].buffer.ptr, layer, rows, "m4096", tables)?;
+        let cap = if tables.decode { "m64" } else { "m4096" };
+        self.attention_on(1, w, peer.kv[index].buffer.ptr, layer, rows, cap, tables)?;
         let attended = unit_slot(index, false, lane);
         self.push(1, attended, w.delta.buffer.ptr, bytes)?;
         self.wait(1, attended)?;
         self.norm_on(1, w, layer.ptr("post_norm")?, 2, rows, self.recv(1, attended))?;
         if layer.dense {
-            self.dense_ffn(1, w, layer, rows, "m4096", false)?;
+            self.dense_ffn(1, w, layer, rows, cap, tables.decode)?;
             self.push(1, unit_slot(index, true, lane), w.delta.buffer.ptr, bytes)?;
         } else if self.tp2_layer(index) {
             self.moe_front_on(1, w, layer, tables.positions.len(), true)?;
@@ -2773,8 +2778,8 @@ impl<'a> MimoEngine<'a> {
     /// next norm's residual add.
     /// With `forward`, the sum is also pushed into that exchange slot of the head split's
     /// second GPU (from the Spark path right after the reduce, before the host wait).
-    fn moe(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
-        forward: Option<usize>) -> Result<()> {
+    async fn moe(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
+        forward: Option<usize>, aggregate: bool) -> Result<()> {
         let bytes = t * self.cfg.hidden * 2;
         if self.tp2_layer(index) {
             self.moe_front(w, layer, t, true)?;
@@ -2787,7 +2792,7 @@ impl<'a> MimoEngine<'a> {
             return match forward { Some(slot) => self.push(0, slot, w.delta.buffer.ptr, bytes), None => Ok(()) };
         }
         let spark = matches!(self.experts, Some(Experts::Spark { .. }));
-        self.moe_local(w, index, layer, t, decode, forward.filter(|_| spark))?;
+        self.moe_local(w, index, layer, t, decode, forward.filter(|_| spark), aggregate).await?;
         match forward {
             Some(slot) if !spark => self.push(0, slot, w.delta.buffer.ptr, bytes),
             _ => Ok(()),
@@ -2830,8 +2835,8 @@ impl<'a> MimoEngine<'a> {
         }
     }
 
-    fn moe_local(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
-        forward: Option<usize>) -> Result<()> {
+    async fn moe_local(&self, w: &Workspace<'_>, index: usize, layer: &MimoLayer<'_>, t: usize, decode: bool,
+        forward: Option<usize>, aggregate: bool) -> Result<()> {
         let experts = self.experts.as_ref().with_context(|| format!(
             "layer {index} is an MoE layer: pass Spark --peers serving the fp8 family, or --local-experts \
              (run --layers 1 for the dense layer alone)"))?;
@@ -2840,7 +2845,19 @@ impl<'a> MimoEngine<'a> {
         match experts {
             Experts::Spark { decode: decode_link, prefill, runtime, .. } => {
                 let transport = if decode { decode_link } else { prefill };
-                self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
+                let mut transport = transport.borrow_mut();
+                let mut sent = self.spark_send(w, index, t, decode, bf16_input, false, &mut transport)?;
+                let receive = if aggregate {
+                    let waited = std::time::Instant::now();
+                    let wave = sent.wave.take().context("wave already received")?;
+                    transport.receive_aggregate(wave, t, self.stream).await?;
+                    self.require_live()?;
+                    self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
+                    waited.elapsed().as_secs_f64()
+                } else {
+                    self.spark_receive(t, &mut transport, runtime, &mut sent)?
+                };
+                self.spark_landed(w, index, t, &transport, sent, forward, true, !aggregate, receive)
             }
             _ => self.moe_run(w, index, t, decode),
         }
@@ -2901,16 +2918,7 @@ impl<'a> MimoEngine<'a> {
         }
     }
 
-    /// Routes and wire rows down, one request to every Spark rank, the BF16
-    /// rank partials summed into `delta` (GLM's exchange, no shared expert).
-    #[allow(clippy::too_many_arguments)]
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
-        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime, forward: Option<usize>) -> Result<()> {
-        let sent = self.spark_send(w, index, t, decode, bf16_input, false, transport)?;
-        self.spark_land(w, index, t, transport, runtime, sent, forward, true)
-    }
-
-    /// The send half of [`Self::spark_moe`]: routes and wire rows down (the
+    /// Routes and wire rows down (the
     /// stream drains first), the request out to every rank.
     #[allow(clippy::too_many_arguments)]
     fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool, staged: bool,
@@ -3022,14 +3030,22 @@ impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn spark_land(&self, w: &Workspace<'_>, index: usize, t: usize, transport: &mut SparkLink<'_>,
         runtime: &tokio::runtime::Runtime, sent: SentWave, forward: Option<usize>, drain: bool) -> Result<()> {
-        let h = self.cfg.hidden;
         let mut sent = sent;
         let receive = self.spark_receive(t, transport, runtime, &mut sent)?;
+        self.spark_landed(w, index, t, transport, sent, forward, drain, true, receive)
+    }
+
+    /// Shared reduction/forwarding epilogue. Aggregate failure cleanup belongs
+    /// to both views, never a one-view drain before peer abort publication.
+    #[allow(clippy::too_many_arguments)]
+    fn spark_landed(&self, w: &Workspace<'_>, index: usize, t: usize, transport: &SparkLink<'_>,
+        sent: SentWave, forward: Option<usize>, drain: bool, local_drain: bool, receive: f64) -> Result<()> {
+        let h = self.cfg.hidden;
         let reduced = std::time::Instant::now();
         // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
         // intake planes are ordered after the wave by `receive`.
         unsafe {
-            transport.reduce(w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?;
+            transport.reduce_with_drain(w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream, local_drain)?;
             if let Some(slot) = forward {
                 self.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
             }

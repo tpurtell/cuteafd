@@ -294,6 +294,35 @@ mod draft_storage_tests {
     }
 
     #[test]
+    fn independent_spark_decode_accepts_graphs_off_before_checkpoint_loading() {
+        let args = args(&["--decode-lanes", "2", "--peers", "127.0.0.1:1234"]);
+        assert!(!args.decode_graphs);
+        let error = match open(&args) {
+            Ok(_) => panic!("missing checkpoint unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(!matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
+            Some(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes", .. })));
+    }
+
+    #[test]
+    fn graph_off_lanes_share_the_serial_layer_sequence_and_defer_peer_waits() {
+        let engine = include_str!("engine.rs");
+        assert_eq!(engine.matches("async fn step_inner(").count(), 1);
+        let verifier = engine.split("async fn verify_device_async(").nth(1).unwrap().split("    fn step(").next().unwrap();
+        assert!(verifier.contains("self.step_inner(&tables, tokens, rows, None, None, None, true).await?"));
+        assert!(!verifier.contains("decode_layers_async("));
+        let step = engine.split("async fn step_inner(").nth(1).unwrap().split("    /// Logits of").next().unwrap();
+        assert!(step.contains("self.moe(w, index, layer, t, tables.decode, forward, aggregate).await?"));
+        assert!(step.contains("self.peer_unit_attention(index, 0, w1, rows, tables, bytes)?"));
+        assert!(step.contains("self.peer_unit_post(index, 0, w1, rows)?"));
+        assert!(step.contains("let ahead = forced.is_none() && !aggregate;"));
+        let moe = engine.split("async fn moe_local(").nth(1).unwrap().split("    /// The routed experts").next().unwrap();
+        assert!(moe.contains("transport.receive_aggregate(wave, t, self.stream).await?"));
+        assert!(moe.contains("forward, true, !aggregate, receive)"));
+    }
+
+    #[test]
     fn absent_conversion_options_leave_selection_to_metadata_policy() {
         let args = args(&[]);
         assert_eq!(args.weight_policy, WeightPolicyArg::Auto);
@@ -871,10 +900,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
-    if args.decode_lanes == 2 && (args.peers.is_none() || args.local_experts || args.skip_experts || args.mtp > 0 || !args.decode_graphs) {
+    if args.decode_lanes == 2 && (args.peers.is_none() || args.local_experts || args.skip_experts || args.mtp > 0) {
         return Err(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes",
             value: args.decode_lanes, family: "mimo_v2".into(),
-            reason: "independent lanes require Spark experts, startup decode graphs and DFlash or no drafter" }.into());
+            reason: "independent lanes require Spark experts and DFlash or no drafter" }.into());
     }
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
