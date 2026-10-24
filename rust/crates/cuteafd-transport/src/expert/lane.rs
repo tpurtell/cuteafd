@@ -217,7 +217,7 @@ mod tests {
         let mut transport = SparkExperts::new_world(SparkWorld::canonical(1)?, &peers, 1,
             TcpTransportConfig { timing: false, timeout: Duration::from_secs(1), max_frame_bytes: 64 << 20 })?;
         // SAFETY: setup never connects or dereferences these dummy ranges.
-        unsafe { prepare_transport(&mut transport, Some(vec![DeviceLanding { ptr: 1, bytes: 10240 }]))? };
+        unsafe { prepare_transport(&mut transport, Some(vec![DeviceLanding { ptr: 1, bytes: 10240, slot_bytes: 10240 }]))? };
         assert!(transport.terminal_ready_for_test());
         transport.terminal_quiesce()?;
         transport.terminal_release()?;

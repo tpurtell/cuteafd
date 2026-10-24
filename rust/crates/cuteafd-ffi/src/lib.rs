@@ -1529,6 +1529,7 @@ type RdmaRcEndpointSetRecvLandingFn = unsafe extern "C" fn(
     device_ptr: *mut c_void,
     bytes: usize,
     header_bytes: usize,
+    slot_bytes: usize,
 ) -> CuteafdStatus;
 type RdmaGpuLandingProbeFn = unsafe extern "C" fn(
     device_name: *const c_char,
@@ -4617,12 +4618,13 @@ impl NativeLibrary {
         handle: *mut c_void,
         device: Option<CuteafdDeviceBuffer>,
         header_bytes: usize,
+        slot_bytes: usize,
     ) -> Result<()> {
         let set_fn: Symbol<RdmaRcEndpointSetRecvLandingFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_set_recv_landing")? };
         let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
         // SAFETY: the caller guarantees the handle and range contract above.
-        let status = unsafe { set_fn(handle, ptr, bytes, header_bytes) };
+        let status = unsafe { set_fn(handle, ptr, bytes, header_bytes, slot_bytes) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_set_recv_landing", status)
     }
 

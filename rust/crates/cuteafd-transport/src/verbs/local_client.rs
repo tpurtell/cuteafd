@@ -35,6 +35,7 @@ pub(crate) struct LocalTp4Client {
     /// Post the ranks' zero-copy requests one after another (each once the
     /// previous rank's send completed) rather than all at once.
     stagger: bool,
+    egress_slot: usize,
     /// Optional terminal contract. A failed temporary/persistent endpoint
     /// publishes into this witness before its external landing owner drops.
     terminal_owner: Option<Arc<AtomicBool>>,
@@ -71,6 +72,7 @@ impl LocalTp4Client {
             write: vec![None; world],
             egress: None,
             stagger: false,
+            egress_slot: 0,
             terminal_owner: None,
             terminal_failed: false,
             terminal_quiesced: false,
@@ -91,6 +93,8 @@ impl LocalTp4Client {
     pub(crate) fn set_max_waves(&mut self, waves: usize) -> Result<()> {
         anyhow::ensure!((1..=4).contains(&waves), "Spark transport admits 1..=4 outstanding waves");
         anyhow::ensure!(self.waves.is_empty(), "cannot change wave admission with waves in flight");
+        anyhow::ensure!(self.egress.is_none() && self.sessions.iter().all(Option::is_none),
+            "wave admission must precede egress allocation and bootstrap");
         self.max_waves = waves;
         Ok(())
     }
@@ -197,8 +201,12 @@ impl LocalTp4Client {
     /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
     /// and registers it on every session from the next connection on.
     pub(crate) fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<CuteafdHostBuffer> {
-        self.reset();
-        let buffer = super::egress::EgressBuffer::new(bytes)?;
+        anyhow::ensure!(self.waves.is_empty(), "cannot replace egress with outstanding waves");
+        if self.sessions.iter().any(Option::is_some) {
+            anyhow::ensure!(self.terminal_owner.is_none(), "terminal egress must precede bootstrap");
+            self.reset();
+        }
+        let buffer = super::egress::EgressBuffer::new(bytes, self.max_waves)?;
         let host = buffer.host();
         self.egress = Some(buffer);
         self.stagger = stagger;
@@ -208,8 +216,8 @@ impl LocalTp4Client {
     /// session's request sends have left, so it may be rewritten.
     pub(crate) fn egress_target(&mut self) -> Result<CuteafdHostBuffer> {
         let buffer = self.egress.as_ref().context("this transport has no egress buffer")?;
-        anyhow::ensure!(buffer.writable(), "a request still views the egress buffer");
-        let host = buffer.host();
+        anyhow::ensure!(buffer.writable(self.egress_slot), "a request still views the egress buffer");
+        let host = buffer.target(self.egress_slot)?;
         for session in self.sessions.iter_mut().flatten() {
             session.drain_request_sends(&self.config)?;
         }
@@ -217,7 +225,7 @@ impl LocalTp4Client {
     }
     /// The first `len` bytes of the egress buffer as a request payload.
     pub(crate) fn egress_payload(&self, len: usize) -> Result<bytes::Bytes> {
-        self.egress.as_ref().context("this transport has no egress buffer")?.payload(len)
+        self.egress.as_ref().context("this transport has no egress buffer")?.payload(self.egress_slot, len)
     }
     /// Lands each rank's response payloads in its device range from the next
     /// connection on; drops current sessions so they reconnect that way.
@@ -273,6 +281,7 @@ impl LocalTp4Client {
     fn reset_storage(&mut self) {
         // Drop queued payloads before sessions unregister their receive rings.
         self.waves.clear();
+        self.egress_slot = 0;
         for pending in &mut self.pending {
             pending.clear();
         }
@@ -349,6 +358,7 @@ impl LocalTp4Client {
         // Each wave's deadline counts from when it becomes the oldest, so a
         // queued wave is not charged for the waves ahead of it.
         self.waves.push_back(OpenWave { chunks: rx, done, deadline: None });
+        self.egress_slot = (self.egress_slot + 1) % self.max_waves;
         Ok(())
     }
 
