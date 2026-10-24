@@ -311,7 +311,8 @@ def _export_exl3(extra, output):
             compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
                 geometry, role, width, rows)
             ws = compact_ws or (len(bits) == 2 and tile is None
-                                and (role != "coordinator" or bits == (4, 5))
+                                and (role != "coordinator"
+                                     or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
                 block = 32 if compact_ws else 64
@@ -345,11 +346,15 @@ def export_exl3_routes(extra, output):
     from export_b12x_exl3_routes_aot import export
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
-    _, width, experts, topk, _, _ = package.profiles_for_role("coordinator", geometry)[0]
+    profiles = package.profiles_for_role("coordinator", geometry)
+    _, _, experts, topk, _, _ = profiles[0]
     for rows in capacities:
-        block = (64 if package.warp_specialized(geometry, "coordinator", width, rows)
-                 else package.route_block(geometry, rows))
-        export(output / f"m{rows}", rows, experts, topk, block)
+        blocks = sorted({64 if package.warp_specialized(geometry, "coordinator", width, rows)
+                         else package.route_block(geometry, rows)
+                         for _, width, *_ in profiles})
+        for block in blocks:
+            stem = f"m{rows}" if len(blocks) == 1 else f"m{rows}-b{block}"
+            export(output / stem, rows, experts, topk, block)
 
 
 def worker(payload):

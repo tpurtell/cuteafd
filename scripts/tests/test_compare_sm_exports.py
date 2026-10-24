@@ -435,6 +435,8 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
 @pytest.mark.parametrize("geometry,compact,role,bits", [
     ("qwen4", True, "spark", (4, 5)), ("glm", False, "spark", (4, 5)),
     ("glm", False, "coordinator", (4, 5)), ("glm", False, "coordinator", (3, 4)),
+    ("glmf", False, "spark", (3, 4)), ("glmf", False, "coordinator", (3, 4)),
+    ("glmf", False, "coordinator", (4, 5)),
 ])
 def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compact, role, bits):
     fixture = compare_sm.load_file(
@@ -449,7 +451,8 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         capacities=capacities, compact=compact,
         profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
     expected = {(call.args[0].parent.name.split('+')[0], call.args[3]): call.kwargs for call in calls
-                if bool(call.kwargs.get("compact_weights")) == compact}
+                if bool(call.kwargs.get("compact_weights")) == compact
+                and not call.args[0].parent.name.endswith("+gb10")}
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
@@ -467,7 +470,25 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert not any(options.get("warp_specialized") for _, options in recorded)
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
-        assert any(options.get("warp_specialized") for _, options in recorded) == (role == "spark" or bits == (4, 5))
+        assert any(options.get("warp_specialized") for _, options in recorded) == (
+            role == "spark" or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
+
+
+def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypatch):
+    package = compare_sm.load_file("test_routes_package", ROOT / "python/tools/aot/package_exl3_aot.py")
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    for geometry, expected in (
+        ("glm", [("m80", 80, 256, 8, 8), ("m256", 256, 256, 8, 64), ("m1024", 1024, 256, 8, 64)]),
+        ("glmf", [("m80", 80, 288, 8, 8), ("m256-b8", 256, 288, 8, 8),
+                  ("m256-b64", 256, 288, 8, 64), ("m1024", 1024, 288, 8, 64)]),
+    ):
+        recorded = []
+        monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(
+            export=lambda out, rows, experts, topk, block, rec=recorded:
+                rec.append((out.name, rows, experts, topk, block))))
+        compare_sm.export_exl3_routes(["--geometry", geometry, "--capacities", "80,256,1024"],
+                                      tmp_path / geometry)
+        assert recorded == expected
 
 
 def residency_gate(name="validate_table_residency"):

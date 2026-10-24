@@ -584,36 +584,44 @@ class PackageProfileTests(unittest.TestCase):
             for width in (512, 640, 768, 1024, 1536):
                 self.assertEqual([w(geometry, 'spark', width, c) for c in (1, 16, 80, 256, 1024, 4096)],
                                  [False, False, False, True, True, True])
-                if geometry != 'glm' or width != 1024:
+                if geometry not in ('glm', 'glmf') or width != 1024:
                     self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
 
     def test_glm_coordinator_ws_only_for_measured_tiers_and_capacities(self):
-        for bits in ((4, 5), (3, 4), (3, 4, 5)):
-            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
-                _, _, calls, _ = self.build_fixture(
-                    Path(temporary), 'coordinator', bits, geometry='glm',
-                    capacities=(80, 256, 1024, 2752, 4096))
-                for call in calls:
-                    width, capacity = call.args[1], call.args[3]
-                    ws = bits == (4, 5) and (
-                        (width == 1024 and capacity in (256, 1024, 2752))
-                        or (width == 2048 and capacity == 256))
-                    wire = ws and width == 1024 and capacity == 256
-                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
-                    self.assertEqual(call.kwargs.get('wire_input', False), wire)
-                    self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
-                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), wire)
-                    self.assertEqual('+ws-' in str(call.args[0]), ws)
-                    if ws:
-                        self.assertEqual(call.kwargs['route_block'], 64)
-                        self.assertNotIn('token_major_rotation', call.kwargs)
-                        self.assertIn('-wire-s3-dynamic' if wire else '-bf16-static', str(call.args[0]))
-        for width in (256, 384, 512, 640, 768, 1536):
-            self.assertFalse(package.warp_specialized('glm', 'coordinator', width, 256))
-        for capacity in (1, 16, 80, 128, 512, 2048, 8192):
-            self.assertFalse(package.warp_specialized('glm', 'coordinator', 1024, capacity))
+        for geometry, target_bits in (('glm', (4, 5)), ('glmf', (3, 4))):
+            for bits in ((4, 5), (3, 4), (3, 4, 5)):
+                with self.subTest(geometry=geometry, bits=bits), tempfile.TemporaryDirectory() as temporary:
+                    _, _, calls, _ = self.build_fixture(
+                        Path(temporary), 'coordinator', bits, geometry=geometry,
+                        capacities=(80, 256, 1024, 2752, 4096))
+                    for call in calls:
+                        width, capacity = call.args[1], call.args[3]
+                        if geometry == 'glm':
+                            ws = bits == target_bits and (
+                                (width == 1024 and capacity in (256, 1024, 2752))
+                                or (width == 2048 and capacity == 256))
+                        else:
+                            ws = bits == target_bits and width == 1024 and capacity in (256, 2752)
+                        wire = ws and geometry == 'glm' and width == 1024 and capacity == 256
+                        self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                        self.assertEqual(call.kwargs.get('wire_input', False), wire)
+                        self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
+                        self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), wire)
+                        self.assertEqual('+ws-' in str(call.args[0]), ws)
+                        if ws:
+                            self.assertEqual(call.kwargs['route_block'], 64)
+                            self.assertNotIn('token_major_rotation', call.kwargs)
+                            self.assertIn('-wire-s3-dynamic' if wire else '-bf16-static', str(call.args[0]))
+        for geometry in ('glm', 'glmf'):
+            for width in (256, 384, 512, 640, 768, 1536):
+                self.assertFalse(package.warp_specialized(geometry, 'coordinator', width, 256))
+            for capacity in (1, 16, 80, 128, 512, 2048, 4096, 8192):
+                self.assertFalse(package.warp_specialized(geometry, 'coordinator', 1024, capacity))
+        for capacity in (80, 256, 1024, 2752, 4096):
+            self.assertFalse(package.warp_specialized('glmf', 'coordinator', 2048, capacity))
+        self.assertFalse(package.warp_specialized('glmf', 'coordinator', 1024, 1024))
 
     def test_kimi_ws64_only_for_qualified_ordinary_tp6_prefill(self):
         capacities = (1, 16, 80, 256, 1024, 2048, 4096)

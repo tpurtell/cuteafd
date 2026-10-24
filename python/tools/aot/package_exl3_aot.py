@@ -367,12 +367,23 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     WS random/72-histogram paired-median speedups m1024 1.080/1.059,
     m2752 1.037/1.033. Width2048 m256 is 1.054/1.148; larger capacities
     regress and stay cooperative. Width1024 m256 uses wire (see below).
+    GLM 5.3 Flash (H4096/E288/top8, K3/K4 tiers, 72 K4 experts per
+    projection, random top-8 routes, same harness): width1024 BF16 WS
+    (resolved 3 input stages, 1 CTA/SM) beats cooperative at m256
+    (1131.30 [1125.28, 1131.30, 1159.84] -> 1080.22 [1011.36, 1080.22,
+    1084.03] us, 1.047x) and m2752 (3454.34 [3242.66, 3454.34, 3480.51]
+    -> 3344.03 [3138.21, 3351.20, 3344.03] us, 1.033x); m1024 (1516.19
+    vs 1496.10 us, overlapping samples) and m4096 (5476.22 vs 5628.48 us)
+    stay cooperative, as does width2048 (m256 3120.77 vs 3022.50 us
+    inside round spread; m1024/m2752/m4096 cooperative 2817.63/6270.43/
+    7966.37 vs WS 2912.93/6357.66/8128.13 us).
     Other tier pairs, widths, families and unmeasured capacities stay off.
     """
     if role == 'coordinator':
-        return (geometry == 'glm'
-                and ((width == 1024 and capacity in (256, 1024, 2752))
-                     or (width == 2048 and capacity == 256)))
+        if geometry == 'glm':
+            return ((width == 1024 and capacity in (256, 1024, 2752))
+                    or (width == 2048 and capacity == 256))
+        return geometry == 'glmf' and width == 1024 and capacity in (256, 2752)
     if role != 'spark':
         return False
     if geometry == 'kimik3':
@@ -874,7 +885,8 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
-                                    and (args.role != 'coordinator' or tuple(args.bits) == (4, 5))
+                                    and (args.role != 'coordinator'
+                                         or (geometry, tuple(args.bits)) in (('glm', (4, 5)), ('glmf', (3, 4))))
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 32 if compact_ws else 64
