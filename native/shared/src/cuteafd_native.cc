@@ -463,6 +463,11 @@ struct CuteafdRdmaRcEndpointHandle {
   ibv_mr* exposed_mr = nullptr;
   // Send-buffer prefix a peer RDMA-reads (`cuteafd_rdma_rc_endpoint_expose_send_read`).
   ibv_mr* read_mr = nullptr;
+  ibv_mr* request_target_mr = nullptr;
+  ibv_mr* request_bells_mr = nullptr;
+  // Separate receive storage prevents the SEND from overwriting request data.
+  alignas(64) unsigned char request_bells[64][40] = {};
+  bool request_poisoned = false;
   // Registered host words the completion flags of written responses are sent
   // from (a ring, so a value is never rewritten while its write may be queued).
   ibv_mr* flag_source_mr = nullptr;
@@ -528,6 +533,8 @@ bool destroy_rdma_rc_endpoint(CuteafdRdmaRcEndpointHandle* endpoint) {
   if (endpoint->read_mr != nullptr) {
     deregister(endpoint->read_mr);
   }
+  if (endpoint->request_target_mr != nullptr) deregister(endpoint->request_target_mr);
+  if (endpoint->request_bells_mr != nullptr) deregister(endpoint->request_bells_mr);
   if (endpoint->flag_source_mr != nullptr) {
     deregister(endpoint->flag_source_mr);
   }
@@ -4338,7 +4345,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_poll_with_timeout(
     if (wc.status != IBV_WC_SUCCESS) {
       return fail_completion(cq_name, wc);
     }
-    if (wc.opcode != expected_opcode) {
+    if (wc.opcode != expected_opcode && !(expected_opcode == IBV_WC_SEND && wc.opcode == IBV_WC_RDMA_WRITE)) {
       return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                   std::string("RDMA RC endpoint ") + cq_name +
                       " CQ completion had unexpected opcode");
@@ -4562,7 +4569,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_try_poll(
       if (wc.status != IBV_WC_SUCCESS) {
         return fail_completion(cq_name, wc);
       }
-      if (wc.opcode != expected_opcode) {
+      if (wc.opcode != expected_opcode && !(expected_opcode == IBV_WC_SEND && wc.opcode == IBV_WC_RDMA_WRITE)) {
         return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                     std::string("RDMA RC endpoint ") + cq_name +
                         " CQ completion had unexpected opcode");
@@ -4722,6 +4729,174 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
   (void)wr_id;
   return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
               "RDMA RC endpoint regions require CUTEAFD_ENABLE_RDMA=ON");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_request_target(
+    void* handle, uint64_t* address, uint32_t* rkey) {
+  if (handle == nullptr || address == nullptr || rkey == nullptr)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid request target output");
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* ep = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (ep->request_poisoned || ep->qp == nullptr)
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request endpoint poisoned or quiesced");
+  if (ep->request_target_mr == nullptr) {
+    // No RELAXED_ORDERING: same-QP SEND receive completion publishes all prior
+    // WRITEs to the CPU; GPU readers are launched only after this completion.
+    ep->request_target_mr = ibv_reg_mr(ep->pd, ep->recv_buffer,
+        ep->recv_registered_span_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+    if (ep->request_target_mr == nullptr)
+      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "register request WRITE target failed");
+  }
+  *address = reinterpret_cast<uintptr_t>(ep->recv_buffer);
+  *rkey = ep->request_target_mr->rkey;
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request WRITE requires RDMA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_request_write(
+    void* handle, size_t slot_offset, size_t prefix_bytes, uint32_t region,
+    size_t region_offset, size_t frame_offset, size_t bytes, uint64_t remote,
+    uint32_t rkey, uint64_t wr_id) {
+  if (handle == nullptr || bytes == 0 || bytes > UINT32_MAX || remote == 0 || bytes > UINT64_MAX - remote)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid request WRITE");
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* ep = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (ep->request_poisoned || ep->qp == nullptr)
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request endpoint poisoned or quiesced");
+  if (frame_offset > ep->send_frame_bytes || bytes > ep->send_frame_bytes - frame_offset ||
+      slot_offset > ep->send_registered_span_bytes ||
+      frame_offset > ep->send_registered_span_bytes - slot_offset ||
+      bytes > ep->send_registered_span_bytes - slot_offset - frame_offset)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "request WRITE exceeds source slot");
+  ibv_sge sge[2] = {};
+  int count = 0;
+  const bool gathered = region != UINT32_MAX;
+  const size_t prefix_part = gathered && frame_offset < prefix_bytes
+      ? std::min(bytes, prefix_bytes - frame_offset) : (gathered ? 0 : bytes);
+  if (prefix_part != 0) {
+    sge[count].addr = reinterpret_cast<uintptr_t>(ep->send_buffer + slot_offset + frame_offset);
+    sge[count].length = static_cast<uint32_t>(prefix_part);
+    sge[count++].lkey = ep->send_mr->lkey;
+  }
+  const size_t payload_part = bytes - prefix_part;
+  if (payload_part != 0) {
+    if (region >= ep->regions.size())
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "request WRITE region not registered");
+    auto* mr = ep->regions[region];
+    const size_t relative = frame_offset + prefix_part - prefix_bytes;
+    if (region_offset > mr->length || relative > mr->length - region_offset ||
+        payload_part > mr->length - region_offset - relative)
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "request WRITE exceeds payload region");
+    sge[count].addr = reinterpret_cast<uintptr_t>(mr->addr) + region_offset + relative;
+    sge[count].length = static_cast<uint32_t>(payload_part);
+    sge[count++].lkey = mr->lkey;
+  }
+  ibv_send_wr wr = {};
+  wr.wr_id = wr_id;
+  wr.sg_list = sge;
+  wr.num_sge = count;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  wr.wr.rdma.remote_addr = remote;
+  wr.wr.rdma.rkey = rkey;
+  ibv_send_wr* bad = nullptr;
+  // Exactly one WR: never lose track of a partially accepted linked list.
+  if (ibv_post_send(ep->qp, &wr, &bad) != 0) {
+    ep->request_poisoned = true;
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "post request WRITE failed; endpoint poisoned");
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request WRITE requires RDMA");
+#endif
+}
+
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+static cuteafd_status_t request_bells(CuteafdRdmaRcEndpointHandle* ep, size_t slot) {
+  if (slot >= 64 || ep->request_poisoned || ep->qp == nullptr)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "request doorbell slot or endpoint invalid");
+  if (ep->request_bells_mr == nullptr) {
+    ep->request_bells_mr = ibv_reg_mr(ep->pd, ep->request_bells,
+        sizeof(ep->request_bells), IBV_ACCESS_LOCAL_WRITE);
+    if (ep->request_bells_mr == nullptr)
+      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "register request doorbells failed");
+  }
+  return ok();
+}
+#endif
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_request_doorbell(
+    void* handle, size_t slot, const void* doorbell, uint64_t wr_id) {
+  if (handle == nullptr || doorbell == nullptr || slot >= 64)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid request doorbell");
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* ep = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  auto status = request_bells(ep, slot);
+  if (status != CUTEAFD_STATUS_OK) return status;
+  std::memcpy(ep->request_bells[slot], doorbell, 40);
+  ibv_sge sge = {};
+  sge.addr = reinterpret_cast<uintptr_t>(ep->request_bells[slot]);
+  sge.length = 40;
+  sge.lkey = ep->request_bells_mr->lkey;
+  ibv_send_wr wr = {};
+  wr.wr_id = wr_id;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_SEND;
+  wr.send_flags = IBV_SEND_SIGNALED;
+  ibv_send_wr* bad = nullptr;
+  if (ibv_post_send(ep->qp, &wr, &bad) != 0) {
+    ep->request_poisoned = true;
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "post request doorbell failed; endpoint poisoned");
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request doorbell requires RDMA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_request_recv(void* handle, size_t slot, uint64_t wr_id) {
+  if (handle == nullptr || slot >= 64)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid request doorbell receive");
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* ep = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  auto status = request_bells(ep, slot);
+  if (status != CUTEAFD_STATUS_OK) return status;
+  ibv_sge sge = {};
+  sge.addr = reinterpret_cast<uintptr_t>(ep->request_bells[slot]);
+  sge.length = 40;
+  sge.lkey = ep->request_bells_mr->lkey;
+  ibv_recv_wr wr = {};
+  wr.wr_id = wr_id;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  ibv_recv_wr* bad = nullptr;
+  if (ibv_post_recv(ep->qp, &wr, &bad) != 0) {
+    ep->request_poisoned = true;
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "post request doorbell receive failed");
+  }
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request doorbell requires RDMA");
+#endif
+}
+
+extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_request_read_doorbell(void* handle, size_t slot, void* doorbell) {
+  if (handle == nullptr || slot >= 64 || doorbell == nullptr)
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid request doorbell read");
+#if CUTEAFD_NATIVE_ENABLE_RDMA
+  auto* ep = static_cast<CuteafdRdmaRcEndpointHandle*>(handle);
+  if (ep->request_poisoned) return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request endpoint poisoned");
+  // Called only after a successful same-QP SEND receive CQE. MRs deliberately
+  // omit relaxed ordering. Acquire precedes host parse and CUDA launch.
+  std::atomic_thread_fence(std::memory_order_acquire);
+  std::memcpy(doorbell, ep->request_bells[slot], 40);
+  return ok();
+#else
+  return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "request doorbell requires RDMA");
 #endif
 }
 

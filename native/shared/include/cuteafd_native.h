@@ -578,6 +578,16 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* pt
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
     void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
     size_t region_bytes, uint64_t wr_id);
+// Request-only WRITE transport. Registers the admitted receive ring without
+// relaxed ordering. Keys and doorbell storage live until QP quiescence/destroy.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_request_target(void* handle, uint64_t* address, uint32_t* rkey);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_request_write(
+    void* handle, size_t slot_offset, size_t prefix_bytes, uint32_t region, size_t region_offset,
+    size_t frame_offset, size_t bytes, uint64_t remote, uint32_t rkey, uint64_t wr_id);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_request_doorbell(
+    void* handle, size_t slot, const void* doorbell, uint64_t wr_id);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_request_recv(void* handle, size_t slot, uint64_t wr_id);
+cuteafd_status_t cuteafd_rdma_rc_endpoint_request_read_doorbell(void* handle, size_t slot, void* doorbell);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle);
 // Stop all QP DMA without releasing registrations or any host/device landing
 // storage. Success is idempotent; failure leaves all ownership unchanged.

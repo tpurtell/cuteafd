@@ -1,4 +1,5 @@
 mod registered_response;
+mod request_write;
 mod landing;
 pub use landing::{gpu_landing_probe, DeviceLanding, DeviceWriteTarget, GpuLandingProbe};
 use registered_response::{RegisteredResponseFrame, RegisteredResponseRing};
@@ -28,7 +29,7 @@ use std::time::{Duration, Instant};
 use crate::synthetic::{expert_response_from_protocol_v2_response, protocol_v2_request_from_expert_request, ProtocolV2ExecutorResponseRef, ProtocolV2ExpertExecutor, ProtocolV2RequestDevicePayload, SyntheticRouteExecutor};
 use crate::{is_connection_closed, verbs_host_preflight, ExpertProtocolV2FrameBuffer, ExpertProtocolV2Request, ExpertProtocolV2RequestView, ExpertProtocolV2Response, ExpertProtocolV2ResponseHeader, ExpertProtocolV2ResponseView, ExpertProtocolV2Status, ExpertV2Dtype, TcpTransportConfig, EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN, EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN};
 
-const PERSISTENT_CONTROL_VERSION: u32 = 3;
+const PERSISTENT_CONTROL_VERSION: u32 = 4;
 const PERSISTENT_CONTROL_LIMIT: usize = 64 * 1024;
 
 fn decode_persistent_control<T: DeserializeOwned>(value: serde_json::Value) -> Result<T> {
@@ -1812,6 +1813,8 @@ struct VerbsHostProtocolV2PersistentClientSession {
     egress: Option<(Arc<egress::EgressBuffer>, u32)>,
     /// Responses arrive as RDMA writes into the exposed device range.
     write_mode: bool,
+    request_write: Option<request_write::State>,
+    request_write_target: Option<request_write::Target>,
 }
 
 struct ProtocolV2ResponseChunkAssembler {
@@ -2050,7 +2053,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         execution_lane: u32,
         cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
     ) -> Result<Self> {
-        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None, None)
+        Self::connect_impl(addr, config, request, execution_lane, cq_harvester, false, None, false, None, None, 0, None, None, false)
     }
 
     /// `flow_label`: both QPs' RoCE v2 flow label (0: the kernel's own).
@@ -2059,9 +2062,9 @@ impl VerbsHostProtocolV2PersistentClientSession {
                      request: &ExpertProtocolV2Request, landing: Option<DeviceLanding>,
                      egress: Option<&Arc<egress::EgressBuffer>>, write: Option<DeviceWriteTarget>,
                      terminal_owner: Option<Arc<AtomicBool>>, flow_label: u32, capacity: Option<u32>,
-                     model_endpoint: Option<u32>) -> Result<Self> {
+                     model_endpoint: Option<u32>, request_write: bool) -> Result<Self> {
         let mut session = Self::connect_impl(addr, config, request, 0, None, true, landing, egress.is_some(), write,
-            terminal_owner, flow_label, capacity, model_endpoint)?;
+            terminal_owner, flow_label, capacity, model_endpoint, request_write)?;
         if let Some(buffer) = egress {
             let host = buffer.host();
             // SAFETY: the buffer is pinned host memory kept alive by the Arc
@@ -2081,8 +2084,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
                     cq_harvester: Option<Arc<VerbsHostProtocolV2CqHarvester>>,
                     retain_final_response: bool, landing: Option<DeviceLanding>, gathered_sends: bool,
                     write: Option<DeviceWriteTarget>, terminal_owner: Option<Arc<AtomicBool>>,
-                    flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>)
+                    flow_label: u32, capacity: Option<u32>, model_endpoint: Option<u32>,
+                    request_write: bool)
                     -> Result<Self> {
+        anyhow::ensure!(!request_write || write.is_none(), "request WRITE requires unchanged SEND replies");
         let admitted = crate::worker_selection::reserve_peer_endpoint(addr, &request.header, capacity, model_endpoint)?;
         verbs_host_preflight()?;
         let native_path = verbs_host_native_library_path().context(
@@ -2164,6 +2169,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             flow_label,
             worker_selection_digest: crate::worker_selection::peer_selection_digest(addr)?,
             model_endpoint,
+            request_write,
         };
         write_control(&mut stream, &start)?;
         let ready: VerbsHostProtocolV2PersistentReady = decode_persistent_control(read_control_value(&mut reader)?)?;
@@ -2217,6 +2223,11 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 ready.server_native_endpoint.status
             );
         }
+        anyhow::ensure!(ready.request_write_target.is_some() == request_write, "worker request WRITE negotiation mismatch");
+        if let Some(target) = ready.request_write_target {
+            anyhow::ensure!(target.address != 0 && target.epoch != 0 && request_ring.depth <= 64 && endpoint.info.max_send_wr >= 2, "invalid request WRITE target");
+            target.address.checked_add(request_registered_span_bytes as u64).context("request WRITE target span overflow")?;
+        }
         endpoint.connect_with_flow_label(&ready.server_native_endpoint, flow_label)?;
         // Before any receive is posted, so every response slot scatters alike.
         let gpu_landing = match landing {
@@ -2266,6 +2277,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
             gpu_landing,
             egress: None,
             write_mode,
+            request_write: None,
+            request_write_target: ready.request_write_target,
         })
     }
 
@@ -2450,7 +2463,10 @@ impl VerbsHostProtocolV2PersistentClientSession {
         while self.request_send_in_flight > 0 {
             let stats = self.endpoint.try_poll(self.request_send_in_flight as u32, 0)?;
             anyhow::ensure!(stats.recv_completions == 0, "request send drain consumed a response");
-            self.request_send_in_flight -= (stats.send_completions as usize).min(self.request_send_in_flight);
+            let count = stats.send_completions as usize;
+            anyhow::ensure!(count <= self.request_send_in_flight, "unexpected request send CQEs");
+            if let Some(state) = &mut self.request_write { state.complete(count)?; }
+            self.request_send_in_flight -= count;
             anyhow::ensure!(started.elapsed() < config.timeout, "request sends never completed");
         }
         Ok(())
@@ -2541,6 +2557,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 self.request_send_in_flight
             );
         }
+        if let Some(state) = &mut self.request_write { state.complete(send_completions)?; }
         self.request_send_in_flight -= send_completions;
         for _ in 0..stats.recv_completions {
             self.accept_chunk_response_frame(pending, config)?;
@@ -2648,6 +2665,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             .pop_front()
             .expect("persistent verbs-host pending request is present");
         let response_executor_id = completed.assembler.finish_validation()?.executor_id;
+        self.request_write_final_reply(completed.request.header.request_id)?;
         if timing_enabled {
             eprintln!(
                 "protocol_v2_verbs_persistent_client_roundtrip_timing addr={} request_id={} layer_id={} rows={} routes={} request_wire_bytes={} response_frames={} received_wire_bytes={} assembled_wire_bytes=0 encode_ms={:.3} expected_response_ms={:.3} post_recv_ms={:.3} send_ms={:.3} poll_ms={:.3} copy_recv_ms={:.3} parse_ms={:.3} assemble_ms=0.000 total_ms={:.3} pipelined=true",
@@ -3417,6 +3435,7 @@ struct VerbsHostProtocolV2PersistentStart {
     /// Index in the coordinator's sealed endpoint set; not an execution lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model_endpoint: Option<u32>,
+    request_write: bool,
 }
 
 fn is_zero_label(label: &u32) -> bool {
@@ -3446,6 +3465,7 @@ struct VerbsHostProtocolV2PersistentReady {
     expert_grouping: Option<crate::worker_selection::InstalledExpertGrouping>,
     server_endpoint: VerbsHostRcEndpointDescriptor,
     server_native_endpoint: VerbsHostNativeEndpointDescriptor,
+    request_write_target: Option<request_write::Target>,
     /// The start's flow label, echoed by a server that connected with it.
     #[serde(default, skip_serializing_if = "is_zero_label")]
     flow_label: u32,

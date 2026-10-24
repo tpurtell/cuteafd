@@ -202,6 +202,10 @@ HOST_ISA
 PROBE_DUMP_ROOT
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_REQUEST_WRITE
+SPARK_REQUEST_CHUNK_BYTES
+SPARK_REQUEST_DESTINATION_BYTES
+SPARK_REQUEST_AGGREGATE_BYTES
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
@@ -251,6 +255,10 @@ DRAFT_ROW_COST
 SPECULATION_TRACE
 TARGET_HEAD
 SPARK_INTAKE
+SPARK_REQUEST_WRITE
+SPARK_REQUEST_CHUNK_BYTES
+SPARK_REQUEST_DESTINATION_BYTES
+SPARK_REQUEST_AGGREGATE_BYTES
 CONSOLE_TEXT
 FP8_EXPERT_PREFILL
 ATTENTION_PLAN_ROWS
@@ -498,6 +506,10 @@ SPARKINFER_EXL3
 SPECULATION_TRACE
 SPECULATOR
 SPARK_INTAKE
+SPARK_REQUEST_WRITE
+SPARK_REQUEST_CHUNK_BYTES
+SPARK_REQUEST_DESTINATION_BYTES
+SPARK_REQUEST_AGGREGATE_BYTES
 TARGET_HEAD
 THERMAL
 TP2_ATTENTION
@@ -620,9 +632,29 @@ thermal_args=(-e "CUTEAFD_THERMAL=$thermal")
 # (the former programs) or w8a8 (also quantizes the BF16 rows of experts on the
 # coordinator GPU). Spark workers and the coordinator both read it.
 # ATTENTION_PLACEMENT (validated per family before this) reaches the server too.
+shared_request_write_args() {
+request_write="$(get SPARK_REQUEST_WRITE off)"
+case "$request_write" in on|off) ;; *) release_die "SPARK_REQUEST_WRITE must be on or off" ;; esac
+request_write_args=()
+if [[ "$request_write" == on ]]; then
+  request_chunk="$(get SPARK_REQUEST_CHUNK_BYTES 262144)"
+  request_destination="$(get SPARK_REQUEST_DESTINATION_BYTES off)"
+  request_aggregate="$(get SPARK_REQUEST_AGGREGATE_BYTES off)"
+  [[ "$request_chunk" =~ ^[1-9][0-9]*$ && ${#request_chunk} -le 10 ]] || release_die "request WRITE chunk must be a positive integer"
+  ((request_chunk <= 4294967295)) || release_die "request WRITE chunk exceeds the native length limit"
+  for value in "$request_destination" "$request_aggregate"; do
+    [[ "$value" == off ]] && continue
+    [[ "$value" =~ ^[1-9][0-9]*$ && ${#value} -le 10 ]] || release_die "request WRITE windows must be off or positive integers"
+    ((value >= request_chunk)) || release_die "request WRITE windows must hold at least one chunk"
+  done
+  request_write_args=(-e CUTEAFD_SPARK_REQUEST_WRITE=on -e "CUTEAFD_SPARK_REQUEST_CHUNK_BYTES=$request_chunk"
+    -e "CUTEAFD_SPARK_REQUEST_DESTINATION_BYTES=$request_destination" -e "CUTEAFD_SPARK_REQUEST_AGGREGATE_BYTES=$request_aggregate")
+fi
+}
 shared_coordinator_env_args() {
 intake="$(get SPARK_INTAKE auto)"
 case "$intake" in auto|gpu|pinned|host) ;; *) echo "SPARK_INTAKE must be auto, gpu, pinned or host" >&2; exit 2 ;; esac
+shared_request_write_args
 console_text="$(get CONSOLE_TEXT on)"
 case "$console_text" in on|off) ;; *) echo "CONSOLE_TEXT must be on or off" >&2; exit 2 ;; esac
 fp8_prefill="$(get FP8_EXPERT_PREFILL auto)"
@@ -631,7 +663,7 @@ attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
 fi
-shared_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
+shared_env_args=("${request_write_args[@]}" -e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
@@ -1081,6 +1113,7 @@ for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
 done
 ((${#deployment_peers[@]} == 0)) || count_args+=(--deployment-peers "$(IFS=,; echo "${deployment_peers[*]}")")
 release_reject_unused_keys deepseek_v41 $(_v41_allowed_keys)
+shared_request_write_args
 readiness_args=(--require-ready)
 [[ -z "$wip_slot" ]] || readiness_args=()
 count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_DOCKER_INFERENCE" \
@@ -2723,6 +2756,7 @@ audio_encoder_hash=""
     fi
   done
   release_reject_unused_keys "$family" $(_family_allowed_keys "$family")
+  shared_request_write_args
   deployment_args=()
   deployment_peers=()
   for ((rank = 0; rank < available_sparks; rank++)); do

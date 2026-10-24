@@ -629,6 +629,7 @@ mod tests {
             flow_label,
             worker_selection_digest: None,
             model_endpoint: None,
+            request_write: false,
         }
     }
 
@@ -649,6 +650,7 @@ mod tests {
             expert_grouping: None,
             server_endpoint: session_start(0).client_endpoint,
             server_native_endpoint: endpoint(),
+            request_write_target: None,
             flow_label,
         };
         let old = serde_json::to_value(ready(0)).unwrap();
