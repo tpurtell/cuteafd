@@ -527,10 +527,11 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, 
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
 // Receives scatter their first `header_bytes` into the host slot and the rest
-// into [device_ptr, device_ptr + bytes) (dma-buf MR); a null range restores
-// host-only receives. Applies to receives posted afterwards.
+// into equal `slot_bytes` ranges of [device_ptr, device_ptr + bytes) (dma-buf
+// MR), rotating in successful receive-post order. A null range restores host
+// receives. Register before posting; the caller fences consumers before reuse.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
-                                                       size_t bytes, size_t header_bytes);
+                                                       size_t bytes, size_t header_bytes, size_t slot_bytes);
 // Registers [device_ptr, device_ptr + bytes) for remote RDMA writes on this
 // endpoint (dma-buf, no relaxed ordering) and returns its rkey; a null range
 // removes the registration.
