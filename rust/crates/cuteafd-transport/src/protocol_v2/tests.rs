@@ -1107,7 +1107,7 @@ fn frame_prefix_encoders_match_full_wire_frames() -> Result<()> {
 #[test]
 fn admitted_response_prefix_never_grows_and_rejects_oversized_rows() -> Result<()> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16, execution_lane: 0 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 };
     let mut buffer = ExpertProtocolV2FrameBuffer::for_endpoint_response(endpoint)?;
     assert_eq!(buffer.capacity(), EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN + 640 * 4);
     assert_eq!(buffer.capacity(), endpoint.response_prefix_bytes().unwrap());

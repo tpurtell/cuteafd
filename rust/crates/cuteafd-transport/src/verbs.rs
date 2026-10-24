@@ -2098,7 +2098,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 } else {
                     cuteafd_core::SparkIngress::Fp8K32
                 };
-                let (max_request, max_response) = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows, ingress, execution_lane: 0 }
+                let (max_request, max_response) = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows, ingress }
                     .wire_bytes(cuteafd_core::expert_geometry()).context("invalid expert endpoint wire geometry")?;
                 (request_wire_bytes.max(max_request), expected_response_wire_bytes.max(max_response))
             }
@@ -5483,7 +5483,7 @@ mod persistent_tests {
             request.header.hidden_row_stride_bytes = geometry.hidden + geometry.hidden / 32;
             request.header.flags = crate::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
-                ingress: cuteafd_core::SparkIngress::Fp8K32, execution_lane: 0 };
+                ingress: cuteafd_core::SparkIngress::Fp8K32 };
             let (_, response) = endpoint.wire_bytes(geometry).unwrap();
             for debug in [false, true] {
                 if debug { request.header.flags |= crate::EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM; }

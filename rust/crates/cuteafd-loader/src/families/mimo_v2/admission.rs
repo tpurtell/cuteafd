@@ -406,8 +406,8 @@ pub fn spark_endpoints(rows: usize, input: super::MimoExpertInput) -> Result<[cu
     let decode = u32::try_from(super::decode_graph::MIMO_DECODE_ROWS)?;
     let decode_ingress = if input.bf16(true) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
     let prefill_ingress = if input.bf16(false) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1), execution_lane: 0 },
-        SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None, execution_lane: 0 }])
+    Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1) },
+        SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None }])
 }
 
 /// Endpoint indices remain stable: decode0, shared prefill, then decode1.
@@ -416,9 +416,7 @@ pub fn decode_spark_endpoints(rows: usize, input: super::MimoExpertInput, decode
     ensure!((1..=2).contains(&decode_lanes), "MiMo decode lanes must be 1 or 2");
     let [decode, prefill] = spark_endpoints(rows, input)?;
     let mut endpoints = vec![decode, prefill];
-    // The second decode lane's waves run on their own Spark execution lane,
-    // overlapping lane zero's expert work on every rank.
-    if decode_lanes == 2 { endpoints.push(cuteafd_core::SparkEndpoint { execution_lane: 1, ..decode }); }
+    if decode_lanes == 2 { endpoints.push(decode); }
     Ok(endpoints)
 }
 

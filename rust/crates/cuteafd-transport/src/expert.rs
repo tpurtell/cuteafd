@@ -38,7 +38,7 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// never this frame bound. Keep the ordinary transport default as the floor.
 pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None,
-        capacity, ingress: cuteafd_core::SparkIngress::Bf16, execution_lane: 0 
+        capacity, ingress: cuteafd_core::SparkIngress::Bf16
     };
     let (request, response) = endpoint.wire_bytes(geometry)
         .context("invalid native frame capacity or geometry")?;
@@ -650,7 +650,7 @@ mod tests {
                 let budget = native_frame_budget(geometry, capacity)?;
                 assert_eq!(budget, indexed_reply.max(request).max(crate::DEFAULT_MAX_FRAME_BYTES));
                 let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
-                    ingress: cuteafd_core::SparkIngress::Bf16, execution_lane: 0 };
+                    ingress: cuteafd_core::SparkIngress::Bf16 };
                 let (input, output) = endpoint.wire_bytes(geometry).unwrap();
                 assert_eq!(output + 32, indexed_reply);
                 assert!(input + 32 <= budget && output + 32 <= budget);

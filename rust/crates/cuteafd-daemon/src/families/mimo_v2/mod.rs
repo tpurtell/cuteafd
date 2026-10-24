@@ -1075,6 +1075,10 @@ impl Opened {
                 endpoints: cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(
                     args.prefill_rows, args.expert_input.into(), args.decode_lanes)?,
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
+                // The prefill link's waves or the decode lanes, whichever keeps
+                // more requests in flight to a rank (they never coexist).
+                execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("mimo_v2",
+                    preflight.working_set.prefill_lanes, args.decode_lanes),
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?;

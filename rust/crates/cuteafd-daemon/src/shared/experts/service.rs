@@ -400,14 +400,11 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
-    // Each further Spark execution lane owns an execution workspace (stream,
-    // scratch, inputs, staging) over the shared resident weights. Its
-    // execution is sized for its own endpoints' capacity, whose kernel
-    // scratch need not shrink linearly with rows, so admission charges it the
-    // full lane-zero workspace: an upper bound, never an undercharge.
-    let lanes = config.model_admission.as_ref().map_or(1, |model| model.endpoints.iter()
-        .map(|endpoint| usize::from(endpoint.execution_lane)).max().map_or(1, |lane| lane + 1));
-    let workspace = workspace.checked_mul(lanes).context("Spark execution lane workspace overflow")?;
+    // Every execution slot owns a full execution workspace (stream, scratch,
+    // inputs, staging) sized for the largest admitted unit, over the shared
+    // resident weights.
+    let slots = config.model_admission.as_ref().map_or(1, |model| usize::from(model.execution_slots));
+    let workspace = workspace.checked_mul(slots).context("Spark execution slot workspace overflow")?;
     // The loader's pinned buffers and read scratch live only for one layer load;
     // the exchange, row-index scratch and registered rings live while serving.
     let load_peak = resident
@@ -560,9 +557,9 @@ mod tests {
             model_admission: Some(cuteafd_transport::worker_selection::ModelAdmission {
                 capacity: 16, compiled_capacity: 16,
                 endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 16,
-                    ingress: cuteafd_core::SparkIngress::Fp8K32, execution_lane: 0 }; 2],
+                    ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2],
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
             }),
             selected_layers: None,
             capacity: 16,
@@ -644,7 +641,7 @@ mod tests {
                     model.capacity = capacity;
                     model.compiled_capacity = 4096;
                     model.endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
-                        ingress: cuteafd_core::SparkIngress::Fp8K32, execution_lane: 0 }];
+                        ingress: cuteafd_core::SparkIngress::Fp8K32 }];
                     let workspace = Exl3Worker::plan(&package.join(format!("tp6-rank{rank}")), capacity,
                         Default::default())?;
                     let mut resident = 0;
@@ -751,9 +748,9 @@ mod tests {
             capacity, compiled_capacity: capacity,
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress: if bf16 {
                 cuteafd_core::SparkIngress::Bf16
-            } else { cuteafd_core::SparkIngress::Fp8K32 }, execution_lane: 0 }; endpoints],
+            } else { cuteafd_core::SparkIngress::Fp8K32 } }; endpoints],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
         });
     }
 
@@ -935,24 +932,23 @@ mod tests {
         assert_eq!(HostExpertExchange::bytes_for(16).unwrap(), 16 * (48 + 10240));
     }
 
-    /// A second Spark execution lane owns a full execution workspace; every
-    /// other term (rings, exchange, staging) is unchanged by the lane count.
+    /// Every execution slot owns one execution workspace; every other term
+    /// (rings, exchange, staging) is unchanged by the slot count.
     #[test]
-    fn a_second_execution_lane_charges_one_more_execution_workspace() {
+    fn each_execution_slot_charges_one_execution_workspace() {
         let topology = SparkTopology::new(2, 2).unwrap();
         let mut config = config(4, 0, Some(topology));
         config.capacity = 4096;
         set_model(&mut config, 4096, false, 3);
         let one = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
-        config.model_admission.as_mut().unwrap().endpoints[2].execution_lane = 1;
-        let two = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
-        assert_eq!(two.serve_peak - one.serve_peak, 4);
-        assert_eq!((two.load_peak, two.rings, two.exchange), (one.load_peak, one.rings, one.exchange));
+        for slots in 2..=4u8 {
+            config.model_admission.as_mut().unwrap().execution_slots = slots;
+            let pool = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
+            assert_eq!(pool.serve_peak - one.serve_peak, 4 * (u64::from(slots) as usize - 1));
+            assert_eq!((pool.load_peak, pool.rings, pool.exchange), (one.load_peak, one.rings, one.exchange));
+        }
     }
 
-    /// The ring term mirrors the transport's own sizing rule: minimum 8 MiB per
-    /// slot, `depth` slots per ring, one request and one response ring per
-    /// persistent endpoint, rounded up to the verbs-host alignment.
     #[test]
     fn registered_ring_bytes_match_the_transport_sizing_rule() {
         let alignment = 4096;
@@ -1021,7 +1017,7 @@ mod tests {
         use cuteafd_loader::placement::SparkWorkingSet;
         use cuteafd_transport::worker_selection::ModelAdmission;
         let geometry = ExpertGeometry::STEP5;
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16, execution_lane: 0 };
+        let endpoint = SparkEndpoint { ring_depth: None, capacity: 640, ingress: SparkIngress::Bf16 };
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
         let working = SparkWorkingSet { spark_layers: (3..91).collect(), spark_ranks: 6,
@@ -1078,13 +1074,13 @@ mod tests {
         for device in [1, 2] {
             let mut config = config(4, 0, None);
             let mut endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 1024,
-                ingress: cuteafd_core::SparkIngress::Fp8K32, execution_lane: 0 }; 2];
+                ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2];
             endpoints.extend(std::iter::repeat_n(cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
-                ingress: cuteafd_core::SparkIngress::Fp8K32, execution_lane: 0 }, device));
+                ingress: cuteafd_core::SparkIngress::Fp8K32 }, device));
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity: 1024, compiled_capacity: 1024, endpoints,
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
             };
             model.validate(geometry).unwrap();
             let exact = model.ring_bytes(geometry).unwrap();
@@ -1167,10 +1163,10 @@ mod tests {
                     let mut config = config(world, 0, None);
                     config.capacity = 4096;
                     let mut endpoints = vec![SparkEndpoint { ring_depth: None, capacity: 4096,
-                        ingress: SparkIngress::Bf16Decode { rows: 80 }, execution_lane: 0 }];
+                        ingress: SparkIngress::Bf16Decode { rows: 80 } }];
                     endpoints.extend(std::iter::repeat_n(SparkEndpoint { ring_depth: None, capacity: 80,
-                        ingress: SparkIngress::Fp8K32, execution_lane: 0 }, rtx));
-                    endpoints.push(SparkEndpoint { ring_depth: Some(2), capacity: 1024, ingress: SparkIngress::Fp8K32, execution_lane: 0 });
+                        ingress: SparkIngress::Fp8K32 }, rtx));
+                    endpoints.push(SparkEndpoint { ring_depth: Some(2), capacity: 1024, ingress: SparkIngress::Fp8K32 });
                     config.model_admission.as_mut().unwrap().endpoints = endpoints.clone();
                     config.model_admission.as_mut().unwrap().capacity = 4096;
                     config.model_admission.as_mut().unwrap().compiled_capacity = 4096;

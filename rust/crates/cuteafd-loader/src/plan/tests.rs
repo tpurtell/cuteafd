@@ -81,7 +81,7 @@ fn native_host_ledger_charges_six_spark_ranks_without_spark_device_entries() {
     let moe = spec.moe.as_ref().unwrap();
     let geometry = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
         topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32, execution_lane: 0 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 };
     let (request, response) = endpoint.wire_bytes(geometry).unwrap();
     let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
         depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -117,9 +117,9 @@ fn mimo_split_links_charge_decode_and_each_prefill_return_slot() {
                 let ingress = match input { MimoExpertInput::Fp8 => SparkIngress::Fp8K32,
                     MimoExpertInput::Bf16 => SparkIngress::Bf16,
                     MimoExpertInput::Bf16Decode => SparkIngress::Fp8K32 };
-                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None, execution_lane: 0 };
+                let endpoint = SparkEndpoint { capacity: rows as u32, ingress, ring_depth: None };
                 let decode = SparkEndpoint { capacity: 64, ingress: if input.bf16(true) { SparkIngress::Bf16 }
-                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1), execution_lane: 0 };
+                    else { SparkIngress::Fp8K32 }, ring_depth: Some(1) };
                 assert_eq!(admission::spark_endpoints(rows, input).unwrap(), [decode, endpoint]);
                 let (request, response) = endpoint.wire_bytes(geometry).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
@@ -178,7 +178,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                     continue;
                 }
                 let endpoints = layout::spark_endpoints(family, 1) as u64;
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Fp8K32, execution_lane: 0 };
+                let endpoint = SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: SparkIngress::Fp8K32 };
                 let (request, response) = endpoint.wire_bytes(geometry).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
@@ -699,7 +699,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             else { cuteafd_core::SparkIngress::Fp8K32 };
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
                             capacity: options.layout.as_ref().unwrap().spark_capacity_rows as u32,
-                            ingress, execution_lane: 0 
+                            ingress
                         }; 2];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {

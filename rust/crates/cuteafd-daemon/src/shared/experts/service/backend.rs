@@ -454,7 +454,7 @@ mod admission_tests {
     fn mixed_ingress_requires_both_backends_even_at_full_decode_extent() {
         use cuteafd_core::{SparkEndpoint, SparkIngress};
         for rows in [16, 80] {
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Bf16Decode { rows }, execution_lane: 0 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Bf16Decode { rows } };
             for (fp8, bf16) in [(false, false), (false, true), (true, false), (true, true)] {
                 assert_eq!(super::supports_ingress(endpoint.ingress, fp8, bf16), fp8 && bf16);
             }

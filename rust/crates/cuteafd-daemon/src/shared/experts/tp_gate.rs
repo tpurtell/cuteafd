@@ -270,8 +270,8 @@ fn native_tp_rank_sum() -> Result<()> {
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
             spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
         ModelAdmission { capacity: 16, compiled_capacity: 4096,
-            endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress, execution_lane: 0 }],
-            rings: spark_rings(config.max_frame_bytes)? })?.select(&peers)?;
+            endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress }],
+            rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1 })?.select(&peers)?;
     let h = geometry.hidden as usize;
     let zero = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
     let output = DeviceAllocation::new(&library, 16 * output_row_bytes)?;

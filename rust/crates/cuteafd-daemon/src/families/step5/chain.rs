@@ -603,9 +603,9 @@ mod tests {
                 compiled_capacity: u32::try_from(compiled)?,
                 endpoints: vec![SparkEndpoint { ring_depth: None,
                     capacity: 64,
-                    ingress: SparkIngress::Bf16, execution_lane: 0 
+                    ingress: SparkIngress::Bf16
                 }],
-                rings: spark_rings(config.max_frame_bytes)?,
+                rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1
             },
         )?
         .select(&peers)?;

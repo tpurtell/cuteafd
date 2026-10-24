@@ -1863,8 +1863,11 @@ impl Opened {
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, execution_lane: 0 }],
+                endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
+                // One execution slot per prefill wave the link keeps in flight.
+                execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("glm5_flash",
+                    args.prefill_waves as u64, 1)
             };
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;

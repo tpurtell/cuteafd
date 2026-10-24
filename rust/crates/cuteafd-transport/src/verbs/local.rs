@@ -111,9 +111,11 @@ pub struct LocalVerbsExpertConnection {
     liveness_polls: u8,
     /// Startup-resolved diagnostics flag; see `protocol_v2_timing_from_env`.
     timing: bool,
-    /// A request received by `begin_deferred` and not yet finished: its
-    /// receive start time (timing only). Holds the request and response slots.
-    deferred: Option<Option<Instant>>,
+    /// Requests received by `begin_deferred` and not yet finished, oldest
+    /// first: their receive start times (timing only). Request `k` holds
+    /// receive slot `request_recv_sequence + k` and send slot
+    /// `response_send_sequence + k`; they finish in this order.
+    deferred: std::collections::VecDeque<Option<Instant>>,
     // EOF acknowledges teardown only after native rings and their credit are released.
     stream: TcpStream,
 }
@@ -190,12 +192,6 @@ impl LocalVerbsExpertConnection {
             verbs_host_native_library_path().context("native RoCE library not configured")?;
         let library = Arc::new(unsafe { NativeLibrary::load(&path) }?);
         Self::initialize_with_rings(stream, library, start, request_ring, response_ring, timing, grouping, Some((reservation, endpoint)))
-    }
-
-    /// The Spark execution lane serving this connection, from its admitted
-    /// endpoint (lane zero without typed admission). The client cannot choose it.
-    pub fn execution_lane(&self) -> u8 {
-        self.endpoint.credits.endpoint.as_ref().map_or(0, |endpoint| endpoint.contract().0.execution_lane)
     }
 
     /// Negotiated wire ring geometry from the persistent handshake, as
@@ -444,7 +440,7 @@ impl LocalVerbsExpertConnection {
             response_copy_stream: None,
             next_liveness: Instant::now(),
             liveness_polls: 0,
-            deferred: None,
+            deferred: std::collections::VecDeque::new(),
             timing,
         })
     }
@@ -788,20 +784,22 @@ impl LocalVerbsExpertConnection {
         result
     }
 
-    /// Whether a request launched by [`Self::begin_deferred`] awaits
-    /// [`Self::finish_deferred`]. Its request and response slots stay held.
-    pub fn deferred(&self) -> bool { self.deferred.is_some() }
+    /// Requests launched by [`Self::begin_deferred`] that await
+    /// [`Self::finish_deferred`]; their request and response slots stay held.
+    pub fn deferred(&self) -> usize { self.deferred.len() }
 
     /// Receive at most one request and hand it to `launch`, which may leave GPU
     /// work queued on the mapped request and response slots. The request slot
-    /// is not reposted and no response is sent until [`Self::finish_deferred`],
-    /// so both slots stay owned by the queued work. With a request already
-    /// deferred on this connection, nothing is received.
-    pub fn begin_deferred<T, F>(&mut self, wait: Option<Duration>, launch: F) -> Result<Option<T>>
+    /// is not reposted and no response is sent until [`Self::finish_deferred`]
+    /// finishes it, so both slots stay owned by the queued work. Up to `limit`
+    /// requests may be deferred on one connection (bounded by its rings);
+    /// at the limit nothing is received.
+    pub fn begin_deferred<T, F>(&mut self, wait: Option<Duration>, limit: usize, launch: F) -> Result<Option<T>>
     where
         F: FnOnce(&ExpertProtocolV2RequestView<'_>, ProtocolV2RequestDevicePayload) -> Result<T>,
     {
-        if self.deferred.is_some() { return Ok(None); }
+        let held = self.deferred.len();
+        if !deferred_admits(held, limit, self.request_ring.depth, self.response_ring.depth) { return Ok(None); }
         if self.liveness_polls == 0 || wait.is_some() {
             check_peer_liveness(&self.stream, &mut self.next_liveness)?;
         }
@@ -822,9 +820,9 @@ impl LocalVerbsExpertConnection {
         self.liveness_polls = 0;
         // The completion is consumed: from here the request is owned by this
         // connection until finish_deferred reposts it, even if launch fails.
-        self.deferred = Some(started);
+        self.deferred.push_back(started);
         let request_slot = mapped_ring_slot(self.request_recv_view, self.request_ring,
-            self.request_recv_sequence as u64)?;
+            (self.request_recv_sequence + held) as u64)?;
         // SAFETY: the received slot lies inside this endpoint's mapped receive
         // ring and is not reposted until finish_deferred.
         let storage = unsafe { std::slice::from_raw_parts(request_slot.host_ptr.cast_const(),
@@ -834,22 +832,23 @@ impl LocalVerbsExpertConnection {
         let request = ExpertProtocolV2RequestView::parse(&storage[..wire_bytes])
             .context("parsing deferred verbs-host ProtocolV2 request frame")?;
         if let Some(admitted) = &self.endpoint.credits.endpoint { admitted.validate_request(&request.header)?; }
-        // The response is written into the next send slot; drain one send
-        // completion first if the ring is full, exactly as the emit path does.
-        if self.response_send_in_flight == self.response_ring.depth {
+        // The response goes into send slot `response_send_sequence + held`;
+        // drain send completions until that slot (and every earlier deferred
+        // request's) is free, exactly as the emit path does for one.
+        while !deferred_send_slot_free(self.response_send_in_flight, held, self.response_ring.depth) {
             self.endpoint.poll(1, 0, default_control_timeout())?;
             self.response_send_in_flight -= 1;
         }
         let response_slot = mapped_ring_slot(self.response_send_view, self.response_ring,
-            self.response_send_sequence as u64)?;
+            (self.response_send_sequence + held) as u64)?;
         let payload = protocol_v2_request_device_payload(&storage[..wire_bytes], &request,
             request_slot.device_buffer, Some(response_slot.device_buffer), self.start.execution_lane)?;
         launch(&request, payload).map(Some)
     }
 
-    /// Complete the request [`Self::begin_deferred`] launched: `complete`
-    /// receives the same request and payload, waits for nothing it did not
-    /// queue (callers poll their own completion first), and emits the
+    /// Complete the oldest request [`Self::begin_deferred`] launched:
+    /// `complete` receives the same request and payload, waits for nothing it
+    /// did not queue (callers poll their own completion first), and emits the
     /// response; the request slot is then reposted.
     pub fn finish_deferred<F>(&mut self, mut complete: F) -> Result<()>
     where
@@ -859,9 +858,21 @@ impl LocalVerbsExpertConnection {
             &mut dyn FnMut(ProtocolV2ExecutorResponseRef<'_>) -> Result<()>,
         ) -> Result<()>,
     {
-        let started = self.deferred.take().context("no deferred request to finish")?;
+        let started = self.deferred.pop_front().context("no deferred request to finish")?;
         self.serve_received(started, started, &mut complete)
     }
+}
+
+/// Whether a connection holding `held` deferred requests may receive another:
+/// each holds one receive and one send slot until it finishes.
+fn deferred_admits(held: usize, limit: usize, request_depth: usize, response_depth: usize) -> bool {
+    held < limit.min(request_depth).min(response_depth)
+}
+
+/// Whether the send slot of the next deferred request (after `held` deferred
+/// and `in_flight` sent-but-uncompleted responses) is free to write.
+fn deferred_send_slot_free(in_flight: usize, held: usize, depth: usize) -> bool {
+    in_flight + held < depth
 }
 
 /// A final Error must never publish a successful flag for an untouched plane.
@@ -886,6 +897,27 @@ fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
 }
 
 #[cfg(test)]
+mod deferred_tests {
+    use super::{deferred_admits, deferred_send_slot_free};
+
+    /// N deferred requests per connection, bounded by the slot count and both
+    /// rings; each request's send slot is reserved before the next is received.
+    #[test]
+    fn deferred_requests_are_bounded_by_slots_and_rings() {
+        assert!(deferred_admits(0, 1, 8, 8));
+        assert!(!deferred_admits(1, 1, 8, 8));
+        assert!(deferred_admits(2, 3, 8, 8));
+        assert!(!deferred_admits(3, 3, 8, 8));
+        // A depth-one decode ring holds one request in flight whatever the pool size.
+        assert!(!deferred_admits(1, 4, 1, 1));
+        // Send slots: two responses in flight and one deferred leave room only below depth.
+        assert!(deferred_send_slot_free(2, 1, 4));
+        assert!(!deferred_send_slot_free(2, 2, 4));
+        assert!(!deferred_send_slot_free(0, 1, 1));
+    }
+}
+
+#[cfg(test)]
 mod budget_tests {
     use super::*;
 
@@ -900,8 +932,8 @@ mod budget_tests {
         let selection = placement_selection(&[13]).with_model(ModelAdmission {
             capacity: 80, compiled_capacity: 80,
             endpoints: depths.iter().map(|&ring_depth| SparkEndpoint {
-                capacity: 80, ingress: SparkIngress::Bf16, ring_depth, execution_lane: 0 }).collect(),
-            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                capacity: 80, ingress: SparkIngress::Bf16, ring_depth }).collect(),
+            rings: SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
         })?;
         let report = ModelAdmissionResponse {
             rank: 0, resident_bytes: 1,

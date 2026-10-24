@@ -178,7 +178,7 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = SparkEndpoint { ring_depth: None, capacity: args.span(), ingress: SparkIngress::Bf16, execution_lane: 0 };
+    let endpoint = SparkEndpoint { ring_depth: None, capacity: args.span(), ingress: SparkIngress::Bf16 };
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig::default();
     // Spark admission is planned (headers only) here and started below, once the
@@ -472,7 +472,7 @@ mod tests {
                     "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
                     cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: args.prefill_rows, ingress: SparkIngress::Bf16, execution_lane: 0 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: args.prefill_rows, ingress: SparkIngress::Bf16 };
             let clients = admitted.ownership.routed_endpoints()?;
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },
