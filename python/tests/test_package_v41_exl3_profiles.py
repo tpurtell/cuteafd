@@ -283,6 +283,12 @@ class PackageProfileTests(unittest.TestCase):
         self.assertIsNone(package.ws_tile('glm', 'spark', 384, 80, compact=True))
         # Ordinary width-384 packs keep their 192-wide FC1 tile.
         self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096), package.TILE_384)
+        # The measured cell is the K4/K5 tier family; another tier pair is a
+        # different, unmeasured cell.
+        self.assertTrue(package.compact_ws_export('glm', 'spark', 384, 4096, (4, 5)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (5, 6)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 80, (4, 5)))
 
     def test_compact_glm_ws_prefill_export_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -312,6 +318,33 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT))
             self.assertEqual(variant['route_block'], 64)
             self.assertTrue(variant['ws_dynamic_tiles'])
+
+    def test_compact_unmeasured_tier_family_stays_cooperative(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (3, 4), geometry='glm', capacities=(4096,),
+                compact=True, profiles=('tp6-width256',))
+            compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
+            self.assertTrue(compact_calls)
+            for call in compact_calls:
+                self.assertNotIn('warp_specialized', call.kwargs)
+                self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                self.assertNotIn('+ws-m', str(call.args[0]))
+            package.verify(output)
+            # The same package may not claim the qualified cell's contract.
+            variant = next(v for v in manifest['variants']
+                           if '-compact-' in v['directory'] and v['capacity'] == 4096)
+            path = output / variant['directory'] / 'v41_exl3.json'
+            meta = json.loads(path.read_text())
+            meta.update(warp_specialized=True, route_block=64,
+                        ws_dynamic_tiles=True, tile=list(package.TILE_384_COMPACT))
+            path.write_text(json.dumps(meta))
+            manifest['files'][str(path.relative_to(output))] = {
+                'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+            (output / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'invalid compact geometry or execution contract'):
+                package.verify(output)
 
     def test_compact_ws_verifier_rejects_unqualified_execution_contracts(self):
         cases = [

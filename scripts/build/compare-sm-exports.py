@@ -308,8 +308,12 @@ def _export_exl3(extra, output):
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows)
-            compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
-                geometry, role, width, rows)
+            # A baseline package that predates the measured-tier gate only has
+            # the width/capacity predicate; keep its exports loadable.
+            compact_ws = compact and len(bits) == 2 and (
+                package.compact_ws_export(geometry, role, width, rows, bits)
+                if hasattr(package, 'compact_ws_export') else
+                package.compact_warp_specialized(geometry, role, width, rows))
             ws = compact_ws or (len(bits) == 2 and tile is None
                                 and (role != "coordinator"
                                      or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))

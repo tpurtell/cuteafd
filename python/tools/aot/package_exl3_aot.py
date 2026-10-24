@@ -103,8 +103,9 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
                     or len(meta['bits']) != 2
                     or (meta.get('tile') != (list(cw_tile) if cw_tile is not None else None) if ws
                         else meta.get('tile') != [64, 128, 64, 128])
-                    or (ws and (not compact_warp_specialized(geometry, manifest['role'],
-                                                             meta['intermediate'], meta['capacity'])
+                    or (ws and (not compact_ws_export(geometry, manifest['role'],
+                                                     meta['intermediate'], meta['capacity'],
+                                                     meta['bits'])
                                 or meta.get('route_block', 8) != compact_ws_route_block(
                                     geometry, manifest['role'], meta['intermediate'], meta['capacity'])
                                 or meta.get('ws_dynamic_tiles', False) != ws_dynamic_tiles(
@@ -414,6 +415,9 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
 # `compact_warp_specialized`); the packaged compact profile carries 256, 1024
 # and 4096, and 2752 is the planner's intermediate prefill unit.
 COMPACT_GLM_WS_CAPACITIES = (256, 1024, 2752, 4096)
+# Measured tier families of the compact WS cell; a different tier pair is a
+# different cell and stays cooperative until it is measured.
+COMPACT_WS_BITS = {('glm', (4, 5))}
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -440,10 +444,25 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     4.84 / 4.96; m256 3.80 / 3.80 vs 3.88 / 3.88. So the compact layout
     recovers what the October 20 rotation moved off warp specialization.
     Qualification is the measured capacity set only; every other width,
-    family and capacity stays cooperative.
+    family and capacity stays cooperative. `compact_ws_export` adds the
+    measured tier family (`COMPACT_WS_BITS`: GLM 5.3 K4/K5 only), so the
+    same geometry with another tier pair (GLM 5.3 K3/K4) stays cooperative
+    until that cell is measured.
     """
     return (geometry == 'glm' and role == 'spark' and width == 384
             and capacity in COMPACT_GLM_WS_CAPACITIES)
+
+
+def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
+                      bits) -> bool:
+    """Whether this exact compact cell exports the warp-specialized kernel.
+
+    `compact_warp_specialized` is the width/capacity policy; this adds the
+    measured tier family so an unmeasured quant of the same geometry (for
+    example GLM 5.3 K3/K4 at TP6 compact) stays cooperative.
+    """
+    return (compact_warp_specialized(geometry, role, width, capacity)
+            and (geometry, tuple(bits)) in COMPACT_WS_BITS)
 
 
 def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int | None:
@@ -953,8 +972,8 @@ def build(args: argparse.Namespace) -> None:
                 # path is what every existing build used.
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
-                compact_ws = compact and len(args.bits) == 2 and compact_warp_specialized(
-                    geometry, args.role, width, capacity)
+                compact_ws = compact and len(args.bits) == 2 and compact_ws_export(
+                    geometry, args.role, width, capacity, args.bits)
                 compact_block = (compact_ws_route_block(geometry, args.role, width, capacity)
                                  if compact_ws else None)
                 if compact_block is not None:
