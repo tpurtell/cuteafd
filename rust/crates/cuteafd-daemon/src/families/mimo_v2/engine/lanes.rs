@@ -3,7 +3,50 @@ use super::{MimoEngine, MimoPlacement};
 use crate::shared::serve::lanes::LaneSet;
 use crate::shared::token_io::{DeviceLogits, RowResult, SelectBatch, TokenSelector};
 use anyhow::{Context, Result};
-use std::{cell::Cell, future::Future};
+use std::{cell::{Cell, RefCell}, future::{Future, poll_fn}, panic::{AssertUnwindSafe, catch_unwind}, task::Poll};
+
+/// Stable slots stay in the serving owner; a round temporarily owns only its
+/// cohort. Never borrow the bank across an await or expose its slot vector.
+#[derive(Default)]
+pub(in super::super) struct RoundBank<T> {
+    slots: RefCell<Vec<Option<T>>>,
+}
+impl<T> RoundBank<T> {
+    pub(in super::super) fn from_requests(requests: Vec<T>) -> Self {
+        Self { slots: RefCell::new(requests.into_iter().map(Some).collect()) }
+    }
+
+    pub(in super::super) fn extract(&self, mut selected: impl FnMut(&T) -> bool) -> OwnedRound<'_, T> {
+        // Install the restore guard before calling a fallible/panicking selector.
+        let mut round = OwnedRound { bank: self, requests: Vec::new() };
+        let mut slots = self.slots.borrow_mut();
+        for (index, slot) in slots.iter_mut().enumerate() {
+            if slot.as_ref().is_some_and(&mut selected) {
+                round.requests.push((index, slot.take().expect("selected live request")));
+            }
+        }
+        round
+    }
+}
+
+pub(in super::super) struct OwnedRound<'b, T> {
+    bank: &'b RoundBank<T>,
+    requests: Vec<(usize, T)>,
+}
+impl<T> OwnedRound<'_, T> {
+    pub(in super::super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.requests.iter_mut().map(|(_, request)| request)
+    }
+}
+impl<T> Drop for OwnedRound<'_, T> {
+    fn drop(&mut self) {
+        let mut slots = self.bank.slots.borrow_mut();
+        for (index, request) in self.requests.drain(..) {
+            debug_assert!(slots[index].is_none(), "round slot reused before restoration");
+            slots[index] = Some(request);
+        }
+    }
+}
 
 /// Publication is synchronous, retirement is deferred until both futures return.
 /// In particular, a pending receive still owns its link's mutable borrow.
@@ -33,7 +76,16 @@ impl<A: Fn() -> Result<()>> Boundary<A> {
     async fn future<T, F: Future<Output = Result<T>>>(&self, body: impl FnOnce() -> F) -> Result<T> {
         anyhow::ensure!(!self.failed.get(), "decode aggregate already failed");
         let mut guard = PublicationGuard { boundary: self, completed: false };
-        let result = body().await;
+        let future = catch_unwind(AssertUnwindSafe(body))
+            .map_err(|_| anyhow::anyhow!("decode lane panicked while constructing its future"))?;
+        let mut future = Box::pin(future);
+        let result = poll_fn(|cx| match catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(poll) => poll,
+            Err(_) => Poll::Ready(Err(anyhow::anyhow!("decode lane panicked while polling its future"))),
+        }).await;
+        // Restore every round owner before publishing abort, including owners
+        // left in the future after a caught poll panic. The peer must still join.
+        drop(future);
         guard.completed = result.is_ok();
         result
     }
@@ -86,8 +138,9 @@ impl<'e, 'a> DecodeLanes<'e, 'a> {
 
     fn operation<T>(&self, body: impl FnOnce() -> Result<T>) -> Result<T> {
         anyhow::ensure!(!self.failed.get(), "decode aggregate already failed");
-        let boundary = Boundary::new(|| { self.fail(); Ok(()) });
-        boundary.operation(body)
+        // Only the whole-future boundary publishes failure, after its owned
+        // round has restored media and grammar owners to the serving bank.
+        body()
     }
 
     pub(in super::super) async fn run<'s, F, G>(&'s self,
@@ -161,12 +214,8 @@ impl<'a> DecodeLane<'_, '_, 'a> {
     pub(in super::super) async fn verify(&self, sequences: &mut [(&mut MimoPlacement, usize)], tokens: &[u32])
         -> Result<DeviceLogits> {
         anyhow::ensure!(!self.owner.failed.get(), "decode aggregate already failed");
-        let boundary = Boundary::new(|| { self.owner.fail(); Ok(()) });
-        let mut guard = PublicationGuard { boundary: &boundary, completed: false };
-        let result = self.view().verify_device_async(sequences, tokens).await?
-            .context("decode needs every layer");
-        guard.completed = result.is_ok();
-        result
+        self.view().verify_device_async(sequences, tokens).await?
+            .context("decode needs every layer")
     }
 }
 
@@ -175,6 +224,111 @@ mod tests {
     use super::*;
     use crate::shared::{experts::rtx::pair::{SubmissionOwners, Teardown}, spark_intake::ReceiveDrain};
     use std::cell::RefCell;
+
+    struct RequestOwner<'s> {
+        media: cuteafd_engine::media::RequestMedia,
+        constraint: DropOwner<'s>,
+        media_owner: DropOwner<'s>,
+    }
+    struct DropOwner<'s> {
+        kind: &'static str,
+        drained: &'s Cell<bool>,
+        events: &'s RefCell<Vec<&'static str>>,
+    }
+    impl Drop for DropOwner<'_> {
+        fn drop(&mut self) {
+            assert!(self.drained.get(), "request owner dropped before aggregate drain");
+            self.events.borrow_mut().push(self.kind);
+        }
+    }
+
+    #[test]
+    fn extracted_round_restores_before_abort_and_keeps_requests_through_peer_drain() {
+        for panics in [false, true] {
+            let events = RefCell::new(Vec::new());
+            let drained = Cell::new(false);
+            let waiting = Cell::new(false);
+            let resumed = Cell::new(false);
+            let aborted = Cell::new(false);
+            let bank = RoundBank::from_requests((0..2).map(|_| RequestOwner {
+                media: cuteafd_engine::media::RequestMedia::new(Vec::new(), 1, 0).unwrap(),
+                constraint: DropOwner { kind: "constraint-drop", drained: &drained, events: &events },
+                media_owner: DropOwner { kind: "media-drop", drained: &drained, events: &events },
+            }).collect());
+            let boundary = Boundary::new(|| {
+                // Lane A has restored its slot while B still owns a receive round.
+                let slots = bank.slots.borrow();
+                assert!(slots[0].is_some() && slots[1].is_none());
+                events.borrow_mut().push("abort");
+                aborted.set(true);
+                Ok(())
+            });
+            let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let result = runtime.block_on(LaneSet::default().run(|_| boundary.future(|| async {
+                let mut first = true;
+                let mut round = bank.extract(|_| { let take = first; first = false; take });
+                assert_eq!(round.iter_mut().count(), 1);
+                while !waiting.get() { tokio::task::yield_now().await; }
+                events.borrow_mut().push("lane-error");
+                if panics { panic!("injected lane panic after extracting its round"); }
+                anyhow::bail!("injected lane error after extracting its round")
+            }), |_| boundary.future(|| async {
+                let round = bank.extract(|_| true);
+                let receive_drain = ReceiveDrain::when(false, || panic!("local receive drain"));
+                waiting.set(true);
+                events.borrow_mut().push("spark-wait");
+                while !aborted.get() { tokio::task::yield_now().await; }
+                assert!(!drained.get());
+                drop(receive_drain);
+                resumed.set(true);
+                events.borrow_mut().push("receive-return");
+                drop(round);
+                Ok(())
+            })));
+            assert!(result.is_err());
+            assert!(resumed.get());
+            assert!(bank.slots.borrow().iter().all(Option::is_some));
+            let mut owners: Vec<_> = (0..2).map(|_| Teardown {
+                abort: || { assert!(aborted.get()); Ok(()) },
+                ranks: || { assert!(resumed.get()); events.borrow_mut().push("rank-drain"); Ok(()) },
+                links: || Ok(()), copies: || Ok(()), graphs: || Ok(()),
+                finish: |success: bool| { assert!(success); events.borrow_mut().push("lane-drained"); },
+            }).collect();
+            let mut views: Vec<&mut dyn SubmissionOwners> = owners.iter_mut().map(|owner| owner as _).collect();
+            super::super::super::teardown::retire_views(&mut views).unwrap();
+            drained.set(true);
+            // All real media values and both tracked owner types survive the drain.
+            for request in bank.slots.borrow().iter().flatten() {
+                assert!(request.media.spans().is_empty());
+                assert_eq!(request.constraint.kind, "constraint-drop");
+                assert_eq!(request.media_owner.kind, "media-drop");
+            }
+            drop(bank);
+            let events = events.borrow();
+            let drain_end = events.iter().rposition(|event| *event == "lane-drained").unwrap();
+            assert_eq!(events.iter().filter(|event| **event == "media-drop").count(), 2);
+            assert_eq!(events.iter().filter(|event| **event == "constraint-drop").count(), 2);
+            assert!(events.iter().position(|event| *event == "media-drop").unwrap() > drain_end);
+            assert!(events.iter().position(|event| *event == "constraint-drop").unwrap() > drain_end);
+        }
+    }
+
+    #[test]
+    fn round_restores_in_place_on_success_and_selector_unwind() {
+        let bank = RoundBank::from_requests(vec![1, 2, 3]);
+        {
+            let mut round = bank.extract(|request| *request != 2);
+            for request in round.iter_mut() { *request += 10; }
+            assert_eq!(*bank.slots.borrow(), [None, Some(2), None]);
+        }
+        assert_eq!(*bank.slots.borrow(), [Some(11), Some(2), Some(13)]);
+        let result = catch_unwind(AssertUnwindSafe(|| bank.extract(|request| {
+            assert!(*request != 2, "injected selector unwind");
+            true
+        })));
+        assert!(result.is_err());
+        assert_eq!(*bank.slots.borrow(), [Some(11), Some(2), Some(13)]);
+    }
 
     #[test]
     fn host_failure_in_whole_lane_future_publishes_before_join_returns() {
