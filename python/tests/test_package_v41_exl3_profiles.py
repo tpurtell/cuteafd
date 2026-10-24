@@ -263,32 +263,50 @@ class PackageProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'descriptor contract mismatch'):
                 package.verify(output)
 
-    def test_compact_ws_qualifies_glm_tp6_width384_prefill(self):
+    def test_compact_ws_qualifies_measured_glm_cells(self):
         capacities = (1, 16, 80, 256, 1024, 2752, 4096)
         self.assertEqual([package.compact_warp_specialized('glm', 'spark', 384, c)
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('glm', 'spark', 384, c)
                           for c in capacities], [None] * 3 + [32, 64, 64, 64])
+        # TP3 compact width 768 is the second measured cell: 64-row blocks at
+        # every served capacity (32 ties at m256 and loses from m1024 up).
+        self.assertEqual([package.compact_warp_specialized('glm', 'spark', 768, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('glm', 'spark', 768, c)
+                          for c in capacities], [None] * 3 + [64] * 4)
         for geometry in ('v41', 'qwen4', 'glmf', 'dsv4p', 'kimik3'):
-            self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', 384, c)
-                                 for c in capacities))
+            for width in (384, 768):
+                self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', width, c)
+                                     for c in capacities))
         self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 384, 4096))
+        self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 768, 4096))
         # Unmeasured capacities stay cooperative even above the smallest one.
-        self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', 384, c)
-                             for c in (512, 2048, 8192)))
+        for width in (384, 768):
+            self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, c)
+                                 for c in (512, 2048, 8192)))
+        # Unmeasured widths of the same geometry stay cooperative at every
+        # capacity; TP5 compact (640) and TP8 compact (256) were never measured.
         self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, 4096)
-                             for width in (256, 512, 640, 768)))
+                             for width in (256, 512, 640)))
         self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096, compact=True),
                          package.TILE_384_COMPACT)
+        self.assertEqual(package.ws_tile('glm', 'spark', 768, 4096, compact=True),
+                         package.TILE_384_COMPACT)
         self.assertIsNone(package.ws_tile('glm', 'spark', 384, 80, compact=True))
+        self.assertIsNone(package.ws_tile('glm', 'spark', 640, 4096, compact=True))
         # Ordinary width-384 packs keep their 192-wide FC1 tile.
         self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096), package.TILE_384)
-        # The measured cell is the K4/K5 tier family; another tier pair is a
+        # The measured cells are the K4/K5 tier family; another tier pair is a
         # different, unmeasured cell.
         self.assertTrue(package.compact_ws_export('glm', 'spark', 384, 4096, (4, 5)))
+        self.assertTrue(package.compact_ws_export('glm', 'spark', 768, 4096, (4, 5)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (3, 4)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (3, 4)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 4096, (5, 6)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 4096, (5, 6)))
         self.assertFalse(package.compact_ws_export('glm', 'spark', 384, 80, (4, 5)))
+        self.assertFalse(package.compact_ws_export('glm', 'spark', 768, 80, (4, 5)))
 
     def test_compact_glm_ws_prefill_export_and_verification(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -411,11 +411,16 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
 
 
-# Compact capacity set with a measured warp-specialized win (see
-# `compact_warp_specialized`); the packaged compact profile carries 256, 1024
-# and 4096, and 2752 is the planner's intermediate prefill unit.
-COMPACT_GLM_WS_CAPACITIES = (256, 1024, 2752, 4096)
-# Measured tier families of the compact WS cell; a different tier pair is a
+# Measured compact warp-specialized cells on GB10 (SM121), keyed by
+# (geometry, width) with the route block of each qualified capacity (see
+# `compact_warp_specialized`). The packaged compact profile carries 256, 1024
+# and 4096, and 2752 is the planner's intermediate prefill unit. A cell that
+# is not listed here stays cooperative.
+COMPACT_WS_CELLS = {
+    ('glm', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+    ('glm', 768): {256: 64, 1024: 64, 2752: 64, 4096: 64},
+}
+# Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
 COMPACT_WS_BITS = {('glm', (4, 5))}
 
@@ -444,14 +449,25 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     12.95 / 13.16; m2752 9.60 / 9.42 vs 9.72 / 9.47; m1024 4.79 / 4.92 vs
     4.84 / 4.96; m256 3.78 / 3.78 vs 3.88 / 3.88. So the compact layout
     recovers what the October 20 rotation moved off warp specialization.
-    Qualification is the measured capacity set only; every other width,
-    family and capacity stays cooperative. `compact_ws_export` adds the
-    measured tier family (`COMPACT_WS_BITS`: GLM 5.3 K4/K5 only), so the
-    same geometry with another tier pair (GLM 5.3 K3/K4) stays cooperative
-    until that cell is measured.
+
+    GLM 5.3 K4 TP3 compact width 768 is the same arm on the planner's rotated
+    ownership at world 3 (live widths 640/768), layer-7 recorded histograms,
+    kernel + top-k sum, median of three interleaved rounds of twenty graph
+    replays, ms (cooperative -> warp-specialized, kernel reduction): m4096
+    31.30 -> 21.66 (-30.8%); m2752 23.26 -> 15.61 (-32.9%); m1024 11.34 ->
+    8.18 (-27.9%); m256 7.42 -> 6.53 (-12.0%). A 64-row block ties 32 at
+    m256 here and wins from m1024 up (m4096 21.66 vs 27.29), so every
+    qualified capacity takes 64. Every prefix row count in the gate, arm
+    output and three replays over poisoned workspaces are bitwise equal to
+    the cooperative oracle.
+
+    Qualification is the measured capacity set of each listed cell only;
+    every other width, family and capacity stays cooperative.
+    `compact_ws_export` adds the measured tier family (`COMPACT_WS_BITS`:
+    GLM 5.3 K4/K5 only), so the same geometry with another tier pair
+    (GLM 5.3 K3/K4) stays cooperative until that cell is measured.
     """
-    return (geometry == 'glm' and role == 'spark' and width == 384
-            and capacity in COMPACT_GLM_WS_CAPACITIES)
+    return role == 'spark' and capacity in COMPACT_WS_CELLS.get((geometry, width), ())
 
 
 def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
@@ -469,15 +485,15 @@ def compact_ws_export(geometry: str, role: str, width: int, capacity: int,
 def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int | None:
     """Route block of a compact warp-specialized export, or None when off.
 
-    Measured per capacity (see `compact_warp_specialized`): a 64-row block
-    beats 32 from m1024 up (m1024 4.79 vs 5.76 ms); at m256, with dynamic
-    tile claims, 32 is 1.2% faster (3.78 vs 3.82), so the small capacity
-    keeps the 32-row block and larger ones take 64. Gemini's S1 round
-    measured the same arm set independently and splits the same way.
+    Measured per capacity (see `compact_warp_specialized`). Width 384: a
+    64-row block beats 32 from m1024 up (m1024 4.79 vs 5.76 ms); at m256,
+    with dynamic tile claims, 32 is 1.2% faster (3.78 vs 3.82), so the small
+    capacity keeps the 32-row block and larger ones take 64. Gemini's S1
+    round measured the same arm set independently and splits the same way.
+    Width 768 takes 64 at every capacity (m256 6.53 vs 6.52, m4096 21.66 vs
+    27.29). `COMPACT_WS_CELLS` holds both tables.
     """
-    if not compact_warp_specialized(geometry, role, width, capacity):
-        return None
-    return 32 if capacity < 1024 else 64
+    return COMPACT_WS_CELLS.get((geometry, width), {}).get(capacity) if role == 'spark' else None
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
