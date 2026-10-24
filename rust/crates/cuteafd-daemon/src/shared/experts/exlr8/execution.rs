@@ -7,21 +7,47 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 use std::ffi::c_void;
 
+/// Measured small-row dispatch: grouped is faster at every measured row once a
+/// rank owns four units (TP4: 1.59x at one row, 1.97x at 64 rows). With three
+/// owned units (TP6) K1 still wins at one row and grouped wins from four rows
+/// (realistic routes 1.19x at four, 1.26x at 64), so the threshold keys on
+/// owned units and never on the SM count.
+pub(crate) fn grouped_decode_from_row(unit_limit: usize) -> usize {
+    if unit_limit >= 4 { 1 } else { 4 }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    /// Serving kernel below the grouped threshold (one row here at TP6).
+    DecodeK1,
+    /// 64-row grouped instance with F32 FC2 partials: bit-identical to K1.
+    DecodeGrouped,
+    /// 4096-row grouped prefill.
+    Prefill,
+}
+
+impl Variant {
+    fn grouped(self) -> bool {
+        !matches!(self, Self::DecodeK1)
+    }
+}
+
 fn program_names(
     set: ExpertSet,
-    rows: usize,
+    variant: Variant,
     activations: Exlr8PrefillActivations,
 ) -> (&'static str, &'static str) {
-    match set {
-        ExpertSet::Routed if rows > 64 => (
+    match (set, variant) {
+        (ExpertSet::Routed, Variant::Prefill) => (
             match activations {
                 Exlr8PrefillActivations::A16 => "exlr8_a16_grouped",
                 Exlr8PrefillActivations::A8 => "exlr8_a8_grouped",
             },
             "exlr8_grouped_group",
         ),
-        ExpertSet::Routed => ("exlr8_a16_serving", "exlr8_group"),
-        ExpertSet::Shared => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
+        (ExpertSet::Routed, Variant::DecodeGrouped) => ("exlr8_a16_grouped64", "exlr8_group"),
+        (ExpertSet::Routed, Variant::DecodeK1) => ("exlr8_a16_serving", "exlr8_group"),
+        (ExpertSet::Shared, _) => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
     }
 }
 
@@ -41,9 +67,11 @@ const K1_POINTERS: &[&str] = &[
     "group_count",
 ];
 
-fn pointers(set: ExpertSet, rows: usize) -> Vec<&'static str> {
+fn pointers(set: ExpertSet, variant: Variant) -> Vec<&'static str> {
     let mut names = K1_POINTERS.to_vec();
-    if set == ExpertSet::Routed && rows > 64 { names.extend(["unit_count", "unit_map"]); }
+    if set == ExpertSet::Routed && variant.grouped() {
+        names.extend(["unit_count", "unit_map"]);
+    }
     names
 }
 
@@ -85,23 +113,33 @@ struct Workspace {
     units: usize,
     unit_limit: usize,
     intermediate_bytes: usize,
+    /// Owned-unit tables and unit-scaled scratch: every grouped instance.
+    compact: bool,
 }
 impl Workspace {
     fn plan(
         spec: &ProgramSpec,
         rows: usize,
         set: ExpertSet,
+        variant: Variant,
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
         cuteafd_ffi::exlr8::validate(spec)?;
         ensure!(
-            spec.name == program_names(set, rows, activations).0 && spec.geometry["abi_version"] == 3,
+            spec.name == program_names(set, variant, activations).0 && spec.geometry["abi_version"] == 3,
             "EXLR8 execution requires fused rotation ABI v3"
         );
         ensure!(
             rows > 0 && rows <= spec.capacity_rows as usize,
             "EXLR8 rows outside admitted K1 capacity"
+        );
+        // Decode rows route to the K1 or the 64-row grouped instance; the
+        // 4096-row prefill instance is only admitted above the K1 row limit.
+        ensure!(
+            variant != Variant::Prefill
+                || rows > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS,
+            "EXLR8 prefill instance is only admitted above the K1 row limit"
         );
         let dimension = |name| -> Result<usize> {
             usize::try_from(
@@ -119,7 +157,7 @@ impl Workspace {
             usize::try_from(*spec.scratch.get(name).context("missing K1 scratch")?)
                 .context("K1 scratch exceeds address space")
         };
-        let compact = set == ExpertSet::Routed && rows > 64;
+        let compact = set == ExpertSet::Routed && variant.grouped();
         ensure!(!compact || (1..=units).contains(&unit_limit), "invalid compact unit limit");
         let scratch = |name: &str| -> Result<usize> {
             let bytes = scratch(name)?;
@@ -144,6 +182,7 @@ impl Workspace {
             units,
             unit_limit: if compact { unit_limit } else { units },
             intermediate_bytes,
+            compact,
         })
     }
 }
@@ -166,7 +205,8 @@ impl<'a> Exlr8Execution<'a> {
         rows: usize,
         set: ExpertSet,
     ) -> Result<usize> {
-        Self::workspace_bytes_with_limit(programs, rows, set, 16, Exlr8PrefillActivations::A16)
+        Self::workspace_bytes_for(programs, rows, set, Variant::DecodeK1, 16,
+            Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn workspace_bytes_with_limit(
@@ -176,8 +216,30 @@ impl<'a> Exlr8Execution<'a> {
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<usize> {
-        let k1 = programs.program(program_names(set, rows, activations).0, &pointers(set, rows))?;
-        Ok(Workspace::plan(k1.spec(), rows, set, unit_limit, activations)?.bytes)
+        Self::workspace_bytes_for(programs, rows, set, Variant::Prefill, unit_limit, activations)
+    }
+
+    /// 64-row grouped decode arena; F32 FC2 partials keep it bit-identical to K1.
+    pub(crate) fn decode_grouped_workspace_bytes(
+        programs: &'a Programs<'a>,
+        rows: usize,
+        unit_limit: usize,
+    ) -> Result<usize> {
+        Self::workspace_bytes_for(programs, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+            unit_limit, Exlr8PrefillActivations::A16)
+    }
+
+    fn workspace_bytes_for(
+        programs: &'a Programs<'a>,
+        rows: usize,
+        set: ExpertSet,
+        variant: Variant,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
+    ) -> Result<usize> {
+        let core = programs.program(program_names(set, variant, activations).0,
+            &pointers(set, variant))?;
+        Ok(Workspace::plan(core.spec(), rows, set, variant, unit_limit, activations)?.bytes)
     }
 
     pub(crate) fn new(
@@ -187,7 +249,8 @@ impl<'a> Exlr8Execution<'a> {
         available: usize,
         set: ExpertSet,
     ) -> Result<Self> {
-        Self::new_with_limit(library, programs, rows, available, set, 16, Exlr8PrefillActivations::A16)
+        Self::new_for(library, programs, rows, available, set, Variant::DecodeK1, 16,
+            Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn new_with_limit(
@@ -199,8 +262,32 @@ impl<'a> Exlr8Execution<'a> {
         unit_limit: usize,
         activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
-        let (k1_name, group_name) = program_names(set, rows, activations);
-        let k1 = programs.program(k1_name, &pointers(set, rows))?;
+        Self::new_for(library, programs, rows, available, set, Variant::Prefill, unit_limit, activations)
+    }
+
+    pub(crate) fn new_decode_grouped(
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+        unit_limit: usize,
+    ) -> Result<Self> {
+        Self::new_for(library, programs, rows, available, ExpertSet::Routed, Variant::DecodeGrouped,
+            unit_limit, Exlr8PrefillActivations::A16)
+    }
+
+    fn new_for(
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+        set: ExpertSet,
+        variant: Variant,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
+    ) -> Result<Self> {
+        let (k1_name, group_name) = program_names(set, variant, activations);
+        let k1 = programs.program(k1_name, &pointers(set, variant))?;
         let group = programs.program(
             group_name,
             &[
@@ -214,7 +301,7 @@ impl<'a> Exlr8Execution<'a> {
                 "activation",
             ],
         )?;
-        let layout = Workspace::plan(k1.spec(), rows, set, unit_limit, activations)?;
+        let layout = Workspace::plan(k1.spec(), rows, set, variant, unit_limit, activations)?;
         ensure!(
             group.spec().geometry["abi_version"] == 2
                 && group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
@@ -337,7 +424,7 @@ impl<'a> Exlr8Execution<'a> {
             self.intermediate_bytes,
             buffers[9].bytes - self.intermediate_bytes,
         )?;
-        let compact = self.set == ExpertSet::Routed && self.layout.rows > 64;
+        let compact = self.layout.compact;
         ensure!(!compact || weights.layout.compact_unit_limit() <= self.layout.unit_limit,
             "EXLR8 layer ownership exceeds compact arena stride");
         let scalars = [Scalar::I32(rows as i32), Scalar::I32(self.cta_limit),
@@ -373,7 +460,7 @@ mod tests {
             ExpertSet::Shared => (1, 4),
         };
         ProgramSpec {
-            name: program_names(set, 64, Exlr8PrefillActivations::A16).0.into(),
+            name: program_names(set, Variant::DecodeK1, Exlr8PrefillActivations::A16).0.into(),
             pointers: K1_POINTERS.iter().map(|name| (*name).into()).collect(),
             scalar_kinds: b"ii".to_vec(),
             scratch: [
@@ -389,12 +476,40 @@ mod tests {
         }
     }
 
+    /// The shipped 64-row grouped instance: 16-row groups, F32 FC2 partials.
+    fn grouped64_spec() -> ProgramSpec {
+        let mut spec = spec(ExpertSet::Routed);
+        spec.name = program_names(ExpertSet::Routed, Variant::DecodeGrouped,
+            Exlr8PrefillActivations::A16).0.into();
+        spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeGrouped)
+            .into_iter().map(String::from).collect();
+        spec.scalar_kinds = b"iii".to_vec();
+        spec.geometry["group_rows"] = serde_json::json!(16);
+        spec.geometry["fc2_partials"] = serde_json::json!("f32");
+        spec.geometry["ctas_per_sm"] = serde_json::json!(2);
+        spec
+    }
+
+    #[test]
+    fn exlr8_grouped_decode_threshold_follows_owned_units() {
+        // Measured on GB10: TP4 (4 owned units) wins at every row, TP6 (3)
+        // keeps K1 at one row, and narrower ranks have no measured K1 win.
+        assert_eq!(grouped_decode_from_row(1), 4);
+        assert_eq!(grouped_decode_from_row(2), 4);
+        assert_eq!(grouped_decode_from_row(3), 4);
+        assert_eq!(grouped_decode_from_row(4), 1);
+        assert_eq!(grouped_decode_from_row(8), 1);
+        assert_eq!(grouped_decode_from_row(16), 1);
+    }
+
     #[test]
     fn exlr8_shared_workspace_keeps_exact_aligned_admission() {
         for set in [ExpertSet::Routed, ExpertSet::Shared] {
             let spec = spec(set);
-            let wide = Workspace::plan(&spec, 64, set, 16, Exlr8PrefillActivations::A16).unwrap();
-            let single = Workspace::plan(&spec, 1, set, 16, Exlr8PrefillActivations::A16).unwrap();
+            let wide = Workspace::plan(&spec, 64, set, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).unwrap();
+            let single = Workspace::plan(&spec, 1, set, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).unwrap();
             for layout in [&single, &wide] {
                 let mut end = 0;
                 for (offset, bytes) in layout.ranges {
@@ -417,66 +532,130 @@ mod tests {
             });
             let mut stale = spec.clone();
             stale.geometry["abi_version"] = serde_json::json!(2);
-            assert!(Workspace::plan(&stale, 64, set, 16, Exlr8PrefillActivations::A16).is_err());
-            assert!(Workspace::plan(&spec, 0, set, 16, Exlr8PrefillActivations::A16).is_err());
-            assert!(Workspace::plan(&spec, 65, set, 16, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&stale, 64, set, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&spec, 0, set, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&spec, 65, set, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).is_err());
             let other = if set == ExpertSet::Shared {
                 ExpertSet::Routed
             } else {
                 ExpertSet::Shared
             };
-            assert!(Workspace::plan(&spec, 64, other, 16, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&spec, 64, other, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).is_err());
         }
         assert!(
-            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared, 16, Exlr8PrefillActivations::A16)
-                .unwrap()
-                .bytes
-                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16)
-                    .unwrap()
-                    .bytes
+            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared, Variant::DecodeK1,
+                16, Exlr8PrefillActivations::A16).unwrap().bytes
+                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed,
+                    Variant::DecodeK1, 16, Exlr8PrefillActivations::A16).unwrap().bytes
         );
+    }
+
+    #[test]
+    fn grouped_decode_instance_compacts_and_keeps_k1_route_slots() {
+        let grouped = grouped64_spec();
+        for rows in [1, 4, 17, 64] {
+            let full = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+                16, Exlr8PrefillActivations::A16).unwrap();
+            let owned = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+                3, Exlr8PrefillActivations::A16).unwrap();
+            assert!(full.compact && owned.compact && owned.unit_limit == 3);
+            // fc1 and the activation scratch follow owned units; FC2 keeps the
+            // full group capacity exactly as K1's arena does.
+            assert_eq!(owned.ranges[8].1 * 16, full.ranges[8].1 * 3);
+            assert_eq!(owned.intermediate_bytes * 16, full.intermediate_bytes * 3);
+            assert_eq!(owned.ranges[9].1 - owned.intermediate_bytes,
+                full.ranges[9].1 - full.intermediate_bytes);
+            assert!(owned.bytes < full.bytes);
+            assert_eq!(full.ranges[4].1, 512 * 4);
+            assert_eq!(full.ranges[5].1, 512 * 16 * 4);
+            assert_eq!(full.ranges[0].1, rows * 6336);
+            // Serving K1 does not compact at these rows, so the grouped arena
+            // is strictly smaller once a rank owns three units.
+            let k1 = spec(ExpertSet::Routed);
+            let decode = Workspace::plan(&k1, rows, ExpertSet::Routed, Variant::DecodeK1, 16,
+                Exlr8PrefillActivations::A16).unwrap();
+            assert!(!decode.compact);
+            assert_eq!(decode.ranges[8].1, full.ranges[8].1);
+        }
+        for rows in [0, 65] {
+            assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+                3, Exlr8PrefillActivations::A16).is_err());
+        }
+        let mut missing_partials = grouped.clone();
+        missing_partials.geometry["fc2_partials"] = serde_json::json!("f16");
+        assert!(Workspace::plan(&missing_partials, 64, ExpertSet::Routed,
+            Variant::DecodeGrouped, 3, Exlr8PrefillActivations::A16).is_err());
+        // A K1 spec cannot masquerade as the grouped decode instance.
+        assert!(Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed,
+            Variant::DecodeGrouped, 3, Exlr8PrefillActivations::A16).is_err());
     }
 
     #[test]
     fn grouped_workspace_uses_wide_route_slots_without_changing_decode() {
         let mut grouped = spec(ExpertSet::Routed);
-        grouped.name = program_names(ExpertSet::Routed, 65, Exlr8PrefillActivations::A16).0.into();
+        grouped.name = program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A16).0.into();
         grouped.capacity_rows = 4096;
+        grouped.pointers = pointers(ExpertSet::Routed, Variant::Prefill)
+            .into_iter().map(String::from).collect();
+        grouped.scalar_kinds = b"iii".to_vec();
         grouped.geometry["max_rows"] = serde_json::json!(4096);
         grouped.geometry["group_rows"] = serde_json::json!(64);
         grouped.geometry["ctas_per_sm"] = serde_json::json!(2);
         for bytes in grouped.scratch.values_mut() { *bytes *= 4; }
         for rows in [65, 128, 4095, 4096] {
-            grouped.pointers = pointers(ExpertSet::Routed, rows).into_iter().map(String::from).collect();
-            grouped.scalar_kinds = b"iii".to_vec();
-            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).unwrap();
-            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, 3, Exlr8PrefillActivations::A16).unwrap();
+            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill,
+                16, Exlr8PrefillActivations::A16).unwrap();
+            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill,
+                3, Exlr8PrefillActivations::A16).unwrap();
             assert_eq!(compact.ranges[8].1 * 16, workspace.ranges[8].1 * 3);
             assert_eq!(compact.intermediate_bytes * 16, workspace.intermediate_bytes * 3);
             assert!(compact.bytes < workspace.bytes);
             assert_eq!(workspace.ranges[5].1, 512 * 64 * 4);
             assert_eq!(workspace.ranges[0].1, rows * 6336);
             assert_eq!(workspace.ranges[10].1, rows * 6144 * 2);
-            assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A8).is_err());
+            assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill, 16,
+                Exlr8PrefillActivations::A8).is_err());
             let mut grouped_a8 = grouped.clone();
-            grouped_a8.name = program_names(ExpertSet::Routed, rows, Exlr8PrefillActivations::A8).0.into();
+            grouped_a8.name = program_names(ExpertSet::Routed, Variant::Prefill,
+                Exlr8PrefillActivations::A8).0.into();
             grouped_a8.geometry["activations"] = serde_json::json!("a8");
-            let workspace_a8 = Workspace::plan(&grouped_a8, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A8).unwrap();
+            let workspace_a8 = Workspace::plan(&grouped_a8, rows, ExpertSet::Routed,
+                Variant::Prefill, 16, Exlr8PrefillActivations::A8).unwrap();
             assert_eq!(workspace_a8.bytes, workspace.bytes);
-            assert!(Workspace::plan(&grouped_a8, rows, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&grouped_a8, rows, ExpertSet::Routed, Variant::Prefill,
+                16, Exlr8PrefillActivations::A16).is_err());
         }
         for invalid in [0, 17, usize::MAX] {
-            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, invalid, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, Variant::Prefill,
+                invalid, Exlr8PrefillActivations::A16).is_err());
         }
-        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).is_err());
-        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, 16, Exlr8PrefillActivations::A16).is_err());
-        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, 16, Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, Variant::Prefill, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, Variant::Prefill, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, Variant::Prefill, 16,
+            Exlr8PrefillActivations::A16).is_err());
         for activations in [Exlr8PrefillActivations::A16, Exlr8PrefillActivations::A8] {
-            assert_eq!(program_names(ExpertSet::Routed, 64, activations).0, "exlr8_a16_serving");
-            assert_eq!(program_names(ExpertSet::Shared, 64, activations).0, "exlr8_shared_a16_serving");
+            assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeK1, activations).0,
+                "exlr8_a16_serving");
+            assert_eq!(program_names(ExpertSet::Shared, Variant::DecodeK1, activations).0,
+                "exlr8_shared_a16_serving");
+            assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeGrouped, activations).0,
+                "exlr8_a16_grouped64");
         }
-        assert_eq!(program_names(ExpertSet::Routed, 65, Exlr8PrefillActivations::A16).0, "exlr8_a16_grouped");
-        assert_eq!(program_names(ExpertSet::Routed, 65, Exlr8PrefillActivations::A8).0, "exlr8_a8_grouped");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A16).0, "exlr8_a16_grouped");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A8).0, "exlr8_a8_grouped");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeGrouped,
+            Exlr8PrefillActivations::A16).1, "exlr8_group");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A16).1, "exlr8_grouped_group");
     }
 
     #[test]

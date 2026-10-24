@@ -19,19 +19,28 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     };
     let shared = spec.name == "exlr8_shared_a16_serving";
     let grouped_a8 = spec.name == "exlr8_a8_grouped";
-    let grouped = spec.name == "exlr8_a16_grouped" || grouped_a8;
+    // The 64-row grouped instance reuses the grouped ABI below the K1
+    // threshold; its F32 FC2 partials must match the K1 serving kernel.
+    let grouped_decode = spec.name == "exlr8_a16_grouped64";
+    let grouped = spec.name == "exlr8_a16_grouped" || grouped_a8 || grouped_decode;
     let serving = shared || grouped || spec.name == "exlr8_a16_serving";
     let activations = spec.geometry.get("activations").and_then(|v| v.as_str());
     if (grouped_a8 && activations != Some("a8"))
-        || (!grouped_a8 && activations.is_some_and(|v| v != "a16"))
+        || (grouped_decode && activations.is_some())
+        || (!grouped_a8 && !grouped_decode && activations.is_some_and(|v| v != "a16"))
     {
         return Err(invalid("grouped activation mode mismatch"));
     }
-    let max_rows = if grouped { 4096 } else { 64 };
+    if grouped_decode
+        && spec.geometry.get("fc2_partials").and_then(|v| v.as_str()) != Some("f32")
+    {
+        return Err(invalid("64-row grouped instance requires F32 FC2 partials"));
+    }
+    let max_rows = if grouped && !grouped_decode { 4096 } else { 64 };
     let group_rows = if grouped {
         let rows = field("group_rows")?;
-        if !matches!(rows, 16 | 32 | 64) {
-            return Err(invalid("grouped row tile must be 16, 32 or 64"));
+        if !matches!(rows, 16 | 32 | 64) || (grouped_decode && rows != 16) {
+            return Err(invalid("grouped row tile must be 16, 32 or 64 (16 when decoding)"));
         }
         rows
     } else {
@@ -164,11 +173,15 @@ pub fn validate_entry(spec: &ProgramSpec, entry: &serde_json::Value) -> Result<(
             | "exlr8_shared_a16_serving"
             | "exlr8_a16_grouped"
             | "exlr8_a8_grouped"
+            | "exlr8_a16_grouped64"
     ) {
         shapes.push("[1]".into());
         dtypes.push("int32");
     }
-    if matches!(spec.name.as_str(), "exlr8_a16_grouped" | "exlr8_a8_grouped") {
+    if matches!(
+        spec.name.as_str(),
+        "exlr8_a16_grouped" | "exlr8_a8_grouped" | "exlr8_a16_grouped64"
+    ) {
         shapes.extend(["[E]".into(), format!("[E,{u}]")]);
         dtypes.extend(["int32", "int32"]);
     }

@@ -81,6 +81,10 @@ impl<'a> WarmModules<'a> {
                 (config.capacity as usize).min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS),
                 cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
             programs.program("exlr8_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
+            // The 64-row grouped decode instance is part of every Spark
+            // EXLR8 image; validation here precedes any workspace allocation.
+            crate::shared::experts::exlr8::Exlr8Execution::decode_grouped_workspace_bytes(programs,
+                (config.capacity as usize).min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS), 16)?;
             if config.capacity as usize > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS {
                 crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes_with_limit(programs,
                     config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed, 16,

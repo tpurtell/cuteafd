@@ -6,7 +6,7 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, CuteafdHostBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::Residency;
 
 mod execution;
-pub(crate) use execution::Exlr8Execution;
+pub(crate) use execution::{Exlr8Execution, grouped_decode_from_row};
 
 pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 

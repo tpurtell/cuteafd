@@ -212,7 +212,8 @@ def test_release_inventory_requires_each_roles_exlr8_set(tmp_path):
                    spark_count=4, spark_tp=4, dual=False, roles=[], nvfp4=False, audio=False,
                    context_split=False, exlr8=True)]
     coordinator = ['exlr8_shared_a16_serving', 'exlr8_shared_group']
-    spark = ['exlr8_a16_serving', 'exlr8_group', 'exlr8_a16_grouped', 'exlr8_a8_grouped', 'exlr8_grouped_group']
+    spark = ['exlr8_a16_serving', 'exlr8_group', 'exlr8_a16_grouped', 'exlr8_a8_grouped',
+             'exlr8_grouped_group', 'exlr8_a16_grouped64']
     write_programs(tmp_path / 'c', ['glm'], 'coordinator', coordinator)
     write_programs(tmp_path / 'e', [], 'spark', spark)
     SCOPE.check_inventory(tmp_path / 'c', 'coordinator', wanted, symbols=set())

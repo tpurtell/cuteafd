@@ -61,12 +61,20 @@ def test_serving_and_glue_export_inventory():
     inventory = namespace["exlr8_export_programs"]
     spark = inventory("spark")
     assert [p[0] for p in spark] == [
-        "a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group"]
+        "a16_serving", "group", "a16_grouped", "a8_grouped", "grouped_group",
+        "a16_grouped64"]
     a16_grouped = dict(spark[2][2])
     a8_grouped = dict(spark[3][2])
     assert a16_grouped == {"max_rows": 4096} and a8_grouped == {"max_rows": 4096, "activations": "a8"}
     assert spark[2][3]()["grouped"] is True and "activations" not in spark[2][3]()
     assert spark[3][3]() == {**spark[2][3](), "activations": "a8"}
+    # The 64-row grouped instance is the only export that must match K1's
+    # F32 FC2 partial precision, and it pairs with the existing 64-row glue.
+    assert dict(spark[5][2]) == {"max_rows": 64, "fc2_partials": "f32"}
+    grouped64 = spark[5][3]()
+    assert grouped64["grouped"] is True and grouped64["group_rows"] == 16
+    assert grouped64["grouped_rows"] == 64 and grouped64["fc2_partials"] == "f32"
+    assert grouped64["max_groups"] == 512
     assert [p[0] for p in inventory("coordinator")] == ["shared_a16_serving", "shared_group"]
     with pytest.raises(ValueError):
         inventory("unknown")
