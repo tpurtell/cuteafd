@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.05-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3@sha256:6e8ccc607fc2a51e3741667b86316a0889418ba8b78ed0ba96e8d282b648a7a6
 FROM ${BASE_IMAGE} AS inference
 ARG TARGETARCH
 # Cache mounts stay out of layers. Reset with: docker buildx prune --filter type=exec.cachemount
@@ -27,21 +27,21 @@ RUN --mount=type=cache,target=/root/.cache/pip,id=cuteafd-pip-${TARGETARCH},shar
     uv pip install --system --break-system-packages \
       safetensors \
       "huggingface-hub>=2.2,<3" \
-      "nvidia-cutlass-dsl[cu13]==4.6.2" \
-      "apache-tvm-ffi==0.1.12" \
-      "cuda-tile==1.5.0" \
-      "nvidia-cudnn-frontend==1.26.0" \
+      "nvidia-cutlass-dsl[cu13]==4.8.1" \
+      "apache-tvm-ffi==0.1.15.post0" \
+      "cuda-tile==1.7.0" \
+      "nvidia-cudnn-frontend==1.31.0" \
       "einops==0.8.2" \
       "ninja==1.13.0" \
       "nvidia-ml-py==13.610.43" \
       "tabulate==0.10.0" \
       "transformers==5.13.0" \
       "rich==15.0.0" && \
-    uv pip install --system --break-system-packages --no-deps \
-      "flashinfer-python==0.6.14" && \
+    uv pip install --system --break-system-packages \
+      "flashinfer-python==0.7.2.post1" && \
     python3 -c 'import torch; print(torch.__version__)'
 
-# The NGC 26.05 base declares pytest as a runtime requirement of its bundled
+# The NGC 26.09 base declares pytest as a runtime requirement of its bundled
 # triton-kernels distribution. Keep the release environment dependency-complete
 # so the source-pinned SparkInfer installation can be checked globally below.
 RUN --mount=type=cache,target=/root/.cache/uv,id=cuteafd-uv-${TARGETARCH},sharing=locked \

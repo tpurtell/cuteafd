@@ -35,7 +35,7 @@ CUTLASS_PACKAGES = (
     "nvidia-cutlass-dsl-libs-cu12",
     "nvidia-cutlass-dsl-libs-cu13",
 )
-QUALIFIED_CUTLASS_VERSION = "4.6.2"
+QUALIFIED_CUTLASS_VERSION = "4.8.1"
 METADATA_FREE_PYTHON_CACHE_MARKERS = (
     ".mypy_cache",
     ".pytest_cache",
