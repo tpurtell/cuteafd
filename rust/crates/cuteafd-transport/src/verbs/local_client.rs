@@ -2,11 +2,11 @@
 //! response assembler/recycling code runs locally; no QP worker is spawned.
 use super::*;
 
-/// Requests up to this size go out rank after rank under a staggered egress.
-/// Posted alone, one rank's zero-copy request completes at ~12-14 GB/s up to
-/// 13 MB but at ~3 GB/s at 26 MB (raptor to a Spark, 200 Gb); larger requests
-/// go out all at once, where the ranks' queue pairs overlap that.
-const STAGGER_MAX_BYTES: usize = 16 << 20;
+/// Large registered requests need the same pacing as small ones: concurrent
+/// line-rate sends can overrun slower receiver links and amplify RC retries.
+fn drain_after_rank(stagger: bool, registered: bool, rank: usize, ranks: usize) -> bool {
+    stagger && registered && rank + 1 < ranks
+}
 
 pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
@@ -332,8 +332,7 @@ impl LocalTp4Client {
         for rank in 0..self.peers.len() {
             let session = self.sessions[rank].as_mut().unwrap();
             let timing = session.post_chunk_request(request, &self.config)?;
-            if self.stagger && rank + 1 < self.peers.len() && request.hidden_payload.len() <= STAGGER_MAX_BYTES
-                && session.sends_from_egress(request) {
+            if drain_after_rank(self.stagger, session.sends_from_egress(request), rank, self.peers.len()) {
                 // The next rank's request goes out once this one has left: each
                 // rank gets the whole link in turn and starts computing as early
                 // as it can, so the ranks finish, and their partials land,
@@ -655,6 +654,22 @@ mod tests {
 
     const STATS: VerbsHostProtocolV2ResponseStreamStats =
         VerbsHostProtocolV2ResponseStreamStats { response_frames: 1, response_wire_bytes: 0, response_executor_id: 1 };
+
+    #[test]
+    fn registered_staggered_waves_drain_between_ranks_without_a_size_cutoff() {
+        // Payload size is deliberately absent from the pacing decision, including
+        // full 4096-row requests above the former 16 MiB bypass.
+        for waves in [2, 3] {
+            for _ in 0..waves {
+                for rank in 0..6 {
+                    assert_eq!(drain_after_rank(true, true, rank, 6), rank < 5);
+                    assert!(!drain_after_rank(false, true, rank, 6), "explicit parallel mode paced");
+                    assert!(!drain_after_rank(true, false, rank, 6), "copied egress paced");
+                }
+            }
+        }
+        assert!(!drain_after_rank(true, true, 0, 1));
+    }
 
     #[test]
     fn waves_are_admitted_up_to_the_limit_and_served_oldest_first() -> Result<()> {
