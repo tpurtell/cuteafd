@@ -60,6 +60,14 @@ class GlmExl3PackageTest(unittest.TestCase):
         # Other geometries keep their policies.
         self.assertEqual([tool.route_block('dsv4p', c) for c in (256, 1024, 4096)], [8, 16, 64])
         self.assertEqual(tool.route_block('v41', 4096), 8)
+        self.assertEqual(
+            [tool.compact_warp_specialized('glm', 'spark', 384, c) for c in (1, 80, 256, 1024, 4096)],
+            [False, False, True, True, True])
+        self.assertEqual(
+            [tool.compact_warp_specialized('qwen4', 'spark', 256, c) for c in (1, 80, 256, 1024, 4096)],
+            [False, False, True, True, True])
+        self.assertFalse(tool.compact_warp_specialized('glm', 'spark', 768, 4096))
+        self.assertFalse(tool.compact_warp_specialized('qwen4', 'spark', 384, 4096))
 
 
 if __name__ == '__main__':

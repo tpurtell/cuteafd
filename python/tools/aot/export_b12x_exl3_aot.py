@@ -127,8 +127,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Packed routes are grouped into M blocks of route_block rows per expert; each
     # block decodes its expert's Trellis tiles once, so larger blocks amortize the
     # decode over more rows once many rows share an expert (large prefill).
-    if compact_weights and (len(bits) != 2 or warp_specialized):
-        raise ValueError("compact weights require cooperative two-tier exports")
+    if compact_weights and (len(bits) != 2 or wire_input
+                            or (warp_specialized and (tile is None or int(tile[1]) != 128))):
+        raise ValueError("compact weights require two-tier BF16 exports and H128 FC1 tiles")
     if activation not in ("silu", "situ"):
         raise ValueError("EXL3 activation must be silu or situ")
     if activation == "situ" and swiglu_limit is not None:

@@ -149,10 +149,16 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
     for values, options in recorded:
         assert values[4] == tuple(map(int, bits))
         assert options["compile_only"] and options["compact_weights"]
-        assert options["tile"] == (64, 128, 64, 128)
-        assert not options.get("warp_specialized") and not options.get("wire_input")
+        width = values[1]
         rows = values[3]
-        assert options.get("route_block", 8) == package.route_block(geometry, rows)
+        compact_ws = package.compact_warp_specialized(geometry, "spark", width, rows)
+        assert options["tile"] == (package.COMPACT_WS_TILE if compact_ws else (64, 128, 64, 128))
+        assert bool(options.get("warp_specialized")) == compact_ws
+        assert bool(options.get("ws_dynamic_tiles")) == compact_ws
+        assert not options.get("wire_input")
+        expected_block = ((64 if geometry == "glm" and rows >= 1024 else 32)
+                          if compact_ws else package.route_block(geometry, rows))
+        assert options.get("route_block", 8) == expected_block
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else
@@ -433,7 +439,8 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
 
 
 @pytest.mark.parametrize("geometry,compact,role,bits", [
-    ("qwen4", True, "spark", (4, 5)), ("glm", False, "spark", (4, 5)),
+    ("qwen4", True, "spark", (4, 5)), ("glm", True, "spark", (4, 5)),
+    ("glm", False, "spark", (4, 5)),
     ("glm", False, "coordinator", (4, 5)), ("glm", False, "coordinator", (3, 4)),
     ("glmf", False, "spark", (3, 4)), ("glmf", False, "coordinator", (3, 4)),
     ("glmf", False, "coordinator", (4, 5)),
@@ -442,7 +449,7 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
     fixture = compare_sm.load_file(
         "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
     package = fixture.package
-    # Compare the shipping cooperative compact route and its measured hint.
+    # Compare the shipping compact and fixed routes and their measured hints.
     capacities = (1, 80, 256, 1024, 2752, 4096)
     build_root = tmp_path / "build-fixture"
     build_root.mkdir()
@@ -467,7 +474,8 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert options.pop("compile_only") is True
         assert options == expected[(values[0].parent.name, values[3])]
     if compact:
-        assert not any(options.get("warp_specialized") for _, options in recorded)
+        assert any(options.get("warp_specialized") for _, options in recorded) == (
+            geometry in ("glm", "qwen4"))
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
         assert any(options.get("warp_specialized") for _, options in recorded) == (

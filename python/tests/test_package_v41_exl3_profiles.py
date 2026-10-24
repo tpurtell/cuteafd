@@ -153,6 +153,9 @@ class PackageProfileTests(unittest.TestCase):
                 meta.update(descriptor_rows=7, native_info_version=3)
             if 'token_major_rotation' in options:
                 meta['token_major_rotation'] = options['token_major_rotation']
+            for key in ('warp_specialized', 'ws_dynamic_tiles'):
+                if key in options:
+                    meta[key] = options[key]
             if 'route_block' in options:
                 meta['route_block'] = options['route_block']
             if 'decode_schedule' in options:
@@ -271,6 +274,56 @@ class PackageProfileTests(unittest.TestCase):
                 else:
                     self.assertIn(path.parts[0], ('tp4-width512', 'tp4-width640'))
                     self.assertNotIn('descriptor_rows', json.loads((call.args[0] / 'v41_exl3.json').read_text()))
+
+    def test_compact_ws_qualifies_only_glm_tp6_and_qwen_tp4_prefill(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'glm').mkdir()
+            (root / 'qwen').mkdir()
+            _output, _manifest, glm_calls, _ = self.build_fixture(
+                root / 'glm', 'spark', (4, 5), geometry='glm',
+                capacities=(80, 256, 1024, 4096), compact=True,
+                profiles=('tp3-width768', 'tp6-width256'))
+            glm_compact = {(call.args[1], call.args[3]): call
+                           for call in glm_calls if call.kwargs.get('compact_weights')}
+            self.assertEqual(set(glm_compact),
+                             {(width, cap) for width in (384, 768) for cap in (80, 256, 1024, 4096)})
+            for (width, capacity), call in glm_compact.items():
+                stem = call.args[0].parent.name
+                if width == 384 and capacity >= 256:
+                    expected_block = 64 if capacity >= 1024 else 32
+                    self.assertTrue(call.kwargs.get('warp_specialized'))
+                    self.assertTrue(call.kwargs.get('ws_dynamic_tiles'))
+                    self.assertNotIn('wire_input', call.kwargs)
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 256))
+                    self.assertEqual(call.kwargs['route_block'], expected_block)
+                    self.assertEqual(
+                        stem, f'tp6-compact-width384+tile64-128-64-256+ws-m{expected_block}-dynamic')
+                else:
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                    self.assertNotIn('+ws-', stem)
+
+            _output, _manifest, qwen_calls, _ = self.build_fixture(
+                root / 'qwen', 'spark', (4, 5), geometry='qwen4',
+                capacities=(80, 256, 1024, 4096), compact=True,
+                profiles=('tp2-width384', 'tp4-width256'))
+            qwen_compact = {(call.args[1], call.args[3]): call
+                            for call in qwen_calls if call.kwargs.get('compact_weights')}
+            for (width, capacity), call in qwen_compact.items():
+                stem = call.args[0].parent.name
+                if width == 256 and capacity >= 256:
+                    self.assertTrue(call.kwargs.get('warp_specialized'))
+                    self.assertTrue(call.kwargs.get('ws_dynamic_tiles'))
+                    self.assertNotIn('wire_input', call.kwargs)
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 256))
+                    self.assertEqual(call.kwargs['route_block'], 32)
+                    self.assertEqual(
+                        stem, 'tp4-compact-width256+tile64-128-64-256+ws-m32-dynamic')
+                else:
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                    self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                    self.assertNotIn('+ws-', stem)
 
     def test_compact_even_control_preserves_legacy_package(self):
         with tempfile.TemporaryDirectory() as temporary:

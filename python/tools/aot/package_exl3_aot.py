@@ -95,11 +95,16 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             companions = compact_profiles(geometry, profiles_for_role('spark', geometry))
             widths = {dest: width for _, width, _, _, _, destinations in companions
                       for dest in destinations}
+            compact_ws = compact_warp_specialized(
+                geometry, manifest['role'], meta['intermediate'], meta['capacity'])
+            expected_tile = list(COMPACT_WS_TILE) if compact_ws else [64, 128, 64, 128]
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
-                    or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
-                    or meta.get('warp_specialized', False)
-                    or meta.get('decode_schedule') not in (None, 'l2=2,pf1=0,pf2=0,pdl=1')
+                    or len(meta['bits']) != 2 or meta.get('tile') != expected_tile
+                    or meta.get('warp_specialized', False) != compact_ws
+                    or (compact_ws and not meta.get('ws_dynamic_tiles', False))
+                    or meta.get('decode_schedule') not in (
+                        (None,) if compact_ws else (None, 'l2=2,pf1=0,pf2=0,pdl=1'))
                     or meta.get('input_format', 'bf16') != 'bf16'):
                 raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
         if 'blocks_per_sm' in variant and variant['blocks_per_sm'] != meta.get('blocks_per_sm'):
@@ -392,9 +397,22 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
 
 
+COMPACT_WS_TILE = (64, 128, 64, 256)
+
+
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Compact profiles retain the cooperative kernel until qualified."""
-    return False
+    """Qualified compact Spark prefill exports (GB10 SM121, 1..4096 bitwise-exact,
+    poisoned graph replays):
+    - GLM 5.3 K4/K5 TP6 compact width-384: M4096 coop 24.11 ms random / 24.45 ms
+      recorded layer-7 -> M64 FC2-N256 dynamic 13.15 ms (0.545x, 1.834x) /
+      13.52 ms (0.554x, 1.804x); M256 uses M32 FC2-N256 dynamic (1.445x).
+    - Qwen 3.8 K4/K5 TP4 compact width-256: M32 FC2-N256 dynamic 1.341x (m256),
+      1.454x (m512), 1.549x (m1024), 1.577x (m2048), 1.588x (m4096, 8.805 -> 5.545 ms).
+    Other geometries, widths, roles and decode capacities stay cooperative.
+    """
+    if role != 'spark' or capacity < 256:
+        return False
+    return (geometry, width) in (('glm', 384), ('qwen4', 256))
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
@@ -858,7 +876,10 @@ def build(args: argparse.Namespace) -> None:
             compact = '-compact-' in profile
             for capacity in capacities:
                 requested = tiles.get(profile, {}).get(capacity)
-                tile = (64, 128, 64, 128) if compact else requested
+                compact_ws = compact and len(args.bits) == 2 and compact_warp_specialized(
+                    geometry, args.role, width, capacity)
+                tile = ((COMPACT_WS_TILE if compact_ws else (64, 128, 64, 128))
+                        if compact else requested)
                 if tile is None:
                     # A decode capacity the B12x policy widens is pinned back to the
                     # canonical tile (an explicit override above still wins).
@@ -870,11 +891,11 @@ def build(args: argparse.Namespace) -> None:
                 # path is what every existing build used.
                 profile_dir = (args.build_dir / profile if tile is None else
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
-                compact_ws = compact and len(args.bits) == 2 and compact_warp_specialized(
-                    geometry, args.role, width, capacity)
+                compact_block = 64 if (geometry == 'glm' and capacity >= 1024) else 32
                 if compact_ws:
-                    # N128 alone also names the cooperative export; separate its cache.
-                    profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m32')
+                    # Separate compact WS cache identity by route block and dynamic claims.
+                    profile_dir = profile_dir.with_name(
+                        f'{profile_dir.name}+ws-m{compact_block}-dynamic')
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
@@ -889,8 +910,8 @@ def build(args: argparse.Namespace) -> None:
                                          or (geometry, tuple(args.bits)) in (('glm', (4, 5)), ('glmf', (3, 4))))
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
-                    block = 32 if compact_ws else 64
-                    if geometry == 'kimik3' or args.role == 'coordinator':
+                    block = compact_block if compact_ws else 64
+                    if not compact_ws and (geometry == 'kimik3' or args.role == 'coordinator'):
                         # Existing policy-keyed directories contain cooperative exports.
                         suffix = ('-wire-s3-dynamic' if wire_input(geometry, args.role, width, capacity)
                                   else '-bf16-static' if args.role == 'coordinator' else '')
@@ -900,14 +921,17 @@ def build(args: argparse.Namespace) -> None:
                     options['route_block'] = block
                 if ws:
                     options['warp_specialized'] = True
-                    if wire_input(geometry, args.role, width, capacity):
-                        options['wire_input'] = True
-                    if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
-                        options['ws_input_stages'] = stages
-                    if ws_dynamic_tiles(geometry, args.role, width, capacity):
+                    if compact_ws:
                         options['ws_dynamic_tiles'] = True
-                    if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
-                        options['tile'] = policy_tile
+                    else:
+                        if wire_input(geometry, args.role, width, capacity):
+                            options['wire_input'] = True
+                        if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
+                            options['ws_input_stages'] = stages
+                        if ws_dynamic_tiles(geometry, args.role, width, capacity):
+                            options['ws_dynamic_tiles'] = True
+                        if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
+                            options['tile'] = policy_tile
                 elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
                 elif len(args.bits) == 2 and token_major_rotation(geometry, capacity):

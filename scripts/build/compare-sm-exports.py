@@ -300,7 +300,10 @@ def _export_exl3(extra, output):
             options = {"compile_only": True}
             if compact:
                 options["compact_weights"] = True
-            tile = (64, 128, 64, 128) if compact else package.decode_tile(geometry, width, rows)
+            compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
+                geometry, role, width, rows)
+            tile = ((package.COMPACT_WS_TILE if compact_ws else (64, 128, 64, 128))
+                    if compact else package.decode_tile(geometry, width, rows))
             if tile is not None:
                 options["tile"] = tile
             if geometry != "v41":
@@ -308,25 +311,26 @@ def _export_exl3(extra, output):
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows)
-            compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
-                geometry, role, width, rows)
             ws = compact_ws or (len(bits) == 2 and tile is None
                                 and (role != "coordinator"
                                      or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
-                block = 32 if compact_ws else 64
+                block = (64 if geometry == "glm" and rows >= 1024 else 32) if compact_ws else 64
                 options["warp_specialized"] = True
-                if package.wire_input(geometry, role, width, rows):
-                    options["wire_input"] = True
-                stages = package.ws_input_stages(geometry, role, width, rows)
-                if stages is not None:
-                    options["ws_input_stages"] = stages
-                if package.ws_dynamic_tiles(geometry, role, width, rows):
+                if compact_ws:
                     options["ws_dynamic_tiles"] = True
-                policy_tile = package.ws_tile(geometry, role, width, rows)
-                if policy_tile is not None:
-                    options["tile"] = policy_tile
+                else:
+                    if package.wire_input(geometry, role, width, rows):
+                        options["wire_input"] = True
+                    stages = package.ws_input_stages(geometry, role, width, rows)
+                    if stages is not None:
+                        options["ws_input_stages"] = stages
+                    if package.ws_dynamic_tiles(geometry, role, width, rows):
+                        options["ws_dynamic_tiles"] = True
+                    policy_tile = package.ws_tile(geometry, role, width, rows)
+                    if policy_tile is not None:
+                        options["tile"] = policy_tile
             elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
                 options["fused_input_rotation"] = True
             elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
