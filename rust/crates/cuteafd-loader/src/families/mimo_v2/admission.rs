@@ -3,34 +3,16 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::serving_capacity::MemoryReservation;
 use super::{MimoV2Config, MimoKvFormats, MimoPrefillOutput};
 
-pub fn resolve_transport_lanes(spark: bool, family: &str, configured: Option<&str>) -> Result<usize> {
-    if !spark {
-        return Ok(1);
-    }
-    match configured {
-        Some("1") => Ok(1),
-        Some("2") => Ok(2),
-        // Three lanes: 1 RTX 8K prefill 2951 -> 2745 ms, 2 RTX equal, C4 code
-        // 219 -> 247 tok/s (MiMo V2.6 Pro TP6).
-        Some("3") => Ok(3),
-        Some("4") => Ok(4),
-        // Flash TP4 prefill is faster with two larger waves; the Pro TP6
-        // measurement above does not apply to its smaller expert geometry.
-        None => Ok(if matches!(family, "mimo" | "mimo2" | "mimof" | "mimof2") { 2 } else { 3 }),
-        Some(other) => anyhow::bail!("CUTEAFD_MIMO_PREFILL_LANES is 1, 2, 3 or 4, not {other}"),
-    }
+pub fn resolve_prefill_waves(spark: bool, family: &str, configured: Option<&str>) -> Result<usize> {
+    if !spark { return Ok(1); }
+    let waves = configured.map(str::parse::<usize>).transpose()?.unwrap_or(if matches!(family, "mimop" | "mimop2") { 3 } else { 2 });
+    ensure!((1..=4).contains(&waves), "MiMo prefill waves must be 1 to 4");
+    Ok(waves)
 }
 
-pub fn workspace_shapes(rows: usize, lead: bool, spark: bool, lanes: usize, output: MimoPrefillOutput, mtp: usize)
+pub fn workspace_shapes(rows: usize, lead: bool, _spark: bool, _waves: usize, _output: MimoPrefillOutput, _mtp: usize)
     -> Vec<(&'static str, bool, usize, bool)> {
-    let mut shapes = vec![("prefill", false, rows, lead), ("decode", true, 64, lead)];
-    if spark && lanes >= 2 && rows >= 2048 {
-        shapes.push(("prefill_first_lane", false, rows, lead && mtp == 0 && output == MimoPrefillOutput::LastRow));
-        for name in ["prefill_second_lane", "prefill_third_lane"].into_iter().take(lanes - 2) {
-            shapes.push((name, false, rows, false));
-        }
-    }
-    shapes
+    vec![("prefill", false, rows, lead), ("decode", true, 64, lead)]
 }
 
 pub fn tensor_bytes(label: &str, dimensions: &[usize]) -> Result<u64> {
@@ -345,10 +327,6 @@ pub fn spark_intake_probe_bytes(spark: bool, configured: Option<&str>) -> Result
     }
 }
 
-pub fn prefill_lane_taps(lanes: usize, rows: usize, mtp: usize, output: MimoPrefillOutput) -> bool {
-    lanes >= 2 && rows >= 2048 && mtp == 0 && output == MimoPrefillOutput::LastRow
-}
-
 pub fn attention_workspace_geometry(rank: usize, ranks: usize, decode: bool,
     all_target_layers_split: bool) -> super::MimoAttentionWorkspace {
     match (rank, ranks, decode, all_target_layers_split) {
@@ -363,12 +341,23 @@ pub fn workspace_options(cfg: &MimoV2Config, ranks: usize, rank: usize, rows: us
     mut query: impl FnMut(&str) -> Result<u64>) -> Result<Vec<(String, super::MimoWorkspaceOptions)>> {
     workspace_shapes(rows, rank == 0, spark, lanes, output, mtp).into_iter()
         .map(|(name, decode, rows, with_head)| Ok((name.into(), super::MimoWorkspaceOptions {
-            rows: rows as u64, decode, lead: rank == 0, with_head, spark: spark && rank == 0, expert_input,
+            rows: rows as u64, waves: if decode { 1 } else { lanes as u64 }, decode, lead: rank == 0, with_head, spark: spark && rank == 0, expert_input,
             max_context: context as u64, pool_pages: 0, kv_cache: kv,
             attention: attention_workspace_geometry(rank, ranks, decode, true), prefill_output: output,
             native_scratch_bytes: workspace_scratch(cfg, ranks, rank, decode, kv, fp8_output, &mut query)?,
             head_workspace_bytes: 4 << 20,
         }))).collect()
+}
+
+/// Immutable endpoints: decode is one sequential m64 wave; prefill keeps the
+/// selected unit capacity and the shared transport's full ring depth.
+pub fn spark_endpoints(rows: usize, input: super::MimoExpertInput) -> Result<[cuteafd_core::SparkEndpoint; 2]> {
+    use cuteafd_core::{SparkEndpoint, SparkIngress};
+    let decode = u32::try_from(super::decode_graph::MIMO_DECODE_ROWS)?;
+    let decode_ingress = if input.bf16(true) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    let prefill_ingress = if input.bf16(false) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
+    Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1) },
+        SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None }])
 }
 
 pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
@@ -381,7 +370,9 @@ pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
     }
     if rank == 0 && spark_ranks > 0 {
         costs.push(MemoryReservation { name: "transport.spark_intake_planes".into(),
-            bytes: tensor_bytes("MiMo intake planes", &[lanes, spark_ranks, rows.max(128), cfg.hidden, 2])? });
+            bytes: tensor_bytes("MiMo prefill intake planes", &[lanes, spark_ranks, rows.max(128), cfg.hidden, 2])?
+                .checked_add(tensor_bytes("MiMo decode intake planes", &[super::decode_graph::MIMO_DECODE_ROWS, spark_ranks, cfg.hidden, 2])?)
+                .context("MiMo intake planes overflow")? });
     }
     Ok(costs)
 }
@@ -417,6 +408,68 @@ pub fn draft_scratch_bytes(shape: DraftScratch, sm_count: usize) -> Result<usize
         }
         DraftScratch::Topk { rows } => usize::try_from(tensor_bytes("DFlash topk scratch", &[rows, 64, 16, 8])?)?,
     })
+}
+
+/// Still-lazy coordinator host owners, shared by live and offline admission.
+/// Intake/egress and synchronous staging are safe upper bounds; table extents
+/// and router allocations are the same checked layouts the engine allocates.
+pub fn future_host_workspaces(cfg: &MimoV2Config, rows: usize, waves: usize, ranks: usize,
+    pool_tokens: u64, context: usize, spark_ranks: usize, expert_input: super::MimoExpertInput,
+    kv: MimoKvFormats, output: MimoPrefillOutput, serving: bool,
+    diagnostic_rows: usize, diagnostic_layers: usize) -> Result<Vec<(String, u64)>> {
+    let mut demands = vec![("mimo/mtp-staging".into(), 1 << 20)];
+    let mut sync = 64u64 << 20; // embedding loader's pinned chunk / synchronous copy upper bound
+    for rank in 0..ranks {
+        for (name, mut options) in workspace_options(cfg, ranks, rank, rows, context, waves,
+            spark_ranks > 0, expert_input, kv, 0, output, false, |_| Ok(0))? {
+            options.pool_pages = pool_tokens.div_ceil(64);
+            let layout = super::MimoWorkspaceLayout::new(cfg, options)?;
+            let label = format!("mimo/owner-{rank}/{name}");
+            demands.push((format!("{label}/ordered-tables"), layout.ordered_host_bytes(options.waves)?));
+            demands.push((format!("{label}/router"), layout.router_host));
+            sync = sync.max(layout.page_table).max(layout.step_inputs).max(layout.ids);
+        }
+    }
+    demands.push(("mimo/staging/sync-h2d-upper-bound".into(), sync));
+    if diagnostic_layers > 0 {
+        demands.push(("mimo/router-diagnostics".into(), tensor_bytes("MiMo route checks",
+            &[diagnostic_rows.max(1), cfg.topk, 8, ranks, diagnostic_layers])?));
+    }
+    if serving {
+        let mask = allocation_bytes("MiMo sampling mask", &[64, cfg.vocab_size.div_ceil(32), 4])?;
+        demands.push(("mimo/sampling".into(), mask.checked_add(64 * (64 + 5 * 4 + 12))
+            .context("MiMo sampling host overflow")?));
+    }
+    if spark_ranks > 0 {
+        use cuteafd_core::{ExpertGeometry, SparkRings};
+        let geometry = ExpertGeometry { hidden: u32::try_from(cfg.hidden)?, experts: u32::try_from(cfg.experts)?,
+            topk: u32::try_from(cfg.topk)?, intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
+        let endpoints = spark_endpoints(rows, expert_input)?;
+        let mut ring = 0usize;
+        let mut prefix = 0usize;
+        for endpoint in endpoints {
+            let (request, response) = endpoint.wire_bytes(geometry).context("MiMo host wire overflow")?;
+            let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response), depth: 8,
+                slot_bytes: 8 << 20, alignment: 4096 };
+            ring = ring.checked_add(endpoint.ring_bytes(geometry, rings).context("MiMo host rings overflow")?)
+                .context("MiMo host rings overflow")?;
+            prefix = prefix.checked_add(endpoint.response_prefix_bytes().context("MiMo response prefix")?)
+                .context("MiMo response prefixes overflow")?;
+        }
+        demands.push(("mimo/transport/rdma-rings".into(), tensor_bytes("MiMo coordinator rings", &[ring, spark_ranks])?));
+        demands.push(("mimo/transport/response-prefix".into(), tensor_bytes("MiMo response metadata", &[prefix, spark_ranks])?));
+        let decode_rows = endpoints[0].capacity as usize;
+        let prefill_rows = endpoints[1].capacity as usize;
+        let intake_rows = prefill_rows.checked_mul(waves).and_then(|n| n.checked_add(decode_rows))
+            .context("MiMo host intake rows overflow")?;
+        demands.push(("mimo/spark-intake-upper-bound".into(), tensor_bytes("MiMo host intake", &[intake_rows, cfg.hidden, 2, spark_ranks])?));
+        let decode_request = endpoints[0].wire_bytes(geometry).context("MiMo decode egress geometry")?.0;
+        let prefill_request = endpoints[1].wire_bytes(geometry).context("MiMo prefill egress geometry")?.0;
+        let egress = prefill_request.checked_mul(waves).and_then(|n| n.checked_add(decode_request))
+            .context("MiMo host egress bytes overflow")?;
+        demands.push(("mimo/transport/egress-upper-bound".into(), u64::try_from(egress)?));
+    }
+    Ok(demands)
 }
 
 pub fn sampling_wave_bytes(capacity: usize, vocab: usize) -> usize {

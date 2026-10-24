@@ -817,6 +817,8 @@ explicit = "--spark-tp" in args or family == "deepseek_v41" and ranks not in (0,
 peers = value("--deployment-peers", "").split(",")[:ranks] if ranks else []
 report = json.loads(os.environ["STUB_ENCODER_PLAN"])
 report.update(spark_ranks=ranks)
+if family == "mimo_v2":
+    report["prefill_lanes"] = int(value("--prefill-lanes", "3" if config.get("hidden_size") == 6144 else "2"))
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
 shared = family in {"step5", "kimi_k3"}
@@ -926,19 +928,43 @@ def test_shared_prefill_launcher_forwards_resolved_units_without_span(
     assert f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves}" in result.stdout
 
 
-@pytest.mark.parametrize("family_config", [
-    {"model_type": "mimo_v2_flash", "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
-])
-def test_legacy_prefill_launcher_does_not_forward_typed_shape(tmp_path: Path, family_config: dict) -> None:
-    result = _family_launch_result(tmp_path, family_config, "test/model",
-        "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
-        deployment_overrides={"prefill_unit_rows": 1024, "prefill_waves": 3, "prefill_span_rows": 32768})
+@pytest.mark.parametrize("unit,waves,span", [(4096, 2, 16384), (1024, 3, 6144)])
+def test_mimo_prefill_launcher_forwards_exact_unit_wave_and_span(tmp_path, unit, waves, span):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "test/mimo", f"SPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_ROWS={unit}\nPREFILL_WAVES={waves}\n",
+        deployment_overrides={"prefill_unit_rows": unit, "prefill_waves": waves, "prefill_span_rows": span})
     assert result.returncode == 0, result.stderr
-    serve = next(shlex.split(line) for line in result.stderr.splitlines()
-                 if "docker run -d" in line and "cuteafd serve-" in line)
-    assert "--prefill-waves" not in serve and "--prefill-span-rows" not in serve
-    assert "Resolved prefill:" not in result.stdout
-    assert "PREFILL_SPAN_ROWS" not in result.stdout + result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
+    serve = next(shlex.split(line) for line in result.stderr.splitlines() if "docker run -d" in line and "serve-mimo" in line)
+    assert plan.count("--prefill-rows") == 1
+    assert plan[plan.index("--prefill-rows") + 1] == str(unit)
+    assert plan[plan.index("--prefill-waves") + 1] == str(waves)
+    assert "--prefill-lanes" not in plan
+    for flag, value in [("--prefill-rows", unit), ("--prefill-waves", waves), ("--prefill-span-rows", span)]:
+        assert serve.count(flag) == 1
+        assert serve[serve.index(flag) + 1] == str(value)
+    assert f"PREFILL_SPAN_ROWS={span}" in result.stdout
+
+
+@pytest.mark.parametrize("keys", ["", "PREFILL_ROWS=1024\n"])
+def test_mimo_prefill_launcher_rejects_legacy_batch_key(tmp_path, keys):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "test/mimo", "SPECULATOR=off\nVISION=off\nAUDIO=off\nPREFILL_BATCH_TOKENS=2048\n" + keys)
+    assert result.returncode == 2, result.stderr
+    assert "unused configuration key: PREFILL_BATCH_TOKENS" in result.stderr
+    assert "cuteafd plan" not in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
+def test_mimo_prefill_launcher_leaves_unset_unit_to_planner(tmp_path):
+    result = _family_launch_result(tmp_path,
+        {"model_type": "mimo_v2", "hidden_size": 6144, "num_hidden_layers": 2, "moe_layer_freq": [0, 1]},
+        "test/mimo", "SPECULATOR=off\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines() if "cuteafd plan" in line and "--deployment" in line)
+    assert "--prefill-rows" not in plan
 
 
 @pytest.mark.parametrize("wip", [False, True])
@@ -1199,7 +1225,7 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     source = (ROOT / "rust/crates/cuteafd-daemon/src/families/mimo_v2/mod.rs").read_text()
     timing = "let timing = cuteafd_transport::protocol_v2_timing_from_env();"
     start = source.index(timing)
-    link = source.index("let link = ||", start)
+    link = source.index("let link = |endpoint: u32, waves: usize, request:", start)
     end = source.index("crate::shared::memory_report::release_load_staging", link)
     assert start < link
     assert source.count(timing) == 1
@@ -1215,9 +1241,9 @@ def test_mimo_transport_timing_is_resolved_once_for_all_prefill_lanes():
     ({"model_type": "glm5_next"}, "", {}, 1),
     ({"model_type": "glm5_next"}, "PREFILL_WAVES=4\n", {}, 1),
     ({"model_type": "qwen4_exp"}, "", {}, 1),
-    ({"model_type": "mimo_v2_flash"}, "", {}, 2),
-    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 3),
-    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {"CUTEAFD_MIMO_PREFILL_LANES": "4"}, 4),
+    ({"model_type": "mimo_v2_flash"}, "", {}, 1),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "", {}, 1),
+    ({"model_type": "mimo_v2", "hidden_size": 6144}, "PREFILL_WAVES=4\n", {}, 1),
 ])
 def test_worker_endpoint_count_matches_family_connection_ownership(tmp_path, config, keys, env, endpoints):
     dense_layers = config.get("first_k_dense_replace", 0)
@@ -2930,7 +2956,8 @@ def test_mimo_warm_marks_reach_startup_layout(tmp_path, warm, concurrency, gpu_t
     assert f"--max-sequences {effective}" in launch
     assert "unbound variable" not in result.stderr
     assert "--context-tokens 131072" in preflight
-    assert "--prefill-rows 4096" in preflight
+    assert "--prefill-rows" not in shlex.split(preflight)
+    assert "--prefill-rows 4096" in launch
     assert "--expert-input fp8" in preflight
 
 

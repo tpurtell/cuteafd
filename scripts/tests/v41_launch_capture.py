@@ -137,7 +137,13 @@ if tool == "docker":
                 waves = 1 if family == "glm5" and int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
                 span = int(value("--prefill-span-rows", "0")) or 16384
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
+            if family == "mimo_v2":
+                unit = int(value("--prefill-rows", "0")) or 4096
+                waves = int(value("--prefill-waves", "0")) or (3 if "Pro" in os.environ.get("CAPTURE_SERVED_MODEL", "") else 2)
+                response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=16384)
             report = dict(response)
+            if family == "mimo_v2":
+                report["prefill_lanes"] = response["prefill_waves"]
             exl3 = os.environ.get("CAPTURE_EXL3") == "1"
             explicit_topology = "--spark-tp" in args or family == "deepseek_v41" and (int(ranks) == 3 if exl3 else int(ranks) not in (0, 4))
             response.update(version=1, family=family, executable=True, wip_launchable=True,

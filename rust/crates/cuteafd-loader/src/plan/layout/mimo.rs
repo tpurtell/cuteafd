@@ -50,7 +50,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         // solve. An explicit POOL_TOKENS stays strict.
         media_options.pool_ceiling_at_target = true;
         let mut admission = devices.clone();
-        match apply_selected(input, &media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
+        match select_and_apply(input, &mut media_options, &mut admission, spark_ranks, rows, concurrency, context, manifest) {
             Ok((placement, working)) => {
                 if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
                     report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
@@ -87,8 +87,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     let mut pool_tokens = 0;
     let mut waste = Vec::new();
-    match apply_selected(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
+    match select_and_apply(input, options, &mut devices, spark_ranks, rows, concurrency, context, manifest) {
         Ok((placement, working)) => {
+            report.prefill_span_rows = Some(16384);
+            report.prefill_transports = Some(1);
             spark_io(report, model, options, &working, &mut sparks, &mut notes);
             waste = replicated_weights(&placement);
             report.solver_placement = Some(placement.clone());
@@ -128,13 +130,30 @@ const SPARK_WAVE_BYTES: u64 = gib(51);
 /// format (`--expert-input`), beside the non-I/O wave residual.
 fn spark_io(report: &mut PlanReport, model: &dyn super::super::FamilyModel, options: &LayoutOptions,
     working: &crate::placement::SparkWorkingSet, sparks: &mut [DeviceLayout], notes: &mut Vec<String>) {
-    let rings = spark_ring_geometry(spark_endpoints("mimo_v2", working.prefill_lanes));
+    let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20, depth: 8,
+        slot_bytes: 8 << 20, alignment: 4096 };
     for device in sparks {
-        let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
-            .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
-                .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
-                .and_then(|capacity| charge_spark_io(device, working, geometry, capacity,
-                    options.mimo_expert_input.bf16(false), rings, SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)));
+        let io = (|| -> Result<(), crate::placement::PlacementError> {
+            let geometry = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))?;
+            let capacity = u32::try_from(options.spark_capacity_rows)
+                .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))?;
+            let endpoints = crate::families::mimo_v2::admission::spark_endpoints(capacity as usize, options.mimo_expert_input)
+                .map_err(|_| crate::placement::PlacementError::Inventory("MiMo Spark endpoint geometry"))?;
+            charge_spark_io(device, working, geometry, capacity, options.mimo_expert_input.bf16(false),
+                spark_ring_geometry(1), SPARK_WAVE_BYTES * options.spark_capacity_rows / 4096)?;
+            let exact = working.rank_endpoints_io(device.index as usize, geometry, &endpoints, rings)?;
+            for item in &mut device.items {
+                match item.group.as_str() {
+                    "expert intake" => item.bytes = exact.intake,
+                    "host expert exchange" => item.bytes = exact.host_exchange,
+                    "expert row indices" => item.bytes = exact.row_indices,
+                    "rdma rings" => item.bytes = exact.mapped_rings,
+                    "endpoint response prefixes" => item.bytes = exact.endpoint_staging,
+                    _ => {},
+                }
+            }
+            Ok(())
+        })();
         if let Err(error) = io {
             report.placement_supported = false;
             notes.push(format!("{} I/O admission: {error}", device.name()));
@@ -208,9 +227,9 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
         source(&name).map(|r| (name, r))
     }).collect();
     let fp8_output = output_formats.values().any(|&r| r == R::Fp8);
-    let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
+    let lanes = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-        else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
+        else { None }.as_deref())?;
     let rings = options.mimo_rings.max(concurrency);
     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     let dir = checkpoint.snapshot.join("dflash");
@@ -247,10 +266,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
                     |shape| draft_scratch_bytes(shape, options.physical_sms.unwrap_or_else(||
                         crate::placement::inventory::ArchContext::for_device("sm_120", options.rtx_bytes[0]).sms) as usize))?;
                 additional.extend(costs.steady);
-                if prefill_lane_taps(lanes, rows as usize, 0, output) {
-                    additional.push(cuteafd_core::serving_capacity::MemoryReservation {
-                        name: "draft.prefill_first_lane_taps".into(), bytes: draft.prefill_lane_tap_bytes()? as u64 });
-                }
+
             }
             additional.extend(draft_prefix_reservations(options.mimo_prefix_draft, draft_mark, marks, rings)?);
         }
@@ -344,6 +360,40 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     Ok((costs, workspace, tp2_workspace, onboard))
 }
 
+/// Retry every candidate from the same pre-admission inventory. Failed solves
+/// publish refusal reservations, so reusing their devices would double-charge.
+#[allow(clippy::too_many_arguments)]
+fn select_and_apply(input: &super::super::PlanInput, options: &mut LayoutOptions,
+    devices: &mut Vec<DeviceLayout>, spark_ranks: usize, rows: u64, concurrency: u64,
+    context: u64, manifest: Option<&serde_json::Value>)
+    -> Result<(crate::placement::Placement, crate::placement::SparkWorkingSet)> {
+    use crate::serving_capacity::{select_prefill_shape, CacheGeometryError, PrefillShape};
+    let cfg = MimoV2Config::from_hf(&input.checkpoint().config)?;
+    let waves = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
+        (options.prefill_lanes > 0).then(|| options.prefill_lanes.to_string()).as_deref())? as u64;
+    let initial = devices.clone();
+    let (shape, (placement, working, admitted)) = select_prefill_shape(
+        PrefillShape { unit_rows: rows, waves }, options.context_tokens == 0 && options.pool_tokens.is_none(),
+        |candidate| {
+            let mut trial = initial.clone();
+            let mut selected = options.clone();
+            selected.prefill_lanes = candidate.waves;
+            let result = apply_selected(input, &selected, &mut trial, spark_ranks,
+                candidate.unit_rows, concurrency, context, manifest);
+            match result {
+                Ok((placement, working)) => Ok((placement, working, trial)),
+                Err(error) => { *devices = trial; Err(error) }
+            }
+        }, |(placement, _, _)| placement.pool_tokens,
+        |error| matches!(error.downcast_ref::<CacheGeometryError>(),
+            Some(CacheGeometryError::ResidentTensor { name, .. }) if name == "placement"))?;
+    options.prefill_unit_rows = Some(shape.unit_rows);
+    options.prefill_waves = working.prefill_lanes;
+    options.prefill_lanes = working.prefill_lanes;
+    *devices = admitted;
+    Ok((placement, working))
+}
+
 #[cfg(test)]
 fn apply(input: &super::super::PlanInput, options: &LayoutOptions,
     devices: &mut [DeviceLayout], spark_ranks: usize, rows: u64, concurrency: u64,
@@ -370,9 +420,9 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
     let ranks = devices.len();
     let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
-    let lanes = resolve_transport_lanes(spark_ranks > 0, cfg.program_family()?,
+    let lanes = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
-        else { std::env::var("CUTEAFD_MIMO_PREFILL_LANES").ok() }.as_deref())?;
+        else { None }.as_deref())?;
     let inputs = crate::placement::families::mimo_v2::MimoInputs { automatic_context: options.context_tokens == 0,
         cfg: &cfg, profile: &profiles.steady, layers: cfg.layers,
         kv: MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, mtp_stages: 0,
@@ -454,7 +504,7 @@ mod tests {
                             pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
                             mimo_expert_input: expert_input, ..Default::default() };
                         let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
-                        let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
+                        let lanes = resolve_prefill_waves(true, cfg.program_family().unwrap(), None).unwrap();
                         let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
                         let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
                         let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
@@ -504,6 +554,30 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn selected_shape_preserves_explicit_pool_and_publishes_exact_units() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_mopd_config(), &mimo_flash_mopd_tensors(), Some(4));
+        let input = PlanInput::from_checkpoint(Checkpoint::open(dir.path()).unwrap());
+        for waves in [1, 2, 3] {
+            let mut options = LayoutOptions { rtx_bytes: vec![95 * GIB], pool_tokens: Some(32768),
+                prefill_lanes: waves, concurrency: 4, ..Default::default() };
+            let initial = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
+                capacity_bytes: 95 * GIB, items: vec![], kv_tokens: 0 }];
+            let mut expected = initial.clone();
+            let (placement, working) = apply_selected(&input, &options, &mut expected,
+                4, 4096, 4, 32768, None).unwrap();
+            let mut actual = initial;
+            let selected = select_and_apply(&input, &mut options, &mut actual,
+                4, 4096, 4, 32768, None).unwrap();
+            assert_eq!(selected.0, placement);
+            assert_eq!(selected.1, working);
+            assert_eq!((options.prefill_unit_rows, options.prefill_waves), (Some(4096), waves));
+            assert_eq!(actual[0].used_bytes(), expected[0].used_bytes());
+            assert_eq!(actual[0].kv_tokens, 32768);
         }
     }
 
@@ -612,7 +686,7 @@ mod tests {
                     let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
                     let (experts, expert_workspace, tp2_workspace, onboard) =
                         expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
-                    let lanes = resolve_transport_lanes(true, cfg.program_family().unwrap(), None).unwrap();
+                    let lanes = resolve_prefill_waves(true, cfg.program_family().unwrap(), None).unwrap();
                     let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
                         kv, mtp_stages: 0, gpus: totals.iter().enumerate().map(|(rank, &total)|
                             (total, Baseline::Measured { free_bytes: total - baseline[rank] })).collect(),
@@ -638,8 +712,28 @@ mod tests {
                             cost.whole.resident, runtime_request.expert_workspace);
                         if pro {
                             match sliding {
-                                MimoKvCache::Bf16 => assert!(remaining < cost.whole.resident,
-                                    "BF16 Pro min cannot fit one TP1 layer even with zero scratch"),
+                                MimoKvCache::Bf16 => {
+                                    let (_, options) = workspace_options(&cfg, ranks, 0, 4096, context as usize,
+                                        lanes, true, opts.mimo_expert_input, kv, 0, MimoPrefillOutput::LastRow,
+                                        true, |_| Ok(0)).unwrap().remove(0);
+                                    let current = MimoWorkspaceLayout::new(&cfg, options).unwrap().device_bytes().unwrap();
+                                    let mut shadow = crate::families::mimo_v2::workspace::MimoPrefillKvShadowPlan::default();
+                                    let legacy = (0..lanes).map(|lane| {
+                                        let options = MimoWorkspaceOptions { waves: 1, with_head: lane < 2, ..options };
+                                        let layout = MimoWorkspaceLayout::new(&cfg, options).unwrap();
+                                        shadow.workspace_reservations(&format!("legacy{lane}"), &layout, options)
+                                            .unwrap().iter().map(|r| r.bytes).sum::<u64>()
+                                    }).sum::<u64>() + shadow.reservation().map_or(0, |r| r.bytes);
+                                    let old_remaining = remaining - (legacy - current);
+                                    println!("BF16 Pro TP1 free before -> after: {old_remaining} -> {remaining}; complete layer threshold {}",
+                                        cost.whole.resident + runtime_request.expert_workspace);
+                                    assert!(old_remaining < cost.whole.resident,
+                                        "legacy duplicate workspaces did not fit even weights alone");
+                                    assert!(remaining >= cost.whole.resident,
+                                        "unit workspaces now admit weights alone, not the complete expert allocation");
+                                    assert!(remaining < cost.whole.resident + runtime_request.expert_workspace,
+                                        "BF16 Pro min cannot fit one complete TP1 layer including scratch");
+                                },
                                 MimoKvCache::Int8 | MimoKvCache::Fp8 => assert!(
                                     remaining >= cost.whole.resident + runtime_request.expert_workspace,
                                     "compact Pro min fits one TP1 layer including scratch"),
@@ -781,8 +875,8 @@ mod tests {
 
     #[test]
     fn backend_slots_and_scope_categories_match_allocators() {
-        assert_eq!(peer_slots(resolve_transport_lanes(false, "mimop", None).unwrap()), 8);
-        assert_eq!(peer_slots(resolve_transport_lanes(true, "mimop", None).unwrap()), 12);
+        assert_eq!(peer_slots(resolve_prefill_waves(false, "mimop", None).unwrap()), 8);
+        assert_eq!(peer_slots(resolve_prefill_waves(true, "mimop", None).unwrap()), 12);
         assert_eq!(reservation_category("prefill.step_inputs"), Category::Workspace);
         assert_eq!(reservation_category("state.prefill_kv_wide"), Category::Workspace);
         assert_eq!(reservation_category("prefill_first_lane.scratch"), Category::Workspace);
