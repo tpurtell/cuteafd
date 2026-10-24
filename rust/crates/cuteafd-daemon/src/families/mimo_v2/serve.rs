@@ -16,6 +16,8 @@
 //! (`Turn`, EOS or max_tokens with the client still there); a prefill whose
 //! client left is parked at its last chunk boundary; a decode whose client
 //! left is not retained. `prompt_cache_hit_tokens` reports the restored rows.
+mod independent;
+
 use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
@@ -328,6 +330,8 @@ struct Prefill<'a> {
 }
 
 pub(super) struct Active<'a> {
+    lane: usize,
+    finished: bool,
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
@@ -479,6 +483,23 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
     slots.extend(slot);
 }
 
+fn make_policy(engine: &MimoEngine<'_>, head_numerics: &str, width: usize)
+    -> Result<Option<crate::shared::draft::runtime::SharedPolicy>> {
+    let drafter = engine.drafter.as_ref();
+    let shared = if width > 0 {
+        let prior = match drafter {
+            Some(d) => resource::Prior::Selector(d.confidence_prior(head_numerics)?),
+            None => resource::Prior::History,
+        };
+        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
+            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
+        shared.policy.set_native_confidence_positions(width)?;
+        resource::publish(&shared.policy, 0, 0, None);
+        Some(shared)
+    } else { None };
+    Ok(shared)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
@@ -492,21 +513,12 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
         super::head::MimoHead::Fp8 { .. } => "head-fp8",
     };
     let width = drafter.map_or_else(|| engine.mtp.as_ref().map_or(0, |m| m.stages.len()), |d| d.cfg.drafts());
-    let mut shared = if width > 0 {
-        let prior = match drafter {
-            Some(d) => resource::Prior::Selector(d.confidence_prior(head_numerics)?),
-            None => resource::Prior::History,
-        };
-        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
-            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
-        shared.policy.set_native_confidence_positions(width)?;
-        resource::publish(&shared.policy, 0, 0, None);
-        Some(shared)
-    } else { None };
+    let mut shared = make_policy(engine, head_numerics, width)?;
     let (mut observed_rounds, mut skipped_rounds) = (0u64, 0u64);
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
-    let (family, cache, selector, active) = owners.scheduler_parts();
+    let (family, cache, selector, active, lanes, second_selector, rounds) = owners.scheduler_parts();
+    let mut second_shared = if lanes.has_second() { make_policy(engine, head_numerics, width)? } else { None };
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;
@@ -819,6 +831,7 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
                 let draft_from = if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.draft_from(p.placement.ring) } else { resume };
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
+                        lane: 0, finished: false,
                         slot,
                         drafts: DraftHistory::default(),
                         counts: [0; 6],
@@ -900,6 +913,24 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
         }
         if active.is_empty() { continue; }
         let cycle = Instant::now();
+        let finished = if lanes.has_second() {
+            crate::shared::serve::lanes::rebalance(active, |a| Some(a.lane), |a, lane| a.lane = lane);
+            if active.len() == 1 { active[0].lane = 0; }
+            let mut second_trace = trace.clone();
+            let pending = !prefills.is_empty() || !media.is_empty() || snapshot_waiter.is_some() || kv_waiter.len() > 0;
+            rounds.install(std::mem::take(active));
+            let cache_enabled = cache.enabled();
+            let executor = engine.decode_executor()?;
+            let result = executor.block_on(lanes.run(
+                |lane| independent::lane_rounds(lane, selector, rounds, &mut shared, width, policy, prefix,
+                    cache_enabled, receive, pending, &mut trace),
+                |lane| independent::lane_rounds(lane, second_selector.as_mut().expect("prepared second selector"),
+                    rounds, &mut second_shared, width, policy, prefix, cache_enabled, receive, pending, &mut second_trace)));
+            *active = rounds.take_restored();
+            result?;
+            for request in active.iter().filter(|a| a.finished) { failures.finished(&request.job.events); }
+            active.iter().map(|a| a.finished).collect::<Vec<_>>()
+        } else {
         let mut round_clock = RoundClock::at(cycle);
         let mut drafted_requests = 0;
         let mut drafted_width = 0;
@@ -1224,6 +1255,8 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
             vec![("draft", 1e6 * (draft_s - draft0)), ("plan", plan_us), ("verify", 1e6 * step_s),
                 ("emit", 1e6 * (emit_s - emit0)), ("gpu", gpu(0)), ("experts", gpu(1))]
         });
+        finished
+        };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;

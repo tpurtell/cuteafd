@@ -1,5 +1,5 @@
 //! Callback-local GPU owners must retire before the enclosing engine closes.
-use super::{engine::{DecodeLanes, MimoEngine}, prefix::MimoPrefix};
+use super::{engine::{DecodeLanes, MimoEngine, RoundBank}, prefix::MimoPrefix};
 use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::token_io::TokenSelector;
 use anyhow::Result;
@@ -14,6 +14,7 @@ struct Buffers<'e, 'a> {
     second_selector: Option<TokenSelector<'a>>,
     lanes: DecodeLanes<'e, 'a>,
     active: Vec<super::serve::Active<'a>>,
+    rounds: RoundBank<super::serve::Active<'a>>,
 }
 
 /// Installed before the first serving-owned GPU buffer is created. This also
@@ -30,7 +31,7 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
 
     pub(super) fn with_lanes(engine: &'e MimoEngine<'a>, second: Option<MimoEngine<'a>>) -> Self {
         Self { engine, buffers: Some(Buffers { prefix: None, selector: None,
-            second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new() }) }
+            second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new(), rounds: RoundBank::from_requests(Vec::new()) }) }
     }
 
     pub(super) fn prepare(&mut self, select: crate::shared::token_io::SelectPlacement,
@@ -47,7 +48,6 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
             buffers.second_selector.as_mut().unwrap().reserve_sampler()?;
         }
         buffers.lanes.prepare(probe)
-
     }
 
     pub(super) fn prefix(&mut self, family: MimoPrefix<'e, 'a>, cache: PrefixCache<CudaCopyEngine<'a>>) {
@@ -66,11 +66,12 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
     }
 
     pub(super) fn scheduler_parts(&mut self) -> (&MimoPrefix<'e, 'a>,
-        &mut PrefixCache<CudaCopyEngine<'a>>, &mut TokenSelector<'a>, &mut Vec<super::serve::Active<'a>>) {
+        &mut PrefixCache<CudaCopyEngine<'a>>, &mut TokenSelector<'a>, &mut Vec<super::serve::Active<'a>>,
+        &DecodeLanes<'e, 'a>, &mut Option<TokenSelector<'a>>, &mut RoundBank<super::serve::Active<'a>>) {
         let buffers = self.buffers.as_mut().expect("live serving owners");
         let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
         let selector = buffers.selector.as_mut().expect("initialized serving selector");
-        (family, cache, selector, &mut buffers.active)
+        (family, cache, selector, &mut buffers.active, &buffers.lanes, &mut buffers.second_selector, &mut buffers.rounds)
     }
 }
 

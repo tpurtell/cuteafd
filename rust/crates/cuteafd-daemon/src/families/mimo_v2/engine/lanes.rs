@@ -16,6 +16,17 @@ impl<T> RoundBank<T> {
         Self { slots: RefCell::new(requests.into_iter().map(Some).collect()) }
     }
 
+    pub(in super::super) fn install(&mut self, requests: Vec<T>) {
+        assert!(self.slots.get_mut().is_empty(), "previous serving cohort not returned");
+        *self = Self::from_requests(requests);
+    }
+
+    pub(in super::super) fn take_restored(&mut self) -> Vec<T> {
+        let slots = self.slots.get_mut();
+        assert!(slots.iter().all(Option::is_some), "lane still owns a request");
+        slots.drain(..).map(Option::unwrap).collect()
+    }
+
     pub(in super::super) fn extract(&self, mut selected: impl FnMut(&T) -> bool) -> OwnedRound<'_, T> {
         // Install the restore guard before calling a fallible/panicking selector.
         let mut round = OwnedRound { bank: self, requests: Vec::new() };
@@ -34,6 +45,8 @@ pub(in super::super) struct OwnedRound<'b, T> {
     requests: Vec<(usize, T)>,
 }
 impl<T> OwnedRound<'_, T> {
+    pub(in super::super) fn is_empty(&self) -> bool { self.requests.is_empty() }
+
     pub(in super::super) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
         self.requests.iter_mut().map(|(_, request)| request)
     }
@@ -221,6 +234,16 @@ impl<'a> DecodeLane<'_, '_, 'a> {
     pub(in super::super) fn stop(&self) { self.owner.stop.set(true); }
     fn view(&self) -> &MimoEngine<'a> {
         if self.index == 0 { self.owner.first } else { self.owner.second.as_ref().expect("admitted lane one") }
+    }
+
+    pub(in super::super) fn index(&self) -> usize { self.index }
+    pub(in super::super) fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.view().library }
+    pub(in super::super) fn profile(&self) -> [f64; 2] { *self.view().profile.borrow() }
+    pub(in super::super) fn probe_begin(&self, rows: usize) { self.view().probe_begin(rows); }
+    pub(in super::super) fn probe_end(&self) { self.view().probe_end(); }
+    pub(in super::super) fn probe_finish<T>(&self, observe: impl FnOnce(
+        &crate::shared::draft::routes::RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        self.view().probe_finish(observe)
     }
 
     pub(in super::super) fn draft(&self, sequences: &[super::super::dflash::DraftSeq])

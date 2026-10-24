@@ -27,7 +27,7 @@
 //! ([`MimoEngine::decode_layers`]), every 1..=64-row shape captured at startup.
 mod tp2;
 mod lanes;
-pub(super) use lanes::DecodeLanes;
+pub(super) use lanes::{DecodeLane, DecodeLanes, RoundBank};
 use super::weights::{MimoLayer, MimoWeights};
 use super::head::BorrowedHead;
 use cuteafd_loader::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
@@ -1568,6 +1568,13 @@ impl<'a> MimoEngine<'a> {
             placement.len += *count;
         }
         Ok(logits)
+    }
+
+    pub(super) fn decode_executor(&self) -> Result<Rc<tokio::runtime::Runtime>> {
+        match &self.experts {
+            Some(Experts::Spark { runtime, .. }) => Ok(Rc::clone(runtime)),
+            _ => anyhow::bail!("independent MiMo lanes need a Spark executor"),
+        }
     }
 
     /// Lane-local verifier. Its enclosing LaneSet drains both futures and then
