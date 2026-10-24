@@ -17,7 +17,7 @@ impl<'a> MimoEngine<'a> {
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|value| value.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
             .transpose()?.unwrap_or(0);
-        self.tp2 = Some(Tp2 { layers, ranks: ranks.map(RefCell::new), combine, routes,
+        self.tp2 = Some(Tp2 { layers, ranks: Rc::new(ranks.map(RefCell::new)), combine, routes,
             source: Cell::new(RouteSource::Broadcast), checking: Cell::new(false), interval,
             steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()) });
         if self.prefill_rows >= DECODE_ROWS { self.prepare_scoring_prefill()?; }
@@ -214,6 +214,30 @@ impl<'a> MimoEngine<'a> {
             "MiMo startup router qualification checked no decode routes");
         tp2.source.set(identity.source());
         tracing::info!(?identity, source = ?tp2.source.get(), "MiMo TP2 startup router qualification");
+        *tp2.identity.borrow_mut() = RouteIdentity::default();
+        Ok(())
+    }
+
+    /// A decode-only view qualifies its own routes on KV filled by the admitted
+    /// prefill owner; it must never construct a second prefill workspace.
+    pub(super) fn check_tp2_decode_routers(&self, prefill: &Self) -> Result<()> {
+        let Some(tp2) = &self.tp2 else { return Ok(()) };
+        ensure!(Rc::ptr_eq(&self.weights, &prefill.weights), "decode qualification needs shared target weights");
+        let rows = prefill.prefill_rows.min(256).min(self.max_context.saturating_sub(1));
+        ensure!(rows > 0, "MiMo route qualification needs prefill plus decode");
+        let mut allocator = Allocator::new(self.pages, self.rings);
+        let mut placement = allocator.admit(rows + 1)?;
+        let tokens = (0..rows).map(|i| (i % self.cfg.vocab_size) as u32).collect::<Vec<_>>();
+        prefill.prefill_device(&mut placement, &tokens, false, None, None)?;
+        *tp2.identity.borrow_mut() = RouteIdentity::default();
+        tp2.checking.set(true);
+        self.verify_device(&mut [(&mut placement, 1)], &[1], None)?;
+        allocator.release(placement);
+        let identity = tp2.identity.borrow().clone();
+        ensure!(identity.layers_checked > 0 && identity.rows_checked > 0,
+            "MiMo startup second-view qualification checked no decode routes");
+        tp2.source.set(identity.source());
+        tracing::info!(?identity, source = ?tp2.source.get(), "MiMo TP2 decode-only router qualification");
         *tp2.identity.borrow_mut() = RouteIdentity::default();
         Ok(())
     }

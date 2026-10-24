@@ -291,14 +291,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 retire_request(entry.take().unwrap(), requests, &mut prefixes, draft.as_deref_mut())?;
             }
         }
-        let mut loads = [0usize; 2];
-        for request in active.iter().flatten() { loads[request.lane()] += 1; }
-        while loads[0].abs_diff(loads[1]) > 1 {
-            let heavy = usize::from(loads[1] > loads[0]);
-            let Some(request) = active.iter_mut().flatten().find(|r| r.lane() == heavy) else { break };
-            request.ticket.set_lane(1 - heavy);
-            loads[heavy] -= 1; loads[1 - heavy] += 1;
-        }
+        let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
+            |entry| entry.as_ref().map(Active::lane),
+            |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
         // Admit available work at a completed boundary. Prefill currently owns
         // both lanes; mixed prefill/decode interleaving is a subsequent policy.
         let mut media_ready = media_ready.into_iter();

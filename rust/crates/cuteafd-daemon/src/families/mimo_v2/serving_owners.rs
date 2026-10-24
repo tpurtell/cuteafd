@@ -1,16 +1,20 @@
 //! Callback-local GPU owners must retire before the enclosing engine closes.
-use super::{engine::MimoEngine, prefix::MimoPrefix};
+use super::{engine::{DecodeLanes, MimoEngine, RoundBank}, prefix::MimoPrefix};
 use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::token_io::TokenSelector;
 use anyhow::Result;
 use cuteafd_engine::prefix::{PrefixCache, PrefixFamily};
 use cuteafd_hostcache::copy::Stream;
 
-/// Unlike request/grammar metadata, these owners contain CUDA allocations or
-/// pinned storage addressed by asynchronous compute and host-copy queues.
+/// Keep request media and grammar owners with the CUDA and pinned storage
+/// addressed by asynchronous compute and host-copy queues.
 struct Buffers<'e, 'a> {
     prefix: Option<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)>,
     selector: Option<TokenSelector<'a>>,
+    second_selector: Option<TokenSelector<'a>>,
+    lanes: DecodeLanes<'e, 'a>,
+    active: Vec<super::serve::Active<'a>>,
+    rounds: RoundBank<super::serve::Active<'a>>,
 }
 
 /// Installed before the first serving-owned GPU buffer is created. This also
@@ -22,7 +26,32 @@ pub(super) struct ServingOwners<'e, 'a> {
 
 impl<'e, 'a> ServingOwners<'e, 'a> {
     pub(super) fn new(engine: &'e MimoEngine<'a>) -> Self {
-        Self { engine, buffers: Some(Buffers { prefix: None, selector: None }) }
+        Self::with_lanes(engine, None)
+    }
+
+    pub(super) fn with_lanes(engine: &'e MimoEngine<'a>, second: Option<MimoEngine<'a>>) -> Self {
+        Self { engine, buffers: Some(Buffers { prefix: None, selector: None,
+            second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new(), rounds: RoundBank::from_requests(Vec::new()) }) }
+    }
+
+    pub(super) fn install_second(&mut self, second: Option<MimoEngine<'a>>) {
+        self.buffers.as_mut().expect("live serving owners").lanes.install_second(second);
+    }
+
+    pub(super) fn prepare(&mut self, select: crate::shared::token_io::SelectPlacement,
+        probe: bool) -> Result<usize> {
+        // Install each selector before further fallible initialization so even
+        // a sampler allocation failure retires its queues with both views.
+        self.selector(TokenSelector::new(self.engine.library, select, self.engine.cfg.vocab_size,
+            super::engine::DECODE_ROWS)?);
+        let buffers = self.buffers.as_mut().expect("live serving owners");
+        buffers.selector.as_mut().unwrap().reserve_sampler()?;
+        if buffers.lanes.has_second() {
+            buffers.second_selector = Some(TokenSelector::new(self.engine.library, select,
+                self.engine.cfg.vocab_size, super::engine::DECODE_ROWS)?);
+            buffers.second_selector.as_mut().unwrap().reserve_sampler()?;
+        }
+        buffers.lanes.prepare(probe)
     }
 
     pub(super) fn prefix(&mut self, family: MimoPrefix<'e, 'a>, cache: PrefixCache<CudaCopyEngine<'a>>) {
@@ -38,6 +67,15 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
         let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
         let selector = buffers.selector.as_mut().expect("initialized serving selector");
         (family, cache, selector)
+    }
+
+    pub(super) fn scheduler_parts(&mut self) -> (&MimoPrefix<'e, 'a>,
+        &mut PrefixCache<CudaCopyEngine<'a>>, &mut TokenSelector<'a>, &mut Vec<super::serve::Active<'a>>,
+        &DecodeLanes<'e, 'a>, &mut Option<TokenSelector<'a>>, &mut RoundBank<super::serve::Active<'a>>) {
+        let buffers = self.buffers.as_mut().expect("live serving owners");
+        let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
+        let selector = buffers.selector.as_mut().expect("initialized serving selector");
+        (family, cache, selector, &mut buffers.active, &buffers.lanes, &mut buffers.second_selector, &mut buffers.rounds)
     }
 }
 
@@ -70,14 +108,18 @@ impl Drop for ServingOwners<'_, '_> {
         let Some(buffers) = self.buffers.take() else { return; };
         let engine = self.engine;
         retire_or_retain(buffers, |buffers| {
-            // A host restore can wait on a compute event. Do not attempt its
-            // queues when publication/compute drainage failed; keep all owners.
-            engine.terminal_shutdown()?;
-            if let Some((family, cache)) = &mut buffers.prefix {
-                retire_copy_queues(|| family.drain().map_err(|error| anyhow::anyhow!("{error:#}")),
-                    |stream| cache.host_engine_mut().map_or(Ok(()), |copy| copy.synchronize(stream)))?;
-            }
-            Ok(())
+            let result = (|| {
+                // A host restore can wait on a compute event. Do not attempt
+                // its queues until both execution views have retired together.
+                buffers.lanes.retire()?;
+                if let Some((family, cache)) = &mut buffers.prefix {
+                    retire_copy_queues(|| family.drain().map_err(|error| anyhow::anyhow!("{error:#}")),
+                        |stream| cache.host_engine_mut().map_or(Ok(()), |copy| copy.synchronize(stream)))?;
+                }
+                Ok(())
+            })();
+            if result.is_err() { buffers.lanes.retain(); }
+            result
         }, |error| {
             engine.retain_serving_storage();
             tracing::error!(%error, "serving owners did not drain; retaining complete engine and serving storage");

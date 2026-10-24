@@ -32,6 +32,7 @@ pub struct MimoInputs<'a> {
     pub tp2_workspace: [u64; 2],
     pub rows: u64,
     pub lanes: u64,
+    pub decode_lanes: u8,
 }
 
 pub struct MimoSolution {
@@ -46,6 +47,7 @@ impl<'a> MimoInputs<'a> {
         MimoInputs { profile: if remote { self.profile } else { no_spark },
             spark_ranks: working_set.selected_ranks().len(),
             lanes: if remote { working_set.prefill_lanes } else { 1 },
+            decode_lanes: if remote { self.decode_lanes } else { 1 },
             startup_probe_bytes: if remote { self.startup_probe_bytes } else { 0 },
             ..self.clone() }
     }
@@ -236,7 +238,7 @@ mod tests {
                 headroom_floor: 0, spark_ranks: 6, startup_probe_bytes: 64 << 20, context: 256 << 10,
                 requested_pool: Some(2 << 20), pool_ceiling_at_target: false, onboard: Onboard::Auto,
                 experts: vec![None, Some(cost), Some(cost), Some(cost)], expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
-                tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
+                tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3, decode_lanes: 1 };
             let all = solve_working_set(&inputs, &local).unwrap();
             assert_eq!(all.placement.onboard_layers, 3);
             assert_eq!(all.working_set, SparkWorkingSet { rtx_layers: vec![1, 2, 3],
@@ -349,7 +351,7 @@ mod tests {
                     requested_pool: None, pool_ceiling_at_target: false, onboard,
                     experts: vec![None, Some(cost), Some(cost), Some(cost)],
                     expert_workspace: if ranks == 1 { 1 << 20 } else { 0 },
-                    tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3 };
+                    tp2_workspace: if ranks == 2 { [1 << 20; 2] } else { [0; 2] }, rows: 4096, lanes: 3, decode_lanes: 1 };
                 let req = request(&inputs).unwrap();
                 assert_eq!(req.movables.len(), 1);
                 assert!(req.fixed.iter().all(|d| !d.group.starts_with("draft.")));
@@ -442,8 +444,13 @@ pub fn request(inputs: &MimoInputs<'_>) -> Result<PlacementRequest, CacheGeometr
     }
     let mut tp2_workspace = inputs.tp2_workspace;
     if ranks == 2 && tp2_workspace.iter().any(|&bytes| bytes > 0) {
-        let bytes = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
+        let mut bytes = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
             .map_err(|_| PlacementError::Overflow("MiMo route exchange"))?;
+        if inputs.decode_lanes == 2 {
+            bytes = bytes.checked_add(route_exchange_bytes(64, inputs.cfg.topk as u64, 1)
+                .map_err(|_| PlacementError::Overflow("MiMo lane1 routes"))?)
+                .ok_or(PlacementError::Overflow("MiMo lane1 route sum"))?;
+        }
         for workspace in &mut tp2_workspace {
             *workspace = workspace.checked_add(bytes).ok_or(PlacementError::Overflow("MiMo TP2 workspace"))?;
         }
@@ -519,8 +526,13 @@ pub fn expert_items(inputs: &MimoInputs<'_>, placement: &Placement, rank: usize)
     let mut items = placement.items[rank].iter().filter(|item| item.format == "tp2" || item.format == "local")
         .cloned().collect::<Vec<_>>();
     if placement.tp2.is_some() {
-        let route = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
+        let mut route = route_exchange_bytes(inputs.rows.max(64), inputs.cfg.topk as u64, inputs.lanes)
             .map_err(|_| PlacementError::Overflow("MiMo route exchange"))?;
+        if inputs.decode_lanes == 2 {
+            route = route.checked_add(route_exchange_bytes(64, inputs.cfg.topk as u64, 1)
+                .map_err(|_| PlacementError::Overflow("MiMo lane1 routes"))?)
+                .ok_or(PlacementError::Overflow("MiMo lane1 route sum"))?;
+        }
         let arena = items.iter_mut().find(|item| item.format == "tp2")
             .ok_or(PlacementError::Inventory("MiMo TP2 arena item"))?;
         arena.bytes = arena.bytes.checked_sub(route).ok_or(PlacementError::Inventory("MiMo TP2 route reservation"))?;

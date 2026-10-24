@@ -32,6 +32,9 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Independent decode views. The second is admitted before readiness, not on demand.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub decode_lanes: u8,
     /// Shared GQA drafter-ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -268,12 +271,55 @@ mod draft_storage_tests {
         // Keep these joined so the assertions cannot match their own text.
         assert!(source.contains(&["let mut decode = link", "(0, 1, &decode_warm)?;"].concat()));
         assert!(source.contains(&["let mut prefill = link", "(1, lanes, &prefill_warm)?;"].concat()));
+        assert!(source.contains(&["Some(link", "(2, 1, &decode_warm)?)"].concat()));
+        assert!(source.contains(&["let endpoints = cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(",
+            "\n            args.prefill_rows, args.expert_input.into(), args.decode_lanes)?;"].concat()));
         assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
-        assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "spark_endpoints("].concat()));
+        assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "decode_spark_endpoints("].concat()));
         let engine = include_str!("engine.rs");
         assert!(engine.contains(&["Experts::Spark { prefill: transport, runtime, .. })", " = &e.experts"].concat()));
-        assert!(engine.contains(&["Experts::Spark { decode: transport, .. }) => transport.borrow().intake", ".pointers()"].concat()));
+        assert!(engine.contains(&["Experts::Spark { decode, .. }) => decode.borrow().intake", ".pointers()"].concat()));
         assert!(engine.contains(&["for transport in [decode, prefill]", " {"].concat()));
+    }
+
+    #[test]
+    fn unsupported_second_decode_view_is_refused_before_checkpoint_or_native_loading() {
+        let args = args(&["--decode-lanes", "2"]);
+        let error = match open(&args) {
+            Ok(_) => panic!("second decode view was admitted without Spark experts"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
+            Some(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes", value: 2, .. })));
+    }
+
+    #[test]
+    fn independent_spark_decode_accepts_graphs_off_before_checkpoint_loading() {
+        let args = args(&["--decode-lanes", "2", "--peers", "127.0.0.1:1234"]);
+        assert!(!args.decode_graphs);
+        let error = match open(&args) {
+            Ok(_) => panic!("missing checkpoint unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(!matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
+            Some(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes", .. })));
+    }
+
+    #[test]
+    fn graph_off_lanes_share_the_serial_layer_sequence_and_defer_peer_waits() {
+        let engine = include_str!("engine.rs");
+        assert_eq!(engine.matches("async fn step_inner(").count(), 1);
+        let verifier = engine.split("async fn verify_device_async(").nth(1).unwrap().split("    fn step(").next().unwrap();
+        assert!(verifier.contains("self.step_inner(&tables, tokens, rows, None, None, None, true).await?"));
+        assert!(!verifier.contains("decode_layers_async("));
+        let step = engine.split("async fn step_inner(").nth(1).unwrap().split("    /// Logits of").next().unwrap();
+        assert!(step.contains("self.moe(w, index, layer, t, tables.decode, forward, aggregate).await?"));
+        assert!(step.contains("self.peer_unit_attention(index, 0, w1, rows, tables, bytes)?"));
+        assert!(step.contains("self.peer_unit_post(index, 0, w1, rows)?"));
+        assert!(step.contains("let ahead = forced.is_none() && !aggregate;"));
+        let moe = engine.split("async fn moe_local(").nth(1).unwrap().split("    /// The routed experts").next().unwrap();
+        assert!(moe.contains("transport.receive_aggregate(wave, t, self.stream).await?"));
+        assert!(moe.contains("forward, true, !aggregate, receive)"));
     }
 
     #[test]
@@ -854,6 +900,11 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
+    if args.decode_lanes == 2 && (args.peers.is_none() || args.local_experts || args.skip_experts || args.mtp > 0) {
+        return Err(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes",
+            value: args.decode_lanes, family: "mimo_v2".into(),
+            reason: "independent lanes require Spark experts and DFlash or no drafter" }.into());
+    }
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
@@ -910,6 +961,8 @@ impl Opened {
         let automatic_context = args.max_context == 0;
         engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?;
         let mut resolved = args.clone();
+        resolved.decode_lanes = cuteafd_loader::plan::resolve_decode_lanes("mimo_v2",
+            Some(resolved.decode_lanes), serving.map_or(1, |(_, concurrency)| concurrency) as u64)?;
         if resolved.max_context == 0 {
             resolved.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&self.checkpoint.config)?
                 .context("MiMo checkpoint lacks full-context capability")?.try_into()?;
@@ -1019,8 +1072,8 @@ impl Opened {
             let capacity = u32::try_from(engine::expert_capacity(args.prefill_rows))?;
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity, compiled_capacity: capacity,
-                endpoints: cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
-                    args.prefill_rows, args.expert_input.into())?.to_vec(),
+                endpoints: cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(
+                    args.prefill_rows, args.expert_input.into(), args.decode_lanes)?,
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
@@ -1315,8 +1368,8 @@ impl Opened {
             request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
             Ok(request)
         };
-        let endpoints = cuteafd_loader::families::mimo_v2::admission::spark_endpoints(
-            args.prefill_rows, args.expert_input.into())?;
+        let endpoints = cuteafd_loader::families::mimo_v2::admission::decode_spark_endpoints(
+            args.prefill_rows, args.expert_input.into(), args.decode_lanes)?;
         let decode_warm = warm(engine::DECODE_ROWS, args.expert_input.bf16(true))?;
         let prefill_warm = warm(engine::expert_capacity(args.prefill_rows), args.expert_input.bf16(false))?;
         let link = |endpoint: u32, waves: usize, request: &cuteafd_transport::ExpertProtocolV2Request|
@@ -1337,6 +1390,7 @@ impl Opened {
         // only prefill owns overlapping waves and rotating pinned return slots.
         let mut decode = link(0, 1, &decode_warm)?;
         let mut prefill = link(1, lanes, &prefill_warm)?;
+        let mut second = if args.decode_lanes == 2 { Some(link(2, 1, &decode_warm)?) } else { None };
         tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let started = Instant::now();
@@ -1347,10 +1401,18 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
             })?;
         }
+        if let Some(transport) = &mut second {
+            runtime.block_on(async {
+                let wave = transport.dispatch(&decode_warm)?;
+                transport.receive(wave, engine::DECODE_ROWS, warm_stream.raw()).await
+            })?;
+        }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { decode: std::cell::RefCell::new(decode),
-            prefill: std::cell::RefCell::new(prefill), runtime }))
+        Ok(Some(engine::Experts::Spark { decode: std::rc::Rc::new(std::cell::RefCell::new(decode)),
+            prefill: std::rc::Rc::new(std::cell::RefCell::new(prefill)),
+            second: std::cell::RefCell::new(second.map(|link| std::rc::Rc::new(std::cell::RefCell::new(link)))),
+            runtime: std::rc::Rc::new(runtime) }))
     }
 }
 

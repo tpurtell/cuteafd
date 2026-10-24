@@ -16,6 +16,8 @@
 //! (`Turn`, EOS or max_tokens with the client still there); a prefill whose
 //! client left is parked at its last chunk boundary; a decode whose client
 //! left is not retained. `prompt_cache_hit_tokens` reports the restored rows.
+mod independent;
+
 use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
 use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
@@ -27,7 +29,7 @@ use cuteafd_engine::prefix::{After, MarkArena, PointPolicy, PrefixCache, PrefixC
 use crate::shared::draft_policy::DraftHistory;
 use crate::shared::draft::{resource, clock::RoundClock, evidence::{Censor, DraftSource}};
 use super::{open, Opened};
-use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
+use crate::shared::token_io::{SelectBatch, TokenSelector};
 use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeShareArgs};
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::qwen4::QwenEncoding;
@@ -158,6 +160,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
+    engine_args.decode_lanes = cuteafd_loader::plan::resolve_decode_lanes("mimo_v2",
+        Some(engine_args.decode_lanes), args.max_sequences as u64)?;
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
@@ -273,19 +277,22 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         // Every decode/verify shape the scheduler can step (1..=64 rows) is captured before
         // the server is ready: serving replays them without capturing.
         let started = std::time::Instant::now();
-        let graphs = engine.capture_decode_graphs(DECODE_ROWS)?;
+        let mut owners = super::serving_owners::ServingOwners::new(engine);
+        owners.install_second(engine.take_decode_view()?);
+        let (family, cache) = prefix_cache_with(engine, &prefix, max_sequences, |_| Ok(host_config))?;
+        owners.prefix(family, cache);
+        let graphs = owners.prepare(args.token_io.token_select, engine.drafter.is_some() || engine.mtp.is_some())?;
         if graphs > 0 {
             tracing::info!(graphs, rows = DECODE_ROWS, elapsed_ms = started.elapsed().as_millis() as u64,
                 "MiMo decode graphs captured");
         }
-        engine.check_tp2_routers()?;
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
         }
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select, host_config, &mut media, preparer.as_deref())
+        schedule_inner(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
+            &mut owners, &mut media, preparer.as_deref())
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| (args.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer, audio_preparer, health, audio_health)))).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -325,7 +332,9 @@ struct Prefill<'a> {
     ticket: console::Ticket,
 }
 
-struct Active<'a> {
+pub(super) struct Active<'a> {
+    lane: usize,
+    finished: bool,
     job: NativeRequest,
     /// Prompt and generated tokens, for copy-window drafts.
     history: Vec<u32>,
@@ -415,6 +424,7 @@ impl Active<'_> {
             return Ok(false);
         };
         self.finish(finish)?;
+        self.finished = true;
         Ok(true)
     }
 
@@ -477,24 +487,27 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
     slots.extend(slot);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
-    receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
-    host_config: Option<cuteafd_hostcache::config::Config>,
-    media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
-    let mut owners = super::serving_owners::ServingOwners::new(engine);
-    let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
-    owners.prefix(family, cache);
-    owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
-    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer)
+fn make_policy(engine: &MimoEngine<'_>, head_numerics: &str, width: usize)
+    -> Result<Option<crate::shared::draft::runtime::SharedPolicy>> {
+    let drafter = engine.drafter.as_ref();
+    let shared = if width > 0 {
+        let prior = match drafter {
+            Some(d) => resource::Prior::Selector(d.confidence_prior(head_numerics)?),
+            None => resource::Prior::History,
+        };
+        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
+            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
+        shared.policy.set_native_confidence_positions(width)?;
+        resource::publish(&shared.policy, 0, 0, None);
+        Some(shared)
+    } else { None };
+    Ok(shared)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
+fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
+    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, 'a>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) -> Result<()> {
     let drafter = engine.drafter.as_ref();
@@ -504,30 +517,21 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         super::head::MimoHead::Fp8 { .. } => "head-fp8",
     };
     let width = drafter.map_or_else(|| engine.mtp.as_ref().map_or(0, |m| m.stages.len()), |d| d.cfg.drafts());
-    let mut shared = if width > 0 {
-        let prior = match drafter {
-            Some(d) => resource::Prior::Selector(d.confidence_prior(head_numerics)?),
-            None => resource::Prior::History,
-        };
-        let mut shared = crate::shared::draft::runtime::SharedPolicy::with_geometry(
-            engine.draft_geometry(width)?, prior, cuteafd_core::PolicySeed::weak(width))?;
-        shared.policy.set_native_confidence_positions(width)?;
-        engine.arm_draft_probe()?;
-        resource::publish(&shared.policy, 0, 0, None);
-        Some(shared)
-    } else { None };
+    let mut shared = make_policy(engine, head_numerics, width)?;
     let (mut observed_rounds, mut skipped_rounds) = (0u64, 0u64);
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
-    let (family, cache, selector) = owners.parts();
+    let (family, cache, selector, active, lanes, second_selector, rounds) = owners.scheduler_parts();
+    let mut second_shared = if lanes.has_second() { make_policy(engine, head_numerics, width)? } else { None };
+    let mut first_observations = independent::Observations::default();
+    let mut second_observations = independent::Observations::default();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;
     let mut free_rings: Vec<i32> = (0..engine.rings as i32).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::with_vocab(
-        &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
+        engine.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
-    let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     // Verify steps since the last completed request, and host seconds in
     // them (engine) and in token selection + streaming.
@@ -833,6 +837,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let draft_from = if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.draft_from(p.placement.ring) } else { resume };
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
+                        lane: 0, finished: false,
                         slot,
                         drafts: DraftHistory::default(),
                         counts: [0; 6],
@@ -904,6 +909,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 tracing::warn!(%error, "MiMo KV growth exhausted; finishing at committed frontier");
                 let mut request = active.remove(index);
                 if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                if let Some(shared) = second_shared.as_mut() { shared.policy.release(request.ticket.id()); }
                 let _ = request.finish(InferenceFinishReason::Length);
                 requests += 1;
                 generated_total += request.generated as u64;
@@ -914,6 +920,25 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         }
         if active.is_empty() { continue; }
         let cycle = Instant::now();
+        let finished = if lanes.has_second() {
+            crate::shared::serve::lanes::rebalance(active, |a| Some(a.lane), |a, lane| a.lane = lane);
+            if active.len() == 1 { active[0].lane = 0; }
+            let mut second_trace = trace.clone();
+            let pending = !prefills.is_empty() || !media.is_empty() || snapshot_waiter.is_some() || kv_waiter.len() > 0;
+            rounds.install(std::mem::take(active));
+            let cache_enabled = cache.enabled();
+            let executor = engine.decode_executor()?;
+            let result = executor.block_on(lanes.run(
+                |lane| independent::lane_rounds(lane, selector, rounds, &mut shared, width, policy, prefix,
+                    cache_enabled, receive, pending, &mut trace, &mut first_observations),
+                |lane| independent::lane_rounds(lane, second_selector.as_mut().expect("prepared second selector"),
+                    rounds, &mut second_shared, width, policy, prefix, cache_enabled, receive, pending, &mut second_trace,
+                    &mut second_observations)));
+            *active = rounds.take_restored();
+            for request in active.iter().filter(|a| a.finished) { failures.finished(&request.job.events); }
+            result?;
+            active.iter().map(|a| a.finished).collect::<Vec<_>>()
+        } else {
         let mut round_clock = RoundClock::at(cycle);
         let mut drafted_requests = 0;
         let mut drafted_width = 0;
@@ -1107,6 +1132,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 }
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                    if let Some(shared) = second_shared.as_mut() { shared.policy.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
                 }
@@ -1238,12 +1264,15 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             vec![("draft", 1e6 * (draft_s - draft0)), ("plan", plan_us), ("verify", 1e6 * step_s),
                 ("emit", 1e6 * (emit_s - emit0)), ("gpu", gpu(0)), ("experts", gpu(1))]
         });
+        finished
+        };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
             }
             let mut request = active.remove(index);
             if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if let Some(shared) = second_shared.as_mut() { shared.policy.release(request.ticket.id()); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;

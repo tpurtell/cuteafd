@@ -263,6 +263,42 @@ pub fn draft_reservations_with(
     })
 }
 
+impl DraftReservations {
+    /// Execution views share immutable weights and request-indexed rings only.
+    pub fn execution_view(&self) -> Vec<MemoryReservation> {
+        self.steady.iter().filter(|cost| !cost.name.starts_with("draft.weights.")
+            && !(cost.name.starts_with("draft.layer") && cost.name.ends_with("_ring")))
+            .map(|cost| MemoryReservation { name: format!("draft.lane1.{}", cost.name.strip_prefix("draft.").unwrap()),
+                bytes: cost.bytes }).collect()
+    }
+}
+
+/// A second decode view owns no prefill state, weights, KV or request rings.
+/// Pool-dependent page indices remain in the workspace's linear pool term.
+pub fn decode_view_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
+    spark_ranks: usize, graphs: &super::decode_graph::MimoDecodeGraphPlan,
+    bytes_per_exec: u64, driver_margin: u64) -> Result<Vec<MemoryReservation>> {
+    ensure!((1..=2).contains(&ranks) && rank < ranks && spark_ranks > 0,
+        "independent MiMo decode admission requires Spark experts and a valid coordinator rank");
+    let mut costs = graphs.reservations(rank, bytes_per_exec, driver_margin)?;
+    for cost in &mut costs { cost.name = cost.name.replacen("runtime.", "runtime.lane1.", 1); }
+    if ranks == 2 {
+        costs.push(MemoryReservation { name: "transport.lane1.peer_receive_slots".into(),
+            bytes: tensor_bytes("MiMo lane1 peer slots", &[peer_slots(1), super::decode_graph::MIMO_DECODE_ROWS, cfg.hidden, 2])? });
+        costs.push(MemoryReservation { name: "transport.lane1.peer_control".into(),
+            bytes: ((peer_slots(1) + 1) * 16).max(256) as u64 + 256 });
+    }
+    if rank == 0 {
+        costs.push(MemoryReservation { name: "diagnostics.lane1.draft_route_arena".into(),
+            bytes: allocation_bytes("MiMo lane1 draft routes", &[cfg.layers, super::decode_graph::MIMO_DECODE_ROWS, cfg.topk, 4])? });
+        costs.extend(sampling_reservations(cfg.vocab_size)?.into_iter().map(|cost|
+            MemoryReservation { name: cost.name.replacen("sampling.", "sampling.lane1.", 1), bytes: cost.bytes }));
+        costs.push(MemoryReservation { name: "transport.lane1.spark_intake_planes".into(),
+            bytes: tensor_bytes("MiMo lane1 intake planes", &[super::decode_graph::MIMO_DECODE_ROWS, spark_ranks, cfg.hidden, 2])? });
+    }
+    Ok(costs)
+}
+
 pub fn workspace_scratch(
     cfg: &MimoV2Config,
     ranks: usize,
@@ -358,6 +394,16 @@ pub fn spark_endpoints(rows: usize, input: super::MimoExpertInput) -> Result<[cu
     let prefill_ingress = if input.bf16(false) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
     Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1) },
         SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None }])
+}
+
+/// Endpoint indices remain stable: decode0, shared prefill, then decode1.
+pub fn decode_spark_endpoints(rows: usize, input: super::MimoExpertInput, decode_lanes: u8)
+    -> Result<Vec<cuteafd_core::SparkEndpoint>> {
+    ensure!((1..=2).contains(&decode_lanes), "MiMo decode lanes must be 1 or 2");
+    let [decode, prefill] = spark_endpoints(rows, input)?;
+    let mut endpoints = vec![decode, prefill];
+    if decode_lanes == 2 { endpoints.push(decode); }
+    Ok(endpoints)
 }
 
 pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
@@ -468,6 +514,48 @@ pub fn future_host_workspaces(cfg: &MimoV2Config, rows: usize, waves: usize, ran
         demands.push(("mimo/transport/egress-upper-bound".into(), tensor_bytes("MiMo registered egress", &[egress_rows, cfg.hidden, 2])?));
     }
     Ok(demands)
+}
+
+/// Pinned owners introduced by decode1; shared checkpoint/context storage is absent.
+pub fn decode_view_host_workspaces(cfg: &MimoV2Config, ranks: usize, pool_tokens: u64,
+    context: usize, spark_ranks: usize, input: super::MimoExpertInput, kv: MimoKvFormats,
+    diagnostic_layers: usize) -> Result<Vec<(String, u64)>> {
+    ensure!(spark_ranks > 0, "MiMo decode1 needs Spark endpoints");
+    let rows = super::decode_graph::MIMO_DECODE_ROWS;
+    let mut costs = vec![("mimo/lane1/mtp-staging".into(), 256),
+        ("mimo/lane1/draft-route-arena".into(), allocation_bytes("MiMo lane1 draft routes", &[cfg.layers, rows, cfg.topk, 4])?)];
+    for rank in 0..ranks {
+        let mut options = workspace_options(cfg, ranks, rank, rows, context, 1, true, input, kv,
+            0, MimoPrefillOutput::LastRow, false, |_| Ok(0))?.into_iter()
+            .find(|(_, options)| options.decode).context("MiMo decode1 host workspace")?.1;
+        options.pool_pages = pool_tokens.div_ceil(64);
+        let layout = super::MimoWorkspaceLayout::new(cfg, options)?;
+        costs.push((format!("mimo/lane1/owner-{rank}/ordered-tables"), layout.ordered_host_bytes(1)?));
+        costs.push((format!("mimo/lane1/owner-{rank}/router"), layout.router_host));
+    }
+    let mask = allocation_bytes("MiMo lane1 sampling mask", &[rows, cfg.vocab_size.div_ceil(32), 4])?;
+    costs.push(("mimo/lane1/sampling".into(), mask.checked_add((rows * (64 + 5 * 4 + 12)) as u64)
+        .context("MiMo lane1 sampler overflow")?));
+    if diagnostic_layers > 0 {
+        costs.push(("mimo/lane1/router-diagnostics".into(), tensor_bytes("MiMo lane1 route checks",
+            &[rows, cfg.topk, 8, ranks, diagnostic_layers])?));
+    }
+    let geometry = cuteafd_core::ExpertGeometry { hidden: u32::try_from(cfg.hidden)?,
+        experts: u32::try_from(cfg.experts)?, topk: u32::try_from(cfg.topk)?,
+        intermediate: u32::try_from(cfg.moe_intermediate)?, layers: u32::try_from(cfg.layers)? };
+    let endpoint = spark_endpoints(rows, input)?[0];
+    let (request, response) = endpoint.wire_bytes(geometry).context("MiMo lane1 host wire")?;
+    let rings = cuteafd_core::SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+        depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+    costs.push(("mimo/lane1/transport/rdma-rings".into(), tensor_bytes("MiMo lane1 rings",
+        &[endpoint.ring_bytes(geometry, rings).context("MiMo lane1 host rings")?, spark_ranks])?));
+    costs.push(("mimo/lane1/transport/response-prefix".into(), tensor_bytes("MiMo lane1 prefix",
+        &[endpoint.response_prefix_bytes().context("MiMo lane1 response metadata")?, spark_ranks])?));
+    costs.push(("mimo/lane1/spark-intake-upper-bound".into(), tensor_bytes("MiMo lane1 host intake",
+        &[rows, cfg.hidden, 2, spark_ranks])?));
+    costs.push(("mimo/lane1/transport/egress-upper-bound".into(), tensor_bytes("MiMo lane1 registered egress",
+        &[rows, cfg.hidden, 2])?));
+    Ok(costs)
 }
 
 pub fn sampling_wave_bytes(capacity: usize, vocab: usize) -> usize {
