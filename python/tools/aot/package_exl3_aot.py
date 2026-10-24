@@ -469,12 +469,13 @@ def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) 
     """Route block of a compact warp-specialized export, or None when off.
 
     Measured per capacity (see `compact_warp_specialized`): a 64-row block
-    beats 32 from m1024 up and, with dynamic tile claims, ties it at m256, so
-    every qualified capacity takes 64.
+    beats 32 from m1024 up (m1024 4.97 vs 5.74 ms); at m256, with dynamic
+    tile claims, the two tie (3.81 vs 3.81), so the small capacity keeps the
+    32-row block and larger ones take 64.
     """
     if not compact_warp_specialized(geometry, role, width, capacity):
         return None
-    return 64
+    return 32 if capacity < 1024 else 64
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd

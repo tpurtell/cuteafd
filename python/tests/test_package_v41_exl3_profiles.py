@@ -268,7 +268,7 @@ class PackageProfileTests(unittest.TestCase):
         self.assertEqual([package.compact_warp_specialized('glm', 'spark', 384, c)
                           for c in capacities], [False] * 3 + [True] * 4)
         self.assertEqual([package.compact_ws_route_block('glm', 'spark', 384, c)
-                          for c in capacities], [None] * 3 + [64] * 4)
+                          for c in capacities], [None] * 3 + [32, 64, 64, 64])
         for geometry in ('v41', 'qwen4', 'glmf', 'dsv4p', 'kimik3'):
             self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', 384, c)
                                  for c in capacities))
@@ -319,6 +319,24 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(variant['route_block'], 64)
             self.assertTrue(variant['ws_dynamic_tiles'])
 
+    def test_compact_ws_small_capacity_keeps_the_32_row_block(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (4, 5), geometry='glm', capacities=(256, 1024, 4096),
+                compact=True, profiles=('tp6-width256',))
+            ws_calls = [call for call in calls if call.kwargs.get('compact_weights')
+                        and call.kwargs.get('warp_specialized')]
+            self.assertEqual({call.args[3]: call.kwargs['route_block'] for call in ws_calls},
+                             {256: 32, 1024: 64, 4096: 64})
+            self.assertTrue(any('+ws-m32-dynamic' in str(call.args[0]) for call in ws_calls
+                                if call.args[3] == 256))
+            self.assertTrue(all('+ws-m64-dynamic' in str(call.args[0]) for call in ws_calls
+                                if call.args[3] >= 1024))
+            for variant in manifest['variants']:
+                if '-compact-' in variant['directory'] and variant['capacity'] == 256:
+                    self.assertEqual(variant['route_block'], 32)
+
     def test_compact_unmeasured_tier_family_stays_cooperative(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -348,7 +366,7 @@ class PackageProfileTests(unittest.TestCase):
 
     def test_compact_ws_verifier_rejects_unqualified_execution_contracts(self):
         cases = [
-            ('glm', 384, 256, {'route_block': 32}),
+            ('glm', 384, 256, {'route_block': 64}),
             ('glm', 384, 1024, {'route_block': 32}),
             ('glm', 384, 256, {'ws_dynamic_tiles': False}),
             ('glm', 384, 256, {'ws_input_stages': 3}),
