@@ -26,6 +26,8 @@
 //! captured graph per layer segment between the Spark exchanges
 //! ([`MimoEngine::decode_layers`]), every 1..=64-row shape captured at startup.
 mod tp2;
+mod lanes;
+pub(super) use lanes::DecodeLanes;
 use super::weights::{MimoLayer, MimoWeights};
 use super::head::BorrowedHead;
 use cuteafd_loader::families::mimo_v2::workspace::MimoPrefillKvShadowPlan;
@@ -1133,15 +1135,7 @@ impl<'a> MimoEngine<'a> {
     /// release its pinned/landing owners until all compute and copy streams
     /// drain. Publication failure skips potentially blocked compute drains.
     pub(crate) fn terminal_shutdown(&self) -> Result<()> {
-        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
-        match self.terminal.get() {
-            TerminalState::Drained => return Ok(()),
-            TerminalState::Active => self.terminal.set(TerminalState::Aborting),
-            state => return Err(TerminalPeerError::Closed(state).into()),
-        }
-        let mut owners = self.terminal_owners();
-        super::teardown::retire_views(&mut [&mut owners])
-            .map_err(|error| TerminalPeerError::Retain(format!("{error:#}")).into())
+        self.terminal_shutdown_views(None)
     }
 
     fn terminal_owners(&self) -> impl crate::shared::experts::rtx::pair::SubmissionOwners + '_ + use<'_, 'a> {
@@ -1191,17 +1185,11 @@ impl<'a> MimoEngine<'a> {
     /// Shared rank streams can contain waits from either view. Publish every
     /// abort first; an unsuccessful proof quarantines both complete views.
     pub(super) fn terminal_shutdown_views(&self, peer: Option<&Self>) -> Result<()> {
-        use crate::shared::peer_split::{TerminalPeerError, TerminalState};
-        let Some(peer) = peer else { return self.terminal_shutdown() };
+        use crate::shared::peer_split::TerminalPeerError;
         let mut views = Vec::new();
-        for view in [self, peer] {
-            match view.terminal.get() {
-                TerminalState::Drained => {},
-                TerminalState::Active | TerminalState::Aborting => {
-                    view.terminal.set(TerminalState::Aborting);
-                    views.push(view.terminal_owners());
-                },
-                state => return Err(TerminalPeerError::Closed(state).into()),
+        for view in std::iter::once(self).chain(peer) {
+            if super::teardown::begin_retirement(&view.terminal)? {
+                views.push(view.terminal_owners());
             }
         }
         let mut owners: Vec<&mut dyn crate::shared::experts::rtx::pair::SubmissionOwners> =
@@ -1584,7 +1572,7 @@ impl<'a> MimoEngine<'a> {
 
     /// Lane-local verifier. Its enclosing LaneSet drains both futures and then
     /// retires both views on failure; never run a one-view shutdown here.
-    pub(super) async fn verify_device_async(&self, sequences: &mut [(&mut MimoPlacement, usize)],
+    async fn verify_device_async(&self, sequences: &mut [(&mut MimoPlacement, usize)],
         tokens: &[u32]) -> Result<Option<DeviceLogits>> {
         self.require_live()?;
         ensure!(self.decode_graphs && self.graphable(), "independent MiMo verification needs startup decode graphs");
@@ -1907,13 +1895,15 @@ impl<'a> MimoEngine<'a> {
     async fn decode_layers_async(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>,
         tables: &StepTables, t: usize, gather: bool, head: bool) -> Result<()> {
         for index in 0..=self.weights.layers.len() {
+            self.require_live()?;
             if let Some(mut sent) = self.decode_layer(index, w, w1, tables, t, gather, head, true)? {
                 let Some(Experts::Spark { decode, .. }) = &self.experts else { unreachable!() };
                 let waited = std::time::Instant::now();
                 let wave = sent.wave.take().context("wave already received")?;
                 // Only this view's fixed transport is borrowed across its wait;
                 // request banks and the serialized RTX package are not borrowed.
-                decode.borrow_mut().receive(wave, t, self.stream).await?;
+                decode.borrow_mut().receive_aggregate(wave, t, self.stream).await?;
+                self.require_live()?;
                 self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
                 self.wave_line(index, t, &sent, waited.elapsed().as_secs_f64(), 0.0);
                 self.decode_layer_received(index)?;

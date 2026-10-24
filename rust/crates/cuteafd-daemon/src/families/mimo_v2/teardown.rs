@@ -2,6 +2,19 @@
 use anyhow::Result;
 use crate::shared::experts::rtx::pair::{SubmissionOwners, teardown};
 
+/// Active and already-aborted views use the same retirement phases.
+pub(super) fn begin_retirement(state: &std::cell::Cell<crate::shared::peer_split::TerminalState>) -> Result<bool> {
+    use crate::shared::peer_split::{TerminalPeerError, TerminalState};
+    match state.get() {
+        TerminalState::Drained => Ok(false),
+        TerminalState::Active | TerminalState::Aborting => {
+            state.set(TerminalState::Aborting);
+            Ok(true)
+        },
+        retained => Err(TerminalPeerError::Closed(retained).into()),
+    }
+}
+
 /// Every view must publish its abort before touching shared rank streams.
 /// A failed proof retains all views, including peers whose own drain succeeded.
 pub(super) fn retire_views(views: &mut [&mut dyn SubmissionOwners]) -> Result<()> {
@@ -75,6 +88,35 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("forward capacity failure")]
     struct ForwardFailure;
+
+    #[test]
+    fn one_and_two_lane_retirement_accept_active_and_aborting_states() {
+        use std::cell::{Cell, RefCell};
+        use crate::shared::{experts::rtx::pair::Teardown, peer_split::TerminalState};
+        for count in [1, 2] {
+            for initial in [TerminalState::Active, TerminalState::Aborting] {
+                let states: Vec<_> = (0..count).map(|_| Cell::new(initial)).collect();
+                let events = RefCell::new(Vec::new());
+                let mut owners: Vec<_> = states.iter().enumerate().filter_map(|(lane, state)| {
+                    let events = &events;
+                    begin_retirement(state).unwrap().then(move || Teardown {
+                        abort: move || { events.borrow_mut().push((lane, "abort")); Ok(()) },
+                        ranks: move || { events.borrow_mut().push((lane, "ranks")); Ok(()) },
+                        links: || Ok(()), copies: || Ok(()), graphs: || Ok(()),
+                        finish: move |drained| state.set(if drained { TerminalState::Drained } else { TerminalState::Retained }),
+                    })
+                }).collect();
+                let mut views: Vec<&mut dyn SubmissionOwners> = owners.iter_mut().map(|owner| owner as _).collect();
+                retire_views(&mut views).unwrap();
+                assert!(states.iter().all(|state| state.get() == TerminalState::Drained));
+                let events = events.borrow();
+                assert!(events[..count].iter().all(|(_, phase)| *phase == "abort"));
+                assert!(events[count..].iter().all(|(_, phase)| *phase == "ranks"));
+                assert!(!begin_retirement(&states[0]).unwrap());
+            }
+        }
+        assert!(begin_retirement(&Cell::new(TerminalState::Retained)).is_err());
+    }
 
     struct Lane<'a> {
         index: usize,

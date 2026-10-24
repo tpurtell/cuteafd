@@ -513,19 +513,24 @@ impl<'a> SparkIntake<'a> {
     /// it; the reduce may follow on `stream` (then call [`Self::consumed`]).
     pub(crate) async fn receive(&self, transport: &mut SparkExperts, wave: SparkExpertWave, t: usize,
         stream: *mut c_void) -> Result<WaveReceipt> {
+        self.receive_with_drain(transport, wave, t, stream, true).await
+    }
+
+    async fn receive_with_drain(&self, transport: &mut SparkExperts, wave: SparkExpertWave, t: usize,
+        stream: *mut c_void, local_drain: bool) -> Result<WaveReceipt> {
         let plane_bytes = self.check(t, transport.world_size())?;
         let slot = self.state.receive_slot.get();
         if self.waves > 1 { self.release_held()?; }
         // A receive can fail or be cancelled after an upload queues but before
         // its completion event is recorded. Drain while every source is held.
-        let drain = ReceiveDrain(Some(|| {
+        let drain = ReceiveDrain::when(local_drain, || {
             // SAFETY: the caller's stream and the intake's copy stream
             // outlive this receive, as do all retained source owners.
             crate::shared::decode_graph::fatal_drain(unsafe {
                 self.terminal_drain_copies().and_then(|()|
                     self.library.cuda_stream_synchronize(stream))
             }, "cancelled Spark intake receive");
-        }));
+        });
         let receipt = match self.stages(plane_bytes) {
             true => {
                 let mut staging = self.staging.as_ref().context("host intake staging")?.borrow_mut();
@@ -794,8 +799,9 @@ fn upload_offset(ranks: usize, rank: usize, first: u32, row_bytes: usize,
 }
 
 /// Error/cancellation must drain queued uploads even before event publication.
-struct ReceiveDrain<F: FnOnce()>(Option<F>);
+pub(crate) struct ReceiveDrain<F: FnOnce()>(Option<F>);
 impl<F: FnOnce()> ReceiveDrain<F> {
+    pub(crate) fn when(local: bool, drain: F) -> Self { Self(local.then_some(drain)) }
     fn complete(mut self) { self.0.take(); }
 }
 impl<F: FnOnce()> Drop for ReceiveDrain<F> {
@@ -1441,6 +1447,14 @@ impl<'a> SparkLink<'a> {
     pub(crate) async fn receive(&mut self, wave: SparkExpertWave, t: usize, stream: *mut c_void)
         -> Result<WaveReceipt> {
         self.intake.receive(&mut self.transport, wave, t, stream).await
+    }
+
+    /// The aggregate retains this intake and publishes both peer aborts before
+    /// draining any shared stream. Errors must return without local drainage.
+    pub(crate) async fn receive_aggregate(&mut self, wave: SparkExpertWave, t: usize, stream: *mut c_void)
+        -> Result<WaveReceipt> {
+        ensure!(self.transport.terminal_owned(), "aggregate receive requires terminal-owned transport");
+        self.intake.receive_with_drain(&mut self.transport, wave, t, stream, false).await
     }
 
     /// Queues `output = shared + sum of the rank planes` for `t` rows on
