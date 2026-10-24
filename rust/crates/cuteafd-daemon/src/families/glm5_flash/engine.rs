@@ -5364,12 +5364,23 @@ mod prefill_lane_tests {
             // projection routes and capacity-based thresholds are unchanged.
             // Fork #136 adds full-head MLA absorb/UV cache hints and preserves W8 prefill mode;
             // projection dispatch, shapes and arithmetic thresholds remain unchanged.
-            ("integration/cuteafd/glmf.py", 0xf39b_b9ad_75d4_25a9_u64),
+            // Fork #146 (FP8 dense decode duel, #703) moves the GEMV tuning table into
+            // `_fp8_weights` (re-exported) and gives each measured shape one column group and the
+            // wide tile its own (column block, tiles per CTA): the per-shape `warps` (the K split
+            // and cross-warp fold, hence the numerics), the head-split KDA tile (8, 2), the
+            // projection routes and the capacity thresholds are unchanged; only the launch grid
+            // partitions, so a shape outside the table keeps master's (warps, 4) bitwise.
+            ("integration/cuteafd/glmf.py", 0x3d18_c625_28d5_0755_u64),
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
             ("integration/cuteafd/_glm_kernels.py", 0xd327_0840_454a_bc62),
-            ("integration/cuteafd/_fp8_weights.py", 0xab87_f59d_f17b_3556),
+            // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
+            // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
+            // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path
+            // (16-byte read-only loads, L1 evict, ping-pong widen) runs the same MMAs in the same
+            // order with the same FP32 accumulation: bitwise-equal outputs at every row count.
+            ("integration/cuteafd/_fp8_weights.py", 0x8bca_9b91_3c5f_9e49),
             // 5dcdd837 opts decode mHC into partial-group fusion; projection thresholds and arithmetic stay unchanged.
             ("integration/cuteafd/dsv4_mhc.py", 0x978a_179d_ef8c_2101),
             // KDAGeometry import/export and signed-byte operand registration only;
