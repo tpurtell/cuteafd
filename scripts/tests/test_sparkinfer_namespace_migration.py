@@ -294,8 +294,8 @@ def test_fork_accepts_the_ngc_base_torch_prerelease() -> None:
         if Requirement(requirement).name == "torch"
     ]
     assert len(torch_requirements) == 1
-    assert Version("2.12.0a0") in torch_requirements[0].specifier, (
-        "nvcr.io/nvidia/pytorch:26.05-py3 contains torch 2.12.0a0; "
+    assert Version("2.14.0a0") in torch_requirements[0].specifier, (
+        "nvcr.io/nvidia/pytorch:26.09-py3 contains torch 2.14.0a0; "
         f"the fork requirement {torch_requirements[0]} rejects that base and "
         "makes the image's `uv pip check` fail"
     )
