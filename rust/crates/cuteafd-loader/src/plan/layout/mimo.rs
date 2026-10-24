@@ -513,6 +513,9 @@ mod tests {
             assert!(two.reservations.iter().any(|cost| cost.name == "decode.lane1.h"));
             assert!(two.reservations.iter().any(|cost| cost.name.starts_with("runtime.lane1.decode_graph")));
             assert!(two.reservations.iter().any(|cost| cost.name == "transport.lane1.peer_receive_slots"));
+            // Untracked driver objects are charged, calibrated, on both GPUs.
+            assert!(two.reservations.iter().any(|cost| cost.name == "runtime.lane1.driver_objects"
+                && cost.bytes >= crate::families::mimo_v2::admission::LANE1_DRIVER_OBJECTS_PEER));
             // Route weights and ring-slot indices are private execution tables,
             // not immutable checkpoint weights or request-indexed KV rings.
             assert!(two.reservations.iter().filter(|cost| cost.name.contains("lane1")).all(|cost|

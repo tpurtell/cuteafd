@@ -1203,13 +1203,13 @@ impl<'a> MimoEngine<'a> {
         use crate::shared::peer_split::TerminalPeerError;
         let mut views = Vec::new();
         for view in std::iter::once(self).chain(peer) {
-            if super::teardown::begin_retirement(&view.terminal)? {
+            if crate::shared::serve::decode_lanes::begin_retirement(&view.terminal)? {
                 views.push(view.terminal_owners());
             }
         }
         let mut owners: Vec<&mut dyn crate::shared::experts::rtx::pair::SubmissionOwners> =
             views.iter_mut().map(|view| view as &mut dyn crate::shared::experts::rtx::pair::SubmissionOwners).collect();
-        super::teardown::retire_views(&mut owners)
+        crate::shared::serve::decode_lanes::retire_views(&mut owners)
             .map_err(|error| TerminalPeerError::Retain(format!("{error:#}")).into())
     }
 

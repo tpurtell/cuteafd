@@ -26,6 +26,7 @@ pub enum LaneSupport {
 pub fn support(family: &str) -> LaneSupport {
     match family {
         "deepseek_v41" => LaneSupport::FixedTwo,
+        "mimo_v2" => LaneSupport::OneOrTwo { default: 1 },
         _ => LaneSupport::One,
     }
 }
@@ -64,6 +65,16 @@ pub fn assign(loads: [usize; MAX_DECODE_LANES as usize]) -> usize {
     usize::from(loads[1] < loads[0])
 }
 
+/// Lane `lane`'s name for a lane-zero item: `group.rest` becomes
+/// `group.lane1.rest`; lane zero keeps its name.
+pub fn lane_name(name: &str, lane: u8) -> String {
+    if lane == 0 { return name.to_owned(); }
+    match name.split_once('.') {
+        Some((group, rest)) => format!("{group}.lane{lane}.{rest}"),
+        None => format!("{name}.lane{lane}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,8 +100,10 @@ mod tests {
                 assert!(matches!(resolve(family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
             }
         }
-        // The fixed pair holds at concurrency one.
+        // The fixed pair holds at concurrency one; an optional second lane does not.
         assert_eq!(resolve("deepseek_v41", Some(2), 1).unwrap(), 2);
+        assert_eq!(resolve("mimo_v2", Some(2), 1).unwrap(), 1);
+        assert_eq!(resolve("mimo_v2", Some(2), 16).unwrap(), 2);
     }
 
     #[test]
@@ -101,5 +114,13 @@ mod tests {
             loads[assign(loads)] += 1;
             assert!(loads[0].abs_diff(loads[1]) <= 1);
         }
+    }
+
+    #[test]
+    fn lane_names_insert_the_lane_after_the_group() {
+        assert_eq!(lane_name("decode.h", 1), "decode.lane1.h");
+        assert_eq!(lane_name("runtime.decode_graph_driver_margin", 1), "runtime.lane1.decode_graph_driver_margin");
+        assert_eq!(lane_name("graphs", 1), "graphs.lane1");
+        assert_eq!(lane_name("decode.h", 0), "decode.h");
     }
 }

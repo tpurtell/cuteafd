@@ -837,7 +837,11 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
                 let draft_from = if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.draft_from(p.placement.ring) } else { resume };
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
-                        lane: 0, finished: false,
+                        // The lighter lane (shared rule); rebalance keeps cohorts even.
+                        lane: crate::shared::serve::decode_lanes::assign(
+                            [0, 1].map(|lane| active.iter().filter(|a| a.lane == lane).count()),
+                            if lanes.has_second() { 2 } else { 1 }),
+                        finished: false,
                         slot,
                         drafts: DraftHistory::default(),
                         counts: [0; 6],

@@ -14,7 +14,7 @@ pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut
     width: usize, policy: Policy, prefix: &PrefixArgs, cache_enabled: bool,
     receive: &mpsc::Receiver<NativeRequest>, admission_pending: bool,
     trace: &mut Option<crate::shared::speculation_trace::Trace>, observations: &mut Observations) -> Result<()> {
-    let (mut verify_s, mut draft_s, mut emit_s) = (0f64, 0f64, 0f64);
+    let (mut draft_s, mut emit_s) = (0f64, 0f64);
     loop {
         if lane.stopping() { return Ok(()); }
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
@@ -129,7 +129,6 @@ pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut
         let selected = lane.sample(selector, &logits, &batch)?;
         lane.probe_end();
         let step_s = timer.elapsed().as_secs_f64();
-        verify_s += step_s;
         let timer = Instant::now();
         let mut offset = 0;
         let mut context = Vec::new();
