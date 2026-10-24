@@ -315,16 +315,20 @@ def _export_exl3(extra, output):
                                      or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
-                block = 32 if compact_ws else 64
+                block = (package.compact_ws_route_block(geometry, role, width, rows)
+                         if compact_ws else 64)
+                # The compact keyword only exists where the compact WS policy does;
+                # never pass it to a baseline package that predates the policy.
+                compact_kw = {"compact": True} if compact_ws else {}
                 options["warp_specialized"] = True
-                if package.wire_input(geometry, role, width, rows):
+                if package.wire_input(geometry, role, width, rows, **compact_kw):
                     options["wire_input"] = True
-                stages = package.ws_input_stages(geometry, role, width, rows)
+                stages = package.ws_input_stages(geometry, role, width, rows, **compact_kw)
                 if stages is not None:
                     options["ws_input_stages"] = stages
-                if package.ws_dynamic_tiles(geometry, role, width, rows):
+                if package.ws_dynamic_tiles(geometry, role, width, rows, **compact_kw):
                     options["ws_dynamic_tiles"] = True
-                policy_tile = package.ws_tile(geometry, role, width, rows)
+                policy_tile = package.ws_tile(geometry, role, width, rows, **compact_kw)
                 if policy_tile is not None:
                     options["tile"] = policy_tile
             elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):

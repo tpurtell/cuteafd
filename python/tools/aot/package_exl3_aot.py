@@ -95,10 +95,24 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             companions = compact_profiles(geometry, profiles_for_role('spark', geometry))
             widths = {dest: width for _, width, _, _, _, destinations in companions
                       for dest in destinations}
+            ws = meta.get('warp_specialized', False)
+            cw_tile = (ws_tile(geometry, manifest['role'], meta['intermediate'], meta['capacity'],
+                               compact=True) if ws else None)
             if (manifest['role'] != 'spark'
                     or widths.get(directory.split('/')[0]) != meta['intermediate']
-                    or len(meta['bits']) != 2 or meta.get('tile') != [64, 128, 64, 128]
-                    or meta.get('warp_specialized', False)
+                    or len(meta['bits']) != 2
+                    or (meta.get('tile') != (list(cw_tile) if cw_tile is not None else None) if ws
+                        else meta.get('tile') != [64, 128, 64, 128])
+                    or (ws and (not compact_warp_specialized(geometry, manifest['role'],
+                                                             meta['intermediate'], meta['capacity'])
+                                or meta.get('route_block', 8) != compact_ws_route_block(
+                                    geometry, manifest['role'], meta['intermediate'], meta['capacity'])
+                                or meta.get('ws_dynamic_tiles', False) != ws_dynamic_tiles(
+                                    geometry, manifest['role'], meta['intermediate'], meta['capacity'],
+                                    compact=True)
+                                or meta.get('ws_input_stages') is not None
+                                or meta.get('token_major_rotation', False)
+                                or meta.get('fused_input_rotation', False)))
                     or meta.get('decode_schedule') not in (None, 'l2=2,pf1=0,pf2=0,pdl=1')
                     or meta.get('input_format', 'bf16') != 'bf16'):
                 raise ValueError(f'EXL3 invalid compact geometry or execution contract: {directory}')
@@ -126,6 +140,10 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
             raise ValueError(f'EXL3 variant fused input rotation mismatch: {directory}')
         if variant.get('warp_specialized', False) != meta.get('warp_specialized', False):
             raise ValueError(f'EXL3 variant warp specialization mismatch: {directory}')
+        if variant.get('ws_dynamic_tiles', False) != meta.get('ws_dynamic_tiles', False):
+            raise ValueError(f'EXL3 variant dynamic tile claim mismatch: {directory}')
+        if variant.get('ws_input_stages') != meta.get('ws_input_stages'):
+            raise ValueError(f'EXL3 variant input stage mismatch: {directory}')
         if variant.get('input_format', 'bf16') != meta.get('input_format', 'bf16'):
             raise ValueError(f'EXL3 variant input format mismatch: {directory}')
         # The variant records its exact compiled schedule, including defaults.
@@ -392,17 +410,64 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     return geometry in ('dsv4p', 'glm', 'glmf') and capacity >= 256
 
 
+# Compact capacity set with a measured warp-specialized win (see
+# `compact_warp_specialized`); the packaged compact profile carries 256, 1024
+# and 4096, and 2752 is the planner's intermediate prefill unit.
+COMPACT_GLM_WS_CAPACITIES = (256, 1024, 2752, 4096)
+
+
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
-    """Compact profiles retain the cooperative kernel until qualified."""
-    return False
+    """Whether a compact profile exports the warp-specialized prefill kernel.
+
+    Compact ownership shipped the cooperative kernel. On GB10 the same
+    FC1-N128/FC2-N256 warp-specialized export with 64-row blocks and dynamic
+    tile claims is bit-identical to it and much faster at the served GLM 5.3
+    K4 TP6 compact width 384: actual rotated H128 ownership, layer-7 recorded
+    histograms plus uniform top-8, kernel + top-k sum, median of three
+    interleaved rounds of twenty graph replays, ms (cooperative -> ship,
+    uniform top-8 / recorded): m4096 24.19 -> 12.94 / 24.56 -> 13.19;
+    m2752 18.98 -> 9.73 / 17.86 -> 9.53; m1024 8.32 -> 4.87 / 8.73 -> 4.99;
+    m256 5.29 -> 3.81 / 5.30 -> 3.81. Every graph replay is bitwise equal to
+    the cooperative oracle, including three replays over poisoned workspaces.
+    Wire input loses here (0.706 at m4096), so it stays off; the three
+    input stages ride with it and have no separate arm.
+
+    Against the ordinary contiguous TP6 width-384 export (warp-specialized,
+    direct wire input, `TILE_384`, 64-row blocks, three input stages) this
+    compact arm is at parity at every capacity in the same session, ms
+    (compact / ordinary, uniform top-8 / recorded): m4096 12.99 / 13.18 vs
+    12.97 / 13.17; m2752 9.69 / 9.49 vs 9.72 / 9.47; m1024 4.86 / 4.93 vs
+    4.84 / 4.96; m256 3.80 / 3.80 vs 3.88 / 3.88. So the compact layout
+    recovers what the October 20 rotation moved off warp specialization.
+    Qualification is the measured capacity set only; every other width,
+    family and capacity stays cooperative.
+    """
+    return (geometry == 'glm' and role == 'spark' and width == 384
+            and capacity in COMPACT_GLM_WS_CAPACITIES)
+
+
+def compact_ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int | None:
+    """Route block of a compact warp-specialized export, or None when off.
+
+    Measured per capacity (see `compact_warp_specialized`): a 64-row block
+    beats 32 from m1024 up and, with dynamic tile claims, ties it at m256, so
+    every qualified capacity takes 64.
+    """
+    if not compact_warp_specialized(geometry, role, width, capacity):
+        return None
+    return 64
 
 
 # Warp-specialized tile (fc1_k, fc1_n, fc2_k, fc2_n) of widths that are odd
 # multiples of 128 and multiples of 192 (GLM 5.3 TP6 width 384).
 TILE_384 = (64, 192, 64, 256)
+# Compact widths are live at 256/384 H128 blocks, so FC1 keeps 128-wide N
+# tiles (a 192 tile straddles the live edge); FC2 widens over hidden size.
+TILE_384_COMPACT = (64, 128, 64, 256)
 
 
-def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
+def wire_input(geometry: str, role: str, width: int, capacity: int, *,
+               compact: bool = False) -> bool:
     """Whether a warp-specialized export reads the FP8 E4M3 + UE8M0 K32 wire
     rows itself (the worker then skips its BF16 decode pass and FC1 gathers
     half the bytes). Bit-identical. One of the GLM 5.3 GB10 changes below.
@@ -419,35 +484,53 @@ def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
     across 72 histograms), conditions in `warp_specialized`. At m1024 wire
     loses on random (0.927x); wider coordinator profiles keep BF16 input.
     """
+    if compact:
+        return False
     return (geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
             and (role == 'spark' or (width == 1024 and capacity == 256)))
 
 
-def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int | None:
+def ws_input_stages(geometry: str, role: str, width: int, capacity: int, *,
+                    compact: bool = False) -> int | None:
     """Input-row ring depth of the Spark warp-specialized exports: GB10 gathers
     the routed rows from LPDDR5X at high latency, and four stages (the ring the
     weight ring of 256-wide 4-bit tiles leaves room for) hide it; with K4/K5
     tiers three stages measure faster than four (see `wire_input`). Bit-identical.
+    Compact widths keep the resolved default: wire input loses at width 384
+    (see `compact_warp_specialized`), so its stages stay off too.
     """
+    if compact:
+        return None
     return 3 if wire_input(geometry, role, width, capacity) else None
 
 
-def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
+def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int, *,
+                     compact: bool = False) -> bool:
     """Whether Spark warp-specialized exports claim tiles dynamically. With the
     static round-robin an expert's route blocks start on different CTAs at
     different times and each streams the expert's weights from LPDDR5X (ncu,
     width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
     Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
+    Compact width 384 takes them at every qualified capacity: m4096
+    13.89 -> 12.94 ms, m2752 10.07 -> 9.53, m1024 5.16 -> 4.99, and m256 ties
+    its static arm at 3.81 (see `compact_warp_specialized`).
     """
+    if compact:
+        return compact_warp_specialized(geometry, role, width, capacity)
     return wire_input(geometry, role, width, capacity)
 
 
-def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
+def ws_tile(geometry: str, role: str, width: int, capacity: int, *,
+            compact: bool = False) -> tuple[int, ...] | None:
     """Warp-specialized tile for widths that are odd multiples of 128, which
     the B12x policy gives 128-wide tiles on both stages (four consumer warps).
     Bit-identical (the N tiling does not change any accumulation). Width 384
     (GLM 5.3 TP6 ranks 0-3) takes 192-wide FC1 tiles: m4096 14.89 -> 12.8 ms.
+    Compact ownership keeps FC1 at 128 (live widths are 256/384) and widens
+    only FC2 over the unchanged hidden size.
     """
+    if compact:
+        return TILE_384_COMPACT if compact_warp_specialized(geometry, role, width, capacity) else None
     if (geometry != 'glm' or not warp_specialized(geometry, role, width, capacity)
             or width % 256 != 128 or width % 192):
         return None
@@ -872,9 +955,13 @@ def build(args: argparse.Namespace) -> None:
                                args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 compact_ws = compact and len(args.bits) == 2 and compact_warp_specialized(
                     geometry, args.role, width, capacity)
-                if compact_ws:
+                compact_block = (compact_ws_route_block(geometry, args.role, width, capacity)
+                                 if compact_ws else None)
+                if compact_block is not None:
                     # N128 alone also names the cooperative export; separate its cache.
-                    profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m32')
+                    dynamic = ws_dynamic_tiles(geometry, args.role, width, capacity, compact=True)
+                    profile_dir = profile_dir.with_name(
+                        f'{profile_dir.name}+ws-m{compact_block}-{"dynamic" if dynamic else "static"}')
                 raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
@@ -889,7 +976,7 @@ def build(args: argparse.Namespace) -> None:
                                          or (geometry, tuple(args.bits)) in (('glm', (4, 5)), ('glmf', (3, 4))))
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
-                    block = 32 if compact_ws else 64
+                    block = compact_block if compact_block is not None else 64
                     if geometry == 'kimik3' or args.role == 'coordinator':
                         # Existing policy-keyed directories contain cooperative exports.
                         suffix = ('-wire-s3-dynamic' if wire_input(geometry, args.role, width, capacity)
@@ -900,13 +987,15 @@ def build(args: argparse.Namespace) -> None:
                     options['route_block'] = block
                 if ws:
                     options['warp_specialized'] = True
-                    if wire_input(geometry, args.role, width, capacity):
+                    if wire_input(geometry, args.role, width, capacity, compact=compact_ws):
                         options['wire_input'] = True
-                    if (stages := ws_input_stages(geometry, args.role, width, capacity)) is not None:
+                    if (stages := ws_input_stages(geometry, args.role, width, capacity,
+                                                 compact=compact_ws)) is not None:
                         options['ws_input_stages'] = stages
-                    if ws_dynamic_tiles(geometry, args.role, width, capacity):
+                    if ws_dynamic_tiles(geometry, args.role, width, capacity, compact=compact_ws):
                         options['ws_dynamic_tiles'] = True
-                    if (policy_tile := ws_tile(geometry, args.role, width, capacity)) is not None:
+                    if (policy_tile := ws_tile(geometry, args.role, width, capacity,
+                                              compact=compact_ws)) is not None:
                         options['tile'] = policy_tile
                 elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
@@ -968,6 +1057,10 @@ def build(args: argparse.Namespace) -> None:
                     variant['fused_input_rotation'] = True
                 if meta.get('warp_specialized'):
                     variant['warp_specialized'] = True
+                if meta.get('ws_dynamic_tiles'):
+                    variant['ws_dynamic_tiles'] = True
+                if meta.get('ws_input_stages') is not None:
+                    variant['ws_input_stages'] = meta['ws_input_stages']
                 if 'input_format' in meta:
                     variant['input_format'] = meta['input_format']
                 if schedule is not None:

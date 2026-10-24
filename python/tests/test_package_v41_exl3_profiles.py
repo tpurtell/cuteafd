@@ -151,6 +151,16 @@ class PackageProfileTests(unittest.TestCase):
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
                 meta.update(descriptor_rows=7, native_info_version=3)
+            if 'warp_specialized' in options:
+                meta['warp_specialized'] = options['warp_specialized']
+            if options.get('ws_input_stages') is not None:
+                meta['ws_input_stages'] = options['ws_input_stages']
+            if options.get('ws_dynamic_tiles'):
+                meta['ws_dynamic_tiles'] = True
+            if options.get('wire_input'):
+                meta['input_format'] = 'e4m3_k32'
+            if 'fused_input_rotation' in options:
+                meta['fused_input_rotation'] = options['fused_input_rotation']
             if 'token_major_rotation' in options:
                 meta['token_major_rotation'] = options['token_major_rotation']
             if 'route_block' in options:
@@ -252,6 +262,89 @@ class PackageProfileTests(unittest.TestCase):
             (output / 'manifest.json').write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, 'descriptor contract mismatch'):
                 package.verify(output)
+
+    def test_compact_ws_qualifies_glm_tp6_width384_prefill(self):
+        capacities = (1, 16, 80, 256, 1024, 2752, 4096)
+        self.assertEqual([package.compact_warp_specialized('glm', 'spark', 384, c)
+                          for c in capacities], [False] * 3 + [True] * 4)
+        self.assertEqual([package.compact_ws_route_block('glm', 'spark', 384, c)
+                          for c in capacities], [None] * 3 + [64] * 4)
+        for geometry in ('v41', 'qwen4', 'glmf', 'dsv4p', 'kimik3'):
+            self.assertFalse(any(package.compact_warp_specialized(geometry, 'spark', 384, c)
+                                 for c in capacities))
+        self.assertFalse(package.compact_warp_specialized('glm', 'coordinator', 384, 4096))
+        # Unmeasured capacities stay cooperative even above the smallest one.
+        self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', 384, c)
+                             for c in (512, 2048, 8192)))
+        self.assertFalse(any(package.compact_warp_specialized('glm', 'spark', width, 4096)
+                             for width in (256, 512, 640, 768)))
+        self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096, compact=True),
+                         package.TILE_384_COMPACT)
+        self.assertIsNone(package.ws_tile('glm', 'spark', 384, 80, compact=True))
+        # Ordinary width-384 packs keep their 192-wide FC1 tile.
+        self.assertEqual(package.ws_tile('glm', 'spark', 384, 4096), package.TILE_384)
+
+    def test_compact_glm_ws_prefill_export_and_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _output, manifest, calls, _ = self.build_fixture(
+                root, 'spark', (4, 5), geometry='glm', capacities=(1, 4096),
+                compact=True, profiles=('tp6-width256',))
+            compact_calls = [call for call in calls if call.kwargs.get('compact_weights')]
+            ws_calls = [call for call in compact_calls if call.args[3] == 4096]
+            self.assertTrue(ws_calls)
+            for call in ws_calls:
+                self.assertTrue(call.kwargs['warp_specialized'])
+                self.assertEqual(call.kwargs['route_block'], 64)
+                self.assertEqual(call.kwargs['tile'], package.TILE_384_COMPACT)
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertNotIn('token_major_rotation', call.kwargs)
+                self.assertNotIn('wire_input', call.kwargs)
+                self.assertNotIn('ws_input_stages', call.kwargs)
+                self.assertIn('+ws-m64-dynamic', str(call.args[0]))
+            for call in [call for call in compact_calls if call.args[3] == 1]:
+                self.assertNotIn('warp_specialized', call.kwargs)
+                self.assertEqual(call.kwargs['tile'], (64, 128, 64, 128))
+                self.assertNotIn('+ws-m', str(call.args[0]))
+            variant = next(v for v in manifest['variants']
+                           if '-compact-' in v['directory'] and v['capacity'] == 4096)
+            self.assertTrue(variant['warp_specialized'])
+            self.assertEqual(variant['tile'], list(package.TILE_384_COMPACT))
+            self.assertEqual(variant['route_block'], 64)
+            self.assertTrue(variant['ws_dynamic_tiles'])
+
+    def test_compact_ws_verifier_rejects_unqualified_execution_contracts(self):
+        cases = [
+            ('glm', 384, 256, {'route_block': 32}),
+            ('glm', 384, 1024, {'route_block': 32}),
+            ('glm', 384, 256, {'ws_dynamic_tiles': False}),
+            ('glm', 384, 256, {'ws_input_stages': 3}),
+            ('glm', 384, 256, {'token_major_rotation': True}),
+            ('glm', 384, 256, {'fused_input_rotation': True}),
+            ('glm', 384, 256, {'tile': [64, 128, 64, 128]}),
+            ('glm', 384, 80, {}),
+            ('qwen4', 256, 256, {}),
+            ('v41', 640, 256, {}),
+        ]
+        for geometry, width, capacity, overrides in cases:
+            with self.subTest(geometry=geometry, width=width, capacity=capacity,
+                              overrides=overrides), tempfile.TemporaryDirectory() as temporary:
+                output, manifest, _, _ = self.build_fixture(
+                    Path(temporary), 'spark', (4, 5), geometry=geometry,
+                    capacities=(capacity,), compact=True)
+                variant = next(v for v in manifest['variants']
+                               if '-compact-' in v['directory'] and v['intermediate'] == width)
+                path = output / variant['directory'] / 'v41_exl3.json'
+                meta = json.loads(path.read_text())
+                meta.update(warp_specialized=True, route_block=64,
+                            ws_dynamic_tiles=True, tile=list(package.TILE_384_COMPACT))
+                meta.update(overrides)
+                path.write_text(json.dumps(meta))
+                manifest['files'][str(path.relative_to(output))] = {
+                    'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+                (output / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaisesRegex(ValueError, 'invalid compact geometry or execution contract'):
+                    package.verify(output)
 
     def test_compact_prefill_keeps_cooperative_route_and_legacy_cache_keys(self):
         with tempfile.TemporaryDirectory() as temporary:
