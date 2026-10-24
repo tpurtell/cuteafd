@@ -256,6 +256,9 @@ pub struct PlanReport {
     /// Where the expert service read the routed EXL3 storage layout from.
     pub expert_storage: Option<crate::formats::exl3_storage::Exl3StorageSource>,
     pub hints: Vec<Hint>,
+    /// Native EXLR8 trellis prefill activations the layout charged (EXLR8 native plans only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exlr8_prefill_activations: Option<exlr8::PrefillActivations>,
     /// Per-device memory layout, when requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_layout: Option<cuteafd_core::memory_layout::MemoryLayout>,
@@ -570,6 +573,7 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         launch: launch::describe(&checkpoint.config).ok(),
         expert_storage: None,
         hints: Vec::new(),
+        exlr8_prefill_activations: None,
         memory_layout: None,
         solver_placement: None,
     })
@@ -1213,6 +1217,12 @@ pub fn render(report: &PlanReport) -> String {
     }
     let _ = writeln!(out, "snapshot   {}", report.snapshot);
     let _ = writeln!(out, "arch       {}", report.architectures.join(", "));
+    if let Some(activations) = report.exlr8_prefill_activations {
+        let _ = writeln!(out, "exlr8      prefill activations {activations}{}", match activations {
+            exlr8::PrefillActivations::A16 => " (BF16)",
+            exlr8::PrefillActivations::A8 => " (MXFP8 lane records charged)",
+        });
+    }
     if let Some(quantization) = &report.quantization {
         let _ = writeln!(out, "quant      {quantization}");
     }

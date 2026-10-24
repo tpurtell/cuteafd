@@ -24,6 +24,38 @@ pub struct NativeSelection {
     pub set_id: String,
 }
 
+/// Native EXLR8 trellis prefill activations: BF16 (A16, default) or MXFP8 with
+/// per-row per-K32 E8M0 scales (A8, ABI version 2 lane records). Decode and
+/// verify always keep A16. Shared by the engine launch flag and `cuteafd plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillActivations {
+    #[default]
+    A16,
+    A8,
+}
+
+impl PrefillActivations {
+    pub const fn label(self) -> &'static str {
+        match self { Self::A16 => "a16", Self::A8 => "a8" }
+    }
+}
+
+impl std::fmt::Display for PrefillActivations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.label()) }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported EXLR8 prefill activations {0:?}: expected a16 or a8")]
+pub struct PrefillActivationsError(String);
+
+impl std::str::FromStr for PrefillActivations {
+    type Err = PrefillActivationsError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value { "a16" => Ok(Self::A16), "a8" => Ok(Self::A8), _ => Err(PrefillActivationsError(value.into())) }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SparkRequirements {
     pub resident_bytes_per_rank: Vec<u64>,
@@ -124,6 +156,7 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     let model = family.open(&checkpoint)?;
     let records = dense::DenseRecord::inventory(snapshot)?;
     report.family = Some(family.id().into());
+    report.exlr8_prefill_activations = Some(layout.exlr8_prefill_activations);
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
     let mut components = BTreeMap::<Component, (usize, u64)>::new();

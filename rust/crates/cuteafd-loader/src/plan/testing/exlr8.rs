@@ -144,3 +144,23 @@ pub fn fixture(root: &Path, padded: bool) {
         tensors,
     );
 }
+
+/// A GLM 5.3-geometry native snapshot, headers only: `glm5_config` (hidden 6144, 64 heads, 2
+/// layers), one input-sharded trellis dense record (`model.layers.0.mlp.gate_proj`) and a
+/// layer-1 expert index. Enough for `native_layout`, which reads no payload.
+pub fn glm_snapshot(root: &Path) {
+    std::fs::create_dir(root.join("dense")).unwrap();
+    std::fs::create_dir(root.join("experts")).unwrap();
+    std::fs::write(root.join("config.json"), super::glm5_config().to_string()).unwrap();
+    let metadata = |layer: &str| json!({"format":"exlr8-v2","scheme":"exlr8-e4m3-v2","layer":layer});
+    let record: Vec<u8> = [1i64, 128, 256, 4, 2, 128, 0, 1].into_iter().flat_map(i64::to_le_bytes).collect();
+    write(&root.join("dense/exlr8-dense-000.safetensors"), metadata("0"), vec![
+        ("mlp.gate_proj.record".into(), "I64", vec![8], record),
+        ("mlp.gate_proj.trellis".into(), "U8", vec![2, 8192], vec![0; 16384]),
+        ("mlp.gate_proj.suh".into(), "F16", vec![256], vec![0; 512]),
+        ("mlp.gate_proj.svh".into(), "F16", vec![128], vec![0; 256]),
+        ("mlp.gate_proj.checksum".into(), "U64", vec![2], vec![0; 16]),
+    ]);
+    write(&root.join("experts/exlr8-layer-001.index.safetensors"), metadata("1"),
+        vec![("k4.index".into(), "I64", vec![1], vec![0; 8])]);
+}

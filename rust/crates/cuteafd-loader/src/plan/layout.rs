@@ -59,6 +59,8 @@ pub struct LayoutOptions {
     pub prefill_span_rows: Option<u64>,
     /// Continuous row-unit waves on one transport.
     pub prefill_waves: u64,
+    /// Native EXLR8 trellis prefill activations: A8 also charges every prefill lane's MX8 records.
+    pub exlr8_prefill_activations: crate::plan::exlr8::PrefillActivations,
     /// Rows of a GLM 5.3 Flash decode or verify step (`--decode-rows`): 64, or 128 with the wide
     /// `_m128` programs (one GPU). The decode workspace, the token selector and the speculative
     /// replay records hold this many rows.
@@ -195,6 +197,7 @@ impl Default for LayoutOptions {
             prefill_unit_rows: None,
             prefill_span_rows: None,
             prefill_waves: 1,
+            exlr8_prefill_activations: Default::default(),
             glmf_decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS,
             glmf_representation: Default::default(),
             glmf_kda_state: Default::default(),

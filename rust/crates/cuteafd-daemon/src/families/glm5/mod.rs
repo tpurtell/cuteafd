@@ -18,12 +18,8 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::time::Instant;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub(crate) enum Exlr8PrefillActivations {
-    #[default]
-    A16,
-    A8,
-}
+/// One enum for the engine flag and `cuteafd plan`, so the planner charges what admission charges.
+pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillActivations;
 
 /// What every GLM command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
@@ -38,7 +34,8 @@ pub(crate) struct EngineArgs {
     #[arg(long)]
     pub exlr8_manifest: Option<String>,
     /// Native EXLR8 trellis prefill activations; decode/verify always keep A16.
-    #[arg(long, value_enum, default_value_t = Exlr8PrefillActivations::A16)]
+    #[arg(long, value_parser = crate::cli::exlr8_prefill_activations_parser(),
+        default_value_t = Exlr8PrefillActivations::A16)]
     pub exlr8_prefill_activations: Exlr8PrefillActivations,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
     pub native_lib: PathBuf,
@@ -151,6 +148,16 @@ fn native_activation(args: &EngineArgs, first_moe: usize, layers: usize, serving
     Ok(())
 }
 
+/// Bytes one coordinator GPU admits for native dense execution before any allocation: decode
+/// scratch plus every prefill lane's scratch and, with A8 prefill, its MX8 records.
+/// `cuteafd plan --layout` charges the same bytes (`plan::layout::glm5::native_layout`).
+fn native_dense_charge(cfg: &GlmDsaConfig, gpus: usize, args: &EngineArgs) -> u64 {
+    let lanes = cuteafd_loader::placement::families::glm5::prefill_lanes(
+        args.peers.as_deref().map_or(0, |peers| peers.split(',').count()), u64::from(args.prefill_waves)) as usize;
+    cuteafd_loader::plan::exlr8::dense::lane_charge_bytes(cfg, gpus, engine::DECODE_ROWS, args.prefill_rows, lanes,
+        args.exlr8_prefill_activations == Exlr8PrefillActivations::A8) as u64
+}
+
 fn spark_model(lanes: usize, bf16: bool, native: bool) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(lanes > 0, "GLM Spark admission requires at least one prefill lane");
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
@@ -212,6 +219,52 @@ mod draft_cli_tests {
         assert_eq!(parse(&["--exlr8-prefill-activations", "a16"]).unwrap(), Exlr8PrefillActivations::A16);
         assert_eq!(parse(&["--exlr8-prefill-activations", "a8"]).unwrap(), Exlr8PrefillActivations::A8);
         assert!(parse(&["--exlr8-prefill-activations", "fp8"]).is_err());
+    }
+
+    /// `cuteafd plan --layout` and `serve-glm` admission charge the same native dense bytes for the same
+    /// geometry: the planner's per-GPU "native dense scratch" item equals `native_dense_charge`.
+    #[test]
+    fn planner_charge_equals_admission_charge_for_the_same_geometry() {
+        use cuteafd_loader::plan::exlr8::PrefillActivations;
+        const GROUP: &str = "native dense scratch and prefill staging";
+        let dir = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::exlr8::glm_snapshot(dir.path());
+        let manifest = cuteafd_loader::plan::testing::glm5_native_programs();
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        for (gpus, peers, split) in [(1usize, "a:1,b:1,c:1,d:1", None), (2, "a:1,b:1,c:1,d:1,e:1,f:1", Some("1"))] {
+            for (rows, waves) in [("4096", "1"), ("4096", "2"), ("2048", "3"), ("1024", "4")] {
+                let engine = |activations: &str| {
+                    let mut argv = vec!["test", "--snapshot", "/native", "--native-lib", "/library", "--peers", peers,
+                        "--prefill-rows", rows, "--prefill-waves", waves, "--exlr8-prefill-activations", activations];
+                    if let Some(device) = split { argv.extend(["--split-device", device]); }
+                    Parse::try_parse_from(argv).unwrap().engine
+                };
+                let mut admitted = Vec::new();
+                for activations in ["a16", "a8"] {
+                    let engine = engine(activations);
+                    let charge = native_dense_charge(&cfg, gpus, &engine);
+                    let layout = cuteafd_loader::plan::layout::LayoutOptions {
+                        rtx_bytes: vec![96 << 30; gpus], prefill_rows: engine.prefill_rows as u64,
+                        prefill_lanes: u64::from(engine.prefill_waves), prefill_waves: u64::from(engine.prefill_waves),
+                        exlr8_prefill_activations: activations.parse::<PrefillActivations>().unwrap(), context_tokens: 65536,
+                        onboard: Some(cuteafd_loader::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                        host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
+                    let (memory, _) = cuteafd_loader::plan::layout::glm5::native_layout(&checkpoint, &layout,
+                        &vec![256; gpus], 256, peers.split(',').count(), &manifest).unwrap();
+                    assert_eq!(memory.devices.len(), gpus);
+                    for device in &memory.devices {
+                        let planned: u64 = device.items.iter().filter(|item| item.group == GROUP).map(|item| item.bytes).sum();
+                        assert_eq!(planned, charge, "{gpus} RTX/{rows} rows/{waves} waves/{activations}");
+                    }
+                    admitted.push(charge);
+                }
+                // 4 or 6 Sparks: lanes are the requested waves (1..=4), each carrying its own records.
+                let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+                let records = cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&cfg, heads, inter, rows.parse().unwrap());
+                assert_eq!(admitted[1] - admitted[0], waves.parse::<u64>().unwrap() * records as u64, "{gpus} RTX/{rows}/{waves}");
+            }
+        }
     }
 
     #[test]
@@ -560,17 +613,7 @@ impl Opened {
         let spark_bf16 = checkpoint.as_ref().is_some_and(|c| c.spark_input_is_bf16());
         // Native dense: decode plus every prefill lane's scratch and opt-in A8 records.
         let native_dense_charge: Vec<u64> = if native {
-            let split = devices.len() == 2;
-            let heads = self.cfg.heads / if split { 2 } else { 1 };
-            let inter = self.cfg.dense_intermediate / if split { 2 } else { 1 };
-            let lanes = glm::prefill_lanes(args.peers.as_deref().map_or(0, |p| p.split(',').count()),
-                u64::from(args.prefill_waves)) as usize;
-            let per_gpu = engine::native_dense::scratch_bytes(&self.cfg, heads, inter, engine::DECODE_ROWS)
-                + lanes * (engine::native_dense::scratch_bytes(&self.cfg, heads, inter, args.prefill_rows)
-                    + if args.exlr8_prefill_activations == Exlr8PrefillActivations::A8 {
-                        cuteafd_loader::plan::exlr8::dense::a8_scratch_bytes(&self.cfg, heads, inter, args.prefill_rows)
-                    } else { 0 });
-            vec![per_gpu as u64; devices.len()]
+            vec![native_dense_charge(&self.cfg, devices.len(), args); devices.len()]
         } else { Vec::new() };
         let gpus = inventory.gpus.iter().zip(&reserved_weights).map(|(gpu, &bytes)| -> Result<_> {
             let free_bytes = gpu.free_bytes.checked_sub(bytes)

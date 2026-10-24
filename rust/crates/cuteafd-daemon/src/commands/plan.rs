@@ -16,6 +16,9 @@ fn coordinator_bytes(gib: Option<f64>) -> Result<u64, PlanError> {
 
 /// The planning options `args` name, validated before any checkpoint is read.
 fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
+    if !args.layout && args.exlr8_prefill_activations.is_some() {
+        return Err(PlanError::InvalidOption { option: "--exlr8-prefill-activations", reason: "requires --layout to charge the lane records".into() });
+    }
     if !args.layout && args.vision_replicas != 1 {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
@@ -77,6 +80,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 // Lane families still read prefill_lanes until their unit ports land.
                 prefill_lanes: args.prefill_waves,
                 prefill_waves: args.prefill_waves.max(1),
+                exlr8_prefill_activations: args.exlr8_prefill_activations.unwrap_or_default(),
                 prefill_span_rows: (args.prefill_span_rows > 0).then_some(args.prefill_span_rows),
                 glmf_decode_rows: args.decode_rows,
                 glmf_representation: cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation {
@@ -240,6 +244,8 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
     }
     anyhow::ensure!(args.exlr8_manifest.is_none(),
         "--exlr8-manifest requires an EXLR8 checkpoint");
+    anyhow::ensure!(args.exlr8_prefill_activations.is_none(),
+        "--exlr8-prefill-activations requires an EXLR8 checkpoint");
     let inventory = cuteafd_loader::plan::Checkpoint::inventory(&snapshot)?;
     let family = cuteafd_loader::plan::family::detect(&inventory).map_or("", |family| family.id());
     validate_glmf_precision(&args, family)?;
@@ -770,6 +776,47 @@ mod tests {
     }
 
     #[test]
+    fn exlr8_prefill_activations_flag_defaults_to_a16_and_takes_only_a16_or_a8() {
+        use clap::Parser;
+        use cuteafd_loader::plan::exlr8::PrefillActivations;
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["cuteafd", "plan", "model", "--layout"];
+            argv.extend_from_slice(extra);
+            crate::cli::Cli::try_parse_from(argv).map(|cli| match cli.command {
+                crate::cli::Commands::Plan(args) => options(&args).map(|o| (args.exlr8_prefill_activations,
+                    o.layout.unwrap().exlr8_prefill_activations)),
+                _ => panic!("expected plan command"),
+            })
+        };
+        assert_eq!(parse(&[]).unwrap().unwrap(), (None, PrefillActivations::A16));
+        assert_eq!(parse(&["--exlr8-prefill-activations", "a16"]).unwrap().unwrap(),
+            (Some(PrefillActivations::A16), PrefillActivations::A16));
+        assert_eq!(parse(&["--exlr8-prefill-activations", "a8"]).unwrap().unwrap(),
+            (Some(PrefillActivations::A8), PrefillActivations::A8));
+        for invalid in ["fp8", "A8", "", "a8,a16"] {
+            assert!(parse(&["--exlr8-prefill-activations", invalid]).is_err(), "{invalid:?}");
+        }
+        // The charge is a layout charge: without --layout the flag has nothing to apply to.
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "model", "--exlr8-prefill-activations", "a8"]).unwrap();
+        let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan command") };
+        assert!(options(&args).unwrap_err().to_string().contains("--layout"));
+    }
+
+    #[test]
+    fn exlr8_prefill_activations_requires_an_exlr8_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &mimo_flash_config(), &mimo_flash_tensors(), None);
+        for activations in [cuteafd_loader::plan::exlr8::PrefillActivations::A16,
+            cuteafd_loader::plan::exlr8::PrefillActivations::A8] {
+            let request = PlanArgs { exlr8_prefill_activations: Some(activations), ..args(dir.path(), 4, false) };
+            let error = run_plan(request).unwrap_err().to_string();
+            assert!(error.contains("--exlr8-prefill-activations requires an EXLR8 checkpoint"), "{activations}: {error}");
+        }
+        // The same checkpoint plans without the flag, so the refusal is the flag's.
+        run_plan(args(dir.path(), 4, false)).unwrap();
+    }
+
+    #[test]
     fn exlr8_mounted_cli_reports_fit_and_refuses_serving_modes() {
         use clap::Parser;
         let Some(snapshot) = std::env::var_os("CUTEAFD_EXLR8_TEST_SNAPSHOT") else { return; };
@@ -815,6 +862,7 @@ mod tests {
         PlanArgs {
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
             exlr8_manifest: None,
+            exlr8_prefill_activations: None,
             mapped_scale_preload_gib: 0.0,
             vision_replicas: 1,
             vision: cuteafd_loader::plan::MediaMode::Auto,

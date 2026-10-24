@@ -82,11 +82,6 @@ pub(crate) struct NativeScratch<'a> {
     values: Dev<'a>,
 }
 
-/// Bytes of one lane's native dense scratch, charged before allocation.
-pub(crate) fn scratch_bytes(cfg: &GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
-    cuteafd_loader::plan::exlr8::dense::scratch_bytes(cfg, heads, inter, rows)
-}
-
 impl<'a> NativeScratch<'a> {
     pub(crate) fn new(engine: &GlmEngine<'a>, heads: usize, inter: usize, rows: usize) -> Result<Self> {
         let _scope = cuteafd_ffi::memory_ledger::scope("native-dense-scratch");
@@ -332,6 +327,7 @@ mod charge_tests {
             shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
             mtp_layers: 1, eos_tokens: vec![154820] };
         let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
+        let scratch_bytes = cuteafd_loader::plan::exlr8::dense::scratch_bytes;
         let decode = scratch_bytes(&cfg, heads, inter, NATIVE_DECODE_ROWS);
         let prefill = scratch_bytes(&cfg, heads, inter, 4096);
         // Rows-proportional terms only: no 1 GiB (4096 x 8 x 8192 x 4) partial.

@@ -337,6 +337,24 @@ pub fn glm5_tensors(expert: impl Fn(&str, usize, usize) -> Vec<Tensor>) -> Vec<T
     out
 }
 
+/// PROGRAMS.json entries (256-byte scratch each) for a GLM 5.3 native plan: the context split's
+/// programs and the decode/prefill producers, attention, o_proj and dense/MoE FFNs of both shares.
+pub fn glm5_native_programs() -> Value {
+    use crate::placement::families::glm5 as glm;
+    let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
+        names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
+        for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {
+            names.extend([format!("{prefix}_producer_{cap}"), format!("{prefix}_sparse_mla_{mode}_{cap}"),
+                format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
+                format!("{prefix}_ffn_i{dense}_{cap}")]);
+        }
+    }
+    names.extend(["glm_sparse_mla_partial_h0_s2_m64".into(), "glm_sparse_mla_partial_h32_s2_m64".into()]);
+    json!({"programs": names.into_iter().map(|name|
+        json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()})
+}
+
 /// GLM 5.3 Flash's config with `layers` layers (KDA / MLA alternating, the
 /// first dense).
 pub fn glm5_flash_config(layers: usize) -> Value {

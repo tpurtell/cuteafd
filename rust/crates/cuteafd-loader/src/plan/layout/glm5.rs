@@ -379,10 +379,9 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
     let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
         else { glm_prefill_lanes(None) as u64 });
     let dense_scratch = if native {
-        let heads = cfg.heads / gpu_count;
-        let inter = cfg.dense_intermediate / gpu_count;
-        let bytes = crate::plan::exlr8::dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
-            + lanes as usize * crate::plan::exlr8::dense::scratch_bytes(&cfg, heads, inter, rows as usize);
+        let a8 = options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8;
+        let bytes = crate::plan::exlr8::dense::lane_charge_bytes(&cfg, gpu_count, glm::DECODE_ROWS as usize,
+            rows as usize, lanes as usize, a8);
         vec![bytes as u64; gpu_count]
     } else { Vec::new() };
     let mut devices = Vec::new();
@@ -433,22 +432,7 @@ mod tests {
     use super::*;
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
-    fn native_manifest() -> serde_json::Value {
-        use crate::placement::families::glm5 as glm;
-        use serde_json::json;
-        let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
-        for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
-            names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
-            for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {
-                names.extend([format!("{prefix}_producer_{cap}"), format!("{prefix}_sparse_mla_{mode}_{cap}"),
-                    format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
-                    format!("{prefix}_ffn_i{dense}_{cap}")]);
-            }
-        }
-        names.extend(["glm_sparse_mla_partial_h0_s2_m64".into(), "glm_sparse_mla_partial_h32_s2_m64".into()]);
-        json!({"programs": names.into_iter().map(|name|
-            json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()})
-    }
+    fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
 
     #[test]
     fn exlr8_min_max_prefill_matches_exl3_and_charges_every_wave() {
@@ -504,6 +488,58 @@ mod tests {
                 assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(expert, rings).unwrap() as u64 * endpoints * sparks as u64);
                 assert_eq!(bytes("workspace/router"), (shape.slot_rows() + 64) * (expert.hidden as u64 * 2 + expert.topk as u64 * 8));
                 assert_eq!(host.shortfall_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn exlr8_a8_prefill_charges_exactly_the_lane_records_and_nothing_else() {
+        use crate::placement::families::glm5 as glm;
+        use crate::plan::exlr8::{dense, PrefillActivations};
+        const GROUP: &str = "native dense scratch and prefill staging";
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::exlr8::glm_snapshot(dir.path());
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        let manifest = native_manifest();
+        let scratch = |layout: &MemoryLayout, gpu: usize| layout.devices[gpu].items.iter()
+            .filter(|item| item.group == GROUP).map(|item| item.bytes).sum::<u64>();
+        let rest = |layout: &MemoryLayout| MemoryLayout { devices: layout.devices.iter().map(|device| DeviceLayout {
+            items: device.items.iter().filter(|item| item.group != GROUP).cloned().collect(), ..device.clone() })
+            .collect(), ..layout.clone() };
+        for (gpus, sparks) in [(1, 4), (2, 6)] {
+            for (rows, lanes) in [(4096u64, 1u64), (4096, 2), (2048, 3), (1024, 4)] {
+                let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: rows, prefill_lanes: lanes,
+                    prefill_waves: lanes, context_tokens: 65536, onboard: Some(crate::placement::Onboard::Layers(0)),
+                    glm5_drafter_disabled: true, host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                    ..Default::default() };
+                let plan = |activations| native_layout(&checkpoint,
+                    &LayoutOptions { exlr8_prefill_activations: activations, ..options.clone() },
+                    &vec![256; gpus], 256, sparks, &manifest).unwrap();
+                let (a16, a16_placement) = plan(PrefillActivations::A16);
+                let (a8, a8_placement) = plan(PrefillActivations::A8);
+                let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+                let records = dense::a8_scratch_bytes(&cfg, heads, inter, rows as usize) as u64;
+                assert!(records > 0);
+                let context = format!("{gpus} RTX/{sparks} Sparks/{rows} rows/{lanes} lanes");
+                for gpu in 0..gpus {
+                    assert_eq!(scratch(&a16, gpu), (dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
+                        + lanes as usize * dense::scratch_bytes(&cfg, heads, inter, rows as usize)) as u64, "{context}");
+                    assert_eq!(scratch(&a8, gpu), scratch(&a16, gpu) + lanes * records, "{context} gpu {gpu}");
+                }
+                // The automatic pool takes what is left, so it absorbs the records (never grows) ...
+                assert!(a8_placement.pool_tokens <= a16_placement.pool_tokens, "{context}");
+                assert!(a8_placement.pool_tokens < a16_placement.pool_tokens || records * lanes < 1 << 20, "{context}");
+                // ... and with the pool pinned, nothing but the scratch item differs.
+                let pinned = |activations| native_layout(&checkpoint, &LayoutOptions { pool_tokens: Some(1 << 19),
+                    exlr8_prefill_activations: activations, ..options.clone() },
+                    &vec![256; gpus], 256, sparks, &manifest).unwrap().0;
+                let (pinned_a16, pinned_a8) = (pinned(PrefillActivations::A16), pinned(PrefillActivations::A8));
+                assert_eq!(pinned_a8.pool_tokens, 1 << 19, "{context}");
+                for gpu in 0..gpus {
+                    assert_eq!(scratch(&pinned_a8, gpu), scratch(&pinned_a16, gpu) + lanes * records, "{context}");
+                }
+                assert_eq!(rest(&pinned_a8), rest(&pinned_a16), "{context}");
             }
         }
     }
