@@ -275,8 +275,8 @@ impl DraftReservations {
 
 /// Lane one's untracked driver objects on the lead and peer GPU
 /// ([`decode_view_reservations`]).
-pub const LANE1_DRIVER_OBJECTS_LEAD: u64 = 10_722_048;
-pub const LANE1_DRIVER_OBJECTS_PEER: u64 = 6_836_992;
+pub const LANE1_DRIVER_OBJECTS_LEAD: u64 = 14_905_088;
+pub const LANE1_DRIVER_OBJECTS_PEER: u64 = 8_922_880;
 
 /// A second decode view owns no prefill state, weights, KV or request rings.
 /// Pool-dependent page indices remain in the workspace's linear pool term.
@@ -289,11 +289,12 @@ pub fn decode_view_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,
     let mut costs = graphs.reservations(rank, bytes_per_exec, driver_margin)?;
     for cost in &mut costs { cost.name = lane_name(&cost.name, 1); }
     // Driver objects lane one creates outside the allocation ledger: on each
-    // GPU a terminal-abort publisher stream per abortable peer exchange (the
-    // head split's and the TP2 route exchange), and on the lead the Spark
-    // intake copy stream, its ordering events and the round probe's layer
-    // events. Calibrated against the ready ledger delta (lane two minus lane
-    // one, MiMo Pro max, 7363d8b9e: untracked 10,722,048 / 6,836,992 B).
+    // GPU its own rank stream and a terminal-abort publisher stream per
+    // abortable peer exchange (the head split's and the TP2 route exchange),
+    // its TP2 arena's completion event, and on the lead the Spark intake copy
+    // stream, its ordering events and the round probe's layer events.
+    // Calibrated against the ready ledger delta (lane two minus lane one,
+    // MiMo Pro max, cdc79293d: untracked 14,905,088 / 8,922,880 B).
     costs.push(MemoryReservation { name: "runtime.lane1.driver_objects".into(),
         bytes: if rank == 0 { LANE1_DRIVER_OBJECTS_LEAD } else { LANE1_DRIVER_OBJECTS_PEER } });
     if ranks == 2 {
