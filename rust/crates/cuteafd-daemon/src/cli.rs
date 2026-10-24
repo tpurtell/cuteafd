@@ -358,6 +358,9 @@ pub(crate) struct PlanArgs {
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,
+    /// Decode views: V4.1 requires 2, MiMo accepts 1 or 2, other families require 1.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub(crate) decode_lanes: Option<u8>,
     /// Rows one continuous prefill call streams for --layout (0: the family
     /// default). Shared by every units-span family (launcher PREFILL_SPAN_ROWS).
     #[arg(long, default_value_t = 0)]
@@ -915,6 +918,22 @@ mod tests {
     }
 
     #[test]
+    fn decode_lane_cli_keeps_family_defaults_and_rejects_invalid_counts() {
+        for (value, expected) in [("1", 1), ("2", 2)] {
+            let Commands::Plan(args) = Cli::try_parse_from([
+                "cuteafd", "plan", "model", "--decode-lanes", value]).unwrap().command else { panic!("plan"); };
+            assert_eq!(args.decode_lanes, Some(expected));
+        }
+        for value in ["0", "3", "auto", "-1"] {
+            assert!(Cli::try_parse_from(["cuteafd", "plan", "model", "--decode-lanes", value]).is_err());
+        }
+        let Commands::ServeNative(args) = Cli::try_parse_from([
+            "cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"]).unwrap().command else { panic!("native"); };
+        assert_eq!(args.decode_lanes, 2);
+    }
+
+    #[test]
     fn plan_prefill_wave_option_has_no_lane_alias() {
         let Commands::Plan(args) = Cli::try_parse_from([
             "cuteafd", "plan", "model", "--prefill-waves", "2"]).unwrap().command else {
@@ -1033,6 +1052,9 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
+    /// V4.1 has a fixed pair of decode views; 1 is unsupported.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub decode_lanes: u8,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,

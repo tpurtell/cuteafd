@@ -7,6 +7,47 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn decode_lane_policy_preserves_fixed_family_defaults_and_mimo_c1() {
+    for (family, default) in [("deepseek_v41", 2), ("mimo_v2", 1), ("glm5", 1),
+        ("glm5_flash", 1), ("deepseek_v4", 1), ("qwen4", 1), ("qwen3_5", 1), ("kimi_k3", 1), ("step5", 1)] {
+        assert_eq!(resolve_decode_lanes(family, None, 16).unwrap(), default);
+        for lanes in [1, 2] {
+            let supported = if family == "deepseek_v41" { lanes == 2 } else { family == "mimo_v2" || lanes == 1 };
+            let result = resolve_decode_lanes(family, Some(lanes), 16);
+            if supported { assert_eq!(result.unwrap(), lanes); }
+            else { assert!(matches!(result, Err(PlanError::UnsupportedOption { option: "--decode-lanes", value, .. }) if value == lanes)); }
+        }
+    }
+    assert_eq!(resolve_decode_lanes("mimo_v2", Some(2), 1).unwrap(), 1);
+    assert_eq!(resolve_decode_lanes("deepseek_v41", Some(2), 1).unwrap(), 2);
+    for lanes in [0, 3, 255] {
+        assert!(matches!(resolve_decode_lanes("mimo_v2", Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
+    }
+}
+
+#[test]
+fn planner_rejects_unsupported_decode_views_before_family_layout() {
+    let glm = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let v41 = tempfile::tempdir().unwrap();
+    write_v41_snapshot(v41.path());
+    for (path, family, lanes) in [(glm.path(), "glm5", 2), (v41.path(), "deepseek_v41", 1)] {
+        let options = PlanOptions { decode_lanes: Some(lanes), ..Default::default() };
+        let error = plan(path, &options).unwrap_err();
+        assert!(matches!(&error, PlanError::UnsupportedOption { family: actual, value, .. } if actual == family && *value == lanes));
+        assert!(error.to_string().contains("unsupported --decode-lanes"));
+    }
+    let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    for (requested, concurrency, expected) in [(None, 16, 1), (Some(2), 16, 2), (Some(2), 1, 1)] {
+        let options = PlanOptions { decode_lanes: requested,
+            layout: Some(layout::LayoutOptions { concurrency, host_memory: Some((128 << 30, 128 << 30)),
+                ..Default::default() }), ..Default::default() };
+        let report = plan(mimo.path(), &options).unwrap();
+        assert_eq!(report.decode_lanes, expected);
+        assert_eq!(serde_json::to_value(&report).unwrap()["decode_lanes"], expected);
+    }
+}
+
+#[test]
 fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     use cuteafd_core::memory_layout::ItemLifetime;
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
