@@ -312,6 +312,9 @@ struct Tp2<'a> {
     steps: Cell<usize>,
     checks: RefCell<HashMap<(usize, usize), PendingRouteCheck<'a>>>,
     identity: RefCell<RouteIdentity>,
+    /// A second decode view's own package scratch and output per rank over
+    /// the shared TP2 weights (None: the view uses the ranks' shared ones).
+    arenas: Option<RefCell<[crate::shared::experts::rtx::fp8moe::Fp8LaneArena<'a>; 2]>>,
 }
 
 struct PendingRouteCheck<'a> {
@@ -717,6 +720,10 @@ pub(crate) struct MimoEngine<'a> {
     /// Graphs captured while serving (after [`Self::capture_decode_graphs`]): each is a
     /// shape the startup capture missed.
     late_captures: Cell<usize>,
+    /// A second decode view's own rank streams (lead, peer): its work never
+    /// queues behind the other lane's, so neither lane's host waits block on
+    /// the other. Declared last: dropped after every owner that uses them.
+    _lane_streams: Option<[crate::shared::memory::device::Stream<'a>; 2]>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -804,7 +811,8 @@ impl<'a> MimoEngine<'a> {
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
-            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
+            graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0),
+            _lane_streams: None })
     }
 
     pub(super) fn take_decode_view(&self) -> Result<Option<Self>> {
@@ -825,15 +833,21 @@ impl<'a> MimoEngine<'a> {
         let Some(Experts::Spark { prefill, runtime, .. }) = &self.experts else {
             anyhow::bail!("independent MiMo decode views require Spark experts");
         };
+        ensure!(self.rtx_local.is_none(), "independent MiMo decode views require Spark or TP2 experts, not resident local experts");
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("decode/lane1");
+        use crate::shared::memory::device::{Device, Stream};
+        let peer_device = self.peer.as_ref().map_or(self.device, |peer| peer.device);
+        let lane_streams = [Stream::new(Device { library: self.library, id: self.device })?,
+            Stream::new(Device { library: self.library, id: peer_device })?];
+        let (lead_stream, peer_stream) = (lane_streams[0].raw, lane_streams[1].raw);
         let peer = self.peer.as_ref().map(|peer| -> Result<_> {
-            Ok(Peer { device: peer.device, stream: peer.stream, layers: Rc::clone(&peer.layers),
+            Ok(Peer { device: peer.device, stream: peer_stream, layers: Rc::clone(&peer.layers),
                 kv: peer.kv.clone(), workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None),
                 unit_done: Vec::new(), decode_workspace: RefCell::new(None), graphs: RefCell::new(HashMap::new()) })
         }).transpose()?;
         let devices = || -> Result<_> { Ok([
-            RankDevice { device: self.device, stream: self.stream },
-            RankDevice { device: self.peer.as_ref().context("MiMo decode peer")?.device, stream: self.stream_of(1) },
+            RankDevice { device: self.device, stream: lead_stream },
+            RankDevice { device: self.peer.as_ref().context("MiMo decode peer")?.device, stream: peer_stream },
         ]) };
         let exchange = self.exchange.as_ref().map(|_| PeerExchange::new_abortable(self.library,
             devices()?, cuteafd_loader::families::mimo_v2::admission::peer_slots(1),
@@ -844,14 +858,16 @@ impl<'a> MimoEngine<'a> {
                 routes: PeerExchange::new_abortable(self.library, devices()?, 2,
                     (DECODE_ROWS * self.cfg.topk * 4).next_multiple_of(16) * 2)?,
                 source: Cell::new(tp2.source.get()), checking: Cell::new(false), interval: tp2.interval,
-                steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()) })
+                steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()),
+                arenas: Some(RefCell::new([tp2.ranks[0].borrow().lane_arena(DECODE_ROWS)?,
+                    tp2.ranks[1].borrow().lane_arena(DECODE_ROWS)?])) })
         }).transpose()?;
         let view = Self {
             graphs: RefCell::new(HashMap::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             submission_failed: Cell::new(false), quantize_grid: self.quantize_grid,
             rope: RopeWindow::new(self.cfg.rope_dim, self.cfg.full_rope_theta, self.cfg.swa_rope_theta),
             library: self.library, programs: self.programs, cfg: self.cfg.clone(), weights: Rc::clone(&self.weights),
-            stream: self.stream, max_context: self.max_context, prefill_rows: DECODE_ROWS,
+            stream: lead_stream, max_context: self.max_context, prefill_rows: DECODE_ROWS,
             prefill_unit_waves: 1, prefill_span_rows: DECODE_ROWS, request_id: Cell::new(0),
             unit_position: Cell::new(0), unit_index: Cell::new(None), prefill_output: self.prefill_output,
             pages: self.pages, rings: self.rings, family: self.family, device: self.device,
@@ -868,6 +884,7 @@ impl<'a> MimoEngine<'a> {
             decode_graphs: self.decode_graphs, graph_storage_plan: self.graph_storage_plan.clone(),
             graph_storage_bound_bytes: self.graph_storage_bound_bytes.clone(),
             graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0),
+            _lane_streams: Some(lane_streams),
         };
         let fp8_head = matches!(view.weights.head, super::head::MimoHead::Fp8 { .. });
         // Keep the original lane unchanged; only this FP8 view omits unused BLAS plans.

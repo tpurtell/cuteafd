@@ -19,7 +19,8 @@ impl<'a> MimoEngine<'a> {
             .transpose()?.unwrap_or(0);
         self.tp2 = Some(Tp2 { layers, ranks: Rc::new(ranks.map(RefCell::new)), combine, routes,
             source: Cell::new(RouteSource::Broadcast), checking: Cell::new(false), interval,
-            steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()) });
+            steps: Cell::new(0), checks: RefCell::new(HashMap::new()), identity: RefCell::new(RouteIdentity::default()),
+            arenas: None });
         if self.prefill_rows >= DECODE_ROWS { self.prepare_scoring_prefill()?; }
         else {
             *self.decode_workspace.borrow_mut() = Some(self.workspace(0, DECODE_ROWS, true)?);
@@ -102,9 +103,22 @@ impl<'a> MimoEngine<'a> {
             // SAFETY: router, BF16 input and package output are rank-local,
             // stream-ordered, and no next launch may precede this output copy.
             unsafe {
-                experts.enqueue(index, rows, RtxInput::Bf16(w.x.buffer.ptr), routes, stream, &mut abort)?;
+                // A second decode view runs on its own stream with its own
+                // package scratch and output; the first uses the rank's.
+                let output = match &tp2.arenas {
+                    Some(arenas) => {
+                        let arena = &mut arenas.borrow_mut()[rank];
+                        experts.enqueue_lane(arena, index, rows, RtxInput::Bf16(w.x.buffer.ptr), routes,
+                            stream, &mut abort)?;
+                        arena.output()
+                    }
+                    None => {
+                        experts.enqueue(index, rows, RtxInput::Bf16(w.x.buffer.ptr), routes, stream, &mut abort)?;
+                        experts.output()
+                    }
+                };
                 self.library.copy_d2d_async(w.delta.buffer, cuteafd_ffi::CuteafdDeviceBuffer {
-                    ptr: experts.output(), bytes, ..w.delta.buffer }, bytes, stream)?;
+                    ptr: output, bytes, ..w.delta.buffer }, bytes, stream)?;
             }
             self.push(rank, unit_slot(index, true, lane), w.delta.buffer.ptr, bytes)
         })

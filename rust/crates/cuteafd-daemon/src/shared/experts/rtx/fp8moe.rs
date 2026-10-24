@@ -61,6 +61,27 @@ fn workspace(scratch: usize, hidden: usize, rows: usize) -> Result<(usize, usize
     Ok((scratch, output, total))
 }
 
+/// A decode lane's own FP8 MoE scratch and BF16 output over a rank's shared
+/// TP2 weights: lanes on separate streams never share either.
+pub(crate) struct Fp8LaneArena<'a> {
+    /// First field: drains the lane's queued work before its storage is released.
+    completion: RankCompletion<Event<'a>>,
+    scratch: Allocation<'a>,
+    output: Allocation<'a>,
+    rows: usize,
+}
+
+impl Fp8LaneArena<'_> {
+    pub(crate) fn output(&self) -> *mut c_void { self.output.buffer.ptr }
+}
+
+/// Bytes of one decode lane's arena on a rank for `rows` rows: package
+/// scratch plus the BF16 output (the planner's per-lane TP2 charge).
+pub(crate) fn lane_arena_bytes(scratch: usize, hidden: usize, rows: usize) -> Result<(usize, usize)> {
+    let (scratch, output, _) = workspace(scratch, hidden, rows)?;
+    Ok((scratch, output))
+}
+
 /// One serialized rank stream shares the package scratch and BF16 output.
 /// Graph owners must be destroyed before this owner, as with NativeTp2.
 pub(crate) struct Fp8MoeTp2<'a> {
@@ -115,6 +136,37 @@ impl<'a> Fp8MoeTp2<'a> {
         let output = Allocation::new(device, plan.output_bytes)?;
         Ok(Self { completion, device, rank: rank as u8, layers, max_rows,
             workspace_bytes: plan.workspace_bytes, experts, output })
+    }
+
+    /// A decode lane's arena for up to `rows` rows on this rank.
+    pub(crate) fn lane_arena(&self, rows: usize) -> Result<Fp8LaneArena<'a>> {
+        ensure!((1..=self.max_rows).contains(&rows), "FP8 MoE TP2 lane arena exceeds the package rows");
+        let hidden = self.output.buffer.bytes / (self.max_rows * 2);
+        let (scratch, output) = lane_arena_bytes(self.experts.lane_scratch_bytes(rows)?, hidden, rows)?;
+        Ok(Fp8LaneArena { completion: RankCompletion::new(Event::new(self.device)?),
+            scratch: Allocation::new(self.device, scratch)?, output: Allocation::new(self.device, output)?, rows })
+    }
+
+    /// [`RtxExpertLayer::enqueue`] on a lane's own arena (its scratch and
+    /// output), on that lane's stream.
+    ///
+    /// # Safety
+    /// As `enqueue`; `arena` is used by no other stream until completion.
+    pub(crate) unsafe fn enqueue_lane(&self, arena: &mut Fp8LaneArena<'a>, layer: usize, rows: usize,
+        input: ExpertInput, routes: Routes, stream: *mut c_void, abort: &mut dyn FnMut()) -> Result<()> {
+        let result = (|| {
+            ensure!(self.layers.contains(&layer) && (1..=arena.rows).contains(&rows),
+                "FP8 MoE TP2 lane layer/row range exceeded");
+            let ExpertInput::Bf16(input) = input else { bail!("FP8 MoE TP2 requires BF16 input rows") };
+            let index = self.experts.index_of(layer)?;
+            self.device.run(|| {
+                // SAFETY: caller retains the lane's input, routes, arena and stream through completion.
+                unsafe { self.experts.run_lane(index, rows, input, routes.ids, routes.weights,
+                    arena.output(), arena.scratch.buffer.ptr, stream) }
+            })
+        })();
+        // The lane's own completion: the shared weights outlive every arena.
+        arena.completion.finish(result, stream, abort)
     }
 
     /// Both halves are admitted before either allocates; P4's shared pinned
@@ -240,6 +292,17 @@ impl RtxExpertLayer for Fp8MoeTp2<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode lane's TP2 arena is the package scratch at the lane's rows
+    /// plus a BF16 output of those rows: the exact bytes the planner charges.
+    #[test]
+    fn lane_arena_is_decode_sized_scratch_plus_output() {
+        let (scratch, output) = lane_arena_bytes(10_000, 6144, 64).unwrap();
+        assert_eq!((scratch, output), (10_000, 64 * 6144 * 2));
+        assert_eq!(lane_arena_bytes(1, 6144, 64).unwrap().0, 256, "scratch floors at 256 bytes");
+        let (_, _, total) = workspace(10_000, 6144, 64).unwrap();
+        assert_eq!(scratch + output, total);
+    }
 
     #[test]
     fn sparse_backbone_inventory_preserves_ids_and_rejects_gaps() -> Result<()> {

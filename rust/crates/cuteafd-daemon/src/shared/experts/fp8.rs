@@ -699,10 +699,38 @@ impl<'a> Fp8Experts<'a> {
     #[allow(clippy::too_many_arguments)]
     unsafe fn run_with(&self, module: &Fp8MoeModule, index: usize, rows: usize, input: *mut c_void,
         ids: *mut c_void, weights: *mut c_void, out: *mut c_void, stream: *mut c_void) -> Result<()> {
+        // SAFETY: the shared scratch is serialized by the caller's stream, as `run` documents.
+        unsafe { self.run_scratch(module, index, rows, input, ids, weights, out, self.scratch.buffer.ptr, stream) }
+    }
+
+    /// Scratch bytes the package needs for up to `rows` rows: a lane arena's size.
+    pub fn lane_scratch_bytes(&self, rows: usize) -> Result<usize> {
+        let top = self.module.info().capacity_for(rows)
+            .with_context(|| format!("FP8 package has no capacity for {rows} rows"))?;
+        Ok(self.module.scratch_bytes(top)?.max(256))
+    }
+
+    /// `run` on a caller-owned scratch arena: independent decode lanes share
+    /// the resident weights but never one scratch.
+    ///
+    /// # Safety
+    /// As `run`; `scratch` holds [`Self::lane_scratch_bytes`] for `rows` and
+    /// is used by no other stream until this launch completes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn run_lane(&self, index: usize, rows: usize, input: *mut c_void, ids: *mut c_void,
+        weights: *mut c_void, out: *mut c_void, scratch: *mut c_void, stream: *mut c_void) -> Result<()> {
+        // SAFETY: forwarded caller contract; the same module `run` launches.
+        unsafe { self.run_scratch(&self.module, index, rows, input, ids, weights, out, scratch, stream) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_scratch(&self, module: &Fp8MoeModule, index: usize, rows: usize, input: *mut c_void,
+        ids: *mut c_void, weights: *mut c_void, out: *mut c_void, scratch: *mut c_void, stream: *mut c_void)
+        -> Result<()> {
         let layer = self.layers.get(index).context("FP8 expert layer index out of range")?;
         let [w1, s1, w3, s3, w2, s2] = layer.pointers();
         let pointers: [*mut c_void; FP8_MOE_POINTERS] =
-            [input, ids, weights, w1, s1, w3, s3, w2, s2, out, self.scratch.buffer.ptr];
+            [input, ids, weights, w1, s1, w3, s3, w2, s2, out, scratch];
         module.launch(&pointers, rows, stream)
     }
 }

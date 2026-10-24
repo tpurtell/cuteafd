@@ -311,7 +311,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
 
 fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     options: &LayoutOptions, ranks: usize, spark_ranks: usize, rows: u64)
-    -> Result<(Vec<Option<crate::placement::ExpertCost>>, u64, [u64; 2], crate::placement::Onboard)> {
+    -> Result<(Vec<Option<crate::placement::ExpertCost>>, u64, [u64; 2], crate::placement::Onboard, [u64; 2])> {
     use crate::placement::{Bytes2, ExpertCost, Onboard};
     use crate::placement::families::mimo_v2::{expert_layer_bytes, exact_package, package_directory, package_manifest};
     use crate::formats::fp8_experts::Slicing;
@@ -330,6 +330,9 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     let mut half = [Bytes2::default(); 2];
     let mut workspace = 0;
     let mut tp2_workspace = [0; 2];
+    // A second decode lane's TP2 arena per rank: package scratch and BF16
+    // output at the decode rows, over the shared weights.
+    let mut tp2_lane = [0u64; 2];
     if let Some(metadata) = metadata.as_ref() {
         for rank in 0..ranks {
             let (path, slicing) = exact_package(&directory, tensors, ranks, rank);
@@ -356,6 +359,10 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
                 let output = rows.max(64).checked_mul(cfg.hidden as u64).and_then(|bytes| bytes.checked_mul(2))
                     .context("MiMo TP2 output overflow")?;
                 tp2_workspace[rank] = scratch.checked_add(output).context("MiMo TP2 workspace overflow")?;
+                let lane_rows = crate::families::mimo_v2::decode_graph::MIMO_DECODE_ROWS as u64;
+                tp2_lane[rank] = crate::placement::inventory::fp8moe_scratch_bytes(metadata, layout, lane_rows)
+                    .context("MiMo expert manifest lacks decode capacity")?.max(256)
+                    + lane_rows * cfg.hidden as u64 * 2;
             } else { workspace = scratch; }
         }
     } else {
@@ -367,7 +374,7 @@ fn expert_costs(input: &super::super::PlanInput, cfg: &MimoV2Config,
     let costs = cfg.dense.iter().map(|&dense| (!dense).then_some(ExpertCost {
         whole, half, tp2: ranks == 2, spark_ok: spark_ranks > 0,
     })).collect();
-    Ok((costs, workspace, tp2_workspace, onboard))
+    Ok((costs, workspace, tp2_workspace, onboard, tp2_lane))
 }
 
 /// Retry every candidate from the same pre-admission inventory. Failed solves
@@ -429,7 +436,12 @@ fn apply_selected(input: &super::super::PlanInput, options: &LayoutOptions,
     }
     let cfg = MimoV2Config::from_hf(&checkpoint.config)?;
     let ranks = devices.len();
-    let (experts, expert_workspace, tp2_workspace, onboard) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
+    let (experts, expert_workspace, mut tp2_workspace, onboard, tp2_lane) = expert_costs(input, &cfg, options, ranks, spark_ranks, rows)?;
+    // A second decode lane owns its own TP2 arena on each rank, charged with
+    // the TP2 workspace (so only when TP2 layers are onboard).
+    if options.decode_lanes == 2 && spark_ranks > 0 {
+        for (workspace, lane) in tp2_workspace.iter_mut().zip(tp2_lane) { *workspace += lane; }
+    }
     let lanes = resolve_prefill_waves(spark_ranks > 0, cfg.program_family()?,
         if options.prefill_lanes > 0 { Some(options.prefill_lanes.to_string()) }
         else { None }.as_deref())?;
@@ -737,7 +749,7 @@ mod tests {
                         pool_tokens: Some(2 << 20), concurrency: 16, host_cache_bytes: Some(0), mimo_expert_manifest: Some(package),
                         ..Default::default() };
                     let costs = profile(&checkpoint, &opts, ranks, sparks, 4096, 16, context, None).unwrap();
-                    let (experts, expert_workspace, tp2_workspace, onboard) =
+                    let (experts, expert_workspace, tp2_workspace, onboard, _) =
                         expert_costs(&input, &cfg, &opts, ranks, sparks, 4096).unwrap();
                     let lanes = resolve_prefill_waves(true, cfg.program_family().unwrap(), None).unwrap();
                     let inputs = MimoInputs { automatic_context: opts.context_tokens == 0, cfg: &cfg, profile: &costs.steady, layers: cfg.layers,
