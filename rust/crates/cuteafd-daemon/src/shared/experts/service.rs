@@ -87,6 +87,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         .context("native local RoCE owner failed")?
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeExpertServiceConfig {
     pub encoder: Option<crate::shared::vision::worker::EncoderWorkerConfig>,
     pub audio_encoder: Option<crate::shared::vision::worker::AudioWorkerConfig>,
@@ -399,8 +400,11 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
-    // Each Spark execution lane owns a full execution workspace (stream,
-    // scratch, inputs, staging) over the shared resident weights.
+    // Each further Spark execution lane owns an execution workspace (stream,
+    // scratch, inputs, staging) over the shared resident weights. Its
+    // execution is sized for its own endpoints' capacity, whose kernel
+    // scratch need not shrink linearly with rows, so admission charges it the
+    // full lane-zero workspace: an upper bound, never an undercharge.
     let lanes = config.model_admission.as_ref().map_or(1, |model| model.endpoints.iter()
         .map(|endpoint| usize::from(endpoint.execution_lane)).max().map_or(1, |lane| lane + 1));
     let workspace = workspace.checked_mul(lanes).context("Spark execution lane workspace overflow")?;

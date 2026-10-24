@@ -325,10 +325,15 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         let mut budget = remaining;
         for lane in 0..lanes {
             let before = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device);
+            // A lane serves only its own endpoints, whose admitted capacity
+            // bounds every request it receives (the transport validates each
+            // request against its endpoint): a decode lane gets a decode-sized
+            // execution, not the full prefill capacity.
+            let lane_config = config_for_lane(&config, lane)?;
             let mut execution = {
                 let _memory_scope = cuteafd_ffi::memory_ledger::scope(
                     if lane == 0 { "experts/workspace" } else { "experts/workspace/lane1" });
-                weights.execution(&library, &config, budget, &mut modules)?
+                weights.execution(&library, &lane_config, budget, &mut modules)?
             };
             if lanes > 1 { execution.defer()?; }
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
@@ -649,6 +654,19 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
             std::hint::spin_loop();
         }
     }
+}
+
+/// The worker config lane `lane`'s execution is built from: its capacity is
+/// the largest admitted endpoint capacity on that lane (lane zero keeps the
+/// worker capacity, which every single-lane layout uses unchanged).
+fn config_for_lane(config: &NativeExpertServiceConfig, lane: usize) -> Result<NativeExpertServiceConfig> {
+    let mut lane_config = config.clone();
+    if lane > 0 {
+        let model = config.model_admission.as_ref().context("execution lanes require typed model admission")?;
+        lane_config.capacity = model.endpoints.iter().filter(|endpoint| usize::from(endpoint.execution_lane) == lane)
+            .map(|endpoint| endpoint.capacity).max().context("execution lane has no admitted endpoint")?;
+    }
+    Ok(lane_config)
 }
 
 /// How many Spark execution lanes the admitted endpoints name (one without
