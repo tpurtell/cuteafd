@@ -153,6 +153,8 @@ impl<'a> DenseEngine<'a> {
             let mark = self.checkpoint(&[0])?;
             self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
             self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: keep }])?;
+            // The commit stays queued on the target stream; host reads use the default stream.
+            self.stream.drain()?;
             let mut replay = Vec::new();
             for region in self.mark_regions() {
                 let mut bytes = vec![0; region.bytes];
