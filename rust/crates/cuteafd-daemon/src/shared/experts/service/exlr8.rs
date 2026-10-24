@@ -1,6 +1,6 @@
 //! Native FP8 K32 Spark adapter with distinct decode and grouped prefill arenas.
 use super::*;
-use crate::shared::experts::exlr8::{Exlr8Execution, Exlr8Weights, grouped_decode_from_row};
+use crate::shared::experts::exlr8::{grouped_decode_from_row, Exlr8Execution, Exlr8Weights};
 use crate::shared::memory::LoadStream;
 use cuteafd_ffi::{CuteafdDeviceBuffer, programs::Programs};
 use cuteafd_loader::plan::exlr8::residency::{ExpertSet, Residency};
@@ -20,15 +20,11 @@ fn execution_bytes(programs: &Programs<'_>, capacity: usize, unit_limit: usize,
     activations: crate::shared::experts::exlr8::Exlr8PrefillActivations) -> Result<usize> {
     ensure!((1..=PREFILL_ROWS).contains(&capacity), "EXLR8 capacity must be 1..4096");
     let decode_rows = capacity.min(K1_ROWS);
-    let grouped_from = grouped_decode_from_row(unit_limit);
-    // Below the measured threshold K1 owns the decode arena; above it the
-    // 64-row grouped instance does, and ranks that still need K1 retain both.
-    let mut decode = if grouped_from == 1 {
-        Exlr8Execution::decode_grouped_workspace_bytes(programs, decode_rows, unit_limit)?
-    } else {
-        Exlr8Execution::workspace_bytes(programs, decode_rows, ExpertSet::Routed)?
-    };
-    if grouped_from > 1 && grouped_from <= decode_rows {
+    // Decode admits the routed serving core below the measured grouped
+    // threshold and the 64-row grouped instance above it.
+    let mut decode =
+        Exlr8Execution::decode_compact_workspace_bytes(programs, decode_rows, unit_limit)?;
+    if grouped_decode_from_row(unit_limit) <= decode_rows {
         decode = decode.checked_add(
             Exlr8Execution::decode_grouped_workspace_bytes(programs, decode_rows, unit_limit)?)
             .context("EXLR8 decode workspace overflow")?;
@@ -53,7 +49,7 @@ pub(super) struct Worker<'w, 'a> {
     // Drain before execution storage or the borrowed weights can be released.
     stream: LoadStream<'a>,
     execution: Exlr8Execution<'a>,
-    // Present only when a rank still needs K1 below the grouped threshold.
+    // Present only when the decode capacity covers the grouped threshold.
     grouped_decode: Option<Exlr8Execution<'a>>,
     grouped_from_row: usize,
     prefill: Option<Exlr8Execution<'a>>,
@@ -132,19 +128,13 @@ impl<'w, 'a> Worker<'w, 'a> {
         ensure!(workspace <= remaining, "EXLR8 retained arenas exceed admitted bytes");
         let decode_rows = capacity.min(K1_ROWS);
         let grouped_from_row = grouped_decode_from_row(unit_limit);
-        let grouped_decode = grouped_from_row > 1 && grouped_from_row <= decode_rows;
+        let grouped_decode = grouped_from_row <= decode_rows;
         // Admission above charged exactly the instances built here, before any
         // device storage is allocated.
-        let decode_bytes = if grouped_from_row == 1 {
-            Exlr8Execution::decode_grouped_workspace_bytes(programs, decode_rows, unit_limit)?
-        } else {
-            Exlr8Execution::workspace_bytes(programs, decode_rows, ExpertSet::Routed)?
-        };
-        let execution = if grouped_from_row == 1 {
-            Exlr8Execution::new_decode_grouped(library, programs, decode_rows, decode_bytes, unit_limit)?
-        } else {
-            Exlr8Execution::new(library, programs, decode_rows, decode_bytes, ExpertSet::Routed)?
-        };
+        let decode_bytes =
+            Exlr8Execution::decode_compact_workspace_bytes(programs, decode_rows, unit_limit)?;
+        let execution = Exlr8Execution::new_decode_compact(library, programs, decode_rows,
+            decode_bytes, unit_limit)?;
         let mut retained = decode_bytes;
         let grouped_decode = if grouped_decode {
             let bytes = Exlr8Execution::decode_grouped_workspace_bytes(
@@ -201,10 +191,10 @@ impl<'w, 'a> Worker<'w, 'a> {
         let execution = if rows > K1_ROWS {
             self.prefill.as_ref().context("EXLR8 grouped prefill was not admitted")?
         } else if rows >= self.grouped_from_row {
-            // With no separate grouped instance the decode arena itself is the
-            // grouped one, so this arm covers both admitted shapes.
-            self.grouped_decode.as_ref().unwrap_or(&self.execution)
-        } else { &self.execution };
+            self.grouped_decode.as_ref().context("EXLR8 grouped decode was not admitted")?
+        } else {
+            &self.execution
+        };
         let work = (|| -> Result<()> {
             for (first, rows) in chunks(request.rows() as usize) {
                 let routes = rows * topk;

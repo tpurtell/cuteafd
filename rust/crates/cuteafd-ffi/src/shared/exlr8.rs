@@ -36,6 +36,18 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     {
         return Err(invalid("64-row grouped instance requires F32 FC2 partials"));
     }
+    // The routed serving core is a compact-unit instance selected by name and
+    // variant; its geometry must declare which served variant it is, and only
+    // the compact-unit routed variants are accepted here.
+    if spec.name == "exlr8_a16_serving" {
+        let variant = spec.geometry.get("serving_variant").and_then(|v| v.as_str());
+        if !matches!(variant, Some("k1_compact_prefetch" | "k1_paired_fc1" | "k1_reg_pair_b2"))
+        {
+            return Err(invalid("routed serving requires a declared compact-unit variant"));
+        }
+    } else if spec.geometry.get("serving_variant").is_some() {
+        return Err(invalid("serving_variant applies to the routed serving instance"));
+    }
     let max_rows = if grouped && !grouped_decode { 4096 } else { 64 };
     let group_rows = if grouped {
         let rows = field("group_rows")?;
@@ -430,6 +442,7 @@ mod tests {
         let mut s = spec();
         s.name = "exlr8_a16_serving".into();
         s.geometry["abi_version"] = serde_json::json!(3);
+        s.geometry["serving_variant"] = serde_json::json!("k1_reg_pair_b2");
         s.pointers.push("group_count".into());
         s.scalar_kinds = b"ii".to_vec();
         let mut e = entry();
@@ -509,6 +522,35 @@ mod tests {
             e["pointers"][4]["shape"] = serde_json::json!("[512,8]");
             assert!(validate_entry(&s, &e).is_err());
         }
+    }
+
+    #[test]
+    fn routed_serving_requires_a_declared_compact_unit_variant() {
+        let mut s = spec();
+        s.name = "exlr8_a16_serving".into();
+        s.pointers.push("group_count".into());
+        s.scalar_kinds = b"ii".to_vec();
+        let mut e = entry();
+        e["pointers"].as_array_mut().unwrap().push(serde_json::json!({
+            "name":"group_count", "shape":"[1]", "dtype":"int32", "role":"in"}));
+        // The manifest must name the compact-unit variant it was built from.
+        assert!(validate(&s).is_err());
+        s.geometry["serving_variant"] = serde_json::json!("k1_reg_pair_b2");
+        validate_entry(&s, &e).unwrap();
+        for variant in ["baseline", "k1_unknown", ""] {
+            let mut bad = s.clone();
+            bad.geometry["serving_variant"] = serde_json::json!(variant);
+            assert!(validate(&bad).is_err(), "{variant}");
+        }
+        // Only the routed serving instance carries a variant.
+        let mut shared = s.clone();
+        shared.name = "exlr8_shared_a16_serving".into();
+        shared.geometry["top_k"] = serde_json::json!(1);
+        shared.geometry["max_groups"] = serde_json::json!(4);
+        for bytes in shared.scratch.values_mut() { *bytes /= 128; }
+        assert!(validate(&shared).is_err());
+        shared.geometry.as_object_mut().unwrap().remove("serving_variant");
+        validate(&shared).unwrap();
     }
 
     #[test]

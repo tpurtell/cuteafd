@@ -60,7 +60,7 @@ impl NativePlan {
             .checked_add(pinned)
             .and_then(|n| n.checked_add(scratch))
             .context("EXLR8 coordinator host peak overflow")?;
-        let workspace = Exlr8Execution::workspace_bytes(programs, ROWS, ExpertSet::Shared)?;
+        let workspace = Exlr8Execution::shared_workspace_bytes(programs, ROWS)?;
         Ok(Self {
             plans,
             resident,
@@ -127,7 +127,7 @@ impl<'a> NativeExperts<'a> {
         programs: &'a Programs<'a>,
     ) -> Result<Exlr8Execution<'a>> {
         let mut execution =
-            Exlr8Execution::new(library, programs, ROWS, self.workspace, ExpertSet::Shared)?;
+            Exlr8Execution::new_shared(library, programs, ROWS, self.workspace)?;
         library.copy_h2d(execution.ids()?, &vec![0; ROWS * 4])?;
         library.copy_h2d(execution.route_weights()?, bytes_of(&vec![1.0f32; ROWS]))?;
         execution.seal_graph_storage()?;
