@@ -888,7 +888,8 @@ impl<'a> Engine<'a> {
         let t = tokens.len();
         ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
             "prefill span of {t} tokens at {start} exceeds the span or context capacity");
-        let logits = self.prefill_units(placement, tokens, transports, runtime, logit_rows, on_layer, download)?;
+        let _ = runtime; // Prefill waves run on the link's transport worker.
+        let logits = self.prefill_units(placement, tokens, transports, logit_rows, on_layer, download)?;
         placement.len += t;
         Ok(logits)
     }
@@ -1948,6 +1949,50 @@ impl<'a> Engine<'a> {
         })();
         self.capture_only.set(false);
         result
+    }
+
+    /// A prefill unit's wave on the link's transport worker: routes and wire
+    /// rows copy into the wave slot's pinned staging on the stream; the worker
+    /// builds (row positions start at `first`) and posts the request once they
+    /// complete. This thread does not wait for the GPU.
+    fn wave_send(&self, layer: usize, t: usize, w: &Workspace<'_>, first: u64,
+        transport: &mut crate::shared::spark_waves::Waves<'_, '_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
+        let timer = Instant::now();
+        // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let ticket = unsafe {
+            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+                Box::new(move |routes, wire| {
+                    let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
+                    for row in &mut request.rows { row.token_position += first; }
+                    Ok(request)
+                }))?
+        };
+        self.profile.borrow_mut().add(Phase::Routing, timer);
+        Ok(ticket)
+    }
+
+    /// The land half of [`Self::wave_send`]: the stream waits for the wave's
+    /// planes; returns the rank count the post's reduce needs.
+    fn wave_land(&self, layer: usize, transport: &mut crate::shared::spark_waves::Waves<'_, '_>,
+        ticket: crate::shared::spark_waves::WaveTicket) -> Result<usize> {
+        let slot = ticket.slot();
+        let timer = Instant::now();
+        transport.land(ticket, self.stream)?;
+        self.profile.borrow_mut().add(Phase::Experts, timer);
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
+            probe.staged(layer, transport.staged_ids(slot)?);
+        }
+        Ok(transport.ranks())
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self) -> Result<usize> {
+        let h = self.cfg.dim;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.n_activated_experts,
+            h + h / 32)?.bytes)
     }
 
     /// Waits for the unit's routes and wire rows and builds its Spark request.

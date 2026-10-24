@@ -1656,8 +1656,15 @@ fn audit_route_counts(routes: &[ExpertProtocolV2RouteEntry]) -> std::collections
 /// both take this format.
 fn spark_request(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
     wire: Vec<u8>, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
+    spark_request_bytes(hidden, topk, layer, rows, routes, wire.into(), kind, bf16)
+}
+
+/// [`spark_request`] with a shared payload (a view of a wave slot's staging).
+#[allow(clippy::too_many_arguments)]
+fn spark_request_bytes(hidden: usize, topk: usize, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
+    wire: bytes::Bytes, kind: ExpertV2SourceKind, bf16: bool) -> Result<ExpertProtocolV2Request> {
     let topk = topk as u32;
-    let mut request = ExpertProtocolV2Request::new(layer as u64 + 1, 17, layer as u32, hidden as u32,
+    let mut request = ExpertProtocolV2Request::new_bytes(layer as u64 + 1, 17, layer as u32, hidden as u32,
         if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..rows as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,
@@ -5073,12 +5080,55 @@ impl<'a> GlmfEngine<'a> {
         unsafe { transport.reduce(w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
     }
 
-    fn spark_land_unit(&self, w: &Workspace<'_>, rows: usize, wave: SparkExpertWave) -> Result<()> {
-        let Some(Experts::Spark { transport, runtime }) = &self.experts else {
-            anyhow::bail!("Spark completion without its installed backend");
-        };
-        let mut transport = transport.borrow_mut();
-        runtime.block_on(self.spark_land(w, rows, &mut transport, wave))
+    /// A prefill unit's wave on the link's transport worker: routes and wire
+    /// rows copy into the wave slot's pinned staging on the stream, and the
+    /// worker builds and posts the request once they complete. This thread
+    /// does not wait for the GPU.
+    fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize,
+        transport: &mut crate::shared::spark_waves::Waves<'_, '_>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
+        ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
+        let audit = self.split_audit && t >= 256;
+        // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
+        // stream order; the copies read them before later stream work.
+        unsafe {
+            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
+                    let request = spark_request_bytes(h, topk, index, t, routes, wire, ExpertV2SourceKind::Prefill, bf16)?;
+                    if audit {
+                        let counts = audit_route_counts(&request.routes);
+                        tracing::info!(layer = index, rows = t, distinct = counts.len(),
+                            max_routes = counts.values().max().copied().unwrap_or(0),
+                            histogram = %serde_json::to_string(&counts)?, "GLM Flash split audit routes");
+                    }
+                    Ok(request)
+                }))
+        }
+    }
+
+    /// The land half of [`Self::wave_send`]: the stream waits for the wave's
+    /// planes and sums them with the shared expert into `delta`.
+    fn wave_land(&self, w: &Workspace<'_>, index: usize, t: usize,
+        transport: &mut crate::shared::spark_waves::Waves<'_, '_>, wave: crate::shared::spark_waves::WaveTicket)
+        -> Result<()> {
+        let slot = wave.slot();
+        let timer = std::time::Instant::now();
+        transport.land(wave, self.stream)?;
+        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
+            probe.staged(index, transport.staged_ids(slot)?);
+        }
+        // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
+        // buffers; the slot's planes are ordered after the wave by `land`.
+        unsafe { transport.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?.bytes)
     }
 
     /// Execute one continuous span with retained per-unit slots.

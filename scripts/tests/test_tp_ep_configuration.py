@@ -414,6 +414,8 @@ shared_worker_env_args=(-e CUTEAFD_FP8_EXPERT_PREFILL=auto -e CUTEAFD_THERMAL=on
 thermal_args=(-e CUTEAFD_THERMAL=on)
 v41_fp8_head_args=()
 v41_l2_prefetch=
+v41_decode_lanes=
+resolved_decode_lanes=2
 {extra_setup}'''
             setup += '\ncount_plan=\'{"spark_admission":"coordinator_authoritative"}\'\n'
             result = subprocess.run(

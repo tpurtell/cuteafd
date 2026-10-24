@@ -405,9 +405,8 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
 #[test]
 #[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
 fn native_prefill_two_waves_byte_exact() -> Result<()> {
-    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned")
-        && std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() == Ok("copied"),
-        "two-wave exactness gate requires pinned intake and copied egress on both links");
+    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned"),
+        "two-wave exactness gate requires pinned intake on both links");
     prefill_lanes_byte_exact(8192, 4096, 2)
 }
 

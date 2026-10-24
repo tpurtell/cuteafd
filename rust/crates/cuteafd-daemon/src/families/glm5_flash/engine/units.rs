@@ -2,7 +2,7 @@
 use super::*;
 use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, run_prefill_units};
 
-enum Ticket { Spark(SparkExpertWave), Mixed(layers::Ticket) }
+enum Ticket { Spark(crate::shared::spark_waves::WaveTicket), Mixed(layers::Ticket) }
 
 /// The MLA ordinal, not the absolute layer, selects Flash's two staging views.
 fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer: usize, unit: usize) -> bool {
@@ -12,8 +12,10 @@ fn staging_turn(owners: &mut [Option<(usize, usize)>; 2], ordinal: usize, layer:
     reuse
 }
 
-struct UnitHooks<'e, 'a, 'w, 'd, 'f> {
+struct UnitHooks<'e, 'a, 'w, 'd, 'f, 't, 'l, 'n> {
     engine: &'e GlmfEngine<'a>,
+    /// The Spark link's transport worker (every Spark layer's waves).
+    transport: Option<&'t mut crate::shared::spark_waves::Waves<'l, 'n>>,
     steps: &'w [(StepTables, &'w [u32])],
     ranked: Vec<[StepTables; 2]>,
     work: &'w [Workspace<'a>],
@@ -31,7 +33,7 @@ struct UnitHooks<'e, 'a, 'w, 'd, 'f> {
     forced: Option<&'f dyn Fn(usize) -> Option<Vec<u8>>>,
 }
 
-impl<'a> UnitHooks<'_, 'a, '_, '_, '_> {
+impl<'a> UnitHooks<'_, 'a, '_, '_, '_, '_, '_, '_> {
     fn rows(&self, unit: &Unit) -> usize { unit.rows.len() }
     fn peer(&self, unit: &Unit) -> Result<Option<&Workspace<'a>>> {
         self.peer.map(|p| p.get(unit.slot)).transpose()
@@ -90,7 +92,7 @@ impl<'a> UnitHooks<'_, 'a, '_, '_, '_> {
     }
 }
 
-impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
+impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_, '_> {
     type Ticket = Ticket;
     fn route(&self, layer: usize) -> FfnRoute {
         if !self.engine.weights.layers[layer].dense
@@ -198,15 +200,18 @@ impl PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
         }
         e.moe_front(w, index, layer, unit.rows.len(), rows, PREFILL_CAP,
             &self.steps[unit.index].0.spans())?;
-        let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) else {
-            anyhow::bail!("Spark unit without its link");
-        };
-        e.spark_dispatch(w, index, unit.rows.len(), false, &mut transport.borrow_mut(), ||
-            e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows)).map(Ticket::Spark)
+        let transport = self.transport.as_mut().context("Spark unit without its transport worker")?;
+        let wave = e.wave_send(w, index, unit.rows.len(), transport)?;
+        // The shared expert runs while the worker sends and the Sparks compute.
+        e.ffn(w, layer, e.cfg.moe_intermediate, PREFILL_CAP, w.shared.buffer.ptr, rows)?;
+        Ok(Ticket::Spark(wave))
     }
     fn land_experts(&mut self, layer: usize, unit: &Unit, wave: Self::Ticket) -> Result<()> {
         match wave {
-            Ticket::Spark(wave) => self.engine.spark_land_unit(&self.work[unit.slot], unit.rows.len(), wave)?,
+            Ticket::Spark(wave) => {
+                let transport = self.transport.as_mut().context("Spark unit without its transport worker")?;
+                self.engine.wave_land(&self.work[unit.slot], layer, unit.rows.len(), transport, wave)?
+            }
             Ticket::Mixed(ticket) => self.engine.unit_ffn_finish(
                 [&self.work[unit.slot], self.peer(unit)?.context("owned peer slot")?],
                 &self.ranked[unit.index], unit, layer, self.total, ticket)?,
@@ -284,26 +289,40 @@ impl<'a> GlmfEngine<'a> {
             crate::shared::memory::device::Event::new(crate::shared::memory::device::Device {
                 library: self.library, id: p.device })).transpose()).collect::<Result<_>>()?;
         self.prepare_unit_route_checks(waves)?;
-        let mut hooks = UnitHooks { engine: self, steps, ranked, work: &work, peer: peer.as_ref(), released,
-            consumed: (0..steps.len()).map(|_| vec![0; self.layer_execution.as_ref()
-                .map_or(0, |execution| execution.plan.hops().len())]).collect(),
-            waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None, media, on_layer, forced };
+        let consumed = (0..steps.len()).map(|_| vec![0; self.layer_execution.as_ref()
+            .map_or(0, |execution| execution.plan.hops().len())]).collect();
         self.unit_prefill.set(true);
-        let outcome = run_prefill_units(&mut hooks, &units, waves);
+        let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_, '_>>| {
+            let mut hooks = UnitHooks { engine: self, transport, steps, ranked, work: &work, peer: peer.as_ref(),
+                released, consumed, waves, total, wanted: logit_rows, device, logits: Vec::new(), result: None,
+                media, on_layer, forced };
+            run_prefill_units(&mut hooks, &units, waves).map(|()| (hooks.result, hooks.logits))
+        };
+        // Spark waves build, post and land on the link's transport worker
+        // while this thread queues GPU work; owned-attention units exchange
+        // inside their own FFN hooks.
+        let outcome = match (&self.experts, &self.layer_execution) {
+            (Some(Experts::Spark { transport, .. }), None) => {
+                let staging = self.wave_staging_bytes()?;
+                transport.borrow_mut().with_waves(staging, |waves| run(Some(waves)))
+            }
+            _ => run(None),
+        };
         self.unit_prefill.set(false);
         self.context_unit.set(0);
         self.context_reuse.set(false);
         let complete = self.finish_unit_route_span();
-        if let Err(error) = outcome {
-            return match complete {
+        let (result, logits) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => return match complete {
                 Ok(()) => Err(error),
                 Err(unfinished) => Err(error.context(format!("{unfinished:#}"))),
-            };
-        }
+            },
+        };
         complete?;
         if logit_rows == 0 || self.weights.layers.len() < self.cfg.layers { self.synchronize()?; return Ok(None); }
-        Ok(Some(if device { StepLogits::Device(hooks.result.context("last-unit logits")?) }
-            else { StepLogits::Host(hooks.logits) }))
+        Ok(Some(if device { StepLogits::Device(result.context("last-unit logits")?) }
+            else { StepLogits::Host(logits) }))
     }
 }
 
