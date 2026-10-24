@@ -382,9 +382,10 @@ impl LocalTp4Client {
                 let mut progressed = false;
                 for rank in 0..uploads.len() {
                     let session = self.sessions[rank].as_mut().unwrap();
-                    let stats = session.endpoint.try_poll(session.request_send_in_flight as u32, 0)?;
-                    if let Some(state) = &mut session.request_write { state.complete(stats.send_completions as usize)?; }
-                    session.request_send_in_flight -= stats.send_completions as usize;
+                    let count = request_write::poll_sends(session.request_send_in_flight,
+                        |maximum| session.endpoint.try_poll(maximum, 0))?;
+                    if let Some(state) = &mut session.request_write { state.complete(count)?; }
+                    session.request_send_in_flight -= count;
                     if !sent[rank] {
                         let before = uploads[rank].posted;
                         sent[rank] = session.post_written_chunk(&mut uploads[rank])?;
