@@ -1360,34 +1360,6 @@ pub(crate) fn copy_parallel(dst: &mut [u8], src: &[u8]) {
 /// (decode) requests keep their own copy.
 const EGRESS_MIN_BYTES: usize = 1 << 20;
 
-/// How prefill requests leave (`CUTEAFD_SPARK_EGRESS`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Egress {
-    /// Each rank's session copies the payload into its own send ring.
-    Copied,
-    /// Zero-copy from one registered buffer, every rank's send posted at once.
-    Parallel,
-    /// Zero-copy, each rank's send posted once the previous one left (default).
-    Staggered,
-}
-
-fn egress_setting() -> Egress {
-    static SETTING: OnceLock<Egress> = OnceLock::new();
-    *SETTING.get_or_init(|| {
-        let egress = match std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() {
-            Ok("off" | "0" | "copied") => Egress::Copied,
-            Ok("parallel") => Egress::Parallel,
-            Ok("on" | "staggered") | Err(_) => Egress::Staggered,
-            Ok(other) => {
-                tracing::warn!(setting = other, "CUTEAFD_SPARK_EGRESS is staggered, parallel or off; staggered");
-                Egress::Staggered
-            }
-        };
-        tracing::info!(?egress, min_bytes = EGRESS_MIN_BYTES, "Spark request egress");
-        egress
-    })
-}
-
 fn registered_egress_bytes(request: &cuteafd_transport::ExpertProtocolV2Request) -> Result<usize> {
     let mut geometry = cuteafd_core::expert_geometry();
     geometry.hidden = request.header.hidden_dim;
@@ -1400,8 +1372,8 @@ fn registered_egress_bytes(request: &cuteafd_transport::ExpertProtocolV2Request)
 }
 
 /// Logs once how this coordinator moves expert traffic, from the fabric it
-/// detected: requests leave zero-copy from one registered buffer
-/// (`CUTEAFD_SPARK_EGRESS`), partials arrive by the probed intake
+/// detected: large requests leave zero-copy from one registered buffer as
+/// chunked WRITEs, partials arrive by the probed intake
 /// (`CUTEAFD_SPARK_INTAKE`), and every rank's traffic uses the coordinator's
 /// first rail. Measured on raptor (one 400 Gb port, both GPUs a host bridge
 /// away from the NIC) with six Sparks: the coordinator's intake (~19 GB/s
@@ -1414,7 +1386,7 @@ fn log_transfer_plan(mode: IntakeMode, ranks: usize) {
         Ok(report) => {
             let ports = report.rails.rails.iter().map(|rail| format!("{}@{} {:.0}G", rail.device, rail.address,
                 rail.effective_gbps)).collect::<Vec<_>>().join(", ");
-            tracing::info!(ranks, intake = mode.name(), egress = ?egress_setting(),
+            tracing::info!(ranks, intake = mode.name(),
                 coordinator_rails = %ports, "Spark transfer plan: every rank on the first coordinator rail");
         }
         Err(error) => tracing::warn!("Spark transfer plan: fabric discovery failed: {error:#}"),
@@ -1492,7 +1464,7 @@ impl<'a> SparkLink<'a> {
         unsafe { intake.attach(&mut transport)? };
         log_transfer_plan(mode, ranks);
         Ok(Self { transport, intake: std::rc::Rc::new(intake), egress_bytes: 0,
-            egress_enabled: enable_egress && egress_setting() != Egress::Copied, terminal_library: None, terminal_released: false })
+            egress_enabled: enable_egress, terminal_library: None, terminal_released: false })
     }
 
     /// Where to write a wave's `bytes` of expert input so it goes out
@@ -1529,11 +1501,10 @@ impl<'a> SparkLink<'a> {
         if self.egress_enabled && self.egress_bytes == 0 {
             let bytes = registered_egress_bytes(request)?;
             let _memory_scope = cuteafd_ffi::memory_ledger::scope("spark-intake");
-            self.transport.enable_egress(bytes, egress_setting() == Egress::Staggered)?;
+            self.transport.enable_egress(bytes)?;
             self.egress_bytes = bytes;
-            tracing::info!(slot_bytes = bytes, slots = self.waves(),
-                registered_bytes = bytes * self.waves(), egress = ?egress_setting(),
-                "Spark registered request egress");
+            tracing::info!(slot_bytes = bytes, slots = self.waves(), min_bytes = EGRESS_MIN_BYTES,
+                registered_bytes = bytes * self.waves(), "Spark registered request egress");
         }
         self.transport.bootstrap(request)
     }

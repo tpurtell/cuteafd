@@ -4880,6 +4880,43 @@ impl NativeLibrary {
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_slot_region", status)
     }
 
+    /// Registers the endpoint's receive ring for remote request WRITEs and
+    /// returns its address and rkey (stable until the endpoint is destroyed).
+    pub fn rdma_rc_endpoint_request_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_target")? };
+        let (mut address, mut rkey) = (0, 0);
+        // SAFETY: the caller owns the live endpoint handle; both outputs are
+        // valid locals that native writes only on success.
+        let status = unsafe { f(handle, &mut address, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_request_target", status)?;
+        Ok((address, rkey))
+    }
+
+    /// Posts one signaled WR carrying frame bytes `[offset, offset + bytes)`
+    /// of the request staged at send-ring `slot`: the first `prefix` bytes
+    /// from the slot, the rest from `region` (`None`: all from the slot).
+    /// `remote = None` posts a SEND, otherwise an RDMA WRITE to `(address, rkey)`.
+    ///
+    /// # Safety
+    /// `handle` is a live connected endpoint. The source bytes stay unmodified
+    /// and registered until this WR's completion or QP quiescence; a remote
+    /// range is one the peer exposed for this QP and holds the written extent.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rdma_rc_endpoint_post_request_part(&self, handle: *mut c_void, slot: usize, prefix: usize,
+        region: Option<(u32, usize)>, offset: usize, bytes: usize, remote: Option<(u64, u32)>, wr: u64) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, usize, u64, u32, u64) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_request_part")? };
+        let (region, region_offset) = region.unwrap_or((u32::MAX, 0));
+        let (address, rkey) = remote.unwrap_or((0, 0));
+        // SAFETY: forwarded from this function's contract; native bounds-checks
+        // every local range against its registrations.
+        let status = unsafe { f(handle, slot, prefix, region, region_offset, offset, bytes, address, rkey, wr) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_request_part", status)
+    }
+
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
         let destroy_fn: Symbol<RdmaRcEndpointDestroyFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_destroy")? };

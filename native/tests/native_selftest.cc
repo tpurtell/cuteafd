@@ -188,6 +188,15 @@ void test_rdma_landing_slots_rotate_independently_of_header_ring() {
 
 void test_rdma_abi() {
   unsigned char endpoint_byte = 0;
+  uint64_t request_address = 0;
+  uint32_t request_rkey = 0;
+  assert(cuteafd_rdma_rc_endpoint_request_target(nullptr, &request_address, &request_rkey) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_post_request_part(nullptr, 0, 0, UINT32_MAX, 0, 0, 1, 1, 1, 1) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_post_request_part(&endpoint_byte, 0, 0, UINT32_MAX, 0, 0, 0, 0, 0, 1) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+
   assert(cuteafd_rdma_rc_endpoint_post_recv_at(nullptr, 0, 1, 1) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_send_at(nullptr, &endpoint_byte, 0, 1, 1) ==

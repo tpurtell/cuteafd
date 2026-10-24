@@ -136,6 +136,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         completed.response_frames += 1;
         completed.response_wire_bytes += wire_bytes;
         let response_executor_id = completed.assembler.finish_validation()?.executor_id;
+        self.request_credits.final_reply()?;
         let _ = completed.response_tx.send(Ok(VerbsHostProtocolV2ResponseStreamStats {
             response_frames: completed.response_frames,
             response_wire_bytes: completed.response_wire_bytes,

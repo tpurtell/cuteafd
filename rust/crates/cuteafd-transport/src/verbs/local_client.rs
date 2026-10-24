@@ -2,12 +2,6 @@
 //! response assembler/recycling code runs locally; no QP worker is spawned.
 use super::*;
 
-/// Requests up to this size go out rank after rank under a staggered egress.
-/// Posted alone, one rank's zero-copy request completes at ~12-14 GB/s up to
-/// 13 MB but at ~3 GB/s at 26 MB (raptor to a Spark, 200 Gb); larger requests
-/// go out all at once, where the ranks' queue pairs overlap that.
-const STAGGER_MAX_BYTES: usize = 16 << 20;
-
 pub(crate) struct LocalTp4Client {
     peers: Vec<SocketAddr>,
     config: TcpTransportConfig,
@@ -32,9 +26,6 @@ pub(crate) struct LocalTp4Client {
     write: Vec<Option<DeviceWriteTarget>>,
     /// Shared registered request buffer (zero-copy egress).
     egress: Option<Arc<super::egress::EgressBuffer>>,
-    /// Post the ranks' zero-copy requests one after another (each once the
-    /// previous rank's send completed) rather than all at once.
-    stagger: bool,
     egress_slot: usize,
     /// Optional terminal contract. A failed temporary/persistent endpoint
     /// publishes into this witness before its external landing owner drops.
@@ -71,7 +62,6 @@ impl LocalTp4Client {
             landing: vec![None; world],
             write: vec![None; world],
             egress: None,
-            stagger: false,
             egress_slot: 0,
             terminal_owner: None,
             terminal_failed: false,
@@ -200,7 +190,7 @@ impl LocalTp4Client {
 
     /// Allocates the shared request buffer (`bytes`, pinned and device-mapped)
     /// and registers it on every session from the next connection on.
-    pub(crate) fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<CuteafdHostBuffer> {
+    pub(crate) fn enable_egress(&mut self, bytes: usize) -> Result<CuteafdHostBuffer> {
         anyhow::ensure!(self.waves.is_empty(), "cannot replace egress with outstanding waves");
         if self.sessions.iter().any(Option::is_some) {
             anyhow::ensure!(self.terminal_owner.is_none(), "terminal egress must precede bootstrap");
@@ -209,7 +199,6 @@ impl LocalTp4Client {
         let buffer = super::egress::EgressBuffer::new(bytes, self.max_waves)?;
         let host = buffer.host();
         self.egress = Some(buffer);
-        self.stagger = stagger;
         Ok(host)
     }
     /// The shared request buffer, once no request payload views it and every
@@ -261,6 +250,8 @@ impl LocalTp4Client {
             }
             let session = self.sessions[rank].as_mut().unwrap();
             anyhow::ensure!(session.write_mode, "rank {rank} session is not in write mode");
+            // No reply arrives on this QP; the caller's GPU fence is the credit.
+            session.request_credits.written_reply_observed();
             session.post_chunk_request(request, &self.config)?;
         }
         Ok(())
@@ -329,17 +320,30 @@ impl LocalTp4Client {
         }
         if self.expert_grouping.iter().any(Option::is_some) { self.installed_grouping()?; }
         // Every rank's bootstrap is validated before any request enters a QP.
-        for rank in 0..self.peers.len() {
-            let session = self.sessions[rank].as_mut().unwrap();
-            let timing = session.post_chunk_request(request, &self.config)?;
-            if self.stagger && rank + 1 < self.peers.len() && request.hidden_payload.len() <= STAGGER_MAX_BYTES
-                && session.sends_from_egress(request) {
-                // The next rank's request goes out once this one has left: each
-                // rank gets the whole link in turn and starts computing as early
-                // as it can, so the ranks finish, and their partials land,
-                // staggered instead of all at once.
-                session.drain_request_sends(&self.config)?;
+        let mut uploads = Vec::with_capacity(self.peers.len());
+        for session in self.sessions.iter_mut() {
+            uploads.push(session.as_mut().unwrap().stage_request(request, &self.config)?);
+        }
+        // One chunk per rank per round: the coordinator port interleaves every
+        // rank's tail instead of bursting whole frames rank after rank.
+        let deadline = Instant::now() + self.config.timeout;
+        while uploads.iter().any(|upload| !upload.sent()) {
+            anyhow::ensure!(Instant::now() < deadline, "Spark request upload deadline expired");
+            let mut progressed = false;
+            for (session, upload) in self.sessions.iter_mut().zip(&mut uploads) {
+                let session = session.as_mut().unwrap();
+                progressed |= session.try_reap_request_sends()?;
+                progressed |= session.post_request_part(upload)?;
             }
+            if !progressed {
+                // Every unsent rank's send queue is full: wait on one of them.
+                let rank = uploads.iter().position(|upload| !upload.sent()).expect("an unsent upload remains");
+                let session = self.sessions[rank].as_mut().unwrap();
+                session.post_request_parts(&mut uploads[rank], deadline.saturating_duration_since(Instant::now()))?;
+            }
+        }
+        for (rank, upload) in uploads.into_iter().enumerate() {
+            let timing = upload.timing;
             let (response_tx, response_rx) = tokio::sync::oneshot::channel();
             self.pending[rank].push_back(VerbsHostProtocolV2PendingChunkRoundtrip::new(
                 VerbsHostProtocolV2QueuedChunkCommand {
