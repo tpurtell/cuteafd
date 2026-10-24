@@ -1254,7 +1254,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         let cfg = crate::families::mimo_v2::MimoV2Config::from_hf(&checkpoint.config)?;
         let pool = report.memory_layout.as_ref().map_or(0, |m| m.pool_tokens);
         let local_ranks = if options.head_split { options.rtx_bytes.len().clamp(1, 2) } else { 1 };
-        let demands = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
+        let mut demands = crate::families::mimo_v2::admission::future_host_workspaces(&cfg,
             usize::try_from(unit_rows)?, usize::try_from(options.prefill_waves)?, local_ranks,
             pool, usize::try_from(options.context_tokens.max(1))?, ranks, options.mimo_expert_input,
             crate::families::mimo_v2::MimoKvFormats { full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
@@ -1262,6 +1262,13 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 else { crate::families::mimo_v2::MimoPrefillOutput::LastRow }, true,
             usize::try_from(unit_rows.min(256))?, report.solver_placement.as_ref()
                 .and_then(|p| p.tp2).map_or(0, |tp2| tp2.layers))?;
+        if options.decode_lanes == 2 && ranks > 0 {
+            demands.extend(crate::families::mimo_v2::admission::decode_view_host_workspaces(&cfg,
+                local_ranks, pool, usize::try_from(options.context_tokens.max(1))?, ranks,
+                options.mimo_expert_input, crate::families::mimo_v2::MimoKvFormats {
+                    full: crate::families::mimo_v2::MimoKvCache::Int8, sliding: options.mimo_swa_kv },
+                report.solver_placement.as_ref().and_then(|p| p.tp2).map_or(0, |tp2| tp2.layers))?);
+        }
         for (name, bytes) in demands { push(Category::Staging, &name, "pinned", bytes, Basis::Formula); }
     } else {
         if ranks > 0 {
