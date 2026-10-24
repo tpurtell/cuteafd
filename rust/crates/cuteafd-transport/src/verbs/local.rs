@@ -383,6 +383,7 @@ impl LocalVerbsExpertConnection {
         )?;
         endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
         let request_write_target = if start.request_write {
+            endpoint.traffic.receives_writes();
             anyhow::ensure!(start.write_target.is_none() && request_ring.depth <= 64,
                 "request WRITE requires SEND replies and at most 64 slots");
             let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
@@ -537,7 +538,7 @@ impl LocalVerbsExpertConnection {
             )?;
             let resize_ms = 0.0_f64;
             let copy_request_ms = 0.0_f64;
-            endpoint.traffic.received(request_wire_bytes);
+            endpoint.traffic.received(request_wire_bytes + if start.request_write { request_write::DOORBELL_BYTES } else { 0 });
             let mut post_recv_ms = 0.0_f64;
             let parse_started = timing_enabled.then(Instant::now);
             let request =

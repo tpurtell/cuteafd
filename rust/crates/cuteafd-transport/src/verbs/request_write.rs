@@ -5,6 +5,16 @@ use super::*;
 
 pub(super) const DOORBELL_BYTES: usize = 40;
 
+/// Native rejects an empty CQ poll. The scheduler reaches this on its first
+/// round and whenever a rank has already drained while another still posts.
+pub(super) fn poll_sends(in_flight: usize,
+    poll: impl FnOnce(u32) -> Result<CuteafdRdmaRcCompletionStats>) -> Result<usize> {
+    if in_flight == 0 { return Ok(0); }
+    let count = poll(u32::try_from(in_flight)?)?.send_completions as usize;
+    anyhow::ensure!(count <= in_flight, "request WRITE unexpected send completions");
+    Ok(count)
+}
+
 pub(super) fn next_epoch() -> Result<u64> {
     static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now = u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos())?;
@@ -240,6 +250,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             let bell = doorbell(state.target.epoch, upload.sequence, upload.request, upload.bytes);
             if let Err(error) = self.endpoint.library.rdma_rc_endpoint_request_doorbell(self.endpoint.info.handle, slot, &bell,
                 VERBS_HOST_SEND_WR_ID + slot as u64) { state.poison(); return Err(error); }
+            self.endpoint.traffic.sent(DOORBELL_BYTES);
             state.completions.push_back(0);
             self.request_send_in_flight += 1;
             self.request_send_sequence = self.request_send_sequence.checked_add(1).context("request WRITE sequence exhausted")?;
@@ -258,6 +269,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             upload.prefix_bytes, upload.payload_region, upload.posted, bytes, remote, state.target.rkey,
             VERBS_HOST_SEND_WR_ID + slot as u64);
         if let Err(error) = result { state.poison(); return Err(error); }
+        self.endpoint.traffic.written(bytes);
         state.completions.push_back(bytes);
         self.request_send_in_flight += 1;
         upload.posted += bytes;
@@ -282,6 +294,27 @@ impl VerbsHostProtocolV2PersistentClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mocked_round_robin_skips_idle_cqs_and_validates_completion_counts() -> Result<()> {
+        let mut calls = Vec::new();
+        // First round, mixed ranks, and fully drained round all use the same
+        // poll adapter as dispatch. An empty native poll would fail this mock.
+        for counts in [[0, 0, 0], [2, 0, 3], [0, 0, 0]] {
+            for in_flight in counts {
+                let count = poll_sends(in_flight, |maximum| {
+                    assert!(maximum > 0);
+                    calls.push(maximum);
+                    Ok(CuteafdRdmaRcCompletionStats { send_completions: maximum, ..Default::default() })
+                })?;
+                assert_eq!(count, in_flight);
+            }
+        }
+        assert_eq!(calls, [2, 3]);
+        assert!(poll_sends(1, |_| Ok(CuteafdRdmaRcCompletionStats {
+            send_completions: 2, ..Default::default() })).is_err());
+        assert!(poll_sends(1, |_| bail!("mock CQ failure")).is_err());
+        Ok(())
+    }
     #[test]
     fn generation_credit_requires_final_reply_not_writes_or_doorbell() -> Result<()> {
         let mut leases = Leases::new(2);
