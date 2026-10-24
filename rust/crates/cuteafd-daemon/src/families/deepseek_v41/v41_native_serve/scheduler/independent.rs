@@ -14,10 +14,9 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
     let draft = RefCell::new(draft);
     let prefixes = RefCell::new(prefixes);
     let set = LaneSet::default();
-    // Do not cancel the peer future on error: it may own queued CUDA/RDMA work.
-    runtime.block_on(set.join(
-        set.lease(0).run(lane(set.lease(0), first, first_transport, &requests, &active, &draft, &prefixes, receive, wake)),
-        set.lease(1).run(lane(set.lease(1), second, second_transport, &requests, &active, &draft, &prefixes, receive, wake)),
+    runtime.block_on(set.run(
+        |lease| lane(lease, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
+        |lease| lane(lease, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
     ))
 }
 
