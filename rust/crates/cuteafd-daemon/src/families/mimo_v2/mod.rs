@@ -271,6 +271,7 @@ mod draft_storage_tests {
         // Keep these joined so the assertions cannot match their own text.
         assert!(source.contains(&["let mut decode = link", "(0, 1, &decode_warm)?;"].concat()));
         assert!(source.contains(&["let mut prefill = link", "(1, lanes, &prefill_warm)?;"].concat()));
+        assert!(source.contains(&["Some(link", "(2, 1, &decode_warm)?)"].concat()));
         assert!(source.contains(&["link.transport.bind_model_", "endpoint(endpoint)?;"].concat()));
         assert!(source.contains(&["endpoints: cuteafd_loader::families::mimo_v2::admission::", "decode_spark_endpoints("].concat()));
         let engine = include_str!("engine.rs");
@@ -280,10 +281,10 @@ mod draft_storage_tests {
     }
 
     #[test]
-    fn second_decode_view_is_refused_before_checkpoint_or_native_loading() {
+    fn unsupported_second_decode_view_is_refused_before_checkpoint_or_native_loading() {
         let args = args(&["--decode-lanes", "2"]);
         let error = match open(&args) {
-            Ok(_) => panic!("second decode view was admitted without runtime scheduling"),
+            Ok(_) => panic!("second decode view was admitted without Spark experts"),
             Err(error) => error,
         };
         assert!(matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
@@ -868,10 +869,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
-    if args.decode_lanes != 1 {
+    if args.decode_lanes == 2 && (args.peers.is_none() || args.local_experts || args.skip_experts || args.mtp > 0 || !args.decode_graphs) {
         return Err(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes",
             value: args.decode_lanes, family: "mimo_v2".into(),
-            reason: "second-lane readiness capture and scheduler are not installed" }.into());
+            reason: "independent lanes require Spark experts, startup decode graphs and DFlash or no drafter" }.into());
     }
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
@@ -929,6 +930,8 @@ impl Opened {
         let automatic_context = args.max_context == 0;
         engine::prefill_span_rows(args.prefill_span_rows, args.prefill_rows)?;
         let mut resolved = args.clone();
+        resolved.decode_lanes = cuteafd_loader::plan::resolve_decode_lanes("mimo_v2",
+            Some(resolved.decode_lanes), serving.map_or(1, |(_, concurrency)| concurrency) as u64)?;
         if resolved.max_context == 0 {
             resolved.max_context = cuteafd_loader::serving_capacity::checkpoint_context_limit(&self.checkpoint.config)?
                 .context("MiMo checkpoint lacks full-context capability")?.try_into()?;
@@ -1356,6 +1359,7 @@ impl Opened {
         // only prefill owns overlapping waves and rotating pinned return slots.
         let mut decode = link(0, 1, &decode_warm)?;
         let mut prefill = link(1, lanes, &prefill_warm)?;
+        let mut second = if args.decode_lanes == 2 { Some(link(2, 1, &decode_warm)?) } else { None };
         tracing::info!(waves = lanes, rows = args.prefill_rows, "MiMo shared prefill units");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let started = Instant::now();
@@ -1366,10 +1370,18 @@ impl Opened {
                 transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
             })?;
         }
+        if let Some(transport) = &mut second {
+            runtime.block_on(async {
+                let wave = transport.dispatch(&decode_warm)?;
+                transport.receive(wave, engine::DECODE_ROWS, warm_stream.raw()).await
+            })?;
+        }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { decode: std::rc::Rc::new(std::cell::RefCell::new(decode)),
-            prefill: std::rc::Rc::new(std::cell::RefCell::new(prefill)), runtime: std::rc::Rc::new(runtime) }))
+            prefill: std::rc::Rc::new(std::cell::RefCell::new(prefill)),
+            second: std::cell::RefCell::new(second.map(|link| std::rc::Rc::new(std::cell::RefCell::new(link)))),
+            runtime: std::rc::Rc::new(runtime) }))
     }
 }
 

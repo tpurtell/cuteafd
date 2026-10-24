@@ -34,6 +34,10 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
             second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new(), rounds: RoundBank::from_requests(Vec::new()) }) }
     }
 
+    pub(super) fn install_second(&mut self, second: Option<MimoEngine<'a>>) {
+        self.buffers.as_mut().expect("live serving owners").lanes.install_second(second);
+    }
+
     pub(super) fn prepare(&mut self, select: crate::shared::token_io::SelectPlacement,
         probe: bool) -> Result<usize> {
         // Install each selector before further fallible initialization so even

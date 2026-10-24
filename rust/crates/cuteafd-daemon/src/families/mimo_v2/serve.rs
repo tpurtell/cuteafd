@@ -160,6 +160,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
+    engine_args.decode_lanes = cuteafd_loader::plan::resolve_decode_lanes("mimo_v2",
+        Some(engine_args.decode_lanes), args.max_sequences as u64)?;
     engine_args.rings = engine_args.rings.max(args.max_sequences);
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
@@ -276,6 +278,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         // the server is ready: serving replays them without capturing.
         let started = std::time::Instant::now();
         let mut owners = super::serving_owners::ServingOwners::new(engine);
+        owners.install_second(engine.take_decode_view()?);
         let (family, cache) = prefix_cache_with(engine, &prefix, max_sequences, |_| Ok(host_config))?;
         owners.prefix(family, cache);
         let graphs = owners.prepare(args.token_io.token_select, engine.drafter.is_some() || engine.mtp.is_some())?;
@@ -421,6 +424,7 @@ impl Active<'_> {
             return Ok(false);
         };
         self.finish(finish)?;
+        self.finished = true;
         Ok(true)
     }
 
@@ -519,6 +523,8 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let (family, cache, selector, active, lanes, second_selector, rounds) = owners.scheduler_parts();
     let mut second_shared = if lanes.has_second() { make_policy(engine, head_numerics, width)? } else { None };
+    let mut first_observations = independent::Observations::default();
+    let mut second_observations = independent::Observations::default();
     // Messages start with `<|im_start|>`: a snapshot right before one is a message boundary.
     let message_start = *QwenEncoding::from_snapshot(snapshot)?.tokens().turn_markers.first()
         .context("the chat template names no message-start token")?;
@@ -903,6 +909,7 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
                 tracing::warn!(%error, "MiMo KV growth exhausted; finishing at committed frontier");
                 let mut request = active.remove(index);
                 if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                if let Some(shared) = second_shared.as_mut() { shared.policy.release(request.ticket.id()); }
                 let _ = request.finish(InferenceFinishReason::Length);
                 requests += 1;
                 generated_total += request.generated as u64;
@@ -923,12 +930,13 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
             let executor = engine.decode_executor()?;
             let result = executor.block_on(lanes.run(
                 |lane| independent::lane_rounds(lane, selector, rounds, &mut shared, width, policy, prefix,
-                    cache_enabled, receive, pending, &mut trace),
+                    cache_enabled, receive, pending, &mut trace, &mut first_observations),
                 |lane| independent::lane_rounds(lane, second_selector.as_mut().expect("prepared second selector"),
-                    rounds, &mut second_shared, width, policy, prefix, cache_enabled, receive, pending, &mut second_trace)));
+                    rounds, &mut second_shared, width, policy, prefix, cache_enabled, receive, pending, &mut second_trace,
+                    &mut second_observations)));
             *active = rounds.take_restored();
-            result?;
             for request in active.iter().filter(|a| a.finished) { failures.finished(&request.job.events); }
+            result?;
             active.iter().map(|a| a.finished).collect::<Vec<_>>()
         } else {
         let mut round_clock = RoundClock::at(cycle);
@@ -1124,6 +1132,7 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
                 }
                 for request in active.drain(..) {
                     if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+                    if let Some(shared) = second_shared.as_mut() { shared.policy.release(request.ticket.id()); }
                     let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                     release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
                 }
@@ -1263,6 +1272,7 @@ fn schedule_inner<'a>(engine: &MimoEngine<'a>, opened: &Opened, snapshot: &std::
             }
             let mut request = active.remove(index);
             if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if let Some(shared) = second_shared.as_mut() { shared.policy.release(request.ticket.id()); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;

@@ -2,13 +2,18 @@
 use super::*;
 use super::super::engine::{DecodeLane, RoundBank};
 
+#[derive(Default)]
+pub(super) struct Observations {
+    observed: u64,
+    skipped: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut TokenSelector<'a>,
     bank: &RoundBank<Active<'a>>, shared: &mut Option<crate::shared::draft::runtime::SharedPolicy>,
     width: usize, policy: Policy, prefix: &PrefixArgs, cache_enabled: bool,
     receive: &mpsc::Receiver<NativeRequest>, admission_pending: bool,
-    trace: &mut Option<crate::shared::speculation_trace::Trace>) -> Result<()> {
-    let (mut observed_rounds, mut skipped_rounds) = (0u64, 0u64);
+    trace: &mut Option<crate::shared::speculation_trace::Trace>, observations: &mut Observations) -> Result<()> {
     let (mut verify_s, mut draft_s, mut emit_s) = (0f64, 0f64, 0f64);
     loop {
         if lane.stopping() { return Ok(()); }
@@ -136,6 +141,7 @@ pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut
                 let _ = request.job.events.send(Err(NativeFailure::Worker(error)));
                 verified[i] = (rows.len(), 1, Some(Censor::Cancelled));
                 offset += rows.len();
+                request.finished = true;
                 return true;
             }
             let mut finished = false;
@@ -162,6 +168,7 @@ pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut
                     Err(error) => {
                         let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
                         finished = true;
+                        request.finished = true;
                         cancelled = true;
                         break;
                     }
@@ -204,17 +211,17 @@ pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut
             let times = round_clock.observe();
             match lane.probe_finish(|routes, layer_us| resource::observe_drafted(&mut shared.policy,
                 &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
-                Some(Ok(())) => observed_rounds += 1,
+                Some(Ok(())) => observations.observed += 1,
                 Some(Err(error)) => {
-                    skipped_rounds += 1;
+                    observations.skipped += 1;
                     tracing::debug!(%error, "MiMo draft round not observed");
                 }
                 None => {
-                    skipped_rounds += 1;
+                    observations.skipped += 1;
                     tracing::debug!("MiMo draft round probe incomplete");
                 }
             }
-            resource::publish(&shared.policy, observed_rounds, skipped_rounds, None);
+            resource::publish(&shared.policy, observations.observed, observations.skipped, None);
         }
         if let Some(trace) = trace.as_mut() {
             let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
@@ -248,7 +255,7 @@ pub(super) async fn lane_rounds<'a>(lane: DecodeLane<'_, '_, 'a>, selector: &mut
         });
         let stop = finished.iter().any(|done| *done) || admission_pending || !receive.is_empty()
             || active.iter().any(|a| a.placement.len.saturating_add(DECODE_ROWS) > a.capacity
-                || a.placement.len.saturating_add(DECODE_ROWS) > a.placement.pages.len() * 64);
+                || a.placement.len.saturating_add(DECODE_ROWS) > a.placement.pages.len() * super::super::engine::PAGE_ROWS);
         for (request, done) in active.iter_mut().zip(finished) { request.finished = done; }
         // The guard restores the exact stable bank slots before the next loop,
         // a normal stop, or the enclosing whole-future failure boundary.

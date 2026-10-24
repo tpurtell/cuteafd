@@ -132,7 +132,8 @@ pub(crate) enum Experts<'a> {
     /// outputs are not the model's).
     Skip,
     /// Spark ranks serving the `fp8` family over RoCE.
-    Spark { decode: Rc<RefCell<SparkLink<'a>>>, prefill: Rc<RefCell<SparkLink<'a>>>, runtime: Rc<tokio::runtime::Runtime> },
+    Spark { decode: Rc<RefCell<SparkLink<'a>>>, prefill: Rc<RefCell<SparkLink<'a>>>,
+        second: RefCell<Option<Rc<RefCell<SparkLink<'a>>>>>, runtime: Rc<tokio::runtime::Runtime> },
 }
 
 /// A dispatched Spark wave and its send-side host phases (seconds).
@@ -806,10 +807,20 @@ impl<'a> MimoEngine<'a> {
             graph_storage_observed_bytes: std::array::from_fn(|_| Cell::new(0)), late_captures: Cell::new(0) })
     }
 
+    pub(super) fn take_decode_view(&self) -> Result<Option<Self>> {
+        let Some(Experts::Spark { second, .. }) = &self.experts else { return Ok(None) };
+        // Keep the warmed endpoint in the enclosing engine until the complete
+        // view exists, so partial construction cannot drop its queued owners.
+        let link = second.borrow().as_ref().map(Rc::clone);
+        let view = link.map(|link| self.decode_view(link)).transpose()?;
+        second.borrow_mut().take();
+        Ok(view)
+    }
+
     /// A decode-only view shares model/KV and serialized RTX package owners,
     /// but never graph operands, peer slots, route checks or draft scratch.
     /// The enclosing lane owner must retire all views together.
-    pub(super) fn decode_view(&self, decode: SparkLink<'a>) -> Result<Self> {
+    fn decode_view(&self, decode: Rc<RefCell<SparkLink<'a>>>) -> Result<Self> {
         ensure!(self.mtp.is_none(), "independent MiMo decode views require DFlash or no drafter");
         let Some(Experts::Spark { prefill, runtime, .. }) = &self.experts else {
             anyhow::bail!("independent MiMo decode views require Spark experts");
@@ -846,8 +857,8 @@ impl<'a> MimoEngine<'a> {
             pages: self.pages, rings: self.rings, family: self.family, device: self.device,
             split_family: self.split_family, peer, exchange, kv: self.kv.clone(),
             workspace: RefCell::new(None), decode_workspace: RefCell::new(None), prefill_kv_wide: RefCell::new(None),
-            experts: Some(Experts::Spark { decode: Rc::new(RefCell::new(decode)),
-                prefill: Rc::clone(prefill), runtime: Rc::clone(runtime) }), tp2, rtx_local: self.rtx_local.clone(),
+            experts: Some(Experts::Spark { decode,
+                prefill: Rc::clone(prefill), second: RefCell::new(None), runtime: Rc::clone(runtime) }), tp2, rtx_local: self.rtx_local.clone(),
             expert_input: self.expert_input, profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
             wave_timing: self.wave_timing, drafter: self.drafter.as_ref().map(|draft| draft.execution_view()).transpose()?,
             l2: None, mtp: None, embedding: Rc::clone(&self.embedding),
@@ -1200,12 +1211,18 @@ impl<'a> MimoEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>)->Result<()>) -> Result<()> {
         let mut failures=Vec::new();
-        if let Some(Experts::Spark { decode, prefill, .. }) = &self.experts {
+        if let Some(Experts::Spark { decode, prefill, second, .. }) = &self.experts {
             for transport in [decode, prefill] {
                 let result = transport.try_borrow_mut().map_err(anyhow::Error::from)
                     .and_then(|mut link| action(&mut link));
                 if let Err(error) = result { failures.push(format!("{error:#}")); }
             }
+            let result = second.try_borrow().map_err(anyhow::Error::from)
+                .and_then(|link| link.as_ref().map_or(Ok(()), |link| {
+                    link.try_borrow_mut().map_err(anyhow::Error::from)
+                        .and_then(|mut link| action(&mut link))
+                }));
+            if let Err(error) = result { failures.push(format!("{error:#}")); }
         }
         ensure!(failures.is_empty(),"{}",failures.join("; "));
         Ok(())
@@ -2821,7 +2838,7 @@ impl<'a> MimoEngine<'a> {
         let bf16_input = self.expert_bf16_input(decode);
         self.moe_front(w, layer, t, bf16_input)?;
         match experts {
-            Experts::Spark { decode: decode_link, prefill, runtime } => {
+            Experts::Spark { decode: decode_link, prefill, runtime, .. } => {
                 let transport = if decode { decode_link } else { prefill };
                 self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
             }

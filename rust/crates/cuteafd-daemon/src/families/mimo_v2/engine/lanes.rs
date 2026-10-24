@@ -146,6 +146,11 @@ impl<'e, 'a> DecodeLanes<'e, 'a> {
         })
     }
 
+    pub(in super::super) fn install_second(&mut self, second: Option<MimoEngine<'a>>) {
+        assert!(self.second.is_none(), "second decode view already installed");
+        self.second = second;
+    }
+
     pub(in super::super) fn has_second(&self) -> bool { self.second.is_some() }
 
     pub(in super::super) fn retire(&self) -> Result<()> {
