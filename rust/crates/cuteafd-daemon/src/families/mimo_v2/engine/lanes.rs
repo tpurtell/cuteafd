@@ -64,10 +64,18 @@ impl<'e, 'a> DecodeLanes<'e, 'a> {
     pub(in super::super) fn prepare(&self, probe: bool) -> Result<usize> {
         self.operation(|| {
             let mut graphs = 0;
-            for view in std::iter::once(self.first).chain(self.second.as_ref()) {
-                graphs += view.capture_decode_graphs(super::DECODE_ROWS)?;
-                view.check_tp2_routers()?;
-                if probe { view.arm_draft_probe()?; }
+            graphs += self.first.capture_decode_graphs(super::DECODE_ROWS)?;
+            self.first.check_tp2_routers()?;
+            if probe { self.first.arm_draft_probe()?; }
+            if let Some(second) = &self.second {
+                graphs += second.capture_decode_graphs(super::DECODE_ROWS)?;
+                second.check_tp2_decode_routers(self.first)?;
+                if probe { second.arm_draft_probe()?; }
+                anyhow::ensure!(second.workspace.borrow().is_none()
+                    && second.prefill_kv_wide.borrow().is_none()
+                    && second.peer.as_ref().is_none_or(|peer| peer.workspace.borrow().is_none()
+                        && peer.prefill_kv_wide.borrow().is_none()),
+                    "decode-only view acquired an unadmitted prefill allocation");
             }
             Ok(graphs)
         })
