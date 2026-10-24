@@ -45,6 +45,9 @@ impl EgressBuffer {
         (start >= base && start + payload.len() <= base + self.host.bytes).then(|| start - base)
     }
 
+    /// The slot a payload at buffer offset `offset` lies in.
+    pub(crate) fn slot_of(&self, offset: usize) -> usize { offset / self.slot_bytes }
+
     /// The slot is writable only after its last request owner has gone.
     pub(crate) fn writable(&self, slot: usize) -> bool {
         self.views.get(slot).is_some_and(views_writable)

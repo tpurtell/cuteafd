@@ -24,6 +24,17 @@ pub(super) struct Target {
     pub rkey: u32,
 }
 
+/// Send-queue entries for `depth` frames of up to `frame_bytes` each, every
+/// frame split into one WR per chunk. Posting a full ring of chunked frames
+/// then never waits for a completion: the posting thread is the inference
+/// owner, and a queue sized to the ring depth alone would hold it inside
+/// `post` for nearly the whole transfer of a large frame.
+pub(super) fn send_queue_depth(depth: u32, frame_bytes: usize) -> Result<u32> {
+    // Chunks per frame (its head is one of them) plus one spare entry.
+    let parts = u32::try_from(frame_bytes.div_ceil(CHUNK_BYTES).max(1) + 1)?;
+    depth.checked_mul(parts).context("send queue depth overflow")
+}
+
 /// Whether a session of this request capacity can carry a WRITE tail.
 pub(super) fn needs_target(request_capacity_wire_bytes: usize) -> bool {
     request_capacity_wire_bytes > CHUNK_BYTES
@@ -70,23 +81,26 @@ impl Credits {
 /// still owns its slot and still receives the parts posted after it.
 #[derive(Debug, Default)]
 pub(super) struct SendQueue {
-    /// (WRs posted and not completed, head SEND posted), oldest first.
-    requests: VecDeque<(usize, bool)>,
+    /// Per request, oldest first: WRs posted and not completed, whether its
+    /// head SEND is posted, and the registered egress slot its payload reads.
+    requests: VecDeque<Pending>,
     pub in_flight: usize,
 }
+#[derive(Debug, Clone, Copy)]
+struct Pending { parts: usize, sealed: bool, egress: Option<usize> }
 impl SendQueue {
-    pub fn posted_request(&mut self) -> Result<()> {
-        anyhow::ensure!(self.requests.back().is_none_or(|&(_, sealed)| sealed),
+    pub fn posted_request(&mut self, egress: Option<usize>) -> Result<()> {
+        anyhow::ensure!(self.requests.back().is_none_or(|p| p.sealed),
             "request staged before the previous request's head SEND was posted");
-        self.requests.push_back((0, false));
+        self.requests.push_back(Pending { parts: 0, sealed: false, egress });
         Ok(())
     }
     /// One WR of the newest request; `head` marks its final (head SEND) part.
     pub fn posted_part(&mut self, head: bool) -> Result<()> {
-        let (parts, sealed) = self.requests.back_mut().context("request part without a request")?;
-        anyhow::ensure!(!*sealed, "request part posted after its head SEND");
-        *parts += 1;
-        *sealed = head;
+        let pending = self.requests.back_mut().context("request part without a request")?;
+        anyhow::ensure!(!pending.sealed, "request part posted after its head SEND");
+        pending.parts += 1;
+        pending.sealed = head;
         self.in_flight += 1;
         Ok(())
     }
@@ -96,19 +110,23 @@ impl SendQueue {
         self.in_flight -= count;
         let mut index = 0;
         while count > 0 {
-            let (parts, _) = self.requests.get_mut(index).context("request send completion without a request")?;
-            let taken = count.min(*parts);
-            *parts -= taken;
+            let pending = self.requests.get_mut(index).context("request send completion without a request")?;
+            let taken = count.min(pending.parts);
+            pending.parts -= taken;
             count -= taken;
             index += 1;
         }
-        while self.requests.front().is_some_and(|&(parts, sealed)| parts == 0 && sealed) {
+        while self.requests.front().is_some_and(|p| p.parts == 0 && p.sealed) {
             self.requests.pop_front();
         }
         Ok(())
     }
     /// Requests that still own their source slot.
     pub fn requests_in_flight(&self) -> usize { self.requests.len() }
+    /// Whether some unretired request still reads registered egress `slot`.
+    pub fn reads_egress(&self, slot: usize) -> bool {
+        self.requests.iter().any(|p| p.egress == Some(slot))
+    }
 }
 
 /// A staged request whose parts are being posted.
@@ -203,7 +221,8 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let wr_id = VERBS_HOST_SEND_WR_ID + (self.request_send_sequence % self.request_ring.depth) as u64;
         // The worker's slot for this sequence; released by its final reply.
         self.request_credits.acquire(self.request_ring.depth)?;
-        self.request_sends.posted_request()?;
+        let egress_slot = payload_region.and_then(|(_, at)| self.egress.as_ref().map(|(buffer, _)| buffer.slot_of(at)));
+        self.request_sends.posted_request(egress_slot)?;
         self.request_send_sequence = self.request_send_sequence.wrapping_add(1);
         Ok(Upload { wr_id, slot_offset, remote, prefix_bytes, payload_region, bytes, cursor: bytes.min(CHUNK_BYTES), sent: false,
             timing: VerbsHostProtocolV2ChunkSubmissionTiming { total_started,
@@ -285,6 +304,29 @@ mod tests {
     }
 
     #[test]
+    fn send_queue_holds_a_full_ring_of_chunked_frames() -> Result<()> {
+        assert_eq!(send_queue_depth(8, 96)?, 16);
+        assert_eq!(send_queue_depth(8, CHUNK_BYTES + 1)?, 24);
+        assert_eq!(send_queue_depth(8, 26_509_408)?, 8 * 103);
+        // A full ring of full-capacity MiMo requests (26,509,408 B, 102 WRs
+        // each) posts in one pass: no part ever finds the queue full.
+        for (depth, frame) in [(1u32, 26_509_408usize), (2, 26_509_408), (8, 26_509_408), (8, 33_816_672), (8, 96)] {
+            let max = send_queue_depth(depth, frame)? as usize;
+            let mut queue = SendQueue::default();
+            for _ in 0..depth {
+                queue.posted_request(None)?;
+                let parts = parts(frame).count();
+                for part in 0..parts {
+                    assert!(queue.in_flight < max, "posting would wait for a completion");
+                    queue.posted_part(part + 1 == parts)?;
+                }
+            }
+            assert!(queue.in_flight < max);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn worker_slot_credit_follows_final_replies_only() -> Result<()> {
         for depth in [1, 2, 3, 8] {
             let mut credits = Credits::default();
@@ -308,7 +350,7 @@ mod tests {
     fn source_slots_free_only_after_every_part_completes() -> Result<()> {
         let mut queue = SendQueue::default();
         for parts in [102, 1, 3] {
-            queue.posted_request()?;
+            queue.posted_request(None)?;
             for part in 0..parts { queue.posted_part(part + 1 == parts)?; }
         }
         assert_eq!((queue.in_flight, queue.requests_in_flight()), (106, 3));
@@ -322,13 +364,32 @@ mod tests {
         queue.completed(1)?;
         assert_eq!((queue.in_flight, queue.requests_in_flight()), (0, 0));
         // A staged request owns its slot before any part is posted.
-        queue.posted_request()?;
+        queue.posted_request(None)?;
         assert_eq!(queue.requests_in_flight(), 1);
-        assert!(queue.posted_request().is_err(), "second request staged before the first was sealed");
+        assert!(queue.posted_request(None).is_err(), "second request staged before the first was sealed");
         queue.posted_part(true)?;
         assert!(queue.posted_part(false).is_err(), "part after the head SEND");
         queue.completed(1)?;
         assert_eq!(queue.requests_in_flight(), 0);
+        Ok(())
+    }
+
+    /// Rewriting egress slot `w % N` waits only for the requests that read
+    /// that slot (wave `w - N`), not for every wave still on the wire.
+    #[test]
+    fn egress_slot_reuse_waits_only_for_its_own_readers() -> Result<()> {
+        let mut queue = SendQueue::default();
+        for slot in [0, 1, 2] {
+            queue.posted_request(Some(slot))?;
+            for part in 0..102 { queue.posted_part(part == 101)?; }
+        }
+        assert!(queue.reads_egress(0) && queue.reads_egress(2));
+        queue.completed(102)?;
+        assert!(!queue.reads_egress(0), "slot 0 is free once its own wave completed");
+        assert!(queue.reads_egress(1) && queue.reads_egress(2));
+        queue.posted_request(None)?; // a decode-sized copied frame reads no egress
+        queue.posted_part(true)?;
+        assert!(!queue.reads_egress(0));
         Ok(())
     }
 
@@ -353,7 +414,7 @@ mod tests {
                         let all = queue.in_flight;
                         queue.completed(all)?;
                     }
-                    queue.posted_request()?;
+                    queue.posted_request(None)?;
                     uploads.push(parts(bytes).peekable());
                 }
                 let mut round = 0;
@@ -372,7 +433,7 @@ mod tests {
                 }
                 for queue in &mut ranks {
                     assert!(queue.requests_in_flight() <= depth);
-                    assert!(queue.requests.back().is_some_and(|&(_, sealed)| sealed));
+                    assert!(queue.requests.back().is_some_and(|p| p.sealed));
                 }
             }
             for queue in &mut ranks {

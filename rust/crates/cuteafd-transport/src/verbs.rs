@@ -2348,12 +2348,13 @@ impl VerbsHostProtocolV2PersistentClientSession {
         self.post_request(request, config)
     }
 
-    /// Waits until every request this session posted has left (its send
-    /// completed), so a shared egress buffer may be rewritten.
-    fn drain_request_sends(&mut self, config: &TcpTransportConfig) -> Result<()> {
+    /// Waits until no request of this session still reads egress `slot`, so
+    /// that slot may be rewritten. Later waves' sends (other slots) keep going.
+    fn drain_egress_reads(&mut self, slot: usize, config: &TcpTransportConfig) -> Result<()> {
         let started = Instant::now();
-        while self.request_sends.in_flight > 0 {
-            self.try_reap_request_sends()?;
+        self.try_reap_request_sends()?;
+        while self.request_sends.reads_egress(slot) {
+            self.wait_request_send(config.timeout)?;
             anyhow::ensure!(started.elapsed() < config.timeout, "request sends never completed");
         }
         Ok(())
@@ -3497,11 +3498,15 @@ impl NativeRdmaEndpoint {
             other => bail!("unsupported verbs-host RDMA endpoint role: {other}"),
         };
         let rdma_device = rdma_device.context("RDMA endpoint requires an address-selected device/port/GID")?;
+        let send_depth = request_write::send_queue_depth(queue_depth, send_frame_bytes)?;
         let info = library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
             &rdma_device.device, rdma_device.port, rdma_device.gid_index, local_psn,
             send_frame_bytes, recv_frame_bytes, send_span, recv_span,
-            queue_depth, queue_depth, max_sge, host_buffer_flags,
+            send_depth, queue_depth, max_sge, host_buffer_flags,
         )?;
+        anyhow::ensure!(info.max_send_wr >= send_depth,
+            "RDMA endpoint send queue {} is below the {send_depth} WRs a full ring of chunked frames posts",
+            info.max_send_wr);
         Ok(Self { library, info, terminal_owner: None, credits: EndpointCredits::default(),
             traffic: crate::traffic::register(&rdma_device.device, rdma_device.port, "", c_char_array_to_string(&info.gid_hex), info.active_mtu) })
     }

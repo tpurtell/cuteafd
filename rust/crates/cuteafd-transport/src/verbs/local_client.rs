@@ -208,7 +208,7 @@ impl LocalTp4Client {
         anyhow::ensure!(buffer.writable(self.egress_slot), "a request still views the egress buffer");
         let host = buffer.target(self.egress_slot)?;
         for session in self.sessions.iter_mut().flatten() {
-            session.drain_request_sends(&self.config)?;
+            session.drain_egress_reads(self.egress_slot, &self.config)?;
         }
         Ok(host)
     }
