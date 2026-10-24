@@ -6,13 +6,14 @@ use anyhow::Result;
 use cuteafd_engine::prefix::{PrefixCache, PrefixFamily};
 use cuteafd_hostcache::copy::Stream;
 
-/// Unlike request/grammar metadata, these owners contain CUDA allocations or
-/// pinned storage addressed by asynchronous compute and host-copy queues.
+/// Keep request media and grammar owners with the CUDA and pinned storage
+/// addressed by asynchronous compute and host-copy queues.
 struct Buffers<'e, 'a> {
     prefix: Option<(MimoPrefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)>,
     selector: Option<TokenSelector<'a>>,
     second_selector: Option<TokenSelector<'a>>,
     lanes: DecodeLanes<'e, 'a>,
+    active: Vec<super::serve::Active<'a>>,
 }
 
 /// Installed before the first serving-owned GPU buffer is created. This also
@@ -29,7 +30,7 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
 
     pub(super) fn with_lanes(engine: &'e MimoEngine<'a>, second: Option<MimoEngine<'a>>) -> Self {
         Self { engine, buffers: Some(Buffers { prefix: None, selector: None,
-            second_selector: None, lanes: DecodeLanes::new(engine, second) }) }
+            second_selector: None, lanes: DecodeLanes::new(engine, second), active: Vec::new() }) }
     }
 
     pub(super) fn prepare(&mut self, select: crate::shared::token_io::SelectPlacement,
@@ -46,6 +47,7 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
             buffers.second_selector.as_mut().unwrap().reserve_sampler()?;
         }
         buffers.lanes.prepare(probe)
+
     }
 
     pub(super) fn prefix(&mut self, family: MimoPrefix<'e, 'a>, cache: PrefixCache<CudaCopyEngine<'a>>) {
@@ -61,6 +63,14 @@ impl<'e, 'a> ServingOwners<'e, 'a> {
         let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
         let selector = buffers.selector.as_mut().expect("initialized serving selector");
         (family, cache, selector)
+    }
+
+    pub(super) fn scheduler_parts(&mut self) -> (&MimoPrefix<'e, 'a>,
+        &mut PrefixCache<CudaCopyEngine<'a>>, &mut TokenSelector<'a>, &mut Vec<super::serve::Active<'a>>) {
+        let buffers = self.buffers.as_mut().expect("live serving owners");
+        let (family, cache) = buffers.prefix.as_mut().expect("initialized serving prefix");
+        let selector = buffers.selector.as_mut().expect("initialized serving selector");
+        (family, cache, selector, &mut buffers.active)
     }
 }
 
