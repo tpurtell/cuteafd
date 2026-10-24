@@ -254,3 +254,32 @@ def test_implicit_mimo_host_cache_matches_effective_serve_argv(enabled: str) -> 
     assert serve.count("--host-cache-bytes") == 1
     assert actual == "auto"
     assert plan[plan.index("--host-cache-bytes") + 1] == actual
+
+
+@pytest.mark.parametrize("card,lanes,concurrency,resolved", [
+    ("v41-flash-max", "2", "16", "2"),
+    ("mimo-pro-max", "1", "16", "1"),
+    ("mimo-pro-max", "2", "16", "2"),
+    ("mimo-pro-max", "2", "1", "1"),
+    ("glm53-exl3-max", "1", "16", None),
+])
+def test_decode_lanes_forward_planner_resolution(card, lanes, concurrency, resolved):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    entry["set"].update(DECODE_LANES=lanes, CONCURRENCY=concurrency)
+    result = capture(ROOT, "decode-" + card + "-" + lanes + "-" + concurrency, release_entry=entry)
+    plan = result["plans"][0]
+    assert plan[plan.index("--decode-lanes") + 1] == lanes
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if resolved is None:
+        assert "--decode-lanes" not in command
+    else:
+        assert command[command.index("--decode-lanes") + 1] == resolved
+
+
+@pytest.mark.parametrize("card,lanes", [("v41-flash-max", "1"), ("glm53-exl3-max", "2"),
+    ("mimo-pro-max", "0"), ("mimo-pro-max", "3")])
+def test_decode_lanes_refuse_invalid_or_unsupported_before_serving(card, lanes):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    entry["set"]["DECODE_LANES"] = lanes
+    with pytest.raises(RuntimeError, match="unsupported --decode-lanes|DECODE_LANES must be"):
+        capture(ROOT, "decode-refuse-" + card + "-" + lanes, release_entry=entry)
