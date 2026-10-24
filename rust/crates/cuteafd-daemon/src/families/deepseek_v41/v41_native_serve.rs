@@ -129,7 +129,8 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
-    cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    args.decode_lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes),
+        u64::from(args.concurrency))?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -489,7 +490,7 @@ fn worker(
     };
     let mut draft = draft_weights
         .as_ref()
-        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency))
+        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency, args.decode_lanes))
         .transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_draft_limit(args.dspark_draft_limit)?;

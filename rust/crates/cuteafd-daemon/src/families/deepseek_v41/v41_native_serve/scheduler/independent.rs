@@ -94,7 +94,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     r.as_ref().filter(|r| r.lane() == lane).map(|_| slot)).collect()
             };
             if members.is_empty() { return Ok(()); }
-            ensure!(members.len() <= 8, "independent lane exceeds eight requests");
+            ensure!(members.len() <= active.borrow().len(), "independent lane exceeds the configured concurrency");
             let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
             let started = Instant::now();
             // Reserve target capacity and snapshot this lane's seeds, then release

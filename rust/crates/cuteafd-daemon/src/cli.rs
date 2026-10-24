@@ -1068,7 +1068,8 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub(crate) struct NativeServeArgs {
-    /// V4.1 has a fixed pair of decode views; 1 is unsupported.
+    /// Decode lanes (1 or 2). Both lanes' owners are allocated either way; one
+    /// lane routes every request to lane zero (one batch per round).
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub decode_lanes: u8,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
