@@ -477,7 +477,11 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert options.pop("compile_only") is True
         assert options == expected[(values[0].parent.name, values[3])]
     if compact:
-        assert not any(options.get("warp_specialized") for _, options in recorded)
+        # Qwen4 compact now carries measured warp-specialized cells at the
+        # served capacities and keeps the cooperative kernel at decode ones;
+        # the gate must reproduce both streams.
+        assert any(options.get("warp_specialized") for _, options in recorded)
+        assert any(not options.get("warp_specialized") for _, options in recorded)
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
         assert any(options.get("warp_specialized") for _, options in recorded) == (

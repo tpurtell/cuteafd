@@ -419,10 +419,16 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
 COMPACT_WS_CELLS = {
     ('glm', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
     ('glm', 768): {256: 64, 1024: 64, 2752: 64, 4096: 64},
+    ('v41', 640): {256: 32, 1024: 32, 2752: 64, 4096: 64},
+    ('qwen4', 384): {256: 32, 1024: 64, 2752: 64, 4096: 64},
+    # TP3 and TP4 compact share width 256; one table entry serves both and
+    # takes 64 everywhere (TP3 m256 1.279x vs its 32-row arm 1.282x, TP4
+    # m256 1.334x vs 1.327x).
+    ('qwen4', 256): {256: 64, 1024: 64, 2752: 64, 4096: 64},
 }
 # Measured tier families of the compact WS cells; a different tier pair is a
 # different cell and stays cooperative until it is measured.
-COMPACT_WS_BITS = {('glm', (4, 5))}
+COMPACT_WS_BITS = {('glm', (4, 5)), ('v41', (3, 4)), ('qwen4', (4, 5))}
 
 
 def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -461,11 +467,22 @@ def compact_warp_specialized(geometry: str, role: str, width: int, capacity: int
     output and three replays over poisoned workspaces are bitwise equal to
     the cooperative oracle.
 
+    V4.1 K3/K4 TP4 compact width 640 follows the same ranking on uniform
+    top-6 routes: cooperative -> best arm, ms, at m4096 21.51 -> 13.40
+    (1.61x, 64-row), m2752 16.78 -> 9.64 (1.74x, 64-row), m1024 8.43 ->
+    6.46 (1.31x, 32-row), m256 6.38 -> 5.53 (1.15x, 32-row). Qwen4 K4/K5
+    TP2 compact width 384 on layer-23 recorded histograms: m4096 11.54 ->
+    7.52 (1.53x, 64-row), m2752 8.48 -> 5.57 (1.52x), m1024 4.39 -> 3.15
+    (1.39x), m256 2.33 -> 1.93 (1.21x, 32-row). Qwen4 TP3 and TP4 compact
+    width 256 both take 64-row blocks at every capacity (TP4 m4096 9.02 ->
+    4.79, 1.88x; TP3 m4096 10.14 -> 5.75, 1.76x).
+
     Qualification is the measured capacity set of each listed cell only;
     every other width, family and capacity stays cooperative.
     `compact_ws_export` adds the measured tier family (`COMPACT_WS_BITS`:
-    GLM 5.3 K4/K5 only), so the same geometry with another tier pair
-    (GLM 5.3 K3/K4) stays cooperative until that cell is measured.
+    GLM 5.3 K4/K5, V4.1 K3/K4, Qwen K4/K5), so the same geometry with
+    another tier pair (GLM 5.3 K3/K4) stays cooperative until that cell is
+    measured.
     """
     return role == 'spark' and capacity in COMPACT_WS_CELLS.get((geometry, width), ())
 
