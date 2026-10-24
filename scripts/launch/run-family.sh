@@ -1114,8 +1114,8 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
   --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
 release_validate_deployment "$count_plan" deepseek_v41
-resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
-  release_die "DeepSeek V4.1 deployment requires two decode lanes"
+resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$count_plan")" ||
+  release_die "DeepSeek V4.1 deployment does not name a supported decode lane count"
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   [[ "$selected_count" == "$SPARK_COUNT" ]] || release_die "planner changed exact Spark count $SPARK_COUNT to $selected_count"

@@ -1189,7 +1189,7 @@ mod tests {
             .build()?;
         let draft_weights = devices[1].own(|| DsparkWeights::load(&lib, &catalog, 80, 1, 32usize << 30, 16 << 20))?;
         let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
-            devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
+            devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2, 2)?;
         draft.admit(91001)?;
         let lease = requests.admit(0, 91001)?;
         let mut tokens = vec![100u32, 200, 300, 400];
@@ -1402,7 +1402,7 @@ mod tests {
             let id = 93000 + chunk_rows as u64;
             let lease = requests.admit(0, id)?;
             let mut draft = crate::families::deepseek_v41::v41_native_serve::speculative::DraftRuntime::with_distributed_requests(
-                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2)?;
+                devices, &draft_weights, &table, [&vocab[0], &vocab[1]], 16, 2, 2)?;
             draft.admit(id)?;
             let anchor = crate::families::deepseek_v41::v41_native_serve::prefill_target::exercise_prefill(&lib, &runtime,
                 &mut pass, &mut other, &mut requests, [&mut transport, &mut other_transport], lease,

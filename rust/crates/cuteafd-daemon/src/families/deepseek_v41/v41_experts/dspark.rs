@@ -243,10 +243,10 @@ impl<'library> DsparkWeights<'library> {
     /// request lanes, main contexts and windows as one exact named owner, and
     /// the loader's load phase. Marks are 0; the caller fills `marks`.
     pub fn single_inventory(library: &NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, width: usize, directory: Option<&Path>)
+        context_capacity: u32, requests: u32, decode_lanes: u8, width: usize, directory: Option<&Path>)
         -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
         use cuteafd_core::memory_layout::{Basis, Category};
-        let (resident, runtime, staging) = Self::serving_bytes(library, catalog, context_capacity, requests, width, directory)?;
+        let (resident, runtime, staging) = Self::serving_bytes(library, catalog, context_capacity, requests, decode_lanes, width, directory)?;
         // `load_serving_with_width` plans at the full request batch; its check is weights-only.
         let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
         let budget = Self::plan_with_width(library, catalog, capacity, width, directory)?;
@@ -266,14 +266,14 @@ impl<'library> DsparkWeights<'library> {
     /// later allocate; the admission solver places them as one drafter Movable.
     #[allow(clippy::too_many_arguments)]
     pub fn distributed_inventory(library: &NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, width: usize, tp2_experts: bool,
+        context_capacity: u32, requests: u32, decode_lanes: u8, width: usize, tp2_experts: bool,
         exl3_directory: Option<&Path>, split: usize, mark_bytes: usize)
         -> Result<cuteafd_loader::placement::families::deepseek_v41::DraftInventory> {
         use cuteafd_core::memory_layout::{Basis, Category};
         use cuteafd_loader::placement::Demand;
         ensure!((1..=16).contains(&requests), "invalid draft request limit");
         ensure!(!tp2_experts || catalog.native_dspark_experts(), "TP2 dSpark requires native expert weights");
-        let lanes = if requests == 1 { 1 } else { 2 };
+        let lanes = cuteafd_loader::plan::decode_lanes::draft_chains(requests.into(), decode_lanes) as u32;
         let lane_requests = requests.div_ceil(lanes);
         let capacity = DsparkAttentionWave::projection_capacity_with_width(requests, width)?;
         let experts = if tp2_experts { DraftExpertKind::Tp2 }
@@ -324,9 +324,9 @@ impl<'library> DsparkWeights<'library> {
 
     /// Exact single-coordinator serving owners, before reading any payload.
     pub fn serving_bytes(library: &NativeLibrary, catalog: &OfficialV41Catalog,
-        context_capacity: u32, requests: u32, width: usize, directory: Option<&Path>) -> Result<(usize, usize, usize)> {
+        context_capacity: u32, requests: u32, decode_lanes: u8, width: usize, directory: Option<&Path>) -> Result<(usize, usize, usize)> {
         ensure!((1..=16).contains(&requests), "invalid draft request limit");
-        let lanes = if requests == 1 { 1 } else { 2 };
+        let lanes = cuteafd_loader::plan::decode_lanes::draft_chains(requests.into(), decode_lanes) as u32;
         let members = requests.div_ceil(lanes);
         let capacity = DsparkAttentionWave::projection_capacity_with_width(members, width)?;
         let budget = Self::plan_with_width(library, catalog, capacity, width, directory)?;

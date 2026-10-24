@@ -177,7 +177,7 @@ pub(super) fn admit_startup(
             &args.native_lib, tiers, "dspark");
         let mut draft =
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
-                lib, catalog, capacity, args.concurrency,
+                lib, catalog, capacity, args.concurrency, args.decode_lanes,
                 if args.dspark_draft_limit > 5 { 7 } else { 5 }, Some(&directory))?;
         startup.extend(target_owners.draft_load_phases(&draft)?);
         draft.marks = resident::prefix_arena_bytes(slots, true, 1)[0]

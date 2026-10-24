@@ -288,7 +288,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
-            &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
+            &lib, &catalog, capacity, args.concurrency, args.decode_lanes, draft_width, args.tp2_dspark_experts,
             Some(&dspark_directory), 64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
@@ -340,8 +340,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
         // The loaded weights size their lane chains through the same shape the
         // pre-load inventory used; any divergence is an accounting defect.
-        let lane_requests = args.concurrency.div_ceil(if args.concurrency == 1 { 1 } else { 2 });
-        let lanes = if args.concurrency == 1 { 1 } else { 2 };
+        let lanes = cuteafd_loader::plan::decode_lanes::draft_chains(args.concurrency.into(), args.decode_lanes) as usize;
+        let lane_requests = args.concurrency.div_ceil(lanes as u32);
         let loaded = devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain::device_bytes(
             weights, lane_requests, 64640))?;
         for (gpu, bytes) in loaded.iter().enumerate() {
@@ -351,7 +351,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         }
     }
     let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
-        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
+        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency, args.decode_lanes)).transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_draft_limit(args.dspark_draft_limit)?;
         draft.set_fixed(args.dspark_fixed);
