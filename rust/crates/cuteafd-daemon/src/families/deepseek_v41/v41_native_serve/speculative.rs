@@ -74,17 +74,17 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
         head: &'w VocabularyHead<'a>,
         capacity: u32,
     ) -> Result<Self> {
-        Self::with_requests(lib, weights, table, head, capacity, 16)
+        Self::with_requests(lib, weights, table, head, capacity, 16, 2)
     }
     pub fn with_requests(
         lib: &'a NativeLibrary, weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, head: &'w VocabularyHead<'a>,
-        capacity: u32, requests: u32,
+        capacity: u32, requests: u32, decode_lanes: u8,
     ) -> Result<Self> {
         ensure!((1..=16).contains(&requests), "invalid draft request limit");
         let window = || DsparkWindow::new(lib, requests as usize, capacity,
             DsparkWindow::device_bytes(requests as usize, capacity)?);
-        let lane_count = if requests == 1 { 1 } else { 2 };
+        let lane_count = cuteafd_loader::plan::decode_lanes::draft_chains(requests.into(), decode_lanes) as usize;
         let lane_requests = requests.div_ceil(lane_count as u32);
         let shared_bytes = weights.draft_bytes(requests)?;
         let lane_bytes = weights.draft_bytes(lane_requests)?;

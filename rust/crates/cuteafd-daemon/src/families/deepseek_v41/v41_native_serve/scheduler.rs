@@ -291,7 +291,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 retire_request(entry.take().unwrap(), requests, &mut prefixes, draft.as_deref_mut())?;
             }
         }
-        let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
+        let mut loads = crate::shared::serve::lanes::rebalance(args.decode_lanes, &mut active,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
         // Admit available work at a completed boundary. Prefill currently owns
@@ -453,7 +453,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
             (prepared, id, lease, slot, image_keys, hit, restore)
             };
-            let lane = usize::from(loads[1] < loads[0]);
+            let lane = cuteafd_loader::plan::decode_lanes::assign(args.decode_lanes, loads);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
@@ -1365,7 +1365,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 ) -> Result<()> {
     let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
-    ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
+    ensure!(!members.is_empty() && members.len() <= active.len(), "invalid single decode lane");
     let speculative = draft.is_some();
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,

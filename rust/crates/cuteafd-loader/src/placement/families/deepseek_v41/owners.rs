@@ -231,9 +231,9 @@ impl<'a> NativePrograms<'a> {
     /// Decoder-local default dSpark: request chains are independent by lane;
     /// main-context producers and committed windows are shared across them.
     /// `experts` is the published coordinator (not RTX backbone) manifest.
-    pub fn dspark(&self, experts: &Value, rows: u64, requests: u64, width: u64,
+    pub fn dspark(&self, experts: &Value, rows: u64, requests: u64, decode_lanes: u8, width: u64,
         ranks: usize, fp8_head: bool) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && (1..=16).contains(&requests)
+        ensure!((1..=4096).contains(&rows) && (1..=16).contains(&requests) && matches!(decode_lanes, 1 | 2)
             && matches!(width, 5 | 7) && matches!(ranks, 1 | 2), "invalid V4.1 draft owners");
         ensure!(experts["role"].as_str() == Some("coordinator"), "dSpark expert manifest role mismatch");
         ensure!(experts["input_format"].as_str() == Some("bf16"),
@@ -242,7 +242,7 @@ impl<'a> NativePrograms<'a> {
             ("kernel_intermediate", 2304), ("experts", 128), ("topk", 3)] {
             ensure!(experts["geometry"][key].as_u64() == Some(expected), "dSpark expert geometry mismatch: {key}");
         }
-        let lanes = if requests == 1 { 1 } else { 2 };
+        let lanes = crate::plan::decode_lanes::draft_chains(requests, decode_lanes);
         let members = requests.div_ceil(lanes);
         let live = members * width;
         let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= 80 { 80 } else { 256 };
@@ -466,8 +466,8 @@ mod tests {
         let programs = NativePrograms::new(&manifest, 188)?;
         let experts = experts();
         for ranks in [1, 2] {
-            let one = programs.dspark(&experts, 1024, 1, 5, ranks, false)?;
-            let two = programs.dspark(&experts, 1024, 2, 5, ranks, false)?;
+            let one = programs.dspark(&experts, 1024, 1, 2, 5, ranks, false)?;
+            let two = programs.dspark(&experts, 1024, 2, 2, 5, ranks, false)?;
             let decoder = (ranks - 1) as u8;
             for rank in 0..ranks as u8 {
                 assert_eq!(owner(&two, rank, "dSpark request lanes"),
@@ -479,7 +479,7 @@ mod tests {
                 - owner(&one, decoder, "dSpark windows"), 3 * 128 * 528);
             for requests in 1..=16 {
                 for width in [5, 7] {
-                    let demands = programs.dspark(&experts, 1024, requests, width, ranks, true)?;
+                    let demands = programs.dspark(&experts, 1024, requests, 2, width, ranks, true)?;
                     assert!(demands.iter().all(|d| d.category == Category::Drafter));
                     assert_eq!(owner(&demands, decoder, "dSpark windows"),
                         3 * (requests * 128 * 528 + 1024 * 1024 + 384));
@@ -489,15 +489,15 @@ mod tests {
         for (key, value) in [("input_format", json!("fp8")), ("role", json!("rtx_backbone"))] {
             let mut bad = experts.clone();
             bad[key] = value;
-            assert!(programs.dspark(&bad, 256, 1, 5, 1, false).is_err());
+            assert!(programs.dspark(&bad, 256, 1, 2, 5, 1, false).is_err());
         }
         let mut bad = experts.clone();
         bad["geometry"]["kernel_intermediate"] = 2560.into();
-        assert!(programs.dspark(&bad, 256, 1, 5, 1, false).is_err());
+        assert!(programs.dspark(&bad, 256, 1, 2, 5, 1, false).is_err());
         let mut duplicate = experts.clone();
         let variant = duplicate["variants"][0].clone();
         duplicate["variants"].as_array_mut().unwrap().push(variant);
-        assert!(programs.dspark(&duplicate, 256, 1, 5, 1, false).is_err());
+        assert!(programs.dspark(&duplicate, 256, 1, 2, 5, 1, false).is_err());
         Ok(())
     }
 

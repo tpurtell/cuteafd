@@ -7,6 +7,38 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 #[test]
+fn planner_rejects_unsupported_decode_views_before_family_layout() {
+    let glm = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
+    let v41 = tempfile::tempdir().unwrap();
+    write_v41_snapshot(v41.path());
+    let options = PlanOptions { decode_lanes: Some(2), ..Default::default() };
+    let error = plan(glm.path(), &options).unwrap_err();
+    assert!(matches!(&error, PlanError::UnsupportedOption { family: actual, value: 2, .. } if actual == "glm5"));
+    assert!(error.to_string().contains("unsupported --decode-lanes"));
+    // V4.1 routes one or two lanes over its allocated pair; the default stays two.
+    for (requested, expected) in [(None, 2), (Some(1), 1), (Some(2), 2)] {
+        let options = PlanOptions { decode_lanes: requested, ..Default::default() };
+        assert_eq!(plan(v41.path(), &options).unwrap().decode_lanes, expected);
+    }
+    let options = PlanOptions { decode_lanes: Some(3), ..Default::default() };
+    assert!(matches!(plan(v41.path(), &options), Err(PlanError::InvalidOption { .. })));
+    let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    for concurrency in [1, 16] {
+        let options = PlanOptions { decode_lanes: Some(2),
+            layout: Some(layout::LayoutOptions { concurrency, ..Default::default() }), ..Default::default() };
+        assert!(matches!(plan(mimo.path(), &options), Err(PlanError::UnsupportedOption { value: 2, .. })));
+    }
+    for (requested, concurrency, expected) in [(None, 16, 1), (Some(1), 16, 1), (Some(1), 1, 1)] {
+        let options = PlanOptions { decode_lanes: requested,
+            layout: Some(layout::LayoutOptions { concurrency, host_memory: Some((128 << 30, 128 << 30)),
+                ..Default::default() }), ..Default::default() };
+        let report = plan(mimo.path(), &options).unwrap();
+        assert_eq!(report.decode_lanes, expected);
+        assert_eq!(serde_json::to_value(&report).unwrap()["decode_lanes"], expected);
+    }
+}
+
+#[test]
 fn host_ledger_charges_resolved_quota_and_reports_other_owners_and_refusal() {
     use cuteafd_core::memory_layout::ItemLifetime;
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());

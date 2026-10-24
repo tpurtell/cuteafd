@@ -56,11 +56,15 @@ impl LaneSet {
 /// Balance a drained request cohort before admission. Preserve the first
 /// survivor migration and lane-zero tie break. Call only after both lanes
 /// release their outstanding device and transport work.
-pub(crate) fn rebalance<T>(entries: &mut [T], lane: impl Fn(&T) -> Option<usize>,
+pub(crate) fn rebalance<T>(lanes: u8, entries: &mut [T], lane: impl Fn(&T) -> Option<usize>,
     set_lane: impl Fn(&mut T, usize)) -> [usize; 2] {
     let mut loads = [0usize; 2];
     for entry in entries.iter() {
         if let Some(index) = lane(entry) { loads[index] += 1; }
+    }
+    if lanes == 1 {
+        debug_assert_eq!(loads[1], 0, "one decode lane admits on lane zero only");
+        return loads;
     }
     while loads[0].abs_diff(loads[1]) > 1 {
         let heavy = usize::from(loads[1] > loads[0]);
@@ -164,14 +168,22 @@ mod tests {
                 loads[1 - heavy] += 1;
             }
             let mut actual = original;
-            assert_eq!(rebalance(&mut actual, |entry| *entry,
+            assert_eq!(rebalance(2, &mut actual, |entry| *entry,
                 |entry, index| *entry = Some(index)), loads);
             assert_eq!(actual, expected);
             let unchanged = actual.clone();
-            assert_eq!(rebalance(&mut actual, |entry| *entry,
+            assert_eq!(rebalance(2, &mut actual, |entry| *entry,
                 |entry, index| *entry = Some(index)), loads);
             assert_eq!(actual, unchanged);
         }
+    }
+
+    #[test]
+    fn one_lane_keeps_every_request_on_lane_zero() {
+        let mut entries = vec![Some(0); 16];
+        entries.push(None);
+        assert_eq!(rebalance(1, &mut entries, |entry| *entry, |_, _| panic!("one lane never migrates")), [16, 0]);
+        assert!(entries.iter().flatten().all(|&lane| lane == 0));
     }
 
     async fn record(ran: &RefCell<Vec<usize>>, index: usize, fail: bool) -> Result<()> {

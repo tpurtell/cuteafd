@@ -106,8 +106,9 @@ fn stages(draft: f64, prepare: f64, verify: f64, commit: f64, ffn: &FfnSplit) ->
 pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     let mut layout = Layout::new("deepseek_v41", cuteafd_api::openai::MODEL.into(), args.snapshot.clone());
     layout.hardware = crate::shared::console::hardware(args.rtx_gpus as usize, args.peers.len(), false);
-    layout.split = (args.rtx_gpus > 1).then(|| "layer range · 2 lanes".to_string());
-    layout.lanes = 2;
+    layout.split = (args.rtx_gpus > 1).then(|| format!("layer range · {} lane{}", args.decode_lanes,
+        if args.decode_lanes == 1 { "" } else { "s" }));
+    layout.lanes = usize::from(args.decode_lanes);
     layout.concurrency = args.concurrency as usize;
     layout.eos = vec![1];
     layout.speculator = args.dspark.then(|| Speculator {
