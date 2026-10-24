@@ -11,12 +11,17 @@ fn planner_rejects_unsupported_decode_views_before_family_layout() {
     let glm = snapshot(glm5_config(), &glm5_tensors(|name, n, k| fp8(name, n, k, None)));
     let v41 = tempfile::tempdir().unwrap();
     write_v41_snapshot(v41.path());
-    for (path, family, lanes) in [(glm.path(), "glm5", 2), (v41.path(), "deepseek_v41", 1)] {
-        let options = PlanOptions { decode_lanes: Some(lanes), ..Default::default() };
-        let error = plan(path, &options).unwrap_err();
-        assert!(matches!(&error, PlanError::UnsupportedOption { family: actual, value, .. } if actual == family && *value == lanes));
-        assert!(error.to_string().contains("unsupported --decode-lanes"));
+    let options = PlanOptions { decode_lanes: Some(2), ..Default::default() };
+    let error = plan(glm.path(), &options).unwrap_err();
+    assert!(matches!(&error, PlanError::UnsupportedOption { family: actual, value: 2, .. } if actual == "glm5"));
+    assert!(error.to_string().contains("unsupported --decode-lanes"));
+    // V4.1 routes one or two lanes over its allocated pair; the default stays two.
+    for (requested, expected) in [(None, 2), (Some(1), 1), (Some(2), 2)] {
+        let options = PlanOptions { decode_lanes: requested, ..Default::default() };
+        assert_eq!(plan(v41.path(), &options).unwrap().decode_lanes, expected);
     }
+    let options = PlanOptions { decode_lanes: Some(3), ..Default::default() };
+    assert!(matches!(plan(v41.path(), &options), Err(PlanError::InvalidOption { .. })));
     let mimo = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     for concurrency in [1, 16] {
         let options = PlanOptions { decode_lanes: Some(2),

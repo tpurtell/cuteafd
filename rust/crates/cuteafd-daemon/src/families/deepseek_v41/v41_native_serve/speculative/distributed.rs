@@ -10,11 +10,11 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     /// no device scope survives a scheduler yield.
     pub fn with_distributed_requests(devices: [Device<'a>; 2], weights: &'w DsparkWeights<'a>,
         table: &'w NativeRtxTensors<'a>, shards: [&'w VocabularyShard<'a>; 2],
-        capacity: u32, requests: u32) -> Result<DeviceOwner<'a, Self>> {
+        capacity: u32, requests: u32, decode_lanes: u8) -> Result<DeviceOwner<'a, Self>> {
         ensure!((1..=16).contains(&requests), "invalid draft request limit");
         devices[1].own(|| {
             let lib = devices[1].library;
-            let lane_count = if requests == 1 { 1 } else { 2 };
+            let lane_count = cuteafd_loader::plan::decode_lanes::draft_chains(requests.into(), decode_lanes) as usize;
             let lane_requests = requests.div_ceil(lane_count as u32);
             let lane_bytes = DistributedDsparkChain::device_bytes(weights, lane_requests, shards[0].tokens().end)?;
             let mut mains = vec![weights.main_context(capacity, DsparkMainContext::device_bytes(lib, capacity)?)?];
@@ -75,8 +75,8 @@ mod tests {
         let weights = devices[1].own(|| DsparkWeights::load_serving_with_width(&lib, &catalog,
             80, 16, 32usize << 30, 16 << 20, 5, exl3_directory.as_deref()))?;
         let mut actual = DraftRuntime::with_distributed_requests(devices, &weights, &embedding,
-            [&shards[0], &shards[1]], 80, 16)?;
-        let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16))?;
+            [&shards[0], &shards[1]], 80, 16, 2)?;
+        let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, 16, 2))?;
         devices[1].run(|| {
             let geometry = policy::remote_geometry(5);
             actual.bind_policy(geometry.clone())?; reference.bind_policy(geometry)?;
