@@ -360,7 +360,19 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     -> 15.47; single runs 3-25% faster for TP2/TP3/TP6 widths (tile-128
     GLM TP3 640 included) and at m128/m256. Decode capacities (<= 80 rows)
     keep the cooperative kernel.
+
+    SM120 RTX PRO 6000, 2026-10-24, H6144/E256/top8, K4 weights with
+    K5 slots, FP32 sums, common wire-roundtripped input, three interleaved
+    rounds of five graph replays (core + sum, no packing): width1024 BF16
+    WS random/72-histogram paired-median speedups m1024 1.080/1.059,
+    m2752 1.037/1.033. Width2048 m256 is 1.054/1.148; larger capacities
+    regress and stay cooperative. Width1024 m256 uses wire (see below).
+    Other tier pairs, widths, families and unmeasured capacities stay off.
     """
+    if role == 'coordinator':
+        return (geometry == 'glm'
+                and ((width == 1024 and capacity in (256, 1024, 2752))
+                     or (width == 2048 and capacity == 256)))
     if role != 'spark':
         return False
     if geometry == 'kimik3':
@@ -390,8 +402,14 @@ def wire_input(geometry: str, role: str, width: int, capacity: int) -> bool:
     (with the 192-wide tile); 256 9.04 / 10.15 -> 7.34 / 9.36. Four input
     stages instead of three lose 0.2-0.8 ms at every width on K4/K5. Measured on
     GLM 5.3 only: GLM 5.3 Flash and V4 Pro keep the former exports until measured.
+
+    SM120 RTX PRO 6000, 2026-10-24, width1024 m256: cooperative 1737.66 us
+    -> wire/stage3/dynamic 1516.48 us (1.146x random, 1.204x median paired
+    across 72 histograms), conditions in `warp_specialized`. At m1024 wire
+    loses on random (0.927x); wider coordinator profiles keep BF16 input.
     """
-    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+    return (geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+            and (role == 'spark' or (width == 1024 and capacity == 256)))
 
 
 def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int | None:
@@ -400,7 +418,7 @@ def ws_input_stages(geometry: str, role: str, width: int, capacity: int) -> int 
     weight ring of 256-wide 4-bit tiles leaves room for) hide it; with K4/K5
     tiers three stages measure faster than four (see `wire_input`). Bit-identical.
     """
-    return 3 if geometry == 'glm' and warp_specialized(geometry, role, width, capacity) else None
+    return 3 if wire_input(geometry, role, width, capacity) else None
 
 
 def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -410,7 +428,7 @@ def ws_dynamic_tiles(geometry: str, role: str, width: int, capacity: int) -> boo
     width 512 m2752: FC1 fills 1761 MB of LPDDR5X for 805 MB of weights).
     Bit-identical; the largest of the GLM 5.3 GB10 gains (see `wire_input`).
     """
-    return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
+    return wire_input(geometry, role, width, capacity)
 
 
 def ws_tile(geometry: str, role: str, width: int, capacity: int) -> tuple[int, ...] | None:
@@ -856,12 +874,15 @@ def build(args: argparse.Namespace) -> None:
                     options['hidden'] = hidden
                 block = route_block(geometry, capacity)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
+                                    and (args.role != 'coordinator' or tuple(args.bits) == (4, 5))
                                     and warp_specialized(geometry, args.role, width, capacity))
                 if ws:
                     block = 32 if compact_ws else 64
-                    if geometry == 'kimik3':
+                    if geometry == 'kimik3' or args.role == 'coordinator':
                         # Existing policy-keyed directories contain cooperative exports.
-                        profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}')
+                        suffix = ('-wire-s3-dynamic' if wire_input(geometry, args.role, width, capacity)
+                                  else '-bf16-static' if args.role == 'coordinator' else '')
+                        profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}{suffix}')
                         raw = profile_dir / f'm{capacity}'
                 if block != 8:
                     options['route_block'] = block

@@ -124,7 +124,15 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             eprintln!("{count} reports: updated {} and {}", readme.display(), index.display());
             Ok(())
         }
-        Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
+        Some(BenchAction::Smoke(smoke)) => match cuteafd_bench::smoke::run(smoke) {
+            // Torn down after SIGTERM/SIGINT/SIGHUP: exit as the signal would have.
+            Err(error) if error.downcast_ref::<cuteafd_bench::smoke::Cancelled>().is_some() => {
+                let signal = error.downcast_ref::<cuteafd_bench::smoke::Cancelled>().map_or(15, |c| c.0);
+                eprintln!("smoke: {error:#}");
+                std::process::exit(128 + signal);
+            }
+            other => other,
+        },
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
         Some(BenchAction::Export { json, out, root, export }) => {
             let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;

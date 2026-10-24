@@ -577,18 +577,43 @@ class PackageProfileTests(unittest.TestCase):
         for capacity in (1, 16, 80, 256, 1024, 4096):
             self.assertFalse(f('v41', 'spark', 512, capacity) or f('dsv4p', 'coordinator', 768, capacity))
 
-    def test_warp_specialized_prefill_only_for_spark_prefill_capacities(self):
-        """V4 Pro, GLM 5.3 and GLM 5.3 Flash Spark packages at m256 and above;
-        decode capacities (<= 80), V4.1, V4 Flash, Qwen and the coordinator's
-        packages keep the cooperative kernel."""
+    def test_warp_specialized_spark_prefill_policy_is_unchanged(self):
+        """Existing Spark widths retain WS; unrelated coordinator families do not."""
         w = package.warp_specialized
         for geometry in ('dsv4p', 'glm', 'glmf'):
             for width in (512, 640, 768, 1024, 1536):
                 self.assertEqual([w(geometry, 'spark', width, c) for c in (1, 16, 80, 256, 1024, 4096)],
                                  [False, False, False, True, True, True])
-                self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
+                if geometry != 'glm' or width != 1024:
+                    self.assertFalse(any(w(geometry, 'coordinator', width, c) for c in (256, 1024, 4096)))
         for geometry in ('v41', 'dsv4f', 'qwen4'):
             self.assertFalse(any(w(geometry, 'spark', 512, c) for c in (256, 1024, 4096)))
+
+    def test_glm_coordinator_ws_only_for_measured_tiers_and_capacities(self):
+        for bits in ((4, 5), (3, 4), (3, 4, 5)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='glm',
+                    capacities=(80, 256, 1024, 2752, 4096))
+                for call in calls:
+                    width, capacity = call.args[1], call.args[3]
+                    ws = bits == (4, 5) and (
+                        (width == 1024 and capacity in (256, 1024, 2752))
+                        or (width == 2048 and capacity == 256))
+                    wire = ws and width == 1024 and capacity == 256
+                    self.assertEqual(call.kwargs.get('warp_specialized', False), ws)
+                    self.assertEqual(call.kwargs.get('wire_input', False), wire)
+                    self.assertEqual(call.kwargs.get('ws_input_stages'), 3 if wire else None)
+                    self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), wire)
+                    self.assertEqual('+ws-' in str(call.args[0]), ws)
+                    if ws:
+                        self.assertEqual(call.kwargs['route_block'], 64)
+                        self.assertNotIn('token_major_rotation', call.kwargs)
+                        self.assertIn('-wire-s3-dynamic' if wire else '-bf16-static', str(call.args[0]))
+        for width in (256, 384, 512, 640, 768, 1536):
+            self.assertFalse(package.warp_specialized('glm', 'coordinator', width, 256))
+        for capacity in (1, 16, 80, 128, 512, 2048, 8192):
+            self.assertFalse(package.warp_specialized('glm', 'coordinator', 1024, capacity))
 
     def test_kimi_ws64_only_for_qualified_ordinary_tp6_prefill(self):
         capacities = (1, 16, 80, 256, 1024, 2048, 4096)

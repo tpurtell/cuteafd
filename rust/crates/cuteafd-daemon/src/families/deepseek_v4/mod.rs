@@ -584,11 +584,11 @@ pub(crate) fn with_engine<T>(
         if !skip {
             transports.push(SparkLink::new(&loaded.library,
                 spark_world.context("Spark transport needs a declared world")?, &peers, engine.decode_rows as u32,
-                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
                 loaded.cfg.dim * 2)?);
             transports.push(SparkLink::new_waves(&loaded.library,
                 spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
-                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
                 loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
         }
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
@@ -622,7 +622,7 @@ pub(crate) fn with_engine<T>(
         if device_exchange {
             let started = Instant::now();
             engine.attach_device_link(spark_world.context("device exchange needs a declared world")?, &peers,
-                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
         }
         engine.prepare_workspaces()?;

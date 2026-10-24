@@ -5492,13 +5492,14 @@ Every family that sends experts to Sparks prefills the same way.
     absolute 8K/64K prefill on the pre-shared path, on the same layout, quant
     and benchmark corpus, before it lands. Numbers from before #592's
     realistic corpus (2026-10-21) are not comparable: the old filler routed
-    ~59% of tokens to one expert. References: GLM 5.3 K4 max 8K ≥ 1,870 (old
-    3-lane path, realistic corpus, d0a73ee30, #703; the shared path does
-    1,947 at onboard 0 and 2,063 at the default); MiMo Pro max 8K ≥ 3,479
-    (old 3-lane path, 2026-10-24). Every card reports the absolute numbers
-    next to the family's reference. A family that was good before cannot
-    land slower. GLM K4's open gap is kernel-side, not transport: EXLR8 does
-    2,863 on the same tree and corpus (#703).
+    ~59% of tokens to one expert; re-measure the reference release on the
+    current corpus instead. References: GLM 5.3 K4 max 8K ≥ 3,168 and 64K ≥
+    3,087, min 8K ≥ 2,696 (v3.0.1 release, own launcher and defaults,
+    realistic corpus, 2026-10-24, #703; today's work/p0 does 2,063, so K4
+    regressed between v3.0.1 and the Oct 23 old path, before the shared
+    executor); MiMo Pro max 8K ≥ 3,479 (old 3-lane path, 2026-10-24). Every
+    card reports the absolute numbers next to the family's reference. A
+    family that was good before cannot land slower.
 - **Today (audit 2026-10-23):**
   - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
     on `PipelineOrder`;

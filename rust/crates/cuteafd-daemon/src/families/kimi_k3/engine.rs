@@ -131,7 +131,9 @@ impl<'a> Engine<'a> {
         let endpoints = vec![SparkEndpoint { ring_depth: None, capacity: rows, ingress: SparkIngress::Fp8K32 };
             plan.spec().lanes as usize];
         let model = ModelAdmission { capacity: rows, compiled_capacity: compiled_rows,
-            endpoints, rings: spark_rings(config.max_frame_bytes)? };
+            endpoints, rings: spark_rings(config.max_frame_bytes)?,
+            // Each routed lane's wave is in flight to a rank at once.
+            execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("kimi_k3", plan.spec().lanes as u64, 1) };
         model.validate(ExpertGeometry::KIMI_K3)?;
         let catalog = cuteafd_loader::read_expert_catalog(&checkpoint.snapshot)?;
         let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,

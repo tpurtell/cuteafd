@@ -381,8 +381,16 @@ before starting the gate; never move HEAD during it.
   mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
   `--expand-environment=no`, or put the commands in a script file and run
   `bash /path/script.sh`.
+- Keep systemd's stop defaults on those units (KillMode=control-group,
+  TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
+  `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
+  and Spark workers (bounded, 60 s) and `hwlock.py` / `wip-cards.py` forward
+  the signal and keep the locks until it has, so the next lock holder finds
+  clean hardware.
 - Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
-  `pkill -f`: the pattern can match your own Bash command line and kill it.
+  `pkill -f` (the pattern can match your own Bash command line and kill it),
+  `kill -9` or `systemctl kill -s KILL` (no teardown runs; the containers
+  outlive the released locks).
 
 ### Known Codex behavior
 

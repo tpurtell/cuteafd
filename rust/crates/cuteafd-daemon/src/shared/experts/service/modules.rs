@@ -131,9 +131,12 @@ impl<'a> WarmModules<'a> {
             _ => anyhow::bail!("FP8 module owner/backend mismatch"),
         }
     }
-    pub(super) fn take_exl3(&mut self) -> Result<Vec<Exl3Modules<'a>>> {
+    /// The warmed EXL3 modules for the first execution slot; later slots
+    /// (`None`) load their own module set from the same exports, so no two
+    /// slots share kernel state.
+    pub(super) fn take_exl3(&mut self) -> Result<Option<Vec<Exl3Modules<'a>>>> {
         match self {
-            Self::Exl3(modules) => modules.take().context("EXL3 modules already consumed"),
+            Self::Exl3(modules) => Ok(modules.take()),
             _ => anyhow::bail!("EXL3 module owner/backend mismatch"),
         }
     }
@@ -141,6 +144,16 @@ impl<'a> WarmModules<'a> {
 
 #[cfg(test)]
 mod tests {
+    /// Every execution slot builds its own EXL3 execution: the first takes the
+    /// warmed modules, later slots load their own (a second take is not an error).
+    #[test]
+    fn later_execution_slots_load_their_own_exl3_modules() {
+        let mut modules = super::WarmModules::Exl3(Some(Vec::new()));
+        assert!(modules.take_exl3().unwrap().is_some());
+        assert!(modules.take_exl3().unwrap().is_none());
+        assert!(modules.take_exl3().unwrap().is_none());
+    }
+
     #[test]
     fn owner_binds_primary_context_without_census_before_all_backends() {
         let worker = include_str!("local.rs");

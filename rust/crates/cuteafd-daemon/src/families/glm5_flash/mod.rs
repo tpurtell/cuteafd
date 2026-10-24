@@ -1865,6 +1865,9 @@ impl Opened {
                 capacity, compiled_capacity: capacity,
                 endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
                 rings: crate::shared::placement::spark_rings(64 << 20)?,
+                // One execution slot per prefill wave the link keeps in flight.
+                execution_slots: cuteafd_loader::plan::layout::spark_execution_slots("glm5_flash",
+                    args.prefill_waves as u64, 1)
             };
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;
@@ -2215,7 +2218,7 @@ impl Opened {
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One link retains independent intake planes for every outstanding unit wave.
         let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library,
-            spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
+            spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;

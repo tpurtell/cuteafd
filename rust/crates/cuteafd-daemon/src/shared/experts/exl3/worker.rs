@@ -146,6 +146,10 @@ pub(crate) struct Exl3Worker<'a> {
     layer_ids: Vec<usize>,
     layer: usize,
     executor_id: u64,
+    /// Lane-owned execution on a rank serving several execution lanes: a
+    /// mapped request returns with its work queued; the owner emits it once
+    /// [`Self::stream_idle`] reports this stream drained.
+    deferred: bool,
 }
 
 impl<'a> Exl3Worker<'a> {
@@ -333,7 +337,17 @@ impl<'a> Exl3Worker<'a> {
             layer_ids,
             layer: 0,
             executor_id,
+            deferred: false,
         })
+    }
+
+    /// Leave mapped requests queued at return (see `deferred`).
+    pub(crate) fn defer(&mut self) { self.deferred = true; }
+
+    /// Whether every request queued on this execution's stream has completed.
+    pub(crate) fn stream_idle(&self) -> Result<bool> {
+        // SAFETY: the owned stream is live for the worker's lifetime.
+        unsafe { self.library.cuda_stream_query(self.stream.raw) }
     }
 
     pub(crate) fn install_topology(&mut self, topology: Option<SparkTopology>) -> Result<()> {
@@ -533,6 +547,9 @@ impl<'a> Exl3Worker<'a> {
         if let Some(timing) = &self.worker_timing {
             unsafe { timing.record(1, self.stream.raw)?; }
         }
+        // A deferred mapped request completes when the owner observes the
+        // stream idle; the transport holds both slots until then.
+        if self.deferred && destination.is_some() { return Ok(()); }
         match self.host_path {
             // Poll instead of sleeping in the driver: a blocking synchronize
             // returned about 8 us after the GPU finished (nsys of a GB10

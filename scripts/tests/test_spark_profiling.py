@@ -372,4 +372,4 @@ def test_wip_cards_requires_a_smoke_binary_with_graceful_worker_stop():
     assert "(['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])" in source
     smoke = (ROOT / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
     assert 'worker_stop={}' in smoke and 'const WORKER_STOP: &str = "graceful";' in smoke
-    assert 'worker_teardown_script(&worker)' in smoke
+    assert 'worker_teardown_script(&worker, stop_timeout)' in smoke

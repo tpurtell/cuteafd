@@ -655,7 +655,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             else { cuteafd_core::SparkIngress::Fp8K32 };
                         let endpoints = vec![cuteafd_core::SparkEndpoint { ring_depth: None,
                             capacity: options.layout.as_ref().unwrap().spark_capacity_rows as u32,
-                            ingress,
+                            ingress
                         }; 2];
                         assert_eq!(rings.bytes, endpoints.iter().map(|endpoint| endpoint.ring_bytes(
                             cuteafd_core::ExpertGeometry::DEEPSEEK_V41, cuteafd_core::SparkRings {

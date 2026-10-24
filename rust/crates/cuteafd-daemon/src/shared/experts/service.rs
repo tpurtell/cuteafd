@@ -87,6 +87,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         .context("native local RoCE owner failed")?
 }
 
+#[derive(Clone)]
 pub(crate) struct NativeExpertServiceConfig {
     pub encoder: Option<crate::shared::vision::worker::EncoderWorkerConfig>,
     pub audio_encoder: Option<crate::shared::vision::worker::AudioWorkerConfig>,
@@ -399,6 +400,11 @@ fn spark_admission_budget_for_geometry(config: &NativeExpertServiceConfig,
     let rings = usize::try_from(io.mapped_rings)?;
     let endpoint_staging = usize::try_from(io.endpoint_staging)?;
     let headroom = spark_runtime_headroom()?;
+    // Every execution slot owns a full execution workspace (stream, scratch,
+    // inputs, staging) sized for the largest admitted unit, over the shared
+    // resident weights.
+    let slots = config.model_admission.as_ref().map_or(1, |model| usize::from(model.execution_slots));
+    let workspace = workspace.checked_mul(slots).context("Spark execution slot workspace overflow")?;
     // The loader's pinned buffers and read scratch live only for one layer load;
     // the exchange, row-index scratch and registered rings live while serving.
     let load_peak = resident
@@ -553,7 +559,7 @@ mod tests {
                 endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 16,
                     ingress: cuteafd_core::SparkIngress::Fp8K32 }; 2],
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
             }),
             selected_layers: None,
             capacity: 16,
@@ -744,7 +750,7 @@ mod tests {
                 cuteafd_core::SparkIngress::Bf16
             } else { cuteafd_core::SparkIngress::Fp8K32 } }; endpoints],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
         });
     }
 
@@ -926,9 +932,23 @@ mod tests {
         assert_eq!(HostExpertExchange::bytes_for(16).unwrap(), 16 * (48 + 10240));
     }
 
-    /// The ring term mirrors the transport's own sizing rule: minimum 8 MiB per
-    /// slot, `depth` slots per ring, one request and one response ring per
-    /// persistent endpoint, rounded up to the verbs-host alignment.
+    /// Every execution slot owns one execution workspace; every other term
+    /// (rings, exchange, staging) is unchanged by the slot count.
+    #[test]
+    fn each_execution_slot_charges_one_execution_workspace() {
+        let topology = SparkTopology::new(2, 2).unwrap();
+        let mut config = config(4, 0, Some(topology));
+        config.capacity = 4096;
+        set_model(&mut config, 4096, false, 3);
+        let one = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
+        for slots in 2..=4u8 {
+            config.model_admission.as_mut().unwrap().execution_slots = slots;
+            let pool = spark_admission_budget(&config, 10, 1, 2, 3, 4).unwrap();
+            assert_eq!(pool.serve_peak - one.serve_peak, 4 * (u64::from(slots) as usize - 1));
+            assert_eq!((pool.load_peak, pool.rings, pool.exchange), (one.load_peak, one.rings, one.exchange));
+        }
+    }
+
     #[test]
     fn registered_ring_bytes_match_the_transport_sizing_rule() {
         let alignment = 4096;
@@ -1060,7 +1080,7 @@ mod tests {
             let model = cuteafd_transport::worker_selection::ModelAdmission {
                 capacity: 1024, compiled_capacity: 1024, endpoints,
                 rings: cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
-                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 },
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 }, execution_slots: 1
             };
             model.validate(geometry).unwrap();
             let exact = model.ring_bytes(geometry).unwrap();

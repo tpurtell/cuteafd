@@ -1,10 +1,26 @@
 #!/usr/bin/env python3
-"""Task-private WIP cards. Smoke alone owns serving locks; dry-run is CPU-only."""
+"""Task-private WIP cards. Smoke alone owns serving locks; dry-run is CPU-only.
+
+Stopping: SIGTERM, SIGINT or SIGHUP is forwarded to every running smoke, which
+tears down its coordinator and Spark workers (bounded, 60 s) before it exits;
+wip-cards waits for that (up to SMOKE_STOP_GRACE_S), starts no further job and
+exits 128 + the signal. Launch it as a systemd user unit with the defaults
+(KillMode=control-group, TimeoutStopSec=90 s), under hwlock.py when it needs
+an outer turn, e.g.
+  systemd-run --user --unit=TASK --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" \\
+    --working-directory=REPO scripts/hw/hwlock.py --locks ... -- scripts/bench/wip-cards.py ...
+and stop it with `systemctl --user stop TASK`: the locks are released only
+after the containers are gone. Never pass KillMode=mixed or KillMode=process
+(only the main process would be signalled, so smoke would not tear down), a
+TimeoutStopSec below 90 s (systemd would SIGKILL the teardown), and never
+`systemctl kill -s KILL` or `kill -9` a running card.
+"""
 from __future__ import annotations
 
 import argparse
 import base64
 import concurrent.futures
+import contextlib
 import itertools
 import hashlib
 import importlib.util
@@ -15,6 +31,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import statistics
 import socket
 import threading
@@ -573,12 +590,76 @@ def smoke_command(binary, repo, job):
     return [binary, 'bench', 'smoke', '--matrix', str(dest / 'matrix.json'), '--repo', str(repo), '--state', str(dest / 'smoke'), '--out-root', str(dest / 'reports'), '--parallel', '1']
 
 
+# How long a signalled smoke may take to tear down before it is killed: above its
+# own 60 s bound, under hwlock.py's 80 s grace and systemd's 90 s TimeoutStopSec.
+SMOKE_STOP_GRACE_S = 75.0
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# The first stop signal received, and the detached smoke process groups it reaches.
+STOP = dict(signal=None)
+_LIVE = {}  # id(process) -> process
+_LIVE_LOCK = threading.RLock()  # re-entrant: the handler runs on the main thread
+
+
+def _signal_live(signum):
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for process in live:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signum)
+
+
+def forward_stop(signum, _frame=None):
+    """Signal handler: remember the first stop signal and pass it to every
+    running smoke's process group (smoke ignores repeats)."""
+    if STOP['signal'] is None:
+        STOP['signal'] = signum
+    _signal_live(signum)
+
+
+def install_stop_handlers():
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, forward_stop)
+
+
+def stopped_code():
+    return 128 + STOP['signal'] if STOP['signal'] is not None else None
+
+
 def detached(cmd, log, exit_file, env):
     # Shell remains in the detached group and writes a numeric status even if the
-    # CLI disappears. No flock here: smoke owns all serving locks.
-    script = '"$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
+    # CLI disappears. It ignores stop signals itself (smoke handles them), so it
+    # waits for smoke's teardown and still records smoke's exit status. No flock
+    # here: smoke owns all serving locks.
+    script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
     with Path(log).open('w') as output:
-        return subprocess.Popen(['setsid', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+        process = subprocess.Popen(['setsid', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+    with _LIVE_LOCK:
+        _LIVE[id(process)] = process
+    if STOP['signal'] is not None:  # arrived while it started
+        _signal_live(STOP['signal'])
+    return process
+
+
+def wait_detached(process, grace=SMOKE_STOP_GRACE_S):
+    """Waits for a detached smoke. After a stop signal it gets `grace` seconds
+    to tear down, then its group is killed."""
+    deadline = None
+    try:
+        while True:
+            try:
+                return process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            if STOP['signal'] is not None:
+                deadline = deadline or time.monotonic() + grace
+                if time.monotonic() >= deadline:
+                    print(f'wip-cards: smoke did not stop within {grace:.0f} s; killing it', file=sys.stderr)
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    return process.wait()
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.pop(id(process), None)
 
 
 def http(url, path, body=None):
@@ -2231,12 +2312,20 @@ def main():
         return 0
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
+    # From here on a stop signal reaches every running smoke (which tears down)
+    # and no further job starts.
+    install_stop_handlers()
     if args.nonce_seed is not None:
         env['CUTEAFD_BENCH_NONCE_SEED'] = args.nonce_seed
     def execute(job):
         dest = Path(job['state'])
         if job['state'] in kept:
             return kept[job['state']]
+        if STOP['signal'] is not None:
+            row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
+            row.update(status='failed', exit_code=stopped_code(), error=f"stopped by signal {STOP['signal']} before it started",
+                       failure_kind='cancelled', state=str(dest))
+            return row
         try:
             # Re-checked right before this job's turn: an earlier job may have
             # left a container, or a slot may have been rebuilt meanwhile.
@@ -2257,7 +2346,7 @@ def main():
         if job.get('nonce_seed'):
             job_env['CUTEAFD_BENCH_NONCE_SEED'] = job['nonce_seed']
         process = detached(smoke_command(job['binary'], job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
-        rc = process.wait()
+        rc = wait_detached(process)
         code = int(exit_file.read_text()) if exit_file.exists() else (rc if rc >= 0 else 128 - rc)
         exit_file.write_text(str(code) + '\n')
         row = summarize_job(job, code)
@@ -2285,7 +2374,7 @@ def main():
         command = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
         command[-1] = str(args.parallel)
         process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
-        rc = process.wait()
+        rc = wait_detached(process)
         rows = []
         for job in jobs:
             row = summarize_job(job, rc)
@@ -2298,13 +2387,13 @@ def main():
             row['exit_code'] = code
             rows.append(row)
         write_summary(state, rows, arms)
-        return int(any(row['status'] != 'pass' for row in rows))
+        return stopped_code() or int(any(row['status'] != 'pass' for row in rows))
     rows = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
         for row in executor.map(execute, jobs):
             rows.append(row)
             write_summary(state, rows, arms)
-    return int(any(r['status'] != 'pass' for r in rows))
+    return stopped_code() or int(any(r['status'] != 'pass' for r in rows))
 
 
 if __name__ == '__main__':

@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,15 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('wip_cards', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)
+
+
+@pytest.fixture(autouse=True)
+def no_stop_handlers(monkeypatch):
+    """main() would install its stop handlers in the pytest process; tests that
+    need a stop set cards.STOP themselves."""
+    monkeypatch.setattr(cards, 'install_stop_handlers', lambda: None)
+    monkeypatch.setitem(cards.STOP, 'signal', None)
+    monkeypatch.setattr(cards, '_LIVE', {})
 
 
 @pytest.fixture
@@ -241,6 +251,51 @@ def test_smoke_no_outer_lock_and_detached_numeric_exit(entry, tmp_path, monkeypa
     assert 'secret' not in str(cmd)
     assert 'printf' in cmd[3] and '$rc' in cmd[3]
     assert kwargs['env']['CUTEAFD_API_KEY'] == 'secret'
+
+
+def test_stop_signal_reaches_detached_smoke_which_finishes_its_teardown(tmp_path, monkeypatch):
+    import signal
+    # A stand-in smoke that tears down for a moment on SIGTERM, then exits 143.
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'def stop(*_):\n    time.sleep(0.5); (d/"torn-down").write_text(""); sys.exit(143)\n'
+             'signal.signal(signal.SIGTERM, stop); (d/"ready").write_text("")\n'
+             'while True: time.sleep(0.05)\n']
+    process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', dict(os.environ))
+    end = time.time() + 10
+    while not (tmp_path / 'ready').exists():
+        assert time.time() < end and process.poll() is None
+        time.sleep(0.02)
+    # What the handler does on SIGTERM: forward to the smoke's process group,
+    # whose bash wrapper must wait for smoke rather than exit first.
+    cards.forward_stop(signal.SIGTERM)
+    assert cards.wait_detached(process, grace=30) == 143
+    assert (tmp_path / 'torn-down').exists()
+    assert (tmp_path / 'exit').read_text().strip() == '143'
+    assert cards.stopped_code() == 128 + signal.SIGTERM
+    assert not cards._LIVE
+
+
+def test_stopped_wip_cards_starts_no_further_job(entry, tmp_path, monkeypatch):
+    import signal
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
+                                      '--arm', 'base=b:s', '--arm', 'cand=c:s', '--state', str(tmp_path / 'state'), '--binary', sys.executable])
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
+    started = []
+    def detached(cmd, log, exit_file, env):
+        started.append(cmd)
+        cards.STOP['signal'] = signal.SIGTERM  # the stop arrives while the first job runs
+        exit_file.write_text('143\n')
+        return SimpleNamespace(wait=lambda timeout=None: 143, pid=0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 128 + signal.SIGTERM
+    assert len(started) == 1
 
 
 def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
@@ -859,7 +914,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     def detached(cmd, log, exit_file, env):
         seen.append(env)
         exit_file.write_text('0\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
@@ -924,7 +979,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     def detached(cmd, log, exit_file, env):
         commands.append(cmd)
         exit_file.write_text('0\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
@@ -1253,7 +1308,7 @@ def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
         job = json.loads((exit_file.parent / 'job.json').read_text())
         launched.append(job['card'] + '/' + job['arm'])
         exit_file.write_text(f'{rc_for(job)}\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     def summarize(job, code):
         row = dict(card=job['card'], arm=job['arm'], repeat=job['repeat'], simulated=False,

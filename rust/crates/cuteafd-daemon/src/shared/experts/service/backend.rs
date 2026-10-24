@@ -169,12 +169,15 @@ impl<'a> Weights<'a> {
                 .filter(|width| experts.iter().all(|group| group.module.info().slice == *width)),
         }
     }
+    /// Execution slot `slot`'s execution. Every slot owns its stream, inputs
+    /// and kernel scratch over the shared resident weights.
     pub(super) fn execution(
         &self,
         library: &'a NativeLibrary,
         config: &NativeExpertServiceConfig,
         remaining: usize,
         modules: &mut super::modules::WarmModules<'a>,
+        slot: usize,
     ) -> Result<Execution<'_, 'a>> {
         Ok(match self {
             Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
@@ -196,7 +199,7 @@ impl<'a> Weights<'a> {
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
-                    Some(modules.take_exl3()?),
+                    modules.take_exl3()?,
                 )?;
                 execution.install_topology(config.spark_world()?.ownership_topology())?;
                 Execution::Exl3(execution)
@@ -204,12 +207,16 @@ impl<'a> Weights<'a> {
             Self::Fp8(experts) => {
                 let workspace = fp8_worker_workspace(config)?.checked_mul(experts.len())
                     .context("expert group workspace overflow")?;
+                // Slots beyond the first also own each group's package scratch.
+                let scratch: usize = if slot > 0 { experts.iter().map(|group| group.lane_scratch_bytes(config.capacity as usize))
+                    .collect::<Result<Vec<_>>>()?.into_iter().sum() } else { 0 };
+                let workspace = workspace.checked_add(scratch).context("expert slot scratch overflow")?;
                 ensure!(workspace <= remaining, "expert worker workspace exceeds the device budget");
                 let mut workers = Vec::with_capacity(experts.len());
                 let mut bindings = Vec::new();
                 for (group, experts) in experts.iter().enumerate() {
                     bindings.extend(experts.layers.iter().enumerate().map(|(index, layer)| (layer.layer, group, index)));
-                    workers.push(Fp8Worker::new(library, experts.clone(), config.capacity)?);
+                    workers.push(Fp8Worker::for_slot(library, experts.clone(), config.capacity, slot)?);
                 }
                 let bindings = fp8_bindings(bindings)?;
                 Execution::Fp8(Fp8Groups { workers, bindings, selected: 0,
@@ -280,6 +287,10 @@ impl<'a> Fp8Groups<'a> {
         where F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()> {
         self.workers[self.selected].execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
     }
+    fn stream_idle(&self) -> Result<bool> {
+        for worker in &self.workers { if !worker.stream_idle()? { return Ok(false); } }
+        Ok(true)
+    }
 }
 
 pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -327,6 +338,27 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
+        }
+    }
+    /// Lane-owned mode on a multi-lane rank: mapped requests return with their
+    /// work queued; the owner emits once [`Self::stream_idle`] holds. EXLR8
+    /// has no deferred path and is served on lane zero only.
+    pub(super) fn defer(&mut self) -> Result<()> {
+        match self {
+            Self::Full(execution) => execution.defer(),
+            Self::Exl3(execution) => execution.defer(),
+            Self::Fp8(groups) => groups.workers.iter_mut().for_each(Fp8Worker::defer),
+            Self::Exlr8(_) => anyhow::bail!("EXLR8 Spark workers have one execution lane"),
+        }
+        Ok(())
+    }
+    /// Whether every request this execution queued has completed.
+    pub(super) fn stream_idle(&self) -> Result<bool> {
+        match self {
+            Self::Full(execution) => execution.stream_idle(),
+            Self::Exl3(execution) => execution.stream_idle(),
+            Self::Fp8(groups) => groups.stream_idle(),
+            Self::Exlr8(_) => Ok(true),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {
@@ -528,6 +560,16 @@ pub(super) fn load_fp8<'a>(
         budgets.push(resident.checked_add(group.scratch).context("expert group budget overflow")?);
     }
     let permanent = totals.permanent()?;
+    // Each execution slot beyond the first owns every group's package scratch
+    // (the admission multiplies `workspace` by the slot count): fold one
+    // slot's scratch into the per-slot workspace, and keep the first slot's
+    // scratch in `permanent`.
+    let slots = config.model_admission.as_ref().map_or(1, |model| usize::from(model.execution_slots));
+    let workspace = if slots > 1 {
+        let scratch: usize = groups.iter().map(|group| group.scratch).sum();
+        workspace.checked_add(scratch.checked_mul(slots - 1).context("expert slot scratch overflow")?
+            .div_ceil(slots)).context("expert slot workspace overflow")?
+    } else { workspace };
     let peak = spark_admission_budget(config, permanent, 0, totals.pinned, totals.host, workspace)?;
     ensure!(peak.load_peak <= config.device_budget && peak.serve_peak <= config.device_budget,
         "native expert groups exceed budget: load {} serve {} budget {}",

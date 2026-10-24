@@ -5,6 +5,9 @@
 //! launch down and moves on, past failures. Entries on disjoint hardware run
 //! side by side (taking the shared lock files for the hardware they use);
 //! finished entries are remembered per build so an interrupted matrix resumes.
+//! SIGTERM, SIGINT or SIGHUP cancels the run: every launched entry's launcher
+//! is stopped and its containers removed (bounded, see [`CANCEL_TEARDOWN_S`])
+//! before the process exits non-zero and its hardware locks are released.
 use crate::report::Report;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -15,7 +18,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::os::unix::process::CommandExt;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, clap::Args)]
@@ -177,10 +181,11 @@ struct HookChild {
     finish_timeout: Duration,
     stop: PathBuf,
     cleanup: Option<Vec<String>>,
+    inflight: Arc<Inflight>,
 }
 
 impl HookChild {
-    fn spawn(hook: &Hook, url: &str, config: &Path, log: &Path, kind: &str) -> Result<Self> {
+    fn spawn(hook: &Hook, url: &str, config: &Path, log: &Path, kind: &str, inflight: &Arc<Inflight>) -> Result<Self> {
         if hook.argv.is_empty() || hook.timeout_s == 0 || hook.timeout_s > 7200 {
             bail!("{kind} hook needs argv and timeout_s in 1..=7200");
         }
@@ -191,13 +196,21 @@ impl HookChild {
         let stop = log.with_extension(format!("{kind}.stop"));
         let _ = std::fs::remove_file(&stop);
         let output = File::create(log.with_extension(format!("{kind}.log")))?;
+        // Registered under the lock a cancellation snapshots, so none is missed.
+        let mut hooks = inflight.hooks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(signal) = inflight.cancelled() {
+            bail!("{kind} hook not started: {}", Cancelled(signal));
+        }
         let child = Command::new("timeout").args(["--kill-after=1s", &format!("{}s", hook.timeout_s)])
             .args(&hook.argv)
             .env("CUTEAFD_SMOKE_URL", url).env("CUTEAFD_SMOKE_CONFIG", config)
             .env("CUTEAFD_SMOKE_STOP", &stop)
             .stdout(output.try_clone()?).stderr(output).process_group(0).spawn()
             .with_context(|| format!("starting {kind} hook"))?;
-        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), finish_timeout, stop, cleanup: hook.cleanup.clone() })
+        hooks.insert(child.id(), hook.cleanup.clone());
+        drop(hooks);
+        Ok(Self { child, deadline: Instant::now() + Duration::from_secs(hook.timeout_s), finish_timeout, stop,
+            cleanup: hook.cleanup.clone(), inflight: inflight.clone() })
     }
 
     fn wait(&mut self) -> Result<()> {
@@ -225,16 +238,203 @@ impl HookChild {
 
 impl Drop for HookChild {
     fn drop(&mut self) {
+        // Unregistered before it is reaped: a cancellation never signals a reused pid.
+        self.inflight.hooks.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.child.id());
         // Kill the group, including an exited hook's descendants, before locks release.
-        let _ = Command::new("/bin/kill").args(["-KILL", "--", &format!("-{}", self.child.id())])
-            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+        kill_group(self.child.id(), "KILL");
         let _ = self.child.wait();
-        if let Some(argv) = &self.cleanup {
-            if !argv.is_empty() {
-                let _ = Command::new("timeout").args(["--kill-after=1s", "10s"]).args(argv)
-                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
-            }
+        hook_cleanup(&self.cleanup);
+    }
+}
+
+/// A hook's bounded cleanup command (idempotent: a cancellation may run it too).
+fn hook_cleanup(cleanup: &Option<Vec<String>>) {
+    if let Some(argv) = cleanup.as_ref().filter(|argv| !argv.is_empty()) {
+        let _ = Command::new("timeout").args(["--kill-after=1s", "10s"]).args(argv)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+}
+
+/// Sends SIG (a `kill` name, e.g. TERM) to process group `pgid`.
+fn kill_group(pgid: u32, signal: &str) {
+    let _ = Command::new("/bin/kill").args([&format!("-{signal}"), "--", &format!("-{pgid}")])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
+/// A smoke run stopped by SIGTERM, SIGINT or SIGHUP (the signal number). The
+/// CLI exits 128 + the signal once every launched entry is torn down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("cancelled by {}", signal_name(*.0))]
+pub struct Cancelled(pub i32);
+
+fn signal_name(signal: i32) -> String {
+    match signal {
+        signal_hook::consts::SIGTERM => "SIGTERM".into(),
+        signal_hook::consts::SIGINT => "SIGINT".into(),
+        signal_hook::consts::SIGHUP => "SIGHUP".into(),
+        other => format!("signal {other}"),
+    }
+}
+
+/// Wall-clock bound (seconds) on a cancelled run's cleanup: hooks killed,
+/// launchers stopped, then every launched entry's coordinator and Spark
+/// workers removed, all in parallel and each command bounded. It stays under
+/// systemd's default TimeoutStopSec (90 s) and hwlock.py's stop grace (80 s),
+/// so the hardware locks are released only after the containers are gone.
+const CANCEL_TEARDOWN_S: u64 = 60;
+/// How long a signalled launcher (./run.sh) may take to exit before SIGKILL.
+const LAUNCHER_GRACE_S: u64 = 5;
+/// Bounds (seconds) on each cancelled-teardown step: `docker inspect`, the
+/// graceful `docker stop -t`, `docker logs` and `docker rm -f`; `timeout`
+/// adds [`KILL_AFTER_S`] to each.
+const INSPECT_S: u64 = 5;
+const STOP_S: u64 = 15;
+const LOGS_S: u64 = 10;
+const RM_S: u64 = 10;
+const KILL_AFTER_S: u64 = 1;
+// The coordinator's steps run one after another (a worker's take less) after the launcher stops.
+const _: () = assert!(LAUNCHER_GRACE_S + INSPECT_S + (STOP_S + 5) + LOGS_S + RM_S + 4 * KILL_AFTER_S <= CANCEL_TEARDOWN_S);
+
+/// Programs teardown runs (tests substitute logging fakes).
+#[derive(Debug, Clone)]
+struct Tools {
+    docker: PathBuf,
+    ssh: PathBuf,
+}
+
+impl Default for Tools {
+    fn default() -> Self {
+        Self { docker: "docker".into(), ssh: "ssh".into() }
+    }
+}
+
+/// An entry whose launcher started: its containers exist until teardown.
+struct Launch {
+    launcher: Child,
+    config: PathBuf,
+    log: PathBuf,
+}
+
+/// What a cancellation must undo, shared by the scheduler and entry threads:
+/// the signal that cancelled the run (0 while running), launched entries (an
+/// entry stays here until its own teardown finished) and live hook process
+/// groups with their cleanup commands.
+#[derive(Default)]
+struct Inflight {
+    signal: Arc<AtomicUsize>,
+    launches: Mutex<BTreeMap<String, Launch>>,
+    hooks: Mutex<BTreeMap<u32, Option<Vec<String>>>>,
+    tools: Tools,
+}
+
+impl Inflight {
+    /// Routes SIGTERM, SIGINT and SIGHUP to the cancel flag (the first one
+    /// wins; repeats, e.g. systemd's cgroup-wide SIGTERM plus a parent
+    /// forwarding its own, change nothing).
+    fn install(&self) -> Result<()> {
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        self.register(&[SIGTERM, SIGINT, SIGHUP])
+    }
+
+    fn register(&self, signals: &[i32]) -> Result<()> {
+        for &signal in signals {
+            // A plain flag, never the default action: a repeated signal must not
+            // cut a running teardown short (systemd's own SIGKILL bounds it).
+            signal_hook::flag::register_usize(signal, self.signal.clone(), signal as usize)
+                .with_context(|| format!("installing the {} handler", signal_name(signal)))?;
         }
+        Ok(())
+    }
+
+    fn cancelled(&self) -> Option<i32> {
+        match self.signal.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal as i32),
+        }
+    }
+
+    #[cfg(test)]
+    fn cancel(&self, signal: i32) {
+        let _ = self.signal.compare_exchange(0, signal as usize, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    /// Starts `command` as entry `name`'s launcher, in its own process group
+    /// so a cancellation can stop it and everything it started. Refused once
+    /// cancelled: a launch never begins after the cancellation's snapshot.
+    fn launch(&self, name: &str, command: &mut Command, config: &Path, log: &Path) -> Result<()> {
+        let mut launches = self.launches.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(signal) = self.cancelled() {
+            return Err(Cancelled(signal).into());
+        }
+        let launcher = command.process_group(0).spawn().context("starting ./run.sh")?;
+        launches.insert(name.into(), Launch { launcher, config: config.into(), log: log.into() });
+        Ok(())
+    }
+
+    /// The launcher's exit status, once it exited.
+    fn launcher_status(&self, name: &str) -> Result<Option<std::process::ExitStatus>> {
+        let mut launches = self.launches.lock().unwrap_or_else(|e| e.into_inner());
+        let launch = launches.get_mut(name).context("launcher not registered")?;
+        Ok(launch.launcher.try_wait()?)
+    }
+
+    /// Stops entry `name`'s launcher and its process group (TERM, then KILL).
+    fn stop_launcher(&self, name: &str) {
+        let pgid = {
+            let mut launches = self.launches.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(launch) = launches.get_mut(name) else { return };
+            if !matches!(launch.launcher.try_wait(), Ok(None)) {
+                return;
+            }
+            launch.launcher.id()
+        };
+        kill_group(pgid, "TERM");
+        let deadline = Instant::now() + Duration::from_secs(LAUNCHER_GRACE_S);
+        while Instant::now() < deadline && matches!(self.launcher_status(name), Ok(None)) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        kill_group(pgid, "KILL");
+        if let Some(launch) = self.launches.lock().unwrap_or_else(|e| e.into_inner()).get_mut(name) {
+            let _ = launch.launcher.wait();
+        }
+    }
+
+    /// The entry's own teardown finished: nothing of it is left to undo.
+    fn finished(&self, name: &str) {
+        self.launches.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+    }
+
+    /// Undoes everything in flight, bounded by [`CANCEL_TEARDOWN`]: kills hook
+    /// groups (running their cleanups), stops launchers, then tears down every
+    /// launched entry in parallel. Returns the entries torn down.
+    fn cancel_all(&self) -> Vec<String> {
+        let hooks: Vec<(u32, Option<Vec<String>>)> = self.hooks.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().map(|(pid, cleanup)| (*pid, cleanup.clone())).collect();
+        let names: Vec<(String, PathBuf, PathBuf)> = self.launches.lock().unwrap_or_else(|e| e.into_inner())
+            .iter().map(|(name, launch)| (name.clone(), launch.config.clone(), launch.log.clone())).collect();
+        std::thread::scope(|scope| {
+            for (pid, cleanup) in &hooks {
+                scope.spawn(move || {
+                    kill_group(*pid, "KILL");
+                    hook_cleanup(cleanup);
+                });
+            }
+            for (name, config, log) in &names {
+                scope.spawn(move || {
+                    self.stop_launcher(name);
+                    let mut log = match File::options().create(true).append(true).open(log) {
+                        Ok(file) => file,
+                        Err(_) => match File::create("/dev/null") { Ok(file) => file, Err(_) => return },
+                    };
+                    let _ = writeln!(log, "cancelled: tearing down {name}");
+                    match read_config(config) {
+                        Ok(config) => teardown(name, &config, &mut log, &self.tools, true),
+                        Err(error) => { let _ = writeln!(log, "cancel teardown: {error:#}"); }
+                    }
+                });
+            }
+        });
+        names.into_iter().map(|(name, _, _)| name).collect()
     }
 }
 
@@ -534,7 +734,7 @@ struct Locks {
 impl Locks {
     /// Takes `names`, waiting in line like every other agent (flock), when
     /// nothing of ours runs; with entries running, only what is free now.
-    fn take(&mut self, names: &[&'static str], wait: bool) -> Result<bool> {
+    fn take(&mut self, names: &[&'static str], wait: bool, cancelled: &dyn Fn() -> Option<i32>) -> Result<bool> {
         if !wait {
             return self.try_take(names);
         }
@@ -583,6 +783,9 @@ impl Locks {
                     }
                     break;
                 }
+            }
+            if let Some(signal) = cancelled() {
+                return Err(Cancelled(signal).into());
             }
             if Instant::now() >= deadline {
                 bail!("timed out after {wait} s waiting for a fair turn on {}", wanted.join(","));
@@ -772,6 +975,8 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         return Ok(());
     }
     let profile = matrix.profile.clone().unwrap_or_else(|| "smoke".into());
+    let inflight = Arc::new(Inflight::default());
+    inflight.install()?;
     let mut queue: std::collections::VecDeque<Entry> = pending.into();
     let mut running: Vec<Entry> = Vec::new();
     let mut locks = Locks::default();
@@ -779,6 +984,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     let started = Instant::now();
     let mut waiting_note = Instant::now() - Duration::from_secs(600);
     while !queue.is_empty() || !running.is_empty() {
+        if let Some(signal) = inflight.cancelled() {
+            return cancel_run(&inflight, signal, &running, &mut state, &paths, &state_dir, &entries, &build, started);
+        }
         // Start whatever fits beside the running entries.
         let mut started_one = false;
         if running.len() < args.parallel.max(1) {
@@ -790,7 +998,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
                 if running.is_empty() {
                     eprintln!("{}: waiting in line for {needed:?}", entry.name);
                 }
-                if locks.take(&needed, running.is_empty())? {
+                if locks.take(&needed, running.is_empty(), &|| inflight.cancelled())? {
                     queue.remove(index);
                     running.push(entry.clone());
                     started_one = true;
@@ -798,8 +1006,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
                         entry.profile.clone().unwrap_or_else(|| profile.clone()), build.clone());
                     let (configs, logs) = (paths.configs.clone(), paths.logs.clone());
                     let parallel = args.parallel > 1;
+                    let inflight = inflight.clone();
                     std::thread::spawn(move || {
-                        let outcome = run_entry(&entry, &repo, &out_root, &configs, &logs, &profile, &build, parallel);
+                        let outcome = run_entry(&entry, &repo, &out_root, &configs, &logs, &profile, &build, parallel, &inflight);
                         let _ = tx.send((entry.name.clone(), outcome));
                     });
                 } else if waiting_note.elapsed() > Duration::from_secs(120) {
@@ -811,7 +1020,7 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if started_one {
             continue;
         }
-        match done_rx.recv_timeout(Duration::from_secs(5)) {
+        match done_rx.recv_timeout(Duration::from_secs(1)) {
             Ok((name, outcome)) => {
                 if let Some(index) = running.iter().position(|e| e.name == name) {
                     let entry = running.remove(index);
@@ -825,6 +1034,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    if let Some(signal) = inflight.cancelled() {
+        return cancel_run(&inflight, signal, &running, &mut state, &paths, &state_dir, &entries, &build, started);
+    }
     let summary = summary(&entries, &state, &build, started.elapsed().as_secs_f64());
     std::fs::write(state_dir.join("summary.md"), &summary)?;
     println!("{summary}");
@@ -833,6 +1045,27 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         bail!("{failed} of {} entries did not finish (see {})", entries.len(), state_dir.join("summary.md").display());
     }
     Ok(())
+}
+
+/// A signal cancelled the run: tear down everything launched (bounded), record
+/// the running entries as cancelled and return [`Cancelled`]. The caller's
+/// locks are released only after this returns, once the containers are gone.
+#[allow(clippy::too_many_arguments)]
+fn cancel_run(inflight: &Inflight, signal: i32, running: &[Entry], state: &mut BTreeMap<String, Outcome>, paths: &Paths,
+    state_dir: &Path, entries: &[Entry], build: &str, started: Instant) -> Result<()> {
+    let reason = Cancelled(signal);
+    eprintln!("smoke: {reason}; tearing down {} running entr{}", running.len(), if running.len() == 1 { "y" } else { "ies" });
+    let torn = inflight.cancel_all();
+    for entry in running {
+        let error = if torn.contains(&entry.name) { format!("{reason}; its containers were torn down") } else { reason.to_string() };
+        state.insert(entry.name.clone(), Outcome { key: entry.key(), build: build.to_string(), status: "cancelled".into(),
+            error: Some(error), finished: crate::report::now_rfc3339(), ..Outcome::default() });
+    }
+    let _ = save_state(&paths.state, state);
+    let summary = summary(entries, state, build, started.elapsed().as_secs_f64());
+    let _ = std::fs::write(state_dir.join("summary.md"), &summary);
+    println!("{summary}");
+    Err(reason.into())
 }
 
 fn summary(entries: &[Entry], state: &BTreeMap<String, Outcome>, build: &str, seconds: f64) -> String {
@@ -928,45 +1161,79 @@ fn log_path(log: &File) -> std::io::Result<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{}", log.as_raw_fd()))
 }
 
-/// Removes the entry's coordinator and expert containers.
-fn teardown(entry: &Entry, config: &HashMap<String, String>, log: &mut File) {
+/// `program args`, under `timeout` when bounded (a cancellation must finish
+/// within [`CANCEL_TEARDOWN_S`]); unbounded otherwise, since a profiled
+/// container's own stop timeout may be long.
+fn tool(program: &Path, args: &[&str], bound: Option<u64>) -> Command {
+    let mut command = match bound {
+        Some(seconds) => {
+            let mut command = Command::new("timeout");
+            command.args([format!("--kill-after={KILL_AFTER_S}s"), format!("{seconds}s")]).arg(program);
+            command
+        }
+        None => Command::new(program),
+    };
+    command.args(args);
+    command
+}
+
+/// Removes the entry's coordinator and expert containers; the Spark workers in
+/// parallel with the coordinator. `cancelled` bounds every step (see
+/// [`CANCEL_TEARDOWN_S`]), including a graceful stop's own timeout.
+fn teardown(name: &str, config: &HashMap<String, String>, log: &mut File, tools: &Tools, cancelled: bool) {
+    let bound = |seconds: u64| cancelled.then_some(seconds);
+    let stop_timeout = cancelled.then_some(STOP_S);
     let instance = config.get("INSTANCE").filter(|v| !v.is_empty());
     let coordinator = match instance {
         Some(instance) => format!("cuteafd-coordinator-{instance}"),
         None => "cuteafd-coordinator".into(),
     };
-    // A launcher that labels its coordinator cuteafd.graceful-stop=1 (a process
-    // that writes output at exit, e.g. under a profiler) gets `docker stop`, with
-    // the container's own stop signal and timeout, before the forced removal.
-    let label = Command::new("docker").args(["inspect", "-f", "{{index .Config.Labels \"cuteafd.graceful-stop\"}}", &coordinator])
-        .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    if label.as_deref() == Some("1") {
-        let stopped = Command::new("docker").args(["stop", &coordinator]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-        let _ = writeln!(log, "graceful stop {coordinator}: {}", stopped.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
-    }
-    // The coordinator's own log goes next to the entry's (failures and warnings outlive the container).
-    if let Ok(path) = log_path(log) {
-        if let Ok(file) = File::create(path.with_extension("coordinator.log")) {
-            let _ = Command::new("docker").args(["logs", &coordinator]).stdout(file.try_clone().map(Stdio::from)
-                .unwrap_or(Stdio::null())).stderr(Stdio::from(file)).status();
-        }
-    }
-    let _ = Command::new("docker").args(["rm", "-f", &coordinator]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let base = log_path(log).ok();
     let port = config.get("EXPERT_PORT").cloned().unwrap_or_else(|| "19441".into());
     let count: usize = config.get("SPARK_COUNT").and_then(|v| v.parse().ok()).unwrap_or(0);
-    for rank in 0..count {
-        let Some(host) = config.get(&format!("SPARK_{rank}_HOST")) else { continue };
-        let worker = format!("cuteafd-spark-expert-{host}-{port}");
-        if let Ok(path) = log_path(log) {
-            if let Ok(file) = File::create(path.with_extension(format!("{host}.log"))) {
-                let _ = Command::new("ssh").args(["-o", "BatchMode=yes", host, "docker", "logs", &worker])
-                    .stdout(file.try_clone().map(Stdio::from).unwrap_or(Stdio::null()))
-                    .stderr(Stdio::from(file)).status();
-            }
+    let hosts: Vec<&String> = (0..count).filter_map(|rank| config.get(&format!("SPARK_{rank}_HOST"))).collect();
+    let ssh = |host: &str, remote: &[&str], seconds: u64| {
+        let mut args = vec!["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host];
+        args.extend_from_slice(remote);
+        tool(&tools.ssh, &args, bound(seconds))
+    };
+    std::thread::scope(|scope| {
+        for host in &hosts {
+            let (base, port, ssh) = (&base, &port, &ssh);
+            scope.spawn(move || {
+                let worker = format!("cuteafd-spark-expert-{host}-{port}");
+                if let Some(file) = base.as_ref().and_then(|p| File::create(p.with_extension(format!("{host}.log"))).ok()) {
+                    let _ = ssh(host, &["docker", "logs", &worker], LOGS_S)
+                        .stdout(file.try_clone().map(Stdio::from).unwrap_or(Stdio::null()))
+                        .stderr(Stdio::from(file)).status();
+                }
+                let _ = ssh(host, &[&worker_teardown_script(&worker, stop_timeout)], STOP_S + RM_S + 5)
+                    .stdout(Stdio::null()).stderr(Stdio::null()).status();
+            });
         }
-        let _ = Command::new("ssh").args(["-o", "BatchMode=yes", host, &worker_teardown_script(&worker)]).status();
-    }
-    let _ = writeln!(log, "teardown {} ({coordinator})", entry.name);
+        // A launcher that labels its coordinator cuteafd.graceful-stop=1 (a process
+        // that writes output at exit, e.g. under a profiler) gets `docker stop`, with
+        // the container's own stop signal and timeout, before the forced removal.
+        let label = tool(&tools.docker, &["inspect", "-f", "{{index .Config.Labels \"cuteafd.graceful-stop\"}}", &coordinator], bound(INSPECT_S))
+            .stderr(Stdio::null()).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        if label.as_deref() == Some("1") {
+            let timeout = stop_timeout.map(|t| t.to_string());
+            let mut args = vec!["stop"];
+            if let Some(timeout) = &timeout {
+                args.extend(["-t", timeout]);
+            }
+            args.push(&coordinator);
+            let stopped = tool(&tools.docker, &args, bound(STOP_S + 5)).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            let _ = writeln!(log, "graceful stop {coordinator}: {}", stopped.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
+        }
+        // The coordinator's own log goes next to the entry's (failures and warnings outlive the container).
+        if let Some(file) = base.as_ref().and_then(|p| File::create(p.with_extension("coordinator.log")).ok()) {
+            let _ = tool(&tools.docker, &["logs", &coordinator], bound(LOGS_S)).stdout(file.try_clone().map(Stdio::from)
+                .unwrap_or(Stdio::null())).stderr(Stdio::from(file)).status();
+        }
+        let _ = tool(&tools.docker, &["rm", "-f", &coordinator], bound(RM_S)).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    });
+    let _ = writeln!(log, "teardown {name} ({coordinator})");
 }
 
 /// Advertised by `--dry-run` (`worker_stop=graceful`): wip-cards refuses a
@@ -975,17 +1242,19 @@ const WORKER_STOP: &str = "graceful";
 
 /// Removes one Spark worker. A worker labelled cuteafd.graceful-stop=1 (a
 /// profiled worker, PROFILE_SPARK) first gets `docker stop`, with its own stop
-/// signal and timeout, so the profiler writes its report before the removal.
-fn worker_teardown_script(worker: &str) -> String {
+/// signal and timeout (or `stop_timeout` seconds, on a cancellation), so the
+/// profiler writes its report before the removal.
+fn worker_teardown_script(worker: &str, stop_timeout: Option<u64>) -> String {
+    let stop = stop_timeout.map(|t| format!("-t {t} ")).unwrap_or_default();
     format!("ids=$(docker ps -aq --filter name=^{worker}$); \
         if [ -n \"$ids\" ] && [ \"$(docker inspect -f '{{{{index .Config.Labels \"cuteafd.graceful-stop\"}}}}' {worker} 2>/dev/null)\" = 1 ]; then \
-        docker stop {worker} >/dev/null 2>&1 || true; fi; \
+        docker stop {stop}{worker} >/dev/null 2>&1 || true; fi; \
         [ -z \"$ids\" ] || docker rm -f $ids >/dev/null 2>&1 || true")
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: &Path, profile: &str, build: &str,
-    parallel: bool) -> Outcome {
+    parallel: bool, inflight: &Arc<Inflight>) -> Outcome {
     let started = Instant::now();
     let mut outcome = Outcome { key: entry.key(), build: build.to_string(), status: "failed".into(),
         finished: String::new(), ..Outcome::default() };
@@ -1004,7 +1273,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
     let window_open = std::cell::Cell::new(false);
     let window_results = std::cell::RefCell::new(BTreeMap::<String, String>::new());
     let window_hook = |kind: &str, hook: &Hook, url: &str, config: &Path| -> Result<()> {
-        let checked = HookChild::spawn(hook, url, config, &log_path, kind).and_then(|mut child| child.wait());
+        let checked = HookChild::spawn(hook, url, config, &log_path, kind, inflight).and_then(|mut child| child.wait());
         window_results.borrow_mut().insert(kind.into(), checked.as_ref().map(|_| "pass".into())
             .unwrap_or_else(|error| format!("{error:#}")));
         checked.with_context(|| format!("{kind} hook"))
@@ -1025,11 +1294,11 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         let port = entry.port(&config);
         let mut command = Command::new(repo.join("run.sh"));
         command.arg("--config").arg(&config_path).arg("--restart").args(entry.run_args.clone().unwrap_or_default())
-            .current_dir(repo).stdout(log.try_clone()?).stderr(log.try_clone()?);
+            .current_dir(repo).stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log.try_clone()?);
         let url = format!("http://127.0.0.1:{port}");
         if let Some(hook) = &entry.prelaunch {
             let checked = (|| -> Result<()> {
-                let mut child = HookChild::spawn(hook, &url, &config_path, &log_path, "prelaunch")?;
+                let mut child = HookChild::spawn(hook, &url, &config_path, &log_path, "prelaunch", inflight)?;
                 child.wait()
             })();
             hook_results.insert("prelaunch".into(), checked.as_ref().map(|_| "pass".into())
@@ -1038,7 +1307,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         }
         let launch = Instant::now();
         if let Some(hook) = &entry.observer {
-            match HookChild::spawn(hook, &url, &config_path, &log_path, "observer") {
+            match HookChild::spawn(hook, &url, &config_path, &log_path, "observer", inflight) {
                 Ok(child) => observer = Some(child),
                 Err(error) => {
                     hook_results.insert("observer".into(), format!("{error:#}"));
@@ -1046,12 +1315,16 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 }
             }
         }
-        let mut child = command.spawn().context("starting ./run.sh")?;
+        // Registered before it starts: a cancellation tears down what it launches.
+        inflight.launch(&entry.name, &mut command, &config_path, &log_path)?;
         launcher_started = true;
         let timeout = Duration::from_secs(entry.timeout_s.unwrap_or(900));
         // run.sh waits for readiness itself; poll /health too in case it returns early.
         loop {
-            if let Some(status) = child.try_wait()? {
+            if let Some(signal) = inflight.cancelled() {
+                return Err(Cancelled(signal).into());
+            }
+            if let Some(status) = inflight.launcher_status(&entry.name)? {
                 if !status.success() {
                     bail!("./run.sh exited {status} (log {})", log_path.display());
                 }
@@ -1060,7 +1333,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 }
             }
             if launch.elapsed() > timeout {
-                let _ = child.kill();
+                inflight.stop_launcher(&entry.name);
                 bail!("not ready within {} s", timeout.as_secs());
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -1068,7 +1341,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         outcome.launch_s = Some(launch.elapsed().as_secs_f64());
         if let Some(hook) = &entry.precheck {
             let checked = (|| -> Result<()> {
-                let mut child = HookChild::spawn(hook, &url, &config_path, &log_path, "precheck")?;
+                let mut child = HookChild::spawn(hook, &url, &config_path, &log_path, "precheck", inflight)?;
                 child.wait()
             })();
             hook_results.insert("precheck".into(), checked.as_ref().map(|_| "pass".into())
@@ -1173,7 +1446,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         Ok(None) => {
             outcome.status = if outcome.error.is_some() { "failed" } else { "done" }.into();
             outcome.code_tok_s = outcome.sweep.as_ref().and_then(|s| s.rate(1, "levels"));
-            let running = Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
+            let running = Command::new(&inflight.tools.docker).args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
                 .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
             if running == Some(false) {
                 outcome.error = Some("the server exited during or after the run (see its coordinator log)".into());
@@ -1200,7 +1473,7 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
             outcome.build = build.to_string();
             let _ = writeln!(log, "server build {}", report.server.build.label());
             // A server that died after finishing the run still fails the entry's serving check.
-            let running = Command::new("docker").args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
+            let running = Command::new(&inflight.tools.docker).args(["inspect", "-f", "{{.State.Running}}", &coordinator_name(entry, parallel)])
                 .output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true");
             if running == Some(false) {
                 outcome.error = Some("the server exited during or after the run (see its coordinator log)".into());
@@ -1210,9 +1483,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         Err(error) => {
             outcome.error = Some(format!("{error:#}"));
             let _ = writeln!(log, "error: {error:#}");
-            // Only collect serving diagnostics after this entry launched containers.
-            if launcher_started {
-                let tail = Command::new("docker").args(["logs", "--tail", "40", &coordinator_name(entry, parallel)]).output();
+            // Only collect serving diagnostics after this entry launched containers
+            // (not on a cancellation: the bounded teardown collects the logs).
+            if launcher_started && inflight.cancelled().is_none() {
+                let tail = Command::new(&inflight.tools.docker).args(["logs", "--tail", "40", &coordinator_name(entry, parallel)]).output();
                 if let Ok(tail) = tail {
                     let _ = log.write_all(&tail.stdout);
                     let _ = log.write_all(&tail.stderr);
@@ -1226,10 +1500,19 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
         let _ = std::fs::write(log_path.with_extension("report.json"), serde_json::to_vec_pretty(&failure).unwrap_or_default());
     }
     // A rejected prelaunch hook never owns any serving containers.
-    if launcher_started {
+    // A cancelled run's teardown belongs to the scheduler (Inflight::cancel_all,
+    // bounded, all entries at once): the entry stays registered for it. A
+    // cancellation arriving during this teardown repeats it there, bounded.
+    if launcher_started && inflight.cancelled().is_none() {
+        inflight.stop_launcher(&entry.name);
         if let Ok(config) = read_config(&configs.join(format!("{}.config", entry.name))) {
-            teardown(entry, &config, &mut log);
+            teardown(&entry.name, &config, &mut log, &inflight.tools, false);
         }
+        inflight.finished(&entry.name);
+    }
+    if let Some(signal) = inflight.cancelled().filter(|_| outcome.status != "done") {
+        outcome.status = "cancelled".into();
+        outcome.error.get_or_insert_with(|| Cancelled(signal).to_string());
     }
     outcome.fabric_caveats = crate::fabric::caveats(&outcome.fabric);
     outcome.ab_verdict = if outcome.fabric_caveats.is_empty() { "eligible" } else { "rerun" }.into();
@@ -1354,9 +1637,9 @@ mod tests {
         // A fake docker: logs each call; `ps` finds the worker, `inspect` prints LABEL.
         std::fs::write(&docker, "#!/bin/sh\necho \"$*\" >>\"$LOG\"\ncase \"$1\" in ps) echo id1;; inspect) printf '%s\\n' \"$LABEL\";; esac\n").unwrap();
         std::fs::set_permissions(&docker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let script = worker_teardown_script("cuteafd-spark-expert-kiwi-19441");
-        for (label, stopped) in [("1", true), ("", false)] {
-            let log = dir.join(format!("log-{stopped}"));
+        for (label, stopped, bound) in [("1", true, None), ("", false, None), ("1", true, Some(15))] {
+            let script = worker_teardown_script("cuteafd-spark-expert-kiwi-19441", bound);
+            let log = dir.join(format!("log-{stopped}-{bound:?}"));
             let status = Command::new("sh").arg("-c").arg(&script)
                 .env("PATH", format!("{}:/usr/bin:/bin", dir.display())).env("LOG", &log).env("LABEL", label)
                 .status().unwrap();
@@ -1364,7 +1647,8 @@ mod tests {
             let calls = std::fs::read_to_string(&log).unwrap();
             let lines: Vec<&str> = calls.lines().collect();
             assert!(lines.iter().any(|l| l.starts_with("inspect -f {{index .Config.Labels \"cuteafd.graceful-stop\"}} cuteafd-spark-expert-kiwi-19441")), "{calls}");
-            assert_eq!(lines.iter().any(|l| *l == "stop cuteafd-spark-expert-kiwi-19441"), stopped, "{calls}");
+            let stop = match bound { Some(t) => format!("stop -t {t} cuteafd-spark-expert-kiwi-19441"), None => "stop cuteafd-spark-expert-kiwi-19441".into() };
+            assert_eq!(lines.iter().any(|l| *l == stop), stopped, "{calls}");
             assert_eq!(lines.last(), Some(&"rm -f id1"), "{calls}");
             if stopped {
                 let stop = lines.iter().position(|l| l.starts_with("stop ")).unwrap();
@@ -1372,6 +1656,93 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fakes for teardown: `docker` and `ssh` append their argv to `log`.
+    fn fake_tools(dir: &Path, log: &Path) -> Tools {
+        for name in ["docker", "ssh"] {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >>'{}'\n", log.display())).unwrap();
+            std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        }
+        Tools { docker: dir.join("docker"), ssh: dir.join("ssh") }
+    }
+
+    fn wait_until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_signal_tears_down_the_launched_entry_before_smoke_returns() {
+        let root = tempfile::tempdir().unwrap();
+        let (configs, logs) = (root.path().join("configs"), root.path().join("logs"));
+        std::fs::create_dir_all(&configs).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        let calls = root.path().join("calls.log");
+        // A launcher that never becomes ready (and records that it was stopped).
+        let launcher_pid = root.path().join("launcher.pid");
+        std::fs::write(root.path().join("run.sh"), format!(
+            "#!/bin/sh\necho $$ >'{}'\ntrap 'echo launcher stopped >>\"{}\"; exit 143' TERM\nwhile :; do sleep 0.05; done\n",
+            launcher_pid.display(), calls.display())).unwrap();
+        std::fs::set_permissions(root.path().join("run.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        std::fs::write(root.path().join("base.config"),
+            "ADDR=127.0.0.1:9\nINSTANCE=cancel-test\nEXPERT_PORT=19441\nSPARK_COUNT=2\nSPARK_0_HOST=kiwi\nSPARK_1_HOST=rhea\n").unwrap();
+        let entry = Entry { name: "cancel".into(), config: Some("base.config".into()), ..Entry::default() };
+        let inflight = Arc::new(Inflight { tools: fake_tools(root.path(), &calls), ..Inflight::default() });
+        inflight.register(&[signal_hook::consts::SIGUSR2]).unwrap();
+        let worker = {
+            let (entry, repo, configs, logs, inflight) = (entry.clone(), root.path().to_path_buf(), configs.clone(), logs.clone(), inflight.clone());
+            std::thread::spawn(move || run_entry(&entry, &repo, &repo, &configs, &logs, "smoke", "test", false, &inflight))
+        };
+        wait_until("launcher registered", || launcher_pid.exists() && inflight.launches.lock().unwrap().contains_key("cancel"));
+        // A real signal through the installed handler, as systemd's stop sends one
+        // (SIGUSR2 stands in for SIGTERM, which would reach the whole test binary).
+        signal_hook::low_level::raise(signal_hook::consts::SIGUSR2).unwrap();
+        wait_until("cancel flag", || inflight.cancelled().is_some());
+        let outcome = worker.join().unwrap();
+        assert_eq!(outcome.status, "cancelled");
+        assert!(outcome.error.as_deref().unwrap().contains("cancelled by signal"), "{:?}", outcome.error);
+        // The entry left its teardown to the scheduler and is still registered for it.
+        assert!(inflight.launches.lock().unwrap().contains_key("cancel"));
+        assert!(!std::fs::read_to_string(&calls).unwrap_or_default().contains("rm -f"));
+        let started = Instant::now();
+        assert_eq!(inflight.cancel_all(), vec!["cancel".to_string()]);
+        assert!(started.elapsed() < Duration::from_secs(CANCEL_TEARDOWN_S));
+        let calls = std::fs::read_to_string(&calls).unwrap();
+        assert!(calls.contains("launcher stopped"), "{calls}");
+        assert!(calls.contains("docker rm -f cuteafd-coordinator-cancel-test"), "{calls}");
+        for host in ["kiwi", "rhea"] {
+            assert!(calls.lines().any(|l| l.starts_with("ssh ") && l.contains(host) && l.contains("docker rm -f") && l.contains(&format!("cuteafd-spark-expert-{host}-19441"))), "{calls}");
+        }
+        assert!(std::fs::read_to_string(logs.join("cancel.log")).unwrap().contains("teardown cancel (cuteafd-coordinator-cancel-test)"));
+        // A cancelled registry refuses new launches and hooks.
+        let mut command = Command::new("true");
+        assert!(inflight.launch("late", &mut command, &configs, &logs).unwrap_err().downcast_ref::<Cancelled>().is_some());
+        let hook = Hook { argv: vec!["true".into()], timeout_s: 2, required: false, cleanup: None, finish_timeout_s: None };
+        assert!(HookChild::spawn(&hook, "http://127.0.0.1", &logs.join("x.log"), &logs.join("x.log"), "precheck", &inflight).is_err());
+    }
+
+    #[test]
+    fn cancel_all_kills_hook_groups_and_runs_their_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("hook.log");
+        let cleaned = root.path().join("cleaned");
+        let hook = Hook { argv: vec!["sleep".into(), "30".into()], timeout_s: 60, required: false,
+            cleanup: Some(vec!["touch".into(), cleaned.display().to_string()]), finish_timeout_s: None };
+        let inflight = Arc::new(Inflight::default());
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer", &inflight).unwrap();
+        inflight.cancel(signal_hook::consts::SIGTERM);
+        let started = Instant::now();
+        assert!(inflight.cancel_all().is_empty());
+        assert!(cleaned.exists());
+        assert!(child.wait().is_err(), "the hook was killed");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        drop(child);
+        assert!(inflight.hooks.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1402,7 +1773,7 @@ mod tests {
             prelaunch: Some(Hook { argv: vec!["false".into()], timeout_s: 2, required: true,
                 cleanup: None, finish_timeout_s: None }), ..Entry::default() };
         // No run.sh exists: the hook failure must precede any spawn attempt.
-        let outcome = run_entry(&e, root.path(), root.path(), &configs, &logs, "smoke", "test", false);
+        let outcome = run_entry(&e, root.path(), root.path(), &configs, &logs, "smoke", "test", false, &Arc::new(Inflight::default()));
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.unwrap().contains("prelaunch hook failed before launcher"));
         assert!(outcome.launch_s.is_none());
@@ -1416,11 +1787,12 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let log = root.join("test.log");
         let hook = Hook { argv: vec!["false".into()], timeout_s: 2, required: false, cleanup: None, finish_timeout_s: None };
-        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "precheck").unwrap();
+        let inflight = Arc::new(Inflight::default());
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "precheck", &inflight).unwrap();
         assert!(child.wait().unwrap_err().to_string().contains("exited"));
         drop(child);
         let hook = Hook { argv: vec!["sleep".into(), "20".into()], timeout_s: 1, required: false, cleanup: None, finish_timeout_s: None };
-        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer", &inflight).unwrap();
         let started = Instant::now();
         assert!(child.wait().is_err());
         drop(child);
@@ -1436,7 +1808,8 @@ mod tests {
         let mut hook: Hook = serde_json::from_value(serde_json::json!({
             "argv": ["sleep", "20"], "timeout_s": 30, "finish_timeout_s": 300
         })).unwrap();
-        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").unwrap();
+        let inflight = Arc::new(Inflight::default());
+        let mut child = HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer", &inflight).unwrap();
         assert_eq!(child.finish_timeout, Duration::from_secs(300));
         child.deadline = Instant::now() + Duration::from_millis(100);
         let total_deadline = child.deadline;
@@ -1446,7 +1819,7 @@ mod tests {
         drop(child);
         for invalid in [0, 7201] {
             hook.finish_timeout_s = Some(invalid);
-            assert!(HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer").is_err());
+            assert!(HookChild::spawn(&hook, "http://127.0.0.1", &log, &log, "observer", &inflight).is_err());
         }
         let _ = std::fs::remove_dir_all(root);
     }

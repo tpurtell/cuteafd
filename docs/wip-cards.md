@@ -3,7 +3,11 @@
 Use `scripts/bench/wip-cards.py` instead of copying an RC kit driver. It reads
 `cfg/*.config` and `matrix-*.json` from the kit (default: release-v2-rc2), writes
 private one-card matrices and a 0600 API key, and runs `cuteafd bench smoke`
-under `setsid` with numeric exit files. Smoke alone owns serving locks. Use a
+under `setsid` with numeric exit files. Smoke alone owns serving locks.
+Stopping a run (`systemctl --user stop UNIT`, Ctrl-C, SIGTERM/SIGHUP) makes
+smoke tear down its coordinator and Spark workers before it exits; wip-cards
+and `hwlock.py` wait for it, so the locks are released on clean hardware (see
+the module help for the systemd-run flags). Use a
 current CLI containing the opt-in observer/precheck hooks for probes.
 
 Fabric attribution reads each serving host's SparkNest 0.4.1 schema-1 stream.

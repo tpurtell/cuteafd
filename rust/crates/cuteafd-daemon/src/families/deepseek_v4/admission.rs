@@ -64,7 +64,7 @@ pub(crate) fn spark_model(decode_rows: usize, device_exchange: bool)
     }
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity: 4096, compiled_capacity: 4096, endpoints,
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
+        rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
     })
 }
 

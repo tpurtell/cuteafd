@@ -413,7 +413,7 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *args, **kwargs: recorded.append((args, kwargs))))
-    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024",
+    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024", "--role", "spark",
                             "--bits", ",".join(map(str, bits))], tmp_path)
     assert len(recorded) == 1
     assert recorded[0][0][4] == bits
@@ -432,26 +432,29 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
     assert [module._trellis256_execution_lut for module in (first, fourth)] == originals
 
 
-@pytest.mark.parametrize("geometry,compact", [("qwen4", True), ("glm", False)])
-def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, compact):
+@pytest.mark.parametrize("geometry,compact,role,bits", [
+    ("qwen4", True, "spark", (4, 5)), ("glm", False, "spark", (4, 5)),
+    ("glm", False, "coordinator", (4, 5)), ("glm", False, "coordinator", (3, 4)),
+])
+def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compact, role, bits):
     fixture = compare_sm.load_file(
         "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
     package = fixture.package
     # Compare the shipping cooperative compact route and its measured hint.
-    capacities = (1, 80, 256, 4096)
+    capacities = (1, 80, 256, 1024, 2752, 4096)
     build_root = tmp_path / "build-fixture"
     build_root.mkdir()
     _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
-        build_root, "spark", (4, 5), geometry=geometry,
+        build_root, role, bits, geometry=geometry,
         capacities=capacities, compact=compact,
-        profiles=() if compact else tuple(p[0] for p in package.profiles_for_role("spark", geometry)))
+        profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
     expected = {(call.args[0].parent.name.split('+')[0], call.args[3]): call.kwargs for call in calls
                 if bool(call.kwargs.get("compact_weights")) == compact}
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *values, **options: recorded.append((values, options))))
-    args = ["--geometry", geometry, "--bits", "4,5", "--role", "spark",
+    args = ["--geometry", geometry, "--bits", ",".join(map(str, bits)), "--role", role,
             "--capacities", ",".join(map(str, capacities))]
     if compact:
         args.append("--compact-companions")
@@ -464,7 +467,7 @@ def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, 
         assert not any(options.get("warp_specialized") for _, options in recorded)
         assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
     else:
-        assert any(options.get("warp_specialized") for _, options in recorded)
+        assert any(options.get("warp_specialized") for _, options in recorded) == (role == "spark" or bits == (4, 5))
 
 
 def residency_gate(name="validate_table_residency"):
