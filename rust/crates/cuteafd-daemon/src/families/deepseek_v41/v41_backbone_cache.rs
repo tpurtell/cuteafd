@@ -173,6 +173,9 @@ pub(crate) struct BackboneCache<'a> {
     /// Per capture lane: a stream for queued snapshot copies and the lease it captures.
     prefix_copies: [crate::shared::memory::SnapshotCopies<'a, CacheLease>; 2],
     prefix_stream: crate::shared::memory::LoadStream<'a>,
+    /// Recorded on the prefix stream before a lane's queued snapshot: the lane's copies wait
+    /// on it on the device instead of the host draining the prefix stream.
+    prefix_queued: prefix::PrefixEvent<'a>,
     #[cfg(test)]
     test_queued: [Option<(CacheLease, crate::shared::memory::DeviceAllocation<'a>, BackboneMark)>; 2],
     windows: Vec<DeviceOwner<'a, WindowState<'a>>>,
@@ -333,6 +336,7 @@ impl<'a> BackboneCache<'a> {
             prefix_copies: [crate::shared::memory::SnapshotCopies::new(library)?,
                 crate::shared::memory::SnapshotCopies::new(library)?],
             prefix_stream: crate::shared::memory::LoadStream { library, raw: library.cuda_stream_create()? },
+            prefix_queued: prefix::PrefixEvent::new(library)?,
             #[cfg(test)]
             test_queued: [None, None],
             windows,

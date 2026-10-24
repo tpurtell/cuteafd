@@ -1,5 +1,5 @@
 //! Committed state only. Proposal workspaces never alias these planes.
-use crate::shared::memory::device::{Allocation, Device, Stream};
+use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
@@ -8,10 +8,18 @@ use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 pub(super) use cuteafd_loader::plan::families::step5::admission::Reservation;
 
 /// Maintenance owns its stream; transactions use registered lane streams.
-/// Boundary operations join every live lane before copying shared state.
+/// Boundary operations join every live lane before copying shared state, on
+/// the device ([`Self::ordered`]): the maintenance stream waits for each lane's
+/// queued work, copies, and every lane waits for the copies. No lane stream is
+/// synchronized on the host; [`Self::drain`] is that fence plus a host wait on
+/// the maintenance stream alone (the argument in `shared::prefix::copy_stream`).
 pub(super) struct CacheRank<'a> {
     pub stream: Stream<'a>,
     lane_streams: RefCell<Vec<Weak<Stream<'a>>>>,
+    /// Join events: one per registered lane (grown on registration), and the
+    /// copies' completion.
+    produced: RefCell<Vec<Event<'a>>>,
+    landed: RefCell<Event<'a>>,
     active: Allocation<'a>,
     marks: Option<Rc<Allocation<'a>>>,
     pages: Option<Rc<Allocation<'a>>>,
@@ -50,7 +58,9 @@ impl<'a> CacheRank<'a> {
         let pages = if reservation.pages > 0 { Some(Rc::new(Allocation::new(device, reservation.pages)?)) } else { None };
         let predictor_evidence = (0..sequences).map(|_|
             (0..layout.ranks[rank].mtp_lengths.len()).map(|_| Cell::new(0)).collect()).collect();
-        let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), active, marks, pages, page_count, layout, rank, sequences, slots,
+        let landed = RefCell::new(Event::new(device)?);
+        let owner = Self { stream, lane_streams: RefCell::new(Vec::new()), produced: RefCell::new(Vec::new()), landed,
+            active, marks, pages, page_count, layout, rank, sequences, slots,
             marks_at, pending_bank: vec![Cell::new(false); usize::try_from(sequences)?], predictor_evidence,
             poisoned: Cell::new(false), busy: vec![Cell::new(false); usize::try_from(sequences)?], reservation };
         let mut guard = owner.stream.cancellation_guard("Step-5 cache initialization");
@@ -76,13 +86,40 @@ impl<'a> CacheRank<'a> {
         if streams.iter().all(|other| !other.ptr_eq(&stream)) {
             streams.push(stream);
         }
+        let mut produced = self.produced.borrow_mut();
+        while produced.len() < streams.len() { produced.push(Event::new(self.stream.device)?); }
         Ok(())
     }
 
+    /// Runs `copies` on the maintenance stream between two device fences: it
+    /// first waits for every live lane's queued work, and every live lane then
+    /// waits for whatever `copies` queued (even after a partial failure).
+    fn ordered<T>(&self, copies: impl FnOnce() -> Result<T>) -> Result<T> {
+        let lanes: Vec<_> = self.lane_streams.borrow().iter().filter_map(Weak::upgrade).collect();
+        let mut produced = self.produced.borrow_mut();
+        ensure!(produced.len() >= lanes.len(), "Step-5 cache lane without a join event");
+        let device = self.stream.device;
+        for (event, lane) in produced.iter_mut().zip(&lanes) {
+            event.record(lane)?;
+            // SAFETY: the maintenance stream and the event are owned here and live.
+            device.run(|| unsafe { device.library.cuda_stream_wait_event(self.stream.raw, event.raw) })?;
+        }
+        let result = copies();
+        let mut landed = self.landed.borrow_mut();
+        landed.record(&self.stream)?;
+        for lane in &lanes {
+            // SAFETY: the lane stream is retained above; the event is owned here.
+            device.run(|| unsafe { device.library.cuda_stream_wait_event(lane.raw, landed.raw) })?;
+        }
+        result
+    }
+
+    /// Every lane's and the maintenance stream's queued work has completed
+    /// when this returns: a device fence, then a host wait on the maintenance
+    /// stream only.
     pub fn drain(&self) -> Result<()> {
-        super::execution::collect_lane_results(self.lane_streams.borrow().iter()
-            .filter_map(Weak::upgrade).map(|stream| stream.drain())
-            .chain(std::iter::once_with(|| self.stream.drain())))
+        self.ordered(|| Ok(()))?;
+        self.stream.drain()
     }
 
     pub(super) fn validate_reset(&self, sequence: u64) -> Result<()> {
@@ -172,18 +209,20 @@ impl<'a> CacheRank<'a> {
         ensure!(rows <= cuteafd_loader::serving_capacity::step5::PAGE_ROWS as usize,
             "Step-5 CSA tail longer than a page");
         ensure!(from != to, "Step-5 CSA COW requires distinct pages");
-        self.drain()?;
         let source = self.page_views(from)?;
         let target = self.page_views(to)?;
         let mut guard = self.stream.cancellation_guard("Step-5 CSA tail copy");
-        for (source, target) in source.into_iter().zip(target) {
-            let bytes = source.bytes / 64 * rows;
-            if bytes > 0 {
-                self.copy(view(target, ByteSpan { offset: 0, bytes: bytes as u64 })?,
-                    view(source, ByteSpan { offset: 0, bytes: bytes as u64 })?)?;
+        self.ordered(|| {
+            for (source, target) in source.into_iter().zip(target) {
+                let bytes = source.bytes / 64 * rows;
+                if bytes > 0 {
+                    self.copy(view(target, ByteSpan { offset: 0, bytes: bytes as u64 })?,
+                        view(source, ByteSpan { offset: 0, bytes: bytes as u64 })?)?;
+                }
             }
-        }
-        self.stream.drain()?;
+            Ok(())
+        })?;
+        // The shared prefix cache drains before it hands either page to anyone else.
         guard.complete = true;
         Ok(())
     }
@@ -287,17 +326,19 @@ impl<'a> CacheRank<'a> {
         self.marks_at[usize::try_from(slot)?] = None;
         let mut guard = self.stream.cancellation_guard("Step-5 cache capture");
         let mark = self.mark_view(u32::try_from(slot)?)?;
-        self.stream.device.run(|| {
-            // SAFETY: this owned slot is unpublished, and the stream drains below.
-            // Host snapshots store the full slot, including unused summary capacity.
-            unsafe { self.stream.device.library.cuda_zero_bytes_async(mark, mark.bytes, self.stream.raw) }
+        self.ordered(|| {
+            self.stream.device.run(|| {
+                // SAFETY: this owned slot is unpublished until the cache drains.
+                // Host snapshots store the full slot, including unused summary capacity.
+                unsafe { self.stream.device.library.cuda_zero_bytes_async(mark, mark.bytes, self.stream.raw) }
+            })?;
+            for copy in copies {
+                let source = view(self.active.buffer, copy.active)?;
+                let target = view(marks, copy.mark)?;
+                self.copy(target, source)?;
+            }
+            Ok(())
         })?;
-        for copy in copies {
-            let source = view(self.active.buffer, copy.active)?;
-            let target = view(marks, copy.mark)?;
-            self.copy(target, source)?;
-        }
-        self.stream.drain()?;
         guard.complete = true;
         self.marks_at[usize::try_from(slot)?] = Some(frontier);
         Ok(())
@@ -364,12 +405,15 @@ impl<'a> CacheRank<'a> {
     fn restore_copies(&self, copies: Vec<cuteafd_loader::serving_capacity::step5::SnapshotCopy>) -> Result<()> {
         let marks = self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer;
         let mut guard = self.stream.cancellation_guard("Step-5 cache restore");
-        for copy in copies {
-            let source = view(marks, copy.mark)?;
-            let target = view(self.active.buffer, copy.active)?;
-            self.copy(target, source)?;
-        }
-        self.stream.drain()?;
+        // Every lane's next work on the restored state waits for these copies.
+        self.ordered(|| {
+            for copy in copies {
+                let source = view(marks, copy.mark)?;
+                let target = view(self.active.buffer, copy.active)?;
+                self.copy(target, source)?;
+            }
+            Ok(())
+        })?;
         guard.complete = true;
         Ok(())
     }
@@ -377,7 +421,8 @@ impl<'a> CacheRank<'a> {
     fn copy(&self, target: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
         self.stream.device.run(|| {
             // SAFETY: both checked views belong to this owner on the stream's device;
-            // capture/restore drain (including error paths) before returning or freeing.
+            // the lane fences order them, and the cancellation guards and the cache's
+            // drain retire them before any storage is reused or freed.
             unsafe { self.stream.device.library.copy_d2d_async(target, source, source.bytes, self.stream.raw) }
         })
     }

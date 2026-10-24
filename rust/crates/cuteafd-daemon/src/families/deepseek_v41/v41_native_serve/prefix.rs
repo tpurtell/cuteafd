@@ -276,9 +276,9 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn queue_capture(&self, slot: MarkSlot, placement: &V41Placement, len: usize, tail: Option<TailCopy>)
         -> Result<Option<CaptureTicket>, BoxError> {
         let lane = self.lane.get();
+        // The tail copy runs on the prefix stream; `queue_mark` orders the lane's copies after
+        // it on the device.
         if let Some(tail) = tail { self.copy_rows(tail)?; }
-        // The tail copy runs on the prefix stream; order the lane's copies after it.
-        self.requests.borrow().cache().drain_prefix_stream().map_err(boxed)?;
         let target = self.arena.target(slot).map_err(boxed)?;
         let saved = self.requests.borrow_mut().queue_mark(lane, placement.lease, target).map_err(boxed)?;
         if saved.backbone.end as usize != len {
@@ -326,7 +326,7 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         requests.cache().publish_units(&[copy.to]).map_err(boxed)
     }
     fn drain(&self) -> Result<(), BoxError> {
-        self.requests.borrow().cache().drain_prefix_stream().map_err(boxed)
+        self.requests.borrow().cache().prefix_drain().map_err(boxed)
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.requests.borrow().cache().unit_segments(page).into_iter().map(range).collect()

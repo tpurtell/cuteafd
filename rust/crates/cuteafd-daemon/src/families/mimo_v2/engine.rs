@@ -114,17 +114,7 @@ pub(crate) enum Experts<'a> {
     /// `lanes`: further transports to the same ranks for the earlier row lanes
     /// of a pipelined prefill ([`MimoEngine::prefill_capacity`]; `transport`
     /// carries the last lane); empty keeps prefill serial.
-    Spark { transport: RefCell<SparkLink<'a>>, lanes: Vec<RefCell<SparkLink<'a>>>, runtime: tokio::runtime::Runtime },
-}
-
-/// A dispatched Spark wave and its send-side host phases (seconds).
-struct SentWave {
-    /// Taken by [`MimoEngine::spark_receive`].
-    wave: Option<cuteafd_transport::expert::SparkExpertWave>,
-    gpu_wait: f64,
-    build: f64,
-    dispatch: f64,
-    sent: std::time::Instant,
+    Spark { transport: RefCell<SparkLink<'a>>, lanes: Vec<RefCell<SparkLink<'a>>> },
 }
 
 pub(crate) use crate::shared::experts::rtx::pair::TerminalStepError;
@@ -361,6 +351,10 @@ struct Workspace<'a> {
     /// Spark exchange: rank partial planes, a zero shared-expert plane (MiMo
     /// has none), and pinned staging for routes, wire rows and partials.
     zero_plane: Dev<'a>,
+    /// Admitted pinned route staging (the planner charges it); Spark waves
+    /// now stage in the link exchange's slots, so it stays unused until the
+    /// planner drops the charge.
+    #[allow(dead_code)]
     router_host: RefCell<HostAllocation<'a>>,
     /// The step's token ids (U32), gathered from the device embedding table.
     ids: Dev<'a>,
@@ -508,9 +502,6 @@ pub(crate) struct MimoEngine<'a> {
     /// Host time per phase: GPU wait before the expert request, the Spark exchange.
     pub profile: RefCell<[f64; 2]>,
     draft_probe: RefCell<Option<crate::shared::draft::probe::RoundProbe<'a>>>,
-    /// `CUTEAFD_MIMO_WAVE_TIMING=1`: one line per Spark wave with its host
-    /// phases (diagnostics; read once at construction).
-    wave_timing: bool,
     /// The DFlash drafter (V2.6 Pro's dflash/): every step taps its target layers.
     pub drafter: Option<super::dflash::MimoDrafter<'a>>,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -622,7 +613,7 @@ impl<'a> MimoEngine<'a> {
             lane_workspaces: RefCell::new(Vec::new()), prefill_kv_wide: RefCell::new(None), experts: None, tp2: None, rtx_local: None,
             expert_input: ExpertInput::Fp8,
             profile: RefCell::new([0.0; 2]), draft_probe: RefCell::new(None),
-            wave_timing: std::env::var("CUTEAFD_MIMO_WAVE_TIMING").is_ok_and(|v| v == "1"), drafter: None, mtp: None, l2: None, embedding,
+            drafter: None, mtp: None, l2: None, embedding,
             mtp_staging: RefCell::new((HostAllocation::new(library, 1 << 20)?, 0)), prefill_w8a8: true,
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(HashMap::new()), graph_storage_plan: None, graph_storage_bound_bytes: None,
@@ -673,7 +664,7 @@ impl<'a> MimoEngine<'a> {
     pub(crate) fn draft_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let reports = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
             _ => Vec::new(),
         };
         let homes = self.weights.layers.iter().enumerate().map(|(index, layer)| {
@@ -1322,7 +1313,7 @@ impl<'a> MimoEngine<'a> {
     fn step_lanes_inner(&self, lanes: &[(&StepTables, &[u32])], independent: bool,
         media: &[Option<&cuteafd_engine::media::RequestMedia>])
         -> Result<Vec<Option<DeviceLogits>>> {
-        let Some(Experts::Spark { transport, lanes: links, runtime }) = &self.experts else {
+        let Some(Experts::Spark { transport, lanes: links, .. }) = &self.experts else {
             anyhow::bail!("pipelined prefill needs Spark experts with lane transports");
         };
         let n = lanes.len();
@@ -1393,9 +1384,38 @@ impl<'a> MimoEngine<'a> {
         }
         let layers = &self.weights.layers;
         let bf16_input = self.expert_input.bf16(false);
-        let mut transports: Vec<_> = links[..last].iter().map(RefCell::borrow_mut)
+        let mut links: Vec<_> = links[..last].iter().map(RefCell::borrow_mut)
             .chain(std::iter::once(transport.borrow_mut())).collect();
-        let mut inflight: Vec<Option<(usize, SentWave)>> = (0..n).map(|_| None).collect();
+        // Each lane link's exchange worker builds, posts and lands that lane's
+        // waves while this thread queues the lanes' GPU work.
+        let staging = self.wave_staging_bytes(bf16_input)?;
+        let mut exchanges = links.iter_mut().map(|link| {
+            let exchange = link.exchange()?;
+            ensure!(exchange.fits(staging), "Spark exchange staging is narrower than a prefill lane");
+            Ok(exchange)
+        }).collect::<Result<Vec<_>>>()?;
+        self.lane_layers(&mut exchanges, &w, w1, &t, &rows, lanes, independent, bf16_input, last)?;
+        self.finish_tp2_route_step()?;
+        if layers.len() < self.cfg.layers {
+            // SAFETY: the engine owns both streams; every queued wait has a matching push.
+            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+            if w1.is_some() {
+                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
+            }
+            return Ok((0..n).map(|_| None).collect());
+        }
+        self.lane_heads(&w, &t, independent, n, last)
+    }
+
+    /// The lane layer loop of [`Self::step_lanes_inner`]: lane `i`'s waves go
+    /// out on `transports[i]`'s worker.
+    #[allow(clippy::too_many_arguments)]
+    fn lane_layers(&self, transports: &mut [&mut crate::shared::spark_waves::Waves<'_>], w: &[&Workspace<'_>],
+        w1: Option<&[&Workspace<'_>]>, t: &[usize], rows: &[Scalar], lanes: &[(&StepTables, &[u32])],
+        independent: bool, bf16_input: bool, last: usize) -> Result<()> {
+        let n = lanes.len();
+        let layers = &self.weights.layers;
+        let mut inflight: Vec<Option<(usize, crate::shared::spark_waves::WaveTicket)>> = (0..n).map(|_| None).collect();
         // After a lane's FFN output is in its `delta`: both GPUs' next input
         // norms, then each independent request's drafter taps on rank 0.
         // Consecutive chunks of one request keep the historical last-lane taps.
@@ -1440,7 +1460,7 @@ impl<'a> MimoEngine<'a> {
                 if let Some((previous, sent)) = inflight[i].take() {
                     let forward = (w1.is_some() && previous + 1 < layers.len())
                         .then_some(lane_slot(previous, true, i));
-                    self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, forward, false)?;
+                    self.wave_land(w[i], t[i], transports[i], sent, forward)?;
                     after_ffn(i, previous)?;
                 }
                 if let Some(peers) = w1 {
@@ -1477,7 +1497,7 @@ impl<'a> MimoEngine<'a> {
                     after_ffn(i, index)?;
                 } else {
                     self.moe_front(w[i], layer, t[i], bf16_input)?;
-                    inflight[i] = Some((index, self.spark_send(w[i], index, t[i], false, bf16_input, false, &mut transports[i])?));
+                    inflight[i] = Some((index, self.wave_send(w[i], index, t[i], ExpertV2SourceKind::Prefill, bf16_input, transports[i])?));
                 }
             }
         }
@@ -1485,19 +1505,16 @@ impl<'a> MimoEngine<'a> {
             if let Some((previous, sent)) = inflight[i].take() {
                 let forward = (w1.is_some() && previous + 1 < layers.len())
                     .then_some(lane_slot(previous, true, i));
-                self.spark_land(w[i], previous, t[i], &mut transports[i], runtime, sent, forward, false)?;
+                self.wave_land(w[i], t[i], transports[i], sent, forward)?;
                 after_ffn(i, previous)?;
             }
         }
-        self.finish_tp2_route_step()?;
-        if layers.len() < self.cfg.layers {
-            // SAFETY: the engine owns both streams; every queued wait has a matching push.
-            unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-            if w1.is_some() {
-                self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
-            }
-            return Ok((0..n).map(|_| None).collect());
-        }
+        Ok(())
+    }
+
+    /// Each lane's last-row head after [`Self::lane_layers`].
+    fn lane_heads(&self, w: &[&Workspace<'_>], t: &[usize], independent: bool, n: usize, last: usize)
+        -> Result<Vec<Option<DeviceLogits>>> {
         let mut logits: Vec<Option<DeviceLogits>> = (0..n).map(|_| None).collect();
         for i in if independent { 0..n } else { last..n } {
             self.launch_head(w[i], t[i], 1, false)?;
@@ -1812,20 +1829,42 @@ impl<'a> MimoEngine<'a> {
     fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, tables: &StepTables, t: usize,
         gather: bool, head: bool, launch: bool) -> Result<()> {
         let layers = &self.weights.layers;
-        let planes = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().intake.pointers(),
-            _ => [std::ptr::null(); MAX_RANKS],
+        // The decode link has one return slot: every decode wave lands in its
+        // planes, which the replayed segments bake in.
+        let mut link = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => Some(transport.borrow_mut()),
+            _ => None,
+        };
+        let planes = match link.as_mut() {
+            Some(link) => {
+                let exchange = link.exchange()?;
+                ensure!(exchange.waves() == 1, "MiMo decode graphs bake one return slot's planes");
+                exchange.planes(0)
+            }
+            None => [std::ptr::null(); MAX_RANKS],
         };
         let bf16_input = self.expert_bf16_input(true);
+        // The previous layer's wave: landed (a device wait) before the segment
+        // that reduces its planes, consumed after it.
+        let mut pending: Option<crate::shared::spark_waves::WaveTicket> = None;
         for index in 0..=layers.len() {
             let previous = self.previous(index);
             let last = index == layers.len();
             let key = GraphKey { layer: index, rows: t, table_stride: tables.table_stride, previous, head: head && last };
+            let landed = match (pending.take(), link.as_mut()) {
+                (Some(wave), Some(link)) => {
+                    let slot = wave.slot();
+                    link.exchange()?.land(wave, self.stream)?;
+                    Some(slot)
+                }
+                (Some(_), None) => anyhow::bail!("MiMo decode wave without its Spark link"),
+                (None, _) => None,
+            };
             self.graph(0, key, launch, || self.decode_segment(index, previous, w, w1, tables, t, gather, key.head,
                 planes, bf16_input))?;
-            if let (true, Previous::Planes(_), Some(Experts::Spark { transport, .. })) = (launch, previous, &self.experts) {
+            if let (Some(slot), Some(link)) = (landed, link.as_mut()) {
                 // The planes are free for the next wave once the stream passes this segment's reduce.
-                transport.borrow().intake.consumed(self.stream)?;
+                link.exchange()?.consumed(slot, self.stream)?;
             }
             if let Some(w1) = w1 {
                 // Queue the matching peer attention before any host-driven
@@ -1848,15 +1887,18 @@ impl<'a> MimoEngine<'a> {
                 self.probe_mark(index)?;
                 continue;
             }
-            match self.experts.as_ref() {
-                Some(Experts::Spark { transport, runtime, .. }) => {
-                    let mut transport = transport.borrow_mut();
-                    let mut sent = self.spark_send(w, index, t, true, bf16_input, true, &mut transport)?;
-                    let receive = self.spark_receive(t, &mut transport, runtime, &mut sent)?;
-                    self.wave_line(index, t, &sent, receive, 0.0);
+            match (self.experts.as_ref(), link.as_mut()) {
+                (Some(Experts::Spark { .. }), Some(link)) => {
+                    // The router's ids into the probe ring, then the wave: its
+                    // copies, the L2 prefetch behind them, and the post on the
+                    // exchange worker; the next segment's land orders the reduce.
+                    self.probe_ring(w, index, t)?;
+                    pending = Some(self.wave_send(w, index, t, ExpertV2SourceKind::Decode, bf16_input,
+                        link.exchange()?)?);
+                    if let Some(l2) = &self.l2 { l2.issue(self.library, index, self.stream)?; }
                 }
-                Some(_) => self.moe_run(w, index, t, true)?,
-                None => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
+                (Some(_), _) => self.moe_run(w, index, t, true)?,
+                (None, _) => anyhow::bail!("layer {index} is an MoE layer; pass Spark peers for its routed experts"),
             }
             crate::shared::console::layer_mark(index);
             self.probe_mark(index)?;
@@ -1946,12 +1988,7 @@ impl<'a> MimoEngine<'a> {
             Ok(())
         } else {
             let local = self.tp2_layer(index) || self.rtx_local_layer(index);
-            self.moe_front(w, layer, t, local || bf16_input)?;
-            if !local && matches!(self.experts, Some(Experts::Spark { .. })) {
-                // The wave's routes and rows down to the host inside the segment.
-                self.stage_routes(w, t, bf16_input)?;
-            }
-            Ok(())
+            self.moe_front(w, layer, t, local || bf16_input)
         }
     }
 
@@ -2714,8 +2751,15 @@ impl<'a> MimoEngine<'a> {
         let bf16_input = self.expert_bf16_input(decode);
         self.moe_front(w, layer, t, bf16_input)?;
         match experts {
-            Experts::Spark { transport, runtime, .. } => {
-                self.spark_moe(w, index, t, decode, bf16_input, &mut transport.borrow_mut(), runtime, forward)
+            Experts::Spark { transport, .. } => {
+                let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+                // Verify steps' draft probe reads the routes from its device ring.
+                self.probe_ring(w, index, t)?;
+                let mut link = transport.borrow_mut();
+                let exchange = link.exchange()?;
+                let wave = self.wave_send(w, index, t, kind, bf16_input, exchange)?;
+                if let Some(l2) = self.l2.as_ref().filter(|_| decode) { l2.issue(self.library, index, self.stream)?; }
+                self.wave_land(w, t, exchange, wave, forward)
             }
             _ => self.moe_run(w, index, t, decode),
         }
@@ -2776,162 +2820,65 @@ impl<'a> MimoEngine<'a> {
         }
     }
 
-    /// Routes and wire rows down, one request to every Spark rank, the BF16
-    /// rank partials summed into `delta` (GLM's exchange, no shared expert).
-    #[allow(clippy::too_many_arguments)]
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool,
-        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime, forward: Option<usize>) -> Result<()> {
-        let sent = self.spark_send(w, index, t, decode, bf16_input, false, transport)?;
-        self.spark_land(w, index, t, transport, runtime, sent, forward, true)
-    }
-
-    /// The send half of [`Self::spark_moe`]: routes and wire rows down (the
-    /// stream drains first), the request out to every rank.
-    #[allow(clippy::too_many_arguments)]
-    fn spark_send(&self, w: &Workspace<'_>, index: usize, t: usize, decode: bool, bf16_input: bool, staged: bool,
-        transport: &mut SparkLink<'_>) -> Result<SentWave> {
-        let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
+    /// A wave on the link's exchange: routes and expert input rows copy into
+    /// the wave slot's pinned staging on the stream, and the worker builds and
+    /// posts the request once they complete. This thread does not wait for
+    /// the GPU. Complete with [`Self::wave_land`].
+    fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, kind: ExpertV2SourceKind, bf16_input: bool,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, if bf16_input { t * h * 2 } else { t * (h + h / 32) });
-        let (input, dtype) = if bf16_input { (&w.x, ExpertV2Dtype::Bf16) } else { (&w.wire, ExpertV2Dtype::Fp8E4m3Ue8m0K32) };
-        let staging = w.router_host.borrow_mut();
-        let host = staging.buffer;
-        let at = |offset: usize| Self::staging_at(host, offset);
-        let timer = std::time::Instant::now();
-        // Prefill rows go straight into the transport's registered egress
-        // buffer and out from there to every rank; small waves keep a copy.
-        let egress = transport.egress(wire_bytes)?;
-        // SAFETY: the pinned regions are large enough; the sync completes them.
-        unsafe {
-            // `staged`: a decode segment already queued these copies into the staging
-            // ([`Self::stage_routes`]); only a wave bound for the egress buffer copies again.
-            if !staged {
-                self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-                self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes,
-                    self.stream)?;
-            }
-            match egress {
-                Some(target) => self.library.copy_d2h_host_buffer_async(target, input.buffer, wire_bytes, self.stream)?,
-                None if !staged => self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer,
-                    wire_bytes, self.stream)?,
-                None => {}
-            }
-        }
-        // In a decode step the L2 prefetch queues behind the copies; the host waits for the copies only.
-        match self.l2.as_ref().filter(|_| decode) {
-            Some(l2) => {
-                let mark = crate::shared::l2_prefetch::mark(self.library, self.stream)?;
-                l2.issue(self.library, index, self.stream)?;
-                crate::shared::l2_prefetch::reached(self.library, mark)?;
-            }
-            // SAFETY: the engine owns this stream.
-            None => unsafe { self.library.cuda_stream_synchronize(self.stream)? },
-        }
-        let gpu_wait = timer.elapsed().as_secs_f64();
-        self.profile.borrow_mut()[0] += gpu_wait;
-        let built = std::time::Instant::now();
-        let staged = staging.bytes();
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
-            probe.staged(index, &staged[..route_bytes]);
-        }
-        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
-        }).collect();
-        let wire = match egress {
-            Some(_) => transport.egress_payload(wire_bytes)?,
-            None => staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec().into(),
-        };
-        drop(staging);
-        let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
-            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
-            }).collect(),
-            routes, wire)?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        let ranks = transport.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        let build = built.elapsed().as_secs_f64();
-        let timer = std::time::Instant::now();
-        let wave = transport.dispatch(&request)?;
-        Ok(SentWave { wave: Some(wave), gpu_wait, build, dispatch: timer.elapsed().as_secs_f64(), sent: timer })
-    }
-
-    /// `offset` bytes into the pinned router staging.
-    fn staging_at(host: cuteafd_ffi::CuteafdHostBuffer, offset: usize) -> cuteafd_ffi::CuteafdHostBuffer {
-        cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
-        }
-    }
-
-    /// Queues a decode wave's routes and expert input rows into the pinned router
-    /// staging, where [`Self::spark_send`] (with `staged`) reads them after its sync.
-    fn stage_routes(&self, w: &Workspace<'_>, t: usize, bf16_input: bool) -> Result<()> {
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, if bf16_input { t * h * 2 } else { t * (h + h / 32) });
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+            if bf16_input { h * 2 } else { h + h / 32 })?;
         let input = if bf16_input { &w.x } else { &w.wire };
-        let host = w.router_host.borrow().buffer;
-        ensure!(2 * route_bytes + wire_bytes <= host.bytes, "router staging of {} bytes for {t} rows", host.bytes);
-        let at = |offset: usize| Self::staging_at(host, offset);
-        // SAFETY: the pinned regions hold these bytes (checked above); the host reads them
-        // only after the stream passes the copies (spark_send's sync), and the next
-        // segment rewrites them only after the request was built from them.
+        ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
+        // SAFETY: ids, weights and input rows hold this wave's `t` rows in
+        // stream order; the copies read them before later stream work.
         unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), input.buffer, wire_bytes, self.stream)
+            exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, input.buffer], self.stream,
+                Box::new(move |routes, wire| mimo_request(routes, wire, index, t, h, topk, kind, bf16_input)))
         }
     }
 
-    /// The land half: receives the wave into the transport's planes and
-    /// queues their sum into `delta` (forwarded to the head split's second GPU
-    /// when `forward`); `drain` waits for the stream after it.
-    #[allow(clippy::too_many_arguments)]
-    fn spark_land(&self, w: &Workspace<'_>, index: usize, t: usize, transport: &mut SparkLink<'_>,
-        runtime: &tokio::runtime::Runtime, sent: SentWave, forward: Option<usize>, drain: bool) -> Result<()> {
-        let h = self.cfg.hidden;
-        let mut sent = sent;
-        let receive = self.spark_receive(t, transport, runtime, &mut sent)?;
-        let reduced = std::time::Instant::now();
+    /// The land half of [`Self::wave_send`]: orders the stream after the
+    /// wave's planes and queues their sum into `delta` (forwarded to the head
+    /// split's second GPU when `forward`).
+    fn wave_land(&self, w: &Workspace<'_>, t: usize, exchange: &mut crate::shared::spark_waves::Waves<'_>,
+        sent: crate::shared::spark_waves::WaveTicket, forward: Option<usize>) -> Result<()> {
+        let slot = sent.slot();
+        exchange.land(sent, self.stream)?;
         // SAFETY: the zero plane and delta are live [t, h] BF16 buffers; the
-        // intake planes are ordered after the wave by `receive`.
+        // slot's planes are ordered after the wave by `land`.
         unsafe {
-            transport.reduce(w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?;
-            if let Some(slot) = forward {
-                self.push(0, slot, w.delta.buffer.ptr, t * h * 2)?;
-            }
-            if drain {
-                // The next layer's request staging is rewritten only after this drains.
-                self.library.cuda_stream_synchronize(self.stream)?;
-            }
+            exchange.reduce(slot, w.zero_plane.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream)?;
         }
-        self.wave_line(index, t, &sent, receive, reduced.elapsed().as_secs_f64());
+        if let Some(slot) = forward {
+            self.push(0, slot, w.delta.buffer.ptr, t * self.cfg.hidden * 2)?;
+        }
         Ok(())
     }
 
-    /// Receives `sent`'s wave into the transport's intake planes (the stream is ordered
-    /// after it); returns the host seconds spent receiving.
-    fn spark_receive(&self, t: usize, transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime,
-        sent: &mut SentWave) -> Result<f64> {
-        let waited = std::time::Instant::now();
-        let wave = sent.wave.take().context("wave already received")?;
-        runtime.block_on(transport.receive(wave, t, self.stream))?;
-        self.profile.borrow_mut()[1] += sent.sent.elapsed().as_secs_f64();
-        Ok(waited.elapsed().as_secs_f64())
+    /// Bytes of the widest prefill wave's pinned staging (routes and input rows).
+    fn wave_staging_bytes(&self, bf16_input: bool) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.topk,
+            if bf16_input { h * 2 } else { h + h / 32 })?.bytes)
     }
+}
 
-    /// `CUTEAFD_MIMO_WAVE_TIMING=1`: one line per Spark wave.
-    fn wave_line(&self, index: usize, t: usize, sent: &SentWave, receive: f64, reduce: f64) {
-        if self.wave_timing {
-            eprintln!("mimo_wave layer={index} rows={t} gpu_wait_ms={:.3} build_ms={:.3} dispatch_ms={:.3} \
-                receive_ms={:.3} reduce_ms={:.3}", sent.gpu_wait * 1e3, sent.build * 1e3, sent.dispatch * 1e3,
-                receive * 1e3, reduce * 1e3);
-        }
-    }
+/// A wave's request from its route entries and input rows (`wire` views the
+/// wave slot's pinned staging).
+#[allow(clippy::too_many_arguments)]
+fn mimo_request(routes: Vec<ExpertProtocolV2RouteEntry>, wire: bytes::Bytes, index: usize, t: usize, h: usize,
+    topk: usize, kind: ExpertV2SourceKind, bf16_input: bool) -> Result<ExpertProtocolV2Request> {
+    let dtype = if bf16_input { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 };
+    let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32, dtype,
+        (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+            token_position: u64::from(row), route_offset: row * topk as u32, route_count: topk as u32,
+        }).collect(),
+        routes, wire)?;
+    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    Ok(request)
 }
 
 #[cfg(test)]

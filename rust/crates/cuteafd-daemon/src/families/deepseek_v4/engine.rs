@@ -18,7 +18,7 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_core::coordinator_programs::AttentionReductionPlan;
 use cuteafd_loader::families::deepseek_v4::DeepseekV4Config;
 use crate::shared::spark_intake::SparkLink;
-use cuteafd_transport::expert::{SparkExpertWave, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16};
+use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use cuteafd_transport::{
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype,
     ExpertV2SourceKind,
@@ -90,9 +90,6 @@ pub(crate) struct Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Benchmarks and token gates only: MoE layers run the shared expert alone.
     pub skip_routed: bool,
-    /// The device-driven Spark exchange for decode and verify steps
-    /// (`CUTEAFD_SPARK_DEVICE=1`); without it they use the first transport.
-    pub device_link: Option<crate::shared::spark_intake::SparkDeviceLink<'a>>,
     /// This engine's GPU (rank 0 of a head split).
     pub device: i32,
     /// Program family of one GPU's share under a head split (`dsv4f2`, `dsv4p2`).
@@ -180,7 +177,7 @@ struct GraphKey {
 
 impl GraphKey {
     fn coverage_segments(self, rank: usize, skip_routed: bool, tp2_layer: bool,
-        device_exchange: bool, draft_ready: bool, last_layer: usize, tap_layers: &[usize],
+        draft_ready: bool, last_layer: usize, tap_layers: &[usize],
         mut record: impl FnMut(usize, &'static str)) {
         let lane = if self.attention == "local-experts" || self.attention.starts_with("tp2-") { self.previous } else { 0 };
         let tap = |layer, record: &mut dyn FnMut(usize, &'static str)| {
@@ -203,7 +200,7 @@ impl GraphKey {
                 }
                 record(lane, "front"); record(lane, "back");
                 if !skip_routed && (rank == 0 || tp2_layer) { record(lane, "router"); }
-                if rank == 1 || device_exchange { record(lane, "shared"); }
+                if rank == 1 { record(lane, "shared"); }
             }
         }
     }
@@ -350,14 +347,11 @@ struct Workspace<'a> {
     markov: Dev<'a>,
     /// dSpark: the draft block's token ids (token, then noise) for the gather.
     draft_ids: Dev<'a>,
-    /// Pinned staging: routes + wire rows down, rank partials up.
-    router_host: HostAllocation<'a>,
     /// A head split's sums of the two GPUs' partials ([rows, dim] BF16).
     sum: Dev<'a>,
     // Drops before its workspace below (rank 0 only).
     head: Option<cuteafd_ffi::programs::VocabularyHead<'a>>,
     _head_workspace: Dev<'a>,
-    route_ready: crate::shared::memory::device::Event<'a>,
 }
 
 /// Device copies of one step's tables.
@@ -600,7 +594,6 @@ impl<'a> Engine<'a> {
             local: RefCell::new(None),
             embedding: parts.embedding,
             skip_routed: parts.skip_routed,
-            device_link: None,
         })
     }
 
@@ -736,7 +729,6 @@ impl<'a> Engine<'a> {
             drafts: self.alloc(draft_bytes(t * 4))?,
             markov: self.alloc(if draft { self.library.dsv4_markov_workspace(t)? } else { 0 })?,
             draft_ids: self.alloc(draft_bytes(t * 4))?,
-            router_host: HostAllocation::new(self.library, lead_only(t * (topk * 8 + h + h / 32)))?,
             sum: self.alloc(if self.split_family.is_some() { t * h * 2 } else { 256 })?,
             // SAFETY: the workspace buffer lives in the same struct and drops
             // after the head (field order).
@@ -746,8 +738,6 @@ impl<'a> Engine<'a> {
                 None
             },
             _head_workspace: head_workspace,
-            route_ready: crate::shared::memory::device::Event::new(crate::shared::memory::device::Device {
-                library: self.library, id: if rank == 0 { self.device } else { self.peer()?.device } })?,
         })
     }
 
@@ -888,7 +878,8 @@ impl<'a> Engine<'a> {
         let t = tokens.len();
         ensure!(t > 0 && t <= self.prefill_capacity() && start + t <= self.max_context,
             "prefill span of {t} tokens at {start} exceeds the span or context capacity");
-        let logits = self.prefill_units(placement, tokens, transports, runtime, logit_rows, on_layer, download)?;
+        let _ = runtime; // Prefill waves run on the link's transport worker.
+        let logits = self.prefill_units(placement, tokens, transports, logit_rows, on_layer, download)?;
         placement.len += t;
         Ok(logits)
     }
@@ -902,7 +893,7 @@ impl<'a> Engine<'a> {
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
         let logits = self.decode_device(rows, transport, runtime)?.to_host(self.library)?;
-        self.check_device()?;
+        crate::shared::spark_waves::healthy()?;
         Ok(logits)
     }
 
@@ -947,7 +938,7 @@ impl<'a> Engine<'a> {
         runtime: &tokio::runtime::Runtime,
     ) -> Result<Vec<f32>> {
         let logits = self.verify_device(sequences, transports, runtime)?.to_host(self.library)?;
-        self.check_device()?;
+        crate::shared::spark_waves::healthy()?;
         Ok(logits)
     }
 
@@ -1056,19 +1047,22 @@ impl<'a> Engine<'a> {
         {
             let (tables, lane) = (lanes[0].tables, &w.slots[0]);
             let (t, rows) = (tables.rows, rows_of(0));
-            // Decode waves go to the first transport; its planes are baked into
-            // the replayed graphs (they never move).
-            let device = self.device_link.as_ref().filter(|_| !self.skip_routed);
-            if let Some(link) = device {
-                link.arm()?;
-            }
-            let decode_planes = match (device, transports.first()) {
-                (Some(link), _) => link.pointers(),
-                (None, Some(transport)) => transport.intake.pointers(),
-                (None, None) if self.skip_routed || self.local_layers() == self.weights.layers.len() =>
+            // Decode waves go to the first transport's exchange; its one
+            // return slot's planes are baked into the replayed graphs (they
+            // never move). A landed wave is consumed after the replay whose
+            // post reduced it.
+            let mut decode_link = transports.first_mut().filter(|_| !self.skip_routed);
+            let decode_planes = match decode_link.as_deref_mut() {
+                Some(link) => {
+                    let exchange = link.exchange()?;
+                    ensure!(exchange.waves() == 1, "V4 decode bakes one return slot's planes into its graphs");
+                    exchange.planes(0)
+                }
+                None if self.skip_routed || self.local_layers() == self.weights.layers.len() =>
                     [std::ptr::null(); crate::shared::spark_intake::MAX_INTAKE_RANKS],
-                (None, None) => anyhow::bail!("no transport"),
+                None => anyhow::bail!("no transport"),
             };
+            let mut unread = false;
             let local_layers = self.local_layers();
             let mut ranks = 0usize;
             for (layer, weights) in self.weights.layers.iter().enumerate() {
@@ -1094,12 +1088,7 @@ impl<'a> Engine<'a> {
                     } else {
                         self.attention(layer, weights, tables, lane, w, rows, cap)?;
                     }
-                    // Device exchange: the layer's Spark wave, the shared expert while the
-                    // Sparks compute, and the wait for its partials join the segment.
-                    match device {
-                        Some(link) if layer >= local_layers => self.device_experts(link, layer, t, w, lane, cap),
-                        _ => Ok(()),
-                    }
+                    Ok(())
                 };
                 let key = GraphKey {
                     layer,
@@ -1111,16 +1100,17 @@ impl<'a> Engine<'a> {
                     previous,
                     tp2_broadcast: false, exchange_f32: false,
                 };
-                if let Some(link) = device.filter(|_| layer >= local_layers) {
-                    // Announced before the replay can publish it: the proxy spins for it.
-                    link.expect(1);
-                }
                 if self.mixed_attention(weights.ratio, tables) {
                     self.coverage_legacy(0, key, crate::shared::decode_graph::census::Launch::Eager, "mixed-c128");
                     segment()?;
                 } else { self.replay_on(0, key, segment)?; }
+                if std::mem::take(&mut unread) {
+                    // The replay's post reduced the previous layer's planes.
+                    decode_link.as_deref_mut().context("decode transport")?.exchange()?.consumed(0, self.stream)?;
+                }
                 // Preserve owner routes outside capture before another router reuses them.
-                self.probe_ring(layer, w, t, device.is_none() && layer >= local_layers)?;
+                // Every routed layer rings its ids on the device (read after the step's sync).
+                self.probe_ring(layer, w, t, false)?;
                 if let Some(w1) = w1 {
                     // Rank 1's segments: layer 0 after rank 0's, then each next one before the
                     // host waits in this layer's exchange.
@@ -1132,10 +1122,9 @@ impl<'a> Engine<'a> {
                         self.peer_segment(layer + 1, tables, w1, t, cap)?;
                     }
                 }
-                ranks = match device {
-                    Some(link) if layer >= local_layers => link.world_size(),
-                    _ => self.decode_experts(layer, t, w, lane, cap, transports.first_mut(), runtime)?,
-                };
+                let _ = runtime;
+                ranks = self.decode_experts(layer, t, w, lane, cap, decode_link.as_deref_mut())?;
+                unread = layer >= local_layers && !self.skip_routed;
                 self.probe_mark(layer)?;
                 crate::shared::console::layer_mark(layer);
             }
@@ -1151,6 +1140,9 @@ impl<'a> Engine<'a> {
                 self.write_draft_kv(w, lane, t, cap)?;
                 self.head_launch(&lane.stream_a, t, t, 0, w)
             })?;
+            if unread {
+                decode_link.as_deref_mut().context("decode transport")?.exchange()?.consumed(0, self.stream)?;
+            }
             self.finish_route_step()?;
             Ok(Logits::Device(Some(self.device_logits(w, t))))
         }
@@ -1197,7 +1189,6 @@ impl<'a> Engine<'a> {
         launch: crate::shared::decode_graph::census::Launch, reason: &'static str) {
         if !self.graph_coverage.enabled() { return; }
         key.coverage_segments(rank, self.skip_routed, self.tp2_layer(key.layer),
-            self.device_link.is_some() && !self.skip_routed && key.layer >= self.local_layers(),
             self.draft_ready(), self.cfg.n_layers - 1, &self.cfg.dspark_target_layer_ids,
             |lane, segment| self.coverage_launch(segment, rank, lane, key.rows, launch, reason));
     }
@@ -1743,55 +1734,10 @@ impl<'a> Engine<'a> {
         ], &[rows])
     }
 
-    /// Router download, shared expert launch, host routing, Spark exchange
-    /// and plane uploads; returns the Spark rank count.
-    #[allow(clippy::too_many_arguments)]
     /// One Spark request for `rows` wire rows with `topk` routes each.
     fn expert_request(&self, layer: usize, rows: usize, routes: Vec<ExpertProtocolV2RouteEntry>,
         wire: bytes::Bytes, kind: ExpertV2SourceKind) -> Result<ExpertProtocolV2Request> {
         spark_request(self.cfg.dim, self.cfg.n_activated_experts, layer, rows, routes, wire, kind)
-    }
-
-    /// A decode unit's Spark layer on the device exchange: the wave goes out
-    /// from the stream, the shared expert runs while the Sparks compute, and
-    /// the stream waits for the partials (the next segment's post reduces).
-    fn device_experts(&self, link: &crate::shared::spark_intake::SparkDeviceLink<'_>, layer: usize, t: usize,
-        w: &Workspace<'_>, lane: &UnitSlot<'_>, cap: usize) -> Result<()> {
-        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
-        let sized = |dev: &Dev<'_>, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer };
-        // SAFETY: routes and wire rows are complete in stream order (the
-        // segment's router ran before); the previous wave on this link was
-        // collected and reduced earlier on the stream.
-        unsafe {
-            link.dispatch(layer, t, DEVICE_DECODE, sized(&w.route_ids, t * topk * 4),
-                sized(&w.route_weights, t * topk * 4), sized(&w.wire, t * (h + h / 32)), self.stream)?;
-        }
-        self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
-        // SAFETY: the dispatch above is this wait's wave.
-        unsafe { link.collect(self.stream) }
-    }
-
-    /// Connects the device-driven exchange for decode/verify steps (see
-    /// [`Self::device_link`]); its transport is warmed with a full wave.
-    pub fn attach_device_link(&mut self, world: cuteafd_transport::expert::SparkWorld, peers: &[std::net::SocketAddr],
-        config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
-        let (dim, topk, experts, rows) =
-            (self.cfg.dim, self.cfg.n_activated_experts, self.cfg.n_routed_experts, self.decode_rows);
-        let warm = spark_request(dim, topk, self.cfg.n_layers - 1, rows, (0..rows * topk).map(|i|
-            ExpertProtocolV2RouteEntry { row_index: (i / topk) as u32, expert_id: (i % experts) as u32,
-                gate_weight: 0.0 }).collect(), vec![0u8; rows * (dim + dim / 32)].into(), ExpertV2SourceKind::Decode)?;
-        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
-            let kind = if wave.kind == DEVICE_DECODE { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-            spark_request(dim, topk, wave.layer as usize, wave.rows as usize, routes, wire, kind)
-        });
-        self.device_link = Some(crate::shared::spark_intake::SparkDeviceLink::new(self.library, self.device, world, peers, rows, topk, dim + dim / 32, dim * 2, config, Some(warm), build)?);
-        Ok(())
-    }
-
-    /// After a decode/verify step's results were read: the device exchange's
-    /// waves of that step all succeeded (otherwise the step must be discarded).
-    pub fn check_device(&self) -> Result<()> {
-        self.device_link.as_ref().map_or(Ok(()), |link| link.check())
     }
 
     /// Zero-valued wave at the link's live row capacity. Decode and prefill
@@ -1806,11 +1752,11 @@ impl<'a> Engine<'a> {
     }
 
     /// Warm a link without exceeding its own return-plane capacity.
-    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime,
-        rows: usize, kind: ExpertV2SourceKind) -> Result<()> {
+    pub fn warm_transport(&self, transport: &mut SparkLink<'_>, rows: usize, kind: ExpertV2SourceKind) -> Result<()> {
         let request = self.warm_request(rows, kind)?;
-        let wave = transport.dispatch(&request)?;
-        runtime.block_on(transport.receive(wave, rows, self.stream))?;
+        let exchange = transport.exchange()?;
+        let ticket = exchange.send_request(request)?;
+        exchange.land_drained(ticket, self.stream)?;
         self.sync()
     }
 
@@ -1950,68 +1896,52 @@ impl<'a> Engine<'a> {
         result
     }
 
-    /// Waits for the unit's routes and wire rows and builds its Spark request.
-    fn stage_request(&self, layer: usize, t: usize, w: &Workspace<'_>, kind: ExpertV2SourceKind,
-        transport: &mut SparkLink<'_>) -> Result<ExpertProtocolV2Request> {
+    /// A prefill unit's wave on the link's transport worker: routes and wire
+    /// rows copy into the wave slot's pinned staging on the stream; the worker
+    /// builds (row positions start at `first`) and posts the request once they
+    /// complete. This thread does not wait for the GPU.
+    fn wave_send(&self, layer: usize, t: usize, w: &Workspace<'_>, first: u64,
+        transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
         let timer = Instant::now();
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (h + h / 32));
-        let host = w.router_host.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
+        // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let ticket = unsafe {
+            transport.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+                Box::new(move |routes, wire| {
+                    let mut request = spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Prefill)?;
+                    for row in &mut request.rows { row.token_position += first; }
+                    Ok(request)
+                }))?
         };
-        // Prefill rows go straight into this transport's registered egress
-        // buffer and out from there to every rank; small waves keep a copy.
-        let egress = transport.egress(wire_bytes)?;
-        // SAFETY: the pinned regions are large enough; the sync below completes them.
-        unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.stream)?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.stream)?;
-            let target = egress.unwrap_or(at(2 * route_bytes));
-            self.library.copy_d2h_host_buffer_async(target, w.wire.buffer, wire_bytes, self.stream)?;
-        }
-        // SAFETY: this event follows only this unit's route/wire copies on the live stream.
-        unsafe {
-            self.library.cuda_event_record(w.route_ready.raw, self.stream)?;
-            self.library.cuda_event_synchronize(w.route_ready.raw)?;
-        }
-        self.profile.borrow_mut().add(Phase::RouterSync, timer);
-        let timer = Instant::now();
-        let staged = w.router_host.bytes();
-        if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
-            probe.staged(layer, &staged[..route_bytes]);
-        }
-        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32,
-            expert_id: word(0, i),
-            gate_weight: f32::from_bits(word(route_bytes, i)),
-        }).collect();
-        let wire = match egress {
-            Some(_) => transport.egress_payload(wire_bytes)?,
-            None => staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec().into(),
-        };
-        let request = self.expert_request(layer, t, routes, wire, kind);
         self.profile.borrow_mut().add(Phase::Routing, timer);
-        request
+        Ok(ticket)
     }
 
-    /// Receives a unit's partial rows into its transport's intake planes; the
-    /// reduce that reads them is ordered after the intake on the stream.
-    async fn land(&self, transport: &mut SparkLink<'_>, wave: SparkExpertWave, t: usize, _w: &Workspace<'_>)
-        -> Result<usize> {
+    /// The land half of [`Self::wave_send`]: the stream waits for the wave's
+    /// planes; returns the rank count the post's reduce needs.
+    fn wave_land(&self, transport: &mut crate::shared::spark_waves::Waves<'_>,
+        ticket: crate::shared::spark_waves::WaveTicket) -> Result<usize> {
         let timer = Instant::now();
-        transport.receive(wave, t, self.stream).await?;
+        transport.land(ticket, self.stream)?;
         self.profile.borrow_mut().add(Phase::Experts, timer);
-        Ok(transport.world_size())
+        Ok(transport.ranks())
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self) -> Result<usize> {
+        let h = self.cfg.dim;
+        Ok(crate::shared::experts::staging::RouteStaging::new(self.prefill_rows, self.cfg.n_activated_experts,
+            h + h / 32)?.bytes)
     }
 
     /// A decode unit's experts; returns the rank count its post needs
-    /// ([`LOCAL_EXPERTS`] for a coordinator-resident layer).
-    #[allow(clippy::too_many_arguments)]
+    /// ([`LOCAL_EXPERTS`] for a coordinator-resident layer). A Spark layer's
+    /// routes and wire rows copy into the exchange's staging on the stream,
+    /// the shared expert runs while the worker posts and the Sparks compute,
+    /// and the stream then waits for the partials; the next segment's post
+    /// reduces them. The host never waits.
     fn decode_experts(
         &self,
         layer: usize,
@@ -2020,7 +1950,6 @@ impl<'a> Engine<'a> {
         lane: &UnitSlot<'_>,
         cap: usize,
         transport: Option<&mut SparkLink<'_>>,
-        runtime: &tokio::runtime::Runtime,
     ) -> Result<usize> {
         if self.skip_routed {
             self.coverage_launch("shared", 0, lane.index, t,
@@ -2032,15 +1961,24 @@ impl<'a> Engine<'a> {
             self.local_experts(layer, t, w, lane, cap, 0)?;
             return Ok(LOCAL_EXPERTS);
         }
-        let transport = transport.context("no transport")?;
-        // Decode rows poll without the prefill spin quantum.
-        let request = self.stage_request(layer, t, w, ExpertV2SourceKind::Decode, transport)?;
-        let wave = transport.dispatch(&request)?;
+        let exchange = transport.context("no transport")?.exchange()?;
+        let (h, topk) = (self.cfg.dim, self.cfg.n_activated_experts);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, h + h / 32)?;
+        let timer = Instant::now();
+        // SAFETY: ids, weights and wire rows hold this unit's `t` rows in
+        // stream order (the segment's router ran before); the copies read
+        // them before later stream work rewrites them.
+        let ticket = unsafe {
+            exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer, w.wire.buffer], self.stream,
+                Box::new(move |routes, wire| spark_request(h, topk, layer, t, routes, wire, ExpertV2SourceKind::Decode)))?
+        };
+        self.profile.borrow_mut().add(Phase::Routing, timer);
         // The shared expert runs on the GPU while the Sparks compute.
         self.coverage_launch("shared", 0, lane.index, t,
             crate::shared::decode_graph::census::Launch::Eager, "spark-host");
         self.shared_ffn(layer, w, lane, Scalar::I32(t as i32), cap, &self.weights.layers[layer])?;
-        runtime.block_on(self.land(transport, wave, t, w))
+        exchange.land(ticket, self.stream)?;
+        Ok(exchange.ranks())
     }
 
     /// Logits of the last `n` of `t` rows into vocabulary logits rows `at..at + n`.
@@ -2062,9 +2000,6 @@ impl<'a> Engine<'a> {
         }
     }
 }
-
-/// [`cuteafd_transport::expert::DeviceWave::kind`] of decode/verify waves.
-const DEVICE_DECODE: u32 = 0;
 
 /// One Spark request for `rows` wire rows (FP8, UE8M0 scales per 32) with
 /// `topk` routes each; the response is compact BF16 partials.
@@ -2104,29 +2039,29 @@ mod coverage_tests {
     fn legacy_coverage_matches_attention_expert_and_tail_composition() {
         let base = super::GraphKey { layer: 3, rows: 33, chunked: true, attention: "c4",
             table_width: 8, table_stride: 8, previous: 4, tp2_broadcast: false, exchange_f32: false };
-        let segments = |key: super::GraphKey, rank, skip, tp2, device, draft| {
+        let segments = |key: super::GraphKey, rank, skip, tp2, draft| {
             let mut out = Vec::new();
-            key.coverage_segments(rank, skip, tp2, device, draft, 7, &[2, 7],
+            key.coverage_segments(rank, skip, tp2, draft, 7, &[2, 7],
                 |lane, segment| out.push((lane, segment)));
             out
         };
-        assert_eq!(segments(base, 0, false, true, false, true),
+        assert_eq!(segments(base, 0, false, true, true),
             vec![(0, "post"), (0, "tap"), (0, "front"), (0, "back"), (0, "router")]);
-        assert_eq!(segments(base, 1, false, true, false, true),
+        assert_eq!(segments(base, 1, false, true, true),
             vec![(0, "post"), (0, "front"), (0, "back"), (0, "router"), (0, "shared")]);
-        assert_eq!(segments(base, 1, true, false, false, true),
+        assert_eq!(segments(base, 1, true, false, true),
             vec![(0, "post"), (0, "front"), (0, "back"), (0, "shared")]);
-        assert_eq!(segments(super::GraphKey { layer: 0, previous: 0, ..base }, 0, false, false, true, false),
-            vec![(0, "front"), (0, "back"), (0, "router"), (0, "shared")]);
+        assert_eq!(segments(super::GraphKey { layer: 0, previous: 0, ..base }, 0, false, false, false),
+            vec![(0, "front"), (0, "back"), (0, "router")]);
         for attention in ["local-experts", "tp2-replicated", "tp2-broadcast"] {
             let key = super::GraphKey { attention, previous: 1, ..base };
-            assert_eq!(segments(key, 0, false, true, false, true), vec![(1, "shared"), (1, "partial")]);
-            assert_eq!(segments(key, 1, false, true, false, true), vec![(1, "partial")]);
+            assert_eq!(segments(key, 0, false, true, true), vec![(1, "shared"), (1, "partial")]);
+            assert_eq!(segments(key, 1, false, true, true), vec![(1, "partial")]);
         }
         let tail = super::GraphKey { attention: "tail", ..base };
-        assert_eq!(segments(tail, 0, false, true, false, true),
+        assert_eq!(segments(tail, 0, false, true, true),
             vec![(0, "post"), (0, "tap"), (0, "draft-kv"), (0, "head")]);
-        assert_eq!(segments(super::GraphKey { previous: 0, ..tail }, 0, true, false, false, false), vec![(0, "head")]);
+        assert_eq!(segments(super::GraphKey { previous: 0, ..tail }, 0, true, false, false), vec![(0, "head")]);
     }
 
 }

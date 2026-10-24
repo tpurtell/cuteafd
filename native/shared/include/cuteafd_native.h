@@ -322,6 +322,22 @@ cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cuda_stream);
 // Retains a timestamp-producing event node inside captured profiling graphs.
 cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_event_synchronize(void* cuda_event);
+// Returns immediately: ready=0 means the event's work is pending; asynchronous
+// errors remain errors. Safe from any host thread on the event's device.
+cuteafd_status_t cuteafd_cuda_event_query(void* cuda_event, int32_t* ready);
+// Stream memory operations on one u32 word of mapped pinned host memory
+// (`cuteafd_alloc_host_buffer`): a host thread and the GPU exchange sequence
+// numbers through it with no host wait. `word` is the host address; the call
+// resolves its device alias on the stream's device. Both are queued eagerly
+// (between graph replays), never captured: the counters' values are runtime
+// state, not graph parameters.
+// wait: later work on `cuda_stream` starts only once (int32_t)(*word - value)
+// >= 0 (cyclic, wraparound-safe). Where the device can flush remote writes
+// the wait also orders GPUDirect RDMA writes that preceded the host's store.
+cuteafd_status_t cuteafd_cuda_stream_wait_value32(void* cuda_stream, const uint32_t* word, uint32_t value);
+// write: stores `value` to `word` once `cuda_stream`'s earlier work (copies
+// into host memory included) is complete and visible to the host.
+cuteafd_status_t cuteafd_cuda_stream_write_value32(void* cuda_stream, uint32_t* word, uint32_t value);
 cuteafd_status_t cuteafd_cuda_event_elapsed_ms(void* start_event, void* end_event, float* out_ms);
 // Opt-in census spans never synchronize. Completed device timings are drained
 // at later span calls; the bounded pending queue drops samples under overload.
@@ -527,10 +543,11 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv(void* handle, size_t bytes, 
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);
 // Receives scatter their first `header_bytes` into the host slot and the rest
-// into [device_ptr, device_ptr + bytes) (dma-buf MR); a null range restores
-// host-only receives. Applies to receives posted afterwards.
+// into equal `slot_bytes` ranges of [device_ptr, device_ptr + bytes) (dma-buf
+// MR), rotating in successful receive-post order. A null range restores host
+// receives. Register before posting; the caller fences consumers before reuse.
 cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
-                                                       size_t bytes, size_t header_bytes);
+                                                       size_t bytes, size_t header_bytes, size_t slot_bytes);
 // Registers [device_ptr, device_ptr + bytes) for remote RDMA writes on this
 // endpoint (dma-buf, no relaxed ordering) and returns its rkey; a null range
 // removes the registration.
@@ -577,6 +594,21 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_register_region(void* handle, void* pt
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_slot_region(
     void* handle, size_t slot_offset, size_t slot_bytes, uint32_t region, size_t region_offset,
     size_t region_bytes, uint64_t wr_id);
+// Exposes the GPU landing range set by `set_recv_landing` for remote WRITE
+// (strict ordering, second MR over the same pages); stable until the landing
+// changes or the endpoint is destroyed.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_recv_landing_target(void* handle, uint64_t* address, uint32_t* rkey);
+// Request frames (every persistent request). The receiver exposes its admitted
+// request ring for remote WRITE (no relaxed ordering; key lives until destroy).
+cuteafd_status_t cuteafd_rdma_rc_endpoint_request_target(void* handle, uint64_t* address, uint32_t* rkey);
+// Posts one signaled WR carrying frame bytes [frame_offset, frame_offset + bytes)
+// of the request staged at send-ring `slot_offset`: the first `prefix_bytes`
+// from the slot, the rest from registered `region` at `region_offset`
+// (UINT32_MAX: the whole frame is in the slot). `remote == 0` posts a SEND,
+// otherwise an RDMA WRITE to `remote`/`rkey`.
+cuteafd_status_t cuteafd_rdma_rc_endpoint_post_request_part(
+    void* handle, size_t slot_offset, size_t prefix_bytes, uint32_t region, size_t region_offset,
+    size_t frame_offset, size_t bytes, uint64_t remote, uint32_t rkey, uint64_t wr_id);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_destroy(void* handle);
 // Stop all QP DMA without releasing registrations or any host/device landing
 // storage. Success is idempotent; failure leaves all ownership unchanged.

@@ -246,39 +246,10 @@ pub(crate) fn enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CUTEAFD_STAGE_CHAIN").map_or(true, |v| v != "0"))
 }
 
-/// Whether V4.1 remote verification waves use the device-driven Spark
-/// exchange (`CUTEAFD_V41_DEVICE=1`, opt-in). Device-ordered passes
-/// themselves (chained stages, SM peer copies, no host waits between
-/// stages) are always on; see [`deferred`].
-pub(crate) fn device_exchange_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = matches!(std::env::var("CUTEAFD_V41_DEVICE").as_deref(), Ok("1" | "on" | "true"));
-        if on { tracing::info!("V4.1 remote verification waves use the device-driven Spark exchange"); }
-        on
-    })
-}
-
-/// `CUTEAFD_V41_DEVICE_LANES=1`: device-ordered passes also while both lanes
-/// are busy (off: a lane runs device-ordered only while the other is idle).
-pub(crate) fn device_with_lanes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("CUTEAFD_V41_DEVICE_LANES").as_deref(), Ok("1" | "on")))
-}
-
-/// `CUTEAFD_V41_STAGING_FENCE=0`: device-ordered passes do not wait for the
-/// previous layer's staged uploads before preparing the next layer (stages
-/// whose pinned staging differs by layer keep one region per layer,
-/// `LayerStaging`), so the host can queue the pass ahead of the GPU.
-pub(crate) fn staging_fence() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("CUTEAFD_V41_STAGING_FENCE").as_deref(), Ok("0" | "off")))
-}
-
 /// Device-ordered passes run under this watchdog: a pass still pending after
 /// `CUTEAFD_V41_DEVICE_WATCHDOG_S` (default 60) seconds is a device wait that
-/// never released (draining it would block forever), so the process logs every
-/// device lane's sequences and exits instead of holding the GPUs.
+/// never released (draining it would block forever), so the process logs it
+/// and exits instead of holding the GPUs.
 pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| std::env::var("CUTEAFD_V41_DEVICE_WATCHDOG_S").ok()
@@ -287,8 +258,7 @@ pub(crate) async fn watchdog<F: Future>(future: F) -> F::Output {
     tokio::select! {
         output = &mut future => output,
         () = tokio::time::sleep(std::time::Duration::from_secs(limit)) => {
-            tracing::error!(limit_s = limit, lanes = %cuteafd_transport::expert::device_stuck_report(),
-                "device-ordered pass stuck: exiting (a device wait never released)");
+            tracing::error!(limit_s = limit, "device-ordered pass stuck: exiting (a device wait never released)");
             std::process::exit(70);
         }
     }

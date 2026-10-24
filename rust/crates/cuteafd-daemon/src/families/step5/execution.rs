@@ -3,7 +3,7 @@ use super::{scratch::Arena, cache::CacheRank, csa::CsaLayer, ffn::{DenseFfn, Den
     rope::TargetTables, routed::{RoutedFfn, RoutedPlan}, swa::SwaLayer,
     transaction::{Staging, Step}};
 use crate::shared::{experts::{rtx::pair::{self, SubmissionScope}, staging::RouteStaging},
-    memory::{HostAllocation, device::{Allocation, Device, DeviceOwner}},
+    memory::device::{Allocation, Device, DeviceOwner},
     peer_split::{PeerExchange, RankDevice, attention::{self, AttentionStateOwners,
         HeadKernels, HeadMerge, HeadPrecision, HeadProjection, HeadSequence,
         LaneOrder, LayerKernels, LayerProtocol, PipelineKernels}, hop::{HopLink, HopTicket}, TerminalState}, spark_intake::SparkLink};
@@ -175,15 +175,10 @@ struct MainExecution<'e, 'a> {
     stages: Vec<&'e Staging<'a>>,
     exchange: Exchange<'a>,
     sequence: RefCell<HeadSequence>,
-    /// Dispatched Spark waves, oldest first (one per in-flight prefill unit).
-    pending_wave: RefCell<std::collections::VecDeque<cuteafd_transport::expert::SparkExpertWave>>,
+    /// Sent Spark waves, oldest first (one per in-flight prefill unit).
+    pending_wave: RefCell<std::collections::VecDeque<crate::shared::spark_waves::WaveTicket>>,
     transport: RefCell<Option<DeviceOwner<'a, SparkLink<'a>>>>,
-    runtime: tokio::runtime::Runtime,
     routed_reply: Allocation<'a>,
-    pinned: Vec<RefCell<HostAllocation<'a>>>,
-    /// Per rank: recorded after the route copies into `pinned`; the host waits
-    /// on it alone, never the stream (another unit's work may be queued behind).
-    routes_ready: Vec<RefCell<crate::shared::memory::device::Event<'a>>>,
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
@@ -408,12 +403,6 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             Exchange::Local(Cell::new(TerminalState::Active))
         };
         let ranks = &native.ranks;
-        // Route staging is drained into an owned request before dispatch returns.
-        let bytes = RouteStaging::new(usize::try_from(ownership.execution().spec().rows)?, 8, H * 2)?.bytes;
-        let pinned = devices.iter().map(|device| HostAllocation::new(device.library, bytes).map(RefCell::new))
-            .collect::<Result<Vec<_>>>()?;
-        let routes_ready = devices.iter().map(|&device| crate::shared::memory::device::Event::new(device).map(RefCell::new))
-            .collect::<Result<Vec<_>>>()?;
         let mut inventory = Vec::new();
         for layer in 0..count {
             let mut state = Inventory { weights: Vec::new(), kv: Vec::new(),
@@ -461,13 +450,11 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         let entry = usize::from(ownership.execution().spec().entry_gpu);
         if let Some(link) = &transport {
             ensure!(link.device.id == devices[entry].id, "Step-5 main intake must be on the entry GPU");
-            link.transport.installed_grouping()?;
+            link.installed_grouping()?;
         }
         let routed_reply = Allocation::new(devices[entry], rows * H * 2)?;
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         let execution = Self { ownership, native, caches, stages, exchange,
-            sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), runtime, routed_reply,
-            pinned, routes_ready, rows, inventory, requests: Cell::new(0), placement_version,
+            sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
         if count == 92 { execution.validate_replications()?; }
@@ -619,7 +606,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn draft_geometry(&self, width: usize, rows: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let transport = self.main.transport.borrow();
-        let reports = transport.as_ref().context("Step-5 main transport missing")?.transport.installed_grouping()?;
+        let reports = transport.as_ref().context("Step-5 main transport missing")?.installed_grouping()?;
         let homes = (0..92).map(|layer| {
             if layer < 3 || layer == 91 { Ok(LayerHome::Dense) }
             else { Ok(LayerHome::Remote { slice_bytes: resource::worker_weight_read_bytes(&reports, layer)? as f64 }) }
@@ -709,6 +696,12 @@ impl<'e, 'a> Execution<'e, 'a> {
             sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(), "Step-5 prefill units");
         pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
             step.compose(entry, input, |_, _| Ok(()))?;
+            // Routed waves build, post and land on the main link's exchange
+            // worker while this thread queues GPU work.
+            if let Some(link) = main.transport.borrow_mut().as_mut() {
+                let staging = RouteStaging::new(units.iter().map(|unit| unit.rows.len()).max().unwrap_or(1), 8, H * 2)?.bytes;
+                ensure!(link.get_mut().exchange()?.fits(staging), "Step-5 main link staging is narrower than a unit");
+            }
             let binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
                 input: input.buffer, kind, layer: 0, diagnostic: None, units: true };
             let mut hooks = UnitHooks { binding, span: input.buffer,
@@ -716,6 +709,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 consumed: vec![vec![0; main.ownership.execution().hops().len()]; units.len()] };
             crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
             ensure!(hooks.consumed.iter().flatten().all(|&count| count == 1), "Step-5 unit hop inventory");
+            ensure!(main.pending_wave.borrow().is_empty(), "Step-5 prefill ended with Spark waves outstanding");
             hooks.binding.step.finish_units();
             main.reset_units()?;
             main.terminal_output.set(Some(input.buffer));
@@ -1011,37 +1005,28 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                     if dispatch {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
                         let layout = RouteStaging::new(self.rows(), 8, H * 2)?;
-                        let host = execution.pinned[rank].borrow();
-                        let mut ready = execution.routes_ready[rank].borrow_mut();
-                        self.step.compose(rank, ffn, |ffn, meta| {
-                            meta.stream.device.run(|| {
-                                // SAFETY: pinned arena belongs to this rank; its previous bytes were
-                                // copied into an owned request before the previous dispatch returned.
-                                unsafe { layout.enqueue(meta.stream.device.library, host.buffer, ffn.wave_inputs(), meta.stream.raw) }
-                            })?;
-                            ready.record(meta.stream)
-                        })?;
-                        // The shared expert queues behind the route copies and runs
-                        // while the host builds and dispatches the request.
-                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
-                        // Wait for this unit's route copies only, never the stream:
-                        // another unit's queued work must not serialize the wave.
-                        // SAFETY: the event was recorded on this rank's lane stream above.
-                        ready.device.run(|| unsafe { ready.device.library.cuda_event_synchronize(ready.raw) })?;
-                        drop(ready);
-                        let routes = layout.routes(host.bytes())?;
-                        let wire = bytes::Bytes::copy_from_slice(layout.wire(host.bytes())?);
                         let descriptors = self.step.expert_rows(self.kind)?;
-                        let mut transport = execution.transport.borrow_mut();
-                        let link = transport.as_mut().context("Step-5 main transport missing")?;
-                        let device = link.device;
                         let ordinal = execution.requests.get();
                         let identity = request_identity(ordinal)?;
                         execution.requests.set(identity);
-                        let request = expert_request(identity, execution.placement_version, layer, descriptors, routes, wire)?;
-                        ensure!(execution.pending_wave.borrow().len() < link.get_mut().waves(),
+                        let placement_version = execution.placement_version;
+                        let rows = self.rows();
+                        let mut transport = execution.transport.borrow_mut();
+                        let link = transport.as_mut().context("Step-5 main transport missing")?;
+                        let exchange = link.get_mut().exchange()?;
+                        ensure!(execution.pending_wave.borrow().len() < exchange.waves(),
                             "Step-5 Spark waves in flight exceed the transport's return slots");
-                        let ticket = device.run(|| link.get_mut().dispatch(&request))?;
+                        let ticket = self.step.compose(rank, ffn, |ffn, meta| meta.stream.device.run(|| {
+                            let [ids, weights, input] = ffn.wave_inputs();
+                            // SAFETY: the routed front end wrote these rows on
+                            // this lane stream; the copies read them in order.
+                            unsafe { exchange.send(rows, layout, [ids, weights, input], meta.stream.raw,
+                                Box::new(move |routes, wire| expert_request(identity, placement_version, layer,
+                                    descriptors, routes, wire))) }
+                        }))?;
+                        drop(transport);
+                        // The shared expert runs while the worker sends and the Sparks compute.
+                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
                         execution.pending_wave.borrow_mut().push_back(ticket);
                         wave = Some(rank);
                     } else {
@@ -1059,25 +1044,23 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         let execution = self.execution;
         let Some(rank) = ticket else { return self.retain_diagnostic_output(layer); };
         self.select_ffn(layer)?;
-        // Waves land in dispatch order: the executor lands the oldest first.
-        let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
         let entry = usize::from(execution.ownership.execution().spec().entry_gpu);
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
         let split = execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit;
         let output = if rank == entry { ffn.routed_output() } else { self.routed_reply()? };
-        self.step.compose(entry, &execution.routed_reply, |_, meta| {
-            let mut transport = execution.transport.borrow_mut();
-            let link = transport.as_mut().context("Step-5 main transport missing")?;
-            let device = link.device;
-            device.run(|| execution.runtime.block_on(link.get_mut().receive(wave, meta.rows, meta.stream.raw)))?;
-            device.run(|| {
-                // SAFETY: intake planes and the admitted BF16 reply owner are
-                // disjoint; the submission retains both through their consumers.
-                unsafe { device.library.v41_compact_reducer()?.reduce_planes(link.intake.pointers(),
-                    link.world_size() as u32, std::ptr::null(), output.ptr.cast(), meta.rows as u32, meta.stream.raw) }
-            })?;
-            device.run(|| link.intake.consumed(meta.stream.raw))
-        })?;
+        // Waves land in dispatch order: the executor lands the oldest first.
+        let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
+        let mut transport = execution.transport.borrow_mut();
+        let link = transport.as_mut().context("Step-5 main transport missing")?;
+        let exchange = link.get_mut().exchange()?;
+        self.step.compose(entry, &execution.routed_reply, |_, meta| meta.stream.device.run(|| {
+            let slot = wave.slot();
+            exchange.land(wave, meta.stream.raw)?;
+            // SAFETY: the slot's planes and the admitted BF16 reply owner are
+            // disjoint; `land` ordered the planes on this lane stream.
+            unsafe { exchange.reduce(slot, std::ptr::null(), output.ptr.cast(), meta.rows, meta.stream.raw) }
+        }))?;
+        drop(transport);
         if split || rank != entry {
             let destination_rank = 1 - entry;
             let Ffn::Routed(destination) = &execution.layer(destination_rank, layer)?.ffn else { anyhow::bail!("Step-5 routed receive owner"); };

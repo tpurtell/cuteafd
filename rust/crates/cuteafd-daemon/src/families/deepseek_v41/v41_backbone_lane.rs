@@ -412,10 +412,7 @@ impl LaneFfn<'_, '_, '_> {
         }
         let output = complete_ffn(self.phase, async {
             let timing = std::time::Instant::now();
-            // Device waves read the routes on the device like local layers do.
-            let device_wave = !transport.has_local_layer(input.layer) && transport.device_wave(input.layer, rows.len());
-            let tp2_shared_device = transport.has_tp2_shared_layer(input.layer);
-            router.set_local_mode(transport.has_local_layer(input.layer) || device_wave)?;
+            router.set_local_mode(transport.has_local_layer(input.layer))?;
             let ring = router.ring_capture();
             let routed = unsafe { if cooperative { router.execute_ffn_cooperative(input, image_mask).await? }
                 else { router.execute_ffn(input, image_mask)? } };
@@ -461,33 +458,25 @@ impl LaneFfn<'_, '_, '_> {
                 }
                 return result;
             }
-            if device_wave && tp2_shared_device {
-                let result = unsafe { transport.execute_device_tp2(input, &routed, placement, rows).await };
-                tracing::debug!(target: "cuteafd::timing", layer=input.layer, rows=rows.len(),
-                    enqueue_us=timing.elapsed().as_micros() as u64, "target device experts");
-                return result;
-            }
-            if device_wave {
-                // One GPU: the wave leaves first, the shared expert runs meanwhile.
-                let shared = shared.as_mut().context("decoder shared expert workspace absent")?;
-                let binding = unsafe { transport.device_dispatch(&routed, placement, rows)? };
-                let contribution = unsafe { shared.execute_ffn_cooperative(input).await? };
-                if let Some(l2) = l2 { l2.issue(input.layer)?; }
-                return unsafe { transport.device_collect(binding, contribution.values, routed.rows,
-                    input.values.device_id).await };
-            }
             let tp2_shared = transport.has_tp2_shared_layer(input.layer);
             ensure!(shared.is_some() || tp2_shared, "decoder shared TP2 execution required");
-            let mut request = unsafe { routed.expert_request(library, placement, rows)? };
-            if let Some(capture) = route_capture.as_deref_mut() {
-                let output = &mut capture[input.layer];
-                output.clear();
-                output.extend(request.request().routes.chunks_exact(6)
-                    .map(|routes| std::array::from_fn(|i| routes[i].expert_id)));
+            let trace = tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG);
+            ensure!(!(ring && trace), "route policy tracing reads host routes; remote routes stay on the device");
+            let mut traced = Vec::new();
+            // A ring-captured remote layer's routes are read after the pass
+            // (`drain_route_ring`); otherwise the router drained, and its
+            // pinned staging holds them.
+            let captured = if let Some(capture) = route_capture.as_deref_mut().filter(|_| !ring) {
+                Some(&mut capture[input.layer])
+            } else if trace { Some(&mut traced) } else { None };
+            if let Some(output) = captured {
+                unsafe { routed.capture_route_ids(library, output)?; }
             }
             let routed_us = timing.elapsed().as_micros() as u64;
-            transport.prepare_remote_request(&mut request)?;
-            let pending = transport.dispatch_ffn(&request).await?;
+            // SAFETY: the router outputs complete in its stream's order, which
+            // the wave's staging copies follow; they stay unchanged until the
+            // next layer's router runs, which follows this wave's staging.
+            let pending = unsafe { transport.dispatch_ffn(&routed, routed.stream, placement, rows)? };
             let dispatched_us = timing.elapsed().as_micros() as u64;
             if tp2_shared {
                 // The TP2 shared halves are queued inside `finish_tp2`, beside the prefetch.
@@ -519,11 +508,10 @@ impl LaneFfn<'_, '_, '_> {
                 split.remote_collect_us += timing.elapsed().as_micros() as u64 - shared_us;
             }
             tracing::debug!(target: "cuteafd::timing", layer=input.layer, rows=rows.len(), routed_us, dispatch_us=dispatched_us-routed_us, shared_us=shared_us-dispatched_us, collect_us=timing.elapsed().as_micros() as u64-shared_us, "target experts");
-            if tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG) {
+            if trace {
                 let ffn_us = timing.elapsed().as_micros() as u64;
-                // The dispatch request already owns these CPU-side routes.
-                // No extra device read or worker instrumentation is needed.
-                let route_ids: Vec<_> = request.request().routes.iter().map(|r| r.expert_id & 511).collect();
+                let route_ids: Vec<_> = route_capture.as_deref().map_or(&traced, |capture| &capture[input.layer])
+                    .iter().flatten().map(|&expert| expert & 511).collect();
                 let owners: Vec<_> = rows.iter().map(|r| (r.request_id, r.position)).collect();
                 let unique_experts = route_ids.iter().collect::<std::collections::BTreeSet<_>>().len();
                 tracing::debug!(target: "cuteafd::route_policy", layer=input.layer,

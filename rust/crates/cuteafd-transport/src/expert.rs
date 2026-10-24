@@ -13,13 +13,6 @@ mod chunks;
 pub use chunks::V41Tp4ChunkReceiver;
 mod roce;
 pub use roce::{SparkExpertPending, SparkExpertWave, SparkExperts, WaveReceipt};
-mod device;
-pub use device::{
-    DeviceBuild, DeviceLaneStats, DeviceWave, SparkDeviceLane, mailbox as device_mailbox,
-    stuck_report as device_stuck_report,
-};
-mod lane;
-pub use lane::{LaneBuild, LaneOwnedSink, LaneSink, LaneTimes, SparkExpertLane};
 mod tcp;
 pub use tcp::{V41Tp4Pending, V41Tp4Tcp};
 mod native_group;
@@ -38,7 +31,7 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// never this frame bound. Keep the ordinary transport default as the floor.
 pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None,
-        capacity, ingress: cuteafd_core::SparkIngress::Bf16,
+        capacity, ingress: cuteafd_core::SparkIngress::Bf16
     };
     let (request, response) = endpoint.wire_bytes(geometry)
         .context("invalid native frame capacity or geometry")?;

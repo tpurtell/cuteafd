@@ -9,7 +9,8 @@ pub(super) struct Execution<'a> {
     plan: LayerExecutionPlan,
     hops: HopLink<'a>,
     // Keep dispatched receivers owned across submission errors until engine drainage.
-    waves: RefCell<Vec<Option<SparkExpertWave>>>,
+    /// Per lane: the return slot of the Spark wave its `begin_ffn` landed.
+    waves: RefCell<Vec<Option<usize>>>,
     pub(super) segments: Vec<GlmOwnedSegment>,
 }
 
@@ -241,7 +242,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         ensure!(owner.is_none(), "GLM FFNs are split");
         let e = self.engine;
         let [w, w1] = self.work;
-        let layer = self.layer(0, index);
+        let layer = &e.weights.layers[index];
         let rows = Scalar::I32(self.rows() as i32);
         if !layer.dense && e.tp2_layer(index) {
             e.moe_front(w, layer, self.rows())?;
@@ -269,25 +270,22 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(w, layer, self.rows()))?;
         let real = self.tables[0].exchange_rows;
         if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
-        e.moe_stage(w, index, layer, real, self.cap())?;
         let decode = self.tables[0].decode;
-        if decode { e.prefetch(index)?; }
-        match &mut self.transport {
-            Transport::Serial(Some((link, _))) => {
-                let execution = e.layer_execution.as_ref().context("layer execution")?;
-                ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
-                execution.waves.borrow_mut()[self.lane] = Some(e.moe_send(w, index, real, decode, link)?);
-                Ok(Ticket::Spark)
-            },
-            Transport::Shared(link, _) => {
-                let execution = e.layer_execution.as_ref().context("layer execution")?;
-                ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
-                let wave = e.moe_send(w, index, real, decode, &mut link.borrow_mut())?;
-                execution.waves.borrow_mut()[self.lane] = Some(wave);
-                Ok(Ticket::Lane)
-            }
+        let execution = e.layer_execution.as_ref().context("layer execution")?;
+        ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
+        // Routes and wire rows go to the link's exchange; the shared expert
+        // and the prefetch queue behind them; the planes' wait is queued in
+        // `finish_ffn`. The host never waits for the GPU or the Sparks.
+        let cap = self.cap();
+        let (slot, ticket) = match &mut self.transport {
+            Transport::Serial(Some((link, _))) => (e.moe_exchange(w, index, layer, real, cap, decode,
+                link.exchange()?)?, Ticket::Spark),
+            Transport::Shared(link, _) => (e.moe_exchange(w, index, layer, real, cap, decode,
+                link.borrow_mut().exchange()?)?, Ticket::Lane),
             _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
-        }
+        };
+        execution.waves.borrow_mut()[self.lane] = Some(slot);
+        Ok(ticket)
     }
     fn finish_ffn(&mut self, index: usize, ticket: Ticket) -> Result<()> {
         let e = self.engine;
@@ -295,29 +293,20 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let real = self.tables[0].exchange_rows;
         let planes = match ticket {
             Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
-            Ticket::Spark => match &mut self.transport {
-                Transport::Serial(Some((link, runtime))) => {
-                    let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
-                        .take().context("missing dispatched Spark wave")?;
-                    let ranks = runtime.block_on(e.moe_land(real, link, wave))?;
-                    e.reduce(link.intake.pointers(), w, ranks, real)?;
-                    link.intake.consumed(e.stream)?;
-                    None
-                },
-                _ => anyhow::bail!("Spark completion transport changed"),
-            },
-            Ticket::Lane => match &mut self.transport {
-                Transport::Shared(link, runtime) => {
-                    let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
-                        .take().context("missing dispatched Spark wave")?;
-                    let mut link = link.borrow_mut();
-                    let ranks = runtime.block_on(e.moe_land(real, &mut link, wave))?;
-                    e.reduce(link.intake.pointers(), w, ranks, real)?;
-                    link.intake.consumed(e.stream)?;
-                    None
+            Ticket::Spark | Ticket::Lane => {
+                let slot = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
+                    .take().context("missing dispatched Spark wave")?;
+                let mut reduce = |waves: &mut crate::shared::spark_waves::Waves<'_>| -> Result<()> {
+                    e.reduce(waves.planes(slot), w, waves.ranks(), real)?;
+                    waves.consumed(slot, e.stream)
+                };
+                match (&mut self.transport, ticket) {
+                    (Transport::Serial(Some((link, _))), Ticket::Spark) => reduce(link.exchange()?)?,
+                    (Transport::Shared(link, _), Ticket::Lane) => reduce(link.borrow_mut().exchange()?)?,
+                    _ => anyhow::bail!("Spark completion transport changed"),
                 }
-                _ => anyhow::bail!("lane completion transport changed"),
-            },
+                None
+            }
             Ticket::Complete => None,
         };
         if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }

@@ -85,6 +85,19 @@ pub(crate) struct MimoPrefix<'e, 'a> {
     draft_floors: RefCell<Vec<usize>>,
     draft_metadata: Option<Rc<Allocation<'a>>>,
     draft_offset: usize,
+    /// Per rank: the prefix copy stream, fenced against that rank's engine stream (the
+    /// drafter and MTP run on rank 0's).
+    copies: crate::shared::prefix::PrefixCopies<'a>,
+}
+
+/// Device copies `(rank, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
+
+fn copy_readers<'a>(engine: &MimoEngine<'a>) -> Result<crate::shared::prefix::PrefixCopies<'a>> {
+    crate::shared::prefix::PrefixCopies::new(engine.library, (0..engine.ranks())
+        .map(|rank| Ok(vec![crate::shared::prefix::Reader {
+            device: engine.on(rank, || engine.library.cuda_get_device())?, stream: engine.stream_of(rank) }]))
+        .collect::<Result<_>>()?)
 }
 
 /// A byte range inside `buffer` (bounds-checked; pointer arithmetic only).
@@ -159,7 +172,7 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         Ok(Self { engine, full, states, rank_mark_bytes: offsets, mark_bytes, arenas, slots, partial,
             draft_slots: RefCell::new(if draft_metadata.is_some() { vec![None; engine.rings] } else { Vec::new() }),
             draft_floors: RefCell::new(if draft_metadata.is_some() { vec![0; engine.rings] } else { Vec::new() }),
-            draft_metadata, draft_offset })
+            draft_metadata, draft_offset, copies: copy_readers(engine)? })
     }
 
     pub fn bind_drafter(&self, ring: i32, slot: Option<usize>) {
@@ -209,51 +222,54 @@ impl<'e, 'a> MimoPrefix<'e, 'a> {
         Ok(Self { engine, full: Vec::new(), states: Vec::new(),
             rank_mark_bytes: vec![4096; engine.ranks()], mark_bytes: 4096 * engine.ranks(),
             arenas, slots: 1, partial: false, draft_slots: RefCell::new(vec![None; engine.rings]),
-            draft_floors: RefCell::new(vec![0; engine.rings]), draft_metadata: None, draft_offset: 0 })
+            draft_floors: RefCell::new(vec![0; engine.rings]), draft_metadata: None, draft_offset: 0,
+            copies: copy_readers(engine)? })
     }
 
     /// Zero every state's rows before `len` (a partial restore's empty window).
     fn empty_window(&self, ring: usize, len: usize) -> Result<()> {
-        for state in &self.states {
-            let Some(ring) = self.state_ring(state, ring) else { continue };
-            for (ring_row, _, rows) in runs(ring, state.ring_rows, state.rows, len) {
-                let target = view(state.buffer, ring_row * state.row, rows * state.row)?;
-                // SAFETY: the view lies inside a live allocation of the state's GPU; ordered on its stream.
-                self.engine.on(state.rank, || unsafe {
-                    self.engine.library.cuda_zero_bytes_async(target, target.bytes, self.engine.stream_of(state.rank))
-                })?;
+        for rank in 0..self.copies.ranks() {
+            let mut targets = Vec::new();
+            for state in self.states.iter().filter(|state| state.rank == rank) {
+                let Some(ring) = self.state_ring(state, ring) else { continue };
+                for (ring_row, _, rows) in runs(ring, state.ring_rows, state.rows, len) {
+                    targets.push(view(state.buffer, ring_row * state.row, rows * state.row)?);
+                }
             }
+            if targets.is_empty() { continue; }
+            self.copies.ordered(rank, |stream| {
+                for target in targets {
+                    // SAFETY: the view lies inside a live allocation of the state's GPU; the copy
+                    // stream is fenced against every forward pass on both sides.
+                    unsafe { self.engine.library.cuda_zero_bytes_async(target, target.bytes, stream)? };
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
 
-    /// A copy between two views on rank `rank`'s GPU.
-    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
-        // is ordered on its stream with every forward pass that reads or writes them.
-        self.engine.on(rank, || unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
-        })
+    /// Queues `copies` on their ranks' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: every view lies inside a live allocation of its rank (checked by `view`); the
+        // cache drains the copy streams before it hands any of that storage to someone else.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// Copy every state's last rows before `len` between ring `ring` and mark `slot`.
     fn move_mark(&self, slot: MarkSlot, ring: usize, len: usize, capture: bool) -> Result<()> {
         ensure!(!self.arenas.is_empty(), "no mark arena");
         ensure!((slot.0 as usize) < self.slots, "mark slot {} of {}", slot.0, self.slots);
+        let mut copies = Copies::new();
         for state in &self.states {
             let arena = self.arenas[state.rank].buffer;
             let base = slot.0 as usize * self.rank_mark_bytes[state.rank];
             let Some(state_ring) = self.state_ring(state, ring) else { continue };
             for (ring_view, mark_view) in state.mark_views(arena, base, state_ring, len)? {
-                if capture {
-                    self.copy(state.rank, mark_view, ring_view)?;
-                } else {
-                    self.copy(state.rank, ring_view, mark_view)?;
-                }
+                copies.push(if capture { (state.rank, mark_view, ring_view) } else { (state.rank, ring_view, mark_view) });
             }
         }
-        Ok(())
+        self.submit(&copies)
     }
 }
 
@@ -328,12 +344,13 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
                 self.draft_floors.borrow()[ring].max(len.saturating_sub(rows))
             } else { len };
             let source = view(metadata.buffer, ring * 8, 8)?;
-            // Synchronous host writes must not race a previous snapshot's async read.
-            self.drain()?;
+            // Only the copy stream reads the metadata words: a synchronous host write must not
+            // race a previous snapshot's queued read of them.
+            self.copies.synchronize(0)?;
             self.engine.library.copy_h2d(source, &(floor as u64).to_le_bytes())?;
             let target = view(self.arenas[0].buffer,
                 slot.0 as usize * self.rank_mark_bytes[0] + self.draft_metadata_offset(), 8)?;
-            self.copy(0, target, source)?;
+            self.submit(&vec![(0, target, source)])?;
         }
         Ok(())
     }
@@ -353,8 +370,9 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             let source = view(self.arenas[0].buffer,
                 slot.0 as usize * self.rank_mark_bytes[0] + self.draft_metadata_offset(), 8)?;
             let target = view(metadata.buffer, ring * 8, 8)?;
-            self.copy(0, target, source)?;
-            self.drain()?;
+            self.submit(&vec![(0, target, source)])?;
+            // The metadata words are written only by the copy stream.
+            self.copies.synchronize(0)?;
             let mut bytes = [0u8; 8];
             self.engine.library.copy_d2h(&mut bytes, target)?;
             self.draft_floors.borrow_mut()[ring] = usize::try_from(u64::from_le_bytes(bytes))?;
@@ -364,22 +382,17 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
+        let mut copies = Copies::new();
         for &(rank, buffer, record) in &self.full {
             let page = PAGE_ROWS * record;
-            self.copy(rank, view(buffer, copy.to as usize * page, copy.rows * record)?,
-                view(buffer, copy.from as usize * page, copy.rows * record)?)?;
+            copies.push((rank, view(buffer, copy.to as usize * page, copy.rows * record)?,
+                view(buffer, copy.from as usize * page, copy.rows * record)?));
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for rank in 0..self.engine.ranks() {
-            self.engine.on(rank, || {
-                // SAFETY: the engine owns this stream on the selected rank.
-                unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank)) }
-            })?;
-        }
-        Ok(())
+        Ok(self.copies.drain()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {

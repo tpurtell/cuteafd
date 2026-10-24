@@ -20,9 +20,7 @@ macro_rules! layer_schedule {
         for $layer in range {
             $($setup)*
             if $layer != $first && crate::shared::memory::chain::deferred() {
-                if crate::shared::memory::chain::staging_fence() {
-                    crate::shared::memory::chain::fence_wait($library, ($layer - 1) % 2).await?;
-                }
+                crate::shared::memory::chain::fence_wait($library, ($layer - 1) % 2).await?;
                 tokio::task::yield_now().await;
             }
             $body
@@ -176,8 +174,7 @@ impl<'a, R> Pass<'a, R> {
 
     fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
-        chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
-            error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
+        chain.drain_bounded(Duration::from_secs(60))
     }
 
     /// Device order for the next pass only, within this pass's default.
@@ -436,17 +433,22 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // `--l2-prefetch` only while the other lane is idle (consumed per pass).
         self.resources.lane.set_l2_prefetch(std::mem::replace(&mut self.l2_solo, true));
         let Some(handle) = self.begin_chain(verification)? else {
-            return unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
+            let result = unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
+            // A failed Spark wire released its waits over garbage planes.
+            let result = result.and_then(|()| crate::shared::spark_waves::healthy());
+            if result.is_ok() { self.resources.lane.drain_route_ring()?; }
+            return result;
         };
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_phase_inner(
             requests, batch, transport, placement, selected, suffix, encoder, terminal)) }).await;
         // Every consumer after the pass (commit, dSpark, logits downloads) is
         // unscoped, so the chained work must be complete before returning.
         let drained = self.drain_chain();
-        let result = result.and(drained).and_then(|()| transport.check_device());
+        // A failed Spark wire released its waits over garbage planes.
+        let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());
         if result.is_ok() {
-            // Device-ordered local layers left their captured routes in the router's ring.
+            // Device-read layers left their captured routes in the router's ring.
             self.resources.lane.drain_route_ring()?;
         }
         if let Some((rows, started)) = step_sample {

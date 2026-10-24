@@ -107,18 +107,20 @@ impl<'a> Execution<'a> {
         sequence: &super::device::SequenceRows<'_>, pool: &cuteafd_engine::prefix::RefPagePool,
         draft: Option<&super::draft::NativeDraft<'a>>) -> Result<CuteafdDeviceBuffer> {
         let protocol = self.protocol(peer, hops)?;
+        tracing::info!(start = sequence.start, rows = sequence.rows, units = units.len(), waves,
+            sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(),
+            "Kimi prefill units");
+        // Spark waves build, post and land on the routed link's exchange
+        // worker while this thread queues GPU work.
         let mut binding = Bindings::new(local, routed, experts, self, peer, hops, scope, 0,
             units[0].rows.len(), false)?;
         binding.draft = draft;
         binding.defer_publication = true;
-        tracing::info!(start = sequence.start, rows = sequence.rows, units = units.len(), waves,
-            sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(),
-            "Kimi prefill units");
         let mut hooks = UnitHooks { binding, protocol: &protocol, sequence, pool,
             state: units.iter().map(|_| UnitState::default()).collect(), consumed:
                 vec![vec![0; self.plan.hops().len()]; units.len()] };
         crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, units, waves)?;
-        let UnitHooks { mut binding, consumed, .. } = hooks;
+        let UnitHooks { binding, consumed, .. } = hooks;
         ensure!(consumed.iter().flatten().all(|&count| count == 1), "Kimi unit hop inventory");
         for local in binding.local.iter_mut() { local.select_subwave(None)?; }
         binding.local[1].buffer("normalized")
@@ -337,7 +339,10 @@ pub(crate) struct Bindings<'e, 'a, 's> {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FfnTicket { layer: usize, spark: Option<super::spark::Ticket>, rtx: Option<usize> }
+pub(crate) struct FfnTicket { layer: usize, spark: Option<Spark>, rtx: Option<usize> }
+
+/// The Spark wave of one FFN, on the routed link's exchange.
+type Spark = super::spark::Ticket;
 
 impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     pub(crate) fn new(local: &'e mut [LocalLane<'a>; 2], routed: &'e mut RoutedLane<'a>,
@@ -572,11 +577,13 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             }
             // The optional shared ring check also preserves remote rank1 routes on GPU0.
             let mut check_remote = false;
-            self.with_probe(|probe| { check_remote = probe.wants_ring(true); Ok(()) })?;
+            // Every routed layer rings its ids on rank 0 (Spark layers included:
+            // their staged ids are read by the exchange worker, not the host).
+            self.with_probe(|probe| { check_remote = probe.wants_ring(false); Ok(()) })?;
             if check_remote && !rtx && owner == 1 { self.transfer(1, "route ids", canonical.ids.bytes)?; }
             // Local IDs have joined rank0 before the reusable router outputs change.
             self.with_probe(|probe| {
-                if probe.wants_ring(!rtx) {
+                if probe.wants_ring(false) {
                     let stream = self.local[0].stream();
                     // SAFETY: transfer joined these exact rank0 operands and stream.
                     unsafe { probe.ring(stream.device.library, layer,
@@ -622,11 +629,9 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 let routes = cuteafd_ffi::KimiRoutes {
                     ids: self.local[1].buffer("route ids")?, weights: self.local[1].buffer("route weights")? };
                 let wire = self.local[1].buffer("expert wire")?;
-                let mut probe = self.probe.map(|probe| probe.borrow_mut());
-                let ticket = self.routed.begin(&mut self.local[1], layer, self.rows, kind, routes, wire,
-                    probe.as_mut().and_then(|p| p.as_mut()).map(|p| p.get_mut()))?;
+                let spark = self.routed.begin(&mut self.local[1], layer, self.rows, kind, routes, wire)?;
                 self.local[0].ffn(layer, self.rows)?;
-                Some(ticket)
+                Some(spark)
             }
         };
         if !self.defer_publication { self.publish_ffn(layer)?; }

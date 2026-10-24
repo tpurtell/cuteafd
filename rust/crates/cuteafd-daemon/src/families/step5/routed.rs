@@ -3,7 +3,7 @@ use super::scratch::{self, Arena, Plane};
 use super::weights::load_operand;
 use crate::shared::{
     memory::device::{Allocation, Device, Stream},
-    spark_intake::SparkDeviceLink,
+    spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{DType, FfnActivation};
@@ -16,6 +16,11 @@ use cuteafd_loader::plan::{
     families::step5::coordinator::{CoordinatorContract, RankWeightLayout, WeightOperand},
 };
 use std::ffi::c_void;
+
+/// Builds a gate's Spark request for (layer, rows) from its staged routes and
+/// wire rows, on the link's exchange worker.
+pub(crate) type GateRequest = fn(usize, usize, Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, bytes::Bytes)
+    -> Result<cuteafd_transport::ExpertProtocolV2Request>;
 
 const H: usize = 4096;
 const E: usize = 352;
@@ -393,11 +398,14 @@ impl<'a> RoutedFfn<'a> {
         })
     }
 
+    /// One routed layer through `link`'s exchange on `stream`: the front end,
+    /// the wave out (built by `request` on the link's worker), the shared
+    /// expert, the device wait for the partials and their reduce.
     pub fn enqueue_on(
         &self,
         rows: usize,
-        kind: u32,
-        link: &SparkDeviceLink<'a>,
+        link: &std::cell::RefCell<SparkLink<'a>>,
+        request: GateRequest,
         stream: &Stream<'a>,
     ) -> Result<()> {
         ensure!(
@@ -410,21 +418,27 @@ impl<'a> RoutedFfn<'a> {
             "Step-5 routed stream mismatch"
         );
         self.frontend_on(rows, stream)?;
-        stream.device.run(|| {
-            // SAFETY: the diagnostic owner retains normalized rows and routes through drainage.
+        let layer = self.immutable.layer;
+        let layout = crate::shared::experts::staging::RouteStaging::new(rows, 8, 4096 * 2)?;
+        let mut link = link.borrow_mut();
+        let exchange = link.exchange()?;
+        let wave = stream.device.run(|| {
+            // SAFETY: the diagnostic owner retains normalized rows and routes
+            // through drainage; the copies read them in stream order.
             unsafe {
-                link.dispatch(self.immutable.layer, rows, kind, self.plane(IDS),
-                    self.plane(ROUTES), self.plane(NORM), stream.raw)
+                exchange.send(rows, layout, [self.plane(IDS), self.plane(ROUTES), self.plane(NORM)], stream.raw,
+                    Box::new(move |routes, wire| request(layer, rows, routes, wire)))
             }
         })?;
         self.shared_on(rows, stream)?;
+        let slot = wave.slot();
         stream.device.run(|| {
-            // SAFETY: the retained diagnostic link orders collection before reduction.
-            unsafe {
-                link.collect(stream.raw)?;
-                link.reduce(std::ptr::null(), self.plane(ROUTED).ptr.cast(), rows, stream.raw)
-            }
+            exchange.land(wave, stream.raw)?;
+            // SAFETY: `land` orders the slot's planes on this stream before
+            // the reduce; the routed plane is this owner's disjoint output.
+            unsafe { exchange.reduce(slot, std::ptr::null(), self.plane(ROUTED).ptr.cast(), rows, stream.raw) }
         })?;
+        drop(link);
         self.finish_on(rows, stream)
     }
 

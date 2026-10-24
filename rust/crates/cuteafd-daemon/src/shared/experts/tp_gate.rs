@@ -271,7 +271,7 @@ fn native_tp_rank_sum() -> Result<()> {
             spark_ranks: world, prefill_lanes: 1 }, world, spark_world.ownership_topology(),
         ModelAdmission { capacity: 16, compiled_capacity: 4096,
             endpoints: vec![SparkEndpoint { ring_depth: None, capacity: 16, ingress }],
-            rings: spark_rings(config.max_frame_bytes)? })?.select(&peers)?;
+            rings: spark_rings(config.max_frame_bytes)?, execution_slots: 1 })?.select(&peers)?;
     let h = geometry.hidden as usize;
     let zero = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
     let output = DeviceAllocation::new(&library, 16 * output_row_bytes)?;
@@ -279,19 +279,20 @@ fn native_tp_rank_sum() -> Result<()> {
     let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
     let mut link = SparkLink::new(&library, spark_world, &peers, 16, config, output_row_bytes)?;
     link.enable_terminal_ownership(library.clone())?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let result = runtime.block_on(async {
+    let result = (|| -> Result<()> {
         link.bootstrap(&requests.build(geometry, layers[0], 16, dtype)?)?;
         let out = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_OUT")?);
         let mut metrics = Vec::new();
         for &layer in &layers {
             for rows in [1, 16] {
                 let request = requests.build(geometry, layer, rows, dtype)?;
-                let wave = link.dispatch(&request)?;
-                link.receive(wave, rows, stream.raw).await?;
+                let exchange = link.exchange()?;
+                let wave = exchange.send_request(request)?;
+                let slot = wave.slot();
+                exchange.land(wave, stream.raw)?;
                 // SAFETY: full-width buffers and rank planes stay owned until
-                // the stream drains; receive orders every rank plane first.
-                unsafe { link.reduce(zero.buffer.ptr.cast(), output.buffer.ptr.cast(), rows, stream.raw)?; }
+                // the stream drains; `land` orders every rank plane first.
+                unsafe { exchange.reduce(slot, zero.buffer.ptr.cast(), output.buffer.ptr.cast(), rows, stream.raw)?; }
                 // SAFETY: stream and all queued storage remain live here.
                 unsafe { library.cuda_stream_synchronize(stream.raw)?; }
                 let mut bytes = vec![0; output.buffer.bytes];
@@ -315,8 +316,8 @@ fn native_tp_rank_sum() -> Result<()> {
             }
         }
         std::fs::write(out.join("rank-sum.json"), serde_json::to_vec_pretty(&metrics)?)?;
-        Ok::<_, anyhow::Error>(())
-    });
+        crate::shared::spark_waves::healthy()
+    })();
     let quiesce = link.terminal_quiesce();
     let copies = link.terminal_drain_copies();
     // SAFETY: allocations, stream and intake remain alive on every result path.

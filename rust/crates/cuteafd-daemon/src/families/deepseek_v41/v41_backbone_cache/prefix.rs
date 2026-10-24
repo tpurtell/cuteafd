@@ -139,10 +139,19 @@ impl<'a> BackboneCache<'a> {
     }
     /// [`BackboneCache::capture_mark`] queued on capture lane `lane`'s own stream; the request
     /// cannot run or be released until [`BackboneCache::mark_ready`] or `abort_mark`.
+    ///
+    /// The lane's copies follow everything queued on the prefix stream so far (a snapshot's
+    /// tail copy) through a device event, not a host drain: another request's queued restore
+    /// or snapshot on the prefix stream never stalls this one's admission.
     pub fn queue_mark(&mut self, lane: usize, lease: CacheLease, mark: CuteafdDeviceBuffer) -> Result<BackboneMark> {
         let copies = self.prefix_copies.get(lane).context("invalid snapshot lane")?;
         ensure!(copies.pending.is_none(), "backbone snapshot lane is occupied");
         let stream = copies.stream.raw;
+        // SAFETY: both streams and the event belong to this cache and are live.
+        unsafe {
+            self.prefix_stream.library.cuda_event_record(self.prefix_queued.0, self.prefix_stream.raw)?;
+            self.prefix_stream.library.cuda_stream_wait_event(stream, self.prefix_queued.0)?;
+        }
         let saved = self.copy_mark(lease, mark, stream)?;
         self.prefix_copies[lane].pending = Some(lease);
         Ok(saved)
@@ -271,8 +280,9 @@ impl<'a> BackboneCache<'a> {
         Ok(BackboneMark { end, windows })
     }
 
-    /// Wait for every snapshot copy and restore queued on the prefix stream.
-    pub fn drain_prefix_stream(&self) -> Result<()> {
+    /// Wait for every snapshot copy and restore queued on the prefix stream (never a compute
+    /// stream: prefix copies run on their own stream).
+    pub fn prefix_drain(&self) -> Result<()> {
         unsafe { self.prefix_stream.library.cuda_stream_synchronize(self.prefix_stream.raw) }
     }
 
@@ -316,7 +326,7 @@ impl<'a> BackboneCache<'a> {
     /// host restore or a tail copy wrote them. Drains the prefix stream first.
     pub fn publish_units(&self, units: &[u32]) -> Result<()> {
         if !self.sources.iter().any(|s| s.source_cache().replicated()) { return Ok(()); }
-        self.drain_prefix_stream()?;
+        self.prefix_drain()?;
         let pages = self.unit_pages(units);
         for (source, pages) in self.sources.iter().zip(&pages) {
             // SAFETY: the pages' writes completed (drained above or host restore done) and the
@@ -456,5 +466,22 @@ impl<'a> BackboneCache<'a> {
         ensure!(end <= saved.meta.end && end % 2 == 0, "encoder prefix past the snapshot or unaligned");
         self.test_fork(lease, saved, Some(end))?;
         self.restore_encoder_prefix(lease, end, prompt_end)
+    }
+}
+
+/// An ordering event owned by the backbone cache (destroyed with it).
+pub(crate) struct PrefixEvent<'a>(pub(crate) *mut std::ffi::c_void, &'a NativeLibrary);
+impl<'a> PrefixEvent<'a> {
+    pub(crate) fn new(library: &'a NativeLibrary) -> Result<Self> {
+        Ok(Self(library.cuda_event_create_ordering()?, library))
+    }
+}
+impl Drop for PrefixEvent<'_> {
+    fn drop(&mut self) {
+        // SAFETY: created here; the streams that wait on it are drained by their owners first
+        // (the cache's prefix stream and snapshot lanes drop before or with this event).
+        if let Err(error) = unsafe { self.1.cuda_event_destroy(self.0) } {
+            tracing::error!(%error, "destroying V4.1 prefix ordering event");
+        }
     }
 }

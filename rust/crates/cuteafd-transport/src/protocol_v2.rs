@@ -16,7 +16,7 @@ pub fn compact_expert_wire_bytes(
 }
 
 const MAGIC: &[u8; 8] = b"CUTEAFD3";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const REQUEST_KIND: u16 = 1;
 const RESPONSE_KIND: u16 = 2;
 pub const EXPERT_PROTOCOL_V2_FRAME_PROTOCOL: &str = "ExpertProtocolV2";
@@ -438,6 +438,14 @@ impl ExpertProtocolV2FrameArena {
         self.response_buffer.encode_response(response)?;
         ExpertProtocolV2ResponseView::parse(self.response_buffer.as_slice())
     }
+}
+
+/// Offset of the request header's 32-bit reply watermark word: the last four
+/// bytes of the base (96) or debug (128) header, after every other field and
+/// the debug checksum (92..124). Encoders write it as zero; only a persistent
+/// verbs session stamps it (`verbs::request_write`), and parsers ignore it.
+pub(crate) fn request_reply_watermark_offset(flags: u32) -> usize {
+    request_header_len_from_flags(flags) - 4
 }
 
 fn debug_checksum_enabled(flags: u32) -> bool {

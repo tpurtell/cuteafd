@@ -7,8 +7,7 @@ use cuteafd_core::{
 };
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_transport::{
-    expert::{SparkTopology, SparkExpertWave, SparkExperts, V41_PARTIAL_ROW_BYTES,
-        V41_ROUTED_EXPERTS},
+    expert::{SparkTopology, SparkExperts, V41_PARTIAL_ROW_BYTES, V41_ROUTED_EXPERTS},
     ExpertProtocolV2Request,
 };
 
@@ -170,61 +169,22 @@ pub(crate) struct NativeTp4Wave<'a> {
     link: crate::shared::spark_intake::SparkLink<'a>,
     // Drop drains the stream before fields release any GPU allocations.
     stream: LoadStream<'a>,
-    shared: DeviceAllocation<'a>,
     output: DeviceAllocation<'a>,
     library: &'a NativeLibrary,
     ready_rows: Option<u32>,
     local: Option<super::local::LocalExpertWave<'a>>,
     tp2: Option<Box<super::tp2_ffn::Wave<'a>>>,
     /// Present only for an explicit `TP×EP` topology; legacy transports stay on
-    /// the canonical request contract.
-    native: Option<ReplicatedGroupPlanner>,
-    /// The device-driven exchange for verification waves (`CUTEAFD_V41_DEVICE=1`).
-    device: Option<DeviceExchange<'a>>,
+    /// the canonical request contract. Shared with the exchange worker, which
+    /// encodes each request's ownership in issue order.
+    native: Option<(SparkTopology, std::sync::Arc<std::sync::Mutex<ReplicatedGroupPlanner>>)>,
 }
 
-/// Request metadata the proxy thread stamps on this lane's device waves: the
-/// pass's placement and its rows in block order (identical for every layer).
-#[derive(Default)]
-struct DeviceContext {
-    placement: u64,
-    rows: Vec<cuteafd_transport::ExpertProtocolV2RowDescriptor>,
-}
-
-struct DeviceExchange<'a> {
-    link: crate::shared::spark_intake::SparkDeviceLink<'a>,
-    context: std::sync::Arc<std::sync::Mutex<DeviceContext>>,
-    capacity: usize,
-}
-
-/// A V4.1 Spark request from a device wave (FP8 wire rows, top-6 routes).
-fn device_request(context: &DeviceContext, layer: u32, rows: usize,
-    routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    // Distinct from the router's ids (which count up from 1).
-    static NEXT: AtomicU64 = AtomicU64::new(1 << 62);
-    ensure!(context.rows.len() == rows, "device wave of {rows} rows for a pass of {}", context.rows.len());
-    let mut request = ExpertProtocolV2Request::new_bytes(NEXT.fetch_add(1, Ordering::Relaxed), context.placement,
-        layer, 5120, cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32, context.rows.clone(), routes, wire)?;
-    request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-    cuteafd_transport::expert::BackboneRequest::validate_owned(&request, rows as u32)?;
-    Ok(request)
-}
 impl<'a> NativeTp4Wave<'a> {
-    pub(crate) fn spark_world(&self) -> usize { self.link.transport.world_size() }
+    pub(crate) fn spark_world(&self) -> usize { self.link.world_size() }
     /// Explicit replicated topology of this lane, or `None` for the legacy path.
     pub(crate) fn native_topology(&self) -> Option<SparkTopology> {
-        self.native.as_ref().map(ReplicatedGroupPlanner::topology)
-    }
-    /// Apply the lane's whole-expert ownership to one remote request. Legacy
-    /// lanes are a no-op; replicated lanes re-encode the route words and set the
-    /// native group flag, so every remote path that dispatches through this wave
-    /// carries the same contract.
-    pub(crate) fn prepare_remote_request(&mut self, request: &mut crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest) -> Result<()> {
-        if let Some(native) = &mut self.native {
-            request.assign_native(native)?;
-        }
-        Ok(())
+        self.native.as_ref().map(|(topology, _)| *topology)
     }
 
     pub fn install_local(&mut self, wave: super::local::LocalExpertWave<'a>) -> Result<()> {
@@ -287,18 +247,19 @@ impl<'a> NativeTp4Wave<'a> {
     pub fn begin_request(&mut self) {
         self.ready_rows = None;
     }
-    pub fn reset_connections(&mut self) {
+    /// After a cancelled or failed pass whose streams drained: stops the
+    /// exchange, resets the connections and starts it again.
+    pub fn reset_connections(&mut self) -> Result<()> {
         self.ready_rows = None;
-        self.link.transport.reset_connections();
+        self.link.reset_connections()
     }
     /// Legacy TP4 upper-bound reservation (four rank planes), also sufficient
     /// for a legacy TP2 transport.
     pub fn device_bytes(capacity: u32) -> Result<usize> {
         Self::device_bytes_for(capacity, 4)
     }
-    /// Reservation for exactly `ranks` physical rank planes plus the shared
-    /// input and final output planes. Six-rank layouts need their own, larger
-    /// reservation; reusing the four-rank reserve undercounts by two planes.
+    /// Reservation for exactly `ranks` physical rank planes plus the final
+    /// output plane. Six-rank layouts need their own, larger reservation.
     pub fn device_bytes_for(capacity: u32, ranks: usize) -> Result<usize> {
         ensure!(
             capacity > 0 && capacity <= 4096,
@@ -334,251 +295,79 @@ impl<'a> NativeTp4Wave<'a> {
         reducer.require_rank_count(world_size as u32)?;
         let native = transport
             .ownership_topology()
-            .map(ReplicatedGroupPlanner::new)
+            .map(|topology| ReplicatedGroupPlanner::new(topology)
+                .map(|planner| (topology, std::sync::Arc::new(std::sync::Mutex::new(planner)))))
             .transpose()?;
+        let timing = crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing();
         let hidden_bytes = capacity as usize * 5120 * 2;
         Ok(Self {
             link: crate::shared::spark_intake::SparkLink::from_transport(library, transport,
-                V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed)?,
+                V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed, timing)?,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
             },
-            shared: DeviceAllocation::new(library, hidden_bytes)?,
             output: DeviceAllocation::new(library, hidden_bytes)?,
             library,
             ready_rows: None,
             local: None,
             tp2: None,
             native,
-            device: None,
-        })
-    }
-    /// Connects this lane's device-driven exchange (`capacity` rows per wave,
-    /// on the current GPU, which must be the transport's reduction GPU), for
-    /// legacy TP4 FP8 transports; `layer` is a Spark layer for the warm-up.
-    pub(crate) fn install_device_link(&mut self, peers: &[std::net::SocketAddr], capacity: usize, layer: u32,
-        config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
-        if !crate::shared::spark_intake::preferred_device_exchange_available(self.library, crate::shared::spark_intake::IntakePreference::Probed)? {
-            return Ok(());
-        }
-        ensure!(self.native.is_none(),
-            "the device exchange serves the legacy TP contract only");
-        let spark_world = self.link.transport.world();
-        let warm_context = DeviceContext { placement: 0, rows: (0..capacity as u64).map(|row|
-            cuteafd_transport::ExpertProtocolV2RowDescriptor { row_id: row,
-                source_kind: cuteafd_transport::ExpertV2SourceKind::MtpVerify, source_request_id: 1,
-                token_position: row, route_offset: row as u32 * 6, route_count: 6 }).collect() };
-        let routes = (0..capacity * 6).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-            row_index: (i / 6) as u32, expert_id: (i % V41_ROUTED_EXPERTS) as u32, gate_weight: 0.0 }).collect();
-        let warm = device_request(&warm_context, layer, capacity, routes, vec![0u8; capacity * 5280].into())?;
-        let context = std::sync::Arc::new(std::sync::Mutex::new(DeviceContext::default()));
-        let shared = std::sync::Arc::clone(&context);
-        let build: cuteafd_transport::expert::DeviceBuild = Box::new(move |wave, routes, wire| {
-            let context = shared.lock().map_err(|_| anyhow::anyhow!("device context poisoned"))?;
-            device_request(&context, wave.layer, wave.rows as usize, routes, wire)
-        });
-        let device = self.library.cuda_get_device()?;
-        let link = crate::shared::spark_intake::SparkDeviceLink::new(self.library, device, spark_world, peers,
-            capacity, 6, 5280, V41_PARTIAL_ROW_BYTES as usize,
-            cuteafd_transport::TcpTransportConfig { timing: false, ..config }, Some(warm), build)?;
-        // The other RTX publishes waves too when the router runs there.
-        if self.tp2.is_some() {
-            link.initialize_on(1 - device)?;
-        }
-        self.device = Some(DeviceExchange { link, context, capacity });
-        Ok(())
-    }
-    /// Whether a remote wave of `rows` goes through the device exchange.
-    pub(crate) fn device_wave(&self, layer: usize, rows: usize) -> bool {
-        self.device.as_ref().is_some_and(|d| rows <= d.capacity)
-            && (self.tp2.is_none() || self.has_tp2_shared_layer(layer)) && crate::shared::memory::chain::deferred()
-    }
-    /// The device exchange's sequences (stuck-step reports).
-    pub(crate) fn device_state(&self) -> Option<String> {
-        self.device.as_ref().map(|d| d.link.state())
-    }
-    /// After the pass drained: any device wave's error.
-    pub(crate) fn check_device(&self) -> Result<()> {
-        self.device.as_ref().map_or(Ok(()), |d| d.link.check())
-    }
-    /// Publishes a remote layer's wave from the device: the routes and wire
-    /// rows leave from a stream of the router's GPU once the chain reaches it.
-    ///
-    /// # Safety
-    /// [`Self::device_wave`] holds; the router output finished into the chain
-    /// and stays unchanged until the matching [`Self::device_collect`].
-    pub(crate) unsafe fn device_dispatch(&mut self,
-        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
-        placement: u64, rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow])
-        -> Result<crate::families::deepseek_v41::v41_attention_binding::QueryBinding> {
-        self.ready_rows = None;
-        let binding = routed.validate_request_rows(rows)?;
-        ensure!(!routed.request_nvfp4(), "the device exchange carries FP8 wire rows");
-        let device = self.device.as_ref().context("device exchange absent")?;
-        // Wakes a parked proxy (and surfaces an earlier wave's error).
-        device.link.arm()?;
-        {
-            let mut context = device.context.lock().map_err(|_| anyhow::anyhow!("device context poisoned"))?;
-            context.placement = placement;
-            context.rows.clear();
-            context.rows.extend(rows.iter().enumerate().map(|(i, r)| cuteafd_transport::ExpertProtocolV2RowDescriptor {
-                row_id: i as u64, source_kind: r.kind, source_request_id: r.request_id, token_position: r.position,
-                route_offset: i as u32 * 6, route_count: 6 }));
-        }
-        let count = routed.rows as usize;
-        let (origin, device_id) = match self.tp2.as_deref() {
-            Some(tp2) => { let s = tp2.stream(routed.ids.device_id as usize); (s.raw, s.device) }
-            None => (self.stream.raw, crate::shared::memory::device::Device { library: self.library,
-                id: self.output.buffer.device_id }),
-        };
-        ensure!(device_id.id == routed.ids.device_id, "device wave origin GPU differs from the router's");
-        device.link.expect(1);
-        device_id.run(|| unsafe {
-            crate::shared::memory::chain::join(self.library, origin)?;
-            device.link.dispatch(routed.layer, count, 0, routed.ids, routed.routing, routed.expert_input, origin)
-        })?;
-        Ok(binding)
-    }
-    /// Waits (on the transport GPU's stream) for the dispatched wave's
-    /// partials, reduces them with `shared` (complete in the chain) and, for a
-    /// block on the other GPU, returns the result there.
-    ///
-    /// # Safety
-    /// Follows this lane's [`Self::device_dispatch`] of `rows` rows.
-    pub(crate) async unsafe fn device_collect(&mut self, binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
-        shared: CuteafdDeviceBuffer, rows: u32, destination: i32) -> Result<NativeFfnOutput<'_>> {
-        let device = self.device.as_ref().context("device exchange absent")?;
-        ensure!(shared.device_id == self.output.buffer.device_id && shared.bytes >= rows as usize * 10240,
-            "device reduction shared input differs");
-        let stream = &self.stream;
-        let mut output = self.output.buffer;
-        output.bytes = rows as usize * 10240;
-        unsafe {
-            crate::shared::memory::chain::join(self.library, stream.raw)?;
-            device.link.collect(stream.raw)?;
-            device.link.reduce(shared.ptr.cast(), output.ptr.cast(), rows as usize, stream.raw)?;
-            crate::shared::memory::chain::finish(self.library, stream.raw)?;
-        }
-        let values = if destination != output.device_id {
-            unsafe { self.tp2.as_mut().context("TP2 return workspace missing")?
-                .return_result(output, destination as usize, rows).await? }
-        } else { output };
-        self.ready_rows = Some(rows);
-        Ok(NativeFfnOutput { values, binding, _owner: std::marker::PhantomData })
-    }
-    /// A remote layer on the device exchange with the TP2 shared expert: the
-    /// wave goes out, both GPUs' shared halves run meanwhile, the transport
-    /// GPU waits for the partials and reduces, all queued without a host wait.
-    ///
-    /// # Safety
-    /// As [`Self::execute_tp2_ffn`]; [`Self::device_wave`] holds.
-    pub(crate) async unsafe fn execute_device_tp2(&mut self,
-        input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>,
-        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
-        placement: u64, rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow])
-        -> Result<NativeFfnOutput<'_>> {
-        let binding = unsafe { self.device_dispatch(routed, placement, rows)? };
-        ensure!(binding == input.binding() && input.layer == routed.layer, "device TP2 input/router identity mismatch");
-        let reduction = self.output.buffer.device_id as usize;
-        let tp2 = self.tp2.as_mut().context("TP2 shared workspace missing")?;
-        let values = unsafe { tp2.execute_shared_on(input.layer, routed.rows, input.values, reduction).await? };
-        unsafe { self.device_collect(binding, values, routed.rows, input.values.device_id).await }
-    }
-    /// RoCE execution with optional host BF16 shared-expert contribution.
-    /// All GPU copies finish before frame storage can be reused, and reduction
-    /// finishes before the borrowed output view is exposed. Cancellation leaves
-    /// output unavailable until an entirely successful subsequent execution.
-    pub async fn execute(
-        &mut self,
-        request: &ExpertProtocolV2Request,
-        shared: Option<&[u8]>,
-    ) -> Result<CuteafdDeviceBuffer> {
-        self.ready_rows = None;
-        self.synchronize()?;
-        let rows = request.header.row_count;
-        ensure!(
-            rows > 0 && rows <= self.link.transport.capacity(),
-            "native wave exceeds capacity"
-        );
-        let hidden_bytes = rows as usize * 5120 * 2;
-        if let Some(shared) = shared {
-            ensure!(
-                shared.len() == hidden_bytes,
-                "native shared output has wrong BF16 geometry"
-            );
-            self.library.copy_h2d(self.shared.buffer, shared)?;
-        }
-        self.execute_prepared(request, shared.is_some()).await
-    }
-    /// # Safety
-    /// Shared device values are complete and immutable through the copy. The
-    /// request and shared result must derive from the same actual block input.
-    pub async unsafe fn execute_ffn<'w>(
-        &'w mut self,
-        request: &crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
-        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>,
-    ) -> Result<NativeFfnOutput<'w>> {
-        self.ready_rows = None;
-        validate_shared(
-            request,
-            shared,
-            self.shared.buffer,
-            self.link.transport.capacity(),
-        )?;
-        unsafe { self.dispatch_ffn(request).await?.finish(shared).await }
-    }
-    /// Enqueue all TP rank expert requests before returning. The caller can then run
-    /// shared FFN work on RTX while the Spark workers execute the routed experts.
-    pub async fn dispatch_ffn<'w, 'r>(
-        &'w mut self,
-        request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
-    ) -> Result<NativePendingFfn<'w, 'a, 'r>> {
-        self.ready_rows = None;
-        // Previous output or cancellation cleanup completed this wave.
-        self.stream.require_complete()?;
-        let header = &request.request().header;
-        ensure!(
-            header.layer_id as usize == request.binding().layer()
-                && header.row_count > 0
-                && header.row_count <= self.link.transport.capacity(),
-            "native dispatched FFN identity or rows differ"
-        );
-        let capacity = self.link.transport.capacity();
-        let pending = self.link.dispatch(request.request())?;
-        Ok(NativePendingFfn {
-            pending,
-            request,
-            capacity,
-            library: self.library,
-            stream: &self.stream,
-            link: &mut self.link,
-            shared: self.shared.buffer,
-            output: self.output.buffer,
-            ready_rows: &mut self.ready_rows,
-            tp2: self.tp2.as_deref_mut(),
         })
     }
 
-    async fn execute_prepared(
-        &mut self,
-        request: &ExpertProtocolV2Request,
-        has_shared: bool,
-    ) -> Result<CuteafdDeviceBuffer> {
-        let rows = request.header.row_count;
-        let wave = self.link.dispatch(request)?;
-        // SAFETY: this wave owns the intake planes and output until its stream drains.
-        unsafe { crate::shared::memory::chain::join(self.library, self.stream.raw)? };
-        self.link.receive(wave, rows as usize, self.stream.raw).await?;
-        // SAFETY: receive orders the same stream after all partials, and the optional
-        // shared plane was initialized by execute before dispatch.
-        unsafe {
-            self.link.reduce(if has_shared { self.shared.buffer.ptr.cast() } else { std::ptr::null() },
-                self.output.buffer.ptr.cast(), rows as usize, self.stream.raw)?;
-            crate::shared::memory::chain::finish(self.library, self.stream.raw)?;
+    /// Opens every rank's session once the workers serve `layer` (a remote
+    /// layer) and starts the link's exchange worker. The widest request (the
+    /// transport's capacity, in the checkpoint's wire format) sizes the rings;
+    /// only the control bootstrap runs, nothing is posted.
+    pub(crate) fn bootstrap(&mut self, layer: u32, nvfp4: bool) -> Result<()> {
+        use cuteafd_transport::{ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind};
+        let rows = self.link.capacity();
+        let (dtype, width) = if nvfp4 { (ExpertV2Dtype::Bf16, 10240) } else { (ExpertV2Dtype::Fp8E4m3Ue8m0K32, 5280) };
+        let descriptors = (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row.into(),
+            source_kind: ExpertV2SourceKind::Prefill, source_request_id: 1, token_position: row.into(),
+            route_offset: row * 6, route_count: 6 }).collect();
+        let routes = (0..rows * 6).map(|i| ExpertProtocolV2RouteEntry { row_index: i / 6,
+            expert_id: i % V41_ROUTED_EXPERTS as u32, gate_weight: 0.0 }).collect();
+        let mut request = ExpertProtocolV2Request::new(1, 0, layer, 5120, dtype, descriptors, routes,
+            vec![0; rows as usize * width])?;
+        request.header.flags |= cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+        if let Some((_, planner)) = &self.native {
+            planner.lock().map_err(|_| anyhow::anyhow!("replicated expert planner poisoned"))?.encode(&mut request)?;
         }
-        self.ready_rows = Some(rows);
-        self.output()
+        self.link.bootstrap(&request)
+    }
+
+    /// Sends a remote layer's wave on the link's exchange: the router's route
+    /// ids, gate weights and expert input rows copy into the wave's staging on
+    /// the router stream (joined to the chain), and the exchange worker builds,
+    /// posts and lands it. Nothing waits on the host. Finish with
+    /// [`NativePendingFfn::finish`] (or its TP2 form).
+    ///
+    /// # Safety
+    /// The router output was produced in stream order on its own stream (the
+    /// chain head or `router_stream`) and stays unchanged until the wave's
+    /// staging copies ran, which later work on `router_stream` orders.
+    pub(crate) unsafe fn dispatch_ffn<'w>(&'w mut self,
+        routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
+        router_stream: *mut std::ffi::c_void, placement: u64,
+        rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativePendingFfn<'w, 'a>> {
+        self.ready_rows = None;
+        let capacity = self.link.capacity();
+        ensure!(routed.rows > 0 && routed.rows <= capacity, "native dispatched FFN rows exceed capacity");
+        let (binding, build) = routed.request_builder(placement, rows,
+            self.native.as_ref().map(|(_, planner)| std::sync::Arc::clone(planner)))?;
+        let (layout, sources) = routed.wave_sources()?;
+        let exchange = self.link.exchange()?;
+        // SAFETY: the sources are the router's live device outputs, complete
+        // in `router_stream` order once it joined the chain (caller contract).
+        let ticket = unsafe {
+            crate::shared::memory::chain::join(self.library, router_stream)?;
+            exchange.send(routed.rows as usize, layout, sources, router_stream, build)?
+        };
+        Ok(NativePendingFfn { ticket, binding, layer: routed.layer, rows: routed.rows, library: self.library,
+            stream: &self.stream, link: &mut self.link, output: self.output.buffer, ready_rows: &mut self.ready_rows,
+            tp2: self.tp2.as_deref_mut() })
     }
     /// Borrowed device view; never free it or retain it across wave reuse/drop.
     pub fn output(&self) -> Result<CuteafdDeviceBuffer> {
@@ -613,47 +402,27 @@ impl NativeFfnOutput<'_> {
     }
 }
 
-fn validate_shared(
-    request: &crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
-    shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>,
-    destination: CuteafdDeviceBuffer,
-    capacity: u32,
-) -> Result<()> {
-    let header = &request.request().header;
-    ensure!(
-        request.binding() == shared.binding()?
-            && header.layer_id as usize == shared.layer
-            && header.row_count == shared.rows
-            && header.row_count > 0
-            && header.row_count <= capacity
-            && shared.values.bytes == header.row_count as usize * 10240
-            && shared.values.device_id == destination.device_id,
-        "native TP shared contribution differs from routed request"
-    );
-    Ok(())
-}
-/// Borrows every mutable reduction buffer and owns all unread response sockets.
-/// Dropping before completion leaves the wave unpublished and closes the sockets.
-pub(crate) struct NativePendingFfn<'w, 'a, 'r> {
-    pending: SparkExpertWave,
-    request: &'r crate::families::deepseek_v41::v41_backbone_router::BoundExpertRequest,
-    capacity: u32,
+/// A remote layer's wave on the exchange, borrowed until its reduction is
+/// queued. Dropping it unfinished leaves the wave unlanded: the owner's pass
+/// fails and resets the link (stopping the exchange) after its streams drain.
+pub(crate) struct NativePendingFfn<'w, 'a> {
+    ticket: crate::shared::spark_waves::WaveTicket,
+    binding: crate::families::deepseek_v41::v41_attention_binding::QueryBinding,
+    layer: usize,
+    rows: u32,
     library: &'a NativeLibrary,
     stream: &'w LoadStream<'a>,
     link: &'w mut crate::shared::spark_intake::SparkLink<'a>,
-    shared: CuteafdDeviceBuffer,
     output: CuteafdDeviceBuffer,
     ready_rows: &'w mut Option<u32>,
     tp2: Option<&'w mut super::tp2_ffn::Wave<'a>>,
 }
-impl<'w> NativePendingFfn<'w, '_, '_> {
+impl<'w> NativePendingFfn<'w, '_> {
     /// # Safety
     /// Shared values hold the completed contribution for this exact request and
-    /// remain immutable until the final reduction drains. Producers must be drained.
-    pub async unsafe fn finish(
-        self,
-        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>,
-    ) -> Result<NativeFfnOutput<'w>> {
+    /// remain immutable until the final reduction completes on the stream.
+    pub async unsafe fn finish(self,
+        shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'w>> {
         unsafe { self.finish_inner(shared, false).await }
     }
     /// # Safety
@@ -662,49 +431,49 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
         shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>) -> Result<NativeFfnOutput<'w>> {
         unsafe { self.finish_inner(shared, true).await }
     }
-    /// Run shared TP2 after Spark dispatch, reduce on the transport GPU, and
+    /// Run shared TP2 after the Spark dispatch, reduce on the transport GPU, and
     /// return the result to the block's GPU. The pending owner retains every lane workspace.
     /// # Safety
     /// Input is the completed normalized FFN input for the dispatched request;
     /// its storage remains immutable through completion or cancellation drain.
     pub async unsafe fn finish_tp2(mut self, input: &crate::families::deepseek_v41::v41_block::FfnInput<'_>) -> Result<NativeFfnOutput<'w>> {
-        let header = &self.request.request().header;
-        ensure!(self.request.binding() == input.binding() && header.layer_id as usize == input.layer
-            && header.row_count as usize == input.tokens.len()
-            && matches!(input.values.device_id, 0 | 1),
+        ensure!(self.binding == input.binding() && self.layer == input.layer
+            && self.rows as usize == input.tokens.len() && matches!(input.values.device_id, 0 | 1),
             "TP2 shared input/request/device differs");
         let values = unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
-            .execute_shared_on(input.layer,header.row_count,input.values,self.output.device_id as usize).await? };
+            .execute_shared_on(input.layer, self.rows, input.values, self.output.device_id as usize).await? };
         let destination = input.values.device_id;
         if destination != self.output.device_id {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.device_id };
-            device.future(unsafe { self.finish_values(values,true,Some(destination)) }).await
+            device.future(unsafe { self.finish_values(values, true, Some(destination)) }).await
         } else {
-            unsafe { self.finish_values(values,true,Some(destination)).await }
+            unsafe { self.finish_values(values, true, Some(destination)).await }
         }
     }
     async unsafe fn finish_inner(self,
         shared: &crate::families::deepseek_v41::v41_backbone_shared::SharedOutput<'_>, cooperative: bool) -> Result<NativeFfnOutput<'w>> {
-        validate_shared(self.request, shared, self.shared, self.capacity)?;
-        unsafe { self.finish_values(shared.values,cooperative,None).await }
+        ensure!(self.binding == shared.binding()? && self.layer == shared.layer && self.rows == shared.rows
+            && shared.values.bytes == self.rows as usize * 10240 && shared.values.device_id == self.output.device_id,
+            "native TP shared contribution differs from routed request");
+        unsafe { self.finish_values(shared.values, cooperative, None).await }
     }
     async unsafe fn finish_values(mut self, values: CuteafdDeviceBuffer, cooperative: bool,
         destination: Option<i32>) -> Result<NativeFfnOutput<'w>> {
-        ensure!(values.device_id == self.output.device_id
-            && values.bytes == self.request.request().header.row_count as usize * 10240,
+        ensure!(values.device_id == self.output.device_id && values.bytes == self.rows as usize * 10240,
             "shared reduction device/extent differs");
         let timing = std::time::Instant::now();
-        // The shared owner remains borrowed until reduction drains, so consume
-        // its completed device output directly instead of copying it first.
-        let shared_copy_us = 0u64;
-        let rows = self.request.request().header.row_count;
-        // SAFETY: shared producers have drained or published their chain dependency;
-        // all receive/reduction storage is borrowed by this pending owner.
-        unsafe { crate::shared::memory::chain::join(self.library, self.stream.raw)? };
-        self.link.receive(self.pending, rows as usize, self.stream.raw).await?;
-        let received_us = timing.elapsed().as_micros() as u64;
-        // SAFETY: the intake, shared values and output live through the stream fence.
-        unsafe { self.link.reduce(values.ptr.cast(), self.output.ptr.cast(), rows as usize, self.stream.raw)? };
+        let rows = self.rows;
+        let slot = self.ticket.slot();
+        let exchange = self.link.exchange()?;
+        // SAFETY: the reduce stream joins the chain (the shared contribution's
+        // producers), then waits on the device for this wave's planes; the
+        // intake planes, shared values and output stay live until the stream
+        // completes (the pass drains before releasing them).
+        unsafe {
+            crate::shared::memory::chain::join(self.library, self.stream.raw)?;
+            exchange.land(self.ticket, self.stream.raw)?;
+            exchange.reduce(slot, values.ptr.cast(), self.output.ptr.cast(), rows as usize, self.stream.raw)?;
+        }
         if cooperative {
             // SAFETY: the pending owner retains every input until completion or cancellation.
             unsafe { crate::shared::memory::chain::finish_cooperative(self.stream).await? };
@@ -712,9 +481,8 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
             // SAFETY: the same stream owns the reduction and its inputs.
             unsafe { crate::shared::memory::chain::finish(self.library, self.stream.raw)? };
         }
-        tracing::debug!(target: "cuteafd::timing", layer=self.request.request().header.layer_id, rows,
-            shared_copy_us, receive_us=received_us, reduce_us=timing.elapsed().as_micros() as u64-received_us,
-            "target collection");
+        tracing::debug!(target: "cuteafd::timing", layer = self.layer, rows,
+            collect_us = timing.elapsed().as_micros() as u64, "target collection");
         *self.ready_rows = Some(rows);
         let mut values = self.output;
         values.bytes = rows as usize * 10240;
@@ -724,7 +492,7 @@ impl<'w> NativePendingFfn<'w, '_, '_> {
         }
         Ok(NativeFfnOutput {
             values,
-            binding: self.request.binding(),
+            binding: self.binding,
             _owner: std::marker::PhantomData,
         })
     }

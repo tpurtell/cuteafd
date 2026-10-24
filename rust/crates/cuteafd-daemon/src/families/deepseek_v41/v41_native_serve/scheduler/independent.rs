@@ -170,7 +170,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 pass.set_capture(capture)?;
                 // Device-ordered passes only while the other lane is idle (two
                 // busy lanes interleave on host waits; see PLAN.md).
-                pass.set_device_order(!shared || crate::shared::memory::chain::device_with_lanes());
+                pass.set_device_order(!shared);
                 // The peer lane's work would fill this lane's exchanges and evict an L2 prefetch.
                 pass.set_l2_prefetch(!shared);
                 let current = batch.as_mut().unwrap();

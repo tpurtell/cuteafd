@@ -171,6 +171,12 @@ pub(crate) fn register(device: &str, port: u32, peer: &str, local_gid: String, m
     counter
 }
 
+/// Total one-sided bytes written by every QP in this process (loopback tests).
+#[cfg(test)]
+pub(crate) fn written_total() -> u64 {
+    registry().lock().unwrap().counters.iter().map(|c| c.bytes.written.load(Ordering::Relaxed)).sum()
+}
+
 /// Called during transport setup, not while dispatching requests.
 pub fn observe_peers(peers: &[SocketAddr]) {
     registry().lock().unwrap().peers.extend(peers.iter().copied());

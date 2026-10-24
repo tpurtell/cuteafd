@@ -365,8 +365,10 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         for lane in &mut self.resources.lanes { lane.get_mut().set_l2_prefetch(solo); }
         let chained = verification && !self.resources.lanes.iter().any(|lane| lane.uses_peer_projection());
         let Some(handle) = self.begin_chain(chained)? else {
-            return unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
+            let result = unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
+            // A failed Spark wire released its waits over garbage planes.
+            return result.and_then(|()| crate::shared::spark_waves::healthy());
         };
         let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG).then(Instant::now);
         let result = crate::shared::memory::chain::watchdog(unsafe { handle.scope(self.execute_unchained(
@@ -374,7 +376,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         let issued_us = timed.map(|t| t.elapsed().as_micros() as u64);
         let drained = self.drain_chain();
         let drained_us = timed.map(|t| t.elapsed().as_micros() as u64);
-        let result = result.and(drained).and_then(|()| transport.get().check_device());
+        // A failed Spark wire released its waits over garbage planes.
+        let result = result.and(drained).and_then(|()| crate::shared::spark_waves::healthy());
         if let (Some(t), Some(issued_us), Some(drained_us)) = (timed, issued_us, drained_us) {
             tracing::debug!(target: "cuteafd::timing", issued_us, drain_us=drained_us-issued_us,
                 check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");

@@ -476,7 +476,7 @@ fn speculative_step(
     engine.probe_begin(total_rows);
     let verified = engine.verify_device(&mut rows, transports, runtime).and_then(|logits| {
         let (selected, poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
-        engine.check_device()?;
+        crate::shared::spark_waves::healthy()?;
         Ok((logits, selected, poisoned))
     });
     engine.probe_end(verified.is_ok());
@@ -920,7 +920,7 @@ fn schedule(
             let timer = Instant::now();
             engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
                 let (selected, mut poisoned) = select_rows(selector, &logits, &active, &sequences, &starts)?;
-                engine.check_device()?;
+                crate::shared::spark_waves::healthy()?;
                 shape.verify_us = console::us(timer);
                 Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
                     let token = match poisoned[row].take() {

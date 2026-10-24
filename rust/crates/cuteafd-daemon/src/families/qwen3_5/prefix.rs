@@ -27,6 +27,9 @@ pub(crate) struct DensePrefix<'e, 'a> {
     mark: MarkLayout,
     drafter: Option<Rc<crate::shared::speculation::block_dspark::DsparkDrafter<'a>>>,
     mtp: Option<Rc<super::mtp::MtpCache<'a>>>,
+    /// The prefix copy stream, fenced against the target stream (the drafter's and the MTP
+    /// chain's copies run on that stream too).
+    copies: crate::shared::prefix::PrefixCopies<'a>,
 }
 
 impl<'e, 'a> DensePrefix<'e, 'a> {
@@ -47,8 +50,10 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
             page_bytes: 64 * target.cfg.full_kv_bytes_per_token(target.kv_format),
             mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: Default::default() };
+        let copies = crate::shared::prefix::PrefixCopies::new(target.stream.device.library,
+            vec![vec![crate::shared::prefix::Reader { device: target.stream.device.id, stream: target.stream.raw }]])?;
         drop(target);
-        Ok(Self { engine, layout, mark, drafter, mtp: None })
+        Ok(Self { engine, layout, mark, drafter, mtp: None, copies })
     }
 
     pub(crate) fn with_mtp(engine: &'e RefCell<DenseEngine<'a>>, mtp: Rc<super::mtp::MtpCache<'a>>) -> Result<Self> {
@@ -80,12 +85,10 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
         let marks = self.mark_buffers(mark)?;
         let target = self.engine.borrow();
         ensure!(state < target.slots.len(), "dense prefix state outside admitted slots");
-        for (live, saved) in Self::state(&target, state).into_iter().zip(marks) {
-            let (dst, src) = if capture { (saved, live) } else { (live, saved) };
-            // SAFETY: admitted arena and live bank outlive the shared prefix cache's drain.
-            unsafe { target.stream.device.library.copy_d2d_async(dst, src, src.bytes, target.stream.raw)?; }
-        }
-        Ok(())
+        let copies: Vec<_> = Self::state(&target, state).into_iter().zip(marks)
+            .map(|(live, saved)| if capture { (0, saved, live) } else { (0, live, saved) }).collect();
+        // SAFETY: admitted arena and live bank outlive the shared prefix cache's drain.
+        unsafe { self.copies.copy_d2d(&copies) }
     }
 
     fn page_buffers(&self, page: u32, rows: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
@@ -377,7 +380,7 @@ impl PrefixFamily for DensePrefix<'_, '_> {
         }
         self.move_mark(mark, placement.slot, false)?;
         let mut target = self.engine.borrow_mut();
-        target.stream.drain()?;
+        // The restored state is ordered before the target stream's next pass by the copy fence.
         target.slots[placement.slot].position = len;
         target.position = target.slots[0].position;
         target.healthy = true;
@@ -389,15 +392,12 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let source = self.page_buffers(copy.from, copy.rows)?;
         let destination = self.page_buffers(copy.to, copy.rows)?;
-        let target = self.engine.borrow();
-        for (dst, src) in destination.into_iter().zip(source) {
-            // SAFETY: shared pool owns both page views until this family drains.
-            unsafe { target.stream.device.library.copy_d2d_async(dst, src, src.bytes, target.stream.raw)?; }
-        }
-        Ok(())
+        let copies: Vec<_> = destination.into_iter().zip(source).map(|(dst, src)| (0, dst, src)).collect();
+        // SAFETY: shared pool owns both page views until this family drains.
+        Ok(unsafe { self.copies.copy_d2d(&copies) }?)
     }
 
-    fn drain(&self) -> Result<(), BoxError> { Ok(self.engine.borrow().stream.drain()?) }
+    fn drain(&self) -> Result<(), BoxError> { Ok(self.copies.drain()?) }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         self.page_buffers(page, 64).unwrap_or_default().into_iter()
             .map(|buffer| DeviceRange { addr: buffer.ptr as u64, bytes: buffer.bytes }).collect()

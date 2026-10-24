@@ -19,6 +19,9 @@ pub struct SparkEndpoint {
     pub ring_depth: Option<usize>,
 }
 
+/// Most execution slots one Spark rank runs (a link admits at most four waves).
+pub const MAX_SPARK_EXECUTION_SLOTS: u8 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SparkIngress {

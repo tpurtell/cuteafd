@@ -44,7 +44,7 @@ pub(super) fn new(engine: &Engine<'_>, loaded: &Loaded, transports: &[SparkLink<
         && shape.topk == engine.cfg.n_activated_experts, "V4 checkpoint/router geometry differs");
     let local = engine.local_layers();
     let remote = if local < shape.layers {
-        transports.first().context("no installed V4 Spark transport")?.transport.installed_grouping()?
+        transports.first().context("no installed V4 Spark transport")?.installed_grouping()?
     } else { Vec::new() };
     let bytes = |layer: usize, tp: usize| match loaded.catalog.exl3() {
         Some(manifest) => resource::exl3_slice_bytes(manifest, layer, tp),

@@ -95,6 +95,9 @@ pub(super) struct RegisteredResponseRing {
     tx: mpsc::Sender<usize>,
     rx: mpsc::Receiver<usize>,
 }
+// SAFETY: `view` describes the session endpoint's registered receive ring
+// (pinned host memory); the ring is used only through its owning session.
+unsafe impl Send for RegisteredResponseRing {}
 impl RegisteredResponseRing {
     pub(super) fn new(endpoint: &NativeRdmaEndpoint, ring: VerbsHostRdmaRing) -> Result<Self> {
         let view = endpoint.recv_buffer_view()?;

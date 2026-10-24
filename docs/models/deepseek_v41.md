@@ -72,8 +72,9 @@ placeholder Spark hosts and addresses): Official MXFP4 [min](../../examples/conf
   verify remain deferred.
 - Large index-selection and attention-query graph entries can be evicted
   between encoder and replay shapes, so warmed requests can recapture graphs.
-- Device-driven exchange remains opt-in (`CUTEAFD_V41_DEVICE=1`); write mode
-  (`CUTEAFD_SPARK_WRITE=1`) can stall on written flags and is unqualified.
+- Remote expert layers run on the shared Spark exchange (#717): the router's
+  routes and input rows stage from the device, the link's worker builds and
+  posts the request, and the reduce waits on the device for the reply.
 - NVFP4 uses W4A4 for prefill, decode and speculative verification, with
   per-expert checkpoint `input_scale` calibration for FC1 and FC2. The old
   FC1 layer-maximum substitution is gone; BF16 wire rows preserve the

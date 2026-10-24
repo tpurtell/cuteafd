@@ -74,7 +74,12 @@ pub(crate) struct Dsv4Prefix<'e, 'a> {
     /// Per rank: its marks' arena.
     arenas: Vec<DeviceAllocation<'a>>,
     slots: usize,
+    /// Per rank: the prefix copy stream, fenced against that rank's engine stream.
+    copies: crate::shared::prefix::PrefixCopies<'a>,
 }
+
+/// Device-to-device copies `(rank, destination, source)` queued as one batch.
+type Copies = Vec<(usize, CuteafdDeviceBuffer, CuteafdDeviceBuffer)>;
 
 fn layer_buffers(engine: &Engine<'_>) -> Result<Vec<LayerBuffers>> {
     let sequences = engine.shape.sequences;
@@ -117,7 +122,11 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         } else {
             Vec::new()
         };
-        Ok(Self { engine, layers, rank_mark_bytes, mark_bytes, arenas, slots })
+        let copies = crate::shared::prefix::PrefixCopies::new(engine.library, (0..engine.ranks())
+            .map(|rank| Ok(vec![crate::shared::prefix::Reader {
+                device: engine.on(rank, || engine.library.cuda_get_device())?, stream: engine.stream_of(rank) }]))
+            .collect::<Result<_>>()?)?;
+        Ok(Self { engine, layers, rank_mark_bytes, mark_bytes, arenas, slots, copies })
     }
 
     /// A head split's GPU1 mark must be byte-for-byte the prefix of GPU0's: GPU1's layers are GPU0's
@@ -178,14 +187,12 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         self.layers[0].main
     }
 
-    /// A copy between two views on rank `rank`'s GPU.
-    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
-        // is ordered on its stream with every forward pass that reads or writes them.
-        self.engine.on(rank, || unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
-        })
+    /// Queues `copies` on their ranks' prefix copy streams.
+    fn submit(&self, copies: &Copies) -> Result<()> {
+        // SAFETY: every view lies inside a live engine allocation of its rank (checked by `view`,
+        // or a registered replica range); the cache drains the copy streams before it hands any
+        // of that storage to someone else.
+        unsafe { self.copies.copy_d2d(copies) }
     }
 
     /// Whether C4 pages are partitioned by unit parity (context attention).
@@ -233,11 +240,13 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         ensure!(placement.state < shape.sequences, "state slot {} of {}", placement.state, shape.sequences);
         let first = len - len.min(WINDOW);
         let mut offsets: Vec<usize> = self.rank_mark_bytes.iter().map(|&bytes| slot.0 as usize * bytes).collect();
+        let mut copies = Copies::new();
         for layer in &self.layers {
             let (rank, arena) = (layer.rank, self.arenas[layer.rank].buffer);
             let offset = &mut offsets[rank];
-            let copy = |ring: CuteafdDeviceBuffer, mark: CuteafdDeviceBuffer| {
-                if capture { self.copy(rank, mark, ring) } else { self.copy(rank, ring, mark) }
+            let mut copy = |ring: CuteafdDeviceBuffer, mark: CuteafdDeviceBuffer| -> Result<()> {
+                copies.push(if capture { (rank, mark, ring) } else { (rank, ring, mark) });
+                Ok(())
             };
             // Positions [first, len) in runs that stay inside one window page.
             let mut position = first;
@@ -258,7 +267,7 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
                 *offset += stride;
             }
         }
-        Ok(())
+        self.submit(&copies)
     }
 }
 
@@ -319,19 +328,16 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
             || u32::from(o) != copy.to & 1) {
             return Err(format!("tail copy {copy:?} crosses GPUs").into());
         }
+        let mut copies = Copies::new();
         for ((rank, from, _), (to_rank, to, _)) in self.unit_ranges(copy.from)?.into_iter().zip(self.unit_ranges(copy.to)?) {
             if rank != to_rank { return Err(format!("tail copy {copy:?} pairs pages of two GPUs").into()); }
-            self.copy(rank, to, from)?;
+            copies.push((rank, to, from));
         }
-        Ok(())
+        Ok(self.submit(&copies)?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for rank in 0..self.engine.ranks() {
-            // SAFETY: the engine owns these streams.
-            unsafe { self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))? };
-        }
-        Ok(())
+        Ok(self.copies.drain()?)
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
@@ -375,13 +381,14 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
         if copies.is_empty() { return Ok(()); }
         if !self.parity() { return Err("a heads split has no replicated snapshot bytes".into()); }
         let template = self.template();
+        let mut batch = Copies::new();
         for &(from, to) in copies {
             let buffer = |r: DeviceRange| CuteafdDeviceBuffer { ptr: r.addr as *mut std::ffi::c_void, bytes: r.bytes, ..template };
             if from.bytes != to.bytes { return Err("replica ranges differ in length".into()); }
-            // A peer read queued on GPU1's stream, ordered before its next forward pass.
-            self.copy(1, buffer(to), buffer(from))?;
+            // A peer read queued on GPU1's copy stream, ordered before its next forward pass.
+            batch.push((1, buffer(to), buffer(from)));
         }
-        Ok(())
+        Ok(self.submit(&batch)?)
     }
 }
 

@@ -10,7 +10,7 @@ use crate::shared::{
     memory::device::{Allocation, Device},
     golden_scores::{select_scored_rows, scored_nll, scored_kl},
     placement::{spark_rings, SparkAdmission},
-    spark_intake::SparkDeviceLink,
+    spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
@@ -21,7 +21,7 @@ use cuteafd_loader::{
     serving_capacity::step5::Step5CacheLayout,
 };
 use cuteafd_transport::{
-    expert::{DeviceBuild, SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+    expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
     worker_selection::ModelAdmission,
     ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertProtocolV2RowDescriptor,
     ExpertV2Dtype, ExpertV2SourceKind, TcpTransportConfig,
@@ -501,9 +501,8 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
     Ok((world, config))
 }
 
-fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<SparkDeviceLink<'a>> {
+fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<RefCell<SparkLink<'a>>> {
     let (world, config) = expert_admission(args, rows, layers)?;
-    ensure!(world.supports_device_exchange(), "Step-5 diagnostic requires native device exchange");
     let warm = request(
         3,
         rows,
@@ -516,22 +515,10 @@ fn link<'a>(device: Device<'a>, args: &GoldenArgs, rows: usize, layers: &[usize]
             .collect(),
         vec![0; rows * H * 2].into(),
     )?;
-    let build: DeviceBuild = Box::new(|wave, routes, wire| {
-        request(wave.layer as usize, wave.rows as usize, routes, wire)
-    });
-    SparkDeviceLink::new(
-        device.library,
-        device.id,
-        world,
-        &args.peers,
-        rows,
-        8,
-        H * 2,
-        H * 2,
-        config,
-        Some(warm),
-        build,
-    )
+    // The widest wave sizes every rank's rings and the exchange staging.
+    let mut link = SparkLink::new(device.library, world, &args.peers, u32::try_from(rows)?, config, H * 2)?;
+    link.bootstrap(&warm)?;
+    Ok(RefCell::new(link))
 }
 
 const PREFIX_FRONTIERS: [usize; 5] = [63, 64, 65, 575, 576];
@@ -581,16 +568,14 @@ fn committed_step<'a>(
     checkpoint: &Checkpoint, vocab: usize, tokens: &[u32], chain: &mut TargetChain<'a>,
     cache: &RefCell<CacheRank<'a>>, staging: &Staging<'a>,
     pool: &RefCell<PrefixCache<StubCopyEngine, Frontier>>, placement: &mut Placement,
-    input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize,
+    input: &Allocation<'a>, link: &RefCell<SparkLink<'a>>,
 ) -> Result<Vec<u8>> {
     let device = cache.borrow().stream.device;
     device.run(|| device.library.copy_h2d(input.buffer, &embedding_rows(checkpoint, tokens, vocab)?))?;
-    link.arm()?;
-    link.expect(waves as u64);
     let mut step = Step::begin(vec![cache], vec![staging], pool, placement, tokens.len())?;
-    chain.enqueue_step(&mut step, 0, input, Some(link), 0)?;
+    chain.enqueue_step(&mut step, 0, input, Some((link, request as super::routed::GateRequest)))?;
     cache.borrow().drain()?;
-    link.check()?;
+    crate::shared::spark_waves::healthy()?;
     step.publish(tokens.len())?;
     let mut output = chain.output(91)?;
     output.bytes = tokens.len() * H * 4;
@@ -605,7 +590,7 @@ fn check_prefix_state<'a>(
     device: Device<'a>, programs: &'a cuteafd_ffi::programs::Programs<'a>,
     checkpoint: &Checkpoint, cfg: &Config, tokens: &[u32], chain: &mut TargetChain<'a>,
     kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
-    input: &Allocation<'a>, link: &SparkDeviceLink<'a>, waves: usize, available: usize,
+    input: &Allocation<'a>, link: &RefCell<SparkLink<'a>>, available: usize,
 ) -> Result<()> {
     let shape = Step5CacheLayout::new(cfg, 1, tokens.len() as u64, 0, tokens.len() as u64, kv_format)?;
     prefix_state_bytes(&shape, tokens.len())?;
@@ -619,14 +604,14 @@ fn check_prefix_state<'a>(
         let mut source = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
             |pages| Placement { pages, sequence: 0, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
-            &pool, &mut source, input, link, waves)?;
+            &pool, &mut source, input, link)?;
         let expected = canonical_state(&cache, &source)?;
         ensure!(pool.borrow_mut().capture(&family, SnapshotKind::Prompt, &tokens[..frontier], &source, After::default())?,
             "Step-5 diagnostic snapshot was not retained");
         let mut cold = pool.borrow_mut().admit_cold(&family, frontier, frontier + 1,
             |pages| Placement { pages, sequence: 1, committed: 0 })?.placement;
         committed_step(checkpoint, cfg.vocab, &tokens[..frontier], chain, &cache, &staging,
-            &pool, &mut cold, input, link, waves)?;
+            &pool, &mut cold, input, link)?;
         ensure!(expected == canonical_state(&cache, &cold)?,
             "Step-5 independently cold state differs at {frontier}");
         let admitted = pool.borrow_mut().admit(&family, &tokens[..frontier + 1], frontier + 1, false,
@@ -638,9 +623,9 @@ fn check_prefix_state<'a>(
         ensure!(expected == canonical_state(&cache, &restored)?,
             "Step-5 restored canonical mark or live CSA rows differ at {frontier}");
         let cold_hidden = committed_step(checkpoint, cfg.vocab, &tokens[frontier..frontier + 1],
-            chain, &cache, &staging, &pool, &mut cold, input, link, waves)?;
+            chain, &cache, &staging, &pool, &mut cold, input, link)?;
         let restored_hidden = committed_step(checkpoint, cfg.vocab, &tokens[frontier..frontier + 1],
-            chain, &cache, &staging, &pool, &mut restored, input, link, waves)?;
+            chain, &cache, &staging, &pool, &mut restored, input, link)?;
         ensure!(cold_hidden == restored_hidden, "Step-5 continuation hidden bytes differ at {frontier}");
         ensure!(canonical_state(&cache, &cold)? == canonical_state(&cache, &restored)?,
             "Step-5 continuation canonical state differs at {frontier}");
@@ -780,7 +765,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         let input = Allocation::new(device, rows * H * 4)?;
         library.copy_h2d(input.buffer, &embedding_rows(checkpoint, &reference.tokens, cfg.vocab)?)?;
         let mut step = Step::begin(vec![&cache], vec![&staging], &pool, &mut placement, rows)?;
-        chain.enqueue_step(&mut step, 0, &input, None, 0)?;
+        chain.enqueue_step(&mut step, 0, &input, None)?;
         cache.borrow().drain()?;
         drop(step);
         ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
@@ -1103,10 +1088,8 @@ fn run(args: GoldenArgs) -> Result<()> {
     );
     if args.prefix_state {
         return check_prefix_state(device, &programs, &checkpoint, &cfg, &tokens,
-            &mut chain, args.kv_cache, &input, &link, layers.len(), remaining);
+            &mut chain, args.kv_cache, &input, &link, remaining);
     }
-    link.arm()?;
-    link.expect(layers.len() as u64);
     let mut step = Step::begin(
         vec![&cache],
         vec![&staging],
@@ -1114,9 +1097,9 @@ fn run(args: GoldenArgs) -> Result<()> {
         &mut placement,
         rows,
     )?;
-    chain.enqueue_step(&mut step, 0, &input, Some(&link), 0)?;
+    chain.enqueue_step(&mut step, 0, &input, Some((&link, request as super::routed::GateRequest)))?;
     cache.borrow().drain()?;
-    link.check()?;
+    crate::shared::spark_waves::healthy()?;
     drop(step);
     ensure!(
         placement.committed == 0,

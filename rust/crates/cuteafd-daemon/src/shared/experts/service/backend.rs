@@ -196,7 +196,7 @@ impl<'a> Weights<'a> {
                     config.capacity,
                     remaining,
                     config.exl3_schedule,
-                    Some(modules.take_exl3()?),
+                    modules.take_exl3()?,
                 )?;
                 execution.install_topology(config.spark_world()?.ownership_topology())?;
                 Execution::Exl3(execution)
@@ -280,6 +280,10 @@ impl<'a> Fp8Groups<'a> {
         where F: FnMut(ExpertProtocolV2ResponseRef<'_>) -> Result<()> {
         self.workers[self.selected].execute_host_chunks(request, executor_id, exchange, row_indices, max_frame_bytes, sink)
     }
+    fn stream_idle(&self) -> Result<bool> {
+        for worker in &self.workers { if !worker.stream_idle()? { return Ok(false); } }
+        Ok(true)
+    }
 }
 
 pub(super) fn conservative_grouping(loaded: cuteafd_transport::worker_selection::WorkerSelection,
@@ -327,6 +331,34 @@ impl<'w, 'a> Execution<'w, 'a> {
             Self::Exl3(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Fp8(execution) => execution.installed_grouping(loaded, rank).map(Some),
             Self::Exlr8(execution) => execution.grouping(loaded, rank).map(Some),
+        }
+    }
+    /// Lane-owned mode: mapped requests return with their work queued; the
+    /// owner emits once [`Self::stream_idle`] holds, after [`Self::complete`].
+    pub(super) fn defer(&mut self) -> Result<()> {
+        match self {
+            Self::Full(execution) => execution.defer(),
+            Self::Exl3(execution) => execution.defer(),
+            Self::Fp8(groups) => groups.workers.iter_mut().for_each(Fp8Worker::defer),
+            Self::Exlr8(execution) => execution.defer(),
+        }
+        Ok(())
+    }
+    /// A deferred request's stream drained ([`Self::stream_idle`]): finish its
+    /// host bookkeeping (EXLR8 publishes its timing here) before emission.
+    pub(super) fn complete(&mut self) -> Result<()> {
+        match self {
+            Self::Exlr8(execution) => execution.complete(),
+            Self::Full(_) | Self::Exl3(_) | Self::Fp8(_) => Ok(()),
+        }
+    }
+    /// Whether every request this execution queued has completed.
+    pub(super) fn stream_idle(&self) -> Result<bool> {
+        match self {
+            Self::Full(execution) => execution.stream_idle(),
+            Self::Exl3(execution) => execution.stream_idle(),
+            Self::Fp8(groups) => groups.stream_idle(),
+            Self::Exlr8(execution) => execution.stream_idle(),
         }
     }
     pub(super) fn bind_layer(&mut self, weights: &'w Weights<'a>, index: usize) -> Result<()> {

@@ -1,6 +1,6 @@
 //! Exact KDA frontiers and placement-owned MLA pages for the shared prefix cache.
 use super::{mla::{CacheBank, PREFIX_REUSE}, state::KdaBank};
-use crate::shared::{memory::device::{Allocation, Event, Stream}, prefix::cuda_copy::range};
+use crate::shared::{memory::device::Allocation, prefix::{cuda_copy::range, PrefixCopies, Reader}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PrefixFamily, TailCopy};
 use cuteafd_ffi::{CuteafdDeviceBuffer, MLA_PAGE_ROWS};
@@ -32,24 +32,23 @@ pub(crate) struct SnapshotMeta {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Frontier { units: Vec<u32>, len: usize }
 
-struct Joins<'a> { produced: Vec<Event<'a>>, landed: Event<'a> }
-
 struct Inner<'a> {
     kda: [Rc<KdaBank<'a>>; 2],
     mla: [Rc<CacheBank<'a>>; 2],
     cfg: KimiK3Config,
     context: usize,
     layout: FamilyLayout,
-    joins: [RefCell<Joins<'a>>; 2],
+    /// Per rank: the prefix copy stream, fenced against that rank's lane streams.
+    copies: PrefixCopies<'a>,
     live: RefCell<Vec<Option<Frontier>>>,
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
 }
 
 impl Drop for Inner<'_> {
     fn drop(&mut self) {
+        // The copy streams drain in `PrefixCopies`' own drop; the readers before the banks go.
         for bank in &self.kda {
             for stream in bank.readers() { stream.drain_or_abort("Kimi prefix reader teardown"); }
-            bank.stream.drain_or_abort("Kimi prefix copy teardown");
         }
     }
 }
@@ -82,17 +81,13 @@ impl<'a> KimiPrefix<'a> {
         let mark_bytes = geometry.ranks.iter().map(|rank| rank.retained_mark_bytes as usize).sum();
         ensure!(mark_bytes == kda[0].mark_bytes() + kda[1].mark_bytes(), "Kimi prefix KDA shard geometry differs");
         ensure!(page_bytes > 0, "Kimi prefix has no resident MLA pages");
-        let joins = |rank: usize| -> Result<_> {
-            let device = kda[rank].stream.device;
-            Ok(RefCell::new(Joins { produced: kda[rank].readers().iter()
-                .map(|_| Event::new(device)).collect::<Result<_>>()?, landed: Event::new(device)? }))
-        };
-        let joins = [joins(0)?, joins(1)?];
+        let copies = PrefixCopies::new(kda[0].stream.device.library, kda.iter().map(|bank| bank.readers().iter()
+            .map(|reader| Reader { device: reader.device.id, stream: reader.raw }).collect()).collect())?;
         let layout = FamilyLayout { page_rows: MLA_PAGE_ROWS, pages: mla[0].pages(), page_bytes,
             mark_bytes, draft_bytes: 0,
             rule: PREFIX_REUSE, mark_store: MarkStore::Arena, page_owners: Default::default() };
         let live = RefCell::new(vec![None; kda[0].slots()]);
-        Ok(Self(Rc::new(Inner { kda, mla, cfg: cfg.clone(), context, layout, joins, live, draft: None })))
+        Ok(Self(Rc::new(Inner { kda, mla, cfg: cfg.clone(), context, layout, copies, live, draft: None })))
     }
 
     pub(crate) fn with_draft(mut self, draft: Option<Rc<super::draft::NativeDraft<'a>>>) -> Result<Self> {
@@ -177,43 +172,14 @@ impl<'a> KimiPrefix<'a> {
             .map(|(layer, _)| self.0.mla[rank].page(layer, page as usize, rows)).collect()
     }
 
-    fn ordered(&self, rank: usize, copies: impl FnOnce(&Stream<'a>) -> Result<()>) -> Result<()> {
-        let bank = &self.0.kda[rank];
-        let copy = &bank.stream;
-        let mut joins = self.0.joins[rank].borrow_mut();
-        // Ordered copy fence, not a compute drain. Join every exact producer,
-        // then make every possible consumer wait before reusing the bank.
-        for (event, reader) in joins.produced.iter_mut().zip(bank.readers()) {
-            event.record(reader)?;
-            copy.device.run(|| {
-                // SAFETY: the bank and event owners outlive all queued waits.
-                unsafe { copy.device.library.cuda_stream_wait_event(copy.raw, event.raw) }
-            })?;
-        }
-        let result = copy.device.run(|| copies(copy));
-        joins.landed.record(copy)?;
-        for reader in bank.readers() {
-            reader.device.run(|| {
-                // SAFETY: the retained reader joins this exact completed copy frontier.
-                unsafe { reader.device.library.cuda_stream_wait_event(reader.raw, joins.landed.raw) }
-            })?;
-        }
-        result
-    }
-
     fn move_mark(&self, mark: MarkSlot, slot: usize, capture: bool) -> Result<()> {
         let plans = (0..2).map(|rank| Ok((self.state_buffers(rank, slot)?, self.mark_buffers(rank, mark)?)))
             .collect::<Result<Vec<_>>>()?;
-        for (rank, (state, marks)) in plans.into_iter().enumerate() {
-            self.ordered(rank, |stream| {
-                for (live, saved) in state.into_iter().zip(marks) {
-                    let (dst, src) = if capture { (saved, live) } else { (live, saved) };
-                    // SAFETY: both exact views are retained by this prefix owner through drain.
-                    unsafe { stream.device.library.copy_d2d_async(dst, src, src.bytes, stream.raw)?; }
-                }
-                Ok(())
-            })?;
-        }
+        let copies: Vec<_> = plans.into_iter().enumerate().flat_map(|(rank, (state, marks))| state.into_iter()
+            .zip(marks).map(move |(live, saved)| if capture { (rank, saved, live) } else { (rank, live, saved) }))
+            .collect();
+        // SAFETY: both exact views are retained by this prefix owner through drain.
+        unsafe { self.0.copies.copy_d2d(&copies)?; }
         if let Some(draft) = &self.0.draft { draft.move_mark(mark.0 as usize, slot, capture)?; }
         Ok(())
     }
@@ -292,10 +258,11 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         // The scheduler recycles slots only after releasing/draining their pages.
         for rank in 0..2 {
             let regions = self.state_buffers(rank, placement.slot)?;
-            self.ordered(rank, |stream| {
+            let library = self.0.kda[rank].stream.device.library;
+            self.0.copies.ordered(rank, |stream| {
                 for region in regions {
                     // SAFETY: this slot is private, and all readers join this initialization.
-                    unsafe { stream.device.library.cuda_zero_bytes_async(region, region.bytes, stream.raw)?; }
+                    unsafe { library.cuda_zero_bytes_async(region, region.bytes, stream)?; }
                 }
                 Ok(())
             })?;
@@ -341,24 +308,14 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
         }
         let plans = (0..2).map(|rank| Ok((self.page_buffers(rank, copy.from, copy.rows)?,
             self.page_buffers(rank, copy.to, copy.rows)?))).collect::<Result<Vec<_>>>()?;
-        for (rank, (source, destination)) in plans.into_iter().enumerate() {
-            self.ordered(rank, |stream| {
-                for (src, dst) in source.into_iter().zip(destination) {
-                    // SAFETY: the shared page pool retains source and private destination through drain.
-                    unsafe { stream.device.library.copy_d2d_async(dst, src, src.bytes, stream.raw)?; }
-                }
-                Ok(())
-            })?;
-        }
-        Ok(())
+        let copies: Vec<_> = plans.into_iter().enumerate().flat_map(|(rank, (source, destination))|
+            source.into_iter().zip(destination).map(move |(src, dst)| (rank, dst, src))).collect();
+        // SAFETY: the shared page pool retains source and private destination through drain.
+        Ok(unsafe { self.0.copies.copy_d2d(&copies) }?)
     }
     fn drain(&self) -> Result<(), BoxError> {
         if let Some(draft) = &self.0.draft { draft.drain()?; }
-        for rank in 0..2 {
-            self.ordered(rank, |_| Ok(()))?;
-            self.0.kda[rank].stream.drain()?;
-        }
-        Ok(())
+        Ok(self.0.copies.drain()?)
     }
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
         (0..2).flat_map(|rank| self.page_buffers(rank, page, MLA_PAGE_ROWS).unwrap_or_default()).map(range).collect()
@@ -373,7 +330,7 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shared::memory::device::Device;
+    use crate::shared::memory::device::{Device, Stream};
     use cuteafd_ffi::native_library_lifetime_fixture::Fixture;
     use cuteafd_loader::placement::AttentionPlacement;
 

@@ -129,6 +129,7 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+    cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -530,11 +531,8 @@ fn worker(
         projected_free_bytes=free.saturating_sub(pool.cache_bytes[0]),reservation_bytes=?pool.reservation_bytes,
         "shared V4.1 cache and expert admission");
     let local_layers = pool.placement.onboard_layers;
-    let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && spark_world.supports_device_exchange()
-        && catalog.nvfp4().is_none() && catalog.exl3().is_none() && local_layers < 40;
     let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity, aot_capacity,
-        topology, usize::from(device_exchange))?;
+        topology)?;
     let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     admission::startup_phase(&lib, "v41/kv", device_total)?;
@@ -587,12 +585,11 @@ fn worker(
             "local RTX experts ready");
     }
     if let Some(pending) = spark_admission { pending.wait()?; }
-    if device_exchange {
-        // Verification waves (up to 80 rows) on the device-driven exchange; it
-        // connects (and warms) the workers, so only once they are serving.
-        transport.install_device_link(&args.peers, 80.min(capacity as usize), 39,
-            cuteafd_transport::TcpTransportConfig { timing: protocol_v2_timing, timeout: Duration::from_secs(120),
-                max_frame_bytes: 64 << 20 })?;
+    if local_layers < 40 {
+        // The workers serve their layers now: open the sessions and start each
+        // link's exchange worker (the first remote layer sizes the rings).
+        transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
+        prefill_transport.bootstrap(local_layers as u32, catalog.nvfp4().is_some())?;
     }
     let (free, total) = lib.cuda_memory_info()?;
     let occupied = total - free;

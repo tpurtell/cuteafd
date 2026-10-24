@@ -259,8 +259,7 @@ pub(crate) enum Experts<'a> {
     LocalExl3(LocalExl3<'a>),
     Tp2 { routed: RefCell<QwenTp2<'a>>, mtp: Option<MtpExperts<'a>> },
     /// Spark ranks over RoCE (one BF16 partial plane per rank), plus a local draft layer.
-    Spark { transport: RefCell<SparkLink<'a>>, runtime: tokio::runtime::Runtime,
-        mtp: Option<MtpExperts<'a>> },
+    Spark { transport: RefCell<SparkLink<'a>>, mtp: Option<MtpExperts<'a>> },
     /// No routed experts (plumbing tests only: the MoE output is the shared expert alone).
     SharedOnly,
 }
@@ -694,6 +693,10 @@ struct Workspace<'a> {
     route_ids: Dev<'a>,
     route_weights: Dev<'a>,
     wire: Dev<'a>,
+    /// Admitted pinned route staging (the planner charges it); Spark waves
+    /// now stage in the link exchange's slots, so it stays unused until the
+    /// planner drops the charge.
+    #[allow(dead_code)]
     router_host: RefCell<HostAllocation<'a>>,
     /// MTP steps: the source row of each row's feedback, and the greedy draft
     /// (U32 token, FP32 logit) of each head row.
@@ -1074,9 +1077,6 @@ pub(crate) struct Qwen4Engine<'a> {
     /// (W8A8, `fp8_rows` 1) instead of W8A16 (`--fp8-prefill-w8a8`).
     pub w8a8_prefill: bool,
     pub full_prefill_logits: bool,
-    /// Recorded after a Spark exchange's device-to-host copies: the host
-    /// waits on it while the shared expert runs behind it.
-    routes_ready: *mut c_void,
     /// L2 prefetch of the next layer's weights during decode exchanges.
     pub l2: Option<crate::shared::l2_prefetch::L2Prefetch>,
     /// The token embedding table (resident on this GPU or read from its shard).
@@ -1264,7 +1264,7 @@ impl<'a> Qwen4Engine<'a> {
             use_graphs: std::env::var("CUTEAFD_QWEN4_GRAPHS").map_or(true, |v| v != "0"),
             startup_graphs: false,
             warming_graphs: Cell::new(false), w8a8_prefill: false, spark_bf16: false, full_prefill_logits: false,
-            routes_ready: library.cuda_event_create_ordering()?, l2: None, embedding,
+            l2: None, embedding,
             mtp_drafts: zeroed(MTP_DEFERRED_STEPS * DECODE_ROWS * 4)?,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)? })
     }
@@ -1688,7 +1688,7 @@ impl<'a> Qwen4Engine<'a> {
                             .map(|rank| rank.weight_read_bytes()).collect::<Result<Vec<_>>>()?
                             .into_iter().max().context("Qwen installed TP2 ranks missing")?,
                         Some(Experts::Spark { transport, .. }) => resource::worker_weight_read_bytes(
-                            &transport.borrow().transport.installed_grouping()?, index)?,
+                            &transport.borrow().installed_grouping()?, index)?,
                         _ => anyhow::bail!("Qwen layer {index} has no installed FP8-family byte descriptor"),
                     };
                     bytes as f64
@@ -1704,7 +1704,7 @@ impl<'a> Qwen4Engine<'a> {
         -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource;
         let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().transport.installed_grouping()?,
+            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
             _ => Vec::new(),
         };
         resource::geometry_with_grouping(&self.draft_homes(snapshot)?, self.cfg.experts, self.cfg.topk,
@@ -1773,9 +1773,10 @@ impl<'a> Qwen4Engine<'a> {
 
     fn probe_layer(&self, w: &Workspace<'_>, index: usize, rows: usize) -> Result<()> {
         if index >= self.cfg.layers { return Ok(()); }
-        let spark = matches!(self.experts, Some(Experts::Spark { .. }));
         if let Some(probe) = self.draft_probes.borrow_mut().get_mut(self.active_owner.get()) {
-            if probe.wants_ring(spark) {
+            // Spark layers ring too: their routes reach the host only on the
+            // exchange worker, after the post.
+            if probe.wants_ring(false) {
                 // SAFETY: replay/router precedes this async copy on the owning device stream.
                 unsafe { probe.ring(self.library, index, w.route_ids.buffer, rows, self.execution_stream())?; }
             }
@@ -1801,6 +1802,12 @@ impl<'a> Qwen4Engine<'a> {
         owners.extend(self.ple_state.as_ref().cloned());
         owners.extend(self.mtp_pending.as_ref().cloned());
         owners
+    }
+
+    /// Every execution owner's (device, stream): the streams that read and write its KV pages
+    /// and GDN state (prefix copies fence against them).
+    pub(crate) fn owner_streams(&self) -> Vec<(i32, *mut c_void)> {
+        self.gdn_banks.iter().map(|bank| (bank.device.id, bank.stream)).collect()
     }
 
     pub(crate) fn state_stream(&self, device: i32) -> Result<*mut c_void> {
@@ -2268,11 +2275,26 @@ impl<'a> Qwen4Engine<'a> {
         let w = workspace.as_ref().context("Qwen prefill workspace")?;
         w.terminal_valid.set(false);
         w.units.set(true);
-        let mut hooks = UnitHooks { engine: self, w, placement, tokens,
-            tables: units.iter().map(|unit| tables.unit(unit.rows.clone(), if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect(),
-            current: vec![0; units.len()], entered: vec![false; units.len()],
-            pending: (0..units.len()).map(|_| None).collect(), logit_rows };
-        let result = run_prefill_units(&mut hooks, &units, waves);
+        let unit_tables: Vec<_> = units.iter().map(|unit| tables.unit(unit.rows.clone(),
+            if self.ple.is_some() { self.cfg.ple_rows() } else { 0 }, self.cfg.dense_context())).collect();
+        let run = |transport: Option<&mut crate::shared::spark_waves::Waves<'_>>| {
+            let mut hooks = UnitHooks { engine: self, transport, w, placement, tokens, tables: unit_tables,
+                current: vec![0; units.len()], entered: vec![false; units.len()],
+                pending: (0..units.len()).map(|_| None).collect(), logit_rows };
+            run_prefill_units(&mut hooks, &units, waves)
+        };
+        // Spark waves build, post and land on the link's exchange worker
+        // while this thread queues GPU work.
+        let result = match &self.experts {
+            Some(Experts::Spark { transport, .. }) => {
+                let staging = self.wave_staging_bytes(shape.unit_rows as usize)?;
+                let mut link = transport.borrow_mut();
+                let exchange = link.exchange()?;
+                ensure!(exchange.fits(staging), "Spark exchange staging is narrower than a prefill unit");
+                run(Some(exchange))
+            }
+            _ => run(None),
+        };
         w.row_offset.set(0); w.logit_offset.set(0); w.position.set(0); w.units.set(false);
         self.last_stream_offset.set(0);
         result?;
@@ -3436,7 +3458,7 @@ impl<'a> Qwen4Engine<'a> {
             self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
                 w.route_weights.buffer.ptr, t, self.cfg.experts, self.cfg.topk, 1.0, true, self.execution_stream())?;
         }
-        // Spark layers run the shared expert during the exchange (spark_moe).
+        // Spark layers run the shared expert during the exchange (wave_send).
         if !matches!(experts, Experts::Spark { .. }) || index == self.cfg.layers {
             self.shared(w, layer, rows)?;
         }
@@ -3542,9 +3564,12 @@ impl<'a> Qwen4Engine<'a> {
                 }
                 return Ok(());
             }
-            Experts::Spark { transport, runtime, mtp } => {
+            Experts::Spark { transport, mtp } => {
                 if index < self.cfg.layers {
-                    return self.spark_moe(w, index, t, rows, decode, &mut transport.borrow_mut(), runtime);
+                    let mut link = transport.borrow_mut();
+                    let exchange = link.exchange()?;
+                    let wave = self.wave_send(w, index, t, rows, decode, exchange)?;
+                    return self.wave_land(w, t, wave, exchange);
                 }
                 ensure!(index == self.cfg.layers, "unknown Qwen expert layer {index}");
                 match mtp.as_ref().context("Spark backbone needs coordinator-local MTP experts (--mtp)")? {
@@ -3578,94 +3603,74 @@ impl<'a> Qwen4Engine<'a> {
             &[rows])
     }
 
-    /// Routes and wire rows down, one request to every Spark rank, the BF16
-    /// rank partials and the shared expert summed into `delta`. Serial today:
-    /// the shared prefill executor will call the two hooks with other units'
-    /// work between them.
-    #[allow(clippy::too_many_arguments)]
-    fn spark_moe(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
-        transport: &mut SparkLink<'_>,
-        runtime: &tokio::runtime::Runtime) -> Result<()> {
-        let wave = self.send_experts(w, index, t, rows, decode, transport)?;
-        self.land_experts(w, t, wave, transport, runtime)
-    }
-
-    /// Router outputs and wire rows go down to pinned staging, the shared
-    /// expert queues behind the copies, and one owned request is dispatched.
-    /// The host waits only on the copies' event, never the stream.
-    fn send_experts(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
-        transport: &mut SparkLink<'_>) -> Result<cuteafd_transport::expert::SparkExpertWave> {
+    /// A wave on the link's exchange: router outputs and wire rows copy into
+    /// the wave slot's pinned staging, the shared expert (and in a decode
+    /// step the L2 prefetch) queues behind them, and the worker builds and
+    /// posts the request once the copies complete. This thread does not wait
+    /// for the GPU. Complete with [`Self::wave_land`].
+    fn wave_send(&self, w: &Workspace<'_>, index: usize, t: usize, rows: Scalar, decode: bool,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<crate::shared::spark_waves::WaveTicket> {
         let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
-        let (h, topk) = (self.cfg.hidden, self.cfg.topk);
-        let (route_bytes, wire_bytes) = (t * topk * 4, t * (if self.spark_bf16 { h * 2 } else { h + h / 32 }));
-        let staging = w.router_host.borrow_mut();
-        let host = staging.buffer;
-        let at = |offset: usize| cuteafd_ffi::CuteafdHostBuffer {
-            // SAFETY: ids, weights and wire rows are consecutive inside the pinned buffer.
-            ptr: unsafe { host.ptr.cast::<u8>().add(offset) }.cast(),
-            bytes: host.bytes - offset,
-            ..host
-        };
-        let timer = std::time::Instant::now();
-        // SAFETY: the pinned regions are large enough; the event wait completes them.
-        unsafe {
-            self.library.copy_d2h_host_buffer_async(at(0), w.route_ids.buffer, route_bytes, self.execution_stream())?;
-            self.library.copy_d2h_host_buffer_async(at(route_bytes), w.route_weights.buffer, route_bytes, self.execution_stream())?;
-            self.library.copy_d2h_host_buffer_async(at(2 * route_bytes), if self.spark_bf16 { w.live_buffer(&w.x, self.cfg.hidden * 2) } else { w.wire.buffer }, wire_bytes, self.execution_stream())?;
-            self.library.cuda_event_record(self.routes_ready, self.execution_stream())?;
-        }
-        // The shared expert queues behind the copies and runs during the
-        // exchange (the L2 prefetch behind it); the host waits for the copies only.
-        self.shared(w, &self.weights.layers[index], rows)?;
-        self.exchange_window(index, decode, false)?;
-        // SAFETY: the event was recorded on this engine's stream above.
-        unsafe { self.library.cuda_event_synchronize(self.routes_ready)? };
-        self.profile.borrow_mut()[0] += timer.elapsed().as_secs_f64();
-        let staged = staging.bytes();
-        if let Some(probe) = self.draft_probes.borrow_mut().get_mut(self.active_owner.get()) {
-            probe.staged(index, &staged[..route_bytes]);
-        }
-        let word = |offset: usize, i: usize| u32::from_le_bytes(staged[offset + i * 4..][..4].try_into().unwrap());
-        let routes = (0..t * topk).map(|i| ExpertProtocolV2RouteEntry {
-            row_index: (i / topk) as u32, expert_id: word(0, i), gate_weight: f32::from_bits(word(route_bytes, i)),
-        }).collect();
-        let wire = staged[2 * route_bytes..2 * route_bytes + wire_bytes].to_vec();
-        drop(staging);
+        let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
+        let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
+        ensure!(exchange.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", exchange.ranks());
+        let sized = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize| cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer };
+        let input = if bf16 { w.live_buffer(&w.x, h * 2) } else { w.wire.buffer };
         let request_id = self.request_id.get();
         self.request_id.set(request_id.checked_add(1).context("Qwen Spark request id overflow")?);
-        let mut request = ExpertProtocolV2Request::new(request_id, 17, index as u32, h as u32,
-            if self.spark_bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
-            (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
-                row_id: u64::from(row), source_kind: kind, source_request_id: 1,
-                token_position: (w.position.get() + row as usize) as u64, route_offset: row * topk as u32, route_count: topk as u32,
-            }).collect(),
-            routes, wire)?;
-        request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        let ranks = transport.world_size();
-        ensure!(ranks <= MAX_RANKS, "{ranks} Spark ranks exceed the reduction planes");
-        transport.dispatch(&request)
+        let position = w.position.get();
+        // SAFETY: ids, weights and input rows hold this wave's `t` rows in
+        // stream order; the copies read them before later stream work.
+        let ticket = unsafe {
+            exchange.send(t, layout, [sized(w.route_ids.buffer, layout.route_bytes),
+                sized(w.route_weights.buffer, layout.route_bytes), sized(input, layout.wire_bytes)],
+                self.execution_stream(), Box::new(move |routes, wire| {
+                    let mut request = ExpertProtocolV2Request::new_bytes(request_id, 17, index as u32, h as u32,
+                        if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
+                        (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
+                            row_id: u64::from(row), source_kind: kind, source_request_id: 1,
+                            token_position: (position + row as usize) as u64, route_offset: row * topk as u32,
+                            route_count: topk as u32,
+                        }).collect(),
+                        routes, wire)?;
+                    request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+                    Ok(request)
+                }))?
+        };
+        // The shared expert runs during the exchange (the L2 prefetch behind it).
+        self.shared(w, &self.weights.layers[index], rows)?;
+        self.exchange_window(index, decode, false)?;
+        Ok(ticket)
     }
 
-    /// Receives the wave's BF16 rank partials and sums them with the shared
-    /// expert into `delta`, ordered on the engine stream.
-    fn land_experts(&self, w: &Workspace<'_>, t: usize, wave: cuteafd_transport::expert::SparkExpertWave,
-        transport: &mut SparkLink<'_>, runtime: &tokio::runtime::Runtime) -> Result<()> {
-        let timer = std::time::Instant::now();
-        runtime.block_on(transport.receive(wave, t, self.execution_stream()))?;
-        self.profile.borrow_mut()[1] += timer.elapsed().as_secs_f64();
+    /// The land half of [`Self::wave_send`]: the stream waits for the wave's
+    /// planes and sums them with the shared expert into `delta`.
+    fn wave_land(&self, w: &Workspace<'_>, t: usize, wave: crate::shared::spark_waves::WaveTicket,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<()> {
+        let slot = wave.slot();
+        exchange.land(wave, self.execution_stream())?;
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
-        // buffers; the intake planes are ordered after the wave by `receive`.
+        // buffers; the slot's planes are ordered after the wave by `land`.
         unsafe {
-            transport.reduce(w.live(&w.shared, self.cfg.hidden * 2).cast(), w.live(&w.delta, self.cfg.hidden * 2).cast(), t, self.execution_stream())?;
-            Ok(())
+            exchange.reduce(slot, w.live(&w.shared, self.cfg.hidden * 2).cast(),
+                w.live(&w.delta, self.cfg.hidden * 2).cast(), t, self.execution_stream())
         }
+    }
+
+    /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
+    fn wave_staging_bytes(&self, rows: usize) -> Result<usize> {
+        let h = self.cfg.hidden;
+        Ok(crate::shared::experts::staging::RouteStaging::new(rows, self.cfg.topk,
+            if self.spark_bf16 { h * 2 } else { h + h / 32 })?.bytes)
     }
 }
 
 /// Live rows survive hooks in slot planes; all tables and scratch are shared
 /// and rewritten on the execution stream before the hook that consumes them.
-struct UnitHooks<'e, 'w, 'p, 't, 'a> {
+struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     engine: &'e Qwen4Engine<'a>,
+    /// The Spark link's exchange.
+    transport: Option<&'r mut crate::shared::spark_waves::Waves<'n>>,
     w: &'w Workspace<'a>,
     placement: &'p Qwen4Placement,
     tokens: &'t [u32],
@@ -3676,7 +3681,7 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a> {
     logit_rows: usize,
 }
 
-impl UnitHooks<'_, '_, '_, '_, '_> {
+impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
     fn select(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
         self.w.row_offset.set(Workspace::unit_offset(unit.slot, shape.unit_rows as usize));
@@ -3709,8 +3714,8 @@ impl UnitHooks<'_, '_, '_, '_, '_> {
     }
 }
 
-impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_> {
-    type Ticket = cuteafd_transport::expert::SparkExpertWave;
+impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
+    type Ticket = crate::shared::spark_waves::WaveTicket;
 
     fn route(&self, _: usize) -> crate::shared::prefill_pipeline::FfnRoute {
         if matches!(self.engine.experts, Some(Experts::Spark { .. })) {
@@ -3756,15 +3761,15 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         self.select(unit)?;
         let rows = Scalar::I32(unit.rows.len() as i32);
         self.engine.moe_front(self.w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
-        let Some(Experts::Spark { transport, .. }) = &self.engine.experts else { anyhow::bail!("Qwen unit Spark route") };
-        self.engine.send_experts(self.w, layer, unit.rows.len(), rows, false, &mut transport.borrow_mut())
+        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
+        self.engine.wave_send(self.w, layer, unit.rows.len(), rows, false, transport)
     }
 
     fn land_experts(&mut self, layer: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket)
         -> Result<()> {
         self.select(unit)?;
-        let Some(Experts::Spark { transport, runtime, .. }) = &self.engine.experts else { anyhow::bail!("Qwen unit Spark route") };
-        self.engine.land_experts(self.w, unit.rows.len(), ticket, &mut transport.borrow_mut(), runtime)?;
+        let transport = self.transport.as_mut().context("Qwen unit Spark route without its transport worker")?;
+        self.engine.wave_land(self.w, unit.rows.len(), ticket, transport)?;
         self.finish_ffn(layer, unit)
     }
 
@@ -3926,10 +3931,6 @@ mod prefill_unit_tests {
 impl Drop for Qwen4Engine<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "Qwen engine retirement");
-        if let Some(bank) = self.gdn_banks.first() {
-            // SAFETY: the root owner owns this ordering event; all streams have drained.
-            let _ = bank.device.run(|| unsafe { self.library.cuda_event_destroy(self.routes_ready) });
-        }
     }
 }
 

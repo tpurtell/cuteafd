@@ -1172,6 +1172,9 @@ type CudaEventDestroyFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> Cutea
 type CudaEventRecordFn =
     unsafe extern "C" fn(cuda_event: *mut c_void, cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaEventSynchronizeFn = unsafe extern "C" fn(cuda_event: *mut c_void) -> CuteafdStatus;
+type CudaEventQueryFn = unsafe extern "C" fn(cuda_event: *mut c_void, ready: *mut i32) -> CuteafdStatus;
+type CudaStreamWaitValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *const u32, value: u32) -> CuteafdStatus;
+type CudaStreamWriteValue32Fn = unsafe extern "C" fn(cuda_stream: *mut c_void, word: *mut u32, value: u32) -> CuteafdStatus;
 type CudaEventElapsedMsFn = unsafe extern "C" fn(
     start_event: *mut c_void,
     end_event: *mut c_void,
@@ -1529,6 +1532,7 @@ type RdmaRcEndpointSetRecvLandingFn = unsafe extern "C" fn(
     device_ptr: *mut c_void,
     bytes: usize,
     header_bytes: usize,
+    slot_bytes: usize,
 ) -> CuteafdStatus;
 type RdmaGpuLandingProbeFn = unsafe extern "C" fn(
     device_name: *const c_char,
@@ -2465,6 +2469,49 @@ impl NativeLibrary {
             unsafe { self.lib.get(b"cuteafd_cuda_event_synchronize")? };
         let status = unsafe { synchronize_fn(cuda_event) };
         self.status_to_result("cuteafd_cuda_event_synchronize", status)
+    }
+
+    /// Whether `cuda_event`'s recorded work completed, without blocking; a
+    /// never-recorded event is complete. Any host thread may call it once
+    /// the event's device is current on that thread.
+    ///
+    /// # Safety
+    /// `cuda_event` is a live event created by this library.
+    pub unsafe fn cuda_event_query(&self, cuda_event: *mut c_void) -> Result<bool> {
+        let query_fn: Symbol<CudaEventQueryFn> = unsafe { self.lib.get(b"cuteafd_cuda_event_query")? };
+        let mut ready = 0;
+        let status = unsafe { query_fn(cuda_event, &mut ready) };
+        self.status_to_result("cuteafd_cuda_event_query", status)?;
+        anyhow::ensure!(ready == 0 || ready == 1, "invalid CUDA event query result");
+        Ok(ready == 1)
+    }
+
+    /// Queues on `cuda_stream` a wait until the mapped pinned host word
+    /// `word` reaches `value` (cyclic `>=`); later work on the stream starts
+    /// after it. Captures into graphs.
+    ///
+    /// # Safety
+    /// `cuda_stream` is live on the current device and `word` is an aligned
+    /// u32 of a live mapped host allocation (`alloc_host_buffer`) that outlives
+    /// every queued wait. Some host thread must eventually store a satisfying
+    /// value, or the stream never drains.
+    pub unsafe fn cuda_stream_wait_value32(&self, cuda_stream: *mut c_void, word: *const u32, value: u32)
+        -> Result<()> {
+        let wait_fn: Symbol<CudaStreamWaitValue32Fn> = unsafe { self.lib.get(b"cuteafd_cuda_stream_wait_value32")? };
+        let status = unsafe { wait_fn(cuda_stream, word, value) };
+        self.status_to_result("cuteafd_cuda_stream_wait_value32", status)
+    }
+
+    /// Queues on `cuda_stream` a store of `value` to the mapped pinned host
+    /// word `word`, after (and fenced behind) the stream's earlier work.
+    ///
+    /// # Safety
+    /// As [`Self::cuda_stream_wait_value32`]; the word outlives the queued store.
+    pub unsafe fn cuda_stream_write_value32(&self, cuda_stream: *mut c_void, word: *mut u32, value: u32)
+        -> Result<()> {
+        let write_fn: Symbol<CudaStreamWriteValue32Fn> = unsafe { self.lib.get(b"cuteafd_cuda_stream_write_value32")? };
+        let status = unsafe { write_fn(cuda_stream, word, value) };
+        self.status_to_result("cuteafd_cuda_stream_write_value32", status)
     }
 
     pub unsafe fn cuda_event_elapsed_ms(
@@ -4617,12 +4664,13 @@ impl NativeLibrary {
         handle: *mut c_void,
         device: Option<CuteafdDeviceBuffer>,
         header_bytes: usize,
+        slot_bytes: usize,
     ) -> Result<()> {
         let set_fn: Symbol<RdmaRcEndpointSetRecvLandingFn> =
             unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_set_recv_landing")? };
         let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
         // SAFETY: the caller guarantees the handle and range contract above.
-        let status = unsafe { set_fn(handle, ptr, bytes, header_bytes) };
+        let status = unsafe { set_fn(handle, ptr, bytes, header_bytes, slot_bytes) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_set_recv_landing", status)
     }
 
@@ -4876,6 +4924,57 @@ impl NativeLibrary {
         let post: Symbol<PostFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_send_slot_region")? };
         let status = unsafe { post(handle, slot_offset, slot_bytes, region, region_offset, region_bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_slot_region", status)
+    }
+
+    /// Registers the endpoint's receive ring for remote request WRITEs and
+    /// returns its address and rkey (stable until the endpoint is destroyed).
+    pub fn rdma_rc_endpoint_request_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_request_target")? };
+        let (mut address, mut rkey) = (0, 0);
+        // SAFETY: the caller owns the live endpoint handle; both outputs are
+        // valid locals that native writes only on success.
+        let status = unsafe { f(handle, &mut address, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_request_target", status)?;
+        Ok((address, rkey))
+    }
+
+    /// Exposes the endpoint's GPU landing range for remote reply-tail WRITEs
+    /// and returns its address and rkey.
+    pub fn rdma_rc_endpoint_recv_landing_target(&self, handle: *mut c_void) -> Result<(u64, u32)> {
+        type F = unsafe extern "C" fn(*mut c_void, *mut u64, *mut u32) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_recv_landing_target")? };
+        let (mut address, mut rkey) = (0, 0);
+        // SAFETY: the caller owns the live endpoint handle; both outputs are
+        // valid locals that native writes only on success.
+        let status = unsafe { f(handle, &mut address, &mut rkey) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_recv_landing_target", status)?;
+        Ok((address, rkey))
+    }
+
+    /// Posts one signaled WR carrying frame bytes `[offset, offset + bytes)`
+    /// of the request staged at send-ring `slot`: the first `prefix` bytes
+    /// from the slot, the rest from `region` (`None`: all from the slot).
+    /// `remote = None` posts a SEND, otherwise an RDMA WRITE to `(address, rkey)`.
+    ///
+    /// # Safety
+    /// `handle` is a live connected endpoint. The source bytes stay unmodified
+    /// and registered until this WR's completion or QP quiescence; a remote
+    /// range is one the peer exposed for this QP and holds the written extent.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn rdma_rc_endpoint_post_request_part(&self, handle: *mut c_void, slot: usize, prefix: usize,
+        region: Option<(u32, usize)>, offset: usize, bytes: usize, remote: Option<(u64, u32)>, wr: u64) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, usize, u64, u32, u64) -> CuteafdStatus;
+        // SAFETY: symbol resolved by name with the declared C signature.
+        let f: Symbol<F> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_request_part")? };
+        let (region, region_offset) = region.unwrap_or((u32::MAX, 0));
+        let (address, rkey) = remote.unwrap_or((0, 0));
+        // SAFETY: forwarded from this function's contract; native bounds-checks
+        // every local range against its registrations.
+        let status = unsafe { f(handle, slot, prefix, region, region_offset, offset, bytes, address, rkey, wr) };
+        self.status_to_result("cuteafd_rdma_rc_endpoint_post_request_part", status)
     }
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {

@@ -474,6 +474,23 @@ impl SelectBatch {
 
 pub(crate) type RowResult = std::result::Result<Selected, TargetSamplingError>;
 
+impl Drop for TokenSelector<'_> {
+    fn drop(&mut self) {
+        for &(device, event) in &self.landed {
+            let previous = self.library.cuda_get_device();
+            let _ = self.library.cuda_set_device(device);
+            // SAFETY: created by this selector on `device`; synchronizing
+            // retires its last record before the event is destroyed.
+            unsafe {
+                let _ = self.library.cuda_event_synchronize(event);
+                let _ = self.library.cuda_event_destroy(event);
+            }
+            if let Ok(previous) = previous { let _ = self.library.cuda_set_device(previous); }
+        }
+    }
+}
+
+
 /// Selects next tokens from device logits (see the module docs).
 pub(crate) struct TokenSelector<'a> {
     library: &'a NativeLibrary,
@@ -486,6 +503,10 @@ pub(crate) struct TokenSelector<'a> {
     landing: HostAllocation<'a>,
     /// The GPU sampler, allocated by the first sampled or masked selection.
     wave: Option<TargetSamplingWave<'a>>,
+    /// Per CUDA device: an ordering event recorded behind a selection's
+    /// landing copies, so the host waits for those and not for whatever is
+    /// queued on the logits stream after them.
+    landed: Vec<(i32, *mut c_void)>,
     /// Selections served by the greedy kernel, the sampler, the host.
     pub counts: [u64; 3],
 }
@@ -556,7 +577,33 @@ impl<'a> TokenSelector<'a> {
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
         Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12)?,
-            landing: HostAllocation::new(library, capacity * 12)?, wave: None, counts: [0; 3] })
+            landing: HostAllocation::new(library, capacity * 12)?, wave: None, landed: Vec::new(), counts: [0; 3] })
+    }
+
+    /// Waits until `stream` passed the work queued on it so far (the
+    /// selection's landing copies), through this device's ordering event,
+    /// then checks that no Spark exchange released this step over a failed
+    /// wire.
+    ///
+    /// # Safety
+    /// `stream` is a live stream of the current device.
+    unsafe fn wait_landed(&mut self, stream: *mut c_void) -> Result<()> {
+        let device = self.library.cuda_get_device()?;
+        let event = match self.landed.iter().find(|(owner, _)| *owner == device) {
+            Some(&(_, event)) => event,
+            None => {
+                let event = self.library.cuda_event_create_ordering()?;
+                self.landed.push((device, event));
+                event
+            }
+        };
+        // SAFETY: the event belongs to the current device, as does `stream`
+        // (the caller's contract); the event lives until this selector drops.
+        unsafe {
+            self.library.cuda_event_record(event, stream)?;
+            self.library.cuda_event_synchronize(event)?;
+        }
+        crate::shared::spark_waves::healthy()
     }
 
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
@@ -583,6 +630,7 @@ impl<'a> TokenSelector<'a> {
         if self.placement == SelectPlacement::Host {
             self.counts[2] += n as u64;
             let host = logits.to_host(self.library)?;
+            crate::shared::spark_waves::healthy()?;
             return Ok(rows.iter().enumerate()
                 .map(|(i, r)| Self::host_select(&host[i * self.vocab..][..self.vocab], r)).collect());
         }
@@ -637,7 +685,7 @@ impl<'a> TokenSelector<'a> {
                         logits.stream)?;
                 }
             }
-            self.library.cuda_stream_synchronize(logits.stream)?;
+            self.wait_landed(logits.stream)?;
         }
         self.counts[0] += n as u64;
         let landing = self.landing.bytes().to_vec();
@@ -682,9 +730,10 @@ impl<'a> TokenSelector<'a> {
         let wave = self.wave.as_mut().context("sampler")?;
         wave.upload(&requests, masked.then_some(arena.as_slice()), words, logits.stream)?;
         wave.launch(buffer, n, ordered, logits.stream)?;
-        // SAFETY: the sampler's copies are queued on this stream.
-        unsafe { self.library.cuda_stream_synchronize(logits.stream)? };
-        let sampled = wave.output(buffer, n)?;
+        // SAFETY: the sampler's copies are queued on this stream, the
+        // current device's (the sampler just launched on it).
+        unsafe { self.wait_landed(logits.stream)? };
+        let sampled = self.wave.as_mut().context("sampler")?.output(buffer, n)?;
         self.counts[1] += n as u64;
         let mut out = Vec::with_capacity(n);
         for (i, row) in rows.iter().enumerate() {

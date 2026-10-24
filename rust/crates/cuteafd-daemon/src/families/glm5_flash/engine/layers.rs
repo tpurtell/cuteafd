@@ -398,13 +398,13 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)?;
         } else {
             e.moe_front(w, index, layer, real, rows, self.cap(), &[Span { first: 0, rows: real }])?;
-            e.probe_ring(index, w, real, matches!(e.routed_experts(index), Some(Experts::Spark { .. })))?;
+            e.probe_ring(index, w, real)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
             } else if let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) {
                 ensure!(e.layer_waves.borrow()[self.lane].is_none(), "unconsumed per-layer Spark wave");
                 let mut transport = transport.borrow_mut();
-                let wave = e.spark_dispatch(w, index, real, self.tables[0].decode, &mut transport, || {
+                let wave = e.spark_send(w, index, real, self.tables[0].decode, transport.exchange()?, || {
                     e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)
                 })?;
                 e.layer_waves.borrow_mut()[self.lane] = Some(wave);
@@ -420,12 +420,12 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let e = self.engine;
         let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
         if ticket.spark {
-            let Some(Experts::Spark { transport, runtime }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
+            let Some(Experts::Spark { transport }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
             let wave = e.layer_waves.borrow_mut()[self.lane].take().context("retained Spark wave")?;
-            // Only protocol assembly state moves into receive. All QPs, receive registrations,
-            // intake planes and pinned upload owners remain in the engine through teardown.
+            // A device wait on the stream: the QPs, intake planes and staging stay
+            // with the link's exchange through teardown.
             let mut transport = transport.borrow_mut();
-            runtime.block_on(e.spark_land(self.work[0], real, &mut transport, wave))?;
+            e.spark_land(self.work[0], real, transport.exchange()?, wave)?;
         }
         if !self.layer(0, index).dense && real < self.rows {
             let offset = real * e.cfg.hidden * 2;

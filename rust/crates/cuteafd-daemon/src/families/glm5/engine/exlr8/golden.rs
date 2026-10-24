@@ -286,7 +286,7 @@ fn native_layer3_same_quant() -> Result<()> {
     ])?
     .engine;
     let opened = crate::families::glm5::open(&args)?;
-    opened.with_engine(&args, |engine, transport, runtime| {
+    opened.with_engine(&args, |engine, transport, _runtime| {
         let transport = transport.context("native gate needs real workers")?;
         // Retain the admitted serial workspace and drain on both success and error
         // before with_engine drops transport or native owners.
@@ -321,8 +321,9 @@ fn native_layer3_same_quant() -> Result<()> {
                     "m4096",
                     false,
                     transport,
-                    runtime,
                 )?;
+                // The exchange staged its own copy; stage the same rows here for the wire check.
+                engine.moe_stage(w, 3, &engine.weights.layers[3], rows, "m4096")?;
                 let staged = w.router_host.borrow();
                 let request = expert_request(
                     staged.bytes(),
@@ -405,9 +406,8 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
 #[test]
 #[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
 fn native_prefill_two_waves_byte_exact() -> Result<()> {
-    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned")
-        && std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() == Ok("copied"),
-        "two-wave exactness gate requires pinned intake and copied egress on both links");
+    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned"),
+        "two-wave exactness gate requires pinned intake on both links");
     prefill_lanes_byte_exact(8192, 4096, 2)
 }
 

@@ -777,8 +777,7 @@ impl Opened {
         transport.bootstrap(&engine::spark_bootstrap_request(&self.cfg, args.prefill_wave_rows(),
             self.checkpoint.spark_input_is_bf16())?)?;
         crate::shared::memory_report::release_load_staging(&self.library);
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), runtime, mtp }))
+        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport), mtp }))
     }
 
     fn spark_mtp_experts<'s>(&'s self, args: &EngineArgs, layer: usize, stream: *mut std::ffi::c_void)

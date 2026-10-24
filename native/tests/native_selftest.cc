@@ -1,5 +1,6 @@
 #include "cuteafd_native.h"
 #include "../shared/src/rdma_endpoint_destroy.h"
+#include "../shared/src/rdma_landing_slots.h"
 
 #include <cassert>
 #include <cstring>
@@ -170,8 +171,34 @@ void test_rdma_destroy_failure_retains_registrations() {
   assert(quiesced.released);
 }
 
+void test_rdma_landing_slots_rotate_independently_of_header_ring() {
+  for (size_t depth : {2, 3}) {
+    cuteafd::RdmaLandingSlots slots{12288, depth, 0};
+    // Initial eight receives and every subsequent repost use the same phase.
+    for (size_t sequence = 0; sequence < 4096; ++sequence) {
+      const size_t expected = (sequence % depth) * slots.bytes;
+      assert(slots.offset() == expected);
+      assert(slots.offset() == expected);  // A failed post changes no phase.
+      slots.posted();
+    }
+    slots = {12288, depth, 0};
+    assert(slots.offset() == 0);  // A drained reconnect starts at slot zero.
+  }
+}
+
 void test_rdma_abi() {
   unsigned char endpoint_byte = 0;
+  uint64_t request_address = 0;
+  uint32_t request_rkey = 0;
+  assert(cuteafd_rdma_rc_endpoint_request_target(nullptr, &request_address, &request_rkey) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_recv_landing_target(nullptr, &request_address, &request_rkey) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_post_request_part(nullptr, 0, 0, UINT32_MAX, 0, 0, 1, 1, 1, 1) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+  assert(cuteafd_rdma_rc_endpoint_post_request_part(&endpoint_byte, 0, 0, UINT32_MAX, 0, 0, 0, 0, 0, 1) ==
+         CUTEAFD_STATUS_INVALID_ARGUMENT);
+
   assert(cuteafd_rdma_rc_endpoint_post_recv_at(nullptr, 0, 1, 1) ==
          CUTEAFD_STATUS_INVALID_ARGUMENT);
   assert(cuteafd_rdma_rc_endpoint_send_at(nullptr, &endpoint_byte, 0, 1, 1) ==
@@ -289,6 +316,7 @@ int main() {
   test_error_propagation();
   test_nccl_abi();
   test_rdma_destroy_failure_retains_registrations();
+  test_rdma_landing_slots_rotate_independently_of_header_ring();
   test_rdma_abi();
   std::cout << "cuteafd_native_selftest passed\n";
   return 0;

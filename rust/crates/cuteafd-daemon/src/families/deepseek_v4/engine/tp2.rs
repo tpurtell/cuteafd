@@ -170,9 +170,10 @@ impl<'a> Engine<'a> {
             abort: || {
                 let home = crate::shared::memory::device::Device { library: self.library, id: self.device };
                 home.run(|| self.publish_tp2_abort())?;
-                // The proxy cannot abort its completion waits yet. Refuse before
-                // rank drainage rather than blocking on an unprovable consumer.
-                ensure!(self.device_link.is_none(), "device Spark proxy requires terminal owner retention");
+                // Stopping each link's exchange (its terminal quiesce, below)
+                // releases every queued exchange wait before the rank drains
+                // would block on one: stop them first.
+                for link in transports.borrow_mut().iter_mut() { link.terminal_quiesce()?; }
                 Ok(())
             },
             ranks: || {

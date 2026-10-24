@@ -364,9 +364,6 @@ pub(crate) fn with_engine<T>(
         ensure!((1..=8).contains(&peers.len()), "DeepSeek V4 Spark transport requires 1..=8 peers, got {}", peers.len());
         loaded.library.v41_compact_reducer()?.require_rank_count(peers.len() as u32)?;
     }
-    // Resolve once: the admitted endpoint set and the constructed links must agree.
-    let device_exchange = !skip && crate::shared::spark_intake::device_exchange_enabled()
-        && crate::shared::spark_intake::device_exchange_available(&loaded.library)?;
     // Select and freeze owners before the first weight upload. Header-derived
     // uploads are explicit demands, so the owner chooser sees their true costs.
     let placement = {
@@ -441,7 +438,7 @@ pub(crate) fn with_engine<T>(
             };
             crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
-                peers.len(), None, admission::spark_model(decode_rows, device_exchange)?)?.select(&peers)?;
+                peers.len(), None, admission::spark_model(decode_rows)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();
@@ -608,8 +605,8 @@ pub(crate) fn with_engine<T>(
         let mut installed = None;
         for (index, transport) in transports.iter_mut().enumerate() {
             let (rows, kind) = warm_shape(index);
-            engine.warm_transport(transport, &runtime, rows, kind)?;
-            let reports = transport.transport.installed_grouping()?;
+            engine.warm_transport(transport, rows, kind)?;
+            let reports = transport.installed_grouping()?;
             for (rank, report) in reports.iter().enumerate() {
                 report.validate_for(identity.as_ref().context("Spark worker identity")?, rank,
                     engine.decode_rows, engine.local_layers()..loaded.cfg.n_layers)?;
@@ -619,12 +616,6 @@ pub(crate) fn with_engine<T>(
             } else { installed = Some(reports); }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
-        if device_exchange {
-            let started = Instant::now();
-            engine.attach_device_link(spark_world.context("device exchange needs a declared world")?, &peers,
-                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
-            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
-        }
         engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;

@@ -32,6 +32,9 @@ use std::time::Instant;
 /// What every MiMo command needs to stand up the engine.
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct EngineArgs {
+    /// Independent decode views. Only one is supported until second-view admission lands.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub decode_lanes: u8,
     /// Shared GQA drafter-ring storage (independent of weight precision).
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
@@ -254,6 +257,17 @@ mod draft_storage_tests {
     fn args(extra: &[&str]) -> EngineArgs {
         Command::try_parse_from(["mimo", "--snapshot", "/missing/checkpoint", "--native-lib", "/missing/native.so"]
             .into_iter().chain(extra.iter().copied())).unwrap().engine
+    }
+
+    #[test]
+    fn second_decode_view_is_refused_before_checkpoint_or_native_loading() {
+        let args = args(&["--decode-lanes", "2"]);
+        let error = match open(&args) {
+            Ok(_) => panic!("second decode view was admitted without runtime owners"),
+            Err(error) => error,
+        };
+        assert!(matches!(error.downcast_ref::<cuteafd_loader::plan::PlanError>(),
+            Some(cuteafd_loader::plan::PlanError::UnsupportedOption { option: "--decode-lanes", value: 2, .. })));
     }
 
     #[test]
@@ -781,6 +795,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
+    cuteafd_loader::plan::resolve_decode_lanes("mimo_v2", Some(args.decode_lanes), args.rings as u64)?;
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
@@ -949,7 +964,7 @@ impl Opened {
                 capacity, compiled_capacity: capacity,
                 endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress };
                     usize::try_from(preflight.working_set.prefill_lanes)?],
-                rings: crate::shared::placement::spark_rings(64 << 20)?,
+                rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
             };
             let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot, geometry, self.catalog.as_ref(),
                 &preflight.working_set, peers.len(), None, model)?;
@@ -1269,28 +1284,25 @@ impl Opened {
         ensure!(lanes > 0, "MiMo selected transport lanes must be positive");
         let mut lane_links = (1..lanes).map(|_| link()).collect::<Result<Vec<_>>>()?;
         tracing::info!(lanes, "MiMo prefill lanes");
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
         // Connect every rank and register full-size buffers now: the first
         // request otherwise pays seconds of connection setup.
         let started = Instant::now();
         // Drained and destroyed on every way out, before the transports drop.
         let warm_stream = crate::shared::spark_intake::WarmStream::new(&*self.library)?;
         for request in &warmups {
-            runtime.block_on(async {
-                let wave = transport.dispatch(request)?;
-                transport.receive(wave, request.header.row_count as usize, warm_stream.raw()).await
-            })?;
+            let exchange = transport.exchange()?;
+            let wave = exchange.send_request(request.clone())?;
+            exchange.land_drained(wave, warm_stream.raw())?;
         }
         for lane in &mut lane_links {
-            runtime.block_on(async {
-                let wave = lane.dispatch(&warmups[0])?;
-                lane.receive(wave, warmups[0].header.row_count as usize, warm_stream.raw()).await
-            })?;
+            let exchange = lane.exchange()?;
+            let wave = exchange.send_request(warmups[0].clone())?;
+            exchange.land_drained(wave, warm_stream.raw())?;
         }
         warm_stream.finish()?;
         tracing::info!(ranks = peers.len(), elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport),
-            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect(), runtime }))
+            lanes: lane_links.into_iter().map(std::cell::RefCell::new).collect() }))
     }
 }
 

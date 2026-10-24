@@ -1148,7 +1148,9 @@ mod tests {
     }
 
     #[test]
-    fn v4_unabortable_device_proxy_is_refused_before_rank_drainage() {
+    fn v4_exchange_waits_are_released_before_rank_drainage() {
+        // Rank streams may hold queued Spark exchange waits: the abort stops
+        // every link's exchange (releasing them) before the ranks drain.
         let source = include_str!("../../../families/deepseek_v4/engine/tp2.rs");
         let start = source.find("pub(crate) fn shutdown_submission(").unwrap();
         let source = &source[start..];
@@ -1156,9 +1158,9 @@ mod tests {
         let publication = source
             .find("home.run(|| self.publish_tp2_abort())?;")
             .unwrap();
-        let refusal = source.find("ensure!(self.device_link.is_none()").unwrap();
+        let release = source.find("link.terminal_quiesce()?; }").unwrap();
         let ranks = source.find("ranks: ||").unwrap();
-        assert!(abort < publication && publication < refusal && refusal < ranks);
+        assert!(abort < publication && publication < release && release < ranks);
     }
 
     #[test]

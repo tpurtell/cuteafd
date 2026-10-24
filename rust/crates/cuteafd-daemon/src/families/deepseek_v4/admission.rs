@@ -35,36 +35,29 @@ pub(crate) struct Inputs<'a> {
 #[cfg(test)]
 mod spark_tests {
     #[test]
-    fn v4_spark_endpoints_match_prefill_links_and_optional_decode_link() -> anyhow::Result<()> {
+    fn v4_spark_endpoints_match_the_decode_and_prefill_links() -> anyhow::Result<()> {
         for decode_rows in [16, 64, 80] {
-            for device in [false, true] {
-                let model = super::spark_model(decode_rows, device)?;
-                model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
-                assert_eq!((model.capacity, model.compiled_capacity), (4096, 4096));
-                assert_eq!(model.endpoints.len(), 2 + usize::from(device));
-                assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
-                assert_eq!(model.endpoints[1].capacity, 4096);
-                if device { assert_eq!(model.endpoints.last().unwrap().capacity, decode_rows as u32); }
-                assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
-            }
+            let model = super::spark_model(decode_rows)?;
+            model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
+            assert_eq!((model.capacity, model.compiled_capacity), (4096, 4096));
+            assert_eq!(model.endpoints.len(), 2);
+            assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
+            assert_eq!(model.endpoints[1].capacity, 4096);
+            assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
         }
         Ok(())
     }
 }
 
-pub(crate) fn spark_model(decode_rows: usize, device_exchange: bool)
-    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+pub(crate) fn spark_model(decode_rows: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
-    let mut endpoints = vec![
+    let endpoints = vec![
         SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },
         SparkEndpoint { ring_depth: None, capacity: 4096, ingress: SparkIngress::Fp8K32 },
     ];
-    if device_exchange {
-        endpoints.push(SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 });
-    }
     Ok(cuteafd_transport::worker_selection::ModelAdmission {
         capacity: 4096, compiled_capacity: 4096, endpoints,
-        rings: crate::shared::placement::spark_rings(64 << 20)?,
+        rings: crate::shared::placement::spark_rings(64 << 20)?, execution_slots: 1
     })
 }
 

@@ -368,12 +368,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let rank_budgets=std::array::from_fn(|gpu| admitted.peak_bytes[gpu].saturating_sub((2*per_lane) as u64) as usize);
     tracing::info!(expert_layers,rank_peak_bytes=?rank_budgets,cache_bytes=?pool.cache_bytes,
         pool_tokens=pool.placement.pool_tokens,deferred_bytes=?deferred,"shared dual RTX admission");
-    let device_exchange = crate::shared::memory::chain::device_exchange_enabled()
-        && spark_world.supports_device_exchange()
-        && format == crate::families::deepseek_v41::v41_experts::ExpertFormat::Native
-        && expert_layers < 40;
     let spark_plan = admission::plan_sparks(&args, &catalog, expert_layers, capacity, aot_capacity,
-        topology, if device_exchange { 2 } else { 0 })?;
+        topology)?;
     // Coordinator ranks join only a pushing group, planned before membership:
     // a planning error leaves them out (the Sparks still push).
     let coordinator = match (records.as_ref(), spark_plan.as_ref()) {
@@ -419,11 +415,10 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             NativeTp4Wave::new(&lib, roce, wave_bytes)
         })?;
         transport.install_tp2(tp2_ffn::Wave::new(routed.clone(), shared.clone(), expert_layers, capacity, lane_modules.next().context("missing admitted TP2 lane")?)?)?;
-        if device_exchange {
-            // Verification waves (up to 80 rows) on the device-driven exchange.
-            devices[1].run(|| transport.get_mut().install_device_link(&args.peers, 80.min(capacity as usize), 39,
-                cuteafd_transport::TcpTransportConfig { timing, timeout: Duration::from_secs(120),
-                    max_frame_bytes: 64 << 20 }))?;
+        if expert_layers < 40 {
+            // The workers serve their layers: open the sessions and start the
+            // link's exchange worker (the first remote layer sizes the rings).
+            devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
         Ok::<_, anyhow::Error>(transport)
     };

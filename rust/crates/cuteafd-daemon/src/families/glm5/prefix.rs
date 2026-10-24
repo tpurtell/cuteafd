@@ -21,7 +21,7 @@
 //! copies and the host tier preserve all those segments without replicating any layer.
 use super::engine::{GlmEngine, GlmPlacement, INDEX_PAGE_BYTES, PAGE_ROWS, RECORD_BYTES};
 use crate::shared::memory::DeviceAllocation;
-use crate::shared::prefix::view;
+use crate::shared::prefix::{view, PrefixCopies, Reader};
 use anyhow::Result;
 use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixFamily, ReuseRule,
     TailCopy};
@@ -78,6 +78,8 @@ pub(crate) struct GlmPrefix<'e, 'a> {
     partial: bool,
     /// The host tier's stand-in tail (one byte host restores overwrite and nothing reads).
     scratch: DeviceAllocation<'a>,
+    /// Per rank: the prefix copy stream, fenced against that rank's engine stream.
+    copies: PrefixCopies<'a>,
 }
 
 impl<'e, 'a> GlmPrefix<'e, 'a> {
@@ -86,7 +88,10 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
         let paged = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
             .collect();
-        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)? })
+        let copies = PrefixCopies::new(engine.library, (0..engine.ranks())
+            .map(|rank| Ok(vec![Reader { device: engine.on(rank, || engine.library.cuda_get_device())?,
+                stream: engine.stream_of(rank) }])).collect::<Result<_>>()?)?;
+        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies })
     }
 
     /// Host bytes of one logical page: one complete layer set, replicated under heads,
@@ -108,15 +113,6 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
             .chain(std::iter::once(self.scratch.buffer)).collect()
     }
 
-    /// A copy between two views on rank `rank`'s GPU.
-    fn copy(&self, rank: usize, dst: CuteafdDeviceBuffer, src: CuteafdDeviceBuffer) -> Result<()> {
-        debug_assert_eq!(dst.bytes, src.bytes);
-        // SAFETY: both views lie inside live allocations of that GPU (checked by `view`); the copy
-        // is ordered on its stream with every forward pass that reads or writes them.
-        self.engine.on(rank, || unsafe {
-            self.engine.library.copy_d2d_async(dst, src, src.bytes, self.engine.stream_of(rank))
-        })
-    }
 }
 
 impl PrefixFamily for GlmPrefix<'_, '_> {
@@ -156,18 +152,15 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
-        copy_rows(&self.paged, self.parity(), copy, |rank, dst, src| self.copy(rank, dst, src))
-            .map_err(Into::into)
+        let mut copies = Vec::new();
+        copy_rows(&self.paged, self.parity(), copy, |rank, dst, src| { copies.push((rank, dst, src)); Ok(()) })?;
+        // SAFETY: every view lies inside a live page pool of its rank (checked by `view`); the
+        // cache drains the copy stream before it hands either page to anyone else.
+        Ok(unsafe { self.copies.copy_d2d(&copies) }?)
     }
 
     fn drain(&self) -> Result<(), BoxError> {
-        for rank in 0..self.engine.ranks() {
-            // SAFETY: the engine owns these rank-local streams and their storage.
-            self.engine.on(rank, || unsafe {
-                self.engine.library.cuda_stream_synchronize(self.engine.stream_of(rank))
-            })?;
-        }
-        Ok(())
+        Ok(self.copies.drain()?)
     }
 
     fn page_device(&self, page: u32) -> Option<u8> {

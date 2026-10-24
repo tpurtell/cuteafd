@@ -8,6 +8,8 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 pub(crate) mod budget;
 pub(crate) use budget::HostBudget;
 pub(crate) mod cuda_copy;
+pub(crate) mod copy_stream;
+pub(crate) use copy_stream::{PrefixCopies, Reader};
 pub(crate) use cuda_copy::CudaCopyEngine;
 
 /// The prefix cache's knobs.

@@ -127,18 +127,11 @@ impl<'a> GlmEngine<'a> {
                 if let Some(pair) = &self.tp2 { pair.routes.drain_compute()?; }
                 Ok(())
             },
-            links: || {
-                let mut failures = Vec::new();
-                for lane in self.lanes.borrow_mut().iter_mut() {
-                    if let Err(error) = lane.terminal_quiesce() { failures.push(format!("{error:#}")); }
-                }
-                ensure!(failures.is_empty(), "GLM lane quiescence: {}", failures.join("; "));
-                Ok(())
-            },
-            copies: || {
-                for lane in self.lanes.borrow().iter() { lane.intake.terminal_drain_copies()?; }
-                Ok(())
-            },
+            // The engine owns no terminal Spark links: prefill waves run on the
+            // caller's prefill link through its transport worker, which drains
+            // its uploads before every call returns.
+            links: || Ok(()),
+            copies: || Ok(()),
             graphs: || {
                 for rank in 0..self.ranks() {
                     self.on(rank, || {
@@ -147,7 +140,6 @@ impl<'a> GlmEngine<'a> {
                         Ok(())
                     })?;
                 }
-                for lane in self.lanes.borrow_mut().iter_mut() { lane.terminal_release()?; }
                 Ok(())
             },
             finish: |drained| {

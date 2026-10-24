@@ -3,18 +3,18 @@
 use super::device::LocalLane;
 use crate::shared::{
     experts::staging::RouteStaging,
-    memory::{HostAllocation, device::{Event, Stream}},
+    memory::device::Stream,
     spark_intake::SparkLink,
 };
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::ExpertGeometry;
 use cuteafd_ffi::KimiExpertInput;
 use cuteafd_loader::placement::{Demand, Placement};
-use cuteafd_transport::{expert::{SparkWorld, SparkExpertWave}, ExpertProtocolV2Request,
+use cuteafd_transport::{expert::SparkWorld, ExpertProtocolV2Request,
     ExpertProtocolV2RowDescriptor, ExpertV2Dtype, ExpertV2SourceKind,
     TcpTransportConfig};
 use cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-use std::{net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+use std::{net::SocketAddr, rc::Rc, sync::Arc};
 
 const RANKS: usize = 6;
 const LATENT: usize = 3584;
@@ -36,8 +36,8 @@ pub(crate) fn demand_with(rows: usize, waves: usize, unit: Option<usize>, lane: 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Ticket { layer: usize, rows: usize, sequence: u64 }
 
-/// A dispatched wave and the latent output rows its reduce writes.
-struct Outstanding { ticket: Ticket, wave: SparkExpertWave, output: cuteafd_ffi::CuteafdDeviceBuffer }
+/// A sent wave and the latent output rows its reduce writes.
+struct Outstanding { ticket: Ticket, wave: crate::shared::spark_waves::WaveTicket, output: cuteafd_ffi::CuteafdDeviceBuffer }
 
 /// Engine-retained wave owner; tickets never own the transport or copy sources.
 /// The main engine thread owns the transport. Drop completes copies before
@@ -45,16 +45,13 @@ struct Outstanding { ticket: Ticket, wave: SparkExpertWave, output: cuteafd_ffi:
 pub(crate) struct RoutedLane<'a> {
     stream: Rc<Stream<'a>>,
     link: Option<SparkLink<'a>>,
-    runtime: tokio::runtime::Runtime,
     library_owner: Arc<cuteafd_ffi::NativeLibrary>,
     terminal: bool,
-    staging: HostAllocation<'a>,
-    ready: Event<'a>,
     capacity: usize,
     /// Most outstanding waves; each holds one intake return slot of `unit` rows.
     waves: usize,
     unit: usize,
-    sequence: u64,
+    sequence: std::cell::Cell<u64>,
     /// Dispatched waves in dispatch order, received oldest first.
     outstanding: std::collections::VecDeque<Outstanding>,
 }
@@ -83,32 +80,30 @@ impl<'a> RoutedLane<'a> {
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
             "Kimi Spark intake differs from accepted admission");
         let stream = local.stream().clone();
-        // Each wave is one unit's rows: staging and transport serve a unit.
-        let layout = RouteStaging::new(unit, TOPK, KimiExpertInput::ROW_BYTES)?;
+        // Each wave is one unit's rows: every exchange slot stages a unit.
         let library = library_owner.as_ref();
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-        let (mut link, staging, ready) = stream.device.run(|| {
+        let mut link = stream.device.run(|| {
             library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
             let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
                 waves, u32::try_from(unit)?)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
-            Ok((link, HostAllocation::new(library, layout.bytes)?, Event::new(stream.device)?))
+            Ok(link)
         })?;
         ensure!(link.world_size() == RANKS, "Kimi Spark transport world differs from admission");
         if let Some(layer) = placement.layers.iter().position(|assignment|
             assignment.experts == cuteafd_loader::placement::ExpertHome::Spark) {
             stream.device.run(|| link.bootstrap(&bootstrap_request(layer, unit)?))?;
-            ensure!(link.transport.installed_grouping()?.len() == RANKS,
+            ensure!(link.installed_grouping()?.len() == RANKS,
                 "Kimi bootstrap requires installed grouping from all six ranks");
         }
-        Ok(Self { stream, link: Some(link), runtime, library_owner: Arc::clone(library_owner),
-            terminal: false, staging, ready, capacity: unit, waves, unit, sequence: 0,
+        Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner),
+            terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
             outstanding: std::collections::VecDeque::new() })
     }
 
     pub(crate) fn installed_grouping(&self)
         -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
-        self.link.as_ref().context("Kimi Spark link retired")?.transport.installed_grouping()
+        self.link.as_ref().context("Kimi Spark link retired")?.installed_grouping()
     }
 
     /// Checked QP quiescence precedes copy drainage and owner release.
@@ -123,7 +118,7 @@ impl<'a> RoutedLane<'a> {
 
     pub(crate) fn drain_copies(&self) -> Result<()> {
         self.stream.device.run(|| match &self.link {
-            Some(link) => link.intake.terminal_drain_copies(),
+            Some(link) => link.terminal_drain_copies(),
             None => Ok(()),
         })
     }
@@ -148,44 +143,39 @@ impl<'a> RoutedLane<'a> {
         Ok(())
     }
 
-    /// Route copies precede the shared FFN on this stream. Fence only the copy
-    /// event so the host can parse ordinary protocol rows while the FFN runs.
+    /// Route copies queue into the exchange slot's staging ahead of the
+    /// shared FFN on this stream; the link's worker builds and posts the
+    /// request once they complete. This thread never waits for the GPU.
     pub(crate) fn begin(&mut self, local: &mut LocalLane<'a>, layer: usize, rows: usize,
         kind: ExpertV2SourceKind, routes: cuteafd_ffi::KimiRoutes,
-        wire: cuteafd_ffi::CuteafdDeviceBuffer,
-        probe: Option<&mut crate::shared::draft::probe::RoundProbe<'a>>) -> Result<Ticket> {
+        wire: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Ticket> {
         self.check(local, rows)?;
         ensure!(self.outstanding.len() < self.waves, "Kimi main link already has {} outstanding waves", self.waves);
         ensure!(rows <= self.unit, "Kimi wave of {rows} rows exceeds its {}-row return slot", self.unit);
-        let sequence = self.sequence.checked_add(1).context("Kimi Spark request sequence overflow")?;
+        ensure!((1..93).contains(&layer), "Kimi Spark request geometry");
+        let sequence = self.sequence.get().checked_add(1).context("Kimi Spark request sequence overflow")?;
         let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
-        self.stream.device.run(|| {
-            // SAFETY: LocalLane and this engine-retained staging owner survive
-            // partial enqueue failures through whole-submission teardown.
-            unsafe { layout.enqueue(self.stream.device.library, self.staging.buffer,
-                [routes.ids, routes.weights, wire], self.stream.raw) }
-        })?;
-        self.ready.record(&self.stream)?;
-        local.ffn(layer, rows)?;
-        self.stream.device.run(|| {
-            // SAFETY: ordered copy fence, not a compute drain; this event
-            // covers only copies before the shared FFN;
-            // pinned staging remains exclusively owned until this fence.
-            unsafe { self.stream.device.library.cuda_event_synchronize(self.ready.raw) }
-        })?;
-        if let Some(probe) = probe { probe.staged(layer, &self.staging.bytes()[..layout.route_bytes]); }
-        let request = request(layer, rows, sequence, kind, &layout, self.staging.bytes())?;
-        let ticket = Ticket { layer, rows, sequence };
-        self.sequence = sequence;
-        let output = local.buffer("expert combined")?;
+        let stream = self.stream.raw;
         let link = self.link.as_mut().context("Kimi Spark lane retired")?;
-        let wave = self.stream.device.run(|| link.dispatch(&request))?;
+        let wave = self.stream.device.run(|| {
+            // SAFETY: LocalLane retains these operands through whole-submission
+            // teardown; the copies read them in stream order.
+            unsafe { link.exchange()?.send(rows, layout, [routes.ids, routes.weights, wire], stream,
+                Box::new(move |routes, wire| request_parts(layer, rows, sequence, kind, routes, wire))) }
+        })?;
+        self.sequence.set(sequence);
+        local.ffn(layer, rows)?;
+        let ticket = Ticket { layer, rows, sequence };
+        let output = local.buffer("expert combined")?;
         self.outstanding.push_back(Outstanding { ticket, wave, output });
         Ok(ticket)
     }
 
+    pub(crate) fn has_link(&self) -> bool { self.link.is_some() }
+
     /// All six latent partials are reduced once with FP32 accumulation and one
     /// BF16 rounding. No hidden-space shared FFN participates in this reduction.
+    /// The lane stream waits (on the device) for the wave's planes.
     pub(crate) fn finish(&mut self, local: &LocalLane<'a>, ticket: Ticket) -> Result<()> {
         self.check(local, ticket.rows)?;
         ensure!(self.outstanding.front().is_some_and(|front| front.ticket == ticket),
@@ -194,20 +184,15 @@ impl<'a> RoutedLane<'a> {
         let landing = local.buffer("expert combined")?;
         ensure!(output.ptr == landing.ptr && output.bytes == landing.bytes,
             "Kimi Spark wave lands into other rows than it was sent for");
+        let (slot, rows, stream) = (wave.slot(), wave.rows(), self.stream.raw);
         let link = self.link.as_mut().context("Kimi Spark lane retired")?;
         self.stream.device.run(|| {
-            self.runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(120), link.receive(wave, ticket.rows, self.stream.raw))
-                    .await.context("Kimi main-link receive timed out")?
-            })?;
-            // SAFETY: receive orders all six live intake planes before this exact
-            // lane stream; output is a disjoint admitted latent allocation.
-            unsafe { self.stream.device.library.v41_compact_reducer()?.reduce_planes(
-                link.intake.pointers(), RANKS as u32, std::ptr::null(),
-                output.ptr.cast(), ticket.rows as u32, self.stream.raw)?; }
-            link.intake.consumed(self.stream.raw)
-        })?;
-        Ok(())
+            let exchange = link.exchange()?;
+            exchange.land(wave, stream)?;
+            // SAFETY: `land` orders all six live planes before this exact lane
+            // stream; the output is a disjoint admitted latent allocation.
+            unsafe { exchange.reduce(slot, std::ptr::null(), output.ptr.cast(), rows, stream) }
+        })
     }
 }
 
@@ -222,18 +207,22 @@ fn bootstrap_request(layer: usize, rows: usize) -> Result<ExpertProtocolV2Reques
 
 fn request(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
     layout: &RouteStaging, bytes: &[u8]) -> Result<ExpertProtocolV2Request> {
+    request_parts(layer, rows, sequence, kind, layout.routes(bytes)?, bytes::Bytes::copy_from_slice(layout.wire(bytes)?))
+}
+
+fn request_parts(layer: usize, rows: usize, sequence: u64, kind: ExpertV2SourceKind,
+    routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
     ensure!((1..93).contains(&layer) && (1..=4096).contains(&rows) && sequence > 0,
         "Kimi Spark request geometry or sequence");
-    let routes = layout.routes(bytes)?;
     ensure!(routes.len() == rows * TOPK && routes.iter().all(|route|
         route.expert_id < 896 && route.gate_weight.is_finite() && route.gate_weight >= 0.0),
         "Kimi Spark route outside E896/K16 or invalid gate weight");
-    let mut request = ExpertProtocolV2Request::new(sequence, 17, layer as u32, LATENT as u32,
+    let mut request = ExpertProtocolV2Request::new_bytes(sequence, 17, layer as u32, LATENT as u32,
         ExpertV2Dtype::Fp8E4m3Ue8m0K32,
         (0..rows).map(|row| ExpertProtocolV2RowDescriptor { row_id: row as u64,
             source_kind: kind, source_request_id: sequence, token_position: row as u64,
             route_offset: (row * TOPK) as u32, route_count: TOPK as u32 }).collect(),
-        routes, layout.wire(bytes)?.to_vec())?;
+        routes, wire)?;
     request.header.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     Ok(request)
 }
@@ -251,10 +240,11 @@ mod tests {
         assert!(source.contains("Arc::clone(library_owner)"));
         assert!(!source.contains("SparkLane"));
         assert!(!source.contains("submit_lane"));
-        assert!(source.contains("link.dispatch(&request)"));
-        assert!(source.contains("link.receive(wave, ticket.rows, self.stream.raw)"));
+        assert!(source.contains("link.exchange()?.send("));
+        assert!(source.contains("exchange.land(wave, stream)"));
+        assert!(!source.contains("block_on"));
         assert!(source.find("link.enable_terminal_ownership").unwrap() < source.find("link.bootstrap").unwrap());
-        assert!(source.find("link.bootstrap").unwrap() < source.find("link.transport.installed_grouping()").unwrap());
+        assert!(source.find("link.bootstrap").unwrap() < source.find("link.installed_grouping()").unwrap());
         let release = source.split("pub(crate) fn release_payloads").nth(1).unwrap()
             .split("fn check").next().unwrap();
         assert!(release.find("self.drain_copies()?").unwrap() < release.find("link.terminal_release()?").unwrap());

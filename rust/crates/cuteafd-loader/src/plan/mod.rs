@@ -1,6 +1,7 @@
 //! `cuteafd plan`: what a checkpoint is, where each part would live, and what
 //! this build can or cannot run - with hints a code agent can act on.
 pub mod checkpoint;
+pub mod decode_lanes;
 pub mod deployment;
 pub mod experts;
 pub mod exlr8;
@@ -151,8 +152,16 @@ pub enum PlanError {
     SparkRange(#[from] spark_range::RangeRefusal),
     #[error("invalid {option}: {reason}")]
     InvalidOption { option: &'static str, reason: String },
+    #[error("unsupported {option}={value} for {family}: {reason}")]
+    UnsupportedOption { option: &'static str, value: u8, family: String, reason: &'static str },
     #[error(transparent)]
     Checkpoint(#[from] anyhow::Error),
+}
+
+/// Resolve the decode-lane count before layout or CUDA allocation
+/// ([`decode_lanes::resolve`]).
+pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+    decode_lanes::resolve(family, requested, concurrency)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -235,6 +244,8 @@ pub struct PlanReport {
     /// Family-resolved units in flight on each transport.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_waves: Option<u64>,
+    /// Resolved decode views, independent of prefill units in flight.
+    pub decode_lanes: u8,
     /// Solver-selected transport count, independent of units in flight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_transports: Option<u64>,
@@ -289,6 +300,8 @@ impl PlanReport {
 
 #[derive(Debug, Clone)]
 pub struct PlanOptions {
+    /// None preserves each family's qualified decode-view default.
+    pub decode_lanes: Option<u8>,
     pub mapped_scale_preload_bytes: u64,
     /// Available host budget override for offline planning; live cgroup-aware sample otherwise.
     pub mapped_scale_host_budget_bytes: Option<u64>,
@@ -311,6 +324,7 @@ pub struct PlanOptions {
 impl Default for PlanOptions {
     fn default() -> Self {
         Self {
+            decode_lanes: None,
             mapped_scale_preload_bytes: crate::formats::mapped_preload::DEFAULT_CAP_BYTES,
             mapped_scale_host_budget_bytes: None,
             draft_ownership: None,
@@ -338,6 +352,9 @@ impl PlanOptions {
     /// Rejects counts outside the shared world ceiling and empty budgets.
     /// Zero is the local-only placement.
     pub fn validate(&self) -> Result<(), PlanError> {
+        if self.decode_lanes.is_some_and(|lanes| !(1..=2).contains(&lanes)) {
+            return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
+        }
         if let ExpertPlacement::Sparks { ranks } = self.placement {
             if !(1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks) {
                 return Err(PlanError::InvalidOption {
@@ -563,6 +580,7 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         prefill_span_rows: None,
         prefill_unit_rows: None,
         prefill_waves: None,
+        decode_lanes: 1,
         prefill_transports: None,
         prefill_selection: None,
         experts: None,
@@ -618,6 +636,8 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         return Ok(report);
     };
     report.family = Some(family.id().into());
+    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
+        options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
@@ -660,6 +680,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
     // shared default); an explicit --spark-budget-gib always wins.
     let mut resolved = options.clone();
+    if let Some(layout) = &mut resolved.layout { layout.decode_lanes = report.decode_lanes; }
     resolved.apply_spark_budget();
     resolved.spark_budget_bytes = Some(options.spark_budget_bytes.unwrap_or_else(|| model.spark_budget_bytes()));
     let options = &resolved;
@@ -1182,6 +1203,7 @@ pub fn plan_preferred(snapshot: &Path, options: &PlanOptions) -> Result<PlanRepo
 pub fn render(report: &PlanReport) -> String {
     use std::fmt::Write;
     let mut out = String::new();
+    let _ = writeln!(out, "decode     {} lane(s)", report.decode_lanes);
     if report.mapped_placement.mapped + report.mapped_placement.preloaded > 0 {
         let p = &report.mapped_placement;
         let _ = writeln!(out, "{}; scales {} bytes / cap {} bytes; host preload {} bytes / budget {} bytes ({})",
