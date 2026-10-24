@@ -63,37 +63,52 @@ impl Credits {
     pub fn written_reply_observed(&mut self) { self.outstanding = 0; }
 }
 
-/// Send-queue entries per request, oldest first. A source slot is restaged
-/// only once every WR of the request that used it last has completed.
+/// Send-queue entries per request, oldest first. A request owns its source
+/// slot from staging until its head SEND is posted (`sealed`) and every one
+/// of its WRs has completed; only then is the slot restaged. Completions can
+/// arrive between part posts, so an unsealed request with zero WRs in flight
+/// still owns its slot and still receives the parts posted after it.
 #[derive(Debug, Default)]
 pub(super) struct SendQueue {
-    requests: VecDeque<usize>,
+    /// (WRs posted and not completed, head SEND posted), oldest first.
+    requests: VecDeque<(usize, bool)>,
     pub in_flight: usize,
 }
 impl SendQueue {
-    pub fn posted_request(&mut self) { self.requests.push_back(0); }
-    pub fn posted_part(&mut self) -> Result<()> {
-        *self.requests.back_mut().context("request part without a request")? += 1;
+    pub fn posted_request(&mut self) -> Result<()> {
+        anyhow::ensure!(self.requests.back().is_none_or(|&(_, sealed)| sealed),
+            "request staged before the previous request's head SEND was posted");
+        self.requests.push_back((0, false));
+        Ok(())
+    }
+    /// One WR of the newest request; `head` marks its final (head SEND) part.
+    pub fn posted_part(&mut self, head: bool) -> Result<()> {
+        let (parts, sealed) = self.requests.back_mut().context("request part without a request")?;
+        anyhow::ensure!(!*sealed, "request part posted after its head SEND");
+        *parts += 1;
+        *sealed = head;
         self.in_flight += 1;
         Ok(())
     }
+    /// Send CQEs arrive in post order on one QP: they retire the oldest WRs.
     pub fn completed(&mut self, mut count: usize) -> Result<()> {
         anyhow::ensure!(count <= self.in_flight, "{count} request send completions with {} in flight", self.in_flight);
         self.in_flight -= count;
+        let mut index = 0;
         while count > 0 {
-            let front = self.requests.front_mut().context("request send completion without a request")?;
-            let taken = count.min(*front);
-            *front -= taken;
+            let (parts, _) = self.requests.get_mut(index).context("request send completion without a request")?;
+            let taken = count.min(*parts);
+            *parts -= taken;
             count -= taken;
-            if *front == 0 { self.requests.pop_front(); }
+            index += 1;
         }
-        while self.requests.front() == Some(&0) && self.requests.len() > 1 { self.requests.pop_front(); }
+        while self.requests.front().is_some_and(|&(parts, sealed)| parts == 0 && sealed) {
+            self.requests.pop_front();
+        }
         Ok(())
     }
-    /// Requests that still own their source slot (some WR not yet completed).
-    pub fn requests_in_flight(&self) -> usize {
-        self.requests.iter().filter(|&&parts| parts > 0).count()
-    }
+    /// Requests that still own their source slot.
+    pub fn requests_in_flight(&self) -> usize { self.requests.len() }
 }
 
 /// A staged request whose parts are being posted.
@@ -188,7 +203,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         let wr_id = VERBS_HOST_SEND_WR_ID + (self.request_send_sequence % self.request_ring.depth) as u64;
         // The worker's slot for this sequence; released by its final reply.
         self.request_credits.acquire(self.request_ring.depth)?;
-        self.request_sends.posted_request();
+        self.request_sends.posted_request()?;
         self.request_send_sequence = self.request_send_sequence.wrapping_add(1);
         Ok(Upload { wr_id, slot_offset, remote, prefix_bytes, payload_region, bytes, cursor: bytes.min(CHUNK_BYTES), sent: false,
             timing: VerbsHostProtocolV2ChunkSubmissionTiming { total_started,
@@ -219,7 +234,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             self.endpoint.library.rdma_rc_endpoint_post_request_part(self.endpoint.info.handle, upload.slot_offset,
                 upload.prefix_bytes, upload.payload_region, offset, bytes, remote, upload.wr_id)?;
         }
-        self.request_sends.posted_part()?;
+        self.request_sends.posted_part(remote.is_none())?;
         match remote {
             Some(_) => { self.endpoint.traffic.written(bytes); upload.cursor += bytes; }
             None => { self.endpoint.traffic.sent(bytes); upload.sent = true; }
@@ -293,8 +308,8 @@ mod tests {
     fn source_slots_free_only_after_every_part_completes() -> Result<()> {
         let mut queue = SendQueue::default();
         for parts in [102, 1, 3] {
-            queue.posted_request();
-            for _ in 0..parts { queue.posted_part()?; }
+            queue.posted_request()?;
+            for part in 0..parts { queue.posted_part(part + 1 == parts)?; }
         }
         assert_eq!((queue.in_flight, queue.requests_in_flight()), (106, 3));
         queue.completed(101)?;
@@ -306,11 +321,66 @@ mod tests {
         assert!(queue.completed(2).is_err());
         queue.completed(1)?;
         assert_eq!((queue.in_flight, queue.requests_in_flight()), (0, 0));
-        // A request staged but not yet posted owns no completion.
-        queue.posted_request();
-        assert_eq!(queue.requests_in_flight(), 0);
-        queue.posted_part()?;
+        // A staged request owns its slot before any part is posted.
+        queue.posted_request()?;
         assert_eq!(queue.requests_in_flight(), 1);
+        assert!(queue.posted_request().is_err(), "second request staged before the first was sealed");
+        queue.posted_part(true)?;
+        assert!(queue.posted_part(false).is_err(), "part after the head SEND");
+        queue.completed(1)?;
+        assert_eq!(queue.requests_in_flight(), 0);
+        Ok(())
+    }
+
+    /// The serving sequence that failed on GLM K4 max (`request part without
+    /// a request`): `LocalTp4Client::post` reaps each rank's CQ between that
+    /// rank's part posts, so every earlier WRITE can complete while later
+    /// tail chunks are still unposted. Drives several ranks through bootstrap
+    /// (one small SEND), decode-sized frames, then N-wave prefill frames with
+    /// a CQ that completes everything posted so far before each post.
+    #[test]
+    fn completions_between_part_posts_keep_the_request_open_until_its_head() -> Result<()> {
+        let max_send_wr = 16;
+        for depth in [1usize, 2, 3, 8] {
+            let mut ranks: Vec<SendQueue> = (0..6).map(|_| SendQueue::default()).collect();
+            // (frame bytes) per wave: bootstrap, decode, prefill N waves, decode again.
+            let waves = [96, 40_000, 26_509_408, 26_509_408, 26_509_408, 8_000, CHUNK_BYTES + 1];
+            for (wave, &bytes) in waves.iter().enumerate() {
+                let mut uploads: Vec<std::iter::Peekable<_>> = Vec::new();
+                for queue in &mut ranks {
+                    // `stage_request`: wait until a source slot is free.
+                    while queue.requests_in_flight() >= depth {
+                        let all = queue.in_flight;
+                        queue.completed(all)?;
+                    }
+                    queue.posted_request()?;
+                    uploads.push(parts(bytes).peekable());
+                }
+                let mut round = 0;
+                while uploads.iter_mut().any(|parts| parts.peek().is_some()) {
+                    for (rank, (queue, parts)) in ranks.iter_mut().zip(&mut uploads).enumerate() {
+                        // `try_reap_request_sends` before every post: alternate
+                        // between completing everything and completing nothing.
+                        if (round + rank + wave) % 2 == 0 { let all = queue.in_flight; queue.completed(all)?; }
+                        if queue.in_flight >= max_send_wr { continue; }
+                        if let Some((_, _, write)) = parts.next() {
+                            queue.posted_part(!write)?;
+                            assert!(queue.requests_in_flight() >= 1);
+                        }
+                    }
+                    round += 1;
+                }
+                for queue in &mut ranks {
+                    assert!(queue.requests_in_flight() <= depth);
+                    assert!(queue.requests.back().is_some_and(|&(_, sealed)| sealed));
+                }
+            }
+            for queue in &mut ranks {
+                let all = queue.in_flight;
+                queue.completed(all)?;
+                assert_eq!((queue.in_flight, queue.requests_in_flight()), (0, 0));
+            }
+        }
         Ok(())
     }
 
