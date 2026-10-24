@@ -122,7 +122,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
         prefill_rows: 4096, ..Default::default() };
     report.prefill_transports = Some(1);
     for native in [false, true] {
-        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (4096, 2, 16384), (2048, 2, 16384), (4096, 2, 2048)] {
+        for (unit, waves, span) in [(4096, 1, 4096), (4096, 2, 8192), (4096, 3, 16384), (4096, 2, 16384), (2048, 2, 16384), (4096, 2, 2048)] {
             options.prefill_rows = span;
             options.prefill_unit_rows = Some(unit);
             options.prefill_waves = waves;
@@ -140,6 +140,7 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
                 assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(geometry, rings).unwrap() as u64
                     * endpoints * 4, "{family} {unit}x{waves}");
+                assert_eq!(bytes("transport/egress"), request as u64 * waves * endpoints);
                 assert_eq!(bytes("spark-intake"), unit * waves * geometry.hidden as u64
                     * if native { 4 } else { 2 } * endpoints * 4);
                 assert_eq!(bytes("workspace/router"), (unit + 64)

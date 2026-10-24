@@ -277,11 +277,9 @@ impl SparkExperts {
     /// on). Requests whose hidden payload comes from [`Self::egress_payload`]
     /// are sent without copying it into each rank's send ring. Returns the
     /// buffer, for the engine's D2H target.
-    /// `stagger`: post the ranks' requests one after another, each once the
-    /// previous rank's has left, instead of all at once.
-    pub fn enable_egress(&mut self, bytes: usize, stagger: bool) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
+    pub fn enable_egress(&mut self, bytes: usize) -> Result<cuteafd_ffi::CuteafdHostBuffer> {
         self.open_waves.clear();
-        self.clients.enable_egress(bytes, stagger)
+        self.clients.enable_egress(bytes)
     }
 
     /// The egress buffer to write the next wave's payload into: fails unless

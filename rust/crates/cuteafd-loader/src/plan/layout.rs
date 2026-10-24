@@ -1328,6 +1328,11 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             .checked_mul(endpoints as u64).and_then(|n| n.checked_mul(ranks as u64))
             .context("coordinator host rings overflow")?;
         push(Category::Transport, "transport/rdma-rings", "registered", bytes, Basis::Formula);
+        let egress_request = geometry.compact_wire_bytes(u32::try_from(unit_rows)?,
+            !native && checkpoint.spark_input_is_bf16()).context("host egress geometry overflow")?.0;
+        let egress = (egress_request as u64).checked_mul(options.prefill_waves)
+            .and_then(|n| n.checked_mul(endpoints as u64)).context("coordinator registered egress overflow")?;
+        push(Category::Transport, "transport/egress", "registered request slots", egress, Basis::Formula);
         // Host-mode intake is the upper bound; auto/GPU landing can use less.
         let intake = intake_rows.checked_mul(hidden).and_then(|n| n.checked_mul(if native { 4 } else { 2 }))
             .and_then(|n| n.checked_mul(ranks as u64)).and_then(|n| n.checked_mul(endpoints as u64))

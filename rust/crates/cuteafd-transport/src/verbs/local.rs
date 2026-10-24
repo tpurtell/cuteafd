@@ -105,7 +105,8 @@ pub struct LocalVerbsExpertConnection {
     response_frame: ExpertProtocolV2FrameBuffer,
     request_recv_sequence: usize,
     response_send_sequence: usize,
-    response_send_in_flight: usize,
+    /// Reply frames posted and not yet fully completed (WRs per frame).
+    response_sends: request_write::SendQueue,
     response_copy_stream: Option<VerbsHostCudaStream>,
     next_liveness: Instant,
     liveness_polls: u8,
@@ -116,6 +117,14 @@ pub struct LocalVerbsExpertConnection {
     /// receive slot `request_recv_sequence + k` and send slot
     /// `response_send_sequence + k`; they finish in this order.
     deferred: std::collections::VecDeque<Option<Instant>>,
+    /// Where reply frames above one chunk WRITE their tail (none: write mode,
+    /// or every reply fits one chunk).
+    reply_target: Option<request_write::ReplyTarget>,
+    /// Newest coordinator receives-posted watermark seen on a request.
+    reply_watermark: Option<u32>,
+    /// Large reply frames sent whole because their receive was not yet
+    /// covered by a watermark (RC SEND waits for the receive instead).
+    uncovered_replies: u64,
     // EOF acknowledges teardown only after native rings and their credit are released.
     stream: TcpStream,
 }
@@ -123,6 +132,133 @@ pub struct LocalVerbsExpertConnection {
 // remain owned by the endpoint. Like VerbsHostMappedRdmaRing, a session may move
 // from its bootstrap thread to the GPU owner, but is never shared concurrently.
 unsafe impl Send for LocalVerbsExpertConnection {}
+
+/// The coordinator's last bootstrap message, after it connected its QP and
+/// posted its receives: where reply tails land. Required exactly when replies
+/// can exceed one chunk and are not write-mode.
+fn read_reply_target(reader: &mut BufReader<TcpStream>, start: &VerbsHostProtocolV2PersistentStart,
+    response_ring: VerbsHostRdmaRing) -> Result<Option<request_write::ReplyTarget>> {
+    let reply: VerbsHostProtocolV2ReplyTarget = decode_persistent_control(read_control_value(reader)?)?;
+    anyhow::ensure!(reply.message == "protocol_v2_reply_target", "expected protocol_v2_reply_target, got {}",
+        reply.message);
+    anyhow::ensure!(reply.target.is_some() == (start.write_target.is_none()
+        && request_write::needs_target(start.response_capacity_wire_bytes)),
+        "coordinator reply target does not match response capacity {}", start.response_capacity_wire_bytes);
+    if let Some(target) = &reply.target {
+        target.validate(response_ring.slot_capacity_bytes)?;
+        anyhow::ensure!(target.depth == response_ring.depth, "coordinator reply ring depth differs from the start");
+    }
+    Ok(reply.target)
+}
+
+/// Raises the newest coordinator watermark from a received request header
+/// (wrapping 32-bit; a request never lowers it).
+fn observe_watermark(watermark: &mut Option<u32>, frame: &[u8], flags: u32) -> Result<()> {
+    let seen = request_write::read_watermark(frame, flags)?;
+    *watermark = Some(match *watermark {
+        Some(current) if (seen.wrapping_sub(current) as i32) < 0 => current,
+        _ => seen,
+    });
+    Ok(())
+}
+
+/// A reply frame already staged contiguously at a response send slot.
+enum Reply {
+    /// To the coordinator's posted receive (SEND, or tail WRITEs + head SEND).
+    Send { offset: usize, bytes: usize, wr_id: u64 },
+    /// Write mode: `bytes` of rows to the client's plane, then `flag`.
+    Written { target: VerbsHostWriteTarget, offset: usize, bytes: usize, flag: u64, wr_id: u64 },
+}
+
+/// Posts reply frames on the worker QP with WR-level send-queue accounting.
+/// Every frame posts its WRs back to back on one QP, the head (SEND or flag
+/// WRITE) last, so the coordinator never observes a frame before its tail.
+struct ReplyPoster<'a> {
+    endpoint: &'a NativeRdmaEndpoint,
+    sends: &'a mut request_write::SendQueue,
+    target: Option<request_write::ReplyTarget>,
+    watermark: Option<u32>,
+    capacity: usize,
+    uncovered: &'a mut u64,
+}
+impl ReplyPoster<'_> {
+    /// Waits for one send completion and retires it.
+    fn reap_one(&mut self) -> Result<()> {
+        let stats = self.endpoint.poll_stats(1, 0, default_control_timeout())?;
+        self.sends.completed(stats.send_completions as usize)
+    }
+    /// Frees a response send slot: fewer than `depth - held` frames own one.
+    fn reserve_slot(&mut self, depth: usize, held: usize) -> Result<()> {
+        while self.sends.requests_in_flight() + held >= depth { self.reap_one()?; }
+        Ok(())
+    }
+    /// Send-queue room for one more WR. Every reply WR is signaled, so each
+    /// completion frees exactly one entry.
+    fn room(&mut self) -> Result<()> {
+        while self.sends.in_flight >= self.endpoint.info.max_send_wr as usize { self.reap_one()?; }
+        Ok(())
+    }
+    /// Posts `reply`, the `sequence`-th frame that consumes a coordinator
+    /// receive (write mode never does; its sequence is unused).
+    fn post(&mut self, reply: Reply, sequence: u64) -> Result<()> {
+        self.sends.posted_request(None)?;
+        match reply {
+            Reply::Send { offset, bytes, wr_id } => {
+                let (parts, chunked) = request_write::reply_parts(self.target.as_ref(), self.watermark, sequence,
+                    bytes, self.capacity)?;
+                if !chunked && bytes > request_write::CHUNK_BYTES && self.target.is_some() {
+                    *self.uncovered += 1;
+                    if self.uncovered.is_power_of_two() {
+                        tracing::debug!(uncovered = *self.uncovered, sequence, bytes,
+                            "reply receive not yet covered by a watermark; sent as one SEND");
+                    }
+                }
+                for part in parts {
+                    self.room()?;
+                    match part {
+                        request_write::ReplyPart::Write { offset: at, bytes: len, remote } => {
+                            // SAFETY: the frame is staged at `offset` in this
+                            // endpoint's registered send ring and stays unmodified
+                            // until its WRs complete (`reserve_slot`); `remote` lies
+                            // in the coordinator receive this frame will complete,
+                            // which the watermark shows is posted and unread.
+                            unsafe { self.endpoint.library.rdma_rc_endpoint_post_request_part(self.endpoint.info.handle,
+                                offset, 0, None, at, len, Some(remote), wr_id)?; }
+                            self.endpoint.traffic.written(len);
+                            self.sends.posted_part(false)?;
+                        }
+                        request_write::ReplyPart::Send { bytes: len } => {
+                            self.endpoint.post_send_at(offset, len, wr_id)?;
+                            self.sends.posted_part(true)?;
+                        }
+                    }
+                }
+            }
+            Reply::Written { target, offset, bytes, flag, wr_id } => {
+                anyhow::ensure!(bytes as u64 <= target.plane_bytes, "written response exceeds the client's plane");
+                // Rows to the plane in chunks, then the flag alone, last: RC
+                // orders it behind every row WRITE on this QP.
+                for at in (0..bytes).step_by(request_write::CHUNK_BYTES) {
+                    let len = request_write::CHUNK_BYTES.min(bytes - at);
+                    self.room()?;
+                    // SAFETY: the rows are staged at `offset` in this endpoint's
+                    // registered send ring and stay unmodified until their WRs
+                    // complete (`reserve_slot`); the plane range was exposed by
+                    // the client for this connection (checked against
+                    // `plane_bytes` above).
+                    unsafe { self.endpoint.library.rdma_rc_endpoint_post_request_part(self.endpoint.info.handle,
+                        offset, 0, None, at, len, Some((target.plane_addr + at as u64, target.rkey)), wr_id)?; }
+                    self.endpoint.traffic.written(len);
+                    self.sends.posted_part(false)?;
+                }
+                self.room()?;
+                self.endpoint.post_write_flagged(&target, offset, 0, flag, wr_id)?;
+                self.sends.posted_part(true)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 impl LocalVerbsExpertConnection {
     /// An opt-in placement worker rejects unsealed or different later lanes
@@ -386,6 +522,12 @@ impl LocalVerbsExpertConnection {
             response_ring.depth,
         )?;
         endpoint.connect_with_flow_label(&start.client_native_endpoint, start.flow_label)?;
+        // Frames above one chunk arrive as WRITE tails into the request ring.
+        let request_target = if request_write::needs_target(start.request_capacity_wire_bytes) {
+            endpoint.traffic.receives_writes();
+            let (address, rkey) = library.rdma_rc_endpoint_request_target(endpoint.info.handle)?;
+            Some(request_write::Target { address, rkey })
+        } else { None };
         for slot in 0..request_ring.depth {
             endpoint.post_recv_at(
                 request_ring.slot_offset(slot),
@@ -420,9 +562,11 @@ impl LocalVerbsExpertConnection {
                 expert_grouping: grouping.cloned(),
                 server_endpoint,
                 server_native_endpoint: endpoint.native_descriptor(),
+                request_target,
                 flow_label: start.flow_label,
             },
         )?;
+        let reply = read_reply_target(&mut BufReader::new(stream.try_clone()?), &start, response_ring)?;
 
         Ok(Self {
             stream,
@@ -436,11 +580,14 @@ impl LocalVerbsExpertConnection {
             response_frame,
             request_recv_sequence: 0,
             response_send_sequence: 0,
-            response_send_in_flight: 0,
+            response_sends: Default::default(),
             response_copy_stream: None,
             next_liveness: Instant::now(),
             liveness_polls: 0,
             deferred: std::collections::VecDeque::new(),
+            reply_target: reply,
+            reply_watermark: None,
+            uncovered_replies: 0,
             timing,
         })
     }
@@ -518,7 +665,10 @@ impl LocalVerbsExpertConnection {
         let write_target = self.start.write_target;
         let mut request_recv_sequence = self.request_recv_sequence;
         let mut response_send_sequence = self.response_send_sequence;
-        let mut response_send_in_flight = self.response_send_in_flight;
+        let mut poster = ReplyPoster { endpoint, sends: &mut self.response_sends, target: self.reply_target,
+            watermark: self.reply_watermark, capacity: start.response_capacity_wire_bytes,
+            uncovered: &mut self.uncovered_replies };
+        let reply_watermark = &mut self.reply_watermark;
         let result = (|| -> Result<()> {
             let poll_recv_ms = elapsed_ms_optional(poll_recv_started);
             let request_recv_slot = mapped_ring_slot(
@@ -539,7 +689,9 @@ impl LocalVerbsExpertConnection {
             )?;
             let resize_ms = 0.0_f64;
             let copy_request_ms = 0.0_f64;
-            endpoint.traffic.received(request_wire_bytes);
+            // SEND bytes only: the client counts its WRITE tail as written
+            // bytes, which the fabric report adds for a `receives_writes` QP.
+            endpoint.account_received()?;
             let mut post_recv_ms = 0.0_f64;
             let parse_started = timing_enabled.then(Instant::now);
             let request =
@@ -548,6 +700,8 @@ impl LocalVerbsExpertConnection {
             if let Some(admitted) = &endpoint.credits.endpoint {
                 admitted.validate_request(&request.header)?;
             }
+            observe_watermark(reply_watermark, &request_storage[..request_wire_bytes], request.header.flags)?;
+            poster.watermark = *reply_watermark;
             let parse_ms = elapsed_ms_optional(parse_started);
             let request_id = request.header.request_id;
             let layer_id = request.header.layer_id;
@@ -578,12 +732,9 @@ impl LocalVerbsExpertConnection {
             let mut poll_send_ms = 0.0_f64;
             let mut direct_device_response_frames = 0_usize;
             let mut final_response_emitted = false;
-            if response_send_in_flight == response_ring.depth {
-                let poll_send_started = timing_enabled.then(Instant::now);
-                endpoint.poll(1, 0, default_control_timeout())?;
-                poll_send_ms += elapsed_ms_optional(poll_send_started);
-                response_send_in_flight -= 1;
-            }
+            let poll_send_started = timing_enabled.then(Instant::now);
+            poster.reserve_slot(response_ring.depth, 0)?;
+            poll_send_ms += elapsed_ms_optional(poll_send_started);
             let first_response_slot = mapped_ring_slot(
                 response_send_view,
                 response_ring,
@@ -597,18 +748,20 @@ impl LocalVerbsExpertConnection {
                 start.execution_lane,
             )?;
             let execute_started = timing_enabled.then(Instant::now);
+            // The final reply is the client's credit to WRITE into this request
+            // slot again, so it is posted only after execute has returned and
+            // the slot's receive is reposted (below).
+            let mut deferred_final: Option<(Reply, u64)> = None;
             execute(&request, device_payload, &mut |response| {
                 if final_response_emitted {
                     bail!(
                         "persistent verbs-host executor emitted a response after the final chunk"
                     );
                 }
-                if response_send_in_flight == response_ring.depth {
-                    let poll_send_started = timing_enabled.then(Instant::now);
-                    endpoint.poll(1, 0, default_control_timeout())?;
-                    poll_send_ms += elapsed_ms_optional(poll_send_started);
-                    response_send_in_flight -= 1;
-                }
+                let poll_send_started = timing_enabled.then(Instant::now);
+                poster.reserve_slot(response_ring.depth, 0)?;
+                poll_send_ms += elapsed_ms_optional(poll_send_started);
+                let reply_sequence = response_send_sequence as u64;
                 let response_has_more = response.more_chunks();
                 let response_send_slot = response_send_sequence % response_ring.depth;
                 let response_send_offset = response_ring.slot_offset(response_send_sequence);
@@ -626,8 +779,11 @@ impl LocalVerbsExpertConnection {
                             bytes); }
                         let flag = written_response_flag(&response.header, response_has_more || response.row_indices.is_some());
                         let send_started = timing_enabled.then(Instant::now);
-                        endpoint.post_write_flagged(&target, response_send_offset, if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0
-                            { 0 } else { bytes }, flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                        let reply = Reply::Written { target, offset: response_send_offset,
+                            bytes: if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else { bytes }, flag,
+                            wr_id: VERBS_HOST_SEND_WR_ID + response_send_slot as u64 };
+                        if response_has_more { poster.post(reply, reply_sequence)? }
+                        else { deferred_final = Some((reply, reply_sequence)) }
                         send_ms += elapsed_ms_optional(send_started);
                         bytes
                     }
@@ -645,12 +801,21 @@ impl LocalVerbsExpertConnection {
                             start.response_capacity_wire_bytes
                         );
                         let send_started = timing_enabled.then(Instant::now);
-                        endpoint.send_parts_at(
-                            response_prefix,
-                            response.partial_output_payload,
-                            response_send_offset,
-                            VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                        )?;
+                        // Staged in the send slot (the borrowed payload ends with
+                        // this callback); a final frame is posted once the
+                        // request slot is reposted.
+                        let slot = mapped_ring_slot(response_send_view, response_ring, response_send_sequence as u64)?;
+                        anyhow::ensure!(wire_bytes <= slot.capacity_bytes, "response exceeds its send slot");
+                        // SAFETY: the range lies in this endpoint's mapped send
+                        // ring (capacity checked above), and every WR of the frame
+                        // that last used this slot completed (`reserve_slot`).
+                        let dst = unsafe { std::slice::from_raw_parts_mut(slot.host_ptr, wire_bytes) };
+                        dst[..response_prefix.len()].copy_from_slice(response_prefix);
+                        dst[response_prefix.len()..].copy_from_slice(response.partial_output_payload);
+                        let reply = Reply::Send { offset: response_send_offset, bytes: wire_bytes,
+                            wr_id: VERBS_HOST_SEND_WR_ID + response_send_slot as u64 };
+                        if response_has_more { poster.post(reply, reply_sequence)? }
+                        else { deferred_final = Some((reply, reply_sequence)) }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
@@ -707,27 +872,27 @@ impl LocalVerbsExpertConnection {
                                 library.cuda_stream_synchronize(copy_stream)?;
                             }
                         }
-                        match write_target {
+                        let wr_id = VERBS_HOST_SEND_WR_ID + response_send_slot as u64;
+                        let reply = match write_target {
                             Some(target) => {
                                 // Write mode: rows to the client's plane, then the flag.
                                 let flag = written_response_flag(&response.header, response_has_more);
-                                endpoint.post_write_flagged(&target, response_send_offset + response_prefix.len(),
-                                    if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
-                                        response.partial_output_payload.bytes },
-                                    flag, VERBS_HOST_SEND_WR_ID + response_send_slot as u64)?;
+                                Reply::Written { target, offset: response_send_offset + response_prefix.len(),
+                                    bytes: if flag & VERBS_HOST_WRITE_FLAG_ERROR != 0 { 0 } else {
+                                        response.partial_output_payload.bytes }, flag, wr_id }
                             }
-                            None => endpoint.post_send_at(
-                                response_send_offset,
-                                wire_bytes,
-                                VERBS_HOST_SEND_WR_ID + response_send_slot as u64,
-                            )?,
-                        }
+                            None => Reply::Send { offset: response_send_offset, bytes: wire_bytes, wr_id },
+                        };
+                        if response_has_more { poster.post(reply, reply_sequence)? }
+                        else { deferred_final = Some((reply, reply_sequence)) }
                         send_ms += elapsed_ms_optional(send_started);
                         wire_bytes
                     }
                 };
+                // One send slot per frame; in SEND mode it is also the coordinator
+                // receive the frame completes (write mode posts no receives and
+                // has no reply target, so its sequence is never a landing).
                 response_send_sequence = response_send_sequence.wrapping_add(1);
-                response_send_in_flight += 1;
                 response_frames += 1;
                 response_wire_bytes = response_wire_bytes
                     .checked_add(response_wire_bytes_for_chunk)
@@ -740,11 +905,12 @@ impl LocalVerbsExpertConnection {
                 bail!("persistent verbs-host executor did not emit a final response chunk");
             }
             let post_recv_started = timing_enabled.then(Instant::now);
-            endpoint.post_recv_at(
-                request_ring.slot_offset(request_recv_sequence),
-                request_ring.slot_capacity_bytes,
-                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64,
-            )?;
+            // execute has returned, so every host and GPU consumer of the request
+            // slot is done: repost it, then grant it back with the final reply.
+            endpoint.post_recv_at(request_ring.slot_offset(request_recv_sequence), request_ring.slot_capacity_bytes,
+                VERBS_HOST_RECV_WR_ID + request_recv_slot.slot_index as u64)?;
+            let (reply, sequence) = deferred_final.context("persistent verbs-host final response was not staged")?;
+            poster.post(reply, sequence)?;
             request_recv_sequence = request_recv_sequence.wrapping_add(1);
             post_recv_ms = elapsed_ms_optional(post_recv_started);
             if timing_enabled {
@@ -780,7 +946,6 @@ impl LocalVerbsExpertConnection {
         })();
         self.request_recv_sequence = request_recv_sequence;
         self.response_send_sequence = response_send_sequence;
-        self.response_send_in_flight = response_send_in_flight;
         result
     }
 
@@ -835,10 +1000,11 @@ impl LocalVerbsExpertConnection {
         // The response goes into send slot `response_send_sequence + held`;
         // drain send completions until that slot (and every earlier deferred
         // request's) is free, exactly as the emit path does for one.
-        while !deferred_send_slot_free(self.response_send_in_flight, held, self.response_ring.depth) {
-            self.endpoint.poll(1, 0, default_control_timeout())?;
-            self.response_send_in_flight -= 1;
-        }
+        self.endpoint.account_received()?;
+        observe_watermark(&mut self.reply_watermark, &storage[..wire_bytes], request.header.flags)?;
+        ReplyPoster { endpoint: &self.endpoint, sends: &mut self.response_sends, target: self.reply_target,
+            watermark: self.reply_watermark, capacity: self.start.response_capacity_wire_bytes,
+            uncovered: &mut self.uncovered_replies }.reserve_slot(self.response_ring.depth, held)?;
         let response_slot = mapped_ring_slot(self.response_send_view, self.response_ring,
             (self.response_send_sequence + held) as u64)?;
         let payload = protocol_v2_request_device_payload(&storage[..wire_bytes], &request,
@@ -869,11 +1035,6 @@ fn deferred_admits(held: usize, limit: usize, request_depth: usize, response_dep
     held < limit.min(request_depth).min(response_depth)
 }
 
-/// Whether the send slot of the next deferred request (after `held` deferred
-/// and `in_flight` sent-but-uncompleted responses) is free to write.
-fn deferred_send_slot_free(in_flight: usize, held: usize, depth: usize) -> bool {
-    in_flight + held < depth
-}
 
 /// A final Error must never publish a successful flag for an untouched plane.
 fn written_response_flag(header: &ExpertProtocolV2ResponseHeader, unwritable: bool) -> u64 {
@@ -898,7 +1059,8 @@ fn ensure_peer_open(stream: &TcpStream) -> Result<()> {
 
 #[cfg(test)]
 mod deferred_tests {
-    use super::{deferred_admits, deferred_send_slot_free};
+    use super::deferred_admits;
+    use crate::verbs::request_write::SendQueue;
 
     /// N deferred requests per connection, bounded by the slot count and both
     /// rings; each request's send slot is reserved before the next is received.
@@ -910,10 +1072,20 @@ mod deferred_tests {
         assert!(!deferred_admits(3, 3, 8, 8));
         // A depth-one decode ring holds one request in flight whatever the pool size.
         assert!(!deferred_admits(1, 4, 1, 1));
-        // Send slots: two responses in flight and one deferred leave room only below depth.
-        assert!(deferred_send_slot_free(2, 1, 4));
-        assert!(!deferred_send_slot_free(2, 2, 4));
-        assert!(!deferred_send_slot_free(0, 1, 1));
+        // Send slots count reply frames, not WRs: a chunked frame of many WRs
+        // owns one slot until its head is posted and every WR completed.
+        let mut sends = SendQueue::default();
+        for parts in [101, 1] {
+            sends.posted_request(None).unwrap();
+            for part in 0..parts { sends.posted_part(part + 1 == parts).unwrap(); }
+        }
+        let free = |sends: &SendQueue, held: usize, depth: usize| sends.requests_in_flight() + held < depth;
+        assert!(free(&sends, 1, 4) && !free(&sends, 2, 4));
+        sends.completed(100).unwrap();
+        assert!(!free(&sends, 2, 4), "a chunked frame freed its slot before its head completed");
+        sends.completed(1).unwrap();
+        assert!(free(&sends, 2, 4));
+        assert!(!free(&SendQueue::default(), 1, 1));
     }
 }
 
@@ -1129,6 +1301,63 @@ mod budget_tests {
         });
         if let Some(digest) = digest { start["worker_selection_digest"] = digest.into(); }
         start
+    }
+
+    /// The persistent bootstrap with reply targets, over a real TCP pair (no
+    /// NIC): the worker reads the coordinator's start, writes ready, then
+    /// reads `protocol_v2_reply_target`, which the coordinator sends only
+    /// after ready. A large-reply session must get a valid target for its
+    /// ring; a small-reply or write-mode one must get none; anything else,
+    /// a wrong message or a stale control version, fails closed.
+    #[test]
+    fn bootstrap_reads_the_reply_target_after_ready_and_fails_closed() -> Result<()> {
+        let small = 64 << 10;
+        let large = 33_816_672;
+        let ring = |capacity: usize| VerbsHostRdmaRing::new(capacity, 4096, 8);
+        let target = |ring: VerbsHostRdmaRing| request_write::ReplyTarget { address: 1 << 40, rkey: 3,
+            slot_stride_bytes: ring.slot_stride_bytes, depth: ring.depth, landing: None };
+        let cases: Vec<(usize, bool, serde_json::Value, bool)> = vec![
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: Some(target(ring(large)?)) })?, true),
+            (small, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: None })?, true),
+            // Write mode: replies are flagged writes to the client's plane.
+            (large, true, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: None })?, true),
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: None })?, false),
+            (small, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: Some(target(ring(small)?)) })?, false),
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION, target: Some(request_write::ReplyTarget { depth: 2,
+                    ..target(ring(large)?) }) })?, false),
+            (large, false, serde_json::to_value(VerbsHostProtocolV2ReplyTarget { message: "protocol_v2_reply_target".into(),
+                wire_version: PERSISTENT_CONTROL_VERSION - 1, target: Some(target(ring(large)?)) })?, false),
+            (large, false, serde_json::json!({"message": "protocol_v2_persistent_ready",
+                "wire_version": PERSISTENT_CONTROL_VERSION}), false),
+        ];
+        for (capacity, write_mode, reply, accepted) in cases {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let mut coordinator = TcpStream::connect(listener.local_addr()?)?;
+            let (worker, _) = listener.accept()?;
+            let mut start = placement_start(None, 0);
+            start["response_capacity_wire_bytes"] = capacity.into();
+            if write_mode {
+                start["write_target"] = serde_json::json!({"plane_addr": 1, "plane_bytes": capacity, "flag_addr": 2, "rkey": 4});
+            }
+            write_control(&mut coordinator, &start)?;
+            let start: VerbsHostProtocolV2PersistentStart = decode_persistent_control(
+                read_control_value(&mut BufReader::new(worker.try_clone()?))?)?;
+            // The worker answers ready; the coordinator reads it before sending
+            // its reply target, so the start reader cannot have buffered it.
+            write_control(&mut worker.try_clone()?, &serde_json::json!({"message": "protocol_v2_persistent_ready"}))?;
+            read_control_value(&mut BufReader::new(coordinator.try_clone()?))?;
+            write_control(&mut coordinator, &reply)?;
+            let result = read_reply_target(&mut BufReader::new(worker), &start, ring(capacity)?);
+            assert_eq!(result.is_ok(), accepted, "capacity {capacity} write {write_mode}: {reply} -> {result:?}");
+            if let Ok(target) = result { assert_eq!(target.is_some(), capacity == large && !write_mode); }
+        }
+        Ok(())
     }
 
     #[test]
