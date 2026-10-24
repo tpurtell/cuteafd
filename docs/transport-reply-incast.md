@@ -1,9 +1,11 @@
 # Reply incast reference
 
-CPU-only audit, 2026-10-25; source base `974d235de` on `work/p0`.
-Existing receipts only: no hardware runs, kernel changes or network changes.
-Related evidence: #693, #714, #715, #718 and the corrected probe history in
-#497. Rates use decimal GB/s and Gb/s; frame capacities use bytes.
+Reference audit and measured experiments, 2026-10-25; source base
+`974d235de` on `work/p0`. The reference audit uses existing receipts;
+new hardware measurements are explicitly labeled under Experiments.
+No kernel or network settings are changed by these experiments.
+Related evidence: #693, #714, #715, #718, #729 and the corrected probe history
+in #497. Rates use decimal GB/s and Gb/s; frame capacities use bytes.
 
 ## Verdict
 
@@ -203,7 +205,10 @@ the six-rank critical path after the kernel fix if this proxy holds; the
 400G port is only a peak-burst constraint in that calculation. At four
 ranks the analogous GPU estimate is 10.27 ms. No observed serving-wave rate
 yet distinguishes actual landing service, buffering, synchronization and
-Spark compute as the binding limit.
+Spark compute as the binding limit. The new frozen-batch experiment below
+establishes that GLM's multiwave prefill actually retains **pinned** intake;
+the direct-GPU branch of this hypothetical model does not describe that
+measurement. Its logged staged-path proxy is 27.4 GB/s, not 19.6 GB/s.
 
 ## Remedy bounds, not promised speedups
 
@@ -234,12 +239,14 @@ Spark compute as the binding limit.
   head-of-line blocking. Do not infer their status from OOS alone or change
   switch policy as part of a launcher-only experiment.
 
-## Bounded experiment plan (coordinator schedules; none run here)
+## Bounded experiment plan (status updated by Experiments)
 
 Existing setting: `SPARK_INTAKE=gpu|pinned|auto|host` in the shared launcher
 (`scripts/launch/run-family.sh:613`), mapped to `CUTEAFD_SPARK_INTAKE` at
 line 633. Use explicit `gpu` versus `pinned`, and check the prefill executor's
-final startup line. `host` is an alias, not a third physical landing path.
+final startup line. `host` also lands in host memory but uses the original
+staging/compute-stream upload path; it is not an alias for pinned intake's
+large-wave receive-slot retention and copy-stream uploads.
 
 At inspected base `974d235de`, no runtime reply-chunk cutoff setting exists;
 the prior combined seal has a hard-coded 256 KiB request/reply WRITE chunk
@@ -252,7 +259,14 @@ call site selecting it was found at this base: end-to-end serving integration,
 launcher controls and correctness/quality gates are still needed.
 Any subsequently landed controls must be checked against their own revision.
 
-1. **Available now: landing x ranks.** GLM K4 max, then EXLR8 max, fixed
+The measured explicit-GPU attempt below exposes a feasibility limitation:
+this base's multiwave path requires pinned intake (`spark_intake.rs:428`).
+The setting exists, but a GPU/pinned pair is not runnable for that executor
+without implementing per-wave GPU landing ranges or changing execution.
+The latter would confound a landing-only comparison. The matrix below is
+therefore conditional, not a claim that every arm currently launches.
+
+1. **Conditional: landing x ranks.** GLM K4 max, then EXLR8 max, fixed
    source/checkpoint/prompt hashes, 4096-row units and identical onboarding
    and KV policy wherever both layouts fit. GPU/pinned x 4/6 Sparks is four
    launches/model. If a fixed placement cannot fit both, mark the rank
@@ -262,8 +276,10 @@ Any subsequently landed controls must be checked against their own revision.
    40 min total), explicit load/run timeout; readiness can exceed budget
    when streaming, so report load separately rather than hiding it.
    Ceiling: conditional 15.41 vs 11.02 ms six-rank service estimates, not a
-   guaranteed pinned end-to-end win. Stop immediately on correctness/memory
-   failure; do not pursue a clearly >=5% slower arm without a new hypothesis.
+   guaranteed pinned end-to-end win. A started bounded smoke finishes and
+   tears down naturally; mark failed arms invalid and schedule no follow-up
+   on correctness/memory failure. Do not pursue a clearly >=5% slower arm
+   without a new hypothesis.
    One launch/arm is the screen, repeats only for genuinely borderline wins.
 2. **Once independent chunk controls exist:** same two landing modes x
    reply cutoff off/256 KiB/1 MiB/4 MiB x 4/6 Sparks = 16 configurations
@@ -300,6 +316,209 @@ Prefer true receive/post/completion timings if existing instrumentation can
 supply them; mark missing data instead of using CUDA idle as a surrogate.
 Hold hardware locks only around the run and tear down before releasing.
 No new driver or hardware queue is created by this reference.
+
+## Experiments
+
+### Measured: compact-WS kernel batch, frozen 974d235de
+
+One launch per arm, baseline `12d743f7136e92f98a1898f41d10a9a6bd275f65`
+to candidate `974d235def25603ce42de3140c845d28011f5d86` (SparkInfer
+`080bd9255a01062aa0cc0653810a50aeffad7095`). GLM K4, 2 RTX + 6 Sparks,
+DFlash2, context attention, 2,097,152-token pool and identical five TP2
+onboarded expert layers (3..8). Both arms have transport timing enabled;
+one untimed warm request per length precedes each timed request. These
+are paired profiled measurements, not an unprofiled release card.
+
+| Measured metric | Baseline | Candidate |
+| --- | ---: | ---: |
+| Warm 8K / 64K prefill tok/s | 2051.75 / 2032.29 | 2709.46 / 2604.22 |
+| C1 / C16 aggregate emitted tok/s | 54.040 / 147.139 | 53.679 / 150.457 |
+| C1 / C16 request-step-weighted ms/step | 57.523 / 207.093 | 56.985 / 210.433 |
+| C1 / C16 emitted tokens/step | 3.13115 / 2.57023 | 3.08065 / 2.57023 |
+| Worker execute median ms, 8K / 64K | 25.9045 / 25.918 | 14.059 / 13.953 |
+| Worker inter-service gap median ms, 8K / 64K | 0.015 / 0.015 | 5.425 / 5.813 |
+| Worker inter-service gap p95 ms, 8K / 64K | 4.750 / 4.437 | 7.496 / 10.026 |
+| Reply worker retransmits, 8K / 64K | 16 / 3078 | 7 / 1298 |
+| Reply coordinator OOS, 8K / 64K | 1395 / 98923 | 4578 / 70172 |
+| Reply worker sequence events, 8K / 64K | 627 / 98918 | 4583 / 73276 |
+| Worker TX amplification, 8K / 64K | 0.9859! / 1.2675 | 1.1328 / 1.1923 |
+
+Spark execute drops 45.7% / 46.2%, while end-to-end prefill improves
+32.1% / 28.1%. The candidate remains below the historical 3168/3087 tok/s
+8K/64K anchors (0.855x/0.844x); those are absolute targets, not a matched
+same-session comparison. C1/C16 ratios are 0.9933x/1.0226x, clearing the
+requested 0.98x decode floor. Per-rank summed execute is approximately 3.622 -> 1.975 s
+at 8K and 29.243 -> 15.835 s at 64K, against request prefill wall spans
+3.962 -> 2.998 s and 32.376 -> 25.285 s. This exposes more non-service
+spacing after the compute improvement. The inter-service gap is successive
+worker end timestamps minus the next service total; it is not coordinator
+CPU idle or a measurement of landing alone. It includes reply landing and
+reduction, next-request arrival, coordinator GPU work and scheduling.
+Console handoffs between 16K chunks remain 7-12 us. On ostrich's timed
+8K request, candidate same-layer row-unit gaps have a 5.700 ms median
+(70 pairs), versus 4.873 ms between layers (69 pairs); both baseline
+medians are 0.015 ms. Thus the gap is not solely next-layer attention.
+Full-4096-row 64K per-rank mean execute ranges 25.365-26.171 ms before
+and 13.891-14.266 ms after, confirming the gain across all six ranks.
+Approximate epoch alignment clips a few 64K boundary records (1189-1190
+per worker); sums are approximate. The 8K amplification below one is
+sampling-skew-invalid.
+
+These counters support residual reply contention/replay, not a causal split
+between incast, landing and coordinator work. Traffic-bearing links remain
+100G on Sparks and 400G on raptor. Crucially, the candidate's actual prefill
+intake is **pinned**, not GPU: its coordinator startup line 70 logs
+`mode="pinned"` with `reason=executor retains pinned uploads`; the earlier
+line 55 selects GPU only for the generic/decode transport. Thus the measured
+2709/2604 tok/s prefill did not use direct-GPU landing. The direct-GPU
+19.6 GB/s (157G) proxy and 15.41 ms estimate cannot explain this prefill's
+critical path. The relevant staged-path proxy is the logged harmonic
+27.4 GB/s (219G, about 11.02 ms per full reply wave), still not measured
+remote-wave throughput. Host ingress and subsequent H2D remain distinct
+queues; that harmonic estimate is not a NIC ingress ceiling. The prefill
+landing-mode axis is moot on this frozen multiwave build.
+
+Both arms pass prompt/turn-end byte-exact cache restore and cold recompute,
+128-token spec/no-spec equality and the strict 10/10 lossless set. Strict
+set success is not universal row-width-invariance proof. Quick KL changes
+0.036301322 -> 0.037048855, so the unchanged-KL condition does not pass.
+Object/source audit identifies a changed K4 indexer arithmetic route:
+shared FP8 GEMV shape `(4096,2048)` selects two warps rather than the
+former four, also affecting `_IndexProducerW8` rather than only Flash's
+shared-down projection. Only `glm_index_producer_m64` changes among 90
+hashed GLM coordinator objects; six of eight fidelity windows are identical.
+A separate fix is outside this frozen measurement.
+
+Receipts: `kernel-batch-k4/summary.json` and the two
+`kernel-batch-k4/glm53-exl3-max-{base,cand}-r1/result.json` files under
+`~/.cache/cuteafd/builds/`. Detailed tables and conditions are on #729 and
+#703. No newer source is mixed into the measurements.
+
+### Null: EXLR8 up1 candidate correctness failure
+
+The same frozen baseline/candidate max-layout screen does not yield an
+accepted EXLR8 comparison. Candidate aborts during the C16 warmup with
+`ExpertProtocolV2 route gate_weight must be finite; queued streams drained;
+engine cannot be reused` (2026-10-24T21:49:25Z). Candidate 8K, KL, cache,
+spec and matched decode sweep are therefore unavailable, not regressions
+quantified by a valid ratio. Baseline alone passes quick KL 0.028109469,
+exact cache/spec and strict 10/10, with C1/C16 59.043/141.878 tok/s and
+8K 2299.867 tok/s. Earlier partial baseline-panel decode numbers are not
+accepted paired results. Both arms use a 2,849,024-token pool and zero
+onboarded layers. The run finishes naturally; no source fix or retry is
+mixed into this measurement. Detailed failure receipts are on #729/#703.
+
+### Measured/null: explicit GPU versus pinned, same frozen seal
+
+One launch per setting, same candidate seal `974d235de`, GLM K4,
+2 RTX + 6 Sparks, context attention, five TP2 onboard layers and the
+2,097,152-token pool. Transport timing enabled; one untimed warm request
+per prefill length. The runner completed both attempts naturally.
+
+| Metric | Explicit GPU | Explicit pinned |
+| --- | --- | ---: |
+| Launch / paired validity | Failed before readiness / invalid | Completed / unmatched |
+| Readiness s | NA | 50.749 |
+| Warm 8K / 64K prefill tok/s | NA | 2662.270 / 2537.890 |
+| 8K / 64K TTFT s | NA | 3.059 / 25.999 |
+| C1 / C16 aggregate emitted tok/s | NA | 57.103 / 134.200 |
+| Strict lossless set | Not run | 10/10 pass |
+| Reply worker retransmits, 8K / 64K | NA | 39 / 1798 |
+| Reply worker sequence events, 8K / 64K | NA | 5359 / 80640 |
+| Reply coordinator OOS, 8K / 64K | NA | 5359 / 80655 |
+| Worker TX amplification, 8K / 64K | NA | 1.11649 / 1.21274 |
+
+The explicit-GPU arm fails with `GPU landing has one landing range per rank`.
+`SparkIntake::with_waves` rejects GPU mode when `waves > 1`
+(`rust/crates/cuteafd-daemon/src/shared/spark_intake.rs:428`);
+`SparkLink::new_waves` otherwise chooses a pinned preference at line 1440.
+An explicit GPU setting overrides that preference and reaches the rejection.
+The earlier successful 19.63 GB/s local probe and generic GPU startup lines
+do not establish that the multiwave prefill executor can use GPU landing.
+
+There is **no valid GPU/pinned throughput ratio or causal landing result**.
+The pinned arm supplies standalone measurements only; its paired verdict
+fails because the GPU arm has no prompt hashes. KL, cache-restore and the
+separate spec/no-spec panel were not requested in this landing screen and
+are absent, not passed. The strict set checks its ten cases, not universal
+row-width invariance. Root ports remain 100G on Sparks and 400G on raptor.
+Four-Spark measurement was skipped: this frozen export seal lacks its
+width-512 slices and another build was not justified at 93% root usage.
+
+Receipts: `kernel-incast-tp6/summary.json` and
+`kernel-incast-tp6/glm53-exl3-max-{gpu,pinned}-r1/result.json` under
+`~/.cache/cuteafd/builds/`. No source or network changes, no repeat.
+
+### Measured: candidate-only coordinator Nsight prefill trace
+
+The initial forced-GPU capture fails at the same multiwave guard and writes
+no report. One authorized retry leaves intake at `auto`, uses the same frozen
+candidate, five onboard layers, pool and attention policy, and captures only
+prefill with `PROFILE=nsys,transport-timing`. It completes successfully with
+an 83,776,679-byte coordinator report. No Spark GPU trace is collected.
+The first 8K warm request is outside capture; 64K warmup is inside capture
+but excluded from the timed windows below. Nsight perturbs execution:
+client rates are 2100.01/2126.24 tok/s, not a replacement speed card or a
+paired regression. No quality/cache/spec panels run in this diagnostic.
+
+Console prefill events identify timed requests 4 and 6. Their process epoch
+is aligned to `TARGET_INFO_SESSION_START_TIME.utcEpochNs` in the exported
+SQLite trace. Durations below use clipped interval unions across both RTX
+GPUs, not sums of overlapping kernels. H2D bytes count completed copies
+inside the window; boundary clipping can affect a few records.
+
+| Coordinator trace metric | Timed 8K | Timed 64K |
+| --- | ---: | ---: |
+| Console prefill wall s | 3.4310 | 30.9772 |
+| Any traced CUDA activity union s | 2.1325 | 18.6096 |
+| Neither GPU has traced CUDA activity s | 1.2985 | 12.3676 |
+| H2D bytes GB / active copy union s | 42.026 / 0.7731 | 338.232 / 6.2268 |
+| H2D bytes / summed copy duration GB/s | 54.36 | 54.32 |
+| Peer push/flag-wait kernel union s | 1.2689 | 10.4803 |
+| Other kernel union s | 0.9070 | 8.7201 |
+| Compact reducer summed kernel s | 0.0362 | 0.2922 |
+
+Peer push includes data movement and flag publication, not just idle wait.
+Kernel categories overlap each other and H2D, so these rows must not be
+added into a serial critical-path budget. `cudaEventSynchronize` summed
+host-thread durations are 1.904/16.866 s; they can overlap device work and
+each other and are not CPU execution time. No NVTX ranges appear in this
+export despite the trace selection, limiting phase attribution.
+
+Approximate epoch alignment to ostrich's worker timings gives a more direct
+view of inter-service spacing in this **profiled** run. There are 140/1188
+worker records inside the timed windows; a few 64K boundaries are clipped.
+Execute medians remain 14.232/14.221 ms, but gap medians grow to
+8.317/10.436 ms under profiling, versus 5.425/5.813 ms in the original
+six-worker untraced-CUDA A/B. Do not transfer the following fractions to
+those original gaps as if profiling were free.
+
+| Coordinator activity inside ostrich inter-service gaps | 8K | 64K |
+| --- | ---: | ---: |
+| Gap count / total gap s | 139 / 1.2956 | 1187 / 14.7113 |
+| H2D union s | 0.6657 | 4.2495 |
+| Peer push/flag-wait union s | 0.6223 | 4.2691 |
+| Other kernel union s | 0.0991 | 1.7157 |
+| Any traced CUDA union s | 0.7870 | 6.3049 |
+| No traced CUDA on either RTX s | 0.5086 | 8.4064 |
+
+Again, the activity rows overlap: they are coverage, not additive causal
+shares. The trace establishes substantial pinned uploads and peer exchange
+within the gaps, with the compact reducer a much smaller summed GPU cost.
+It also leaves 39.3%/57.1% of those profiled gaps without traced CUDA.
+That remainder can include remote reply/network wait, host scheduling and
+coordination; it is not proof of CPU idle, incast latency or an isolated
+landing stall. H2D reaches about 54.3 GB/s while copying, so the 27.4 GB/s
+sequential host-plus-H2D probe model is not the measured copy-engine rate.
+The residual path is mixed transfer/synchronization/coordination; exact
+receive/post/land critical-path attribution remains unavailable.
+
+Receipts: `kernel-incast-nsys-auto/glm53-exl3-max-cand-r1/result.json`,
+`console-frames.jsonl`, `smoke/logs/*.ostrich.log` and
+`profile/{nsys-raptor.nsys-rep,nsys-raptor.sqlite,interval-analysis.json}`
+under `~/.cache/cuteafd/builds/`. Export uses the matching dev image's
+Nsight 2026.2 CPU-only, as host Nsight 2026.1 cannot read the newer report.
+No source/network changes or further hardware repeat.
 
 ## Receipt inventory
 
