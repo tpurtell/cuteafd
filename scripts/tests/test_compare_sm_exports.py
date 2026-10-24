@@ -440,13 +440,19 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
     ("glmf", False, "coordinator", (4, 5)),
     ("kimik3", False, "spark", (2, 3)), ("kimik3", False, "coordinator", (2, 3)),
     ("kimik3", False, "coordinator", (3, 4)),
+    ("dsv4p", False, "spark", (2, 3)), ("dsv4p", False, "coordinator", (2, 3)),
+    ("dsv4p", False, "coordinator", (3, 4)),
 ])
 def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compact, role, bits):
     fixture = compare_sm.load_file(
         "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
     package = fixture.package
     # Compare the shipping cooperative compact route and its measured hint.
-    capacities = (1, 80, 256, 1024, 4096) if geometry == "kimik3" else (1, 80, 256, 1024, 2752, 4096)
+    capacities = (
+        (1, 80, 256, 1024, 4096) if geometry == "kimik3"
+        else (1, 16, 80, 256, 1024, 4096) if geometry == "dsv4p"
+        else (1, 80, 256, 1024, 2752, 4096)
+    )
     build_root = tmp_path / "build-fixture"
     build_root.mkdir()
     _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
@@ -486,6 +492,7 @@ def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypa
         ("glmf", [("m80", 80, 288, 8, 8), ("m256-b8", 256, 288, 8, 8),
                   ("m256-b64", 256, 288, 8, 64), ("m1024", 1024, 288, 8, 64)]),
         ("kimik3", [("m80", 80, 896, 16, 8), ("m256", 256, 896, 16, 8), ("m1024", 1024, 896, 16, 64)]),
+        ("dsv4p", [("m80", 80, 384, 6, 8), ("m256", 256, 384, 6, 8), ("m1024", 1024, 384, 6, 64)]),
     ):
         recorded = []
         monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(

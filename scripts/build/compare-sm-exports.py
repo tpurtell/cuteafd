@@ -317,7 +317,10 @@ def _export_exl3(extra, output):
                 options["hidden"] = package.GEOMETRIES[geometry][0]
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
-            block = package.route_block(geometry, rows)
+            role_arg = ((role,) if role != "spark" and (
+                package.route_block.__code__.co_argcount >= 3
+                or (package.route_block.__code__.co_flags & 4)) else ())
+            block = package.route_block(geometry, rows, *role_arg)
             compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
                 geometry, role, width, rows)
             ws = compact_ws or (len(bits) == 2 and tile is None
@@ -340,7 +343,7 @@ def _export_exl3(extra, output):
                     options["tile"] = policy_tile
             elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
                 options["fused_input_rotation"] = True
-            elif len(bits) == 2 and package.token_major_rotation(geometry, rows):
+            elif len(bits) == 2 and package.token_major_rotation(geometry, rows, *role_arg):
                 options["token_major_rotation"] = True
             if block != 8:
                 options["route_block"] = block
@@ -359,9 +362,12 @@ def export_exl3_routes(extra, output):
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
     profiles = package.profiles_for_role("coordinator", geometry)
     _, _, experts, topk, _, _ = profiles[0]
+    role_arg = (("coordinator",) if (
+        package.route_block.__code__.co_argcount >= 3
+        or (package.route_block.__code__.co_flags & 4)) else ())
     for rows in capacities:
         blocks = sorted({64 if package.warp_specialized(geometry, "coordinator", width, rows)
-                         else package.route_block(geometry, rows)
+                         else package.route_block(geometry, rows, *role_arg)
                          for _, width, *_ in profiles})
         for block in blocks:
             stem = f"m{rows}" if len(blocks) == 1 else f"m{rows}-b{block}"

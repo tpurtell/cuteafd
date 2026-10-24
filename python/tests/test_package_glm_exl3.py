@@ -63,12 +63,25 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(spark['tp3-width768'][1], ['tp3-rank0'])
 
     def test_route_policy(self):
-        self.assertEqual([tool.route_block('glm', c) for c in (1, 16, 80, 256, 1024, 4096)],
-                         [8, 8, 8, 8, 64, 64])
-        self.assertEqual([tool.token_major_rotation('glm', c) for c in (80, 256, 1024, 4096)],
-                         [False, False, True, True])
-        # Other geometries keep their policies.
+        for geometry in ('glm', 'glmf', 'kimik3'):
+            self.assertEqual([tool.route_block(geometry, c) for c in (1, 16, 80, 256, 1024, 4096)],
+                             [8, 8, 8, 8, 64, 64])
+            self.assertEqual([tool.token_major_rotation(geometry, c) for c in (80, 256, 1024, 4096)],
+                             [False, False, True, True])
         self.assertEqual([tool.route_block('dsv4p', c) for c in (256, 1024, 4096)], [8, 16, 64])
+        self.assertEqual([tool.route_block('dsv4p', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 64, 64])
+        self.assertEqual([tool.token_major_rotation('dsv4p', c) for c in (80, 256, 1024, 4096)],
+                         [False, False, False, True])
+        self.assertEqual([tool.token_major_rotation('dsv4p', c, 'coordinator') for c in (80, 256, 1024, 4096)],
+                         [False, False, True, True])
+        for width in (1536, 3072):
+            for capacity in (1, 16, 80, 256, 1024, 4096):
+                self.assertFalse(tool.warp_specialized('dsv4p', 'coordinator', width, capacity))
+                self.assertFalse(tool.ws_dynamic_tiles('dsv4p', 'coordinator', width, capacity))
+                self.assertFalse(tool.wire_input('dsv4p', 'coordinator', width, capacity))
+                self.assertIsNone(tool.ws_input_stages('dsv4p', 'coordinator', width, capacity))
+        # Other geometries keep their policies.
         self.assertEqual(tool.route_block('v41', 4096), 8)
 
 

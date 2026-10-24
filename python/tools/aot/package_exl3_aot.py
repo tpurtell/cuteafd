@@ -264,7 +264,7 @@ def swiglu_limit(geometry: str) -> float | None:
     return SWIGLU_LIMITS.get(geometry, 10.0)
 
 
-def route_block(geometry: str, capacity: int) -> int:
+def route_block(geometry: str, capacity: int, role: str = 'spark') -> int:
     """Packed-route M block per capacity: rows of one expert that share a Trellis decode.
 
     V4.1 keeps its qualified 8-row blocks everywhere. DeepSeek V4 Pro Spark prefill
@@ -272,8 +272,10 @@ def route_block(geometry: str, capacity: int) -> int:
     weight tile once per 8 rows, so wide prefill capacities use wider blocks
     (GB10, TP4 width 768, random top-6 routes: m4096 53 -> 25 ms, m1024 15 -> 11 ms;
     m81..256 stays fastest at 8). At m4096, 64-row blocks skip their empty M16
-    fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. The coordinator's whole-intermediate rtx-tp1 package
-    gains the same way (RTX PRO 6000, width 3072: m4096 74 -> 35 ms, m1024 23 -> 16 ms).
+    fragments (b12x 4d7cb455), so they beat 32 from about 2048 rows up. On SM120
+    coordinator exports (`role == 'coordinator'`), m1024 also takes 64-row blocks
+    with token-major rotation (see `glm_route_block` and `warp_specialized`), while
+    non-WS Spark exports keep 16 rows at m1024.
     """
     # Build-time A/B knob: CUTEAFD_EXL3_ROUTE_BLOCKS=CAPACITY=BLOCK[,...].
     override = dict(item.split('=') for item in os.environ.get('CUTEAFD_EXL3_ROUTE_BLOCKS', '').split(',') if item)
@@ -281,7 +283,7 @@ def route_block(geometry: str, capacity: int) -> int:
         return int(override[str(capacity)])
     if geometry == 'qwen4':
         return qwen4_route_block(capacity)
-    if geometry in ('glm', 'glmf', 'kimik3'):
+    if geometry in ('glm', 'glmf', 'kimik3') or (geometry == 'dsv4p' and role == 'coordinator'):
         return glm_route_block(capacity)
     if geometry != 'dsv4p' or capacity <= 256:
         return 8
@@ -297,8 +299,9 @@ def glm_route_block(capacity: int) -> int:
     keeps 8 rows (16 is 1.9% faster on the RTX, but its Spark TP3 width-640
     kernel resolves a residency the native bridge does not take).
     Kimi K3 (896 experts, top-16, capacity / 56 rows per expert on average)
-    follows the same boundary on SM120 coordinator packages (m256 keeps 8 rows;
-    m1024 and m4096 use 64-row blocks, see `warp_specialized`).
+    and DeepSeek V4 Pro (384 experts, top-6, capacity / 64 rows per expert on
+    average) follow the same boundary on SM120 coordinator packages (m256 keeps
+    8 rows; m1024 and m4096 use 64-row blocks, see `warp_specialized`).
     """
     return 8 if capacity <= 256 else 64
 
@@ -313,16 +316,19 @@ def qwen4_route_block(capacity: int) -> int:
     return 8 if capacity <= 80 else 32
 
 
-def token_major_rotation(geometry: str, capacity: int) -> bool:
+def token_major_rotation(geometry: str, capacity: int, role: str = 'spark') -> bool:
     """Whether a capacity rotates each token's input once for all of its routes.
 
-    Bit-identical to per-route rotation. It pays where the rotation phase is
-    large (V4 Pro m2048..4096 prefill); at m1024 and below it is neutral.
+    Bit-identical to per-route rotation.
+    GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
+    Kimi K3 top-16 (SM120): m1024 width1536 8756.86 -> 4909.73 us (1.784x),
+    width3072 17200.77 -> 9633.41 us (1.786x).
+    DeepSeek V4 Pro top-6 (SM120 coordinator): m1024 width1536 5717.82 ->
+    4934.27 us (1.159x, vs 5141.09 us per-route 64-row), width3072 9495.17 ->
+    7999.10 us (1.187x, vs 8277.63 us per-route 64-row); m4096 width1536
+    9543.33 -> 9286.30 us, width3072 17338.02 -> 17122.98 us.
     """
-    if geometry in ('glm', 'glmf', 'qwen4', 'kimik3'):
-        # GLM top-8 (rtx-tp1): m1024 3910 -> 3830 us, m4096 11790 -> 11470 us.
-        # Kimi K3 top-16 (SM120): m1024 width1536 8756.86 -> 4909.73 us (1.784x),
-        # width3072 17200.77 -> 9633.41 us (1.786x).
+    if geometry in ('glm', 'glmf', 'qwen4', 'kimik3') or (geometry == 'dsv4p' and role == 'coordinator'):
         return capacity > 256
     return geometry == 'dsv4p' and capacity > 1024
 
@@ -385,8 +391,11 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     Kimi K3 (H3584/E896/top16, situ, K2 weights with K3 slots, k5_experts=0,
     random top-16 routes, five interleaved rounds of five graph replays):
     m256 stays on 8-row cooperative per-route rotation at both widths
-    (width1536 3429.02 us vs WS 3768.99 us / tok_b64 3888.80 us; width3072
-    7056.03 us vs coop_b64 8195.74 us / WS 8576.67 us). m1024 uses 64-row
+    (width1536 3429.02 us vs WS 3768.99 us / tok_b64 3888.80 us, confirm
+    coop 4224.61 [3231.39..4624.00] vs tok_b8 4101.79 [3232.64..4593.28] us
+    overlapping; width3072 7056.03 us vs coop_b64 8195.74 us / WS 8576.67 us,
+    confirm coop 8629.92 [6746.78..8793.76] vs tok_b8 8543.90
+    [8165.02..8644.26] us, +1.00% overlapping). m1024 uses 64-row
     cooperative token-major rotation (width1536 8756.86 -> 4909.73 us,
     1.784x, overlapping ws_b32 4882.02 us and beating ws_b64 5013.12 us;
     width3072 17200.77 -> 9633.41 us, 1.786x, beating ws_b32 9823.87 us and
@@ -395,6 +404,26 @@ def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> boo
     12151.55 us (2.526x vs coop, 1.060x vs tok_b64 12885.66 us, 1.038x vs
     static WS 12610.62 us); width3072 60103.29 -> 24238.72 us (2.480x vs
     coop, 1.019x vs tok_b64 24700.54 us, 1.035x vs static WS 25099.10 us).
+    DeepSeek V4 Pro (H7168/E384/top6, silu, SwiGLU clamp 10.0, K2 weights
+    with K3 slots, k5_experts=0, random top-6 routes, five interleaved rounds
+    of five graph replays): coordinator stays cooperative at both widths
+     across all prefill capacities. m256 keeps 8-row per-route rotation
+    (width1536 3611.30 [3286.72..3622.56] us vs tok_b8 3573.98
+    [3408.80..3600.00] overlapping, coop_b16 3833.47, ws_b16 4068.00,
+    ws_b64 4234.88; width3072 7080.61 [6302.37..7106.21] us vs tok_b8
+    7020.42 [6939.30..7055.20] overlapping, coop_b16 7572.13, ws_b16 6832.06
+    vs batch coop 6054.56). m1024 switches from 16-row per-route to 64-row
+    token-major rotation (width1536 5717.82 [5008.00..5812.83] -> 4934.27
+    [4324.99..4981.63] us, 1.159x, beating coop_b64 5141.09, ws_b32 5029.50,
+    ws_b64 5064.32, ws_b64_dyn 5082.72 and tying ws_b32_dyn 4926.11;
+    width3072 9495.17 [8846.98..10754.69] -> 7999.10 [7451.58..8132.22] us,
+    1.187x, beating coop_b64 8277.63, ws_b32_dyn 8500.86, ws_b64_s2 8607.36
+    and ws_b64_dyn 9167.49). m4096 keeps 64-row token-major rotation
+    (width1536 9286.30 [9166.50..9771.68] us in batch_a / 9828.10
+    [9252.51..11256.45] in batch_c vs ws_b64_dyn 9537.18 [9214.62..11071.17]
+    and ws_b64 9736.10 [9083.55..11241.34] overlapping; width3072 17122.98
+    [16891.55..20603.78] us vs ws_b64_dyn 17198.75 [17008.26..18261.66] and
+    ws_b64 17650.56 [17566.59..18834.08]).
     Other tier pairs, widths, families and unmeasured capacities stay off.
     """
     if role == 'coordinator':
@@ -907,7 +936,7 @@ def build(args: argparse.Namespace) -> None:
                     options['tile'] = tile
                 if geometry != 'v41':
                     options['hidden'] = hidden
-                block = route_block(geometry, capacity)
+                block = route_block(geometry, capacity, args.role)
                 ws = compact_ws or (len(args.bits) == 2 and tile is None
                                     and (args.role != 'coordinator'
                                          or (geometry, tuple(args.bits)) in (
@@ -936,7 +965,7 @@ def build(args: argparse.Namespace) -> None:
                         options['tile'] = policy_tile
                 elif len(args.bits) == 2 and tile is None and fused_input_rotation(geometry, args.role, width, capacity):
                     options['fused_input_rotation'] = True
-                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity):
+                elif len(args.bits) == 2 and token_major_rotation(geometry, capacity, args.role):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit

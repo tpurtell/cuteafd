@@ -730,8 +730,27 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(package.route_block('dsv4f', capacity), 8)
         self.assertEqual([package.route_block('dsv4p', c) for c in (1, 16, 80, 256, 1024, 4096)],
                          [8, 8, 8, 8, 16, 64])
+        self.assertEqual([package.route_block('dsv4p', c, 'coordinator') for c in (1, 16, 80, 256, 1024, 4096)],
+                         [8, 8, 8, 8, 64, 64])
         self.assertEqual([package.token_major_rotation(g, c) for g in ('v41', 'dsv4f', 'dsv4p')
                           for c in (1024, 4096)], [False, False, False, False, False, True])
+        self.assertEqual([package.token_major_rotation('dsv4p', c, 'coordinator')
+                          for c in (256, 1024, 4096)], [False, True, True])
+        for bits in ((2, 3), (3, 4), (2, 3, 4)):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as temporary:
+                _, _, calls, _ = self.build_fixture(
+                    Path(temporary), 'coordinator', bits, geometry='dsv4p',
+                    capacities=(1, 16, 80, 256, 1024, 4096))
+                for call in calls:
+                    capacity = call.args[3]
+                    self.assertNotIn('warp_specialized', call.kwargs)
+                    self.assertNotIn('+ws-', str(call.args[0]))
+                    if capacity <= 256:
+                        self.assertNotIn('route_block', call.kwargs)
+                        self.assertNotIn('token_major_rotation', call.kwargs)
+                    else:
+                        self.assertEqual(call.kwargs['route_block'], 64)
+                        self.assertEqual(call.kwargs.get('token_major_rotation', False), len(bits) == 2)
 
     def test_qwen4_uneven_blocks_and_route_policy(self):
         """Qwen's five H128 blocks use native unequal TP2 and Spark shards."""
