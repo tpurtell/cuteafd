@@ -466,6 +466,16 @@ pub(crate) struct GoldenArgs {
     /// uncaptured, on the same kernels.
     #[arg(long, value_delimiter = ',')]
     pub width_invariance: Vec<usize>,
+    /// Diagnostic only: save landed Spark replies and existing width taps. Uses
+    /// tokens.bin only, cycling it for --prefill rows on --sequences fresh prompts.
+    #[arg(long, requires = "reply_layers")]
+    pub reply_capture: Option<PathBuf>,
+    /// Subset of layers to download for --reply-capture (comma-separated).
+    #[arg(long, value_delimiter = ',', requires = "reply_capture")]
+    pub reply_layers: Vec<usize>,
+    /// First real rows of each selected layer/wave (decode rows are retained).
+    #[arg(long, default_value_t = 128)]
+    pub reply_rows: usize,
     /// With --bench-verify: prefill this many tokens (the golden prompt
     /// repeated) instead of --prefill, for long-context step costs.
     #[arg(long)]
@@ -1463,6 +1473,36 @@ fn golden(args: GoldenArgs) -> Result<()> {
 
 fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, mut transport: Option<&mut SparkLink<'_>>,
     runtime: &tokio::runtime::Runtime) -> Result<()> {
+    if let Some(dir) = &args.reply_capture {
+        ensure!(transport.is_some() && engine.layers_kv(), "reply capture requires real Sparks and two-GPU layers attention placement");
+        ensure!(args.reply_layers.iter().all(|&l| l < engine.cfg.layers), "reply tap layer out of range");
+        *engine.reply_capture.borrow_mut() = Some(engine::reply_tap::ReplyCapture::new(
+            dir.clone(), args.reply_layers.clone(), args.reply_rows, 28 * (1usize << 30))?);
+        let raw = std::fs::read(args.golden.join("tokens.bin"))?;
+        ensure!(raw.len() % 4 == 0 && !raw.is_empty(), "invalid capture tokens.bin");
+        let tokens: Vec<u32> = raw.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let prefill = args.prefill.unwrap_or(8192);
+        let decode = args.generate.unwrap_or(16);
+        let prompts = args.sequences.unwrap_or(3);
+        ensure!(prefill > 0 && prompts > 0 && prefill + decode <= engine.max_context, "invalid reply capture extent");
+        let mut allocator = engine::PageAllocator::new(engine);
+        for prompt in 0..prompts {
+            let input: Vec<u32> = tokens.iter().copied().cycle().skip(prompt * 127).take(prefill + decode).collect();
+            let mut placement = allocator.admit(input.len())?;
+            for chunk in input[..prefill].chunks(engine.prefill_capacity()) {
+                engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
+            }
+            // The existing hook disables graph replay so taps observe each decode.
+            let mut hook = |_: usize, _: &[u8]| Ok(());
+            for &token in &input[prefill..] {
+                engine.verify(&mut [(&mut placement, 1)], &[token], transport.as_deref_mut().map(|t| (t, runtime)), Some(&mut hook))?;
+            }
+            allocator.release(placement);
+            println!("reply capture prompt {prompt}: {prefill} prefill + {decode} teacher-forced decode rows");
+        }
+        engine.reply_capture.borrow_mut().take();
+        return Ok(());
+    }
     if let Some(dir) = &args.draft_oracle {
         return draft_oracle(args, opened, engine, dir);
     }

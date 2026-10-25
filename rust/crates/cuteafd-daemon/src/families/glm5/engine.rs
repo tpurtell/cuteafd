@@ -36,6 +36,7 @@ use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, PartialDtype,
 mod context;
 mod tp2;
 mod layers;
+pub(crate) mod reply_tap;
 #[path = "engine/native_dense.rs"]
 pub(crate) mod native_dense;
 pub(crate) mod exlr8;
@@ -194,6 +195,7 @@ pub(crate) struct WidthTap {
     pub x: Vec<u8>,
     pub routes: Vec<u8>,
     pub delta: Vec<u8>,
+    pub reply: Option<reply_tap::ReplyTap>,
 }
 
 struct Workspace<'a> {
@@ -362,6 +364,7 @@ pub(crate) struct GlmEngine<'a> {
     /// `glm-golden --width-invariance` only: each MoE layer's input rows, staged
     /// routes and routed+shared output of the steps it verifies.
     pub(crate) width_taps: RefCell<Option<Vec<WidthTap>>>,
+    pub(crate) reply_capture: RefCell<Option<reply_tap::ReplyCapture>>,
     graphs: RefCell<std::collections::HashMap<GraphKey, GraphExec<'a>>>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
@@ -455,6 +458,7 @@ impl<'a> GlmEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             lanes: RefCell::new(Vec::new()), terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: DEFAULT_PREFILL_SPAN_ROWS, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
+            reply_capture: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, embedding, prefill_w8a8: true })
     }
 
