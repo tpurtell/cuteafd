@@ -180,7 +180,7 @@ fn with_backend<T>(args: &ServeArgs,
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
     let endpoint = SparkEndpoint { ring_depth: None, capacity: args.span(), ingress: SparkIngress::Bf16 };
     let clients = admission.ownership.routed_endpoints()?;
-    let config = TcpTransportConfig::default();
+    let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
     // coordinator's own allocations are admitted; the coordinator then loads
     // its weights while the Sparks load theirs (and, pushing, in one group).

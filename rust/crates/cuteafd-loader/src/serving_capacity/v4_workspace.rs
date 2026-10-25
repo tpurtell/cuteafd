@@ -41,19 +41,19 @@ pub fn compiled_c128_width(manifest: &Value, family: &str) -> Result<u64, CacheG
 /// Four peer slots per each of the two prefill lanes, release flags, and
 /// the local TP2 pair's persistent abort word.
 pub fn deepseek_v4_peer_exchange_bytes(hidden: u64, prefill_rows: u64, decode_rows: u64,
-    tp2: bool, exchange_f32: bool) -> Result<u64, CacheGeometryError> {
+    tp2: bool, exchange_f32: bool, waves: u64) -> Result<u64, CacheGeometryError> {
     let slot = if exchange_f32 { product("V4 F32 peer slot", &[prefill_rows.max(decode_rows), hidden, 4])? }
         else { product("V4 prefill peer slot", &[prefill_rows, hidden, 2])?
             .max(product("V4 decode peer slot", &[decode_rows, hidden, if tp2 { 4 } else { 2 }])?) };
-    sum("V4 peer exchange", &[product("V4 peer slots", &[8, slot])?, 256, if tp2 { 256 } else { 0 }])
+    sum("V4 peer exchange", &[product("V4 peer slots", &[4 * waves, slot])?, 256, if tp2 { 256 } else { 0 }])
 }
 
 /// TP2 route-broadcast fallback: two lanes, two parities, per GPU. No
 /// hidden/shared packing buffer, peer wire, or direction multiplier.
-pub fn deepseek_v4_expert_exchange_bytes(_hidden: u64, topk: u64, prefill: u64, decode: u64, _rank: usize)
+pub fn deepseek_v4_expert_exchange_bytes(_hidden: u64, topk: u64, prefill: u64, decode: u64, _rank: usize, waves: u64)
     -> Result<u64, CacheGeometryError> {
     let payload = sum("V4 route payload", &[product("V4 route rows", &[prefill.max(decode), topk, 8])?, 16])?;
-    sum("V4 route exchange", &[product("V4 route slots", &[4, payload])?, 256, 256])
+    sum("V4 route exchange", &[product("V4 route slots", &[2 * waves, payload])?, 256, 256])
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,7 +68,8 @@ pub struct V4WorkspaceScratch {
 pub struct V4WorkspaceRank {
     /// Everything except the pool-unit-sized C4 page tables.
     pub fixed_device_bytes: u64,
-    /// C4 page tables: one row/unit entry in each persistent workspace lane.
+    pub prefill_waves: u64,
+    /// C4 page tables: one request list per prefill slot, one list per decode row.
     pub pool_unit_device_bytes: u64,
     /// Pinned router staging, reported outside GPU admission.
     pub pinned_host_bytes: u64,
@@ -87,7 +88,7 @@ impl V4WorkspaceRank {
                 product(
                     "V4 prefill pool tables",
                     &[
-                        2,
+                        self.prefill_waves,
                         product(
                             "V4 prefill lane table",
                             &[units, self.prefill_lane_table_unit_bytes],
@@ -135,9 +136,10 @@ pub fn deepseek_v4_workspace_scratch(
         }
     }
     let shared_bytes = selected.shared_scratch(sizes);
+    let prefill_kernel_rows = manifest["capacities"]["prefill_rows"].as_u64().unwrap_or(prefill_rows);
     let mut index_topk_bytes = 0;
     for name in [
-        format!("{family}_index_topk_prefill_m{prefill_rows}"),
+        format!("{family}_index_topk_prefill_m{prefill_kernel_rows}"),
         format!("{family}_index_topk_decode_m{decode_rows}"),
     ] {
         let program = programs
@@ -162,6 +164,7 @@ pub fn deepseek_v4_workspace_geometry(
     decode_rows: u64,
     max_context: u64,
     ranks: usize,
+    waves: u64,
     scratch: V4WorkspaceScratch,
 ) -> Result<Vec<V4WorkspaceRank>, CacheGeometryError> {
     if ![1, 2].contains(&ranks)
@@ -184,19 +187,17 @@ pub fn deepseek_v4_workspace_geometry(
         .ok_or(CacheGeometryError::Overflow("V4 C128 table extent"))?;
     (0..ranks)
         .map(|rank| {
-            let prefill = step(cfg, prefill_rows, 2, width, rank, ranks, scratch)?;
+            let prefill = step(cfg, prefill_rows, waves, width, rank, ranks, scratch)?;
             let decode = step(cfg, decode_rows, 1, width, rank, ranks, scratch)?;
             Ok(V4WorkspaceRank {
+                prefill_waves: waves,
                 fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
                 pool_unit_device_bytes: sum(
                     "V4 prefill/decode table slope",
-                    &[prefill.1, decode.1],
+                    &[product("V4 prefill table slope", &[waves, 4])?, decode.1],
                 )?,
                 pinned_host_bytes: sum("V4 prefill/decode pinned staging", &[prefill.2, decode.2])?,
-                prefill_lane_table_unit_bytes: product(
-                    "V4 prefill table slope",
-                    &[prefill_rows, 4],
-                )?,
+                prefill_lane_table_unit_bytes: 4,
                 decode_lane_table_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
             })
         })
@@ -300,14 +301,14 @@ mod expert_exchange_tests {
                 let payload = prefill.max(decode) * 6 * 8 + 16;
                 let lead = 4 * payload + 512;
                 let peer = lead;
-                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, false).unwrap(),
+                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, false, 2).unwrap(),
                     8 * (prefill * h * 2).max(decode * h * 4) + 512);
-                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, true).unwrap(),
+                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, true, true, 2).unwrap(),
                     8 * prefill.max(decode) * h * 4 + 512);
-                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, false, false).unwrap(),
+                assert_eq!(deepseek_v4_peer_exchange_bytes(h, prefill, decode, false, false, 2).unwrap(),
                     8 * prefill.max(decode) * h * 2 + 256);
-                assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 0).unwrap(), lead);
-                assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 1).unwrap(), peer);
+                assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 0, 2).unwrap(), lead);
+                assert_eq!(deepseek_v4_expert_exchange_bytes(h, 6, prefill, decode, 1, 2).unwrap(), peer);
             }
         }
     }
@@ -365,15 +366,16 @@ mod tests {
             index_topk_bytes: 558_007_296,
         };
         let flash =
-            deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, scratch).unwrap();
-        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_711_427_504);
-        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_364_218_800);
-        assert_eq!(flash[0].pool_unit_device_bytes, (4096 * 2 + 64) * 4);
+            deepseek_v4_workspace_geometry(&config(false), 4096, 64, 131072, 2, 2, scratch).unwrap();
+        assert_eq!(flash[0].device_bytes(1032).unwrap(), 3_677_619_184);
+        assert_eq!(flash[1].device_bytes(1032).unwrap(), 3_330_410_480);
+        assert_eq!(flash[0].pool_unit_device_bytes, (2 + 64) * 4);
         let pro = deepseek_v4_workspace_geometry(
             &config(true),
             4096,
             64,
             131072,
+            2,
             2,
             V4WorkspaceScratch {
                 index_topk_bytes: 574_784_512,
@@ -381,15 +383,15 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_940_200_880);
-        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_320_362_416);
+        assert_eq!(pro[0].device_bytes(1032).unwrap(), 4_906_392_560);
+        assert_eq!(pro[1].device_bytes(1032).unwrap(), 4_286_554_096);
         assert_eq!(
             pro[0].device_bytes(1033).unwrap() - pro[0].device_bytes(1032).unwrap(),
             pro[0].pool_unit_device_bytes
         );
         // The table floors are still exact for a custom one-row manifest.
         let tiny =
-            deepseek_v4_workspace_geometry(&config(false), 1, 1, 128, 1, scratch).unwrap()[0];
+            deepseek_v4_workspace_geometry(&config(false), 1, 1, 128, 1, 2, scratch).unwrap()[0];
         assert_eq!(
             tiny.device_bytes(1).unwrap() - tiny.fixed_device_bytes,
             3 * 256
@@ -401,9 +403,9 @@ mod tests {
         for pro in [false, true] {
             let mut cfg = config(pro);
             let scratch = V4WorkspaceScratch::default();
-            let off = deepseek_v4_workspace_geometry(&cfg, 4096, 64, 131072, 2, scratch).unwrap();
+            let off = deepseek_v4_workspace_geometry(&cfg, 4096, 64, 131072, 2, 2, scratch).unwrap();
             cfg.n_mtp_layers = 3;
-            let selected = deepseek_v4_workspace_geometry(&cfg, 4096, 64, 131072, 2, scratch).unwrap();
+            let selected = deepseek_v4_workspace_geometry(&cfg, 4096, 64, 131072, 2, 2, scratch).unwrap();
             // Runtime workspace_here allocates taps per lane plus six shared
             // draft buffers per step, each with the same 256-byte floor.
             let h = cfg.dim as u64;
@@ -441,6 +443,18 @@ mod tests {
                 assert_eq!(runtime, if split { 200 } else { 100 });
                 assert_eq!(planned.index_topk_bytes, 300);
             }
+        }
+    }
+
+    #[test]
+    fn live_v4_units_select_the_compiled_topk_scratch() {
+        let manifest = serde_json::json!({"capacities": {"prefill_rows": 4096}, "programs": [
+            {"name": "dsv4p_index_topk_prefill_m4096", "scratch_bytes_at_capacity": {"scratch": 300}},
+            {"name": "dsv4p_index_topk_decode_m64", "scratch_bytes_at_capacity": {"scratch": 40}}
+        ]});
+        for rows in [512, 1024, 2048, 4096] {
+            assert_eq!(deepseek_v4_workspace_scratch(&manifest, "dsv4p", false, rows, 64)
+                .unwrap().index_topk_bytes, 300);
         }
     }
 

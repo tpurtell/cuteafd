@@ -395,11 +395,20 @@ fn native_layer3_same_quant() -> Result<()> {
 }
 
 /// Keep projection and attention row shapes identical: the serial arm finishes
-/// each chunk, while the pipeline schedules the same three chunks layer-major.
+/// each chunk, while the pipeline schedules the same chunks layer-major.
 #[test]
 #[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
 fn native_prefill_lanes_byte_exact() -> Result<()> {
-    prefill_lanes_byte_exact(3072, 1024)
+    prefill_lanes_byte_exact(3072, 1024, 3)
+}
+
+#[test]
+#[ignore = "requires native SM120 exports, two GPUs and real EXLR8 workers"]
+fn native_prefill_two_waves_byte_exact() -> Result<()> {
+    ensure!(std::env::var("CUTEAFD_SPARK_INTAKE").as_deref() == Ok("pinned")
+        && std::env::var("CUTEAFD_SPARK_EGRESS").as_deref() == Ok("copied"),
+        "two-wave exactness gate requires pinned intake and copied egress on both links");
+    prefill_lanes_byte_exact(8192, 4096, 2)
 }
 
 #[test]
@@ -407,25 +416,24 @@ fn native_prefill_lanes_byte_exact() -> Result<()> {
 fn native_prefill_lanes_long_byte_exact() -> Result<()> {
     let lengths = std::env::var("CUTEAFD_EXLR8_LANE_LENGTHS").unwrap_or_else(|_| "10771,16384,32768".into());
     for length in lengths.split(',') {
-        prefill_lanes_byte_exact(length.parse()?, 4096)?;
+        prefill_lanes_byte_exact(length.parse()?, 4096, 3)?;
     }
     Ok(())
 }
 
-fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
+fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<()> {
     use clap::Parser;
     #[derive(Parser)]
     struct Args {
         #[command(flatten)]
         engine: crate::families::glm5::EngineArgs,
     }
-    const LANES: usize = 3;
     let context = total.next_multiple_of(2 * PAGE_ROWS);
     let mut shape = Vec::new();
     let mut start = 0;
     while start < total {
-        let batch = (total - start).min(chunk * LANES);
-        let count = LANES.min(batch / MIN_LANE_ROWS).max(1);
+        let batch = (total - start).min(chunk * waves);
+        let count = waves.min(batch / MIN_LANE_ROWS).max(1);
         let per_lane = batch.div_ceil(count).next_multiple_of(PAGE_ROWS);
         let mut first = 0;
         while first < batch {
@@ -435,7 +443,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
         }
         start += batch;
     }
-    eprintln!("EXLR8 lane golden total={total} chunk={chunk} shape={shape:?}");
+    eprintln!("EXLR8 lane golden total={total} chunk={chunk} waves={waves} shape={shape:?}");
     let args = Args::try_parse_from([
         "exlr8-lanes".into(),
         "--snapshot".into(),
@@ -451,6 +459,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
         "--max-context".into(), context.to_string().into(),
         "--pool-tokens".into(), context.to_string().into(),
         "--prefill-rows".into(), chunk.to_string().into(),
+        "--prefill-waves".into(), waves.to_string().into(),
         "--rtx-expert-layers".into(), "0".into(),
         "--l2-prefetch".into(), "off".into(),
         "--peers".into(),
@@ -458,8 +467,9 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
     ])?.engine;
     let opened = crate::families::glm5::open(&args)?;
     opened.with_engine(&args, |engine, transport, runtime| {
-        ensure!(engine.prefill_lanes == LANES && engine.lanes.borrow().len() == LANES,
-            "lane exactness gate requires exactly three admitted prefill lanes");
+        ensure!(engine.prefill_lanes == waves
+            && engine.prefill_link.borrow().as_ref().is_some_and(|link| link.waves() == waves),
+            "lane exactness gate requires exactly {waves} admitted waves on the prefill link");
         ensure!(engine.native_experts.len() == 2, "lane gate requires native shared owners");
         let transport = transport.context("lane gate needs real workers")?;
         let mut allocator = PageAllocator::new(engine);
@@ -527,8 +537,8 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
             let serial_state = snapshot()?;
             clear()?;
             let mut pipelined = None;
-            for (batch, (tables, chunks)) in tables.chunks(LANES).zip(chunks.chunks(LANES)).enumerate() {
-                let last = (batch + 1) * LANES >= shape.len();
+            for (batch, (tables, chunks)) in tables.chunks(waves).zip(chunks.chunks(waves)).enumerate() {
+                let last = (batch + 1) * waves >= shape.len();
                 eprintln!("EXLR8 lane golden pipeline total={total} batch={batch} rows={:?}",
                     chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>());
                 let mut link = engine.prefill_link.borrow_mut();
@@ -549,7 +559,7 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize) -> Result<()> {
             ensure!(serial.len() == pipelined.len() && serial.iter().zip(&pipelined)
                 .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits()),
                 "fixed-chunk prefill final logits differ");
-            eprintln!("EXLR8 lanes exact: total={total} chunk={chunk} ranks={} layers={} logits={}",
+            eprintln!("EXLR8 lanes exact: total={total} chunk={chunk} waves={waves} ranks={} layers={} logits={}",
                 engine.ranks(), engine.weights.layers.len(), serial.len());
             Ok(())
         })();

@@ -183,6 +183,11 @@ def jobs(scope):
          ["--geometry", "exlr8_dense", "--only", ",".join(
              f"trellis_{name}{tp}_bf16" for tp in ("", "_tp2")
              for name in ("q_b", "o", "gate_up", "down"))]),
+        ("exlr8-dense-a8", "export_b12x_dsv4_aot.py",
+         ["--geometry", "exlr8_dense", "--only", ",".join(
+             [f"trellis_{name}{tp}_a8" for tp in ("", "_tp2")
+              for name in ("q_b", "o", "gate_up", "down")]
+             + [f"quant_k{k}_a8" for k in (2048, 6144, 8192, 12288, 16384)])]),
         ("exlr8-dense-mxfp8", "export_b12x_dsv4_aot.py",
          ["--geometry", "exlr8_dense", "--only",
           "mxfp8_q_a,mxfp8_kv_a,mxfp8_index_q,mxfp8_index_k"]),
@@ -308,21 +313,35 @@ def _export_exl3(extra, output):
             if package.activation(geometry) != "silu":
                 options["activation"] = package.activation(geometry)
             block = package.route_block(geometry, rows)
-            compact_ws = compact and len(bits) == 2 and package.compact_warp_specialized(
-                geometry, role, width, rows)
+            # A baseline package that predates the measured-tier gate only has
+            # the width/capacity predicate; keep its exports loadable.
+            compact_ws = compact and len(bits) == 2 and (
+                package.compact_ws_export(geometry, role, width, rows, bits)
+                if hasattr(package, 'compact_ws_export') else
+                package.compact_warp_specialized(geometry, role, width, rows))
+            # A baseline package that predates the measured-tier set only has the
+            # two shipped coordinator pairs; keep its exports loadable.
+            ws_tiers = getattr(package, "WS_TIER_PAIRS", (("glm", (4, 5)), ("glmf", (3, 4))))
             ws = compact_ws or (len(bits) == 2 and tile is None
+                                and (role != "coordinator" or (geometry, bits) in ws_tiers)
                                 and package.warp_specialized(geometry, role, width, rows))
             if ws:
-                block = 32 if compact_ws else 64
+                block = (package.compact_ws_route_block(geometry, role, width, rows)
+                         if compact_ws else
+                         package.ws_route_block(geometry, role, width, rows)
+                         if hasattr(package, "ws_route_block") else 64)
+                # The compact keyword only exists where the compact WS policy does;
+                # never pass it to a baseline package that predates the policy.
+                compact_kw = {"compact": True} if compact_ws else {}
                 options["warp_specialized"] = True
-                if package.wire_input(geometry, role, width, rows):
+                if package.wire_input(geometry, role, width, rows, **compact_kw):
                     options["wire_input"] = True
-                stages = package.ws_input_stages(geometry, role, width, rows)
+                stages = package.ws_input_stages(geometry, role, width, rows, **compact_kw)
                 if stages is not None:
                     options["ws_input_stages"] = stages
-                if package.ws_dynamic_tiles(geometry, role, width, rows):
+                if package.ws_dynamic_tiles(geometry, role, width, rows, **compact_kw):
                     options["ws_dynamic_tiles"] = True
-                policy_tile = package.ws_tile(geometry, role, width, rows)
+                policy_tile = package.ws_tile(geometry, role, width, rows, **compact_kw)
                 if policy_tile is not None:
                     options["tile"] = policy_tile
             elif len(bits) == 2 and tile is None and package.fused_input_rotation(geometry, role, width, rows):
@@ -333,6 +352,8 @@ def _export_exl3(extra, output):
                 options["route_block"] = block
             if (limit := package.swiglu_limit(geometry)) != 10.0:
                 options["swiglu_limit"] = limit
+            if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
+                options["decode_schedule"] = schedule
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 
 
@@ -342,11 +363,17 @@ def export_exl3_routes(extra, output):
     from export_b12x_exl3_routes_aot import export
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
-    _, width, experts, topk, _, _ = package.profiles_for_role("coordinator", geometry)[0]
+    profiles = package.profiles_for_role("coordinator", geometry)
+    _, _, experts, topk, _, _ = profiles[0]
     for rows in capacities:
-        block = (64 if package.warp_specialized(geometry, "coordinator", width, rows)
-                 else package.route_block(geometry, rows))
-        export(output / f"m{rows}", rows, experts, topk, block)
+        blocks = sorted({(package.ws_route_block(geometry, "coordinator", width, rows)
+                          if hasattr(package, "ws_route_block") else 64)
+                         if package.warp_specialized(geometry, "coordinator", width, rows)
+                         else package.route_block(geometry, rows)
+                         for _, width, *_ in profiles})
+        for block in blocks:
+            stem = f"m{rows}" if len(blocks) == 1 else f"m{rows}-b{block}"
+            export(output / stem, rows, experts, topk, block)
 
 
 def worker(payload):

@@ -188,10 +188,9 @@ pub fn validate_retired(entries: &[Retired]) -> Result<()> {
             || !entry.config.starts_with("examples/configs") || entry.config.extension().is_none_or(|e| e != "config") {
             bail!("retired config must be examples/configs/<name>.config");
         }
-        let version = entry.release.strip_prefix('v').unwrap_or("");
-        if version.split('.').count() != 3 || !version.split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+        if entry.release.trim().is_empty() || entry.release.chars().any(char::is_control)
             || entry.release_note.trim().is_empty() {
-            bail!("retired cards need a final release tag and an explicit release mapping note");
+            bail!("retired cards need a build version label and an explicit provenance note");
         }
     }
     Ok(())
@@ -617,8 +616,8 @@ fn retired_results(placed: &[Placed], entries: &[Retired]) -> Result<String> {
     if entries.is_empty() { return Ok(String::new()); }
     let escape = crate::render::svg::escape;
     let mut out = String::from("\n### Retired\n\nLast Release-smoke cards for retired configurations; no new measurements. \
-        Release labels use the nearest final release where the archived build was not tagged; hover for provenance.\n\n\
-        <table>\n<tr><th>Model</th><th>Config</th><th>Release</th><th>Last card</th></tr>\n");
+        Version labels identify the actual tagged or development build recorded by each report; hover for provenance.\n\n\
+        <table>\n<tr><th>Model</th><th>Config</th><th>Version</th><th>Last card</th></tr>\n");
     for entry in entries {
         let p = placed.iter().find(|p| p.dir == entry.report)
             .with_context(|| format!("{}: missing retired report {}", entry.name, entry.report.display()))?;
@@ -1196,14 +1195,18 @@ mod tests {
         p.report.profile = "smoke".into();
         p.report.server.build.commit = Some("abc123".into());
         let entry = Retired { name: "old<&".into(), config: "examples/configs/old.config".into(),
-            report: p.dir.clone(), release: "v3.0.0".into(), release_note: "nearest <release>".into() };
+            report: p.dir.clone(), release: "v3 dev 2026-10-14 <local>".into(), release_note: "actual <build>".into() };
         let doc = serde_json::json!({"schema": MATRIX_SCHEMA, "cells": [], "retired": [entry]});
         let matrix = Matrix::parse(&doc.to_string()).unwrap();
         let html = results(&[p.clone()], &matrix).unwrap();
         assert!(html.contains("### Retired"));
         assert!(html.contains("old&lt;&amp;"));
-        assert!(html.contains("abc123; nearest &lt;release&gt;"));
-        assert!(html.contains("v3.0.0</td>"));
+        assert!(html.contains("abc123; actual &lt;build&gt;"));
+        assert!(html.contains("v3 dev 2026-10-14 &lt;local&gt;</td>"));
+        let mut tagged = doc.clone();
+        tagged["retired"][0]["release"] = "v3.0.0-rc5".into();
+        let tagged = Matrix::parse(&tagged.to_string()).unwrap();
+        assert!(results(&[p.clone()], &tagged).unwrap().contains("v3.0.0-rc5</td>"));
         assert!(html.contains("benchmarks/deepseek_v41/old/card.svg"));
         assert!(!html.contains("<th>5090</th>"));
         let newer = marked("newer", 1, None);
@@ -1211,7 +1214,7 @@ mod tests {
         p.report.profile = "speed".into();
         assert!(results(&[p], &matrix).is_err());
         for (key, bad) in [("report", "../escape"), ("config", "examples/configs/../bad.config"),
-            ("release", "v3.0.0-rc5"), ("release_note", ""), ("name", "")] {
+            ("release", ""), ("release", " \t"), ("release", "v3\ninvalid"), ("release_note", ""), ("name", "")] {
             let mut invalid = doc.clone();
             invalid["retired"][0][key] = bad.into();
             assert!(Matrix::parse(&invalid.to_string()).is_err(), "{key}");
@@ -1236,6 +1239,16 @@ mod tests {
         // Once the generated README carries Retired, compare the same main section.
         assert_eq!(current, existing.split_once("\n### Retired").map_or(existing, |(main, _)| main).trim());
         assert_eq!(matrix.retired.len(), 14);
+        let retired = rendered.split_once("\n### Retired").unwrap().1;
+        assert!(!retired.contains("nearest final release"));
+        for entry in &matrix.retired {
+            let report = &placed.iter().find(|p| p.dir == entry.report).unwrap().report;
+            let expected = report.server.build.release.clone()
+                .unwrap_or_else(|| format!("v3 dev {}", &report.created[..10]));
+            assert_eq!(entry.release, expected, "{} must name the actual build", entry.name);
+            assert!(retired.contains(&format!(">{}</td>", crate::render::svg::escape(&expected))));
+            assert!(retired.contains(report.server.build.commit.as_deref().unwrap()));
+        }
         let smoke: crate::smoke::Matrix = serde_json::from_str(&std::fs::read_to_string(
             root.join("scripts/bench/release-smoke-v4.json")).unwrap()).unwrap();
         assert_eq!(serde_json::to_value(&matrix.retired).unwrap(), serde_json::to_value(&smoke.retired).unwrap());

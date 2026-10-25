@@ -854,6 +854,19 @@ def test_dense_native_test_without_sparks(env, monkeypatch):
     assert f'{fixtures}:{fixtures}:ro' in mounts and '--network' not in call
 
 
+def test_rdma_loopback_native_test_without_sparks(env, monkeypatch):
+    write_slot(env['home'], 'i1')
+    monkeypatch.setenv('STUB_RUN_OUTPUT', PASSED)
+    test = env['tmp'] / 'loopback-test'
+    test.write_text('#!/bin/sh\n')
+    test.chmod(0o755)
+    argv = SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1', '--native-test', str(test),
+                         '--rdma', '--', 'transport::tests::loopback', '--exact', '--ignored']
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert '--network' in call and '--device=/dev/infiniband' in call
+
+
 def test_spark_port_checked_only_at_grant():
     """A run queued behind another golden must not fail preflight on its port."""
     import inspect

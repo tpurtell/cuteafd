@@ -21,12 +21,16 @@ pub struct ContextLoad;
 pub struct Options {
     pub lengths: Vec<u64>,
     pub levels: Vec<usize>,
+    /// Additional fresh suffix tokens, targeted using the panel's reference-token calibration.
+    #[serde(default)]
+    pub suffix_tokens: u64,
 }
 impl Default for Options {
     fn default() -> Self {
         Self {
             lengths: vec![32768, 131072],
             levels: vec![1, 8, 16],
+            suffix_tokens: 0,
         }
     }
 }
@@ -48,6 +52,9 @@ impl Options {
                 .collect::<Vec<_>>()
                 .join(","),
         )?;
+        if self.suffix_tokens > 1 << 20 {
+            return Err("context suffix must be 0..=1048576 tokens".into());
+        }
         Ok(())
     }
 }
@@ -69,10 +76,33 @@ fn base(run: &str, length: u64, words: usize) -> Value {
 pub(crate) fn body(configuration: &crate::report::Configuration, messages: Value, output: u64) -> Value {
     crate::request::thinking_off(configuration, json!({"messages": messages, "max_tokens": output, "temperature": 0, "thinking": {"type": "disabled"}}))
 }
-pub(crate) fn request(configuration: &crate::report::Configuration, base: &Value, run: &str, phase: &str, c: usize, i: usize, output: u64) -> Value {
+pub(crate) fn request(configuration: &crate::report::Configuration, base: &Value, run: &str, phase: &str, c: usize, i: usize, output: u64, suffix_tokens: usize) -> Value {
     let mut messages = base.as_array().unwrap().clone();
-    messages.push(json!({"role": "user", "content": format!("[{run}-{phase}-C{c}-{i}] Ignore the notes. Write a complete Python LRU cache module with TTL, a background janitor and pytest tests. Output only code.")}));
+    let mut content = format!("[{run}-{phase}-C{c}-{i}] Ignore the notes. Write a complete Python LRU cache module with TTL, a background janitor and pytest tests. Output only code.");
+    if suffix_tokens > 0 {
+        // The unique tag precedes the corpus, so neither another request nor the warm wave can cache it.
+        let seed = (c as u64 * 257 + i as u64).wrapping_add(if phase == "warm" { 0 } else { 1 << 32 });
+        content.push_str("\n\nFresh reference notes:\n");
+        content.push_str(&corpus(seed, suffix_tokens));
+    }
+    messages.push(json!({"role": "user", "content": content}));
     body(configuration, json!(messages), output)
+}
+
+/// A client must check the returned evidence too: an older server may ignore the request option.
+pub(crate) fn validate_suffix(record: &Value, requested: u64) -> Result<(), String> {
+    if requested == 0 { return Ok(()); }
+    let error = || format!("server does not support context suffix: expected every measured request to report uncached_rows >= {requested}");
+    let points = record["points"].as_array().filter(|p| !p.is_empty()).ok_or_else(error)?;
+    for point in points {
+        let requests = point["requests"].as_array().filter(|r| !r.is_empty()).ok_or_else(error)?;
+        if point["status"] != "ok" || point["suffix_tokens"].as_u64() != Some(requested)
+            || point["c"].as_u64() != Some(requests.len() as u64)
+            || requests.iter().any(|r| r["uncached_rows"].as_u64().is_none_or(|rows| rows < requested)) {
+            return Err(error());
+        }
+    }
+    Ok(())
 }
 
 fn fit(
@@ -194,7 +224,7 @@ impl Panel for ContextLoad {
         let options = ctx.context_load;
         options.validate().map_err(anyhow::Error::msg)?;
         let output = 256.min(ctx.max_output);
-        let suffix = 128;
+        let suffix = 128 + options.suffix_tokens;
         let room = output + suffix + 256;
         let capacity = ctx
             .baseline
@@ -233,6 +263,7 @@ impl Panel for ContextLoad {
             1.0
         };
         let intercept = a.timing.prompt_tokens as f64 - slope * 300.0;
+        let suffix_words = (options.suffix_tokens as f64 / slope).ceil() as usize;
         let mut lengths = Vec::new();
         for &requested in &options.lengths {
             let length = requested.min(ctx.max_context.saturating_sub(room));
@@ -277,7 +308,7 @@ impl Panel for ContextLoad {
                 ctx.client.check()?;
                 let (copied, shared, why) = fit(pool, slots, c, actual, output + suffix, page);
                 let mut point = json!({"context": length, "requested_context": requested, "base_tokens": actual, "c": c,
-                    "cold_ttft_s": cold.timing.ttft_s, "pool_tokens": pool, "tokens_per_page": page, "max_tokens": output, "suffix_allowance_tokens": suffix,
+                    "cold_ttft_s": cold.timing.ttft_s, "pool_tokens": pool, "tokens_per_page": page, "max_tokens": output, "suffix_allowance_tokens": suffix, "suffix_tokens": options.suffix_tokens,
                     "copied_estimate_tokens": copied, "shared_estimate_tokens": shared,
                     "admission_estimate": "shared full pages; one base plus per-request suffix, output and partial tail; state marks observed separately"});
                 let why = why.or_else(|| {
@@ -297,7 +328,7 @@ impl Panel for ContextLoad {
                 );
                 let bodies = |phase| {
                     (0..c)
-                        .map(|i| request(&ctx.info.configuration, &retained, &run, phase, c, i, output))
+                        .map(|i| request(&ctx.info.configuration, &retained, &run, phase, c, i, output, suffix_words))
                         .collect()
                 };
                 // Every request of a retained-base batch re-renders the
@@ -363,7 +394,11 @@ impl Panel for ContextLoad {
                 point["ttft_s"] = json!(median(&mut ttft));
                 point["cached_tokens"] = json!(median(&mut cached));
                 point["prompt_tokens"] = json!(median(&mut prompts));
-                point["requests"] = json!(ok.iter().map(|r| json!({"timing": r.chat.timing, "decode_tok_s": r.chat.timing.decode_tok_s(), "sent_s": r.sent})).collect::<Vec<_>>());
+                let mut uncached: Vec<_> = ok.iter().map(|r|
+                    r.chat.timing.prompt_tokens.saturating_sub(r.chat.timing.cached_tokens) as f64).collect();
+                point["uncached_rows"] = json!(median(&mut uncached));
+                point["requests"] = json!(ok.iter().map(|r| json!({"timing": r.chat.timing, "decode_tok_s": r.chat.timing.decode_tok_s(), "sent_s": r.sent,
+                    "uncached_rows": r.chat.timing.prompt_tokens.saturating_sub(r.chat.timing.cached_tokens)})).collect::<Vec<_>>());
                 point["restore_pages"] = json!(sharing(&before, &samples, c, actual / page));
                 point["observed_peak_active"] =
                     json!(samples.iter().filter_map(|s| s["active"].as_u64()).max());
@@ -383,7 +418,9 @@ impl Panel for ContextLoad {
                 ctx.progress.partial(record(&bases, &points));
             }
         }
-        Ok(record(&bases, &points))
+        let result = record(&bases, &points);
+        validate_suffix(&result, options.suffix_tokens).map_err(anyhow::Error::msg)?;
+        Ok(result)
     }
 }
 
@@ -400,13 +437,15 @@ fn record(bases: &[Value], points: &[Value]) -> Value {
                 json!(p["ttft_s"].as_f64().map(|v| v * 1e3)),
                 p["cached_tokens"].clone(),
                 p["prompt_tokens"].clone(),
+                p["suffix_tokens"].clone(),
+                p["uncached_rows"].clone(),
                 json!(p["cold_ttft_s"].as_f64().map(|v| v * 1e3)),
                 p["restore_pages"].clone(),
                 p["reason"].clone(),
             ]
         })
         .collect();
-    json!({"bases": bases, "points": points, "table": table(&["context", "C", "status", "aggregate tok/s", "median tok/s", "TTFT ms", "cached tokens", "prompt tokens", "cold TTFT ms", "restore pages", "reason"], rows)})
+    json!({"bases": bases, "points": points, "table": table(&["context", "C", "status", "aggregate tok/s", "median tok/s", "TTFT ms", "cached tokens", "prompt tokens", "suffix tokens", "uncached rows", "cold TTFT ms", "restore pages", "reason"], rows)})
 }
 
 #[cfg(test)]
@@ -416,12 +455,58 @@ mod tests {
     fn common_base_and_distinct_suffixes() {
         let b = base("test", 32768, 100);
         assert_eq!(b, base("test", 32768, 100));
-        let a = request(&crate::report::Configuration::default(), &b, "test", "timed", 8, 0, 256);
-        let c = request(&crate::report::Configuration::default(), &b, "test", "timed", 8, 1, 256);
+        let a = request(&crate::report::Configuration::default(), &b, "test", "timed", 8, 0, 256, 0);
+        let c = request(&crate::report::Configuration::default(), &b, "test", "timed", 8, 1, 256, 0);
         assert_eq!(a["messages"][0], c["messages"][0]);
         assert_eq!(a["messages"][1], c["messages"][1]);
         assert_ne!(a["messages"][2], c["messages"][2]);
-        assert_ne!(a, request(&crate::report::Configuration::default(), &b, "test", "warm", 8, 0, 256));
+        assert_ne!(a, request(&crate::report::Configuration::default(), &b, "test", "warm", 8, 0, 256, 0));
+    }
+    #[test]
+    fn zero_suffix_preserves_the_original_request_and_retained_base() {
+        let configuration = crate::report::Configuration::default();
+        let mut retained = base("test", 8192, 100).as_array().unwrap().clone();
+        retained.push(json!({"role": "assistant", "content": "OK"}));
+        let retained = json!(retained);
+        let request = request(&configuration, &retained, "test", "timed", 16, 0, 256, 0);
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(&messages[..3], retained.as_array().unwrap());
+        assert_eq!(messages[3], json!({"role": "user", "content":
+            "[test-timed-C16-0] Ignore the notes. Write a complete Python LRU cache module with TTL, a background janitor and pytest tests. Output only code."}));
+        assert_eq!(Options::default().suffix_tokens, 0);
+    }
+    #[test]
+    fn fresh_suffixes_are_unique_per_request_and_wave_after_the_same_base() {
+        let configuration = crate::report::Configuration::default();
+        let retained = json!([{"role": "system", "content": "retained notes"},
+            {"role": "user", "content": "Read them"}, {"role": "assistant", "content": "OK"}]);
+        let mut suffixes = std::collections::HashSet::new();
+        for phase in ["warm", "timed"] {
+            for i in 0..16 {
+                let request = request(&configuration, &retained, "test", phase, 16, i, 256, 512);
+                let messages = request["messages"].as_array().unwrap();
+                assert_eq!(&messages[..3], retained.as_array().unwrap());
+                let content = messages[3]["content"].as_str().unwrap();
+                assert!(content.starts_with(&format!("[test-{phase}-C16-{i}]")));
+                let notes = content.split_once("Fresh reference notes:\n").unwrap().1;
+                assert!(notes.len() > corpus(0, 32).len());
+                assert!(suffixes.insert(content.to_string()));
+            }
+        }
+        assert_eq!(suffixes.len(), 32);
+    }
+    #[test]
+    fn suffix_evidence_fails_closed_for_old_or_underfilled_servers() {
+        let good = json!({"points": [{"status": "ok", "c": 2, "suffix_tokens": 512,
+            "requests": [{"uncached_rows": 570}, {"uncached_rows": 512}]}]});
+        assert!(validate_suffix(&good, 512).is_ok());
+        assert!(validate_suffix(&json!({}), 0).is_ok());
+        for bad in [json!({}), json!({"points": []}),
+            json!({"points": [{"status": "ok", "c": 1, "requests": [{}]}]}),
+            json!({"points": [{"status": "ok", "c": 1, "suffix_tokens": 512, "requests": [{"uncached_rows": 57}]}]}),
+            json!({"points": [{"status": "ok", "c": 2, "suffix_tokens": 512, "requests": [{"uncached_rows": 570}, {}]}]})] {
+            assert!(validate_suffix(&bad, 512).unwrap_err().contains("server does not support context suffix"));
+        }
     }
     #[test]
     fn pool_fit_uses_shared_not_copied_base() {
@@ -436,6 +521,8 @@ mod tests {
     #[test]
     fn options_validate() {
         assert!(Options::default().validate().is_ok());
+        assert!(Options { suffix_tokens: 512, ..Options::default() }.validate().is_ok());
+        assert!(Options { suffix_tokens: 1048577, ..Options::default() }.validate().is_err());
         assert_eq!(parse_lengths_arg("32768,131072").unwrap(), "32768,131072");
         assert_eq!(parse_levels_arg("1,8,16").unwrap(), "1,8,16");
         assert!(parse_levels_arg("8,8").is_err());

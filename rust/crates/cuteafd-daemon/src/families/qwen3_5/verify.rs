@@ -153,6 +153,8 @@ impl<'a> DenseEngine<'a> {
             let mark = self.checkpoint(&[0])?;
             self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
             self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: keep }])?;
+            // The commit stays queued on the target stream; host reads use the default stream.
+            self.stream.drain()?;
             let mut replay = Vec::new();
             for region in self.mark_regions() {
                 let mut bytes = vec![0; region.bytes];
@@ -309,12 +311,12 @@ impl<'a> DenseEngine<'a> {
             // SAFETY: mark storage and the live bank are retained until the enclosing drain.
             unsafe { self.stream.device.library.copy_d2d_async(dst, src, bytes, self.stream.raw)?; }
         }
-        self.stream.drain()
+        // Every reader and writer of the mark and the live bank runs on this stream.
+        Ok(())
     }
 
     fn restore_mark(&mut self, mark: &DenseMark<'_>) -> Result<()> {
         self.verification.validate(mark)?;
-        self.stream.drain()?;
         self.healthy = false;
         self.move_mark(mark, false)?;
         // Append-only records beyond each saved frontier are unreachable and overwritten.
@@ -346,12 +348,11 @@ impl<'a> DenseEngine<'a> {
     pub(crate) fn verify_taps(&self) -> &[HiddenTap] { &self.verification.taps }
 
     fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
-        self.stream.drain()?;
         self.healthy = false;
         let tokens = &plan.tokens;
         let physical = &plan.physical;
         let library = self.stream.device.library;
-        // SAFETY: output arenas are admitted and no prior consumer remains after the drain.
+        // SAFETY: output arenas are admitted; their prior consumers precede this on the one stream.
         unsafe {
             library.cuda_zero_bytes_async(self.verification.logits.buffer, rows * self.cfg.vocab * 4, self.stream.raw)?;
             library.cuda_zero_bytes_async(self.verification.hidden.buffer, layers.len() * rows * self.cfg.hidden * 2,
@@ -394,7 +395,7 @@ impl<'a> DenseEngine<'a> {
                 unsafe { library.copy_d2d_async(dst, src, width, self.stream.raw)?; }
             }
         }
-        self.stream.drain()?;
+        // The logits and taps carry this stream; selection and drafting wait on it.
         if speculative {
             self.verification.pending = Some(plan);
         } else {
@@ -415,7 +416,6 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
             ensure!(slot < self.slots.len() && !slots[..index].contains(&slot), "duplicate or unadmitted dense checkpoint slot");
         }
         ensure!(self.healthy && self.verification.pending.is_none(), "dense checkpoint requires committed healthy state");
-        self.stream.drain()?;
         self.verification.invalidate()?;
         let mark = DenseMark { owner: self.verification.owner, generation: self.verification.generation,
             slots: slots.iter().map(|&slot| (slot, self.slots[slot].clone())).collect(), storage: self.verification.mark.clone() };
@@ -446,7 +446,7 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         let table = verified.accepted(accepted)?;
         self.restore_mark(mark)?;
         self.healthy = false;
-        let result = self.bank.commit(&table, accepted.len()).and_then(|()| self.stream.drain());
+        let result = self.bank.commit(&table, accepted.len());
         if let Err(error) = result {
             self.restore_mark(mark).context("restoring dense checkpoint after failed commit")?;
             return Err(error);

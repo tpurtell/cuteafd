@@ -12,6 +12,41 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// When a receive loop that has not yet seen its responses hands the executor to
+/// other lanes. A zero quantum (decode) yields on every empty poll and never reads
+/// the clock; a nonzero one spins and reads the clock only once per
+/// [`PollBackoff::SPINS`] polls, since a clock read costs as much as a poll.
+struct PollBackoff {
+    quantum: std::time::Duration,
+    /// Set once the first wait has yielded; the quantum's start (unused at zero).
+    since: Option<std::time::Instant>,
+    spins: u32,
+}
+
+impl PollBackoff {
+    const SPINS: u32 = 64;
+
+    fn new(quantum: std::time::Duration) -> Self { Self { quantum, since: None, spins: 0 } }
+
+    /// After an empty poll: whether to yield now (the first wait always does).
+    fn yield_now(&mut self) -> bool {
+        let Some(since) = self.since else { return true };
+        if self.quantum.is_zero() { return true; }
+        self.spins += 1;
+        if self.spins < Self::SPINS { return false; }
+        self.spins = 0;
+        since.elapsed() >= self.quantum
+    }
+
+    /// The executor came back: restart the quantum. A zero quantum never reads the clock.
+    fn yielded(&mut self) {
+        self.spins = 0;
+        if self.since.is_none() || !self.quantum.is_zero() {
+            self.since = Some(std::time::Instant::now());
+        }
+    }
+}
+
 fn poll_quantum(rows: &[ExpertProtocolV2RowDescriptor]) -> std::time::Duration {
     let decode = !rows.is_empty()
         && rows.iter().all(|row| {
@@ -369,8 +404,7 @@ impl SparkExperts {
         // lost ~3% when an extra drain future sat on this hot path. All shared
         // Spark intakes use this path, including device-landing receipts.
         let mut receipt = WaveReceipt::default();
-        let mut quantum = std::time::Instant::now();
-        let mut first_wait = true;
+        let mut backoff = PollBackoff::new(wave.poll_quantum);
         let result = loop {
             let polled = self.clients.poll(|chunk| {
                 if chunk.landed {
@@ -397,10 +431,9 @@ impl SparkExperts {
             }
             // Let another lane run at the first wait; later polls keep this
             // wave's existing decode/prefill quantum. Ready responses never yield.
-            if first_wait || quantum.elapsed() >= wave.poll_quantum {
-                first_wait = false;
+            if backoff.yield_now() {
                 tokio::task::yield_now().await;
-                quantum = std::time::Instant::now();
+                backoff.yielded();
             } else {
                 std::hint::spin_loop();
             }
@@ -498,8 +531,7 @@ impl SparkExpertPending<'_, '_> {
         // Borrowed legacy callers retain their inline loop. Shared intake uses
         // receive_wave_owned's inline loop; neither adds a separate drain future
         // (that extra future previously cost ~3% at C1, 153.5 -> 148.4 tok/s).
-        let mut quantum = std::time::Instant::now();
-        let mut first_wait = true;
+        let mut backoff = PollBackoff::new(self.poll_quantum);
         loop {
             let receiver = &mut self.receiver;
             if self.owner.clients.poll(|chunk| {
@@ -517,10 +549,9 @@ impl SparkExpertPending<'_, '_> {
             })? {
                 break;
             }
-            if first_wait || quantum.elapsed() >= self.poll_quantum {
-                first_wait = false;
+            if backoff.yield_now() {
                 tokio::task::yield_now().await;
-                quantum = std::time::Instant::now();
+                backoff.yielded();
             } else {
                 std::hint::spin_loop();
             }
@@ -658,6 +689,23 @@ mod tests {
             );
         }
         assert_eq!(poll_quantum(&[]).as_micros(), 250);
+    }
+
+    #[test]
+    fn decode_backoff_yields_every_empty_poll_and_prefill_spins_between_clock_reads() {
+        let mut decode = PollBackoff::new(std::time::Duration::ZERO);
+        for _ in 0..3 {
+            assert!(decode.yield_now());
+            decode.yielded();
+        }
+        let mut prefill = PollBackoff::new(std::time::Duration::from_secs(3600));
+        assert!(prefill.yield_now(), "the first wait always yields");
+        prefill.yielded();
+        assert!((0..4 * PollBackoff::SPINS).all(|_| !prefill.yield_now()), "an unexpired quantum keeps spinning");
+        let mut expired = PollBackoff::new(std::time::Duration::from_nanos(1));
+        expired.yielded();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert!((0..PollBackoff::SPINS).any(|_| expired.yield_now()), "an expired quantum yields within one clock read");
     }
 
     #[test]

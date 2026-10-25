@@ -47,6 +47,8 @@ pub struct RunRequest {
     pub context_lengths: Option<Vec<u64>>,
     #[serde(default)]
     pub context_levels: Option<Vec<usize>>,
+    #[serde(default)]
+    pub context_suffix: Option<u64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -506,6 +508,7 @@ impl Bench {
         let context_load = panels::context_load::Options {
             lengths: request.context_lengths.clone().unwrap_or(defaults.lengths),
             levels: request.context_levels.clone().unwrap_or(defaults.levels),
+            suffix_tokens: request.context_suffix.unwrap_or(defaults.suffix_tokens),
         };
         context_load.validate().map_err(StartError::InvalidContext)?;
         let (name, planned) = match (&request.panels, &request.profile) {

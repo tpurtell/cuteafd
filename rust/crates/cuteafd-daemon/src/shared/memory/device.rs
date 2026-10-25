@@ -364,8 +364,7 @@ impl<'a> PeerTransfer<'a> {
         let stream = Stream::new(destination)?;
         let ready = Event { device: source,
             raw: source.run(|| source.library.cuda_event_create())? };
-        let sm = super::chain::device_enabled()
-            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
+        let sm = Some(destination.run(|| destination.library.v41_peer_copy())?);
         Ok(Self { destination: stream, ready, sm })
     }
 

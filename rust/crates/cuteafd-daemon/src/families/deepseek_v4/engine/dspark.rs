@@ -12,7 +12,7 @@
 //! affects draft quality, never the verified output). The last stage's
 //! mHC head, the shared vocabulary head and the Markov head then pick the
 //! drafts greedily on the device.
-use super::{Dev, Engine, Lane, Workspace, LOCAL_EXPERTS, TAP_ROWS};
+use super::{Dev, Engine, UnitSlot, Workspace, LOCAL_EXPERTS, TAP_ROWS};
 use crate::families::deepseek_v4::local::LocalLayer;
 use crate::families::deepseek_v4::metadata::WINDOW;
 use crate::families::deepseek_v4::pool::Placement;
@@ -53,7 +53,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Records `layer`'s output for the lane's last rows when it is a target.
-    pub(super) fn tap(&self, _w: &Workspace<'_>, lane: &Lane<'_>, layer: usize, t: usize) -> Result<()> {
+    pub(super) fn tap(&self, _w: &Workspace<'_>, lane: &UnitSlot<'_>, layer: usize, t: usize) -> Result<()> {
         if !self.draft_ready() {
             return Ok(());
         }
@@ -72,7 +72,7 @@ impl<'a> Engine<'a> {
     }
 
     /// Writes every stage's main KV for the lane's tapped rows.
-    pub(super) fn write_draft_kv(&self, w: &Workspace<'_>, lane: &Lane<'_>, t: usize, cap: usize) -> Result<()> {
+    pub(super) fn write_draft_kv(&self, w: &Workspace<'_>, lane: &UnitSlot<'_>, t: usize, cap: usize) -> Result<()> {
         let Some(dspark) = self.weights.dspark.as_ref().filter(|_| self.draft_ready()) else { return Ok(()) };
         let (h, n) = (self.cfg.dim, t.min(TAP_ROWS));
         let k = self.cfg.dspark_target_layer_ids.len() * h;
@@ -85,7 +85,7 @@ impl<'a> Engine<'a> {
         let first = t - n;
         for (stage, weights) in dspark.stages.iter().enumerate() {
             let cache = &self.pools[self.cfg.n_layers + stage];
-            self.run(&format!("producer_m{cap}"), &[
+            self.run(&format!("producer_m{}", self.kernel_rows(cap)), &[
                 ("hidden", w.main_x.buffer.ptr), ("positions", offset(&lane.tables.positions, first * 8)),
                 ("main_slots", offset(&lane.tables.main_slots, first * 8)), ("cos_sin", self.rope_window.buffer.ptr),
                 ("w_qkv", weights.ptr("w_qkv")?), ("w_qkv_scale", weights.ptr("w_qkv_scale")?),
@@ -112,14 +112,14 @@ impl<'a> Engine<'a> {
         let rows = draft_rows(requests.len(), block, self.cfg.dspark_block_size, self.decode_rows, inputs.len())?;
         let slot = &self.decode_workspace;
         if slot.borrow().is_none() {
-            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1)?);
+            *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
         }
         let workspace = slot.borrow();
         let w = workspace.as_ref().context("workspace")?;
         // Target and draft steps share one stream and the workspace's query,
         // scratch and logits buffers. Reuse the first lane too: target-only
         // decoding may have initialized this workspace with just one lane.
-        let lane = w.lanes.first().context("dSpark decode workspace has no lane")?;
+        let lane = w.slots.first().context("dSpark decode workspace has no lane")?;
         let (mut positions, mut slots) = (Vec::with_capacity(rows), Vec::with_capacity(rows));
         let (mut indices, mut lengths) = (vec![-1i32; rows * WINDOW], Vec::with_capacity(rows));
         for (index, request) in requests.iter().enumerate() {
@@ -159,7 +159,7 @@ impl<'a> Engine<'a> {
                 ("base", weights.ptr("attn.base")?), ("norm", weights.ptr("attn.norm")?), ("post", lane.post.buffer.ptr),
                 ("comb", lane.comb.buffer.ptr), ("y", w.y.buffer.ptr), ("scratch", w.scratch.buffer.ptr),
             ], &[scalar])?;
-            self.run(&format!("producer_m{cap}"), &[
+            self.run(&format!("producer_m{}", self.kernel_rows(cap)), &[
                 ("hidden", w.y.buffer.ptr), ("positions", m.positions.buffer.ptr), ("main_slots", m.main_slots.buffer.ptr),
                 ("cos_sin", self.rope_window.buffer.ptr), ("w_qkv", weights.ptr("w_qkv")?),
                 ("w_qkv_scale", weights.ptr("w_qkv_scale")?), ("w_q", weights.ptr("w_q")?),

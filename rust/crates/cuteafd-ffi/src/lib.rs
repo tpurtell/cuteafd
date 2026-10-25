@@ -484,12 +484,14 @@ pub mod native_library_lifetime_fixture;
 mod native_library_lifetime;
 
 use anyhow::{Context, Result};
-use libloading::{Library, Symbol};
+use libloading::Library;
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
+use libloading::Symbol;
 use std::ffi::{CStr, CString};
 use std::mem::ManuallyDrop;
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// CUDA graph captures begun through this crate since the process started
@@ -1656,8 +1658,146 @@ type XGrammarMatcherIsCompletedFn = unsafe extern "C" fn(
     error_bytes: usize,
 ) -> CuteafdStatus;
 
+// Each private accessor binds one export to one ABI and caches failures as well as
+// pointers. No accessor or raw pointer escapes the NativeLibrary owner; its module
+// remains loaded through all calls and staging teardown (or is quarantined).
+macro_rules! native_symbols {
+    ($($name:ident: $ty:ty,)*) => {
+        #[derive(Default)]
+        struct NativeSymbols {
+            $($name: OnceLock<std::result::Result<$ty, Arc<libloading::Error>>>,)*
+        }
+
+        impl NativeLibrary {
+            $(fn $name(&self) -> Result<$ty> {
+                self.symbols.$name.get_or_init(|| {
+                    // SAFETY: each export below declares its native C ABI. The
+                    // pointer is private and used only while self owns the DSO.
+                    unsafe { self.lib.get::<$ty>(stringify!($name).as_bytes()) }
+                        .map(|symbol| *symbol).map_err(Arc::new)
+                }).as_ref().copied().map_err(|error| anyhow::Error::new(error.clone()))
+            })*
+        }
+    };
+}
+
+native_symbols! {
+    cuteafd_xgrammar_compile: XGrammarCompileFn,
+    cuteafd_xgrammar_matcher_create: XGrammarMatcherCreateFn,
+    cuteafd_xgrammar_matcher_fork: XGrammarMatcherForkFn,
+    cuteafd_xgrammar_matcher_fill_bitmask: XGrammarMatcherFillBitmaskFn,
+    cuteafd_xgrammar_matcher_accept_token: XGrammarMatcherAcceptTokenFn,
+    cuteafd_xgrammar_matcher_is_completed: XGrammarMatcherIsCompletedFn,
+    cuteafd_native_version: VersionFn,
+    cuteafd_alloc_host_buffer: AllocHostBufferFn,
+    cuteafd_cuda_host_buffer_device_alias: CudaHostBufferDeviceAliasFn,
+    cuteafd_free_host_buffer: FreeHostBufferFn,
+    cuteafd_cuda_memory_info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus,
+    cuteafd_cuda_get_device: unsafe extern "C" fn(*mut i32) -> CuteafdStatus,
+    cuteafd_cuda_set_device: unsafe extern "C" fn(i32) -> CuteafdStatus,
+    cuteafd_cuda_enable_peer: unsafe extern "C" fn(i32) -> CuteafdStatus,
+    cuteafd_copy_peer_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, *mut c_void) -> CuteafdStatus,
+    cuteafd_copy_device_rows_async: unsafe extern "C" fn(CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, usize, usize, usize, *mut c_void) -> CuteafdStatus,
+    cuteafd_alloc_device_buffer: AllocDeviceBufferFn,
+    cuteafd_alloc_managed_device_buffer: AllocManagedDeviceBufferFn,
+    cuteafd_free_device_buffer: FreeDeviceBufferFn,
+    cuteafd_cuda_stream_create: CudaStreamCreateFn,
+    cuteafd_cuda_stream_destroy: CudaStreamDestroyFn,
+    cuteafd_cuda_stream_synchronize: CudaStreamSynchronizeFn,
+    cuteafd_cuda_stream_query: CudaStreamQueryFn,
+    cuteafd_cuda_stream_wait_event: CudaStreamWaitEventFn,
+    cuteafd_cuda_event_create: CudaEventCreateFn,
+    cuteafd_cuda_event_create_ordering: CudaEventCreateFn,
+    cuteafd_cuda_event_destroy: CudaEventDestroyFn,
+    cuteafd_cuda_event_record: CudaEventRecordFn,
+    cuteafd_cuda_event_record_external: CudaEventRecordFn,
+    cuteafd_cuda_event_synchronize: CudaEventSynchronizeFn,
+    cuteafd_cuda_event_elapsed_ms: CudaEventElapsedMsFn,
+    cuteafd_cuda_graph_census_begin: unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char, u64, i32, i32, *mut *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_graph_census_end: unsafe extern "C" fn(*mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_graph_begin_capture: CudaGraphBeginCaptureFn,
+    cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
+    cuteafd_cuda_graph_launch: CudaGraphLaunchFn,
+    cuteafd_cuda_graph_exec_destroy: CudaGraphExecDestroyFn,
+    cuteafd_copy_h2d: CopyH2DFn,
+    cuteafd_copy_h2d_async: CopyH2DAsyncFn,
+    cuteafd_copy_h2d_batch_async: CopyH2DBatchAsyncFn,
+    cuteafd_copy_h2d_2d_async: CopyH2D2DAsyncFn,
+    cuteafd_copy_d2h: CopyD2HFn,
+    cuteafd_copy_d2d: CopyD2DFn,
+    cuteafd_copy_d2h_async: CopyD2HAsyncFn,
+    cuteafd_copy_d2d_2d_async: unsafe extern "C" fn(CuteafdDeviceBuffer, usize, CuteafdDeviceBuffer, usize, usize, usize, *mut c_void) -> CuteafdStatus,
+    cuteafd_copy_d2d_async: CopyD2DAsyncFn,
+    cuteafd_cuda_kv_cache_write_blocks_async: unsafe extern "C" fn(*const u8, *mut u8, *const u64, *const u64, *const u64, usize, *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_engram_dequant_bf16_async: unsafe extern "C" fn(*const u8, *const u8, *mut u16, i32, *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_engram_nvfp4_dequant_bf16_async: unsafe extern "C" fn(*const u8, *const u8, f32, *mut u16, i32, *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_engram_gate_bf16_async: unsafe extern "C" fn(*const u16, *const u16, *const u16, *const u16, *const u8, *mut u16, i32, *mut c_void) -> CuteafdStatus,
+    cuteafd_cuda_ds4_rmsnorm_bf16_rne_async: CudaDs4RmsNormBf16RneAsyncFn,
+    cuteafd_cuda_nvfp4_pad_expert_async: CudaNvfp4PadExpertAsyncFn,
+    cuteafd_cuda_nvfp4_swizzle_scale_async: CudaNvfp4SwizzleScaleAsyncFn,
+    cuteafd_cuda_zero_bytes: CudaZeroBytesFn,
+    cuteafd_cuda_zero_bytes_async: CudaZeroBytesAsyncFn,
+    cuteafd_cuda_accumulate_bf16_to_f32_async: CudaAccumulateBf16ToF32AsyncFn,
+    cuteafd_cuda_f32_to_bf16: CudaF32ToBf16Fn,
+    cuteafd_cuda_f32_to_bf16_async: CudaF32ToBf16AsyncFn,
+    cuteafd_cuda_gather_rows_f32_to_fp8_e4m3_row_scaled_async: CudaGatherRowsF32ToFp8E4m3RowScaledAsyncFn,
+    cuteafd_cuda_gather_rows_f32_to_nvfp4_e2m1_fp8_e4m3_async: CudaGatherRowsF32ToNvfp4E2m1Fp8E4m3AsyncFn,
+    cuteafd_cuda_reduce_route_shards_to_f32_async: CudaReduceRouteShardsToF32AsyncFn,
+    cuteafd_cuda_embedding_lookup_bf16_async: CudaEmbeddingLookupBf16AsyncFn,
+    cuteafd_cuda_v41_target_sample_async: CudaV41TargetSampleAsyncFn,
+    cuteafd_cuda_v41_target_sample: CudaV41TargetSampleFn,
+    cuteafd_cuda_v41_topk_select_async: CudaV41TopkSelectAsyncFn,
+    cuteafd_cuda_v41_topk_select: CudaV41TopkSelectFn,
+    cuteafd_cuda_v41_nucleus_async: CudaV41NucleusAsyncFn,
+    cuteafd_cuda_v41_nucleus: CudaV41NucleusFn,
+    cuteafd_cuda_logits_argmax_checked_f32_async: CudaLogitsArgmaxF32AsyncFn,
+    cuteafd_rdma_device_info: RdmaDeviceInfoFn,
+    cuteafd_rdma_plan_host_buffer_registration: RdmaPlanHostBufferRegistrationFn,
+    cuteafd_rdma_register_host_buffer_probe: RdmaRegisterHostBufferProbeFn,
+    cuteafd_rdma_create_rc_qp_probe: RdmaCreateRcQpProbeFn,
+    cuteafd_rdma_rc_send_recv_loopback_probe: RdmaRcSendRecvLoopbackProbeFn,
+    cuteafd_rdma_rc_protocol_v2_loopback_probe: RdmaRcProtocolV2LoopbackProbeFn,
+    cuteafd_rdma_rc_endpoint_create: RdmaRcEndpointCreateFn,
+    cuteafd_rdma_rc_endpoint_create_with_buffer_flags: RdmaRcEndpointCreateWithBufferFlagsFn,
+    cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags: RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn,
+    cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags: RdmaRcEndpointCreateOnGidWithBufferFlagsFn,
+    cuteafd_rdma_rc_endpoint_buffer_view: RdmaRcEndpointBufferViewFn,
+    cuteafd_rdma_rc_endpoint_connect: RdmaRcEndpointConnectFn,
+    cuteafd_rdma_rc_endpoint_connect_flow_label: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const c_char, u32) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_expose_send_read: unsafe extern "C" fn(*mut c_void, usize, *mut u64, *mut u32) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_read_wait: unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u32) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_post_recv: RdmaRcEndpointPostRecvFn,
+    cuteafd_rdma_rc_endpoint_post_recv_at: RdmaRcEndpointPostRecvAtFn,
+    cuteafd_rdma_rc_endpoint_set_recv_landing: RdmaRcEndpointSetRecvLandingFn,
+    cuteafd_rdma_gpu_landing_probe: RdmaGpuLandingProbeFn,
+    cuteafd_rdma_rc_endpoint_post_send_at: RdmaRcEndpointPostSendAtFn,
+    cuteafd_rdma_rc_endpoint_send: RdmaRcEndpointSendFn,
+    cuteafd_rdma_rc_endpoint_send_at: RdmaRcEndpointSendAtFn,
+    cuteafd_rdma_rc_endpoint_send_parts_at: RdmaRcEndpointSendPartsAtFn,
+    cuteafd_rdma_rc_endpoint_poll: RdmaRcEndpointPollFn,
+    cuteafd_rdma_rc_endpoint_copy_recv: RdmaRcEndpointCopyRecvFn,
+    cuteafd_rdma_rc_endpoint_copy_recv_at: RdmaRcEndpointCopyRecvAtFn,
+    cuteafd_rdma_rc_endpoint_expose_device: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_post_write_flagged: unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u64, u64, u32, u64) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_register_region: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_post_send_slot_region: unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, u64) -> CuteafdStatus,
+    cuteafd_rdma_rc_endpoint_destroy: RdmaRcEndpointDestroyFn,
+    cuteafd_rdma_rc_endpoint_quiesce: RdmaRcEndpointDestroyFn,
+    cuteafd_last_error: LastErrorFn,
+    cuteafd_cuda_device_synchronize: unsafe extern "C" fn() -> i32,
+    cuteafd_cuda_device_info: unsafe extern "C" fn(i32, *mut CuteafdCudaDeviceInfo) -> CuteafdStatus,
+    cuteafd_xgrammar_compiler_destroy: XGrammarCompilerDestroyFn,
+    cuteafd_xgrammar_grammar_destroy: XGrammarGrammarDestroyFn,
+    cuteafd_xgrammar_matcher_destroy: XGrammarMatcherDestroyFn,
+    cuteafd_nccl_comm_destroy: NcclCommDestroyFn,
+    cuteafd_rdma_rc_endpoint_poll_with_timeout: RdmaRcEndpointPollWithTimeoutFn,
+    cuteafd_xgrammar_compiler_create: XGrammarCompilerCreateFn,
+    cuteafd_xgrammar_compiler_create_json: XGrammarCompilerCreateFn,
+}
+
 pub struct NativeLibrary {
     lib: ManuallyDrop<Library>,
+    symbols: NativeSymbols,
     quarantine_after_failed_drain: AtomicBool,
     sync_h2d_staging: Mutex<SyncH2DStagingBuffer>,
     ordered_h2d_staging: Mutex<std::collections::BTreeMap<(i32, usize, usize), OrderedH2DStaging>>,
@@ -1717,20 +1857,18 @@ impl NativeLibrary {
     ) -> Result<CuteafdXGrammarCompiler<'a>> {
         let path = CString::new(tokenizer_json_path.to_string_lossy().as_bytes())
             .context("XGrammar tokenizer path contains a NUL byte")?;
-        self.xgrammar_compiler_input(&path, b"cuteafd_xgrammar_compiler_create", vocab_size, stop_token_ids)
+        self.xgrammar_compiler_input(&path, self.cuteafd_xgrammar_compiler_create()?, vocab_size, stop_token_ids)
     }
 
     /// Compile from the already loaded checkpoint tokenizer, including native TikToken snapshots.
     pub fn xgrammar_compiler_json<'a>(&'a self, tokenizer_json: &str, vocab_size: usize,
         stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
         let json = CString::new(tokenizer_json).context("XGrammar tokenizer JSON contains a NUL byte")?;
-        self.xgrammar_compiler_input(&json, b"cuteafd_xgrammar_compiler_create_json", vocab_size, stop_token_ids)
+        self.xgrammar_compiler_input(&json, self.cuteafd_xgrammar_compiler_create_json()?, vocab_size, stop_token_ids)
     }
 
-    fn xgrammar_compiler_input<'a>(&'a self, input: &std::ffi::CStr, symbol: &[u8], vocab_size: usize,
+    fn xgrammar_compiler_input<'a>(&'a self, input: &std::ffi::CStr, create: XGrammarCompilerCreateFn, vocab_size: usize,
         stop_token_ids: &[i32]) -> Result<CuteafdXGrammarCompiler<'a>> {
-        // SAFETY: both native entry points share this signature and consume input before returning.
-        let create: Symbol<XGrammarCompilerCreateFn> = unsafe { self.lib.get(symbol)? };
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         // SAFETY: the input and stop-token slices remain live; native code initializes the owned handle.
@@ -1770,8 +1908,7 @@ impl<'a> CuteafdXGrammarCompiler<'a> {
                 CString::new(value).context("XGrammar source contains an embedded NUL byte")
             })
             .transpose()?;
-        let compile: Symbol<XGrammarCompileFn> =
-            unsafe { self.library.lib.get(b"cuteafd_xgrammar_compile")? };
+        let compile: XGrammarCompileFn = self.library.cuteafd_xgrammar_compile()?;
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         let status = unsafe {
@@ -1798,8 +1935,7 @@ impl<'a> CuteafdXGrammarCompiler<'a> {
 
 impl<'a> CuteafdXGrammarGrammar<'a> {
     pub fn matcher(&self) -> Result<CuteafdXGrammarMatcher<'a>> {
-        let create: Symbol<XGrammarMatcherCreateFn> =
-            unsafe { self.library.lib.get(b"cuteafd_xgrammar_matcher_create")? };
+        let create: XGrammarMatcherCreateFn = self.library.cuteafd_xgrammar_matcher_create()?;
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         let status = unsafe { create(self.handle, &mut handle, error.as_mut_ptr(), error.len()) };
@@ -1814,8 +1950,7 @@ impl<'a> CuteafdXGrammarGrammar<'a> {
 
 impl<'a> CuteafdXGrammarMatcher<'a> {
     pub fn fork(&self) -> Result<Self> {
-        let fork: Symbol<XGrammarMatcherForkFn> =
-            unsafe { self.library.lib.get(b"cuteafd_xgrammar_matcher_fork")? };
+        let fork: XGrammarMatcherForkFn = self.library.cuteafd_xgrammar_matcher_fork()?;
         let mut handle = std::ptr::null_mut();
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         let status = unsafe { fork(self.handle, &mut handle, error.as_mut_ptr(), error.len()) };
@@ -1829,11 +1964,7 @@ impl<'a> CuteafdXGrammarMatcher<'a> {
 
     pub fn fill_bitmask(&mut self, bitmask: &mut [u32]) -> Result<bool> {
         anyhow::ensure!(!bitmask.is_empty(), "XGrammar bitmask is empty");
-        let fill: Symbol<XGrammarMatcherFillBitmaskFn> = unsafe {
-            self.library
-                .lib
-                .get(b"cuteafd_xgrammar_matcher_fill_bitmask")?
-        };
+        let fill: XGrammarMatcherFillBitmaskFn = self.library.cuteafd_xgrammar_matcher_fill_bitmask()?;
         let mut needs_mask = 0;
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         let status = unsafe {
@@ -1851,11 +1982,7 @@ impl<'a> CuteafdXGrammarMatcher<'a> {
     }
 
     pub fn accept_token(&mut self, token_id: u32) -> Result<bool> {
-        let accept: Symbol<XGrammarMatcherAcceptTokenFn> = unsafe {
-            self.library
-                .lib
-                .get(b"cuteafd_xgrammar_matcher_accept_token")?
-        };
+        let accept: XGrammarMatcherAcceptTokenFn = self.library.cuteafd_xgrammar_matcher_accept_token()?;
         let mut accepted = 0;
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         let status = unsafe {
@@ -1872,11 +1999,7 @@ impl<'a> CuteafdXGrammarMatcher<'a> {
     }
 
     pub fn is_completed(&self) -> Result<bool> {
-        let completed: Symbol<XGrammarMatcherIsCompletedFn> = unsafe {
-            self.library
-                .lib
-                .get(b"cuteafd_xgrammar_matcher_is_completed")?
-        };
+        let completed: XGrammarMatcherIsCompletedFn = self.library.cuteafd_xgrammar_matcher_is_completed()?;
         let mut is_completed = 0;
         let mut error = [0 as c_char; XGRAMMAR_ERROR_BYTES];
         let status = unsafe {
@@ -1894,11 +2017,7 @@ impl<'a> CuteafdXGrammarMatcher<'a> {
 
 impl Drop for CuteafdXGrammarCompiler<'_> {
     fn drop(&mut self) {
-        if let Ok(destroy) = unsafe {
-            self.library
-                .lib
-                .get::<XGrammarCompilerDestroyFn>(b"cuteafd_xgrammar_compiler_destroy")
-        } {
+        if let Ok(destroy) = self.library.cuteafd_xgrammar_compiler_destroy() {
             let _ = unsafe { destroy(self.handle) };
         }
         self.handle = std::ptr::null_mut();
@@ -1907,11 +2026,7 @@ impl Drop for CuteafdXGrammarCompiler<'_> {
 
 impl Drop for CuteafdXGrammarGrammar<'_> {
     fn drop(&mut self) {
-        if let Ok(destroy) = unsafe {
-            self.library
-                .lib
-                .get::<XGrammarGrammarDestroyFn>(b"cuteafd_xgrammar_grammar_destroy")
-        } {
+        if let Ok(destroy) = self.library.cuteafd_xgrammar_grammar_destroy() {
             let _ = unsafe { destroy(self.handle) };
         }
         self.handle = std::ptr::null_mut();
@@ -1920,11 +2035,7 @@ impl Drop for CuteafdXGrammarGrammar<'_> {
 
 impl Drop for CuteafdXGrammarMatcher<'_> {
     fn drop(&mut self) {
-        if let Ok(destroy) = unsafe {
-            self.library
-                .lib
-                .get::<XGrammarMatcherDestroyFn>(b"cuteafd_xgrammar_matcher_destroy")
-        } {
+        if let Ok(destroy) = self.library.cuteafd_xgrammar_matcher_destroy() {
             let _ = unsafe { destroy(self.handle) };
         }
         self.handle = std::ptr::null_mut();
@@ -1960,11 +2071,7 @@ impl Drop for CuteafdNcclComm {
         if self.handle.is_null() {
             return;
         }
-        if let Ok(destroy_fn) = unsafe {
-            self.library
-                .lib
-                .get::<NcclCommDestroyFn>(b"cuteafd_nccl_comm_destroy")
-        } {
+        if let Ok(destroy_fn) = self.library.cuteafd_nccl_comm_destroy() {
             let _ = unsafe { destroy_fn(self.handle) };
         }
         self.handle = std::ptr::null_mut();
@@ -2036,11 +2143,11 @@ impl SyncH2DStagingBuffer {
         Ok(self.buffer)
     }
 
-    fn release_with_library(&mut self, lib: &Library) {
+    fn release_with_library(&mut self, library: &NativeLibrary) {
         if self.buffer.ptr.is_null() {
             return;
         }
-        if let Ok(free_fn) = unsafe { lib.get::<FreeHostBufferFn>(b"cuteafd_free_host_buffer") } {
+        if let Ok(free_fn) = library.cuteafd_free_host_buffer() {
             memory_ledger::record_free(self.buffer.ptr as usize);
             let _ = unsafe { free_fn(&mut self.buffer) };
         }
@@ -2061,8 +2168,8 @@ impl Drop for NativeLibrary {
             tracing::error!(%error, "retaining ordered uploads after failed completion drain");
             return;
         }
-        if let Ok(staging) = self.sync_h2d_staging.get_mut() {
-            staging.release_with_library(&self.lib);
+        if let Ok(mut staging) = self.sync_h2d_staging.lock() {
+            staging.release_with_library(self);
         }
         // SAFETY: this is the sole normal-path owner of the module. Staging
         // was released while its free function was still loaded; quarantine
@@ -2103,6 +2210,7 @@ impl NativeLibrary {
         sync_expert_hidden(&lib)?;
         Ok(Self {
             lib: ManuallyDrop::new(lib),
+            symbols: NativeSymbols::default(),
             quarantine_after_failed_drain: AtomicBool::new(false),
             sync_h2d_staging: Mutex::new(SyncH2DStagingBuffer::default()),
             ordered_h2d_staging: Mutex::new(Default::default()),
@@ -2133,7 +2241,7 @@ impl NativeLibrary {
     }
 
     pub fn version(&self) -> Result<String> {
-        let version_fn: Symbol<VersionFn> = unsafe { self.lib.get(b"cuteafd_native_version")? };
+        let version_fn: VersionFn = self.cuteafd_native_version()?;
         let mut buf = vec![0 as c_char; 128];
         let status = unsafe { version_fn(buf.as_mut_ptr(), buf.len()) };
         self.status_to_result("cuteafd_native_version", status)?;
@@ -2146,8 +2254,7 @@ impl NativeLibrary {
 
 
     pub fn alloc_host_buffer(&self, bytes: usize) -> Result<CuteafdHostBuffer> {
-        let alloc_fn: Symbol<AllocHostBufferFn> =
-            unsafe { self.lib.get(b"cuteafd_alloc_host_buffer")? };
+        let alloc_fn: AllocHostBufferFn = self.cuteafd_alloc_host_buffer()?;
         let mut buffer = CuteafdHostBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_host_buffer", status)?;
@@ -2162,8 +2269,7 @@ impl NativeLibrary {
         if host.ptr.is_null() || host.bytes == 0 {
             anyhow::bail!("mapped host buffer is empty");
         }
-        let alias_fn: Symbol<CudaHostBufferDeviceAliasFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_host_buffer_device_alias")? };
+        let alias_fn: CudaHostBufferDeviceAliasFn = self.cuteafd_cuda_host_buffer_device_alias()?;
         let mut alias = CuteafdDeviceBuffer::default();
         let status = unsafe { alias_fn(host, &mut alias) };
         self.status_to_result("cuteafd_cuda_host_buffer_device_alias", status)?;
@@ -2171,7 +2277,7 @@ impl NativeLibrary {
     }
 
     pub fn free_host_buffer(&self, buffer: &mut CuteafdHostBuffer) -> Result<()> {
-        let free_fn: Symbol<FreeHostBufferFn> = unsafe { self.lib.get(b"cuteafd_free_host_buffer")? };
+        let free_fn: FreeHostBufferFn = self.cuteafd_free_host_buffer()?;
         memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_host_buffer", status)
@@ -2183,8 +2289,7 @@ impl NativeLibrary {
     /// for sizing and keep this raw sample only for diagnostics. Audits distinguish
     /// this from the logical admission sample returned by `cuda_memory_info`.
     pub fn cuda_physical_memory_info(&self) -> Result<(usize, usize)> {
-        let info: Symbol<unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus> =
-            unsafe { self.lib.get(b"cuteafd_cuda_memory_info")? };
+        let info: unsafe extern "C" fn(*mut usize, *mut usize) -> CuteafdStatus = self.cuteafd_cuda_memory_info()?;
         let (mut free, mut total) = (0, 0);
         self.status_to_result("cuteafd_cuda_memory_info", unsafe { info(&mut free, &mut total) })?;
         anyhow::ensure!(free <= total && total > 0, "invalid CUDA memory information");
@@ -2252,8 +2357,7 @@ impl NativeLibrary {
         // SAFETY: the symbol follows the bundled C ABI; initialized info is
         // exclusively writable and the library remains live across the call.
         unsafe {
-            let call: Symbol<unsafe extern "C" fn(i32, *mut CuteafdCudaDeviceInfo) -> CuteafdStatus> =
-                self.lib.get(b"cuteafd_cuda_device_info")?;
+            let call: unsafe extern "C" fn(i32, *mut CuteafdCudaDeviceInfo) -> CuteafdStatus = self.cuteafd_cuda_device_info()?;
             let mut info = CuteafdCudaDeviceInfo::default();
             self.status_to_result("cuteafd_cuda_device_info", call(device, &mut info))?;
             Ok(info)
@@ -2261,8 +2365,7 @@ impl NativeLibrary {
     }
 
     pub fn cuda_get_device(&self) -> Result<i32> {
-        let call: Symbol<unsafe extern "C" fn(*mut i32) -> CuteafdStatus> =
-            unsafe { self.lib.get(b"cuteafd_cuda_get_device")? };
+        let call: unsafe extern "C" fn(*mut i32) -> CuteafdStatus = self.cuteafd_cuda_get_device()?;
         let mut device = -1;
         self.status_to_result("cuteafd_cuda_get_device", unsafe { call(&mut device) })?;
         Ok(device)
@@ -2275,14 +2378,12 @@ impl NativeLibrary {
 
     /// Host-thread-local selection. Restore the previous device before yielding.
     pub fn cuda_set_device(&self, device: i32) -> Result<()> {
-        let call: Symbol<unsafe extern "C" fn(i32) -> CuteafdStatus> =
-            unsafe { self.lib.get(b"cuteafd_cuda_set_device")? };
+        let call: unsafe extern "C" fn(i32) -> CuteafdStatus = self.cuteafd_cuda_set_device()?;
         self.status_to_result("cuteafd_cuda_set_device", unsafe { call(device) })
     }
 
     pub fn cuda_enable_peer(&self, peer: i32) -> Result<()> {
-        let call: Symbol<unsafe extern "C" fn(i32) -> CuteafdStatus> =
-            unsafe { self.lib.get(b"cuteafd_cuda_enable_peer")? };
+        let call: unsafe extern "C" fn(i32) -> CuteafdStatus = self.cuteafd_cuda_enable_peer()?;
         self.status_to_result("cuteafd_cuda_enable_peer", unsafe { call(peer) })
     }
 
@@ -2299,9 +2400,9 @@ impl NativeLibrary {
         bytes: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        let call: Symbol<unsafe extern "C" fn(
+        let call: unsafe extern "C" fn(
             CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, *mut c_void,
-        ) -> CuteafdStatus> = unsafe { self.lib.get(b"cuteafd_copy_peer_async")? };
+        ) -> CuteafdStatus = self.cuteafd_copy_peer_async()?;
         self.status_to_result("cuteafd_copy_peer_async", unsafe { call(dst, src, bytes, stream) })
     }
 
@@ -2316,9 +2417,9 @@ impl NativeLibrary {
         width: usize, rows: usize, dst_pitch: usize, src_pitch: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        let call: Symbol<unsafe extern "C" fn(
+        let call: unsafe extern "C" fn(
             CuteafdDeviceBuffer, CuteafdDeviceBuffer, usize, usize, usize, usize, *mut c_void,
-        ) -> CuteafdStatus> = unsafe { self.lib.get(b"cuteafd_copy_device_rows_async")? };
+        ) -> CuteafdStatus = self.cuteafd_copy_device_rows_async()?;
         self.status_to_result("cuteafd_copy_device_rows_async", unsafe {
             call(dst, src, width, rows, dst_pitch, src_pitch, stream)
         })
@@ -2326,8 +2427,7 @@ impl NativeLibrary {
 
     pub fn alloc_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
-        let alloc_fn: Symbol<AllocDeviceBufferFn> =
-            unsafe { self.lib.get(b"cuteafd_alloc_device_buffer")? };
+        let alloc_fn: AllocDeviceBufferFn = self.cuteafd_alloc_device_buffer()?;
         let mut buffer = CuteafdDeviceBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_device_buffer", status)?;
@@ -2337,8 +2437,7 @@ impl NativeLibrary {
 
     pub fn alloc_managed_device_buffer(&self, bytes: usize) -> Result<CuteafdDeviceBuffer> {
         let _budget_guard = self.admit_gpu_allocation(bytes)?;
-        let alloc_fn: Symbol<AllocManagedDeviceBufferFn> =
-            unsafe { self.lib.get(b"cuteafd_alloc_managed_device_buffer")? };
+        let alloc_fn: AllocManagedDeviceBufferFn = self.cuteafd_alloc_managed_device_buffer()?;
         let mut buffer = CuteafdDeviceBuffer::default();
         let status = unsafe { alloc_fn(bytes, &mut buffer) };
         self.status_to_result("cuteafd_alloc_managed_device_buffer", status)?;
@@ -2347,16 +2446,14 @@ impl NativeLibrary {
     }
 
     pub fn free_device_buffer(&self, buffer: &mut CuteafdDeviceBuffer) -> Result<()> {
-        let free_fn: Symbol<FreeDeviceBufferFn> =
-            unsafe { self.lib.get(b"cuteafd_free_device_buffer")? };
+        let free_fn: FreeDeviceBufferFn = self.cuteafd_free_device_buffer()?;
         memory_ledger::record_free(buffer.ptr as usize);
         let status = unsafe { free_fn(buffer) };
         self.status_to_result("cuteafd_free_device_buffer", status)
     }
 
     pub fn cuda_stream_create(&self) -> Result<*mut c_void> {
-        let create_fn: Symbol<CudaStreamCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_stream_create")? };
+        let create_fn: CudaStreamCreateFn = self.cuteafd_cuda_stream_create()?;
         let mut cuda_stream = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_stream) };
         self.status_to_result("cuteafd_cuda_stream_create", status)?;
@@ -2364,23 +2461,21 @@ impl NativeLibrary {
     }
 
     pub unsafe fn cuda_stream_destroy(&self, cuda_stream: *mut c_void) -> Result<()> {
-        let destroy_fn: Symbol<CudaStreamDestroyFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_stream_destroy")? };
+        let destroy_fn: CudaStreamDestroyFn = self.cuteafd_cuda_stream_destroy()?;
         let status = unsafe { destroy_fn(cuda_stream) };
         self.status_to_result("cuteafd_cuda_stream_destroy", status)
     }
 
     /// Diagnostic drain of every stream on the calling thread's current CUDA device.
     pub fn cuda_device_synchronize(&self) -> Result<()> {
-        type Call = unsafe extern "C" fn() -> i32;
+        let synchronize = self.cuteafd_cuda_device_synchronize()?;
         // SAFETY: the pinned native ABI takes no operands; this library owns the symbol.
-        let status = unsafe { self.lib.get::<Call>(b"cuteafd_cuda_device_synchronize")?() };
+        let status = unsafe { synchronize() };
         self.status_to_result("cuteafd_cuda_device_synchronize", status)
     }
 
     pub unsafe fn cuda_stream_synchronize(&self, cuda_stream: *mut c_void) -> Result<()> {
-        let synchronize_fn: Symbol<CudaStreamSynchronizeFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_stream_synchronize")? };
+        let synchronize_fn: CudaStreamSynchronizeFn = self.cuteafd_cuda_stream_synchronize()?;
         let status = unsafe { synchronize_fn(cuda_stream) };
         self.status_to_result("cuteafd_cuda_stream_synchronize", status)
     }
@@ -2388,8 +2483,7 @@ impl NativeLibrary {
     /// Poll completion without blocking the CUDA owner thread.
     /// The stream must remain live on the current CUDA device.
     pub unsafe fn cuda_stream_query(&self, cuda_stream: *mut c_void) -> Result<bool> {
-        let query_fn: Symbol<CudaStreamQueryFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_stream_query")? };
+        let query_fn: CudaStreamQueryFn = self.cuteafd_cuda_stream_query()?;
         let mut ready = 0;
         let status = unsafe { query_fn(cuda_stream, &mut ready) };
         self.status_to_result("cuteafd_cuda_stream_query", status)?;
@@ -2402,15 +2496,13 @@ impl NativeLibrary {
         cuda_stream: *mut c_void,
         cuda_event: *mut c_void,
     ) -> Result<()> {
-        let wait_fn: Symbol<CudaStreamWaitEventFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_stream_wait_event")? };
+        let wait_fn: CudaStreamWaitEventFn = self.cuteafd_cuda_stream_wait_event()?;
         let status = unsafe { wait_fn(cuda_stream, cuda_event) };
         self.status_to_result("cuteafd_cuda_stream_wait_event", status)
     }
 
     pub fn cuda_event_create(&self) -> Result<*mut c_void> {
-        let create_fn: Symbol<CudaEventCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_create")? };
+        let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create()?;
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
         self.status_to_result("cuteafd_cuda_event_create", status)?;
@@ -2419,8 +2511,7 @@ impl NativeLibrary {
 
     /// Timing-disabled event for stream ordering only.
     pub fn cuda_event_create_ordering(&self) -> Result<*mut c_void> {
-        let create_fn: Symbol<CudaEventCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_create_ordering")? };
+        let create_fn: CudaEventCreateFn = self.cuteafd_cuda_event_create_ordering()?;
         let mut cuda_event = std::ptr::null_mut();
         let status = unsafe { create_fn(&mut cuda_event) };
         self.status_to_result("cuteafd_cuda_event_create_ordering", status)?;
@@ -2428,8 +2519,7 @@ impl NativeLibrary {
     }
 
     pub unsafe fn cuda_event_destroy(&self, cuda_event: *mut c_void) -> Result<()> {
-        let destroy_fn: Symbol<CudaEventDestroyFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_destroy")? };
+        let destroy_fn: CudaEventDestroyFn = self.cuteafd_cuda_event_destroy()?;
         let status = unsafe { destroy_fn(cuda_event) };
         self.status_to_result("cuteafd_cuda_event_destroy", status)
     }
@@ -2439,8 +2529,7 @@ impl NativeLibrary {
         cuda_event: *mut c_void,
         cuda_stream: *mut c_void,
     ) -> Result<()> {
-        let record_fn: Symbol<CudaEventRecordFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_record")? };
+        let record_fn: CudaEventRecordFn = self.cuteafd_cuda_event_record()?;
         let status = unsafe { record_fn(cuda_event, cuda_stream) };
         self.status_to_result("cuteafd_cuda_event_record", status)
     }
@@ -2454,15 +2543,13 @@ impl NativeLibrary {
         cuda_event: *mut c_void,
         cuda_stream: *mut c_void,
     ) -> Result<()> {
-        let record_fn: Symbol<CudaEventRecordFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_record_external")? };
+        let record_fn: CudaEventRecordFn = self.cuteafd_cuda_event_record_external()?;
         let status = unsafe { record_fn(cuda_event, cuda_stream) };
         self.status_to_result("cuteafd_cuda_event_record_external", status)
     }
 
     pub unsafe fn cuda_event_synchronize(&self, cuda_event: *mut c_void) -> Result<()> {
-        let synchronize_fn: Symbol<CudaEventSynchronizeFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_synchronize")? };
+        let synchronize_fn: CudaEventSynchronizeFn = self.cuteafd_cuda_event_synchronize()?;
         let status = unsafe { synchronize_fn(cuda_event) };
         self.status_to_result("cuteafd_cuda_event_synchronize", status)
     }
@@ -2472,8 +2559,7 @@ impl NativeLibrary {
         start_event: *mut c_void,
         end_event: *mut c_void,
     ) -> Result<f32> {
-        let elapsed_fn: Symbol<CudaEventElapsedMsFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_event_elapsed_ms")? };
+        let elapsed_fn: CudaEventElapsedMsFn = self.cuteafd_cuda_event_elapsed_ms()?;
         let mut out_ms = 0.0_f32;
         let status = unsafe { elapsed_fn(start_event, end_event, &mut out_ms) };
         self.status_to_result("cuteafd_cuda_event_elapsed_ms", status)?;
@@ -2519,7 +2605,7 @@ impl NativeLibrary {
     pub unsafe fn cuda_graph_census_begin(&self, stream: *mut c_void,
         bank: &std::ffi::CStr, rows: u64, replay: bool, arm: u8) -> Result<*mut c_void> {
         type Begin = unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char, u64, i32, i32, *mut *mut c_void) -> CuteafdStatus;
-        let begin: Symbol<Begin> = unsafe { self.lib.get(b"cuteafd_cuda_graph_census_begin")? };
+        let begin: Begin = self.cuteafd_cuda_graph_census_begin()?;
         let mut token = std::ptr::null_mut();
         let status = unsafe { begin(stream, bank.as_ptr(), rows, i32::from(replay), i32::from(arm), &mut token) };
         self.status_to_result("cuteafd_cuda_graph_census_begin", status)?;
@@ -2530,7 +2616,7 @@ impl NativeLibrary {
     /// Token is the unconsumed result of census_begin on the current device.
     pub unsafe fn cuda_graph_census_end(&self, token: *mut c_void) -> Result<()> {
         type End = unsafe extern "C" fn(*mut c_void) -> CuteafdStatus;
-        let end: Symbol<End> = unsafe { self.lib.get(b"cuteafd_cuda_graph_census_end")? };
+        let end: End = self.cuteafd_cuda_graph_census_end()?;
         let status = unsafe { end(token) };
         self.status_to_result("cuteafd_cuda_graph_census_end", status)
     }
@@ -2545,8 +2631,7 @@ impl NativeLibrary {
                 None => sites.push((site, 1)),
             }
         }
-        let begin_capture_fn: Symbol<CudaGraphBeginCaptureFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_graph_begin_capture")? };
+        let begin_capture_fn: CudaGraphBeginCaptureFn = self.cuteafd_cuda_graph_begin_capture()?;
         let status = unsafe { begin_capture_fn(cuda_stream) };
         GRAPH_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.status_to_result("cuteafd_cuda_graph_begin_capture", status)
@@ -2556,8 +2641,7 @@ impl NativeLibrary {
     pub unsafe fn cuda_graph_end_capture(&self, cuda_stream: *mut c_void) -> Result<*mut c_void> {
         let _budget_guard = coordinator_gpu_budget().map(|_| GPU_BUDGET_ALLOCATION.lock()
             .unwrap_or_else(|e| e.into_inner()));
-        let end_capture_fn: Symbol<CudaGraphEndCaptureFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_graph_end_capture")? };
+        let end_capture_fn: CudaGraphEndCaptureFn = self.cuteafd_cuda_graph_end_capture()?;
         let mut cuda_graph_exec = std::ptr::null_mut();
         let status = unsafe { end_capture_fn(cuda_stream, &mut cuda_graph_exec) };
         self.status_to_result("cuteafd_cuda_graph_end_capture", status)?;
@@ -2582,8 +2666,7 @@ impl NativeLibrary {
         cuda_graph_exec: *mut c_void,
         cuda_stream: *mut c_void,
     ) -> Result<()> {
-        let launch_fn: Symbol<CudaGraphLaunchFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_graph_launch")? };
+        let launch_fn: CudaGraphLaunchFn = self.cuteafd_cuda_graph_launch()?;
         let status = unsafe { launch_fn(cuda_graph_exec, cuda_stream) };
         self.status_to_result("cuteafd_cuda_graph_launch", status)
     }
@@ -2591,8 +2674,7 @@ impl NativeLibrary {
 
 
     pub unsafe fn cuda_graph_exec_destroy(&self, cuda_graph_exec: *mut c_void) -> Result<()> {
-        let destroy_fn: Symbol<CudaGraphExecDestroyFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_graph_exec_destroy")? };
+        let destroy_fn: CudaGraphExecDestroyFn = self.cuteafd_cuda_graph_exec_destroy()?;
         let status = unsafe { destroy_fn(cuda_graph_exec) };
         self.status_to_result("cuteafd_cuda_graph_exec_destroy", status)
     }
@@ -2755,7 +2837,7 @@ impl NativeLibrary {
             }
             for ((device, _, _), entry) in entries.iter_mut() {
                 self.cuda_set_device(*device)?;
-                entry.staging.release_with_library(&self.lib);
+                entry.staging.release_with_library(self);
                 // SAFETY: all pending copies completed; this event is owned by the entry.
                 unsafe { self.cuda_event_destroy(entry.event)?; }
                 entry.event = std::ptr::null_mut();
@@ -2803,7 +2885,7 @@ impl NativeLibrary {
         src: *const c_void,
         bytes: usize,
     ) -> Result<()> {
-        let copy_fn: Symbol<CopyH2DFn> = unsafe { self.lib.get(b"cuteafd_copy_h2d")? };
+        let copy_fn: CopyH2DFn = self.cuteafd_copy_h2d()?;
         let status = unsafe { copy_fn(dst, src, bytes) };
         self.status_to_result("cuteafd_copy_h2d", status)
     }
@@ -2824,7 +2906,7 @@ impl NativeLibrary {
                 src.bytes
             );
         }
-        let copy_fn: Symbol<CopyH2DAsyncFn> = unsafe { self.lib.get(b"cuteafd_copy_h2d_async")? };
+        let copy_fn: CopyH2DAsyncFn = self.cuteafd_copy_h2d_async()?;
         let status = unsafe { copy_fn(dst, src.ptr as *const c_void, bytes, cuda_stream) };
         self.status_to_result("cuteafd_copy_h2d_async", status)
     }
@@ -2878,8 +2960,7 @@ impl NativeLibrary {
             .iter()
             .map(|source| source.ptr.cast_const())
             .collect::<Vec<_>>();
-        let copy_fn: Symbol<CopyH2DBatchAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_copy_h2d_batch_async")? };
+        let copy_fn: CopyH2DBatchAsyncFn = self.cuteafd_copy_h2d_batch_async()?;
         let status = unsafe {
             copy_fn(
                 dsts.as_ptr(),
@@ -2927,8 +3008,7 @@ impl NativeLibrary {
                 src.bytes
             );
         }
-        let copy_fn: Symbol<CopyH2D2DAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_copy_h2d_2d_async")? };
+        let copy_fn: CopyH2D2DAsyncFn = self.cuteafd_copy_h2d_2d_async()?;
         let status = unsafe {
             copy_fn(
                 dst,
@@ -2944,7 +3024,7 @@ impl NativeLibrary {
     }
 
     pub fn copy_d2h(&self, dst: &mut [u8], src: CuteafdDeviceBuffer) -> Result<()> {
-        let copy_fn: Symbol<CopyD2HFn> = unsafe { self.lib.get(b"cuteafd_copy_d2h")? };
+        let copy_fn: CopyD2HFn = self.cuteafd_copy_d2h()?;
         let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len()) };
         self.status_to_result("cuteafd_copy_d2h", status)
     }
@@ -3005,7 +3085,7 @@ impl NativeLibrary {
                 src.bytes
             );
         }
-        let copy_fn: Symbol<CopyD2DFn> = unsafe { self.lib.get(b"cuteafd_copy_d2d")? };
+        let copy_fn: CopyD2DFn = self.cuteafd_copy_d2d()?;
         let status = unsafe { copy_fn(dst, src, bytes) };
         self.status_to_result("cuteafd_copy_d2d", status)
     }
@@ -3016,7 +3096,7 @@ impl NativeLibrary {
         src: &[u8],
         cuda_stream: *mut c_void,
     ) -> Result<()> {
-        let copy_fn: Symbol<CopyH2DAsyncFn> = unsafe { self.lib.get(b"cuteafd_copy_h2d_async")? };
+        let copy_fn: CopyH2DAsyncFn = self.cuteafd_copy_h2d_async()?;
         let status = unsafe { copy_fn(dst, src.as_ptr().cast(), src.len(), cuda_stream) };
         self.status_to_result("cuteafd_copy_h2d_async", status)
     }
@@ -3027,7 +3107,7 @@ impl NativeLibrary {
         src: CuteafdDeviceBuffer,
         cuda_stream: *mut c_void,
     ) -> Result<()> {
-        let copy_fn: Symbol<CopyD2HAsyncFn> = unsafe { self.lib.get(b"cuteafd_copy_d2h_async")? };
+        let copy_fn: CopyD2HAsyncFn = self.cuteafd_copy_d2h_async()?;
         let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len(), cuda_stream) };
         self.status_to_result("cuteafd_copy_d2h_async", status)
     }
@@ -3048,7 +3128,7 @@ impl NativeLibrary {
                 dst.bytes
             );
         }
-        let copy_fn: Symbol<CopyD2HAsyncFn> = unsafe { self.lib.get(b"cuteafd_copy_d2h_async")? };
+        let copy_fn: CopyD2HAsyncFn = self.cuteafd_copy_d2h_async()?;
         let status = unsafe { copy_fn(dst.ptr, src, bytes, cuda_stream) };
         self.status_to_result("cuteafd_copy_d2h_async", status)
     }
@@ -3065,7 +3145,7 @@ impl NativeLibrary {
         src_pitch_bytes: usize, width_bytes: usize, rows: usize, cuda_stream: *mut c_void) -> Result<()> {
         type F = unsafe extern "C" fn(CuteafdDeviceBuffer, usize, CuteafdDeviceBuffer, usize, usize, usize, *mut c_void)
             -> CuteafdStatus;
-        let copy_fn: Symbol<F> = unsafe { self.lib.get(b"cuteafd_copy_d2d_2d_async")? };
+        let copy_fn: F = self.cuteafd_copy_d2d_2d_async()?;
         let status = unsafe { copy_fn(dst, dst_pitch_bytes, src, src_pitch_bytes, width_bytes, rows, cuda_stream) };
         self.status_to_result("cuteafd_copy_d2d_2d_async", status)
     }
@@ -3098,7 +3178,7 @@ impl NativeLibrary {
                 src.bytes
             );
         }
-        let copy_fn: Symbol<CopyD2DAsyncFn> = unsafe { self.lib.get(b"cuteafd_copy_d2d_async")? };
+        let copy_fn: CopyD2DAsyncFn = self.cuteafd_copy_d2d_async()?;
         let status = unsafe { copy_fn(dst, src, bytes, cuda_stream) };
         self.status_to_result("cuteafd_copy_d2d_async", status)
     }
@@ -3117,7 +3197,7 @@ impl NativeLibrary {
         cuda_stream: *mut c_void) -> Result<()> {
         type F = unsafe extern "C" fn(*const u8, *mut u8, *const u64, *const u64, *const u64, usize, *mut c_void)
             -> CuteafdStatus;
-        let copy_fn: Symbol<F> = unsafe { self.lib.get(b"cuteafd_cuda_kv_cache_write_blocks_async")? };
+        let copy_fn: F = self.cuteafd_cuda_kv_cache_write_blocks_async()?;
         let status = unsafe { copy_fn(src.cast(), cache.cast(), src_offsets.cast(), cache_offsets.cast(),
             block_bytes.cast(), count, cuda_stream) };
         self.status_to_result("cuteafd_cuda_kv_cache_write_blocks_async", status)
@@ -3143,7 +3223,7 @@ impl NativeLibrary {
         validate_device_buffer_bytes(NAME, scales, values / 32)?;
         validate_u16_buffer_values(NAME, out, values)?;
         type Kernel = unsafe extern "C" fn(*const u8, *const u8, *mut u16, i32, *mut c_void) -> CuteafdStatus;
-        let kernel: Symbol<Kernel> = unsafe { self.lib.get(b"cuteafd_cuda_engram_dequant_bf16_async")? };
+        let kernel: Kernel = self.cuteafd_cuda_engram_dequant_bf16_async()?;
         let status = unsafe { kernel(weights.ptr.cast(), scales.ptr.cast(), out.ptr.cast(), hash_rows, cuda_stream) };
         self.status_to_result(NAME, status)
     }
@@ -3163,7 +3243,7 @@ impl NativeLibrary {
         validate_device_buffer_bytes(NAME, scales, values / 16)?;
         validate_u16_buffer_values(NAME, out, values)?;
         type Kernel = unsafe extern "C" fn(*const u8, *const u8, f32, *mut u16, i32, *mut c_void) -> CuteafdStatus;
-        let kernel: Symbol<Kernel> = unsafe { self.lib.get(b"cuteafd_cuda_engram_nvfp4_dequant_bf16_async")? };
+        let kernel: Kernel = self.cuteafd_cuda_engram_nvfp4_dequant_bf16_async()?;
         let status = unsafe { kernel(weights.ptr.cast(), scales.ptr.cast(), global_scale,
             out.ptr.cast(), hash_rows, cuda_stream) };
         self.status_to_result(NAME, status)
@@ -3197,7 +3277,7 @@ impl NativeLibrary {
         if let Some(mask) = text_mask { validate_device_buffer_bytes(NAME, mask, rows as usize)?; }
         type Kernel = unsafe extern "C" fn(*const u16, *const u16, *const u16, *const u16,
             *const u8, *mut u16, i32, *mut c_void) -> CuteafdStatus;
-        let kernel: Symbol<Kernel> = unsafe { self.lib.get(b"cuteafd_cuda_engram_gate_bf16_async")? };
+        let kernel: Kernel = self.cuteafd_cuda_engram_gate_bf16_async()?;
         let status = unsafe { kernel(x.ptr.cast(), projected_kv.ptr.cast(), q_weight.ptr.cast(),
             k_weight.ptr.cast(), text_mask.map_or(std::ptr::null(), |mask| mask.ptr.cast()),
             out.ptr.cast(), rows, cuda_stream) };
@@ -3230,8 +3310,7 @@ impl NativeLibrary {
         )?;
         validate_u16_buffer_values("cuteafd_cuda_ds4_rmsnorm_bf16_rne_async out", out, row_values)?;
 
-        let kernel_fn: Symbol<CudaDs4RmsNormBf16RneAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_ds4_rmsnorm_bf16_rne_async")? };
+        let kernel_fn: CudaDs4RmsNormBf16RneAsyncFn = self.cuteafd_cuda_ds4_rmsnorm_bf16_rne_async()?;
         let status = unsafe {
             kernel_fn(
                 x.ptr.cast::<u16>() as *const u16,
@@ -3294,8 +3373,7 @@ impl NativeLibrary {
         kernel_intermediate: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        let kernel_fn: Symbol<CudaNvfp4PadExpertAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_nvfp4_pad_expert_async")? };
+        let kernel_fn: CudaNvfp4PadExpertAsyncFn = self.cuteafd_cuda_nvfp4_pad_expert_async()?;
         let status = unsafe {
             kernel_fn(sources.as_ptr(), destinations.as_ptr(), source_intermediate,
                       kernel_intermediate, stream)
@@ -3312,8 +3390,7 @@ impl NativeLibrary {
         cols: usize,
         cuda_stream: *mut c_void,
     ) -> Result<()> {
-        let kernel_fn: Symbol<CudaNvfp4SwizzleScaleAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_nvfp4_swizzle_scale_async")? };
+        let kernel_fn: CudaNvfp4SwizzleScaleAsyncFn = self.cuteafd_cuda_nvfp4_swizzle_scale_async()?;
         let status = unsafe { kernel_fn(source, destination, rows, cols, cuda_stream) };
         self.status_to_result("cuteafd_cuda_nvfp4_swizzle_scale_async", status)
     }
@@ -3367,7 +3444,7 @@ impl NativeLibrary {
     pub fn cuda_zero_bytes(&self, dst: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
         validate_device_buffer_bytes("cuteafd_cuda_zero_bytes dst", dst, bytes)?;
 
-        let kernel_fn: Symbol<CudaZeroBytesFn> = unsafe { self.lib.get(b"cuteafd_cuda_zero_bytes")? };
+        let kernel_fn: CudaZeroBytesFn = self.cuteafd_cuda_zero_bytes()?;
         let status = unsafe { kernel_fn(dst.ptr, bytes) };
         self.status_to_result("cuteafd_cuda_zero_bytes", status)
     }
@@ -3380,8 +3457,7 @@ impl NativeLibrary {
     ) -> Result<()> {
         validate_device_buffer_bytes("cuteafd_cuda_zero_bytes_async dst", dst, bytes)?;
 
-        let kernel_fn: Symbol<CudaZeroBytesAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_zero_bytes_async")? };
+        let kernel_fn: CudaZeroBytesAsyncFn = self.cuteafd_cuda_zero_bytes_async()?;
         let status = unsafe { kernel_fn(dst.ptr, bytes, cuda_stream) };
         self.status_to_result("cuteafd_cuda_zero_bytes_async", status)
     }
@@ -3401,8 +3477,7 @@ impl NativeLibrary {
         validate_bf16_to_f32_accumulation(src, dst, count)?;
         if count == 0 { return Ok(()); }
         // SAFETY: the native symbol has this ABI; the caller retains the stream and buffers.
-        let kernel: Symbol<CudaAccumulateBf16ToF32AsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_accumulate_bf16_to_f32_async")? };
+        let kernel: CudaAccumulateBf16ToF32AsyncFn = self.cuteafd_cuda_accumulate_bf16_to_f32_async()?;
         // SAFETY: validated extents; initialization and ordering are the caller's contract.
         let status = unsafe { kernel(src.ptr.cast::<u16>(), dst.ptr.cast::<f32>(), count, cuda_stream) };
         self.status_to_result("cuteafd_cuda_accumulate_bf16_to_f32_async", status)
@@ -3416,8 +3491,7 @@ impl NativeLibrary {
     ) -> Result<()> {
         validate_f32_to_bf16_buffers("cuteafd_cuda_f32_to_bf16", src, dst, count)?;
 
-        let kernel_fn: Symbol<CudaF32ToBf16Fn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_f32_to_bf16")? };
+        let kernel_fn: CudaF32ToBf16Fn = self.cuteafd_cuda_f32_to_bf16()?;
         let status = unsafe {
             kernel_fn(
                 src.ptr.cast::<f32>() as *const f32,
@@ -3437,8 +3511,7 @@ impl NativeLibrary {
     ) -> Result<()> {
         validate_f32_to_bf16_buffers("cuteafd_cuda_f32_to_bf16_async", src, dst, count)?;
 
-        let kernel_fn: Symbol<CudaF32ToBf16AsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_f32_to_bf16_async")? };
+        let kernel_fn: CudaF32ToBf16AsyncFn = self.cuteafd_cuda_f32_to_bf16_async()?;
         let status = unsafe {
             kernel_fn(
                 src.ptr.cast::<f32>() as *const f32,
@@ -3475,10 +3548,7 @@ impl NativeLibrary {
             row_width,
             dst_row_stride_bytes,
         )?;
-        let kernel_fn: Symbol<CudaGatherRowsF32ToFp8E4m3RowScaledAsyncFn> = unsafe {
-            self.lib
-                .get(b"cuteafd_cuda_gather_rows_f32_to_fp8_e4m3_row_scaled_async")?
-        };
+        let kernel_fn: CudaGatherRowsF32ToFp8E4m3RowScaledAsyncFn = self.cuteafd_cuda_gather_rows_f32_to_fp8_e4m3_row_scaled_async()?;
         let status = unsafe {
             kernel_fn(
                 src.ptr.cast::<f32>() as *const f32,
@@ -3522,10 +3592,7 @@ impl NativeLibrary {
             row_width,
             dst_row_stride_bytes,
         )?;
-        let kernel_fn: Symbol<CudaGatherRowsF32ToNvfp4E2m1Fp8E4m3AsyncFn> = unsafe {
-            self.lib
-                .get(b"cuteafd_cuda_gather_rows_f32_to_nvfp4_e2m1_fp8_e4m3_async")?
-        };
+        let kernel_fn: CudaGatherRowsF32ToNvfp4E2m1Fp8E4m3AsyncFn = self.cuteafd_cuda_gather_rows_f32_to_nvfp4_e2m1_fp8_e4m3_async()?;
         let status = unsafe {
             kernel_fn(
                 src.ptr.cast::<f32>() as *const f32,
@@ -3579,10 +3646,7 @@ impl NativeLibrary {
             peer_count,
         )?;
         let peer_count = u32::try_from(peer_count).context("route shard peer count exceeds u32")?;
-        let kernel_fn: Symbol<CudaReduceRouteShardsToF32AsyncFn> = unsafe {
-            self.lib
-                .get(b"cuteafd_cuda_reduce_route_shards_to_f32_async")?
-        };
+        let kernel_fn: CudaReduceRouteShardsToF32AsyncFn = self.cuteafd_cuda_reduce_route_shards_to_f32_async()?;
         let status = unsafe {
             kernel_fn(
                 buffers,
@@ -3709,8 +3773,7 @@ impl NativeLibrary {
             hidden,
         )?;
 
-        let kernel_fn: Symbol<CudaEmbeddingLookupBf16AsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_embedding_lookup_bf16_async")? };
+        let kernel_fn: CudaEmbeddingLookupBf16AsyncFn = self.cuteafd_cuda_embedding_lookup_bf16_async()?;
         let status = unsafe {
             kernel_fn(
                 embedding.ptr.cast::<u16>() as *const u16,
@@ -3782,8 +3845,7 @@ impl NativeLibrary {
             scratch,
         )?;
         validate_v41_params_device(NAME, params_device, rows)?;
-        let kernel_fn: Symbol<CudaV41TargetSampleAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_v41_target_sample_async")? };
+        let kernel_fn: CudaV41TargetSampleAsyncFn = self.cuteafd_cuda_v41_target_sample_async()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -3852,8 +3914,7 @@ impl NativeLibrary {
             scratch,
         )?;
         validate_v41_params_device(NAME, params_device, rows)?;
-        let kernel_fn: Symbol<CudaV41TargetSampleFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_v41_target_sample")? };
+        let kernel_fn: CudaV41TargetSampleFn = self.cuteafd_cuda_v41_target_sample()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -3934,8 +3995,7 @@ impl NativeLibrary {
             scratch,
         )?;
         validate_v41_params_device(NAME, params_device, rows)?;
-        let kernel_fn: Symbol<CudaV41TopkSelectAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_v41_topk_select_async")? };
+        let kernel_fn: CudaV41TopkSelectAsyncFn = self.cuteafd_cuda_v41_topk_select_async()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -4000,8 +4060,7 @@ impl NativeLibrary {
             scratch,
         )?;
         validate_v41_params_device(NAME, params_device, rows)?;
-        let kernel_fn: Symbol<CudaV41TopkSelectFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_v41_topk_select")? };
+        let kernel_fn: CudaV41TopkSelectFn = self.cuteafd_cuda_v41_topk_select()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -4080,8 +4139,7 @@ impl NativeLibrary {
             scratch,
         )?;
         validate_v41_params_device(NAME, params_device, rows)?;
-        let kernel_fn: Symbol<CudaV41NucleusAsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_v41_nucleus_async")? };
+        let kernel_fn: CudaV41NucleusAsyncFn = self.cuteafd_cuda_v41_nucleus_async()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -4154,8 +4212,7 @@ impl NativeLibrary {
             scratch,
         )?;
         validate_v41_params_device(NAME, params_device, rows)?;
-        let kernel_fn: Symbol<CudaV41NucleusFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_v41_nucleus")? };
+        let kernel_fn: CudaV41NucleusFn = self.cuteafd_cuda_v41_nucleus()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -4207,8 +4264,7 @@ impl NativeLibrary {
             vocab,
         )?;
 
-        let kernel_fn: Symbol<CudaLogitsArgmaxF32AsyncFn> =
-            unsafe { self.lib.get(b"cuteafd_cuda_logits_argmax_checked_f32_async")? };
+        let kernel_fn: CudaLogitsArgmaxF32AsyncFn = self.cuteafd_cuda_logits_argmax_checked_f32_async()?;
         let status = unsafe {
             kernel_fn(
                 logits.ptr.cast::<f32>() as *const f32,
@@ -4229,7 +4285,7 @@ impl NativeLibrary {
 
 
     pub fn rdma_device_info(&self) -> Result<CuteafdRdmaDeviceInfo> {
-        let info_fn: Symbol<RdmaDeviceInfoFn> = unsafe { self.lib.get(b"cuteafd_rdma_device_info")? };
+        let info_fn: RdmaDeviceInfoFn = self.cuteafd_rdma_device_info()?;
         let mut info = CuteafdRdmaDeviceInfo::default();
         let status = unsafe { info_fn(&mut info) };
         self.status_to_result("cuteafd_rdma_device_info", status)?;
@@ -4242,8 +4298,7 @@ impl NativeLibrary {
         bytes: usize,
         alignment: usize,
     ) -> Result<CuteafdRdmaHostBufferPlan> {
-        let plan_fn: Symbol<RdmaPlanHostBufferRegistrationFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_plan_host_buffer_registration")? };
+        let plan_fn: RdmaPlanHostBufferRegistrationFn = self.cuteafd_rdma_plan_host_buffer_registration()?;
         let mut plan = CuteafdRdmaHostBufferPlan::default();
         let status = unsafe { plan_fn(ptr, bytes, alignment, &mut plan) };
         self.status_to_result("cuteafd_rdma_plan_host_buffer_registration", status)?;
@@ -4254,8 +4309,7 @@ impl NativeLibrary {
         &self,
         buffer: &mut [u8],
     ) -> Result<CuteafdRdmaRegisterProbe> {
-        let register_fn: Symbol<RdmaRegisterHostBufferProbeFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_register_host_buffer_probe")? };
+        let register_fn: RdmaRegisterHostBufferProbeFn = self.cuteafd_rdma_register_host_buffer_probe()?;
         let mut probe = CuteafdRdmaRegisterProbe::default();
         let status = unsafe { register_fn(buffer.as_mut_ptr().cast(), buffer.len(), &mut probe) };
         self.status_to_result("cuteafd_rdma_register_host_buffer_probe", status)?;
@@ -4269,8 +4323,7 @@ impl NativeLibrary {
         recv_wr: u32,
         max_sge: u32,
     ) -> Result<CuteafdRdmaRcQpProbe> {
-        let qp_fn: Symbol<RdmaCreateRcQpProbeFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_create_rc_qp_probe")? };
+        let qp_fn: RdmaCreateRcQpProbeFn = self.cuteafd_rdma_create_rc_qp_probe()?;
         let mut probe = CuteafdRdmaRcQpProbe::default();
         let status = unsafe { qp_fn(port_num, send_wr, recv_wr, max_sge, &mut probe) };
         self.status_to_result("cuteafd_rdma_create_rc_qp_probe", status)?;
@@ -4282,8 +4335,7 @@ impl NativeLibrary {
         port_num: u32,
         bytes: usize,
     ) -> Result<CuteafdRdmaRcSendRecvProbe> {
-        let probe_fn: Symbol<RdmaRcSendRecvLoopbackProbeFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_send_recv_loopback_probe")? };
+        let probe_fn: RdmaRcSendRecvLoopbackProbeFn = self.cuteafd_rdma_rc_send_recv_loopback_probe()?;
         let mut probe = CuteafdRdmaRcSendRecvProbe::default();
         let status = unsafe { probe_fn(port_num, bytes, &mut probe) };
         self.status_to_result("cuteafd_rdma_rc_send_recv_loopback_probe", status)?;
@@ -4296,8 +4348,7 @@ impl NativeLibrary {
         request_frame: &[u8],
         response_frame: &[u8],
     ) -> Result<CuteafdRdmaRcProtocolV2LoopbackProbe> {
-        let probe_fn: Symbol<RdmaRcProtocolV2LoopbackProbeFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_protocol_v2_loopback_probe")? };
+        let probe_fn: RdmaRcProtocolV2LoopbackProbeFn = self.cuteafd_rdma_rc_protocol_v2_loopback_probe()?;
         let mut probe = CuteafdRdmaRcProtocolV2LoopbackProbe::default();
         let status = unsafe {
             probe_fn(
@@ -4325,8 +4376,7 @@ impl NativeLibrary {
         max_recv_wr: u32,
         max_sge: u32,
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
-        let create_fn: Symbol<RdmaRcEndpointCreateFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_create")? };
+        let create_fn: RdmaRcEndpointCreateFn = self.cuteafd_rdma_rc_endpoint_create()?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         let status = unsafe {
             create_fn(
@@ -4360,10 +4410,7 @@ impl NativeLibrary {
         max_sge: u32,
         host_buffer_flags: u64,
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
-        let create_fn: Symbol<RdmaRcEndpointCreateWithBufferFlagsFn> = unsafe {
-            self.lib
-                .get(b"cuteafd_rdma_rc_endpoint_create_with_buffer_flags")?
-        };
+        let create_fn: RdmaRcEndpointCreateWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_with_buffer_flags()?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         let status = unsafe {
             create_fn(
@@ -4400,10 +4447,7 @@ impl NativeLibrary {
         max_sge: u32,
         host_buffer_flags: u64,
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
-        let create_fn: Symbol<RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn> = unsafe {
-            self.lib
-                .get(b"cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags")?
-        };
+        let create_fn: RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         let status = unsafe {
@@ -4447,10 +4491,7 @@ impl NativeLibrary {
         host_buffer_flags: u64,
     ) -> Result<CuteafdRdmaRcEndpointInfo> {
         // SAFETY: the symbol has the declared C ABI; all argument buffers live through the call.
-        let create_fn: Symbol<RdmaRcEndpointCreateOnGidWithBufferFlagsFn> = unsafe {
-            self.lib
-                .get(b"cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags")?
-        };
+        let create_fn: RdmaRcEndpointCreateOnGidWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags()?;
         let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut info = CuteafdRdmaRcEndpointInfo::default();
         // SAFETY: device_name and info remain valid for the synchronous native call.
@@ -4484,8 +4525,7 @@ impl NativeLibrary {
         handle: *mut c_void,
         receive_buffer: bool,
     ) -> Result<CuteafdRdmaRcEndpointBufferView> {
-        let view_fn: Symbol<RdmaRcEndpointBufferViewFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_buffer_view")? };
+        let view_fn: RdmaRcEndpointBufferViewFn = self.cuteafd_rdma_rc_endpoint_buffer_view()?;
         let mut view = CuteafdRdmaRcEndpointBufferView::default();
         let status = unsafe { view_fn(handle, c_int::from(receive_buffer), &mut view) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_buffer_view", status)?;
@@ -4500,8 +4540,7 @@ impl NativeLibrary {
         remote_lid: u32,
         remote_gid_hex: &str,
     ) -> Result<()> {
-        let connect_fn: Symbol<RdmaRcEndpointConnectFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_connect")? };
+        let connect_fn: RdmaRcEndpointConnectFn = self.cuteafd_rdma_rc_endpoint_connect()?;
         let remote_gid_hex =
             CString::new(remote_gid_hex).context("RDMA remote GID contains nul byte")?;
         let status = unsafe {
@@ -4532,8 +4571,7 @@ impl NativeLibrary {
         type ConnectFlowLabelFn =
             unsafe extern "C" fn(*mut c_void, u32, u32, u32, *const c_char, u32) -> CuteafdStatus;
         // SAFETY: resolving the symbol does not call it.
-        let connect: Symbol<ConnectFlowLabelFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_connect_flow_label")? };
+        let connect: ConnectFlowLabelFn = self.cuteafd_rdma_rc_endpoint_connect_flow_label()?;
         let remote_gid_hex =
             CString::new(remote_gid_hex).context("RDMA remote GID contains nul byte")?;
         // SAFETY: `handle` is a live endpoint owned by the caller and the GID
@@ -4549,8 +4587,7 @@ impl NativeLibrary {
     pub fn rdma_rc_endpoint_expose_send_read(&self, handle: *mut c_void, bytes: usize) -> Result<(u64, u32)> {
         type ExposeReadFn = unsafe extern "C" fn(*mut c_void, usize, *mut u64, *mut u32) -> CuteafdStatus;
         // SAFETY: resolving the symbol does not call it.
-        let expose: Symbol<ExposeReadFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_expose_send_read")? };
+        let expose: ExposeReadFn = self.cuteafd_rdma_rc_endpoint_expose_send_read()?;
         let (mut addr, mut rkey) = (0_u64, 0_u32);
         // SAFETY: `handle` is a live endpoint; the registration covers its own
         // send buffer and is released with it.
@@ -4572,7 +4609,7 @@ impl NativeLibrary {
     ) -> Result<()> {
         type ReadWaitFn = unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u32) -> CuteafdStatus;
         // SAFETY: resolving the symbol does not call it.
-        let read: Symbol<ReadWaitFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_read_wait")? };
+        let read: ReadWaitFn = self.cuteafd_rdma_rc_endpoint_read_wait()?;
         // SAFETY: `handle` is a live connected endpoint; the read lands in its
         // own registered receive buffer, which the native side bounds-checks.
         let status = unsafe { read(handle, offset, bytes, remote_addr, rkey, timeout_ms) };
@@ -4585,8 +4622,7 @@ impl NativeLibrary {
         bytes: usize,
         wr_id: u64,
     ) -> Result<()> {
-        let recv_fn: Symbol<RdmaRcEndpointPostRecvFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_recv")? };
+        let recv_fn: RdmaRcEndpointPostRecvFn = self.cuteafd_rdma_rc_endpoint_post_recv()?;
         let status = unsafe { recv_fn(handle, bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_recv", status)
     }
@@ -4598,8 +4634,7 @@ impl NativeLibrary {
         bytes: usize,
         wr_id: u64,
     ) -> Result<()> {
-        let recv_fn: Symbol<RdmaRcEndpointPostRecvAtFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_recv_at")? };
+        let recv_fn: RdmaRcEndpointPostRecvAtFn = self.cuteafd_rdma_rc_endpoint_post_recv_at()?;
         let status = unsafe { recv_fn(handle, offset_bytes, bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_recv_at", status)
     }
@@ -4618,8 +4653,7 @@ impl NativeLibrary {
         device: Option<CuteafdDeviceBuffer>,
         header_bytes: usize,
     ) -> Result<()> {
-        let set_fn: Symbol<RdmaRcEndpointSetRecvLandingFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_set_recv_landing")? };
+        let set_fn: RdmaRcEndpointSetRecvLandingFn = self.cuteafd_rdma_rc_endpoint_set_recv_landing()?;
         let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
         // SAFETY: the caller guarantees the handle and range contract above.
         let status = unsafe { set_fn(handle, ptr, bytes, header_bytes) };
@@ -4631,8 +4665,7 @@ impl NativeLibrary {
     /// struct is returned even when landing is unavailable (see `status`).
     pub fn rdma_gpu_landing_probe(&self, device_name: Option<&str>, port_num: u32, bytes: usize,
         iterations: u32) -> Result<(CuteafdRdmaGpuLandingProbe, Option<String>)> {
-        let probe_fn: Symbol<RdmaGpuLandingProbeFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_gpu_landing_probe")? };
+        let probe_fn: RdmaGpuLandingProbeFn = self.cuteafd_rdma_gpu_landing_probe()?;
         let name = device_name.map(std::ffi::CString::new).transpose()?;
         let mut out = CuteafdRdmaGpuLandingProbe::default();
         // SAFETY: the name is NUL-terminated or null, and `out` is a live struct.
@@ -4650,8 +4683,7 @@ impl NativeLibrary {
         bytes: usize,
         wr_id: u64,
     ) -> Result<()> {
-        let send_fn: Symbol<RdmaRcEndpointPostSendAtFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_send_at")? };
+        let send_fn: RdmaRcEndpointPostSendAtFn = self.cuteafd_rdma_rc_endpoint_post_send_at()?;
         let status = unsafe { send_fn(handle, offset_bytes, bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_at", status)
     }
@@ -4662,8 +4694,7 @@ impl NativeLibrary {
         frame: &[u8],
         wr_id: u64,
     ) -> Result<()> {
-        let send_fn: Symbol<RdmaRcEndpointSendFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_send")? };
+        let send_fn: RdmaRcEndpointSendFn = self.cuteafd_rdma_rc_endpoint_send()?;
         let status = unsafe { send_fn(handle, frame.as_ptr().cast(), frame.len(), wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_send", status)
     }
@@ -4675,8 +4706,7 @@ impl NativeLibrary {
         offset_bytes: usize,
         wr_id: u64,
     ) -> Result<()> {
-        let send_fn: Symbol<RdmaRcEndpointSendAtFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_send_at")? };
+        let send_fn: RdmaRcEndpointSendAtFn = self.cuteafd_rdma_rc_endpoint_send_at()?;
         let status = unsafe {
             send_fn(
                 handle,
@@ -4697,8 +4727,7 @@ impl NativeLibrary {
         offset_bytes: usize,
         wr_id: u64,
     ) -> Result<()> {
-        let send_fn: Symbol<RdmaRcEndpointSendPartsAtFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_send_parts_at")? };
+        let send_fn: RdmaRcEndpointSendPartsAtFn = self.cuteafd_rdma_rc_endpoint_send_parts_at()?;
         let status = unsafe {
             send_fn(
                 handle,
@@ -4722,10 +4751,7 @@ impl NativeLibrary {
         active_event_poll_timeout_ms: u32,
     ) -> Result<CuteafdRdmaRcCompletionStats> {
         let mut stats = CuteafdRdmaRcCompletionStats::default();
-        if let Ok(poll_fn) = unsafe {
-            self.lib
-                .get::<RdmaRcEndpointPollWithTimeoutFn>(b"cuteafd_rdma_rc_endpoint_poll_with_timeout")
-        } {
+        if let Ok(poll_fn) = self.cuteafd_rdma_rc_endpoint_poll_with_timeout() {
             let status = unsafe {
                 poll_fn(
                     handle,
@@ -4738,8 +4764,7 @@ impl NativeLibrary {
             };
             self.status_to_result("cuteafd_rdma_rc_endpoint_poll_with_timeout", status)?;
         } else {
-            let poll_fn: Symbol<RdmaRcEndpointPollFn> =
-                unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_poll")? };
+            let poll_fn: RdmaRcEndpointPollFn = self.cuteafd_rdma_rc_endpoint_poll()?;
             let status = unsafe {
                 poll_fn(
                     handle,
@@ -4779,8 +4804,7 @@ impl NativeLibrary {
         out: &mut [u8],
         bytes: usize,
     ) -> Result<()> {
-        let copy_fn: Symbol<RdmaRcEndpointCopyRecvFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_copy_recv")? };
+        let copy_fn: RdmaRcEndpointCopyRecvFn = self.cuteafd_rdma_rc_endpoint_copy_recv()?;
         let status = unsafe { copy_fn(handle, out.as_mut_ptr().cast(), out.len(), bytes) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_copy_recv", status)
     }
@@ -4792,8 +4816,7 @@ impl NativeLibrary {
         offset_bytes: usize,
         bytes: usize,
     ) -> Result<()> {
-        let copy_fn: Symbol<RdmaRcEndpointCopyRecvAtFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_copy_recv_at")? };
+        let copy_fn: RdmaRcEndpointCopyRecvAtFn = self.cuteafd_rdma_rc_endpoint_copy_recv_at()?;
         let status = unsafe {
             copy_fn(
                 handle,
@@ -4821,7 +4844,7 @@ impl NativeLibrary {
     pub unsafe fn rdma_rc_endpoint_expose_device(&self, handle: *mut c_void, device: Option<CuteafdDeviceBuffer>)
         -> Result<u32> {
         type ExposeFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
-        let expose: Symbol<ExposeFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_expose_device")? };
+        let expose: ExposeFn = self.cuteafd_rdma_rc_endpoint_expose_device()?;
         let (ptr, bytes) = device.map_or((std::ptr::null_mut(), 0), |d| (d.ptr, d.bytes));
         let mut rkey = 0;
         let status = unsafe { expose(handle, ptr, bytes, &mut rkey) };
@@ -4839,7 +4862,7 @@ impl NativeLibrary {
     pub unsafe fn rdma_rc_endpoint_post_write_flagged(&self, handle: *mut c_void, offset: usize, bytes: usize,
         remote: u64, rkey: u32, flag_value: u64, flag_remote: u64, flag_rkey: u32, wr_id: u64) -> Result<()> {
         type WriteFn = unsafe extern "C" fn(*mut c_void, usize, usize, u64, u32, u64, u64, u32, u64) -> CuteafdStatus;
-        let write: Symbol<WriteFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_write_flagged")? };
+        let write: WriteFn = self.cuteafd_rdma_rc_endpoint_post_write_flagged()?;
         let status = unsafe { write(handle, offset, bytes, remote, rkey, flag_value, flag_remote, flag_rkey, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_write_flagged", status)
     }
@@ -4851,8 +4874,7 @@ impl NativeLibrary {
         bytes: usize,
     ) -> Result<u32> {
         type RegisterFn = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut u32) -> CuteafdStatus;
-        let register: Symbol<RegisterFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_register_region")? };
+        let register: RegisterFn = self.cuteafd_rdma_rc_endpoint_register_region()?;
         let mut region = 0;
         let status = unsafe { register(handle, ptr, bytes, &mut region) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_register_region", status)?;
@@ -4873,14 +4895,13 @@ impl NativeLibrary {
         wr_id: u64,
     ) -> Result<()> {
         type PostFn = unsafe extern "C" fn(*mut c_void, usize, usize, u32, usize, usize, u64) -> CuteafdStatus;
-        let post: Symbol<PostFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_post_send_slot_region")? };
+        let post: PostFn = self.cuteafd_rdma_rc_endpoint_post_send_slot_region()?;
         let status = unsafe { post(handle, slot_offset, slot_bytes, region, region_offset, region_bytes, wr_id) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_post_send_slot_region", status)
     }
 
     pub fn rdma_rc_endpoint_destroy(&self, handle: *mut c_void) -> Result<()> {
-        let destroy_fn: Symbol<RdmaRcEndpointDestroyFn> =
-            unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_destroy")? };
+        let destroy_fn: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_destroy()?;
         memory_ledger::record_free(handle as usize);
         let status = unsafe { destroy_fn(handle) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_destroy", status)
@@ -4890,20 +4911,20 @@ impl NativeLibrary {
     /// libraries and must be rejected before external landing allocation.
     pub fn rdma_rc_endpoint_quiesce_available(&self) -> Result<()> {
         // SAFETY: resolving a function does not invoke it or create CUDA state.
-        let _: Symbol<RdmaRcEndpointDestroyFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_quiesce")? };
+        let _: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_quiesce()?;
         Ok(())
     }
 
     pub fn rdma_rc_endpoint_quiesce(&self, handle: *mut c_void) -> Result<()> {
         // SAFETY: the transport owns the live endpoint; this optional ABI only
         // destroys its QP and retains every registration and storage owner.
-        let quiesce: Symbol<RdmaRcEndpointDestroyFn> = unsafe { self.lib.get(b"cuteafd_rdma_rc_endpoint_quiesce")? };
+        let quiesce: RdmaRcEndpointDestroyFn = self.cuteafd_rdma_rc_endpoint_quiesce()?;
         let status = unsafe { quiesce(handle) };
         self.status_to_result("cuteafd_rdma_rc_endpoint_quiesce", status)
     }
 
     pub fn last_error(&self) -> Result<String> {
-        let last_error_fn: Symbol<LastErrorFn> = unsafe { self.lib.get(b"cuteafd_last_error")? };
+        let last_error_fn: LastErrorFn = self.cuteafd_last_error()?;
         let mut buf = vec![0 as c_char; 512];
         let status = unsafe { last_error_fn(buf.as_mut_ptr(), buf.len()) };
         if status != CUTEAFD_STATUS_OK {

@@ -22,6 +22,7 @@ fn invalid(message: impl Into<String>) -> GlueError {
 pub enum Op {
     TrellisInput { features: u32, rotated_bf16: bool },
     TrellisOutput { features: u32 },
+    Mx8Quant { features: u32 },
     Unpack { input: u32, output: u32, side: u32 },
     Prefill { input: u32, output: u32 },
     SwigluSplit { inter: u32 },
@@ -41,6 +42,9 @@ impl Op {
                 ("input", "float32", format!("[rows,{n}]"), "in"),
                 ("svh", "float16", format!("[{n}]"), "in"),
                 ("output", "bfloat16", format!("[rows,{n}]"), "out")], &["rows", "cta_limit"]),
+            Op::Mx8Quant { .. } => (vec![
+                ("rotated_inputs", "int64", "[4]".into(), "in"),
+                ("records", "uint8", "[record_bytes]".into(), "out")], &["rows", "rotation_id", "cta_limit"]),
             Op::Unpack { input: k, output: n, .. } => (vec![
                 ("payload", "uint8", format!("[{}]", u64::from(k) * u64::from(n) / 2), "in"),
                 ("output", "uint8", format!("[{n},{k}]"), "out")], &[]),
@@ -74,6 +78,15 @@ fn u32_of(g: &serde_json::Value, key: &str) -> Result<u32> {
 pub fn op_of(entry: &serde_json::Value) -> Result<Option<Op>> {
     let g = &entry["geometry"];
     Ok(Some(match entry["op"].as_str() {
+        Some("dense_mxfp8_quant") => {
+            let features = u32_of(g, "input_features")?;
+            if ![2048, 6144, 8192, 12288, 16384].contains(&features)
+                || g["input_dtype"] != "f16" || g["rotation_count"] != 4 || g["max_rows"] != 4096
+                || g["abi_version"] != 2 {
+                return Err(invalid("MX8 quant geometry"));
+            }
+            Op::Mx8Quant { features }
+        }
         Some("trellis_input") => {
             if g["input_dtype"].as_str() != Some("bf16") { return Err(invalid("trellis input takes BF16 rows")); }
             let rotated_bf16 = match g["output_dtype"].as_str() { None | Some("f16") => false, Some("bf16") => true,
@@ -193,6 +206,41 @@ mod tests {
     }
 
     #[test]
+    fn native_mx8_quant_contract_rejects_geometry_and_abi_mutations() {
+        let quant = entry("dense_mxfp8_quant",
+            json!({"input_features":2048,"input_dtype":"f16","rotation_count":4,"max_rows":4096,"abi_version":2}),
+            json!([{"name":"rotated_inputs","dtype":"int64","shape":"[4]","role":"in"},
+                {"name":"records","dtype":"uint8","shape":"[record_bytes]","role":"out"}]),
+            &["rows", "rotation_id", "cta_limit"]);
+        for features in [2048, 6144, 8192, 12288, 16384] {
+            let mut candidate = quant.clone();
+            candidate["geometry"]["input_features"] = json!(features);
+            assert_eq!(validate_entry(&spec("q", &candidate, 4096), &candidate).unwrap(),
+                Op::Mx8Quant { features });
+        }
+        for (field, value) in [("input_features", json!(4096)), ("input_dtype", json!("bf16")),
+            ("rotation_count", json!(1)), ("max_rows", json!(64)),
+            ("abi_version", json!(1)), ("abi_version", json!(null))] {
+            let mut bad = quant.clone();
+            bad["geometry"][field] = value;
+            assert!(validate_entry(&spec("q", &bad, 4096), &bad).is_err(), "{field}");
+        }
+        for (field, value) in [("name", "partial"), ("dtype", "float32"),
+            ("shape", "[0]"), ("role", "scratch")] {
+            let mut bad = quant.clone();
+            bad["pointers"][1][field] = json!(value);
+            assert!(validate_entry(&spec("q", &bad, 4096), &bad).is_err(), "{field}");
+        }
+        let mut bad = quant.clone();
+        bad["scalars"][1]["name"] = json!("c0");
+        assert!(validate_entry(&spec("q", &bad, 4096), &bad).is_err());
+        assert!(validate_entry(&spec("q", &quant, 64), &quant).is_err());
+        let mut bad = spec("q", &quant, 4096);
+        bad.scratch.insert("records".into(), 1);
+        assert!(validate_entry(&bad, &quant).is_err());
+    }
+
+    #[test]
     fn exported_companion_contracts_validate_and_mutations_fail() {
         let prefill = entry("trellis_fp8_prefill", json!({"input_features": 2048, "output_features": 16384,
             "max_rows": 4096, "scales": "block", "output_dtype": "f32", "compute_warps": 8, "num_stages": 3}),
@@ -266,6 +314,7 @@ mod exported_manifest {
             }
             checked += 1;
         }
-        assert_eq!(checked, 87);
+        // 76 dense operands/companions, 14 full-head and 18 TP2 attention stages.
+        assert_eq!(checked, 108);
     }
 }

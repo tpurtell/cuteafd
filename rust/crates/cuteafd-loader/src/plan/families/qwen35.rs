@@ -109,10 +109,10 @@ impl FamilyModel for Model {
 }
 
 fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::plan::PlanInput,
-    report: &mut crate::plan::PlanReport, options: &crate::plan::layout::LayoutOptions)
+    report: &mut crate::plan::PlanReport, options: &mut crate::plan::layout::LayoutOptions)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     use anyhow::{ensure, Context};
-    use crate::placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights},
+    use crate::placement::{self, families::qwen3_5::{DenseInputs, NativeBuffers, NativeWeights, PREFILL_ROWS},
         ArchContext, Baseline, GpuBudget, ProgramSet};
     use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
     ensure!(options.rtx_bytes.len() == 1 && report.spark_ranks == 0,
@@ -122,6 +122,17 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         "dense Qwen media execution is not qualified");
     ensure!(options.drafter_bytes == 0 && !(options.dense_qwen_mtp && options.dense_qwen_drafter_snapshot.is_some()),
         "dense native planner requires one checkpoint-native drafter admission");
+    let rows = PREFILL_ROWS as u64;
+    ensure!(options.prefill_rows == 0 || options.prefill_rows == rows,
+        "dense native prefill requires capacity {rows}");
+    ensure!(options.prefill_unit_rows.is_none_or(|n| n == rows)
+        && options.prefill_span_rows.is_none_or(|n| n == rows)
+        && options.prefill_waves == 1 && options.prefill_lanes <= 1,
+        "dense native prefill requires one coordinator unit of {rows} rows and one wave, with no Spark exchange");
+    // Dense execution retains one coordinator chunk, not Spark exchange slots.
+    options.prefill_unit_rows = Some(rows);
+    report.prefill_span_rows = Some(rows);
+    report.prefill_transports = Some(0);
     let prefix = match (cfg.hidden, cfg.intermediate, cfg.heads, cfg.gdn.value_heads) {
         (4096, 12288, 16, 32) => "qwen35", (5120, 17408, 24, 48) => "qwen38",
         _ => anyhow::bail!("dense Qwen geometry lacks native exports"),
@@ -151,7 +162,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             norm = Some(dtype);
         }
     }
-    ensure!(scratch > 0 && matches!(options.prefill_rows, 0 | 4096), "dense native prefill requires capacity 4096");
+    ensure!(scratch > 0, "dense native prefill requires nonzero scratch");
     let slots = usize::try_from(if options.concurrency == 0 { 4 } else { options.concurrency })?;
     ensure!(options.state_slots.is_none_or(|n| n == slots as u64), "dense state slots must equal concurrency");
     let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;

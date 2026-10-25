@@ -80,6 +80,9 @@ pub(crate) struct RunArgs {
     /// Decode concurrency levels for context_load (distinct values in 1..256).
     #[arg(long, value_parser = cuteafd_bench::panels::context_load::parse_levels_arg)]
     pub(crate) context_levels: Option<String>,
+    /// Additional fresh suffix tokens per context_load request (0..1048576; default 0).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(0..=1048576))]
+    pub(crate) context_suffix: Option<u64>,
     /// Exports to write: svg (report, card, panels), png (report, card), json.
     #[arg(long, value_delimiter = ',', default_value = "svg,png,json")]
     pub(crate) export: Vec<String>,
@@ -124,7 +127,15 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             eprintln!("{count} reports: updated {} and {}", readme.display(), index.display());
             Ok(())
         }
-        Some(BenchAction::Smoke(smoke)) => cuteafd_bench::smoke::run(smoke),
+        Some(BenchAction::Smoke(smoke)) => match cuteafd_bench::smoke::run(smoke) {
+            // Torn down after SIGTERM/SIGINT/SIGHUP: exit as the signal would have.
+            Err(error) if error.downcast_ref::<cuteafd_bench::smoke::Cancelled>().is_some() => {
+                let signal = error.downcast_ref::<cuteafd_bench::smoke::Cancelled>().map_or(15, |c| c.0);
+                eprintln!("smoke: {error:#}");
+                std::process::exit(128 + signal);
+            }
+            other => other,
+        },
         Some(BenchAction::Cancel { url, api_key }) => cuteafd_bench::cli::cancel(&url, &api_key),
         Some(BenchAction::Export { json, out, root, export }) => {
             let report: cuteafd_bench::report::Report = serde_json::from_str(&std::fs::read_to_string(&json)?)?;
@@ -147,7 +158,7 @@ pub(crate) fn run(args: BenchArgs) -> Result<()> {
             let options = cuteafd_bench::cli::RunOptions { url: run.url, profile: run.profile, panels: run.panels,
                 passes, baseline: None, fabric: run.fabric, export: run.export, out: run.out, label: None, root: run.root, api_key: run.api_key, quiet: false, deadline: None,
                 lossless_set, lossless_dump: run.lossless_dump, context_lengths: run.context_lengths.as_deref().map(cuteafd_bench::sweep::parse_lengths).transpose().map_err(anyhow::Error::msg)?,
-                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)? };
+                context_levels: run.context_levels.as_deref().map(cuteafd_bench::sweep::parse_levels).transpose().map_err(anyhow::Error::msg)?, context_suffix: run.context_suffix };
             let (report, dir) = cuteafd_bench::cli::run(&options)?;
             println!("{}", dir.display());
             if report.quality_failed() {
@@ -312,6 +323,12 @@ mod tests {
         let bench = BenchArgs::from_arg_matches(parsed.subcommand().unwrap().1).unwrap();
         assert_eq!(bench.run.context_lengths.as_deref(), Some("32768,131072"));
         assert_eq!(bench.run.context_levels.as_deref(), Some("1,8,16"));
+        let suffix = |n: &str| crate::cli::Cli::command().try_get_matches_from([
+            "cuteafd", "bench", "--panels", "context_load", "--context-suffix", n]);
+        let parsed = suffix("512").unwrap();
+        assert_eq!(BenchArgs::from_arg_matches(parsed.subcommand().unwrap().1).unwrap().run.context_suffix, Some(512));
+        assert!(suffix("0").is_ok());
+        for n in ["-1", "1048577", "abc"] { assert!(suffix(n).is_err()); }
         for (l, c) in [("255", "1"), ("1048577", "1"), ("abc", "1"), ("32768", "0"), ("32768", "8,8")] {
             assert!(args(l, c).is_err());
         }

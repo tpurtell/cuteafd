@@ -56,6 +56,11 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
                 # Local/dual still execute their whole-step default, now explicit in the plan.
                 position = before["command"].index("--console-secret-file")
                 before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "1"]
+            if entry["family"] == "deepseek_v4":
+                # V4 forwards the planner's resolved unit and wave defaults.
+                anchor = "--split-device" if "--split-device" in before["command"] else "--pool-tokens"
+                position = before["command"].index(anchor) + 2
+                before["command"][position:position] = ["--prefill-rows", "4096", "--prefill-waves", "2"]
             if compact_draft:
                 anchor = {"glm5": "--pool-tokens", "glm5_flash": "--host-cache-bytes",
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]

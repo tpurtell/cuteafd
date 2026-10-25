@@ -25,7 +25,7 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
 # WIP qualification configs for families without a release card yet (#273, #274):
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config"}
-V4_PREP = {"glm53-exlr8-min.config", "glm53-exlr8-max.config",
+V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
            "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
@@ -61,6 +61,9 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1": {**QWEN, "quantization_config": {"quant_method": "exl3"}},
     "nvidia/Qwen3.8-Flash-Next-NVFP4": {**QWEN, "quantization_config": {"quant_method": "modelopt", **NVFP4_GROUPS}},
     "kindlingai/glm-5.3-exlr8-k2-k3-k4": GLM5,
+    "Qwen/Qwen3.5-9B": {"model_type": "qwen3_5", "text_config": {
+        "hidden_size": 4096, "num_hidden_layers": 32,
+        "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
     "Qwen/Qwen3.8-27B": {"model_type": "qwen3_5", "text_config": {
         "hidden_size": 5120, "num_hidden_layers": 32,
         "layer_types": ["linear_attention"] * 31 + ["full_attention"]}},
@@ -593,7 +596,8 @@ def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
         # The smoke-entry loader test above still validates every config key.
     else:
         assert values["SPARK_COUNT"] == "0" and values["RTX_GPUS"] == "1"
-        assert values["SPECULATOR"] == "dspark"
+        speculator = "off" if name.startswith("qwen35-9b") else "dspark"
+        assert values["SPECULATOR"] == speculator
         from test_run_family_dispatch import _family_launch_result, _snapshot
         _snapshot(tmp_path / "hf", "RadixArk/Qwen3.8-27B-DSpark",
                   {"speculators_model_type": "dspark"}, "85ef153be924f17ce4bf62726954eeaa4a73e854")
@@ -602,7 +606,8 @@ def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
             "".join(f"{k}={v}\n" for k, v in launch_values.items()),
             extra_args=("--wip", "dense-test"), encoder_plan=LOCAL_PLAN)
         launch = _coordinator(result)
-        assert "serve-qwen35" in launch and "--draft " in launch
+        assert "serve-qwen35" in launch
+        assert ("--draft " in launch) == (speculator == "dspark")
         assert "--peers " not in launch
 
 
@@ -613,7 +618,9 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
     assert len(entries) == len(v4["entries"])
     for entry in v3["entries"]:
         if entry["name"].endswith("-5090") and entry["name"] != "qwen38-nvfp4-5090":
-            assert entries[entry["name"]] == entry
+            candidate = {**entries[entry["name"]], "set": dict(entries[entry["name"]]["set"])}
+            candidate["set"].pop("SPARK_EXPERT_DOCKER_INFERENCE", None)
+            assert candidate == entry
     assert entries["qwen38-exl3-5090"]["set"]["SPARK_COUNT"] == "1"
     for name, gpus, sparks in [
         ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
@@ -621,11 +628,29 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6),
         ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
         ("step5-nvfp4-min", 1, 4), ("qwen38-27b-bf16-min", 1, 0),
-        ("qwen38-27b-fp8-min", 1, 0),
+        ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),
+        ("qwen38-27b-bf16-min-nospec", 1, 0), ("qwen38-27b-fp8-min-nospec", 1, 0),
     ]:
         assert len(entries[name]["gpus"]) == gpus
         assert len(entries[name]["sparks"]) == sparks
         assert entries[name]["set"]["SPARK_COUNT"] == str(sparks)
+    dense = [entry for entry in v4["entries"] if entry["family"] == "qwen3_5"]
+    assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
+        "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",
+        "qwen38-27b-fp8-min": "dspark", "qwen38-27b-bf16-min-nospec": "off",
+        "qwen38-27b-fp8-min-nospec": "off"}
+    for quant in ("bf16", "fp8"):
+        base = entries[f"qwen38-27b-{quant}-min"]
+        nospec = entries[f"{base['name']}-nospec"]
+        assert nospec == {**base, "name": f"{base['name']}-nospec", "set": {
+            **base["set"], "SPECULATOR": "off", "ADDR": nospec["set"]["ADDR"]}}
+    assert "SPARK_EXPERT_DOCKER_INFERENCE" not in v4["defaults"]["set"]
+    for entry in v4["entries"]:
+        assert ("SPARK_EXPERT_DOCKER_INFERENCE" in entry["set"]) == bool(entry["sparks"])
+    for entry in dense:
+        assert "EXPERT_PORT" not in entry["set"]
+        assert sum(other.get("set", {}).get("ADDR") == entry["set"]["ADDR"]
+                   for other in v4["entries"]) == 1
     assert not any(name.startswith("qwen38-nvfp4") for name in entries)
     retired = v4["retired"]
     assert len(retired) == 14
@@ -637,7 +662,10 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert (ROOT / entry["config"]).is_file()
         report = json.loads((ROOT / entry["report"] / "report.json").read_text())
         assert report["profile"] == "smoke" and report["baseline"]
-        assert entry["release"] == "v3.0.0" and entry["release_note"]
+        build = report["server"]["build"]
+        expected = build["release"] or f"v3 dev {report['created'][:10]}"
+        assert entry["release"] == expected and entry["release_note"]
+        assert "nearest" not in entry["release_note"].lower()
         if entry["name"] == "glm53f-exl3-v1":
             candidates = [d for _, d in reports if d["profile"] == "smoke" and
                           d["server"]["model"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1"]

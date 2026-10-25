@@ -10,6 +10,28 @@ use super::*;
 /// (exact rank I/O and rings are charged from the selected working set).
 const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190), basis: Basis::Calibrated };
 
+/// Both checkpoint formats publish the same slot-owned GLM prefill geometry
+/// before device or host admission. The continuous span owns no workspace.
+pub(crate) fn resolve_prefill(report: &mut PlanReport, options: &mut LayoutOptions,
+    rows: u64, spark_ranks: usize) -> crate::serving_capacity::PrefillShape {
+    let requested = if options.prefill_lanes > 0 { options.prefill_lanes }
+        else if options.prefill_waves > 1 { options.prefill_waves }
+        else { glm_prefill_lanes(None) as u64 };
+    let shape = crate::serving_capacity::PrefillShape {
+        unit_rows: options.prefill_unit_rows.unwrap_or(rows),
+        waves: crate::placement::families::glm5::prefill_lanes(spark_ranks, requested),
+    };
+    options.prefill_rows = shape.unit_rows;
+    options.prefill_unit_rows = Some(shape.unit_rows);
+    options.prefill_lanes = shape.waves;
+    options.prefill_waves = shape.waves;
+    report.prefill_unit_rows = Some(shape.unit_rows);
+    report.prefill_waves = Some(shape.waves);
+    report.prefill_transports = Some(shape.waves);
+    report.prefill_span_rows = Some(options.prefill_span_rows.unwrap_or(GLM_DEFAULT_PREFILL_SPAN_ROWS));
+    shape
+}
+
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
@@ -53,16 +75,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
             local_package(report), split, index, options.rtx_bytes[index]));
     }
-    let lanes = if options.prefill_lanes > 0 { options.prefill_lanes }
-        else { glm_prefill_lanes(None) as u64 };
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
-    // Publish the actual prefill units: `prefill_rows` each, `lanes` in flight
-    // on the one prefill transport (one with no Sparks), streamed over a span
-    // of rows per call. Workspaces are per unit slot; the span charges nothing.
-    options.prefill_unit_rows = Some(shape.prefill_rows);
-    options.prefill_waves = if spark_ranks == 0 { 1 } else { lanes };
-    report.prefill_span_rows = Some(options.prefill_span_rows
-        .unwrap_or(crate::plan::layout::GLM_DEFAULT_PREFILL_SPAN_ROWS));
+    let prefill = resolve_prefill(report, options, shape.prefill_rows, spark_ranks);
+    shape.prefill_rows = prefill.unit_rows;
+    let lanes = prefill.waves;
     let mut working = crate::placement::SparkWorkingSet { rtx_layers: Vec::new(),
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
@@ -363,10 +379,9 @@ pub fn native_layout(checkpoint: &Checkpoint, options: &LayoutOptions, shared_by
     let lanes = glm::prefill_lanes(spark_ranks, if options.prefill_lanes > 0 { options.prefill_lanes }
         else { glm_prefill_lanes(None) as u64 });
     let dense_scratch = if native {
-        let heads = cfg.heads / gpu_count;
-        let inter = cfg.dense_intermediate / gpu_count;
-        let bytes = crate::plan::exlr8::dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
-            + lanes as usize * crate::plan::exlr8::dense::scratch_bytes(&cfg, heads, inter, rows as usize);
+        let a8 = options.exlr8_prefill_activations == crate::plan::exlr8::PrefillActivations::A8;
+        let bytes = crate::plan::exlr8::dense::lane_charge_bytes(&cfg, gpu_count, glm::DECODE_ROWS as usize,
+            rows as usize, lanes as usize, a8);
         vec![bytes as u64; gpu_count]
     } else { Vec::new() };
     let mut devices = Vec::new();
@@ -417,25 +432,125 @@ mod tests {
     use super::*;
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
+    fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
+
+    #[test]
+    fn exlr8_min_max_prefill_matches_exl3_and_charges_every_wave() {
+        use crate::plan::{PlanInput, PlanOptions, ExpertPlacement, testing};
+        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| testing::exl3(n, r, k, 4)), None);
+        let input = PlanInput::open(dir.path()).unwrap();
+        let manifest = native_manifest();
+        let path = dir.path().join("PROGRAMS.json");
+        std::fs::write(&path, manifest.to_string()).unwrap();
+        for (gpus, sparks) in [(1, 4), (2, 6)] {
+            // CLI maps PREFILL_WAVES to prefill_lanes, preserving explicit N1.
+            for (unit, requested, span) in [(0, 0, None), (2048, 1, Some(8192)),
+                (4096, 2, Some(32768)), (1024, 3, None)] {
+                let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: unit,
+                    prefill_lanes: requested, prefill_waves: requested.max(1), prefill_span_rows: span,
+                    workspace_manifest: Some(path.clone()), context_tokens: 65536,
+                    onboard: Some(crate::placement::Onboard::Layers(0)), glm5_drafter_disabled: true,
+                    host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), ..Default::default() };
+                let plan_options = PlanOptions { placement: ExpertPlacement::Sparks { ranks: sparks },
+                    layout: Some(options.clone()), ..Default::default() };
+                let exl3 = input.plan(&plan_options).unwrap();
+                let mut native = crate::plan::empty_report(input.checkpoint(), &plan_options).unwrap();
+                let mut options = options;
+                let rows = if unit == 0 { 4096 } else { unit };
+                let shape = resolve_prefill(&mut native, &mut options, rows, sparks);
+                native.family = exl3.family.clone();
+                native.spec = exl3.spec.clone();
+                native.cache_requirements = exl3.cache_requirements.clone();
+                native.spark_ranks = sparks;
+                native.memory_layout = Some(native_layout(input.checkpoint(), &options,
+                    &vec![256; gpus], 256, sparks, &manifest).unwrap().0);
+                charge_host(&mut native, &options, input.checkpoint(), true).unwrap();
+                let geometry = |r: &PlanReport| (r.prefill_unit_rows, r.prefill_waves,
+                    r.prefill_span_rows, r.prefill_transports);
+                let rows = if unit == 0 { 4096 } else { unit };
+                let waves = if requested == 0 { 2 } else { requested };
+                assert_eq!(geometry(&native), (Some(rows), Some(waves), Some(span.unwrap_or(16384)), Some(waves)));
+                assert_eq!(geometry(&native), geometry(&exl3), "{gpus} RTX/{sparks} Sparks");
+                let spec = native.spec.as_ref().unwrap();
+                let moe = spec.moe.as_ref().unwrap();
+                let expert = ExpertGeometry { hidden: spec.hidden as u32, experts: moe.experts as u32,
+                    topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
+                let endpoints = spark_endpoints("glm5", waves) as u64;
+                let endpoint = SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Fp8K32 };
+                let (request, response) = endpoint.wire_bytes(expert).unwrap();
+                let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
+                    depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+                let host = native.host_ledger.as_ref().unwrap();
+                let bytes = |name| host.items.iter().find(|i| i.group == name).unwrap().bytes;
+                assert_eq!(bytes("spark-intake"), shape.slot_rows() * expert.hidden as u64 * 4 * endpoints * sparks as u64);
+                assert_eq!(bytes("transport/rdma-rings"), endpoint.ring_bytes(expert, rings).unwrap() as u64 * endpoints * sparks as u64);
+                assert_eq!(bytes("workspace/router"), (shape.slot_rows() + 64) * (expert.hidden as u64 * 2 + expert.topk as u64 * 8));
+                assert_eq!(host.shortfall_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn exlr8_a8_prefill_charges_exactly_the_lane_records_and_nothing_else() {
+        use crate::placement::families::glm5 as glm;
+        use crate::plan::exlr8::{dense, PrefillActivations};
+        const GROUP: &str = "native dense scratch and prefill staging";
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::exlr8::glm_snapshot(dir.path());
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        let manifest = native_manifest();
+        let scratch = |layout: &MemoryLayout, gpu: usize| layout.devices[gpu].items.iter()
+            .filter(|item| item.group == GROUP).map(|item| item.bytes).sum::<u64>();
+        let rest = |layout: &MemoryLayout| MemoryLayout { devices: layout.devices.iter().map(|device| DeviceLayout {
+            items: device.items.iter().filter(|item| item.group != GROUP).cloned().collect(), ..device.clone() })
+            .collect(), ..layout.clone() };
+        for (gpus, sparks) in [(1, 4), (2, 6)] {
+            for (rows, lanes) in [(4096u64, 1u64), (4096, 2), (2048, 3), (1024, 4)] {
+                let options = LayoutOptions { rtx_bytes: vec![96 << 30; gpus], prefill_rows: rows, prefill_lanes: lanes,
+                    prefill_waves: lanes, context_tokens: 65536, onboard: Some(crate::placement::Onboard::Layers(0)),
+                    glm5_drafter_disabled: true, host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                    ..Default::default() };
+                let plan = |activations| native_layout(&checkpoint,
+                    &LayoutOptions { exlr8_prefill_activations: activations, ..options.clone() },
+                    &vec![256; gpus], 256, sparks, &manifest).unwrap();
+                let (a16, a16_placement) = plan(PrefillActivations::A16);
+                let (a8, a8_placement) = plan(PrefillActivations::A8);
+                let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+                let records = dense::a8_scratch_bytes(&cfg, heads, inter, rows as usize) as u64;
+                assert!(records > 0);
+                let context = format!("{gpus} RTX/{sparks} Sparks/{rows} rows/{lanes} lanes");
+                for gpu in 0..gpus {
+                    assert_eq!(scratch(&a16, gpu), (dense::scratch_bytes(&cfg, heads, inter, glm::DECODE_ROWS as usize)
+                        + lanes as usize * dense::scratch_bytes(&cfg, heads, inter, rows as usize)) as u64, "{context}");
+                    assert_eq!(scratch(&a8, gpu), scratch(&a16, gpu) + lanes * records, "{context} gpu {gpu}");
+                }
+                // The automatic pool takes what is left, so it absorbs the records (never grows) ...
+                assert!(a8_placement.pool_tokens <= a16_placement.pool_tokens, "{context}");
+                assert!(a8_placement.pool_tokens < a16_placement.pool_tokens || records * lanes < 1 << 20, "{context}");
+                // ... and with the pool pinned, nothing but the scratch item differs.
+                let pinned = |activations| native_layout(&checkpoint, &LayoutOptions { pool_tokens: Some(1 << 19),
+                    exlr8_prefill_activations: activations, ..options.clone() },
+                    &vec![256; gpus], 256, sparks, &manifest).unwrap().0;
+                let (pinned_a16, pinned_a8) = (pinned(PrefillActivations::A16), pinned(PrefillActivations::A8));
+                assert_eq!(pinned_a8.pool_tokens, 1 << 19, "{context}");
+                for gpu in 0..gpus {
+                    assert_eq!(scratch(&pinned_a8, gpu), scratch(&pinned_a16, gpu) + lanes * records, "{context}");
+                }
+                assert_eq!(rest(&pinned_a8), rest(&pinned_a16), "{context}");
+            }
+        }
+    }
+
     #[test]
     fn native_automatic_pool_matches_ordinary_and_keeps_explicit_requests_strict() {
         use crate::placement::{families::glm5 as glm, PlacementError};
-        use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
         let checkpoint = Checkpoint::open(dir.path()).unwrap();
-        let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
-        for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
-            names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
-            for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {
-                names.extend([format!("{prefix}_producer_{cap}"), format!("{prefix}_sparse_mla_{mode}_{cap}"),
-                    format!("{prefix}_o_{cap}"), format!("{prefix}_ffn_i{moe}_{cap}"),
-                    format!("{prefix}_ffn_i{dense}_{cap}")]);
-            }
-        }
-        names.extend(["glm_sparse_mla_partial_h0_s2_m64".into(), "glm_sparse_mla_partial_h32_s2_m64".into()]);
-        let manifest = json!({"programs": names.into_iter().map(|name|
-            json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()});
+        let manifest = native_manifest();
         let default = cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS;
         for gpus in 1..=2 {
             // Whole execution must not depend on any context-split or glm2 exports.

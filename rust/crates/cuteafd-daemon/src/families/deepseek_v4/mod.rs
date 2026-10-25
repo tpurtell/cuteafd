@@ -49,6 +49,12 @@ pub(crate) struct EngineArgs {
     /// Optional expert-input quantizer SM ceiling (default: this device's SM count).
     #[arg(long)]
     pub sms: Option<usize>,
+    /// Rows per prefill unit; defaults to the export's maximum capacity.
+    #[arg(long)]
+    pub prefill_rows: Option<usize>,
+    /// Independently outstanding units on one Spark transport.
+    #[arg(long, default_value_t = engine::PREFILL_WAVES)]
+    pub prefill_waves: usize,
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
@@ -112,12 +118,15 @@ fn parse_plan_rows(text: &str) -> std::result::Result<PlanRows, String> {
 pub(crate) struct GoldenArgs {
     #[command(flatten)]
     pub engine: EngineArgs,
-    /// Directory with tokens.bin, layerNN.bin and logits.bin from golden.py.
+    /// Published shared fidelity directory, or tokens.bin/layerNN.bin/logits.bin from golden.py.
     #[arg(long)]
     pub golden: PathBuf,
     /// Score every prefill row: mean next-token NLL, top-1 agreement and KL against golden.
     #[arg(long)]
     pub nll: bool,
+    /// One window from the published sealed quick subset (default: all eight).
+    #[arg(long)]
+    pub window: Option<String>,
     /// Save tokens.bin and F32 logits.bin for a reference run: with --nll every prefill row,
     /// with --prefill N only the decode/verify rows (positions N.., tokens.bin from N), so two
     /// runs compare exactly the rows the decode path produced.
@@ -292,7 +301,8 @@ pub(crate) fn with_engine<T>(
     args: &EngineArgs,
     prefix: Option<&crate::shared::prefix::PrefixArgs>,
     held: impl FnOnce(&engine::Engine<'_>) -> Result<usize>,
-    body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime) -> Result<T>,
+    body: impl FnOnce(&engine::Engine<'_>, &mut [SparkLink<'_>], &tokio::runtime::Runtime,
+        Option<cuteafd_hostcache::config::Config>) -> Result<T>,
 ) -> Result<T> {
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?;
     let caps = &loaded.manifest["capacities"];
@@ -339,7 +349,11 @@ pub(crate) fn with_engine<T>(
     };
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
-    let prefill_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
+    let prefill_kernel_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
+    let prefill_rows = args.prefill_rows.unwrap_or(prefill_kernel_rows.min(4096));
+    ensure!(matches!(prefill_rows, 512 | 1024 | 2048 | 4096)
+        && prefill_rows <= caps["prefill_rows"].as_u64().context("prefill_rows")? as usize
+        && (1..=3).contains(&args.prefill_waves), "V4 prefill needs page-aligned rows within the export capacity and 1..=3 waves");
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
@@ -423,7 +437,7 @@ pub(crate) fn with_engine<T>(
                     (home.experts == ExpertHome::Spark).then_some(layer)).collect(),
                 rtx_layers: placement.layers.iter().enumerate().filter_map(|(layer, home)|
                     matches!(home.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2).then_some(layer)).collect(),
-                spark_ranks: peers.len(), prefill_lanes: engine::PREFILL_LANES as u64,
+                spark_ranks: peers.len(), prefill_lanes: 1,
             };
             crate::shared::placement::SparkAdmission::plan(&loaded.snapshot,
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
@@ -488,7 +502,7 @@ pub(crate) fn with_engine<T>(
         usize::try_from(placement.pool_tokens)?, 256)?;
     let shape = pool::PoolShape::new(
         args.max_sequences,
-        caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
+        prefill_rows,
         pool::PoolShape::context_units(pool::PoolShape::units_for(usize::try_from(placement.pool_tokens)?,
             args.max_sequences), context_mode.is_some()),
     );
@@ -499,7 +513,9 @@ pub(crate) fn with_engine<T>(
         weights: model,
         family: loaded.family,
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
-        prefill_rows: caps["prefill_rows"].as_u64().context("prefill_rows")? as usize,
+        prefill_rows,
+        prefill_kernel_rows,
+        prefill_waves: args.prefill_waves,
         c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,
         stream,
@@ -517,6 +533,9 @@ pub(crate) fn with_engine<T>(
         if let Some((device, stream)) = peer_stream {
             engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.as_ref().is_some_and(|t| t.layers > 0) })?;
         }
+        // Freeze the prefix quota and admit it together with every future table before
+        // attach_context or workspace preparation can reserve ordered-upload staging.
+        let host_config = admission::host_memory(&engine, args, prefix, context_extent)?;
         let held = held(&engine)?;
         let _ = held; // Prefix bytes were reserved before placement.
         let started = Instant::now();
@@ -560,43 +579,53 @@ pub(crate) fn with_engine<T>(
             elapsed_ms = started.elapsed().as_millis() as u64, "DeepSeek V4 expert layers resident on coordinator GPUs");
         // Declare rank ownership once for every transport and device lane.
         let spark_world = (!peers.is_empty()).then(|| cuteafd_transport::expert::SparkWorld::canonical(peers.len())).transpose()?;
-        // One transport (connection set) per prefill lane, so each lane can keep
-        // a Spark wave in flight; decode uses the first.
-        let lanes = if skip { 0 } else { engine::PREFILL_LANES };
-        transports = (0..lanes).map(|_| SparkLink::new(&loaded.library, spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
-            TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-            loaded.cfg.dim * 2))
-            .collect::<Result<Vec<_>>>()?;
+        // Decode graphs retain fixed reply pointers; prefill alone rotates N
+        // FIFO return slots on its separate connection set.
+        if !skip {
+            transports.push(SparkLink::new(&loaded.library,
+                spark_world.context("Spark transport needs a declared world")?, &peers, engine.decode_rows as u32,
+                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                loaded.cfg.dim * 2)?);
+            transports.push(SparkLink::new_waves(&loaded.library,
+                spark_world.context("Spark transport needs a declared world")?, &peers, 4096,
+                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
+                loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
+        }
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
         // Every rank's persistent bootstrap runs before the warm-up wave does,
         // so the workers' installed grouping is readable at any later point.
-        // Each lane's session is sized by the same prefill-sized request the
-        // warm-up below dispatches.
-        let warm = engine.warm_request()?;
-        for transport in &mut transports { transport.bootstrap(&warm)?; }
+        let warm_shape = |index| if index == 0 {
+            (engine.decode_rows, cuteafd_transport::ExpertV2SourceKind::Decode)
+        } else { (engine.prefill_rows, cuteafd_transport::ExpertV2SourceKind::Prefill) };
+        for (index, transport) in transports.iter_mut().enumerate() {
+            let (rows, kind) = warm_shape(index);
+            transport.bootstrap(&engine.warm_request(rows, kind)?)?;
+        }
         crate::shared::memory_report::release_load_staging(&loaded.library);
         let started = Instant::now();
         let identity = if skip { None } else { Some(cuteafd_transport::worker_selection::WorkerIdentity::from_snapshot(
             &loaded.snapshot, loaded.catalog.routed_experts().geometry()?, spark_world.context("worker identity needs a declared world")?)?) };
         let mut installed = None;
-        for transport in &mut transports {
-            engine.warm_transport(transport, &runtime)?;
+        for (index, transport) in transports.iter_mut().enumerate() {
+            let (rows, kind) = warm_shape(index);
+            engine.warm_transport(transport, &runtime, rows, kind)?;
             let reports = transport.transport.installed_grouping()?;
             for (rank, report) in reports.iter().enumerate() {
                 report.validate_for(identity.as_ref().context("Spark worker identity")?, rank,
                     engine.decode_rows, engine.local_layers()..loaded.cfg.n_layers)?;
             }
             if let Some(previous) = &installed {
-                ensure!(previous == &reports, "Spark prefill lanes report different installed expert packages");
+                ensure!(previous == &reports, "Spark transports report different installed expert packages");
             } else { installed = Some(reports); }
         }
         tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "Spark expert transport warm");
         if device_exchange {
             let started = Instant::now();
             engine.attach_device_link(spark_world.context("device exchange needs a declared world")?, &peers,
-                TcpTransportConfig { timing: false, timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
+                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 })?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "decode and verify waves use the device exchange");
         }
+        engine.prepare_workspaces()?;
         if args.full_prefill_logits { engine.prepare_scoring_prefill()?; }
         engine.warm_local_graphs()?;
         engine.check_routes(&mut transports, &runtime)?;
@@ -604,7 +633,7 @@ pub(crate) fn with_engine<T>(
         tracing::info!(graphs0, graphs1, captures, units = engine.shape.units,
             classes = metadata::c4_width_classes(engine.shape.units).len(), "V4 decode graph inventory");
         let _coverage_session = engine.graph_coverage.session();
-        body(&engine, &mut transports, &runtime)
+        body(&engine, &mut transports, &runtime, host_config)
     })();
     crate::shared::decode_graph::fatal_drain(engine.shutdown_submission(&mut transports), "V4 RTX engine retirement");
     if let Err(error) = &result {
@@ -627,19 +656,34 @@ pub(crate) fn with_engine<T>(
 }
 
 fn golden(args: GoldenArgs) -> Result<()> {
+    let shared = args.golden.join("manifest.json").try_exists()?;
+    if shared {
+        ensure!(args.nll && args.save_logits.is_some(), "shared V4 fidelity needs --nll --save-logits DIR");
+        ensure!(args.prefill.is_none() && !args.draft && args.verify_rows.is_none()
+            && args.token_check.is_none() && args.resume_at.is_empty() && args.layers.is_none(),
+            "shared V4 fidelity cannot be combined with legacy golden diagnostics");
+        let output = args.save_logits.as_deref().unwrap();
+        ensure!(!output.try_exists()? && output.parent().is_some_and(std::path::Path::is_dir),
+            "V4 fidelity output needs an existing parent and a new directory");
+    } else {
+        ensure!(args.window.is_none(), "--window needs a published shared fidelity set");
+    }
     let started = Instant::now();
     let loaded = load(&args.engine)?;
     let cfg = loaded.cfg.clone();
-    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime| {
+    let windows = if shared { Some(fidelity_windows(&args.golden, loaded.family, args.window.as_deref())?) } else { None };
+    with_engine(&loaded, &args.engine, None, |_| Ok(0), |engine, transports, runtime, _host_config| {
         let before = engine.graph_capture_counts();
         println!("golden ready: {:.3} s | graph captures {} | TP2 expert graph captures {}",
             started.elapsed().as_secs_f64(), before.0, before.1);
-        let result = match args.token_check {
+        let result = if let Some(windows) = &windows {
+            score_fidelity(&args, engine, transports, runtime, windows)
+        } else { match args.token_check {
             Some(steps) => token_check(&args, &loaded, engine, transports, runtime, steps),
             None if !args.resume_at.is_empty() => resume(&args, engine, transports, runtime),
             None if args.nll => nll_run(&args, &cfg, engine, transports, runtime),
             None => golden_run(&args, &cfg, engine, transports, runtime),
-        };
+        } };
         let after = engine.graph_capture_counts();
         println!("golden post-ready captures: all {} | TP2 experts {}", after.0 - before.0, after.1 - before.1);
         for setting in cuteafd_bench::context::get().settings.into_iter().filter(|s| s.name.starts_with("route-")) {
@@ -647,6 +691,106 @@ fn golden(args: GoldenArgs) -> Result<()> {
         }
         result
     })
+}
+
+fn fidelity_publication(family: &str) -> Result<(&'static str, &'static str, &'static str)> {
+    use cuteafd_bench::fidelity_dataset;
+    Ok(match family {
+        "dsv4f" => (fidelity_dataset::V4FLASH_CONFIG, fidelity_dataset::V4FLASH_REVISION,
+            "0566bf91385805a7ab98f850e066c173b467db8bdf574240edee854290d33100"),
+        "dsv4p" => (fidelity_dataset::V4PRO_CONFIG, fidelity_dataset::V4PRO_REVISION,
+            "7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
+        _ => anyhow::bail!("no shared V4 fidelity publication for {family}"),
+    })
+}
+
+fn fidelity_windows(root: &std::path::Path, family: &str, selected: Option<&str>)
+    -> Result<Vec<cuteafd_bench::reference::Window>> {
+    use cuteafd_bench::fidelity_dataset;
+    use sha2::{Digest, Sha256};
+    let (config, _, hash) = fidelity_publication(family)?;
+    let bytes = std::fs::read(root.join("manifest.json"))?;
+    ensure!(format!("{:x}", Sha256::digest(&bytes)) == hash,
+        "V4 fidelity manifest differs from immutable publication");
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(manifest["config"] == config && manifest["vocab"] == 129280,
+        "V4 fidelity config/vocabulary differs");
+    let reference = fidelity_dataset::load(root, &manifest)?;
+    let mut windows = fidelity_dataset::quick_windows(&reference)?;
+    if let Some(id) = selected {
+        windows.retain(|window| window.id == id);
+        ensure!(windows.len() == 1, "V4 fidelity window must belong to the sealed quick subset");
+    }
+    ensure!(windows.iter().all(|window| window.media.is_empty() && window.tokens.len() <= 16384
+        && window.score_from > 0 && window.score_from < window.tokens.len()),
+        "V4 fidelity requires text-only bounded causal windows");
+    Ok(windows)
+}
+
+fn fidelity_chunks(tokens: usize, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
+    ensure!((2..=16384).contains(&tokens) && capacity > 0, "V4 fidelity causal window/chunk extent differs");
+    let count = tokens - 1;
+    Ok((0..count).step_by(capacity).map(|first| first..(first + capacity).min(count)).collect())
+}
+
+fn score_fidelity(args: &GoldenArgs, engine: &engine::Engine<'_>, transports: &mut [SparkLink<'_>],
+    runtime: &tokio::runtime::Runtime, windows: &[cuteafd_bench::reference::Window]) -> Result<()> {
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_bench::{fidelity_rows, reference::Fidelity};
+    let (config, revision, hash) = fidelity_publication(engine.family)?;
+    ensure!(engine.weights.layers.len() == engine.cfg.n_layers && engine.cfg.vocab_size == 129280
+        && !args.engine.skip_routed_experts, "V4 fidelity needs every target layer, routed experts and published vocabulary");
+    let root = args.save_logits.as_deref().context("shared V4 fidelity requires --save-logits")?;
+    std::fs::create_dir(root).context("V4 fidelity output must be a new directory with an existing parent")?;
+    let chunk_rows = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
+    ensure!(chunk_rows > 0, "V4 fidelity chunk must be positive");
+    let provenance = serde_json::json!({"prefill_rows":engine.prefill_rows,
+        "prefill_waves":engine.prefill_waves,"prefill_span_rows":chunk_rows});
+    let mut allocator = pool::PoolAllocator::for_engine(engine)?;
+    let mut records = Vec::new();
+    let vocab = engine.cfg.vocab_size;
+    for window in windows {
+        let mut placement = allocator.admit(window.tokens.len() - 1)?;
+        let dump = root.join(&window.id);
+        let probe = Probe::new(ProbeSpec { cold: true, no_speculation: true,
+            prompt_ids: Some(window.tokens.clone()), score_from: Some(window.score_from),
+            score_positions: Some(window.positions.iter().map(|p| p.pos).collect()), top_k: 32,
+            want: window.want(), dump_rows: Some(dump.clone()), ..Default::default() });
+        probe.admitted("deepseek_v4", &window.tokens, 0);
+        probe.selected_score_path("prefill");
+        probe.provenance(provenance.clone());
+        for chunk in fidelity_chunks(window.tokens.len(), chunk_rows)? {
+            let first_scored = chunk.start.max(window.score_from - 1).min(chunk.end);
+            let wanted = chunk.end - first_scored;
+            let logits = engine.prefill(&mut placement, &window.tokens[chunk.clone()], transports, runtime, wanted, None)?;
+            ensure!(logits.len() == wanted * vocab, "V4 fidelity logits shape differs");
+            for (row, logits) in logits.chunks_exact(vocab).enumerate() {
+                probe.row(first_scored + row + 1, logits);
+            }
+            if wanted > 0 { probe.scored_prefill_chunk(first_scored + 1, wanted); }
+        }
+        let record = probe.record();
+        ensure!(record.error.is_none(), "V4 fidelity row dump failed: {:?}", record.error);
+        let mut score = window.score(&record.rows);
+        ensure!(score.missing == 0 && score.non_finite == 0 && score.records.len() == window.positions.len(),
+            "V4 fidelity did not cover every finite scored row");
+        fidelity_rows::score_compact(vocab, window, &dump, &mut score)?;
+        println!("V4 window {}: rows={} top-1={:.4}% mean NLL={:.8} mean KL(top1024+tail)={:.8}",
+            window.id, score.positions, score.top1 * 100.0, score.nll, score.kl);
+        let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join(format!("{}.json", window.id)))?;
+        serde_json::to_writer(file, &serde_json::json!({"probe":record,"score":score}))?;
+        records.extend(score.records);
+        engine.drain_state()?;
+        allocator.release(placement);
+    }
+    let score = Fidelity::from_records(records);
+    println!("V4 prefill logits: rows={} top-1 agreement {:.4}% | mean NLL engine {:.8} | mean KL(top1024+tail) {:.8}",
+        score.positions, score.top1 * 100.0, score.nll, score.kl);
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(root.join("fidelity.json"))?;
+    serde_json::to_writer(file, &serde_json::json!({"schema":"cuteafd.deepseek_v4.golden/1",
+        "reference_config":config,"reference_revision":revision,"reference_manifest_sha256":hash,
+        "path_shape":"prefill-shaped","kl_kind":"top1024+tail","provenance":provenance,"score":score}))?;
+    Ok(())
 }
 
 /// `--nll` scores the complete prompt with prefill-shaped kernels, never decode fallbacks.
@@ -668,7 +812,7 @@ fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_
     };
     let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
-    let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
+    let chunk = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
     ensure!(chunk > 0, "prefill chunk must be positive");
     let started = Instant::now();
     let mut logits = Vec::new();
@@ -748,7 +892,7 @@ fn golden_run(
     let prefill = args.prefill.unwrap_or(tokens.len()).min(tokens.len());
     let mut allocator = pool::PoolAllocator::for_engine(engine)?;
     let mut placement = allocator.admit(tokens.len())?;
-    let chunk = args.chunk.unwrap_or(engine.prefill_rows).min(engine.prefill_rows);
+    let chunk = args.chunk.unwrap_or(engine.prefill_capacity()).min(engine.prefill_capacity());
     let mut logits = Vec::new();
     let mut offset = 0;
     while offset < prefill {
@@ -887,6 +1031,56 @@ fn token_check(args: &GoldenArgs, loaded: &Loaded, engine: &engine::Engine<'_>, 
 }
 
 #[cfg(test)]
+mod fidelity_tests {
+    use super::*;
+
+    #[test]
+    fn published_fidelity_identity_is_family_specific() {
+        let (flash, flash_revision, flash_hash) = fidelity_publication("dsv4f").unwrap();
+        let (pro, pro_revision, pro_hash) = fidelity_publication("dsv4p").unwrap();
+        assert_ne!(flash, pro);
+        assert_ne!(flash_revision, pro_revision);
+        assert_ne!(flash_hash, pro_hash);
+        assert_eq!(flash_hash.len(), 64);
+        assert_eq!(pro_hash.len(), 64);
+        assert!(fidelity_publication("dsv4f2").is_err());
+    }
+
+    #[test]
+    fn fidelity_chunks_predict_each_next_token_once_without_final_token_input() -> Result<()> {
+        for tokens in [2, 513, 576, 2011, 4610, 11284, 16384] {
+            for capacity in [512, 4096, 8192, 16384] {
+                let chunks = fidelity_chunks(tokens, capacity)?;
+                assert_eq!(chunks.first().unwrap().start, 0);
+                assert_eq!(chunks.last().unwrap().end, tokens - 1);
+                assert_eq!(chunks.iter().map(|chunk| chunk.len()).sum::<usize>(), tokens - 1);
+                assert!(chunks.iter().all(|chunk| !chunk.is_empty() && chunk.len() <= capacity));
+                assert!(chunks.windows(2).all(|pair| pair[0].end == pair[1].start));
+            }
+        }
+        assert!(fidelity_chunks(1, 4096).is_err());
+        assert!(fidelity_chunks(16385, 4096).is_err());
+        assert!(fidelity_chunks(513, 0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn common_span_preserves_unit_cuts_at_one_and_two_waves() -> Result<()> {
+        use crate::shared::prefill_pipeline::prefill_units;
+        // Full spans have an even unit count; tiny tails cannot split below the floor.
+        for rows in [4096, 2048, 1024, 512] {
+            for span in [8192, 16384, 256] {
+                assert_eq!(prefill_units(span, rows, 1, 256)?, prefill_units(span, rows, 2, 256)?);
+            }
+        }
+        for (span, rows) in [(4609, 4096), (4613, 4096), (11283, 2048), (11136, 2048)] {
+            assert_eq!(prefill_units(span, rows, 1, 256)?, prefill_units(span, rows, 2, 256)?);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod program_selection_tests {
     use cuteafd_core::coordinator_programs::{AttentionReductionPlan, CoordinatorPrograms};
 
@@ -934,7 +1128,11 @@ mod program_selection_tests {
                             for attention in ["win", "c4", "c128"] {
                                 for ratio in ["4", "128"] {
                                     for program in ["prefill", "continuation"] {
-                                        let suffix = template.replace("{cap}", cap).replace("{mode}", mode)
+                                        if template.contains("{}") {
+                                            assert!(line.contains("self.kernel_rows(cap)"),
+                                                "unrecognized positional dispatch capacity: {line}");
+                                        }
+                                        let suffix = template.replace("{cap}", cap).replace("{}", cap).replace("{mode}", mode)
                                             .replace("{attention}", attention).replace("{ratio}", ratio)
                                             .replace("{program}", program);
                                         let name = format!("{family}_{suffix}");

@@ -26,6 +26,9 @@ pub enum LaneSupport {
 pub fn support(family: &str) -> LaneSupport {
     match family {
         "deepseek_v41" => LaneSupport::FixedTwo,
+        // Pro and Flash keep one lane: two-lane emitted decode lost the #723 A/B
+        // (Flash 0.66-0.73x at C4-C16; Pro 0.91-0.93x). The shared selector
+        // remains available for explicit experiments, not the default (#744).
         "mimo_v2" => LaneSupport::OneOrTwo { default: 1 },
         _ => LaneSupport::One,
     }

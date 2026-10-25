@@ -276,6 +276,9 @@ EOF
   case "$1" in
     deepseek_v4)
       cat <<'EOF'
+PREFILL_ROWS
+PREFILL_WAVES
+PREFILL_SPAN_ROWS
 RTX_EXPERT_PEER
 SPECULATOR_MODEL_ID
 SPECULATOR_MODEL_REVISION
@@ -287,6 +290,7 @@ PREFILL_ROWS
 PREFILL_WAVES
 PREFILL_SPAN_ROWS
 EXLR8_MANIFEST
+EXLR8_PREFILL_ACTIVATIONS
 RTX_EXPERT_PEER
 L2_PREFETCH
 FP8_SCALES
@@ -388,7 +392,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|qwen4) echo units ;;
+    step5|kimi_k3|qwen4|deepseek_v4) echo units ;;
     glm5|mimo_v2) echo units-span ;;
     *) echo legacy ;;
   esac
@@ -1766,6 +1770,11 @@ snapshot_of() {
   readlink -f "$dir/snapshots/$rev"
 }
 exlr8_manifest="$(get EXLR8_MANIFEST)"
+exlr8_prefill_activations="$(get EXLR8_PREFILL_ACTIVATIONS)"
+if [[ -n "$exlr8_prefill_activations" ]]; then
+  [[ "$exlr8_prefill_activations" == a16 || "$exlr8_prefill_activations" == a8 ]] || release_die "EXLR8_PREFILL_ACTIVATIONS must be a16 or a8"
+  [[ -n "$exlr8_manifest" ]] || release_die "EXLR8_PREFILL_ACTIVATIONS requires EXLR8_MANIFEST"
+fi
 exlr8_plan_args=()
 if [[ -n "$exlr8_manifest" ]]; then
   [[ "$family" == glm5 ]] || release_die "EXLR8 is supported only for glm5"
@@ -1779,6 +1788,10 @@ if [[ -n "$exlr8_manifest" ]]; then
   [[ "$attention_placement" == auto || "$attention_placement" == "$exlr8_attention" ]] || release_die "EXLR8 requires $exlr8_attention attention for $exlr8_gpu_count RTX GPUs"
   exlr8_plan_args=(--exlr8-manifest "$exlr8_manifest")
   spark_worker_args+=" --exlr8-manifest $exlr8_manifest"
+  if [[ -n "$exlr8_prefill_activations" ]]; then
+    exlr8_plan_args+=(--exlr8-prefill-activations "$exlr8_prefill_activations")
+    spark_worker_args+=" --exlr8-prefill-activations $exlr8_prefill_activations"
+  fi
   cfg[RTX_EXPERT_LAYERS]=0
 fi
 # SPECULATOR picks the drafter. Unset, each family takes the speculator its
@@ -2555,7 +2568,9 @@ fi
 # the Spark world size. Forward the resolved lane policy to the coordinator.
 lane_env_args=()
 case "$family" in
-  deepseek_v4) ;;
+  deepseek_v4)
+    [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || lane_env_args+=(-e "CUTEAFD_PREFILL_SPAN_ROWS=$(get PREFILL_SPAN_ROWS)")
+    ;;
   glm5)
     # Prefill units, waves and span come from the deployment plan (units-span).
     ;;
@@ -2707,6 +2722,10 @@ audio_encoder_hash=""
   if [[ "$family" == glm5_flash ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-lanes "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+  fi
+  if [[ "$family" == deepseek_v4 ]]; then
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi
   if [[ "$family" == step5 || "$family" == mimo_v2 ]]; then
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")

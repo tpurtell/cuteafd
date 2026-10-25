@@ -236,10 +236,15 @@ int main() {
         subprocess.run([str(directory / "test")], check=True, timeout=30)
 
 
-@pytest.mark.parametrize("options", [
-    dict(bits=(3, 4, 5)), dict(warp_specialized=True), dict(decode_schedule="gb10"),
+@pytest.mark.parametrize("options,message", [
+    (dict(bits=(3, 4, 5)), "compact weights require a disjoint two-tier export"),
+    # Compact warp specialization is a measured Spark prefill cell, so the
+    # remaining rejection is a contract the kernel cannot run (8-row blocks).
+    (dict(warp_specialized=True, route_block=8),
+     "warp-specialized prefill requires a disjoint two-tier export"),
 ])
-def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatch, tmp_path, options):
+def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(
+        monkeypatch, tmp_path, options, message):
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
     spec = importlib.util.spec_from_file_location(
         "compact_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
@@ -247,8 +252,50 @@ def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(monkeypatc
     spec.loader.exec_module(exporter)
     kwargs = dict(bits=(3, 4), routing="packed", compact_weights=True)
     kwargs.update(options)
-    with pytest.raises(ValueError, match="compact weights require cooperative two-tier"):
+    with pytest.raises(ValueError, match=message):
         exporter.export(tmp_path, 384, 256, 16, **kwargs)
+
+
+@pytest.mark.parametrize("bits,compact", [((3, 4), True), ((2, 3, 4), False), ((2, 3, 4, 5), False)])
+def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path, bits, compact):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
+    spec = importlib.util.spec_from_file_location(
+        "schedule_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    observed = []
+
+    class Compiled(Exception):
+        pass
+
+    def compile_kernel(**kwargs):
+        observed.append(kwargs)
+        raise Compiled
+
+    modules = {
+        "torch": dict(int32="int32", cuda=SimpleNamespace(get_device_properties=lambda _: SimpleNamespace(
+            major=12, minor=0, multi_processor_count=170, shared_memory_per_block_optin=101376))),
+        "b12x.moe._shared.kernels.w4a16.host": dict(route_pack_capacity=lambda *a, **k: (0, 128)),
+        "b12x.moe._shared.kernels.w4a16.mixed_trellis": dict(
+            EXL3_AOT_MAX_SMS={(12, 0): 188}, compile_mixed_trellis=compile_kernel,
+            compile_mixed_trellis3=compile_kernel, make_mixed_trellis_buffers=None),
+        "b12x.moe._shared.kernels.w4a16.mixed_trellis4": dict(compile_mixed_trellis4=compile_kernel),
+        "b12x.moe.fused_moe._impl": dict(_projection_mixed_direct_topk_routes=lambda *a, **k: False,
+            _projection_mixed_tile_config=lambda *a, **k: (64, 128, 64, 128)),
+    }
+    for name, attrs in modules.items():
+        module = ModuleType(name)
+        module.__dict__.update(attrs)
+        monkeypatch.setitem(sys.modules, name, module)
+    schedule = "l2=2,pf1=0,pf2=0,pdl=1"
+    with pytest.raises(Compiled):
+        exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed",
+                        compact_weights=compact, decode_schedule=schedule)
+    assert observed[0]["decode_schedule"] == schedule
+    if compact:
+        assert observed[0]["compact_weights"] is True
 
 
 @pytest.mark.parametrize("blocks", [1, 2])

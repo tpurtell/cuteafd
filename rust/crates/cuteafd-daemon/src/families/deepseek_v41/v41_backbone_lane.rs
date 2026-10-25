@@ -421,7 +421,7 @@ impl LaneFfn<'_, '_, '_> {
                 else { router.execute_ffn(input, image_mask)? } };
             if transport.has_local_layer(input.layer) {
                 ensure!(!(ring && tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG)),
-                    "route policy tracing reads host routes; it is not available with CUTEAFD_V41_DEVICE");
+                    "route policy tracing reads host routes; device-ordered passes keep local routes in the ring");
                 routed.validate_request_rows(rows)?;
                 let trace = tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG);
                 let mut temporary = Vec::new();

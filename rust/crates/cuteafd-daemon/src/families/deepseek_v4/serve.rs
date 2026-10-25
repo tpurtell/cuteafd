@@ -174,7 +174,7 @@ fn serve_loop(
         let mark = Dsv4Prefix::mark_bytes_of(engine)?;
         Ok(mark_slots(engine, &prefix, mark) * mark)
     };
-    let result = with_engine(&loaded, &args, Some(&prefix), arena, |engine, transports, runtime| {
+    let result = with_engine(&loaded, &args, Some(&prefix), arena, |engine, transports, runtime, host_config| {
         if engine.skip_routed {
             tracing::warn!("serve-dsv4 --skip-routed-experts: replies do not match the model (plumbing and cache gates only)");
         }
@@ -191,7 +191,7 @@ fn serve_loop(
             let _ = ready.send(Ok(engine.max_context));
         }
         schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats,
-            decode_share, &prefix, &mut selector, shared)
+            decode_share, &prefix, host_config, &mut selector, shared)
     });
     if let Some(ready) = ready.take() {
         let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
@@ -545,12 +545,11 @@ fn mark_slots(engine: &super::engine::Engine<'_>, args: &PrefixArgs, mark: usize
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the unit allocator).
-fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs)
+fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs,
+    host_config: Option<cuteafd_hostcache::config::Config>)
     -> Result<(Dsv4Prefix<'e, 'a>, PrefixCache<CudaCopyEngine<'a>>)> {
     anyhow::ensure!(args.prefix_partial == Toggle::Off,
         "DeepSeek V4 restores exact snapshots only (window and compressor state)");
-    let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
-        engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = Dsv4Prefix::new(engine, |mark| mark_slots(engine, args, mark))?;
     // The pinned host tier copies through one GPU's copy engine; a heads split keeps its
@@ -566,11 +565,12 @@ fn prefix_cache<'e, 'a>(engine: &'e super::engine::Engine<'a>, args: &PrefixArgs
     } else if engine.ranks() > 1 {
         // SAFETY of the registration: the engine (and its pools) outlives the cache, which
         // `schedule` drops first.
-        args.host_config(family.layout(), engine.max_context, engine.shape.sequences)?.map(|config|
+        host_config.map(|config|
             crate::shared::prefix::CudaCopyEngine::registered(engine.library, &family.buffers())
                 .map(|copy| (config, copy))).transpose()?
     } else {
-        args.host_tier(engine.library, family.template(), family.layout(), engine.max_context, engine.shape.sequences)?
+        host_config.map(|config| crate::shared::prefix::CudaCopyEngine::new(engine.library, family.template())
+            .map(|copy| (config, copy))).transpose()?
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
@@ -620,11 +620,12 @@ fn schedule(
     stats: &Mutex<serde_json::Value>,
     decode_share: DecodeShareArgs,
     prefix: &PrefixArgs,
+    host_config: Option<cuteafd_hostcache::config::Config>,
     selector: &mut TokenSelector<'_>,
     mut shared: Option<SharedPolicy>,
 ) -> Result<()> {
     let (mut observed, mut skipped) = (0u64, 0u64);
-    let (family, mut cache) = prefix_cache(engine, prefix)?;
+    let (family, mut cache) = prefix_cache(engine, prefix, host_config)?;
     let markers = crate::shared::prefix::marker_ids(&loaded.snapshot, &MESSAGE_STARTS)?;
     let mut states: Vec<usize> = (0..engine.shape.sequences).rev().collect();
     let mut grammars = crate::shared::constraints::Compiler::new(

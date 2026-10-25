@@ -289,6 +289,7 @@ pub(crate) struct GlmEngine<'a> {
     /// Per rank: bound native dense programs and the prefill unpack staging
     /// (EXLR8 checkpoint dense operands); empty on the official path.
     pub(crate) native_dense: Vec<Option<native_dense::NativePrograms<'a>>>,
+    pub(crate) exlr8_prefill_activations: super::Exlr8PrefillActivations,
     pub(crate) native_experts: Vec<exlr8::NativeExperts<'a>>,
     quantize_grid: Fp8QuantizeGrid,
     pub library: &'a NativeLibrary,
@@ -433,7 +434,7 @@ impl<'a> GlmEngine<'a> {
         let local = if context_mode.is_some() { pages / 2 } else { pages };
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
         let device = library.cuda_get_device()?;
-        Ok(Self { quantize_grid, device, native_experts: Vec::new(), native_dense: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
+        Ok(Self { quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), lane_workspaces: RefCell::new(Vec::new()),
             prefill_lanes, staged: Cell::new(library.cuda_event_create_ordering()?),
@@ -726,10 +727,16 @@ impl<'a> GlmEngine<'a> {
         })
     }
 
+    /// Uploads a table in order on the stream of the rank that owns `dev`
+    /// (callers run under [`Self::on`]), after that stream's earlier readers.
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
         let bytes = bytes_of(values);
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        let rank = usize::from(self.peer.as_ref().is_some_and(|peer| peer.device == dev.buffer.device_id));
+        // SAFETY: a live buffer of that rank; every reader of a rank's step tables and ids
+        // (its kernels and graph replays) runs on its stream, outside capture. The whole
+        // buffer: its ordered staging is sized once, never regrown under queued work.
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream_of(rank)) }
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
@@ -1855,8 +1862,8 @@ impl<'a> GlmEngine<'a> {
                 let start = lanes[unit].positions.first().map_or(0, |&p| p as usize);
                 let mut units = self.context_units.borrow_mut();
                 for rank in 0..2 {
-                    units[unit][rank] = self.context_prefill_tables_on(rank, slot, start, start,
-                        counts[unit], &pages[unit], unit >= waves)?;
+                    units[unit][rank] = self.context_prefill_tables(rank, slot, start, start,
+                        counts[unit], &pages[unit])?;
                 }
             }
             self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
@@ -2042,18 +2049,11 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// Uploads a step's tables (one per prefill lane, or the decode step) to rank 0's and
-    /// rank 1's workspaces once both streams have drained (every wait on them is matched by
-    /// a push already queued, so they drain), and returns each lane's per-rank tables:
-    /// identical under heads, each GPU's own under context ([`Self::rank_tables`]).
+    /// rank 1's workspaces, in order on each rank's stream behind the work still reading the
+    /// previous tables (no host wait), and returns each lane's per-rank tables: identical
+    /// under heads, each GPU's own under context ([`Self::rank_tables`]).
     fn step_tables(&self, units: &[(&Workspace<'_>, Option<&Workspace<'_>>, &StepTables)], pages: &[Vec<u32>])
         -> Result<Vec<[StepTables; 2]>> {
-        // Rank 1 always drains first (as the head split always did); under context rank 0 too:
-        // its queued gather and commit kernels read the per-step lists rewritten here.
-        let drained = if self.context.is_some() { 0..self.ranks() } else { 1..self.ranks() };
-        for rank in drained {
-            // SAFETY: the engine owns both streams; nothing queued reads these tables after this.
-            self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })?;
-        }
         let mut out = Vec::new();
         let mut context_units = Vec::new();
         // Gather lists are one buffer per rank and every unit's history is a prefix

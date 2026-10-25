@@ -1,5 +1,5 @@
 //! Admitted K1 workspace: graph-visible routing storage never moves.
-use super::{view, Exlr8Weights};
+use super::{view, Exlr8PrefillActivations, Exlr8Weights};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, ProgramSpec, Programs, Scalar};
@@ -7,11 +7,86 @@ use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use cuteafd_loader::plan::exlr8::residency::ExpertSet;
 use std::ffi::c_void;
 
-fn program_names(set: ExpertSet, rows: usize) -> (&'static str, &'static str) {
+/// Measured first decode row at which the 64-row grouped instance beats the
+/// compact-unit routed serving core, keyed on this rank's owned units per
+/// expert and never on the SM count.
+///
+/// Anchors on GB10, one interleaved session per width (rank 0, random and
+/// realistic routes, medians of three): TP6 (three owned units) keeps the
+/// routed core through 8 rows (1.22-1.26x over K1 against 1.17-1.20x for the
+/// grouped instance) and switches at 16 (grouped 1.24-1.28x against
+/// 1.12-1.14x); TP4 (four owned units) is a 1-2% tie at 8 rows and the
+/// grouped instance leads by 4-8% from 16 rows on.
+///
+/// Widths outside those anchors take the nearest measured one: two owned
+/// units take the three-unit threshold and five or more take the four-unit
+/// threshold. A narrow rank wastes more of a fixed grid, which argues for a
+/// later switch below four units, so the nearest anchor stays conservative.
+pub(crate) fn grouped_decode_from_row(unit_limit: usize) -> usize {
+    if unit_limit <= 3 { 16 } else { 8 }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Variant {
+    /// Shared-expert serving kernel: one K1 launch over all units.
+    SharedDecode,
+    /// Routed decode below the grouped threshold: the compact-unit routed
+    /// serving core, whose grids and scratch cover only this rank's owned
+    /// units.
+    DecodeCompact,
+    /// 64-row grouped instance with F32 FC2 partials: bit-identical to K1.
+    DecodeGrouped,
+    /// 4096-row grouped prefill.
+    Prefill,
+}
+
+impl Variant {
+    /// Owned-unit grids and unit-scaled scratch.
+    fn owned_units(self) -> bool {
+        matches!(self, Self::DecodeCompact | Self::DecodeGrouped | Self::Prefill)
+    }
+    /// Carries the `unit_count`/`unit_map` tables; the routed serving core
+    /// derives its live units on device instead.
+    fn unit_tables(self) -> bool {
+        matches!(self, Self::DecodeGrouped | Self::Prefill)
+    }
+    /// Scratch the kernel addresses by owned-unit slot, so its arena may shrink
+    /// from the global unit count to `unit_limit`. FC2 never does. The routed
+    /// serving core indexes FC1 by live owned-unit task but writes and reads the
+    /// activation `intermediate` at `(group * units + unit)` over all global
+    /// units, so it keeps the full stride; the grouped instances index both by
+    /// `group * unit_limit + local`. Shrinking the routed core's intermediate
+    /// let TP6 steps with 96+ groups (12-15 rows) overwrite live FC2 partials.
+    fn owned_unit_scratch(self, name: &str) -> bool {
+        match self {
+            Self::DecodeCompact => name == "fc1",
+            Self::DecodeGrouped | Self::Prefill => name != "fc2",
+            Self::SharedDecode => false,
+        }
+    }
+}
+
+fn program_names(
+    set: ExpertSet,
+    variant: Variant,
+    activations: Exlr8PrefillActivations,
+) -> (&'static str, &'static str) {
     match set {
-        ExpertSet::Routed if rows > 64 => ("exlr8_a16_grouped", "exlr8_grouped_group"),
-        ExpertSet::Routed => ("exlr8_a16_serving", "exlr8_group"),
         ExpertSet::Shared => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
+        ExpertSet::Routed => match variant {
+            Variant::Prefill => (
+                match activations {
+                    Exlr8PrefillActivations::A16 => "exlr8_a16_grouped",
+                    Exlr8PrefillActivations::A8 => "exlr8_a8_grouped",
+                },
+                "exlr8_grouped_group",
+            ),
+            Variant::DecodeGrouped => ("exlr8_a16_grouped64", "exlr8_group"),
+            Variant::DecodeCompact => ("exlr8_a16_serving", "exlr8_group"),
+            // `Workspace::plan` refuses a shared variant on the routed set
+            // before this name reaches a program lookup.
+            Variant::SharedDecode => ("exlr8_shared_a16_serving", "exlr8_shared_group"),
+        },
     }
 }
 
@@ -31,9 +106,11 @@ const K1_POINTERS: &[&str] = &[
     "group_count",
 ];
 
-fn pointers(set: ExpertSet, rows: usize) -> Vec<&'static str> {
+fn pointers(set: ExpertSet, variant: Variant) -> Vec<&'static str> {
     let mut names = K1_POINTERS.to_vec();
-    if set == ExpertSet::Routed && rows > 64 { names.extend(["unit_count", "unit_map"]); }
+    if set == ExpertSet::Routed && variant.unit_tables() {
+        names.extend(["unit_count", "unit_map"]);
+    }
     names
 }
 
@@ -75,17 +152,40 @@ struct Workspace {
     units: usize,
     unit_limit: usize,
     intermediate_bytes: usize,
+    /// Owned-unit instance: FC1 (and, for grouped instances, the activation
+    /// scratch) scale with `unit_limit`; see `Variant::owned_unit_scratch`.
+    compact: bool,
+    /// Registers `unit_count`/`unit_map` and the `unit_limit` scalar.
+    unit_tables: bool,
 }
 impl Workspace {
-    fn plan(spec: &ProgramSpec, rows: usize, set: ExpertSet, unit_limit: usize) -> Result<Self> {
+    fn plan(
+        spec: &ProgramSpec,
+        rows: usize,
+        set: ExpertSet,
+        variant: Variant,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
+    ) -> Result<Self> {
         cuteafd_ffi::exlr8::validate(spec)?;
         ensure!(
-            spec.name == program_names(set, rows).0 && spec.geometry["abi_version"] == 3,
+            (set == ExpertSet::Shared) == (variant == Variant::SharedDecode),
+            "EXLR8 shared decode requires the shared expert set"
+        );
+        ensure!(
+            spec.name == program_names(set, variant, activations).0 && spec.geometry["abi_version"] == 3,
             "EXLR8 execution requires fused rotation ABI v3"
         );
         ensure!(
             rows > 0 && rows <= spec.capacity_rows as usize,
             "EXLR8 rows outside admitted K1 capacity"
+        );
+        // Decode rows route to the K1 or the 64-row grouped instance; the
+        // 4096-row prefill instance is only admitted above the K1 row limit.
+        ensure!(
+            variant != Variant::Prefill
+                || rows > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS,
+            "EXLR8 prefill instance is only admitted above the K1 row limit"
         );
         let dimension = |name| -> Result<usize> {
             usize::try_from(
@@ -103,11 +203,12 @@ impl Workspace {
             usize::try_from(*spec.scratch.get(name).context("missing K1 scratch")?)
                 .context("K1 scratch exceeds address space")
         };
-        let compact = set == ExpertSet::Routed && rows > 64;
+        let compact = set == ExpertSet::Routed && variant.owned_units();
+        let unit_tables = set == ExpertSet::Routed && variant.unit_tables();
         ensure!(!compact || (1..=units).contains(&unit_limit), "invalid compact unit limit");
         let scratch = |name: &str| -> Result<usize> {
             let bytes = scratch(name)?;
-            if compact && name != "fc2" {
+            if compact && variant.owned_unit_scratch(name) {
                 ensure!(bytes % units == 0, "compact scratch must divide by global units");
                 (bytes / units).checked_mul(unit_limit).context("compact scratch overflow")
             } else { Ok(bytes) }
@@ -128,6 +229,8 @@ impl Workspace {
             units,
             unit_limit: if compact { unit_limit } else { units },
             intermediate_bytes,
+            compact,
+            unit_tables,
         })
     }
 }
@@ -145,37 +248,113 @@ pub(crate) struct Exlr8Execution<'a> {
     set: ExpertSet,
 }
 impl<'a> Exlr8Execution<'a> {
-    pub(crate) fn workspace_bytes(
+    pub(crate) fn shared_workspace_bytes(
         programs: &'a Programs<'a>,
         rows: usize,
-        set: ExpertSet,
     ) -> Result<usize> {
-        Self::workspace_bytes_with_limit(programs, rows, set, 16)
+        Self::workspace_bytes_for(programs, rows, ExpertSet::Shared, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16)
+    }
+
+    /// Routed decode arena: the compact-unit serving core over owned units.
+    pub(crate) fn decode_compact_workspace_bytes(
+        programs: &'a Programs<'a>,
+        rows: usize,
+        unit_limit: usize,
+    ) -> Result<usize> {
+        Self::workspace_bytes_for(programs, rows, ExpertSet::Routed, Variant::DecodeCompact,
+            unit_limit, Exlr8PrefillActivations::A16)
     }
 
     pub(crate) fn workspace_bytes_with_limit(
-        programs: &'a Programs<'a>, rows: usize, set: ExpertSet, unit_limit: usize,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        set: ExpertSet,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
     ) -> Result<usize> {
-        let k1 = programs.program(program_names(set, rows).0, &pointers(set, rows))?;
-        Ok(Workspace::plan(k1.spec(), rows, set, unit_limit)?.bytes)
+        Self::workspace_bytes_for(programs, rows, set, Variant::Prefill, unit_limit, activations)
     }
 
-    pub(crate) fn new(
+    /// 64-row grouped decode arena; F32 FC2 partials keep it bit-identical to K1.
+    pub(crate) fn decode_grouped_workspace_bytes(
+        programs: &'a Programs<'a>,
+        rows: usize,
+        unit_limit: usize,
+    ) -> Result<usize> {
+        Self::workspace_bytes_for(programs, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+            unit_limit, Exlr8PrefillActivations::A16)
+    }
+
+    fn workspace_bytes_for(
+        programs: &'a Programs<'a>,
+        rows: usize,
+        set: ExpertSet,
+        variant: Variant,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
+    ) -> Result<usize> {
+        let core = programs.program(program_names(set, variant, activations).0,
+            &pointers(set, variant))?;
+        Ok(Workspace::plan(core.spec(), rows, set, variant, unit_limit, activations)?.bytes)
+    }
+
+    pub(crate) fn new_shared(
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+    ) -> Result<Self> {
+        Self::new_for(library, programs, rows, available, ExpertSet::Shared, Variant::SharedDecode,
+            16, Exlr8PrefillActivations::A16)
+    }
+
+    pub(crate) fn new_decode_compact(
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+        unit_limit: usize,
+    ) -> Result<Self> {
+        Self::new_for(library, programs, rows, available, ExpertSet::Routed,
+            Variant::DecodeCompact, unit_limit, Exlr8PrefillActivations::A16)
+    }
+
+    pub(crate) fn new_with_limit(
         library: &'a NativeLibrary,
         programs: &'a Programs<'a>,
         rows: usize,
         available: usize,
         set: ExpertSet,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
     ) -> Result<Self> {
-        Self::new_with_limit(library, programs, rows, available, set, 16)
+        Self::new_for(library, programs, rows, available, set, Variant::Prefill, unit_limit, activations)
     }
 
-    pub(crate) fn new_with_limit(
-        library: &'a NativeLibrary, programs: &'a Programs<'a>, rows: usize,
-        available: usize, set: ExpertSet, unit_limit: usize,
+    pub(crate) fn new_decode_grouped(
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+        unit_limit: usize,
     ) -> Result<Self> {
-        let (k1_name, group_name) = program_names(set, rows);
-        let k1 = programs.program(k1_name, &pointers(set, rows))?;
+        Self::new_for(library, programs, rows, available, ExpertSet::Routed, Variant::DecodeGrouped,
+            unit_limit, Exlr8PrefillActivations::A16)
+    }
+
+    fn new_for(
+        library: &'a NativeLibrary,
+        programs: &'a Programs<'a>,
+        rows: usize,
+        available: usize,
+        set: ExpertSet,
+        variant: Variant,
+        unit_limit: usize,
+        activations: Exlr8PrefillActivations,
+    ) -> Result<Self> {
+        let (k1_name, group_name) = program_names(set, variant, activations);
+        let k1 = programs.program(k1_name, &pointers(set, variant))?;
         let group = programs.program(
             group_name,
             &[
@@ -189,7 +368,7 @@ impl<'a> Exlr8Execution<'a> {
                 "activation",
             ],
         )?;
-        let layout = Workspace::plan(k1.spec(), rows, set, unit_limit)?;
+        let layout = Workspace::plan(k1.spec(), rows, set, variant, unit_limit, activations)?;
         ensure!(
             group.spec().geometry["abi_version"] == 2
                 && group.spec().geometry["top_k"] == k1.spec().geometry["top_k"]
@@ -312,15 +491,15 @@ impl<'a> Exlr8Execution<'a> {
             self.intermediate_bytes,
             buffers[9].bytes - self.intermediate_bytes,
         )?;
-        let compact = self.set == ExpertSet::Routed && self.layout.rows > 64;
-        ensure!(!compact || weights.layout.compact_unit_limit() <= self.layout.unit_limit,
+        ensure!(!self.layout.compact
+                || weights.layout.compact_unit_limit() <= self.layout.unit_limit,
             "EXLR8 layer ownership exceeds compact arena stride");
         let scalars = [Scalar::I32(rows as i32), Scalar::I32(self.cta_limit),
             Scalar::I32(self.layout.unit_limit as i32)];
         let mut operands = [p(10), weights.pointers()?.ptr, weights.bits()?.ptr,
             p(4), p(5), p(6), p(2), p(8), intermediate.ptr, fc2.ptr,
             weights.signs(true)?.ptr, p(3), p(7), std::ptr::null_mut(), std::ptr::null_mut()];
-        if compact {
+        if self.layout.unit_tables {
             operands[13..].copy_from_slice(&weights.compact()?.map(|buffer| buffer.ptr));
         }
         // SAFETY: private admitted arena views retain the manifest's exact sizes;
@@ -331,8 +510,8 @@ impl<'a> Exlr8Execution<'a> {
                 &[Scalar::I32(rows as i32), Scalar::I32(self.group_cta_limit)],
                 stream,
             )?;
-            self.k1.launch(&operands[..if compact { 15 } else { 13 }],
-                &scalars[..if compact { 3 } else { 2 }], stream)?;
+            self.k1.launch(&operands[..if self.layout.unit_tables { 15 } else { 13 }],
+                &scalars[..if self.layout.unit_tables { 3 } else { 2 }], stream)?;
         }
         Ok(())
     }
@@ -342,105 +521,281 @@ impl<'a> Exlr8Execution<'a> {
 mod tests {
     use super::*;
 
-    fn spec(set: ExpertSet) -> ProgramSpec {
-        let (top_k, groups) = match set {
-            ExpertSet::Routed => (8, 512),
-            ExpertSet::Shared => (1, 4),
-        };
+    fn shared_spec() -> ProgramSpec {
         ProgramSpec {
-            name: program_names(set, 64).0.into(),
+            name: program_names(ExpertSet::Shared, Variant::SharedDecode,
+                Exlr8PrefillActivations::A16).0.into(),
             pointers: K1_POINTERS.iter().map(|name| (*name).into()).collect(),
             scalar_kinds: b"ii".to_vec(),
             scratch: [
-                ("fc1".into(), groups * 16 * 2 * 6 * 16 * 128 * 4),
-                ("intermediate".into(), groups * 16 * 16 * 128 * 2),
-                ("fc2".into(), groups * 16 * 6144 * 4),
+                ("fc1".into(), 4 * 16 * 2 * 6 * 16 * 128 * 4),
+                ("intermediate".into(), 4 * 16 * 16 * 128 * 2),
+                ("fc2".into(), 4 * 16 * 6144 * 4),
             ]
             .into(),
             capacity_rows: 64,
             geometry: serde_json::json!({"abi_version": 3, "hidden": 6144, "units": 16,
-                "top_k": top_k, "max_groups": groups, "max_rows": 64,
+                "top_k": 1, "max_groups": 4, "max_rows": 64,
                 "split_k_blocks": 8, "fc1_splits": 6, "ctas_per_sm": 4}),
         }
     }
 
+    /// The routed decode core: the plain serving ABI over owned-unit scratch.
+    fn compact_spec() -> ProgramSpec {
+        let mut spec = shared_spec();
+        spec.name = program_names(ExpertSet::Routed, Variant::DecodeCompact,
+            Exlr8PrefillActivations::A16).0.into();
+        spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeCompact)
+            .into_iter().map(String::from).collect();
+        assert_eq!(spec.pointers.len(), 13);
+        assert_eq!(spec.scalar_kinds, b"ii");
+        spec.geometry["top_k"] = serde_json::json!(8);
+        spec.geometry["max_groups"] = serde_json::json!(512);
+        spec.geometry["group_rows"] = serde_json::json!(16);
+        spec.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
+        spec.scratch = [
+            ("fc1".into(), 512 * 16 * 2 * 6 * 16 * 128 * 4),
+            ("intermediate".into(), 512 * 16 * 16 * 128 * 2),
+            ("fc2".into(), 512 * 16 * 6144 * 4),
+        ]
+        .into();
+        spec
+    }
+
+    /// The shipped 64-row grouped instance: 16-row groups, F32 FC2 partials.
+    fn grouped64_spec() -> ProgramSpec {
+        let mut spec = compact_spec();
+        spec.name = program_names(ExpertSet::Routed, Variant::DecodeGrouped,
+            Exlr8PrefillActivations::A16).0.into();
+        spec.pointers = pointers(ExpertSet::Routed, Variant::DecodeGrouped)
+            .into_iter().map(String::from).collect();
+        spec.scalar_kinds = b"iii".to_vec();
+        spec.geometry.as_object_mut().unwrap().remove("serving_variant");
+        spec.geometry["fc2_partials"] = serde_json::json!("f32");
+        spec.geometry["ctas_per_sm"] = serde_json::json!(2);
+        spec
+    }
+
+    #[test]
+    fn decode_dispatch_switches_to_grouped_on_the_measured_owned_unit_anchor() {
+        // Measured on GB10: TP6 (three owned units) keeps the routed core
+        // through 8 rows and switches at 16; TP4 (four owned units) switches
+        // at 8. Widths outside the anchors take the nearest one, so no SM
+        // count or card identity enters the decision.
+        assert_eq!(grouped_decode_from_row(1), 16);
+        assert_eq!(grouped_decode_from_row(3), 16);
+        assert_eq!(grouped_decode_from_row(4), 8);
+        assert_eq!(grouped_decode_from_row(8), 8);
+        for variant in [Variant::DecodeCompact, Variant::DecodeGrouped] {
+            assert_eq!(program_names(ExpertSet::Routed, variant,
+                Exlr8PrefillActivations::A16).1, "exlr8_group");
+        }
+        assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeCompact,
+            Exlr8PrefillActivations::A16).0, "exlr8_a16_serving");
+        assert!(!Variant::DecodeCompact.unit_tables() && Variant::DecodeCompact.owned_units());
+        assert!(Variant::DecodeGrouped.unit_tables() && Variant::Prefill.unit_tables());
+    }
+
     #[test]
     fn exlr8_shared_workspace_keeps_exact_aligned_admission() {
-        for set in [ExpertSet::Routed, ExpertSet::Shared] {
-            let spec = spec(set);
-            let wide = Workspace::plan(&spec, 64, set, 16).unwrap();
-            let single = Workspace::plan(&spec, 1, set, 16).unwrap();
-            for layout in [&single, &wide] {
-                let mut end = 0;
-                for (offset, bytes) in layout.ranges {
-                    assert_eq!(offset % 256, 0);
-                    assert!(offset >= end);
-                    end = offset + bytes;
-                }
-                assert_eq!(layout.bytes, end);
+        let spec = shared_spec();
+        let wide = Workspace::plan(&spec, 64, ExpertSet::Shared, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16).unwrap();
+        let single = Workspace::plan(&spec, 1, ExpertSet::Shared, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16).unwrap();
+        for layout in [&single, &wide] {
+            let mut end = 0;
+            for (offset, bytes) in layout.ranges {
+                assert_eq!(offset % 256, 0);
+                assert!(offset >= end);
+                end = offset + bytes;
             }
-            assert_eq!(single.ranges[8].1, wide.ranges[8].1);
-            assert_eq!(single.ranges[9].1, wide.ranges[9].1);
-            assert_eq!(single.ranges[0].1 * 64, wide.ranges[0].1);
-            assert_eq!(single.ranges[3].1 * 64, wide.ranges[3].1);
-            assert_eq!(single.ranges[10].1 * 64, wide.ranges[10].1);
-            assert_eq!(wide.ranges[3].1, 64 * 6144 * 2);
-            assert_eq!(wide.ranges[10].1, 64 * 6144 * 2);
-            assert_eq!(wide.ranges[0].1, 64 * match set {
-                ExpertSet::Routed => 6336,
-                ExpertSet::Shared => 12288,
-            });
-            let mut stale = spec.clone();
-            stale.geometry["abi_version"] = serde_json::json!(2);
-            assert!(Workspace::plan(&stale, 64, set, 16).is_err());
-            assert!(Workspace::plan(&spec, 0, set, 16).is_err());
-            assert!(Workspace::plan(&spec, 65, set, 16).is_err());
-            let other = if set == ExpertSet::Shared {
-                ExpertSet::Routed
-            } else {
-                ExpertSet::Shared
-            };
-            assert!(Workspace::plan(&spec, 64, other, 16).is_err());
+            assert_eq!(layout.bytes, end);
         }
-        assert!(
-            Workspace::plan(&spec(ExpertSet::Shared), 64, ExpertSet::Shared, 16)
-                .unwrap()
-                .bytes
-                < Workspace::plan(&spec(ExpertSet::Routed), 64, ExpertSet::Routed, 16)
-                    .unwrap()
-                    .bytes
-        );
+        assert_eq!(single.ranges[8].1, wide.ranges[8].1);
+        assert_eq!(single.ranges[9].1, wide.ranges[9].1);
+        assert_eq!(single.ranges[0].1 * 64, wide.ranges[0].1);
+        assert_eq!(single.ranges[3].1 * 64, wide.ranges[3].1);
+        assert_eq!(single.ranges[10].1 * 64, wide.ranges[10].1);
+        assert_eq!(wide.ranges[3].1, 64 * 6144 * 2);
+        assert_eq!(wide.ranges[10].1, 64 * 6144 * 2);
+        assert_eq!(wide.ranges[0].1, 64 * 12288);
+        let mut stale = spec.clone();
+        stale.geometry["abi_version"] = serde_json::json!(2);
+        assert!(Workspace::plan(&stale, 64, ExpertSet::Shared, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&spec, 0, ExpertSet::Shared, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&spec, 65, ExpertSet::Shared, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&spec, 64, ExpertSet::Routed, Variant::SharedDecode, 16,
+            Exlr8PrefillActivations::A16).is_err());
+    }
+
+    #[test]
+    fn compact_decode_instances_share_streams_and_scale_scratch_with_owned_units() {
+        let compact = compact_spec();
+        let grouped = grouped64_spec();
+        for rows in [1, 4, 17, 64] {
+            let full = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+                16, Exlr8PrefillActivations::A16).unwrap();
+            let owned = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+                3, Exlr8PrefillActivations::A16).unwrap();
+            assert!(full.compact && owned.compact && owned.unit_limit == 3);
+            // fc1 and the activation scratch follow owned units; FC2 keeps the
+            // full group capacity exactly as K1's arena does.
+            assert_eq!(owned.ranges[8].1 * 16, full.ranges[8].1 * 3);
+            assert_eq!(owned.intermediate_bytes * 16, full.intermediate_bytes * 3);
+            assert_eq!(owned.ranges[9].1 - owned.intermediate_bytes,
+                full.ranges[9].1 - full.intermediate_bytes);
+            assert!(owned.bytes < full.bytes);
+            assert_eq!(full.ranges[4].1, 512 * 4);
+            assert_eq!(full.ranges[5].1, 512 * 16 * 4);
+            assert_eq!(full.ranges[0].1, rows * 6336);
+            // The routed decode core admits the same streams and owned-unit FC1
+            // scratch as the grouped instance at the same rows, without the
+            // unit tables; its activation scratch keeps the global unit stride
+            // its kernels address.
+            let routed = Workspace::plan(&compact, rows, ExpertSet::Routed,
+                Variant::DecodeCompact, 3, Exlr8PrefillActivations::A16).unwrap();
+            assert!(routed.compact && !routed.unit_tables && routed.unit_limit == 3);
+            assert_eq!(routed.ranges[..9], owned.ranges[..9]);
+            assert_eq!(routed.intermediate_bytes, full.intermediate_bytes);
+            assert_eq!(routed.ranges[9].1, full.ranges[9].1);
+            assert!(routed.bytes > owned.bytes && routed.bytes < full.bytes);
+        }
+        for rows in [0, 65] {
+            assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::DecodeGrouped,
+                3, Exlr8PrefillActivations::A16).is_err());
+            assert!(Workspace::plan(&compact, rows, ExpertSet::Routed, Variant::DecodeCompact,
+                3, Exlr8PrefillActivations::A16).is_err());
+        }
+        let mut missing_partials = grouped.clone();
+        missing_partials.geometry["fc2_partials"] = serde_json::json!("f16");
+        assert!(Workspace::plan(&missing_partials, 64, ExpertSet::Routed,
+            Variant::DecodeGrouped, 3, Exlr8PrefillActivations::A16).is_err());
+        // Neither decode instance accepts the other's program.
+        assert!(Workspace::plan(&compact, 64, ExpertSet::Routed,
+            Variant::DecodeGrouped, 3, Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed,
+            Variant::DecodeCompact, 3, Exlr8PrefillActivations::A16).is_err());
+        // The shared set never admits a routed decode variant.
+        assert!(Workspace::plan(&compact, 64, ExpertSet::Shared,
+            Variant::DecodeCompact, 3, Exlr8PrefillActivations::A16).is_err());
+    }
+
+    /// Highest byte each decode kernel addresses in FC1 and in the activation
+    /// `intermediate`, as the fork's kernels index them (475ceec6 `exlr8.py`
+    /// `Exlr8RoutedServingKernel`, `exlr8_grouped.py`): the routed core stores
+    /// FC1 by live owned-unit task (`task < live_units * 2 * splits`) but the
+    /// activation write and FC2 read use `(group * units + unit)` over all
+    /// global units; the grouped instance uses `group * unit_limit + local`.
+    fn decode_scratch_extent(variant: Variant, groups: usize, live_units: usize,
+        unit_limit: usize, last_global_unit: usize) -> (usize, usize) {
+        const TILE_F32: usize = 16 * 128 * 4;
+        const TILE_F16: usize = 16 * 128 * 2;
+        let (units, splits) = (16, 6);
+        let fc1 = live_units * 2 * splits * TILE_F32;
+        let intermediate = match variant {
+            Variant::DecodeCompact => ((groups - 1) * units + last_global_unit + 1) * TILE_F16,
+            Variant::DecodeGrouped => groups * unit_limit * TILE_F16,
+            _ => unreachable!(),
+        };
+        (fc1, intermediate)
+    }
+
+    #[test]
+    fn decode_arenas_cover_every_tp4_and_tp6_owned_unit_kernel_address() {
+        // Fails before the fix: the routed core's activation scratch was cut to
+        // three owned units at TP6, so 96+ live groups (rows 12-15 below the
+        // 16-row grouped switch) wrote over FC2 partials and the next layer's
+        // router saw a non-finite gate weight.
+        let compact = compact_spec();
+        let grouped = grouped64_spec();
+        for (world, unit_limit) in [(4usize, 4usize), (6, 3), (6, 2)] {
+            let switch = grouped_decode_from_row(unit_limit);
+            for rows in 1..=64usize {
+                let variant = if rows >= switch { Variant::DecodeGrouped } else { Variant::DecodeCompact };
+                let spec = if variant == Variant::DecodeGrouped { &grouped } else { &compact };
+                let layout = Workspace::plan(spec, 64, ExpertSet::Routed, variant, unit_limit,
+                    Exlr8PrefillActivations::A16).unwrap();
+                // Distinct experts per route: the most groups this row count makes,
+                // each owning `unit_limit` units up to the highest global unit.
+                let groups = (rows * 8).min(512);
+                let (fc1, intermediate) = decode_scratch_extent(variant, groups,
+                    groups * unit_limit, unit_limit, 15);
+                assert!(fc1 <= layout.ranges[8].1,
+                    "TP{world} u={unit_limit} rows={rows}: FC1 {fc1} > {}", layout.ranges[8].1);
+                assert!(intermediate <= layout.intermediate_bytes,
+                    "TP{world} u={unit_limit} rows={rows} {variant:?}: intermediate {intermediate} > {}",
+                    layout.intermediate_bytes);
+            }
+        }
     }
 
     #[test]
     fn grouped_workspace_uses_wide_route_slots_without_changing_decode() {
-        let mut grouped = spec(ExpertSet::Routed);
-        grouped.name = program_names(ExpertSet::Routed, 65).0.into();
+        let mut grouped = compact_spec();
+        grouped.name = program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A16).0.into();
         grouped.capacity_rows = 4096;
+        grouped.pointers = pointers(ExpertSet::Routed, Variant::Prefill)
+            .into_iter().map(String::from).collect();
+        grouped.scalar_kinds = b"iii".to_vec();
         grouped.geometry["max_rows"] = serde_json::json!(4096);
         grouped.geometry["group_rows"] = serde_json::json!(64);
+        grouped.geometry.as_object_mut().unwrap().remove("serving_variant");
         grouped.geometry["ctas_per_sm"] = serde_json::json!(2);
         for bytes in grouped.scratch.values_mut() { *bytes *= 4; }
         for rows in [65, 128, 4095, 4096] {
-            grouped.pointers = pointers(ExpertSet::Routed, rows).into_iter().map(String::from).collect();
-            grouped.scalar_kinds = b"iii".to_vec();
-            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, 16).unwrap();
-            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, 3).unwrap();
+            let workspace = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill,
+                16, Exlr8PrefillActivations::A16).unwrap();
+            let compact = Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill,
+                3, Exlr8PrefillActivations::A16).unwrap();
             assert_eq!(compact.ranges[8].1 * 16, workspace.ranges[8].1 * 3);
             assert_eq!(compact.intermediate_bytes * 16, workspace.intermediate_bytes * 3);
             assert!(compact.bytes < workspace.bytes);
             assert_eq!(workspace.ranges[5].1, 512 * 64 * 4);
             assert_eq!(workspace.ranges[0].1, rows * 6336);
             assert_eq!(workspace.ranges[10].1, rows * 6144 * 2);
+            assert!(Workspace::plan(&grouped, rows, ExpertSet::Routed, Variant::Prefill, 16,
+                Exlr8PrefillActivations::A8).is_err());
+            let mut grouped_a8 = grouped.clone();
+            grouped_a8.name = program_names(ExpertSet::Routed, Variant::Prefill,
+                Exlr8PrefillActivations::A8).0.into();
+            grouped_a8.geometry["activations"] = serde_json::json!("a8");
+            let workspace_a8 = Workspace::plan(&grouped_a8, rows, ExpertSet::Routed,
+                Variant::Prefill, 16, Exlr8PrefillActivations::A8).unwrap();
+            assert_eq!(workspace_a8.bytes, workspace.bytes);
+            assert!(Workspace::plan(&grouped_a8, rows, ExpertSet::Routed, Variant::Prefill,
+                16, Exlr8PrefillActivations::A16).is_err());
         }
         for invalid in [0, 17, usize::MAX] {
-            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, invalid).is_err());
+            assert!(Workspace::plan(&grouped, 1024, ExpertSet::Routed, Variant::Prefill,
+                invalid, Exlr8PrefillActivations::A16).is_err());
         }
-        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, 16).is_err());
-        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, 16).is_err());
-        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, 16).is_err());
-        assert_eq!(program_names(ExpertSet::Routed, 64).0, "exlr8_a16_serving");
-        assert_eq!(program_names(ExpertSet::Shared, 64).0, "exlr8_shared_a16_serving");
+        assert!(Workspace::plan(&grouped, 64, ExpertSet::Routed, Variant::Prefill, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 4097, ExpertSet::Routed, Variant::Prefill, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        assert!(Workspace::plan(&grouped, 4096, ExpertSet::Shared, Variant::Prefill, 16,
+            Exlr8PrefillActivations::A16).is_err());
+        for activations in [Exlr8PrefillActivations::A16, Exlr8PrefillActivations::A8] {
+                assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeCompact, activations).0,
+                "exlr8_a16_serving");
+            assert_eq!(program_names(ExpertSet::Shared, Variant::SharedDecode, activations).0,
+                "exlr8_shared_a16_serving");
+            assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeGrouped, activations).0,
+                "exlr8_a16_grouped64");
+        }
+        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A16).0, "exlr8_a16_grouped");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A8).0, "exlr8_a8_grouped");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::DecodeGrouped,
+            Exlr8PrefillActivations::A16).1, "exlr8_group");
+        assert_eq!(program_names(ExpertSet::Routed, Variant::Prefill,
+            Exlr8PrefillActivations::A16).1, "exlr8_grouped_group");
     }
 
     #[test]

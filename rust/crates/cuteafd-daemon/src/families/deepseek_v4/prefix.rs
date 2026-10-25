@@ -141,6 +141,16 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
         Ok(layer_buffers(engine)?.iter().map(Self::layer_mark_bytes).sum())
     }
 
+    /// Snapshot geometry before allocating any retained marks or host tables.
+    pub fn layout_of(engine: &Engine<'_>) -> Result<FamilyLayout> {
+        let layers = layer_buffers(engine)?;
+        Self::mirror_prefix(&layers)?;
+        let rank_marks: Vec<_> = (0..engine.ranks()).map(|rank| layers.iter().filter(|l| l.rank == rank)
+            .map(Self::layer_mark_bytes).sum()).collect();
+        let page_bytes = layers.iter().filter(|l| l.rank == 0).map(Self::layer_page_bytes).sum();
+        Ok(snapshot_layout(engine.shape.units, page_bytes, &rank_marks, engine.context_kv()))
+    }
+
     pub fn mark_bytes(&self) -> usize {
         self.mark_bytes
     }
@@ -148,11 +158,15 @@ impl<'e, 'a> Dsv4Prefix<'e, 'a> {
     pub fn page_bytes(&self) -> usize {
         // One rank's layers: under heads every GPU holds every page, under context a unit's C4
         // pages live on one GPU and its C128 pages are stored from GPU0.
-        self.layers.iter().filter(|l| l.rank == 0).map(|l| match l.compressed {
+        self.layers.iter().filter(|l| l.rank == 0).map(Self::layer_page_bytes).sum()
+    }
+
+    fn layer_page_bytes(layer: &LayerBuffers) -> usize {
+        match layer.compressed {
             Some((4, _)) => compressed_page_bytes(4) + INDEX_PAGE_BYTES,
             Some((ratio, _)) => compressed_page_bytes(ratio),
             None => 0,
-        }).sum()
+        }
     }
 
     pub fn slots(&self) -> usize {

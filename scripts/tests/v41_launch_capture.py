@@ -138,9 +138,9 @@ if tool == "docker":
                 unit = int(value("--prefill-rows", "0")) or 2048
                 waves = int(value("--prefill-waves", "0")) or 2
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=unit * waves)
-            elif family == "glm5":
+            elif family in {"glm5", "deepseek_v4"}:
                 unit = int(value("--prefill-rows", "0")) or 4096
-                waves = 1 if int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
+                waves = 1 if family == "glm5" and int(ranks) == 0 else int(value("--prefill-waves", "0")) or 2
                 span = int(value("--prefill-span-rows", "0")) or 16384
                 response.update(prefill_unit_rows=unit, prefill_waves=waves, prefill_span_rows=span)
             if family == "mimo_v2":

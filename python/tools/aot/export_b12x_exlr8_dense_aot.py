@@ -98,6 +98,19 @@ def programs():
     result.append(("bf16_index_weights", "bf16_projection",
                    dict(width=6144, outputs=32, output_dtype="torch.float32"),
                    partial(compile_bf16_projection_aot, **params)))
+    from b12x.integration.cuteafd.dense_mxfp8 import (
+        compile_dense_mxfp8_quant_aot, compile_dense_mxfp8_aot)
+    for name, k, n, side in TRELLIS_SHAPES:
+        params = dict(input_features=k, output_features=n, encoding="trellis",
+                      sharded_side=side, input_dtype="f16", rotation_count=4,
+                      max_rows=4096)
+        result.append((f"trellis_{name}_a8", "dense_mxfp8", params,
+                       partial(compile_dense_mxfp8_aot, **params)))
+    for k in sorted({shape[1] for shape in TRELLIS_SHAPES}):
+        params = dict(input_features=k, input_dtype="f16", rotation_count=4,
+                      max_rows=4096)
+        result.append((f"quant_k{k}_a8", "dense_mxfp8_quant", params,
+                       partial(compile_dense_mxfp8_quant_aot, **params)))
     return result
 
 

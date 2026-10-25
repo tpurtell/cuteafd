@@ -157,8 +157,12 @@ The same brief works for every model. One bounded task with everything the
 agent needs to finish without asking:
 
 1. **Branch and base:** `work/<task>` off `origin/work/p0`, in a worktree
-   outside the repo (the preamble covers this). Name the PR/issue number and
-   the preflight command (`hwlock.py --preflight`) for any hardware run.
+   under `~/Developer/cute-worktrees/<name>`, outside the repo. New CuteAFD
+   and SparkInfer worktrees both go in this folder, not directly in
+   `~/Developer`; use distinct names such as `cuteafd-<task>` and
+   `sparkinfer-<task>`. Leave existing worktrees where they are. Name the
+   PR/issue number and the preflight command (`hwlock.py --preflight`) for
+   any hardware run.
 2. **Context:** the measured numbers and file paths that motivate the task,
    the `PLAN.md` item, what was already tried. Point at earlier reports
    rather than restating them.
@@ -174,6 +178,15 @@ agent needs to finish without asking:
    leave opt-in.
 6. **Report:** before → after tables with conditions, gate results, commits,
    open issues.
+
+Create the parent once, then create each task's worktree from its owning
+checkout (SparkInfer branches use that fork's base, not CuteAFD's):
+
+```sh
+mkdir -p ~/Developer/cute-worktrees
+git -C ~/Developer/cuteafd worktree add ~/Developer/cute-worktrees/cuteafd-<task> -b work/<task> origin/work/p0
+git -C ~/Developer/sparkinfer-glmrt worktree add ~/Developer/cute-worktrees/sparkinfer-<task> -b work/<task> origin/master
+```
 
 Start every cluster brief with `scripts/agents/codex-preamble.md` (worktree,
 build, lock, sudo, frugality and no-merge rules). `codex-launch.sh` prepends
@@ -381,8 +394,16 @@ before starting the gate; never move HEAD during it.
   mangles bash arrays, `$?` and `$(...)` meant for the inner shell: pass
   `--expand-environment=no`, or put the commands in a script file and run
   `bash /path/script.sh`.
+- Keep systemd's stop defaults on those units (KillMode=control-group,
+  TimeoutStopSec=90 s): never pass `-p KillMode=mixed|process` or a shorter
+  `TimeoutStopSec`. On stop, `cuteafd bench smoke` removes its coordinator
+  and Spark workers (bounded, 60 s) and `hwlock.py` / `wip-cards.py` forward
+  the signal and keep the locks until it has, so the next lock holder finds
+  clean hardware.
 - Stop your own jobs by PID or `systemctl --user stop <unit>`, never with
-  `pkill -f`: the pattern can match your own Bash command line and kill it.
+  `pkill -f` (the pattern can match your own Bash command line and kill it),
+  `kill -9` or `systemctl kill -s KILL` (no teardown runs; the containers
+  outlive the released locks).
 
 ### Known Codex behavior
 

@@ -266,16 +266,8 @@ impl<'a> Wave<'a> {
                 Allocation::new(devices[1], capacity as usize * 10240)?,
             ],
             add: devices[0].library.bf16_add()?,
-            sm: [0, 1]
-                .map(|rank| {
-                    crate::shared::memory::chain::device_enabled()
-                        .then(|| devices[rank].run(|| devices[rank].library.v41_peer_copy()))
-                        .transpose()
-                })
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("two TP2 peer copiers"))?,
+            sm: [Some(devices[0].run(|| devices[0].library.v41_peer_copy())?),
+                Some(devices[1].run(|| devices[1].library.v41_peer_copy())?)],
             layers,
             capacity,
         })

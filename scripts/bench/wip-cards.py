@@ -1,10 +1,31 @@
 #!/usr/bin/env python3
-"""Task-private WIP cards. Smoke alone owns serving locks; dry-run is CPU-only."""
+"""Task-private WIP cards. Build/seal first, then hold one fair serving turn.
+
+The union of the smoke jobs' locks stays held across every arm and repeat, until
+the last smoke has torn down. Children inherit CUTEAFD_HW_LOCKS_HELD, so smoke
+does not take those locks again. Builds (including legacy builds and seed/GPU
+exports) finish before this turn; dry-run prints the turn and is CPU-only.
+
+Stopping: SIGTERM, SIGINT or SIGHUP is forwarded to every running smoke, which
+tears down its coordinator and Spark workers (bounded, 60 s) before it exits;
+wip-cards waits for that (75 s, up to SMOKE_STOP_GRACE_S), starts no further job
+and exits 128 + the signal. This fits hwlock.py's 80 s outer stop grace (if
+wrapped) and systemd's 90 s stop timeout. Launch it as a systemd user unit with
+the defaults (KillMode=control-group, TimeoutStopSec=90 s), e.g.
+  systemd-run --user --unit=TASK --collect --setenv=PATH="$PATH" --setenv=HOME="$HOME" \\
+    --working-directory=REPO scripts/bench/wip-cards.py ...
+and stop it with `systemctl --user stop TASK`: the locks are released only
+after the containers are gone. Never pass KillMode=mixed or KillMode=process
+(only the main process would be signalled, so smoke would not tear down), a
+TimeoutStopSec below 90 s (systemd would SIGKILL the teardown), and never
+`systemctl kill -s KILL` or `kill -9` a running card.
+"""
 from __future__ import annotations
 
 import argparse
 import base64
 import concurrent.futures
+import contextlib
 import itertools
 import hashlib
 import importlib.util
@@ -15,6 +36,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import statistics
 import socket
 import threading
@@ -33,6 +55,9 @@ _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
 sys.path.insert(0, str(REPO / 'scripts/lib'))
 from wip_aot_scopes import family_scopes
+_hw_spec = importlib.util.spec_from_file_location('hwlock', REPO / 'scripts/hw/hwlock.py')
+hwlock = importlib.util.module_from_spec(_hw_spec)
+_hw_spec.loader.exec_module(hwlock)
 # Profilers that wrap a serving process (PROFILE on the coordinator, PROFILE_SPARK
 # on Spark workers), and their report suffix.
 PROFILER_REPORTS = {'nsys': '.nsys-rep', 'ncu': '.ncu-rep'}
@@ -285,7 +310,8 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         values.pop('WIP_INSTANCE', None)
         values.pop('WIP_ROOT', None)
         values['COORDINATOR_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-coordinator:' + arm['release']
-        values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
+        if count > 0:
+            values['SPARK_EXPERT_DOCKER_INFERENCE'] = 'ghcr.io/tpurtell/cuteafd-spark-expert:' + arm['release']
         run_args = []
     elif arm.get('root'):
         values['WIP_ROOT'] = arm['root']
@@ -401,6 +427,44 @@ def smoke_groups(jobs, parallel):
     if parallel > 1 and len({j['arm'] for j in jobs}) == 1:
         return [jobs]
     return [[job] for job in jobs]
+
+
+def serving_locks(jobs):
+    """Match smoke.rs locks_for, including its V4.1 exclusive default."""
+    names = set()
+    for job in jobs:
+        entry = job['entry']
+        gpus = entry.get('gpus', [0])
+        hosts = entry.get('sparks', [])
+        exclusive = entry.get('exclusive')
+        if exclusive is None:
+            exclusive = entry.get('family') == 'deepseek_v41'
+        if 0 in gpus or set(hosts) & set(HOSTS[:4]) or exclusive:
+            names.add('sparks')
+        for gpu in (0, 1):
+            if gpu in gpus or exclusive:
+                names.add(f'gpu{gpu}')
+        names.update(set(hosts) & {'rhea', 'moa'})
+    return hwlock.canonical(names)
+
+
+@contextlib.contextmanager
+def serving_turn(jobs, env, wait):
+    """Hold one post-build turn until every smoke has exited and torn down.
+
+    The caller drains detached smokes before leaving, even on a stop signal:
+    60 s smoke teardown, 75 s here, 80 s outer hwlock if used, 90 s systemd.
+    Never put a build or export inside this scope.
+    """
+    parent = hwlock.canonical(filter(None, env.get('CUTEAFD_HW_LOCKS_HELD', '').split(',')))
+    locks = serving_locks(jobs)
+    wanted = [name for name in locks if name not in parent]
+    with contextlib.ExitStack() as stack:
+        if wanted:
+            stack.enter_context(hwlock.hold(wanted, wait, 'wip-cards arms/repeats',
+                                            cancelled=lambda: STOP['signal'] is not None))
+        env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(hwlock.canonical([*parent, *locks]))
+        yield
 
 
 def slot_binary(arm):
@@ -573,12 +637,76 @@ def smoke_command(binary, repo, job):
     return [binary, 'bench', 'smoke', '--matrix', str(dest / 'matrix.json'), '--repo', str(repo), '--state', str(dest / 'smoke'), '--out-root', str(dest / 'reports'), '--parallel', '1']
 
 
+# How long a signalled smoke may take to tear down before it is killed: above its
+# own 60 s bound, under hwlock.py's 80 s grace and systemd's 90 s TimeoutStopSec.
+SMOKE_STOP_GRACE_S = 75.0
+STOP_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+# The first stop signal received, and the detached smoke process groups it reaches.
+STOP = dict(signal=None)
+_LIVE = {}  # id(process) -> process
+_LIVE_LOCK = threading.RLock()  # re-entrant: the handler runs on the main thread
+
+
+def _signal_live(signum):
+    with _LIVE_LOCK:
+        live = list(_LIVE.values())
+    for process in live:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signum)
+
+
+def forward_stop(signum, _frame=None):
+    """Signal handler: remember the first stop signal and pass it to every
+    running smoke's process group (smoke ignores repeats)."""
+    if STOP['signal'] is None:
+        STOP['signal'] = signum
+    _signal_live(signum)
+
+
+def install_stop_handlers():
+    for sig in STOP_SIGNALS:
+        signal.signal(sig, forward_stop)
+
+
+def stopped_code():
+    return 128 + STOP['signal'] if STOP['signal'] is not None else None
+
+
 def detached(cmd, log, exit_file, env):
     # Shell remains in the detached group and writes a numeric status even if the
-    # CLI disappears. No flock here: smoke owns all serving locks.
-    script = '"$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
+    # CLI disappears. It ignores stop signals itself (smoke handles them), so it
+    # waits for smoke's teardown and still records smoke's exit status. The
+    # parent's serving turn outlives this process and its container teardown.
+    script = 'trap : TERM INT HUP; "$@"; rc=$?; printf "%s\\n" "$rc" > "$CARD_EXIT"; exit "$rc"'
     with Path(log).open('w') as output:
-        return subprocess.Popen(['setsid', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+        process = subprocess.Popen(['setsid', 'bash', '-c', script, 'wip-card', *cmd], stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, env={**env, 'CARD_EXIT': str(exit_file)}, start_new_session=False)
+    with _LIVE_LOCK:
+        _LIVE[id(process)] = process
+    if STOP['signal'] is not None:  # arrived while it started
+        _signal_live(STOP['signal'])
+    return process
+
+
+def wait_detached(process, grace=SMOKE_STOP_GRACE_S):
+    """Waits for a detached smoke. After a stop signal it gets `grace` seconds
+    to tear down, then its group is killed."""
+    deadline = None
+    try:
+        while True:
+            try:
+                return process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                pass
+            if STOP['signal'] is not None:
+                deadline = deadline or time.monotonic() + grace
+                if time.monotonic() >= deadline:
+                    print(f'wip-cards: smoke did not stop within {grace:.0f} s; killing it', file=sys.stderr)
+                    with contextlib.suppress(ProcessLookupError, PermissionError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    return process.wait()
+    finally:
+        with _LIVE_LOCK:
+            _LIVE.pop(id(process), None)
 
 
 def http(url, path, body=None):
@@ -991,8 +1119,9 @@ def summarize_job(job, exit_code):
             fail(row, message)
     launched = outcome.get('launch_s') is not None or bool(reports)
     sweep_only = job['entry'].get('profile') == 'panels:' and bool(job['entry'].get('levels') or job['entry'].get('prefill_lengths'))
-    if sweep_only and not reports:
-        pass  # No server-side profile ran; the sweep below carries the numbers.
+    readiness_only = job['entry'].get('profile') == 'panels:' and job['entry'].get('baseline') is False and not sweep_only
+    if (sweep_only or readiness_only) and not reports:
+        pass  # No server-side profile ran; the sweep or the probes carry the results.
     elif len(reports) != 1:
         fail(row, f'expected one report, found {len(reports)}')
     else:
@@ -1895,6 +2024,8 @@ def main():
     parser.add_argument('--matched-prompts', action='store_true', help='interleave with one shared nonce sequence per pair and verified prompt token hashes')
     parser.add_argument('--nonce-seed', help='explicit shared nonce seed for every job, overriding matched-prompts auto-seeds')
     parser.add_argument('--parallel', type=int, default=1)
+    parser.add_argument('--wait', type=float, default=float(os.environ.get('CUTEAFD_HW_LOCK_WAIT_S', 21600)),
+                        help='maximum wait for the single serving turn, in seconds (default 21600)')
     parser.add_argument('--task', default='cards-' + time.strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--state', type=Path)
     parser.add_argument('--repo', type=Path, default=REPO, help='launcher checkout for arms that are neither --build nor --arm-repo')
@@ -1920,6 +2051,7 @@ def main():
                         '(needs PREFIX_CACHE_ENTRIES=0; the sweep fails if a repeat hits the cache)')
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
     parser.add_argument('--context-levels', metavar='C,C', help='context_load concurrency levels (distinct 1..256; default 1,8,16)')
+    parser.add_argument('--context-suffix', type=int, metavar='N', help='additional fresh context_load suffix tokens per request (0..1048576; default 0)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
@@ -1943,6 +2075,8 @@ def main():
     parser.add_argument('--precheck', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--preflight-job', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if not 0 < args.wait < float('inf'):
+        parser.error('--wait must be finite and positive')
     if args.observe or args.precheck:
         job = json.loads((args.observe or args.precheck).read_text())
         (observe if args.observe else precheck)(job)
@@ -2037,6 +2171,8 @@ def main():
         if not parts or not all(x.isdigit() and 256 <= int(x) <= 1 << 20 for x in parts):
             parser.error('--context-lengths takes prompt lengths in 256..1048576, e.g. 32768,131072')
         context_lengths = [int(x) for x in parts]
+    if args.context_suffix is not None and not 0 <= args.context_suffix <= 1 << 20:
+        parser.error('--context-suffix takes tokens in 0..1048576')
     context_levels = None
     if args.context_levels is not None:
         parts = [x.strip() for x in args.context_levels.split(',') if x.strip()]
@@ -2045,14 +2181,14 @@ def main():
         context_levels = [int(x) for x in parts]
     if args.panels is not None:
         selection = '' if args.panels.strip() == 'none' else args.panels.strip()
-        if not selection and not (levels or prefill_lengths):
-            parser.error('--panels none runs nothing without --levels or --prefill-lengths')
+        if not selection and not (levels or prefill_lengths or args.probe):
+            parser.error('--panels none runs nothing without --levels, --prefill-lengths or --probe')
         profile = 'panels:' + selection
         listed = requested_panels(profile)
         for card in cards:
             card['profile'] = profile
-            if listed and 'baseline' not in listed:
-                card['baseline'] = False  # Explicit panels alone; list baseline to keep it.
+            if (listed or not (levels or prefill_lengths)) and 'baseline' not in listed:
+                card['baseline'] = False  # Explicit panels alone, or a probe-only readiness run; list baseline to keep it.
     lossless_set = None
     if args.lossless_set is not None:
         lossless_set = load_lossless_set(args.lossless_set)
@@ -2071,6 +2207,8 @@ def main():
             card['context_lengths'] = context_lengths
         if context_levels is not None:
             card['context_levels'] = context_levels
+        if args.context_suffix is not None:
+            card['context_suffix'] = args.context_suffix
         if lossless_set:
             card['lossless_set'] = lossless_set
         if lossless_dump:
@@ -2166,6 +2304,9 @@ def main():
         save(group_root / 'matrix.json', dict(build='wip-cards', entries=[job['entry'] for job in jobs]))
     save(state / 'plan.json', {'task': args.task, 'arms': arms, 'jobs': [{**j, 'probes': sorted(j['probes'])} for j in jobs]})
     if args.dry_run:
+        print('# single serving turn after all builds/seals: hwlock --locks ' +
+              ','.join(serving_locks(jobs)) + ' --wait ' + str(args.wait) +
+              '; held through all arms/repeats and final teardown')
         if groups and len(groups[0]) > 1:
             cmd = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(state / 'parallel-smoke')))
             cmd[-1] = str(args.parallel)
@@ -2176,6 +2317,8 @@ def main():
             cmd = smoke_command(job['binary'], job['launcher']['repo'], job)
             prefix = ('CUTEAFD_BENCH_NONCE_SEED=' + shlex.quote(job['nonce_seed']) + ' ') if job.get('nonce_seed') else ''
             print('# settings ' + job['arm'] + '/' + job['card'] + ': ' + json.dumps(job['entry']['set'], sort_keys=True))
+            if args.context_suffix is not None:
+                print('# context_suffix=' + str(job['entry']['context_suffix']))
             print(prefix + 'setsid ' + shlex.join(cmd) + ' # numeric exit -> ' + job['state'] + '/exit')
             for kind in ('observer', 'precheck'):
                 if kind in job['entry']:
@@ -2208,6 +2351,7 @@ def main():
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \
         (['lossless_dump'] if any(job['entry'].get('lossless_dump') for job in jobs) else []) + \
         (['context_lengths'] if context_lengths is not None else []) + (['context_levels'] if context_levels is not None else []) + \
+        (['context_suffix'] if args.context_suffix is not None else []) + \
         (['worker_stop'] if any(job['entry']['set'].get('PROFILE_SPARK') for job in jobs) else [])
     for job in {j['launcher']['repo']: j for j in reversed(jobs)}.values():
         binary_supports(job['binary'], job['launcher']['repo'], job, fields)
@@ -2230,12 +2374,23 @@ def main():
         return 0
     env = {**os.environ, 'CUTEAFD_API_KEY': key_file.read_text().strip()}
     env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
+    # From here on a stop signal reaches every running smoke (which tears down)
+    # and no further job starts.
+    install_stop_handlers()
     if args.nonce_seed is not None:
         env['CUTEAFD_BENCH_NONCE_SEED'] = args.nonce_seed
+    def cancelled_row(job):
+        row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
+        row.update(status='failed', exit_code=stopped_code(), error=f"stopped by signal {STOP['signal']} before it started",
+                   failure_kind='cancelled', state=job['state'])
+        return row
+
     def execute(job):
         dest = Path(job['state'])
         if job['state'] in kept:
             return kept[job['state']]
+        if STOP['signal'] is not None:
+            return cancelled_row(job)
         try:
             # Re-checked right before this job's turn: an earlier job may have
             # left a container, or a slot may have been rebuilt meanwhile.
@@ -2255,8 +2410,19 @@ def main():
         job_env.pop('CUTEAFD_BENCH_NONCE_SEED', None)
         if job.get('nonce_seed'):
             job_env['CUTEAFD_BENCH_NONCE_SEED'] = job['nonce_seed']
+        if STOP['signal'] is not None:
+            return cancelled_row(job)
         process = detached(smoke_command(job['binary'], job['launcher']['repo'], job), dest / 'driver.log', exit_file, job_env)
-        rc = process.wait()
+        rc = wait_detached(process)
+        # Cancellation already uses smoke's bounded teardown; remote probes and
+        # profile collection must not extend the 60/75/80/90 s stop chain.
+        if STOP['signal'] is not None:
+            row = cancelled_row(job)
+            row['error'] = f"stopped by signal {STOP['signal']}; smoke exited"
+            exit_file.write_text(str(stopped_code()) + '\n')
+            save(dest / 'result.json', row)
+            return row
+        assert_absent(job)
         code = int(exit_file.read_text()) if exit_file.exists() else (rc if rc >= 0 else 128 - rc)
         exit_file.write_text(str(code) + '\n')
         row = summarize_job(job, code)
@@ -2266,44 +2432,67 @@ def main():
             row['exit_code'] = 81
             save(dest / 'result.json', row)
         return row
-    if groups and len(groups[0]) > 1:
-        group_root = state / 'parallel-smoke'
-        try:
-            for job in jobs:
-                preflight_job(job, arms[job['arm']])
-        except (ValueError, subprocess.SubprocessError) as error:
+    try:
+        # build_arms (including legacy/export turns) completed before job creation;
+        # sealed-slot preflight rejects missing artifacts instead of building lazily.
+        with serving_turn([job for job in jobs if job['state'] not in kept], env, args.wait):
+            if STOP['signal'] is not None:
+                return stopped_code()
+            if groups and len(groups[0]) > 1:
+                group_root = state / 'parallel-smoke'
+                try:
+                    for job in jobs:
+                        preflight_job(job, arms[job['arm']])
+                except (ValueError, subprocess.SubprocessError) as error:
+                    rows = []
+                    for job in jobs:
+                        row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
+                        row.update(status='failed', exit_code=82, error=str(error))
+                        (Path(job['state']) / 'exit').write_text('82\n')
+                        save(Path(job['state']) / 'result.json', row)
+                        rows.append(row)
+                    write_summary(state, rows, arms)
+                    return 1
+                command = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
+                command[-1] = str(args.parallel)
+                if STOP['signal'] is not None:
+                    return stopped_code()
+                process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
+                rc = wait_detached(process)
+                if STOP['signal'] is not None:
+                    for job in jobs:
+                        (Path(job['state']) / 'exit').write_text(str(stopped_code()) + '\n')
+                        save(Path(job['state']) / 'result.json', cancelled_row(job))
+                    return stopped_code()
+                for job in jobs:
+                    assert_absent(job)
+                rows = []
+                for job in jobs:
+                    row = summarize_job(job, rc)
+                    # A different entry's failure does not erase this entry's evidence.
+                    outcomes = row.get('smoke', {})
+                    if isinstance(outcomes, dict) and outcomes.get(job['entry']['name'], {}).get('status') == 'done':
+                        row = summarize_job(job, 0)
+                    code = 0 if row['status'] == 'pass' else (rc or 81)
+                    (Path(job['state']) / 'exit').write_text(str(code) + '\n')
+                    row['exit_code'] = code
+                    rows.append(row)
+                write_summary(state, rows, arms)
+                return stopped_code() or int(any(row['status'] != 'pass' for row in rows))
             rows = []
-            for job in jobs:
-                row = {k: job[k] for k in ('card', 'arm', 'repeat', 'simulated')}
-                row.update(status='failed', exit_code=82, error=str(error))
-                (Path(job['state']) / 'exit').write_text('82\n')
-                save(Path(job['state']) / 'result.json', row)
-                rows.append(row)
-            write_summary(state, rows, arms)
-            return 1
-        command = smoke_command(jobs[0]['binary'], arms[jobs[0]['arm']]['repo'], dict(state=str(group_root)))
-        command[-1] = str(args.parallel)
-        process = detached(command, group_root / 'driver.log', group_root / 'exit', env)
-        rc = process.wait()
-        rows = []
-        for job in jobs:
-            row = summarize_job(job, rc)
-            # A different entry's failure does not erase this entry's evidence.
-            outcomes = row.get('smoke', {})
-            if isinstance(outcomes, dict) and outcomes.get(job['entry']['name'], {}).get('status') == 'done':
-                row = summarize_job(job, 0)
-            code = 0 if row['status'] == 'pass' else (rc or 81)
-            (Path(job['state']) / 'exit').write_text(str(code) + '\n')
-            row['exit_code'] = code
-            rows.append(row)
-        write_summary(state, rows, arms)
-        return int(any(row['status'] != 'pass' for row in rows))
-    rows = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel) as executor:
-        for row in executor.map(execute, jobs):
-            rows.append(row)
-            write_summary(state, rows, arms)
-    return int(any(r['status'] != 'pass' for r in rows))
+            with contextlib.ExitStack() as stack:
+                # Sequential comparisons stop immediately if teardown left containers.
+                if args.parallel > 1:
+                    executor = stack.enter_context(concurrent.futures.ThreadPoolExecutor(max_workers=args.parallel))
+                    outcomes = executor.map(execute, jobs)
+                else:
+                    outcomes = map(execute, jobs)
+                for row in outcomes:
+                    rows.append(row)
+                    write_summary(state, rows, arms)
+            return stopped_code() or int(any(r['status'] != 'pass' for r in rows))
+    except hwlock.Cancelled:
+        return stopped_code() or 1
 
 
 if __name__ == '__main__':

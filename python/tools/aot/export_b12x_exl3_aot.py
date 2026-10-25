@@ -127,8 +127,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Packed routes are grouped into M blocks of route_block rows per expert; each
     # block decodes its expert's Trellis tiles once, so larger blocks amortize the
     # decode over more rows once many rows share an expert (large prefill).
-    if compact_weights and (len(bits) != 2 or warp_specialized or decode_schedule is not None):
-        raise ValueError("compact weights require cooperative two-tier exports without a decode schedule")
+    if compact_weights and len(bits) != 2:
+        raise ValueError("compact weights require a disjoint two-tier export")
     if activation not in ("silu", "situ"):
         raise ValueError("EXL3 activation must be silu or situ")
     if activation == "situ" and swiglu_limit is not None:
@@ -170,9 +170,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # l2/pf1/pf2/pdl options): when and with which L2 policy the cooperative
     # kernel fetches weight words. Bit-identical to the default schedule; the
     # manifest records the canonical options, and only when one is set.
-    if decode_schedule is not None and (warp_specialized
-                                        or len(bits) != 2):
-        raise ValueError("a decode schedule applies to cooperative disjoint two-tier exports")
+    if decode_schedule is not None and warp_specialized:
+        raise ValueError("a decode schedule applies to cooperative exports only")
     # Disk-loaded B12x executors omit the compiler IR required by export_to_c.
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
     import torch
@@ -241,10 +240,11 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         launch = compile_mixed_trellis(**options, direct_topk_routes=direct,
                                       force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
     elif len(bits) == 3:
-        launch = compile_mixed_trellis3(**options, tier2_num_experts=experts, tier2_bits=bits[2])
+        launch = compile_mixed_trellis3(**options, tier2_num_experts=experts, tier2_bits=bits[2],
+            decode_schedule=decode_schedule)
     else:
         launch = compile_mixed_trellis4(**options, tier2_num_experts=experts, tier2_bits=bits[2],
-            tier3_num_experts=experts, tier3_bits=bits[3])
+            tier3_num_experts=experts, tier3_bits=bits[3], decode_schedule=decode_schedule)
     output.mkdir(parents=True, exist_ok=True)
     objects = []
     for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", launch.topk_sum.compiled)]:

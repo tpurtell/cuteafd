@@ -255,6 +255,58 @@
    }
   },
   {
+   "name": "glm53-exl3-min",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exl3-min.config",
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8747",
+    "COORDINATOR_GPU": "1",
+    "EXPERT_PORT": "19847",
+    "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi"
+   }
+  },
+  {
+   "name": "glm53-exlr8-max",
+   "family": "glm5",
+   "config": "examples/configs/glm53-exlr8-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8746",
+    "EXPERT_PORT": "19846",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
    "name": "mimo26-pro-max",
    "family": "mimo_v2",
    "config": "examples/configs/mimo-v26-pro-mxfp4-max.config",

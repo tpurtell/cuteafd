@@ -36,7 +36,7 @@ impl<'w, 'a> Rank<'w, 'a> {
             logits: DeviceAllocation::new(library, capacity * weights.tokens().len() * 4)?,
             candidates: DeviceAllocation::new(library, capacity * 8)?,
             weights, capacity, graphs: std::array::from_fn(|mode| crate::shared::decode_graph::RowGraphs::new(library, if mode == 0 { "vocabulary_logits" } else { "vocabulary_greedy" }, capacity)), fp8_scratch: None,
-            sm: crate::shared::memory::chain::device_enabled().then(|| library.v41_peer_copy()).transpose()?,
+            sm: Some(library.v41_peer_copy()?),
         })
     }
     fn candidates(&self, rows: usize) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {

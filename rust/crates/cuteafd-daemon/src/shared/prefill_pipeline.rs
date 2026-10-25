@@ -199,16 +199,24 @@ pub(crate) enum Step {
     Commit { unit: usize },
 }
 
+/// Fewest rows per wave worth splitting a prompt that fits one unit (TJ,
+/// 2026-10-25: splitting very short prompts buys nothing). Below `2 *` this a
+/// prompt runs as one unit, so its expert and projection kernels see the
+/// whole prompt's rows rather than switching route on a half.
+pub(crate) const MIN_SPLIT_ROWS: usize = 1024;
+
 /// Cut `span` rows into equal 64-row-aligned units of at most `unit_rows`,
 /// a multiple of `waves` of them while each keeps at least `min_rows`, so the
-/// in-flight units finish together and no unit runs a short tail alone.
+/// in-flight units finish together and no unit runs a short tail alone. A span
+/// that fits one unit splits only when each wave keeps [`MIN_SPLIT_ROWS`].
 pub(crate) fn prefill_units(span: usize, unit_rows: usize, waves: usize, min_rows: usize)
     -> anyhow::Result<Vec<std::ops::Range<usize>>> {
     anyhow::ensure!(span > 0 && unit_rows > 0 && unit_rows % 64 == 0 && waves > 0 && min_rows > 0,
         "prefill unit geometry must be positive and page aligned");
     let mut count = span.div_ceil(unit_rows);
     let rounded = count.next_multiple_of(waves);
-    if span / rounded >= min_rows { count = rounded; }
+    let floor = if count == 1 { min_rows.max(MIN_SPLIT_ROWS) } else { min_rows };
+    if span / rounded >= floor { count = rounded; }
     // ceil(span / count) <= unit_rows, and unit_rows is page aligned.
     let width = span.div_ceil(count).next_multiple_of(64);
     Ok((0..span).step_by(width).map(|first| first..span.min(first + width)).collect())
@@ -481,6 +489,15 @@ mod tests {
         assert_eq!(prefill_units(300, 2048, 2, 256)?, [0..300]);
         assert_eq!(prefill_units(8192, 2048, 2, 256)?.len(), 4);
         assert!(prefill_units(0, 2048, 2, 256).is_err() && prefill_units(10, 100, 2, 256).is_err());
+        // Spans that fit one unit stay whole below 2 x MIN_SPLIT_ROWS, at any wave count.
+        for span in [512, 1033, 1354, 2047] {
+            for waves in 1..=4 {
+                assert_eq!(prefill_units(span, 4096, waves, 256)?, [0..span]);
+                assert_eq!(prefill_units(span, 2048, waves, 256)?, [0..span]);
+            }
+        }
+        assert_eq!(prefill_units(2048, 4096, 2, 256)?, [0..1024, 1024..2048]);
+        assert_eq!(prefill_units(2 * 2090, 4096, 2, 256)?, [0..2112, 2112..4180]);
         for span in 1..=9000 {
             for (rows, waves) in [(2048, 2), (1024, 2), (512, 1), (2048, 3)] {
                 let units = prefill_units(span, rows, waves, 256)?;
@@ -490,6 +507,26 @@ mod tests {
                 assert!(units.iter().all(|unit| unit.len() <= rows));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn spans_longer_than_one_unit_keep_their_wave_cuts() -> anyhow::Result<()> {
+        // The cut rule before MIN_SPLIT_ROWS, for spans that need several units.
+        let before = |span: usize, unit_rows: usize, waves: usize| {
+            let mut count = span.div_ceil(unit_rows);
+            if span / count.next_multiple_of(waves) >= 256 { count = count.next_multiple_of(waves); }
+            let width = span.div_ceil(count).next_multiple_of(64);
+            (0..span).step_by(width).map(|first| first..span.min(first + width)).collect::<Vec<_>>()
+        };
+        for (unit_rows, waves) in [(4096, 2), (2048, 2), (1024, 2), (512, 2), (4096, 3), (2048, 4)] {
+            for span in (unit_rows + 1..=70_000).step_by(7).chain([8192, 65536, 2 * 2090]) {
+                assert_eq!(prefill_units(span, unit_rows, waves, 256)?, before(span, unit_rows, waves),
+                    "{span} rows, {unit_rows} x {waves}");
+            }
+        }
+        assert_eq!(prefill_units(8192, 4096, 2, 256)?, [0..4096, 4096..8192]);
+        assert_eq!(prefill_units(65536, 4096, 2, 256)?.len(), 16);
         Ok(())
     }
 

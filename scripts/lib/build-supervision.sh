@@ -71,14 +71,24 @@ build_supervise() {
       completed=""
       for pid in "${build_leg_pids[@]}"; do
         if ! kill -0 "$pid" 2>/dev/null; then
-          status=0
-          wait "$pid" || status=$?
           [[ "$pid" != "$first_pid" ]] && completed="$second" || completed="$first"
           break
         fi
       done
       [[ -n "$completed" ]] || { sleep 1; continue; }
-      release_die "[$completed] $build_context leg failed (exit $status); killed without exit status notification; stopping the other leg; see $build_log_dir"
+      # The poll above can run an instant before a worker's notification becomes
+      # visible, and the notice is written before the worker exits: nothing writes
+      # after exit, so give a dead worker's line a moment to surface before
+      # misreporting a normal completion as a kill. A killed worker never writes,
+      # so this read just times out before the diagnosis.
+      if read -r -t 1 late_leg late_status <&8; then
+        completed="$late_leg"
+        status="$late_status"
+      else
+        status=0
+        wait "$pid" || status=$?
+        release_die "[$completed] $build_context leg failed (exit $status); killed without exit status notification; stopping the other leg; see $build_log_dir"
+      fi
     fi
     case "$completed" in
       "$first") pid="$first_pid" ;;

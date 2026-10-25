@@ -160,11 +160,24 @@ pub(crate) struct FabricArgs {
     pub(crate) p2p_bytes: Vec<usize>,
 }
 
+/// `a16|a8` for `--exlr8-prefill-activations` on `plan` and the engine: the loader owns the one
+/// enum (the planner charges what admission charges), so clap lists its values via a parser.
+pub(crate) fn exlr8_prefill_activations_parser()
+    -> impl clap::builder::TypedValueParser<Value = cuteafd_loader::plan::exlr8::PrefillActivations> {
+    use clap::builder::TypedValueParser;
+    clap::builder::PossibleValuesParser::new(["a16", "a8"])
+        .map(|name| name.parse().expect("clap admits only the listed values"))
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct PlanArgs {
     /// Published EXLR8 manifest name (defaults to bit325).
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
+    /// Native EXLR8 trellis prefill activations the layout charges (default a16); a8 adds every
+    /// prefill lane's MX8 records, as `serve-glm --exlr8-prefill-activations a8` admits them.
+    #[arg(long, value_parser = exlr8_prefill_activations_parser())]
+    pub(crate) exlr8_prefill_activations: Option<cuteafd_loader::plan::exlr8::PrefillActivations>,
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
@@ -513,6 +526,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Published native EXLR8 manifest; binds the worker bootstrap identity.
     #[arg(long)]
     pub(crate) exlr8_manifest: Option<String>,
+    /// Native EXLR8 routed expert prefill activations; decode (`rows <= 64`) always keeps A16.
+    #[arg(long, value_parser = exlr8_prefill_activations_parser(), default_value_t = crate::shared::experts::exlr8::Exlr8PrefillActivations::A16)]
+    pub(crate) exlr8_prefill_activations: crate::shared::experts::exlr8::Exlr8PrefillActivations,
     /// Spark-role native library built with V4.1 expert AOT kernels.
     #[arg(long)]
     pub(crate) native_lib: PathBuf,

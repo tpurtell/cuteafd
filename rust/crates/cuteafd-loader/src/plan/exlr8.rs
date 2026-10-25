@@ -24,6 +24,38 @@ pub struct NativeSelection {
     pub set_id: String,
 }
 
+/// Native EXLR8 trellis prefill activations: BF16 (A16, default) or MXFP8 with
+/// per-row per-K32 E8M0 scales (A8, ABI version 2 lane records). Decode and
+/// verify always keep A16. Shared by the engine launch flag and `cuteafd plan`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrefillActivations {
+    #[default]
+    A16,
+    A8,
+}
+
+impl PrefillActivations {
+    pub const fn label(self) -> &'static str {
+        match self { Self::A16 => "a16", Self::A8 => "a8" }
+    }
+}
+
+impl std::fmt::Display for PrefillActivations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(self.label()) }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("unsupported EXLR8 prefill activations {0:?}: expected a16 or a8")]
+pub struct PrefillActivationsError(String);
+
+impl std::str::FromStr for PrefillActivations {
+    type Err = PrefillActivationsError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value { "a16" => Ok(Self::A16), "a8" => Ok(Self::A8), _ => Err(PrefillActivationsError(value.into())) }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SparkRequirements {
     pub resident_bytes_per_rank: Vec<u64>,
@@ -83,22 +115,21 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
     let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
     resolved_layout.glm5_drafter_disabled = speculator == "off";
-    if resolved_layout.prefill_waves == 1 && resolved_layout.prefill_unit_rows.is_none() {
-        resolved_layout.prefill_unit_rows = Some(if resolved_layout.prefill_rows == 0 { 4096 }
-            else { resolved_layout.prefill_rows });
-    }
-    let layout = &resolved_layout;
-    let gpu_count = layout.rtx_bytes.len();
+    let gpu_count = resolved_layout.rtx_bytes.len();
     ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
     let attention = if gpu_count == 2 { crate::placement::AttentionPlacement::Context }
         else { crate::placement::AttentionPlacement::Heads };
     ensure!(options.attention_placement.is_none_or(|requested| requested == attention),
         "EXLR8 native deployment with {gpu_count} RTX GPUs requires {attention} attention");
-    ensure!(layout.local_expert_layers.is_none_or(|n| n == 0)
-        && layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
+    ensure!(resolved_layout.local_expert_layers.is_none_or(|n| n == 0)
+        && resolved_layout.onboard.is_none_or(|n| n == crate::placement::Onboard::Layers(0)),
         "EXLR8 native deployment cannot onboard routed experts");
-    ensure!(!layout.host_embedding, "EXLR8 requires GPU embedding");
+    ensure!(!resolved_layout.host_embedding, "EXLR8 requires GPU embedding");
     let checkpoint = super::Checkpoint::open(snapshot)?;
+    let mut report = super::empty_report(&checkpoint, options)?;
+    let rows = if resolved_layout.prefill_rows == 0 { 4096 } else { resolved_layout.prefill_rows };
+    super::layout::glm5::resolve_prefill(&mut report, &mut resolved_layout, rows, world);
+    let layout = &resolved_layout;
     let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config)?;
     ensure!(cfg.hidden == 6144 && cfg.layers == 78 && cfg.first_moe_layer == 3,
         "EXLR8 native full-forward requires GLM-5.3 78 layers/hidden6144/first routed3");
@@ -124,8 +155,8 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     let family = super::family::detect(&checkpoint).context("EXLR8 family is not recognized")?;
     let model = family.open(&checkpoint)?;
     let records = dense::DenseRecord::inventory(snapshot)?;
-    let mut report = super::empty_report(&checkpoint, options)?;
     report.family = Some(family.id().into());
+    report.exlr8_prefill_activations = Some(layout.exlr8_prefill_activations);
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
     let mut components = BTreeMap::<Component, (usize, u64)>::new();
@@ -152,9 +183,6 @@ pub fn native_plan(snapshot: &Path, selected: &str,
     report.placement_supported = true;
     report.fits = true;
     report.attention_placement = attention;
-    report.prefill_span_rows = Some(if layout.prefill_rows == 0 { 4096 } else { layout.prefill_rows });
-    report.prefill_unit_rows = layout.prefill_unit_rows;
-    report.prefill_waves = Some(layout.prefill_waves);
     report.experts = Some(super::family::ExpertContract { package: "glm:exlr8".into(), block: 128,
         spark_worlds: vec![world], local: Err("EXLR8 coordinator-local routed experts are unsupported".into()) });
     report.hints = vec![super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),

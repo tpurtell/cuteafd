@@ -53,8 +53,8 @@ impl Exl3Schedule {
         Ok(())
     }
 
-    /// A scheduled capacity's export must record its decode schedule and a
-    /// default one none, so a mislabelled directory fails at start-up.
+    /// Packaged exports must match their variant's exact schedule identity.
+    /// Standalone explicit directories retain the scheduled/default label check.
     pub(crate) fn check_export(self, root: &Path, capacity: u32) -> Result<()> {
         #[derive(Deserialize)]
         struct Record {
@@ -64,9 +64,38 @@ impl Exl3Schedule {
         let directory = self.directory(root, capacity);
         let meta: Record = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))
             .with_context(|| format!("EXL3 {} schedule export {}", self.name(), directory.display()))?)?;
-        ensure!(meta.decode_schedule.is_some() == self.scheduled(capacity),
-            "EXL3 export {} does not carry the {} decode schedule", directory.display(),
-            if self.scheduled(capacity) { self.name() } else { "default" });
+        let package_root = root.parent().context("EXL3 layout directory has no package parent")?;
+        let package_path = package_root.join("manifest.json");
+        if package_path.try_exists()? {
+            #[derive(Deserialize)]
+            struct Variant {
+                directory: String,
+                schedule: Option<String>,
+                decode_schedule: Option<String>,
+            }
+            #[derive(Deserialize)]
+            struct Package {
+                schema: String,
+                variants: Vec<Variant>,
+            }
+            let package: Package = serde_json::from_slice(&std::fs::read(&package_path)
+                .with_context(|| format!("EXL3 package {}", package_path.display()))?)?;
+            ensure!(package.schema == "cuteafd.exl3-package.v1", "unknown EXL3 package schema");
+            let relative = directory.strip_prefix(package_root)?.to_str()
+                .context("EXL3 variant directory is not UTF-8")?;
+            let mut variants = package.variants.iter().filter(|v| v.directory == relative);
+            let variant = variants.next().with_context(|| format!("EXL3 package lacks variant {relative}"))?;
+            ensure!(variants.next().is_none(), "duplicate EXL3 package variant {relative}");
+            let expected = self.scheduled(capacity).then_some(self.name());
+            ensure!(variant.schedule.as_deref() == expected
+                && variant.decode_schedule == meta.decode_schedule
+                && (expected.is_none() || meta.decode_schedule.is_some()),
+                "EXL3 export {} differs from its packaged decode schedule", directory.display());
+        } else {
+            ensure!(meta.decode_schedule.is_some() == self.scheduled(capacity),
+                "EXL3 export {} does not carry the {} decode schedule", directory.display(),
+                if self.scheduled(capacity) { self.name() } else { "default" });
+        }
         Ok(())
     }
 }

@@ -13,8 +13,8 @@ use crate::serving_capacity::{deepseek_v4_cache_geometry, deepseek_v4_expert_cos
     V4WorkspaceRank};
 use cuteafd_core::memory_layout::{Basis, Category};
 
-/// Prefill lanes of the V4 engine (`engine::PREFILL_LANES`).
-pub const PREFILL_LANES: u64 = 2;
+/// Outstanding prefill units on the single Spark connection set.
+pub const PREFILL_WAVES: u64 = 2;
 /// Lazily captured decode graphs per role (1 GPU, lead, peer): V4 keys its
 /// segment graphs by the exact compressed-table width, so the set grows with
 /// traffic after ready (rc3: +0.5-0.65 GiB Flash, +1.2-1.3 GiB Pro within a
@@ -51,6 +51,7 @@ pub struct V4Inputs<'a> {
     pub spark_ranks: usize,
     pub sequences: u64,
     pub prefill_rows: u64,
+    pub prefill_waves: u64,
     pub decode_rows: u64,
     pub max_context: u64,
     /// `--reserve-gib` in bytes.
@@ -136,7 +137,7 @@ pub fn context_workspace(cfg: &DeepseekV4Config, extent: u64, prefill_rows: u64,
     let mut out = vec![("candidates", decode_rows * cfg.index_topk as u64 * 8),
         ("own-head partial", partial), ("peer-head partial", partial),
         ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
-        ("gather tables", 2 * half * 4), ("local selected lengths", decode_rows * 4),
+        ("gather tables", prefill_lanes * 2 * half * 4), ("local selected lengths", decode_rows * 4),
         ("empty window lengths", decode_rows * 4)];
     out.extend((0..prefill_lanes).map(|_| ("commit blocks", commit)));
     let scratch_units = context_scratch_units(decode_rows);
@@ -189,7 +190,7 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
         .map_err(|_| PlacementError::Inventory("V4 cache geometry"))?;
     let hidden = inputs.cfg.dim as u64;
     let topk = inputs.cfg.n_activated_experts as u64;
-    let tables = PREFILL_LANES * inputs.prefill_rows + inputs.decode_rows;
+    let tables = inputs.prefill_waves + inputs.decode_rows;
     let table_bytes = tables.checked_mul(4).ok_or(PlacementError::Overflow("V4 lane tables"))?;
     let mut demands = Vec::new();
     let mut overhead = Vec::new();
@@ -202,10 +203,11 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
             + cache.fixed_state_bytes + cache.speculative_replay_bytes + mul(table_bytes, inputs.sequences, "V4 tables")?;
         let context = mul(cache.context_table_bytes_per_token, inputs.max_context, "V4 RoPE tables")?;
         let intake = if rank == 0 && inputs.spark_ranks > 0 {
-            PREFILL_LANES * inputs.spark_ranks as u64 * 4096 * hidden * 2
+            (inputs.prefill_waves * inputs.prefill_rows + inputs.decode_rows)
+                * inputs.spark_ranks as u64 * hidden * 2
         } else { 0 };
         let exchange = if gpus == 2 {
-            deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank)
+            deepseek_v4_expert_exchange_bytes(hidden, topk, inputs.prefill_rows, inputs.decode_rows, rank, inputs.prefill_waves)
                 .map_err(|_| PlacementError::Overflow("V4 expert exchange"))?
         } else { 0 };
         let probe = if rank == 0 && !inputs.draft.is_empty() { draft_probe_bytes(inputs.cfg, inputs.decode_rows)? } else { 0 };
@@ -226,10 +228,14 @@ pub fn fixed_demands(inputs: &V4Inputs<'_>) -> Result<(Vec<Demand>, Vec<u64>, Ve
                 mul(cache.retained_mark_bytes, inputs.mark_slots, "V4 marks")?, Basis::Formula));
         }
         demands.push(Demand::new(gpu, Category::Workspace, "steps", workspace, basis));
+        if rank == 0 && inputs.spark_ranks > 0 {
+            demands.push(Demand::new(gpu, Category::Transport, "Spark egress",
+                (4096 + inputs.decode_rows) * hidden * 2, Basis::Formula));
+        }
         demands.push(GraphSet::budget(&[GRAPH_BYTES[role]]).demand(0).on(gpu));
         if gpus == 2 {
             demands.push(Demand::new(gpu, Category::Transport, "peer exchange",
-                deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32)
+                deepseek_v4_peer_exchange_bytes(hidden, inputs.prefill_rows, inputs.decode_rows, true, inputs.exchange_f32, inputs.prefill_waves)
                     .map_err(|_| PlacementError::Overflow("V4 peer exchange"))?, Basis::Formula));
             demands.push(Demand::new(gpu, Category::Transport, "expert peer exchange", exchange, Basis::Formula));
         }
@@ -294,7 +300,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         layers_first_gpu: 0,
         // Exactly what the engine allocates under context (charged only when a layer runs it).
         context_buffers: context_buffers(inputs.cfg, inputs.max_context, inputs.prefill_rows, inputs.decode_rows,
-            PREFILL_LANES, context.unwrap_or_default()),
+            inputs.prefill_waves, context.unwrap_or_default()),
         inventory: Inventory { gpus: budgets, spark_ranks: inputs.spark_ranks, peer_access: gpus == 2 },
         pool: PoolPolicy { ceiling: POOL_CEILING_TOKENS, ..PoolPolicy::resolve(
             &inputs.gpus.iter().map(|g| g.0).collect::<Vec<_>>(), inputs.max_context, inputs.requested_pool,
@@ -317,7 +323,7 @@ pub fn request(inputs: &V4Inputs<'_>) -> Result<PlacementRequest, PlacementError
         // The mHC streams `[T,4,H]` BF16; V4's only hop is the entry
         // broadcast of the embedding rows into GPU1's step input.
         hops: HopSpec { storage: crate::placement::HopStorage::ReceiveSlots, row_bytes: 4 * inputs.cfg.dim as u64 * 2, rows: inputs.prefill_rows.max(inputs.decode_rows),
-            lanes: PREFILL_LANES, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
+            lanes: inputs.prefill_waves, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::Head },
         // A build without the C4 context programs runs heads only.
         executor: if context.is_some() { super::DEEPSEEK_V4 }
             else { ExecutorModes { modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],

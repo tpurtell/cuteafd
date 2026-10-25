@@ -277,3 +277,89 @@ def test_gated_child_is_not_deadlocked_by_a_younger_waiter_behind_its_gate(lockd
     assert gate.wait(timeout=30) == 0, gate.stderr.read()
     assert marker.exists()
     assert blocked.wait(timeout=30) == 0
+
+
+# A command that tears down on SIGTERM (as `cuteafd bench smoke` does): it marks
+# the start and end of its teardown, then exits 0.
+TEARDOWN_CHILD = '''import pathlib, signal, sys, time
+d = pathlib.Path(sys.argv[1])
+def stop(*_):
+    if (d / "teardown").exists():
+        return  # repeats (systemd's cgroup-wide TERM plus hwlock's forward) change nothing
+    (d / "teardown").write_text("")
+    time.sleep(1.0)
+    (d / "torn-down").write_text("")
+    sys.exit(0)
+signal.signal(signal.SIGTERM, stop)
+(d / "ready").write_text("")
+while True:
+    time.sleep(0.05)
+'''
+
+
+def held(lockdir, name):
+    import fcntl
+    with open(lockdir / f'{name}.lock', 'a') as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+
+
+@pytest.mark.parametrize('cgroup_wide', [False, True])
+def test_sigterm_is_forwarded_and_locks_outlive_the_commands_teardown(lockdir, cgroup_wide):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    proc = subprocess.Popen([sys.executable, str(SCRIPT), '--locks', 'gpu1', '--', sys.executable, '-c', TEARDOWN_CHILD, str(lockdir)],
+                            env=env, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    end = time.time() + 10
+    while not (lockdir / 'ready').exists():
+        assert time.time() < end and proc.poll() is None
+        time.sleep(0.02)
+    assert held(lockdir, 'gpu1')
+    # systemd's default KillMode=control-group signals every process at once;
+    # a plain `kill PID` reaches hwlock alone, which must forward it.
+    if cgroup_wide:
+        os.killpg(proc.pid, 15)
+    else:
+        proc.send_signal(15)
+    end = time.time() + 10
+    while not (lockdir / 'teardown').exists():
+        assert time.time() < end, 'the command never saw the signal'
+        time.sleep(0.02)
+    # Mid-teardown: hwlock is still alive and still holds the lock.
+    time.sleep(0.3)
+    assert proc.poll() is None
+    assert not (lockdir / 'torn-down').exists() and held(lockdir, 'gpu1')
+    assert proc.wait(timeout=30) == 0
+    assert (lockdir / 'torn-down').exists()
+    assert not held(lockdir, 'gpu1')
+    assert 'forwarded' in proc.stderr.read()
+
+
+def test_a_command_that_ignores_the_signal_is_killed_after_the_grace(tmp_path):
+    import signal
+    import threading
+    ready = tmp_path / 'ready'
+    cmd = [sys.executable, '-c', f'import pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+           f'pathlib.Path({str(ready)!r}).write_text(""); time.sleep(60)']
+    def stop():
+        end = time.time() + 10
+        while not ready.exists() and time.time() < end:
+            time.sleep(0.02)
+        os.kill(os.getpid(), signal.SIGTERM)
+    before = signal.getsignal(signal.SIGTERM)
+    threading.Thread(target=stop, daemon=True).start()
+    started = time.time()
+    assert hwlock.run_forwarding(cmd, dict(os.environ), grace=0.5) == 128 + signal.SIGKILL
+    assert time.time() - started < 10
+    assert signal.getsignal(signal.SIGTERM) is before
+
+
+def test_stop_grace_fits_systemd_default_and_exceeds_smokes_teardown_bound():
+    rust = (Path(__file__).resolve().parents[2] / 'rust/crates/cuteafd-bench/src/smoke.rs').read_text()
+    smoke = int(rust.split('const CANCEL_TEARDOWN_S: u64 = ', 1)[1].split(';', 1)[0])
+    spec = importlib.util.spec_from_file_location('wip_cards', SCRIPT.parents[1] / 'bench/wip-cards.py')
+    cards = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cards)
+    assert smoke < cards.SMOKE_STOP_GRACE_S < hwlock.STOP_GRACE_S < 90

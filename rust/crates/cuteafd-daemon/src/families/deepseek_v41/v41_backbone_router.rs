@@ -87,8 +87,7 @@ impl<'a> BackboneRouterWeights<'a> {
             request_staging: HostAllocation::new(self.library,
                 capacity as usize * (request_hidden_format(self.nvfp4).1 + 48))?,
             mask_staging: HostAllocation::new(self.library, capacity as usize)?,
-            route_ring: crate::shared::memory::chain::device_enabled()
-                .then(|| HostAllocation::new(self.library, 40 * capacity as usize * 24)).transpose()?,
+            route_ring: Some(HostAllocation::new(self.library, 40 * capacity as usize * 24)?),
             ring_capture: false,
             ring_pending: Vec::with_capacity(40),
             weights: self,

@@ -204,6 +204,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             state: State::Idle,
             chain,
             device_order: true,
+            device_default: true,
             l2_solo: true,
             sampled: None,
         })
@@ -379,7 +380,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 check_us=t.elapsed().as_micros() as u64-drained_us, "distributed verification chain");
         }
         let ring_timed = timed.map(|_| Instant::now());
-        if result.is_ok() && self.resources.capture_routes && crate::shared::memory::chain::device_enabled() {
+        if result.is_ok() && self.resources.capture_routes {
             // Device-ordered local layers left their routes in the routers' rings.
             for gpu in 0..self.resources.lanes.len() {
                 let device = self.resources.lanes[gpu].device;

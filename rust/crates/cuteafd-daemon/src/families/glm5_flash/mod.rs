@@ -2218,7 +2218,7 @@ impl Opened {
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         // One link retains independent intake planes for every outstanding unit wave.
         let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library,
-            spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: false,
+            spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
                 timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
             args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
         transport.enable_terminal_ownership(self.library.clone())?;

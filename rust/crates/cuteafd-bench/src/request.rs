@@ -46,8 +46,8 @@ mod tests {
             baseline::plain(&client, "test", 128),
             common::plain(&client, "test", 128),
             context_load::body(&info.configuration, messages.clone(), 128),
-            context_load::request(&info.configuration, &messages, "test", "warm", 16, 0, 128),
-            context_load::request(&info.configuration, &messages, "test", "timed", 16, 0, 128),
+            context_load::request(&info.configuration, &messages, "test", "warm", 16, 0, 128, 0),
+            context_load::request(&info.configuration, &messages, "test", "timed", 16, 0, 128, 512),
             baseline::replay(&info.configuration, "test", "test", 128, &record),
             lossless::evidence(&info.configuration, &set.cases[0], &record, &record),
         ];

@@ -6,7 +6,7 @@ on raptor's RTX GPUs, optionally against real expert workers on Sparks.
       --model HF_ID_OR_SNAPSHOT_DIR --arm A=WIP_INSTANCE:SLOT [--arm B=...] \\
       [--arm-env A:KEY=VALUE] [--arm-arg A:TOKEN] [--env KEY=VALUE] [--gpus 0,1] [--repeats N] \\
       [--timeout SECONDS] [--preflight CMD] [--compare-logits A:B] \\
-      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] \\
+      [--native-test TEST_EXECUTABLE | --command] [--fixtures DIR [--fixtures-writable]] [--rdma] \\
       [--spark-hosts H1,H2,... [--expert-layers 3,5-7] [--worker-env KEY=VALUE] [--arm-worker-env A:KEY=VALUE] [--worker-arg ARG]] \\
       -- ARGS...
 
@@ -23,6 +23,8 @@ unlimited, the host uid (release_serving_docker_args), the full namespace read-o
   read-only and run as `EXE ARGS` (e.g. `NAME --exact --ignored --nocapture`); green only
   when its `test result:` lines show at least one test passed and none failed.
 - --command: ARGS verbatim (e.g. `python3 -m pytest -q python/tests/...`).
+--rdma gives the container host networking and /dev/infiniband without Sparks (a
+same-host verbs loopback test); --spark-hosts implies it.
 Both raw modes run in the slot's sealed source tree, mounted read-only at
 /workspace/cuteafd (the working directory, PYTHONPATH with the reference packages,
 PYTHONDONTWRITEBYTECODE=1), with CUTEAFD_NATIVE_LIB and CUTEAFD_PROGRAM_MANIFEST set.
@@ -774,7 +776,7 @@ def docker_command(state, name, arm, slot, out_dir, golden, packages=None):
            '--ulimit', 'memlock=-1:-1']
     if state.get('memory'):  # cap the coordinator container's host memory, swap equally
         cmd += ['--memory', str(state['memory']), '--memory-swap', str(state['memory'])]
-    if state.get('sparks'):
+    if state.get('sparks') or state.get('rdma'):
         cmd += ['--network', 'host', '--device=/dev/infiniband']
     for source, target in mounts:
         cmd += ['-v', f'{source}:{target}:ro']
@@ -1209,7 +1211,8 @@ def build_state(args, arms):
                  snapshot=str(snapshot), snapshot_container=container_path, hub=str(hub), timeout=args.timeout,
                  golden=golden, extra_mounts=extra + path_mounts(golden, covered + [Path(p) for p in extra]),
                  mode=mode, native_test=native_test, native_test_sha256=native_digest, fixtures=fixtures,
-                 fixtures_writable=bool(args.fixtures_writable), sparks=sparks)
+                 fixtures_writable=bool(args.fixtures_writable), sparks=sparks,
+                 rdma=bool(args.rdma))
     state['locks'] = locks_for(state['gpus'], sparks['hosts'] if sparks else ())
     state['vocab'] = args.vocab or (vocab_size(snapshot) if args.compare_logits else None)
     for arm in arms.values():
@@ -1249,6 +1252,8 @@ def main(argv=None):
     parser.add_argument('--fixtures', metavar='DIR', help='fixture directory, mounted at its own path; {fixtures}')
     parser.add_argument('--fixtures-writable', action='store_true',
                         help='mount --fixtures writable (a GPU-only fixture-generation run under the task)')
+    parser.add_argument('--rdma', action='store_true',
+                        help='host networking and /dev/infiniband without Sparks (same-host verbs loopback)')
     parser.add_argument('--spark-hosts', metavar='H1,H2,...', help='start real expert workers, rank = position')
     parser.add_argument('--expert-layers', metavar='LIST', help='expert layers the run exercises (e.g. 3 or 3,5-7); '
                         'CUTEAFD_GOLDEN_EXPERT_LAYERS and {expert_layers}')

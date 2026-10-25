@@ -318,9 +318,11 @@ pub(crate) fn decode_step(
         tables.c4_visible.push(visible4 as i32);
         tables.c4_indexed_lengths.push(visible4.min(index_topk) as i32);
         tables.c4_table_width = tables.c4_table_width.max(visible4.div_ceil(compressed_page_rows(4)));
-        let mut pages = placement.pages.clone();
-        pages.resize(tables.c4_table_stride, pages.last().copied().unwrap_or(0));
-        tables.c4_page_table.extend(pages);
+        // Pad each row to the table stride with its last page, without a per-row allocation.
+        let pad = placement.pages.last().copied().unwrap_or(0);
+        let filled = tables.c4_page_table.len() + tables.c4_table_stride;
+        tables.c4_page_table.extend_from_slice(&placement.pages[..placement.pages.len().min(tables.c4_table_stride)]);
+        tables.c4_page_table.resize(filled, pad);
         for j in 0..visible128.min(c128_width) {
             tables.c128_indices[row * c128_width + j] = placement.group_slot(128, j)?;
         }

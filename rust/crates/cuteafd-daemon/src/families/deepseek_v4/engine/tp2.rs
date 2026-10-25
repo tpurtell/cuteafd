@@ -74,6 +74,7 @@ pub(super) struct Tp2State<'a> {
     routes: PeerExchange<'a>,
     source: Cell<RouteSource>,
     pub(super) checking: Cell<bool>,
+    check_units: RefCell<Vec<usize>>,
     checks: RefCell<BTreeMap<(usize, usize), PendingCheck<'a>>>,
     schedule: RefCell<Option<Schedule>>,
     identity: RefCell<RouteIdentity>,
@@ -114,14 +115,14 @@ impl<'a> Engine<'a> {
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: peer.device, stream: peer.stream }],
-            2 * PREFILL_LANES, rows * self.cfg.n_activated_experts * 8 + 16)?;
+            2 * self.prefill_waves, rows * self.cfg.n_activated_experts * 8 + 16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|v| v.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
             .transpose()?.unwrap_or(0);
         let combine = [FusedCombine::new(self.library, ExchangeDtype::Bf16)?,
             FusedCombine::new(self.library, ExchangeDtype::F32)?];
         self.tp2 = Some(Tp2State { layers: layers.clone(), ranks: ranks.map(RefCell::new), combine, routes,
-            source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), checks: RefCell::new(BTreeMap::new()),
+            source: Cell::new(RouteSource::Replicated), checking: Cell::new(false), check_units: RefCell::new(Vec::new()), checks: RefCell::new(BTreeMap::new()),
             schedule: RefCell::new(None), identity: RefCell::new(RouteIdentity::default()),
             interval, steps: Cell::new(0), fallbacks: Cell::new(0),
             streams: [self.stream, peer.stream], output_pending: [Cell::new(false), Cell::new(false)] });
@@ -248,7 +249,7 @@ impl<'a> Engine<'a> {
     pub(super) fn tp2_experts(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, rows: usize)
         -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
-        let lane = &w.lanes[index];
+        let lane = &w.slots[index];
         let payload = lane.payload.as_ref().context("TP2 lane payload")?;
         let stream = self.stream_of(rank);
         ensure!(stream == tp2.streams[rank], "TP2 executor moved streams; per-lane scratch ownership is required");
@@ -303,7 +304,7 @@ impl<'a> Engine<'a> {
         })
     }
 
-    pub(super) fn tp2_post(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, lane: &Lane<'_>, rows: usize)
+    pub(super) fn tp2_post(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, lane: &UnitSlot<'_>, rows: usize)
         -> Result<()> {
         let exchange = self.exchange()?;
         let at = slot(layer, true, index);
@@ -325,6 +326,7 @@ impl<'a> Engine<'a> {
     pub(super) fn prepare_route_checks(&self, rows: &[usize]) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         if !tp2.checking.get() { return Ok(()); }
+        *tp2.check_units.borrow_mut() = (0..rows.len()).collect();
         // cudaHostAlloc may synchronize. Allocate before queuing any peer waits,
         // never from a layer whose matching push has not been enqueued yet.
         let mut checks = tp2.checks.borrow_mut();
@@ -340,13 +342,19 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    pub(super) fn route_check_unit(&self, slot: usize, unit: usize) {
+        if let Some(tp2) = self.tp2.as_ref().filter(|t| t.checking.get()) {
+            tp2.check_units.borrow_mut()[slot] = unit;
+        }
+    }
+
     fn collect_routes(&self, rank: usize, layer: usize, lane: usize, rows: usize, w: &Workspace<'_>) -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
         if !tp2.checking.get() || self.capture_only.get() { return Ok(()); }
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
             let checks = tp2.checks.borrow();
-            let check = checks.get(&(layer, lane)).context("route diagnostic storage not prepared")?;
+            let check = checks.get(&(layer, tp2.check_units.borrow()[lane])).context("route diagnostic storage not prepared")?;
             ensure!(check.rows == rows, "route-check rows changed");
             let host = check.ranks[rank].as_ref().context("route diagnostic rank buffer")?;
             // SAFETY: pinned host storage is retained until both streams drain in finish_route_step.
@@ -366,7 +374,11 @@ impl<'a> Engine<'a> {
         let mut schedule = tp2.schedule.borrow_mut();
         let Some(schedule) = schedule.as_mut() else { return };
         let label = format!("gpu{rank} {exchange} {} L{layer} lane{lane}", if push { "push" } else { "wait" });
-        if push { schedule.push(rank, exchange, slot, label); }
+        if exchange == "unit-commit" {
+            // Completion has no payload; distinct slots may publish before either joins.
+            if push { schedule.push_to(rank, exchange, slot, lane, label); }
+            else { schedule.wait_for(rank, exchange, slot, lane, label); }
+        } else if push { schedule.push(rank, exchange, slot, label); }
         else { schedule.wait(rank, exchange, slot, label); }
     }
 
@@ -462,7 +474,7 @@ impl<'a> Engine<'a> {
             let workspace = if rank == 0 { self.decode_workspace.borrow() }
                 else { self.peer()?.decode_workspace.borrow() };
             let w = workspace.as_ref().context("router warm-up workspace")?;
-            let lane = &w.lanes[0];
+            let lane = &w.slots[0];
             let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };
             self.on(rank, || {
                 // CUDA runtime kernels load lazily, which may synchronize the device.
@@ -558,20 +570,67 @@ mod tests {
         s
     }
 
+    fn unit_schedule(layers: usize, local: usize, waves: usize, broadcast: bool) -> Result<Schedule> {
+        use crate::shared::prefill_pipeline::{self, FfnRoute, Step};
+        let routes: Vec<_> = (0..layers).map(|layer| if layer < local {
+            FfnRoute::Local
+        } else { FfnRoute::Spark }).collect();
+        let units = prefill_pipeline::sequence_units(6 * 4096, 4096, waves, layers)?;
+        let mut schedule = Schedule::default();
+        for step in prefill_pipeline::prefill_schedule(&routes, &units, waves)? {
+            match step {
+                Step::Begin { unit } => schedule.push(0, "entry", slot(0, false, units[unit].slot), "unit residual"),
+                Step::Attention { layer, unit } => {
+                    let lane = units[unit].slot;
+                    // UnitHooks queues rank 0, then rank 1 of this same layer.
+                    schedule.push(0, "attention", slot(layer, false, lane), "attention partial");
+                    schedule.wait(0, "attention", slot(layer, false, lane), "attention sum");
+                    if layer == 0 { schedule.wait(1, "entry", slot(0, false, lane), "unit residual"); }
+                    schedule.push(1, "attention", slot(layer, false, lane), "peer attention partial");
+                    schedule.wait(1, "attention", slot(layer, false, lane), "peer attention sum");
+                    if broadcast && layer < local {
+                        schedule.wait(1, "routes", 2 * lane + layer % 2, "canonical routes");
+                    }
+                    schedule.push(1, "ffn", slot(layer, true, lane), "peer FFN payload");
+                }
+                Step::Local { layer, unit } | Step::Land { layer, unit } => {
+                    let lane = units[unit].slot;
+                    if broadcast && layer < local {
+                        schedule.push(0, "routes", 2 * lane + layer % 2, "canonical routes");
+                    }
+                    if layer + 1 < layers {
+                        schedule.push(0, "ffn", slot(layer, true, lane), "FFN payload");
+                    }
+                    schedule.wait(0, "ffn", slot(layer, true, lane), "FFN sum");
+                    if layer + 1 < layers {
+                        schedule.wait(1, "ffn", slot(layer, true, lane), "peer FFN sum");
+                    }
+                }
+                Step::Commit { unit } => {
+                    let lane = units[unit].slot;
+                    schedule.push_to(1, "unit-commit", DIRECT, lane, "peer final reader complete");
+                    schedule.wait_for(0, "unit-commit", DIRECT, lane, "join peer before slot reuse");
+                }
+                Step::Send { .. } | Step::End { .. } => {}
+            }
+        }
+        Ok(schedule)
+    }
+
     #[test]
-    fn tp2_two_lane_and_decode_push_wait_schedules_drain() {
-        // Runtime startup also records the engine's actual calls and checks them,
-        // so this CPU mirror cannot silently qualify a different enqueue order.
-        for layers in [1, 2, 6] {
-            for local in 1..=layers {
+    fn tp2_continuous_unit_and_decode_push_wait_schedules_drain() -> Result<()> {
+        // Startup also records actual engine calls; the CPU mirror uses the executor's order.
+        for layers in [1, 2, 6, 43, 61] {
+            for local in [0, 1, layers / 2, layers] {
                 for broadcast in [false, true] {
-                    for lanes in [1, 2] {
-                        assert_eq!(order::check_submission_faults(&schedule(layers, local, lanes, false, broadcast)), Ok(()));
+                    for waves in [1, 2, 3] {
+                        assert_eq!(order::check_submission_faults(&unit_schedule(layers, local, waves, broadcast)?), Ok(()));
                     }
                     assert_eq!(order::check_submission_faults(&schedule(layers, local, 1, true, broadcast)), Ok(()));
                 }
             }
         }
+        Ok(())
     }
 
     #[test]
@@ -594,7 +653,7 @@ mod tests {
         // Prewarm and capture-only graphs precede the first peer wait and queue
         // no peer operations. Hardware also checks the actual identity steps.
         for broadcast in [false, true] {
-            let mut startup = schedule(43, 8, 2, false, broadcast);
+            let mut startup = unit_schedule(43, 8, 2, broadcast).unwrap();
             let decode = schedule(43, 8, 1, true, broadcast);
             for (prefill, decode) in startup.streams.iter_mut().zip(decode.streams) {
                 prefill.extend(decode);

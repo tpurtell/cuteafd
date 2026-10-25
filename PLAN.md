@@ -49,7 +49,7 @@ Core (parity tier, must match or beat the parent engines):
 
 | Model | Family | Format | Notes |
 | --- | --- | --- | --- |
-| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. The regression anchor. |
+| deepseek-ai/DeepSeek-V4.1-Flash | deepseek_v41 | FP8 block + MXFP4 experts | engram ×2, dSpark 3-stage, vision. |
 | wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1 | glm5 | EXL3 K4 experts | 78 layers, MLA+DSA, DFlash2 draft (`incoai/GLM-5.3-DFlash2`) |
 | deepseek-ai/DeepSeek-V4-Flash-0731 | deepseek_v4 | FP8 block + FP4 experts | compress 4/128 alternating, nextn 1 |
 | wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1 | deepseek_v4 | EXL3 K2 experts | 61 layers, 7168 wide, ~96 GiB per Spark rank at TP4 |
@@ -183,20 +183,28 @@ declares its header, speculator, micro-step stages and layer classes in a `conso
 Shared page shell, palette and SVG chart primitives at `/assets/cuteafd-ui.{css,js}` (also used
 by `/bench`); logo and favicon at `/assets/cuteafd-{logo,mark}.svg`.
 
-## Execution engines (decided 2026-09-29)
+## One engine, shared structure (TJ, 2026-10-25)
 
-V4.1's execution stack is specialized to its causal encoder/decoder: KV and
-index sources [2,8,14,20], engram gates at layers 1 and 14, dSpark taps from
-layer 37, encoder/replay stages. Other families share none of that, so there
-are two engines under one scheduler, API, transport, host cache and sampler:
+There is one engine. Every family, V4.1 included, runs on the same shared
+structure: the shared prefill executor (`shared/prefill_pipeline.rs`), the
+shared decode lane contract and owners, the shared Spark exchange, scheduler,
+API, transport, host cache and sampler. A family supplies hooks (attention,
+router, experts, head, speculator taps) and its `LaneSupport` entry; it does
+not own a private prefill or decode loop. Unified prefill and decode is a v4
+feature, and new families (e.g. MiniMax) start on it.
 
-- `deepseek_v41` keeps its specialized path; nothing regresses it.
-- A generic per-layer engine runs every other family: each layer is a block
-  (norm/HC in, family attention with its own window/compressed/index/state
-  cache, router, shared expert, routed experts on Sparks, HC/residual out),
-  plus head and native speculator. DeepSeek V4 is its first tenant, then GLM,
-  MiMo, Qwen. It adopts V4.1's proven optimizations (chained stages, lanes,
-  dual RTX, route packing) as it matures.
+Family specifics are hook parameters, not separate engines. V4.1's causal
+encoder/decoder (KV and index sources [2,8,14,20], engram gates at layers 1
+and 14, dSpark taps from layer 37, encoder/replay ranges) is expressed as
+layer ranges and per-layer attributes of the shared engine. If a feature truly
+cannot fit, name it and the reason on #744 instead of forking the path.
+
+Why: the early "no regression against ds41rt" gate kept V4.1 on its own path
+and pushed every family into separate optimized loops. That hid shared defects
+behind per-family code (the reply-incast traffic problem, the compact-kernel
+prefill regression) and made each fix land once per family. One structure means
+a fix or a measured win lands for every family at once. The 2026-09-29
+two-engine decision is retired.
 
 Kernels are shared by parameterizing dimensions; `cuteafd plan` feeds the
 AOT exporters the geometry each image must carry.
@@ -5487,6 +5495,19 @@ Every family that sends experts to Sparks prefills the same way.
     byte-identity gate.
   - Card bars: 8K and TTFT ≥ 0.98×, decode ≥ 0.95×, KL identical. Report a
     64K row, the Spark busy fraction and a per-buffer workspace breakdown.
+  - **Absolute bar (TJ, 2026-10-24).** A same-day ratio against work/p0 is not
+    enough: each family's port must also match or beat its best recorded
+    absolute 8K/64K prefill on the pre-shared path, on the same layout, quant
+    and benchmark corpus, before it lands. Numbers from before #592's
+    realistic corpus (2026-10-21) are not comparable: the old filler routed
+    ~59% of tokens to one expert; re-measure the reference release on the
+    current corpus instead. References: GLM 5.3 K4 max 8K ≥ 3,168 and 64K ≥
+    3,087, min 8K ≥ 2,696 (v3.0.1 release, own launcher and defaults,
+    realistic corpus, 2026-10-24, #703; today's work/p0 does 2,063, so K4
+    regressed between v3.0.1 and the Oct 23 old path, before the shared
+    executor); MiMo Pro max 8K ≥ 3,479 (old 3-lane path, 2026-10-24). Every
+    card reports the absolute numbers next to the family's reference. A
+    family that was good before cannot land slower.
 - **Today (audit 2026-10-23):**
   - GLM 5.3 runs 3 lanes, GLM Flash 2, MiMo 3/2 (measured), V4 2 and V4.1 2
     on `PipelineOrder`;
@@ -5590,37 +5611,76 @@ ports for v4.
 
 ## Release v4 cards (TJ, 2026-10-24)
 
-The README keeps one card per checkpoint in the three columns (5090, 1× RTX,
-2× RTX) for every model that ships in v4, plus these additions:
+The README results move from one wide table to **one section per active
+family**. Each section shows that family's chosen cards in whatever
+layout explains them best: some compare quants on the same hardware,
+some compare hardware levels for one quant, some both. Every card stays
+a Release-smoke export generated by `cuteafd bench publish`; the
+renderer groups them per family from a `sections` list in the matrix
+file, instead of forcing the 5090 / 1× RTX / 2× RTX columns.
 
-| Model · checkpoint | 1× RTX (min) | 2× RTX (max) | Notes |
+| Family | Cards in its section | Compares |
+|---|---|---|
+| DeepSeek V4.1 Flash | min 1 RTX + 3 Sparks; reference 1 RTX + 4 Sparks; max 2 RTX + 6 Sparks | hardware levels |
+| DeepSeek V4 Flash | min; reference 1 RTX + 4 Sparks; max | hardware levels |
+| GLM 5.3 | EXL3 K4 max (2 RTX + 6); EXLR8 (native dense) min 1 RTX + 4 at `up1` (4.0 bpw); **EXLR8 min 1 RTX + 4 at `bit325` (3.25 bpw)**; EXLR8 max 2 RTX + 6 | quants at max (K4 vs EXLR8), EXLR8 profiles at min (up1 vs bit325), hardware levels |
+| Kimi K3 (EXL3 K2 + Core-K6) | max 2 RTX + 6 Sparks | — (one card) |
+| Step-5 | NVFP4 min 1 RTX + 4 Sparks; FP8 max 2 RTX + 6 Sparks | quant × hardware level |
+| Dense Qwen 3.5 / 3.8 | 9B BF16 min 1 RTX, speculation off (`qwen35-9b-bf16-min`); 27B BF16 min 1 RTX + dSpark (`qwen38-27b-bf16-min`); 27B FP8 min 1 RTX + dSpark (`qwen38-27b-fp8-min`); 27B BF16 min 1 RTX, speculation off (`qwen38-27b-bf16-min-nospec`); 27B FP8 min 1 RTX, speculation off (`qwen38-27b-fp8-min-nospec`) | sizes, quants and dSpark vs no speculator (all 0 Sparks, no TP2 card; no MTP comparison card) |
+| Qwen 3.8 Flash Next | EXL3 min 1 RTX PRO 6000 (0 Sparks, `qwen38-exl3-min`); EXL3 5090 (1 RTX 5090 + 1 Spark) | hardware levels (both unchanged from v3) |
+
+EXLR8's `bit325` card is a smoke card for the 3.25 bpw width profile
+(`EXLR8_MANIFEST=bit325`, the checkpoint's KL-optimized 3.25 bpw
+manifest; ~75 GB of routed experts per rank at TP4), so the family shows
+the up1-vs-bit325 trade at the same hardware.
+
+**Retired section** (below the family sections): every model that no
+longer ships keeps its last Release-smoke card, one per row with its
+config and the version it ran on. It includes the cards cut from the v3
+matrix (GLM 5.3 NVFP4 max, GLM 5.3 Flash NVFP4 max and TR3 max, MiMo Pro
+min, MiMo Flash max, Qwen 3.8 EXL3 max and NVFP4 min/max/5090, V4 Flash
+max, V4 Pro EXL3 min) and the models retired since: the GLM 5.3 Flash
+non-core FP8 configs (`glm53-flash-fp8-min/max`, last smoke 2026-10-14)
+and the GLM 5.3 Flash EXL3 BF16-dense `-v1` card, replaced by
+`GLM-5.3-Flash-EXL3-K3.25-Core-FP8`.
+
+`cuteafd bench publish` needs: the per-family `sections` renderer (layout
+per section from the matrix file), the retired renderer, and example
+configs for EXLR8 min `bit325`, dense Qwen BF16/FP8 min.
+
+## v5: one decode graph strategy (TJ, 2026-10-24)
+
+Decode graph capture is per family today, and the memory it costs varies
+widely. The goal is less wasted memory and one standard strategy, not graphs
+shared across lanes through address tables.
+
+Where it stands (2026-10-24):
+
+| Family | Row shapes per graph key | Other key axes | Cost |
 |---|---|---|---|
-| DeepSeek V4.1 Flash | 1 RTX + 3 Sparks | 2 RTX + 6 Sparks, **plus a 1 RTX + 4 Sparks reference** | V4.1's TP4 reference |
-| DeepSeek V4 Flash | min | max, **plus a 1 RTX + 4 Sparks reference** | TJ: "Deep seek flash gets a 1+4 reference too" |
-| GLM 5.3 EXLR8 (native dense) | 1 RTX + 4 Sparks | 2 RTX + 6 Sparks | TJ: "EXLR8 max and min do 4 and 6 sparks" |
-| Kimi K3 (EXL3 K2 + Core-K6) | — | 2 RTX + 6 Sparks | DFlash2 |
-| Step-5 | NVFP4 1 RTX + 4 Sparks | FP8 2 RTX + 6 Sparks | RTX PRO only |
-| Dense Qwen 3.8 27B (BF16, FP8) | 1 RTX | — | RTX only; min only, no TP2 card (TJ) |
+| GLM 5.3 / EXLR8 | 24 to 131K (1–16, 20 … 64), 7 above | 11 page-table widths, one capture per layer + head | 213 shapes, ~3 GiB/GPU (`glm_decode_graph_allowance`, 3 GiB floor) |
+| V4.1 | exact rows 1–64 (8 fixed on cards < 32 GB) | per layer, per lane | not measured; largest after GLM |
+| GLM Flash | 6 (1, 4, 8, 16, 32, 64; spec 2–64) | | |
+| Qwen 4 | 4 plain, 7 spec | | |
+| V4, MiMo, shared `decode_graph` | 4 (1, 4, 16, 64) | | MiMo ~0.9 GiB/GPU |
+| Kimi K3, Step-5 | exact verify rows | | not measured |
 
-GLM 5.3 EXL3 K4 max (2 RTX + 6 Sparks) also ships, matching EXLR8 max
-for the same-layout comparison. Qwen 3.8 Flash Next NVFP4 is retired entirely;
-its min, max and 5090 cards move below. The Qwen Flash Next 5090 card is
-EXL3 only: 1 RTX 5090 + 1 Spark, unchanged from v3.
+Work:
+1. Measure every family's graph memory from the startup ledger, per GPU and
+   per lane, on its max card.
+2. One shared row-bucket rule and one place it lives (`shared/decode_graph`),
+   with a family override only where a measured route crossover needs one.
+   Coarser buckets pad rows; decode is bandwidth-bound, so judge by emitted
+   tok/s at C1/C4/C16, not by padded-row count.
+3. One rule for which axes key a graph (rows, table width, layer) and when a
+   shape runs eagerly instead of capturing (odd prefill tails already do).
+4. Planner admission charges each family's graphs from that same rule.
+5. Bar: graph memory down, freed memory reported as pool or onboard layers,
+   and decode within 0.98× at every concurrency. Zero captures per request
+   stays.
 
-**Retired section** (new, below the main table): every model that no longer
-ships keeps its last Release-smoke row, one card per row with its config and
-the release version it came from. It doesn't use the three-column layout.
-It includes:
-- the cards cut from the v3 matrix: GLM 5.3 NVFP4 max, GLM 5.3
-  Flash NVFP4 max and TR3 max, MiMo Pro min, MiMo Flash max, Qwen 3.8 EXL3 max
-  and NVFP4 min/max/5090, V4 Flash max, V4 Pro EXL3 min (each from its last smoke run);
-- models retired since: the GLM 5.3 Flash non-core FP8 configs
-  (`glm53-flash-fp8-min/max`, `zai-org/GLM-5.3-Flash`), last smoke 2026-10-14;
-  the GLM 5.3 Flash EXL3 BF16-dense `-v1` card, replaced by
-  `GLM-5.3-Flash-EXL3-K3.25-Core-FP8`.
-
-`cuteafd bench publish` builds both sections from the smoke exports plus a
-retired list in the matrix file.
+Second decode lanes (MiMo port, 2026-10-24) double a family's graph set,
+so this lands before lanes spread to GLM or V4.1-sized graph sets.
 
 ## Backlog (lowest priority: only when nothing planned is left)
 

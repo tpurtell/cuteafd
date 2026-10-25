@@ -223,3 +223,71 @@ def test_verification_checks_every_packaged_dso_including_routes(tmp_path):
         'variants': [], 'files': files, 'compute': [12, 1]}))
     with pytest.raises(ValueError, match='metadata.so'):
         tool.verify(tmp_path)
+
+
+@pytest.mark.parametrize("geometry,profile,bits", [
+    ("glm", "tp6-compact-width384", [4, 5]),
+    ("glmf", "tp4-width512", [3, 4]),
+    ("qwen4", "tp4-compact-width256", [4, 5]),
+    ("kimik3", "tp6-width512", [2, 3]),
+])
+def test_only_measured_spark_decode_profiles_default_to_pure_hint(geometry, profile, bits):
+    tool = load_tool()
+    measured = [1, 16, 80] if geometry in ("glm", "qwen4") else [1, 80]
+    for capacity in measured:
+        assert tool.default_decode_schedule(geometry, "spark", profile, capacity, bits) == tool.PURE_EVICT_FIRST
+    for capacity in set([1, 16, 80, 256, 1024, 4096]) - set(measured):
+        assert tool.default_decode_schedule(geometry, "spark", profile, capacity, bits) is None
+    assert tool.default_decode_schedule(geometry, "coordinator", profile, 1, bits) is None
+    assert tool.default_decode_schedule(geometry, "spark", profile + "-other", 1, bits) is None
+    assert tool.default_decode_schedule(geometry, "spark", profile, 1, [2, 3, 4]) is None
+
+
+@pytest.mark.parametrize("geometry,bits", [("glm", [4, 5]), ("glmf", [3, 4])])
+def test_only_measured_coordinator_capacities_default_to_pure_hint(geometry, bits):
+    tool = load_tool()
+    for capacity in [1, 16, 80, 256, 1024, 4096]:
+        expected = tool.PURE_EVICT_FIRST if capacity in [1, 80] else None
+        assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp2", capacity, bits) == expected
+        assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp1", capacity, bits) is None
+        for other_bits in ([2, 3], [3, 4], [4, 5], [3, 4, 5]):
+            if other_bits != bits:
+                assert tool.default_decode_schedule(geometry, "coordinator", "rtx-tp2", capacity, other_bits) is None
+
+
+@pytest.mark.parametrize("schedule,allowed", [(None, True), ("l2=2,pf1=0,pf2=0,pdl=1", True),
+                                               ("l2=2,pf1=1,pf2=0,pdl=1", False)])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_compact_package_accepts_only_pure_l2_schedule(tmp_path, monkeypatch, schedule, allowed, explicit):
+    tool = load_tool()
+    monkeypatch.setattr(tool, "verify_object_target", lambda *args: None)
+    suffix = "-hint" if schedule and explicit else ""
+    directory = f"tp6-compact-rank0/m80{suffix}"
+    variant = dict(directory=directory, capacity=80, intermediate=384, experts=256,
+                   top_k=8, output_dtype="bf16", bits=[4, 5], descriptor_rows=7, native_info_version=3)
+    meta = {**variant, "hidden": 6144, "compute": [12, 1], "tile": [64, 128, 64, 128],
+            "requires_route_preparation": False, "sparkinfer_revision": "test"}
+    if schedule:
+        variant["decode_schedule"] = schedule
+        if explicit:
+            variant["schedule"] = "hint"
+        meta["decode_schedule"] = schedule
+    dest = tmp_path / directory
+    dest.mkdir(parents=True)
+    (dest / "v41_exl3.json").write_text(json.dumps(meta))
+    (dest / "trellis_lut.bin").write_bytes(b"test")
+    (dest / "libcuteafd_exl3.so").write_bytes(b"test")
+    files = {str(p.relative_to(tmp_path)): dict(bytes=p.stat().st_size, sha256=tool.digest(p))
+             for p in dest.iterdir()}
+    manifest = dict(schema="cuteafd.exl3-package.v1", role="spark", geometry="glm",
+                    compute=[12, 1], sparkinfer_revision="test", variants=[variant], files=files)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+    if allowed:
+        assert tool.verify(tmp_path) == manifest
+        variant["decode_schedule"] = "mismatched-package-identity"
+        (tmp_path / "manifest.json").write_text(json.dumps(manifest))
+        with pytest.raises(ValueError, match="variant decode schedule mismatch"):
+            tool.verify(tmp_path)
+    else:
+        with pytest.raises(ValueError, match="invalid compact geometry or execution contract"):
+            tool.verify(tmp_path)

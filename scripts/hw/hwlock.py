@@ -19,6 +19,14 @@ CMD that takes the locks itself (an older smoke binary, a driver script): once
 it is our turn the locks are left for CMD, and our ticket stays live until CMD
 exits, so later ticket holders still wait behind it.
 
+SIGTERM, SIGINT or SIGHUP while CMD runs is forwarded to CMD, and the locks
+stay held until CMD exits (at most STOP_GRACE_S = 80 s, then CMD is killed):
+`cuteafd bench smoke` tears down its containers on that signal, and the next
+lock holder must find the hardware clean. 80 s fits systemd's default
+TimeoutStopSec (90 s), so `systemctl --user stop UNIT` on a unit running
+hwlock is safe with the default KillMode=control-group; do not pass
+KillMode=mixed or process, or a TimeoutStopSec below 90 s.
+
 --preflight runs a bounded shell check before enqueue and after grant (only
 after grant with --preflight-at-grant), while
 locks are still held even in --gate mode. Failure or timeout exits 78 without
@@ -49,6 +57,10 @@ ORDER = ('sparks', 'gpu0', 'gpu1', 'rhea', 'moa', *LAN_SEEDS, *(f'{seed}-export'
          'oliver')
 LOCK_DIR = Path(os.environ.get('CUTEAFD_LOCK_DIR', Path.home() / '.cache/cuteafd'))
 POLL_S = 2.0
+# How long a signalled CMD may take to exit (its teardown) before it is killed;
+# under systemd's default TimeoutStopSec (90 s), above smoke's 60 s teardown bound.
+STOP_GRACE_S = 80.0
+FORWARDED = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 GATE_SEQ = [0]  # this process's ticket while it holds a turn (exported in --gate mode)
 
 
@@ -261,6 +273,49 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
             ticket.close()
 
 
+def run_forwarding(cmd, env, grace: float = STOP_GRACE_S) -> int:
+    """Runs CMD to completion while the caller holds the locks. A SIGTERM,
+    SIGINT or SIGHUP is forwarded to CMD, which then gets `grace` seconds to
+    exit (its own teardown) before SIGKILL; only then does this return, so
+    the locks outlive whatever CMD cleans up. Returns CMD's exit status
+    (128 + N when a signal N ended it)."""
+    received: list[int] = []
+    child = None
+
+    def forward(signum, _frame):
+        if not received:
+            received.append(signum)
+        if child is not None and child.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                child.send_signal(signum)
+
+    previous = {sig: signal.signal(sig, forward) for sig in FORWARDED}
+    try:
+        child = subprocess.Popen(cmd, env=env)
+        if received:  # arrived before CMD existed
+            forward(received[0], None)
+        deadline = None
+        while True:
+            try:
+                code = child.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if received and deadline is None:
+                deadline = time.monotonic() + grace
+                print(f'hwlock: signal {received[0]} forwarded; holding the locks up to {grace:.0f} s '
+                      'while the command stops', file=sys.stderr)
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f'hwlock: the command did not stop within {grace:.0f} s; killing it', file=sys.stderr)
+                child.kill()
+                code = child.wait()
+                break
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    return 128 - code if code < 0 else code
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--locks', required=True, help='comma list of ' + ', '.join(ORDER))
@@ -287,7 +342,7 @@ def main() -> int:
                 env['CUTEAFD_HW_LOCKS_HELD'] = ','.join(locks)
             else:
                 env[GATE_ENV] = ':'.join(filter(None, [os.environ.get(GATE_ENV, ''), str(GATE_SEQ[0])]))
-            return subprocess.run(cmd, env=env).returncode
+            return run_forwarding(cmd, env)
     except PreflightFailed as error:
         print(f'hwlock: {error}', file=sys.stderr)
         return 78

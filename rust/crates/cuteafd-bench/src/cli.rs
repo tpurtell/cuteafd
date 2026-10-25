@@ -36,6 +36,7 @@ pub struct RunOptions {
     pub lossless_dump: Option<crate::panels::lossless::RowDump>,
     pub context_lengths: Option<Vec<u64>>,
     pub context_levels: Option<Vec<usize>>,
+    pub context_suffix: Option<u64>,
 }
 
 fn agent() -> ureq::Agent {
@@ -111,6 +112,24 @@ pub fn write_exports(report: &Report, dir: &Path, kinds: &[String]) -> Result<Ve
     Ok(written)
 }
 
+fn check_context_suffix(report: &mut Report, requested: u64) {
+    if requested == 0 { return; }
+    let evidence = report.panels.iter().position(|p| p.id == "context_load");
+    let error = match evidence {
+        Some(index) if !report.panels[index].passes.is_empty() => report.panels[index].passes.iter()
+            .find_map(|pass| crate::panels::context_load::validate_suffix(pass, requested).err()),
+        _ => Some("server does not support context suffix: no measured context_load output".to_string()),
+    };
+    if let Some(error) = error {
+        if let Some(index) = evidence {
+            report.panels[index].status = crate::report::PanelStatus::Failed;
+            report.panels[index].error = Some(error.clone());
+        }
+        report.status = RunStatus::Failed;
+        report.error = Some(error);
+    }
+}
+
 /// Starts a run on `options.url`, follows it to the end and writes the exports.
 pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     let base = options.url.trim_end_matches('/').to_string();
@@ -133,6 +152,7 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     if let Some(dump) = &options.lossless_dump { body["lossless_dump"] = json!(dump); }
     if let Some(lengths) = &options.context_lengths { body["context_lengths"] = json!(lengths); }
     if let Some(levels) = &options.context_levels { body["context_levels"] = json!(levels); }
+    if let Some(suffix) = options.context_suffix { body["context_suffix"] = json!(suffix); }
     let response = authorize(agent.post(&format!("{base}/v1/bench/runs")), &options.api_key)
         .send_json(body);
     let id = match response {
@@ -172,7 +192,8 @@ pub fn run(options: &RunOptions) -> Result<(Report, PathBuf)> {
     // The report this returns is read the way every surface reads it, so the
     // run's own gate check and a run recovered from the local store after the
     // server went away cannot carry a verdict the data no longer earns.
-    let report = crate::quality::under_current_rule(&report);
+    let mut report = crate::quality::under_current_rule(&report);
+    check_context_suffix(&mut report, options.context_suffix.unwrap_or(0));
     let written = write_exports(&report, &dir, &options.export)?;
     if !options.quiet {
         for path in &written {
@@ -300,6 +321,20 @@ pub fn write_bytes_if_changed(path: &Path, bytes: &[u8]) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn old_server_ignoring_suffix_cannot_return_a_passing_report() {
+        let mut report = crate::sample::report(false);
+        report.status = crate::report::RunStatus::Done;
+        report.panels.push(crate::report::PanelResult { id: "context_load".into(),
+            status: crate::report::PanelStatus::Done,
+            passes: vec![serde_json::json!({"points": [{"status": "ok", "c": 1,
+                "requests": [{"timing": {"prompt_tokens": 8149, "cached_tokens": 8092}}]}]})],
+            ..Default::default() });
+        super::check_context_suffix(&mut report, 512);
+        assert_eq!(report.status, crate::report::RunStatus::Failed);
+        assert_eq!(report.panel("context_load").unwrap().status, crate::report::PanelStatus::Failed);
+        assert!(report.error.as_deref().unwrap().contains("server does not support context suffix"));
+    }
     #[test]
     fn a_label_keeps_two_cards_of_one_checkpoint_apart() {
         let report = crate::sample::report(false);

@@ -377,6 +377,27 @@ impl IntakeState {
             copies_pending: Cell::new(false) }
     }
 
+    fn before_dispatch(&self, wait_consumed: impl FnOnce(usize) -> Result<()>,
+        release_uploads: impl FnOnce() -> Result<()>) -> Result<()> {
+        let slot = self.dispatch_slot.get();
+        if self.consumed_pending[slot].get() {
+            wait_consumed(slot)?;
+            self.consumed_pending[slot].set(false);
+        }
+        release_uploads()?;
+        self.dispatch_slot.set((slot + 1) % self.consumed_pending.len());
+        Ok(())
+    }
+
+    fn release_uploads(&self, wait_copied: impl FnOnce() -> Result<()>,
+        release: impl FnOnce() -> Result<()>) -> Result<()> {
+        if self.copies_pending.get() {
+            wait_copied()?;
+            self.copies_pending.set(false);
+        }
+        release()
+    }
+
     fn reset(&self, drain: impl FnOnce() -> Result<()>, reset_transport: impl FnOnce() -> Result<()>,
         release: impl FnOnce() -> Result<()>) -> Result<()> {
         drain()?;
@@ -467,28 +488,13 @@ impl<'a> SparkIntake<'a> {
         unsafe { SparkExpertLane::spawn_world(world, peers, capacity, config, self.landing()) }
     }
 
-    /// Before dispatching a wave on this intake's transport: the previous
-    /// wave's reduce and uploads are done, and its receive slots are released.
+    /// Before dispatch: the reused planes' reduce is done and completed
+    /// uploads have released their receive slots, even with waves in flight.
     pub(crate) fn before_dispatch(&self) -> Result<()> {
-        let slot = self.state.dispatch_slot.get();
-        if self.state.consumed_pending[slot].get() {
+        self.state.before_dispatch(|slot| {
             // SAFETY: the event was recorded on the engine's stream by `consumed`.
-            unsafe { self.library.cuda_event_synchronize(self.consumed[slot])? };
-            self.state.consumed_pending[slot].set(false);
-        }
-        self.state.dispatch_slot.set((slot + 1) % self.waves);
-        // Pinned receive slots and their uploads are released only when no
-        // other wave is in flight: with several waves, the next receive
-        // releases what the previous one held (see `receive`).
-        if self.waves > 1 { return Ok(()); }
-        if self.state.copies_pending.get() {
-            // SAFETY: recorded after the held slots' uploads; they must finish
-            // before the slots go back to the transport.
-            unsafe { self.library.cuda_event_synchronize(self.copied)? };
-            self.state.copies_pending.set(false);
-        }
-        self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
-        Ok(())
+            unsafe { self.library.cuda_event_synchronize(self.consumed[slot]) }
+        }, || self.release_held())
     }
 
     /// Whether a wave of `plane_bytes` per rank goes through the pinned
@@ -661,17 +667,17 @@ impl<'a> SparkIntake<'a> {
         Ok(())
     }
 
-    /// Several waves: the previous receive's pinned slots go back to the
-    /// transport once their uploads finished (not the compute stream, which
-    /// may still be queued behind other units' work).
+    /// Release uploaded sources before dispatch as well as receive: polling
+    /// can retain a later wave's final frame before its receive starts, filling
+    /// a depth-N ring unless the completed wave returns its slots first.
     fn release_held(&self) -> Result<()> {
-        if self.state.copies_pending.get() {
+        self.state.release_uploads(|| {
             // SAFETY: recorded after the held slots' uploads (`join_uploads`).
-            unsafe { self.library.cuda_event_synchronize(self.copied)? };
-            self.state.copies_pending.set(false);
-        }
-        self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
-        Ok(())
+            unsafe { self.library.cuda_event_synchronize(self.copied) }
+        }, || {
+            self.held.lock().map_err(|_| anyhow::anyhow!("intake slots poisoned"))?.clear();
+            Ok(())
+        })
     }
 
     fn reset(&self, transport: &mut SparkExperts) -> Result<()> {
@@ -888,6 +894,110 @@ impl<L: StreamLibrary> Drop for WarmStream<'_, L> {
 #[cfg(test)]
 mod intake_reset_tests {
     use super::*;
+
+    #[test]
+    fn two_inflight_waves_release_upload_sources_before_replacement_dispatch() -> Result<()> {
+        use std::{collections::VecDeque, rc::Rc};
+        struct Frame { slot: usize, occupied: Rc<[Cell<bool>; 2]> }
+        impl Frame {
+            fn new(slot: usize, occupied: &Rc<[Cell<bool>; 2]>) -> Self {
+                assert!(!occupied[slot].replace(true), "response slot reused while owned");
+                Self { slot, occupied: occupied.clone() }
+            }
+        }
+        impl Drop for Frame {
+            fn drop(&mut self) { assert!(self.occupied[self.slot].replace(false)); }
+        }
+
+        let state = IntakeState::new(2);
+        let occupied = Rc::new([Cell::new(false), Cell::new(false)]);
+        state.before_dispatch(|_| unreachable!(), || Ok(()))?;
+        state.before_dispatch(|_| unreachable!(), || Ok(()))?;
+        // One poll can retain both final frames. Only A has reached its upload;
+        // B remains in its response channel when A's replacement is dispatched.
+        let held = Mutex::new(vec![Frame::new(0, &occupied)]);
+        let mut queued = VecDeque::from([Frame::new(1, &occupied)]);
+        state.receive_slot.set(1);
+        state.consumed_pending[0].set(true);
+        state.copies_pending.set(true);
+        let fences = Cell::new(0);
+        for sequence in 0..4096 {
+            let slot = sequence % 2;
+            assert!(occupied.iter().all(Cell::get));
+            assert_eq!(state.dispatch_slot.get(), slot);
+            let copied = Cell::new(false);
+            state.before_dispatch(|reused| {
+                assert_eq!(reused, slot);
+                assert_eq!(held.lock().unwrap()[0].slot, slot);
+                Ok(())
+            }, || state.release_uploads(|| {
+                assert!(occupied.iter().all(Cell::get));
+                copied.set(true);
+                fences.set(fences.get() + 1);
+                Ok(())
+            }, || {
+                assert!(copied.get(), "receive source released before upload fence");
+                held.lock().unwrap().clear();
+                Ok(())
+            }))?;
+            assert!(!occupied[slot].get(), "no receive slot for the replacement request");
+            assert!(occupied[1 - slot].get(), "queued wave lost its response owner");
+            assert!(!state.copies_pending.get());
+            assert!(!state.consumed_pending[slot].get());
+            queued.push_back(Frame::new(slot, &occupied));
+            let received = queued.pop_front().unwrap();
+            let received_slot = state.receive_slot.get();
+            assert_eq!(received.slot, received_slot);
+            retain_before_enqueue(&held, received, |_| Ok(()))?;
+            state.receive_slot.set((received_slot + 1) % 2);
+            state.copies_pending.set(true);
+            state.consumed_pending[received_slot].set(true);
+        }
+        assert_eq!(fences.get(), 4096);
+        state.release_uploads(|| Ok(()), || { held.lock().unwrap().clear(); Ok(()) })?;
+        drop(queued);
+        assert!(occupied.iter().all(|slot| !slot.get()));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_dispatch_fence_keeps_sources_and_dispatch_phase() -> Result<()> {
+        for fail_consumed in [false, true] {
+            let state = IntakeState::new(2);
+            state.consumed_pending[0].set(true);
+            state.copies_pending.set(true);
+            let held = RefCell::new(vec!["pinned source"]);
+            let result = state.before_dispatch(|_| {
+                ensure!(!fail_consumed, "injected consumed fence failure");
+                Ok(())
+            }, || state.release_uploads(|| anyhow::bail!("injected upload fence failure"), || {
+                held.borrow_mut().clear();
+                Ok(())
+            }));
+            assert!(result.is_err());
+            assert_eq!(state.dispatch_slot.get(), 0);
+            assert_eq!(held.borrow().as_slice(), ["pinned source"]);
+            assert!(state.copies_pending.get());
+            assert_eq!(state.consumed_pending[0].get(), fail_consumed);
+            // Terminal cancellation must drain while the failed upload's
+            // source is still retained, then reset the wire before release.
+            let drained = Cell::new(false);
+            state.reset(|| {
+                assert_eq!(held.borrow().len(), 1);
+                drained.set(true);
+                Ok(())
+            }, || { assert!(drained.get()); Ok(()) }, || {
+                assert!(drained.get());
+                held.borrow_mut().clear();
+                Ok(())
+            })?;
+            assert!(held.borrow().is_empty());
+            assert!(!state.copies_pending.get());
+            state.before_dispatch(|_| unreachable!(), || Ok(()))?;
+            assert_eq!(state.dispatch_slot.get(), 1);
+        }
+        Ok(())
+    }
 
     #[test]
     fn cancelled_unread_slots_reset_in_phase_after_consumers_drain() -> Result<()> {
@@ -2125,10 +2235,10 @@ mod tests {
         let generic = IntakeChoice { setting: "auto".into(), mode, reason,
             probe: Some(measured), h2d_gbps: h2d };
         assert!(device_choice_available(&generic));
-        let v41 = preferred_choice(generic, IntakePreference::Pinned);
-        assert_eq!(v41.mode, IntakeMode::Pinned);
-        assert!(!device_choice_available(&v41));
-        assert_eq!(v41.mode_for(4096 * 10240).0, IntakeMode::Pinned);
+        let pinned = preferred_choice(generic, IntakePreference::Pinned);
+        assert_eq!(pinned.mode, IntakeMode::Pinned);
+        assert!(!device_choice_available(&pinned));
+        assert_eq!(pinned.mode_for(4096 * 10240).0, IntakeMode::Pinned);
     }
 
     #[test]

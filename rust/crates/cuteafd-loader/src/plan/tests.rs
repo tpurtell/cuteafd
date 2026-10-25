@@ -1715,6 +1715,46 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn v4_plan_shared_span_is_independent_of_unit_rows_and_waves() {
+    let dir = v4_snapshot();
+    for unit in [2048, 4096] {
+        for waves in [1, 2, 3] {
+            let reports: Vec<_> = [None, Some(2048), Some(32768)].into_iter().map(|span| {
+                let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+                    host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+                    prefill_rows: unit, prefill_unit_rows: Some(unit), prefill_waves: waves,
+                    prefill_span_rows: span, pool_tokens: Some(32768), ..Default::default()
+                }), ..sparks(4) }).unwrap();
+                assert_eq!(report.prefill_span_rows, Some(span.unwrap_or(16384)));
+                assert_eq!(report.prefill_unit_rows, Some(unit));
+                assert_eq!(report.prefill_waves, Some(waves));
+                report
+            }).collect();
+            let device_items = |report: &PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+                .map(|device| device.items.iter().map(|item| (item.group.clone(), item.bytes)).collect::<Vec<_>>())
+                .collect::<Vec<_>>();
+            assert_eq!(device_items(&reports[0]), device_items(&reports[1]));
+            assert_eq!(device_items(&reports[0]), device_items(&reports[2]));
+        }
+    }
+}
+
+#[test]
+fn v4_plan_resolves_serving_wave_default_and_explicit_requests() {
+    let dir = v4_snapshot();
+    for (requested, expected) in [(0, 2), (1, 1), (2, 2), (3, 3)] {
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            prefill_lanes: requested, prefill_waves: requested.max(1),
+            pool_tokens: Some(32768), ..Default::default()
+        }), ..sparks(4) }).unwrap();
+        assert_eq!(report.prefill_unit_rows, Some(4096));
+        assert_eq!(report.prefill_waves, Some(expected));
+        assert_eq!(report.prefill_span_rows, Some(16384));
+    }
+}
+
+#[test]
 fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     use crate::serving_capacity::{compiled_c128_width, deepseek_v4_workspace_geometry,
         deepseek_v4_workspace_scratch};
@@ -1732,7 +1772,7 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::read(dir.path(), 0).unwrap();
     let scratch = deepseek_v4_workspace_scratch(&manifest, "dsv4f", false, 4096, 64).unwrap();
     let runtime = deepseek_v4_workspace_geometry(&cfg, 4096, 64,
-        compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, scratch).unwrap();
+        compiled_c128_width(&manifest, "dsv4f").unwrap() * 128, 1, 2, scratch).unwrap();
     for gib in [31.8, 95.5] {
         let total = cuteafd_core::serving_capacity::GpuMemoryBudget::from_gib(gib).unwrap().0;
         for context in [16384, 32512, 32768] {
@@ -1744,8 +1784,13 @@ fn v4_workspace_plan_matches_runtime_below_compiled_context() {
             let notes = layout.notes.clone();
             let device = layout.devices.remove(0);
             let steps = device.items.iter().find(|i| i.group == "steps").unwrap_or_else(|| panic!("{gib} {context}: {notes:?}"));
-            let intake = 2 * 2 * 4096 * cfg.dim as u64 * 2;
+            let intake = (2 * 4096 + 64) * 2 * cfg.dim as u64 * 2;
             assert_eq!((steps.bytes, steps.basis), (runtime[0].fixed_device_bytes + intake, Basis::Formula));
+            let records = device.items.iter().find(|i| i.group == "records").unwrap();
+            let cache = crate::serving_capacity::deepseek_v4_cache_geometry(&cfg, 1, 4096, 0).unwrap();
+            assert_eq!(runtime[0].pool_unit_device_bytes, (2 + 64) * 4);
+            assert_eq!(records.bytes, (cache.ranks[0].persistent_unit_bytes
+                + cache.ranks[0].pool_metadata_unit_bytes + runtime[0].pool_unit_device_bytes) * (32768 / 256));
             let graph = crate::placement::families::deepseek_v4::GRAPH_BYTES[0];
             // The PRO envelope covers the measured loaded code as well (`V4Inputs::code_bytes`).
             let code = crate::placement::loaded_code("dsv4f", "*", false, 0).unwrap().bytes;

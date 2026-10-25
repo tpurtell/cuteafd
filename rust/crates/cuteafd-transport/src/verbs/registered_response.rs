@@ -182,6 +182,32 @@ mod tests {
     use super::RepostOrder;
 
     #[test]
+    fn depth_two_slots_recycle_with_two_waves_across_many_rotations() -> anyhow::Result<()> {
+        let mut order = RepostOrder::new(2);
+        // An eager poll completes A and B before A's upload owner is released.
+        order.retain(0)?;
+        order.retain(1)?;
+        for sequence in 0..4096 {
+            let slot = sequence % 2;
+            assert_eq!(order.unposted(), 2);
+            assert!(order.ready().is_empty());
+            order.release(slot)?;
+            assert_eq!(order.ready(), [slot]);
+            assert_eq!(order.unposted(), 1, "replacement request has no receive slot");
+            assert!(order.held(1 - slot), "later wave must keep its response");
+            // The replacement response completes before the other wave's
+            // consumer releases it: the receive ring stays fully occupied.
+            order.retain(slot)?;
+        }
+        order.release(1)?;
+        assert!(order.ready().is_empty(), "later response reposted out of order");
+        order.release(0)?;
+        assert_eq!(order.ready(), [0, 1]);
+        assert_eq!(order.unposted(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn slots_return_in_consumption_order_across_outstanding_waves() -> anyhow::Result<()> {
         // Wave A's final frame (slot 0) stays with its consumer while wave B's
         // frames (1 copied, 2 retained) arrive behind it.

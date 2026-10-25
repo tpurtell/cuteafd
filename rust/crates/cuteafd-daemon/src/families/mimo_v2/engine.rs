@@ -1442,10 +1442,16 @@ impl<'a> MimoEngine<'a> {
         ordered_table_upload(self.library, w.step_inputs.buffer, &bytes, self.stream_of(rank))
     }
 
+    /// Uploads a step table in order on the stream of the rank that owns `dev`
+    /// (callers run under [`Self::on`]), after that stream's earlier readers.
     fn put<T: Copy>(&self, dev: &Dev<'_>, values: &[T]) -> Result<()> {
         let bytes = bytes_of(values);
         ensure!(bytes.len() <= dev.buffer.bytes, "table exceeds its buffer");
-        self.library.copy_h2d(cuteafd_ffi::CuteafdDeviceBuffer { bytes: bytes.len(), ..dev.buffer }, bytes)
+        let rank = usize::from(self.peer.as_ref().is_some_and(|peer| peer.device == dev.buffer.device_id));
+        // SAFETY: every reader of a rank's step tables (its kernels, graph replays and
+        // the media injection) runs on that rank's stream, outside capture; the ordered
+        // copy keeps its pinned source until the stream reaches it.
+        unsafe { self.library.copy_h2d_ordered(dev.buffer, bytes, self.stream_of(rank)) }
     }
 
     fn download(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
@@ -1695,16 +1701,8 @@ impl<'a> MimoEngine<'a> {
             Some((peer, ws)) => Some((*peer, ws.as_ref().context("peer workspace")?)),
             None => None,
         };
-        // The tables and ids go up synchronously: the previous step (which no
-        // longer ends in a logits download) must be done reading them.
-        // SAFETY: the engine owns these streams; every exchange wait queued on
-        // them was matched by a push the previous step queued, so they drain.
-        unsafe {
-            self.library.cuda_stream_synchronize(self.stream)?;
-            if let Some((peer, _)) = split {
-                self.library.cuda_stream_synchronize(peer.stream)?;
-            }
-        }
+        // The tables and ids go up in order on each rank's stream, behind the
+        // previous step's readers, so no host wait precedes the step.
         for (rank, w) in std::iter::once(w).chain(split.map(|(_, w1)| w1)).enumerate() {
             self.on(rank, || {
                 self.put_step_inputs(rank, w, &tables.positions)?;

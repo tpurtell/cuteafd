@@ -200,99 +200,99 @@
     "name": "glm53-nvfp4-max",
     "config": "examples/configs/glm53-nvfp4-max.config",
     "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-15",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "glm53f-nvfp4-max",
     "config": "examples/configs/glm53-flash-nvfp4-max.config",
     "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "glm53f-tr3-max",
     "config": "examples/configs/glm53-flash-tr3-max.config",
     "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "mimo-pro-min",
     "config": "examples/configs/mimo-v26-pro-mxfp4-min.config",
     "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "mimo26-flash-max",
     "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
     "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "qwen38-exl3-max",
     "config": "examples/configs/qwen38-exl3-min.config",
     "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "qwen38-nvfp4-max",
     "config": "examples/configs/qwen38-nvfp4-min.config",
     "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "v4-flash-max",
     "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
     "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "v4-pro-exl3-min",
     "config": "examples/configs/deepseek-v4-pro-exl3-min.config",
     "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "glm53f-fp8-min",
     "config": "examples/configs/glm53-flash-fp8-min.config",
     "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "glm53f-fp8-max",
     "config": "examples/configs/glm53-flash-fp8-max.config",
     "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3 dev 2026-10-14",
+    "release_note": "Untagged v3 development build; date is the smoke report date."
   },
   {
     "name": "qwen38-nvfp4-min",
     "config": "examples/configs/qwen38-nvfp4-min.config",
     "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min",
-    "release": "v3.0.0",
-    "release_note": "Exact final release commit."
+    "release": "v3.0.0-rc5",
+    "release_note": "Tagged build recorded by the report."
   },
   {
     "name": "qwen38-nvfp4-5090",
     "config": "examples/configs/qwen38-nvfp4-min.config",
     "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090",
-    "release": "v3.0.0",
-    "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+    "release": "v3.0.0-rc4",
+    "release_note": "Tagged build recorded by the report."
   },
   {
     "name": "glm53f-exl3-v1",
     "config": "examples/configs/glm53-flash-exl3-min.config",
     "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
-    "release": "v3.0.0",
-    "release_note": "Exact final release commit."
+    "release": "v3.0.0-rc5",
+    "release_note": "Tagged build recorded by the report."
   }
 ]
 }

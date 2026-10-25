@@ -25,7 +25,7 @@ import time
 from types import SimpleNamespace
 
 REPO = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(REPO / "third_party/gptqmodel"))
+sys.path.insert(0, os.environ.get("KIMI_GPTQMODEL_SOURCE", str(REPO / "third_party/gptqmodel")))
 sys.path.insert(0, str(REPO / "quantization"))
 os.environ.setdefault("FLA_DISABLE_TENSOR_CACHE", "1")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
@@ -520,31 +520,7 @@ class CoreEngine:
             for module in modules:
                 checkpoints.install(module, block.get_submodule(self._local_name(layer, module)))
             self.progress.emit("layer_loaded", layer=layer)
-            attention = prefix + "self_attn."
-            if phases["d"] is None and phases["e"] is None:
-                if phases["c"] is None:
-                    if phases["a"] is None:
-                        self._phase_a(block, current, store)
-                    entry = [attention + name for name in
-                             (("q_proj", "k_proj", "v_proj", "g_proj") if block.is_linear_attn else
-                              ("q_a_proj", "kv_a_proj_with_mqa", "g_proj"))]
-                    self._quant_group(block, checkpoints, entry, store, "a", "input")
-                    if not block.is_linear_attn:
-                        if phases["b"] is None and checkpoints.load(attention + "q_b_proj") is None:
-                            self._phase_b(block, store)
-                        self._quant_group(block, checkpoints, [attention + "q_b_proj"], store, "b", "q-b")
-                    self._phase_c(block, store)
-                self._quant_group(block, checkpoints, [attention + "o_proj"], store, "c", "o")
-                self._phase_d(block, current, store)
-            if layer:
-                moe = prefix + "block_sparse_moe."
-                if phases["e"] is None:
-                    group = [moe + name for name in ("shared_experts.gate_proj", "shared_experts.up_proj", "routed_expert_down_proj")]
-                    self._quant_group(block, checkpoints, group, store, "d", "input")
-                    self._phase_e(block, store)
-                self._quant_group(block, checkpoints, [moe + "shared_experts.down_proj"], store, "e", "shared-down")
-                self._quant_group(block, checkpoints, [moe + "routed_expert_up_proj"], store, "e", "routed-up")
-            self._phase_f(block, store)
+            self._execute_layer(block, current, store, checkpoints, phases)
             del block
             compact_memory()
         replacements = checkpoints.replacements(modules)
@@ -565,6 +541,36 @@ class CoreEngine:
         self.progress.emit("layer_committed", layer=layer, seconds=elapsed, remaining_layers=92 - layer,
                            layer_eta_seconds=sum(durations) / len(durations) * (92 - layer))
         return current
+
+    def _execute_layer(self, block, current, store, checkpoints, phases):
+        """Shared causal replay stages for production and bounded pilots."""
+        layer = block.layer_idx
+        prefix = f"language_model.model.layers.{layer}."
+        attention = prefix + "self_attn."
+        if phases["d"] is None and phases["e"] is None:
+            if phases["c"] is None:
+                if phases["a"] is None:
+                    self._phase_a(block, current, store)
+                entry = [attention + name for name in
+                         (("q_proj", "k_proj", "v_proj", "g_proj") if block.is_linear_attn else
+                          ("q_a_proj", "kv_a_proj_with_mqa", "g_proj"))]
+                self._quant_group(block, checkpoints, entry, store, "a", "input")
+                if not block.is_linear_attn:
+                    if phases["b"] is None and checkpoints.load(attention + "q_b_proj") is None:
+                        self._phase_b(block, store)
+                    self._quant_group(block, checkpoints, [attention + "q_b_proj"], store, "b", "q-b")
+                self._phase_c(block, store)
+            self._quant_group(block, checkpoints, [attention + "o_proj"], store, "c", "o")
+            self._phase_d(block, current, store)
+        if layer:
+            moe = prefix + "block_sparse_moe."
+            if phases["e"] is None:
+                group = [moe + name for name in ("shared_experts.gate_proj", "shared_experts.up_proj", "routed_expert_down_proj")]
+                self._quant_group(block, checkpoints, group, store, "d", "input")
+                self._phase_e(block, store)
+            self._quant_group(block, checkpoints, [moe + "shared_experts.down_proj"], store, "e", "shared-down")
+            self._quant_group(block, checkpoints, [moe + "routed_expert_up_proj"], store, "e", "routed-up")
+        self._phase_f(block, store)
 
     def retire_committed(self, current):
         """Finish retirement if a previous process died after current.json."""

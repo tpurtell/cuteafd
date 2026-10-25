@@ -6,6 +6,8 @@
 pub(crate) mod execution;
 pub(crate) mod exl3;
 pub(crate) mod exlr8;
+#[cfg(test)]
+mod exlr8_decode_gate;
 pub(crate) mod fp8;
 pub(crate) mod layer;
 pub(crate) mod local;

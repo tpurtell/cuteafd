@@ -319,10 +319,6 @@ impl<'a> NativeTp4Wave<'a> {
     ) -> Result<Self> {
         let capacity = transport.capacity();
         let world_size = transport.world_size();
-        // V4.1's receive uploader already supports pinned-host intake.
-        let choice = crate::shared::spark_intake::choose_preferred_mode(library, crate::shared::spark_intake::IntakePreference::Pinned)?;
-        tracing::info!(mode = choice.mode.name(), reason = %choice.reason,
-            "V4.1 Spark intake probe (host lane uses pinned uploads)");
         ensure!(
             (1..=8).contains(&world_size),
             "native TP wave requires one through eight ranks"
@@ -343,7 +339,7 @@ impl<'a> NativeTp4Wave<'a> {
         let hidden_bytes = capacity as usize * 5120 * 2;
         Ok(Self {
             link: crate::shared::spark_intake::SparkLink::from_transport(library, transport,
-                V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Pinned)?,
+                V41_PARTIAL_ROW_BYTES as usize, crate::shared::spark_intake::IntakePreference::Probed)?,
             stream: LoadStream {
                 library,
                 raw: library.cuda_stream_create()?,
@@ -363,7 +359,7 @@ impl<'a> NativeTp4Wave<'a> {
     /// legacy TP4 FP8 transports; `layer` is a Spark layer for the warm-up.
     pub(crate) fn install_device_link(&mut self, peers: &[std::net::SocketAddr], capacity: usize, layer: u32,
         config: cuteafd_transport::TcpTransportConfig) -> Result<()> {
-        if !crate::shared::spark_intake::preferred_device_exchange_available(self.library, crate::shared::spark_intake::IntakePreference::Pinned)? {
+        if !crate::shared::spark_intake::preferred_device_exchange_available(self.library, crate::shared::spark_intake::IntakePreference::Probed)? {
             return Ok(());
         }
         ensure!(self.native.is_none(),

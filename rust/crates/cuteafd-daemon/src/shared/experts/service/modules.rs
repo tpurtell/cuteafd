@@ -77,13 +77,19 @@ impl<'a> WarmModules<'a> {
         programs: Option<&'a cuteafd_ffi::programs::Programs<'a>>) -> Result<Self> {
         if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
             let programs = programs.context("EXLR8 module owner requires validated programs")?;
-            crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes(programs,
-                (config.capacity as usize).min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS),
-                cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
+            let decode_rows = (config.capacity as usize)
+                .min(cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS);
+            // Both decode instances are part of every Spark EXLR8 image;
+            // validation here precedes any workspace allocation.
+            crate::shared::experts::exlr8::Exlr8Execution::decode_compact_workspace_bytes(programs,
+                decode_rows, 16)?;
             programs.program("exlr8_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
+            crate::shared::experts::exlr8::Exlr8Execution::decode_grouped_workspace_bytes(programs,
+                decode_rows, 16)?;
             if config.capacity as usize > cuteafd_core::expert_geometry::EXLR8_EXECUTION_ROWS {
-                crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes(programs,
-                    config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed)?;
+                crate::shared::experts::exlr8::Exlr8Execution::workspace_bytes_with_limit(programs,
+                    config.capacity as usize, cuteafd_loader::plan::exlr8::residency::ExpertSet::Routed, 16,
+                    config.exlr8_prefill_activations)?;
                 programs.program("exlr8_grouped_group", &["ids", "x", "signs_in", "group_expert", "route_slots", "route_group_lane", "group_count", "activation"])?;
             }
             return Ok(Self::Exlr8(programs));

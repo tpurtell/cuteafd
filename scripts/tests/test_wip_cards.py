@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,19 @@ ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('wip_cards', ROOT / 'scripts/bench/wip-cards.py')
 cards = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(cards)
+
+
+@pytest.fixture(autouse=True)
+def no_stop_handlers(monkeypatch, tmp_path):
+    """main() would install its stop handlers in the pytest process; tests that
+    need a stop set cards.STOP themselves."""
+    monkeypatch.setattr(cards, 'install_stop_handlers', lambda: None)
+    monkeypatch.setitem(cards.STOP, 'signal', None)
+    monkeypatch.setattr(cards, '_LIVE', {})
+    # Tests must never enqueue against the shared cluster hardware queue.
+    monkeypatch.setattr(cards.hwlock, 'LOCK_DIR', tmp_path / 'locks')
+    monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
+    monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
 
 
 @pytest.fixture
@@ -241,6 +255,51 @@ def test_smoke_no_outer_lock_and_detached_numeric_exit(entry, tmp_path, monkeypa
     assert 'secret' not in str(cmd)
     assert 'printf' in cmd[3] and '$rc' in cmd[3]
     assert kwargs['env']['CUTEAFD_API_KEY'] == 'secret'
+
+
+def test_stop_signal_reaches_detached_smoke_which_finishes_its_teardown(tmp_path, monkeypatch):
+    import signal
+    # A stand-in smoke that tears down for a moment on SIGTERM, then exits 143.
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'def stop(*_):\n    time.sleep(0.5); (d/"torn-down").write_text(""); sys.exit(143)\n'
+             'signal.signal(signal.SIGTERM, stop); (d/"ready").write_text("")\n'
+             'while True: time.sleep(0.05)\n']
+    process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', dict(os.environ))
+    end = time.time() + 10
+    while not (tmp_path / 'ready').exists():
+        assert time.time() < end and process.poll() is None
+        time.sleep(0.02)
+    # What the handler does on SIGTERM: forward to the smoke's process group,
+    # whose bash wrapper must wait for smoke rather than exit first.
+    cards.forward_stop(signal.SIGTERM)
+    assert cards.wait_detached(process, grace=30) == 143
+    assert (tmp_path / 'torn-down').exists()
+    assert (tmp_path / 'exit').read_text().strip() == '143'
+    assert cards.stopped_code() == 128 + signal.SIGTERM
+    assert not cards._LIVE
+
+
+def test_stopped_wip_cards_starts_no_further_job(entry, tmp_path, monkeypatch):
+    import signal
+    kit = tmp_path / 'kit'
+    kit.mkdir()
+    (kit / 'matrix-main.json').write_text(json.dumps(dict(entries=[entry])))
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--interleave', '--repeats', '1',
+                                      '--arm', 'base=b:s', '--arm', 'cand=c:s', '--state', str(tmp_path / 'state'), '--binary', sys.executable])
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: None)
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
+    monkeypatch.setattr(cards, 'slot_check', lambda arm, host: json.dumps(dict(slot=arm['slot'], seal_sha256='seal', artifact_manifest_sha256='artifacts')))
+    started = []
+    def detached(cmd, log, exit_file, env):
+        started.append(cmd)
+        cards.STOP['signal'] = signal.SIGTERM  # the stop arrives while the first job runs
+        exit_file.write_text('143\n')
+        return SimpleNamespace(wait=lambda timeout=None: 143, pid=0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 128 + signal.SIGTERM
+    assert len(started) == 1
 
 
 def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
@@ -859,7 +918,7 @@ def test_runtime_seed_is_explicit_only(entry, tmp_path, monkeypatch, seed):
     def detached(cmd, log, exit_file, env):
         seen.append(env)
         exit_file.write_text('0\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
@@ -924,7 +983,7 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     def detached(cmd, log, exit_file, env):
         commands.append(cmd)
         exit_file.write_text('0\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'], repeat=1, simulated=True, status='pass'))
     monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
@@ -941,6 +1000,23 @@ def test_release_arm_uses_same_launcher_without_wip(entry, tmp_path, monkeypatch
     if not dry:
         saved = json.loads((Path(release['state']) / 'job.json').read_text())
         assert saved['artifacts']['raptor']['image_id'] == 'sha256:abc'
+
+
+@pytest.mark.parametrize('dense', [False, True])
+def test_release_arm_worker_image_only_for_spark_entries(entry, tmp_path, dense):
+    if dense:
+        entry = dict(entry, name='dense-min', family='qwen3_5', sparks=[],
+                     set={'SPARK_COUNT': '0', 'ADDR': '0.0.0.0:8501'})
+    arm = cards.arms_from([], ['release=r:v2.0.0'])['release']
+    job = cards.generate(entry, 'release', arm, tmp_path, tmp_path / 'key', {}, set(), None, 1)
+    values = job['entry']['set']
+    assert job['entry']['run_args'] == []
+    assert values['COORDINATOR_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-coordinator:v2.0.0'
+    assert ('SPARK_EXPERT_DOCKER_INFERENCE' in values) == (not dense)
+    if not dense:
+        assert values['SPARK_EXPERT_DOCKER_INFERENCE'] == 'ghcr.io/tpurtell/cuteafd-spark-expert:v2.0.0'
+    else:
+        assert 'EXPERT_PORT' not in values
 
 
 def test_release_arm_validation_and_cleanup(entry, tmp_path, monkeypatch):
@@ -1030,6 +1106,17 @@ def test_panels_levels_and_post_load_reach_every_job(entry, tmp_path, monkeypatc
         matrix = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
         assert matrix['profile'] == 'panels:'
         assert matrix['levels'] == [1, 16] and matrix['post_load_c1'] is True
+
+
+def test_panels_none_with_a_probe_is_a_readiness_run(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
+        '--state', str(state), '--panels', 'none', '--probe', 'v41-min:console', '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    entry = json.loads((Path(job['state']) / 'matrix.json').read_text())['entries'][0]
+    assert entry['profile'] == 'panels:' and entry['baseline'] is False
 
 
 def test_post_load_repeat_reaches_every_job(entry, tmp_path, monkeypatch):
@@ -1227,7 +1314,7 @@ def _fake_slot(packages=(), audio=True):
                                              contents=dict(packages=list(packages), audio=audio)))
 
 
-def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
+def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None, smoke_envs=None):
     """Runs main() with hardware stubbed: no containers, a sealed slot, and a
     smoke 'process' that writes an exit code and (optionally) a result. The binary
     must exist (it never runs); the sealed-slot default needs a built slot."""
@@ -1241,8 +1328,12 @@ def _run_main(monkeypatch, argv, slot=None, rc_for=lambda job: 0, results=None):
     def detached(cmd, log, exit_file, env):
         job = json.loads((exit_file.parent / 'job.json').read_text())
         launched.append(job['card'] + '/' + job['arm'])
+        if smoke_envs is not None:
+            smoke_envs.append(dict(env))
+        # Real smoke invokes this hook immediately before run.sh, under the turn.
+        cards.preflight_at_grant(job, {'instance': job['arm'], 'slot': 's'})
         exit_file.write_text(f'{rc_for(job)}\n')
-        return SimpleNamespace(wait=lambda: 0)
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
     monkeypatch.setattr(cards, 'detached', detached)
     def summarize(job, code):
         row = dict(card=job['card'], arm=job['arm'], repeat=job['repeat'], simulated=False,
@@ -1325,6 +1416,7 @@ def test_preflight_only_and_grant_hook(tmp_path, monkeypatch, capsys):
     argv = ['--kit', str(gate), '--cards', 'qwen38-exl3-min', '--matrix', '--arm', 'c=x:s', '--state', str(state), '--preflight-only']
     rc, launched = _run_main(monkeypatch, argv, slot=_fake_slot(packages=['exl3/exl3-qwen4-k45', 'fp8/fp8-qwen4-nvfp4a4']))
     assert rc == 0 and launched == []
+    assert not cards.hwlock.LOCK_DIR.exists()
     job = json.loads((state / 'qwen38-exl3-min-c-r1' / 'job.json').read_text())
     hook = job['entry']['prelaunch']['argv']
     assert hook[-2] == '--preflight-job' and job['entry']['prelaunch']['required'] is True
@@ -1433,6 +1525,13 @@ def test_panels_alone_skip_the_baseline_and_prefill_lengths_reach_the_sweep(entr
             '--state', str(state2), '--panels', listed, '--prefill-lengths', '8192', '--dry-run'])
         assert cards.main() == 0
         assert json.loads(next(state2.glob('*/matrix.json')).read_text())['entries'][0].get('baseline') is expected
+
+
+def test_readiness_only_row_needs_no_report(entry, tmp_path):
+    job = make({**entry, 'profile': 'panels:', 'baseline': False}, tmp_path)
+    row = cards.summarize_job(job, 0)
+    assert 'expected one report' not in (row.get('error') or '')
+    assert not any('expected one report' in e for e in row.get('errors', []))
 
 
 def test_prefill_sweep_rows(entry, tmp_path):
@@ -1686,19 +1785,22 @@ def test_lossless_set_gate_fails_the_row_and_names_failing_cases(entry, tmp_path
     assert cards.summarize_job(job, 0)['lossless_set']['status'] == 'skipped'
 
 
-def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch):
+def test_context_load_options_reach_matrix(entry, tmp_path, monkeypatch, capsys):
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'context-state'
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
-        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--dry-run'])
+        '--state', str(state), '--panels', 'context_load', '--context-lengths', '32768,131072', '--context-levels', '1,8,16', '--context-suffix', '512', '--dry-run'])
     assert cards.main() == 0
     e = json.loads(next(state.glob('*/matrix.json')).read_text())['entries'][0]
     assert e['profile'] == 'panels:context_load' and e['baseline'] is False
     assert e['context_lengths'] == [32768, 131072] and e['context_levels'] == [1, 8, 16]
+    assert e['context_suffix'] == 512
+    assert 'context_suffix=512' in capsys.readouterr().out
 
 
 @pytest.mark.parametrize('option,value', [('--context-lengths', '255'), ('--context-lengths', '1048577'),
-    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8')])
+    ('--context-lengths', 'oops'), ('--context-levels', '0'), ('--context-levels', '257'), ('--context-levels', '8,8'),
+    ('--context-suffix', '-1'), ('--context-suffix', '1048577'), ('--context-suffix', 'oops')])
 def test_context_load_invalid_options_fail_before_hardware(entry, tmp_path, monkeypatch, option, value):
     kit = _kit(tmp_path, entry)
     monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix', '--arm', 'a=b:s',
@@ -2051,3 +2153,287 @@ seed_host=kakapo wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
 ''' + turn + '\nwip_seed_export_turn\necho unreachable'
     result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=10)
     assert result.returncode == 3 and 'die: no GPU export turn on kakapo' in result.stdout
+
+
+@pytest.mark.parametrize('stop', [None, 'TERM', 'INT', 'HUP'])
+def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, monkeypatch, stop):
+    import contextlib
+    import signal
+    events, smoke_envs = [], []
+    held = []
+    real_hold = cards.hwlock.hold
+    @contextlib.contextmanager
+    def hold(names, wait, *args, **kwargs):
+        assert not held
+        assert wait == 123
+        events.append('grant')
+        with real_hold(names, wait, *args, **kwargs):
+            held.extend(names)
+            try:
+                yield
+            finally:
+                events.append('release')
+                held.clear()
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    original_preflight = cards.preflight_at_grant
+    def at_grant(job, arm):
+        assert held == ['sparks', 'gpu0', 'gpu1']
+        events.append('prelaunch-' + job['arm'])
+        return original_preflight(job, arm)
+    monkeypatch.setattr(cards, 'preflight_at_grant', at_grant)
+    def finished(job):
+        assert held
+        events.append('teardown-' + job['arm'])
+        if stop:
+            cards.forward_stop(getattr(signal, 'SIG' + stop))
+            return 128 + getattr(signal, 'SIG' + stop)
+        return 0
+    argv = ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--interleave',
+            '--repeats', '2', '--arm', 'base=b:s', '--arm', 'cand=c:s', '--wait', '123',
+            '--state', str(tmp_path / 'state')]
+    rc, launched = _run_main(monkeypatch, argv, rc_for=finished, smoke_envs=smoke_envs)
+    assert rc == (128 + getattr(signal, 'SIG' + stop) if stop else 0)
+    expected = ['base'] if stop else ['base', 'cand', 'cand', 'base']
+    assert launched == ['v41-min/' + arm for arm in expected]
+    assert events == ['grant', *[event for arm in expected for event in ('prelaunch-' + arm, 'teardown-' + arm)], 'release']
+    assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1' for env in smoke_envs)
+    assert not held
+    locks = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
+    assert locks is not None
+    for handle in locks:
+        handle.close()
+
+
+@pytest.mark.parametrize('mode', ['legacy-full-build', 'native-phase'])
+def test_all_build_paths_finish_before_shared_serving_turn(entry, tmp_path, monkeypatch, mode):
+    import contextlib
+    events = []
+    @contextlib.contextmanager
+    def hold(*args, **kwargs):
+        assert events == ['build-base', 'build-cand']
+        events.append('grant')
+        yield
+        events.append('release')
+    def build(builds, arms, *args):
+        # Each build's own lock/export behavior is unchanged; never under the
+        # serving union, including old wip.sh's full-build hardware lock.
+        for name in builds:
+            assert 'grant' not in events
+            arms[name]['build_lock_mode'] = mode
+            events.append('build-' + name)
+    monkeypatch.setattr(cards, 'build_arms', build)
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    real_resolve = cards.resolve_launchers
+    monkeypatch.setattr(cards, 'resolve_launchers', lambda arms, repos, builds, *args:
+                        real_resolve(arms, repos, {}, *args))
+    argv = ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--interleave',
+            '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+            '--build', 'base=HEAD', '--build', 'cand=HEAD', '--state', str(tmp_path / 'state')]
+    assert _run_main(monkeypatch, argv)[0] == 0
+    assert events == ['build-base', 'build-cand', 'grant', 'release']
+
+
+def test_serving_lock_union_matches_smoke_rules():
+    import itertools
+    for gpus, hosts, exclusive, family in itertools.product(
+            ([0], [1], [0, 1]), ([], ['ostrich'], ['rhea'], ['moa'], ['rhea', 'moa']),
+            (None, False, True), ('deepseek_v41', 'glm5_flash')):
+        entry = dict(gpus=gpus, sparks=hosts, family=family)
+        if exclusive is not None:
+            entry['exclusive'] = exclusive
+        expected_exclusive = exclusive if exclusive is not None else family == 'deepseek_v41'
+        expected = []
+        if 0 in gpus or 'ostrich' in hosts or expected_exclusive:
+            expected.append('sparks')
+        expected += [f'gpu{gpu}' for gpu in (0, 1) if gpu in gpus or expected_exclusive]
+        expected += [host for host in ('rhea', 'moa') if host in hosts]
+        assert cards.serving_locks([dict(entry=entry)]) == expected
+
+
+def test_dry_run_prints_one_turn_after_builds(entry, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                        '--interleave', '--repeats', '2', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+                        '--state', str(tmp_path / 'state'), '--dry-run'])
+    assert cards.main() == 0
+    output = capsys.readouterr().out
+    assert output.count('single serving turn') == 1
+    assert 'hwlock --locks sparks,gpu0,gpu1 --wait 21600' in output
+    assert output.count('setsid ') == 4
+    assert not cards.hwlock.LOCK_DIR.exists()
+
+
+def test_stop_during_serving_turn_wait_does_not_launch(entry, tmp_path, monkeypatch):
+    import contextlib
+    import signal
+    @contextlib.contextmanager
+    def cancelled(*args, **kwargs):
+        cards.forward_stop(signal.SIGTERM)
+        assert kwargs['cancelled']()
+        raise cards.hwlock.Cancelled()
+        yield
+    monkeypatch.setattr(cards.hwlock, 'hold', cancelled)
+    rc, launched = _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                               '--matrix', '--arm', 'base=b:s', '--state', str(tmp_path / 'state')])
+    assert rc == 143 and not launched
+
+
+@pytest.mark.parametrize('sig', ['TERM', 'INT', 'HUP'])
+def test_real_stopped_smoke_tears_down_before_parent_unlocks(entry, tmp_path, monkeypatch, sig):
+    import signal
+    signum = getattr(signal, 'SIG' + sig)
+    job = make(entry, tmp_path)
+    smoke = [sys.executable, '-c', 'import pathlib,signal,sys,time,os\n'
+             f'd=pathlib.Path({str(tmp_path)!r})\n'
+             'def stop(n,_):\n    time.sleep(0.05); (d/"torn-down").touch(); sys.exit(128+n)\n'
+             'for n in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP): signal.signal(n,stop)\n'
+             '(d/"ready").write_text(os.environ["CUTEAFD_HW_LOCKS_HELD"])\n'
+             'while True: time.sleep(0.01)\n']
+    with cards.serving_turn([job], dict(os.environ), 5):
+        env = {**os.environ, 'CUTEAFD_HW_LOCKS_HELD': 'sparks,gpu0,gpu1'}
+        process = cards.detached(smoke, tmp_path / 'driver.log', tmp_path / 'exit', env)
+        try:
+            deadline = time.monotonic() + 10
+            while not (tmp_path / 'ready').exists():
+                assert time.monotonic() < deadline and process.poll() is None
+                time.sleep(0.01)
+            assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1']) is None
+            cards.forward_stop(signum)
+            assert cards.wait_detached(process, grace=5) == 128 + signum
+            assert (tmp_path / 'torn-down').exists()
+            assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1']) is None
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=5)
+    held = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
+    assert held is not None
+    for handle in held:
+        handle.close()
+
+
+def test_failed_teardown_prevents_next_arm(entry, tmp_path, monkeypatch):
+    finished = []
+    original = cards.wait_detached
+    def wait(process):
+        code = original(process)
+        finished.append('base')
+        return code
+    monkeypatch.setattr(cards, 'wait_detached', wait)
+    real_main = cards.main
+    def main():
+        def absent(job):
+            if finished:
+                raise ValueError('refusing existing (possibly foreign) container: leftover')
+        monkeypatch.setattr(cards, 'assert_absent', absent)
+        return real_main()
+    monkeypatch.setattr(cards, 'main', main)
+    with pytest.raises(ValueError, match='leftover'):
+        _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                   '--interleave', '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+                   '--state', str(tmp_path / 'state')])
+    assert finished == ['base']
+
+
+@pytest.mark.parametrize('value', ['0', '-1', 'nan', 'inf'])
+def test_serving_wait_must_be_positive_finite(monkeypatch, value):
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--wait', value])
+    with pytest.raises(SystemExit) as error:
+        cards.main()
+    assert error.value.code == 2
+
+
+def test_failed_build_never_takes_serving_turn(entry, tmp_path, monkeypatch):
+    def build(*args, **kwargs):
+        raise ValueError('build failed: base')
+    def forbidden(*args, **kwargs):
+        pytest.fail('a failed build must not queue for serving')
+    monkeypatch.setattr(cards, 'build_arms', build)
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    with pytest.raises(ValueError, match='build failed'):
+        _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                   '--matrix', '--arm', 'base=b:s', '--build', 'base=HEAD', '--state', str(tmp_path / 'state')])
+
+
+def test_serving_turn_preserves_inherited_locks(entry, tmp_path, monkeypatch):
+    import contextlib
+    requested = []
+    @contextlib.contextmanager
+    def hold(names, *args, **kwargs):
+        requested.append(names)
+        yield
+    monkeypatch.setattr(cards.hwlock, 'hold', hold)
+    env = {'CUTEAFD_HW_LOCKS_HELD': 'sparks.lock,gpu0.lock'}
+    with cards.serving_turn([make(entry, tmp_path)], env, 5):
+        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1'
+    assert requested == [['gpu1']]
+
+
+def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
+    argv = ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--matrix',
+            '--arm', 'base=b:s', '--state', str(tmp_path / 'state')]
+    assert _run_main(monkeypatch, argv)[0] == 0
+    def forbidden(*args, **kwargs):
+        pytest.fail('no pending jobs, so there must be no serving turn')
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    rc, launched = _run_main(monkeypatch, argv + ['--resume'])
+    assert rc == 0 and not launched
+
+
+def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
+    monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
+    job = make(entry, tmp_path)
+    with cards.hwlock.hold(['gpu1'], 1):
+        with pytest.raises(TimeoutError, match='no turn'):
+            with cards.serving_turn([job], {}, 0.02):
+                pytest.fail('a conflicting turn cannot be granted')
+    assert not list((cards.hwlock.LOCK_DIR / 'hwq').glob('*.ticket'))
+
+
+def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):
+    entries = [dict(entry, name='one', family='glm5_flash', gpus=[0], sparks=['ostrich'],
+                    set={'SPARK_COUNT': '1', 'ADDR': '0.0.0.0:8500', 'EXPERT_PORT': '19600'}),
+               dict(entry, name='two', family='glm5_flash', gpus=[1], sparks=['rhea', 'moa'],
+                    set={'SPARK_COUNT': '2', 'ADDR': '0.0.0.0:8501', 'EXPERT_PORT': '19601'})]
+    state = tmp_path / 'state'
+    seen = []
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(_kit(tmp_path, *entries)),
+                        '--cards', 'one', 'two', '--matrix', '--parallel', '2', '--arm', 'base=b:s',
+                        '--binary', sys.executable, '--state', str(state)])
+    monkeypatch.setattr(cards, 'slot_check', _fake_slot(packages=['fp8/fp8-glmf']))
+    monkeypatch.setattr(cards, 'assert_absent', lambda job: seen.append(('absent', job['card'])))
+    monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
+    def detached(cmd, log, exit_file, env):
+        assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1,rhea,moa'
+        assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1', 'rhea', 'moa']) is None
+        seen.append('launch')
+        exit_file.write_text('0\n')
+        return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)
+    monkeypatch.setattr(cards, 'detached', detached)
+    monkeypatch.setattr(cards, 'summarize_job', lambda job, code: dict(card=job['card'], arm=job['arm'],
+                          repeat=1, simulated=True, status='pass'))
+    monkeypatch.setattr(cards, 'write_summary', lambda *args: None)
+    assert cards.main() == 0
+    assert seen == ['launch', ('absent', 'one'), ('absent', 'two')]
+
+
+def test_null_exclusive_uses_smokes_family_default():
+    assert cards.serving_locks([{'entry': dict(family='deepseek_v41', exclusive=None, gpus=[1])}]) == [
+        'sparks', 'gpu0', 'gpu1']
+
+
+def test_cancelled_smoke_skips_remote_profile_collection(entry, tmp_path, monkeypatch):
+    import signal
+    real_main = cards.main
+    def main():
+        def forbidden(*args):
+            pytest.fail('remote postprocessing must not extend stop teardown')
+        monkeypatch.setattr(cards, 'summarize_job', forbidden)
+        return real_main()
+    monkeypatch.setattr(cards, 'main', main)
+    def stopped(job):
+        cards.forward_stop(signal.SIGTERM)
+        return 143
+    rc, launched = _run_main(monkeypatch, ['--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'],
+                          '--interleave', '--repeats', '1', '--arm', 'base=b:s', '--arm', 'cand=c:s',
+                          '--state', str(tmp_path / 'state')], rc_for=stopped)
+    assert rc == 143 and launched == ['v41-min/base']

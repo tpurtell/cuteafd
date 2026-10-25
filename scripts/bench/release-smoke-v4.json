@@ -6,8 +6,7 @@
     "run_timeout_s": 1800,
     "set": {
       "ENABLE_BENCH": "on",
-      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v4-rc",
-      "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+      "COORDINATOR_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-coordinator:REPLACE-ME-v4-rc"
     },
     "fabric": true
   },
@@ -41,7 +40,8 @@
         "SPARK_2_HOST": "REPLACE-ME-spark-2",
         "SPARK_2_LANE_A": "192.0.2.3",
         "SPARK_2_LANE_B": "198.51.100.3",
-        "SPECULATOR": "dspark"
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -86,7 +86,8 @@
         "SPARK_4_LANE_B": "198.51.100.5",
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
-        "SPARK_5_LANE_B": "198.51.100.6"
+        "SPARK_5_LANE_B": "198.51.100.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -110,7 +111,8 @@
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dspark"
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -147,7 +149,8 @@
         "SPARK_4_LANE_A": "192.0.2.5",
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
-        "SPECULATOR": "dspark"
+        "SPECULATOR": "dspark",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -171,7 +174,8 @@
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -214,7 +218,8 @@
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -238,7 +243,8 @@
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -262,7 +268,8 @@
         "SPARK_0_LANE_A": "192.0.2.1",
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -299,7 +306,8 @@
         "SPARK_4_LANE_A": "192.0.2.5",
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -347,7 +355,8 @@
         "SPARK_2_LANE_A": "192.0.2.3",
         "SPARK_3_HOST": "REPLACE-ME-spark-3",
         "SPARK_3_LANE_A": "192.0.2.4",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -377,7 +386,8 @@
         "SPARK_2_LANE_A": "192.0.2.3",
         "SPARK_3_HOST": "REPLACE-ME-spark-3",
         "SPARK_3_LANE_A": "192.0.2.4",
-        "SPECULATOR": "dflash2"
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -415,7 +425,8 @@
         "SPECULATOR": "dspark",
         "SPARK_3_HOST": "REPLACE-ME-spark-3",
         "SPARK_3_LANE_A": "192.0.2.4",
-        "SPARK_3_LANE_B": "198.51.100.4"
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -449,7 +460,8 @@
         "SPARK_2_LANE_B": "198.51.100.3",
         "SPECULATOR": "dspark",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -485,7 +497,8 @@
         "SPECULATOR": "dspark",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
         "EXPERT_BACKEND": "spark",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -521,7 +534,8 @@
         "SPECULATOR": "dflash2",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
         "EXPERT_BACKEND": "spark",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -557,7 +571,8 @@
         "SPECULATOR": "dflash2",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
         "EXPERT_BACKEND": "spark",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -593,7 +608,8 @@
         "SPECULATOR": "dflash2",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
         "EXPERT_BACKEND": "spark",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -629,7 +645,8 @@
         "SPECULATOR": "dflash2",
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
         "EXPERT_BACKEND": "spark",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -662,7 +679,8 @@
         "COORDINATOR_GPU_BUDGET_GIB": "31.8",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
-        "BENCH_HARDWARE_CLASS": "5090"
+        "BENCH_HARDWARE_CLASS": "5090",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       },
       "precheck": {
         "argv": [
@@ -704,7 +722,8 @@
         "SPARK_3_LANE_A": "192.0.2.4",
         "SPARK_3_LANE_B": "198.51.100.4",
         "ADDR": "0.0.0.0:8821",
-        "EXPERT_PORT": "20320"
+        "EXPERT_PORT": "20320",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -746,7 +765,8 @@
         "SPARK_4_LANE_B": "198.51.100.5",
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
-        "SPARK_5_LANE_B": "198.51.100.6"
+        "SPARK_5_LANE_B": "198.51.100.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -788,7 +808,8 @@
         "SPARK_4_LANE_B": "198.51.100.5",
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
-        "SPARK_5_LANE_B": "198.51.100.6"
+        "SPARK_5_LANE_B": "198.51.100.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -830,7 +851,8 @@
         "SPARK_4_LANE_B": "198.51.100.5",
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
-        "SPARK_5_LANE_B": "198.51.100.6"
+        "SPARK_5_LANE_B": "198.51.100.6",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -863,7 +885,8 @@
         "SPARK_2_LANE_B": "198.51.100.3",
         "SPARK_3_HOST": "REPLACE-ME-spark-3",
         "SPARK_3_LANE_A": "192.0.2.4",
-        "SPARK_3_LANE_B": "198.51.100.4"
+        "SPARK_3_LANE_B": "198.51.100.4",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -896,7 +919,8 @@
         "SPARK_3_LANE_A": "192.0.2.4",
         "SPARK_3_LANE_B": "198.51.100.4",
         "ADDR": "0.0.0.0:8826",
-        "EXPERT_PORT": "20420"
+        "EXPERT_PORT": "20420",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
       }
     },
     {
@@ -938,7 +962,24 @@
         "SPARK_5_LANE_A": "192.0.2.6",
         "SPARK_5_LANE_B": "198.51.100.6",
         "ADDR": "0.0.0.0:8827",
-        "EXPERT_PORT": "20440"
+        "EXPERT_PORT": "20440",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+      }
+    },
+    {
+      "name": "qwen35-9b-bf16-min",
+      "config": "examples/configs/qwen35-9b-bf16-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "SPECULATOR": "off",
+        "ADDR": "0.0.0.0:8830"
       }
     },
     {
@@ -954,7 +995,7 @@
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8828",
-        "EXPERT_PORT": "20460"
+        "SPECULATOR": "dspark"
       }
     },
     {
@@ -970,7 +1011,39 @@
         "COORDINATOR_GPU": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8829",
-        "EXPERT_PORT": "20480"
+        "SPECULATOR": "dspark"
+      }
+    },
+    {
+      "name": "qwen38-27b-bf16-min-nospec",
+      "config": "examples/configs/qwen38-27b-bf16-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8841",
+        "SPECULATOR": "off"
+      }
+    },
+    {
+      "name": "qwen38-27b-fp8-min-nospec",
+      "config": "examples/configs/qwen38-27b-fp8-min.config",
+      "family": "qwen3_5",
+      "gpus": [
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPU": "1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8842",
+        "SPECULATOR": "off"
       }
     }
   ],
@@ -979,99 +1052,99 @@
       "name": "glm53-nvfp4-max",
       "config": "examples/configs/glm53-nvfp4-max.config",
       "report": "benchmarks/glm5/2026-10-15-smoke-glm-5-3-nvfp4-2rtx-6spark-glm53-nvfp4-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-15",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "glm53f-nvfp4-max",
       "config": "examples/configs/glm53-flash-nvfp4-max.config",
       "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-nvfp4-2rtx-2spark-glm53f-nvfp4-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "glm53f-tr3-max",
       "config": "examples/configs/glm53-flash-tr3-max.config",
       "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-tr3-4bpw-2rtx-2spark-glm53f-tr3-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "mimo-pro-min",
       "config": "examples/configs/mimo-v26-pro-mxfp4-min.config",
       "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-pro-mopd-1rtx-6spark-mimo-pro-min",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "mimo26-flash-max",
       "config": "examples/configs/mimo-v26-flash-mxfp4-max.config",
       "report": "benchmarks/mimo_v2/2026-10-14-smoke-mimo-v2-6-flash-mopd-2rtx-4spark-mimo26-flash-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "qwen38-exl3-max",
       "config": "examples/configs/qwen38-exl3-min.config",
       "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-exl3-k4-25-ple-fp8-v1-2rtx-qwen38-exl3-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "qwen38-nvfp4-max",
       "config": "examples/configs/qwen38-nvfp4-min.config",
       "report": "benchmarks/qwen4/2026-10-14-smoke-qwen3-8-flash-next-nvfp4-2rtx-qwen38-nvfp4-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "v4-flash-max",
       "config": "examples/configs/deepseek-v4-flash-mxfp4-max.config",
       "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-flash-0731-2rtx-4spark-v4-flash-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "v4-pro-exl3-min",
       "config": "examples/configs/deepseek-v4-pro-exl3-min.config",
       "report": "benchmarks/deepseek_v4/2026-10-14-smoke-deepseek-v4-pro-0813-exl3-k2-calibrated-v1-1rtx-4spark-v4-pro-exl3-min",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "glm53f-fp8-min",
       "config": "examples/configs/glm53-flash-fp8-min.config",
       "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-1rtx-4spark-glm53f-fp8-min",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "glm53f-fp8-max",
       "config": "examples/configs/glm53-flash-fp8-max.config",
       "report": "benchmarks/glm5_flash/2026-10-14-smoke-glm-5-3-flash-2rtx-4spark-glm53f-fp8-max",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3 dev 2026-10-14",
+      "release_note": "Untagged v3 development build; date is the smoke report date."
     },
     {
       "name": "qwen38-nvfp4-min",
       "config": "examples/configs/qwen38-nvfp4-min.config",
       "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-min",
-      "release": "v3.0.0",
-      "release_note": "Exact final release commit."
+      "release": "v3.0.0-rc5",
+      "release_note": "Tagged build recorded by the report."
     },
     {
       "name": "qwen38-nvfp4-5090",
       "config": "examples/configs/qwen38-nvfp4-min.config",
       "report": "benchmarks/qwen4/2026-10-18-smoke-qwen3-8-flash-next-nvfp4-1rtx-2spark-qwen38-nvfp4-5090",
-      "release": "v3.0.0",
-      "release_note": "Nearest final release by Git graph distance; report is a development build, not a tagged release."
+      "release": "v3.0.0-rc4",
+      "release_note": "Tagged build recorded by the report."
     },
     {
       "name": "glm53f-exl3-v1",
       "config": "examples/configs/glm53-flash-exl3-min.config",
       "report": "benchmarks/glm5_flash/2026-10-18-smoke-glm-5-3-flash-exl3-k3-25-v1-1rtx-2spark-glm53f-exl3-5090",
-      "release": "v3.0.0",
-      "release_note": "Exact final release commit."
+      "release": "v3.0.0-rc5",
+      "release_note": "Tagged build recorded by the report."
     }
   ]
 }

@@ -213,6 +213,22 @@ pub fn scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, in
         .into_iter().map(|b| b.max(256).next_multiple_of(256)).sum()
 }
 
+/// Opt-in MX8 records are per prefill lane, never retained by decode lanes.
+pub fn a8_scratch_bytes(cfg: &crate::families::glm5::GlmDsaConfig, heads: usize, inter: usize, rows: usize) -> usize {
+    if rows <= 64 { return 0; }
+    let max_k = [cfg.hidden, cfg.q_lora_rank, heads * cfg.v_head_dim, inter].into_iter().max().unwrap_or(0);
+    (rows.div_ceil(16) * (max_k / 32) * 528).next_multiple_of(256)
+}
+
+/// One coordinator's native dense charge: decode scratch, plus every prefill lane's scratch and,
+/// with opt-in A8 prefill, its MX8 records. `cuteafd plan` and runtime admission both charge this.
+pub fn lane_charge_bytes(cfg: &crate::families::glm5::GlmDsaConfig, gpus: usize, decode_rows: usize,
+    prefill_rows: usize, lanes: usize, a8: bool) -> usize {
+    let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+    let a8 = if a8 { a8_scratch_bytes(cfg, heads, inter, prefill_rows) } else { 0 };
+    scratch_bytes(cfg, heads, inter, decode_rows) + lanes * (scratch_bytes(cfg, heads, inter, prefill_rows) + a8)
+}
+
 /// Read headers and tiny record tables only. The official checkpoint is not an input.
 impl DenseRecord {
     pub fn inventory(snapshot: &Path) -> Result<Vec<Self>> {
@@ -967,6 +983,30 @@ mod tests {
         f.write_all(&(bytes.len() as u64).to_le_bytes()).unwrap();
         f.write_all(&bytes).unwrap();
         f.write_all(&payload).unwrap();
+    }
+
+    #[test]
+    fn a8_lane_records_scale_with_rows_and_vanish_at_decode_width() {
+        let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
+        // TP2: widest K is o_proj's 32 heads x 256 = 8192; one MX8 record row is K/32 x 528 B per 16 rows.
+        let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
+        let full = a8_scratch_bytes(&cfg, heads, inter, 4096);
+        assert_eq!(full, 256 * (8192 / 32) * 528);
+        assert_eq!(a8_scratch_bytes(&cfg, heads, inter, 2048) * 2, full);
+        assert_eq!(a8_scratch_bytes(&cfg, heads, inter, 65), 5 * (8192 / 32) * 528);
+        for rows in [0, 1, 63, 64] {
+            assert_eq!(a8_scratch_bytes(&cfg, heads, inter, rows), 0, "{rows} rows");
+        }
+        // Full width: K 16384.
+        assert_eq!(a8_scratch_bytes(&cfg, cfg.heads, cfg.dense_intermediate, 4096), 256 * (16384 / 32) * 528);
+        // The shared lane charge is decode plus lanes x (prefill scratch [+ records]).
+        for (gpus, lanes) in [(1, 1), (2, 3)] {
+            let (heads, inter) = (cfg.heads / gpus, cfg.dense_intermediate / gpus);
+            let (decode, prefill) = (scratch_bytes(&cfg, heads, inter, 64), scratch_bytes(&cfg, heads, inter, 4096));
+            let a8 = a8_scratch_bytes(&cfg, heads, inter, 4096);
+            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, lanes, false), decode + lanes * prefill);
+            assert_eq!(lane_charge_bytes(&cfg, gpus, 64, 4096, lanes, true), decode + lanes * (prefill + a8));
+        }
     }
 
     #[test]

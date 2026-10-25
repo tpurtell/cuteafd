@@ -8,6 +8,36 @@ use crate::native_library_lifetime_fixture::Fixture;
 
 #[test]
 #[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
+fn symbols_resolve_once_and_optional_exports_stay_lazy() -> Result<()> {
+    let fixture = Fixture::build()?;
+    let library = fixture.load()?;
+    assert!(library.symbols.cuteafd_cuda_stream_query.get().is_none());
+    assert!(library.symbols.cuteafd_xgrammar_compile.get().is_none());
+    let first = library.cuteafd_cuda_stream_query()?;
+    let second = library.cuteafd_cuda_stream_query()?;
+    assert_eq!(first as usize, second as usize);
+    std::thread::scope(|scope| {
+        for _ in 0..8 {
+            let library = &library;
+            scope.spawn(move || assert_eq!(
+                library.cuteafd_cuda_stream_query().unwrap() as usize, first as usize));
+        }
+    });
+    // SAFETY: the CPU fixture accepts a null synthetic stream and writes ready.
+    assert!(!unsafe { library.cuda_stream_query(std::ptr::null_mut())? });
+    assert!(library.cuteafd_xgrammar_compile().is_err());
+    let first_error = library.symbols.cuteafd_xgrammar_compile.get().unwrap().as_ref().unwrap_err();
+    let error = library.cuteafd_xgrammar_compile().unwrap_err();
+    let cached_error = error.downcast_ref::<Arc<libloading::Error>>().unwrap();
+    assert!(Arc::ptr_eq(first_error, cached_error), "missing exports are cached too");
+    assert!(error.to_string().contains("cuteafd_xgrammar_compile"));
+    drop(library);
+    assert!(!fixture.resident()?, "the cache must not retain a healthy module");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires an allocated CPU build slot and explicit NVMe fixture directory"]
 fn ordered_upload_retains_each_source_until_its_copy_event() -> Result<()> {
     let fixture = Fixture::build()?;
     let library = fixture.load()?;

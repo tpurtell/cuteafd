@@ -149,10 +149,20 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
     for values, options in recorded:
         assert values[4] == tuple(map(int, bits))
         assert options["compile_only"] and options["compact_weights"]
-        assert options["tile"] == (64, 128, 64, 128)
-        assert not options.get("warp_specialized") and not options.get("wire_input")
-        rows = values[3]
-        assert options.get("route_block", 8) == package.route_block(geometry, rows)
+        assert not options.get("wire_input")
+        width, rows = values[1], values[3]
+        # The gate must export exactly the cell the packager claims: FC2 N128
+        # cooperative, or FC2 N256 with dynamic claims on a measured compact
+        # warp-specialized cell (GLM K4/K5 width 384 at 256/1024/2752/4096).
+        ws = package.compact_ws_export(geometry, "spark", width, rows, tuple(map(int, bits)))
+        assert bool(options.get("warp_specialized")) == ws
+        assert bool(options.get("ws_dynamic_tiles")) == ws
+        assert options["tile"] == (
+            package.ws_tile(geometry, "spark", width, rows, compact=True) if ws
+            else (64, 128, 64, 128))
+        assert options.get("route_block", 8) == (
+            package.compact_ws_route_block(geometry, "spark", width, rows) if ws
+            else package.route_block(geometry, rows))
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else
@@ -406,13 +416,14 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
         wire_input=lambda *_: False, ws_input_stages=lambda *_: None,
         ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
         decode_tile=lambda *_: None, activation=lambda *_: "silu",
+        default_decode_schedule=lambda *_: None,
     )
     for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
         setattr(package, name, lambda *_, name=name: name == rotation)
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *args, **kwargs: recorded.append((args, kwargs))))
-    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024",
+    compare_sm._export_exl3(["--geometry", "qwen4", "--capacities", "1024", "--role", "spark",
                             "--bits", ",".join(map(str, bits))], tmp_path)
     assert len(recorded) == 1
     assert recorded[0][0][4] == bits
@@ -431,29 +442,32 @@ def test_cpu_lut_override_covers_all_bindings_and_restores_on_error():
     assert [module._trellis256_execution_lut for module in (first, fourth)] == originals
 
 
-@pytest.mark.parametrize("geometry,compact", [("qwen4", True), ("glm", False)])
-def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, compact):
+@pytest.mark.parametrize("geometry,compact,role,bits", [
+    ("qwen4", True, "spark", (4, 5)), ("glm", False, "spark", (4, 5)),
+    ("glm", False, "coordinator", (4, 5)), ("glm", False, "coordinator", (3, 4)),
+    ("glmf", False, "spark", (3, 4)), ("glmf", False, "coordinator", (3, 4)),
+    ("glmf", False, "coordinator", (4, 5)),
+])
+def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compact, role, bits):
     fixture = compare_sm.load_file(
         "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
     package = fixture.package
-    # Exercise the compact WS branch before any profile is enabled in production.
-    monkeypatch.setattr(package, "compact_warp_specialized",
-                        lambda g, role, width, rows: g == "qwen4" and role == "spark"
-                        and width == 256 and rows >= 256)
-    capacities = (1, 80, 256, 4096)
+    # Compare the shipping cooperative compact route and its measured hint.
+    capacities = (1, 80, 256, 1024, 2752, 4096)
     build_root = tmp_path / "build-fixture"
     build_root.mkdir()
     _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
-        build_root, "spark", (4, 5), geometry=geometry,
+        build_root, role, bits, geometry=geometry,
         capacities=capacities, compact=compact,
-        profiles=() if compact else tuple(p[0] for p in package.profiles_for_role("spark", geometry)))
-    expected = {(call.args[1], call.args[3]): call.kwargs for call in calls
-                if bool(call.kwargs.get("compact_weights")) == compact}
+        profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
+    expected = {(call.args[0].parent.name.split('+')[0], call.args[3]): call.kwargs for call in calls
+                if bool(call.kwargs.get("compact_weights")) == compact
+                and not call.args[0].parent.name.endswith("+gb10")}
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
         export=lambda *values, **options: recorded.append((values, options))))
-    args = ["--geometry", geometry, "--bits", "4,5", "--role", "spark",
+    args = ["--geometry", geometry, "--bits", ",".join(map(str, bits)), "--role", role,
             "--capacities", ",".join(map(str, capacities))]
     if compact:
         args.append("--compact-companions")
@@ -461,8 +475,95 @@ def test_gate_options_match_real_spark_package(tmp_path, monkeypatch, geometry, 
     assert recorded
     for values, options in recorded:
         assert options.pop("compile_only") is True
-        assert options == expected[(values[1], values[3])]
-    assert any(options.get("warp_specialized") for _, options in recorded)
+        assert options == expected[(values[0].parent.name, values[3])]
+    if compact:
+        # Qwen4 compact now carries measured warp-specialized cells at the
+        # served capacities and keeps the cooperative kernel at decode ones;
+        # the gate must reproduce both streams.
+        assert any(options.get("warp_specialized") for _, options in recorded)
+        assert any(not options.get("warp_specialized") for _, options in recorded)
+        assert any(options.get("decode_schedule") == package.PURE_EVICT_FIRST for _, options in recorded)
+    else:
+        assert any(options.get("warp_specialized") for _, options in recorded) == (
+            role == "spark" or (geometry, bits) in (("glm", (4, 5)), ("glmf", (3, 4))))
+
+
+def test_exl3_routes_gate_covers_all_coordinator_route_blocks(tmp_path, monkeypatch):
+    package = compare_sm.load_file("test_routes_package", ROOT / "python/tools/aot/package_exl3_aot.py")
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    for geometry, expected in (
+        ("glm", [("m80", 80, 256, 8, 8), ("m256", 256, 256, 8, 64), ("m1024", 1024, 256, 8, 64)]),
+        ("glmf", [("m80", 80, 288, 8, 8), ("m256-b8", 256, 288, 8, 8),
+                  ("m256-b64", 256, 288, 8, 64), ("m1024", 1024, 288, 8, 64)]),
+    ):
+        recorded = []
+        monkeypatch.setitem(sys.modules, "export_b12x_exl3_routes_aot", SimpleNamespace(
+            export=lambda out, rows, experts, topk, block, rec=recorded:
+                rec.append((out.name, rows, experts, topk, block))))
+        compare_sm.export_exl3_routes(["--geometry", geometry, "--capacities", "80,256,1024"],
+                                      tmp_path / geometry)
+        assert recorded == expected
+
+
+# Measured quant of each family's coordinator warp-specialized exports: another
+# tier pair of the same geometry is a different kernel cost and stays
+# cooperative until it is measured (`WS_TIER_PAIRS`).
+COORDINATOR_TIERS = {"glm": (4, 5), "glmf": (3, 4), "qwen4": (4, 5), "v41": (3, 4),
+                     "dsv4p": (2, 3), "kimik3": (2, 3)}
+CELL_OPTIONS = {"route_block", "wire", "stages", "dynamic", "tile"}
+
+
+def coordinator_package():
+    return compare_sm.load_file("test_coordinator_package",
+                                ROOT / "python/tools/aot/package_exl3_aot.py")
+
+
+def test_coordinator_ws_cells_are_exportable():
+    package = coordinator_package()
+    assert package.COORDINATOR_WS_CELLS
+    for (geometry, width, capacity), cell in package.COORDINATOR_WS_CELLS.items():
+        assert set(cell) <= CELL_OPTIONS and "route_block" in cell
+        # Without the measured tiers the exporter would skip the cell silently.
+        assert (geometry, COORDINATOR_TIERS[geometry]) in package.WS_TIER_PAIRS
+        # A cell no shipped coordinator profile or capacity can name never runs.
+        assert width in {profile[1] for profile in package.profiles_for_role("coordinator", geometry)}
+        assert capacity in package.package_capacities(geometry, str(capacity))
+
+
+def test_coordinator_ws_options_follow_the_measured_cell():
+    package = coordinator_package()
+    for (geometry, width, capacity), cell in package.COORDINATOR_WS_CELLS.items():
+        role = "coordinator"
+        assert package.warp_specialized(geometry, role, width, capacity)
+        assert package.ws_route_block(geometry, role, width, capacity) == cell["route_block"]
+        assert package.wire_input(geometry, role, width, capacity) == bool(cell.get("wire"))
+        assert package.ws_input_stages(geometry, role, width, capacity) == cell.get("stages")
+        assert package.ws_dynamic_tiles(geometry, role, width, capacity) == bool(cell.get("dynamic"))
+        assert package.ws_tile(geometry, role, width, capacity) == cell.get("tile")
+
+
+def test_coordinator_ws_policy_is_table_driven():
+    package = coordinator_package()
+    capacities = (1, 80, 256, 1024, 2752, 4096)
+    for geometry in COORDINATOR_TIERS:
+        for _, width, *_ in package.profiles_for_role("coordinator", geometry):
+            for capacity in capacities:
+                assert package.warp_specialized(geometry, "coordinator", width, capacity) == (
+                    (geometry, width, capacity) in package.COORDINATOR_WS_CELLS)
+
+
+def test_coordinator_unmeasured_tier_pair_exports_cooperative(tmp_path):
+    fixture = compare_sm.load_file(
+        "gate_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
+    # GLM 5.3's coordinator cells are measured on K4/K5; the same width and
+    # capacity on K3 tiers is a different kernel cost and stays cooperative.
+    build_root = tmp_path / "build-fixture"
+    build_root.mkdir()
+    _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
+        build_root, "coordinator", (3, 4), geometry="glm", capacities=(1024,),
+        profiles=("rtx-tp2",))
+    assert calls
+    assert not any(call.kwargs.get("warp_specialized") for call in calls)
 
 
 def residency_gate(name="validate_table_residency"):

@@ -139,6 +139,11 @@ pub(crate) struct Pass<'a, R> {
     sampled: Option<SampledTargetRows>,
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     device_order: bool,
+    /// Device order a pass returns to after a one-pass override: on for the
+    /// two-RTX pass, off for the single-RTX pass (measured 2026-10-25, V4.1
+    /// 1 RTX + 3 Sparks: device-ordered verify 37.9 -> 38.3-39.1 ms, decode
+    /// 0.97-0.98x; 2 RTX + 6 Sparks: 25.8 -> 24.0 ms, decode 1.08-1.10x).
+    device_default: bool,
     /// The next pass may L2-prefetch during its exchanges ([`Self::set_l2_prefetch`]).
     l2_solo: bool,
 }
@@ -161,7 +166,7 @@ impl<'a, R> Pass<'a, R> {
     /// Select ordering once per pass, before borrowing its concrete resources.
     fn begin_chain(&mut self, enabled: bool) -> Result<Option<crate::shared::memory::chain::ChainHandle<'a>>> {
         if let Some(chain) = &self.chain {
-            chain.set_device_order(std::mem::replace(&mut self.device_order, true));
+            chain.set_device_order(std::mem::replace(&mut self.device_order, self.device_default));
         }
         let Some(chain) = self.chain.as_ref().filter(|_| enabled) else { return Ok(None) };
         // Cancellation may have left work queued on this owner.
@@ -171,13 +176,12 @@ impl<'a, R> Pass<'a, R> {
 
     fn drain_chain(&self) -> Result<()> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
-        if crate::shared::memory::chain::device_enabled() {
-            chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
-                error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
-        } else { chain.drain() }
+        chain.drain_bounded(Duration::from_secs(60)).map_err(|error|
+            error.context(format!("device lanes: {}", cuteafd_transport::expert::device_stuck_report())))
     }
 
-    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on; }
+    /// Device order for the next pass only, within this pass's default.
+    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on && self.device_default; }
     /// Whether the next pass may prefetch weights into L2 during its Spark
     /// exchanges (`--l2-prefetch`): only while the other lane is idle. Consumed
     /// by that pass, like the device order.
@@ -254,7 +258,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             state: State::Idle,
             sampled: None,
             chain,
-            device_order: true,
+            device_order: false,
+            device_default: false,
             l2_solo: true,
         })
     }
@@ -440,7 +445,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         // unscoped, so the chained work must be complete before returning.
         let drained = self.drain_chain();
         let result = result.and(drained).and_then(|()| transport.check_device());
-        if result.is_ok() && crate::shared::memory::chain::device_enabled() {
+        if result.is_ok() {
             // Device-ordered local layers left their captured routes in the router's ring.
             self.resources.lane.drain_route_ring()?;
         }
@@ -841,6 +846,7 @@ mod tests {
             sampled: None,
             chain: None,
             device_order: false,
+            device_default: true,
             l2_solo: true,
         };
         assert!(pass.begin_chain(false)?.is_none());
@@ -850,6 +856,10 @@ mod tests {
         assert!(pass.state.begin().is_err());
         pass.set_device_order(true);
         assert!(pass.device_order);
+        // A single-RTX pass stays host-ordered whatever a scheduler asks.
+        pass.device_default = false;
+        pass.set_device_order(true);
+        assert!(!pass.device_order);
         pass.set_l2_prefetch(false);
         assert!(!pass.l2_solo);
         Ok(())

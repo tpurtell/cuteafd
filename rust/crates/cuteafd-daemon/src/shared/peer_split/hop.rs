@@ -41,8 +41,7 @@ impl<'a> DirectInputHop<'a> {
         validate_direct_input_contract(source.id, destination.id, &[], spec)?;
         source.run(|| source.library.cuda_enable_peer(destination.id))?;
         destination.run(|| destination.library.cuda_enable_peer(source.id))?;
-        let sm = crate::shared::memory::chain::device_enabled()
-            .then(|| destination.run(|| destination.library.v41_peer_copy())).transpose()?;
+        let sm = Some(destination.run(|| destination.library.v41_peer_copy())?);
         Ok(Self {
             source,
             contract: spec,
