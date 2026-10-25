@@ -293,6 +293,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let e = self.engine;
         let w = self.work[0];
         let real = self.tables[0].exchange_rows;
+        let mut reply = None;
         let planes = match ticket {
             Ticket::Skip(ranks) => Some((e.skip.as_ref().context("skip")?.pointers(), ranks)),
             Ticket::Spark => match &mut self.transport {
@@ -300,6 +301,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                     let wave = e.layer_execution.as_ref().context("layer execution")?.waves.borrow_mut()[self.lane]
                         .take().context("missing dispatched Spark wave")?;
                     let ranks = runtime.block_on(e.moe_land(real, link, wave))?;
+                    reply = e.capture_reply(index, self.work, link.intake.pointers(), ranks, real, self.tables[0].decode)?;
                     e.reduce(link.intake.pointers(), w, ranks, real)?;
                     link.intake.consumed(e.stream)?;
                     None
@@ -312,6 +314,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                         .take().context("missing dispatched Spark wave")?;
                     let mut link = link.borrow_mut();
                     let ranks = runtime.block_on(e.moe_land(real, &mut link, wave))?;
+                    reply = e.capture_reply(index, self.work, link.intake.pointers(), ranks, real, self.tables[0].decode)?;
                     e.reduce(link.intake.pointers(), w, ranks, real)?;
                     link.intake.consumed(e.stream)?;
                     None
@@ -321,11 +324,19 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             Ticket::Complete => None,
         };
         if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
-        if e.width_taps.borrow().is_some() {
-            let bytes = real * e.cfg.hidden * 2;
-            let routes = w.router_host.borrow().bytes()[..real * e.cfg.topk * 8].to_vec();
-            let tap = super::WidthTap { layer: index, x: e.download(&w.x, bytes)?, routes, delta: e.download(&w.delta, bytes)? };
-            e.width_taps.borrow_mut().as_mut().unwrap().push(tap);
+        if e.width_taps.borrow().is_some() || reply.is_some() {
+            let rows = reply.as_ref().map_or(real, |r| r.residual.len() / (e.cfg.hidden * 2));
+            let bytes = rows * e.cfg.hidden * 2;
+            let all_routes = w.router_host.borrow();
+            let ids = real * e.cfg.topk * 4;
+            let take = rows * e.cfg.topk * 4;
+            let routes = [&all_routes.bytes()[..take], &all_routes.bytes()[ids..ids + take]].concat();
+            let tap = super::WidthTap { layer: index, x: e.download(&w.x, bytes)?, routes,
+                delta: e.download(&w.delta, bytes)?, reply };
+            if tap.reply.is_some() {
+                e.reply_capture.borrow_mut().as_mut().context("reply capture disabled")?.save(&tap, e.cfg.hidden)?;
+            }
+            if let Some(taps) = e.width_taps.borrow_mut().as_mut() { taps.push(tap); }
         }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
