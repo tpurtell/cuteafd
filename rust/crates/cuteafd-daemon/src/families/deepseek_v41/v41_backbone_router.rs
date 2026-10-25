@@ -99,7 +99,6 @@ impl<'a> BackboneRouterWeights<'a> {
             full_request: true,
             ready: None,
             origin: None,
-            wait: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(self.library)),
         })
     }
 }
@@ -363,8 +362,6 @@ pub(crate) struct BackboneRouterWave<'w, 'a> {
     full_request: bool,
     ready: Option<u32>,
     origin: Option<QueryBinding>,
-    /// The per-layer host wait (`--host-wait`: spin or a blocking-sync event).
-    wait: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
 }
 impl<'w, 'a> BackboneRouterWave<'w, 'a> {
     pub fn rebind(&mut self, weights: &'w BackboneRouterWeights<'a>) -> Result<()> {
@@ -396,11 +393,13 @@ impl BackboneRouterWave<'_, '_> {
     /// Whether this wave captures this layer's routes into its ring (no host
     /// read now): every remote layer, and local layers of device-ordered passes.
     /// Whether this layer's routes are read on the device only, so the router
-    /// need not complete on the host: device-ordered passes, unless
-    /// route-policy tracing reads a remote layer's routes from the staging.
+    /// need not complete on the host: remote layers (unless route-policy
+    /// tracing reads them from the staging) and, in device-ordered passes,
+    /// local layers. Requires an active chain (later stages join its head).
     fn device_read(&self) -> bool {
         let trace = tracing::enabled!(target: "cuteafd::route_policy", tracing::Level::DEBUG);
-        crate::shared::memory::chain::deferred() && (!self.full_request || self.ring_capture || !trace)
+        crate::shared::memory::chain::active() && if self.full_request { self.ring_capture || !trace }
+            else { crate::shared::memory::chain::deferred() }
     }
     pub fn ring_capture(&self) -> bool {
         self.ring_capture && (self.full_request || crate::shared::memory::chain::deferred())
@@ -442,8 +441,7 @@ impl BackboneRouterWave<'_, '_> {
         [self.b(0), self.b(1)]
     }
     fn synchronize(&self) -> Result<()> {
-        // SAFETY: the router's live stream, on the current device.
-        unsafe { self.wait.borrow_mut().wait(self.stream.raw) }
+        unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) }
     }
     fn invalidate(&mut self) {
         self.ready = None;
@@ -725,17 +723,18 @@ impl BackboneRouterWave<'_, '_> {
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         unsafe { self.ring_download(rows)?; }
-        // Inside a device-ordered pass every expert (local, or the shared
-        // exchange staging a remote request from the device) reads the routes
-        // on the device: later stages join the chain instead of the host
-        // waiting. A host-ordered pass (1 RTX) keeps this per-layer host wait
-        // (as before the exchange): its owners rebind each layer only after
-        // their streams completed (`LoadStream::require_complete`), which this
-        // wait, behind attention in the chain, proves; and a remote layer's
-        // request is posted as the router's graph downloaded it into pinned
-        // staging (`host_request`). A cold shape always completes on the
-        // host: its eager run precedes the capture. Route-policy tracing reads
-        // a remote layer's routes from the pinned staging on the host.
+        // Every expert that reads the routes on the device lets later stages
+        // join the chain instead of the host waiting here: local layers of a
+        // device-ordered pass, and every remote layer (the shared exchange
+        // stages its request from the device). A host-ordered pass (1 RTX)
+        // then host-waits once per remote layer at its collect, after the
+        // request, shared FFN and prefetch are queued; that wait, behind this
+        // router in the chain, is what its owners' per-layer rebinds rely on
+        // (`LoadStream::require_complete`). Local layers of a host-ordered
+        // pass keep this wait (their experts complete on the host). A cold
+        // shape always completes here: its eager run precedes the capture.
+        // Route-policy tracing reads routes from the pinned staging on the
+        // host, so it keeps the wait too.
         let device_read = self.device_read();
         if !cold && device_read {
             unsafe { crate::shared::memory::chain::finish(self.stream.library, self.stream.raw)?; }
@@ -904,33 +903,6 @@ impl RouterOutput<'_> {
         Ok((layout, [self.ids, self.routing, input]))
     }
 
-    /// A host-ordered pass's Spark request for this remote layer, built now
-    /// from the pinned staging the router's own graph downloaded into (its
-    /// host wait completed it), with the worker's builder: the same bytes,
-    /// posted without a second (device) staging copy. Rows past the pinned
-    /// staging (large prefill) hand the builder back to stage on the device.
-    ///
-    /// # Safety
-    /// This router execution completed on the host and nothing reuses its
-    /// pinned staging before the call returns.
-    pub unsafe fn host_request(&self, build: crate::shared::spark_waves::BuildRequest)
-        -> Result<std::result::Result<cuteafd_transport::ExpertProtocolV2Request, crate::shared::spark_waves::BuildRequest>> {
-        ensure!(self.full_request, "local router output has no remote request payload");
-        let width = request_hidden_format(self.request_nvfp4).1;
-        let hidden_bytes = self.rows as usize * width;
-        let bytes = hidden_bytes + self.rows as usize * 48;
-        if bytes > self.request_staging.bytes { return Ok(Err(build)); }
-        // SAFETY: the completed graph's D2H copies filled these bytes (caller contract).
-        let staging = unsafe { std::slice::from_raw_parts(self.request_staging.ptr.cast::<u8>(), bytes) };
-        let (hidden, routes) = staging.split_at(hidden_bytes);
-        let (ids, weights) = routes.split_at(self.rows as usize * 24);
-        let word = |b: &[u8], i: usize| u32::from_ne_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
-        let entries = (0..self.rows as usize * 6).map(|i| cuteafd_transport::ExpertProtocolV2RouteEntry {
-            row_index: (i / 6) as u32, expert_id: word(ids, i), gate_weight: f32::from_bits(word(weights, i)),
-        }).collect();
-        build(entries, bytes::Bytes::copy_from_slice(hidden)).map(Ok)
-    }
-
     /// The worker-side builder of this layer's Spark request: the same request
     /// bytes [`Self::expert_request`] builds on the host (one request id per
     /// call, taken now, in issue order), from the staged routes and wire rows.
@@ -1027,19 +999,21 @@ impl BackboneRouterWeights<'_> {
 
 #[cfg(test)]
 mod host_order_tests {
-    /// A host-ordered pass (1 RTX, not `chain::deferred`) keeps the layer
-    /// shape it had before the exchange: the router waits on the host (its
-    /// owners' rebinds check completed streams, `LoadStream::require_complete`),
-    /// the request posts as the router's graph downloaded it into pinned
-    /// staging (no device staging copy for the post to wait behind), and the
-    /// collect waits for the reply on the host before queueing the landing
-    /// (no stream blocked on a device wait through the round trip). V4.1 min
-    /// lost 6% at C16 with the device-staged post and device landing (#731).
+    /// A host-ordered pass (1 RTX, not `chain::deferred`) rebinds each owner
+    /// per layer only after a host check that its stream completed
+    /// (`LoadStream::require_complete`, exempt exactly when deferred). Its
+    /// remote layers' one host wait is the collect, after the reduce joined
+    /// the chain behind the router; local layers keep the router's host wait.
+    /// The collect waits for the reply on the host before queueing the
+    /// landing (no stream blocked on a device wait through the round trip:
+    /// V4.1 min C16 lost 6% with the router waiting in front of the request
+    /// and the landing queued as a device wait, #731).
     #[test]
-    fn host_ordered_passes_post_from_the_router_and_land_after_the_reply() {
+    fn host_ordered_passes_wait_once_per_layer_after_issuing_it() {
         let router = include_str!("v41_backbone_router.rs");
         let read = router.split("fn device_read(&self) -> bool {").nth(1).unwrap().split("\n    }\n").next().unwrap();
-        assert!(read.contains("crate::shared::memory::chain::deferred() &&"), "{read}");
+        assert!(read.contains("crate::shared::memory::chain::active() && if self.full_request { self.ring_capture || !trace }")
+            && read.contains("else { crate::shared::memory::chain::deferred() }"), "{read}");
         assert!(router.contains("if !cold && device_read {") && router.contains("self.stream.wait().await?;"));
         let memory = include_str!("../../shared/memory.rs");
         let complete = memory.split("pub(crate) fn require_complete(&self)").nth(1).unwrap().split("\n    }\n").next().unwrap();
@@ -1050,13 +1024,12 @@ mod host_order_tests {
         let coordinator = include_str!("v41_experts/coordinator.rs");
         let dispatch = coordinator.split("pub(crate) unsafe fn dispatch_ffn<'w>(").nth(1).unwrap()
             .split("\n    }\n").next().unwrap();
-        let host = dispatch.find("if crate::shared::memory::chain::deferred() { build } else {").expect("host-ordered branch");
-        let post = dispatch.find("send_request(request)").unwrap();
-        let staged = dispatch.find("exchange.send(routed.rows as usize, layout, sources, stage, build)").unwrap();
-        assert!(host < post && post < staged, "host-ordered passes post the host-built request before any device staging");
+        assert!(dispatch.contains("crate::shared::memory::chain::join(self.library, stage)?;")
+            && dispatch.contains("exchange.send(routed.rows as usize, layout, sources, stage, build)"));
         let collect = coordinator.split("async unsafe fn finish_values(").nth(1).unwrap().split("\n    }\n").next().unwrap();
         let landed = collect.find("while !exchange.landed(&self.ticket)").expect("host-ordered collect waits for the reply");
         let land = collect.find("exchange.land(self.ticket, self.stream.raw)").unwrap();
-        assert!(landed < land, "reply wait, then landing and reduce");
+        let drain = collect.find("if host_ordered && crate::shared::memory::chain::active() {").unwrap();
+        assert!(landed < land && land < drain, "reply wait, then landing and reduce, then the layer's stream wait");
     }
 }

@@ -357,23 +357,6 @@ impl<'a> NativeTp4Wave<'a> {
         ensure!(routed.rows > 0 && routed.rows <= capacity, "native dispatched FFN rows exceed capacity");
         let (binding, build) = routed.request_builder(placement, rows,
             self.native.as_ref().map(|(_, planner)| std::sync::Arc::clone(planner)))?;
-        // A host-ordered pass (1 RTX) waited for the router on the host, whose
-        // graph downloaded the request into pinned staging: post it as built
-        // there (as before the exchange), not through a second, device-side
-        // staging copy behind which the post would wait.
-        let build = if crate::shared::memory::chain::deferred() { build } else {
-            // SAFETY: the router completed on the host (its host wait in a
-            // host-ordered pass) and its staging is not reused before the next layer.
-            match unsafe { routed.host_request(build)? } {
-                Ok(request) => {
-                    let ticket = self.link.exchange()?.send_request(request)?;
-                    return Ok(NativePendingFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
-                        library: self.library, stream: &self.stream, link: &mut self.link, output: self.output.buffer,
-                        ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() });
-                }
-                Err(build) => build,
-            }
-        };
         let (layout, sources) = routed.wave_sources()?;
         // Stage on this wave's own stream when the router shares its GPU: the
         // lane's owners (the router among them) then carry nothing past their
@@ -490,11 +473,11 @@ impl<'w> NativePendingFfn<'w, '_> {
         let slot = self.ticket.slot();
         let exchange = self.link.exchange()?;
         // A host-ordered pass (1 RTX) collects as before the exchange: the
-        // host waits for the reply here, where the layer's request, shared
-        // FFN and L2 prefetch are already issued, and only then queues the
-        // landing and reduce, so no stream sits blocked on a device wait
-        // through the round trip. A device-ordered pass queues them at once
-        // (the device waits).
+        // host waits for the reply here, where everything this layer can
+        // issue (router, staging, shared FFN, L2 prefetch) is already queued,
+        // and only then queues the landing and reduce, so no stream sits
+        // blocked on a device wait through the round trip. A device-ordered
+        // pass queues them at once (the device waits).
         let host_ordered = !crate::shared::memory::chain::deferred();
         if host_ordered {
             // `--host-wait block` spins briefly before it sleeps: a reply
@@ -520,6 +503,14 @@ impl<'w> NativePendingFfn<'w, '_> {
         } else {
             // SAFETY: the same stream owns the reduction and its inputs.
             unsafe { crate::shared::memory::chain::finish(self.library, self.stream.raw)? };
+        }
+        if host_ordered && crate::shared::memory::chain::active() {
+            // The layer's one host wait for its streams: the reduce joined the
+            // chain head (attention, router, shared FFN), so its completion is
+            // what the next layer's rebinds check (`require_complete`).
+            if cooperative { self.stream.wait().await?; }
+            // SAFETY: this owner's live stream.
+            else { unsafe { self.library.cuda_stream_synchronize(self.stream.raw)? }; }
         }
         tracing::debug!(target: "cuteafd::timing", layer = self.layer, rows,
             collect_us = timing.elapsed().as_micros() as u64, "target collection");
