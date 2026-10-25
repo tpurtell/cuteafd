@@ -41,7 +41,7 @@ pub fn validate(spec: &ProgramSpec) -> Result<(), ManifestError> {
     // the compact-unit routed variants are accepted here.
     if spec.name == "exlr8_a16_serving" {
         let variant = spec.geometry.get("serving_variant").and_then(|v| v.as_str());
-        if !matches!(variant, Some("k1_compact_prefetch" | "k1_paired_fc1" | "k1_k23_coalesced"))
+        if !matches!(variant, Some("k1_k23_coalesced"))
         {
             return Err(invalid("routed serving requires a declared compact-unit variant"));
         }
@@ -537,7 +537,7 @@ mod tests {
         assert!(validate(&s).is_err());
         s.geometry["serving_variant"] = serde_json::json!("k1_k23_coalesced");
         validate_entry(&s, &e).unwrap();
-        for variant in ["baseline", "k1_unknown", ""] {
+        for variant in ["baseline", "k1_compact_prefetch", "k1_paired_fc1", "k1_reg_pair_b2", "k1_unknown", ""] {
             let mut bad = s.clone();
             bad.geometry["serving_variant"] = serde_json::json!(variant);
             assert!(validate(&bad).is_err(), "{variant}");
