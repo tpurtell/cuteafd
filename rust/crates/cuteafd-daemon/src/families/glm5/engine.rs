@@ -1699,7 +1699,24 @@ impl<'a> GlmEngine<'a> {
             if let Some(probe) = self.draft_probe.borrow_mut().as_mut().filter(|p| p.active()) {
                 probe.staged(index, &staging.bytes()[..t * self.cfg.topk * 4]);
             }
-            expert_request(staging.bytes(), index, t, self.cfg.hidden, self.cfg.topk, decode, self.spark_bf16)?
+            let (h, topk) = (self.cfg.hidden, self.cfg.topk);
+            let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+                if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
+            // Prefill rows go out zero-copy from the link's registered egress
+            // slot for this wave (one copy here, none per rank); small waves
+            // and links without egress keep their own payload copy.
+            let wire = match transport.egress(layout.wire_bytes)? {
+                Some(target) => {
+                    // SAFETY: `egress` returned this wave's slot, which no
+                    // request views and no send reads any more; it holds at
+                    // least `wire_bytes`, and nothing else writes it.
+                    let slot = unsafe { std::slice::from_raw_parts_mut(target.ptr.cast::<u8>(), layout.wire_bytes) };
+                    copy_parallel(slot, layout.wire(staging.bytes())?);
+                    transport.egress_payload(layout.wire_bytes)?
+                }
+                None => layout.wire(staging.bytes())?.to_vec().into(),
+            };
+            expert_request_with(staging.bytes(), index, t, h, topk, decode, self.spark_bf16, wire)?
         };
         self.exchange_host.borrow_mut()[2] += timer.elapsed().as_secs_f64();
         let post = std::time::Instant::now();
@@ -2415,13 +2432,24 @@ pub(crate) const DEFAULT_PREFILL_SPAN_ROWS: usize = cuteafd_loader::plan::layout
 #[allow(clippy::too_many_arguments)]
 fn expert_request(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool,
     bf16: bool) -> Result<ExpertProtocolV2Request> {
+    let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
+        if bf16 { h * 2 } else { h + h / 32 })?;
+    let mut wire = vec![0u8; layout.wire_bytes];
+    copy_parallel(&mut wire, layout.wire(staged)?);
+    expert_request_with(staged, index, t, h, topk, decode, bf16, wire.into())
+}
+
+/// [`expert_request`] whose wire rows are `wire` (an egress slot's view, or
+/// a copy of the staged rows); routes come from the staging.
+#[allow(clippy::too_many_arguments)]
+fn expert_request_with(staged: &[u8], index: usize, t: usize, h: usize, topk: usize, decode: bool,
+    bf16: bool, wire: bytes::Bytes) -> Result<ExpertProtocolV2Request> {
     let kind = if decode { ExpertV2SourceKind::Decode } else { ExpertV2SourceKind::Prefill };
     let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
         if bf16 { h * 2 } else { h + h / 32 })?;
+    ensure!(wire.len() == layout.wire_bytes, "expert wire payload differs from the staged rows");
     let routes = layout.routes(staged)?;
-    let mut wire = vec![0u8; layout.wire_bytes];
-    copy_parallel(&mut wire, layout.wire(staged)?);
-    let mut request = ExpertProtocolV2Request::new(index as u64 + 1, 17, index as u32, h as u32,
+    let mut request = ExpertProtocolV2Request::new_bytes(index as u64 + 1, 17, index as u32, h as u32,
         if bf16 { ExpertV2Dtype::Bf16 } else { ExpertV2Dtype::Fp8E4m3Ue8m0K32 },
         (0..t as u32).map(|row| ExpertProtocolV2RowDescriptor {
             row_id: u64::from(row), source_kind: kind, source_request_id: 1,

@@ -46,6 +46,44 @@ const VERBS_HOST_RECV_WR_ID: u64 = 0x7256_1001;
 /// cut, 0.953 / 0.962 of p8); MiMo V2.6 Pro's 26 MB waves still gain.
 const PARALLEL_REQUEST_COPY_BYTES: usize = 16 << 20;
 
+/// Retires the `count` oldest posted request sends (send CQEs complete in
+/// post order on one QP).
+fn complete_sends(sends: &mut VecDeque<Option<usize>>, count: usize) -> Result<()> {
+    anyhow::ensure!(count <= sends.len(), "{count} request send completions with {} in flight", sends.len());
+    sends.drain(..count);
+    Ok(())
+}
+
+#[cfg(test)]
+mod request_send_tests {
+    use super::*;
+
+    /// Rewriting egress slot `w % N` waits only for wave `w - N`'s sends,
+    /// never for the other waves still on the wire.
+    #[test]
+    fn egress_slot_reuse_waits_only_for_its_own_readers() -> Result<()> {
+        for depth in [2usize, 3, 4] {
+            let mut sends = VecDeque::new();
+            for sequence in 0..4096usize {
+                let slot = sequence % depth;
+                // Before rewriting `slot`, drain only its readers: exactly the
+                // oldest send (wave `sequence - depth`).
+                let before = sends.len();
+                while sends.iter().any(|&reads| reads == Some(slot)) { complete_sends(&mut sends, 1)?; }
+                assert_eq!(before - sends.len(), usize::from(sequence >= depth));
+                // Every other wave's send is still in flight.
+                assert_eq!(sends.len(), sequence.min(depth - 1));
+                sends.push_back(Some(slot));
+            }
+        }
+        let mut sends = VecDeque::from([Some(0), None]);
+        assert!(complete_sends(&mut sends, 3).is_err());
+        complete_sends(&mut sends, 2)?;
+        assert!(sends.is_empty());
+        Ok(())
+    }
+}
+
 /// `dst.copy_from_slice(src)` split over eight threads.
 fn copy_threads(dst: &mut [u8], src: &[u8]) {
     let chunk = src.len().div_ceil(8).next_multiple_of(4096);
@@ -1796,7 +1834,10 @@ struct VerbsHostProtocolV2PersistentClientSession {
     request_ring: VerbsHostRdmaRing,
     response_ring: VerbsHostRdmaRing,
     request_send_sequence: usize,
-    request_send_in_flight: usize,
+    /// Request sends posted and not yet completed, oldest first: the
+    /// registered egress slot each one reads (`None`: its own ring copy).
+    /// Send CQEs on one QP complete in post order.
+    request_sends: VecDeque<Option<usize>>,
     response_recv_sequence: usize,
     request_frame: ExpertProtocolV2FrameBuffer,
     response_frame_pool: Vec<Vec<u8>>,
@@ -2254,7 +2295,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             request_ring,
             response_ring,
             request_send_sequence: 0,
-            request_send_in_flight: 0,
+            request_sends: VecDeque::new(),
             response_recv_sequence: 0,
             request_frame: ExpertProtocolV2FrameBuffer::with_capacity(request_capacity_wire_bytes),
             response_frame_pool: vec![Vec::new()],
@@ -2365,26 +2406,28 @@ impl VerbsHostProtocolV2PersistentClientSession {
                 self.response_capacity_wire_bytes.min(config.max_frame_bytes)
             );
         }
-        if self.request_send_in_flight == self.request_ring.depth {
+        if self.request_sends.len() == self.request_ring.depth {
             let stats = self
                 .endpoint
                 .poll_stats(1, 0, config.timeout)
                 .context("waiting for a persistent verbs-host request send slot")?;
             let send_completions = stats.send_completions as usize;
             anyhow::ensure!(
-                send_completions > 0 && send_completions <= self.request_send_in_flight,
+                send_completions > 0 && send_completions <= self.request_sends.len(),
                 "persistent verbs-host reclaimed {send_completions} sends with {} in flight",
-                self.request_send_in_flight
+                self.request_sends.len()
             );
-            self.request_send_in_flight -= send_completions;
+            complete_sends(&mut self.request_sends, send_completions)?;
         }
         let send_started = timing_enabled.then(Instant::now);
         let request_send_slot = self.request_send_sequence % self.request_ring.depth;
         let offset = self.request_ring.slot_offset(self.request_send_sequence);
         let egress = self.egress.as_ref()
-            .and_then(|(buffer, region)| Some((*region, buffer.offset_of(&request.hidden_payload)?)))
+            .and_then(|(buffer, region)| Some((*region, buffer.offset_of(&request.hidden_payload)?,
+                buffer.slot_of(buffer.offset_of(&request.hidden_payload)?))))
             .filter(|_| !request.hidden_payload.is_empty());
-        if let Some((region, payload_offset)) = egress {
+        let egress_slot = egress.map(|(_, _, slot)| slot);
+        if let Some((region, payload_offset, _)) = egress {
             // Zero-copy: the header from this session's slot, the payload
             // straight from the shared registered request buffer.
             let view = self.endpoint.send_buffer_view()?;
@@ -2428,7 +2471,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             )?;
         }
         self.request_send_sequence = self.request_send_sequence.wrapping_add(1);
-        self.request_send_in_flight += 1;
+        self.request_sends.push_back(egress_slot);
         Ok(VerbsHostProtocolV2ChunkSubmissionTiming {
             total_started,
             encode_ms,
@@ -2446,14 +2489,30 @@ impl VerbsHostProtocolV2PersistentClientSession {
     /// Waits until every request this session posted has left (its send
     /// completed), so a shared egress buffer may be rewritten.
     fn drain_request_sends(&mut self, config: &TcpTransportConfig) -> Result<()> {
+        self.drain_request_sends_while(config, |sends| !sends.is_empty())
+    }
+
+    /// Waits only for the sends that still read registered egress `slot`, so
+    /// rewriting a wave's slot never waits for the other waves on the wire.
+    fn drain_egress_reads(&mut self, slot: usize, config: &TcpTransportConfig) -> Result<()> {
+        self.drain_request_sends_while(config, |sends| sends.iter().any(|&reads| reads == Some(slot)))
+    }
+
+    fn drain_request_sends_while(&mut self, config: &TcpTransportConfig,
+        busy: impl Fn(&VecDeque<Option<usize>>) -> bool) -> Result<()> {
         let started = Instant::now();
-        while self.request_send_in_flight > 0 {
-            let stats = self.endpoint.try_poll(self.request_send_in_flight as u32, 0)?;
+        while busy(&self.request_sends) {
+            let stats = self.endpoint.try_poll(self.request_sends.len() as u32, 0)?;
             anyhow::ensure!(stats.recv_completions == 0, "request send drain consumed a response");
-            self.request_send_in_flight -= (stats.send_completions as usize).min(self.request_send_in_flight);
+            self.complete_request_sends(stats.send_completions as usize)?;
             anyhow::ensure!(started.elapsed() < config.timeout, "request sends never completed");
         }
         Ok(())
+    }
+
+    /// Send CQEs retire the oldest posted sends.
+    fn complete_request_sends(&mut self, count: usize) -> Result<()> {
+        complete_sends(&mut self.request_sends, count)
     }
 
     fn try_progress_chunk_requests(
@@ -2479,7 +2538,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
         }
         let poll_started = timing_enabled.then(Instant::now);
         let stats = self.endpoint.try_poll(
-            self.request_send_in_flight as u32,
+            self.request_sends.len() as u32,
             self.response_ring.depth as u32,
         )?;
         if let Some(front) = pending.front_mut() {
@@ -2501,7 +2560,7 @@ impl VerbsHostProtocolV2PersistentClientSession {
             let stats = harvester.wait_for_response(
                 &self.endpoint,
                 waiter,
-                self.request_send_in_flight as u32,
+                self.request_sends.len() as u32,
                 self.response_ring.depth as u32,
                 config.timeout,
             )?;
@@ -2534,14 +2593,14 @@ impl VerbsHostProtocolV2PersistentClientSession {
         stats: CuteafdRdmaRcCompletionStats,
     ) -> Result<()> {
         let send_completions = stats.send_completions as usize;
-        if send_completions > self.request_send_in_flight {
+        if send_completions > self.request_sends.len() {
             bail!(
                 "persistent verbs-host observed {} send completions with only {} sends in flight",
                 send_completions,
-                self.request_send_in_flight
+                self.request_sends.len()
             );
         }
-        self.request_send_in_flight -= send_completions;
+        self.complete_request_sends(send_completions)?;
         for _ in 0..stats.recv_completions {
             self.accept_chunk_response_frame(pending, config)?;
         }

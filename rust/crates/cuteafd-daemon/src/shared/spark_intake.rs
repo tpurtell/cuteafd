@@ -961,6 +961,55 @@ mod intake_reset_tests {
         Ok(())
     }
 
+    /// GPU landing with N wave slots: the NIC writes response `k` into the
+    /// landing slot of the `k`-th posted receive WQE, and native posts rotate
+    /// slots in post order (`RdmaLandingSlots`), including the ring-depth
+    /// receives posted at connect. The intake reads wave `k` from
+    /// `receive_slot`. Every response must land in its own wave's slot, and
+    /// never in a slot whose previous wave is not consumed yet.
+    #[test]
+    fn gpu_landing_slots_follow_waves_and_never_overwrite_unconsumed_planes() -> Result<()> {
+        for waves in 2..=4usize {
+            for ring_depth in [1usize, 2, 3, 8] {
+                let state = IntakeState::new(waves);
+                // Initial receive WQEs: WQE `i` carries landing slot `i % waves`.
+                let mut wqe_slots: std::collections::VecDeque<usize> = (0..ring_depth).map(|i| i % waves).collect();
+                let mut posted = ring_depth;
+                // Wave k's planes hold unconsumed data until its reduce.
+                let mut unconsumed = vec![None::<usize>; waves];
+                let mut in_flight = std::collections::VecDeque::new();
+                for sequence in 0..4096usize {
+                    // Dispatch (at most `waves` outstanding), FIFO like the prefill schedule.
+                    let slot = state.dispatch_slot.get();
+                    state.before_dispatch(|reused| {
+                        assert_eq!(reused, slot);
+                        // The consumed fence: the slot's previous wave was reduced.
+                        unconsumed[reused] = None;
+                        Ok(())
+                    }, || Ok(()))?;
+                    assert!(unconsumed[slot].is_none(), "dispatch into slot {slot} before its reduce");
+                    in_flight.push_back((sequence, slot));
+                    if in_flight.len() < waves && sequence + 1 < 4096 { continue; }
+                    // The oldest wave's response consumes the oldest WQE.
+                    let (wave, dispatched_into) = in_flight.pop_front().unwrap();
+                    let landed_in = wqe_slots.pop_front().unwrap();
+                    assert_eq!(landed_in, wave % waves, "{waves} slots, depth {ring_depth}: wave {wave}");
+                    assert_eq!(landed_in, dispatched_into);
+                    assert!(unconsumed[landed_in].is_none(), "wave {wave} overwrote unconsumed planes");
+                    unconsumed[landed_in] = Some(wave);
+                    // Repost: the next WQE takes the next landing slot.
+                    wqe_slots.push_back(posted % waves);
+                    posted += 1;
+                    // The intake reads the same slot, then the reduce consumes it.
+                    assert_eq!(state.receive_slot.get(), landed_in);
+                    state.receive_slot.set((landed_in + 1) % waves);
+                    state.consumed_pending[landed_in].set(true);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn failed_dispatch_fence_keeps_sources_and_dispatch_phase() -> Result<()> {
         for depth in [2, 3] {
