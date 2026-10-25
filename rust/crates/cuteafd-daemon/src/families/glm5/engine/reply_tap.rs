@@ -97,6 +97,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reply_tap_saves_all_planes_and_refuses_nonempty_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut capture = ReplyCapture::new(dir.path().to_path_buf(), vec![4], 1, 1024).unwrap();
+        let tap = WidthTap { layer: 4, x: vec![1, 2], routes: vec![3; 8], delta: vec![4, 5],
+            reply: Some(ReplyTap { partials: vec![vec![6, 7]; 6], shared: vec![vec![8, 9]; 2],
+                residual: vec![10, 11], real_rows: 8, decode: false }) };
+        capture.save(&tap, 1).unwrap();
+        let path = dir.path().join("tap-00000-layer04");
+        for rank in 0..6 {
+            assert_eq!(std::fs::read(path.join(format!("rank{rank}.bin"))).unwrap(), [6, 7]);
+        }
+        for rank in 0..2 {
+            assert_eq!(std::fs::read(path.join(format!("shared{rank}.bin"))).unwrap(), [8, 9]);
+        }
+        assert_eq!(std::fs::read(path.join("residual.bin")).unwrap(), [10, 11]);
+        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta["rows"], 1);
+        assert_eq!(meta["real_rows"], 8);
+        assert_eq!(meta["ranks"], 6);
+        assert_eq!(meta["shared_ranks"], 2);
+        assert_eq!(meta["tensor_bytes"], capture.written);
+        assert_eq!(capture.next, 1);
+        assert!(ReplyCapture::new(dir.path().to_path_buf(), vec![4], 1, 1024).is_err());
+    }
+
+    #[test]
     fn reply_tap_selection_and_budget_are_bounded() {
         let mut capture = ReplyCapture { dir: PathBuf::new(), layers: vec![4, 8], rows: 3,
             max_bytes: 1, written: 0, next: 0 };

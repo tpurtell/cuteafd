@@ -467,7 +467,7 @@ pub(crate) struct GoldenArgs {
     #[arg(long, value_delimiter = ',')]
     pub width_invariance: Vec<usize>,
     /// Diagnostic only: save landed Spark replies and existing width taps. Uses
-    /// tokens.bin only, cycling it for --prefill rows on --sequences fresh prompts.
+    /// contiguous tokens.bin windows of --prefill + --generate tokens per sequence.
     #[arg(long, requires = "reply_layers")]
     pub reply_capture: Option<PathBuf>,
     /// Subset of layers to download for --reply-capture (comma-separated).
@@ -1477,17 +1477,20 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
         ensure!(transport.is_some() && engine.layers_kv(), "reply capture requires real Sparks and two-GPU layers attention placement");
         ensure!(args.reply_layers.iter().all(|&l| l < engine.cfg.layers), "reply tap layer out of range");
         *engine.reply_capture.borrow_mut() = Some(engine::reply_tap::ReplyCapture::new(
-            dir.clone(), args.reply_layers.clone(), args.reply_rows, 28 * (1usize << 30))?);
+            dir.clone(), args.reply_layers.clone(), args.reply_rows, 28_000_000_000)?);
         let raw = std::fs::read(args.golden.join("tokens.bin"))?;
         ensure!(raw.len() % 4 == 0 && !raw.is_empty(), "invalid capture tokens.bin");
         let tokens: Vec<u32> = raw.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
         let prefill = args.prefill.unwrap_or(8192);
         let decode = args.generate.unwrap_or(16);
         let prompts = args.sequences.unwrap_or(3);
-        ensure!(prefill > 0 && prompts > 0 && prefill + decode <= engine.max_context, "invalid reply capture extent");
+        let extent = prefill.checked_add(decode).context("reply capture extent overflow")?;
+        ensure!(prefill > 0 && prompts > 0 && extent <= engine.max_context, "invalid reply capture extent");
+        let required = extent.checked_mul(prompts).context("reply capture token count overflow")?;
+        ensure!(tokens.len() >= required, "reply capture needs {required} contiguous tokens, got {}", tokens.len());
         let mut allocator = engine::PageAllocator::new(engine);
         for prompt in 0..prompts {
-            let input: Vec<u32> = tokens.iter().copied().cycle().skip(prompt * 127).take(prefill + decode).collect();
+            let input = &tokens[prompt * extent..(prompt + 1) * extent];
             let mut placement = allocator.admit(input.len())?;
             for chunk in input[..prefill].chunks(engine.prefill_capacity()) {
                 engine.prefill(&mut placement, chunk, transport.as_deref_mut().map(|t| (t, runtime)), None)?;
