@@ -55,15 +55,18 @@ impl LaneSet {
 }
 
 /// Lanes wait by yielding (stream queries, reply and commit polls), so the
-/// executor re-polls at once: `--host-wait spin` keeps that; `block` polls
-/// every [`PACE_SLEEP`] instead, adding at most that to a wake.
-const PACE_SLEEP: std::time::Duration = std::time::Duration::from_micros(20);
-
+/// executor re-polls at once: `--host-wait spin` keeps that; under `block` a
+/// pending stretch spins for its first [`BLOCK_SPIN`] (most per-layer waits
+/// end within it, and they are the critical path), then sleeps
+/// [`BLOCK_SLEEP`] per poll. A poll that completes restarts the spin.
+///
+/// [`BLOCK_SPIN`]: cuteafd_transport::wait_policy::BLOCK_SPIN
+/// [`BLOCK_SLEEP`]: cuteafd_transport::wait_policy::BLOCK_SLEEP
 async fn paced<F: Future>(mut future: std::pin::Pin<&mut F>) -> F::Output {
-    let block = cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Block;
+    let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
     std::future::poll_fn(move |context| {
         let poll = future.as_mut().poll(context);
-        if poll.is_pending() && block { std::thread::sleep(PACE_SLEEP); }
+        if poll.is_pending() { backoff.pause() } else { backoff.reset() }
         poll
     }).await
 }

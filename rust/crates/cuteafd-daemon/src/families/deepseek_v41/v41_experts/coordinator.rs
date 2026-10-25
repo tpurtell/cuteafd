@@ -497,12 +497,12 @@ impl<'w> NativePendingFfn<'w, '_> {
         // (the device waits).
         let host_ordered = !crate::shared::memory::chain::deferred();
         if host_ordered {
-            let block = cuteafd_transport::wait_policy::wait_policy().wait == cuteafd_transport::wait_policy::HostWait::Block;
+            // `--host-wait block` spins briefly before it sleeps: a reply
+            // usually lands within that, and this wait is the critical path.
+            let mut backoff = cuteafd_transport::wait_policy::Backoff::new();
             while !exchange.landed(&self.ticket) {
                 crate::shared::spark_waves::healthy()?;
-                if cooperative { tokio::task::yield_now().await }
-                else if block { std::thread::sleep(std::time::Duration::from_micros(20)) }
-                else { std::hint::spin_loop() }
+                if cooperative { tokio::task::yield_now().await } else { backoff.pause() }
             }
         }
         // SAFETY: the reduce stream joins the chain (the shared contribution's

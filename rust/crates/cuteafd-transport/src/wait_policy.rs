@@ -75,6 +75,36 @@ pub fn set_wait_policy(policy: WaitPolicy) -> anyhow::Result<()> {
 /// The installed policy, or the defaults.
 pub fn wait_policy() -> WaitPolicy { POLICY.get().copied().unwrap_or_default() }
 
+/// How long a critical-path wait under [`HostWait::Block`] polls before it
+/// starts sleeping. Most per-layer waits (a router, a Spark reply) complete
+/// within this, so they never pay a sleep's wake-up; longer ones sleep.
+pub const BLOCK_SPIN: Duration = Duration::from_micros(50);
+/// One sleep of a critical-path wait past [`BLOCK_SPIN`].
+pub const BLOCK_SLEEP: Duration = Duration::from_micros(20);
+
+/// A bounded backoff for one host wait on the critical path: under
+/// [`HostWait::Spin`] it always spins; under [`HostWait::Block`] it spins for
+/// [`BLOCK_SPIN`], then sleeps [`BLOCK_SLEEP`] per pass. Start one per wait.
+pub struct Backoff { block: bool, started: Option<Instant> }
+
+impl Backoff {
+    pub fn new() -> Self {
+        Self { block: wait_policy().wait == HostWait::Block, started: None }
+    }
+    /// One pass of the wait: spin, or sleep once the spin budget is spent.
+    pub fn pause(&mut self) {
+        if !self.block { return std::hint::spin_loop(); }
+        let started = *self.started.get_or_insert_with(Instant::now);
+        if started.elapsed() < BLOCK_SPIN { std::hint::spin_loop() } else { std::thread::sleep(BLOCK_SLEEP) }
+    }
+    /// The wait made progress: the next pause spins again.
+    pub fn reset(&mut self) { self.started = None; }
+}
+
+impl Default for Backoff {
+    fn default() -> Self { Self::new() }
+}
+
 /// Monotonic nanoseconds since the process's activity epoch.
 fn now_ns() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -106,6 +136,22 @@ mod tests {
         assert_eq!("block".parse::<HostWait>().unwrap(), HostWait::Block);
         assert!("yield".parse::<HostWait>().is_err());
         assert_eq!(WaitPolicy::default(), WaitPolicy { wait: HostWait::Block, idle_park: Duration::from_secs(30) });
+    }
+
+    #[test]
+    fn backoff_spins_first_then_sleeps_under_block() {
+        let mut backoff = Backoff { block: true, started: None };
+        let started = Instant::now();
+        backoff.pause();
+        assert!(started.elapsed() < BLOCK_SLEEP, "the first pause spins");
+        std::thread::sleep(BLOCK_SPIN);
+        let late = Instant::now();
+        backoff.pause();
+        assert!(late.elapsed() >= BLOCK_SLEEP, "past the spin budget it sleeps");
+        backoff.reset();
+        let again = Instant::now();
+        backoff.pause();
+        assert!(again.elapsed() < BLOCK_SLEEP, "progress restarts the spin");
     }
 
     #[test]

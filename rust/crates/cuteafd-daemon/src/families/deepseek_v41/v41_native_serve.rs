@@ -167,6 +167,11 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     let worker_thread = std::thread::Builder::new()
         .name("v41-target-cuda".into())
         .spawn(move || {
+            // `--host-wait block` sleeps briefly in this thread's per-layer
+            // waits: wake within microseconds, not the default 50 us slack.
+            if let Err(error) = cuteafd_ffi::set_thread_timer_slack_ns(1_000) {
+                tracing::warn!("V4.1 engine thread keeps the default timer slack: {error:#}");
+            }
             let mut ready = Some(ready);
             let result = crate::shared::api::catch_scheduler_panic(|| worker(args, receive, &mut ready, worker_stats));
             if let Some(ready) = ready.take() {
