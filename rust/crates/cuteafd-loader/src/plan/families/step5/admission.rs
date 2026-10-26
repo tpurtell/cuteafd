@@ -305,6 +305,7 @@ impl RuntimeInputs {
             attention_by_kind: vec![],
             peer_row_bytes: 0,
             onboard_layers: 0,
+            max_pool_tokens_no_onboard: 0,
             layers: modes
                 .iter()
                 .enumerate()

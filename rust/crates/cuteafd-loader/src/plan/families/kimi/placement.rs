@@ -349,7 +349,9 @@ pub(super) fn layout(model: &Model, report: &mut PlanReport, opts: &mut crate::p
             memory.notes.push(format!("MLA latent {} B/token over {} layers; {} placement, KDA and FFNs split TP2; \
                 pool {} tokens with {} routed layers on RTX ({:.2} GiB each)", opts.mla_kv.record_bytes() * cfg.mla_layers(),
                 cfg.mla_layers(), placed.attention_placement, placed.pool_tokens, placed.onboard_layers, layer_bytes as f64 / GIB as f64));
-            placed.onboard_layers
+            let onboarded = placed.onboard_layers;
+            report.solver_placement = Some(placed);
+            onboarded
         }
         Err(error) => {
             refusal(report, format!("Kimi K3 coordinator admission refused: {error}"),

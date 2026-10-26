@@ -142,6 +142,32 @@ fn fixed_onboard_makes_the_pool_the_output() {
 }
 
 #[test]
+fn max_pool_without_onboard_is_one_extra_solve_and_never_below_the_admitted_pool() {
+    for onboard in [Onboard::Layers(10), Onboard::Fraction(0.25), Onboard::Auto] {
+        let req = request(2, 44 * GIB, 60, 4, onboard);
+        let placement = solve(&req).unwrap();
+        assert!(placement.max_pool_tokens_no_onboard >= placement.pool_tokens, "{onboard:?}");
+        // The same request with the onboarding set emptied, filled to its ceiling.
+        let mut free = req.clone();
+        free.onboard = Onboard::Layers(0);
+        free.pool.target = free.pool.ceiling;
+        let none = solve(&free).unwrap();
+        assert_eq!(placement.max_pool_tokens_no_onboard, none.pool_tokens, "{onboard:?}");
+        if placement.onboard_layers > 0 {
+            assert!(placement.max_pool_tokens_no_onboard > placement.pool_tokens, "{onboard:?}");
+        }
+        assert!(placement.summary().contains(&format!("max_pool_tokens_no_onboard={}",
+            placement.max_pool_tokens_no_onboard)));
+    }
+    // Nothing onboarded: the maximum is the admitted pool.
+    let none = solve(&request(2, 44 * GIB, 60, 4, Onboard::Layers(0))).unwrap();
+    assert_eq!(none.max_pool_tokens_no_onboard, none.pool_tokens);
+    // Spark-free layouts cannot drop their routed layers.
+    let spark_free = solve(&request(2, 80 * GIB, 8, 0, Onboard::Auto)).unwrap();
+    assert_eq!(spark_free.max_pool_tokens_no_onboard, spark_free.pool_tokens);
+}
+
+#[test]
 fn spark_free_layouts_need_every_layer_and_the_agentic_floor() {
     let placement = solve(&request(2, 44 * GIB, 30, 0, Onboard::Auto)).unwrap();
     assert_eq!(placement.onboard_layers, 30);

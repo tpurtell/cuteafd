@@ -974,7 +974,7 @@ mod draft_cli_tests {
         // The small-budget NVFP4 placement retains one empty range per RTX GPU.
         let mut placement = Placement {
             pool_tokens: 1 << 20, pool_limits: PoolLimits(vec![]), attention_placement: AttentionPlacement::Heads,
-            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
             layers: (0..45).map(|layer| LayerAssignment {
                 mode: LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner },
                 experts: if cfg.dense[layer] { ExpertHome::Dense } else { ExpertHome::Spark },

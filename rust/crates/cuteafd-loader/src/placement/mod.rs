@@ -495,6 +495,10 @@ pub struct Placement {
     pub peer_row_bytes: u64,
     /// The onboard this placement resolved: RTX-resident routed layers.
     pub onboard_layers: usize,
+    /// The pool the same solve admits with no RTX expert layers (everything
+    /// else, including the chosen attention modes, unchanged), filled to the
+    /// pool ceiling; equal to `pool_tokens` when nothing is onboarded.
+    pub max_pool_tokens_no_onboard: u64,
     pub layers: Vec<LayerAssignment>,
     pub movables: Vec<(MovableId, u8)>,
     /// Bounding whole-layer RTX expert range per GPU (`layers == 0`: none).
@@ -566,8 +570,8 @@ impl Placement {
             hops.push_str(&format!("; direct-input residual hops [{}] (no extra receive storage)", direct.join(", ")));
         }
         if let Some(t) = self.tp2 {
-            return format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
-                self.pool_tokens, self.onboard_layers, t.layers, t.first, t.first + t.layers,
+            return format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: rtx0/rtx1: {} TP2 expert layer halves ({}..{}); arenas [{}, {}] B; TP1 dSpark {} B{hops}",
+                self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers, t.layers, t.first, t.first + t.layers,
                 t.peak_bytes[0], t.peak_bytes[1], self.expert_ranges[0].peak_bytes);
         }
         let ranges = self.expert_ranges.iter().enumerate()
@@ -575,7 +579,8 @@ impl Placement {
                 .filter_map(|(layer, a)| (a.experts == ExpertHome::RtxWhole { gpu: gpu as u8 }).then_some(layer))
                 .collect::<Vec<_>>(), r.peak_bytes))
             .collect::<Vec<_>>().join(", ");
-        format!("attention {attention}; pool {} tokens; onboard {} RTX expert layers: {ranges}{hops}", self.pool_tokens, self.onboard_layers)
+        format!("attention {attention}; pool {} tokens (max_pool_tokens_no_onboard={}); onboard {} RTX expert layers: {ranges}{hops}",
+            self.pool_tokens, self.max_pool_tokens_no_onboard, self.onboard_layers)
     }
 }
 

@@ -3586,6 +3586,12 @@ fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
     assert!(!tight.executable());
     assert!(tight.hints.iter().any(|hint| hint.what.starts_with("spark0") && hint.what.contains("shortfall 1 bytes")),
         "{:?}", tight.hints);
+    let placement = roomy.solver_placement.as_ref().unwrap();
+    assert!(placement.max_pool_tokens_no_onboard >= placement.pool_tokens);
+    assert!(render(&roomy).contains(&format!("max_pool_tokens_no_onboard {}", placement.max_pool_tokens_no_onboard)));
+    let json = serde_json::to_value(&roomy).unwrap();
+    assert_eq!(json["max_pool_tokens_no_onboard"], placement.max_pool_tokens_no_onboard);
+    assert_eq!(json["onboard_layers"], placement.onboard_layers);
     // One wave fits the same budget: the k units divide the reserve, they
     // never add a second prefill scratch (only per-unit staging differs).
     let one = spark(&plan_at(121 << 30, 1));

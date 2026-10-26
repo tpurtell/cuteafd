@@ -494,7 +494,7 @@ mod tests {
             row_bytes: 32, rows: 8, lanes: lanes as u64, entry_gpu: 0,
             head_gpu: 0, terminal: TerminalHome::Replicated };
         let placement = Placement { pool_tokens: 0, pool_limits: cuteafd_loader::placement::PoolLimits(vec![]), attention_placement: AttentionPlacement::Layers,
-            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0,
+            attention_by_kind: vec![], peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
             layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Dense }).collect(),
             movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec).unwrap(),
             tp2: None, items: vec![], hops: plan_hops(modes, &spec).unwrap() };

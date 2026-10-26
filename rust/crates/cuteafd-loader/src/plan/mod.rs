@@ -246,6 +246,12 @@ pub struct PlanReport {
     /// Family-resolved units in flight on each transport.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_waves: Option<u64>,
+    /// The admitted pool's RTX expert layers and the pool the same solve
+    /// admits with none onboarded (bench cards read both beside the pool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub onboard_layers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_pool_tokens_no_onboard: Option<u64>,
     /// Resolved decode views, independent of prefill units in flight.
     pub decode_lanes: u8,
     /// Solver-selected transport count, independent of units in flight.
@@ -582,6 +588,8 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         prefill_span_rows: None,
         prefill_unit_rows: None,
         prefill_waves: None,
+        onboard_layers: None,
+        max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
         prefill_transports: None,
         prefill_selection: None,
@@ -865,6 +873,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
         report.prefill_waves = Some(layout_options.prefill_waves);
+        if let Some(placement) = &report.solver_placement {
+            report.onboard_layers = Some(placement.onboard_layers);
+            report.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
+        }
         if layout_options.host_embedding {
             for note in memory.notes.iter().filter(|n| n.starts_with("host embedding ineligible:")) {
                 report.fits = false;
@@ -1229,6 +1241,10 @@ pub fn render(report: &PlanReport) -> String {
         for item in &host.items {
             let _ = writeln!(out, "host item  {}: {} bytes ({:?})", item.group, item.bytes, item.basis);
         }
+    }
+    if let (Some(layers), Some(maximum)) = (report.onboard_layers, report.max_pool_tokens_no_onboard) {
+        let pool = report.memory_layout.as_ref().map_or(0, |memory| memory.pool_tokens);
+        let _ = writeln!(out, "pool       {pool} tokens admitted with {layers} RTX expert layers; max_pool_tokens_no_onboard {maximum}");
     }
     if let Some(warning) = &report.spark_count_warning { let _ = writeln!(out, "warning: {warning}"); }
     if let Some(selection) = &report.prefill_selection { let _ = writeln!(out, "{selection}"); }

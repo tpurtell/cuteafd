@@ -110,7 +110,7 @@ pub(crate) fn plan(modes: &[LayerMode], entry: u8, head: u8) -> LayerExecutionPl
         } else { TerminalHome::Replicated } };
     let placement = Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
         attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![],
-        peer_row_bytes: 0, onboard_layers: 0,
+        peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: 0,
         layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
         movables: vec![], expert_ranges: vec![], residual: residual_homes(modes, &spec).unwrap(),
         hops: plan_hops(modes, &spec).unwrap(), tp2: None, items: vec![] };

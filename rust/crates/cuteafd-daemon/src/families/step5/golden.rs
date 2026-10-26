@@ -646,7 +646,7 @@ pub(super) fn split_ownership_lanes(cfg: &Config, rows: usize, lanes: u64)
         rows: rows as u64, lanes, entry_gpu: 0, head_gpu: 0, terminal: TerminalHome::AttentionOwner };
     let placement = cuteafd_loader::placement::Placement { pool_tokens: 0, pool_limits: PoolLimits(vec![]),
         attention_placement: AttentionPlacement::Layers, attention_by_kind: vec![], peer_row_bytes: 0,
-        onboard_layers: 0, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
+        onboard_layers: 0, max_pool_tokens_no_onboard: 0, layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::Spark }).collect(),
         movables: vec![], expert_ranges: vec![], residual: residual_homes(&modes, &spec)?,
         hops: plan_hops(&modes, &spec)?, tp2: None, items: vec![] };
     cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership::new(cfg, 2, LayerExecutionPlan::new(&placement, spec)?)

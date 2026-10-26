@@ -83,6 +83,26 @@ pub fn solve_with_marks(request: &PlacementRequest, legacy_slots: u64, minimum_s
 /// Places `request`. Pure arithmetic over the request: the planner and the
 /// runtime get the same answer for the same inputs.
 pub fn solve(request: &PlacementRequest) -> Result<Placement, PlacementError> {
+    let mut placement = solve_attention(request)?;
+    placement.max_pool_tokens_no_onboard = max_pool_without_onboard(request, &placement);
+    Ok(placement)
+}
+
+/// One extra solve: the same request and attention modes with the RTX
+/// onboarding set emptied and the pool free to fill its ceiling. A Spark-free
+/// layout cannot drop its routed layers, so its maximum is the admitted pool.
+fn max_pool_without_onboard(request: &PlacementRequest, placement: &Placement) -> u64 {
+    if placement.onboard_layers == 0 || request.inventory.spark_ranks == 0 { return placement.pool_tokens; }
+    let mut trial = request.clone();
+    trial.onboard = Onboard::Layers(0);
+    trial.minimum_expert_layers = 0;
+    trial.pool.requested = None;
+    trial.pool.target = trial.pool.ceiling;
+    let chosen = placement.attention_by_kind.clone();
+    solve_once(&trial, &chosen, None).map_or(placement.pool_tokens, |free| free.pool_tokens.max(placement.pool_tokens))
+}
+
+fn solve_attention(request: &PlacementRequest) -> Result<Placement, PlacementError> {
     request.pool.validate_explicit()?;
     validate_attention(request)?;
     if request.policy.expert_ownership == ExpertOwnership::AlternatingWhole
@@ -580,6 +600,7 @@ fn solve_once(request: &PlacementRequest, flips: &[(AttentionClass, AttentionPla
                     .and_then(|n| n.checked_add(sum))).ok_or(Overflow("context peer rows"))?
         } else { 0 },
         onboard_layers,
+        max_pool_tokens_no_onboard: pool_tokens,
         layers: modes.into_iter().zip(homes).map(|(mode, experts)| LayerAssignment { mode, experts }).collect(),
         movables,
         expert_ranges: ranges,
