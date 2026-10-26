@@ -712,8 +712,8 @@ mod tests {
             assert_eq!(args.span(), span as u32);
             let exports = [1, 16, 80, 256, 1024, 4096];
             let model = spark_model(&exports, args.endpoint(), waves, 2, TcpTransportConfig::default().max_frame_bytes)?;
-            // One prefill owner at the ladder maximum; the k units only buffer I/O.
-            assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: 4096,
+            // One prefill owner at the selected unit's covering export; the k units only buffer I/O.
+            assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit as u32,
                 compiled_capacity: 4096, unit_rows: unit as u32, buffered_units: waves as u8 });
             assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution { capacity: 64, compiled_capacity: 80 }]);
             assert_eq!(model.endpoints[0].capacity, unit as u32);
@@ -766,11 +766,14 @@ mod tests {
         let mut metadata = serde_json::json!({"layouts":{"tp4":{"hidden":4096,"experts":352,
             "top_k":8,"intermediate":1536,"capacities":[{"capacity":1},{"capacity":1024}]}}});
         assert_eq!(package_exports(&metadata)?, [1, 1024]);
-        // A package whose largest export cannot hold the ladder's largest unit is refused.
-        let endpoint = SparkEndpoint { ring_depth: None, capacity: 256, ingress: SparkIngress::Bf16 };
-        let error = spark_model(&package_exports(&metadata)?, endpoint, 1, 1, 64 << 20).unwrap_err();
+        // A fixed unit inside the package's largest export is admitted there;
+        // one beyond it is refused, never stretched.
+        let endpoint = |capacity| SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
+        let admitted = spark_model(&package_exports(&metadata)?, endpoint(256), 1, 1, 64 << 20)?;
+        assert_eq!(admitted.executions.prefill.compiled_capacity, 1024);
+        let error = spark_model(&package_exports(&metadata)?, endpoint(2048), 1, 1, 64 << 20).unwrap_err();
         assert!(matches!(error.downcast_ref::<cuteafd_core::ExecutionAdmissionError>(),
-            Some(cuteafd_core::ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 4096, .. })), "{error:#}");
+            Some(cuteafd_core::ExecutionAdmissionError::Uncovered { owner: "prefill", rows: 2048, .. })), "{error:#}");
         metadata["layouts"]["tp6"] = metadata["layouts"]["tp4"].clone();
         metadata["layouts"]["tp6"]["capacities"][1]["capacity"] = 4096.into();
         assert!(package_exports(&metadata).is_err());

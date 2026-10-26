@@ -241,8 +241,8 @@ mod draft_cli_tests {
                 assert!(model.endpoints.iter().all(|endpoint| endpoint.capacity == unit
                     && endpoint.ingress == if bf16 { cuteafd_core::SparkIngress::Bf16 }
                         else { cuteafd_core::SparkIngress::Fp8K32 }));
-                // One prefill owner at the ladder maximum; k only buffers units.
-                assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: 4096,
+                // One prefill owner at the selected unit's covering export; k only buffers units.
+                assert_eq!(model.executions.prefill, cuteafd_core::PrefillExecution { capacity: unit,
                     compiled_capacity: 4096, unit_rows: unit, buffered_units: waves as u8 });
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
                     capacity: engine::DECODE_ROWS as u32, compiled_capacity: 80 }]);

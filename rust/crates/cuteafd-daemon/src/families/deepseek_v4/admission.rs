@@ -60,7 +60,8 @@ mod spark_tests {
         for (decode_rows, compiled) in [(16, 16), (64, 80), (80, 80)] {
             let model = super::spark_model(SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest), decode_rows, 2752, 3)?;
             model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
-            assert_eq!((model.capacity(), model.compiled_capacity()), (4096, 4096));
+            // The static prefill owner holds the selected unit; EXL3 exports m2752.
+            assert_eq!((model.capacity(), model.compiled_capacity()), (2752, 2752));
             assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
                 capacity: decode_rows as u32, compiled_capacity: compiled }]);
             assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units), (2752, 3));

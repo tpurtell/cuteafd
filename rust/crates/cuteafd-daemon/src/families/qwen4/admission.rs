@@ -342,7 +342,8 @@ mod tests {
             for bf16 in [false, true] {
                 let model = super::spark_model(SparkBackend::Fp8, rows, waves, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::QWEN4)?;
-                assert_eq!((model.capacity(), model.compiled_capacity()), (4096, 4096));
+                let compiled = cuteafd_core::covering_export(&SparkBackend::Fp8.exports(), rows as u32).unwrap();
+                assert_eq!((model.capacity(), model.compiled_capacity()), (rows.max(64) as u32, compiled));
                 assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units),
                     (rows as u32, waves as u8));
                 assert_eq!(model.endpoints.len(), 1);
