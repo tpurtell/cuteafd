@@ -318,20 +318,30 @@ mod tests {
             prefill_lanes: 2, ..Default::default() };
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,
             items: vec![], kv_tokens: 0 };
+        let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
+        let decode = 2 * (51 * (1 << 20) + 64 * (5120 + 5120 / 32 + 6 * 8));
+        let charge = |device: &mut DeviceLayout, family: &str, unit: u64, waves: u64| -> anyhow::Result<(u64, u64)> {
+            let executions = crate::plan::spark_executions::admit_family(family, &exports, None, unit, waves)?;
+            charge_executions(device, &input, &working, "deepseek_v41", &executions)?;
+            let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
+            Ok((find("execution owners"), find("execution staging")))
+        };
+        // V4.1's CED executor: two streams of its live chunk on one owner.
+        for live in [256, 1024, 4096] {
+            let (owners, staging) = charge(&mut device, "deepseek_v41", live, 1)?;
+            let prefill = if live <= 80 { 51 * (1 << 20) } else { 810 * (1 << 20) - 4096 * (5120 + 5120 / 32 + 6 * 8) };
+            assert_eq!(owners, prefill + live * (5120 + 5120 / 32 + 6 * 8) + decode);
+            assert_eq!(staging, 2 * 64 * 6 * 8 + 2 * live * 6 * 8);
+        }
+        // A ladder executor on the same package: k units divide the reserve.
         let mut charged = Vec::new();
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4)] {
-            let executions = crate::plan::spark_executions::admit_family("deepseek_v41",
-                &crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports(),
-                None, unit, waves)?;
-            charge_executions(&mut device, &input, &working, "deepseek_v41", &executions)?;
-            let owners = device.items.iter().find(|item| item.group == "execution owners").unwrap().bytes;
-            let staging = device.items.iter().find(|item| item.group == "execution staging").unwrap().bytes;
-            assert_eq!(owners, 810 * (1 << 20) + 2 * (51 * (1 << 20) + 64 * (5120 + 5120 / 32 + 6 * 8)));
-            assert_eq!(staging, 2 * 64 * 6 * 8 + unit * waves * 6 * 8);
+            let (owners, staging) = charge(&mut device, "deepseek_v4", unit, waves)?;
+            assert_eq!(owners, 810 * (1 << 20) + decode / 2);
+            assert_eq!(staging, 64 * 6 * 8 + unit * waves * 6 * 8);
             charged.push(owners);
         }
-        // The reserve is divided into k units, never multiplied by k.
-        assert!(charged.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(charged.windows(2).all(|pair| pair[0] == pair[1]), "{charged:?}");
         Ok(())
     }
 
