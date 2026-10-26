@@ -166,7 +166,11 @@ before → after tables with conditions.
   From a git worktree, run it in `scripts/build/cuteafd-dev.sh cpu` by the worktree's real path
   (`cd ~/Developer/cute-worktrees/cuteafd-<task> && CUTEAFD_SOURCE_ROOT=$PWD ...`), not `/workspace/cuteafd`:
   relative submodule gitfiles resolve only from the real path.
-- Kernel row curves: for new kernels/families/expert formats, duel winners or export/tiling/threshold changes,
+- Kernel row curves: the prefill policy picks the wave count k from S/T (Spark compute vs turnaround) and assumes
+  a unit's Spark compute scales roughly linearly with its rows, so a kernel must keep a stable time per row across the
+  whole band. A per-row cliff makes larger units silently slower and shows up as a wave regression (Step-5's BF16
+  GEMV→GEMM switch above 2048 rows looked like "3 waves is slower"). For new kernels/families/expert formats, duel
+  winners or export/tiling/threshold changes,
   measure warmed time per routed row across the policy's live-row band (8192/k, k=2..4: 2048/2752/4096 plus real tails),
   using runtime-selected exports on SM120 and SM121 where the kernel runs, with fork bench `--capacity` and `--routes`.
   Gate: no per-row collapse; >10% above neighbours or the curve's best, or an adjacent-size jump, needs an explanation,
