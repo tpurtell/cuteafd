@@ -73,6 +73,7 @@ CHECKPOINTS = {
     "RadixArk/Qwen3.8-27B-DSpark": {"speculators_model_type": "dspark"},
     "stepfun-ai/Step-5-Preview": {"model_type": "step3p5", "num_hidden_layers": 8},
     "stepfun-ai/Step-5-Preview-NVFP4": {"model_type": "step3p5", "num_hidden_layers": 8},
+    "wrldsuksgo2mars/Kimi-K3-EXL3-K2": {"model_type": "kimi_k3", "num_hidden_layers": 8},
     "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6": {"model_type": "kimi_k3", "num_hidden_layers": 8},
     # Drafters the starting configs name.
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
@@ -626,7 +627,7 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         ("v41-flash-max", 2, 6), ("v41-flash-reference-tp4", 1, 4),
         ("v4-flash-reference-tp4", 1, 4), ("glm53-exl3-max", 2, 6),
         ("glm53-exlr8-min", 1, 4), ("glm53-exlr8-max", 2, 6),
-        ("kimi-k3-max", 2, 6), ("step5-fp8-max", 2, 6),
+        ("kimi-k3-max", 2, 6), ("kimi-k3-bf16-max", 2, 6), ("step5-fp8-max", 2, 6),
         ("step5-nvfp4-min", 1, 4), ("qwen38-27b-bf16-min", 1, 0),
         ("qwen38-27b-fp8-min", 1, 0), ("qwen35-9b-bf16-min", 1, 0),
         ("qwen38-27b-bf16-min-nospec", 1, 0), ("qwen38-27b-fp8-min-nospec", 1, 0),
@@ -634,6 +635,12 @@ def test_v4_matrix_card_set_and_retired_pins() -> None:
         assert len(entries[name]["gpus"]) == gpus
         assert len(entries[name]["sparks"]) == sparks
         assert entries[name]["set"]["SPARK_COUNT"] == str(sparks)
+    kimi = entries["kimi-k3-max"]
+    bf16 = entries["kimi-k3-bf16-max"]
+    assert bf16 == {**kimi, "name": "kimi-k3-bf16-max", "config": "examples/configs/kimi-k3-exl3-max.config",
+                    "set": {**kimi["set"], "ADDR": bf16["set"]["ADDR"], "EXPERT_PORT": bf16["set"]["EXPERT_PORT"]}}
+    for port in ("ADDR", "EXPERT_PORT"):
+        assert sum(entry.get("set", {}).get(port) == bf16["set"][port] for entry in v4["entries"]) == 1
     dense = [entry for entry in v4["entries"] if entry["family"] == "qwen3_5"]
     assert {entry["name"]: entry["set"]["SPECULATOR"] for entry in dense} == {
         "qwen35-9b-bf16-min": "off", "qwen38-27b-bf16-min": "dspark",

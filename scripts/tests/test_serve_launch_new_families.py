@@ -206,7 +206,8 @@ def test_kimi_example_config_is_the_max_card() -> None:
     assert values["MODEL_REVISION"] == "acba35b61a672561652b16a96fca1be85c1bd875"
     assert (values["RTX_GPUS"], values["SPARK_COUNT"]) == ("2", "6")
     assert "RTX_EXPERT_LAYERS" not in values
-    assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "off", "auto")
+    assert (values["SPECULATOR"], values["SPECULATOR_MODEL_ID"]) == ("dflash2", "lightseekorg/kimi-k3-dflash2")
+    assert (values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == ("off", "off", "auto")
     for absent in ("MAX_CONTEXT_TOKENS", "SPARK_DEVICE_BUDGET_BYTES", "KV_CACHE", "CONCURRENCY"):
         assert absent not in values
     for rank in range(6):
@@ -232,6 +233,7 @@ def test_kimi_k6_example_config_serves_the_k6_core_with_its_own_1m_default() -> 
 
 
 def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None:
+    _snapshot(tmp_path / "hf", "lightseekorg/kimi-k3-dflash2", {})
     keys = "".join(f"{key}={value}\n" for key, value in _keys(EXAMPLE).items()
                    if not key.startswith("SPARK_") and key not in ("MODEL_ID", "MODEL_REVISION"))
     result = _family_launch_result(tmp_path, KIMI, KIMI_ID, keys + "SPARK_COUNT=6\n" + SIX,
@@ -239,6 +241,10 @@ def test_kimi_example_config_launches_through_run_family(tmp_path: Path) -> None
     serve = _line(result, "cuteafd serve-kimi --snapshot")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert "--pool-tokens" not in serve.split() and "--max-context" not in serve.split()
+    plan = _line(result, "cuteafd plan")
+    assert _flag(plan, "--speculator") == "dflash2"
+    assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot")
+    assert _flag(serve, "--draft-fp8") == _flag(plan, "--draft-fp8") == "true"
 
 
 # --- the gate card -------------------------------------------------------------
