@@ -218,11 +218,14 @@ pub fn solve_frozen(request: &PlacementRequest, placement: &Placement) -> Result
     }
     let modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
     if modes.len() != request.layers.len() { return Err(PlacementError::Inventory("frozen modes per layer")); }
-    let checked = solve_once(request, &placement.attention_by_kind, Some(&modes))?;
+    let mut checked = solve_once(request, &placement.attention_by_kind, Some(&modes))?;
     if checked.attention_placement != placement.attention_placement
         || checked.attention_by_kind != placement.attention_by_kind {
         return Err(PlacementError::Inventory("frozen attention policy differs from request"));
     }
+    // A frozen recheck pins the admitted pool; the plan-time maximum it
+    // reports is the frozen decision's, not a new solve.
+    checked.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
     Ok(checked)
 }
 
