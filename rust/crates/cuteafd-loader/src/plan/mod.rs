@@ -162,7 +162,8 @@ pub enum PlanError {
 /// Resolve the decode-lane count before layout or CUDA allocation
 /// ([`decode_lanes::resolve`]).
 pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
-    decode_lanes::resolve(family, requested, concurrency)
+    let descriptor = spark_executions::descriptor(family).map_err(PlanError::Checkpoint)?;
+    decode_lanes::resolve(descriptor, requested, concurrency)
 }
 
 #[derive(Debug, Clone, Serialize)]

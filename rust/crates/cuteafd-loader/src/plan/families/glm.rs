@@ -52,7 +52,7 @@ fn strip_model_prefix(name: &str) -> Option<&str> {
 
 impl Family for Glm {
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
-        Some(crate::plan::spark_executions::SparkDecode { lanes: 1, rows: self.decode_rows })
+        Some(crate::plan::spark_executions::SparkDecode { rows: self.decode_rows })
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         crate::serving_capacity::prefill_waves::PrefillLimits { estimate: self.prefill, ..Default::default() }

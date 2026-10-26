@@ -117,6 +117,9 @@ pub trait Family: Sync {
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         Default::default()
     }
+    /// Decode lanes the executor runs (PLAN "Two decode lanes"); `One` until a
+    /// family's port onto the shared lane owners lands with its planner charges.
+    fn decode_lanes(&self) -> super::decode_lanes::LaneSupport { super::decode_lanes::LaneSupport::One }
     /// Spark decode compute owners: one per decode lane, each admitting the
     /// family's decode rows (its covering export comes from the backend ladder).
     /// `None` for families without Spark experts.

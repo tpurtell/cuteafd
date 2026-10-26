@@ -21,12 +21,10 @@ pub enum LaneSupport {
     FixedTwo,
 }
 
-/// The family's lane support. A family moves from `One` when its port onto
-/// the shared lane owners lands (with its planner charges).
-pub fn support(family: &str) -> LaneSupport {
-    match family {
-        "deepseek_v41" => LaneSupport::FixedTwo,
-        _ => LaneSupport::One,
+impl LaneSupport {
+    /// Most lanes the executor can run (each owns a Spark decode execution).
+    pub fn max_lanes(self) -> u8 {
+        match self { Self::One => 1, Self::OneOrTwo { .. } | Self::FixedTwo => MAX_DECODE_LANES }
     }
 }
 
@@ -34,8 +32,8 @@ pub fn support(family: &str) -> LaneSupport {
 ///
 /// A family that admits one or two resolves one lane at configured
 /// concurrency one: an idle second lane would cost memory for nothing.
-pub fn resolve(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
-    let support = support(family);
+pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+    let support = family.decode_lanes();
     let lanes = requested.unwrap_or(match support {
         LaneSupport::One => 1,
         LaneSupport::OneOrTwo { default } => default,
@@ -50,7 +48,7 @@ pub fn resolve(family: &str, requested: Option<u8>, concurrency: u64) -> Result<
         _ => None,
     };
     if let Some(reason) = refusal {
-        return Err(PlanError::UnsupportedOption { option: "--decode-lanes", value: lanes, family: family.into(), reason });
+        return Err(PlanError::UnsupportedOption { option: "--decode-lanes", value: lanes, family: family.id().into(), reason });
     }
     Ok(match support {
         LaneSupport::OneOrTwo { .. } if concurrency <= 1 => 1,
@@ -70,27 +68,30 @@ mod tests {
 
     #[test]
     fn every_family_resolves_its_default_and_refuses_what_it_cannot_run() {
-        for (family, default) in [("deepseek_v41", 2), ("mimo_v2", 1), ("glm5", 1), ("glm5_flash", 1),
-            ("deepseek_v4", 1), ("qwen4", 1), ("qwen3_5", 1), ("kimi_k3", 1), ("step5", 1)] {
-            assert_eq!(resolve(family, None, 16).unwrap(), default, "{family}");
+        for family in super::super::family::registry() {
+            let default = match family.decode_lanes() {
+                LaneSupport::One => 1, LaneSupport::OneOrTwo { default } => default, LaneSupport::FixedTwo => 2 };
+            assert_eq!(resolve(*family, None, 16).unwrap(), default, "{}", family.id());
             for lanes in [1, 2] {
-                let supported = match support(family) {
+                let supported = match family.decode_lanes() {
                     LaneSupport::One => lanes == 1,
                     LaneSupport::OneOrTwo { .. } => true,
                     LaneSupport::FixedTwo => lanes == 2,
                 };
-                let result = resolve(family, Some(lanes), 16);
+                let result = resolve(*family, Some(lanes), 16);
                 if supported { assert_eq!(result.unwrap(), lanes); } else {
                     assert!(matches!(result, Err(PlanError::UnsupportedOption { option: "--decode-lanes", value, .. })
-                        if value == lanes), "{family} {lanes}");
+                        if value == lanes), "{} {lanes}", family.id());
                 }
             }
             for lanes in [0, 3, 255] {
-                assert!(matches!(resolve(family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
+                assert!(matches!(resolve(*family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
             }
         }
         // The fixed pair holds at concurrency one.
-        assert_eq!(resolve("deepseek_v41", Some(2), 1).unwrap(), 2);
+        let v41 = &crate::plan::families::deepseek::DEEPSEEK_V41;
+        assert_eq!(resolve(v41, Some(2), 1).unwrap(), 2);
+        assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::FixedTwo);
     }
 
     #[test]

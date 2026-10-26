@@ -48,10 +48,10 @@ pub enum SparkPrefill {
     Streams(u8),
 }
 
-/// The family's decode compute owners: lanes and the rows each admits.
+/// Rows each of the family's decode compute owners admits (one owner per
+/// decode lane the family can run, `Family::decode_lanes`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparkDecode {
-    pub lanes: u8,
     pub rows: u32,
 }
 
@@ -108,9 +108,9 @@ impl SparkBackend {
 /// coordinator package fixes it (e.g. a V4 manifest's `decode_rows`).
 pub fn admit(family: &dyn crate::plan::Family, exports: &[u32], decode_rows: Option<u32>,
     prefill: PrefillUnits) -> Result<SparkExecutions, ExecutionAdmissionError> {
-    let decode = family.spark_decode().unwrap_or(SparkDecode { lanes: 0, rows: 0 });
-    let rows = decode_rows.unwrap_or(decode.rows);
-    SparkExecutions::admit(&vec![rows; usize::from(decode.lanes)], prefill.max_unit_rows,
+    let lanes = family.spark_decode().map_or(0, |_| family.decode_lanes().max_lanes());
+    let rows = decode_rows.or(family.spark_decode().map(|decode| decode.rows)).unwrap_or(0);
+    SparkExecutions::admit(&vec![rows; usize::from(lanes)], prefill.max_unit_rows,
         prefill.unit_rows, prefill.waves, exports)
 }
 
@@ -145,7 +145,7 @@ mod tests {
                     let plan = admit(*family, &backend.exports(), None, PrefillUnits::ladder(*family, unit, waves)).unwrap();
                     assert_eq!(plan.prefill, PrefillExecution { capacity: 4096, compiled_capacity: 4096,
                         unit_rows: unit as u32, buffered_units: waves as u8 }, "{} {backend:?}", family.id());
-                    assert_eq!(plan.decode.len(), usize::from(family.spark_decode().unwrap().lanes));
+                    assert_eq!(plan.decode.len(), usize::from(family.decode_lanes().max_lanes()));
                 }
             }
         }

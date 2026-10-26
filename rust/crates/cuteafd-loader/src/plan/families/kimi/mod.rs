@@ -254,7 +254,7 @@ fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
 impl Family for KimiK3 {
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
         // Kimi decode/verify steps send at most 64 rows (`rows.min(64)`).
-        Some(crate::plan::spark_executions::SparkDecode { lanes: 1, rows: 64 })
+        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
         use crate::serving_capacity::prefill_waves::{PrefillEstimate, PrefillLimits};
