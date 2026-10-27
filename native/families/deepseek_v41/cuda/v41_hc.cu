@@ -27,6 +27,31 @@ __global__ void post_kernel(const __nv_bfloat16* sublayer, const __nv_bfloat16* 
   const float expansion = __fmul_rn(post[row*4+destination], __bfloat162float(sublayer[row*5120+col]));
   output[i] = __float2bfloat16_rn(__fadd_rn(expansion, sum));
 }
+// Reuse the source values for all four destinations without reassociating sums.
+__global__ void post_reuse_kernel(const __nv_bfloat16* sublayer,
+    const __nv_bfloat16* residual, const float* post, const float* comb,
+    __nv_bfloat16* output) {
+  const uint64_t row=blockIdx.y;
+  const int col=blockIdx.x*blockDim.x+threadIdx.x;
+  if(col>=5120) return;
+  float sums[4]={0,0,0,0};
+#pragma unroll
+  for(int source=0;source<4;++source) {
+    const float x=__bfloat162float(residual[(row*4+source)*5120+col]);
+#pragma unroll
+    for(int destination=0;destination<4;++destination)
+      sums[destination]=__fadd_rn(sums[destination],
+          __fmul_rn(comb[row*16+source*4+destination],x));
+  }
+  const float x=__bfloat162float(sublayer[row*5120+col]);
+#pragma unroll
+  for(int destination=0;destination<4;++destination) {
+    const float expansion=__fmul_rn(post[row*4+destination],x);
+    output[(row*4+destination)*5120+col]=
+        __float2bfloat16_rn(__fadd_rn(expansion,sums[destination]));
+  }
+}
+
 bool valid(const void* pointer, uint64_t bytes, uint64_t alignment) {
   const auto address = reinterpret_cast<uintptr_t>(pointer);
   return address && address%alignment == 0 && address <= UINTPTR_MAX-bytes;
@@ -56,7 +81,11 @@ extern "C" int32_t cuteafd_v41_hc_post(const uint16_t* sublayer, const uint16_t*
   if (!valid(output,r,2)) return cudaErrorInvalidValue;
   for (int i=0;i<4;++i)
     if (!valid(inputs[i],sizes[i],i<2?2:4) || !disjoint(inputs[i],sizes[i],output,r)) return cudaErrorInvalidValue;
-  post_kernel<<<(r/2+255)/256,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+  if(rows>80) {
+    post_reuse_kernel<<<dim3(20,rows),256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const __nv_bfloat16*>(sublayer),reinterpret_cast<const __nv_bfloat16*>(residual),
+        post,comb,reinterpret_cast<__nv_bfloat16*>(output));
+  } else post_kernel<<<(r/2+255)/256,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
       reinterpret_cast<const __nv_bfloat16*>(sublayer),reinterpret_cast<const __nv_bfloat16*>(residual),
       post,comb,reinterpret_cast<__nv_bfloat16*>(output),r/2);
   return cudaGetLastError();
@@ -116,6 +145,76 @@ __global__ void mixes_kernel(const __nv_bfloat16* residual, const float* fn,
       value/=sum+1e-6f;
     }
     if(lane<16) comb[row*16+lane]=value;
+  }
+}
+// Each fn value feeds several independent rows; lane order stays unchanged.
+template<int Rows>
+__global__ void mixes_reuse_kernel(const __nv_bfloat16* residual, const float* fn,
+    const float* scale, const float* base, float* pre, float* post, float* comb,
+    int rows) {
+  const int first=blockIdx.x*Rows;
+  const int lane=threadIdx.x%32, warp=threadIdx.x/32;
+  float dot[Rows][3]={}, square[Rows]={};
+  for(int col=lane;col<20480;col+=32) {
+    float x[Rows];
+#pragma unroll
+    for(int r=0;r<Rows;++r) {
+      x[r]=first+r<rows ? __bfloat162float(residual[uint64_t(first+r)*20480+col]) : 0;
+      if(warp==0) square[r]=fmaf(x[r],x[r],square[r]);
+    }
+#pragma unroll
+    for(int j=0;j<3;++j) {
+      const float weight=fn[uint64_t(warp+j*8)*20480+col];
+#pragma unroll
+      for(int r=0;r<Rows;++r) dot[r][j]=fmaf(x[r],weight,dot[r][j]);
+    }
+  }
+  __shared__ float projected[Rows][24], inverse[Rows];
+#pragma unroll
+  for(int r=0;r<Rows;++r) {
+    if(warp==0) {
+      square[r]=warp_sum(square[r]);
+      if(lane==0) inverse[r]=rsqrtf(square[r]/20480.0f+1e-20f);
+    }
+#pragma unroll
+    for(int j=0;j<3;++j) {
+      dot[r][j]=warp_sum(dot[r][j]);
+      if(lane==0) projected[r][warp+j*8]=dot[r][j];
+    }
+  }
+  __syncthreads();
+#pragma unroll
+  for(int r=0;r<Rows;++r) {
+    const uint64_t row=first+r;
+    if(row>=rows) continue;
+  if(threadIdx.x<4) {
+    const int j=threadIdx.x;
+    const float a=fmaf(projected[r][j]*inverse[r],scale[0],base[j]);
+    const float b=fmaf(projected[r][j+4]*inverse[r],scale[1],base[j+4]);
+    pre[row*4+j]=1.0f/(1.0f+expf(-a))+1e-6f;
+    post[row*4+j]=2.0f/(1.0f+expf(-b));
+  }
+  if(warp==0) {
+    float value=lane<16 ? fmaf(projected[r][8+lane]*inverse[r],scale[2],base[8+lane]) : 0;
+    float maximum=fmaxf(value,__shfl_xor_sync(0xffffffffu,value,1));
+    maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,2));
+    value=expf(value-maximum);
+    float sum=value+__shfl_xor_sync(0xffffffffu,value,1);
+    sum+=__shfl_xor_sync(0xffffffffu,sum,2);
+    value=value/sum+1e-6f;
+    sum=value+__shfl_xor_sync(0xffffffffu,value,4);
+    sum+=__shfl_xor_sync(0xffffffffu,sum,8);
+    value/=sum+1e-6f;
+    for(int iteration=1;iteration<20;++iteration) {
+      sum=value+__shfl_xor_sync(0xffffffffu,value,1);
+      sum+=__shfl_xor_sync(0xffffffffu,sum,2);
+      value/=sum+1e-6f;
+      sum=value+__shfl_xor_sync(0xffffffffu,value,4);
+      sum+=__shfl_xor_sync(0xffffffffu,sum,8);
+      value/=sum+1e-6f;
+    }
+    if(lane<16) comb[row*16+lane]=value;
+  }
   }
 }
 // Small batches spread the 24 projections across SMs. Each lane retains the
@@ -213,7 +312,10 @@ extern "C" int32_t cuteafd_v41_hc_mixes(const uint16_t* residual, const float* f
     finish_mixes_kernel<0><<<rows,32,0,reinterpret_cast<cudaStream_t>(stream)>>>(
         nullptr,scale,base,pre,post,comb);
   } else {
-    mixes_kernel<<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+    if(rows>80) {
+      mixes_reuse_kernel<4><<<(rows+3)/4,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
+          reinterpret_cast<const __nv_bfloat16*>(residual),fn,scale,base,pre,post,comb,rows);
+    } else mixes_kernel<<<rows,256,0,reinterpret_cast<cudaStream_t>(stream)>>>(
         reinterpret_cast<const __nv_bfloat16*>(residual),fn,scale,base,pre,post,comb);
   }
   return cudaGetLastError();
