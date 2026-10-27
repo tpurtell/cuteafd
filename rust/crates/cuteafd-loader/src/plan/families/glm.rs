@@ -40,8 +40,7 @@ pub static GLM5_FLASH: Glm =
             waves: 2, reference_ranks: 4, larger_topology_waves: 3,
             source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; four-Spark EXL3/FP8 qualified k2; larger counts unmeasured, borrow GLM5 k3; no independent S/T",
         }, decode_rows: crate::serving_capacity::GLMF_DECODE_ROWS as u32,
-        decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
-            reason: "the second lane is not wired yet: only the Spark-bound min card (1 RTX + 2 Sparks) can hide a round trip, and it is the OneOrTwo candidate awaiting its A/B; the 0-Spark layout has no exchange to hide (#744)" } };
+        decode_lanes: crate::plan::decode_lanes::LaneSupport::OneOrTwo { default: 1 } };
 
 fn str_list(config: &Value, key: &str) -> Vec<String> {
     config

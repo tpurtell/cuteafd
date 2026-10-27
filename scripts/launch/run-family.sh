@@ -2802,7 +2802,7 @@ audio_encoder_hash=""
     release_die "deployment does not name a supported decode lane count"
   if [[ -n "$decode_lanes" ]]; then
     case "$family" in
-      deepseek_v41|mimo_v2) family_args+=(--decode-lanes "$resolved_decode_lanes") ;;
+      deepseek_v41|mimo_v2|glm5_flash) family_args+=(--decode-lanes "$resolved_decode_lanes") ;;
     esac
   fi
   case "$(family_prefill_mode "$family")" in

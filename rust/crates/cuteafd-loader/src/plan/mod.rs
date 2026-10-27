@@ -736,7 +736,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     };
     report.family = Some(family.id().into());
     report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
-        options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
+        options.layout.as_ref().filter(|layout| layout.concurrency > 0).map_or(2, |layout| layout.concurrency))?;
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {

@@ -124,6 +124,10 @@ pub(crate) struct EngineArgs {
     #[arg(long, env = "CUTEAFD_GLMF_DECODE_ROWS", default_value_t = engine::DECODE_ROWS,
         value_parser = parse_decode_rows)]
     pub decode_rows: usize,
+    /// Decode execution lanes (1 or 2; default 1 until the Spark-bound min card A/B passes, #744).
+    #[arg(long, env = "CUTEAFD_DECODE_LANES", default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub decode_lanes: u8,
     /// Numerical decode/verify reduction rows, independent of execution capacity.
     #[arg(long, env = "CUTEAFD_ATTENTION_PLAN_ROWS")]
     pub attention_plan_rows: Option<usize>,

@@ -101,13 +101,18 @@ mod tests {
 
     #[test]
     fn one_lane_families_record_their_reason() {
-        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2", "glm5", "glm5_flash", "deepseek_v4"] {
+        for id in ["kimi_k3", "step5", "qwen4", "qwen3_5", "mimo_v2", "glm5", "deepseek_v4"] {
             let family = crate::plan::spark_executions::descriptor(id).unwrap();
             let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
             assert!(reason != DRAFTER && reason.contains("#744"), "{id}: {reason}");
             assert!(matches!(resolve(family, Some(2), 16),
                 Err(PlanError::UnsupportedOption { reason: refused, .. }) if refused == reason), "{id}");
         }
+        let glmf = &crate::plan::families::glm::GLM5_FLASH;
+        assert_eq!(super::super::Family::decode_lanes(glmf), LaneSupport::OneOrTwo { default: 1 });
+        assert_eq!(resolve(glmf, None, 16).unwrap(), 1);
+        assert_eq!(resolve(glmf, Some(2), 16).unwrap(), 2);
+        assert_eq!(resolve(glmf, Some(2), 1).unwrap(), 1);
     }
 
     /// Every target family runs decode on the shared lane owners (#744): only
