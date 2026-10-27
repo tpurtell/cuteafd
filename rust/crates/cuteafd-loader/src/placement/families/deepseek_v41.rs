@@ -62,6 +62,7 @@ impl NativeWorkspace {
         intermediate: u64,
         experts: u64,
         topk: u64,
+        sms: u32,
     ) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         ensure!(
@@ -93,11 +94,23 @@ impl NativeWorkspace {
                 matching.len() == 1,
                 "missing or duplicate V4.1 expert capacity {capacity}"
             );
-            scratch_bytes = scratch_bytes.max(
-                matching[0]["core_scratch_nbytes"]
-                    .as_u64()
-                    .context("missing exact V4.1 expert scratch extent")?,
-            );
+            let mut bytes = matching[0]["core_scratch_nbytes"]
+                .as_u64()
+                .context("missing exact V4.1 expert scratch extent")?;
+            if let Some(ring) = matching[0].get("runtime_ring") {
+                let slices = ring["slices"].as_u64().context("missing ring slices")?;
+                ensure!(slices > 0 && sms > 0 && ring["rows"].as_u64() == Some(16)
+                    && ring["hidden"].as_u64() == Some(hidden)
+                    && ring["control_bytes_per_slot"].as_u64() == Some(8)
+                    && ring["alignment"].as_u64() == Some(16), "invalid runtime ring geometry");
+                let slots = u64::from(sms).div_ceil(slices) + 1;
+                let ring_bytes = slices.checked_mul(16).and_then(|v| v.checked_mul(hidden))
+                    .and_then(|v| v.checked_mul(4)).and_then(|v| v.checked_add(8))
+                    .and_then(|v| v.checked_mul(slots)).context("runtime ring overflow")?;
+                bytes = bytes.checked_add(ring_bytes.div_ceil(16) * 16)
+                    .context("expert scratch overflow")?;
+            }
+            scratch_bytes = scratch_bytes.max(bytes);
         }
         let kernel_intermediate = manifest["geometry"]["kernel_intermediate"]
             .as_u64()
@@ -349,6 +362,7 @@ pub fn expert_inventory(
             (shape.intermediate / gpus) as u64,
             shape.experts as u64,
             shape.topk as u64,
+            sms,
         )?;
         (
             workspace.kernel_intermediate,
@@ -805,26 +819,43 @@ mod tests {
     }
 
     #[test]
+    fn native_ring_reserve_tracks_runtime_sms() {
+        let manifest = serde_json::json!({"role":"rtx_tp2", "geometry": {
+            "hidden":5120,"intermediate":1152,"kernel_intermediate":1152,"experts":384,"topk":6},
+            "variants": ([1,16,80,256].map(|c| serde_json::json!({
+                "capacity_rows":c,"core_scratch_nbytes":1000,
+                "runtime_ring":{"slices":6,"rows":16,"hidden":5120,
+                                "control_bytes_per_slot":8,"alignment":16}})))});
+        for sms in [48u32, 170, 188] {
+            let slots = u64::from(sms).div_ceil(6) + 1;
+            let expected = 1000 + (slots * (8 + 6 * 16 * 5120 * 4)).div_ceil(16) * 16;
+            let demand = NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,384,6,sms).unwrap();
+            assert_eq!(demand.scratch_bytes, expected);
+        }
+        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,384,6,0).is_err());
+    }
+
+    #[test]
     fn native_manifest_demands_use_exact_retained_variants_and_resident_width() {
         let mut manifest = serde_json::json!({"role":"rtx_tp2", "geometry": {
             "hidden":5120,"intermediate":1152,"kernel_intermediate":1280,"experts":256,"topk":6},
             "variants": ([1,16,80,256,1024,4096].map(|c| serde_json::json!({
                 "capacity_rows":c,"core_scratch_nbytes":if c == 16 { 99999 } else { c * 7 }})))});
-        let demand = NativeWorkspace::from_manifest(&manifest,"rtx_tp2", 81,5120,1152,256,6).unwrap();
+        let demand = NativeWorkspace::from_manifest(&manifest,"rtx_tp2", 81,5120,1152,256,6,188).unwrap();
         assert_eq!(demand, NativeWorkspace { scratch_bytes:99999, kernel_intermediate:1280 });
         assert_eq!(demand.lane_bytes(81,5120,6,true,false).unwrap(),99999+81*5120*(24+26));
         assert_eq!(demand.lane_bytes(81,5120,6,true,true).unwrap(),99999+81*5120*(12+26));
         assert_eq!(demand.lane_bytes(81,5120,6,false,false).unwrap(),99999+81*5120*2);
         manifest["variants"][2]["requested_rows"] = 80.into();
         manifest["variants"][2]["capacity_rows"] = 96.into();
-        assert_eq!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).unwrap(), demand);
+        assert_eq!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6,188).unwrap(), demand);
         manifest["variants"][2]["requested_rows"] = 79.into();
-        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
+        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6,188).is_err());
         manifest["variants"][2]["requested_rows"] = 80.into();
         let duplicate = manifest["variants"][2].clone();
         manifest["variants"].as_array_mut().unwrap().push(duplicate);
-        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6).is_err());
-        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_backbone",256,5120,1152,256,6).is_err());
+        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_tp2",81,5120,1152,256,6,188).is_err());
+        assert!(NativeWorkspace::from_manifest(&manifest,"rtx_backbone",256,5120,1152,256,6,188).is_err());
         assert_eq!(exl3_capacities(4096,true).unwrap(), [1,16,80,4096]);
         assert_eq!(exl3_capacities(16,true).unwrap(), [1,16,80]);
         assert_eq!(exl3_capacities(16,false).unwrap(), [1,16,80]);

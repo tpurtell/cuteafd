@@ -88,10 +88,24 @@ Variant* by_handle(void* handle) {
 #endif
   return nullptr;
 }
+uint64_t runtime_ring_bytes(const Variant& variant, int sms) {
+#ifdef CUTEAFD_V41_RUNTIME_RING_CASES
+  const auto slices = [](uint32_t capacity) -> uint64_t {
+    switch (capacity) { CUTEAFD_V41_RUNTIME_RING_CASES default: return 0; }
+  }(variant.info.capacity_rows);
+  if (slices && sms > 0) {
+    const uint64_t slots = (uint64_t(sms) + slices - 1) / slices + 1;
+    const uint64_t bytes = slots * (8 + slices * 16 * variant.info.hidden_size * 4);
+    return (bytes + 15) / 16 * 16;
+  }
+#endif
+  return 0;
+}
 bool valid_scratch(Variant* variant, void* storage, uint64_t bytes) {
-  return variant && variant->device >= 0 && storage &&
-    reinterpret_cast<uintptr_t>(storage) % 16 == 0 && bytes >= variant->info.scratch_bytes &&
-    reinterpret_cast<uintptr_t>(storage) <= UINTPTR_MAX - variant->info.scratch_bytes;
+  if (!variant || variant->device < 0 || !storage) return false;
+  const auto required = variant->info.scratch_bytes + runtime_ring_bytes(*variant, variant->device_sms);
+  return reinterpret_cast<uintptr_t>(storage) % 16 == 0 && bytes >= required &&
+    reinterpret_cast<uintptr_t>(storage) <= UINTPTR_MAX - required;
 }
 Variant* by_capacity(int32_t capacity) {
 #ifdef CUTEAFD_EXPERT_PER_DEVICE_HANDLES
@@ -156,6 +170,14 @@ extern "C" int32_t cuteafd_expert_info(int32_t capacity, cuteafd_expert_info_t* 
   auto* variant = by_capacity(capacity);
   if (!variant || !out) return cudaErrorInvalidValue;
   *out = variant->info;
+#ifdef CUTEAFD_V41_RUNTIME_RING_CASES
+  int device = -1, sms = 0;
+  auto status = cudaGetDevice(&device);
+  if (status != cudaSuccess) return status;
+  status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  if (status != cudaSuccess) return status;
+  out->scratch_bytes += runtime_ring_bytes(*variant, sms);
+#endif
   return cudaSuccess;
 }
 

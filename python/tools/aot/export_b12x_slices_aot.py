@@ -185,7 +185,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                       kernel_intermediate=kernel_intermediate, topk=topk),
         variants=[],
     )
-    includes, entries, reductions = [], [], []
+    includes, entries, reductions, rings = [], [], [], []
     group_rows = slice_group_rows(_pinned_sparkinfer.SOURCE)
     for capacity in capacities:
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
@@ -194,8 +194,6 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         selected_width = width[capacity] if isinstance(width, dict) else width
         routes = capacity * topk
         planes = (intermediate + selected_width - 1) // selected_width
-        ring_slots = (188 + planes - 1) // planes + 1
-        ring_words = 2 * ring_slots + ring_slots * planes * 16 * hidden
         # The native Spark TP3 launch geometry is recorded from the reviewed
         # identity contract (pinned kernel constants + this variant's compiled
         # width). It is keyed on static capacity and model geometry only: no live
@@ -231,7 +229,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             (cutlass.Float32, (routes,), (1,)),
             (cutlass.Int32, (routes,), (1,)),
             (cutlass.Float32, (1,), (1,)) if atomic else
-                (cutlass.Float32, (ring_words,), (1,)) if ordered_groups else
+                (cutlass.Float32, (1,), (1,)) if ordered_groups else
                 (cutlass.Float32, (planes, routes, hidden), (routes * hidden, hidden, 1)),
             (cutlass.Float32, (capacity * hidden,), (1,)) if atomic else
                 (cutlass.Float32, (routes, hidden), (hidden, 1)),
@@ -319,6 +317,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         # point at valid dummy scratch to preserve public nonnull validation.
         scratch_slots = [3, 4, 5, 6, 7, 8, 9, 10, 41]
         for index, slot in zip(range(8, 17), scratch_slots):
+            if ordered_groups and slot == 10:
+                continue  # Runtime ring follows all fixed-size arena allocations.
             dtype, shape, _ = specs[index]
             size = dtype.width // 8
             for dim in shape:
@@ -336,6 +336,10 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             offsets[11] = offset
             scratch.append(dict(slot=11, offset=offset, nbytes=capacity*5280, shape=(capacity, 5280)))
             offset += capacity * 5280
+        if ordered_groups:
+            offset = (offset + 15) // 16 * 16
+            offsets[10] = offset
+            rings.append(f"case {capacity}: return {planes};")
         for slot in list(range(3, 22)) + [34, 35, 36, 42, 43]:
             if offsets[slot] is None:
                 offsets[slot] = 0
@@ -410,6 +414,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 native_abi_version=3 if atomic else 2,
                 capacity_rows=capacity,
                 core_scratch_nbytes=offset,
+                **({"runtime_ring": dict(slices=planes, rows=16, hidden=hidden,
+                                          control_bytes_per_slot=8, alignment=16)}
+                   if ordered_groups else {}),
                 scratch=scratch,
                 scratch_pointer_offsets=offsets,
                 native_entry=symbol[0],
@@ -426,6 +433,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 f"#define CUTEAFD_V41_SMS {workspace_sms}",
                 "#define CUTEAFD_V41_VARIANTS " + ",".join(entries),
                 *native_group_macros(manifest["variants"]),
+                "#define CUTEAFD_V41_RUNTIME_RING_CASES " + " ".join(rings),
                 "#define CUTEAFD_EXPERT_REDUCTION_CASES " + " ".join(reductions),
                 "#define CUTEAFD_V41_OUTPUT_KIND(capacity) (" +
                 (" || ".join(f"((capacity)=={v['capacity_rows']})" for v in manifest['variants']
