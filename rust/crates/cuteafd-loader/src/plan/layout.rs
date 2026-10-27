@@ -998,7 +998,7 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
     // Shared replay records live in the prefill scratch.
     prefill.programs = prefill.programs.max(shared_records);
-    Some(crate::placement::families::glm5_flash::step_workspace_demands_with_decode_lanes(&cfg,
+    Some(crate::placement::families::glm5_flash::step_workspace_demands(&cfg,
         usize::try_from(lanes).ok()?, decode_lanes, rows, decode_rows, shape, decode, prefill))
 }
 

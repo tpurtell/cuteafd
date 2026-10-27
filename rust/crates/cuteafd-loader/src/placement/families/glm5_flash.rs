@@ -243,13 +243,8 @@ pub use crate::placement::{ComponentDemand as GlmfBufferDemand, SparkWorkingSet 
 
 /// Shared attention/head temporaries remain allocated when every expert is remote.
 /// Both callers use the exact base plus optional RTX-buffer delta.
-pub fn step_workspace_demands(cfg: &GlmNextConfig, lanes: usize, prefill_rows: u64, decode_rows: u64,
-    shape: cache::GlmfStepShape, decode: cache::GlmfScratch, prefill: cache::GlmfScratch) -> Vec<GlmfBufferDemand> {
-    step_workspace_demands_with_decode_lanes(cfg, lanes, 1, prefill_rows, decode_rows, shape, decode, prefill)
-}
-
 #[allow(clippy::too_many_arguments)]
-pub fn step_workspace_demands_with_decode_lanes(cfg: &GlmNextConfig, lanes: usize, decode_lanes: u8,
+pub fn step_workspace_demands(cfg: &GlmNextConfig, lanes: usize, decode_lanes: u8,
     prefill_rows: u64, decode_rows: u64, shape: cache::GlmfStepShape,
     decode: cache::GlmfScratch, prefill: cache::GlmfScratch) -> Vec<GlmfBufferDemand> {
     (0..if shape.split { 2 } else { 1 }).flat_map(|rank| {
@@ -709,7 +704,7 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
         if i.graphs.lifetime == Lifetime::Startup {
             let context = glmf_graphs::admitted_graph_context(i.max_context as usize, candidate as usize, automatic_context);
             trial.graphs = graph_cache.entry((context, candidate as usize)).or_insert_with(||
-                startup_graphs_with_decode_lanes(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
+                startup_graphs(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
                     i.speculation, i.gpus.len(), i.decode_rows as usize, sms, i.decode_lanes)).clone();
             if i.local_tp2_exl3 && working.spark_ranks == 0 {
                 calibrate_local_tp2_graphs(&mut trial.graphs);
@@ -729,12 +724,6 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
 
 #[allow(clippy::too_many_arguments)]
 pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
-    speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
-    startup_graphs_with_decode_lanes(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms, 1)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn startup_graphs_with_decode_lanes(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
     speculation: bool, gpus: usize, decode_rows: usize, sms: usize, decode_lanes: u8) -> GraphSet {
     let counts = glmf_graphs::serving_graph_counts(context, pool, cfg.dense_context(), sequences.min(decode_rows), speculation,
         layers, gpus == 2, &glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms)));
@@ -786,7 +775,7 @@ mod tests {
             resident: (0..ranks).map(|rank| GlmfResidentRank {
                 embedding: if rank == 0 { 1 << 30 } else { 0 }, weights: (5 << 30) + if rank == 1 { 64 << 20 } else { 0 } }).collect(), workspace: workspace_fixture(ranks, 3 << 30), local_workspace: workspace_fixture(ranks, 2 << 30),
             graphs: startup_graphs(cfg, cfg.layers, 262_144, if capacity <= 34 << 30 { 1 << 20 } else { 2 << 20 },
-                8, true, ranks, 64, 188),
+                8, true, ranks, 64, 188, 1),
             experts: cfg.dense.iter().filter(|&&dense| !dense).map(|_| ExpertCost {
                 whole: Bytes2 { resident: 2 << 30, staging: 0 },
                 half: [Bytes2 { resident: 1 << 30, staging: 0 }; 2], tp2: ranks == 2, spark_ok: true }).collect(),
@@ -854,11 +843,11 @@ mod tests {
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
         // No external drafter still captures speculative graphs for default copy windows.
-        let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        let copy = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188, 1);
         assert_eq!(copy.shapes, 280);
         assert_eq!(copy.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [12_880, 12_600]);
         assert_eq!([copy.at_ready(0), copy.at_ready(1)], [2_082_618_720, 2_131_554_600]);
-        let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188);
+        let plain = startup_graphs(&cfg, 45, 262_144, 262_144, 8, false, 2, 64, 188, 1);
         assert_eq!(plain.shapes, 112);
         assert_eq!(plain.ranks.iter().map(|r| r.executables).collect::<Vec<_>>(), [5_152, 5_040]);
     }
@@ -869,7 +858,7 @@ mod tests {
         config["text_config"]["layer_types"] = serde_json::json!((0..45).map(|l|
             if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
         let cfg = GlmNextConfig::from_hf(&config).unwrap();
-        let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188);
+        let mut graphs = startup_graphs(&cfg, 45, 262_144, 262_144, 8, true, 2, 64, 188, 1);
         calibrate_local_tp2_graphs(&mut graphs);
         for (rank, (baseline, ready)) in [(1_027_511_116u64, 3_101_594_444u64),
             (900_673_356, 2_905_550_668)].into_iter().enumerate() {
@@ -1547,7 +1536,7 @@ mod tests {
         assert!(placed.pool_tokens < 1 << 20);
         let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
-            input.sequences as usize, true, 1, 64, 170);
+            input.sequences as usize, true, 1, 64, 170, 1);
         assert_eq!(graphs.ranks, expected.ranks);
     }
 
@@ -1562,7 +1551,7 @@ mod tests {
             let (placed, graphs) = solve_with_graphs(&input, 2 << 20, true, 188, true).unwrap();
             let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
             let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
-                64, speculation, 1, 64, 188);
+                64, speculation, 1, 64, 188, 1);
             assert_eq!(graphs.ranks, expected.ranks);
         }
     }
@@ -1576,7 +1565,7 @@ mod tests {
         assert_eq!(placed.onboard_layers, 1);
         let context = glmf_graphs::admitted_graph_context(input.max_context as usize, placed.pool_tokens as usize, true);
         let expected = startup_graphs(&cfg, cfg.layers, context, placed.pool_tokens as usize,
-            input.sequences as usize, true, 1, 64, 188);
+            input.sequences as usize, true, 1, 64, 188, 1);
         assert_eq!(graphs.ranks, expected.ranks);
     }
 
@@ -1939,7 +1928,7 @@ mod tests {
         one.index = cache::GlmfIndexCache::Compact;
         let mut two = one.clone();
         two.decode_lanes = 2;
-        two.graphs = startup_graphs_with_decode_lanes(&cfg, cfg.layers, 262_144, 2 << 20, 8, true, 1, 64, 188, 2);
+        two.graphs = startup_graphs(&cfg, cfg.layers, 262_144, 2 << 20, 8, true, 1, 64, 188, 2);
         let req1 = request(&one).unwrap();
         let req2 = request(&two).unwrap();
         let sum = |req: &crate::placement::PlacementRequest, group: &str| -> u64 {
@@ -1960,8 +1949,8 @@ mod tests {
             tp2_experts: false, spark: true, partial_bytes: 2, output_shard: false,
             full_prefill_logits: false, table_pages: 64, table_pool_pages: 16 };
         let scratch = cache::GlmfScratch::default();
-        let step1 = step_workspace_demands_with_decode_lanes(&cfg, 2, 1, 4096, 64, shape, scratch, scratch);
-        let step2 = step_workspace_demands_with_decode_lanes(&cfg, 2, 2, 4096, 64, shape, scratch, scratch);
+        let step1 = step_workspace_demands(&cfg, 2, 1, 4096, 64, shape, scratch, scratch);
+        let step2 = step_workspace_demands(&cfg, 2, 2, 4096, 64, shape, scratch, scratch);
         let step_sum = |demands: &[GlmfBufferDemand]| demands.iter().map(|d| d.demand.bytes).sum::<u64>();
         assert!(step_sum(&step2) > step_sum(&step1));
     }

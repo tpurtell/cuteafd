@@ -157,7 +157,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 automatic_target
             } else { options.target_pool_tokens.max(context) });
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
-            .unwrap_or_else(|| glmf::startup_graphs_with_decode_lanes(&cfg, cfg.layers, context as usize, target as usize,
+            .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize, report.decode_lanes));
         let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, decode_lanes: report.decode_lanes, prefill_rows: rows,

@@ -778,7 +778,7 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "GlmfComponent::SparkExperts, gpu, Category::Transport, \"Spark intake\"" in request
     expert = source[source.index("    fn experts_for_layers<"):source.index("impl Opened {\n    /// The checkpoint's `embed_tokens`")]
     assert expert.index("validate_expert_layers(&self.cfg, served, selected)?;") < expert.index("if selected.is_empty() { return Ok(None); }")
-    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new_waves(")
+    assert expert.index("if selected.is_empty() { return Ok(None); }") < expert.index("Fp8Experts::load(") < expert.index("SparkLink::new_waves_for_lane(")
     assert "tensors, &directory, selected, 1, 0," in expert
     assert "layers: selected.to_vec()" in expert
     assert "spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())" in expert

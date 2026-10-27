@@ -821,11 +821,12 @@ mod draft_cli_tests {
         let sized = ["args.expert", "_rows()"].concat();
         assert!(dense.contains(&["DenseNvfp4::load(&self.library, &directory, &self.cfg, ", &sized, ")?"].concat()));
         // FP8 experts, EXL3 experts and the Spark transports, each with the rows among its arguments.
-        for site in ["Fp8Experts::load(", "max_rows: ", "SparkLink::new_waves("] {
+        for site in ["Fp8Experts::load(", "max_rows: ", "LaneSet::default().try_map("] {
             let at = experts.find(site).unwrap_or_else(|| panic!("{site}"));
             let arguments: String = experts[at..].chars().take(200).collect();
             assert!(arguments.contains(&sized), "{site}");
         }
+        assert!(experts.contains("SparkLink::new_waves_for_lane("));
         assert_eq!(experts.matches(&sized).count(), 4);
         let lane = ["args.prefill", "_rows"].concat();
         assert!(!dense.contains(&lane));
@@ -1559,7 +1560,7 @@ impl Opened {
         let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
             tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
             output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
-        let workspaces = |spark, lanes| admission::step_workspace_demands_with_decode_lanes(&self.cfg, lanes,
+        let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
             args.decode_lanes, args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let workspace = workspaces(spark_ranks > 0, lanes);
         let local_workspace = workspaces(false, lanes);
@@ -1599,7 +1600,7 @@ impl Opened {
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
-            admission::startup_graphs_with_decode_lanes(&self.cfg, layers, args.max_context, pool,
+            admission::startup_graphs(&self.cfg, layers, args.max_context, pool,
                 sequences, speculation, devices.len(), args.decode_rows, sms, args.decode_lanes)
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
@@ -2297,27 +2298,27 @@ impl Opened {
         let (started, before) = (Instant::now(), rings());
         let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
         let transports = crate::shared::serve::lanes::LaneSet::default().try_map(|lane| -> Result<Option<_>> {
-            if lane.index() >= usize::from(args.decode_lanes) { return Ok(None); }
-            let (capacity, waves, wave_rows) = if lane.index() == 0 {
+            let (warm_rows, waves, wave_rows) = if lane.index() == 0 {
                 (args.expert_rows(), args.prefill_waves, args.prefill_rows)
             } else {
                 (args.decode_rows, 1, args.decode_rows)
             };
+            if lane.index() >= usize::from(args.decode_lanes) { return Ok(None); }
             let mut transport = crate::shared::spark_intake::SparkLink::new_waves_for_lane(&self.library,
-                spark_world, &peers, u32::try_from(capacity)?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
+                spark_world, &peers, u32::try_from(warm_rows)?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
                     timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
                 waves, u32::try_from(wave_rows)?, u32::try_from(lane.index())?)?;
             transport.enable_terminal_ownership(self.library.clone())?;
             if lane.index() == 0 {
                 crate::shared::memory_report::release_load_staging(&self.library);
             }
-            let warm = engine::spark_warmup_request(&self.cfg, capacity, remote[0], self.checkpoint.spark_input_is_bf16())?;
+            let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
             // Publish grouping before the draft planner prices the installed workers.
             transport.bootstrap(&warm)?;
             let exchange = transport.exchange()?;
             let wave = exchange.send_request(warm)?;
             exchange.land_drained(wave, warm_stream.raw())
-                .with_context(|| format!("warming Spark expert transport lane {} with {capacity} rows", lane.index()))?;
+                .with_context(|| format!("warming Spark expert transport lane {} with {warm_rows} rows", lane.index()))?;
             Ok(Some(std::cell::RefCell::new(transport)))
         })?.into_iter().flatten().collect::<Vec<_>>();
         warm_stream.finish()?;
