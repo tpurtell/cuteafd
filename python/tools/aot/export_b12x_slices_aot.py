@@ -190,6 +190,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     for capacity in capacities:
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
         atomic = not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
+        ordered_groups = family == "v41" and not compact and not atomic and capacity >= 256
         selected_width = width[capacity] if isinstance(width, dict) else width
         routes = capacity * topk
         planes = (intermediate + selected_width - 1) // selected_width
@@ -227,7 +228,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             (cutlass.Int32, (routes, 19), (19, 1)),
             (cutlass.Float32, (routes,), (1,)),
             (cutlass.Int32, (routes,), (1,)),
-            (cutlass.Float32, (1,), (1,)) if atomic else
+            (cutlass.Float32, (1,), (1,)) if atomic or ordered_groups else
                 (cutlass.Float32, (planes, routes, hidden), (routes * hidden, hidden, 1)),
             (cutlass.Float32, (capacity * hidden,), (1,)) if atomic else
                 (cutlass.Float32, (routes, hidden), (hidden, 1)),
@@ -238,10 +239,11 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         ]
         label = (f"{family}_{role}_m{capacity}" if standard_names
                  else f"v41_slices_m{capacity}_w{selected_width}")
-        pipeline = (V41DraftSlicePipeline(capacity, selected_width, scale_codes=family == "v41")
+        pipeline = (V41DraftSlicePipeline(capacity, selected_width, scale_codes=family == "v41",
+                                          ordered_groups=ordered_groups)
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
                                                experts=experts, topk=topk, intermediate=intermediate,
-                                               hidden=hidden, scale_codes=family == "v41",
+                                               hidden=hidden, scale_codes=family == "v41", ordered_groups=ordered_groups,
                                                fc2_n_splits=fc2_n_splits(role, capacity, selected_width, hidden)))
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
@@ -398,6 +400,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 compact_group_rows=1 if compact else None,
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,
+                ordered_group_owner=ordered_groups,
                 numerical_recipe=numerical_recipe(selected_width, intermediate,
                                                   atomic=atomic, compact=compact),
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
