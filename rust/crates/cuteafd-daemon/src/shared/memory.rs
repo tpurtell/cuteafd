@@ -228,6 +228,30 @@ impl<'a> BlockingWait<'a> {
             self.library.cuda_event_synchronize(event)
         }
     }
+
+    /// Yields the local task while `stream` completes, draining synchronously on cancellation.
+    ///
+    /// # Safety
+    /// `stream` is a live stream of the current device.
+    pub(crate) async unsafe fn wait_yielding(&self, stream: *mut std::ffi::c_void, context: &'static str) -> Result<()> {
+        struct Drain<'a> { library: &'a NativeLibrary, stream: *mut std::ffi::c_void, context: &'static str, complete: bool }
+        impl Drop for Drain<'_> {
+            fn drop(&mut self) {
+                if !self.complete {
+                    crate::shared::decode_graph::fatal_drain(
+                        unsafe { self.library.cuda_stream_synchronize(self.stream) }.map_err(anyhow::Error::from),
+                        self.context,
+                    );
+                }
+            }
+        }
+        let mut guard = Drain { library: self.library, stream, context, complete: false };
+        while !unsafe { self.library.cuda_stream_query(stream)? } {
+            tokio::task::yield_now().await;
+        }
+        guard.complete = true;
+        Ok(())
+    }
 }
 
 impl Drop for BlockingWait<'_> {

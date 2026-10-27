@@ -106,11 +106,16 @@ impl<'a> Engine<'a> {
 
     /// Runtime width uses the same installed stages and decode-sized workspace.
     pub fn draft_width(&self, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize) -> Result<Vec<Vec<u32>>> {
+        self.draft_width_on_lane(0, requests, inputs, block)
+    }
+
+    pub fn draft_width_on_lane(&self, lane_idx: usize, requests: &[DraftRequest<'_>], inputs: &[u32], block: usize)
+        -> Result<Vec<Vec<u32>>> {
         let dspark = self.weights.dspark.as_ref().context("the checkpoint has no dSpark drafter")?;
         ensure!(self.draft_ready(), "dSpark stage experts are not resident on the coordinator");
         let h = self.cfg.dim;
         let rows = draft_rows(requests.len(), block, self.cfg.dspark_block_size, self.decode_rows, inputs.len())?;
-        let slot = &self.decode_workspace;
+        let slot = self.decode_workspaces.get(lane_idx).context("dSpark decode lane")?;
         if slot.borrow().is_none() {
             *slot.borrow_mut() = Some(self.workspace(self.decode_rows, 1, false)?);
         }

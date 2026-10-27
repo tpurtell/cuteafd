@@ -41,8 +41,7 @@ pub static DEEPSEEK_V4: DeepSeek = DeepSeek {
         waves: 3, reference_ranks: 6, larger_topology_waves: 3,
         source: "https://github.com/tpurtell/cuteafd/issues/762#issuecomment-6405917249; Pro EXL3 six-Spark k3 versus k2, no independent S/T",
     },
-    decode_lanes: crate::plan::decode_lanes::LaneSupport::One {
-        reason: "the second lane is not wired yet: V4 Flash, the closest shape to V4.1, is the OneOrTwo candidate awaiting its A/B on its own decode endpoint (#744)" },
+    decode_lanes: crate::plan::decode_lanes::LaneSupport::OneOrTwo { default: 1 },
     // Installed V4 coordinator manifests fix `decode_rows`; serve passes it.
     decode_rows: 64,
     spark_prefill: crate::plan::spark_executions::SparkPrefill::Ladder,

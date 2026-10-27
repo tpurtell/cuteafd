@@ -735,8 +735,11 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         return Ok(report);
     };
     report.family = Some(family.id().into());
-    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes,
-        options.layout.as_ref().map_or(2, |layout| layout.concurrency))?;
+    let decode_concurrency = options.layout.as_ref().map_or(2, |layout| {
+        if layout.concurrency > 0 { layout.concurrency }
+        else { cuteafd_core::serving_capacity::default_concurrency(layout.rtx_bytes.first().copied().unwrap_or(0)) }
+    });
+    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes, decode_concurrency)?;
     report.precision_optimizations = precision_optimizations(family.id(), options);
     report.numerics_deviations = numerics_deviations(family.id(), &report.module_numerics);
     if let Some(executor) = crate::placement::families::executor(family.id()) {
@@ -958,6 +961,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
+        layout_options.decode_lanes = report.decode_lanes;
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
         let memory = family_layout(model.as_ref(), input, &mut report, &mut layout_options, options.placement)?;
         report.prefill_unit_rows = layout_options.prefill_unit_rows;
@@ -1010,6 +1014,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut inventory = layout::LayoutOptions { rtx_bytes: vec![options.coordinator_budget_bytes], spark_bytes: options.spark_budget(),
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
+            decode_lanes: report.decode_lanes,
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
         let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
         report.prefill_unit_rows = inventory.prefill_unit_rows;

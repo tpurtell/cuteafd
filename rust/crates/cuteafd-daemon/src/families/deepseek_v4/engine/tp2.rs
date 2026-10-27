@@ -112,10 +112,11 @@ impl<'a> Engine<'a> {
         ensure!(self.local.borrow().as_ref().is_none_or(|l| l.layers().is_empty()),
             "TP1 backbone experts cannot coexist with TP2");
         let rows = self.prefill_rows.max(self.decode_rows);
+        let slots = self.prefill_waves.max(self.decode_lanes);
         let routes = PeerExchange::new_abortable(self.library,
             [RankDevice { device: self.device, stream: self.stream },
              RankDevice { device: peer.device, stream: peer.stream }],
-            2 * self.prefill_waves, rows * self.cfg.n_activated_experts * 8 + 16)?;
+            2 * slots, rows * self.cfg.n_activated_experts * 8 + 16)?;
         let interval = std::env::var("CUTEAFD_ROUTE_CHECK").ok()
             .map(|v| v.parse::<usize>().context("CUTEAFD_ROUTE_CHECK must be a nonnegative step interval"))
             .transpose()?.unwrap_or(0);
@@ -250,7 +251,7 @@ impl<'a> Engine<'a> {
     pub(super) fn tp2_experts(&self, rank: usize, layer: usize, index: usize, w: &Workspace<'_>, rows: usize)
         -> Result<()> {
         let tp2 = self.tp2.as_ref().context("TP2 experts")?;
-        let lane = &w.slots[index];
+        let lane = w.slots.iter().find(|s| s.index == index).unwrap_or(&w.slots[0]);
         let payload = lane.payload.as_ref().context("TP2 lane payload")?;
         let stream = self.stream_of(rank);
         ensure!(stream == tp2.streams[rank], "TP2 executor moved streams; per-lane scratch ownership is required");
@@ -355,7 +356,8 @@ impl<'a> Engine<'a> {
         self.on(rank, || {
             let bytes = rows * self.cfg.n_activated_experts * 4;
             let checks = tp2.checks.borrow();
-            let check = checks.get(&(layer, tp2.check_units.borrow()[lane])).context("route diagnostic storage not prepared")?;
+            let unit = tp2.check_units.borrow().get(lane).copied().unwrap_or(0);
+            let check = checks.get(&(layer, unit)).context("route diagnostic storage not prepared")?;
             ensure!(check.rows == rows, "route-check rows changed");
             let host = check.ranks[rank].as_ref().context("route diagnostic rank buffer")?;
             // SAFETY: pinned host storage is retained until both streams drain in finish_route_step.
@@ -472,8 +474,8 @@ impl<'a> Engine<'a> {
     pub(super) fn warm_tp2_routers(&self) -> Result<()> {
         let Some(tp2) = &self.tp2 else { return Ok(()) };
         for rank in 0..2 {
-            let workspace = if rank == 0 { self.decode_workspace.borrow() }
-                else { self.peer()?.decode_workspace.borrow() };
+            let workspace = if rank == 0 { self.decode_workspaces[0].borrow() }
+                else { self.peer()?.decode_workspaces[0].borrow() };
             let w = workspace.as_ref().context("router warm-up workspace")?;
             let lane = &w.slots[0];
             let layers = if rank == 0 { &self.weights.layers } else { &self.peer()?.layers };

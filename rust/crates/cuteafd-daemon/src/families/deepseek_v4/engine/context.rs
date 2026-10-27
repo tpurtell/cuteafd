@@ -35,7 +35,7 @@ use crate::shared::peer_split::attention::{context_decode, Candidates, ContextKe
 use crate::shared::peer_split::context::{local_pages, ContextExchange};
 use cuteafd_core::coordinator_programs::AttentionReductionPlan;
 use cuteafd_ffi::CuteafdDeviceBuffer;
-use cuteafd_loader::placement::families::deepseek_v4::{context_buffers, context_commit_units, context_workspace,
+use cuteafd_loader::placement::families::deepseek_v4::{context_buffers_for_lanes, context_commit_units, context_workspace,
     V4Context};
 use super::metadata::{c4_context_commits, c4_context_prefill_tables, c4_context_tables, C4Shard};
 
@@ -97,7 +97,8 @@ impl<'a> V4ContextSplit<'a> {
         abort: Option<[*const u32; 2]>, plan: &AttentionReductionPlan) -> Result<Self> {
         let cfg = &engine.cfg;
         let (prefill, decode, lanes) = (engine.prefill_rows as u64, engine.decode_rows as u64, engine.prefill_waves as u64);
-        let buffers = context_buffers(cfg, extent as u64, prefill, decode, lanes, context);
+        let buffers = context_buffers_for_lanes(cfg, extent as u64, prefill, decode, lanes,
+            engine.decode_lanes as u64, context);
         let ranks = [RankDevice { device: engine.device, stream: engine.stream_of(0) },
             RankDevice { device: engine.peer()?.device, stream: engine.stream_of(1) }];
         let exchange = ContextExchange::new(engine.library, ranks, &buffers, abort)?;
@@ -352,7 +353,7 @@ impl<'a> Engine<'a> {
         let split = self.context()?;
         let ordinal = split.ordinal(layer).context("context attention on a non-C4 layer")?;
         let t = tables.rows;
-        context_decode(&split.exchange, rank, ordinal, 0, t, &mut Bindings { engine: self, weights, tables, lane,
+        context_decode(&split.exchange, rank, ordinal, lane.index, t, &mut Bindings { engine: self, weights, tables, lane,
             w, rank, layer, ordinal, rows, cap, t })?;
         self.attention_project(rank, weights, lane, w, rows, cap)
     }
@@ -444,7 +445,7 @@ mod tests {
             let allocated: u64 = list.iter().filter(|(n, _)| !n.starts_with("C4 scratch")).map(|&(_, b)| b.max(256)).sum();
             let in_pools = (c4 * metadata::C4_SCRATCH_UNITS * (metadata::compressed_page_bytes(4) + INDEX_PAGE_BYTES)) as u64;
             assert_eq!(allocated + in_pools, charged, "{heads} heads");
-            assert_eq!(context_buffers(&cfg, 1 << 20, 4096, 64, PREFILL_WAVES as u64, context).workspace_bytes, charged);
+            assert_eq!(context_buffers_for_lanes(&cfg, 1 << 20, 4096, 64, PREFILL_WAVES as u64, 1, context).workspace_bytes, charged);
             // The listed order the engine binds: 8 shared buffers, then one commit list per lane.
             let names: Vec<_> = list.iter().map(|(n, _)| *n).filter(|n| !n.starts_with("C4 scratch")).collect();
             assert_eq!(names, ["candidates", "own-head partial", "peer-head partial", "scored top-k scratch",

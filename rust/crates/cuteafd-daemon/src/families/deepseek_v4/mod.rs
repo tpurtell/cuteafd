@@ -58,6 +58,9 @@ pub(crate) struct EngineArgs {
     /// Sequences that can be resident at once (compressor state slots).
     #[arg(long, default_value_t = 8)]
     pub max_sequences: usize,
+    /// Decode lanes (1 or 2); defaults to the family descriptor's default (1).
+    #[arg(long)]
+    pub decode_lanes: Option<u8>,
     /// Admit every prefill row's logits at startup for fidelity probes.
     #[arg(long)]
     pub full_prefill_logits: bool,
@@ -272,6 +275,12 @@ impl EngineArgs {
     pub(crate) fn fixed_onboard(&self) -> bool {
         self.rtx_expert_layers.is_some() || self.local_expert_layers.is_some()
     }
+
+    pub(crate) fn resolved_decode_lanes(&self) -> Result<usize> {
+        let concurrency = u64::try_from(self.max_sequences.max(1)).unwrap_or(u64::MAX);
+        let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v4", self.decode_lanes, concurrency)?;
+        Ok(usize::from(lanes))
+    }
 }
 
 /// The engine runs three shapes: every layer head-split under `--split-device` (`heads`), the
@@ -423,6 +432,7 @@ pub(crate) fn with_engine<T>(
     let prefill = args.prefill_shape(prefill_kernel_rows as u64, span_rows)?;
     let prefill_rows = usize::try_from(prefill.unit_rows)?;
     let decode_rows = caps["decode_rows"].as_u64().context("decode_rows")? as usize;
+    let decode_lanes = args.resolved_decode_lanes()?;
     let skip = args.skip_routed_experts;
     let peers = args.peers.split(',').filter(|p| !p.is_empty()).map(str::parse)
         .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
@@ -508,7 +518,7 @@ pub(crate) fn with_engine<T>(
                 loaded.catalog.routed_experts().geometry()?, Some(&loaded.catalog), &working,
                 peers.len(), None, admission::spark_model(
                     cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&loaded.catalog)?,
-                    decode_rows, prefill_rows, prefill.waves as usize)?)?.select(&peers)?;
+                    decode_rows, prefill_rows, prefill.waves as usize, decode_lanes)?)?.select(&peers)?;
         }
         let loaded_modes = placement.layers.iter().map(|layer| layer.mode).collect::<Vec<_>>();
         let started = Instant::now();
@@ -580,6 +590,7 @@ pub(crate) fn with_engine<T>(
         weights: model,
         family: loaded.family,
         decode_rows: caps["decode_rows"].as_u64().context("decode_rows")? as usize,
+        decode_lanes,
         prefill_rows,
         prefill_kernel_rows,
         prefill_waves: usize::try_from(prefill.waves)?,
@@ -650,19 +661,30 @@ pub(crate) fn with_engine<T>(
         // Decode graphs retain fixed reply pointers; prefill alone rotates N
         // FIFO return slots on its separate connection set.
         if !skip {
-            transports.push(SparkLink::new(&loaded.library,
-                spark_world.context("Spark transport needs a declared world")?, &peers, engine.decode_rows as u32,
-                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-                loaded.cfg.dim * 2)?);
+            let world = spark_world.context("Spark transport needs a declared world")?;
+            let config = TcpTransportConfig {
+                timing: cuteafd_transport::protocol_v2_timing_from_env(),
+                timeout: Duration::from_secs(120),
+                max_frame_bytes: 64 << 20,
+            };
+            if engine.decode_lanes == 2 {
+                let decode_links = crate::shared::serve::lanes::LaneSet::default().try_map(|lane| {
+                    SparkLink::new_for_lane(&loaded.library, world, &peers, engine.decode_rows as u32,
+                        config.clone(), loaded.cfg.dim * 2, lane)
+                })?;
+                transports.extend(decode_links);
+            } else {
+                transports.push(SparkLink::new(&loaded.library, world, &peers, engine.decode_rows as u32,
+                    config.clone(), loaded.cfg.dim * 2)?);
+            }
             transports.push(SparkLink::new_waves(&loaded.library,
-                spark_world.context("Spark transport needs a declared world")?, &peers, engine.prefill_rows.max(engine.decode_rows) as u32,
-                TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), timeout: Duration::from_secs(120), max_frame_bytes: 64 << 20 },
-                loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
+                world, &peers, engine.prefill_rows.max(engine.decode_rows) as u32,
+                config, loaded.cfg.dim * 2, engine.prefill_waves, engine.prefill_rows as u32)?);
         }
         for transport in &mut transports { transport.enable_terminal_ownership(loaded.library.clone())?; }
         // Every rank's persistent bootstrap runs before the warm-up wave does,
         // so the workers' installed grouping is readable at any later point.
-        let warm_shape = |index| if index == 0 {
+        let warm_shape = |index| if index < engine.decode_lanes {
             (engine.decode_rows, cuteafd_transport::ExpertV2SourceKind::Decode)
         } else { (engine.prefill_rows, cuteafd_transport::ExpertV2SourceKind::Prefill) };
         for (index, transport) in transports.iter_mut().enumerate() {

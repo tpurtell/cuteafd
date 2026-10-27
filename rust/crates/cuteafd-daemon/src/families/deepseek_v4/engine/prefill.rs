@@ -37,7 +37,7 @@ impl<'a> Engine<'a> {
                 let mut links = transports.borrow_mut();
                 // Waves build, post and land on the prefill link's exchange
                 // worker while this thread queues GPU work.
-                let transport = match links.get_mut(1) {
+                let transport = match links.get_mut(self.decode_lanes) {
                     Some(link) => {
                         let exchange = link.exchange()?;
                         ensure!(exchange.fits(self.wave_staging_bytes()?), "prefill link staging is narrower than a unit");

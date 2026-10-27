@@ -1226,14 +1226,14 @@ mod warm_stream_tests {
     }
 
     fn spark_transport_constructor(source: &str) -> Option<usize> {
-        ["new", "new_waves"].iter()
+        ["new", "new_for_lane", "new_waves"].iter()
             .filter_map(|constructor| source.find(&format!("SparkLink::{constructor}(")))
             .min()
     }
 
     #[test]
     fn transport_audit_recognizes_single_and_multi_wave_constructors() {
-        for constructor in ["new", "new_waves"] {
+        for constructor in ["new", "new_for_lane", "new_waves"] {
             let source = format!("let transport = SparkLink::{constructor}(");
             assert_eq!(spark_transport_constructor(&source), Some(16));
         }
@@ -1466,6 +1466,14 @@ impl<'a> SparkLink<'a> {
         Self::new_waves(library, world, peers, capacity, config, row_bytes, 1, capacity)
     }
 
+    /// Connects a [`SparkExperts::new_world`] transport bound to `ExecutionOwner::Decode(lane.index())`.
+    pub(crate) fn new_for_lane(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
+        row_bytes: usize, lane: crate::shared::serve::lanes::LaneLease<'_>) -> Result<Self> {
+        Self::new_waves_for_lane(library, world, peers, capacity, config, row_bytes, 1, capacity,
+            u32::try_from(lane.index())?)
+    }
+
     /// A link admitting `waves` outstanding waves of up to `capacity` rows,
     /// each with its own return slot ([`SparkIntake::with_waves`]). Waves are
     /// received in dispatch order, with one GPU landing range per slot.
@@ -1474,9 +1482,16 @@ impl<'a> SparkLink<'a> {
     pub(crate) fn new_waves(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
         peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
         row_bytes: usize, waves: usize, wave_rows: u32) -> Result<Self> {
+        Self::new_waves_for_lane(library, world, peers, capacity, config, row_bytes, waves, wave_rows, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_waves_for_lane(library: &'a NativeLibrary, world: cuteafd_transport::expert::SparkWorld,
+        peers: &[std::net::SocketAddr], capacity: u32, config: cuteafd_transport::TcpTransportConfig,
+        row_bytes: usize, waves: usize, wave_rows: u32, lane: u32) -> Result<Self> {
         ensure!((1..=capacity).contains(&wave_rows), "Spark return slot rows exceed the transport capacity");
         let timing = config.timing;
-        let mut transport = SparkExperts::new_world(world, peers, capacity, config, 0)?;
+        let mut transport = SparkExperts::new_world(world, peers, capacity, config, lane)?;
         transport.set_max_waves(waves)?;
         Self::with_egress_waves(library, transport, row_bytes, IntakePreference::Probed, true, waves, wave_rows, timing)
     }

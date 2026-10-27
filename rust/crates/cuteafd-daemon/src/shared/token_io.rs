@@ -600,6 +600,20 @@ impl<'a> TokenSelector<'a> {
         crate::shared::spark_waves::healthy()
     }
 
+    /// # Safety
+    /// `stream` is a live stream of the current device.
+    async unsafe fn wait_landed_async(&mut self, stream: *mut c_void, yield_wait: bool) -> Result<()> {
+        if yield_wait {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { self.landed.wait_yielding(stream, "cancelled token selector wait").await? };
+            crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, stream)?;
+            crate::shared::spark_waves::healthy()
+        } else {
+            // SAFETY: forwarded from this function's contract.
+            unsafe { self.wait_landed(stream) }
+        }
+    }
+
     /// Allocates the GPU sampler now (eager start-up); otherwise the first sampled or masked
     /// selection does.
     pub fn reserve_sampler(&mut self) -> Result<()> {
@@ -633,6 +647,25 @@ impl<'a> TokenSelector<'a> {
             return self.greedy(logits, rows);
         }
         self.sampled(logits, rows, &routes)
+    }
+
+    /// Selects `batch.rows[i]` from logits row `i`, yielding while waiting on `logits.stream` when `yield_wait` is true.
+    pub async fn select_async(&mut self, logits: &DeviceLogits, batch: &SelectBatch, yield_wait: bool) -> Result<Vec<RowResult>> {
+        if !yield_wait || self.placement == SelectPlacement::Host || batch.rows.is_empty() {
+            return self.select(logits, batch);
+        }
+        let rows = &batch.rows;
+        let n = rows.len();
+        ensure!(n <= logits.rows && logits.vocab == self.vocab && logits.stride >= self.vocab,
+            "selection of {n} rows x {} from {} logits rows x {}", self.vocab, logits.rows, logits.vocab);
+        if n > self.capacity {
+            return Err(TokenIoError::Capacity { rows: n, capacity: self.capacity }.into());
+        }
+        let routes: Vec<Route> = rows.iter().map(|r| route(r.sampling)).collect();
+        if routes.iter().all(|&r| r == Route::Greedy) && rows.iter().all(|r| r.mask.is_none()) {
+            return self.greedy_async(logits, rows, yield_wait).await;
+        }
+        self.sampled_async(logits, rows, &routes, yield_wait).await
     }
 
     fn host_select(logits: &[f32], row: &RowSelect) -> RowResult {
@@ -688,6 +721,49 @@ impl<'a> TokenSelector<'a> {
             }
             self.wait_landed(logits.stream)?;
         }
+        self.finish_greedy(logits, rows)
+    }
+
+    async fn greedy_async(&mut self, logits: &DeviceLogits, rows: &[RowSelect], yield_wait: bool) -> Result<Vec<RowResult>> {
+        let n = rows.len();
+        let logprob = rows.iter().any(|r| r.logprob);
+        let at = |offset: usize| -> *mut c_void {
+            // SAFETY: offsets stay inside the 12-byte-per-row output buffer.
+            unsafe { self.out.buffer.ptr.cast::<u8>().add(offset) }.cast()
+        };
+        let (ids, status, lp) = (at(0), at(4 * self.capacity), at(8 * self.capacity));
+        let landing = |offset: usize, bytes: usize| cuteafd_ffi::CuteafdHostBuffer {
+            // SAFETY: offsets stay inside the 12-byte-per-row landing buffer.
+            ptr: unsafe { self.landing.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+            bytes,
+            ..self.landing.buffer
+        };
+        let device = |ptr: *const c_void, bytes: usize| CuteafdDeviceBuffer { ptr: ptr.cast_mut(), bytes, ..self.out.buffer };
+        // SAFETY: the logits rows, the engine's greedy outputs and ours are
+        // live device buffers of these shapes; the stream orders every copy.
+        unsafe {
+            match logits.greedy.filter(|_| !logprob) {
+                Some((engine_ids, engine_status)) => {
+                    self.library.copy_d2h_host_buffer_async(landing(0, 4 * n), device(engine_ids, 4 * n), 4 * n,
+                        logits.stream)?;
+                    self.library.copy_d2h_host_buffer_async(landing(4 * self.capacity, 4 * n),
+                        device(engine_status, 4 * n), 4 * n, logits.stream)?;
+                }
+                None => {
+                    self.library.cuda_logits_greedy_f32_async(logits.ptr, n, self.vocab, logits.stride, ids,
+                        if logprob { lp } else { std::ptr::null_mut() }, status, logits.stream)?;
+                    self.library.copy_d2h_host_buffer_async(self.landing.buffer,
+                        CuteafdDeviceBuffer { bytes: 12 * self.capacity, ..self.out.buffer }, 12 * self.capacity,
+                        logits.stream)?;
+                }
+            }
+            self.wait_landed_async(logits.stream, yield_wait).await?;
+        }
+        self.finish_greedy(logits, rows)
+    }
+
+    fn finish_greedy(&mut self, logits: &DeviceLogits, rows: &[RowSelect]) -> Result<Vec<RowResult>> {
+        let n = rows.len();
         self.counts[0] += n as u64;
         let landing = self.landing.bytes();
         let word = |offset: usize| u32::from_le_bytes(landing[offset..offset + 4].try_into().unwrap());
@@ -708,6 +784,24 @@ impl<'a> TokenSelector<'a> {
     }
 
     fn sampled(&mut self, logits: &DeviceLogits, rows: &[RowSelect], routes: &[Route]) -> Result<Vec<RowResult>> {
+        let buffer = self.enqueue_sampled(logits, rows, routes)?;
+        // SAFETY: the sampler's copies are queued on this stream, the
+        // current device's (the sampler just launched on it).
+        unsafe { self.wait_landed(logits.stream)? };
+        self.finish_sampled(logits, rows, routes, buffer)
+    }
+
+    async fn sampled_async(&mut self, logits: &DeviceLogits, rows: &[RowSelect], routes: &[Route], yield_wait: bool)
+        -> Result<Vec<RowResult>> {
+        let buffer = self.enqueue_sampled(logits, rows, routes)?;
+        // SAFETY: the sampler's copies are queued on this stream, the
+        // current device's (the sampler just launched on it).
+        unsafe { self.wait_landed_async(logits.stream, yield_wait).await? };
+        self.finish_sampled(logits, rows, routes, buffer)
+    }
+
+    fn enqueue_sampled(&mut self, logits: &DeviceLogits, rows: &[RowSelect], routes: &[Route])
+        -> Result<CuteafdDeviceBuffer> {
         let n = rows.len();
         ensure!(logits.stride == self.vocab, "the GPU sampler reads contiguous logits rows");
         if self.wave.is_none() {
@@ -734,9 +828,12 @@ impl<'a> TokenSelector<'a> {
         let wave = self.wave.as_mut().context("sampler")?;
         wave.upload(&requests, masked.then_some(arena.as_slice()), words, logits.stream)?;
         wave.launch(buffer, n, ordered, logits.stream)?;
-        // SAFETY: the sampler's copies are queued on this stream, the
-        // current device's (the sampler just launched on it).
-        unsafe { self.wait_landed(logits.stream)? };
+        Ok(buffer)
+    }
+
+    fn finish_sampled(&mut self, logits: &DeviceLogits, rows: &[RowSelect], routes: &[Route],
+        buffer: CuteafdDeviceBuffer) -> Result<Vec<RowResult>> {
+        let n = rows.len();
         let sampled = self.wave.as_mut().context("sampler")?.output(buffer, n)?;
         self.counts[1] += n as u64;
         let mut out = Vec::with_capacity(n);

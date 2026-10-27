@@ -36,9 +36,9 @@ pub(crate) struct Inputs<'a> {
 mod spark_tests {
 
     fn planned(family: &str, backend: cuteafd_loader::plan::spark_executions::SparkBackend, decode: Option<u32>,
-        unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
+        decode_lanes: u8, unit: u64, waves: u64) -> cuteafd_core::SparkExecutions {
         let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(unit),
-            prefill_waves: waves, ..Default::default() };
+            prefill_waves: waves, decode_lanes, ..Default::default() };
         cuteafd_loader::plan::layout::planned_spark_executions(family, backend, decode, &options).unwrap()
     }
 
@@ -47,8 +47,10 @@ mod spark_tests {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
         for backend in [SparkBackend::Fp8, SparkBackend::Native, SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest)] {
             for (waves, unit) in [(1usize, 4096usize), (2, 4096), (3, 2752), (4, 2048)] {
-                assert_eq!(super::spark_model(backend, 64, unit, waves)?.executions,
-                    planned("deepseek_v4", backend, Some(64), unit as u64, waves as u64));
+                for lanes in [1usize, 2] {
+                    assert_eq!(super::spark_model(backend, 64, unit, waves, lanes)?.executions,
+                        planned("deepseek_v4", backend, Some(64), lanes as u8, unit as u64, waves as u64));
+                }
             }
         }
         Ok(())
@@ -58,32 +60,38 @@ mod spark_tests {
     fn v4_spark_endpoints_match_the_decode_and_prefill_links() -> anyhow::Result<()> {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
         for (decode_rows, compiled) in [(16, 16), (64, 80), (80, 80)] {
-            let model = super::spark_model(SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest), decode_rows, 2752, 3)?;
-            model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
-            // The static prefill owner holds the selected unit; EXL3 exports m2752.
-            assert_eq!((model.capacity(), model.compiled_capacity()), (2752, 2752));
-            assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
-                capacity: decode_rows as u32, compiled_capacity: compiled }]);
-            assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units), (2752, 3));
-            assert_eq!(model.endpoints.len(), 2);
-            assert_eq!(model.endpoints[0].capacity, decode_rows as u32);
-            assert_eq!(model.endpoints[1].capacity, 2752);
-            assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            for lanes in [1usize, 2] {
+                let model = super::spark_model(SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest), decode_rows, 2752, 3, lanes)?;
+                model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH)?;
+                // The static prefill owner holds the selected unit; EXL3 exports m2752.
+                assert_eq!((model.capacity(), model.compiled_capacity()), (2752, 2752));
+                assert_eq!(model.executions.decode, vec![cuteafd_core::DecodeExecution {
+                    capacity: decode_rows as u32, compiled_capacity: compiled }; lanes]);
+                assert_eq!((model.executions.prefill.unit_rows, model.executions.prefill.buffered_units), (2752, 3));
+                assert_eq!(model.endpoints.len(), lanes + 1);
+                for lane in 0..lanes {
+                    assert_eq!(model.endpoints[lane].capacity, decode_rows as u32);
+                }
+                assert_eq!(model.endpoints[lanes].capacity, 2752);
+                assert!(model.endpoints.iter().all(|endpoint| endpoint.ingress == cuteafd_core::SparkIngress::Fp8K32));
+            }
         }
         Ok(())
     }
 }
 
 pub(crate) fn spark_model(backend: cuteafd_loader::plan::spark_executions::SparkBackend,
-    decode_rows: usize, unit_rows: usize, waves: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
+    decode_rows: usize, unit_rows: usize, waves: usize, decode_lanes: usize) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
+    ensure!((1..=2).contains(&decode_lanes), "V4 Spark model admission supports 1 or 2 decode lanes, got {decode_lanes}");
     // The installed coordinator manifest fixes this build's decode rows.
-    let executions = cuteafd_loader::plan::spark_executions::admit_family("deepseek_v4", &backend.exports(),
-        Some(u32::try_from(decode_rows)?), unit_rows as u64, waves as u64)?;
-    let endpoints = vec![
-        SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 },
-        SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows.max(decode_rows))?, ingress: SparkIngress::Fp8K32 },
+    let executions = cuteafd_loader::plan::spark_executions::admit_family_lanes("deepseek_v4", &backend.exports(),
+        Some(u32::try_from(decode_rows)?), Some(u8::try_from(decode_lanes)?), unit_rows as u64, waves as u64)?;
+    let mut endpoints = vec![
+        SparkEndpoint { ring_depth: None, capacity: u32::try_from(decode_rows)?, ingress: SparkIngress::Fp8K32 };
+        decode_lanes
     ];
+    endpoints.push(SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit_rows.max(decode_rows))?, ingress: SparkIngress::Fp8K32 });
     cuteafd_transport::worker_selection::ModelAdmission::new(endpoints,
         crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
@@ -94,6 +102,7 @@ pub(crate) struct PinnedTables {
     pub units: u64,
     pub prefill_rows: u64,
     pub decode_rows: u64,
+    pub decode_lanes: u64,
     pub waves: u64,
     pub ranks: u64,
     pub c128_width: u64,
@@ -109,11 +118,12 @@ impl PinnedTables {
         let mul = |a: u64, b: u64| a.checked_mul(b).context("V4 pinned table multiplication overflow");
         let add = |a: u64, b: u64| a.checked_add(b).context("V4 pinned table addition overflow");
         ensure!(self.units > 0 && self.prefill_rows > 0 && self.decode_rows > 0
+            && (1..=2).contains(&self.decode_lanes)
             && (1..=cuteafd_loader::serving_capacity::prefill_waves::MAX_WAVES).contains(&self.waves) && (1..=2).contains(&self.ranks)
             && self.c128_width > 0 && self.hidden > 0 && self.topk > 0,
             "invalid V4 pinned table geometry");
         let mut tables = Vec::new();
-        for (prefill, rows, slots) in [(false, self.decode_rows, 1), (true, self.prefill_rows, self.waves)] {
+        for (prefill, rows, slots) in [(false, self.decode_rows, self.decode_lanes), (true, self.prefill_rows, self.waves)] {
             let copies = mul(slots, self.ranks)?;
             let ints = mul(rows, 4)?;
             // Match reserve_slot_uploads/step_buffers, with a floor per destination.
@@ -134,9 +144,10 @@ impl PinnedTables {
             }
             // One HostAllocation per workspace, not per prefill slot; peer is a 256-byte dummy.
             let router_stride = add(mul(self.topk, 8)?, add(self.hidden, self.hidden / 32)?)?;
+            let router_bytes = add(mul(rows, router_stride)?, mul(self.ranks - 1, 256)?)?;
             tables.push((if prefill { "deepseek_v4/prefill-router-host" }
                 else { "deepseek_v4/decode-router-host" },
-                add(mul(rows, router_stride)?, mul(self.ranks - 1, 256)?)?));
+                if prefill { router_bytes } else { mul(router_bytes, self.decode_lanes)? }));
         }
         if let Some(extent) = self.context_extent {
             ensure!(self.ranks == 2 && extent > 0, "V4 context tables need two RTX ranks and nonzero extent");
@@ -157,7 +168,7 @@ mod pinned_tests {
     use super::PinnedTables;
 
     fn geometry() -> PinnedTables {
-        PinnedTables { units: 8200, prefill_rows: 4096, decode_rows: 64, waves: 2,
+        PinnedTables { units: 8200, prefill_rows: 4096, decode_rows: 64, decode_lanes: 1, waves: 2,
             ranks: 2, c128_width: 8192, hidden: 4096, topk: 8,
             host_embedding: false, context_extent: Some(1_048_576) }
     }
@@ -168,26 +179,28 @@ mod pinned_tests {
             for waves in [1, 2, 3] {
                 for prefill_rows in [512, 2048, 4096] {
                     for decode_rows in [1, 64, 80] {
-                        for host_embedding in [false, true] {
-                            let g = PinnedTables { ranks, waves, prefill_rows, decode_rows, host_embedding,
-                                context_extent: (ranks == 2).then_some(1_048_576), ..geometry() };
-                            let named = g.named_bytes()?;
-                            let sum: u64 = named.iter().map(|(_, bytes)| bytes).sum();
-                            let mut expected = 0;
-                            for (rows, slots, lists) in [(decode_rows, 1, decode_rows), (prefill_rows, waves, 1)] {
-                                let buffers = [rows*4, rows*8, rows*8, rows*128*4, rows*4,
-                                    rows*4, rows*4, rows*g.c128_width*4, rows*4, lists*g.units*4];
-                                expected += ranks*slots*(buffers.into_iter().map(|b| b.max(256)).sum::<u64>()
-                                    + 18*((rows+2)*4).max(256));
-                                expected += rows*(g.topk*8+g.hidden+g.hidden/32)+(ranks-1)*256;
-                                if host_embedding { expected += slots*(rows*g.hidden*8).max(256); }
+                        for decode_lanes in [1, 2] {
+                            for host_embedding in [false, true] {
+                                let g = PinnedTables { ranks, waves, prefill_rows, decode_rows, decode_lanes, host_embedding,
+                                    context_extent: (ranks == 2).then_some(1_048_576), ..geometry() };
+                                let named = g.named_bytes()?;
+                                let sum: u64 = named.iter().map(|(_, bytes)| bytes).sum();
+                                let mut expected = 0;
+                                for (rows, slots, lists, workspaces) in [(decode_rows, decode_lanes, decode_rows, decode_lanes), (prefill_rows, waves, 1, 1)] {
+                                    let buffers = [rows*4, rows*8, rows*8, rows*128*4, rows*4,
+                                        rows*4, rows*4, rows*g.c128_width*4, rows*4, lists*g.units*4];
+                                    expected += ranks*slots*(buffers.into_iter().map(|b| b.max(256)).sum::<u64>()
+                                        + 18*((rows+2)*4).max(256));
+                                    expected += workspaces*(rows*(g.topk*8+g.hidden+g.hidden/32)+(ranks-1)*256);
+                                    if host_embedding { expected += slots*(rows*g.hidden*8).max(256); }
+                                }
+                                if ranks == 2 {
+                                    expected += ranks*waves*(2*2048*4 + (96*(prefill_rows.div_ceil(256)+1).div_ceil(2)).max(256));
+                                }
+                                assert_eq!(sum, expected);
+                                assert_eq!(named.iter().find(|(n, _)| *n == "deepseek_v4/c4-page-table/prefill").unwrap().1,
+                                    ranks*waves*8200*4);
                             }
-                            if ranks == 2 {
-                                expected += ranks*waves*(2*2048*4 + (96*(prefill_rows.div_ceil(256)+1).div_ceil(2)).max(256));
-                            }
-                            assert_eq!(sum, expected);
-                            assert_eq!(named.iter().find(|(n, _)| *n == "deepseek_v4/c4-page-table/prefill").unwrap().1,
-                                ranks*waves*8200*4);
                         }
                     }
                 }
@@ -216,6 +229,7 @@ mod pinned_tests {
             PinnedTables { c128_width: u64::MAX, ..geometry() },
             PinnedTables { prefill_rows: u64::MAX, ..geometry() },
             PinnedTables { ranks: 0, ..geometry() }, PinnedTables { waves: 0, ..geometry() },
+            PinnedTables { decode_lanes: 0, ..geometry() }, PinnedTables { decode_lanes: 3, ..geometry() },
             PinnedTables { ranks: 1, ..geometry() }] {
             assert!(g.named_bytes().is_err());
         }
@@ -233,6 +247,7 @@ pub(crate) fn host_memory(engine: &super::engine::Engine<'_>, args: &EngineArgs,
     } else { None };
     let tables = PinnedTables { units: engine.shape.units as u64,
         prefill_rows: engine.prefill_rows as u64, decode_rows: engine.decode_rows as u64,
+        decode_lanes: engine.decode_lanes as u64,
         waves: engine.prefill_waves as u64, ranks: engine.ranks() as u64,
         c128_width: engine.c128_width as u64, hidden: engine.cfg.dim as u64,
         topk: engine.cfg.n_activated_experts as u64, host_embedding: !engine.embedding.device_gather(),
@@ -247,6 +262,7 @@ pub(crate) fn host_memory(engine: &super::engine::Engine<'_>, args: &EngineArgs,
 
 pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<PlacementRequest> {
     let gpus = inputs.gpus.len();
+    let decode_lanes = args.resolved_decode_lanes()? as u64;
     let weights = cuteafd_loader::families::deepseek_v4::resident::WeightInventory::from_headers(
         inputs.cfg, gpus, args.dspark, inputs.catalog.tensors().iter().map(|t| &t.metadata))?;
     let mut baselines = inputs.gpus.clone();
@@ -285,8 +301,9 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
         (inputs.prefix.map_or(0, |p| p.prefix_cache_mark_mib) as u64) << 20, host_marks)?;
     let scratch = cuteafd_loader::serving_capacity::deepseek_v4_workspace_scratch(
         inputs.manifest, inputs.family, gpus == 2, prefill, decode)?;
-    let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry(&cache_cfg, prefill, decode,
-        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, shape.waves, scratch)?;
+    let workspace = cuteafd_loader::serving_capacity::deepseek_v4_workspace_geometry_for_lanes(&cache_cfg, prefill, decode,
+        cuteafd_loader::serving_capacity::compiled_c128_width(inputs.manifest, inputs.family)? * 128, gpus, shape.waves,
+        decode_lanes, scratch)?;
     let onboard = args.onboard()?;
     let stages = if args.dspark && !args.skip_routed_experts { inputs.cache_stages } else { 0 };
     let routed = *inputs.catalog.routed_experts();
@@ -318,6 +335,7 @@ pub(crate) fn request(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<Placemen
     let request = v4::request(&v4::V4Inputs { automatic_context: args.max_context == 0, cfg: &cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, headroom_floor: 0, spark_ranks,
         sequences: args.max_sequences as u64, prefill_rows: prefill, prefill_waves: shape.waves, decode_rows: decode,
+        decode_lanes,
         max_context: inputs.max_context as u64, reserve_bytes: (args.reserve_gib as u64) << 30, mark_slots,
         workspace: Some(workspace), experts, draft, expert_workspace, first_routed: routed.first_layer,
         experts_half, tp2_workspace, exchange_f32: inputs.exchange_f32,

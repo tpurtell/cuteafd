@@ -188,7 +188,7 @@ fn serve_loop(
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
             engine.decode_rows)?;
-        schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats,
+        schedule(engine, &loaded, &args, &tokenizer, eos, &mut receive, transports, runtime, &stats,
             decode_share, &prefix, host_config, &mut selector, shared, || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(engine.max_context));
@@ -232,6 +232,7 @@ struct Prefill<'a> {
 
 /// One admitted request: its placement, stream state and next input token.
 struct Active<'a> {
+    lane: usize,
     job: NativeRequest,
     /// Grammar for structured output and tool calls.
     constraint: Option<crate::shared::constraints::State<'a>>,
@@ -357,12 +358,12 @@ fn round_censor(done: bool, failed: bool, committed: usize, rows: &[u32], token:
 /// Each row draws at the position after it, masked along its sequence's
 /// drafts. A sequence whose grammar fails gets its error (and unmasked rows):
 /// it fails alone, never the batch.
-fn select_rows(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_io::DeviceLogits, active: &[Active<'_>],
-    sequences: &[Vec<u32>], starts: &[usize]) -> Result<(Vec<RowResult>, Vec<Option<String>>)> {
+async fn select_rows_async(selector: &mut TokenSelector<'_>, logits: &crate::shared::token_io::DeviceLogits, active: &[Active<'_>],
+    sequences: &[Vec<u32>], starts: &[usize], dual: bool) -> Result<(Vec<RowResult>, Vec<Option<String>>)> {
     let mut batch = SelectBatch::default();
     let poisoned = active.iter().zip(sequences).zip(starts).map(|((a, rows), &start)|
         batch.push_sequence_isolated(a.job.sampling, a.constraint.as_ref(), rows, start as u64 + 1)).collect();
-    Ok((selector.select(logits, &batch)?, poisoned))
+    Ok((selector.select_async(logits, &batch, dual).await?, poisoned))
 }
 
 fn action_rooms(limits: &[usize], width: usize, rows: usize, start: usize) -> Vec<usize> {
@@ -388,15 +389,16 @@ fn cold_action(widths: &[usize], rooms: &[Vec<usize>], preferred: usize) -> usiz
 
 /// One global verifier budget, including requests that did not draft.
 #[allow(clippy::too_many_arguments)]
-fn speculative_step(
+async fn speculative_step(
+    lane_idx: usize,
+    dual: bool,
     engine: &super::engine::Engine<'_>,
     active: &mut [Active<'_>],
-    shared: &mut SharedPolicy,
+    shared: &std::cell::RefCell<Option<SharedPolicy>>,
     observed: &mut u64,
     skipped: &mut u64,
     eos: u32,
-    transports: &mut [crate::shared::spark_intake::SparkLink<'_>],
-    runtime: &tokio::runtime::Runtime,
+    transport: Option<&mut crate::shared::spark_intake::SparkLink<'_>>,
     selector: &mut TokenSelector<'_>,
     caching: bool,
     shape: &mut StepShape,
@@ -409,33 +411,38 @@ fn speculative_step(
             .min(a.capacity.saturating_sub(a.placement.len + 2))
     }).collect();
     let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
-    let widths: Vec<_> = std::iter::once(0).chain(shared.policy.widths().iter().copied()).collect();
-    let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, engine.decode_rows,
-        observed.wrapping_add(*skipped) as usize)).collect();
-    let actions: Vec<_> = widths.iter().zip(&rooms).map(|(&width, rooms)| cuteafd_core::DraftAction {
-        width, draft_us: shared.policy.draft_cost_drafted(false, active.len(),
-            rooms.iter().filter(|&&room| room > 0).count(), width),
-    }).collect();
-    let masks: Vec<_> = rooms.iter().map(Vec::as_slice).collect();
-    let priced = shared.policy.choose_action_with_rooms(false, &requests, &actions, &masks, engine.decode_rows)?;
-    let chosen = priced.unwrap_or_else(|| {
-        // Collect installed width fits before pricing can choose skip, but do
-        // not discard an eligible narrow pass when the preferred width cannot fit.
-        cold_action(&widths, &rooms, shared.policy.choose_width(false, &requests))
-    });
-    binding::trace_action(&shared.policy, false, &requests, &actions, Some(&masks), engine.decode_rows,
-        priced, chosen);
-    let block = actions[chosen].width;
+    let (block, draft_indices) = {
+        let mut guard = shared.borrow_mut();
+        let shared = guard.as_mut().expect("checked");
+        let widths: Vec<_> = std::iter::once(0).chain(shared.policy.widths().iter().copied()).collect();
+        let rooms: Vec<_> = widths.iter().map(|&width| action_rooms(&limits, width, engine.decode_rows,
+            observed.wrapping_add(*skipped) as usize)).collect();
+        let actions: Vec<_> = widths.iter().zip(&rooms).map(|(&width, rooms)| cuteafd_core::DraftAction {
+            width, draft_us: shared.policy.draft_cost_drafted(false, active.len(),
+                rooms.iter().filter(|&&room| room > 0).count(), width),
+        }).collect();
+        let masks: Vec<_> = rooms.iter().map(Vec::as_slice).collect();
+        let priced = shared.policy.choose_action_with_rooms(false, &requests, &actions, &masks, engine.decode_rows)?;
+        let chosen = priced.unwrap_or_else(|| {
+            // Collect installed width fits before pricing can choose skip, but do
+            // not discard an eligible narrow pass when the preferred width cannot fit.
+            cold_action(&widths, &rooms, shared.policy.choose_width(false, &requests))
+        });
+        binding::trace_action(&shared.policy, false, &requests, &actions, Some(&masks), engine.decode_rows,
+            priced, chosen);
+        let block = actions[chosen].width;
+        let draft_indices: Vec<usize> = rooms[chosen].iter().enumerate().filter_map(|(i, &room)|
+            (room > 0).then_some(i)).collect();
+        (block, draft_indices)
+    };
     let noise = engine.cfg.dspark_noise_token_id as u32;
-    let draft_indices: Vec<usize> = rooms[chosen].iter().enumerate().filter_map(|(i, &room)|
-        (room > 0).then_some(i)).collect();
     let mut drafts = vec![Vec::new(); active.len()];
     if !draft_indices.is_empty() {
         let inputs: Vec<u32> = draft_indices.iter().flat_map(|&i|
             std::iter::once(active[i].next).chain(std::iter::repeat_n(noise, block - 1))).collect();
         let requests: Vec<super::engine::DraftRequest<'_>> = draft_indices.iter().map(|&i|
             super::engine::DraftRequest { placement: &active[i].placement, token: active[i].next }).collect();
-        let proposed = clock.draft(|| engine.draft_width(&requests, &inputs, block))?;
+        let proposed = clock.draft(|| engine.draft_width_on_lane(lane_idx, &requests, &inputs, block))?;
         shape.draft_us = clock.observe().draft_us.unwrap_or(0) as f64;
         ensure!(proposed.len() == draft_indices.len(), "dSpark proposal count differs from participating requests");
         for (&i, proposal) in draft_indices.iter().zip(proposed) {
@@ -445,43 +452,51 @@ fn speculative_step(
         }
     }
     let width = if draft_indices.is_empty() { 0 } else { block };
-    let mut priors: Vec<Vec<f64>> = active.iter().enumerate().map(|(i, a)| {
-        let rates = a.drafts.pooled(drafts[i].len(), active.iter().enumerate()
-            .filter_map(|(j, other)| (i != j).then_some(&other.drafts)));
-        shared.prior(&a.drafts, &resource::DraftEvidence::History(&rates), 0)
-    }).collect();
-    let copies: Vec<_> = active.iter().zip(&drafts).zip(&limits).zip(&mut priors)
-        .map(|(((a, draft), &limit), prior)| resource::copy_continuation(&shared.policy, active.len(), a.ticket.id(),
-            &a.history, draft, prior, limit, a.job.sampling.is_greedy())).collect();
-    let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
-        resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
-    let selection = resource::select_drafted(&mut shared.policy, &candidates, width, engine.decode_rows,
-        draft_indices.len());
-    let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
-        let proposal = copies[i].as_ref().map_or(drafts[i].as_slice(), |copy| copy.tokens.as_slice());
-        let mut rows: Vec<u32> = std::iter::once(a.next)
-            .chain(proposal.iter().copied().take(selection.lengths[i])).collect();
-        if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
-        ensure!(!rows.is_empty(), "grammar removed V4 verifier anchor");
-        Ok(rows)
-    }).collect::<Result<_>>()?;
-    let total_rows = sequences.iter().map(Vec::len).sum();
-    ensure!(total_rows <= engine.decode_rows, "shared V4 verifier budget exceeded");
-    // Prediction follows executed rows, not the pre-grammar selection.
-    let ids: Vec<_> = active.iter().map(|a| a.ticket.id()).collect();
-    let lengths: Vec<_> = sequences.iter().map(|rows| rows.len() - 1).collect();
-    let predicted = shared.policy.predict_drafted(false, &ids, &lengths, width, draft_indices.len());
+    let (priors, copies, sequences, lengths, predicted) = {
+        let mut guard = shared.borrow_mut();
+        let shared = guard.as_mut().expect("checked");
+        let mut priors: Vec<Vec<f64>> = active.iter().enumerate().map(|(i, a)| {
+            let rates = a.drafts.pooled(drafts[i].len(), active.iter().enumerate()
+                .filter_map(|(j, other)| (i != j).then_some(&other.drafts)));
+            shared.prior(&a.drafts, &resource::DraftEvidence::History(&rates), 0)
+        }).collect();
+        let copies: Vec<_> = active.iter().zip(&drafts).zip(&limits).zip(&mut priors)
+            .map(|(((a, draft), &limit), prior)| resource::copy_continuation(&shared.policy, active.len(), a.ticket.id(),
+                &a.history, draft, prior, limit, a.job.sampling.is_greedy())).collect();
+        let candidates: Vec<_> = active.iter().zip(&priors).zip(&limits).map(|((a, prior), &limit)|
+            resource::Candidate { id: a.ticket.id(), prior, limit, selector: false, cold: a.drafts.cold() }).collect();
+        let selection = resource::select_drafted(&mut shared.policy, &candidates, width, engine.decode_rows,
+            draft_indices.len());
+        let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
+            let proposal = copies[i].as_ref().map_or(drafts[i].as_slice(), |copy| copy.tokens.as_slice());
+            let mut rows: Vec<u32> = std::iter::once(a.next)
+                .chain(proposal.iter().copied().take(selection.lengths[i])).collect();
+            if let Some(state) = a.constraint.as_ref() { state.truncate_proposal(&mut rows)?; }
+            ensure!(!rows.is_empty(), "grammar removed V4 verifier anchor");
+            Ok(rows)
+        }).collect::<Result<_>>()?;
+        let total_rows: usize = sequences.iter().map(Vec::len).sum();
+        ensure!(total_rows <= engine.decode_rows, "shared V4 verifier budget exceeded");
+        // Prediction follows executed rows, not the pre-grammar selection.
+        let ids: Vec<_> = active.iter().map(|a| a.ticket.id()).collect();
+        let lengths: Vec<_> = sequences.iter().map(|rows| rows.len() - 1).collect();
+        let predicted = shared.policy.predict_drafted(false, &ids, &lengths, width, draft_indices.len());
+        (priors, copies, sequences, lengths, predicted)
+    };
+    let total_rows: usize = sequences.iter().map(Vec::len).sum();
     let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
     let mut rows: Vec<(&mut Placement, &[u32])> = active.iter_mut().zip(&sequences)
         .map(|(a, tokens)| (&mut a.placement, tokens.as_slice())).collect();
     let timer = Instant::now();
-    engine.probe_begin(total_rows);
-    let verified = engine.verify_device(&mut rows, transports, runtime).and_then(|logits| {
-        let (selected, poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
-        crate::shared::spark_waves::healthy()?;
-        Ok((logits, selected, poisoned))
-    });
-    engine.probe_end(verified.is_ok());
+    engine.probe_begin_on_lane(lane_idx, total_rows);
+    let verified = match engine.verify_device_on_lane(lane_idx, dual, &mut rows, transport).await {
+        Ok(logits) => match select_rows_async(selector, &logits, active, &sequences, &starts, dual).await {
+            Ok((selected, poisoned)) => crate::shared::spark_waves::healthy().map(|()| (logits, selected, poisoned)),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    engine.probe_end_on_lane(lane_idx, verified.is_ok());
     let (logits, selected, mut poisoned) = verified?;
     shape.verify_us = console::us(timer);
     shape.verified = lengths;
@@ -510,30 +525,34 @@ fn speculative_step(
         done
     }).collect();
     let times = clock.observe();
-    let round: Vec<_> = active.iter().enumerate().map(|(i, request)| {
-        let (accepted, censor) = outcomes[i];
-        let neural = copies[i].as_ref().map_or(drafts[i].len(), |copy| copy.neural);
-        let copied = sequences[i].len() - 1 > neural;
-        RoundRequest { id: request.ticket.id(), rows: sequences[i].len(), accepted,
-            source: if copied { DraftSource::Copy } else if drafts[i].is_empty() { DraftSource::Undrafted } else { DraftSource::Neural },
-            evidence: (!drafts[i].is_empty()).then_some(Evidence::History(&priors[i][..neural.min(priors[i].len())])), censor }
-    }).collect();
-    let result = engine.probe_finish(|routes, layer_us| binding::observe(&mut shared.policy, &RoundRecord {
-        shared: false, requests: &round, routes, layer_us, times,
-        draft: (width > 0).then_some(DraftPass { width, requests: Some(draft_indices.len()) }), predicted,
-    }));
-    match result {
-        Some(Ok(())) => *observed += 1,
-        Some(Err(error)) => { *skipped += 1; tracing::debug!(%error, "V4 draft policy round not observed"); }
-        None => *skipped += 1,
+    {
+        let mut guard = shared.borrow_mut();
+        let shared = guard.as_mut().expect("checked");
+        let round: Vec<_> = active.iter().enumerate().map(|(i, request)| {
+            let (accepted, censor) = outcomes[i];
+            let neural = copies[i].as_ref().map_or(drafts[i].len(), |copy| copy.neural);
+            let copied = sequences[i].len() - 1 > neural;
+            RoundRequest { id: request.ticket.id(), rows: sequences[i].len(), accepted,
+                source: if copied { DraftSource::Copy } else if drafts[i].is_empty() { DraftSource::Undrafted } else { DraftSource::Neural },
+                evidence: (!drafts[i].is_empty()).then_some(Evidence::History(&priors[i][..neural.min(priors[i].len())])), censor }
+        }).collect();
+        let result = engine.probe_finish_on_lane(lane_idx, |routes, layer_us| binding::observe(&mut shared.policy, &RoundRecord {
+            shared: false, requests: &round, routes, layer_us, times,
+            draft: (width > 0).then_some(DraftPass { width, requests: Some(draft_indices.len()) }), predicted,
+        }));
+        match result {
+            Some(Ok(())) => *observed += 1,
+            Some(Err(error)) => { *skipped += 1; tracing::debug!(%error, "V4 draft policy round not observed"); }
+            None => *skipped += 1,
+        }
+        for (i, request) in active.iter_mut().enumerate() {
+            let (accepted, censor) = outcomes[i];
+            let neural = copies[i].as_ref().map_or(drafts[i].len(), |copy| copy.neural).min(sequences[i].len() - 1);
+            let accepted = accepted.saturating_sub(1).min(neural);
+            request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted);
+        }
+        resource::publish(&shared.policy, *observed, *skipped, None);
     }
-    for (i, request) in active.iter_mut().enumerate() {
-        let (accepted, censor) = outcomes[i];
-        let neural = copies[i].as_ref().map_or(drafts[i].len(), |copy| copy.neural).min(sequences[i].len() - 1);
-        let accepted = accepted.saturating_sub(1).min(neural);
-        request.drafts.observe(neural.min(accepted + usize::from(censor.is_none())), accepted);
-    }
-    resource::publish(&shared.policy, *observed, *skipped, None);
     shape.drafts = sequences.iter().map(|rows| rows[1..].to_vec()).collect();
     Ok(finished)
 }
@@ -614,6 +633,7 @@ pub(crate) const MESSAGE_STARTS: [&str; 2] = ["<｜User｜>", "<｜Assistant｜>
 fn schedule(
     engine: &super::engine::Engine<'_>,
     loaded: &super::Loaded,
+    args: &EngineArgs,
     tokenizer: &cuteafd_loader::LoadedTokenizer,
     eos: u32,
     receive: &mut mpsc::Receiver<NativeRequest>,
@@ -624,12 +644,12 @@ fn schedule(
     prefix: &PrefixArgs,
     host_config: Option<cuteafd_hostcache::config::Config>,
     selector: &mut TokenSelector<'_>,
-    mut shared: Option<SharedPolicy>,
+    shared: Option<SharedPolicy>,
     ready: impl FnOnce(),
 ) -> Result<()> {
-    let mut lane = DecodeLane::default();
-    // V4's only decode lane (`LaneSupport::One`), polled on this thread.
     let lanes = LaneSet::default();
+    let [mut lane0, mut lane1] = lanes.try_map(|lease| DecodeLane::new(engine, loaded, args, lease))?;
+    let shared = std::cell::RefCell::new(shared);
     let (family, mut cache) = prefix_cache(engine, prefix, host_config)?;
     let markers = crate::shared::prefix::marker_ids(&loaded.snapshot, &MESSAGE_STARTS)?;
     let mut states: Vec<usize> = (0..engine.shape.sequences).rev().collect();
@@ -640,6 +660,7 @@ fn schedule(
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
+    let decode_capacity = engine.decode_rows * engine.decode_lanes;
     // Prefix capacity and all fallible scheduler initialization precede readiness.
     ready();
     loop {
@@ -648,7 +669,7 @@ fn schedule(
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         // Admit while sequence slots and decode rows remain.
-        while !states.is_empty() && active.len() + prefills.len() < engine.decode_rows {
+        while !states.is_empty() && active.len() + prefills.len() < decode_capacity {
             let busy = !active.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
@@ -885,8 +906,18 @@ fn schedule(
                         continue;
                     }
                 };
+                let lane = if engine.decode_lanes == 2 {
+                    let loads = [
+                        active.iter().filter(|r| r.lane == 0).count(),
+                        active.iter().filter(|r| r.lane == 1).count(),
+                    ];
+                    cuteafd_loader::plan::decode_lanes::assign(loads)
+                } else {
+                    0
+                };
+                p.ticket.set_lane(lane);
                 let mut request = Active {
-                    decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
+                    lane, decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
                     next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
                     ticket: p.ticket, drafts: DraftHistory::default(),
                 };
@@ -910,34 +941,64 @@ fn schedule(
         if active.is_empty() {
             continue;
         }
-        let cycle = Instant::now();
-        let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, eos, transports,
-            runtime, &mut lane, &mut active, &mut shared, selector, &family, &mut cache, &mut states, cycle)))?
-            else { continue };
-        for index in (0..active.len()).rev() {
-            if !finished[index] {
-                continue;
-            }
-            let mut request = active.remove(index);
-            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
-            request.ticket.done(request.generated);
-            requests += 1;
-            generated_total += request.generated as u64;
-            let seconds = request.started.elapsed().as_secs_f64();
-            tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
-                draft_calls = request.draft_calls,
-                active = active.len(), "request complete");
-            if let Some(row) = &request.turn {
-                // The conversation so far: every committed row (the last token is not in it).
-                let rows = &request.history[..request.placement.len];
-                cache.capture_session(request.ticket.session());
-                if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
-                    After::from_logits(row, true)) {
-                    tracing::warn!("turn snapshot not retained: {error:#}");
-                }
-            }
-            release(&family, &mut cache, &mut states, &request.placement);
+        if engine.decode_lanes == 2 {
+            lanes::rebalance(&mut active, |r| Some(r.lane), |r, lane| { r.lane = lane; r.ticket.set_lane(lane); });
+        } else {
+            for r in &mut active { r.lane = 0; r.ticket.set_lane(0); }
         }
+        let (mut active0, mut active1): (Vec<_>, Vec<_>) = active.drain(..).partition(|r| r.lane == 0);
+        let cycle = Instant::now();
+        let caching = cache.enabled();
+        let dual = engine.decode_lanes == 2 && !active0.is_empty() && !active1.is_empty();
+        let (link0, link1) = if engine.decode_lanes == 2 && transports.len() >= 2 {
+            let (first, rest) = transports.split_at_mut(1);
+            (first.first_mut(), rest.first_mut())
+        } else {
+            (transports.first_mut(), None)
+        };
+        let (mut done0, mut done1) = (None, None);
+        runtime.block_on(lanes.run(
+            |lease| decode_round(lease, dual, engine, eos, link0, &mut lane0, &mut active0, &shared, caching, cycle, &mut done0),
+            |lease| decode_round(lease, dual, engine, eos, link1, &mut lane1, &mut active1, &shared, caching, cycle, &mut done1),
+        ))?;
+        let mut remaining = active0.len() + active1.len();
+        for (lane_active, finished) in [(&mut active0, done0), (&mut active1, done1)] {
+            let Some(finished) = finished else {
+                for request in lane_active.drain(..) {
+                    remaining -= 1;
+                    if let Some(shared) = shared.borrow_mut().as_mut() { shared.policy.release(request.ticket.id()); }
+                    release(&family, &mut cache, &mut states, &request.placement);
+                }
+                continue;
+            };
+            for index in (0..lane_active.len()).rev() {
+                if !finished[index] {
+                    continue;
+                }
+                let mut request = lane_active.remove(index);
+                remaining -= 1;
+                if let Some(shared) = shared.borrow_mut().as_mut() { shared.policy.release(request.ticket.id()); }
+                request.ticket.done(request.generated);
+                requests += 1;
+                generated_total += request.generated as u64;
+                let seconds = request.started.elapsed().as_secs_f64();
+                tracing::info!(lane = request.lane, tokens = request.generated, seconds,
+                    tok_s = request.generated as f64 / seconds, draft_calls = request.draft_calls,
+                    active = remaining, "request complete");
+                if let Some(row) = &request.turn {
+                    // The conversation so far: every committed row (the last token is not in it).
+                    let rows = &request.history[..request.placement.len];
+                    cache.capture_session(request.ticket.session());
+                    if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
+                        After::from_logits(row, true)) {
+                        tracing::warn!("turn snapshot not retained: {error:#}");
+                    }
+                }
+                release(&family, &mut cache, &mut states, &request.placement);
+            }
+        }
+        active.extend(active0);
+        active.extend(active1);
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
@@ -945,12 +1006,21 @@ fn schedule(
     }
 }
 
-/// Lane-owned decode state: V4's only lane (`LaneSupport::One`), with its
-/// observed and skipped draft-policy rounds.
-#[derive(Default)]
-struct DecodeLane {
+/// Lane-owned decode state: per-lane token selector and observed/skipped
+/// draft-policy round counters.
+struct DecodeLane<'a> {
+    selector: TokenSelector<'a>,
     observed: u64,
     skipped: u64,
+}
+
+impl<'a> DecodeLane<'a> {
+    fn new(engine: &super::engine::Engine<'_>, loaded: &'a super::Loaded, args: &EngineArgs, _lease: LaneLease<'_>)
+        -> Result<Self> {
+        let selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
+            engine.decode_rows)?;
+        Ok(Self { selector, observed: 0, skipped: 0 })
+    }
 }
 
 /// The lane's commit. V4 commits by position inside the round: a verify
@@ -967,52 +1037,60 @@ impl LaneCommit for Committed {
     fn abort_and_drain(&mut self) -> Result<()> { Ok(()) }
 }
 
-/// One round of lane 0: (speculative) verify or decode on the lane's decode
-/// links, select, emit and commit. `None` when the step failed and its
-/// requests were released.
+/// One round of a decode lane: (speculative) verify or decode on the lane's
+/// decode link, select, emit and commit. `out` is `None` when the lane is empty
+/// or the step failed and its requests are ready to be released by the scheduler.
 #[allow(clippy::too_many_arguments)]
-async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, eos: u32,
-    transports: &mut [crate::shared::spark_intake::SparkLink<'_>], runtime: &tokio::runtime::Runtime,
-    lane: &mut DecodeLane, active: &mut Vec<Active<'_>>, shared: &mut Option<SharedPolicy>,
-    selector: &mut TokenSelector<'_>, family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_>>,
-    states: &mut Vec<usize>, cycle: Instant) -> Result<Option<Vec<bool>>> {
-    let mut tally = console::Step::begin(lease.index());
+async fn decode_round(lease: LaneLease<'_>, dual: bool, engine: &super::engine::Engine<'_>, eos: u32,
+    transport: Option<&mut crate::shared::spark_intake::SparkLink<'_>>,
+    lane: &mut DecodeLane<'_>, active: &mut Vec<Active<'_>>, shared: &std::cell::RefCell<Option<SharedPolicy>>,
+    caching: bool, cycle: Instant, out: &mut Option<Vec<bool>>) -> Result<()> {
+    if active.is_empty() {
+        return Ok(());
+    }
+    let lane_idx = lease.index();
+    let mut tally = console::Step::begin(lane_idx);
     let engine_before = tally.live().then(|| engine.profile.borrow().seconds);
     let before: Vec<usize> = active.iter().map(|a| a.history.len()).collect();
     let mut shape = StepShape::default();
-    let caching = cache.enabled();
+    let has_shared = shared.borrow().is_some();
     // Undrafted rounds use the same route and resource observations.
-    let step = if let Some(shared) = shared.as_mut() {
-        speculative_step(engine, active, shared, &mut lane.observed, &mut lane.skipped, eos,
-            transports, runtime, selector, caching, &mut shape, cycle)
+    let step = if has_shared {
+        speculative_step(lane_idx, dual, engine, active, shared, &mut lane.observed, &mut lane.skipped, eos,
+            transport, &mut lane.selector, caching, &mut shape, cycle).await
     } else {
         let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
         let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
         let timer = Instant::now();
-        engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
-            let (selected, mut poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
-            crate::shared::spark_waves::healthy()?;
-            shape.verify_us = console::us(timer);
-            Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
-                let token = match poisoned[row].take() {
-                    Some(error) => Err(anyhow::anyhow!(error)),
-                    None => take(request.constraint.as_mut(), selected),
-                };
-                finish_row(request, token, eos, &logits, row, caching, engine.library)
-            }).collect::<Vec<bool>>())
-        })
+        match engine.decode_device_on_lane(lane_idx, dual, &mut rows, transport).await {
+            Ok(logits) => match select_rows_async(&mut lane.selector, &logits, active, &sequences, &starts, dual).await {
+                Ok((selected, mut poisoned)) => match crate::shared::spark_waves::healthy() {
+                    Ok(()) => {
+                        shape.verify_us = console::us(timer);
+                        Ok(active.iter_mut().zip(&selected).enumerate().map(|(row, (request, selected))| {
+                            let token = match poisoned[row].take() {
+                                Some(error) => Err(anyhow::anyhow!(error)),
+                                None => take(request.constraint.as_mut(), selected),
+                            };
+                            finish_row(request, token, eos, &logits, row, caching, engine.library)
+                        }).collect::<Vec<bool>>())
+                    }
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
     };
     let finished = match step {
         Ok(finished) => finished,
         Err(error) => {
-            tracing::warn!("decode step failed: {error:#}");
-            for request in active.drain(..) {
-                if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            tracing::warn!(lane = lane_idx, "decode step failed: {error:#}");
+            for request in active.iter() {
                 let _ = request.job.events.send(Err(NativeFailure::Worker(format!("{error:#}"))));
-                release(family, cache, states, &request.placement);
             }
-            return Ok(None);
+            return Ok(());
         }
     };
     lanes::commit(&mut Committed).await?;
@@ -1028,24 +1106,25 @@ async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, 
         vec![("draft", shape.draft_us), ("verify", shape.verify_us), ("emit", emit),
             ("router_sync", phase(0)), ("routing", phase(1)), ("experts", phase(2)), ("head", phase(3))]
     });
-    Ok(Some(finished))
+    *out = Some(finished);
+    Ok(())
 }
 
 #[cfg(test)]
 mod lane_tests {
     #[test]
-    fn decode_runs_as_lane_zero_of_a_shared_lane_set() {
+    fn decode_runs_on_a_shared_lane_set() {
         let source = include_str!("serve.rs");
         let schedule = source.split_once("\nfn schedule(").unwrap().1
             .split_once("\n/// Lane-owned decode state").unwrap().0;
-        // One lane (`LaneSupport::One`): every decode round, and only it, runs on the set.
-        assert_eq!(schedule.matches("lanes.run_one(|lease| decode_round(lease,").count(), 1);
-        assert!(!schedule.contains("lanes.run(") && !schedule.contains("lanes.join("));
+        assert_eq!(schedule.matches("lanes.try_map(|lease| DecodeLane::new(").count(), 1);
+        assert_eq!(schedule.matches("lanes.run(").count(), 1);
+        assert!(!schedule.contains("lanes.run_one(") && !schedule.contains("lanes.join("));
         assert!(!schedule.contains("speculative_step(") && !schedule.contains("engine.decode_device("),
             "no private decode round remains");
         let round = source.split_once("\nasync fn decode_round").unwrap().1
             .split_once("\n#[cfg(test)]").unwrap().0;
-        assert!(round.contains("console::Step::begin(lease.index())"));
+        assert!(round.contains("console::Step::begin(lane_idx)"));
         assert!(round.contains("lanes::commit(&mut Committed).await?;"));
     }
 }

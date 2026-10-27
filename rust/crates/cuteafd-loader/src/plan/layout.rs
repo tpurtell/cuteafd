@@ -329,8 +329,13 @@ mod scoring_workspace_tests {
 /// plus one per lane when lanes run in parallel; GLM Flash/MiMo: one per lane;
 /// Qwen: one).
 pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
+    spark_endpoints_for_decode_lanes(family, lanes, 1)
+}
+
+pub fn spark_endpoints_for_decode_lanes(family: &str, lanes: u64, decode_lanes: u8) -> usize {
     match family {
-        "deepseek_v41" | "deepseek_v4" => 2,
+        "deepseek_v41" => 2,
+        "deepseek_v4" => usize::from(decode_lanes.max(1)) + 1,
         // The decode link and one prefill link (its waves share that endpoint's rings).
         "glm5" => 1 + usize::from(lanes > 1),
         "glm5_flash" => 1,
@@ -414,7 +419,13 @@ pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: 
 pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
     decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
-    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit, options.prefill_waves)
+    let descriptor = super::spark_executions::descriptor(family)?;
+    let requested = match descriptor.decode_lanes() {
+        super::decode_lanes::LaneSupport::FixedTwo => None,
+        _ => Some(options.decode_lanes.max(1)),
+    };
+    super::spark_executions::admit_family_lanes(family, &backend.exports(), decode_rows, requested,
+        unit, options.prefill_waves)
 }
 
 #[cfg(test)]

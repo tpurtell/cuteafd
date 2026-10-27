@@ -64,11 +64,15 @@ pub struct V4WorkspaceScratch {
     pub index_topk_bytes: u64,
 }
 
+fn default_decode_lanes() -> u64 { 1 }
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct V4WorkspaceRank {
     /// Everything except the pool-unit-sized C4 page tables.
     pub fixed_device_bytes: u64,
     pub prefill_waves: u64,
+    #[serde(default = "default_decode_lanes")]
+    pub decode_lanes: u64,
     /// C4 page tables: one request list per prefill slot, one list per decode row.
     pub pool_unit_device_bytes: u64,
     /// Pinned router staging, reported outside GPU admission.
@@ -97,10 +101,16 @@ impl V4WorkspaceRank {
                     ],
                 )?,
                 product(
-                    "V4 decode pool table",
-                    &[units, self.decode_lane_table_unit_bytes],
-                )?
-                .max(256),
+                    "V4 decode pool tables",
+                    &[
+                        self.decode_lanes.max(1),
+                        product(
+                            "V4 decode pool table",
+                            &[units, self.decode_lane_table_unit_bytes],
+                        )?
+                        .max(256),
+                    ],
+                )?,
             ],
         )
     }
@@ -167,7 +177,31 @@ pub fn deepseek_v4_workspace_geometry(
     waves: u64,
     scratch: V4WorkspaceScratch,
 ) -> Result<Vec<V4WorkspaceRank>, CacheGeometryError> {
+    deepseek_v4_workspace_geometry_for_lanes(
+        cfg,
+        prefill_rows,
+        decode_rows,
+        max_context,
+        ranks,
+        waves,
+        1,
+        scratch,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn deepseek_v4_workspace_geometry_for_lanes(
+    cfg: &DeepseekV4Config,
+    prefill_rows: u64,
+    decode_rows: u64,
+    max_context: u64,
+    ranks: usize,
+    waves: u64,
+    decode_lanes: u64,
+    scratch: V4WorkspaceScratch,
+) -> Result<Vec<V4WorkspaceRank>, CacheGeometryError> {
     if ![1, 2].contains(&ranks)
+        || !(1..=2).contains(&decode_lanes)
         || prefill_rows == 0
         || decode_rows == 0
         || max_context == 0
@@ -177,7 +211,7 @@ pub fn deepseek_v4_workspace_geometry(
     {
         return Err(CacheGeometryError::Unsupported {
             family: "deepseek_v4",
-            what: "workspace rows, context, heads or coordinator rank geometry",
+            what: "workspace rows, context, heads, decode lanes or coordinator rank geometry",
         });
     }
     let width = max_context
@@ -191,12 +225,22 @@ pub fn deepseek_v4_workspace_geometry(
             let decode = step(cfg, decode_rows, 1, width, rank, ranks, scratch)?;
             Ok(V4WorkspaceRank {
                 prefill_waves: waves,
-                fixed_device_bytes: sum("V4 prefill/decode workspaces", &[prefill.0, decode.0])?,
+                decode_lanes,
+                fixed_device_bytes: sum(
+                    "V4 prefill/decode workspaces",
+                    &[prefill.0, product("V4 decode workspaces", &[decode_lanes, decode.0])?],
+                )?,
                 pool_unit_device_bytes: sum(
                     "V4 prefill/decode table slope",
-                    &[product("V4 prefill table slope", &[waves, 4])?, decode.1],
+                    &[
+                        product("V4 prefill table slope", &[waves, 4])?,
+                        product("V4 decode table slope", &[decode_lanes, decode.1])?,
+                    ],
                 )?,
-                pinned_host_bytes: sum("V4 prefill/decode pinned staging", &[prefill.2, decode.2])?,
+                pinned_host_bytes: sum(
+                    "V4 prefill/decode pinned staging",
+                    &[prefill.2, product("V4 decode pinned staging", &[decode_lanes, decode.2])?],
+                )?,
                 prefill_lane_table_unit_bytes: 4,
                 decode_lane_table_unit_bytes: product("V4 decode table slope", &[decode_rows, 4])?,
             })
