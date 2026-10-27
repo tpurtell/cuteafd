@@ -351,7 +351,11 @@ pub struct GlmfStepWorkspaces {
 
 impl GlmfStepWorkspaces {
     pub fn device_bytes(&self) -> u64 {
-        self.decode + self.lanes * self.lane + self.prefill_temporaries
+        self.device_bytes_with_decode_lanes(1)
+    }
+
+    pub fn device_bytes_with_decode_lanes(&self, decode_lanes: u8) -> u64 {
+        u64::from(decode_lanes.max(1)) * self.decode + self.lanes * self.lane + self.prefill_temporaries
     }
 }
 

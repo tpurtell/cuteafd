@@ -466,8 +466,8 @@ pub(crate) enum Experts<'a> {
     Local(LocalExperts<'a>),
     LocalExl3(LocalExl3<'a>),
     /// Spark ranks serving the routed experts over RoCE (one BF16 partial per
-    /// rank); one transport per prefill lane (decode uses the first).
-    Spark { transport: RefCell<SparkLink<'a>> },
+    /// rank); one transport per decode lane (prefill uses lane 0's).
+    Spark { transports: Vec<RefCell<SparkLink<'a>>> },
     /// Profiling only: the router, the wire rows and the shared expert run,
     /// the routed experts contribute nothing (the coordinator's own work).
     Skip,
@@ -1289,6 +1289,18 @@ impl<'a> Caches<'a> {
     }
 }
 
+/// Coordinator GPU 0's second decode lane (`--decode-lanes 2`): its own stream, decode workspace,
+/// captured decode graphs, speculative replay records and commit tables.
+struct DecodeLaneExecution<'a> {
+    stream: *mut c_void,
+    decode_workspace: RefCell<Option<Workspace<'a>>>,
+    graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
+    kda_replay: Dev<'a>,
+    index_replay: Option<Dev<'a>>,
+    commit_tables: Dev<'a>,
+    replay_rows: Cell<usize>,
+}
+
 /// The second GPU of a two-GPU head split (rank 1): its share of every layer, its caches
 /// (its KDA heads' state; the replicated MLA records and DSA keys), workspaces and captured
 /// decode segments.
@@ -1453,6 +1465,8 @@ pub(crate) struct GlmfEngine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// The serving loop's token selector when start-up made it before the KV pool.
     selector: RefCell<Option<TokenSelector<'a>>>,
+    lane1: Option<DecodeLaneExecution<'a>>,
+    active_decode_lane: Cell<usize>,
 }
 
 /// Which prefill projections run W8A8 block-FP8 GEMMs (E4M3 activations per
@@ -1794,7 +1808,61 @@ impl<'a> GlmfEngine<'a> {
             fp8_prefill: Fp8Prefill::default(), kda_fp32_partials: false,
             kda_output_shard: false, mark_slots: 0,
             kda_prefill_expanded: false, kda_state, l2: None, target_head: TargetHeadRoute::Tensor, embedding,
-            selector: RefCell::new(None) })
+            selector: RefCell::new(None), lane1: None, active_decode_lane: Cell::new(0) })
+    }
+
+    /// Allocates lane 1's stream, speculative replay records and commit tables on rank 0
+    /// (`--decode-lanes 2`). Its decode workspace and startup graphs are allocated with lane 0's.
+    pub(crate) fn enable_second_decode_lane(&mut self) -> Result<()> {
+        ensure!(self.peer.is_none() && self.replay_records == ReplayRecords::Own,
+            "--decode-lanes 2 runs on one coordinator GPU with --replay-records own");
+        ensure!(self.lane1.is_none(), "second decode lane already enabled");
+        let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
+        let stream = self.library.cuda_stream_create()?;
+        let zeroed = |bytes: usize| -> Result<Dev<'a>> {
+            let allocation = Dev::new(self.library, bytes.max(256))?;
+            self.library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
+            Ok(allocation)
+        };
+        let (_, _, replay) = kda_layer_bytes(&self.cfg, self.caches.kda_heads, self.kda_state, self.decode_rows);
+        let kda_layers = self.weights.layers.iter().filter(|l| l.attention == GlmNextAttention::Kda).count();
+        let mla_layers = self.weights.layers.iter()
+            .filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present()).count();
+        let kda_replay = zeroed(kda_layers * replay)?;
+        let index_replay = compact_index_extents(self.index_cache, mla_layers, self.slots, self.decode_rows)
+            .map(|(_, replay)| zeroed(replay)).transpose()?;
+        let commit_tables = zeroed(3 * self.decode_rows * 4)?;
+        self.lane1 = Some(DecodeLaneExecution {
+            stream,
+            decode_workspace: RefCell::new(None),
+            graphs: RefCell::new(GraphBank::new(self.graphs.borrow().budget())),
+            kda_replay,
+            index_replay,
+            commit_tables,
+            replay_rows: Cell::new(DECODE_ROWS),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn decode_lanes(&self) -> u8 {
+        1 + u8::from(self.lane1.is_some())
+    }
+
+    pub(crate) fn with_decode_lane<T>(&self, lane: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
+        ensure!(lane == 0 || (lane == 1 && self.lane1.is_some()), "invalid decode lane {lane}");
+        struct Reset<'a>(&'a Cell<usize>, usize);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) { self.0.set(self.1); }
+        }
+        let prev = self.active_decode_lane.replace(lane);
+        let _reset = Reset(&self.active_decode_lane, prev);
+        body()
+    }
+
+    pub(crate) fn active_spark_transport<'t>(&self, transports: &'t [RefCell<SparkLink<'a>>])
+        -> Result<&'t RefCell<SparkLink<'a>>> {
+        let lane = self.active_decode_lane.get();
+        transports.get(lane).or_else(|| transports.first()).context("Spark expert transport")
     }
 
     /// Decode graphs captured lazily as steps arrive, at their exact rows, instead of the startup set
@@ -1811,6 +1879,9 @@ impl<'a> GlmfEngine<'a> {
         for rank in 0..self.ranks() {
             drop(self.decode_workspace_of(rank)?);
             drop(self.prefill_slots_of(rank, lanes)?);
+        }
+        if self.lane1.is_some() {
+            self.with_decode_lane(1, || { drop(self.decode_workspace_of(0)?); Ok(()) })?;
         }
         if let Some(drafter) = &self.drafter { drafter.prepare_workspace()?; }
         self.synchronize()
@@ -1832,12 +1903,16 @@ impl<'a> GlmfEngine<'a> {
             "startup graph peer layer inventory differs from planner");
         let shapes = startup.keys;
         let segments = self.weights.layers.len() + 1;
-        let expected = startup.inventory.ranks.iter().map(|rank| rank.executables as usize).sum::<usize>();
-        tracing::info!(shapes = shapes.len(), graphs = expected, plain_rows = ?self.buckets.plain,
+        let decode_lanes = usize::from(self.decode_lanes());
+        let expected = startup.inventory.ranks.iter().map(|rank| rank.executables as usize).sum::<usize>() * decode_lanes;
+        tracing::info!(shapes = shapes.len(), graphs = expected, decode_lanes, plain_rows = ?self.buckets.plain,
             spec_rows = ?self.buckets.spec, "GLM Flash startup decode graph admission");
         // Allocate fixed workspaces before measuring the graph executables' physical memory.
         for rank in 0..self.ranks() {
             drop(self.decode_workspace_of(rank)?);
+        }
+        if self.lane1.is_some() {
+            self.with_decode_lane(1, || { drop(self.decode_workspace_of(0)?); Ok(()) })?;
         }
         self.synchronize()?;
         let free = || (0..self.ranks()).map(|rank| self.on(rank,
@@ -1846,33 +1921,47 @@ impl<'a> GlmfEngine<'a> {
         let started = std::time::Instant::now();
         self.warming_graphs.set(true);
         let captured = (|| -> Result<()> {
-            for &(rows, spec, geometry) in &shapes {
-                self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
+            for lane in 0..decode_lanes {
+                self.with_decode_lane(lane, || {
+                    for &(rows, spec, geometry) in &shapes {
+                        self.decode_primitive(&startup_tables(rows, spec, geometry), &vec![0; rows], rows, None, None, None)?;
+                    }
+                    Ok(())
+                })?;
             }
             self.synchronize()
         })();
         self.warming_graphs.set(false);
         captured?;
-        let graphs = self.graphs.borrow().len() + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
+        let graphs = self.graphs.borrow().len()
+            + self.lane1.as_ref().map_or(0, |l| l.graphs.borrow().len())
+            + self.peer.as_ref().map_or(0, |p| p.graphs.borrow().len());
         ensure!(graphs == expected, "startup captured {graphs} graphs, expected {expected}");
-        for rank in 0..self.ranks() {
-            let end = if rank == 0 { segments } else { segments - 1 };
-            let keys: Vec<_> = shapes.iter().flat_map(|&(rows, spec, geometry)| {
-                let tables = startup_tables(rows, spec, geometry);
-                (0..end).map(move |segment| GraphKey::new(segment, rows, &tables))
-            }).collect();
-            self.graphs_of(rank).borrow_mut().seal_startup(&keys)?;
-        }
-        for &(rows, spec, geometry) in &shapes {
-            let tables = startup_tables(rows, spec, geometry);
-            for rank in 0..self.ranks() {
-                let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
-                let end = if rank == 0 { segments } else { segments - 1 };
-                for segment in 0..end {
-                    ensure!(graphs.borrow().contains(&GraphKey::new(segment, rows, &tables)),
-                        "startup graph coverage missing");
+        for lane in 0..decode_lanes {
+            self.with_decode_lane(lane, || {
+                for rank in 0..self.ranks() {
+                    if lane > 0 && rank > 0 { continue; }
+                    let end = if rank == 0 { segments } else { segments - 1 };
+                    let keys: Vec<_> = shapes.iter().flat_map(|&(rows, spec, geometry)| {
+                        let tables = startup_tables(rows, spec, geometry);
+                        (0..end).map(move |segment| GraphKey::new(segment, rows, &tables))
+                    }).collect();
+                    self.graphs_of(rank).borrow_mut().seal_startup(&keys)?;
                 }
-            }
+                for &(rows, spec, geometry) in &shapes {
+                    let tables = startup_tables(rows, spec, geometry);
+                    for rank in 0..self.ranks() {
+                        if lane > 0 && rank > 0 { continue; }
+                        let graphs = self.graphs_of(rank);
+                        let end = if rank == 0 { segments } else { segments - 1 };
+                        for segment in 0..end {
+                            ensure!(graphs.borrow().contains(&GraphKey::new(segment, rows, &tables)),
+                                "startup graph coverage missing");
+                        }
+                    }
+                }
+                Ok(())
+            })?;
         }
         let bytes: Vec<i64> = before.into_iter().zip(free()?).map(|(before, after)| before - after).collect();
         tracing::info!(graphs, shapes = shapes.len(), ?bytes, elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1884,7 +1973,11 @@ impl<'a> GlmfEngine<'a> {
         ensure!(admitted.lifetime == cuteafd_loader::placement::Lifetime::Startup
             && admitted.ranks.len() == self.ranks(), "startup graph admission does not match executor ranks");
         for (rank, expected) in admitted.ranks.iter().enumerate() {
-            let actual = if rank == 0 { self.graphs.borrow().len() } else { self.peer()?.graphs.borrow().len() };
+            let actual = if rank == 0 {
+                self.graphs.borrow().len() + self.lane1.as_ref().map_or(0, |l| l.graphs.borrow().len())
+            } else {
+                self.peer()?.graphs.borrow().len()
+            };
             ensure!(actual as u64 == expected.executables,
                 "GLM Flash rank {rank} captured {actual} graphs, admission reserved {}", expected.executables);
         }
@@ -2025,9 +2118,13 @@ impl<'a> GlmfEngine<'a> {
 
     fn terminal_links(&self, mut action: impl FnMut(&mut SparkLink<'a>) -> Result<()>) -> Result<()> {
         let mut failures = Vec::new();
-        if let Some(Experts::Spark { transport, .. }) = &self.experts {
-            let mut link = transport.try_borrow_mut()?;
-            if let Err(error) = action(&mut link) { failures.push(format!("{error:#}")); }
+        if let Some(Experts::Spark { transports }) = &self.experts {
+            for transport in transports {
+                match transport.try_borrow_mut() {
+                    Ok(mut link) => if let Err(error) = action(&mut link) { failures.push(format!("{error:#}")); },
+                    Err(error) => failures.push(format!("{error:#}")),
+                }
+            }
         }
         ensure!(failures.is_empty(), "{}", failures.join("; ")); Ok(())
     }
@@ -2049,6 +2146,9 @@ impl<'a> GlmfEngine<'a> {
                 self.layer_waves.borrow_mut().clear();
                 for rank in 0..self.ranks() {
                     self.on(rank, || { *self.graphs_of(rank).borrow_mut() = GraphBank::new(None); Ok(()) })?;
+                }
+                if let Some(lane1) = &self.lane1 {
+                    self.on(0, || { *lane1.graphs.borrow_mut() = GraphBank::new(None); Ok(()) })?;
                 }
                 Ok(())
             },
@@ -2299,7 +2399,7 @@ impl<'a> GlmfEngine<'a> {
         extension: usize) -> Result<cuteafd_core::PolicyGeometry> {
         use crate::shared::draft::resource::{self, LayerHome};
         let remote = match &self.experts {
-            Some(Experts::Spark { transport, .. }) => transport.borrow().installed_grouping()?,
+            Some(Experts::Spark { transports }) => transports.first().context("Spark transport")?.borrow().installed_grouping()?,
             _ => Vec::new(),
         };
         let homes = self.weights.layers.iter().enumerate().map(|(layer, weights)| {
@@ -2748,7 +2848,10 @@ impl<'a> GlmfEngine<'a> {
     pub(crate) fn stream_of(&self, rank: usize) -> *mut c_void {
         match (rank, &self.peer) {
             (1, Some(peer)) => peer.stream,
-            _ => self.stream,
+            _ => match (self.active_decode_lane.get(), &self.lane1) {
+                (1, Some(lane1)) => lane1.stream,
+                _ => self.stream,
+            },
         }
     }
 
@@ -2765,6 +2868,40 @@ impl<'a> GlmfEngine<'a> {
         }
     }
 
+    fn kda_replay_of(&self, rank: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
+        if rank == 0 {
+            if let (1, Some(lane1)) = (self.active_decode_lane.get(), &self.lane1) {
+                return lane1.kda_replay.buffer;
+            }
+        }
+        self.caches_of(rank).kda_replay
+    }
+
+    fn index_replay_of(&self, rank: usize) -> Option<cuteafd_ffi::CuteafdDeviceBuffer> {
+        if rank == 0 {
+            if let (1, Some(lane1)) = (self.active_decode_lane.get(), &self.lane1) {
+                return lane1.index_replay.as_ref().map(|d| d.buffer);
+            }
+        }
+        self.caches_of(rank).index_tails.as_ref().map(|(_, records)| records.buffer)
+    }
+
+    fn commit_tables_of(&self, rank: usize) -> &Dev<'a> {
+        if rank == 0 {
+            if let (1, Some(lane1)) = (self.active_decode_lane.get(), &self.lane1) {
+                return &lane1.commit_tables;
+            }
+        }
+        &self.caches_of(rank).commit_tables
+    }
+
+    fn replay_rows_cell(&self) -> &Cell<usize> {
+        match (self.active_decode_lane.get(), &self.lane1) {
+            (1, Some(lane1)) => &lane1.replay_rows,
+            _ => &self.replay_rows,
+        }
+    }
+
     pub(crate) fn finish_request(&self) -> Result<()> {
         if let Some(drafter) = &self.drafter { drafter.finish_request()?; }
         Ok(())
@@ -2772,8 +2909,13 @@ impl<'a> GlmfEngine<'a> {
 
     /// Drains every rank's stream.
     pub(crate) fn synchronize(&self) -> Result<()> {
-        let result = drain_ranks(self.ranks() + usize::from(self.drafter.is_some()), |rank| {
-            if rank == self.ranks() { return self.drafter.as_ref().unwrap().synchronize_remote(); }
+        let extra = usize::from(self.lane1.is_some()) + usize::from(self.drafter.is_some());
+        let result = drain_ranks(self.ranks() + extra, |rank| {
+            if let Some(lane1) = self.lane1.as_ref().filter(|_| rank == self.ranks()) {
+                // SAFETY: lane 1's stream is owned by the engine and its operands remain live.
+                return self.on(0, || unsafe { self.library.cuda_stream_synchronize(lane1.stream) });
+            }
+            if rank >= self.ranks() { return self.drafter.as_ref().unwrap().synchronize_remote(); }
             // SAFETY: the engine owns these streams and retains all queued operands.
             self.on(rank, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank)) })
         });
@@ -3005,7 +3147,7 @@ impl<'a> GlmfEngine<'a> {
             return Ok(());
         }
         self.records.check_commit()?;
-        let recorded = self.replay_rows.get();
+        let recorded = self.replay_rows_cell().get();
         ensure!(sequences.len() <= self.decode_rows && sequences.iter().all(|&(slot, first, keep)|
             slot >= 0 && (slot as usize) < self.slots && first + keep <= recorded), "commit of {sequences:?}");
         let n = sequences.len();
@@ -3019,23 +3161,24 @@ impl<'a> GlmfEngine<'a> {
         let split = self.peer.is_some();
         for rank in 0..self.ranks() {
             let caches = self.caches_of(rank);
+            let commit_tables = self.commit_tables_of(rank);
             if rank == 1 {
                 // SAFETY: the engine owns the peer stream; drained before its tables are rewritten.
                 self.on(1, || unsafe { self.library.cuda_stream_synchronize(self.stream_of(1)) })?;
             }
-            self.on(rank, || self.put(&caches.commit_tables, &tables))?;
+            self.on(rank, || self.put(commit_tables, &tables))?;
             let mut pointers = vec![("state", caches.kda_state.buffer.ptr),
-                ("conv_state", caches.kda_conv.buffer.ptr), ("replay", caches.kda_replay.ptr),
-                ("tables", caches.commit_tables.buffer.ptr)];
+                ("conv_state", caches.kda_conv.buffer.ptr), ("replay", self.kda_replay_of(rank).ptr),
+                ("tables", commit_tables.buffer.ptr)];
             let mut scalars = vec![Scalar::I32(n as i32), Scalar::I32(layers as i32), Scalar::I32(self.slots as i32)];
             // The state's commit; with the compact index cache, the one that also rebuilds the tails.
-            let program = match &caches.index_tails {
-                Some((tails, records)) => {
-                    pointers.extend([("tails", tails.buffer.ptr), ("index_replay", records.buffer.ptr)]);
+            let program = match (&caches.index_tails, self.index_replay_of(rank)) {
+                (Some((tails, _)), Some(records)) => {
+                    pointers.extend([("tails", tails.buffer.ptr), ("index_replay", records.ptr)]);
                     scalars.push(Scalar::I32(caches.mla_ordinal.iter().flatten().count() as i32));
                     self.kda_state.compact_commit_program()
                 }
-                None => self.kda_state.commit_program(),
+                _ => self.kda_state.commit_program(),
             };
             self.run_on(rank, split, &commit_for(program, recorded), &pointers, &scalars)?;
         }
@@ -3080,10 +3223,10 @@ impl<'a> GlmfEngine<'a> {
             (event(&mut ops)?, event(&mut ops)?)
         };
         // SAFETY: both events are live timing events; the engine owns the stream.
-        unsafe { self.library.cuda_event_record(start, self.stream)? };
+        unsafe { self.library.cuda_event_record(start, self.stream_of(0))? };
         let out = body()?;
         // SAFETY: as above.
-        unsafe { self.library.cuda_event_record(end, self.stream)? };
+        unsafe { self.library.cuda_event_record(end, self.stream_of(0))? };
         ops.borrow_mut().pending.push((label.to_owned(), start, end));
         Ok(out)
     }
@@ -3093,7 +3236,7 @@ impl<'a> GlmfEngine<'a> {
     pub fn op_profile(&self) -> Result<std::collections::BTreeMap<String, (f64, usize)>> {
         let Some(ops) = &self.ops else { return Ok(Default::default()) };
         // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        unsafe { self.library.cuda_stream_synchronize(self.stream_of(0))? };
         self.flush_ops()?;
         Ok(std::mem::take(&mut ops.borrow_mut().totals))
     }
@@ -3176,7 +3319,10 @@ impl<'a> GlmfEngine<'a> {
     fn decode_workspace_of(&self, rank: usize) -> Result<std::cell::Ref<'_, Option<Workspace<'a>>>> {
         let cell = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.decode_workspace,
-            _ => &self.decode_workspace,
+            _ => match (self.active_decode_lane.get(), &self.lane1) {
+                (1, Some(lane1)) => &lane1.decode_workspace,
+                _ => &self.decode_workspace,
+            },
         };
         if cell.borrow().is_none() {
             let workspace = self.on(rank, || {
@@ -3233,7 +3379,7 @@ impl<'a> GlmfEngine<'a> {
         let staged = cuteafd_ffi::CuteafdDeviceBuffer { bytes: w.rows * row, ..w.streams[1].buffer };
         ensure!(staged.bytes <= w.streams[1].buffer.bytes, "embedding staging view exceeds its stream buffer");
         // SAFETY: embedding scratch is read/written only on the engine stream.
-        unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream)?; }
+        unsafe { self.library.copy_h2d_ordered(staged, &embed, self.stream_of(0))?; }
         self.host_op("host: embedding upload", host);
         self.timed("stream expansion", || {
             for s in 0..HC {
@@ -3245,7 +3391,7 @@ impl<'a> GlmfEngine<'a> {
                 };
                 // SAFETY: both buffers are live workspace buffers of at least `t` pitched
                 // rows; the upload precedes these copies on the same stream.
-                unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream)? };
+                unsafe { self.library.copy_device_rows_async(dst, staged, row, t, HC * row, row, self.stream_of(0))? };
             }
             Ok(())
         })
@@ -3255,7 +3401,7 @@ impl<'a> GlmfEngine<'a> {
     fn gather_streams(&self, w: &Workspace<'_>, t: usize) -> Result<()> {
         // SAFETY: the ids upload precedes this gather on the same stream; streams hold t x 4 rows.
         unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, HC, std::ptr::null(),
-            w.streams[0].buffer.ptr, self.stream) }
+            w.streams[0].buffer.ptr, self.stream_of(0)) }
     }
 
     fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables,
@@ -3269,7 +3415,7 @@ impl<'a> GlmfEngine<'a> {
         // drains injection before ids are restored; graph pointers/shapes stay fixed.
         self.library.embedding_injection()?.inject_host(&chunk.features, &chunk.indices,
             w.streams[1].buffer, w.ids.buffer, w.streams[0].buffer,
-            tables.positions.len(), self.cfg.hidden, HC, self.stream)?;
+            tables.positions.len(), self.cfg.hidden, HC, self.stream_of(0))?;
         Ok(())
     }
 
@@ -3279,7 +3425,7 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: the logits rows and the select buffer (ids, then statuses) are live buffers of these shapes.
         unsafe {
             self.library.cuda_logits_greedy_f32_async(w.logits.buffer.ptr, rows, vocab, vocab, w.select.buffer.ptr,
-                std::ptr::null_mut(), w.select.buffer.ptr.cast::<u8>().add(rows * 4).cast(), self.stream)
+                std::ptr::null_mut(), w.select.buffer.ptr.cast::<u8>().add(rows * 4).cast(), self.stream_of(0))
         }
     }
 
@@ -3287,7 +3433,7 @@ impl<'a> GlmfEngine<'a> {
     /// selection from [`Self::select_greedy`]).
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
         let vocab = self.cfg.vocab_size;
-        DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream,
+        DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.stream_of(0),
             // SAFETY: the statuses follow the ids inside the rows x 8-byte select buffer.
             greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(),
                 unsafe { w.select.buffer.ptr.cast::<u8>().add(rows * 4) }.cast_const().cast())) }
@@ -3305,7 +3451,7 @@ impl<'a> GlmfEngine<'a> {
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
         ensure!(bytes <= dev.buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", dev.buffer.bytes);
         // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        unsafe { self.library.cuda_stream_synchronize(self.stream_of(0))? };
         let mut out = vec![0u8; bytes];
         self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
@@ -3618,7 +3764,7 @@ impl<'a> GlmfEngine<'a> {
         let bucket = if graphed { self.serving_decode_rows(rows, spec) } else { rows };
         if spec {
             // The step records at its programs' capacity; the commit that follows reads that many rows.
-            self.replay_rows.set(replay_rows_of(decode_cap(bucket)));
+            self.replay_rows_cell().set(replay_rows_of(decode_cap(bucket)));
         }
         let logits = if graphed {
             pad_decode_tables(&mut tables, bucket);
@@ -4161,7 +4307,7 @@ impl<'a> GlmfEngine<'a> {
                         let w1 = w1.context("TP2 peer workspace")?;
                         // SAFETY: masked graph warm-up publishes zero payloads, never uninitialized router ids.
                         unsafe {
-                            self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?;
+                            self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream_of(0))?;
                             self.on(1, || self.library.cuda_zero_bytes_async(w1.shared.buffer,
                                 t * self.cfg.hidden * 2, self.stream_of(1)))?;
                         }
@@ -4184,7 +4330,7 @@ impl<'a> GlmfEngine<'a> {
                                 ptr: w.delta.buffer.ptr.cast::<u8>().add(offset).cast(),
                                 bytes, ..w.delta.buffer
                             };
-                            self.library.cuda_zero_bytes_async(buffer, bytes, self.stream)?;
+                            self.library.cuda_zero_bytes_async(buffer, bytes, self.stream_of(0))?;
                             if self.tp2_layer(index) {
                                 let w1 = w1.context("TP2 peer workspace")?;
                                 self.on(1, || self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
@@ -4238,12 +4384,12 @@ impl<'a> GlmfEngine<'a> {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
                 unsafe { self.weights.head.launch_fp8(self.programs, x, w.logits.buffer.ptr.cast(), logit_rows, h,
-                    self.cfg.vocab_size, self.stream) }
+                    self.cfg.vocab_size, self.stream_of(0)) }
             }),
             // SAFETY: the head's input and operands are live buffers of these shapes.
             GlmfHead::Bf16(head) => unsafe {
                 crate::shared::target_head::launch(self.target_head, w.head.as_ref().context("LM head")?, x,
-                    head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), logit_rows, self.stream)
+                    head.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), logit_rows, self.stream_of(0))
             },
         }
     }
@@ -4333,7 +4479,10 @@ impl<'a> GlmfEngine<'a> {
     fn graphs_of(&self, rank: usize) -> &RefCell<GraphBank<GraphKey, GraphExec<'a>>> {
         match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
-            _ => &self.graphs,
+            _ => match (self.active_decode_lane.get(), &self.lane1) {
+                (1, Some(lane1)) => &lane1.graphs,
+                _ => &self.graphs,
+            },
         }
     }
 
@@ -4341,7 +4490,8 @@ impl<'a> GlmfEngine<'a> {
     /// in flight). Called between decode steps: a sync inside one could wait on a peer push the
     /// host has not queued yet.
     fn release_retired_graphs(&self) -> Result<()> {
-        if (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().retired_len() == 0) {
+        let lane1_retired = self.lane1.as_ref().map_or(0, |l| l.graphs.borrow().retired_len());
+        if (0..self.ranks()).all(|rank| self.graphs_of(rank).borrow().retired_len() == 0) && lane1_retired == 0 {
             return Ok(());
         }
         self.synchronize()?;
@@ -4349,20 +4499,31 @@ impl<'a> GlmfEngine<'a> {
             let retired = self.graphs_of(rank).borrow_mut().drain_retired(|| Ok(()))?;
             self.on(rank, || { drop(retired); Ok(()) })?;
         }
+        if let Some(lane1) = &self.lane1 {
+            let retired = lane1.graphs.borrow_mut().drain_retired(|| Ok(()))?;
+            self.on(0, || { drop(retired); Ok(()) })?;
+        }
         Ok(())
     }
 
     /// The decode graph budget of every rank (None: unbounded).
     pub(crate) fn set_graph_budget(&self, budget: Option<u64>) {
-        for rank in 0..self.ranks() {
-            self.graphs_of(rank).borrow_mut().set_budget(budget);
+        self.graphs.borrow_mut().set_budget(budget);
+        if let Some(lane1) = &self.lane1 {
+            lane1.graphs.borrow_mut().set_budget(budget);
+        }
+        if let Some(peer) = &self.peer {
+            peer.graphs.borrow_mut().set_budget(budget);
         }
     }
 
     /// Decode graph captures, recaptures and evictions, and the measured bytes held (every rank).
     pub(crate) fn graph_stats(&self) -> GraphCounts {
-        (0..self.ranks()).fold(GraphCounts::default(), |total, rank| {
-            let graphs = self.graphs_of(rank).borrow();
+        let banks = std::iter::once(&self.graphs)
+            .chain(self.lane1.iter().map(|l| &l.graphs))
+            .chain(self.peer.iter().map(|p| &p.graphs));
+        banks.fold(GraphCounts::default(), |total, bank| {
+            let graphs = bank.borrow();
             let stats = graphs.stats();
             GraphCounts {
                 stats: GraphStats { captures: total.stats.captures + stats.captures,
@@ -4458,7 +4619,7 @@ impl<'a> GlmfEngine<'a> {
         let state = at(caches.kda_state.buffer, self.slots * d * self.cfg.kda_head_dim * self.kda_state.bytes());
         // Records of the step's programs' rows, layer by layer (an `_m64` step's 64-row records, a wide
         // step's 128-row ones), as the commit that follows reads them.
-        let replay = at(caches.kda_replay, replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)));
+        let replay = at(self.kda_replay_of(rank), replay_bytes(caches.kda_heads, 3 * d, replay_rows_of(cap)));
         let decode = is_decode(cap);
         // Row `first`'s input, state slot, sequence start and output. The output rows are FP32 only
         // for a head split's FP32 partials (`kda_w8_f32`); packed rows run on one GPU, in BF16.
@@ -4558,7 +4719,7 @@ impl<'a> GlmfEngine<'a> {
             // (the expert rows: the widest prefill lane or decode step), the output and the
             // scratch are live device buffers used on the engine stream.
             return self.timed("ffn (NVFP4 dense)", || unsafe {
-                dense.module.launch(&pointers, usize::try_from(rows)?, self.stream)
+                dense.module.launch(&pointers, usize::try_from(rows)?, self.stream_of(0))
             });
         }
         let decode = is_decode(cap);
@@ -4647,15 +4808,16 @@ impl<'a> GlmfEngine<'a> {
                 ("k_norm_b", layer.ptr("k_norm_b")?), ("ape", layer.ptr("ape")?), ("token_keys", keys.buffer.ptr),
                 ("index_cache", pools), ("q_fp8", q_fp8), ("head_weights", head_weights),
                 ("scratch", w.scratch.buffer.ptr)], &[rows]),
-            (None, Some((tails, records))) => {
+            (None, Some((tails, _))) => {
                 // This MLA layer's tails `[slots, TAIL_BYTES]` and speculative key | gate record.
+                let records = self.index_replay_of(rank).context("MLA compact index replay")?;
                 let ordinal = caches.mla_ordinal[index].context("MLA layer without an ordinal")?;
                 let recorded = replay_rows_of(cap);
                 ensure!(!tables.spec || t <= recorded, "a speculative step of {t} rows exceeds the replay record");
                 // SAFETY: ordinal < MLA layers and the records hold `decode_rows` >= `recorded` rows per
                 // layer: both regions lie inside their pools.
                 let (tails, record) = unsafe { (tails.buffer.ptr.cast::<u8>().add(ordinal * self.slots * TAIL_BYTES),
-                    records.buffer.ptr.cast::<u8>().add(ordinal * recorded * KEY_BYTES)) };
+                    records.ptr.cast::<u8>().add(ordinal * recorded * KEY_BYTES)) };
                 self.run_on(rank, false, &format!("index_producer_c_{cap}"), &[("x", x), ("q_resid", q_resid),
                     ("pool_slots", pool_slots), ("positions", positions),
                     ("kda_slots", row_at(&w.kda_slots, first, 4)), ("seq_first", row_at(&w.seq_first, first, 4)),
@@ -4827,7 +4989,7 @@ impl<'a> GlmfEngine<'a> {
             unsafe {
                 self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
                     std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
-                    self.cfg.routed_scale as f32, true, self.stream)
+                    self.cfg.routed_scale as f32, true, self.stream_of(0))
             }
         })?;
         self.probe_ring(index, w, t)?;
@@ -4896,12 +5058,13 @@ impl<'a> GlmfEngine<'a> {
         if !decode {
             return Ok(());
         }
-        let mark = if local { crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)? } else { None };
+        let stream = self.stream_of(0);
+        let mark = if local { crate::shared::l2_prefetch::exchange_mark(self.library, stream)? } else { None };
         if local && mark.is_none() {
             return Ok(());
         }
         if let Some(l2) = &self.l2 {
-            l2.issue(self.library, index, self.stream)?;
+            l2.issue(self.library, index, stream)?;
         }
         crate::shared::l2_prefetch::exchange_wait(self.library, mark)
     }
@@ -4920,6 +5083,7 @@ impl<'a> GlmfEngine<'a> {
             self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
             self.exchange_window(index, decode, !matches!(experts, Experts::Spark { .. }))
         };
+        let stream = self.stream_of(0);
         match experts {
             Experts::Skip => {
                 self.ffn(w, layer, self.cfg.moe_intermediate, cap, w.delta.buffer.ptr, rows)?;
@@ -4934,31 +5098,31 @@ impl<'a> GlmfEngine<'a> {
                 // buffers of `t` rows on this engine's stream.
                 unsafe {
                     fp8.run(resident, t, w.x.buffer.ptr, w.route_ids.buffer.ptr, w.route_weights.buffer.ptr,
-                        w.routed_ptr()?, self.stream)?;
+                        w.routed_ptr()?, stream)?;
                 }
                 if local.window.is_some() {
                     // Diagnostic paging may drop this layer before the stream drains.
                     // SAFETY: the engine owns this stream.
-                    unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+                    unsafe { self.library.cuda_stream_synchronize(stream)? };
                 }
             }
             Experts::LocalExl3(local) => {
                 shared()?;
-                local.ensure(index, self.stream)?;
+                local.ensure(index, stream)?;
                 let mut resident = local.resident.borrow_mut();
                 let (_, experts) = resident.as_mut().context("EXL3 window")?;
                 // SAFETY: wire rows, routes and the shared-expert rows are complete in
                 // stream order; the output is copied before the window can change.
                 unsafe {
                     experts.run(crate::families::deepseek_v4::local::LocalLayer::Backbone(index), t, w.wire.buffer.ptr,
-                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, self.stream)?;
-                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, self.stream)?;
+                        w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, w.shared.buffer.ptr, stream)?;
+                    self.library.copy_d2d_async(w.delta.buffer, experts.output.buffer, t * h * 2, stream)?;
                 }
                 return Ok(());
             }
-            Experts::Spark { transport } => {
+            Experts::Spark { transports } => {
                 // The compact reducer adds the shared expert plane to the rank partials.
-                let mut transport = transport.borrow_mut();
+                let mut transport = self.active_spark_transport(transports)?.borrow_mut();
                 let exchange = transport.exchange()?;
                 let wave = self.spark_send(w, index, t, decode, exchange, shared)?;
                 return self.spark_land(w, t, exchange, wave);
@@ -4971,7 +5135,7 @@ impl<'a> GlmfEngine<'a> {
     fn probe_mark(&self, index: usize) -> Result<()> {
         if let Some(probe) = self.draft_probe.borrow_mut().as_mut() {
             // SAFETY: the engine's own stream, live for the engine's lifetime.
-            unsafe { probe.mark(index, self.stream)? };
+            unsafe { probe.mark(index, self.stream_of(0))? };
         }
         Ok(())
     }
@@ -4985,7 +5149,7 @@ impl<'a> GlmfEngine<'a> {
         let Some(probe) = probe.as_mut().filter(|p| p.wants_ring(false)) else { return Ok(()) };
         // SAFETY: the router just wrote `t` rows of ids into `route_ids` on this stream; the ring
         // is read after the step's sync.
-        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream) }
+        unsafe { probe.ring(self.library, index, w.route_ids.buffer, t, self.stream_of(0)) }
     }
 
     /// Arm the shared draft policy's per-step signals for verify steps of up
@@ -5042,7 +5206,7 @@ impl<'a> GlmfEngine<'a> {
         // stream order; the copies read them before later stream work.
         let ticket = unsafe {
             exchange.send(t, layout, [w.route_ids.buffer, w.route_weights.buffer,
-                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream, Box::new(move |routes, wire| {
+                if bf16 { w.x.buffer } else { w.wire.buffer }], self.stream_of(0), Box::new(move |routes, wire| {
                     let request = spark_request_bytes(h, topk, index, t, routes, wire, kind, bf16)?;
                     if audit {
                         let counts = audit_route_counts(&request.routes);
@@ -5062,10 +5226,11 @@ impl<'a> GlmfEngine<'a> {
     fn spark_land(&self, w: &Workspace<'_>, t: usize, exchange: &mut crate::shared::spark_waves::Waves<'_>,
         wave: crate::shared::spark_waves::WaveTicket) -> Result<()> {
         let slot = wave.slot();
-        exchange.land(wave, self.stream)?;
+        let stream = self.stream_of(0);
+        exchange.land(wave, stream)?;
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the slot's planes are ordered after the wave by `land`.
-        unsafe { exchange.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, self.stream) }
+        unsafe { exchange.reduce(slot, w.shared.buffer.ptr.cast(), w.delta.buffer.ptr.cast(), t, stream) }
     }
 
     /// Bytes of the widest prefill wave's pinned staging (routes and wire rows).
@@ -5130,6 +5295,12 @@ impl Drop for GlmfEngine<'_> {
         // Abort before any owner releases storage when drainage is unproved.
         crate::shared::decode_graph::fatal_drain(self.shutdown_submission(), "GLM Flash engine");
         self.graphs = RefCell::new(GraphBank::new(None));
+        if let Some(lane1) = &mut self.lane1 {
+            lane1.graphs = RefCell::new(GraphBank::new(None));
+            lane1.decode_workspace = RefCell::new(None);
+            // SAFETY: shutdown_submission drained lane 1's stream before dropping its workspaces/graphs.
+            let _ = unsafe { self.library.cuda_stream_destroy(lane1.stream) };
+        }
         if let Some(peer) = &mut self.peer { peer.graphs = RefCell::new(GraphBank::new(None)); }
         if let Some(ops) = self.ops.take() {
             let ops = ops.into_inner();
@@ -6209,8 +6380,7 @@ mod replay_record_tests {
 
 #[cfg(test)]
 mod spark_warmup_tests {
-    use super::{spark_request, spark_warmup_request,
-        DECODE_ROWS, MAX_PREFILL_WAVES};
+    use super::{spark_request, spark_warmup_request, DECODE_ROWS};
     use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
     use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
     use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2Dtype, ExpertV2SourceKind,

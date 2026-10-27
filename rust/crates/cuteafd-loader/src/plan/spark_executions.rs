@@ -95,7 +95,17 @@ impl SparkBackend {
 /// coordinator package fixes it (e.g. a V4 manifest's `decode_rows`).
 pub fn admit(family: &dyn crate::plan::Family, exports: &[u32], decode_rows: Option<u32>,
     prefill: PrefillUnits) -> Result<SparkExecutions, ExecutionAdmissionError> {
-    let lanes = family.spark_decode().map_or(0, |_| family.decode_lanes().max_lanes());
+    admit_with_decode_lanes(family, exports, None, decode_rows, prefill)
+}
+
+/// Admit `family` with an explicit decode lane count (`None` uses the
+/// descriptor's default decode lane count).
+pub fn admit_with_decode_lanes(family: &dyn crate::plan::Family, exports: &[u32],
+    decode_lanes: Option<u8>, decode_rows: Option<u32>,
+    prefill: PrefillUnits) -> Result<SparkExecutions, ExecutionAdmissionError> {
+    let requested = decode_lanes.filter(|&l| family.decode_lanes().admits(l))
+        .unwrap_or_else(|| family.decode_lanes().default_lanes());
+    let lanes = family.spark_decode().map_or(0, |_| requested);
     let rows = decode_rows.or(family.spark_decode().map(|decode| decode.rows)).unwrap_or(0);
     SparkExecutions::admit(&vec![rows; usize::from(lanes)], prefill.unit_rows,
         prefill.unit_rows, prefill.waves, exports)
@@ -112,8 +122,16 @@ pub fn descriptor(family: &str) -> anyhow::Result<&'static dyn crate::plan::Fami
 /// serve and golden all call this.
 pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
     unit_rows: u64, waves: u64) -> anyhow::Result<SparkExecutions> {
+    admit_family_with_decode_lanes(family, exports, None, decode_rows, unit_rows, waves)
+}
+
+/// Admit `family` with an explicit decode lane count (`None` uses the
+/// descriptor's default decode lane count).
+pub fn admit_family_with_decode_lanes(family: &str, exports: &[u32], decode_lanes: Option<u8>,
+    decode_rows: Option<u32>, unit_rows: u64, waves: u64) -> anyhow::Result<SparkExecutions> {
     let descriptor = descriptor(family)?;
-    Ok(admit(descriptor, exports, decode_rows, PrefillUnits::for_family(descriptor, unit_rows, waves))?)
+    Ok(admit_with_decode_lanes(descriptor, exports, decode_lanes, decode_rows,
+        PrefillUnits::for_family(descriptor, unit_rows, waves))?)
 }
 
 #[cfg(test)]
@@ -133,7 +151,10 @@ mod tests {
                     assert_eq!(plan.prefill, PrefillExecution { capacity: unit as u32,
                         compiled_capacity: cuteafd_core::covering_export(&backend.exports(), unit as u32).unwrap(),
                         unit_rows: unit as u32, buffered_units: waves as u8 }, "{} {backend:?}", family.id());
-                    assert_eq!(plan.decode.len(), usize::from(family.decode_lanes().max_lanes()));
+                    assert_eq!(plan.decode.len(), usize::from(family.decode_lanes().default_lanes()));
+                    let max_plan = admit_with_decode_lanes(*family, &backend.exports(),
+                        Some(family.decode_lanes().max_lanes()), None, PrefillUnits::ladder(unit, waves)).unwrap();
+                    assert_eq!(max_plan.decode.len(), usize::from(family.decode_lanes().max_lanes()));
                 }
             }
         }

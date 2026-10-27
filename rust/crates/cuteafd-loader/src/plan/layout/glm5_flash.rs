@@ -87,7 +87,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
         let shared = if options.glmf_shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
-            glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
+            glmf_step_workspace(m, checkpoint, placement, lanes, report.decode_lanes, rows, context, decode_rows, shared,
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials, state));
         let mut workspace = step_workspace(&report.placement, lanes);
@@ -157,10 +157,10 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 automatic_target
             } else { options.target_pool_tokens.max(context) });
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
-            .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
-                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
+            .unwrap_or_else(|| glmf::startup_graphs_with_decode_lanes(&cfg, cfg.layers, context as usize, target as usize,
+                sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize, report.decode_lanes));
         let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
-            headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
+            headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, decode_lanes: report.decode_lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
             index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
@@ -255,13 +255,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                     u32::try_from(options.spark_capacity_rows)
                         .map_err(|_| placement::PlacementError::Overflow("Spark capacity"))
                         .and_then(|capacity| charge_spark_io(&mut device, &working, geometry, capacity,
-                            checkpoint.spark_input_is_bf16(), spark_ring_geometry(spark_endpoints("glm5_flash", working.prefill_lanes)),
+                            checkpoint.spark_input_is_bf16(), spark_ring_geometry(usize::from(report.decode_lanes.max(1))),
                             gib(56) * options.spark_capacity_rows / 4096))
                 });
             if let Err(error) = io {
                 report.placement_supported = false;
                 notes.push(format!("Spark rank {rank} I/O admission: {error}"));
             }
+            options.decode_lanes = report.decode_lanes;
             let charged = input.expert_catalog().and_then(SparkBackend::for_catalog).and_then(|backend|
                 super::planned_spark_executions("glm5_flash", backend,
                     Some(u32::try_from(options.glmf_decode_rows)?), options))

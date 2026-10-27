@@ -31,6 +31,20 @@ impl LaneSupport {
     pub fn max_lanes(self) -> u8 {
         match self { Self::One { .. } => 1, Self::OneOrTwo { .. } | Self::FixedTwo => MAX_DECODE_LANES }
     }
+
+    /// Default decode lanes when no explicit count is requested.
+    pub fn default_lanes(self) -> u8 {
+        match self { Self::One { .. } => 1, Self::OneOrTwo { default } => default, Self::FixedTwo => MAX_DECODE_LANES }
+    }
+
+    /// Whether `lanes` is an admitted decode-lane count for this family.
+    pub fn admits(self, lanes: u8) -> bool {
+        match self {
+            Self::One { .. } => lanes == 1,
+            Self::OneOrTwo { .. } => (1..=MAX_DECODE_LANES).contains(&lanes),
+            Self::FixedTwo => lanes == MAX_DECODE_LANES,
+        }
+    }
 }
 
 /// Resolve the decode-lane count before layout or any CUDA allocation.

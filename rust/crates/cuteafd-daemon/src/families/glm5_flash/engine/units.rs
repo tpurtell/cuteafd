@@ -302,8 +302,8 @@ impl<'a> GlmfEngine<'a> {
         // while this thread queues GPU work; owned-attention units exchange
         // inside their own FFN hooks.
         let outcome = match (&self.experts, &self.layer_execution) {
-            (Some(Experts::Spark { transport, .. }), None) => {
-                let mut link = transport.borrow_mut();
+            (Some(Experts::Spark { transports }), None) => {
+                let mut link = transports.first().context("Spark prefill transport")?.borrow_mut();
                 let exchange = link.exchange()?;
                 ensure!(exchange.fits(self.wave_staging_bytes()?), "Spark exchange staging is narrower than a prefill unit");
                 run(Some(exchange))

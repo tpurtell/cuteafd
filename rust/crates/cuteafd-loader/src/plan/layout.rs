@@ -414,7 +414,8 @@ pub(crate) fn spark_executions(input: &super::PlanInput, family: &str, options: 
 pub fn planned_spark_executions(family: &str, backend: super::spark_executions::SparkBackend,
     decode_rows: Option<u32>, options: &LayoutOptions) -> anyhow::Result<cuteafd_core::SparkExecutions> {
     let unit = options.prefill_unit_rows.unwrap_or(options.spark_capacity_rows);
-    super::spark_executions::admit_family(family, &backend.exports(), decode_rows, unit, options.prefill_waves)
+    super::spark_executions::admit_family_with_decode_lanes(family, &backend.exports(),
+        Some(options.decode_lanes), decode_rows, unit, options.prefill_waves)
 }
 
 #[cfg(test)]
@@ -977,7 +978,7 @@ pub(crate) fn local_package(report: &PlanReport) -> &'static str {
 /// (`serving_capacity::glmf_*`, which the engine sizes its buffers from).
 #[allow(clippy::too_many_arguments)]
 fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpoint, placement: &ExpertPlacement,
-    lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool, split: bool,
+    lanes: u64, decode_lanes: u8, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool, split: bool,
     repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, rtx_experts: bool, fp32_partials: bool,
     kda_state: crate::serving_capacity::GlmfKdaState) -> Option<Vec<crate::placement::families::glm5_flash::GlmfBufferDemand>> {
     use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_table_pages,
@@ -997,8 +998,8 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
     // Shared replay records live in the prefill scratch.
     prefill.programs = prefill.programs.max(shared_records);
-    Some(crate::placement::families::glm5_flash::step_workspace_demands(&cfg,
-        usize::try_from(lanes).ok()?, rows, decode_rows, shape, decode, prefill))
+    Some(crate::placement::families::glm5_flash::step_workspace_demands_with_decode_lanes(&cfg,
+        usize::try_from(lanes).ok()?, decode_lanes, rows, decode_rows, shape, decode, prefill))
 }
 
 /// Local EXL3 arenas from the same capacity manifests used by the loader.

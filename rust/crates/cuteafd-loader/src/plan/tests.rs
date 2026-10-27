@@ -2484,7 +2484,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
                 context_bytes: placement::ArchContext::coordinator(total, None).context_bytes
                     + placement::loaded_code("glmf", "fp8", true, rank as u8).unwrap().bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; 2], headroom_bytes: opts.headroom_bytes,
-            spark_ranks: peers, prefill_lanes: lanes, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
+            spark_ranks: peers, prefill_lanes: lanes, decode_lanes: 1, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262144, sequences: 8, speculation: false, state_slots: 8, mark_slots: 8,
             pool_marks: false, index: opts.glmf_index, kda_state_bytes: 4, shared_replay: false,
             representation: opts.glmf_representation,

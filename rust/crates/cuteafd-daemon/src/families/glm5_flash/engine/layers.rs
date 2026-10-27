@@ -401,9 +401,9 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             e.probe_ring(index, w, real)?;
             if e.tp2_layer(index) {
                 e.tp2_pair(index, self.lane, w, Some(w1), real, rows, self.cap())?;
-            } else if let Some(Experts::Spark { transport, .. }) = e.routed_experts(index) {
+            } else if let Some(Experts::Spark { transports }) = e.routed_experts(index) {
                 ensure!(e.layer_waves.borrow()[self.lane].is_none(), "unconsumed per-layer Spark wave");
-                let mut transport = transport.borrow_mut();
+                let mut transport = e.active_spark_transport(transports)?.borrow_mut();
                 let wave = e.spark_send(w, index, real, self.tables[0].decode, transport.exchange()?, || {
                     e.ffn(w, layer, e.cfg.moe_intermediate, self.cap(), w.shared.buffer.ptr, rows)
                 })?;
@@ -420,11 +420,11 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let e = self.engine;
         let real = if self.tables[0].decode && e.startup_graphs { self.tables[0].real_rows } else { self.rows };
         if ticket.spark {
-            let Some(Experts::Spark { transport }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
+            let Some(Experts::Spark { transports }) = e.routed_experts(index) else { anyhow::bail!("Spark ticket backend changed"); };
             let wave = e.layer_waves.borrow_mut()[self.lane].take().context("retained Spark wave")?;
             // A device wait on the stream: the QPs, intake planes and staging stay
             // with the link's exchange through teardown.
-            let mut transport = transport.borrow_mut();
+            let mut transport = e.active_spark_transport(transports)?.borrow_mut();
             e.spark_land(self.work[0], real, transport.exchange()?, wave)?;
         }
         if !self.layer(0, index).dense && real < self.rows {

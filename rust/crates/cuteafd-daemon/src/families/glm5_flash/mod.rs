@@ -1308,6 +1308,9 @@ fn check_options(args: &EngineArgs) -> Result<()> {
         --decode-rows {}", args.decode_rows, engine::DECODE_ROWS);
     ensure!(args.target_head != Some(head::TargetHead::Tensor) || !args.fp8_head,
         "--target-head tensor runs the BF16 head; the FP8 head (--fp8-head) has its own program");
+    ensure!((1..=2).contains(&args.decode_lanes), "--decode-lanes must be 1 or 2");
+    ensure!(args.decode_lanes == 1 || (args.split_device.is_none() && args.replay_records == engine::ReplayRecords::Own),
+        "--decode-lanes 2 runs on one coordinator GPU with --replay-records own");
     Ok(())
 }
 
@@ -1556,8 +1559,8 @@ impl Opened {
         let shape = GlmfStepShape { lead: true, split, local_experts: !args.skip_experts && !split && self.fp8().is_some(),
             tp2_experts: !args.skip_experts && split, spark: spark_ranks > 0, partial_bytes: if args.kda_fp32_partials { 4 } else { 2 },
             output_shard: args.kda_output_shard, full_prefill_logits: args.full_prefill_logits, table_pages, table_pool_pages };
-        let workspaces = |spark, lanes| admission::step_workspace_demands(&self.cfg, lanes,
-            args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
+        let workspaces = |spark, lanes| admission::step_workspace_demands_with_decode_lanes(&self.cfg, lanes,
+            args.decode_lanes, args.prefill_rows as u64, args.decode_rows as u64, GlmfStepShape { spark, ..shape }, decode, prefill);
         let workspace = workspaces(spark_ranks > 0, lanes);
         let local_workspace = workspaces(false, lanes);
         let mut experts = self.experts.as_ref().map(|c| admission::expert_costs(c, split)).transpose()?.unwrap_or_default();
@@ -1596,8 +1599,8 @@ impl Opened {
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let pool = if args.pool_tokens > 0 { args.pool_tokens } else { cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS as usize };
         let graphs = if args.startup_graphs() {
-            admission::startup_graphs(&self.cfg, layers, args.max_context, pool,
-                sequences, speculation, devices.len(), args.decode_rows, sms)
+            admission::startup_graphs_with_decode_lanes(&self.cfg, layers, args.max_context, pool,
+                sequences, speculation, devices.len(), args.decode_rows, sms, args.decode_lanes)
         } else { placement::GraphSet::budget(&vec![args.graph_budget_mib.map_or(1536 << 20, |mib| mib << 20); devices.len()]) };
         let onboard = args.rtx_expert_layers.unwrap_or_else(|| if args.local_experts {
             placement::Onboard::Layers(experts.len()) } else { admission::default_onboard() });
@@ -1605,7 +1608,7 @@ impl Opened {
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes + prepared_draft.map_or(0, crate::shared::draft::remote::Prepared::sampled_bytes) })).collect(),
             pending_code, headroom_bytes: args.headroom_bytes()?, spark_ranks,
-            prefill_lanes: lanes as u64, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
+            prefill_lanes: lanes as u64, decode_lanes: args.decode_lanes, prefill_rows: args.prefill_rows as u64, decode_rows: args.decode_rows as u64,
             partial_bytes: if args.kda_fp32_partials { 4 } else { 2 }, max_context: args.max_context as u64,
             sequences: sequences.min(args.decode_rows) as u64, speculation, state_slots: args.slots as u64,
             mark_slots: marks as u64, pool_marks: args.prefix_marks == prefix::PrefixMarks::Pool, index: index.into(),
@@ -1928,12 +1931,17 @@ impl Opened {
             let ingress = if self.checkpoint.spark_input_is_bf16() { cuteafd_core::SparkIngress::Bf16 }
                 else { cuteafd_core::SparkIngress::Fp8K32 };
             let catalog = self.experts.as_ref().context("GLM Flash Spark admission requires routed expert headers")?;
-            let executions = cuteafd_loader::plan::spark_executions::admit_family("glm5_flash",
+            let executions = cuteafd_loader::plan::spark_executions::admit_family_with_decode_lanes("glm5_flash",
                 &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(),
-                Some(u32::try_from(args.decode_rows)?), args.prefill_rows as u64, args.prefill_waves as u64)?;
+                Some(args.decode_lanes), Some(u32::try_from(args.decode_rows)?),
+                args.prefill_rows as u64, args.prefill_waves as u64)?;
+            let endpoints = crate::shared::serve::lanes::LaneSet::default().try_map(|lane| -> Result<Option<_>> {
+                if lane.index() >= usize::from(args.decode_lanes) { return Ok(None); }
+                let capacity = if lane.index() == 0 { capacity } else { u32::try_from(args.decode_rows)? };
+                Ok(Some(cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }))
+            })?.into_iter().flatten().collect::<Vec<_>>();
             let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-                vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
-                crate::shared::placement::spark_rings(64 << 20)?, executions)?;
+                endpoints, crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;
             let ranks = if admission.coordinator_pushes() && dense_pushable(&args) {
@@ -2088,6 +2096,9 @@ impl Opened {
             &execution, step_experts)?;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();
+        if args.decode_lanes == 2 {
+            engine.enable_second_decode_lane()?;
+        }
 
         if !startup_graphs {
             engine.capture_graphs_lazily();
@@ -2281,30 +2292,39 @@ impl Opened {
         let remote = selected;
         let peers = peers.split(',').map(str::parse).collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
         let spark_world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
-        // One link retains independent intake planes for every outstanding unit wave.
-        let mut transport = crate::shared::spark_intake::SparkLink::new_waves(&self.library,
-            spark_world, &peers, u32::try_from(args.expert_rows())?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
-                timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
-            args.prefill_waves, u32::try_from(args.prefill_rows)?)?;
-        transport.enable_terminal_ownership(self.library.clone())?;
-        crate::shared::memory_report::release_load_staging(&self.library);
-        let warm_rows = args.expert_rows();
-        let warm = engine::spark_warmup_request(&self.cfg, warm_rows, remote[0], self.checkpoint.spark_input_is_bf16())?;
-        // Publish grouping before the draft planner prices the installed workers.
-        transport.bootstrap(&warm)?;
         let rings = || cuteafd_ffi::memory_ledger::snapshot().by_scope(cuteafd_ffi::memory_ledger::Space::Pinned, -1)
             .get("transport/rdma-rings").copied().unwrap_or(0);
         let (started, before) = (Instant::now(), rings());
         let warm_stream = crate::shared::spark_intake::WarmStream::new(self.library.as_ref())?;
-        let exchange = transport.exchange()?;
-        let wave = exchange.send_request(warm)?;
-        exchange.land_drained(wave, warm_stream.raw())
-            .with_context(|| format!("warming Spark expert transport with {warm_rows} rows"))?;
+        let transports = crate::shared::serve::lanes::LaneSet::default().try_map(|lane| -> Result<Option<_>> {
+            if lane.index() >= usize::from(args.decode_lanes) { return Ok(None); }
+            let (capacity, waves, wave_rows) = if lane.index() == 0 {
+                (args.expert_rows(), args.prefill_waves, args.prefill_rows)
+            } else {
+                (args.decode_rows, 1, args.decode_rows)
+            };
+            let mut transport = crate::shared::spark_intake::SparkLink::new_waves_for_lane(&self.library,
+                spark_world, &peers, u32::try_from(capacity)?, cuteafd_transport::TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(),
+                    timeout: std::time::Duration::from_secs(120), max_frame_bytes: 64 << 20 }, self.cfg.hidden * 2,
+                waves, u32::try_from(wave_rows)?, u32::try_from(lane.index())?)?;
+            transport.enable_terminal_ownership(self.library.clone())?;
+            if lane.index() == 0 {
+                crate::shared::memory_report::release_load_staging(&self.library);
+            }
+            let warm = engine::spark_warmup_request(&self.cfg, capacity, remote[0], self.checkpoint.spark_input_is_bf16())?;
+            // Publish grouping before the draft planner prices the installed workers.
+            transport.bootstrap(&warm)?;
+            let exchange = transport.exchange()?;
+            let wave = exchange.send_request(warm)?;
+            exchange.land_drained(wave, warm_stream.raw())
+                .with_context(|| format!("warming Spark expert transport lane {} with {capacity} rows", lane.index()))?;
+            Ok(Some(std::cell::RefCell::new(transport)))
+        })?.into_iter().flatten().collect::<Vec<_>>();
         warm_stream.finish()?;
-        tracing::info!(waves = args.prefill_waves, ranks = peers.len(), rows = warm_rows,
+        tracing::info!(waves = args.prefill_waves, decode_lanes = transports.len(), ranks = peers.len(), rows = args.expert_rows(),
             ring_bytes = rings().saturating_sub(before), elapsed_ms = started.elapsed().as_millis() as u64,
             "Spark expert transport warm");
-        Ok(Some(engine::Experts::Spark { transport: std::cell::RefCell::new(transport) }))
+        Ok(Some(engine::Experts::Spark { transports }))
     }
 }
 

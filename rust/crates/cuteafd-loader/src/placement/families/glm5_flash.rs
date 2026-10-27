@@ -139,6 +139,7 @@ pub struct GlmfInputs<'a> {
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
     pub prefill_lanes: u64,
+    pub decode_lanes: u8,
     pub prefill_rows: u64,
     pub decode_rows: u64,
     pub partial_bytes: u64,
@@ -244,13 +245,20 @@ pub use crate::placement::{ComponentDemand as GlmfBufferDemand, SparkWorkingSet 
 /// Both callers use the exact base plus optional RTX-buffer delta.
 pub fn step_workspace_demands(cfg: &GlmNextConfig, lanes: usize, prefill_rows: u64, decode_rows: u64,
     shape: cache::GlmfStepShape, decode: cache::GlmfScratch, prefill: cache::GlmfScratch) -> Vec<GlmfBufferDemand> {
+    step_workspace_demands_with_decode_lanes(cfg, lanes, 1, prefill_rows, decode_rows, shape, decode, prefill)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn step_workspace_demands_with_decode_lanes(cfg: &GlmNextConfig, lanes: usize, decode_lanes: u8,
+    prefill_rows: u64, decode_rows: u64, shape: cache::GlmfStepShape,
+    decode: cache::GlmfScratch, prefill: cache::GlmfScratch) -> Vec<GlmfBufferDemand> {
     (0..if shape.split { 2 } else { 1 }).flat_map(|rank| {
         let full = if rank == 0 { shape } else {
             cache::GlmfStepShape { lead: false, local_experts: false, spark: false, ..shape }
         };
         let base = cache::GlmfStepShape { local_experts: false, tp2_experts: false, ..full };
         let bytes = |shape| cache::glmf_step_workspaces(cfg, lanes, prefill_rows, decode_rows,
-            &shape, decode, prefill).device_bytes();
+            &shape, decode, prefill).device_bytes_with_decode_lanes(decode_lanes);
         let always = bytes(base);
         [GlmfBufferDemand::new(GlmfComponent::Always, rank as u8, Category::Workspace, "steps", always, Basis::Formula),
             GlmfBufferDemand::new(GlmfComponent::RtxExperts, rank as u8, Category::Workspace, "steps",
@@ -310,6 +318,13 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     if i.shared_replay && (ranks != 1 || working.spark_ranks == 0) {
         return Err(PlacementError::Inventory("GLM Flash --replay-records shared needs one coordinator GPU and Spark experts (independent of --pool-tokens)"));
     }
+    if !(1..=2).contains(&i.decode_lanes) {
+        return Err(PlacementError::Inventory("GLM Flash decode lanes must be 1 or 2"));
+    }
+    if i.decode_lanes > 1 && (ranks != 1 || i.shared_replay) {
+        return Err(PlacementError::Inventory("GLM Flash two-lane decode needs one coordinator GPU and --replay-records own"));
+    }
+    let decode_lanes = u64::from(i.decode_lanes);
     let geometry = cache::glm_flash_placed_cache_geometry_rows(i.cfg, i.layers, ranks, i.index,
         i.kda_state_bytes, i.decode_rows, i.attention.mode, i.attention.first_owner as usize)
         .map_err(|_| PlacementError::Inventory("GLM Flash cache geometry"))?;
@@ -345,12 +360,13 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "pending code", i.pending_code.get(rank).copied().unwrap_or(0), Basis::Calibrated));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Embedding, "embedding", i.resident[rank].embedding, Basis::Exact));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Weights, "target weights", i.resident[rank].weights, Basis::Exact));
-        let replay = if i.shared_replay { 0 } else { g.speculative_replay_bytes - index_replay };
+        let replay = if i.shared_replay { 0 } else { mul(g.speculative_replay_bytes - index_replay, decode_lanes)? };
+        let index_replay = mul(index_replay, decode_lanes)?;
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "KDA state and replay",
             mul(g.active_state_per_sequence_bytes - tails, i.state_slots)? + replay, Basis::Formula));
         fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "DSA index tails and replay",
             mul(tails, i.state_slots)? + index_replay, Basis::Formula));
-        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "commit tables", g.fixed_state_bytes, Basis::Formula));
+        fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Kv, "commit tables", mul(g.fixed_state_bytes, decode_lanes)?, Basis::Formula));
         if !i.pool_marks {
             fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Prefix, "marks", mul(g.retained_mark_bytes, i.mark_slots)?, Basis::Formula));
         } else {
@@ -383,6 +399,15 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
                 fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "wide decode selector",
                     cache::glmf_selector_bytes(i.decode_rows, i.cfg.vocab_size as u64)
                         - cache::glmf_selector_bytes(cache::GLMF_DECODE_ROWS, i.cfg.vocab_size as u64), Basis::Formula));
+            }
+            if i.decode_lanes == 2 {
+                fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Workspace, "lane 1 decode selector",
+                    cache::glmf_selector_bytes(i.decode_rows, i.cfg.vocab_size as u64), Basis::Formula));
+                fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "lane 1 Spark intake",
+                    cache::spark_intake_bytes(1, working.spark_ranks as u64,
+                        i.decode_rows, i.cfg.hidden as u64), Basis::Formula));
+                fixed.push(GlmfBufferDemand::new(GlmfComponent::Always, gpu, Category::Runtime, "lane 1 workspace runtime allowance",
+                    glmf_graphs::WORKSPACE_RUNTIME_OVERHEAD_BYTES, Basis::Calibrated));
             }
             fixed.push(GlmfBufferDemand::new(GlmfComponent::SparkExperts, gpu, Category::Transport, "Spark intake",
                 cache::spark_intake_bytes(working.prefill_lanes, working.spark_ranks as u64,
@@ -684,8 +709,8 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
         if i.graphs.lifetime == Lifetime::Startup {
             let context = glmf_graphs::admitted_graph_context(i.max_context as usize, candidate as usize, automatic_context);
             trial.graphs = graph_cache.entry((context, candidate as usize)).or_insert_with(||
-                startup_graphs(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
-                    i.speculation, i.gpus.len(), i.decode_rows as usize, sms)).clone();
+                startup_graphs_with_decode_lanes(i.cfg, i.layers, context, candidate as usize, i.sequences as usize,
+                    i.speculation, i.gpus.len(), i.decode_rows as usize, sms, i.decode_lanes)).clone();
             if i.local_tp2_exl3 && working.spark_ranks == 0 {
                 calibrate_local_tp2_graphs(&mut trial.graphs);
             }
@@ -705,16 +730,24 @@ fn solve_profile_with_graphs(i: &GlmfInputs<'_>, target: u64, automatic_context:
 #[allow(clippy::too_many_arguments)]
 pub fn startup_graphs(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
     speculation: bool, gpus: usize, decode_rows: usize, sms: usize) -> GraphSet {
+    startup_graphs_with_decode_lanes(cfg, layers, context, pool, sequences, speculation, gpus, decode_rows, sms, 1)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn startup_graphs_with_decode_lanes(cfg: &GlmNextConfig, layers: usize, context: usize, pool: usize, sequences: usize,
+    speculation: bool, gpus: usize, decode_rows: usize, sms: usize, decode_lanes: u8) -> GraphSet {
     let counts = glmf_graphs::serving_graph_counts(context, pool, cfg.dense_context(), sequences.min(decode_rows), speculation,
         layers, gpus == 2, &glmf_graphs::DecodeBuckets::new(glmf_graphs::verify_budget(decode_rows, sms)));
+    let lanes = u64::from(decode_lanes.max(1));
     let ranks = counts.iter().enumerate().map(|(rank, &count)| {
+        let count = count * lanes;
         let role = if gpus == 1 { 0 } else { rank + 1 };
         let measured = glmf_graphs::measured_graph_bytes(count, role);
         let margin = (measured * glmf_graphs::GRAPH_MARGIN_PERCENT).div_ceil(100)
             .max(glmf_graphs::GRAPH_RANK_MARGIN_BYTES);
         GraphRank { executables: count, bytes: measured + margin, margin }
     }).collect();
-    GraphSet { ranks, shapes: counts[0] / (layers + 1) as u64, lifetime: Lifetime::Startup }
+    GraphSet { ranks, shapes: counts[0] * lanes / (layers + 1) as u64, lifetime: Lifetime::Startup }
 }
 
 /// P6 staged capture after every expert capacity was primed, not legacy Spark-route graphs.
@@ -746,7 +779,7 @@ mod tests {
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + loaded_code("glmf", "exl3", ranks == 2, rank as u8).unwrap().bytes,
                 loaded_bytes: 0 })).collect(), pending_code: vec![0; ranks], local_tp2_exl3: false, headroom_bytes: 1 << 30,
-            spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
+            spark_ranks: 4, prefill_lanes: 2, decode_lanes: 1, prefill_rows: 4096, decode_rows: 64, partial_bytes: 2,
             max_context: 262_144, sequences: 8, speculation: true, state_slots: 8, mark_slots: 16, pool_marks: false,
             index: cache::GlmfIndexCache::Keys, kda_state_bytes: 4, shared_replay: false,
             representation: GlmfRepresentation::default(),
@@ -1897,5 +1930,39 @@ mod tests {
         assert_eq!(placed.onboard_layers, 0);
         input.onboard = Onboard::Layers(1);
         assert!(solve(&request(&input).unwrap()).is_err());
+    }
+
+    #[test]
+    fn decode_lanes_two_charges_every_second_lane_buffer_and_graph_set() {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(2)).unwrap();
+        let mut one = inputs(&cfg, 1, inventory::PRO_TOTAL_BYTES);
+        one.index = cache::GlmfIndexCache::Compact;
+        let mut two = one.clone();
+        two.decode_lanes = 2;
+        two.graphs = startup_graphs_with_decode_lanes(&cfg, cfg.layers, 262_144, 2 << 20, 8, true, 1, 64, 188, 2);
+        let req1 = request(&one).unwrap();
+        let req2 = request(&two).unwrap();
+        let sum = |req: &crate::placement::PlacementRequest, group: &str| -> u64 {
+            req.fixed.iter().filter(|d| d.group == group).map(|d| d.bytes).sum()
+        };
+        assert!(sum(&req2, "KDA state and replay") > sum(&req1, "KDA state and replay"));
+        assert!(sum(&req2, "DSA index tails and replay") > sum(&req1, "DSA index tails and replay"));
+        assert_eq!(sum(&req2, "commit tables"), 2 * sum(&req1, "commit tables"));
+        assert!(sum(&req1, "commit tables") > 0);
+        assert_eq!(sum(&req1, "lane 1 decode selector"), 0);
+        assert_eq!(sum(&req2, "lane 1 decode selector"), cache::glmf_selector_bytes(64, cfg.vocab_size as u64));
+        assert_eq!(sum(&req1, "lane 1 Spark intake"), 0);
+        assert!(sum(&req2, "lane 1 Spark intake") > 0);
+        assert_eq!(sum(&req2, "lane 1 workspace runtime allowance"), glmf_graphs::WORKSPACE_RUNTIME_OVERHEAD_BYTES);
+        assert_eq!(two.graphs.ranks[0].executables, 2 * one.graphs.ranks[0].executables);
+        assert!(two.graphs.ranks[0].bytes > one.graphs.ranks[0].bytes);
+        let shape = cache::GlmfStepShape { lead: true, split: false, local_experts: false,
+            tp2_experts: false, spark: true, partial_bytes: 2, output_shard: false,
+            full_prefill_logits: false, table_pages: 64, table_pool_pages: 16 };
+        let scratch = cache::GlmfScratch::default();
+        let step1 = step_workspace_demands_with_decode_lanes(&cfg, 2, 1, 4096, 64, shape, scratch, scratch);
+        let step2 = step_workspace_demands_with_decode_lanes(&cfg, 2, 2, 4096, 64, shape, scratch, scratch);
+        let step_sum = |demands: &[GlmfBufferDemand]| demands.iter().map(|d| d.demand.bytes).sum::<u64>();
+        assert!(step_sum(&step2) > step_sum(&step1));
     }
 }
