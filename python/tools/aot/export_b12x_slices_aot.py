@@ -194,6 +194,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         selected_width = width[capacity] if isinstance(width, dict) else width
         routes = capacity * topk
         planes = (intermediate + selected_width - 1) // selected_width
+        ring_slots = (188 + planes - 1) // planes + 1
+        ring_words = 2 * ring_slots + ring_slots * planes * 16 * hidden
         # The native Spark TP3 launch geometry is recorded from the reviewed
         # identity contract (pinned kernel constants + this variant's compiled
         # width). It is keyed on static capacity and model geometry only: no live
@@ -228,7 +230,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             (cutlass.Int32, (routes, 19), (19, 1)),
             (cutlass.Float32, (routes,), (1,)),
             (cutlass.Int32, (routes,), (1,)),
-            (cutlass.Float32, (1,), (1,)) if atomic or ordered_groups else
+            (cutlass.Float32, (1,), (1,)) if atomic else
+                (cutlass.Float32, (ring_words,), (1,)) if ordered_groups else
                 (cutlass.Float32, (planes, routes, hidden), (routes * hidden, hidden, 1)),
             (cutlass.Float32, (capacity * hidden,), (1,)) if atomic else
                 (cutlass.Float32, (routes, hidden), (hidden, 1)),
