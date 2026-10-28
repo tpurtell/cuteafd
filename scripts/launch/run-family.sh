@@ -453,6 +453,7 @@ DSPARK_DRAFT_LIMIT
 DSPARK_DRAFT_POLICY
 EMBEDDING
 ENABLE_BENCH
+ENGRAM_WARM
 EXPERT_FORMAT
 EXPERT_PORT
 FP8_EXPERT_PREFILL
@@ -866,8 +867,9 @@ case "$gateway" in on|off) api_args+=(--gateway "$gateway") ;; "") ;; *) echo "G
 # trace and policy switches, profile wrappers, graph census, thermal sampler,
 # probe dumps, Spark intake, console text, API keys and console, serving
 # identity) comes from the shared helpers above, so it reaches V4.1 with no
-# V4.1 code. Engram tables need nothing here: they are read from the
-# checkpoint under the full namespace mount, kept local on raptor by sparknest.
+# V4.1 code. Engram tables need no mount of their own: they are read from the
+# checkpoint under the full namespace mount, kept local on raptor by sparknest
+# (ENGRAM_WARM below optionally warms them into the page cache after readiness).
 # ---------------------------------------------------------------------------
 launch_deepseek_v41() {
 # The release loader validates every key (run.sh --set overrides are in $config).
@@ -935,6 +937,11 @@ esac
 v41_l2_prefetch="$(get L2_PREFETCH)"
 [[ -z "$v41_l2_prefetch" || "$v41_l2_prefetch" =~ ^(off|auto|[0-9]+)$ ]] ||
   release_die "L2_PREFETCH must be off, auto or a MiB count"
+# ENGRAM_WARM (on|off; default off): after readiness, read both Engram tables once
+# into the page cache on a background thread (serve-native --engram-warm), for hosts
+# with RAM for the tables whose checkpoint store has slow random reads.
+v41_engram_warm="$(get ENGRAM_WARM off)"
+case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
@@ -1488,6 +1495,7 @@ fi
 [[ "$TP2_OUTPUT_PROJECTION" != on ]] || args+=(--tp2-output-projection)
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
 [[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
+[[ "$v41_engram_warm" != on ]] || args+=(--engram-warm)
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then
