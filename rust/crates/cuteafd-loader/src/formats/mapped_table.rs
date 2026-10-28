@@ -55,6 +55,9 @@ pub enum MappedTableError {
 
 pub type Result<T, E = MappedTableError> = std::result::Result<T, E>;
 
+/// Bytes per positioned payload read (scale preload, page-cache warm).
+pub(crate) const PAYLOAD_CHUNK_BYTES: usize = 16 << 20;
+
 fn invalid(message: impl Into<String>) -> MappedTableError {
     MappedTableError::Invalid(message.into())
 }
@@ -192,6 +195,17 @@ impl MappedRows {
         self.row_bytes
     }
 
+    fn payload_bytes(&self) -> u64 {
+        self.rows * self.row_bytes as u64
+    }
+
+    /// Positioned read at a payload-relative offset through this part's own
+    /// descriptor; the mapping is not touched.
+    fn read_payload(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buffer, self.file_offset + offset)
+    }
+
     fn row_offset(&self, row: u64) -> Result<usize> {
         if row >= self.rows {
             return Err(MappedTableError::RowRange { row, rows: self.rows });
@@ -300,6 +314,14 @@ impl RowFormat {
         let element = crate::dtype_byte_width(&dtype).map_err(|error| invalid(error.to_string()))?;
         Ok(Self { dtype, width, row_bytes: element * width })
     }
+}
+
+/// What one [`MappedTable::warm`] pass read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WarmReport {
+    /// Payload bytes read; below [`MappedTable::warm_bytes`] after a stop.
+    pub bytes: u64,
+    pub elapsed: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -501,7 +523,6 @@ impl MappedTable {
 
     /// Publish only after every read succeeds; a failure leaves all tables mapped.
     pub fn preload_all(tables: &mut [&mut Self]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
         let buffers = tables.iter().map(|table| {
             let size = usize::try_from(table.bytes()).map_err(|_| invalid("preload size overflow"))?;
             let mut bytes = Vec::new();
@@ -509,9 +530,9 @@ impl MappedTable {
             bytes.resize(size, 0);
             let mut start = 0;
             for part in &table.parts {
-                let size = usize::try_from(part.rows * part.row_bytes as u64).map_err(|_| invalid("preload part overflow"))?;
-                for (i, chunk) in bytes[start..start + size].chunks_mut(16 << 20).enumerate() {
-                    part.file.read_exact_at(chunk, part.file_offset + (i as u64 * (16 << 20)))
+                let size = usize::try_from(part.payload_bytes()).map_err(|_| invalid("preload part overflow"))?;
+                for (i, chunk) in bytes[start..start + size].chunks_mut(PAYLOAD_CHUNK_BYTES).enumerate() {
+                    part.read_payload((i * PAYLOAD_CHUNK_BYTES) as u64, chunk)
                         .map_err(|source| MappedTableError::Io { context: "reading scale preload".into(), source })?;
                 }
                 start += size;
@@ -524,6 +545,80 @@ impl MappedTable {
             table.stats.devices.lock().unwrap_or_else(|p| p.into_inner()).clear();
         }
         Ok(())
+    }
+
+    /// Bytes a [`Self::warm`] pass reads: the mapped payload, or zero once resident.
+    pub fn warm_bytes(&self) -> u64 {
+        if self.resident.is_some() { 0 } else { self.bytes() }
+    }
+
+    /// Advisory page-cache warm: read every part's payload once with
+    /// [`PAYLOAD_CHUNK_BYTES`] positioned reads on `readers` scoped threads,
+    /// which take chunk indices from a shared counter and check `stop` between
+    /// chunks; `progress` receives each finished chunk's bytes on the reader
+    /// threads. The pages stay ordinary page cache the kernel may evict. The
+    /// mapping, its `MADV_RANDOM` advice and every gather path are untouched:
+    /// reads use each part's own descriptor (a FUSE reopen without keep-cache
+    /// would drop the inode's cached pages), whose `POSIX_FADV_RANDOM` keeps
+    /// each read to its own chunk. A resident table returns at once with zero
+    /// bytes.
+    pub fn warm(&self, readers: usize, stop: &AtomicBool, progress: impl Fn(u64) + Sync) -> Result<WarmReport> {
+        let started = Instant::now();
+        if self.resident.is_some() {
+            return Ok(WarmReport::default());
+        }
+        let chunk = PAYLOAD_CHUNK_BYTES as u64;
+        // The first chunk index of each part, then the total.
+        let mut starts = Vec::with_capacity(self.parts.len() + 1);
+        let mut total = 0u64;
+        for part in &self.parts {
+            starts.push(total);
+            total += part.payload_bytes().div_ceil(chunk);
+        }
+        starts.push(total);
+        let buffer_bytes = self.parts.iter().map(MappedRows::payload_bytes).max().unwrap_or(0).min(chunk) as usize;
+        let next = AtomicU64::new(0);
+        let failed = AtomicBool::new(false);
+        let read = || -> Result<u64> {
+            let mut buffer = vec![0; buffer_bytes];
+            let mut bytes = 0;
+            while !stop.load(Ordering::Acquire) && !failed.load(Ordering::Relaxed) {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                if index >= total {
+                    break;
+                }
+                let part = starts.partition_point(|&start| start <= index) - 1;
+                let offset = (index - starts[part]) * chunk;
+                let length = (self.parts[part].payload_bytes() - offset).min(chunk) as usize;
+                if let Err(source) = self.parts[part].read_payload(offset, &mut buffer[..length]) {
+                    failed.store(true, Ordering::Relaxed);
+                    return Err(MappedTableError::Io { context: "warming mapped table".into(), source });
+                }
+                bytes += length as u64;
+                progress(length as u64);
+            }
+            Ok(bytes)
+        };
+        let readers = readers.max(1).min(usize::try_from(total).unwrap_or(usize::MAX));
+        let results = thread::scope(|scope| {
+            let mut results = Vec::with_capacity(readers);
+            let mut handles = Vec::with_capacity(readers);
+            for index in 0..readers {
+                match thread::Builder::new().name(format!("table-warm-{index}")).spawn_scoped(scope, &read) {
+                    Ok(handle) => handles.push(handle),
+                    Err(source) => {
+                        failed.store(true, Ordering::Relaxed);
+                        results.push(Err(MappedTableError::Io { context: "starting mapped table warm reader".into(), source }));
+                        break;
+                    }
+                }
+            }
+            results.extend(handles.into_iter().map(|handle| handle.join()
+                .unwrap_or(Err(MappedTableError::Stopped("mapped table warm reader panicked")))));
+            results
+        });
+        let bytes = results.into_iter().sum::<Result<u64>>()?;
+        Ok(WarmReport { bytes, elapsed: started.elapsed() })
     }
 
     fn locate(&self, row: u64) -> Result<(usize, u64)> {

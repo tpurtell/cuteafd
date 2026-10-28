@@ -36,7 +36,8 @@ pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetch
 pub use formats::mapped_table::{
     AdviseRows, GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
     GatherWorker, MappedRows, PendingGather, MappedTable, MappedTableError, RowFormat, TablePart, TablePrefetchOutcome,
-    TablePrefetchTicket, TablePrefetcher, MappedTableStatsReader, TableStats, TableStatsSnapshot, mapped_table_stats, mapped_table_stats_with_intervals,
+    TablePrefetchTicket, TablePrefetcher, MappedTableStatsReader, TableStats, TableStatsSnapshot, WarmReport, mapped_table_stats,
+    mapped_table_stats_with_intervals,
 };
 mod catalog;
 mod snapshot;

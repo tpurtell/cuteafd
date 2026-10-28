@@ -895,7 +895,73 @@ fn preloaded_rows_are_exact_without_random_io_or_page_accounting() -> TestResult
     assert_eq!(table.prefetch(&[7, 2, 7], 0)?, 0);
     assert!(table.prefetch(&[8], 0).is_err());
     assert!(table.gather_slots(&[0, 1], &[0, 0], &mut actual).is_err());
+    assert_eq!(table.warm_bytes(), 0);
+    assert_eq!(table.warm(4, &AtomicBool::new(false), |_| panic!("a resident table reads nothing"))?,
+        WarmReport::default());
     assert_eq!(table.stats.snapshot(), before);
+    Ok(())
+}
+
+#[test]
+fn warm_reads_exactly_each_part_payload() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: test-owned shards stay immutable while the table reads them;
+    // the truncation below is only ever read through the descriptor.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    let chunks = Mutex::new(Vec::new());
+    let before = table.stats.snapshot();
+    let report = table.warm(3, &AtomicBool::new(false), |bytes| chunks.lock().unwrap().push(bytes))?;
+    assert_eq!((report.bytes, table.warm_bytes()), (32, 32));
+    let mut chunks = chunks.into_inner()?;
+    chunks.sort_unstable();
+    // One read per part payload, never the shard header ahead of the second part.
+    assert_eq!(chunks, [8, 12, 12]);
+    // Warm reads are not gathers: no table counters move.
+    assert_eq!(table.stats.snapshot(), before);
+    // The last part's read ends exactly at its payload end: one byte short fails.
+    std::fs::OpenOptions::new().write(true).open(&parts[2].path)?.set_len(5 + 12 + 7)?;
+    assert!(matches!(table.warm(3, &AtomicBool::new(false), |_| ()), Err(MappedTableError::Io { .. })));
+    Ok(())
+}
+
+#[test]
+fn warm_splits_parts_into_chunks_across_readers_and_stops_between_chunks() -> TestResult {
+    let file = tempfile::NamedTempFile::new()?;
+    let chunk = PAYLOAD_CHUNK_BYTES as u64;
+    let row_bytes = 4096u64;
+    // Sparse fixture: an unaligned 13-byte header, then two full chunks and one row.
+    let rows = 2 * chunk / row_bytes + 1;
+    file.as_file().set_len(13 + rows * row_bytes)?;
+    // SAFETY: the sparse fixture stays immutable while the table lives.
+    let table = unsafe { MappedTable::single(file.path(), 13, rows, u8_rows(row_bytes as usize))? };
+    let chunks = Mutex::new(Vec::new());
+    let report = table.warm(4, &AtomicBool::new(false), |bytes| chunks.lock().unwrap().push(bytes))?;
+    assert_eq!(report.bytes, rows * row_bytes);
+    let mut chunks = chunks.into_inner()?;
+    chunks.sort_unstable();
+    assert_eq!(chunks, [row_bytes, chunk, chunk]);
+    // A stop set before the pass reads nothing; set during a chunk, the reader
+    // finishes that chunk and takes no other.
+    assert_eq!(table.warm(4, &AtomicBool::new(true), |_| panic!("read after stop"))?.bytes, 0);
+    let stop = AtomicBool::new(false);
+    assert_eq!(table.warm(1, &stop, |_| stop.store(true, Ordering::Release))?.bytes, chunk);
+    Ok(())
+}
+
+#[test]
+fn warm_populates_the_page_cache_without_the_mapping() -> TestResult {
+    // Disk-backed (tmpfs cannot evict clean pages), as dontneed_produces_mincore_and_nowait_misses_then_hits.
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    file.write_all(&vec![0x5a; 8 * page])?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test file is immutable while the table lives.
+    let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    let rows: Vec<u64> = (0..8).collect();
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    assert_eq!(table.residency(&rows, false)?, [false; 8]);
+    assert_eq!(table.warm(2, &AtomicBool::new(false), |_| ())?.bytes, 8 * page as u64);
+    assert_eq!(table.residency(&rows, false)?, [true; 8]);
     Ok(())
 }
 
