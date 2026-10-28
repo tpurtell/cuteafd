@@ -3643,7 +3643,7 @@ fn qwen_small_card_one_spark_buffers_three_waves_with_one_compute_slot() {
         .map(|item| item.bytes).sum::<u64>();
     let geometry = cuteafd_core::ExpertGeometry::QWEN4;
     let row = u64::from(geometry.hidden) + u64::from(geometry.hidden) / 32 + 8 * u64::from(geometry.topk);
-    let prefill = layout::spark_slot_bytes("qwen4", 2752);
+    let prefill = layout::spark_slot_bytes("qwen4", 2752) - (4096 - 2752) * row;
     let decode = 51 * (1 << 20) + 64 * row;
     assert_eq!(owners.bytes, prefill + decode - residual.min(prefill));
     assert_eq!(staging.bytes, (64 + 3 * 2752) * 8 * u64::from(geometry.topk));
