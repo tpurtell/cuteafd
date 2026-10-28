@@ -484,6 +484,16 @@ release_prepare_api_key() {
   fi
 }
 
+# release_probe_url ADDR: the URL readiness probes reach a server listening on
+# ADDR (HOST:PORT). A wildcard or empty host is reached on loopback; any other
+# host is the only address the server binds, so loopback would never answer.
+release_probe_url() {
+  local addr="$1" host
+  host="${addr%:*}"
+  case "$host" in ""|0.0.0.0|"::"|"[::]") host=127.0.0.1 ;; esac
+  printf 'http://%s:%s' "$host" "${addr##*:}"
+}
+
 release_api_curl() {
   if [[ -n "${API_KEY_FILE:-}" ]]; then
     # Keep the key out of argv/process listings. Health probes do not need it.

@@ -1598,7 +1598,7 @@ for i in "${!hosts[@]}"; do
 done
 
 start_coordinator
-api_url="http://127.0.0.1:${ADDR##*:}"
+api_url="$(release_probe_url "$ADDR")"
 until curl -fsS "$api_url/health" >/dev/null 2>&1 &&
   release_api_advertises_native_model "$api_url" "$RELEASE_NATIVE_API_MODEL_ID"; do
   [[ "$(docker inspect -f '{{.State.Status}}' "$coordinator" 2>/dev/null)" == running ]] || { docker logs --tail 200 "$coordinator" >&2 || true; release_die "native coordinator exited during startup"; }
@@ -3112,7 +3112,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
   --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
-url="http://127.0.0.1:${addr##*:}"
+url="$(release_probe_url "$addr")"
 ready_deadline=$((SECONDS + 900))
 until curl --max-time 5 -sf "$url/health" >/dev/null; do
   if (( SECONDS >= ready_deadline )); then
