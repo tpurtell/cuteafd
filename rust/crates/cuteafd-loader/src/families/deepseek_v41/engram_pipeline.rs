@@ -124,6 +124,8 @@ pub struct EngramPipeline {
     capacity: usize,
     placement: crate::formats::mapped_preload::MappedPlacement,
     shape: crate::EngramStagingShape,
+    /// Opt-in background page-cache warm; dropping the pipeline stops it.
+    warm: Option<crate::formats::mapped_warm::TableWarm>,
 }
 impl EngramPipeline {
     /// # Safety
@@ -166,12 +168,26 @@ impl EngramPipeline {
             decode_gatherer: Arc::new(EngramGatherer::new_decode(library, shape)?),
             capacity,
             placement, shape,
+            warm: None,
         })
     }
     pub fn placement(&self) -> &crate::formats::mapped_preload::MappedPlacement { &self.placement }
     pub fn shape(&self) -> crate::EngramStagingShape { self.shape }
     pub fn reclaim_copies(&self) -> Result<()> {
         self.gatherer.reclaim_copies()?; self.decode_gatherer.reclaim_copies()
+    }
+    /// Opt-in background page-cache warm of both tables
+    /// ([`TableWarm::start`](crate::formats::mapped_warm::TableWarm::start)):
+    /// once `ready` holds and available host memory admits them, `readers`
+    /// threads read the scale tables (every row read needs one, at a fraction
+    /// of the weight bytes), then the weights. Resident (preloaded) scales are
+    /// skipped. Dropping the pipeline stops it between chunks.
+    pub fn start_warm(&mut self, readers: usize, ready: impl Fn() -> bool + Send + 'static) -> Result<()> {
+        ensure!(self.warm.is_none(), "engram warm already started");
+        self.warm = Some(crate::formats::mapped_warm::TableWarm::start("engram", self.tables.clone(),
+            |[first, second]| vec![first.scales(), second.scales(), first.weights(), second.weights()],
+            readers, ready)?);
+        Ok(())
     }
     pub fn new_history(&self) -> Result<EngramHistory> {
         Ok(EngramHistory::new(self.token_map.pad_id())?)
