@@ -180,6 +180,30 @@ mod tests {
     use cuteafd_core::memory_layout::{Basis, Category, Item, ItemLifetime};
 
     #[test]
+    fn mapped_table_host_workspace_remains_deferred_at_every_depth() -> Result<()> {
+        for depth in 1..=4 {
+            for row_bytes in [160, 320] {
+                let shape = cuteafd_loader::formats::mapped_table::MappedStaging::new(
+                    2752 * 16, depth, 64 * 16, row_bytes)?;
+                let payload = shape.slot_bytes().sum::<usize>() as u64;
+                let workspace = shape.workspace_bytes as u64;
+                let items = host_resident_items(std::collections::BTreeMap::from([
+                    ("mapped-table", payload as usize)]), &[]);
+                let demands = [("staging/mapped-table-worker", workspace)];
+                let ledger = host_admission((2 << 30, 1 << 30), items.clone(), 0, &demands, 0, 0)?;
+                assert_eq!((ledger.resident_bytes, ledger.deferred_bytes), (payload, workspace));
+                assert_eq!(ledger.resident_bytes + ledger.deferred_bytes, shape.total_bytes as u64);
+                let worker = ledger.items.iter().find(|item| item.group == demands[0].0).unwrap();
+                assert_eq!((worker.bytes, worker.lifetime), (workspace, ItemLifetime::PostReadyReserve));
+                let available = (2u64 << 30) / 10 + workspace;
+                assert!(host_admission((2 << 30, available), items.clone(), 0, &demands, 0, 0).is_ok());
+                assert!(host_admission((2 << 30, available - 1), items, 0, &demands, 0, 0).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn engram_host_formula_replaces_payload_attribution_without_double_charge() -> Result<()> {
         for k in 1..=4 {
             let rows = 8192usize.div_ceil(k.max(2)).div_ceil(64) * 64;

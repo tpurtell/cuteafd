@@ -42,6 +42,7 @@ pub(crate) struct MappedTableDevice<'a> {
     prefill_rows: usize,
     decode_rows: usize,
     prefill_slots: usize,
+    host_workspace_bytes: usize,
     logged: Cell<TableStatsSnapshot>,
     ahead: RefCell<Vec<(Vec<i64>, PendingRows)>>,
     destinations: RefCell<Vec<Destination>>,
@@ -75,11 +76,13 @@ impl<'a> MappedTableDevice<'a> {
         let max_rows = prefill_rows.max(decode_rows);
         let prefetcher = if args.prefetch { Some(TablePrefetcher::new(&format!("{name}-prefetch"), 16, max_rows, 2 * max_rows)?) } else { None };
         Ok(Self { library, device, name, logged: Cell::new(table.stats().snapshot()), table, prefetcher,
-            prefill, decode, prefill_rows, decode_rows, prefill_slots, ahead: RefCell::new(Vec::new()),
+            prefill, decode, prefill_rows, decode_rows, prefill_slots, host_workspace_bytes: staging.workspace_bytes,
+            ahead: RefCell::new(Vec::new()),
             destinations: RefCell::new(Vec::new()), active_destination: Cell::new(0),
             upload: Stream::new(Device { library, id: device })?,
             landed: library.cuda_event_create_ordering()? })
     }
+    pub fn host_workspace_bytes(&self) -> usize { self.host_workspace_bytes }
     pub fn lookahead(&self) -> usize { self.prefill_slots }
     pub fn batch(&self, source: Arc<dyn RowSource>) -> Arc<RowBatch> {
         Arc::new(RowBatch { begun: Mutex::new(vec![false; source.units()]), source })
@@ -253,6 +256,19 @@ impl Drop for MappedTableDevice<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qwen_host_admission_retains_mapped_worker_workspace() {
+        let source = include_str!("mapped_table.rs");
+        let constructor = source.split("pub fn new(library:").nth(1).unwrap()
+            .split("pub fn host_workspace_bytes").next().unwrap();
+        assert!(constructor.contains("host_workspace_bytes: staging.workspace_bytes"));
+        let engine = include_str!("../families/qwen4/engine.rs");
+        let demands = engine.split("fn future_host_workspaces(&self").nth(1).unwrap()
+            .split("/// Size every unit-table upload").next().unwrap();
+        assert!(demands.contains("ple.mapped().host_workspace_bytes() as u64"));
+        assert!(demands.contains("staging/mapped-table-worker"));
+    }
+
     #[test]
     fn scheduler_lookahead_is_gathered_before_current_chunk_and_cannot_starve_demand() {
         let scheduler = include_str!("qwen/scheduler.rs");

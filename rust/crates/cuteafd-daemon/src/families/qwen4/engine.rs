@@ -1366,6 +1366,9 @@ impl<'a> Qwen4Engine<'a> {
     fn future_host_workspaces(&self, full_logits: bool) -> Result<Vec<(String, u64)>> {
         use super::admission::HostWorkspaceBytes;
         let mut demands = Vec::new();
+        if let Some(ple) = &self.ple {
+            demands.push(("staging/mapped-table-worker".to_owned(), ple.mapped().host_workspace_bytes() as u64));
+        }
         let spark = matches!(self.experts, Some(Experts::Spark { .. }));
         let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
         for owner in 0..self.gdn_banks.len() {
