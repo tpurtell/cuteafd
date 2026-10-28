@@ -3621,7 +3621,7 @@ fn v41_exl3_exact_tp6_refuses_and_default_falls_back_with_reason() {
 }
 
 #[test]
-fn qwen_small_card_one_spark_buffers_two_waves_with_one_compute_slot() {
+fn qwen_small_card_one_spark_buffers_three_waves_with_one_compute_slot() {
     use cuteafd_core::memory_layout::DeviceKind;
     let dir = qwen_snapshot(4);
     let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
@@ -3631,11 +3631,11 @@ fn qwen_small_card_one_spark_buffers_two_waves_with_one_compute_slot() {
     }), ..sparks(1) }).unwrap();
     assert!(report.executable(), "{}", render(&report));
     assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
-        (Some(4096), Some(2), Some(8192)));
+        (Some(2752), Some(3), Some(8256)));
     let memory = report.memory_layout.unwrap();
     assert_eq!(memory.pool_tokens, 262_144);
     let spark = memory.devices.iter().find(|d| d.kind == DeviceKind::Spark).unwrap();
-    // Two buffered waves, one prefill owner: scratch once at m4096 plus the
+    // Three buffered waves, one prefill owner: scratch once at m2752 plus the
     // m80 decode owner; only the per-unit route staging scales with waves.
     let owners = spark.items.iter().find(|item| item.group == "execution owners").unwrap();
     let staging = spark.items.iter().find(|item| item.group == "execution staging").unwrap();
@@ -3643,10 +3643,10 @@ fn qwen_small_card_one_spark_buffers_two_waves_with_one_compute_slot() {
         .map(|item| item.bytes).sum::<u64>();
     let geometry = cuteafd_core::ExpertGeometry::QWEN4;
     let row = u64::from(geometry.hidden) + u64::from(geometry.hidden) / 32 + 8 * u64::from(geometry.topk);
-    let prefill = layout::spark_slot_bytes("qwen4", 4096);
+    let prefill = layout::spark_slot_bytes("qwen4", 2752);
     let decode = 51 * (1 << 20) + 64 * row;
     assert_eq!(owners.bytes, prefill + decode - residual.min(prefill));
-    assert_eq!(staging.bytes, (64 + 2 * 4096) * 8 * u64::from(geometry.topk));
+    assert_eq!(staging.bytes, (64 + 3 * 2752) * 8 * u64::from(geometry.topk));
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "{}", memory.render());
 }
 
