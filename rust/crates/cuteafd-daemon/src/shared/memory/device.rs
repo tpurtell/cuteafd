@@ -356,12 +356,36 @@ impl Drop for Event<'_> {
     }
 }
 
-/// One transfer direction for one lane; stream and event are allocated at startup.
-/// `CUTEAFD_V41_PEER_COPY=sm`: device-ordered peer copies use the SM copy
-/// kernel (a runtime-sized grid) instead of the copy engines, for comparison.
-pub(crate) fn sm_peer_copy() -> bool {
-    static SM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SM.get_or_init(|| std::env::var("CUTEAFD_V41_PEER_COPY").is_ok_and(|value| value == "sm"))
+/// The widest decode-width peer transfer: a decode lane's 80 rows
+/// (`DECODE_LANE_ROWS`, the compiled cover of the 64-row verify width) of a
+/// 10240-byte BF16 hidden row. Every decode/verify transfer is at most this;
+/// every prefill unit (>= 256 rows, `V41_LIVE_MIN_ROWS`) is wider.
+pub(crate) const DECODE_PEER_COPY_BYTES: usize = 80 * 10240;
+
+/// Whether a device-ordered peer copy of `bytes` runs as an SM copy on the
+/// issuing stream (ordered by its event waits) instead of on a copy engine.
+/// Decode-width transfers do: a copy-engine copy queued behind an unmet event
+/// wait parks that engine and head-of-line blocks every other copy on it
+/// (Engram uploads, peer landings). Prefill-width transfers keep the copy
+/// engines (prof12: SM copies cost ~1.2 s of GPU0 per 64K prefill on two RTX).
+pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize) -> bool {
+    deferred && bytes <= DECODE_PEER_COPY_BYTES
+}
+
+#[cfg(test)]
+mod peer_copy_choice_tests {
+    /// Decode-width device-ordered transfers run as SM copies (never parked on
+    /// a copy engine behind an unmet wait); prefill-width ones keep the copy
+    /// engines; host-ordered passes always use the copy engines.
+    #[test]
+    fn decode_width_device_ordered_copies_use_sm() {
+        use super::{sm_peer_copy_for, DECODE_PEER_COPY_BYTES};
+        assert!(sm_peer_copy_for(true, 1 * 10240));
+        assert!(sm_peer_copy_for(true, DECODE_PEER_COPY_BYTES));
+        assert!(!sm_peer_copy_for(true, 2752 * 10240));
+        assert!(!sm_peer_copy_for(true, DECODE_PEER_COPY_BYTES + 1));
+        assert!(!sm_peer_copy_for(false, 1 * 10240));
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +394,7 @@ thread_local! {
     static SKIP_COPY_ORDER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// One transfer direction for one lane; stream and event are allocated at startup.
 pub(crate) struct PeerTransfer<'a> {
     destination: Stream<'a>,
     ready: Event<'a>,
@@ -430,7 +455,7 @@ impl<'a> PeerTransfer<'a> {
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
-        let sm = self.sm.as_ref().filter(|_| deferred && sm_peer_copy());
+        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for(deferred, bytes));
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
             // The destination's previous readers precede this write: the

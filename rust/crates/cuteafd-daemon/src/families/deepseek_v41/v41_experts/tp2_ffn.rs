@@ -279,12 +279,11 @@ unsafe fn peer_copy(
     source: CuteafdDeviceBuffer,
     bytes: usize,
 ) -> Result<()> {
-    // Device-ordered passes copy on the copy engines by default (#815,
-    // prof12: SM copies took ~1.2 s of GPU0 SM time per 64K prefill on two
-    // RTX). The issuing stream is this wave's own, ordered by a
+    // Device-ordered passes copy decode-width transfers on the SMs and
+    // prefill-width ones on the copy engines (`device::sm_peer_copy_for`).
+    // The issuing stream is this wave's own, ordered by a
     // `cudaStreamWaitEvent` on the chain head, never a memory wait.
-    // `CUTEAFD_V41_PEER_COPY=sm` keeps the SM copy (a runtime-sized grid).
-    match sm.filter(|_| crate::shared::memory::chain::deferred() && crate::shared::memory::device::sm_peer_copy()) {
+    match sm.filter(|_| crate::shared::memory::device::sm_peer_copy_for(crate::shared::memory::chain::deferred(), bytes)) {
         Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
         None => unsafe {
             stream
