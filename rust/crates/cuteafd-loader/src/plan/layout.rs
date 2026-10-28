@@ -1478,7 +1478,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             let staging = crate::formats::mapped_table::MappedStaging::new(usize::try_from(prefill)?,
                 usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?,
                 usize::try_from(decode)?, usize::try_from(row_bytes)?)?;
-            push(Category::Staging, "staging/mapped-table", "PLE rows and counters", staging.total_bytes as u64, Basis::Formula);
+            push(Category::Staging, "staging/mapped-table", "PLE active/lookahead rows and worker workspace", staging.total_bytes as u64, Basis::Formula);
         }
     }
     if family == "qwen4" && ranks > 0 && options.prefill_waves > 1 {

@@ -413,7 +413,6 @@ impl DeviceLogits {
         // is read or, after a failed enqueue, dropped.
         let drained = unsafe { library.cuda_stream_synchronize(self.stream) };
         queued.and(drained)?;
-        crate::shared::mapped_table::check_readback(device_id, self.stream)?;
         Ok(out)
     }
 }
@@ -596,7 +595,6 @@ impl<'a> TokenSelector<'a> {
     unsafe fn wait_landed(&mut self, stream: *mut c_void) -> Result<()> {
         // SAFETY: forwarded from this function's contract.
         unsafe { self.landed.wait(stream)? };
-        crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, stream)?;
         crate::shared::spark_waves::healthy()
     }
 

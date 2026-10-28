@@ -102,6 +102,10 @@ impl EngramBatchStaging {
         batches: &[&EngramBatch],
         layer_index: usize,
     ) -> Result<EngramGatherView<'_>> {
+        self.gather_on(table, batches, layer_index, None)
+    }
+    pub(crate) fn gather_on(&mut self, table: &EngramTable, batches: &[&EngramBatch], layer_index: usize,
+        gather: Option<&crate::shared::token_table::RowGather>) -> Result<EngramGatherView<'_>> {
         self.ready = None;
         ensure!(
             !batches.is_empty() && batches.len() <= 16,
@@ -163,11 +167,15 @@ impl EngramBatchStaging {
         }
         // Both backends read the same distinct rows into the same canonical
         // slots; batching is not an io_uring-only optimization.
-        table.weights().gather_slots(&addresses, &slots, &mut weights[..rows * 24 * weight_bytes])?;
+        let read = |table: &crate::MappedTable, output: &mut [u8]| -> Result<()> {
+            match gather { Some(gather) => gather.gather_slots(table, &addresses, &slots, output),
+                None => Ok(table.gather_slots(&addresses, &slots, output)?) }
+        };
+        read(table.weights(), &mut weights[..rows * 24 * weight_bytes])?;
         if encoding == EngramEncoding::Fp8 {
-            table.scales().gather_slots(&addresses, &slots, &mut scales[..rows * 24 * scale_bytes])?;
+            read(table.scales(), &mut scales[..rows * 24 * scale_bytes])?;
         } else {
-            table.scales().gather_slots(&addresses, &slots, &mut weights[scale_base..scale_base + rows * 24 * scale_bytes])?;
+            read(table.scales(), &mut weights[scale_base..scale_base + rows * 24 * scale_bytes])?;
         }
         let mut previous = None;
         for &(address, slot) in &self.order {

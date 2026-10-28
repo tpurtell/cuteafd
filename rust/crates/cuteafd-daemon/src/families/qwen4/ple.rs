@@ -3,7 +3,7 @@
 //! scale (~48 GiB). Token ids hash to rows on the host (`NgramHasher`), 16
 //! per token; the `qwen4_ple_*` program gathers `table[ids]`.
 //!
-//! Shards stay mapped; each step gathers rows into a pinned upload ring.
+//! Shards stay mapped; each step gathers rows into a shared pinned token-table pipeline.
 use crate::shared::mapped_table::{MappedTableArgs, MappedTableDevice};
 use crate::shared::memory::DeviceAllocation;
 use anyhow::{ensure, Context, Result};

@@ -9,10 +9,10 @@ fn fixed_staging_charges_actual_wave_count_and_separate_decode_rows() -> TestRes
     for k in 1..=4 {
         let staging = MappedStaging::new(2048 * 16, k, 64 * 16, 320)?;
         assert_eq!(staging.slot_bytes().collect::<Vec<_>>(),
-            std::iter::repeat_n(2048 * 16 * 320, k).chain(std::iter::once(64 * 16 * 320)).collect::<Vec<_>>());
-        assert_eq!(staging.counter_bytes, (k + 1) * 2 * 64);
-        assert_eq!(staging.total_bytes, (k * 2048 + 64) * 16 * 320 + (k + 1) * 2 * 64);
-        assert_eq!(staging.slot_bytes().sum::<usize>() + staging.counter_bytes, staging.total_bytes);
+            std::iter::repeat_n(2048 * 16 * 320, 2 * k).chain(std::iter::repeat_n(64 * 16 * 320, 2)).collect::<Vec<_>>());
+        assert_eq!(staging.workspace_bytes, (2048 + 64) * 16 * 1024 + (2 << 20));
+        assert_eq!(staging.total_bytes, 2 * (k * 2048 + 64) * 16 * 320 + staging.workspace_bytes);
+        assert_eq!(staging.slot_bytes().sum::<usize>() + staging.workspace_bytes, staging.total_bytes);
     }
     for (rows, k, decode, bytes) in [(0, 1, 64, 1), (1, 0, 64, 1), (1, 5, 64, 1),
         (1, 1, 0, 1), (1, 1, 64, 0), (usize::MAX, 1, 64, 320), (usize::MAX / 2, 4, 64, 1)] {
@@ -912,5 +912,36 @@ fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
     assert!(second.resident.is_none());
     assert_ne!(first.backend(), TableBackend::Resident);
     assert_ne!(second.backend(), TableBackend::Resident);
+    Ok(())
+}
+
+#[test]
+fn shared_table_small_and_large_gathers_preserve_native_order() -> TestResult {
+    use crate::shared::token_table::{RowGather, PARALLEL_GATHER_BYTES};
+    let mut shard = tempfile::NamedTempFile::new()?;
+    let width = 256;
+    let count = PARALLEL_GATHER_BYTES / width + 1;
+    let bytes: Vec<u8> = (0..count * width).map(|i| ((i / width) % 251) as u8).collect();
+    shard.write_all(&bytes)?;
+    // SAFETY: this test retains the immutable shard for the mapping lifetime.
+    let table = unsafe { MappedTable::single(shard.path(), 0, count as u64, u8_rows(width))? };
+    // Force the mmap fallback so the large arm actually exercises Rayon;
+    // the existing routed-backend tests separately cover io_uring.
+    table.stats.uring.store(false, Ordering::Relaxed);
+    let gather = RowGather::new("table-size-test", 2)?;
+    for n in [32, count] {
+        let ids: Vec<_> = (0..n).map(|i| ((n - 1 - i) / 2) as u64).collect();
+        let mut output = vec![0; n * width];
+        assert_eq!(RowGather::parallel(output.len()), n == count);
+        gather.gather(&table, &ids, &mut output)?;
+        for (&id, actual) in ids.iter().zip(output.chunks_exact(width)) {
+            assert_eq!(actual, &bytes[id as usize * width..(id as usize + 1) * width]);
+        }
+        let slots: Vec<_> = (0..n).rev().collect();
+        gather.gather_slots(&table, &ids, &slots, &mut output)?;
+        for (&id, &slot) in ids.iter().zip(&slots) {
+            assert_eq!(&output[slot * width..(slot + 1) * width], &bytes[id as usize * width..(id as usize + 1) * width]);
+        }
+    }
     Ok(())
 }

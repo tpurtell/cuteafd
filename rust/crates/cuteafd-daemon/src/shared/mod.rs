@@ -16,6 +16,7 @@ pub(crate) mod inventory;
 pub(crate) mod l2_prefetch;
 pub(crate) mod launch_grid;
 pub(crate) mod mapped_table;
+pub(crate) mod token_table;
 pub(crate) mod memory;
 pub(crate) mod memory_report;
 pub(crate) mod peer_probe;

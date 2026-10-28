@@ -79,11 +79,10 @@ pub struct MappedStaging {
     prefill_bytes: usize,
     prefill_slots: usize,
     decode_bytes: usize,
-    pub counter_bytes: usize,
+    pub workspace_bytes: usize,
     pub total_bytes: usize,
 }
 impl MappedStaging {
-    pub const COUNTER_STRIDE: usize = 64;
 
     pub fn new(prefill_rows: usize, prefill_slots: usize, decode_rows: usize, row_bytes: usize) -> Result<Self> {
         if prefill_rows == 0 || decode_rows == 0 || row_bytes == 0 || !(1..=4).contains(&prefill_slots) {
@@ -92,14 +91,19 @@ impl MappedStaging {
         let overflow = || invalid("mapped-table staging overflow");
         let prefill_bytes = prefill_rows.checked_mul(row_bytes).ok_or_else(overflow)?;
         let decode_bytes = decode_rows.checked_mul(row_bytes).ok_or_else(overflow)?;
-        let counter_bytes = (prefill_slots + 1) * 2 * Self::COUNTER_STRIDE;
+        let prefill_slots = crate::shared::token_table::TableShape::new(prefill_rows, prefill_slots, 1)
+            .map_err(|_| invalid("invalid token-table shape"))?.slots().map_err(|_| overflow())?;
+        // Bound row IDs, validation/read descriptors and backend scratch for
+        // the independent prefill/decode workers; no GPU handshake counters.
+        let workspace_bytes = prefill_rows.checked_add(decode_rows).and_then(|n| n.checked_mul(1024))
+            .and_then(|n| n.checked_add(2 << 20)).ok_or_else(overflow)?;
         let total_bytes = prefill_bytes.checked_mul(prefill_slots)
-            .and_then(|n| n.checked_add(decode_bytes)).and_then(|n| n.checked_add(counter_bytes)).ok_or_else(overflow)?;
-        Ok(Self { prefill_bytes, prefill_slots, decode_bytes, counter_bytes, total_bytes })
+            .and_then(|n| decode_bytes.checked_mul(2).and_then(|d| n.checked_add(d))).and_then(|n| n.checked_add(workspace_bytes)).ok_or_else(overflow)?;
+        Ok(Self { prefill_bytes, prefill_slots, decode_bytes, workspace_bytes, total_bytes })
     }
 
     pub fn slot_bytes(self) -> impl Iterator<Item = usize> {
-        std::iter::repeat_n(self.prefill_bytes, self.prefill_slots).chain(std::iter::once(self.decode_bytes))
+        std::iter::repeat_n(self.prefill_bytes, self.prefill_slots).chain(std::iter::repeat_n(self.decode_bytes, 2))
     }
 }
 
@@ -1354,30 +1358,42 @@ impl GatherPool {
     /// Copy rows in order (duplicates kept); validate the batch before writing.
     pub fn gather(&self, table: &MappedTable, rows: &[u64], output: &mut [u8])
         -> Result<GatherReport> {
+        if Some(output.len()) != rows.len().checked_mul(table.row_bytes()) {
+            return Err(invalid("gather output size does not match requested rows"));
+        }
+        let slots: Vec<_> = (0..rows.len()).collect();
+        let report = self.gather_slots(table, rows, &slots, output)?;
+        table.stats.record_gather(rows.len(), output.len(), report.elapsed, [0, report.major_faults, 0]);
+        Ok(report)
+    }
+
+    /// Parallel reads into validated, disjoint canonical row slots.
+    pub fn gather_slots(&self, table: &MappedTable, rows: &[u64], slots: &[usize], output: &mut [u8]) -> Result<GatherReport> {
         use rayon::prelude::*;
         let started = Instant::now();
         let row_bytes = table.row_bytes();
-        if Some(output.len()) != rows.len().checked_mul(row_bytes) {
-            return Err(invalid("gather output size does not match requested rows"));
-        }
-        for &row in rows {
+        if rows.len() != slots.len() { return Err(invalid("gather row/slot count mismatch")); }
+        let mut unique = BTreeSet::new();
+        for (&row, &slot) in rows.iter().zip(slots) {
             table.locate(row)?;
+            if slot.checked_add(1).and_then(|n| n.checked_mul(row_bytes)).is_none_or(|n| n > output.len()) || !unique.insert(slot) {
+                return Err(invalid("invalid or overlapping gather slots"));
+            }
         }
-        let slots: Vec<_> = (0..rows.len()).collect();
         let faults = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
         // Several chunks per thread balance uneven fault latency.
         let chunk = slots.len().div_ceil(self.threads * 4).max(1);
         let base = output.as_mut_ptr() as usize;
         let output_len = output.len();
         if table.backend() != TableBackend::Mmap {
-            table.gather_slots(rows, &slots, output)?;
+            table.gather_slots(rows, slots, output)?;
         } else {
             table.record_residency(rows)?;
             self.pool.install(|| {
-                slots.par_chunks(chunk).try_for_each(|indices| -> Result<()> {
+                rows.par_chunks(chunk).zip(slots.par_chunks(chunk)).try_for_each(|(addresses, indices)| -> Result<()> {
                     let before = thread_faults();
-                    for &index in indices {
-                        let source = table.row(rows[index])?;
+                    for (&row, &index) in addresses.iter().zip(indices) {
+                        let source = table.row(row)?;
                         debug_assert!((index + 1) * row_bytes <= output_len);
                         // SAFETY: `slots` holds distinct indices, so every task
                         // writes disjoint row slots of `output`, which outlives the
@@ -1398,7 +1414,6 @@ impl GatherPool {
         }
         let elapsed = started.elapsed();
         let faults = faults.map(|value| value.load(Ordering::Relaxed) as i64);
-        table.stats.record_gather(rows.len(), output.len(), elapsed, faults);
         Ok(GatherReport { rows: rows.len(), elapsed, major_faults: faults[1] })
     }
 }
@@ -1609,6 +1624,22 @@ impl<S: Send + 'static, J, E> GatherTicket<S, J, E> {
                 }
             }
         }).await
+    }
+
+    /// Synchronous issuers sleep at the consuming layer, never dispatch another
+    /// worker or spin while pages arrive. A timeout cancels this generation.
+    pub fn wait_timeout(&mut self, timeout: Duration) -> std::result::Result<GatherPoll<GatherLease<S, J>>, GatherFailure<E>> {
+        if self.consumed || self.cancelled.load(Ordering::Acquire) { return self.poll(); }
+        let result = self.completion.as_ref().ok_or(GatherFailure::Worker(
+            MappedTableError::Stopped("gather completion receiver is closed")))?.recv_timeout(timeout);
+        self.consumed = true;
+        self.completion.take();
+        match result {
+            Ok(result) => match result.map_err(GatherFailure::Job)? {
+                Some(lease) => Ok(GatherPoll::Ready(lease)), None => Ok(GatherPoll::Cancelled),
+            },
+            Err(_) => { self.cancel(); Err(GatherFailure::Worker(MappedTableError::Stopped("gather wait timed out or worker stopped"))) }
+        }
     }
 
     /// Nonblocking polling for a CUDA or scheduler thread; consume at most once.

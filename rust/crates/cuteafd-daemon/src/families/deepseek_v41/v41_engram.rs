@@ -158,12 +158,11 @@ impl<'a> EngramDeviceRows<'a> {
         let scale_offset = if gathered.encoding == cuteafd_loader::EngramEncoding::Fp8 {
             base * 24 * 256
         } else { base * 24 * 128 };
-        for (destination, offset, bytes) in [(weights, 0, gathered.weights.len()),
-            (scales, scale_offset, gathered.scales.len()), (mask, base * 24 * (256 + 8), gathered.rows)] {
-            let host = cuteafd_ffi::CuteafdHostBuffer { ptr: staging.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..staging };
-            // SAFETY: source lease and disjoint unit window survive copy completion.
-            unsafe { self.library.copy_host_buffer_h2d_async(destination, host, bytes, self.stream.raw)?; }
-        }
+        let planes = [(weights, 0, gathered.weights.len()),
+            (scales, scale_offset, gathered.scales.len()), (mask, base * 24 * (256 + 8), gathered.rows)]
+            .map(|(destination, offset, bytes)| crate::shared::token_table::CopyPlane { destination, offset, bytes });
+        // SAFETY: the unit owns its destination window and retains the source lease.
+        unsafe { crate::shared::token_table::enqueue(self.library, staging, &planes, self.stream.raw)?; }
         Ok(())
     }
     unsafe fn dequantize(&self, gathered: &EngramGatherView<'_>) -> Result<()> {

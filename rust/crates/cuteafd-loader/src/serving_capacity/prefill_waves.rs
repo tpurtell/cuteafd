@@ -247,13 +247,12 @@ mod tests {
     }
 
     #[test]
-    fn qwen_mapped_ple_ring_is_a_hard_two_wave_constraint() {
+    fn qwen_token_tables_follow_explicit_shared_depth() {
         let limits = crate::families::qwen4::prefill_limits(false);
         assert_eq!(prefill_shape(6, limits, Default::default()).unwrap(),
-            PrefillPlan { unit_rows: 4096, waves: 2, span_rows: 8192 });
-        for waves in [3, 4] {
-            assert!(matches!(prefill_shape(6, limits, PrefillOverrides { waves: Some(waves), ..Default::default() }),
-                Err(PrefillError::ExecutorCapacity { max_waves: 2, .. })));
+            PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
+        for waves in 2..=4 {
+            assert_eq!(prefill_shape(6, limits, PrefillOverrides { waves: Some(waves), ..Default::default() }).unwrap().waves, waves);
         }
         assert_eq!(prefill_shape(0, crate::families::qwen4::prefill_limits(true), Default::default()).unwrap().waves, 1);
     }

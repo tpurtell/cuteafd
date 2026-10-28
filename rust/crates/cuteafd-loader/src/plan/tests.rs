@@ -437,8 +437,8 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
         }
         let input = PlanInput::open(dir.path()).unwrap();
         for (gpus, ranks) in [(1, 0), (2, 0), (1, 4)] {
-            // The mapped-PLE ring caps Qwen at two waves (#717).
-            for (unit, k) in [(512usize, 1usize), (1024, 2), (2048, 2), (4096, 2)] {
+            // Both planner and runtime charge the admitted depth, including lookahead.
+            for (unit, k) in [(512usize, 1usize), (1024, 2), (2048, 3), (2048, 4), (4096, 2)] {
                 if ranks == 0 && k != 1 { continue; }
                 let report = input.plan(&PlanOptions {
                     layout: Some(layout::LayoutOptions { rtx_bytes: vec![96 << 30; gpus],
@@ -455,8 +455,8 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                 let staging = host.items.iter().filter(|item| item.group == "staging/mapped-table").collect::<Vec<_>>();
                 assert_eq!(staging.len(), 1, "a dual-owner engine still has one PLE table");
                 let runtime = MappedStaging::new(unit * cfg.ple_rows(), k, 64 * cfg.ple_rows(), row_bytes).unwrap();
-                assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.counter_bytes);
-                assert_eq!(staging[0].bytes as usize, (k * unit + 64) * cfg.ple_rows() * row_bytes + (k + 1) * 128);
+                assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.workspace_bytes);
+                assert_eq!(staging[0].bytes as usize, 2 * (k * unit + 64) * cfg.ple_rows() * row_bytes + runtime.workspace_bytes);
             }
         }
     }

@@ -1,7 +1,7 @@
-//! Bounded background engram gathers on the shared [`GatherWorker`]: reusable
+//! Bounded background engram gathers on the shared [`TablePipeline`]: reusable
 //! staging slots and request-owned cancellation.
 use crate::{EngramBatchStaging, EngramGatherView, EngramTable, GatherFailure, GatherLease, GatherPoll, GatherTicket,
-    GatherWorker};
+    shared::token_table::{TablePipeline, TableShape}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramBatch, ENGRAM_ROWS};
 use std::sync::Arc;
@@ -47,7 +47,7 @@ impl EngramStagingShape {
     }
     pub fn decode_host_bytes(self) -> usize { self.decode_host_resident_bytes() + self.decode_host_workspace_bytes() }
     pub fn prefetch_units(self) -> usize { self.units }
-    pub fn host_slots(self) -> usize { 2 * (self.units + self.prefetch_units()) }
+    pub fn host_slots(self) -> usize { TableShape::new(self.rows, self.units, 2).expect("validated shape").slots().expect("validated shape") }
     pub fn host_resident_bytes(self) -> usize {
         self.host_slots() * EngramBatchStaging::storage_bytes(self.rows).expect("validated shape")
     }
@@ -94,9 +94,6 @@ impl EngramGatherLease {
         // SAFETY: caller provides the stream containing every queued reader.
         unsafe { self.0.slot_mut().context("empty gather lease")?.copied_on(stream) }
     }
-    fn copy_ready(&mut self) -> Result<bool> {
-        self.0.slot_mut().context("empty gather lease")?.copy_ready()
-    }
 }
 
 pub enum EngramGatherPoll {
@@ -131,32 +128,9 @@ impl EngramGatherTicket {
     }
 }
 
-/// Deferred copy leases survive wave cancellation. The readiness predicate is
-/// queried only from the CUDA thread's existing I/O polls.
-pub struct EngramCopyPool<L> { pending: Vec<L>, capacity: usize }
-impl<L> EngramCopyPool<L> {
-    pub fn new(capacity: usize) -> Self { Self { pending: Vec::with_capacity(capacity), capacity } }
-    pub fn retain(&mut self, lease: L) {
-        assert!(self.pending.len() < self.capacity, "copy pool exceeds its gather slots");
-        self.pending.push(lease);
-    }
-    pub fn capacity_stalled(&self, capacity_available: bool) -> bool {
-        !capacity_available && !self.pending.is_empty()
-    }
-    pub fn reclaim(&mut self, mut ready: impl FnMut(&mut L) -> Result<bool>) -> Result<()> {
-        let mut index = 0;
-        while index < self.pending.len() {
-            if ready(&mut self.pending[index])? { self.pending.swap_remove(index); }
-            else { index += 1; }
-        }
-        Ok(())
-    }
-}
-
 pub struct EngramGatherer {
-    worker: GatherWorker<EngramBatchStaging, EngramGatherJob, anyhow::Error>,
+    worker: TablePipeline<EngramBatchStaging, EngramGatherJob>,
     capacity: usize,
-    copies: std::sync::Mutex<EngramCopyPool<EngramGatherLease>>,
 }
 impl EngramGatherer {
     /// The slot pool bounds queued, in-flight and completed-but-unconsumed storage.
@@ -189,28 +163,27 @@ impl EngramGatherer {
         Self::with_staging(shape.decode_rows(), staging)
     }
     pub fn copy_capacity_stalled(&self) -> Result<bool> {
-        let copies = self.copies.lock().unwrap_or_else(|p| p.into_inner());
-        Ok(copies.capacity_stalled(self.worker.capacity_available()?))
+        self.worker.copy_capacity_stalled()
     }
     fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>) -> Result<Self> {
-        let slots = staging.len();
-        let worker = GatherWorker::new("engram-gather", staging, |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
+        let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?;
+        let worker = TablePipeline::new("engram-gather", staging, move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
             let started = Instant::now();
             let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();
-            let view = staging.gather(&job.table, &batches, job.layer)?;
+            let view = staging.gather_on(&job.table, &batches, job.layer, Some(&gather))?;
             let bytes = view.weights.len() + view.scales.len();
             job.table.weights().stats().record_gather(view.rows * 24, bytes, started.elapsed(), [0; 3]);
             Ok(())
-        })
+        }, EngramBatchStaging::copy_ready)
         .context("starting engram gather worker")?;
-        Ok(Self { worker, capacity, copies: std::sync::Mutex::new(EngramCopyPool::new(slots)) })
+        Ok(Self { worker, capacity })
     }
     pub fn retain_copy(&self, lease: EngramGatherLease) {
-        self.copies.lock().unwrap_or_else(|p| p.into_inner()).retain(lease);
+        self.worker.retain_copy(lease.0);
     }
     /// Called from existing request I/O polling, including cancelled waves.
     pub fn reclaim_copies(&self) -> Result<()> {
-        self.copies.lock().unwrap_or_else(|p| p.into_inner()).reclaim(EngramGatherLease::copy_ready)
+        self.worker.reclaim_copies()
     }
     /// Submit early when decode/prefill/verification token hashes become available.
     /// None is bounded backpressure; it performs no mapped reads or blocking wait.
@@ -222,18 +195,16 @@ impl EngramGatherer {
     ) -> Result<Option<EngramGatherTicket>> {
         self.reclaim_copies()?;
         let job = self.job(table, batches, layer)?;
-        let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG);
         // Layer-1 gathers run before every queued layer-14 one: an L14 issued
         // early never delays a unit's L1 deadline.
-        Ok(self.worker.try_submit_with(job, timed, layer == 0)?.map(EngramGatherTicket))
+        Ok(self.worker.try_submit(job, layer == 0)?.map(EngramGatherTicket))
     }
     /// Retain the immutable job while sleeping for bounded staging admission.
     pub async fn submit(&self, table: Arc<EngramTable>, batches: &[Arc<EngramBatch>],
         layer: usize) -> Result<EngramGatherTicket> {
         self.reclaim_copies()?;
         let job = self.job(table, batches, layer)?;
-        let timed = tracing::enabled!(target: "cuteafd::timing", tracing::Level::DEBUG);
-        Ok(EngramGatherTicket(self.worker.submit_with(job, timed, layer == 0).await?))
+        Ok(EngramGatherTicket(self.worker.submit(job, layer == 0).await?))
     }
     fn job(&self, table: Arc<EngramTable>, batches: &[Arc<EngramBatch>],
         layer: usize) -> Result<EngramGatherJob> {
@@ -270,7 +241,7 @@ mod lifecycle_tests {
         for k in 1..=4 {
             let shape = EngramStagingShape::new(((8192usize.div_ceil(k.max(2)) + 63) / 64 * 64), k)?;
             let drops = Rc::new(RefCell::new(Vec::new()));
-            let mut pool = EngramCopyPool::new(shape.host_slots());
+            let mut pool = crate::shared::token_table::CopyPool::new(shape.host_slots());
             let mut events = Vec::new();
             for id in 0..shape.host_slots() {
                 let ready = Arc::new(AtomicBool::new(false));
@@ -327,11 +298,11 @@ mod lifecycle_tests {
             assert_eq!(shape.validate_slots(n - 1), Err(EngramStagingError::Slots { required: n, available: n - 1 }));
             let order = Arc::new(std::sync::Mutex::new(Vec::new()));
             let observed = order.clone();
-            let worker = GatherWorker::new("engram-lifecycle", (0..n).collect::<Vec<_>>(),
+            let worker = crate::GatherWorker::new("engram-lifecycle", (0..n).collect::<Vec<_>>(),
                 move |_: &mut usize, job: &(usize, usize)| {
                     observed.lock().unwrap().push(*job); Ok::<_, ()>(())
                 })?;
-            let mut copies = EngramCopyPool::new(n);
+            let mut copies = crate::shared::token_table::CopyPool::new(n);
             let mut events = Vec::new();
             // k active units retain both layers until their copies complete;
             // k lookahead units hold both layers ready (L14 issued with L1).
@@ -368,7 +339,7 @@ mod lifecycle_tests {
             let (started, seen) = std::sync::mpsc::sync_channel(1);
             let (release, wait) = std::sync::mpsc::sync_channel(1);
             let mut first = true;
-            let worker = GatherWorker::new("engram-cancel-states", (0..n).collect::<Vec<_>>(),
+            let worker = crate::GatherWorker::new("engram-cancel-states", (0..n).collect::<Vec<_>>(),
                 move |_: &mut usize, _: &(usize, usize)| {
                     if first { first = false; let _ = started.send(()); let _ = wait.recv(); }
                     Ok::<_, ()>(())
@@ -384,13 +355,13 @@ mod lifecycle_tests {
             drop(ready(&mut ticket)); // ready cancellation
             let mut ticket = worker.try_submit((4, 0), false)?.unwrap();
             let done = Arc::new(AtomicBool::new(false));
-            let mut copies = EngramCopyPool::new(n);
+            let mut copies = crate::shared::token_table::CopyPool::new(n);
             copies.retain(PendingCopy { lease: ready(&mut ticket), done: done.clone() });
             copies.reclaim(|copy| Ok(copy.done.load(Ordering::Acquire)))?;
-            assert_eq!(copies.pending.len(), 1, "cancel cannot return a copy-pending source");
+            assert_eq!(copies.len(), 1, "cancel cannot return a copy-pending source");
             done.store(true, Ordering::Release);
             copies.reclaim(|copy| Ok(copy.done.load(Ordering::Acquire)))?;
-            assert!(copies.pending.is_empty());
+            assert!(copies.is_empty());
             copies.reclaim(|_| panic!("copy-done lease returned twice"))?;
             let mut tickets = (0..n).map(|i| worker.try_submit((i, 1), false).map(Option::unwrap))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -408,9 +379,9 @@ mod lifecycle_tests {
         impl Wake for Counter { fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Release); } }
         for k in 1..=4 {
             let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
-            let worker = GatherWorker::new("engram-copy-admit", (0..n).collect::<Vec<_>>(),
+            let worker = crate::GatherWorker::new("engram-copy-admit", (0..n).collect::<Vec<_>>(),
                 |_: &mut usize, _: &(usize, usize)| Ok::<_, ()>(()))?;
-            let mut copies = EngramCopyPool::new(n);
+            let mut copies = crate::shared::token_table::CopyPool::new(n);
             let event = Arc::new(AtomicBool::new(false));
             for i in 0..n {
                 let mut ticket = worker.try_submit((i, 0), false)?.unwrap();
@@ -439,9 +410,9 @@ mod lifecycle_tests {
         impl Wake for Counter { fn wake(self: Arc<Self>) { self.0.fetch_add(1, Ordering::Release); } }
         for k in 1..=4 {
             let n = EngramStagingShape::new(8192usize.div_ceil(k.max(2)).div_ceil(64) * 64, k)?.host_slots();
-            let worker = GatherWorker::new("engram-mixed-copy-admit", (0..n).collect::<Vec<_>>(),
+            let worker = crate::GatherWorker::new("engram-mixed-copy-admit", (0..n).collect::<Vec<_>>(),
                 |_: &mut usize, _: &(usize, usize)| Ok::<_, ()>(()))?;
-            let mut copies = EngramCopyPool::new(n);
+            let mut copies = crate::shared::token_table::CopyPool::new(n);
             let event = Arc::new(AtomicBool::new(false));
             let mut cancelled = worker.try_submit((0, 0), false)?.unwrap();
             copies.retain(PendingCopy { lease: ready(&mut cancelled), done: event.clone() });
@@ -486,7 +457,7 @@ mod lifecycle_tests {
             let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
             let started = Arc::new(AtomicBool::new(false));
             let (observed, held, running) = (order.clone(), gate.clone(), started.clone());
-            let worker = GatherWorker::new("engram-priority", (0..4usize).collect::<Vec<_>>(),
+            let worker = crate::GatherWorker::new("engram-priority", (0..4usize).collect::<Vec<_>>(),
                 move |_: &mut usize, job: &(usize, usize)| {
                     if job.0 == 0 {
                         // The first job holds the worker until both later ones are queued.

@@ -23,8 +23,8 @@ impl Family for Qwen {
         Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
     }
     fn prefill_limits(&self) -> crate::serving_capacity::prefill_waves::PrefillLimits {
-        // #717: the mapped-PLE ring has two slots; this is not a measured best k.
-        crate::serving_capacity::prefill_waves::PrefillLimits { max_waves: 2, ..Default::default() }
+        // Shared token-table staging follows the admitted executor depth.
+        crate::serving_capacity::prefill_waves::PrefillLimits::default()
     }
     fn id(&self) -> &'static str {
         "qwen4"

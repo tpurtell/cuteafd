@@ -1904,9 +1904,7 @@ impl<'a> Qwen4Engine<'a> {
     fn drain_partial_step(&self) -> Result<()> {
         drop(self.ple_pending.borrow_mut().take());
         self.drain_state()?;
-        let device = self.library.cuda_get_device()?;
-        if let Some(ple) = &self.ple { ple.mapped().bind_readback(device, self.execution_stream()); }
-        crate::shared::mapped_table::check_readback(device, self.execution_stream())
+        Ok(())
     }
 
     /// `bytes` at `offset` inside `pool`.
@@ -2196,10 +2194,8 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
-        if let Some(ple) = &self.ple { ple.mapped().bind_readback(dev.buffer.device_id, self.execution_stream()); }
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
-        crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, self.execution_stream())?;
         let mut out = vec![0u8; bytes];
         self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
@@ -3152,9 +3148,6 @@ impl<'a> Qwen4Engine<'a> {
     /// The first `rows` logits rows as device logits (`greedy`: with the rows'
     /// selection from [`Self::select_greedy`]).
     fn device_logits(&self, w: &Workspace<'_>, rows: usize, greedy: bool) -> DeviceLogits {
-        if let Some(ple) = &self.ple {
-            ple.mapped().bind_readback(w.logits.buffer.device_id, self.execution_stream());
-        }
         let vocab = self.cfg.vocab_size;
         DeviceLogits { ptr: w.logits.buffer.ptr, rows, vocab, stride: vocab, stream: self.execution_stream(),
             greedy: greedy.then(|| (w.select.buffer.ptr.cast_const(), Self::region(&w.select, rows * 4, rows * 4).ptr
@@ -3163,7 +3156,6 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The first `rows` logits rows through the pinned landing buffer.
     fn download_logits(&self, w: &Workspace<'_>, rows: usize) -> Result<Vec<f32>> {
-        if let Some(ple) = &self.ple { ple.mapped().bind_readback(w.logits.buffer.device_id, self.execution_stream()); }
         let n = rows * self.cfg.vocab_size;
         let host = w.logits_host.borrow();
         ensure!(n * 4 <= host.buffer.bytes, "logits rows exceed the landing buffer");
@@ -3171,7 +3163,6 @@ impl<'a> Qwen4Engine<'a> {
         unsafe {
             self.library.copy_d2h_host_buffer_async(host.buffer, w.logits.buffer, n * 4, self.execution_stream())?;
             self.library.cuda_stream_synchronize(self.execution_stream())?;
-            crate::shared::mapped_table::check_readback(self.library.cuda_get_device()?, self.execution_stream())?;
             Ok(std::slice::from_raw_parts(host.buffer.ptr.cast::<f32>(), n).to_vec())
         }
     }
@@ -3278,7 +3269,14 @@ impl<'a> Qwen4Engine<'a> {
         self.require_live()?;
         if let Some(graph) = self.graphs.borrow().get(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers.
-            return unsafe { self.library.cuda_graph_launch(graph.0, self.execution_stream()) };
+            unsafe { self.library.cuda_graph_launch(graph.0, self.execution_stream())?; }
+            if self.cfg.ple_layers.contains(&key.segment) {
+                if let Some(ple) = &self.ple {
+                    // SAFETY: this replay contains the PLE reader; no later layer is queued yet.
+                    unsafe { ple.mapped().consumed(self.execution_stream())?; }
+                }
+            }
+            return Ok(());
         }
         ensure!(!self.startup_graphs || self.warming_graphs.get(),
             "Qwen serving graph was not captured at startup: {key:?}");
@@ -3295,6 +3293,12 @@ impl<'a> Qwen4Engine<'a> {
         // SAFETY: the new graph reads and writes persistent engine buffers.
         unsafe { self.library.cuda_graph_launch(exec.0, self.execution_stream())? };
         self.graphs.borrow_mut().insert(key, exec);
+        if self.cfg.ple_layers.contains(&key.segment) {
+            if let Some(ple) = &self.ple {
+                // SAFETY: newly launched PLE segment owns the current destination.
+                unsafe { ple.mapped().consumed(self.execution_stream())?; }
+            }
+        }
         Ok(())
     }
 
@@ -3342,8 +3346,8 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// Device-order the gathered rows before PLE, outside graph capture.
-    /// The issuer does not wait for host gathers or staging reuse.
+    /// Late landing, outside graph capture: preceding-layer work is already
+    /// queued before waiting for this consumer's rows.
     fn finish_ple(&self, w: &Workspace<'_>) -> Result<()> {
         let (Some(mapped), Some((rows, _))) = (self.ple.as_ref().map(|p| p.mapped()), &w.ple_rows) else {
             return Ok(());
@@ -3368,7 +3372,9 @@ impl<'a> Qwen4Engine<'a> {
             ("norm_key", layer.ptr("ple.norm_key")?), ("norm_query", layer.ptr("ple.norm_query")?),
             ("norm_conv", layer.ptr("ple.norm_conv")?), ("conv_w", layer.ptr("ple.conv_w")?),
             ("conv_state", state.buffer.ptr), ("slots", w.slots.buffer.ptr), ("seq_first", w.seq_first.buffer.ptr),
-            ("replay", replay.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows, Scalar::I32(i32::from(spec))])
+            ("replay", replay.buffer.ptr), ("scratch", w.scratch.buffer.ptr)], &[rows, Scalar::I32(i32::from(spec))])?;
+        // SAFETY: the PLE program is this destination's final reader.
+        unsafe { table.mapped().consumed(self.execution_stream()) }
     }
 
     /// Layers whose projections are held FP8-only (`--fp8-decode`) take the
@@ -3722,12 +3728,6 @@ struct UnitHooks<'e, 'w, 'p, 't, 'a, 'r, 'n> {
     logit_rows: usize,
 }
 
-impl Drop for UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
-    fn drop(&mut self) {
-        if let Some(batch) = &self.ple_batch { batch.cancel_unbegun(); }
-    }
-}
-
 impl UnitHooks<'_, '_, '_, '_, '_, '_, '_> {
     fn select(&self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         let shape = self.engine.prefill_shape.context("Qwen prefill shape")?;
@@ -3775,7 +3775,12 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         let engine = self.engine;
         if let Some(mapped) = engine.ple.as_ref().map(|p| p.mapped()) {
             let batch = self.ple_batch.as_ref().context("PLE prefill batch ownership")?;
-            self.pending[unit.index] = Some(mapped.begin_unit(batch, unit.index, false)?);
+            // Fill the mandatory lookahead before enqueueing this unit.
+            for index in unit.index..(unit.index + mapped.lookahead()).min(self.pending.len()) {
+                if self.pending[index].is_none() {
+                    self.pending[index] = Some(mapped.begin_unit(batch, index, false)?);
+                }
+            }
         }
         engine.stage_embedding(self.w, &self.tokens[unit.rows.clone()], HC, &self.w.streams[0], false)?;
         let start = self.tables[unit.index].positions[0] as usize;

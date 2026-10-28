@@ -347,7 +347,7 @@ mod weight_representation_tests {
             assert_eq!(parsed.prefill_shape()?, None);
             assert_eq!(parsed.prefill_wave_rows(), 4096);
         }
-        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2)] {
+        for (rows, waves) in [(512, 1), (1024, 2), (2048, 2), (2752, 2), (4096, 2), (2048, 3), (2048, 4), (2752, 3)] {
             let rows_arg = rows.to_string();
             let waves_arg = waves.to_string();
             let parsed = args(&["--shared-only", "--prefill-units", &rows_arg, "--prefill-waves", &waves_arg])?;
@@ -357,8 +357,6 @@ mod weight_representation_tests {
         }
         for extra in [
             vec!["--prefill-waves", "2"],
-            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "3"],
-            vec!["--shared-only", "--prefill-units", "2048", "--prefill-waves", "4"],
             vec!["--shared-only", "--prefill-units", "511"],
             vec!["--shared-only", "--prefill-units", "8192"],
             vec!["--shared-only", "--prefill-units", "4096", "--prefill-waves", "3"],
@@ -401,7 +399,7 @@ mod weight_representation_tests {
     }
 
     #[test]
-    fn six_spark_prefill_keeps_hard_two_slot_mapped_ple_constraint() -> Result<()> {
+    fn six_spark_prefill_charges_shared_token_table_depth() -> Result<()> {
         let mut parsed = args(&["--peers", "a:9870,b:9870,c:9870,d:9870,e:9870,f:9870"])?;
         let shape = parsed.resolved_prefill()?;
         assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (4096, 2, 8192));
@@ -413,8 +411,8 @@ mod weight_representation_tests {
         assert_eq!(inputs.prefill_rows, 8192);
         let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(
             4096 * cfg.ple_rows(), 2, 64 * cfg.ple_rows(), 160)?;
-        assert_eq!(staging.slot_bytes().count(), 3);
-        assert_eq!(staging.counter_bytes, 3 * 128);
+        assert_eq!(staging.slot_bytes().count(), 6);
+        assert_eq!(staging.total_bytes, staging.slot_bytes().sum::<usize>() + staging.workspace_bytes);
         Ok(())
     }
 
