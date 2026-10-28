@@ -402,16 +402,16 @@ mod weight_representation_tests {
     fn six_spark_prefill_charges_shared_token_table_depth() -> Result<()> {
         let mut parsed = args(&["--peers", "a:9870,b:9870,c:9870,d:9870,e:9870,f:9870"])?;
         let shape = parsed.resolved_prefill()?;
-        assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (4096, 2, 8192));
+        assert_eq!((shape.unit_rows, shape.waves, shape.span_rows), (2752, 3, 8256));
         parsed.prefill_rows = shape.span_rows as usize;
         parsed.prefill_units = Some(shape.unit_rows as usize);
         let cfg = Qwen4Config::from_hf(&cuteafd_loader::plan::testing::qwen4_config(48))?;
         let inputs = admission::inputs(&parsed, &cfg, 48, false, None, Some((160, true)), 0)?;
         assert_eq!(inputs.prefill_shape, Some(shape.units()));
-        assert_eq!(inputs.prefill_rows, 8192);
+        assert_eq!(inputs.prefill_rows, 8256);
         let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(
-            4096 * cfg.ple_rows(), 2, 64 * cfg.ple_rows(), 160)?;
-        assert_eq!(staging.slot_bytes().count(), 6);
+            2752 * cfg.ple_rows(), 3, 64 * cfg.ple_rows(), 160)?;
+        assert_eq!(staging.slot_bytes().count(), 8);
         assert_eq!(staging.total_bytes, staging.slot_bytes().sum::<usize>() + staging.workspace_bytes);
         Ok(())
     }
