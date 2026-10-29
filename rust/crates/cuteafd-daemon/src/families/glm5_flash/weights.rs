@@ -53,6 +53,7 @@ pub(crate) struct GlmfLayer<'a> {
     /// FFN width; whole attention still retains a split FFN on two GPUs.
     pub split: bool,
     pub attention_share: AttentionShare,
+    pub(crate) core: std::collections::BTreeMap<String, crate::shared::dense_trellis::CoreWeights<'a>>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -80,7 +81,8 @@ impl GlmfLayer<'_> {
     }
 
     pub fn bytes(&self) -> usize {
-        self.operands.values().map(|a| a.buffer.bytes).sum()
+        self.operands.values().map(|a| a.buffer.bytes).sum::<usize>()
+            + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
     }
 }
 
@@ -121,10 +123,13 @@ impl GlmfWeights<'_> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
-            ensure!(fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
+            let native = layer.core.contains_key("self_attn.q_proj");
+            ensure!(!native || !(bf16 || fp8), "KDA layer {index} has native and converted copies");
+            ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
         }
-        ensure!(matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
+        ensure!(matches!(self.head, super::head::GlmfHead::K6(_))
+            || matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
             "--fp8-head {fp8_head} but the resident head is {}", self.head.name());
         Ok(self.residency())
     }
@@ -669,7 +674,119 @@ impl<'a> GlmfLoader<'a> {
         Ok(())
     }
 
+    fn core_weights(&self, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout,
+        rank: usize) -> Result<crate::shared::dense_trellis::CoreWeights<'a>> {
+        let layout = crate::shared::dense_trellis::CoreWeightLayout::from_shared(layout);
+        let loaded = layout.read(|name| {
+            let (bytes, dtype, shape) = self.raw(name)?;
+            let tensor = self.tensor(name)?;
+            Ok(cuteafd_loader::LoadedTensor {
+                info: cuteafd_core::TensorInfo { name: name.into(), file: tensor.shard.clone(), dtype, shape,
+                    byte_offset: tensor.meta.byte_offset, byte_length: tensor.meta.byte_length,
+                    role: cuteafd_core::TensorRole::Other, layer_id: None, expert_id: None,
+                    is_quantization_metadata: false }, source_path: self.checkpoint.snapshot.join(&tensor.shard),
+                bytes, elapsed_micros: 0, sha256: String::new(),
+            })
+        })?;
+        self.on_rank(rank, || layout.upload(crate::shared::memory::device::Device {
+            library: self.library, id: self.library.cuda_get_device()? }, loaded))
+    }
+
+    fn native_layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode,
+        inventory: &cuteafd_loader::families::glm5_flash::core::CoreInventory) -> Result<Vec<GlmfLayer<'a>>> {
+        let ranks = self.ranks();
+        let attention = cfg.attention[layer];
+        let dense = cfg.dense[layer];
+        ensure!(self.kda_nvfp4.is_none(), "native K6 core cannot use the converted NVFP4 diagnostic");
+        ensure!(attention == GlmNextAttention::Mla || ranks == 1 || mode == LayerMode::HeadSplit,
+            "native KDA retains head ownership");
+        ensure!(ranks == 1 || !matches!(mode, LayerMode::Whole { ffn: FfnMode::Owner, .. }),
+            "native Flash FFNs retain intermediate ownership");
+        let owner = match mode { LayerMode::Whole { gpu, .. } if ranks == 2 => Some(gpu), _ => None };
+        let layouts = inventory.layer_weights(cfg, layer, ranks, owner)?;
+        let attention_shares = AttentionShare::bind(mode, ranks)?;
+        let p = format!("{PREFIX}layers.{layer}");
+        let a = |leaf: &str| format!("{p}.self_attn.{leaf}");
+        let mut ops: Vec<HashMap<&'static str, DeviceAllocation<'a>>> = (0..ranks).map(|_| HashMap::new()).collect();
+        for rank in 0..ranks {
+            for (site, keys) in [("attn", ["attn.fn", "attn.scale", "attn.base"]),
+                ("ffn", ["ffn.fn", "ffn.scale", "ffn.base"])] {
+                for (key, suffix) in keys.into_iter().zip(["fn", "scale", "base"]) {
+                    ops[rank].insert(key, self.f32_on(rank, &[format!("{p}.hc_{site}_{suffix}")])?);
+                }
+            }
+            for (key, leaf) in [("input_norm", "input_layernorm"), ("post_norm", "post_attention_layernorm")] {
+                ops[rank].insert(key, self.one_on(rank, &format!("{p}.{leaf}.weight"))?);
+            }
+            if !dense {
+                ops[rank].insert("gate", self.one_on(rank, &format!("{p}.mlp.gate.weight"))?);
+                ops[rank].insert("gate.bias", self.f32_on(rank, &[format!("{p}.mlp.gate.e_score_correction_bias")])?);
+            }
+        }
+        match attention {
+            GlmNextAttention::Kda => {
+                let beta = self.tensor(&a("b_proj.weight"))?;
+                ensure!(beta.meta.dtype == DType::Bf16 && beta.meta.shape == [cfg.kda_heads, cfg.hidden],
+                    "native KDA beta projection geometry");
+                for rank in 0..ranks {
+                    let mut lands = Vec::new();
+                    let mut at = 0;
+                    for leaf in ["f_a_proj.weight", "g_a_proj.weight", "b_proj.weight"] {
+                        let name = a(leaf);
+                        let tensor = self.tensor(&name)?;
+                        ensure!(tensor.meta.dtype == DType::Bf16 && tensor.meta.shape.len() == 2
+                            && tensor.meta.shape[1] == cfg.hidden, "{name}: native KDA auxiliary matrix");
+                        let n = tensor.meta.shape[0];
+                        let rows = if leaf == "b_proj.weight" { rank*n/ranks..(rank+1)*n/ranks } else { 0..n };
+                        let source = rect(self.checkpoint, &name, rows, 0..cfg.hidden*2)?;
+                        let bytes = source.bytes();
+                        lands.push((source, at)); at += bytes;
+                    }
+                    ops[rank].insert("w_aux", self.landed(rank, lands, at)?);
+                }
+                for operand in [KdaOperand::WFg, KdaOperand::ConvW, KdaOperand::ALog,
+                    KdaOperand::DtBias, KdaOperand::ONorm] {
+                    for (rank, part) in self.kda_operand(cfg, &p, operand, ranks)?.into_iter().enumerate() {
+                        ops[rank].insert(operand.name(), part);
+                    }
+                }
+            }
+            GlmNextAttention::Mla => {
+                let mut local = self.clone();
+                let parts = if let Some(owner) = owner {
+                    let owner = usize::from(owner);
+                    if owner > 0 { local.device = self.peers[owner-1].device; local.stream = self.peers[owner-1].stream; }
+                    local.peers.clear();
+                    self.on_rank(owner, || local.absorbed(cfg, &a("kv_b_proj.weight"), 1))?
+                        .into_iter().map(|pair| (owner, pair)).collect::<Vec<_>>()
+                } else { self.absorbed(cfg, &a("kv_b_proj.weight"), ranks)?.into_iter().enumerate().collect() };
+                for (rank, (uk, uv)) in parts {
+                    ops[rank].insert("w_uk", uk); ops[rank].insert("w_uv", uv);
+                    for (key, leaf) in [("q_a_norm", "q_a_layernorm.weight"), ("kv_a_norm", "kv_a_layernorm.weight"),
+                        ("w_iq", "indexer.wq_b.weight"), ("k_norm_w", "indexer.k_norm.weight"),
+                        ("k_norm_b", "indexer.k_norm.bias"), ("ape", "indexer.index_kpool_compress_ape")] {
+                        ops[rank].insert(key, self.one_on(rank, &a(leaf))?);
+                    }
+                    ops[rank].insert("w_ik", self.rows_on(rank, &[a("indexer.wk.weight"),
+                        a("indexer.weights_proj.weight"), a("indexer.index_kpool_compress_gate")])?);
+                }
+            }
+        }
+        ops.into_iter().zip(attention_shares).zip(layouts).enumerate().map(|(rank, ((operands, attention_share), layouts))| {
+            let expected = if owner.is_some_and(|owner| usize::from(owner) != rank) { 3 } else { 7 };
+            ensure!(layouts.len() == expected, "native Flash requires complete attention and FFN operator groups");
+            let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
+                .collect::<Result<_>>()?;
+            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands })
+        }).collect()
+    }
+
     pub fn layer(&self, cfg: &GlmNextConfig, layer: usize) -> Result<GlmfLayer<'a>> {
+        let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
+        if inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+            return self.native_layer_shares(cfg, layer, LayerMode::HeadSplit, &inventory)?
+                .into_iter().next().context("native Flash lead layer");
+        }
         ensure!(!self.kda_output_shard, "KDA output sharding loads through the two-GPU layer shares");
         let p = format!("{PREFIX}layers.{layer}");
         let attention = cfg.attention[layer];
@@ -753,7 +870,8 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate", self.one(&format!("{p}.mlp.gate.weight"))?);
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
-        Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole, operands: ops })
+        Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
+            core: Default::default(), operands: ops })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -996,6 +1114,10 @@ impl<'a> GlmfLoader<'a> {
     /// Layer `layer`, one share per rank of this loader's head split (see the module
     /// docstring); without a split, [`Self::layer`] alone.
     pub fn layer_shares(&self, cfg: &GlmNextConfig, layer: usize, mode: LayerMode) -> Result<Vec<GlmfLayer<'a>>> {
+        let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
+        if inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}."))) {
+            return self.native_layer_shares(cfg, layer, mode, &inventory);
+        }
         let ranks = self.ranks();
         let attention_shares = AttentionShare::bind(mode, ranks)?;
         ensure!(ranks == 1 || !matches!(mode, LayerMode::Whole { ffn: FfnMode::Owner, .. }),
@@ -1145,14 +1267,17 @@ impl<'a> GlmfLoader<'a> {
                 &[format!("{p}.mlp.gate.e_score_correction_bias")]))?);
         }
         Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
-            GlmfLayer { attention, dense, split: true, attention_share, operands }).collect())
+            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), operands }).collect())
     }
 
     /// The admitted layer plan: rank 0's weights (its
     /// layer shares, the norm and head) and with a head split the other rank's layer shares.
     #[allow(clippy::type_complexity)]
     pub fn model(&self, cfg: &GlmNextConfig, plan: &LayerExecutionPlan) -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
-        validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
+        let inventory = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, self.checkpoint)?;
+        if inventory.projections.is_empty() {
+            validate_kda_output_shard(self.ranks(), self.kda_fp8, self.kda_output_shard)?;
+        }
         let split = crate::shared::memory::load_timing::Split::start();
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
@@ -1165,7 +1290,11 @@ impl<'a> GlmfLoader<'a> {
         let weights = GlmfWeights {
             layers: shares.next().context("rank 0")?,
             norm: self.one(&format!("{PREFIX}norm.weight"))?,
-            head: if self.fp8_head {
+            head: if let Some(head) = inventory.get_weight("lm_head") {
+                super::head::GlmfHead::K6(self.core_weights(
+                    cuteafd_loader::formats::trellis_core::CoreWeightLayout::new(head,
+                        cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?)
+            } else if self.fp8_head {
                 let (values, scales) = self.fp8(&["lm_head.weight".to_string()], super::fp8::Layout::Row128)?;
                 super::head::GlmfHead::Fp8 { values, scales }
             } else {
