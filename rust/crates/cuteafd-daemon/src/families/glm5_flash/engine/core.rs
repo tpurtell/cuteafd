@@ -28,6 +28,14 @@ fn retained_bytes(rows: usize, hidden: usize) -> Result<usize> {
     rows.checked_mul(hidden).and_then(|n| n.checked_mul(4)).context("Flash K6 retained extent overflow")
 }
 
+fn diagnostic_partial_views(narrow: Buffer, rounded: Buffer, count: usize) -> Result<(Buffer, [Buffer; 2])> {
+    let f32_bytes = count.checked_mul(4).filter(|&n| n > 0).context("BF16 partial extent overflow")?;
+    ensure!(narrow.device_id == rounded.device_id, "BF16 partial scratch device mismatch");
+    let view = crate::shared::prefix::view;
+    Ok((view(narrow, 0, f32_bytes / 2)?,
+        [view(rounded, 0, f32_bytes)?, view(rounded, f32_bytes, f32_bytes)?]))
+}
+
 struct Scratch<'a> { projection: ProjectionScratch<'a>, stages: BTreeMap<&'static str, Allocation<'a>> }
 impl Scratch<'_> {
     fn stage(&self, name: &str) -> Result<Buffer> { Ok(self.stages.get(name).context("Flash K6 stage")?.buffer) }
@@ -36,6 +44,7 @@ pub(super) struct Rank<'a> {
     projections: BTreeMap<Key, Projection<'a>>,
     scratch: [Option<Rc<Scratch<'a>>>; 2],
     add: F32Add<'a>,
+    bf16_partials: bool,
 }
 pub(super) struct Slot<'a> {
     scratch: Rc<Scratch<'a>>,
@@ -82,7 +91,9 @@ impl<'a> Rank<'a> {
                 .map(|(&n, &b)| Ok((n, Allocation::new(device, b)?))).collect::<Result<_>>()?;
             Ok(Some(Rc::new(Scratch { projection, stages })))
         };
-        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.f32_add()? })
+        let bf16_partials = std::env::var("CUTEAFD_DIAG_K6_BF16_PARTIALS").is_ok_and(|v| v == "1");
+        tracing::info!(rank, bf16_partials, "K6 partial reduction diagnostic (measurement only)");
+        Ok(Self { scratch: [allocate(0)?, allocate(1)?], projections, add: engine.library.f32_add()?, bf16_partials })
     }
     fn slot(&self, engine: &GlmfEngine<'a>, rank: usize, rows: usize, decode: bool, lane: usize) -> Result<Option<Slot<'a>>> {
         let Some(scratch) = &self.scratch[usize::from(!decode)] else { return Ok(None); };
@@ -201,8 +212,27 @@ impl<'a> GlmfEngine<'a> {
         let peer = self.core_received(rank, at, rows)?;
         let (first, second) = rank_order(rank, local, peer);
         let core = self.core_rank(rank)?;
-        self.on(rank, || core.projections[&key(weights)].reduced(&core.add, rows, first, second,
-            slot.retained[2].buffer, weights, output, self.stream_of(rank)))
+        self.on(rank, || {
+            let stream = self.stream_of(rank);
+            let (first, second) = if core.bf16_partials {
+                let count = rows.checked_mul(self.cfg.hidden).context("BF16 partial count overflow")?;
+                let scratch = &slot.scratch.projection.buffers;
+                let (narrow, rounded) = diagnostic_partial_views(scratch["rotated"], scratch["accumulator"], count)?;
+                // Private serialized projection scratch is dead after the retained core copy.
+                // Never modify the published rank partial while its peer may still read it.
+                for (source, destination) in [(first, rounded[0]), (second, rounded[1])] {
+                    // SAFETY: checked disjoint views on this rank's stream, kept alive
+                    // through graph replay; FIFO orders narrowing before exact widening.
+                    unsafe {
+                        self.library.load_narrow_f32_bf16(source.ptr, narrow.ptr, count, stream)?;
+                        self.library.load_widen_bf16_f32(narrow.ptr, destination.ptr, count, stream)?;
+                    }
+                }
+                (rounded[0], rounded[1])
+            } else { (first, second) };
+            core.projections[&key(weights)].reduced(&core.add, rows, first, second,
+                slot.retained[2].buffer, weights, output, stream)
+        })
     }
     pub(super) fn core_attention_meet(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, at: usize,
         rows: usize) -> Result<Option<*mut c_void>> {
@@ -289,6 +319,32 @@ impl<'a> GlmfEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_rounds_both_partials_before_the_single_existing_reduce() -> Result<()> {
+        let narrow = |x: f32| {
+            let bits = x.to_bits();
+            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
+        };
+        let (a, b) = (1.00390625_f32, -1.0_f32);
+        assert_eq!(narrow(a) + narrow(b), 0.0);
+        assert_ne!(narrow(a) + narrow(b), narrow(a + b));
+        assert_eq!(narrow(f32::from_bits(0x3f818000)), f32::from_bits(0x3f820000));
+        let buffer = |ptr, bytes| Buffer { ptr: std::ptr::without_provenance_mut(ptr), bytes, device_id: 0, flags: 0 };
+        let (n, r) = diagnostic_partial_views(buffer(0x1000, 32), buffer(0x2000, 128), 16)?;
+        assert_eq!(n.bytes, 32);
+        assert_eq!(r[0].bytes, 64);
+        assert_eq!(r[1].ptr as usize, 0x2040);
+        assert!(diagnostic_partial_views(n, buffer(0x2000, 127), 16).is_err());
+        assert!(diagnostic_partial_views(n, r[0], usize::MAX).is_err());
+        let source = include_str!("core.rs");
+        let reduce = source.split("fn core_reduce(").nth(1).unwrap().split("fn core_attention_meet(").next().unwrap();
+        assert!(reduce.contains("[(first, rounded[0]), (second, rounded[1])]"));
+        assert!(reduce.find("load_narrow_f32_bf16").unwrap() < reduce.find("load_widen_bf16_f32").unwrap());
+        assert!(reduce.find("load_widen_bf16_f32").unwrap() < reduce.find(".reduced(").unwrap());
+        assert_eq!(reduce.matches(".reduced(").count(), 1);
+        Ok(())
+    }
 
     #[test]
     fn native_tp2_cores_reduce_in_rank_order_before_one_egress() -> Result<()> {
