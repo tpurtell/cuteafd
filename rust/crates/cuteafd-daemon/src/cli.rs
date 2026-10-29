@@ -723,6 +723,20 @@ mod tests {
     }
 
     #[test]
+    fn engram_warm_is_an_opt_in_native_serve_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        for (flags, warm) in [(vec![], false), (vec!["--engram-warm"], true)] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags))
+                .unwrap().command else { panic!("expected native serve"); };
+            assert_eq!(args.engram_warm, warm);
+        }
+        // A switch, not a value; native serve only.
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--engram-warm", "on"])).is_err());
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--engram-warm"]).is_err());
+    }
+
+    #[test]
     fn plan_mimo_prefix_marks_stay_experimental_and_off() {
         use clap::{CommandFactory, Parser};
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
@@ -1093,6 +1107,11 @@ pub(crate) struct NativeServeArgs {
     /// Host RAM cap for all separate per-row mapped-table scales; 0 keeps all mapped.
     #[arg(long, default_value_t = 0.0, value_parser = parse_scale_preload_gib)]
     pub mapped_scale_preload_gib: f64,
+    /// After readiness, read both Engram tables once into the page cache on a
+    /// background thread (skipped unless available host memory holds them plus
+    /// 16 GiB). For checkpoint stores with slow random reads.
+    #[arg(long)]
+    pub engram_warm: bool,
     /// Checked Spark vision replicas; omitted for local RTX fallback.
     #[arg(long)]
     pub vision_peers: Option<String>,

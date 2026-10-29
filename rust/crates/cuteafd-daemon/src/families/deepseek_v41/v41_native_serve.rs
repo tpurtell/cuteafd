@@ -268,6 +268,30 @@ fn spark_transport(
     SparkExperts::new_world(world, peers, capacity, transport_config(timing), lane)
 }
 
+/// Background page-cache warm readers for `--engram-warm`.
+const ENGRAM_WARM_READERS: usize = 8;
+
+/// The Engram pipeline both V4.1 layouts serve: host staging for `slots`
+/// prefill units of `rows` and the decode lanes (admitted against host
+/// memory), the admitted scale preload and, with `--engram-warm`, a
+/// background page-cache warm that starts once the API reports ready.
+fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Catalog,
+    args: &crate::cli::NativeServeArgs, rows: usize, slots: usize) -> Result<cuteafd_loader::EngramPipeline> {
+    let map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
+    let shape = cuteafd_loader::EngramStagingShape::new(rows, slots)?;
+    crate::shared::memory::budget::admit_host_memory(0,
+        &[("v41/engram-prefill", shape.host_bytes() as u64),
+          ("v41/engram-decode", shape.decode_host_bytes() as u64)], 0, 0)?;
+    // SAFETY: the checkpoint remains immutable for all mapping lifetimes.
+    let mut pipeline = unsafe { cuteafd_loader::EngramPipeline::new(lib, catalog, map, shape,
+        cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
+    cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
+    if args.engram_warm {
+        pipeline.start_warm(ENGRAM_WARM_READERS, || cuteafd_bench::context::readiness_s().is_some())?;
+    }
+    Ok(pipeline)
+}
+
 fn worker(
     mut args: crate::cli::NativeServeArgs,
     mut receive: mpsc::Receiver<NativeRequest>,
@@ -388,15 +412,7 @@ fn worker(
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         cuteafd_core::V41_VERIFY_ROWS, args.dspark.then_some(usize::from(args.dspark_draft_limit)),
         args.attention_plan_rows)?;
-    let map = cuteafd_loader::EngramTokenMap::from_file(&&args.snapshot.join("tokenizer.json"))?;
-    let shape = cuteafd_loader::EngramStagingShape::new(rows, slots)?;
-    crate::shared::memory::budget::admit_host_memory(0,
-        &[("v41/engram-prefill", shape.host_bytes() as u64),
-          ("v41/engram-decode", shape.decode_host_bytes() as u64)], 0, 0)?;
-    // SAFETY: the checkpoint remains immutable for all mapping lifetimes.
-    let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, map, shape,
-        cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
-    cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
+    let pipeline = engram_pipeline(&lib, &catalog, &args, rows, slots)?;
     let engram_weights = [0, 1]
         .map(|i| EngramLayerWeights::load(&lib, &catalog, i, 256 * 1024 * 1024, 16 * 1024 * 1024))
         .into_iter()

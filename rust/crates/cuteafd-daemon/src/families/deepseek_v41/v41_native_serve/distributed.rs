@@ -534,16 +534,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         cache_bytes=?pool.cache_bytes,reservation_bytes=?pool.reservation_bytes,snapshot_slots,snapshot_bytes,
         rtx_expert_layers=expert_layers,"dual RTX cache reservation after fixed allocations");
     let cache_bytes: [usize;2]=pool.cache_bytes.clone().try_into().map_err(|_|anyhow::anyhow!("dual cache budgets"))?;
-    let token_map = cuteafd_loader::EngramTokenMap::from_file(&args.snapshot.join("tokenizer.json"))?;
-    let rows = capacity as usize;
-    let shape = cuteafd_loader::EngramStagingShape::new(rows, slots)?;
-    crate::shared::memory::budget::admit_host_memory(0,
-        &[("v41/engram-prefill", shape.host_bytes() as u64),
-          ("v41/engram-decode", shape.decode_host_bytes() as u64)], 0, 0)?;
-    // SAFETY: the checkpoint remains immutable for all mapping lifetimes.
-    let pipeline = unsafe { cuteafd_loader::EngramPipeline::new(&lib, &catalog, token_map, shape,
-        cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
-    cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());
+    let pipeline = super::engram_pipeline(&lib, &catalog, &args, capacity as usize, slots)?;
     let mut requests = if args.tp2_attention {
         Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
     } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
