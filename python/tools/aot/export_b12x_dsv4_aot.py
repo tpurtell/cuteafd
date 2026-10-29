@@ -932,7 +932,8 @@ def main() -> None:
                     kda_heads=g.kda_heads // 2, dense_inter=g.dense_inter // 2,
                     moe_inter=g.moe_inter // 2)
             manifest["families"][name] = dataclasses.asdict(g)
-            work += [(name, *item) for item in glmf_stage_programs(g, args.decode_rows, args.prefill_rows)]
+            work += [(name, *item) for item in glmf_stage_programs(
+                g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)]
             continue
         if name in ("glm_stage", "glm2_stage"):
             g = glm_stage_geometry(GLM53, name == "glm2_stage")

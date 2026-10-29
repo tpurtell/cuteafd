@@ -85,6 +85,17 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
             assert params == kwargs == {"stage": "swiglu", "max_rows": rows, "inter": inter}
 
 
+def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
+    narrow = exporter.glmf_stage_programs(GEOMETRY, 64, 4096)
+    wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
+    describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
+    narrow, wide = describe(narrow), describe(wide)
+    assert len(narrow) == 12 and len(wide) == 18
+    assert {name: wide[name] for name in narrow} == narrow
+    assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
+    assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()
+
+
 @pytest.mark.parametrize("geometry,checkpoint,limit", [
     ("flash", "deepseek-ai/DeepSeek-V4-Flash-0731", 1048576),
     ("pro", "deepseek-ai/DeepSeek-V4-Pro-0813", 1048576),
