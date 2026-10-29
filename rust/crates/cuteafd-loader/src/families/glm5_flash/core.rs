@@ -357,7 +357,7 @@ mod tests {
                 layout: Some(crate::plan::layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
                     head_split: gpus == 2, host_memory: Some((128 << 30, 128 << 30)), context_tokens: 262144,
                     pool_tokens: Some(262144), workspace_manifest: Some(path.clone()), glmf_drafter_snapshot: Some(draft.clone()),
-                    weight_budget_bytes: 90 << 30, ..Default::default() }), ..Default::default() })?;
+                    weight_budget_bytes: 80 << 30, ..Default::default() }), ..Default::default() })?;
             assert!(report.executable(), "{}", crate::plan::render(&report));
             let layout = report.memory_layout.as_ref().unwrap();
             assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "native K6 core")));
@@ -405,6 +405,24 @@ mod tests {
                 } }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn scratch_masks_preserve_fused_storage_for_mixed_groups() -> Result<()> {
+        let (cfg, checkpoint) = fixture();
+        let mut core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let all = core.scratch_mask(&cfg, cfg.layers);
+        assert!(all.kda && all.mla && all.ffn);
+        core.projections.retain(|name, _| !name.starts_with(&format!("{PREFIX}0.self_attn.")));
+        let mixed = core.scratch_mask(&cfg, cfg.layers);
+        assert!(!mixed.kda && mixed.mla && mixed.ffn);
+        core.projections.retain(|name, _| !name.starts_with(&format!("{PREFIX}3.self_attn.")));
+        core.projections.retain(|name, _| !name.starts_with(&format!("{PREFIX}1.mlp.")));
+        let mixed = core.scratch_mask(&cfg, cfg.layers);
+        assert!(!mixed.kda && !mixed.mla && !mixed.ffn);
+        let empty = core.scratch_mask(&cfg, 0);
+        assert!(empty.kda && empty.mla && empty.ffn);
         Ok(())
     }
 
