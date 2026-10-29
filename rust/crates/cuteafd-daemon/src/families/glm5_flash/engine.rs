@@ -3331,11 +3331,15 @@ impl<'a> GlmfEngine<'a> {
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
-        ensure!(bytes <= dev.buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", dev.buffer.bytes);
-        // SAFETY: the engine owns this stream.
+        self.download_buffer(dev.buffer, bytes)
+    }
+
+    fn download_buffer(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
+        ensure!(bytes <= buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", buffer.bytes);
+        // SAFETY: these rank-0 diagnostic buffers stay live until this engine stream drains.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
+        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
         Ok(out)
     }
 
@@ -3924,11 +3928,14 @@ impl<'a> GlmfEngine<'a> {
         };
         self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
         let out = self.peer_ffn_out(index, w1, layer)?;
+        // Startup bucket graphs exclude both ranks' real-row shared FFNs and their peer publication.
+        if !layer.dense && self.startup_graphs && self.capturing.get() { return Ok(()); }
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
         match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer)) {
             (true, false) => {}
             (true, true) => self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, out, rows)?,
-            (false, _) if !self.tp2_layer(index) => self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, out, rows)?,
+            (false, _) if !self.tp2_layer(index) =>
+                self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, out, rows)?,
             (false, _) => {},
         }
         if self.tp2_layer(index) || self.unit_prefill.get() { return Ok(()) }
@@ -3958,7 +3965,33 @@ impl<'a> GlmfEngine<'a> {
                 self.peer_post(previous, 0, w1, t, decode_cap(t))?;
             }
             self.peer_attention(index, 0, w1, t, decode_cap(t), tables)
-        })
+        })?;
+        let layer = &self.peer()?.layers[index];
+        if self.startup_graphs && !layer.dense && !self.tp2_layer(index) {
+            let out = self.peer_ffn_out(index, w1, layer)?;
+            if self.warming_graphs.get() {
+                self.on(1, || unsafe {
+                    // SAFETY: the masked bucket owns its peer output until the boundary publication.
+                    self.library.cuda_zero_bytes_async(w1.shared.buffer, t * self.cfg.hidden * 2, self.stream_of(1))
+                })?;
+            } else {
+                let real = tables.real_rows;
+                ensure!(real > 0 && real <= t, "peer shared FFN real rows exceed bucket");
+                self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, decode_cap(t), out, Scalar::I32(real as i32))?;
+                if real < t {
+                    let offset = real * self.cfg.hidden * 2;
+                    let bytes = (t - real) * self.cfg.hidden * 2;
+                    self.on(1, || unsafe {
+                        // SAFETY: only the unused tail of this persistent bucket output is cleared.
+                        self.library.cuda_zero_bytes_async(cuteafd_ffi::CuteafdDeviceBuffer {
+                            ptr: out.wrapping_byte_add(offset), bytes, ..w1.shared.buffer }, bytes, self.stream_of(1))
+                    })?;
+                }
+            }
+            // Queue this before the next segment can consume it in peer_post.
+            self.exchange_push(self.exchange()?, "main", 1, slot(index, true, 0), out, t * self.cfg.hidden * 2)?;
+        }
+        Ok(())
     }
 
     fn decode_primitive(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
@@ -4228,16 +4261,16 @@ impl<'a> GlmfEngine<'a> {
             }
             if layers.get(index).is_some_and(|layer| !layer.dense) {
                 if self.warming_graphs.get() {
-                    // Masked startup rows need no routed result; preserve peer event ordering.
-                    if self.tp2_layer(index) {
-                        let w1 = w1.context("TP2 peer workspace")?;
-                        // SAFETY: masked graph warm-up publishes zero payloads, never uninitialized router ids.
-                        unsafe {
-                            self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?;
-                            self.on(1, || self.library.cuda_zero_bytes_async(w1.shared.buffer,
-                                t * self.cfg.hidden * 2, self.stream_of(1)))?;
-                        }
-                    } else { self.exchange_window(index, true, true)?; }
+                    // Both ranks skip native/shared FFNs, so only the ordinary BF16 boundary publishes.
+                    // SAFETY: masked startup owns the live bucket outputs; no router ids are consumed.
+                    unsafe { self.library.cuda_zero_bytes_async(w.delta.buffer, t * self.cfg.hidden * 2, self.stream)?; }
+                    if let Some(w1) = w1 {
+                        let buffer = if self.tp2_layer(index) { w1.delta.buffer } else { w1.shared.buffer };
+                        self.on(1, || unsafe {
+                            // SAFETY: this is the peer output subsequently published by this layer.
+                            self.library.cuda_zero_bytes_async(buffer, t * self.cfg.hidden * 2, self.stream_of(1))
+                        })?;
+                    }
                 } else if self.startup_graphs {
                     // A padded step's real rows run the router, the expert wire and the shared expert
                     // at the step's capacity (a bucket past 64 rows holds more than 64 real rows); the
@@ -4799,16 +4832,29 @@ impl<'a> GlmfEngine<'a> {
         self.mla_producer_into(rank, w, layer, rows, cap, decode, cache)?;
         if let Some(dir) = trace {
             let qkv_width = self.cfg.q_lora_rank + self.cfg.kv_lora_rank;
-            let q_width = self.cfg.heads * self.cfg.qk_nope_dim;
-            let bytes = (t * qkv_width * 2).next_multiple_of(1024)
-                + (t * q_width * 2).next_multiple_of(1024);
-            for (name, buffer, bytes) in [("mla_producer_scratch.bin", &w.scratch, bytes),
-                ("mla_query.bin", &w.query, t * self.cfg.heads * self.cfg.kv_lora_rank * 2),
+            let q_width = heads * self.cfg.qk_nope_dim;
+            let native = layer.core.contains_key("self_attn.q_a_proj");
+            if native {
+                let slot = w.core.as_ref().context("native MLA trace without stage buffers")?;
+                // q_a has been normalized into q_resid; its stage now contains q_b.
+                for (name, buffer, bytes) in [
+                    ("mla_q_b.bin", slot.stage("q")?, t * q_width * 2),
+                    ("mla_kv_a.bin", slot.stage("k")?, t * self.cfg.kv_lora_rank * 2)] {
+                    std::fs::write(dir.join(name), self.download_buffer(buffer, bytes)?)?;
+                }
+            } else {
+                let bytes = (t * qkv_width * 2).next_multiple_of(1024)
+                    + (t * q_width * 2).next_multiple_of(1024);
+                std::fs::write(dir.join("mla_producer_scratch.bin"), self.download(&w.scratch, bytes)?)?;
+            }
+            for (name, buffer, bytes) in [
+                ("mla_query.bin", &w.query, t * heads * self.cfg.kv_lora_rank * 2),
                 ("mla_q_resid.bin", &w.q_resid, t * self.cfg.q_lora_rank * 2)] {
                 std::fs::write(dir.join(name), self.download(buffer, bytes)?)?;
             }
             std::fs::write(dir.join("mla_meta.json"), serde_json::to_vec(&serde_json::json!({
-                "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024 }))?)?;
+                "rows": t, "qkv_width": qkv_width, "q_width": q_width, "alignment": 1024,
+                "native_stages": native }))?)?;
         }
         // The DSA indexer, its pool top-k and the selection read one sequence's tables: a packed
         // prefill runs them once per sequence, over its rows and its tables (one part: the step).
@@ -4878,14 +4924,17 @@ impl<'a> GlmfEngine<'a> {
         }
         if let Some(dir) = trace {
             std::fs::write(dir.join("mla_latent.bin"), self.download(&w.latent,
-                t * self.cfg.heads * self.cfg.kv_lora_rank * 2)?)?;
+                t * heads * self.cfg.kv_lora_rank * 2)?)?;
             std::fs::write(dir.join("mla_sparse_scratch.bin"), self.download(&w.scratch,
                 self.scratch(&format!("sparse_mla_decode_{cap}"))?)?)?;
         }
         self.mla_output(rank, w, layer, cap, rows, decode)?;
         if let Some(dir) = trace {
-            std::fs::write(dir.join("mla_values.bin"), self.download(&w.scratch,
-                t * self.cfg.heads * self.cfg.v_head_dim * 2)?)?;
+            let values = if layer.core.contains_key("self_attn.o_proj") {
+                w.core.as_ref().context("native MLA trace without stage buffers")?.stage("values")?
+            } else { w.scratch.buffer };
+            std::fs::write(dir.join("mla_values.bin"), self.download_buffer(values,
+                t * heads * self.cfg.v_head_dim * 2)?)?;
         }
         Ok(())
     }
@@ -5246,6 +5295,10 @@ fn decode_bucket(rows: usize, spec: bool) -> usize {
     else { PLAIN_DECODE_BUCKETS.into_iter().find(|&bucket| bucket >= rows).unwrap_or(rows) }
 }
 
+
+#[cfg(test)]
+#[path = "engine/warm_exchange_tests.rs"]
+mod warm_exchange_tests;
 
 #[cfg(test)]
 mod tp2_tests {

@@ -42,6 +42,9 @@ pub(super) struct Slot<'a> {
     retained: [Allocation<'a>; 3],
     lane: usize,
 }
+impl Slot<'_> {
+    pub(crate) fn stage(&self, name: &str) -> Result<Buffer> { self.scratch.stage(name) }
+}
 impl<'a> Rank<'a> {
     fn new(engine: &GlmfEngine<'a>, rank: usize, admission: &CoreRankLayout, layers: &[GlmfLayer<'_>]) -> Result<Self> {
         let device = Device { library: engine.library, id: if rank == 0 { engine.device } else { engine.peer()?.device } };
