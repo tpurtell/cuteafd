@@ -60,16 +60,19 @@ def exporter(monkeypatch):
 
 
 @pytest.mark.parametrize("intermediates", [(12288, 2048), (6144, 1024)])
-def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates):
+@pytest.mark.parametrize("decode_rows,prefill_rows", [(64, 4096), (128, 4096), (64, 64)])
+def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates, decode_rows, prefill_rows):
     geometry = types.SimpleNamespace(dense_inter=intermediates[0], moe_inter=intermediates[1])
-    programs = exporter.glmf_stage_programs(geometry, 64, 4096)
+    programs = exporter.glmf_stage_programs(geometry, decode_rows, prefill_rows)
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
-    assert len(calls) == 12
-    for rows in (64, 4096):
+    decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
+    caps = decode_caps | {prefill_rows}
+    assert len(calls) == len(programs) == 6 * len(caps)
+    for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
         assert args == (geometry,)
-        assert params == kwargs == {"max_rows": rows, "decode": rows == 64}
+        assert params == kwargs == {"max_rows": rows, "decode": rows in decode_caps}
         for stage in ("rank_norm", "absorb", "values"):
             op, params, (module, compiler, args, kwargs) = calls[f"{stage}_m{rows}"]
             assert op == "attention_stage"

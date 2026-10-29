@@ -194,8 +194,10 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     from functools import partial
     from b12x.integration.cuteafd.glmf_split import compile_glmf_kda_core_aot, compile_glmf_stage_aot
     out = []
-    for rows in (decode_rows, prefill_rows):
-        params = dict(max_rows=rows, decode=rows == decode_rows)
+    # Wide decode still selects the narrow stage for batches of at most 64 rows.
+    decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, decode=rows in decode_caps)
         out.append((f"kda_core_m{rows}", "kda_core", params,
                     partial(compile_glmf_kda_core_aot, g, **params)))
         for stage in ("rank_norm", "absorb", "values"):
