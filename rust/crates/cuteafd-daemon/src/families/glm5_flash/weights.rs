@@ -1282,9 +1282,10 @@ impl<'a> GlmfLoader<'a> {
         let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
         ensure!(plan.modes().len() <= cfg.layers, "attention plan exceeds checkpoint layers");
         for (layer, &mode) in plan.modes().iter().enumerate() {
-            for (share, part) in shares.iter_mut().zip(self.layer_shares(cfg, layer, mode)?) {
-                share.push(part);
-            }
+            let native = inventory.projections.keys().any(|stem| stem.starts_with(&format!("{PREFIX}layers.{layer}.")));
+            let parts = if native { self.native_layer_shares(cfg, layer, mode, &inventory)? }
+                else { self.layer_shares(cfg, layer, mode)? };
+            for (share, part) in shares.iter_mut().zip(parts) { share.push(part); }
         }
         let mut shares = shares.into_iter();
         let weights = GlmfWeights {

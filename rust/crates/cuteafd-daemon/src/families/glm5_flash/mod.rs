@@ -1548,7 +1548,7 @@ impl Opened {
             cuteafd_loader::placement::families::glm5_flash::GlmfWorkingSet)> {
         use cuteafd_loader::placement::{self, families::glm5_flash as admission};
         use cuteafd_loader::families::glm5_flash::resident::GlmfRepresentation;
-        use cuteafd_loader::serving_capacity::{glmf_step_scratch, glmf_table_pages,
+        use cuteafd_loader::serving_capacity::{glmf_core_step_scratch, glmf_table_pages,
             GlmfScratchOptions, GlmfStepShape};
         ensure!(args.expert_window.is_none(), "solver admission does not support diagnostic expert paging");
         let devices: Vec<_> = std::iter::once(args.device).chain(peer).collect();
@@ -1587,8 +1587,10 @@ impl Opened {
             kda_fp32_partials: args.kda_fp32_partials, kda_output_shard: args.kda_output_shard,
             kda_prefill_expanded: args.kda_prefill_expanded, index_compact: index == engine::IndexCache::Compact,
             kda_state: args.kda_state.into() };
-        let decode = glmf_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true)?;
-        let mut prefill = glmf_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false)?;
+        let native = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&self.cfg, &headers)?
+            .scratch_mask(&self.cfg, layers);
+        let decode = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.decode_rows as u64, true, native)?;
+        let mut prefill = glmf_core_step_scratch(lookup, &self.cfg, scratch, args.prefill_rows as u64, false, native)?;
         if args.replay_records == engine::ReplayRecords::Shared {
             prefill.programs = prefill.programs.max(cuteafd_loader::serving_capacity::glm_flash_kda_replay_bytes_rows(
                 &self.cfg, layers, devices.len(), args.decode_rows as u64)?);

@@ -1020,7 +1020,7 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     lanes: u64, rows: u64, context: u64, decode_rows: u64, shared_records: u64, index_compact: bool, split: bool,
     repr: crate::families::glm5_flash::resident::GlmfRepresentation, expanded: bool, rtx_experts: bool, fp32_partials: bool,
     kda_state: crate::serving_capacity::GlmfKdaState) -> Option<Vec<crate::placement::families::glm5_flash::GlmfBufferDemand>> {
-    use crate::serving_capacity::{glmf_manifest_scratch, glmf_step_scratch, glmf_table_pages,
+    use crate::serving_capacity::{glmf_manifest_scratch, glmf_core_step_scratch, glmf_table_pages,
         GlmfScratchOptions, GlmfStepShape};
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&checkpoint.config).ok()?;
     let lookup = glmf_manifest_scratch(manifest);
@@ -1033,8 +1033,10 @@ fn glmf_step_workspace(manifest: &serde_json::Value, checkpoint: &super::Checkpo
     let spark = matches!(placement, ExpertPlacement::Sparks { .. });
     let shape = GlmfStepShape { lead: true, split, local_experts: !split && rtx_experts, tp2_experts: split && rtx_experts, spark, partial_bytes: if fp32_partials { 4 } else { 2 },
         output_shard: split && repr.output_shard, full_prefill_logits: false, table_pages, table_pool_pages };
-    let decode = glmf_step_scratch(&lookup, &cfg, options, decode_rows, true).ok()?;
-    let mut prefill = glmf_step_scratch(&lookup, &cfg, options, rows, false).ok()?;
+    let core = crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint).ok()?;
+    let native = core.scratch_mask(&cfg, cfg.layers);
+    let decode = glmf_core_step_scratch(&lookup, &cfg, options, decode_rows, true, native).ok()?;
+    let mut prefill = glmf_core_step_scratch(&lookup, &cfg, options, rows, false, native).ok()?;
     // Shared replay records live in the prefill scratch.
     prefill.programs = prefill.programs.max(shared_records);
     Some(crate::placement::families::glm5_flash::step_workspace_demands(&cfg,
