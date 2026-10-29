@@ -1450,10 +1450,12 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
     precision::check_projection_inputs(&checkpoint, &cfg,
         args.layers.unwrap_or(cfg.layers))?;
     if let Some(snapshot) = &args.draft {
-        let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
-            .context("DFlash target has no lm_head.weight")?;
-        // The drafter borrows the target's one head: BF16, or the FP8 head made from it.
-        crate::shared::speculation::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        if core.get_weight("lm_head").is_none() {
+            let head = checkpoint.tensors.iter().find(|t| t.meta.name == "lm_head.weight")
+                .context("DFlash target has no supported vocabulary head")?;
+            crate::shared::speculation::dflash::check_target_head_source(&head.meta, cfg.hidden, cfg.vocab_size)?;
+        }
         if dspark::is_dspark(snapshot)? {
             dspark::check_checkpoint(snapshot, cfg.hidden, cfg.vocab_size, cfg.layers)?;
         } else {

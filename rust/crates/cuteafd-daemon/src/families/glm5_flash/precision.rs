@@ -7,6 +7,8 @@ use cuteafd_loader::plan::checkpoint::Checkpoint;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProjectionInputError {
+    #[error("native K6 header contract: {0}")]
+    Native(String),
     #[error("GLMF checkpoint has no selected projection tensor {name}")]
     Missing { name: String },
     #[error("{name}: GLMF {consumer} reads {expected:?}, found {actual:?}")]
@@ -82,6 +84,8 @@ fn scalar(checkpoint: &Checkpoint, name: String) -> Result<(), ProjectionInputEr
 pub(crate) fn check_projection_inputs(primary: &Checkpoint,
     cfg: &GlmNextConfig, layers: usize) -> Result<(), ProjectionInputError> {
     let h = cfg.hidden;
+    let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, primary)
+        .map_err(|e| ProjectionInputError::Native(format!("{e:#}")))?;
     for layer in 0..layers.min(cfg.layers) {
         let prefix = format!("model.language_model.layers.{layer}");
         if cfg.attention[layer] == GlmNextAttention::Mla {
@@ -95,7 +99,8 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
                 ("q_b_proj.weight", q_width, cfg.q_lora_rank),
                 ("o_proj.weight", h, v_width),
             ] {
-                block(primary, format!("{prefix}.self_attn.{suffix}"), rows, cols, "MLA FP8 block projection")?;
+                let name = format!("{prefix}.self_attn.{suffix}");
+                if core.get_weight(&name).is_none() { block(primary, name, rows, cols, "MLA FP8 block projection")?; }
             }
         }
         let dense = cfg.dense[layer];
@@ -105,6 +110,7 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
             t.meta.name == format!("{mlp}.gate_proj.weight") && t.meta.dtype == DType::U8);
         for (projection, rows, cols) in [("gate_proj", inter, h), ("up_proj", inter, h), ("down_proj", h, inter)] {
             let name = format!("{mlp}.{projection}");
+            if core.get_weight(&name).is_some() { continue; }
             if packed_dense {
                 require(primary, format!("{name}.weight"), DType::U8, vec![rows, cols / 2], 1, "NVFP4 dense MLP")?;
                 require(primary, format!("{name}.weight_scale"), DType::F8E4M3, vec![rows, cols / 16], 1, "NVFP4 dense MLP")?;
@@ -123,6 +129,31 @@ pub(crate) fn check_projection_inputs(primary: &Checkpoint,
 mod tests {
     use super::*;
     use cuteafd_loader::{plan::checkpoint::CheckpointTensor, SafetensorsTensorMetadata};
+
+    #[test]
+    fn native_core_projection_headers_skip_only_the_validated_native_operands() {
+        let (mut checkpoint, cfg) = fixture();
+        let expected = cuteafd_loader::families::glm5_flash::core::expected(&cfg);
+        let mut native = Vec::new();
+        checkpoint.tensors.retain(|tensor| {
+            if let Some(shape) = expected.get(&tensor.meta.name) {
+                let stem = tensor.meta.name.strip_suffix(".weight").unwrap();
+                let (n,k) = (shape[0],shape[1]);
+                for (suffix,dtype,shape,width) in [("trellis",DType::I16,vec![k/16,n/16,96],2),
+                    ("suh",DType::F16,vec![k],2),("svh",DType::F16,vec![n],2),("mcg",DType::I32,vec![1],4)] {
+                    native.push(CheckpointTensor { shard:"no-payload.safetensors".into(), meta:SafetensorsTensorMetadata {
+                        name:format!("{stem}.{suffix}"),dtype,byte_offset:0,
+                        byte_length:width*shape.iter().product::<usize>() as u64,shape } });
+                }
+                false
+            } else { !tensor.meta.name.ends_with(".weight_scale_inv") }
+        });
+        checkpoint.tensors.extend(native);
+        checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        check_projection_inputs(&checkpoint,&cfg,cfg.layers).unwrap();
+        checkpoint.tensors.retain(|t| !t.meta.name.ends_with("q_a_proj.svh"));
+        assert!(matches!(check_projection_inputs(&checkpoint,&cfg,cfg.layers),Err(ProjectionInputError::Native(_))));
+    }
 
     fn input(name: String, dtype: DType, shape: Vec<usize>, width: u64) -> CheckpointTensor {
         CheckpointTensor { shard: "no-payload.safetensors".into(), meta: SafetensorsTensorMetadata {

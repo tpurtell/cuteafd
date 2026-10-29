@@ -5,6 +5,8 @@ use cuteafd_loader::plan::checkpoint::Checkpoint;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum KdaInputError {
+    #[error("native K6 header contract: {0}")]
+    Native(String),
     #[error("GLMF KDA programs support hidden=4096, heads=64, head_dim=128; found hidden={hidden}, heads={heads}, head_dim={head_dim}; add a KDA exporter for this geometry")]
     Geometry {
         hidden: usize,
@@ -60,6 +62,8 @@ pub(crate) fn check_kda_inputs(
         cfg.kda_heads * cfg.kda_head_dim,
         cfg.kda_head_dim,
     );
+    let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(cfg, checkpoint)
+        .map_err(|e| KdaInputError::Native(format!("{e:#}")))?;
     for layer in active {
         for (suffix, shape) in [
             ("q_proj.weight", vec![d, h]),
@@ -74,6 +78,7 @@ pub(crate) fn check_kda_inputs(
             ("o_norm.weight", vec![rank]),
         ] {
             let name = format!("model.language_model.layers.{layer}.self_attn.{suffix}");
+            if core.get_weight(&name).is_some() { continue; }
             let at = checkpoint
                 .tensors
                 .binary_search_by(|t| t.meta.name.cmp(&name))
@@ -185,6 +190,30 @@ mod tests {
             .find(|t| t.meta.name.ends_with(suffix))
             .unwrap()
             .meta
+    }
+
+    #[test]
+    fn native_k6_accepts_only_valid_projection_groups_and_preserves_gate_checks() {
+        let (mut checkpoint, cfg) = fixture();
+        for leaf in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            let name = format!("model.language_model.layers.0.self_attn.{leaf}");
+            let at = checkpoint.tensors.iter().position(|t| t.meta.name == format!("{name}.weight")).unwrap();
+            let original = checkpoint.tensors.remove(at);
+            let (n, k) = (original.meta.shape[0], original.meta.shape[1]);
+            for (suffix, dtype, shape, width) in [("trellis", DType::I16, vec![k/16,n/16,96], 2),
+                ("suh", DType::F16, vec![k], 2), ("svh", DType::F16, vec![n], 2), ("mcg", DType::I32, vec![1], 4)] {
+                checkpoint.tensors.push(CheckpointTensor { shard: "unused.safetensors".into(), meta: SafetensorsTensorMetadata {
+                    name: format!("{name}.{suffix}"), dtype, byte_offset: 0,
+                    byte_length: width * shape.iter().product::<usize>() as u64, shape } });
+            }
+        }
+        checkpoint.tensors.sort_by(|a,b| a.meta.name.cmp(&b.meta.name));
+        check_kda_inputs(&checkpoint, &cfg, cfg.layers).unwrap();
+        tensor(&mut checkpoint, "f_a_proj.weight").dtype = DType::F16;
+        assert!(matches!(check_kda_inputs(&checkpoint, &cfg, cfg.layers), Err(KdaInputError::Dtype { .. })));
+        tensor(&mut checkpoint, "f_a_proj.weight").dtype = DType::Bf16;
+        checkpoint.tensors.retain(|t| !t.meta.name.ends_with("q_proj.svh"));
+        assert!(matches!(check_kda_inputs(&checkpoint, &cfg, cfg.layers), Err(KdaInputError::Native(_))));
     }
 
     #[test]

@@ -607,6 +607,15 @@ def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
     values = keys(path)
     text = path.read_text()
     assert f"./run.sh --config examples/configs/{name}" in text and "--dry-run" in text
+    if name.startswith("glm53f-exl3-k4-core-k6"):
+        assert values["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6"
+        assert values["SPECULATOR"] == "dflash2"
+        assert values["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-Flash-DFlash2"
+        assert values["SPARK_COUNT"] == ("2" if "-min" in name else "0")
+        assert values["RTX_GPUS"] == ("1" if "-min" in name else "2")
+        assert values["POOL_TOKENS"] == "auto"
+        assert not any(needle in text.lower() for needle in PRIVATE)
+        return
     assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
     assert not any(needle in text.lower() for needle in PRIVATE)
     assert "EXLR8_DENSE_FROM" not in values
