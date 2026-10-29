@@ -153,11 +153,10 @@ def test_kimi_refuses_unsupported_configuration(tmp_path: Path, keys: str, diagn
     assert "Traceback" not in result.stderr
 
 
-def test_kimi_refuses_release_images(tmp_path: Path) -> None:
+def test_kimi_serves_from_release_images(tmp_path: Path) -> None:
     result = _kimi(tmp_path, wip=False)
-    assert result.returncode != 0
-    assert "kimi_k3 serving is under qualification; run it from a WIP slot" in result.stderr
-    assert "docker run -d" not in result.stderr and "cuteafd plan" not in result.stderr
+    assert "under qualification" not in result.stderr
+    assert "cuteafd serve-kimi --snapshot" in result.stderr
 
 
 def test_kimi_refuses_a_slot_without_serve_kimi(tmp_path: Path) -> None:
@@ -370,15 +369,15 @@ def test_step5_native_mtp_defaults_on_with_explicit_off(tmp_path: Path, keys: st
     assert _flag(_line(other, "cuteafd plan"), "--native-mtp-layers") is None
 
 
-def test_step5_refuses_release_images_and_slots_without_serve_step5(tmp_path: Path) -> None:
+def test_step5_serves_from_release_images_and_refuses_slots_without_serve_step5(tmp_path: Path) -> None:
     keys = "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6)
     release = _step5(tmp_path / "release", keys, wip=False)
-    assert release.returncode != 0 and "step5 serving is under qualification; run it from a WIP slot" in release.stderr
+    assert "under qualification" not in release.stderr
+    assert "cuteafd serve-step5 --snapshot" in release.stderr
     old = _step5(tmp_path / "old", keys, probe_fails=True)
     assert old.returncode == 2
     assert "WIP slot s5 has no 'serve-step5' command; build the slot from a commit that serves step5" in old.stderr
-    for result in (release, old):
-        assert "cuteafd plan" not in result.stderr and "docker run -d" not in result.stderr
+    assert "cuteafd plan" not in old.stderr and "docker run -d" not in old.stderr
 
 
 def test_family_table_and_planner_fixtures_name_step5() -> None:

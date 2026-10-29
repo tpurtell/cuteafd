@@ -1674,7 +1674,7 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # carries its programs); the planner and the server resolve it. Explicit modes run only where an
 # executor exists.
 case "$attention_placement:$family" in
-  # Families under qualification run only their recorded automatic placement.
+  # Kimi K3 and Step-5 run only their recorded automatic placement.
   auto:kimi_k3|auto:step5) ;;
   *:kimi_k3|*:step5) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
@@ -1696,21 +1696,19 @@ case "$family" in
   step5) serve=serve-step5 ;;
   *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3 and Step-5 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
-# Kimi K3 (#273) and Step-5 (#274) are under qualification: WIP slots only,
-# automatic attention placement, text only (their bundled vision towers are not
-# in scope) and GPU token embeddings. Kimi ships no MTP head; Step-5 defaults
-# to native MTP depth 3 (SPECULATOR=off disables it).
-qualifying=0
-[[ "$family" != kimi_k3 && "$family" != step5 ]] || qualifying=1
-if ((qualifying)); then
-  [[ -n "$wip_slot" ]] || release_die "$family serving is under qualification; run it from a WIP slot (--wip SLOT)"
+# Kimi K3 and Step-5 serve through their own commands: automatic attention
+# placement, text only (their bundled vision towers are not in scope) and GPU
+# token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
+# depth 3 (SPECULATOR=off disables it).
+text_family=0
+[[ "$family" != kimi_k3 && "$family" != step5 ]] || text_family=1
+if ((text_family)); then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
     *) release_die "$family bundled media execution is not qualified; set VISION=off and AUDIO=off" ;;
   esac
 fi
 if [[ "$family" == qwen3_5 ]]; then
-  [[ -n "$wip_slot" ]] || release_die "dense Qwen serving is under qualification; run it from a WIP slot"
   [[ "$attention_placement" == auto ]] || release_die "dense Qwen currently supports only single-GPU automatic attention placement"
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
@@ -1801,9 +1799,9 @@ if [[ -n "$wip_slot" ]]; then
     -e PATH=/opt/cuteafd/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     -e CUTEAFD_NATIVE_LIB=/opt/cuteafd/lib/libcuteafd_native.so --entrypoint /opt/cuteafd/share/release-entrypoint.sh"
 fi
-# Families whose serve command lands on its own branch: refuse a slot whose
-# binary predates it before planning or touching any service.
-if ((qualifying)); then
+# Families with their own serve command: refuse a WIP slot whose binary
+# predates it before planning or touching any service.
+if ((text_family)) && [[ -n "$wip_slot" ]]; then
   docker run --rm --network none --mount "type=bind,src=$wip_layout/bin/cuteafd,dst=/opt/cuteafd-serve-probe,readonly" \
     --entrypoint /opt/cuteafd-serve-probe "$coordinator_image" "$serve" --help >/dev/null ||
     release_die "WIP slot $wip_slot has no '$serve' command; build the slot from a commit that serves $family"
@@ -1955,7 +1953,7 @@ if [[ "$family" == mimo_v2 ]]; then
 fi
 case "$embedding" in host|gpu) ;; *) echo "EMBEDDING must be host or gpu" >&2; exit 2 ;; esac
 [[ "$family" != qwen3_5 || "$embedding" == gpu ]] || release_die "dense Qwen requires device token embedding"
-((qualifying == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
+((text_family == 0)) || [[ "$embedding" == gpu ]] || release_die "$family serves GPU token embeddings only (EMBEDDING=gpu)"
 decode_lanes="$(get DECODE_LANES)"
 if [[ -n "$decode_lanes" ]]; then
   [[ "$decode_lanes" =~ ^[12]$ ]] || release_die "DECODE_LANES must be 1 or 2"
@@ -1982,7 +1980,7 @@ if [[ -n "$chat_template_from" && "$vision" != off ]]; then
   family_args+=(--chat-template-from "$chat_template_from")
 fi
 # Kimi K3 and Step-5 serve text only; their commands take no media options.
-((qualifying)) || family_args+=(--vision "$vision" --audio "$audio")
+((text_family)) || family_args+=(--vision "$vision" --audio "$audio")
 case "$(get FULL_PREFILL_LOGITS off)" in
   on) family_args+=(--full-prefill-logits) ;;
   off) ;;
@@ -2157,7 +2155,7 @@ fi
 if [[ "$family" == step5 ]]; then
   family_args+=(--kv-cache "$step5_kv_cache")
 fi
-if ((qualifying)); then
+if ((text_family)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
 fi
@@ -2265,7 +2263,7 @@ addr="$(get ADDR 0.0.0.0:8000)"
 # Kimi K3 and Step-5 leave an unset budget to the planner, which takes the
 # family's own (the plan's spark_budget_bytes then reaches every worker).
 budget_default=107374182400
-((qualifying == 0)) || budget_default=""
+((text_family == 0)) || budget_default=""
 budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
@@ -3122,7 +3120,7 @@ cuteafd_cdi_gpu_args "$gpus" || exit 2
 context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
 [[ "$family" != qwen3_5 ]] || context_args=()
 # Kimi K3 and Step-5: unset keeps the serve command's own context extent.
-((qualifying == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
+((text_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
 docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
