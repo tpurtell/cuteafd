@@ -183,7 +183,9 @@ def requirements(repo, matrix, scope):
             if dual:
                 programs |= {'glm2', 'glm2_stage'}
         elif family == 'glm5_flash':
-            programs = {'glmf', 'glmf2'} if dual else {'glmf'}
+            programs = {'glmf', 'dense_trellis_k6', 'glmf_stage'}
+            if dual:
+                programs |= {'glmf2', 'glmf2_stage'}
         elif family == 'mimo_v2':
             programs = tokens(scopes['CUTEAFD_WIP_MIMO_GEOMETRIES'])
         elif family == 'qwen4':

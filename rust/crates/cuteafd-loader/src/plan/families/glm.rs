@@ -330,7 +330,7 @@ impl Glm {
         let vision = if self.id == "glm5_flash" { glm_flash_vision_resident_weights(checkpoint) }
             else { Err("this GLM family's vision tower is not qualified".into()) };
         let core_shapes = match &cache_cfg { GlmCacheConfig::Dsa(cfg) => crate::families::glm5::core::expected(cfg),
-            GlmCacheConfig::Flash(_) => Default::default() };
+            GlmCacheConfig::Flash(cfg) => crate::families::glm5_flash::core::expected(cfg) };
         Ok(GlmModel { id: self.id, cache_cfg, core_shapes, vision, spec: ModelSpec {
             family: self.id,
             architecture: self.architecture.into(),
@@ -568,10 +568,10 @@ impl FamilyModel for GlmModel {
             // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
             Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
                 && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
-            _ if self.id == "glm5" && operand.exl3_bits() == Some(6) => {
+            _ if matches!(self.id, "glm5" | "glm5_flash") && operand.exl3_bits() == Some(6) => {
                 let shape = self.core_shapes.get(&format!("{stem}.weight"))
                     .ok_or_else(|| format!("{stem}: outside GLM's native K6 core keep-list"))?;
-                let padded = stem.ends_with(".self_attn.kv_a_proj_with_mqa")
+                let padded = self.id == "glm5" && stem.ends_with(".self_attn.kv_a_proj_with_mqa")
                     && operand.logical == [shape[0].next_multiple_of(128), shape[1]];
                 require(operand.logical == *shape || padded, || format!(
                     "{stem}: native K6 shape {:?}, expected {shape:?} (kv_a may store N128 padding)", operand.logical))?;

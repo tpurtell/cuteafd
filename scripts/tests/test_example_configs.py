@@ -25,7 +25,8 @@ TP_EP = {"tp2ep2-native.config", "tp2ep3-native.config", "tp3ep1-native.config",
 # served from ./wip.sh slots only, checked by test_serve_launch_new_families.py.
 QUALIFICATION = {"kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config"}
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
-           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config"}
+           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
+           "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
 
@@ -55,6 +56,8 @@ CHECKPOINTS = {
     "nvidia/GLM-5.3-NVFP4": GLM5,
     "zai-org/GLM-5.3-Flash": GLMF,
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8": GLMF,
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6": {**GLMF, "quantization_config": {
+        "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
     "brandonmusic/GLM-5.3-Flash-tr3-4bpw": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},

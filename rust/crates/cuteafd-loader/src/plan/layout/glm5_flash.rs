@@ -48,11 +48,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             anyhow::bail!("wide decode needs CUTEAFD_GLMF_WIDE_DECODE_ROWS=128");
         }
         let representation = options.glmf_representation;
+        let core = crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        let native = !core.projections.is_empty();
         let state = options.glmf_kda_state;
+        anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
+            "native K6 requires F32 KDA state programs");
         anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || ranks == 1,
             "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
-            if representation.kda_fp8 { "FP8" } else { "BF16" }, if representation.fp8_head { "FP8" } else { "BF16" }));
+            if native { "native K6" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
+            if native { "native K6" } else if representation.fp8_head { "FP8" } else { "BF16" }));
         let mut resident = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
             attention.mode, attention.first_owner as usize)
             .map_err(anyhow::Error::msg)?;
@@ -119,8 +124,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let draft_sms: Vec<_> = options.rtx_bytes[..ranks].iter().map(|&total|
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(total, None).sms) as u64).collect();
         // Explicit fixture totals remain opaque: do not add inferred scratch on top.
+        let mut draft_rows = None;
         let (draft, drafter_scratch, drafter_bridge) = if options.glmf_drafter_disabled { (0, vec![0; ranks], None) }
-            else if options.drafter_bytes > 0 { (options.drafter_bytes, vec![0; ranks], None) } else {
+            else if options.drafter_bytes > 0 {
+                anyhow::ensure!(!native, "native K6 drafter head requires its actual DFlash2 config, not a bytes-only override");
+                (options.drafter_bytes, vec![0; ranks], None)
+            } else {
             let path = options.glmf_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from).unwrap_or_else(|| "/mnt/sparknest/hf-home".into());
                 crate::resolve_snapshot_at_revision("incoai/GLM-5.3-Flash-DFlash2", Some(&home), None).ok().and_then(|r| r.snapshot_path)
@@ -129,21 +138,54 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             let config = serde_json::from_slice::<serde_json::Value>(&std::fs::read(path.join("config.json"))?)?;
             let slots = options.draft_context_slots.unwrap_or(sequences.max(8)) as usize;
             let batch = options.draft_sequences.max(sequences).min(slots as u64) as usize;
+            let (_, block) = crate::families::glm5::draft_representation::draft_geometry(&config)?;
+            draft_rows = Some(batch.checked_mul(usize::try_from(block)?)
+                .ok_or_else(|| anyhow::anyhow!("Flash native draft head row overflow"))?);
             let (bytes, scratch) = glmf::drafter_inventory(&config, slots, batch,
                 &draft_sms, crate::families::glm5::draft_representation::GlmDraftRepresentation::Fp8Only, 2, options.draft_kv_cache)?;
             let bridge = if ranks == 2 && glmf::remote_dflash_requested() {
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
             (bytes, scratch, bridge)
         };
+        let core_charge = if native {
+            let owners = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
+                let mut next = attention.first_owner as u8;
+                cfg.attention.iter().map(|kind| {
+                    let owner = next;
+                    if *kind == crate::families::glm5_flash::GlmNextAttention::Mla { next ^= 1; }
+                    owner
+                }).collect::<Vec<_>>()
+            });
+            Some(crate::families::glm5_flash::core_admission::CoreCharges::from_package(&cfg, &core,
+                cfg.layers, ranks, owners.as_deref(), rows as usize, lanes as usize,
+                decode_rows as usize, draft_rows,
+                manifest.ok_or_else(|| anyhow::anyhow!("Flash K6 requires PROGRAMS.json with native exports"))?)?)
+        } else { None };
+        if let Some(charge) = &core_charge {
+            let bytes = charge.bytes(cfg.hidden)?;
+            for profile in [&mut workspace, &mut local_workspace] {
+                for (rank, &bytes) in bytes.iter().enumerate() {
+                    profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, rank as u8,
+                        Category::Workspace, "native K6 core", bytes, Basis::Exact));
+                }
+            }
+            notes.push("native K6 body and head; exact compressed owners and projection scratch".into());
+        }
         let local_tp2_exl3 = ranks == 2 && spark_ranks == 0 && catalog.exl3().is_some();
         let mut baselines = Vec::new();
         for rank in 0..ranks {
             let total = options.rtx_bytes[rank];
-            let runtime = runtime_item(manifest, &program_families("glmf", ranks == 2),
-                if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" },
-                ranks == 2, rank, total);
+            let package = if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" };
+            let runtime = if let (Some(charge), Some(manifest)) = (&core_charge, manifest) {
+                let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2"]);
+                set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
+                let arch = placement::ArchContext::coordinator(total, None);
+                let allowance = placement::inventory::loaded_code_allowance("glmf-k6", package,
+                    ranks == 2, rank as u8, &arch, Some(&set));
+                Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
+            } else { runtime_item(manifest, &program_families("glmf", ranks == 2), package, ranks == 2, rank, total) };
             let code = runtime.bytes;
-            if local_tp2_exl3 {
+            if local_tp2_exl3 && !native {
                 devices[rank].items.extend(placement::inventory::glmf_local_tp2_runtime_items(rank));
             } else {
                 devices[rank].items.push(runtime);
@@ -158,7 +200,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let graphs = options.graph_budget_bytes.map(|bytes| placement::GraphSet::budget(&vec![bytes; ranks]))
             .unwrap_or_else(|| glmf::startup_graphs(&cfg, cfg.layers, context as usize, target as usize,
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
-        let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3, gpus: baselines, pending_code: vec![0; ranks],
+        let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
