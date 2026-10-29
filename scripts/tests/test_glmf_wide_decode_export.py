@@ -40,7 +40,7 @@ def exporter(monkeypatch):
         monkeypatch.setenv(name, "1")
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", types.SimpleNamespace(REVISION="test"))
     package = types.ModuleType("b12x.integration.cuteafd")
-    for name in ("glmf", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
+    for name in ("glmf", "glmf_split", "glm_ffn", "glm_attention", "glm_indexer", "dsv4_mhc", "glm_sparse_mla", "context_split", "qwen4", "qwen4_gdn", "qwen4_attention", "qwen_dense", "qwen_dense_fp8", "kimi_mla", "kimi_residual", "pointwise", "mimo_attention", "mimo_ffn", "native_dense"):
         module = _Compilers(f"b12x.integration.cuteafd.{name}")
         setattr(package, name, module)
         monkeypatch.setitem(sys.modules, module.__name__, module)
@@ -57,6 +57,29 @@ def exporter(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.mark.parametrize("intermediates", [(12288, 2048), (6144, 1024)])
+def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, intermediates):
+    geometry = types.SimpleNamespace(dense_inter=intermediates[0], moe_inter=intermediates[1])
+    programs = exporter.glmf_stage_programs(geometry, 64, 4096)
+    calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
+    assert len(calls) == 12
+    for rows in (64, 4096):
+        op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
+        assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
+        assert args == (geometry,)
+        assert params == kwargs == {"max_rows": rows, "decode": rows == 64}
+        for stage in ("rank_norm", "absorb", "values"):
+            op, params, (module, compiler, args, kwargs) = calls[f"{stage}_m{rows}"]
+            assert op == "attention_stage"
+            assert (module, compiler, args) == ("glmf_split", "compile_glmf_stage_aot", (geometry,))
+            assert params == kwargs == {"stage": stage, "max_rows": rows}
+        for inter in intermediates:
+            op, params, (_, compiler, args, kwargs) = calls[f"swiglu_i{inter}_m{rows}"]
+            assert op == "swiglu_split"
+            assert compiler == "compile_glmf_stage_aot" and args == (geometry,)
+            assert params == kwargs == {"stage": "swiglu", "max_rows": rows, "inter": inter}
 
 
 @pytest.mark.parametrize("geometry,checkpoint,limit", [

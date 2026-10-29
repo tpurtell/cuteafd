@@ -317,18 +317,24 @@ def test_non_kimi_scope_does_not_enable_kimi_programs(tmp_path):
     assert scopes['CUTEAFD_WIP_GLM_AOT'] == 'ON'
 
 
-@pytest.mark.parametrize('kimi,glm,exlr8,families', [
-    (True, False, False, 'kimik3'),
-    (False, True, False, 'glm'),
-    (True, True, False, 'kimik3,glm'),
-    (True, True, True, 'kimik3,glm'),
+@pytest.mark.parametrize('kimi,glm,glmf,exlr8,families', [
+    (True, False, False, False, 'kimik3'),
+    (False, True, False, False, 'glm'),
+    (True, True, False, False, 'kimik3,glm'),
+    (True, True, False, True, 'kimik3,glm'),
+    (False, False, True, False, 'glmf'),
+    (False, False, True, True, 'glmf'),
+    (False, True, True, False, 'glm,glmf'),
+    (True, False, True, False, 'kimik3,glmf'),
+    (True, True, True, True, 'kimik3,glm,glmf'),
 ])
-def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kimi, glm, exlr8, families):
+def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kimi, glm, glmf, exlr8, families):
     cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
     source = tmp_path / 'CMakeLists.txt'
     source.write_text('\n'.join([
         'cmake_minimum_required(VERSION 3.18)',
         'project(native_scope NONE)',
+        f'set(CUTEAFD_ENABLE_GLMF_AOT {"ON" if glmf else "OFF"})',
         'set(CUTEAFD_CUDA_ARCHITECTURES 120)',
         'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)',
         'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")',
@@ -347,8 +353,10 @@ def test_native_k6_architecture_tables_follow_existing_cmake_scope(tmp_path, kim
     geometries = geometries.split(',')
     assert len(geometries) == len(set(geometries))
     assert geometries.count('dense_trellis_k6') == 1
-    assert ('glm_stage' in geometries) == glm
-    assert ('glm2_stage' in geometries) == glm
+    assert ('glm_stage' in geometries) == (glm or exlr8)
+    assert ('glm2_stage' in geometries) == (glm or exlr8)
+    assert ('glmf_stage' in geometries) == glmf
+    assert ('glmf2_stage' in geometries) == glmf
     assert f'--dense-trellis-families;{families}' in args
     assert 'snapshot' not in args and 'checkpoint' not in args
 

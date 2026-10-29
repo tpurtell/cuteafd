@@ -38,6 +38,7 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
         return Err("GLM Flash attention weights require valid one/two-rank ownership".into());
     }
     let owned = attention == AttentionPlacement::Layers;
+    let core = super::core::CoreInventory::from_checkpoint(cfg, checkpoint).map_err(|e| e.to_string())?;
     let tensor = |name: &str| checkpoint.tensors.iter().find(|t| t.meta.name == name)
         .ok_or_else(|| format!("GLM Flash resident operand missing: {name}"));
     let elements = |name: &str| -> Result<u64, String> {
@@ -62,12 +63,16 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
     };
     let fp8 = |names: &[String], split: bool, row128: bool| fp8_ranks(names, if split { ranks } else { 1 }, row128);
     out[0].weights = tensor("model.language_model.norm.weight")?.meta.byte_length.max(256)
-        + if repr.fp8_head { fp8(&["lm_head.weight".into()], false, true)? }
+        + if let Some(head) = core.get_weight("lm_head") {
+            head.resident_bytes(1).map_err(|e| e.to_string())?
+        } else if repr.fp8_head { fp8(&["lm_head.weight".into()], false, true)? }
             else { tensor("lm_head.weight")?.meta.byte_length.max(256) };
     let mut mla_owner = first_owner;
     for layer in 0..layers.min(cfg.layers) {
         let owner = mla_owner;
         if cfg.attention[layer] == GlmNextAttention::Mla { mla_owner ^= 1; }
+        let native = core.layer_weights(cfg, layer, ranks, owned.then_some(owner as u8)
+            .filter(|_| cfg.attention[layer] == GlmNextAttention::Mla)).map_err(|e| e.to_string())?;
         let p = format!("model.language_model.layers.{layer}");
         let a = |s: &str| format!("{p}.self_attn.{s}");
         let one = |s: &str| -> Result<u64, String> { Ok(tensor(s)?.meta.byte_length.max(256)) };
@@ -83,17 +88,25 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             bytes += one(&format!("{p}.input_layernorm.weight"))? + one(&format!("{p}.post_attention_layernorm.weight"))?;
             match cfg.attention[layer] {
                 GlmNextAttention::Kda => {
-                    let inputs: Vec<_> = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"]
-                        .iter().map(|s| a(&format!("{s}.weight"))).collect();
-                    let mut input_values = 0;
-                    for (i, name) in inputs.iter().enumerate() {
-                        input_values += elements(name)? / if ranks > 1 && !matches!(i, 3 | 4) { ranks as u64 } else { 1 };
+                    if core.get_weight(&a("q_proj")).is_some() {
+                        bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
+                            .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+                        let aux = elements(&a("f_a_proj.weight"))? + elements(&a("g_a_proj.weight"))?
+                            + elements(&a("b_proj.weight"))? / ranks as u64;
+                        bytes += (aux * 2).max(256);
+                    } else {
+                        let inputs: Vec<_> = ["q_proj", "k_proj", "v_proj", "f_a_proj", "g_a_proj", "b_proj"]
+                            .iter().map(|s| a(&format!("{s}.weight"))).collect();
+                        let mut input_values = 0;
+                        for (i, name) in inputs.iter().enumerate() {
+                            input_values += elements(name)? / if ranks > 1 && !matches!(i, 3 | 4) { ranks as u64 } else { 1 };
+                        }
+                        bytes += if repr.kda_fp8 { input_values.max(256) + (input_values / 128 * 4).max(256) }
+                            else { (input_values * 2).max(256) };
+                        let output_split = ranks > 1 && !(repr.kda_fp8 && repr.output_shard);
+                        bytes += if repr.kda_fp8 { fp8(&[a("o_proj.weight")], output_split, true)? }
+                            else { (elements(&a("o_proj.weight"))? * 2 / ranks as u64).max(256) };
                     }
-                    bytes += if repr.kda_fp8 { input_values.max(256) + (input_values / 128 * 4).max(256) }
-                        else { (input_values * 2).max(256) };
-                    let output_split = ranks > 1 && !(repr.kda_fp8 && repr.output_shard);
-                    bytes += if repr.kda_fp8 { fp8(&[a("o_proj.weight")], output_split, true)? }
-                        else { (elements(&a("o_proj.weight"))? * 2 / ranks as u64).max(256) };
                     bytes += ((elements(&a("f_b_proj.weight"))? + elements(&a("g_b_proj.weight"))?) * 2 / ranks as u64).max(256);
                     bytes += f32(&["q", "k", "v"].map(|s| a(&format!("{s}_conv1d.weight"))), ranks > 1)?;
                     bytes += f32(&[a("A_log")], ranks > 1)? + f32(&[a("dt_bias")], ranks > 1)?;
@@ -105,9 +118,14 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
                         bytes += one(&a("q_a_layernorm.weight"))? + one(&a("kv_a_layernorm.weight"))?;
                         bytes += (cfg.heads * cfg.qk_nope_dim * cfg.kv_lora_rank * 2 / parts) as u64;
                         bytes += (cfg.heads * cfg.v_head_dim * cfg.kv_lora_rank * 2 / parts) as u64;
-                        bytes += fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], false, false)?;
-                        bytes += fp8_ranks(&[a("q_b_proj.weight")], parts, false)?
-                            + fp8_ranks(&[a("o_proj.weight")], parts, false)?;
+                        if core.get_weight(&a("q_a_proj")).is_some() {
+                            bytes += native[rank].iter().filter(|(name, _)| name.starts_with("self_attn."))
+                                .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+                        } else {
+                            bytes += fp8(&[a("q_a_proj.weight"), a("kv_a_proj_with_mqa.weight")], false, false)?;
+                            bytes += fp8_ranks(&[a("q_b_proj.weight")], parts, false)?
+                                + fp8_ranks(&[a("o_proj.weight")], parts, false)?;
+                        }
                         bytes += one(&a("indexer.wq_b.weight"))?;
                         bytes += ["wk.weight", "weights_proj.weight", "index_kpool_compress_gate"].iter()
                             .map(|s| elements(&a(&format!("indexer.{s}")))).collect::<Result<Vec<_>, _>>()?.into_iter().sum::<u64>() * 2;
@@ -117,7 +135,10 @@ pub fn resident_weights_placed(checkpoint: &Checkpoint, cfg: &GlmNextConfig, lay
             }
             let mlp = if cfg.dense[layer] { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
             let gate = format!("{mlp}.gate_proj.weight");
-            if cfg.dense[layer] && tensor(&gate)?.meta.dtype == DType::U8 {
+            if core.get_weight(&gate).is_some() {
+                bytes += native[rank].iter().filter(|(name, _)| name.starts_with("mlp."))
+                    .map(|(_, layout)| layout.bytes as u64).sum::<u64>();
+            } else if cfg.dense[layer] && tensor(&gate)?.meta.dtype == DType::U8 {
                 if rank == 0 {
                     for s in ["gate_proj", "up_proj", "down_proj"] {
                         bytes += one(&format!("{mlp}.{s}.weight"))?;

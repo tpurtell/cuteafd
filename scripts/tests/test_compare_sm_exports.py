@@ -126,7 +126,7 @@ def test_mla_draft_cross_sm_group_and_checkpoint_neutral_registry(monkeypatch):
 
 
 
-@pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage"])
+@pytest.mark.parametrize("geometry", ["glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage"])
 def test_glm_stage_cross_sm_groups(geometry):
     name = geometry.replace("_", "-")
     job = next(job for job in compare_sm.jobs("all") if job[0] == name)
