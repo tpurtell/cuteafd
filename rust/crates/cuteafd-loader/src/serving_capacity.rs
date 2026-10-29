@@ -22,7 +22,7 @@ pub mod glm_graphs;
 pub mod glmf_graphs;
 mod glmf_workspace;
 pub use glmf_workspace::{glmf_expert_rows, glmf_lane_bytes, glmf_manifest_scratch, glmf_selector_bytes,
-    glmf_step_scratch,
+    glmf_step_scratch, glmf_core_step_scratch, GlmfCoreScratch,
     glmf_step_workspaces, glmf_table_pages, glmf_temporary_bytes, GlmfKdaState, GlmfLaneBytes, GlmfMissingProgram,
     GlmfScratch, GlmfScratchOptions, GlmfStepShape, GlmfStepWorkspaces, GlmfTemporaryBytes, GLMF_DECODE_ROWS,
     GLMF_HEAD_WORKSPACE, GLMF_SPARSE_TOPK, GLMF_WIDE_DECODE_ROWS};

@@ -57,7 +57,7 @@ use cuteafd_ffi::programs::{Programs, Scalar, VocabularyHead};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors;
 use cuteafd_loader::families::glm5_flash::{GlmNextAttention, GlmNextConfig};
-use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_step_scratch, glmf_step_workspaces, glmf_table_pages,
+use cuteafd_loader::serving_capacity::{glmf_lane_bytes, glmf_core_step_scratch, GlmfCoreScratch, glmf_step_workspaces, glmf_table_pages,
     glmf_temporary_bytes, GlmfKdaState, GlmfScratchOptions, GlmfStepShape};
 use crate::shared::spark_intake::SparkLink;
 use cuteafd_transport::expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
@@ -845,6 +845,7 @@ pub(crate) struct StepPlan<'p, 'a> {
     programs: &'a Programs<'a>,
     cfg: &'p GlmNextConfig,
     scratch: GlmfScratchOptions,
+    native: GlmfCoreScratch,
     /// Rank 0's shape (rank 1 is not the lead and runs no experts).
     shape: GlmfStepShape,
     /// Rows of the decode workspace (`--decode-rows`): it runs the `_m64` programs, and with 128 the
@@ -903,6 +904,13 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             library,
             programs,
             cfg,
+            native: GlmfCoreScratch {
+                kda: layers.iter().filter(|l| l.attention == GlmNextAttention::Kda)
+                    .all(|l| l.core.contains_key("self_attn.q_proj")),
+                mla: layers.iter().filter(|l| l.attention == GlmNextAttention::Mla && l.attention_share.present())
+                    .all(|l| l.core.contains_key("self_attn.q_a_proj")),
+                ffn: layers.iter().all(core::native_ffn),
+            },
             scratch: GlmfScratchOptions { split, kda_w8: layers.iter().any(|layer| layer.has("w_in_fp8")),
                 kda_fp32_partials: settings.kda_fp32_partials, kda_output_shard: settings.kda_output_shard,
                 kda_prefill_expanded: settings.kda_prefill_expanded, index_compact,
@@ -930,8 +938,8 @@ impl<'p, 'a> StepPlan<'p, 'a> {
     pub(crate) fn workspace_bytes(&self, rank: usize, prefill_rows: usize, lanes: usize) -> Result<u64> {
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let decode_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, self.decode_rows as u64, true)?;
-        let mut prefill_scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false)?;
+        let decode_scratch = glmf_core_step_scratch(lookup, self.cfg, self.scratch, self.decode_rows as u64, true, self.native)?;
+        let mut prefill_scratch = glmf_core_step_scratch(lookup, self.cfg, self.scratch, prefill_rows as u64, false, self.native)?;
         if rank == 0 {
             // The prefill scratch also holds the replay records (`--replay-records shared`).
             prefill_scratch.programs = prefill_scratch.programs.max(self.shared_records);
@@ -940,15 +948,15 @@ impl<'p, 'a> StepPlan<'p, 'a> {
             decode_scratch, prefill_scratch).device_bytes())
     }
 
-    fn key(&self) -> (GlmfScratchOptions, GlmfStepShape, usize, u64) {
-        (self.scratch, self.shape, self.decode_rows, self.shared_records)
+    fn key(&self) -> (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64) {
+        (self.scratch, self.native, self.shape, self.decode_rows, self.shared_records)
     }
 }
 
 /// A GPU's step workspaces allocated before its engine (eager start-up): the decode workspace and
 /// every prefill lane, so the KV pool is sized from the memory they leave.
 pub(crate) struct StepWorkspaces<'a> {
-    key: (GlmfScratchOptions, GlmfStepShape, usize, u64),
+    key: (GlmfScratchOptions, GlmfCoreScratch, GlmfStepShape, usize, u64),
     rows: usize,
     decode: Workspace<'a>,
     lanes: Vec<Workspace<'a>>,
@@ -993,7 +1001,7 @@ impl<'a> StepPlan<'_, 'a> {
         let shape = self.shape(rank);
         let lookup = |name: &str| self.programs.spec(name).ok()
             .map(|spec| spec.scratch.get("scratch").copied().unwrap_or(0));
-        let mut scratch = glmf_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode)?;
+        let mut scratch = glmf_core_step_scratch(lookup, self.cfg, self.scratch, rows as u64, decode, self.native)?;
         if rank == 0 && !decode {
             // The prefill scratch also holds the replay records (`--replay-records shared`).
             scratch.programs = scratch.programs.max(self.shared_records);

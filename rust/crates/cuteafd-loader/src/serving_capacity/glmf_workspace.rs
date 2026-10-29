@@ -71,6 +71,32 @@ pub struct GlmfScratchOptions {
     pub kda_state: GlmfKdaState,
 }
 
+/// Fused projection groups fully replaced by separately admitted native core stages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GlmfCoreScratch {
+    pub kda: bool,
+    pub mla: bool,
+    pub ffn: bool,
+}
+
+/// Native groups own their projection/stage scratch in `CoreCharges`, not the fused arena.
+/// Keep indexer, sparse attention, mHC and top-k scratch for native dense cores.
+pub fn glmf_core_step_scratch(lookup: impl Fn(&str) -> Option<u64>, cfg: &GlmNextConfig,
+    options: GlmfScratchOptions, rows: u64, decode: bool, native: GlmfCoreScratch)
+    -> Result<GlmfScratch, GlmfMissingProgram> {
+    glmf_step_scratch(|name| {
+        let stem = name.strip_prefix("glmf2_").or_else(|| name.strip_prefix("glmf_")).unwrap_or(name);
+        if (native.kda && stem.starts_with("kda_"))
+            || (native.mla && (stem.starts_with("mla_producer_") || stem.starts_with("o_")))
+            || (native.ffn && stem.starts_with("ffn_i")) { Some(0) } else { lookup(name) }
+    }, cfg, GlmfScratchOptions {
+        kda_fp32_partials: options.kda_fp32_partials && !native.kda,
+        kda_output_shard: options.kda_output_shard && !native.kda,
+        kda_prefill_expanded: options.kda_prefill_expanded && !native.kda,
+        ..options
+    }, rows, decode)
+}
+
 /// The storage of GLM 5.3 Flash's KDA recurrent state (`--kda-state`). Every KDA program computes
 /// in FP32; a BF16 state has programs of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -387,6 +413,30 @@ pub fn glmf_step_workspaces(cfg: &GlmNextConfig, lanes: usize, lane_rows: u64, d
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_groups_drop_only_their_fused_scratch_and_package_requirement() {
+        let cfg = glm53_flash();
+        let native = GlmfCoreScratch { kda: true, mla: true, ffn: true };
+        for split in [false, true] {
+            for (rows, decode) in [(64, true), (128, true), (64, false), (4096, false)] {
+                let options = GlmfScratchOptions { split, kda_fp32_partials: split, ..Default::default() };
+                let lookup = |name: &str| {
+                    let stem = name.strip_prefix("glmf2_").or_else(|| name.strip_prefix("glmf_")).unwrap();
+                    if stem.starts_with("kda_") || stem.starts_with("mla_producer_")
+                        || stem.starts_with("o_") || stem.starts_with("ffn_i") { None }
+                    else { Some(if stem.starts_with("index_topk_") { 17 } else { 23 }) }
+                };
+                assert_eq!(glmf_core_step_scratch(lookup, &cfg, options, rows, decode, native).unwrap(),
+                    GlmfScratch { programs: 23, topk: 17 });
+                assert!(glmf_step_scratch(lookup, &cfg, options, rows, decode).is_err());
+                for mask in [GlmfCoreScratch { kda: false, ..native }, GlmfCoreScratch { mla: false, ..native },
+                    GlmfCoreScratch { ffn: false, ..native }] {
+                    assert!(glmf_core_step_scratch(lookup, &cfg, options, rows, decode, mask).is_err());
+                }
+            }
+        }
+    }
 
     /// The GLM programs' scratch at capacity of our first own build (slot `base`,
     /// `work/p0` c3e5de13 exported on an RTX 5090): `glmf_*` single-GPU programs.
