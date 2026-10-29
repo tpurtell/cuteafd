@@ -859,7 +859,7 @@ fn spawned_gathers_complete_into_caller_storage() -> TestResult {
 fn residency_overhead_measurement() -> TestResult {
     use std::hint::black_box;
     let number = |name: &str, default: usize| -> std::result::Result<usize, Box<dyn std::error::Error>> {
-        Ok(std::env::var(name).map(|value| value.parse()).transpose()?.unwrap_or(default))
+        Ok(std::env::var(name).ok().map(|value| value.parse()).transpose()?.unwrap_or(default))
     };
     let width = number("MAPPED_BENCH_WIDTH", 256)?;
     let count = number("MAPPED_BENCH_ROWS", 121_465)?;
@@ -896,6 +896,25 @@ fn residency_overhead_measurement() -> TestResult {
     assert_eq!(delta.page_misses, 0, "warm benchmark must not measure table I/O");
     assert_eq!(delta.late_major_faults, 0, "resident pages faulted during copies");
     assert_eq!(delta.page_hits, (count * repeats) as u64);
+    if std::env::var_os("MAPPED_BENCH_WRAPPER").is_some() {
+        let gather = crate::shared::token_table::RowGather::new("mapped-bench", 16)?;
+        gather.gather_slots(&table, &ids, &slots, &mut output)?;
+        let before = table.stats().snapshot();
+        let wrapped = Instant::now();
+        for _ in 0..repeats {
+            gather.gather_slots(&table, black_box(&ids), &slots, black_box(&mut output))?;
+        }
+        let wrapped = wrapped.elapsed();
+        let wrapped_delta = table.stats().snapshot().since(&before);
+        assert_eq!(wrapped_delta.page_misses, 0, "wrapper benchmark must not measure table I/O");
+        assert_eq!(wrapped_delta.late_major_faults, 0);
+        assert_eq!(wrapped_delta.page_hits, (count * repeats) as u64);
+        eprintln!("mapped_wrapper backend={:?} rows={count} width={width} repeats={repeats} parallel={} direct_us={:.3} wrapped_us={:.3} residency_us={:.3} hits={} misses={} late_faults={}",
+            table.backend(), crate::shared::token_table::RowGather::parallel(count * width),
+            full.as_secs_f64() * 1e6 / repeats as f64, wrapped.as_secs_f64() * 1e6 / repeats as f64,
+            wrapped_delta.residency_ns as f64 / repeats as f64 / 1e3,
+            wrapped_delta.page_hits, wrapped_delta.page_misses, wrapped_delta.late_major_faults);
+    }
     let copying = Instant::now();
     for _ in 0..repeats {
         for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
