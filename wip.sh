@@ -1664,17 +1664,50 @@ CONTAINER
 fi
 }
 
+# wip_distribute_locks: the serving locks of the distribution targets (sparks for
+# the four fabric ranks, rhea and moa their own), so a transfer never lands in
+# another job's card run. A seed's own lock is not needed: it only reads.
+wip_distribute_locks() {
+  local host
+  local -a locks=()
+  for host in "${wip_target_hosts[@]}"; do locks+=("$(wip_seed_lock "$host")"); done
+  ((${#locks[@]})) || return 0
+  printf '%s\n' "${locks[@]}" | sort -u | paste -sd, -
+}
+
 # The seed container was stopped when its lease ended. Distribution uses only
-# tar/file operations; stop the seed again even when transfer fails.
+# tar/file operations; stop the seed again even when transfer fails. It runs
+# in a fair hwlock turn on the targets' serving locks, unless the caller
+# already holds them (CUTEAFD_HW_LOCKS_HELD).
 wip_distribute_sealed_expert() (
   ((wip_spark_leg)) || return 0
-  local running
+  local running locks lock missing=""
   running="$(ssh -o BatchMode=yes "$seed_host" "docker inspect -f '{{.State.Running}}' '$spark_container'")"
   if [[ "$running" != true ]]; then
     ssh -o BatchMode=yes "$seed_host" "docker start '$spark_container' >/dev/null"
     trap 'ssh -o BatchMode=yes "$seed_host" "docker stop -t 10 \"$spark_container\" >/dev/null"' EXIT
   fi
   wip_check_expert_readiness
+  locks="$(wip_distribute_locks)"
+  for lock in ${locks//,/ }; do
+    [[ ",${CUTEAFD_HW_LOCKS_HELD:-}," == *",$lock,"* ]] || missing+="${missing:+,}$lock"
+  done
+  if [[ -z "$missing" ]]; then
+    distribute_expert_slot
+    return
+  fi
+  local wait_seconds="${CUTEAFD_WIP_DISTRIBUTE_WAIT_S:-14400}" lock_dir="$HOME/.cache/cuteafd" fd
+  [[ "$wait_seconds" =~ ^[1-9][0-9]*$ ]] || release_die "CUTEAFD_WIP_DISTRIBUTE_WAIT_S must be positive seconds"
+  echo "WIP Spark distribution: waiting for a fair turn on $missing (${wait_seconds}s)"
+  # As release_with_export_locks: queue fairly, then hold the flocks (canonical
+  # order) on this subshell's descriptors for the transfer only.
+  python3 "$repo_root/scripts/hw/hwlock.py" --locks "$missing" --wait "$wait_seconds" -- true ||
+    release_die "no fair turn on $missing for Spark WIP slot distribution within ${wait_seconds}s"
+  for lock in sparks rhea moa; do
+    [[ ",$missing," == *",$lock,"* ]] || continue
+    exec {fd}>"$lock_dir/$lock.lock"
+    flock -w "$wait_seconds" "$fd" || release_die "timed out waiting for $lock.lock"
+  done
   distribute_expert_slot
 )
 

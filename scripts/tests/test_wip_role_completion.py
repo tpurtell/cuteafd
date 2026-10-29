@@ -446,6 +446,7 @@ def test_distribution_stops_only_seed_it_restarted(tmp_path, running):
 wip_spark_leg=1 seed_host=fixture spark_container=owned
 ssh() {{ echo "$*" >> '{trace}'; [[ $* != *inspect* ]] || echo {running}; }}
 wip_check_expert_readiness() {{ :; }}
+wip_distribute_locks() {{ :; }}
 distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
 """
     result = subprocess.run(['bash', '-c', setup + helper + '\nwip_distribute_sealed_expert'], capture_output=True, text=True, timeout=10)
@@ -454,3 +455,58 @@ distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
     assert 'distribute' in calls
     assert ('docker stop' in calls) == (running == 'false')
     assert ('docker start' in calls) == (running == 'false')
+
+
+def _distribution_script(tmp_path, held, targets):
+    text = (ROOT / 'wip.sh').read_text()
+    start = text.index('wip_distribute_locks() {')
+    helpers = text[start:text.index('\nwip_build_selected_roles() {')]
+    seed_lock = text[text.index('wip_seed_lock() {'):text.index('# Try a configured remote exporter first')]
+    trace = tmp_path / 'trace'
+    hw = tmp_path / 'scripts/hw'
+    hw.mkdir(parents=True)
+    # A fake fair queue: record the requested locks, grant at once.
+    (hw / 'hwlock.py').write_text(f"""import sys
+open({str(trace)!r}, 'a').write('turn ' + sys.argv[sys.argv.index('--locks') + 1] + '\\n')
+""")
+    home = tmp_path / 'home'
+    (home / '.cache/cuteafd').mkdir(parents=True)
+    probe = (f"flock -n {home}/.cache/cuteafd/sparks.lock true && echo sparks-free >> '{trace}' "
+             f"|| echo sparks-held >> '{trace}'")
+    return trace, home, f"""set -euo pipefail
+repo_root='{tmp_path}' wip_spark_leg=1 seed_host=kakapo spark_container=owned
+wip_target_hosts=({' '.join(targets)})
+CUTEAFD_HW_LOCKS_HELD='{held}'
+release_is_lan_seed() {{ [[ $1 == kakapo || $1 == cassowary ]]; }}
+release_die() {{ echo "die: $*" >> '{trace}'; exit 1; }}
+ssh() {{ echo true; }}
+wip_check_expert_readiness() {{ :; }}
+distribute_expert_slot() {{ {probe}; echo distribute >> '{trace}'; }}
+{seed_lock}
+{helpers}
+wip_distribute_sealed_expert
+"""
+
+
+@pytest.mark.parametrize('targets, locks', [
+    (['ostrich', 'dodo', 'emu'], 'sparks'),
+    (['ostrich', 'rhea', 'moa'], 'moa,rhea,sparks'),
+    (['rhea'], 'rhea'),
+])
+def test_distribution_takes_a_fair_turn_on_the_targets_serving_locks(tmp_path, targets, locks):
+    trace, home, script = _distribution_script(tmp_path, '', targets)
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=20,
+                            env={**os.environ, 'HOME': str(home)})
+    assert result.returncode == 0, result.stderr
+    calls = trace.read_text().splitlines()
+    assert calls[0] == 'turn ' + locks
+    # The flock is held across the transfer, and only there.
+    assert calls[1:] == (['sparks-held'] if 'sparks' in locks else ['sparks-free']) + ['distribute']
+
+
+def test_distribution_under_held_locks_takes_no_second_turn(tmp_path):
+    trace, home, script = _distribution_script(tmp_path, 'sparks,gpu1', ['ostrich', 'dodo'])
+    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=20,
+                            env={**os.environ, 'HOME': str(home)})
+    assert result.returncode == 0, result.stderr
+    assert trace.read_text().splitlines() == ['sparks-free', 'distribute']

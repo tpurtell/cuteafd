@@ -370,7 +370,7 @@ printf '%s|%s|%s\\n' "${wip_target_hosts[*]}" "${wip_container_hosts[*]}" "$wip_
     assert result.stdout.splitlines() == ['ostrich dodo|kakapo ostrich dodo|0', 'ostrich|ostrich dodo|1']
     # Distribution and fingerprint checks iterate the targets; containers, process
     # checks and --recreate cover the seed's build container too.
-    assert WIP.count('for host in "${wip_target_hosts[@]}"; do') == 3
+    assert WIP.count('for host in "${wip_target_hosts[@]}"; do') == 4
     assert WIP.count('"${wip_container_hosts[@]}"') == 6
 
 
