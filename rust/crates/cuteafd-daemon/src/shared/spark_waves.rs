@@ -43,10 +43,11 @@
 //! operations is invisible to its scheduler, and a small H2D may read its
 //! host source when queued; a kernel reads and writes when it runs. A lazily
 //! loaded kernel's first launch can wait for the device to idle, so a first
-//! launch behind a pending wait stalls the engine thread until the worker
-//! releases that wait (a one-time stall, not a deadlock: the worker never
-//! waits on the engine). [`Waves::start`] preloads the exchange's own kernels
-//! so its steady path never stalls that way.
+//! launch behind a pending wait stalls the engine thread until that wait is
+//! released, and for good when the release depends on the stalled thread
+//! (the first Engram dequantization of a cold-start request hung a
+//! 0-RTX-layer prefill this way). [`Waves::start`] loads every registered
+//! native kernel before any wait exists.
 //!
 //! The worker queues no GPU work at all. A stream memory wait stalls its
 //! hardware queue, and streams share queues, so a wait released by GPU work
@@ -887,9 +888,13 @@ impl<'a> Waves<'a> {
         let pulls = pull_block.as_ref().map(|block| Pulls { base: block.buffer.ptr as usize });
         let arena_alias = arenas.iter().map(|arena| library.cuda_host_buffer_device_alias(arena.host())
             .map(|alias| alias.ptr as usize)).collect::<Result<Vec<_>>>()?;
-        // The exchange's own kernels load now, with nothing pending: a lazily
-        // loaded kernel's first launch behind a pending wait stalls the engine
-        // thread until the worker releases that wait.
+        // Every registered native kernel loads now, with nothing pending: a
+        // lazily loaded kernel's first launch behind a pending wait stalls the
+        // engine thread, for good when the wait's release depends on it.
+        let started = std::time::Instant::now();
+        library.tp2_native_initialize()?;
+        tracing::info!(elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "native kernels loaded before Spark waits");
         library.peer_exchange_initialize()?;
         warm_reducer(library, &intake)?;
         let timeout = transport.timeout();
