@@ -7,6 +7,14 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 pub(super) const MAX_BATCH: usize = 4096;
+/// io-wq workers per ring, bounded and unbound. A miss that NOWAIT cannot
+/// serve runs on an io-wq worker, and the kernel default allows up to
+/// min(entries, 4 x CPUs) of them for each submitting thread. Cold Engram
+/// rows read through FUSE once grew one coordinator to its container slice's
+/// 16,384-task limit, and unrelated thread spawns then failed with EAGAIN.
+/// Eight per ring still keeps hundreds of misses in flight across the
+/// gather pools.
+pub(super) const IOWQ_MAX_WORKERS: u32 = 8;
 thread_local! { static RING: RefCell<Option<IoUring>> = const { RefCell::new(None) }; }
 #[cfg(test)]
 thread_local! { static SETUP_FAILURE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
@@ -172,7 +180,25 @@ fn new_ring(entries: u32) -> Result<IoUring> {
             std::io::Error::from_raw_os_error(-result),
         ));
     }
+    // Bound io-wq before any buffered read can block; a ring without the
+    // bound is refused (the caller falls back to mmap).
+    let mut workers = [IOWQ_MAX_WORKERS; 2];
+    ring.submitter()
+        .register_iowq_max_workers(&mut workers)
+        .map_err(|error| io("io_uring IOWQ_MAX_WORKERS", error))?;
     Ok(ring)
+}
+
+/// The io-wq worker bounds a fresh ring carries (zero entries query without
+/// changing them).
+#[cfg(test)]
+pub(super) fn ring_worker_bounds() -> Result<[u32; 2]> {
+    let ring = new_ring(2)?;
+    let mut bounds = [0; 2];
+    ring.submitter()
+        .register_iowq_max_workers(&mut bounds)
+        .map_err(|error| io("io_uring IOWQ_MAX_WORKERS query", error))?;
+    Ok(bounds)
 }
 
 /// Checks both ring setup (including seccomp) and this file's buffered NOWAIT

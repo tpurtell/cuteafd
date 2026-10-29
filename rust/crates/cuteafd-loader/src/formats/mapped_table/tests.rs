@@ -179,6 +179,20 @@ fn unclassified_waves_count_batches_not_rows() -> TestResult {
 }
 
 #[test]
+fn every_ring_bounds_its_io_wq_workers() -> TestResult {
+    let (_dir, parts) = parted([3, 3, 2])?;
+    // SAFETY: this test owns the immutable shards until the probe returns.
+    let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.initialize_reads();
+    if table.backend() != TableBackend::MincoreRouted {
+        eprintln!("SKIP io-wq bounds: kernel/seccomp disallows io_uring");
+        return Ok(());
+    }
+    assert_eq!(uring::ring_worker_bounds()?, [uring::IOWQ_MAX_WORKERS; 2]);
+    Ok(())
+}
+
+#[test]
 fn buffered_uring_matches_mmap_across_unaligned_parts_and_duplicates() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: the test owns immutable shards until both tables are dropped.

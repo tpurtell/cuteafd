@@ -717,6 +717,7 @@ impl MappedTable {
         self.stats.uring.store(available, Ordering::Relaxed);
         self.stats.nowait.store(self.parts.iter().all(|part| part.nowait.load(Ordering::Relaxed)), Ordering::Relaxed);
         tracing::info!(backend = %self.backend(), max_ring_entries = uring::MAX_BATCH,
+            iowq_max_workers = uring::IOWQ_MAX_WORKERS,
             accounting = self.stats.accounting(),
             reason = if !available { "io_uring unavailable" }
                 else if !self.stats.nowait.load(Ordering::Relaxed) { "resident memcpy and concurrent buffered misses where NOWAIT unsupported" }
