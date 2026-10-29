@@ -287,7 +287,7 @@ mod tests {
             }
         }
         for (ranks, prefix) in [(1, "glmf"), (2, "glmf2")] {
-            for (cap, mode, rows) in [("m64", "decode", 64), ("m4096", "prefill", 4096)] {
+            for (cap, mode, decode) in [("m64", "decode", true), ("m4096", "prefill", false)] {
                 let mut names = vec![format!("{prefix}_mhc_pre"), format!("{prefix}_mhc_post_pre_{cap}"),
                     format!("{prefix}_kda_{cap}"), format!("{prefix}_kda_w8_{cap}"),
                     format!("{prefix}_kda_w8_expanded_{cap}"), format!("{prefix}_kda_w8_f32_{cap}"),
@@ -298,7 +298,7 @@ mod tests {
                 for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate / ranks] {
                     names.push(format!("{prefix}_ffn_i{inter}_{cap}"));
                 }
-                names.extend(super::super::core_admission::stage_names(cfg, ranks, false, rows, 64));
+                names.extend(super::super::core_admission::route_stage_names(cfg, ranks, false, decode, 64));
                 for name in names { programs.insert(name.clone(), json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})); }
             }
         }

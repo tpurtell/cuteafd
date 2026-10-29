@@ -747,7 +747,9 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert body.index("engine.install_tp2(ranks)?") < body.index("engine.install_workspaces(workspaces)?")
     admission = source[source.index("    fn admit("):source.index("    pub fn with_engine<")]
     assert "solve_attention_working_set_with_graphs(" in admission
-    assert "let local_workspace = workspaces(false, lanes);" in admission
+    assert "let mut local_workspace = workspaces(false, lanes);" in admission
+    assert "for profile in [&mut workspace, &mut local_workspace]" in admission
+    assert "core.bytes(self.cfg.hidden)?" in admission and '"native K6 core"' in admission
     assert "configured_prefill_waves(" not in admission
     assert "admitted_prefill_waves(attention.mode, args.prefill_waves as u64)?" in admission
     assert body.index("resolve_prefill(") < body.index("self.admit(")
