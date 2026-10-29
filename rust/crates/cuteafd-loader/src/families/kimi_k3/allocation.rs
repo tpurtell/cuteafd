@@ -342,8 +342,8 @@ pub fn prefill_shape_with(rows: usize, waves: usize, unit: Option<usize>)
     Ok(crate::serving_capacity::PrefillShape { unit_rows: plan.unit_rows, waves: plan.waves })
 }
 
-pub fn exchange_demand(rows: usize, rank: u8, f32_partials: bool, progress: usize) -> Result<Demand> {
-    let recv = super::core::exchange_recv_bytes(rows, f32_partials)?;
+pub fn exchange_demand(rows: usize, rank: u8, progress: usize) -> Result<Demand> {
+    let recv = super::core::exchange_recv_bytes(rows)?;
     let bytes = recv + 256 + 256 + (((crate::placement::HOP_SLOTS + 1) * 16) as usize).max(256) + progress;
     Ok(Demand::new(rank, Category::Workspace, "Kimi peer/abort/hop controls", bytes as u64, Basis::Exact))
 }
@@ -398,7 +398,7 @@ pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
             io_extents(cfg.vocab_size, rank, rows, core.get_weight("language_model.lm_head").is_some())
                 .into_iter().sum::<usize>() as u64, Basis::Exact));
         demands.push(graph_demand(&graphs, rank));
-        demands.push(exchange_demand(unit, rank as u8, super::core::needs_f32_partials(cfg, core), 0)?);
+        demands.push(exchange_demand(unit, rank as u8, 0)?);
         // Active state and retained marks are charged by the caller's mark policy.
         demands.extend(kda_demands(cfg, slots, 1, 1, rank as u8)?.into_iter()
             .filter(|d| d.category == Category::Workspace));

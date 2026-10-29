@@ -831,7 +831,7 @@ pub(super) mod tests {
                     headroom_bytes: 2 << 30, baseline: Baseline::Measured { free_bytes: free[rank] } });
                 i.state_slots = 8; i.prefix_marks = 1; i.lanes = 1; i.requested_pool = Some(1 << 20);
                 i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, 4096, 4096, context, scratch).unwrap())];
-                i.fixed = startup::exchange_demands(4096, false, false)?;
+                i.fixed = startup::exchange_demands(4096, false)?;
                 for rank in 0..2 { i.fixed.push(startup::code_demand(rank, 71_303_168, 71_303_168, 1)?); }
                 if enabled {
                     i.fixed.extend(super::super::draft::bridge_demands(&draft, i.rows)?);
@@ -1161,12 +1161,10 @@ pub(super) mod tests {
         assert!(!automatic.hints.iter().any(|hint| hint.what.contains("prefill reserve does not fit")));
         assert_eq!((automatic.prefill_unit_rows, automatic.prefill_waves), (Some(2752), Some(3)));
         let unit = automatic.prefill_unit_rows.context("planned Kimi unit rows")? as usize;
-        for f32_partials in [false, true] {
-            let receive = cuteafd_loader::families::kimi_k3::core::exchange_recv_bytes(unit, f32_partials)?;
-            crate::shared::peer_split::validate_slot_sizes([0, 1], &[receive])?;
-            let demands = super::super::startup::exchange_demands(unit, false, f32_partials)?;
-            assert!(demands.iter().all(|demand| demand.bytes >= receive as u64));
-        }
+        let receive = cuteafd_loader::families::kimi_k3::core::exchange_recv_bytes(unit)?;
+        crate::shared::peer_split::validate_slot_sizes([0, 1], &[receive])?;
+        let demands = super::super::startup::exchange_demands(unit, false)?;
+        assert!(demands.iter().all(|demand| demand.bytes >= receive as u64));
         // The max config's remote DFlash bridge has control-only slots. Its
         // planner charge and runtime extents must agree before touching CUDA.
         use cuteafd_loader::placement::draft::{BRIDGE_SLOT_SIZES, BRIDGE_EXCHANGE_BYTES};
@@ -1236,7 +1234,7 @@ pub(super) mod tests {
             i.lanes = 1; i.state_slots = slots as usize; i.prefix_marks = marks as usize;
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&cfg, rows, test_unit(rows, i.waves, i.unit_rows), context,
                 allocation::NativeScratch::from_manifest(&manifest).unwrap()).unwrap())];
-            i.fixed = super::super::startup::exchange_demands(unit, false, false)?;
+            i.fixed = super::super::startup::exchange_demands(unit, false)?;
             i.startup = (0..2).map(|rank| super::super::graphs::demand(
                 &super::super::graphs::owned_inventory(&cfg, 1, unit, slots as usize, 0).unwrap().inventory, rank)).collect();
             for rank in 0..2 {

@@ -753,11 +753,11 @@ impl<'a> LocalLane<'a> {
     pub(crate) fn native_ffn(&self,layer:usize)->Result<bool> {Ok(self.layer(layer)?.is_core("ffn.down"))}
     fn attention_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
         if self.native_attention(layer)? && self.layer(layer)?.attention==crate::shared::placement::layers::AttentionShare::Split {
-            view(self.lane.buffer("K6 attention partial")?,0,rows*7168*4)
+            view(self.lane.buffer("K6 attention partial")?,0,rows*7168*2)
         } else {self.plane("attention output",rows,7168)}
     }
     fn ffn_result(&self,layer:usize,rows:usize)->Result<CuteafdDeviceBuffer> {
-        if self.native_ffn(layer)? {view(self.lane.buffer("K6 FFN partial")?,0,rows*7168*4)}
+        if self.native_ffn(layer)? {view(self.lane.buffer("K6 FFN partial")?,0,rows*7168*2)}
         else {self.plane("ffn output",rows,7168)}
     }
     fn attention_core(&self,layer:usize,rows:usize,speculative:bool)->Result<CuteafdDeviceBuffer> {
@@ -826,9 +826,7 @@ impl<'a> LocalLane<'a> {
                 projection.local(rows,normalized,weight,scratch,output,stream.raw)?;
             } else {
                 let partial=projection.core(rows,normalized,weight,scratch,stream.raw)?;
-                // SAFETY: disjoint lane-private partial survives shared-scratch
-                // reuse and is retained until the executor's peer meet completes.
-                unsafe {stream.device.library.copy_d2d_async(output,partial,rows*7168*4,stream.raw)?;}
+                crate::shared::dense_trellis::retain_partial(stream.device.library,partial,output,rows*7168,stream.raw)?;
             }
             Ok(output)
         })
@@ -843,13 +841,12 @@ impl<'a> LocalLane<'a> {
             let partial=super::core_runtime::ffn_projected(projected("ffn.gate")?,projected("ffn.up")?,projected("ffn.down")?,
                 &programs.situ,&programs.copy,rows,self.plane("normalized",rows,7168)?,self.lane.buffer("K6 FFN gate")?,
                 self.lane.buffer("K6 FFN up")?,self.lane.buffer("gate-up")?,self.lane.buffer("activated")?,self.stream().raw)?;
-            // SAFETY: the retained partial is disjoint from reusable scratch;
-            // the peer executor joins this exact lane before reading it.
-            unsafe {self.stream().device.library.copy_d2d_async(output,partial,rows*7168*4,self.stream().raw)?;}
+            crate::shared::dense_trellis::retain_partial(self.stream().device.library,partial,output,rows*7168,self.stream().raw)?;
             Ok(output)
         })
     }
-    /// Invoked on the exchange stream only after both F32 cores are published.
+    /// Both ranks narrow independently before publication. Sum their BF16
+    /// partials in rank order into F32, then run exactly one H128 egress.
     pub(crate) fn reduce_core(&self,layer:usize,ffn:bool,rows:usize,peer:CuteafdDeviceBuffer,
         destination:&str,stream:*mut std::ffi::c_void)->Result<()> {
         let weights=self.layer(layer)?;
@@ -859,7 +856,8 @@ impl<'a> LocalLane<'a> {
         let weight=weights.core(name)?;
         let programs=self.programs.core.as_ref().context("K6 programs not resolved")?;
         let local=if ffn {self.ffn_result(layer,rows)?}else{self.attention_result(layer,rows)?};
-        programs.projection(weight)?.reduced(&programs.add,rows,local,peer,self.lane.buffer("K6 reduced")?,
+        let (rank0,rank1)=if self.rank==0 {(local,peer)}else{(peer,local)};
+        programs.projection(weight)?.reduced(&programs.core_add,rows,rank0,rank1,self.lane.buffer("K6 reduced")?,
             weight,self.plane(destination,rows,7168)?,stream)
     }
 
@@ -1369,8 +1367,18 @@ mod tests {
     fn subwave_views_partition_persistent_rows_and_preserve_residual_planes() -> Result<()> {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for (rows, unit, waves) in [(4096, 1408, 1), (8192, 4096, 2), (8256, 2752, 3), (8192, 2048, 4)] {
-            let layout = LaneLayout::new(&cfg, rows, unit, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
+            let mut layout = LaneLayout::new(&cfg, rows, unit, 1_048_576, NativeScratch { kda: 16, mla: [16; 3] })?;
+            layout.base=layout.base.with_core_stages(cuteafd_loader::families::kimi_k3::core::
+                lane_extents(rows,unit,16,16,16,16)?)?;
             let windows = crate::shared::prefill_pipeline::prefill_units(rows, unit, waves, 256)?;
+            for name in cuteafd_loader::families::kimi_k3::allocation::CORE_MEET_PLANES {
+                let element=if name=="K6 reduced" {4}else{2};
+                assert_eq!(layout.operands[name],rows*7168*element);
+                for window in &windows {
+                    assert_eq!(subwave_extent(name,layout.operands[name],rows,window)?,
+                        (window.start*7168*element,window.len()*7168*element));
+                }
+            }
             assert_eq!(windows.len(), if waves == 1 { 3 } else { waves });
             for (&name, &bytes) in &layout.operands {
                 if layout.arena_offsets.contains_key(name) || ATTENTION_METADATA.contains(&name) { continue; }

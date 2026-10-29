@@ -32,8 +32,8 @@ pub fn split(stem: &str) -> Option<CoreSplit> {
 pub fn intermediate_extents(rows: usize, unit: usize) -> Result<BTreeMap<&'static str, usize>> {
     [("K6 q",6144,2),("K6 k",6144,2),("K6 v",6144,2),("K6 gate",12288,2),
         ("K6 q_a",1536,2),("K6 kv_a",640,2),("K6 q_b",18432,2),("K6 normalized",12288,2),
-        ("K6 FFN gate",3072,2),("K6 FFN up",3072,2),("K6 attention partial",7168,4),
-        ("K6 FFN partial",7168,4),("K6 reduced",7168,4)].into_iter()
+        ("K6 FFN gate",3072,2),("K6 FFN up",3072,2),("K6 attention partial",7168,2),
+        ("K6 FFN partial",7168,2),("K6 reduced",7168,4)].into_iter()
         .map(|(name,width,element)| {
             let rows = if super::allocation::CORE_MEET_PLANES.contains(&name) { rows } else { unit };
             Ok((name,rows.checked_mul(width*element).context("K6 lane intermediate overflow")?))
@@ -75,14 +75,9 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usi
     lane_extents(rows,unit,base_kda,base_mla,split_kda,split_mla)
 }
 
-pub fn needs_f32_partials(cfg: &KimiK3Config, core: &CoreInventory) -> bool {
-    (0..cfg.layers).any(|layer| ["self_attn.o_proj", "block_sparse_moe.shared_experts.down_proj"]
-        .iter().any(|leaf| core.get_weight(&format!("language_model.model.layers.{layer}.{leaf}")).is_some()))
-}
-
-pub fn exchange_recv_bytes(rows: usize, f32: bool) -> Result<usize> {
+pub fn exchange_recv_bytes(rows: usize) -> Result<usize> {
     ensure!((1..=4096).contains(&rows), "Kimi exchange row capacity");
-    Ok((rows * 7168 * if f32 {4} else {2}).max(256))
+    Ok((rows * 7168 * 2).max(256))
 }
 
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -107,7 +102,7 @@ impl CoreCharges {
         Ok(Self {
             projection: projection_scratch(cfg,core,unit,&manifest["families"]["dense_trellis_k6"] )?,
             stages, stage_bytes,
-            receive: exchange_recv_bytes(unit,needs_f32_partials(cfg,core))?,
+            receive: exchange_recv_bytes(unit)?,
         })
     }
     pub fn demands(&self) -> Result<Vec<crate::placement::Demand>> {
@@ -331,14 +326,39 @@ mod scratch_admission_tests {
         Ok(())
     }
     #[test]
+    fn retained_partials_are_bf16_but_meet_accumulates_f32() -> Result<()> {
+        for (rows,unit) in [(1,1),(64,64),(4096,4096),(8192,4096),(8256,2752)] {
+            let stages=intermediate_extents(rows,unit)?;
+            for name in ["K6 attention partial","K6 FFN partial"] {
+                assert_eq!(stages[name],rows*7168*2);
+            }
+            assert_eq!(stages["K6 reduced"],rows*7168*4);
+            assert_eq!(stages["K6 FFN gate"],unit*3072*2);
+            assert_eq!(exchange_recv_bytes(unit)?,unit*7168*2);
+            let delta=lane_extents(rows,unit,1024,4096,2048,2048)?;
+            let cfg=KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config())?;
+            let base=super::super::allocation::NativeLaneLayout::new(&cfg,rows,unit,1_048_576,
+                super::super::allocation::NativeScratch{kda:1024,mla:[4096;3]})?;
+            let native=base.clone().with_core_stages(delta)?;
+            for name in super::super::allocation::CORE_MEET_PLANES {
+                assert!(!native.arena_offsets.contains_key(name),"retained meet plane must not alias scratch");
+            }
+            let owners=native.bytes()?;
+            // The three retained row planes alone require 2 + 2 + 4 bytes per element.
+            assert!(owners>=base.bytes()?+rows*7168*8);
+        }
+        assert!(exchange_recv_bytes(0).is_err());
+        assert!(exchange_recv_bytes(4097).is_err());
+        Ok(())
+    }
+    #[test]
     fn native_scratch_bounds_partials_and_removes_materialized_weights() -> Result<()> {
         for rows in [1,8,16,63,64,129,130,4096] {
             let layout=ProjectionScratchLayout::new(7168,6144,rows)?;
             assert_eq!(layout.extents["partial"],rows.min(129)*7*6144*4);
             assert_eq!(layout.extents.len(),5);
             assert_eq!(layout.storage()?.owners["route arena"],layout.extents["partial"]);
-            assert_eq!(exchange_recv_bytes(rows,true)?,rows*7168*4);
-            assert_eq!(exchange_recv_bytes(rows,false)?,rows*7168*2);
+            assert_eq!(exchange_recv_bytes(rows)?,rows*7168*2);
         }
         assert!(ProjectionScratchLayout::new(7168,6144,0).is_err());
         let grouped=ProjectionScratchLayout::grouped(7168,6144,4096,4)?;

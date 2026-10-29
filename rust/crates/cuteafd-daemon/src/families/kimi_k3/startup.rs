@@ -56,7 +56,6 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         "Kimi target/draft cache records differ");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
-    let f32_partials = needs_f32_partials(cfg, &core);
     ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
         == Some(options.devices[1]), "Kimi TP2 requires bidirectional peer access");
     let devices = [options.devices[0], options.devices[1]].map(|id| Device { library, id });
@@ -123,7 +122,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         rows => rows,
     };
     let graph_set = options.graphs.then(|| super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows)).transpose()?;
-    let mut fixed = exchange_demands(unit, diagnostics, f32_partials)?;
+    let mut fixed = exchange_demands(unit, diagnostics)?;
     if let Some(layout) = &draft_layout {
         fixed.extend(super::draft::bridge_demands(layout, rows)?);
         fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
@@ -172,7 +171,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         .collect::<Vec<_>>();
     let streams = [Rc::new(Stream::new(devices[0])?), Rc::new(Stream::new(devices[1])?)];
     let ranks = streams.each_ref().map(|s| RankDevice { device: s.device.id, stream: s.raw });
-    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(unit,f32_partials)?))?;
+    let peer = devices[0].run(|| PeerExchange::new_abortable(library, ranks, 1, exchange_recv_bytes(unit)?))?;
     let mut hops = devices[0].run(|| HopLink::new(library, ranks, plan.hops(), plan.spec()))?;
     hops.attach_abort([peer.abort_word(0)?.context("Kimi missing abort owner")?,
         peer.abort_word(1)?.context("Kimi missing abort owner")?])?;
@@ -203,12 +202,12 @@ pub(super) fn code_demand(rank: usize, pending: u64, cublas_bytes: u64, lanes: u
     cuteafd_loader::families::kimi_k3::allocation::code_demand(rank, pending, cublas_bytes, lanes)
 }
 
-use cuteafd_loader::families::kimi_k3::core::{needs_f32_partials,exchange_recv_bytes};
+use cuteafd_loader::families::kimi_k3::core::exchange_recv_bytes;
 
-pub(super) fn exchange_demands(rows: usize, diagnostics: bool,f32_partials:bool) -> Result<Vec<Demand>> {
+pub(super) fn exchange_demands(rows: usize, diagnostics: bool) -> Result<Vec<Demand>> {
     let progress = if diagnostics { (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256) } else { 0 };
     (0..2).map(|rank| cuteafd_loader::families::kimi_k3::allocation::exchange_demand(
-        rows, rank, f32_partials, progress)).collect()
+        rows, rank, progress)).collect()
 }
 
 #[cfg(test)]
@@ -229,7 +228,6 @@ mod tests {
         let head="language_model.lm_head";
         core.projections.insert(head.into(),projection(head));
         core.validate_runtime_groups(&cfg)?;
-        assert!(!needs_f32_partials(&cfg,&core));
         let root="language_model.model.layers.1.self_attn";
         let stem=format!("{root}.q_proj");
         core.projections.insert(stem.clone(),projection(&stem));
@@ -239,25 +237,23 @@ mod tests {
             let stem=format!("{root}.{leaf}");core.projections.insert(stem.clone(),projection(&stem));
         }
         core.validate_runtime_groups(&cfg)?;
-        assert!(needs_f32_partials(&cfg,&core));
-        let mut prefix=cfg.clone();prefix.layers=1;
-        assert!(!needs_f32_partials(&prefix,&core));
         Ok(())
     }
 
     #[test]
-    fn f32_partial_receivers_and_admission_use_the_same_exact_extent()->Result<()> {
+    fn bf16_partial_receivers_and_admission_use_the_same_exact_extent()->Result<()> {
         for rows in [1,8,64,4096] {for diagnostics in [false,true] {
-            let old=exchange_demands(rows,diagnostics,false)?;
-            let native=exchange_demands(rows,diagnostics,true)?;
-            assert_eq!(exchange_recv_bytes(rows,true)?,rows*HIDDEN*4);
+            let native=exchange_demands(rows,diagnostics)?;
+            assert_eq!(exchange_recv_bytes(rows)?,rows*HIDDEN*2);
             for rank in 0..2 {
-                assert_eq!(native[rank].bytes-old[rank].bytes,(rows*HIDDEN*2) as u64);
+                let progress=if diagnostics {(2*std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256)}else{0};
+                assert_eq!(native[rank].bytes as usize,rows*HIDDEN*2+256+256
+                    +(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256)+progress);
                 assert_eq!(native[rank].basis,Basis::Exact);
             }
         }}
-        assert!(exchange_recv_bytes(0,true).is_err());
-        assert!(exchange_recv_bytes(4097,true).is_err());
+        assert!(exchange_recv_bytes(0).is_err());
+        assert!(exchange_recv_bytes(4097).is_err());
         Ok(())
     }
     #[test]

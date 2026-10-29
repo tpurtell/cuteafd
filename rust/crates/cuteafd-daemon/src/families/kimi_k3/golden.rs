@@ -773,7 +773,7 @@ mod tests {
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", 96 << 30);
         let names = programs.iter().filter_map(|p| p["name"].as_str()).collect::<Vec<_>>();
         let selected = cuteafd_loader::placement::ProgramSet::from_names(&["kimik3"], names);
-        let mut fixed = exchange_demands(rows, false,false)?;
+        let mut fixed = exchange_demands(rows, false)?;
         for rank in 0..2 {
             let code = cuteafd_loader::placement::inventory::loaded_code_allowance("kimik3", "exl3", true,
                 rank as u8, arch, Some(&selected));
@@ -861,7 +861,7 @@ mod tests {
     fn peer_exchange_fixed_charges_exclude_solver_owned_hop_planes() -> Result<()> {
         for rows in [1, 64, 4096] {
             for diagnostics in [false, true] {
-                let demands = exchange_demands(rows, diagnostics,false)?;
+                let demands = exchange_demands(rows, diagnostics)?;
                 let progress = if diagnostics {
                     (2 * std::mem::size_of::<cuteafd_ffi::peer_exchange::PeerProgress>()).max(256)
                 } else { 0 };
@@ -873,8 +873,8 @@ mod tests {
                 }
             }
         }
-        assert!(exchange_demands(0, false,false).is_err());
-        assert!(exchange_demands(4097, false,false).is_err());
+        assert!(exchange_demands(0, false).is_err());
+        assert!(exchange_demands(4097, false).is_err());
         Ok(())
     }
 

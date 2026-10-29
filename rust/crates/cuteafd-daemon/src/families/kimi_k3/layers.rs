@@ -508,14 +508,14 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
 
     fn publish_core(&self,ffn:bool)->Result<()> {
         let name=if ffn {"K6 FFN partial"}else{"K6 attention partial"};
-        ensure!(self.protocol.peer.slot_bytes()>=self.rows*7168*4,"Kimi K6 peer slot shorter than F32 hidden rows");
+        ensure!(self.protocol.peer.slot_bytes()>=self.rows*7168*2,"Kimi K6 peer slot shorter than BF16 hidden rows");
         for rank in 0..2 {
             self.protocol.producers(self.lane,rank)?;
-            self.protocol.peer.push(rank,self.lane,self.local[rank].buffer(name)?.ptr,self.rows*7168*4)?;
+            self.protocol.peer.push(rank,self.lane,self.local[rank].buffer(name)?.ptr,self.rows*7168*2)?;
         }
         Ok(())
     }
-    /// Native K6 FFN partials cross the peer link as F32; BF16 otherwise.
+    /// Native K6 and fused FFN partials both cross the peer link as BF16.
     fn publish_ffn(&self, layer: usize) -> Result<()> {
         if self.local[0].native_ffn(layer)? {
             ensure!(self.local[1].native_ffn(layer)?, "Kimi K6 FFN rank formats differ");
@@ -528,7 +528,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         for rank in 0..2 {
             self.protocol.peer.wait(rank,self.lane)?;
             let peer=CuteafdDeviceBuffer{ptr:self.protocol.peer.recv(rank,self.lane)?,
-                bytes:self.rows*7168*4,device_id:self.local[rank].stream().device.id,flags:0};
+                bytes:self.rows*7168*2,device_id:self.local[rank].stream().device.id,flags:0};
             self.protocol.peer.on(rank,||self.local[rank].reduce_core(layer,ffn,self.rows,peer,destination,
                 self.protocol.peer.stream(rank)))?;
             self.protocol.consumer(self.lane,rank)?;

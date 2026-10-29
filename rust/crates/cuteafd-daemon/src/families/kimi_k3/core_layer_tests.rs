@@ -122,6 +122,45 @@ fn compare(source:&Source,device:Device<'_>,actual:Buffer,reference:Buffer,count
     source.report(label,&bf16(&a),&bf16(&b))
 }
 
+fn check_retained_partial(device:Device<'_>,source:Buffer,retained:Buffer,count:usize)->Result<()> {
+    let mut f32_bytes=vec![0;count*4];let mut bf16_bytes=vec![0;count*2];
+    device.run(|| {
+        device.library.copy_d2h(&mut f32_bytes,source)?;
+        device.library.copy_d2h(&mut bf16_bytes,retained)
+    })?;
+    for (source,retained) in f32_bytes.chunks_exact(4).zip(bf16_bytes.chunks_exact(2)) {
+        let bits=u32::from_le_bytes(source.try_into().unwrap());
+        ensure!(f32::from_bits(bits).is_finite(),"K6 retained partial must be finite");
+        let expected=(bits.wrapping_add(0x7fff+((bits>>16)&1))>>16)as u16;
+        assert_eq!(u16::from_le_bytes(retained.try_into().unwrap()),expected,"K6 partial BF16 RNE");
+    }
+    Ok(())
+}
+
+fn compare_meet(device:Device<'_>,source:&Source,stream:&Stream<'_>,rows:usize,
+    ranks:&[(OwnedProjection<'_>,Allocation<'_>,Allocation<'_>)],label:&str)->Result<()> {
+    let add=device.run(||device.library.bf16_f32_add())?;
+    let reduced=zero(device,rows*7168*4)?;let combined=zero(device,rows*7168*2)?;
+    let (projection,rank0,_)=&ranks[0];let rank1=ranks[1].1.buffer;
+    let result=device.run(||projection.program.reduced(&add,rows,rank0.buffer,rank1,reduced.buffer,
+        &projection.weights,combined.buffer,stream.raw));
+    stream.drain_or_abort("K6 BF16 partial / F32 meet / H128 egress");result?;
+    let mut retained=[vec![0;rows*7168*2],vec![0;rows*7168*2]];
+    let mut references=retained.clone();
+    for rank in 0..2 {device.run(|| {
+        device.library.copy_d2h(&mut retained[rank],ranks[rank].1.buffer)?;
+        device.library.copy_d2h(&mut references[rank],ranks[rank].2.buffer)
+    })?;}
+    let mut sum=vec![0;rows*7168*4];device.run(||device.library.copy_d2h(&mut sum,reduced.buffer))?;
+    for ((a,b),actual) in bf16(&retained[0]).iter().zip(bf16(&retained[1])).zip(sum.chunks_exact(4)) {
+        assert_eq!(u32::from_le_bytes(actual.try_into().unwrap()),((*a as f32)+(b as f32)).to_bits(),
+            "K6 rank-ordered BF16 partials sum into F32");
+    }
+    let reference=bf16(&references[0]).iter().zip(bf16(&references[1])).map(|(a,b)|a+b).collect::<Vec<_>>();
+    let mut bytes=vec![0;rows*7168*2];device.run(||device.library.copy_d2h(&mut bytes,combined.buffer))?;
+    source.report(&format!("{label} rows={rows} BF16 partial F32 meet"),&bf16(&bytes),&reference)
+}
+
 fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:&Source,cfg:&KimiK3Config,rows:usize)->Result<()> {
     let stream=Stream::new(device)?;
     let x=upload(device,&input(rows,7168))?;
@@ -156,6 +195,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         let normalized=zero(device,rows*local_width*2)?;let normalized_ref=zero(device,normalized.buffer.bytes)?;
         let output_ref=zero(device,rows*h*2)?;
         let output=zero(device,rows*h*2)?;
+        let retained=zero(device,rows*h*2)?;
         let replay=zero(device,KimiKda::replay_bytes())?;let replay_ref=zero(device,replay.buffer.bytes)?;
         let scratch=zero(device,split.scratch_bytes())?;let scratch_ref=zero(device,fused.scratch_bytes())?;
         let slots=zero(device,rows*4)?;let first=zero(device,rows*4)?;
@@ -171,11 +211,13 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
                 normalized:normalized_ref.buffer,output:output_ref.buffer,replay:Some(replay_ref.buffer),scratch:scratch_ref.buffer},stream.raw)?;
             let partial=out_projection.core(rows,normalized.buffer,stream.raw)?;
             out_projection.program.program.output(rows,partial,out_projection.weights.svh.buffer,output.buffer,stream.raw)?;
+            crate::shared::dense_trellis::retain_partial(device.library,partial,retained.buffer,rows*h,stream.raw)?;
             Ok(partial)
         });
         stream.drain_or_abort("K6 full KDA case");let partial=result?;
-        // Per-rank egress here is diagnostic only; the runtime TP meet instead
-        // uses F32 reduce_output once after both rank cores are published.
+        check_retained_partial(device,partial,retained.buffer,rows*h)?;
+        // Per-rank egress is diagnostic only; the runtime narrows both cores
+        // independently, sums in F32 and runs one H128 egress after the meet.
         compare(source,device,output.buffer,output_ref.buffer,rows*h,&format!("KDA rank={rank} rows={rows} output"))?;
         compare(source,device,normalized.buffer,normalized_ref.buffer,rows*local_width,&format!("KDA rank={rank} rows={rows} normalized"))?;
         compare(source,device,conv.buffer,conv_ref.buffer,conv.buffer.bytes/2,&format!("KDA rank={rank} rows={rows} conv"))?;
@@ -238,18 +280,9 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         compare(source,device,control_conv.buffer,conv_ref.buffer,conv.buffer.bytes/2,&format!("BF16 control rank={rank} rows={rows} conv"))?;
         let mut control=vec![0;state.buffer.bytes];device.run(||device.library.copy_d2h(&mut control,control_state.buffer))?;
         source.report(&format!("BF16 control rank={rank} rows={rows} state"),&floats(&control),&floats(&b))?;
-        rank_cores.push((out_projection,partial,output_ref));
+        rank_cores.push((out_projection,retained,output_ref));
     }
-    let add=device.run(||device.library.f32_add())?;
-    let reduced=zero(device,rows*7168*4)?;let combined=zero(device,rows*7168*2)?;
-    let (projection,local,_)=&rank_cores[0];let peer=rank_cores[1].1;
-    let result=device.run(||projection.program.reduced(&add,rows,*local,peer,reduced.buffer,&projection.weights,combined.buffer,stream.raw));
-    stream.drain_or_abort("K6 diagnostic two-rank F32 meet");result?;
-    let mut references=[vec![0;rows*7168*2],vec![0;rows*7168*2]];
-    for (rank,bytes) in references.iter_mut().enumerate() {device.run(||device.library.copy_d2h(bytes,rank_cores[rank].2.buffer))?;}
-    let reference=bf16(&references[0]).iter().zip(bf16(&references[1])).map(|(a,b)|a+b).collect::<Vec<_>>();
-    let mut bytes=vec![0;rows*7168*2];device.run(||device.library.copy_d2h(&mut bytes,combined.buffer))?;
-    source.report(&format!("KDA rows={rows} F32 meet"),&bf16(&bytes),&reference)?;
+    compare_meet(device,source,&stream,rows,&rank_cores,"KDA")?;
     Ok(())
 }
 
@@ -350,7 +383,7 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
             && truth_input.bytes==input_bytes,"F64 FFN truth must use identical input bytes");
     }
     let input=upload(device,&input_bytes)?;
-    let mut native=Vec::new();let mut refs=Vec::new();
+    let mut rank_cores=Vec::new();
     for (rank,packed) in packed.iter().enumerate() {
         let stem=format!("language_model.model.layers.{layer}.block_sparse_moe.shared_experts");
         let gate=source.projection(device,programs,&format!("{stem}.gate_proj"),"shared_gate_up_tp2",TrellisSide::Output,rank,2,64)?;
@@ -361,15 +394,18 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
         let gate_up=zero(device,rows*6144*2)?;let gate_up_ref=zero(device,rows*6144*2)?;
         let activated=zero(device,rows*3072*2)?;let activated_ref=zero(device,rows*3072*2)?;
         let output=zero(device,rows*7168*2)?;let reference=zero(device,rows*7168*2)?;
+        let retained=zero(device,rows*7168*2)?;
         let result=device.run(|| {
             let partial=super::core_runtime::ffn_projected(gate.projected(),up.projected(),down.projected(),&situ,&copy,rows,
                 input.buffer,gate_out.buffer,up_out.buffer,gate_up.buffer,activated.buffer,stream.raw)?;
             down.program.program.output(rows,partial,down.weights.svh.buffer,output.buffer,stream.raw)?;
+            crate::shared::dense_trellis::retain_partial(device.library,partial,retained.buffer,rows*7168,stream.raw)?;
             fused.launch(KimiFfnBatch{rows,input:input.buffer,gate_up_weight:gate_weight.buffer,down_weight:down_weight.buffer,
                 gate_up:gate_up_ref.buffer,activated:activated_ref.buffer,output:reference.buffer},stream.raw)?;
-            Ok(())
+            Ok(partial)
         });
-        stream.drain_or_abort("K6 shared FFN case");result?;
+        stream.drain_or_abort("K6 shared FFN case");let partial=result?;
+        check_retained_partial(device,partial,retained.buffer,rows*7168)?;
         compare(source,device,activated.buffer,activated_ref.buffer,rows*3072,&format!("layer={layer} FFN rank={rank} rows={rows} activation"))?;
         compare(source,device,output.buffer,reference.buffer,rows*7168,&format!("layer={layer} FFN rank={rank} rows={rows} output"))?;
         if rows==1 {
@@ -385,8 +421,9 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
                 compare_ffn_truth(source,device,bf16,count,layer,rank,stage,"bf16")?;
             }
         }
-        native.push(output);refs.push(reference);
+        rank_cores.push((down,retained,reference));
     }
+    compare_meet(device,source,&stream,rows,&rank_cores,&format!("layer={layer} FFN"))?;
     Ok(())
 }
 

@@ -5,7 +5,7 @@ use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer,programs::Programs,
     dense_trellis::{TrellisDType,
         GroupedMember,GroupedPolicy,GroupedTrellis},
-    KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiMlaRankBatch,KimiSitu,F32Add,V41PeerCopy};
+    KimiKdaCore,KimiKdaCoreBatch,KimiKdaCoreWeights,KimiMlaSplit,KimiMlaRankBatch,KimiSitu,Bf16F32Add,F32Add,V41PeerCopy};
 use std::collections::BTreeMap;
 use std::ffi::c_void;
 
@@ -57,7 +57,8 @@ pub(crate) fn mla_gate_projected(core:&KimiMlaSplit<'_>,gate:Projected<'_,'_>,ro
     gate.run(rows,input,gates,stream)?;core.gate_output(rows,attention,uv,gates,normalized,stream)?;Ok(())
 }
 /// Separate gate/up outputs are interleaved by row for the unchanged Situ op;
-/// down remains F32 until the caller publishes and reduces the peer partial.
+/// down returns F32 scratch; the caller independently narrows its retained
+/// partial to BF16 before publishing it for the rank-ordered F32 meet.
 pub(crate) fn ffn_projected(gate:Projected<'_,'_>,up:Projected<'_,'_>,down:Projected<'_,'_>,situ:&KimiSitu<'_>,
     copy:&V41PeerCopy<'_>,rows:usize,input:Buffer,gate_output:Buffer,up_output:Buffer,gate_up:Buffer,
     activated:Buffer,stream:*mut c_void)->Result<Buffer> {
@@ -82,6 +83,7 @@ pub(crate) struct CorePrograms<'a> {
     pub kda:[KimiKdaCore<'a>;2],
     pub mla:BTreeMap<(usize,usize,usize),KimiMlaSplit<'a>>,
     pub norm:cuteafd_ffi::KimiRmsNorm<'a>,pub situ:KimiSitu<'a>,pub copy:V41PeerCopy<'a>,pub add:F32Add<'a>,
+    pub core_add:Bf16F32Add<'a>,
 }
 impl<'a> CorePrograms<'a> {
     pub(crate) fn load(programs:&'a Programs<'a>,cfg:&cuteafd_loader::families::kimi_k3::config::KimiK3Config,
@@ -143,7 +145,8 @@ impl<'a> CorePrograms<'a> {
                 [&names[0],&names[1],&names[2]],heads,capacity,stride,cache_format)?);
         }}}
         Ok(Some(Self{projections,grouped,grouped_enabled:std::cell::Cell::new(true),layout,kda,mla,norm:cuteafd_ffi::KimiRmsNorm::load(programs,3584)?,situ:KimiSitu::load(programs,3072)?,
-            copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?}))
+            copy:programs.library().v41_peer_copy()?,add:programs.library().f32_add()?,
+            core_add:programs.library().bf16_f32_add()?}))
     }
     pub(crate) fn projection(&self,weights:&CoreWeights<'_>)->Result<&Projection<'a>> {
         self.projections.get(&projection_key(weights.shape,weights.side,weights.codebook))
@@ -265,7 +268,7 @@ mod runtime_layout_tests {
                     }
                 }
                 assert_eq!(charged.projection.as_ref().map(|p|&p.extents),runtime.as_ref().map(|p|&p.extents));
-                assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false,on)?[0].bytes as usize
+                assert_eq!(charged.receive,super::super::startup::exchange_demands(unit,false)?[0].bytes as usize
                     -256-256-(((cuteafd_loader::placement::HOP_SLOTS+1)*16)as usize).max(256));
                 let expected_stages=if on {core::lane_extents(rows,unit,1024,4096,2048,2048)?}else{BTreeMap::new()};
                 assert_eq!(charged.stages,expected_stages);
