@@ -446,6 +446,7 @@ COORDINATOR_GPU_BUDGET_GIB
 COORDINATOR_GPU_HEADROOM_GIB
 COORDINATOR_GPU_PCI_BUS_ID
 COORDINATOR_GPU_UUID
+CUDA_MODULE_LOADING
 DRAFT_POLICY
 DRAFT_ROW_COST
 DRAFT_SURVIVAL_LENGTHS
@@ -928,6 +929,17 @@ case "${V41_FP8_HEAD:-}" in
       release_die "V41_FP8_HEAD=$V41_FP8_HEAD conflicts with CUTEAFD_V41_FP8_HEAD=$CUTEAFD_V41_FP8_HEAD in the environment; set one"
     v41_fp8_head_args=(-e "CUTEAFD_V41_FP8_HEAD=$V41_FP8_HEAD") ;;
   *) release_die "V41_FP8_HEAD must be off, draft or all" ;;
+esac
+# CUDA_MODULE_LOADING (LAZY or EAGER; unset: the CUDA default, LAZY), coordinator
+# only. A lazily loaded kernel's first launch waits for the device to idle, which
+# never happens behind a stream wait only the engine thread releases (a cold 5090
+# card hung in a first-shape cuBLAS draft GEMM). EAGER loads every library kernel
+# at startup instead: about 17 s and 212 MiB more on an RTX 5090.
+v41_module_loading_args=()
+case "$(get CUDA_MODULE_LOADING)" in
+  "") ;;
+  LAZY|EAGER) v41_module_loading_args=(-e "CUDA_MODULE_LOADING=$(get CUDA_MODULE_LOADING)") ;;
+  *) release_die "CUDA_MODULE_LOADING must be LAZY or EAGER" ;;
 esac
 # L2_PREFETCH (off, auto = 3/4 of the L2, or MiB; unset: off): one-lane decode and
 # verify passes pull the next layer's weights into L2 while each layer's routed
@@ -1412,7 +1424,7 @@ for switch_name in CUTEAFD_STAGE_CHAIN CUTEAFD_WINDOW_BATCH CUTEAFD_V41_FP8_HEAD
   [[ "$switch_name" != CUTEAFD_V41_FP8_HEAD || ${#v41_fp8_head_args[@]} == 0 ]] || continue
   [[ -z "${!switch_name:-}" ]] || rdma_env_args+=(-e "$switch_name=${!switch_name}")
 done
-rdma_env_args+=(${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"})
+rdma_env_args+=(${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} ${v41_module_loading_args[@]+"${v41_module_loading_args[@]}"})
 # RDMA_BOND_BALANCE (off, labels or probe): the coordinator's RoCE flow labels on a
 # bonded port; see the generic launch below.
 case "${RDMA_BOND_BALANCE:-off}" in

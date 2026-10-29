@@ -280,6 +280,37 @@ def test_v41_fp8_head_key_reaches_planner_and_coordinator(tmp_root, monkeypatch,
         assert "CUTEAFD_V41_FP8_HEAD" not in parse_run(worker["argv"])["env"]
 
 
+@pytest.mark.parametrize("value", [None, "LAZY", "EAGER", "eager"])
+def test_v41_module_loading_key_reaches_only_the_coordinator(tmp_root, monkeypatch, value) -> None:
+    """CUDA_MODULE_LOADING=LAZY|EAGER sets the coordinator's CUDA_MODULE_LOADING; unset
+    passes nothing (the CUDA default); other spellings fail before any container."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"CUDA_MODULE_LOADING={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    if value == "eager":
+        with pytest.raises(RuntimeError, match=r"CUDA_MODULE_LOADING must be LAZY or EAGER"):
+            capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+        return
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    coordinator = parse_run(result["containers"][0]["argv"])["env"]
+    if value is None:
+        assert "CUDA_MODULE_LOADING" not in coordinator
+    else:
+        assert coordinator["CUDA_MODULE_LOADING"] == value
+        assert result["containers"][0]["argv"].count(f"CUDA_MODULE_LOADING={value}") == 1
+    assert not any("CUDA_MODULE_LOADING" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert "CUDA_MODULE_LOADING" not in parse_run(worker["argv"])["env"]
+
+
 @pytest.mark.parametrize("value", [None, "off", "auto", "48", "on"])
 def test_v41_l2_prefetch_key_reaches_only_the_coordinator_command(tmp_root, monkeypatch, value) -> None:
     """L2_PREFETCH=off|auto|MiB becomes serve-native --l2-prefetch VALUE; unset passes
