@@ -211,6 +211,97 @@ mod tests {
     use std::os::unix::fs::FileExt;
 
     #[test]
+    #[ignore = "CPU warm Engram staging measurement against an immutable local checkpoint"]
+    fn warm_staging_overhead_measurement() -> Result<()> {
+        use std::{hint::black_box, time::Instant};
+        let path = std::path::PathBuf::from(std::env::var_os("MAPPED_BENCH_PATH").context("MAPPED_BENCH_PATH required")?);
+        let repeats: usize = std::env::var("MAPPED_BENCH_REPEATS").unwrap_or_else(|_| "10".into()).parse()?;
+        ensure!(repeats > 0, "positive repeats required");
+        let layer = 1;
+        let rows = ENGRAM_ROWS[layer];
+        let map = |offset, width| -> Result<crate::MappedTable> {
+            // SAFETY: the immutable checkpoint outlives every staging operation.
+            Ok(unsafe { crate::MappedTable::single(&path, offset, rows,
+                crate::RowFormat::of(cuteafd_core::DType::U8, width)?)? })
+        };
+        let table = EngramTable::new(map(672, 256)?, map(98_308_271_264, 8)?)?;
+        // Deterministic compressed tokens exercise the actual Engram hash geometry.
+        let mut state = 8492u64;
+        let tokens: Vec<_> = (0..8192).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            Some(((state >> 32) % cuteafd_core::ENGRAM_COMPRESSED_VOCAB as u64) as u32)
+        }).collect();
+        let mut history = cuteafd_core::EngramHistory::new(0)?;
+        let mut batches = Vec::new();
+        for unit in tokens.chunks(2752) {
+            let batch = history.prepare(history.position(), unit, 2752)?;
+            history.commit(&batch, unit.len())?;
+            batches.push(batch);
+        }
+        let mut row_counts = Vec::new();
+        // Mirror the existing exact mincore coalescer, outside timed gathers.
+        for (unit, batch) in batches.iter().enumerate() {
+            let mut addresses: Vec<_> = batch.hashes().iter().flat_map(|h| h[layer]).collect();
+            addresses.sort_unstable(); addresses.dedup();
+            row_counts.push(addresses.len());
+            for (plane, width, offset) in [("weight", 256u64, 672u64), ("scale", 8, 98_308_271_264)] {
+                let mut pages = Vec::new();
+                for &row in &addresses {
+                    let start = offset % 4096 + row * width;
+                    pages.extend(start / 4096..=(start + width - 1) / 4096);
+                }
+                pages.sort_unstable(); pages.dedup();
+                let runs = pages.iter().enumerate().filter(|&(i, &p)| i == 0 || p != pages[i - 1] + 1).count();
+                let mut at = 0; let mut calls = 0; let mut scanned = 0;
+                while at < pages.len() {
+                    let mut end = at + 1;
+                    while end < pages.len() {
+                        let span = pages[end] - pages[at] + 1;
+                        if span > 4096 || span > (end - at + 1) as u64 * 8 { break; }
+                        end += 1;
+                    }
+                    scanned += pages[end - 1] - pages[at] + 1;
+                    calls += 1; at = end;
+                }
+                eprintln!("staging_geometry unit={unit} plane={plane} token_rows={} unique_rows={} pages={} contiguous_runs={runs} mincore_calls={calls} scanned_pages={scanned}",
+                    batch.hashes().len(), addresses.len(), pages.len());
+            }
+        }
+        for batch in &batches {
+            for hashes in batch.hashes() {
+                for &address in &hashes[layer] {
+                    black_box(table.weights().row(address)?);
+                    black_box(table.scales().row(address)?);
+                }
+            }
+        }
+        let mut staging = EngramBatchStaging::new(2752)?;
+        for batch in &batches { black_box(staging.gather(&table, &[batch], layer)?); }
+        let before_weight = table.weights().stats().snapshot();
+        let before_scale = table.scales().stats().snapshot();
+        let mut elapsed = vec![std::time::Duration::ZERO; batches.len()];
+        for _ in 0..repeats {
+            for (index, batch) in batches.iter().enumerate() {
+                let start = Instant::now();
+                black_box(staging.gather(&table, &[batch], layer)?);
+                elapsed[index] += start.elapsed();
+            }
+        }
+        let weight = table.weights().stats().snapshot().since(&before_weight);
+        let scale = table.scales().stats().snapshot().since(&before_scale);
+        ensure!(weight.page_misses == 0 && scale.page_misses == 0
+            && weight.late_major_faults == 0 && scale.late_major_faults == 0,
+            "warm staging measurement must have zero misses and late faults");
+        eprintln!("staging_bench mode=direct tokens=8192 unit_rows=2752 units={} batches_per_unit=1 table_calls_per_rep={} repeats={repeats} unit_us={:?} total_us={:.3} weight_residency_us={:.3} scale_residency_us={:.3} weight_hits={} scale_hits={} misses=0 late_faults=0",
+            batches.len(), batches.len() * 2,
+            elapsed.iter().map(|t| t.as_secs_f64() * 1e6 / repeats as f64).collect::<Vec<_>>(),
+            elapsed.iter().map(|t| t.as_secs_f64()).sum::<f64>() * 1e6 / repeats as f64,
+            weight.residency_ns as f64 / repeats as f64 / 1e3,
+            scale.residency_ns as f64 / repeats as f64 / 1e3, weight.page_hits, scale.page_hits);
+        Ok(())
+    }
+
+    #[test]
     fn engram_worker_bound_covers_row_scaled_and_fixed_backend_scratch() -> Result<()> {
         let word = std::mem::size_of::<usize>();
         // Sum simultaneous capacities (including geometric growth), rather than
