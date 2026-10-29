@@ -37,16 +37,16 @@ pub(crate) enum GlmfHead<'a> {
 }
 
 impl<'a> GlmfHead<'a> {
-    pub fn allocations(&self) -> Vec<&DeviceAllocation<'a>> {
+    pub fn allocations(&self) -> Vec<cuteafd_ffi::CuteafdDeviceBuffer> {
         match self {
-            Self::K6(weight) => vec![&weight.payload, &weight.suh, &weight.svh],
-            Self::Bf16(weight) => vec![weight],
-            Self::Fp8 { values, scales } => vec![values, scales],
+            Self::K6(weight) => vec![weight.payload.buffer, weight.suh.buffer, weight.svh.buffer],
+            Self::Bf16(weight) => vec![weight.buffer],
+            Self::Fp8 { values, scales } => vec![values.buffer, scales.buffer],
         }
     }
 
     pub fn bytes(&self) -> usize {
-        self.allocations().iter().map(|a| a.buffer.bytes).sum()
+        self.allocations().iter().map(|a| a.bytes).sum()
     }
 
     pub fn name(&self) -> &'static str {

@@ -91,6 +91,7 @@ impl<'a> Dev<'a> {
 
 #[path = "engine/context.rs"]
 mod context;
+mod core;
 #[path = "engine/layers.rs"]
 mod layers;
 #[path = "engine/units.rs"]
@@ -754,6 +755,7 @@ pub(crate) fn output_shard_reserve(lanes: usize, prefill_rows: usize, hidden: us
 /// exchange), so a GPU's lanes share one set of temporaries; decode keeps its own, since its
 /// graphs hold its pointers. Sizes: `cuteafd_loader::serving_capacity::glmf_lane_bytes`.
 struct Workspace<'a> {
+    core: Option<core::Slot<'a>>,
     rows: usize,
     /// Zero rows: rank 1's partial of a dense MLP rank 0 runs whole (ModelOpt NVFP4); rank 1 of a
     /// head split only.
@@ -1049,6 +1051,7 @@ impl<'a> StepPlan<'_, 'a> {
         ensure!(rows <= temps.rows, "a lane of {rows} rows over temporaries of {}", temps.rows);
         let bytes = glmf_lane_bytes(self.cfg, rows as u64, decode, &self.shape(rank));
         Ok(Workspace {
+            core: None,
             rows,
             zero: bytes.zero.map(|b| -> Result<_> {
                 let view = alloc(b)?;
@@ -1313,6 +1316,10 @@ fn output_rows(rows: usize, rank: usize) -> (usize, usize) {
 }
 
 pub(crate) struct GlmfEngine<'a> {
+    core: Vec<Option<core::Rank<'a>>>,
+    core_admission: Option<cuteafd_loader::families::glm5_flash::core_admission::CoreCharges>,
+    core_head: Option<crate::shared::dense_trellis::CoreHead<'a>>,
+    draft_core_head: Option<crate::shared::dense_trellis::CoreHead<'a>>,
     /// The same admitted homes used to allocate early workspaces; validated against installed backends.
     step_experts: StepExperts,
     pub(crate) spark_bf16: bool,
@@ -1758,7 +1765,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+        Ok(Self { core: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
             prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),
@@ -2655,7 +2662,8 @@ impl<'a> GlmfEngine<'a> {
         let rows = self.prefill_rows.max(DECODE_ROWS);
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
-            rows * self.cfg.hidden * self.partial_bytes())?
+            rows * self.cfg.hidden * (self.partial_bytes()
+                + if self.weights.layers.iter().any(|l| !l.core.is_empty()) { 4 } else { 0 }))?
             .with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
@@ -3133,13 +3141,15 @@ impl<'a> GlmfEngine<'a> {
 
     /// Installs step workspaces allocated before this engine (`StepWorkspaces`), which must be
     /// what its step plan holds.
-    pub(crate) fn install_workspaces(&self, workspaces: StepWorkspaces<'a>) -> Result<()> {
+    pub(crate) fn install_workspaces(&self, mut workspaces: StepWorkspaces<'a>) -> Result<()> {
         let key = self.step_plan().key();
         ensure!(workspaces.key == key && workspaces.rows == self.prefill_rows,
             "step workspaces allocated for another plan: allocated {:?} ({} prefill rows), engine {key:?} ({} prefill rows)",
             workspaces.key, workspaces.rows, self.prefill_rows);
         ensure!(self.decode_workspace.borrow().is_none() && self.prefill_slots.borrow().is_empty(),
             "step workspaces already allocated");
+        self.core_slot(0, &mut workspaces.decode, true, 0)?;
+        for (lane, w) in workspaces.lanes.iter_mut().enumerate() { self.core_slot(0, w, false, lane)?; }
         *self.decode_workspace.borrow_mut() = Some(workspaces.decode);
         *self.prefill_slots.borrow_mut() = workspaces.lanes;
         Ok(())
@@ -3166,6 +3176,8 @@ impl<'a> GlmfEngine<'a> {
                 let plan = self.step_plan();
                 plan.lane(rank, self.decode_rows, true, Rc::new(plan.temporaries(rank, self.decode_rows, true)?))
             })?;
+            let mut workspace = workspace;
+            self.core_slot(rank, &mut workspace, true, 0)?;
             *cell.borrow_mut() = Some(workspace);
         }
         Ok(cell.borrow())
@@ -3183,7 +3195,8 @@ impl<'a> GlmfEngine<'a> {
             }
         };
         if cell.borrow().is_empty() {
-            let slots = self.on(rank, || self.step_plan().slots(rank, self.prefill_rows, self.prefill_waves))?;
+            let mut slots = self.on(rank, || self.step_plan().slots(rank, self.prefill_rows, self.prefill_waves))?;
+            for (lane, w) in slots.iter_mut().enumerate() { self.core_slot(rank, w, false, lane)?; }
             *cell.borrow_mut() = slots;
         }
         ensure!(count <= cell.borrow().len(), "prefill slots exceed admission");
@@ -3799,6 +3812,7 @@ impl<'a> GlmfEngine<'a> {
     /// Without a head split, returns `delta` itself.
     fn meet_attention(&self, w: &Workspace<'_>, slot: usize, t: usize, layer: &GlmfLayer<'_>, cap: &str) -> Result<*mut c_void> {
         let Some(exchange) = &self.exchange else { return Ok(w.delta.buffer.ptr) };
+        if let Some(out) = self.core_attention_meet(0, w, layer, slot, t)? { return Ok(out); }
         let (h, precise) = (self.cfg.hidden, self.precise_attention(layer));
         if self.output_shard_attention(layer) {
             return self.complete_output_shard(0, w, layer, slot, t, cap);
@@ -3837,7 +3851,7 @@ impl<'a> GlmfEngine<'a> {
     /// 0 runs the MLP whole) or shared-expert half (`shared`).
     fn peer_ffn_out(&self, index: usize, w1: &Workspace<'_>, layer: &GlmfLayer<'_>) -> Result<*mut c_void> {
         if self.tp2_layer(index) { return Ok(w1.delta.buffer.ptr); }
-        match (layer.dense, layer.has("w_gate_up_fp8")) {
+        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer)) {
             (true, true) => Ok(w1.delta.buffer.ptr),
             (true, false) => w1.zero_ptr(),
             (false, _) => Ok(w1.shared.buffer.ptr),
@@ -3861,7 +3875,8 @@ impl<'a> GlmfEngine<'a> {
         self.attention(1, w1, index, layer, rows, cap, tables, None)?;
         let attended = slot(index, false, lane);
         let precise = self.precise_attention(layer);
-        let sum = if self.output_shard_attention(layer) {
+        let sum = if let Some(out) = self.core_attention_meet(1, w1, layer, attended, t)? { out }
+        else if self.output_shard_attention(layer) {
             self.complete_output_shard(1, w1, layer, attended, t, cap)?
         } else {
             self.exchange_push(exchange, "main", 1, attended, w1.delta.buffer.ptr, t * h * if precise { 4 } else { 2 })?;
@@ -3878,7 +3893,7 @@ impl<'a> GlmfEngine<'a> {
         self.post_pre_on(1, w1, sum, 0, layer, "ffn", "post_norm", rows, cap)?;
         let out = self.peer_ffn_out(index, w1, layer)?;
         // A dense MLP rank 0 runs whole leaves rank 1's zero rows as its partial.
-        match (layer.dense, layer.has("w_gate_up_fp8")) {
+        match (layer.dense, layer.has("w_gate_up_fp8") || core::native_ffn(layer)) {
             (true, false) => {}
             (true, true) => self.ffn_on(1, w1, layer, self.cfg.dense_intermediate, cap, out, rows)?,
             (false, _) if !self.tp2_layer(index) => self.ffn_on(1, w1, layer, self.cfg.moe_intermediate, cap, out, rows)?,
@@ -4259,7 +4274,11 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
         match &self.weights.head {
-            GlmfHead::K6(_) => anyhow::bail!("K6 head runtime not bound"),
+            GlmfHead::K6(weights) => {
+                let head = self.core_head.as_ref().context("Flash K6 head runtime not bound")?;
+                let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: x, bytes: logit_rows*h*2, ..w.x.buffer };
+                head.launch(weights, input, w.logits.buffer, logit_rows, self.stream)
+            },
             GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
@@ -4277,7 +4296,10 @@ impl<'a> GlmfEngine<'a> {
     /// The target head as the DFlash drafter borrows it (the same resident copy).
     pub fn draft_head(&self) -> TargetHead<'_> {
         match &self.weights.head {
-            GlmfHead::K6(_) => TargetHead::Launch(Box::new(|_, _, _, _| anyhow::bail!("K6 draft head runtime not bound"))),
+            GlmfHead::K6(weights) => match &self.draft_core_head {
+                Some(head) => head.target(weights),
+                None => TargetHead::Launch(Box::new(|_, _, _, _| anyhow::bail!("K6 draft head runtime not bound"))),
+            },
             GlmfHead::Bf16(head) => TargetHead::Bf16(head),
             fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                 // SAFETY: the drafter passes its live normalized rows and logits
@@ -4493,6 +4515,10 @@ impl<'a> GlmfEngine<'a> {
         let out_bytes = if self.precise_attention(layer) { 4 } else { 2 };
         let rows_at = [row_at(&w.x, first, h * 2), row_at(&w.kda_slots, first, 4), row_at(&w.seq_first, first, 4),
             w.delta.buffer.ptr.wrapping_byte_add(first * h * out_bytes)];
+        if layer.core.contains_key("self_attn.q_proj") {
+            ensure!(self.kda_state == KdaState::F32, "native Flash K6 requires the F32 KDA stage package");
+            return self.core_kda(rank, w, layer, rows, first, cap, spec, [conv_state, state, replay]);
+        }
         if layer.has("w_in_fp8") {
             return self.kda_w8(rank, w, layer, rows, rows_at, cap, spec, [conv_state, state, replay]);
         }
@@ -4574,6 +4600,7 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn ffn_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, inter: usize, cap: &str, out: *mut c_void,
         rows: Scalar) -> Result<()> {
+        if core::native_ffn(layer) { return self.core_ffn(rank, w, layer, cap, out, rows); }
         if layer.has("nvfp4_w1") {
             ensure!(rank == 0, "NVFP4 dense MLPs run on rank 0");
             let dense = self.dense_nvfp4.as_ref().context("an NVFP4 dense layer needs the fp8-glmfdense-nvfp4 package")?;
@@ -4642,6 +4669,9 @@ impl<'a> GlmfEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn mla_producer_into(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, rows: Scalar, cap: &str,
         decode: bool, cache: *mut c_void) -> Result<()> {
+        if layer.core.contains_key("self_attn.q_a_proj") {
+            return self.core_mla_producer(rank, w, layer, rows, cap, cache);
+        }
         // FP8-only weights: decode rows up to `fp8_rows` on the GEMV; prefill W8A8 or W8A16.
         let fp8 = decode || self.fp8_prefill.mla;
         let mut pointers = vec![("x", w.x.buffer.ptr), ("kv_slots", w.kv_slots.buffer.ptr),
@@ -4706,6 +4736,9 @@ impl<'a> GlmfEngine<'a> {
     /// W_UV + o_proj of this rank's heads over `w.latent` into `delta` (a partial under a split).
     fn mla_output(&self, rank: usize, w: &Workspace<'_>, layer: &GlmfLayer<'_>, cap: &str, rows: Scalar, decode: bool)
         -> Result<()> {
+        if layer.core.contains_key("self_attn.o_proj") {
+            return self.core_mla_output(rank, w, layer, rows, cap);
+        }
         let fp8 = decode || self.fp8_prefill.mla;
         let pointers = [("attn", w.latent.buffer.ptr), ("w_uv", layer.ptr("w_uv")?),
             ("w_o_fp8", layer.ptr("w_o_fp8")?), ("w_o_scale", layer.ptr("w_o_scale")?),
@@ -4909,8 +4942,8 @@ impl<'a> GlmfEngine<'a> {
             }
             None if rank == 1 => Vec::new(),
             None => {
-                std::iter::once(&self.weights.norm).chain(self.weights.head.allocations())
-                    .map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes)).collect()
+                std::iter::once(self.weights.norm.buffer).chain(self.weights.head.allocations())
+                    .map(|a| (a.ptr.cast_const(), a.bytes)).collect()
             }
         }).collect()
     }

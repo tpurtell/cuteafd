@@ -275,6 +275,7 @@ impl Bindings<'_, '_, '_> {
         let weights = self.layer(rank, layer);
         let slot = slot(layer, false, self.lane);
         if rank == 0 { return e.meet_attention(w, slot, self.rows, weights, self.cap()); }
+        if let Some(out) = e.core_attention_meet(rank, w, weights, slot, self.rows)? { return Ok(out); }
         if e.output_shard_attention(weights) { return e.complete_output_shard(rank, w, weights, slot, self.rows, self.cap()); }
         let exchange = e.exchange()?;
         let precise = e.precise_attention(weights);
@@ -381,7 +382,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
         let mut spark = false;
         if !masked && !e.tp2_layer(index) {
             let out = e.peer_ffn_out(index, w1, peer)?;
-            if !layer.dense || peer.has("w_gate_up_fp8") {
+            if !layer.dense || (peer.has("w_gate_up_fp8") || core::native_ffn(peer)) {
                 e.ffn_on(1, w1, peer, if layer.dense { e.cfg.dense_intermediate } else { e.cfg.moe_intermediate },
                     self.cap(), out, rows)?;
             }
@@ -430,7 +431,7 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
             let offset = real * e.cfg.hidden * 2;
             let bytes = (self.rows - real) * e.cfg.hidden * 2;
             let peer = self.layer(1, index);
-            let peer_buffer = if peer.dense && peer.has("w_gate_up_fp8") { self.work[1].delta.buffer }
+            let peer_buffer = if peer.dense && (peer.has("w_gate_up_fp8") || core::native_ffn(peer)) { self.work[1].delta.buffer }
                 else if peer.dense { self.work[1].zero.as_ref().context("peer zero rows")?.buffer }
                 else if e.tp2_layer(index) { self.work[1].delta.buffer }
                 else { self.work[1].shared.buffer };

@@ -84,7 +84,7 @@ impl CoreCharges {
         let lookup = |name: &str| -> Result<usize> {
             let matches = entries.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
             ensure!(matches.len() == 1, "Flash K6 requires one {name}");
-            Ok(matches[0]["scratch"]["scratch"].as_u64().unwrap_or(0).try_into()?)
+            Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
         };
         let scratch = |rows: usize| -> Result<usize> {
             let mut bytes = 0;
