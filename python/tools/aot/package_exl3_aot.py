@@ -1150,6 +1150,13 @@ def init_variant_worker():
     os.environ['CUTEAFD_EXPORT_WORKER_GPU_MIB'] = '2688'
 
 
+def row_address_companion(geometry, role, profile, capacity, bits, options):
+    """Admitted two-member companion; never select a recipe from summed rows."""
+    return (role == 'spark' and capacity == 2752 and geometry == 'glmf'
+            and profile == 'tp2-width1024' and tuple(bits) == (3, 4)
+            and options.get('warp_specialized') and not options.get('wire_input'))
+
+
 def compile_variant(payload):
     args, target_compute, raw, width, experts, capacity, topk, dtype, run_options = payload
     import _pinned_sparkinfer
@@ -1166,26 +1173,33 @@ def compile_variant(payload):
         meta = export(raw, width, experts, capacity, tuple(args.bits), 'auto', topk, dtype, **run_options)
         if meta['compute'] != list(target_compute):
             raise ValueError('EXL3 worker exported the wrong compute target')
-        for label in ('v41_exl3_core', 'v41_exl3_sum'):
-            verify_object_target(raw / f'{label}.o', target_compute)
-        core = raw / 'libcuteafd_exl3.so'
-        subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
-            f'-I{args.cuda_include}', str(raw / 'v41_exl3_bridge.cc'),
-            str(raw / 'v41_exl3_core.o'), str(raw / 'v41_exl3_sum.o'),
-            f'-L{args.cuda_libdir}', '-lcudart', f'-L{args.runtime.parent}',
-            '-lcute_dsl_runtime', '-Wl,-z,defs',
-            '-o', str(core)], check=True)
-        runtime_files = ['v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so']
-        if meta['requires_route_preparation']:
-            routes = raw / 'routes'
+        exports = [(raw, meta)]
+        if meta.get('indirect_companion'):
+            companion_dir = raw / 'indirect'
+            exports.append((companion_dir, json.loads((companion_dir / 'v41_exl3.json').read_text())))
+        runtime_files = []
+        for export_dir, export_meta in exports:
+            for label in ('v41_exl3_core', 'v41_exl3_sum'):
+                verify_object_target(export_dir / f'{label}.o', target_compute)
+            core = export_dir / 'libcuteafd_exl3.so'
             subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
-                f'-I{args.cuda_include}', str(routes / 'v41_exl3_routes.cc'),
-                str(args.cuda_driver), '-Wl,-z,defs',
-                '-o', str(routes / 'libv41_exl3_routes.so')], check=True)
-            runtime_files += ['routes/v41_exl3_routes.json', 'routes/libv41_exl3_routes.so']
-        for name in runtime_files:
-            if name.endswith('.so'):
-                verify_object_target(raw / name, target_compute)
+                f'-I{args.cuda_include}', str(export_dir / 'v41_exl3_bridge.cc'),
+                str(export_dir / 'v41_exl3_core.o'), str(export_dir / 'v41_exl3_sum.o'),
+                f'-L{args.cuda_libdir}', '-lcudart', f'-L{args.runtime.parent}',
+                '-lcute_dsl_runtime', '-Wl,-z,defs',
+                '-o', str(core)], check=True)
+            export_files = ['v41_exl3.json', 'trellis_lut.bin', 'libcuteafd_exl3.so']
+            if export_meta['requires_route_preparation']:
+                routes = export_dir / 'routes'
+                subprocess.run([args.cxx, '-shared', '-fPIC', '-std=c++17',
+                    f'-I{args.cuda_include}', str(routes / 'v41_exl3_routes.cc'),
+                    str(args.cuda_driver), '-Wl,-z,defs',
+                    '-o', str(routes / 'libv41_exl3_routes.so')], check=True)
+                export_files += ['routes/v41_exl3_routes.json', 'routes/libv41_exl3_routes.so']
+            for name in export_files:
+                if name.endswith('.so'):
+                    verify_object_target(export_dir / name, target_compute)
+            runtime_files.extend(str((export_dir / name).relative_to(raw)) for name in export_files)
         gc.collect()
         torch.cuda.empty_cache()
     return meta, runtime_files
@@ -1370,6 +1384,8 @@ def build(args: argparse.Namespace) -> None:
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
+                if row_address_companion(geometry, args.role, profile, capacity, args.bits, options):
+                    options['emit_indirect'] = True
                 default_options = options
                 if (schedule_hint := default_decode_schedule(
                         geometry, args.role, profile, capacity, args.bits)) is not None:
@@ -1422,6 +1438,8 @@ def build(args: argparse.Namespace) -> None:
                     variant['token_major_rotation'] = True
                 if meta.get('fused_input_rotation'):
                     variant['fused_input_rotation'] = True
+                if meta.get('indirect_companion'):
+                    variant['indirect_companion'] = meta['indirect_companion']
                 if meta.get('warp_specialized'):
                     variant['warp_specialized'] = True
                 if meta.get('ws_dynamic_tiles'):

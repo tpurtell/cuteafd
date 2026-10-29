@@ -365,6 +365,9 @@ def _export_exl3(extra, output):
                 options["swiglu_limit"] = limit
             if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
                 options["decode_schedule"] = schedule
+            if hasattr(package, "row_address_companion") and package.row_address_companion(
+                    geometry, role, profile, rows, bits, options):
+                options["emit_indirect"] = True
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
 
 
@@ -522,7 +525,9 @@ def compare(left, right, *, source_comparison=False):
     inspector = load_file("cuteafd_cuda_images", ROOT / "scripts/qualify/deepseek_v41/inspect-cute-object.py")
     left_names = {path.relative_to(left).as_posix() for path in left.rglob("*") if path.suffix in (".o", ".cubin")}
     right_names = {path.relative_to(right).as_posix() for path in right.rglob("*") if path.suffix in (".o", ".cubin")}
-    if not left_names or left_names != right_names:
+    additions = sorted(right_names - left_names) if source_comparison else []
+    if (not left_names or left_names - right_names
+            or (right_names - left_names and not source_comparison)):
         raise ValueError(f"object set mismatch: {left_names ^ right_names}, left={len(left_names)}, right={len(right_names)}")
     contexts = [json.loads((directory / "comparison-context.json").read_text()) for directory in (left, right)]
     if any(context.get("cuda_initialized") is not False for context in contexts):
@@ -586,7 +591,7 @@ def compare(left, right, *, source_comparison=False):
     headers_changed = [name for name in sorted(header_names)
                        if not all((directory / name).exists() for directory in (left, right))
                        or (left / name).read_bytes() != (right / name).read_bytes()]
-    return {"contexts": contexts, "programs": records,
+    return {"contexts": contexts, "programs": records, "added_objects": additions,
             "manifest_changed_fields": differing_fields(*metas), "headers_changed": headers_changed}
 
 
@@ -673,6 +678,8 @@ def main():
                           file=sys.stderr, flush=True)
                     raise
         report = compare(*directories, source_comparison=True) if baseline_source else compare(*directories)
+        for added in report["added_objects"]:
+            print(f"{added}: added object (not singleton identity evidence)", flush=True)
         report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
         (output / name / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")

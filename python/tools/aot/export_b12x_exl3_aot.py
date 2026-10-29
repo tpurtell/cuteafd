@@ -75,7 +75,7 @@ def write_bridge(output: Path, manifest: dict) -> None:
                 args.append('static_cast<cudaStream_t>(stream)')
             elif type_name == 'int32_t':
                 index = len(scalars); scalars.append(name); args.append(f's[{index}]')
-                if name == 'active_m': checks.append(f'if (s[{index}] < 1 || s[{index}] > {manifest["capacity"]}) return int(cudaErrorInvalidValue);')
+                if name == 'active_m': checks.append(f'if (s[{index}] < 1 || s[{index}] > {manifest.get("max_rows", manifest["capacity"])}) return int(cudaErrorInvalidValue);')
                 if name == 'grid_x':
                     checks.append(f'if (s[{index}] < 1) return int(cudaErrorInvalidValue);')
                     # Clamp a local argument, never mutate caller-owned launch tables.
@@ -119,7 +119,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False, activation: str = "silu",
-           compact_weights: bool = False) -> dict:
+           compact_weights: bool = False, indirect_capacity: int | None = None,
+           emit_indirect: bool = False) -> dict:
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -127,6 +128,11 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # Packed routes are grouped into M blocks of route_block rows per expert; each
     # block decodes its expert's Trellis tiles once, so larger blocks amortize the
     # decode over more rows once many rows share an expert (large prefill).
+    if indirect_capacity is not None and (
+            capacity != 2752 or indirect_capacity != 5504 or not warp_specialized
+            or wire_input or len(bits) != 2 or routing == "direct"):
+        raise ValueError("indirect companion requires WS BF16 m2752 with extent 5504")
+    max_rows = capacity if indirect_capacity is None else indirect_capacity
     if compact_weights and len(bits) != 2:
         raise ValueError("compact weights require a disjoint two-tier export")
     if activation not in ("silu", "situ"):
@@ -208,9 +214,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     if direct and len(bits) != 2:
         raise ValueError("three/four-tier export requires packed routing")
     block_m = 8 if direct else route_block
-    route_slots = capacity * topk if direct else route_pack_capacity(capacity * topk, block_m, experts, topk=topk)[1]
+    route_slots = max_rows * topk if direct else route_pack_capacity(max_rows * topk, block_m, experts, topk=topk)[1]
     route_blocks = route_slots if direct else (route_slots + block_m - 1) // block_m
-    options = dict(size_m=capacity, hidden_size=hidden, intermediate_size=intermediate,
+    options = dict(size_m=max_rows, hidden_size=hidden, intermediate_size=intermediate,
         tier0_num_experts=experts, tier1_num_experts=experts, top_k=topk,
         route_num_experts=experts, max_m_blocks=route_blocks,
         sms=workspace_sms, workspace_sms=workspace_sms,
@@ -220,6 +226,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=swiglu_limit,
         moe_block_size=block_m, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
         route_ids_dtype=torch.int32)
+    if indirect_capacity is not None:
+        options["row_addresses"] = True
     if activation != "silu":
         options["activation"] = activation
     if len(bits) == 2:
@@ -299,6 +307,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         "trellis_lut": {"file": "trellis_lut.bin", "bytes": len(lut_bytes),
             "sha256": hashlib.sha256(lut_bytes).hexdigest()},
         "native_execution_verified": False}
+    if indirect_capacity is not None:
+        manifest.update(schema="cuteafd.exl3-row-address-aot.v1", max_rows=max_rows,
+                        max_members=2, row_addresses=True)
+        layouts["input_row_addresses"] = dict(shape=[max_rows], dtype="torch.int64",
+            bytes=max_rows * 8, allocation="input_row_addresses", zero_on_create=False)
+        manifest["unique_execution_buffer_bytes"] += max_rows * 8
     if compact_weights:
         manifest.update(descriptor_rows=7, native_info_version=3)
     if activation != "silu":
@@ -325,7 +339,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     write_bridge(output, manifest)
     if not direct:
         from export_b12x_exl3_routes_aot import export as export_routes
-        route_manifest = export_routes(output / 'routes', capacity, experts, topk, block_m)
+        route_manifest = export_routes(output / 'routes', max_rows, experts, topk, block_m,
+                                       indirect=indirect_capacity is not None)
         for name in ('packed_route_indices', 'block_expert_ids', 'packed_route_count', 'expert_offsets', 'expert_counts'):
             if route_manifest['buffers'][name]['bytes'] > layouts[name]['bytes']:
                 raise ValueError(f'mixed execution buffer {name} cannot hold route preparation')
@@ -333,6 +348,19 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
             'manifest': 'routes/v41_exl3_routes.json',
             'sha256': hashlib.sha256((output / 'routes/v41_exl3_routes.json').read_bytes()).hexdigest(),
         }
+    if emit_indirect:
+        if indirect_capacity is not None:
+            raise ValueError("indirect companions cannot have companions")
+        export(output / 'indirect', intermediate, experts, capacity, bits, routing,
+            topk, output_dtype, blocks_per_sm, tile=tuple(options['force_tile_config']),
+            hidden=hidden, route_block=block_m, swiglu_limit=swiglu_limit,
+            warp_specialized=warp_specialized, wire_input=wire_input,
+            ws_input_stages=ws_input_stages, ws_dynamic_tiles=ws_dynamic_tiles,
+            compile_only=compile_only, activation=activation, compact_weights=compact_weights,
+            indirect_capacity=5504)
+        manifest['indirect_companion'] = dict(manifest='indirect/v41_exl3.json',
+            max_rows=5504, max_members=2,
+            sha256=hashlib.sha256((output / 'indirect/v41_exl3.json').read_bytes()).hexdigest())
     (output / "v41_exl3.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({k: manifest[k] for k in ['capacity','intermediate','bits','direct','unique_execution_buffer_bytes']}), flush=True)
     return manifest

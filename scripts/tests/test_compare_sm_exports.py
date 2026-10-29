@@ -665,7 +665,7 @@ def test_failed_group_does_not_discard_other_completed_reports(tmp_path, monkeyp
     def compare(left, right):
         if left.parent.name == "bad":
             raise ValueError("missing pair")
-        return {"programs": []}
+        return {"programs": [], "added_objects": []}
 
     monkeypatch.setattr(compare_sm, "compare", compare)
     assert compare_sm.main() == 1
@@ -743,3 +743,54 @@ def test_source_comparison_requires_same_sm_and_allows_only_source_changes(tmp_p
     context_file.write_text(json.dumps(context))
     with pytest.raises(ValueError, match="toolchain"):
         compare_sm.compare(left, right, source_comparison=True)
+
+
+def test_row_address_companion_export_coverage():
+    path = ROOT / "python/tools/aot/package_exl3_aot.py"
+    package_spec = importlib.util.spec_from_file_location("row_address_package", path)
+    package = importlib.util.module_from_spec(package_spec)
+    package_spec.loader.exec_module(package)
+    options = {"warp_specialized": True, "ws_dynamic_tiles": True}
+    admitted = ("glmf", "spark", "tp2-width1024", 2752, (3, 4))
+    assert package.row_address_companion(*admitted, options)
+    for index, value in ((0, "glm"), (1, "coordinator"), (2, "tp4-width512"),
+                         (3, 4096), (4, (4, 5))):
+        args = list(admitted)
+        args[index] = value
+        assert not package.row_address_companion(*args, options)
+    assert not package.row_address_companion(*admitted, {**options, "wire_input": True})
+    source = (ROOT / "scripts/build/compare-sm-exports.py").read_text()
+    assert 'package.row_address_companion(' in source
+    assert 'options["emit_indirect"] = True' in source
+
+
+def test_source_comparison_reports_additions_but_rejects_removals(tmp_path):
+    left, right = exports(tmp_path)
+    context = json.loads((right / "comparison-context.json").read_text())
+    context["sms"] = 188
+    (right / "comparison-context.json").write_text(json.dumps(context))
+    (right / "indirect.o").write_bytes(b"host" + cuda_elf())
+    (right / "indirect.h").write_text("new ABI")
+    report = compare_sm.compare(left, right, source_comparison=True)
+    assert report["added_objects"] == ["indirect.o"]
+    assert all(row["object_identical"] for row in report["programs"])
+    with pytest.raises(ValueError, match="object set mismatch"):
+        compare_sm.compare(right, left, source_comparison=True)
+
+
+def test_source_additions_keep_group_report_path(tmp_path, monkeypatch):
+    baseline = tmp_path / "source"
+    (baseline / "third_party").mkdir(parents=True)
+    (baseline / "third_party/sparkinfer.lock.json").write_text("{}")
+    output = tmp_path / "reports"
+    (output / "glmf").mkdir(parents=True)
+    monkeypatch.setattr(compare_sm, "jobs", lambda _: [("glmf", "export.py", [])])
+    monkeypatch.setattr(compare_sm, "load_file", lambda *_: type("Filesystem", (), {"check_path": lambda _: None}))
+    monkeypatch.setattr(compare_sm.sys, "argv", ["compare-sm-exports.py", "--compare-only",
+        "--baseline-source", str(baseline), "--output-dir", str(output)])
+    monkeypatch.setattr(compare_sm, "compare", lambda *_, **kwargs:
+        {"programs": [], "added_objects": ["m2752/indirect/core.o"]})
+    assert compare_sm.main() == 0
+    report = json.loads((output / "glmf/comparison.json").read_text())
+    assert report["group"] == "glmf"
+    assert report["added_objects"] == ["m2752/indirect/core.o"]
