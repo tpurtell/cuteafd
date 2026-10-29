@@ -2,10 +2,11 @@
 """Shared native K6 core projections (trellis ABI v1).
 
 Dimensions are local [K,N] after TP2 placement, not the full checkpoint sizes.
-Whole/replicated MLA and latent operands retain their full dimensions. kv_a
-requires a stored N640 tensor and a caller-side N576 trim; unpadded N576 is
-not a supported native trellis geometry. Independently calibrated projections
-are never concatenated. One fixed arithmetic covers rows 1 through 4096.
+Whole/replicated MLA and latent operands retain their full dimensions. GLM
+and Kimi kv_a use stored N640 with a caller-side N576 trim; Flash is NoPE
+and uses native N512 without padding. Unpadded N576 is unsupported.
+Independently calibrated projections are never concatenated. One fixed
+arithmetic covers rows 1 through 4096.
 
 KDA q/k/v/g share one activation and run as one grouped launch per H128
 stage. Each projection retains its own payload, scales and rotation. Native

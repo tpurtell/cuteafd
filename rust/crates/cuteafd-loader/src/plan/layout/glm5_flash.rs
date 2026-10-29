@@ -47,9 +47,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         if decode_rows > 64 && manifest.is_some_and(|m| crate::serving_capacity::glmf_manifest_scratch(m)("glmf_mhc_post_pre_m128").is_none()) {
             anyhow::bail!("wide decode needs CUTEAFD_GLMF_WIDE_DECODE_ROWS=128");
         }
-        let representation = options.glmf_representation;
         let core = crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let native = !core.projections.is_empty();
+        let native_kda = core.scratch_mask(&cfg, cfg.layers).kda;
+        let mut representation = options.glmf_representation;
+        if native_kda {
+            representation.kda_fp8 = false;
+            representation.output_shard = false;
+        }
+        if core.get_weight("lm_head").is_some() { representation.fp8_head = false; }
         let state = options.glmf_kda_state;
         anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
             "native K6 requires F32 KDA state programs");
@@ -93,7 +99,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
-                ranks == 2, representation, options.glmf_prefill_expanded, available.is_some() && (ranks == 2 || catalog.fp8().is_some()), options.glmf_kda_fp32_partials, state));
+                ranks == 2, representation, options.glmf_prefill_expanded && !native_kda,
+                available.is_some() && (ranks == 2 || catalog.fp8().is_some()),
+                options.glmf_kda_fp32_partials && !native_kda, state));
         let mut workspace = step_workspace(&report.placement, lanes);
         let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
@@ -202,7 +210,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 sequences as usize, draft > 0, ranks, decode_rows as usize, options.physical_sms.unwrap_or(188) as usize));
         let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
-            decode_rows, partial_bytes: if options.glmf_kda_fp32_partials { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
+            decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
             mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
             index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
             resident, workspace, local_workspace, graphs, experts,

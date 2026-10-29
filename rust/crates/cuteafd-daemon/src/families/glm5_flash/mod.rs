@@ -1710,6 +1710,17 @@ impl Opened {
         let probe = |stage| crate::shared::inventory::startup_probe(&self.library, &probe_devices, stage);
         probe("contexts-before-peer")?;
         let mut resolved = args.clone();
+        let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
+        let core = cuteafd_loader::families::glm5_flash::core::CoreInventory::from_checkpoint(
+            &self.cfg, &self.checkpoint)?;
+        if core.scratch_mask(&self.cfg, layers).kda {
+            // Native K6 reduces unrotated F32 cores, not FP8 KDA partials.
+            resolved.kda_fp8 = fp8::KdaFp8::Off;
+            resolved.kda_fp32_partials = false;
+            resolved.kda_output_shard = false;
+            resolved.kda_prefill_expanded = false;
+        }
+        if core.get_weight("lm_head").is_some() { resolved.fp8_head = false; }
         if args.split_device.is_some()
             && crate::shared::peer_split::probed_device(&self.library, args.device, args.split_device)?.is_none() {
             resolved.split_device = None;
