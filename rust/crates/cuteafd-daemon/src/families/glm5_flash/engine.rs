@@ -4259,6 +4259,7 @@ impl<'a> GlmfEngine<'a> {
         // SAFETY: rows t - logit_rows.. of the normalized rows lie inside `w.x`.
         let x = unsafe { w.x.buffer.ptr.cast::<u8>().add((t - logit_rows) * h * 2) }.cast::<c_void>();
         match &self.weights.head {
+            GlmfHead::K6(_) => anyhow::bail!("K6 head runtime not bound"),
             GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
@@ -4276,6 +4277,7 @@ impl<'a> GlmfEngine<'a> {
     /// The target head as the DFlash drafter borrows it (the same resident copy).
     pub fn draft_head(&self) -> TargetHead<'_> {
         match &self.weights.head {
+            GlmfHead::K6(_) => TargetHead::Launch(Box::new(|_, _, _, _| anyhow::bail!("K6 draft head runtime not bound"))),
             GlmfHead::Bf16(head) => TargetHead::Bf16(head),
             fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                 // SAFETY: the drafter passes its live normalized rows and logits

@@ -190,3 +190,56 @@ impl<'a> Projection<'a> {
     }
 }
 
+
+/// Target and drafter use independent scratch even though they share the head weights.
+pub(crate) struct CoreHead<'a> {
+    projection: Projection<'a>, scratch: ProjectionScratch<'a>, device: Device<'a>,
+    stream: *mut c_void, rows: usize,
+}
+impl<'a> CoreHead<'a> {
+    pub(crate) fn new(programs: &'a Programs<'a>, weights: &CoreWeights<'a>, rows: usize,
+        device: Device<'a>, stream: *mut c_void,
+        admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {
+        ensure!(weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Output,
+            "GLM K6 head must be whole on rank 0");
+        let projection = device.run(|| Projection::load_geometry(programs, weights.shape[1], weights.shape[0],
+            1, codebook(weights), rows, TrellisDType::F32))?;
+        let layout = ProjectionLayout::new(&projection.program, rows)?;
+        ensure!(admitted.rows == layout.rows && admitted.extents == layout.extents,
+            "GLM K6 head scratch differs from admission");
+        let scratch = layout.allocate(device)?;
+        Ok(Self { projection, scratch, device, stream, rows })
+    }
+
+    pub(crate) fn launch(&self, weights: &CoreWeights<'_>, input: Buffer, output: Buffer,
+        rows: usize, stream: *mut c_void) -> Result<()> {
+        head_launch(self.rows, self.stream, rows, stream, || {
+            self.device.run(|| self.projection.local(rows, input, weights, &self.scratch, output, stream))
+        })
+    }
+
+    pub(crate) fn target<'s>(&'s self, weights: &'s CoreWeights<'_>) -> crate::shared::speculation::dflash::TargetHead<'s> {
+        crate::shared::speculation::dflash::TargetHead::Launch(Box::new(move |input, logits, rows, stream| {
+            let buffer = |ptr, bytes| Buffer { ptr, bytes, device_id: self.device.id, flags: 0 };
+            self.launch(weights, buffer(input.cast_mut(), rows * weights.shape[1] * 2),
+                buffer(logits.cast(), rows * weights.shape[0] * 4), rows, stream)
+        }))
+    }
+}
+
+/// Target decode/prefill may enqueue before either finishes, but CUDA FIFO
+/// serializes their shared scratch only on this one bound stream.
+pub(crate) fn head_launch<T>(capacity: usize, bound: *mut c_void, rows: usize, stream: *mut c_void,
+    enqueue: impl FnOnce() -> Result<T>) -> Result<T> {
+    ensure!((1..=capacity).contains(&rows) && stream == bound,
+        "GLM K6 head rows/stream differ from admitted scratch");
+    enqueue()
+}
+
+
+pub(crate) fn codebook(weights: &CoreWeights<'_>) -> &'static str {
+    match weights.codebook {
+        cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+        cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1",
+    }
+}

@@ -31,6 +31,7 @@ pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)
 }
 
 pub(crate) enum GlmfHead<'a> {
+    K6(crate::shared::dense_trellis::CoreWeights<'a>),
     Bf16(DeviceAllocation<'a>),
     Fp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
 }
@@ -38,6 +39,7 @@ pub(crate) enum GlmfHead<'a> {
 impl<'a> GlmfHead<'a> {
     pub fn allocations(&self) -> Vec<&DeviceAllocation<'a>> {
         match self {
+            Self::K6(weight) => vec![&weight.payload, &weight.suh, &weight.svh],
             Self::Bf16(weight) => vec![weight],
             Self::Fp8 { values, scales } => vec![values, scales],
         }
@@ -49,6 +51,7 @@ impl<'a> GlmfHead<'a> {
 
     pub fn name(&self) -> &'static str {
         match self {
+            Self::K6(_) => "K6",
             Self::Bf16(_) => "BF16",
             Self::Fp8 { .. } => "FP8",
         }
@@ -58,7 +61,7 @@ impl<'a> GlmfHead<'a> {
     pub fn bf16(&self) -> Option<&DeviceAllocation<'a>> {
         match self {
             Self::Bf16(weight) => Some(weight),
-            Self::Fp8 { .. } => None,
+            Self::Fp8 { .. } | Self::K6(_) => None,
         }
     }
 
