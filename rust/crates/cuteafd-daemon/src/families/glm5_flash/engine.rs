@@ -2115,7 +2115,18 @@ impl<'a> GlmfEngine<'a> {
                 self.router_on(rank, w, weights, rows, &[Span { first: 0, rows }])?;
                 let cap = if self.prefill_rows >= self.decode_rows { PREFILL_CAP } else { decode_cap(rows) };
                 self.ffn_on(rank, w, weights, self.cfg.moe_intermediate, cap,
-                    w.shared.buffer.ptr, Scalar::I32(rows as i32))?;
+                    w.shared.buffer.ptr, Scalar::I32(rows as i32))
+            })?;
+        }
+        // Native shared FFNs wait on their peer: enqueue both before draining either stream.
+        for rank in 0..2 {
+            let decode = self.decode_workspace_of(rank)?;
+            let lanes = self.prefill_slots_of(rank, lanes)?;
+            let w = if self.prefill_rows >= self.decode_rows { &lanes[0] }
+                else { decode.as_ref().context("TP2 priming decode workspace")? };
+            let rows = w.rows;
+            let layer = tp2.layers[0];
+            self.on(rank, || {
                 let mut experts = tp2.ranks[rank].borrow_mut();
                 let input = if experts.partial() == PartialDtype::F32 {
                     let grid = self.quantize_grid.blocks(rows, self.cfg.hidden);
@@ -2243,7 +2254,10 @@ impl<'a> GlmfEngine<'a> {
             for (rank, (layers, caches)) in ranks.iter().enumerate() {
                 let layer = &layers[index];
                 ensure!(layer.attention_share == shares[rank], "attention share differs from admission at layer {index} rank {rank}");
+                let native = layer.core.contains_key("self_attn.o_proj");
                 let operands: &[&str] = match layer.attention {
+                    GlmNextAttention::Mla if native => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_iq", "w_ik",
+                        "k_norm_w", "k_norm_b", "ape"],
                     GlmNextAttention::Mla => &["q_a_norm", "kv_a_norm", "w_uk", "w_uv", "w_qkv_a_fp8",
                         "w_qkv_a_scale", "w_q_b_fp8", "w_q_b_scale", "w_o_fp8", "w_o_scale", "w_iq", "w_ik",
                         "k_norm_w", "k_norm_b", "ape"],
@@ -2251,6 +2265,14 @@ impl<'a> GlmfEngine<'a> {
                 };
                 ensure!(operands.iter().all(|name| layer.has(name) == shares[rank].present()),
                     "attention operands differ from admission at layer {index} rank {rank}");
+                if native {
+                    let leaves: &[&str] = match layer.attention {
+                        GlmNextAttention::Kda => &["q_proj", "k_proj", "v_proj", "o_proj"],
+                        GlmNextAttention::Mla => &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"],
+                    };
+                    ensure!(shares[rank].present() && leaves.iter().all(|leaf|
+                        layer.core.contains_key(&format!("self_attn.{leaf}"))), "Flash K6 attention group incomplete");
+                }
                 if shares[rank].present() { weights.push(rank as u8); }
                 match layer.attention {
                     GlmNextAttention::Mla => {
@@ -2260,7 +2282,8 @@ impl<'a> GlmfEngine<'a> {
                             "compact index ordinal differs from admission at layer {index} rank {rank}");
                     }
                     GlmNextAttention::Kda => {
-                        let projections: &[&str] = if layer.has("w_in_fp8") {
+                        let projections: &[&str] = if native { &["w_aux"] }
+                        else if layer.has("w_in_fp8") {
                             &["w_in_fp8", "w_in_kscale", "w_o_fp8", "w_o_kscale"]
                         } else { &["w_in", "w_o"] };
                         ensure!(projections.iter().all(|name| layer.has(name)),
@@ -2671,7 +2694,8 @@ impl<'a> GlmfEngine<'a> {
         let exchange = PeerExchange::new_abortable(self.library, [RankDevice { device: self.device, stream: self.stream },
             RankDevice { device, stream }], if self.kda_output_shard { 6 } else { 4 } * self.prefill_waves,
             rows * self.cfg.hidden * (self.partial_bytes()
-                + if self.weights.layers.iter().any(|l| !l.core.is_empty()) { 4 } else { 0 }))?
+                + if self.weights.layers.iter().chain(&layers).flat_map(|l| l.core.values())
+                    .any(|w| w.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input) { 4 } else { 0 }))?
             .with_decode_lane_bytes(self.decode_rows * HC * self.cfg.hidden * 2)?;
         exchange.trace_identity("glmf-target-main");
         // Compact state belongs only to whole MLA owners, or to both context halves.
@@ -4946,7 +4970,13 @@ impl<'a> GlmfEngine<'a> {
                     .chain(&["ffn.fn", "ffn.scale", "ffn.base", "post_norm", "gate", "gate.bias", "w_gate_up_fp8",
                         "w_gate_up_scale", "w_down_fp8", "w_down_scale"])
                     .copied().collect();
-                crate::shared::l2_prefetch::operands(&names, |n| next.range(n))
+                let mut ranges = crate::shared::l2_prefetch::operands(&names, |n| next.range(n));
+                for weight in next.core.values() {
+                    ranges.extend([weight.payload.buffer, weight.suh.buffer, weight.svh.buffer]
+                        .map(|buffer| (buffer.ptr.cast_const(), buffer.bytes)));
+                }
+                if let Some(aux) = next.range("w_aux") { ranges.push(aux); }
+                ranges
             }
             None if rank == 1 => Vec::new(),
             None => {

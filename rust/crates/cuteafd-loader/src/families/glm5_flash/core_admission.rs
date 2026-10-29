@@ -86,16 +86,16 @@ impl CoreCharges {
             ensure!(matches.len() == 1, "Flash K6 requires one {name}");
             Ok(matches[0]["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0).try_into()?)
         };
-        let scratch = |rows: usize| -> Result<usize> {
+        let scratch = |decode: bool| -> Result<usize> {
             let mut bytes = 0;
-            for name in stage_names(cfg, ranks, owners.is_some(), rows, decode_rows) {
+            for name in route_stage_names(cfg, ranks, owners.is_some(), decode, decode_rows) {
                 bytes = bytes.max(lookup(&name)?);
             }
             Ok(bytes)
         };
         if bodies.iter().any(|b| !b.is_empty()) {
-            for rows in [decode_rows, unit] {
-                for name in stage_names(cfg, ranks, owners.is_some(), rows, decode_rows) {
+            for decode in [true, false] {
+                for name in route_stage_names(cfg, ranks, owners.is_some(), decode, decode_rows) {
                     lookup(&name)?; programs.insert(name);
                 }
             }
@@ -118,8 +118,8 @@ impl CoreCharges {
         for (rank, body) in bodies.into_iter().enumerate() {
             layouts.push(CoreRankLayout {
                 stages: if body.is_empty() { None } else { Some([
-                    CoreStageLayout::new(cfg, decode_rows, ranks, owners.is_some(), scratch(decode_rows)?)?,
-                    CoreStageLayout::new(cfg, unit, ranks, owners.is_some(), scratch(unit)?)?]) },
+                    CoreStageLayout::new(cfg, decode_rows, ranks, owners.is_some(), scratch(true)?)?,
+                    CoreStageLayout::new(cfg, unit, ranks, owners.is_some(), scratch(false)?)?]) },
                 decode: projection(&body, decode_rows)?, prefill: projection(&body, unit)?,
                 target_head: if rank == 0 { head_scratch(decode_rows.max(unit))? } else { None },
                 draft_head: if rank == 0 { draft_rows.map(head_scratch).transpose()?.flatten() } else { None },
@@ -134,9 +134,15 @@ impl CoreCharges {
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
 }
 
+/// Decode and prefill stages differ even when their live row counts coincide.
+pub fn route_stage_names(cfg: &GlmNextConfig, ranks: usize, owned: bool, decode: bool, decode_rows: usize) -> Vec<String> {
+    let mut names = stage_names(cfg, ranks, owned, if decode { "m64" } else { "m4096" });
+    if decode && decode_rows > 64 { names.extend(stage_names(cfg, ranks, owned, "m128")); }
+    names.sort(); names.dedup(); names
+}
+
 /// Stage package names are separate from the existing fused programs.
-pub fn stage_names(cfg: &GlmNextConfig, ranks: usize, owned: bool, rows: usize, decode_rows: usize) -> Vec<String> {
-    let cap = if rows <= decode_rows { format!("m{decode_rows}") } else { "m4096".into() };
+fn stage_names(cfg: &GlmNextConfig, ranks: usize, owned: bool, cap: &str) -> Vec<String> {
     let mut names = Vec::new();
     for prefix in if ranks == 1 { vec!["glmf_stage"] } else if owned { vec!["glmf_stage", "glmf2_stage"] }
         else { vec!["glmf2_stage"] } {
@@ -154,6 +160,23 @@ pub fn stage_names(cfg: &GlmNextConfig, ranks: usize, owned: bool, rows: usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefill_uses_its_stage_route_even_at_decode_width() -> Result<()> {
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45))?;
+        let decode = route_stage_names(&cfg, 2, true, true, 64);
+        let prefill = route_stage_names(&cfg, 2, true, false, 64);
+        assert!(decode.iter().all(|n| n.ends_with("_m64")));
+        assert!(prefill.iter().all(|n| n.ends_with("_m4096")));
+        assert!(prefill.iter().any(|n| n.starts_with("glmf_stage_rank_norm")));
+        assert!(prefill.iter().any(|n| n.starts_with("glmf2_stage_kda_core")));
+        let wide = route_stage_names(&cfg, 1, false, true, 128);
+        assert!(wide.iter().any(|n| n.ends_with("_m64")));
+        assert!(wide.iter().any(|n| n.ends_with("_m128")));
+        let full = CoreStageLayout::new(&cfg, 64, 2, true, 256)?;
+        assert!(full.extents["values"] >= 64 * cfg.heads * cfg.v_head_dim * 2);
+        Ok(())
+    }
+
     #[test]
     fn exact_native_bytes_include_every_owner_and_no_retained_alias() -> Result<()> {
         let p = ProjectionScratchLayout::new(4096, 8192, 64)?;
