@@ -555,8 +555,6 @@ def wire_input(geometry: str, role: str, width: int, capacity: int, *,
     if role == 'coordinator':
         cell = coordinator_ws_cell(geometry, role, width, capacity)
         return bool(cell and cell.get('wire'))
-    if role == 'spark' and width in (384, 640) and capacity in (2048, 2752):
-        return False
     return geometry == 'glm' and warp_specialized(geometry, role, width, capacity)
 
 
