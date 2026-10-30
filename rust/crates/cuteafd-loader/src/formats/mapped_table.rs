@@ -550,6 +550,9 @@ thread_local! {
 /// A row space over one or more mapped parts, with its stats.
 pub struct MappedTable {
     parts: Vec<MappedRows>,
+    /// Gathers trust the residency hints only while this holds: a late fault
+    /// (a stale bit after eviction) clears it until a full sweep re-anchors them.
+    hint_trusted: AtomicBool,
     resident: Option<ResidentBytes>,
     /// First global row of each part, then the total.
     starts: Vec<u64>,
@@ -584,7 +587,8 @@ impl MappedTable {
         } else {
             0
         };
-        let table = Self { parts: mapped, resident: None, starts, uniform, format, stats: Arc::new(TableStats::default()) };
+        let table = Self { parts: mapped, hint_trusted: AtomicBool::new(false), resident: None, starts, uniform, format,
+            stats: Arc::new(TableStats::default()) };
         {
             use std::os::unix::fs::MetadataExt;
             let mut devices = table.stats.devices.lock().unwrap_or_else(|p| p.into_inner());
@@ -881,7 +885,24 @@ impl MappedTable {
         #[cfg(not(test))]
         let hits = self.residency(rows, false)?;
         let before = thread_faults();
-        for ((part, row, slot), hit) in locations.into_iter().zip(hits) {
+        let trusted = self.hint_trusted.load(Ordering::Acquire);
+        let mut hits = hits;
+        let mut checked = (0usize, before);
+        for (index, ((part, row, slot), hit)) in locations.iter().copied().zip(hits.clone()).enumerate() {
+            // Trusted hints are checked every 64 rows: a major fault means the
+            // hint went stale, so the remaining rows take the mincore split.
+            if trusted && index >= checked.0 + 64 {
+                let now = thread_faults();
+                let stale = checked.1.zip(now).is_some_and(|(a, b)| b[1] > a[1]);
+                checked = (index, now);
+                if stale && self.hint_trusted.load(Ordering::Acquire) {
+                    self.distrust_residency_hint();
+                    let rest: Vec<u64> = locations[index..].iter().map(|&(part, local, _)| self.starts[part] + local).collect();
+                    let fresh = self.residency(&rest, false)?;
+                    hits.splice(index.., fresh);
+                }
+            }
+            let hit = if trusted { hits[index] } else { hit };
             if hit {
                 output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
                 prepared.stats.hits += 1;
@@ -913,7 +934,7 @@ impl MappedTable {
         let started = Instant::now();
         // With residency hints, each row is one or two bit lookups: no page
         // collection, sort or search.
-        if self.parts.iter().all(|part| part.hint.get().is_some()) {
+        if self.hint_trusted.load(Ordering::Acquire) && self.parts.iter().all(|part| part.hint.get().is_some()) {
             let hits = rows.iter().map(|&row| {
                 let (part, local) = self.locate(row)?;
                 let part = &self.parts[part];
@@ -939,12 +960,7 @@ impl MappedTable {
             while at < pages.len() {
                 let part = pages[at].0;
                 let end = at + pages[at..].partition_point(|&(index, _)| index == part);
-                match self.parts[part].hint.get() {
-                    Some(hint) => for (slot, &(_, page)) in resident[at..end].iter_mut().zip(&pages[at..end]) {
-                        *slot = self.parts[part].hint_get(hint, page);
-                    },
-                    None => uring::resident(&self.parts[part], &pages[at..end], &mut resident[at..end], mincore)?,
-                }
+                uring::resident(&self.parts[part], &pages[at..end], &mut resident[at..end], mincore)?;
                 at = end;
             }
             rows.iter().map(|&row| {
@@ -1075,6 +1091,19 @@ impl MappedTable {
             let _ = part.hint.set((0..part.page_count().div_ceil(64)).map(|_| AtomicU64::new(0)).collect());
         }
     }
+    /// A full sweep finished since the last distrust: gathers may trust the hint.
+    pub fn trust_residency_hint(&self) { self.hint_trusted.store(true, Ordering::Release); }
+    /// A hit copy faulted: the hint is stale (pages were evicted). Gathers use
+    /// `mincore` again and the bits restart from zero until a full sweep.
+    fn distrust_residency_hint(&self) {
+        if !self.hint_trusted.swap(false, Ordering::AcqRel) { return; }
+        for part in &self.parts {
+            if let Some(hint) = part.hint.get() { for word in hint.iter() { word.store(0, Ordering::Relaxed); } }
+        }
+        self.stats.residency_hint_distrusts.fetch_add(1, Ordering::Relaxed);
+        tracing::info!("mapped table residency hint went stale (late fault); using mincore until the next full sweep");
+    }
+    pub fn residency_hint_trusted(&self) -> bool { self.hint_trusted.load(Ordering::Acquire) }
     /// Pages in the hint across parts (0 when it is off).
     pub fn residency_pages(&self) -> usize {
         self.parts.iter().filter(|part| part.hint.get().is_some()).map(MappedRows::page_count).sum()
@@ -1250,6 +1279,7 @@ pub struct TableStats {
     pub(crate) stall_decode_pending_rows: AtomicU64,
     pub(crate) residency_sweep_ns: AtomicU64,
     pub(crate) residency_sweep_pages: AtomicU64,
+    pub(crate) residency_hint_distrusts: AtomicU64,
 }
 
 /// A point-in-time copy of [`TableStats`]; `since` gives an interval.
@@ -1377,6 +1407,9 @@ pub struct TableStatsSnapshot {
     pub residency_sweep_ns: u64,
     #[serde(default)]
     pub residency_sweep_pages: u64,
+    /// Times a late fault made the gathers stop trusting the residency hint.
+    #[serde(default)]
+    pub residency_hint_distrusts: u64,
 }
 
 impl TableStats {
@@ -1573,6 +1606,7 @@ impl TableStats {
             stall_decode_pending_rows: get(&self.stall_decode_pending_rows),
             residency_sweep_ns: get(&self.residency_sweep_ns),
             residency_sweep_pages: get(&self.residency_sweep_pages),
+            residency_hint_distrusts: get(&self.residency_hint_distrusts),
         }
     }
 }
@@ -1651,6 +1685,7 @@ impl TableStatsSnapshot {
             stall_decode_pending_rows: d(self.stall_decode_pending_rows, earlier.stall_decode_pending_rows),
             residency_sweep_ns: d(self.residency_sweep_ns, earlier.residency_sweep_ns),
             residency_sweep_pages: d(self.residency_sweep_pages, earlier.residency_sweep_pages),
+            residency_hint_distrusts: d(self.residency_hint_distrusts, earlier.residency_hint_distrusts),
         }
     }
     /// Fraction classified resident by NOWAIT or an approximate mincore snapshot.

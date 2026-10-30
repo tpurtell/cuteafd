@@ -33,6 +33,8 @@ impl ResidencySweep {
                 for table in &tables {
                     for mapped in [Some(table.weights()), table.scales()].into_iter().flatten() {
                         let pages = mapped.residency_pages();
+                        // Trust only a sweep no distrust interrupted (a distrust zeroes the bits).
+                        let generation = mapped.stats().snapshot().residency_hint_distrusts;
                         let mut at = 0;
                         while at < pages && !running.load(Ordering::Acquire) {
                             match mapped.sweep_residency(at, SLICE_PAGES, &mut scratch) {
@@ -46,6 +48,9 @@ impl ResidencySweep {
                             // Late faults mean stale bits: finish this sweep without pausing.
                             let now = tables.iter().map(|t| t.weights().stats().snapshot().late_major_faults).sum::<u64>();
                             if now == faults { std::thread::sleep(PAUSE); } else if faults != u64::MAX { faults = now; }
+                        }
+                        if at >= pages && mapped.stats().snapshot().residency_hint_distrusts == generation {
+                            mapped.trust_residency_hint();
                         }
                     }
                 }

@@ -1399,17 +1399,23 @@ fn residency_hint_tracks_reads_sweeps_and_survives_stale_bits() -> TestResult {
     let mut output = vec![0; ids.len() * 264];
     table.gather_slots(&ids, &slots, &mut output)?;
     expect(&output);
-    assert!(table.residency(&ids, false)?.iter().all(|&hit| hit), "reads mark their pages resident");
-    // A sweep anchors the hint to the kernel's view.
+    // A sweep anchors the hint to the kernel's view; then gathers trust it.
     let mut scratch = Vec::new();
     let mut at = 0;
     while let swept @ 1.. = table.sweep_residency(at, 64, &mut scratch)? { at += swept; }
     assert_eq!(at, table.residency_pages());
+    table.trust_residency_hint();
+    assert!(table.residency(&ids, false)?.iter().all(|&hit| hit), "swept pages are resident");
     // Stale bits: evict, gather without re-sweeping; bytes stay exact (a stale
     // hit copy faults synchronously and is counted, never wrong).
     assert_eq!(super::uring::dontneed(&table.parts[0]), 0);
     let mut stale = vec![0; ids.len() * 264];
     table.gather_slots(&ids, &slots, &mut stale)?;
     expect(&stale);
+    // Faults on stale bits make gathers stop trusting the hint until a sweep.
+    if table.stats().snapshot().late_major_faults > 0 {
+        assert!(!table.residency_hint_trusted());
+        assert_eq!(table.stats().snapshot().residency_hint_distrusts, 1);
+    }
     Ok(())
 }

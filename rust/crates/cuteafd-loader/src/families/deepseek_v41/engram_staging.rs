@@ -488,6 +488,7 @@ mod tests {
                 table.weights().enable_residency_hint();
                 let (mut at, mut scratch, started) = (0, Vec::new(), std::time::Instant::now());
                 while let Ok(swept @ 1..) = table.weights().sweep_residency(at, 1 << 20, &mut scratch) { at += swept; }
+                table.weights().trust_residency_hint();
                 println!("residency sweep: {at} pages in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
             let mut times = Vec::new();
