@@ -78,6 +78,12 @@ pub enum MappedTableError {
 
 pub type Result<T, E = MappedTableError> = std::result::Result<T, E>;
 
+/// Rows a gather copies straight from the mapping before its first check of
+/// the thread's major faults, and the interval the checks double to while the
+/// copy stays resident (a getrusage call, about 5 ns per row at 64).
+const COPY_FIRST_CHECK: usize = 4;
+const COPY_CHECK_ROWS: usize = 64;
+
 /// Bytes per positioned payload read (scale preload, page-cache warm).
 pub(crate) const PAYLOAD_CHUNK_BYTES: usize = 16 << 20;
 
@@ -521,6 +527,9 @@ thread_local! {
 /// A row space over one or more mapped parts, with its stats.
 pub struct MappedTable {
     parts: Vec<MappedRows>,
+    /// Tests of the residency split route every row through it.
+    #[cfg(test)]
+    split_only: AtomicBool,
     resident: Option<ResidentBytes>,
     /// First global row of each part, then the total.
     starts: Vec<u64>,
@@ -555,7 +564,8 @@ impl MappedTable {
         } else {
             0
         };
-        let table = Self { parts: mapped, resident: None, starts, uniform, format, stats: Arc::new(TableStats::default()) };
+        let table = Self { parts: mapped, #[cfg(test)] split_only: AtomicBool::new(false), resident: None, starts, uniform,
+            format, stats: Arc::new(TableStats::default()) };
         {
             use std::os::unix::fs::MetadataExt;
             let mut devices = table.stats.devices.lock().unwrap_or_else(|p| p.into_inner());
@@ -846,13 +856,49 @@ impl MappedTable {
             }
             return Ok(prepared);
         }
-        #[cfg(test)]
-        let hits = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() { vec![false; rows.len()] }
-            else { self.residency(rows, false)? };
-        #[cfg(not(test))]
-        let hits = self.residency(rows, false)?;
         let before = thread_faults();
-        for ((part, row, slot), hit) in locations.into_iter().zip(hits) {
+        // Copy first: a resident batch is a plain copy from the mapping. The
+        // thread's major faults are checked every COPY_CHECK_ROWS rows; the first
+        // one (a row read from the device) sends the rest of the batch to the
+        // residency split, so its misses go to the read reactor instead of
+        // faulting one at a time here. Switches are counted.
+        let mut copied = 0;
+        #[cfg(test)]
+        let copy_first = !self.split_only.load(Ordering::Relaxed) && std::env::var_os("MAPPED_BENCH_ALL_MISS").is_none()
+            && std::env::var_os("MAPPED_BENCH_SPLIT").is_none();
+        #[cfg(not(test))]
+        let copy_first = true;
+        if copy_first {
+            let mut checked = before;
+            // The first check comes after COPY_FIRST_CHECK rows (a cold small
+            // batch faults at most that many rows here); the interval doubles
+            // while the copy stays resident, up to COPY_CHECK_ROWS.
+            let mut group = COPY_FIRST_CHECK;
+            while copied < locations.len() {
+                let end = (copied + group).min(locations.len());
+                for &(part, row, slot) in &locations[copied..end] {
+                    output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
+                }
+                copied = end;
+                let now = thread_faults();
+                if checked.zip(now).is_some_and(|(a, b)| b[1] > a[1]) {
+                    self.stats.copy_switches.fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+                checked = now;
+                group = (group * 2).min(COPY_CHECK_ROWS);
+            }
+            prepared.stats.hits += copied as u64;
+            prepared.stats.hit_bytes += (copied * width) as u64;
+        }
+        let rest = &locations[copied..];
+        let rest_rows: Vec<u64> = rest.iter().map(|&(part, local, _)| self.starts[part] + local).collect();
+        #[cfg(test)]
+        let hits = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() { vec![false; rest_rows.len()] }
+            else if rest_rows.is_empty() { Vec::new() } else { self.residency(&rest_rows, false)? };
+        #[cfg(not(test))]
+        let hits = if rest_rows.is_empty() { Vec::new() } else { self.residency(&rest_rows, false)? };
+        for (&(part, row, slot), hit) in rest.iter().zip(hits) {
             if hit {
                 output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
                 prepared.stats.hits += 1;
@@ -1010,6 +1056,9 @@ impl MappedTable {
             "mapped table backend");
     }
 
+    /// Tests of the residency split: skip the plain copy.
+    #[cfg(test)]
+    pub(crate) fn split_only_for_test(&self) { self.split_only.store(true, Ordering::Relaxed); }
     /// Bench/test only: reclaim this table's mapped pages (`MADV_PAGEOUT`, then
     /// drop the file's page cache) and return how many stayed resident.
     #[cfg(test)]
@@ -1182,6 +1231,7 @@ pub struct TableStats {
     pub(crate) stall_decode_ns: AtomicU64,
     pub(crate) stall_decode_fallback_rows: AtomicU64,
     pub(crate) stall_decode_pending_rows: AtomicU64,
+    pub(crate) copy_switches: AtomicU64,
 }
 
 /// A point-in-time copy of [`TableStats`]; `since` gives an interval.
@@ -1304,6 +1354,10 @@ pub struct TableStatsSnapshot {
     /// Rows decode gathers waited for while another reader filled them.
     #[serde(default)]
     pub stall_decode_pending_rows: u64,
+    /// Gathers whose plain copy hit a slow (device-read) row and switched to the
+    /// residency split for the rest of the batch.
+    #[serde(default)]
+    pub copy_switches: u64,
 }
 
 impl TableStats {
@@ -1498,6 +1552,7 @@ impl TableStats {
             stall_decode_ns: get(&self.stall_decode_ns),
             stall_decode_fallback_rows: get(&self.stall_decode_fallback_rows),
             stall_decode_pending_rows: get(&self.stall_decode_pending_rows),
+            copy_switches: get(&self.copy_switches),
         }
     }
 }
@@ -1574,6 +1629,7 @@ impl TableStatsSnapshot {
             stall_decode_ns: d(self.stall_decode_ns, earlier.stall_decode_ns),
             stall_decode_fallback_rows: d(self.stall_decode_fallback_rows, earlier.stall_decode_fallback_rows),
             stall_decode_pending_rows: d(self.stall_decode_pending_rows, earlier.stall_decode_pending_rows),
+            copy_switches: d(self.copy_switches, earlier.copy_switches),
         }
     }
     /// Fraction classified resident by NOWAIT or an approximate mincore snapshot.

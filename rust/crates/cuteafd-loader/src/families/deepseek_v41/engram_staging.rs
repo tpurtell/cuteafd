@@ -587,6 +587,7 @@ mod tests {
             table.weights().evict_for_test() + table.scales().map_or(0, |s| s.evict_for_test())
         };
         let mode = std::env::var("ENGRAM_BENCH_MODE").unwrap_or_else(|_| "hybrid".into());
+        let fraction = std::env::var("ENGRAM_BENCH_WARM_FRACTION").unwrap_or_default();
         let threads: usize = std::env::var("ENGRAM_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
         let mut times = Vec::new();
         let mut rows_read = 0usize;
@@ -603,10 +604,27 @@ mod tests {
                     let status = std::process::Command::new("sh").arg("-c").arg(&command).status()?;
                     anyhow::ensure!(status.success(), "drop command failed: {command}");
                 }
+                // Partly resident: re-read a random fraction of the batch's rows.
+                if let Some(fraction) = std::env::var("ENGRAM_BENCH_WARM_FRACTION").ok().and_then(|v| v.parse::<f64>().ok()) {
+                    let scales = table.scales().context("paired official table")?;
+                    let mut pick = 0x2545_F491_4F6C_DD1Du64;
+                    for &row in &rows {
+                        pick ^= pick << 13; pick ^= pick >> 7; pick ^= pick << 17;
+                        if (pick % 1000) as f64 / 1000.0 < fraction {
+                            std::hint::black_box((table.weights().row(row)?[0], scales.row(row)?[0]));
+                        }
+                    }
+                }
             } else {
-                // Warm: both tables' pages of this batch are in the page cache.
+                // Warm: both tables' pages of this batch (every byte of each row,
+                // rows straddling a page included) are in the page cache.
                 let scales = table.scales().context("paired official table")?;
-                for &row in &rows { std::hint::black_box((table.weights().row(row)?[0], scales.row(row)?[0])); }
+                let mut sum = 0u64;
+                for &row in &rows {
+                    sum += table.weights().row(row)?.iter().map(|&b| u64::from(b)).sum::<u64>();
+                    sum += scales.row(row)?.iter().map(|&b| u64::from(b)).sum::<u64>();
+                }
+                std::hint::black_box(sum);
             }
             let started = std::time::Instant::now();
             if mode == "mmap" {
@@ -636,9 +654,61 @@ mod tests {
         let median = times[times.len() / 2];
         let distinct = rows_read / repeats;
         // Cold, each distinct row costs one 4 KiB weight page and one 4 KiB scale page from the device.
-        println!("real table {} {} K={threads}: {distinct} distinct rows, median {median:.1} ms (min {:.1}, max {:.1}), {:.2} GB/s of 4 KiB pages",
-            if cold { "COLD" } else { "warm" }, mode, times[0], times[times.len() - 1],
+        let switches = table.weights().stats().snapshot().copy_switches;
+        println!("real table {}{} {} K={threads}: {distinct} distinct rows, median {median:.1} ms (min {:.1}, max {:.1}), {:.2} GB/s of 4 KiB pages, copy switches {switches}",
+            if cold { "COLD" } else { "warm" }, if fraction.is_empty() { String::new() } else { format!(" ({fraction} resident)") },
+            if mode == "hybrid" && std::env::var_os("MAPPED_BENCH_SPLIT").is_some() { "split-first (cand5)".to_string() }
+                else if mode == "hybrid" { "copy-first".to_string() }
+                else { mode.clone() },
+            times[0], times[times.len() - 1],
             distinct as f64 * 2.0 * 4096.0 / (median / 1e3) / 1e9);
+        Ok(())
+    }
+
+    /// Per-group copy time distribution (8 rows) warm vs cold on the real table,
+    /// and the cost of one clock read: picks the copy-first fault threshold.
+    #[test]
+    #[ignore = "CPU/IO microbench on a real snapshot, run in release"]
+    fn engram_copy_group_timing() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("ENGRAM_BENCH_SNAPSHOT") else { return Ok(()) };
+        let catalog = crate::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
+        // SAFETY: the snapshot is immutable for the bench's lifetime.
+        let table = unsafe { catalog.map_engram(1)? };
+        let scales = table.scales().context("paired official table")?;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rows: Vec<u64> = (0..65536).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng % table.weights().rows() }).collect();
+        rows.sort_unstable(); rows.dedup();
+        let started = std::time::Instant::now();
+        let mut sink = std::time::Instant::now();
+        for _ in 0..1_000_000 { sink = std::hint::black_box(std::time::Instant::now()); }
+        let clock_ns = started.elapsed().as_nanos() as f64 / 1e6;
+        let _ = sink;
+        let mut out = [0u8; 264];
+        let mut time_groups = |label: &str| -> Result<()> {
+            let mut groups = Vec::new();
+            for group in rows.chunks(8) {
+                let start = std::time::Instant::now();
+                for &row in group {
+                    out[..256].copy_from_slice(table.weights().row(row)?);
+                    out[256..].copy_from_slice(scales.row(row)?);
+                }
+                std::hint::black_box(&out);
+                groups.push(start.elapsed().as_nanos() as u64);
+            }
+            groups.sort_unstable();
+            let q = |p: f64| groups[((groups.len() - 1) as f64 * p) as usize];
+            let over = groups.iter().filter(|&&t| t > 5_000).count();
+            println!("copy groups of 8 rows {label}: p50 {} ns, p99 {} ns, p99.9 {} ns, max {} ns; {} of {} groups over 5 us",
+                q(0.5), q(0.99), q(0.999), groups[groups.len() - 1], over, groups.len());
+            Ok(())
+        };
+        if let Ok(command) = std::env::var("ENGRAM_BENCH_DROP") {
+            table.weights().evict_for_test(); scales.evict_for_test();
+            anyhow::ensure!(std::process::Command::new("sh").arg("-c").arg(&command).status()?.success(), "drop failed");
+            time_groups("cold")?;
+        }
+        time_groups("warm")?;
+        println!("clock read: {clock_ns:.1} ns ({:.1} ns per row at groups of 8)", clock_ns / 8.0);
         Ok(())
     }
 }

@@ -320,6 +320,7 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
     for backend in [TableBackend::Mmap, TableBackend::MincoreRouted] {
         // SAFETY: test file is immutable while the table lives.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+        table.split_only_for_test();
         table.initialize_reads();
         if backend == TableBackend::MincoreRouted && table.backend() != backend {
             eprintln!("SKIP NOWAIT miss execution: unsupported kernel/seccomp/filesystem");
@@ -360,6 +361,7 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
     let open = || -> Result<MappedTable> {
         // SAFETY: this test owns the immutable file until all tables drop.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+        table.split_only_for_test();
         table.initialize_reads();
         table.parts[0].nowait.store(false, Ordering::Relaxed);
         table.stats.nowait.store(false, Ordering::Relaxed);
@@ -423,6 +425,7 @@ fn failed_misses_keep_initial_residency_and_copy_hits_only_once() -> TestResult 
     file.as_file().sync_all()?;
     // SAFETY: test-owned immutable file outlives all owned reads and mappings.
     let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    table.split_only_for_test();
     assert_eq!(uring::dontneed(&table.parts[0]), 0);
     std::hint::black_box(table.row(1)?[0]);
     assert_eq!(table.residency(&[1, 3, 6], false)?, [true, false, false]);
@@ -441,6 +444,7 @@ fn mincore_routing_keeps_hits_on_caller_and_falls_back_safely() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: test-owned shard files remain immutable through the table lifetime.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.split_only_for_test();
     table.initialize_reads();
     if table.backend() == TableBackend::MincoreRouted {
         let mut output = [0; 12];
@@ -1374,5 +1378,45 @@ fn split_cancel_and_shutdown_recycle_prepared_and_queued_jobs() -> TestResult {
     drops.recv_timeout(Duration::from_secs(5))?;
     assert!(matches!(queued.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Cancelled) | Err(GatherFailure::Worker(_))));
     assert_eq!(slots.free.lock().unwrap().len(), 4);
+    Ok(())
+}
+
+#[test]
+fn copy_first_copies_resident_batches_and_switches_cold_ones_to_the_split() -> TestResult {
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    let rows = 256u64;
+    let payload: Vec<u8> = (0..rows as usize * page).map(|i| (i % 251) as u8).collect();
+    file.write_all(&payload)?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test owns the immutable file for the table's lifetime.
+    let table = unsafe { MappedTable::single(file.path(), 0, rows, u8_rows(page))? };
+    table.prepare_reads();
+    let ids: Vec<u64> = (0..rows).rev().collect();
+    let expect = |output: &[u8]| for (index, &row) in ids.iter().enumerate() {
+        assert_eq!(&output[index * page..(index + 1) * page], &payload[row as usize * page..(row as usize + 1) * page]);
+    };
+    // Warm: one plain copy, no residency split.
+    let mut output = vec![0; ids.len() * page];
+    table.gather_into(&ids, &mut output)?;
+    let mut warm = vec![0; ids.len() * page];
+    let before = table.stats().snapshot();
+    table.gather_into(&ids, &mut warm)?;
+    expect(&warm);
+    let delta = table.stats().snapshot().since(&before);
+    assert_eq!((delta.copy_switches, delta.page_misses), (0, 0));
+    // Cold: the first fault switches the rest of the batch to the split; bytes stay exact.
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    // SAFETY: advice over exactly this live mapping.
+    unsafe { libc::madvise(table.parts[0].base.as_ptr().cast(), table.parts[0].mapped_len, 21 /* MADV_PAGEOUT */) };
+    let before = table.stats().snapshot();
+    let mut cold = vec![0; ids.len() * page];
+    table.gather_into(&ids, &mut cold)?;
+    expect(&cold);
+    let delta = table.stats().snapshot().since(&before);
+    if delta.late_major_faults > 0 {
+        assert_eq!(delta.copy_switches, 1);
+        assert!(delta.page_hits <= COPY_CHECK_ROWS as u64, "at most one check interval copied before the switch");
+    }
     Ok(())
 }
