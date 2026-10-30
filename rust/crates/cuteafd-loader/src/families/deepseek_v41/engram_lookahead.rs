@@ -244,12 +244,12 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
             std::thread::sleep(std::time::Duration::from_micros(50));
             continue;
         }
-        // Layer-14 rows waiting on layer-1 rows a gather is reading: check again shortly.
-        let waiting = plans.iter().any(|plan| plan.pieces.iter().any(|piece| piece.l14_rows.is_some()));
-        let oldest = plans.iter_mut().find(|plan| plan.pieces.iter().any(|piece| piece.reading() > 0));
-        match oldest {
-            Some(plan) => if let Err(error) = land_oldest(plan, &tables) { abandon(plan, &error) },
-            None if waiting => match receive.recv_timeout(std::time::Duration::from_millis(1)) {
+        // Reads in flight, or layer-14 rows waiting on layer-1 rows a gather is
+        // reading: check again shortly, staying responsive to decode commands
+        // rather than blocking on one prefill read.
+        let busy = plans.iter().any(|plan| plan.pieces.iter().any(|piece| piece.l14_rows.is_some() || piece.reading() > 0));
+        match busy {
+            true => match receive.recv_timeout(std::time::Duration::from_micros(200)) {
                 Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
                 Ok(Command::Decode(rows)) => match start_decode(&rows, &tables) {
                     Ok(Some(piece)) => decode.push_back(piece),
@@ -259,7 +259,7 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
                 Ok(command) => apply(&mut plans, command),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             },
-            None => match receive.recv() {
+            false => match receive.recv() {
                 Ok(Command::Stop) | Err(_) => return,
                 Ok(Command::Decode(rows)) => match start_decode(&rows, &tables) {
                     Ok(Some(piece)) => decode.push_back(piece),
@@ -416,20 +416,6 @@ fn poll(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<bool> {
     plan.count(0, landed[0]);
     plan.count(1, landed[1]);
     Ok(landed != [0, 0])
-}
-
-/// Wait for the oldest outstanding read (layer 1 first) and publish it.
-fn land_oldest(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<()> {
-    let piece = plan.pieces.iter_mut().find(|piece| piece.reading() > 0).expect("an in-flight read");
-    let landed = if let Some((mut read, slots)) = piece.l1_read.take() {
-        read.finish(&tables[0])?;
-        (0, publish_read(&mut piece.l1, (read, slots), &tables[0])?)
-    } else if let Some((mut read, slots)) = piece.l14_read.take() {
-        read.finish(&tables[1])?;
-        (1, publish_read(piece.l14.as_mut().expect("layer-14 pins"), (read, slots), &tables[1])?)
-    } else { (0, 0) };
-    plan.count(landed.0, landed.1);
-    Ok(())
 }
 
 fn publish_read(pins: &mut Pins, (read, slots): (RowRead, Vec<u32>), table: &EngramTable) -> Result<u64> {

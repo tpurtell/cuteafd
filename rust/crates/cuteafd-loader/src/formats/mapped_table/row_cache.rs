@@ -41,7 +41,9 @@ impl Hasher for RowHasher {
     fn finish(&self) -> u64 { self.0 }
     fn write(&mut self, bytes: &[u8]) { for &b in bytes { self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15); } }
     fn write_u64(&mut self, value: u64) { self.0 = value.wrapping_mul(0x9E37_79B9_7F4A_7C15); }
+    fn write_u32(&mut self, value: u32) { self.write_u64(u64::from(value)); }
 }
+type SlotSet = std::collections::HashSet<u32, BuildHasherDefault<RowHasher>>;
 
 struct Inner {
     index: HashMap<u64, u32, BuildHasherDefault<RowHasher>>,
@@ -117,7 +119,7 @@ impl RowCache {
     /// while the class's share allows. The returned lookups follow `rows`.
     pub fn acquire(self: &Arc<Self>, rows: &[u64], class: RowClass) -> (Pins, Vec<Lookup>) {
         let mut pins = Pins { cache: Arc::clone(self), class, slots: Vec::with_capacity(rows.len()),
-            filling: Vec::new() };
+            filling: SlotSet::default() };
         let mut lookups = Vec::with_capacity(rows.len());
         let (mut hits, mut waits, mut denied, mut evicted) = (0u64, 0u64, 0u64, 0u64);
         // Bounded critical sections: other fillers publish between chunks.
@@ -134,7 +136,7 @@ impl RowCache {
                         }
                     }
                     None => match inner.reserve(row, class, self.shares, &mut evicted) {
-                        Some(slot) => { pins.slots.push(slot); pins.filling.push(slot); Lookup::Fill(slot) },
+                        Some(slot) => { pins.slots.push(slot); pins.filling.insert(slot); Lookup::Fill(slot) },
                         None => { denied += 1; Lookup::Uncached },
                     },
                 };
@@ -250,7 +252,7 @@ pub struct Pins {
     cache: Arc<RowCache>,
     class: RowClass,
     slots: Vec<u32>,
-    filling: Vec<u32>,
+    filling: SlotSet,
 }
 
 impl Pins {
@@ -258,13 +260,13 @@ impl Pins {
 
     /// Write a reserved slot's row (`parts` total the cache width) and publish it.
     pub fn publish(&mut self, slot: u32, parts: &[&[u8]]) -> Result<()> {
-        let at = self.filling.iter().position(|&s| s == slot).ok_or_else(|| invalid("publishing an unreserved row"))?;
+        if !self.filling.contains(&slot) { return Err(invalid("publishing an unreserved row")); }
         if parts.iter().map(|p| p.len()).sum::<usize>() != self.cache.width {
             return Err(invalid("published row width differs from the cache"));
         }
         // SAFETY: `slot` is reserved by these pins and not yet published.
         unsafe { self.cache.write(slot, parts) };
-        self.filling.swap_remove(at);
+        self.filling.remove(&slot);
         self.cache.lock().slots[slot as usize].state = State::Ready;
         self.cache.published.notify_all();
         Ok(())
@@ -287,7 +289,7 @@ impl Pins {
             let mut inner = self.cache.lock();
             for &slot in &written { inner.slots[slot as usize].state = State::Ready; }
         }
-        self.filling.retain(|slot| !written.contains(slot));
+        for slot in &written { self.filling.remove(slot); }
         self.cache.published.notify_all();
         Ok(written.len())
     }

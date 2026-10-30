@@ -20,7 +20,10 @@ impl StagingBytes {
 pub struct EngramBatchStaging {
     capacity: usize,
     payload: StagingBytes,
-    order: Vec<(u64, usize)>,
+    /// Per gather: each distinct row's first (canonical) slot, and the
+    /// (canonical, duplicate) slot pairs copied after the rows land.
+    first: std::collections::HashMap<u64, usize>,
+    dups: Vec<(usize, usize)>,
     ready: Option<(usize, usize, EngramEncoding, f32)>,
 }
 /// One layer's gather between preparation and completion: the row-cache pins,
@@ -72,7 +75,8 @@ impl EngramBatchStaging {
         Ok(Self {
             capacity,
             payload: StagingBytes::Host(vec![0; Self::payload_bytes(capacity)]),
-            order: Vec::with_capacity(capacity * 24),
+            first: std::collections::HashMap::with_capacity(capacity * 24),
+            dups: Vec::with_capacity(capacity * 24),
             ready: None,
         })
     }
@@ -95,7 +99,8 @@ impl EngramBatchStaging {
     pub fn new_pinned(library: &cuteafd_ffi::NativeLibrary, capacity: usize) -> Result<Self> {
         Self::storage_bytes(capacity)?;
         Ok(Self { capacity, payload: StagingBytes::Pinned(library.pinned_bytes(Self::payload_bytes(capacity))?),
-            order: Vec::with_capacity(capacity * 24), ready: None })
+            first: std::collections::HashMap::with_capacity(capacity * 24),
+            dups: Vec::with_capacity(capacity * 24), ready: None })
     }
     pub fn host_buffer(&self) -> Option<cuteafd_ffi::CuteafdHostBuffer> {
         match &self.payload { StagingBytes::Pinned(p) => Some(p.buffer()), _ => None }
@@ -115,7 +120,7 @@ impl EngramBatchStaging {
         match &mut self.payload { StagingBytes::Pinned(p) => p.copy_ready(), _ => Ok(true) }
     }
     /// Concatenate request-owned batches without committing their histories.
-    /// Read each distinct table row once, in address order, then scatter duplicates
+    /// Read each distinct table row once, in token order, then copy duplicates
     /// back to their canonical token/head slots using preallocated storage.
     /// Any failure invalidates the view; no eager table load is performed.
     pub fn gather(
@@ -159,7 +164,16 @@ impl EngramBatchStaging {
         let payload = self.payload.bytes_mut();
         let (weights, rest) = payload.split_at_mut(capacity * 24 * 256);
         let (scales, text_mask) = rest.split_at_mut(capacity * 24 * 8);
-        self.order.clear();
+        // FP4's packed weights and scales fit in the original FP8 weight arena.
+        // Keep the FP8 allocation/budget unchanged and never expand mapped rows.
+        let scale_base = capacity * 24 * 128;
+        // Distinct rows in token order (staging writes stay sequential); every
+        // text slot is written by its row or its duplicate copy, so only image
+        // rows take the defaults (zero embeddings, unit scales).
+        self.first.clear();
+        self.dups.clear();
+        let mut addresses = Vec::with_capacity(rows * 24);
+        let mut slots = Vec::with_capacity(rows * 24);
         let mut token = 0;
         for batch in batches {
             for (row, hashes) in batch.hashes().iter().enumerate() {
@@ -168,28 +182,26 @@ impl EngramBatchStaging {
                 if text {
                     for (head, &address) in hashes[layer_index].iter().enumerate() {
                         ensure!(address < expected_rows, "engram hash is outside its table");
-                        self.order.push((address, token * 24 + head));
+                        let slot = token * 24 + head;
+                        match self.first.entry(address) {
+                            std::collections::hash_map::Entry::Occupied(canonical) => self.dups.push((*canonical.get(), slot)),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(slot);
+                                addresses.push(address);
+                                slots.push(slot);
+                            }
+                        }
+                    }
+                } else {
+                    let span = token * 24..(token + 1) * 24;
+                    weights[span.start * weight_bytes..span.end * weight_bytes].fill(0);
+                    if encoding == EngramEncoding::Fp8 {
+                        scales[span.start * scale_bytes..span.end * scale_bytes].fill(127);
+                    } else {
+                        weights[scale_base + span.start * scale_bytes..scale_base + span.end * scale_bytes].fill(0x38);
                     }
                 }
                 token += 1;
-            }
-        }
-        // FP4's packed weights and scales fit in the original FP8 weight arena.
-        // Keep the FP8 allocation/budget unchanged and never expand mapped rows.
-        let scale_base = capacity * 24 * 128;
-        weights[..rows * 24 * weight_bytes].fill(0);
-        if encoding == EngramEncoding::Fp8 {
-            scales[..rows * 24 * scale_bytes].fill(127);
-        } else {
-            weights[scale_base..scale_base + rows * 24 * scale_bytes].fill(0x38);
-        }
-        self.order.sort_unstable();
-        let mut addresses = Vec::with_capacity(self.order.len());
-        let mut slots = Vec::with_capacity(self.order.len());
-        for &(address, slot) in &self.order {
-            if addresses.last() != Some(&address) {
-                addresses.push(address);
-                slots.push(slot);
             }
         }
         let class = if priority.is_decode() { RowClass::Decode } else { RowClass::Prefill };
@@ -269,21 +281,14 @@ impl EngramBatchStaging {
             }
         }
         drop(pins);
-        let mut previous = None;
-        for &(address, slot) in &self.order {
-            if let Some((last_address, source)) = previous {
-                if last_address == address {
-                    weights.copy_within(source * weight_bytes..(source + 1) * weight_bytes, slot * weight_bytes);
-                    if encoding == EngramEncoding::Fp8 {
-                        scales.copy_within(source * scale_bytes..(source + 1) * scale_bytes, slot * scale_bytes);
-                    } else {
-                        weights.copy_within(scale_base + source * scale_bytes..scale_base + (source + 1) * scale_bytes,
-                            scale_base + slot * scale_bytes);
-                    }
-                    continue;
-                }
+        for &(source, slot) in &self.dups {
+            weights.copy_within(source * weight_bytes..(source + 1) * weight_bytes, slot * weight_bytes);
+            if encoding == EngramEncoding::Fp8 {
+                scales.copy_within(source * scale_bytes..(source + 1) * scale_bytes, slot * scale_bytes);
+            } else {
+                weights.copy_within(scale_base + source * scale_bytes..scale_base + (source + 1) * scale_bytes,
+                    scale_base + slot * scale_bytes);
             }
-            previous = Some((address, slot));
         }
         self.ready = Some((rows, layer, encoding, global_scale));
         Ok(())
@@ -440,6 +445,54 @@ mod tests {
             assert!(staging.gather(&table, &[],0).is_err());
             assert!(staging.view().is_err());
             assert_eq!(addresses_before,staging.payload.bytes().as_ptr());
+        }
+        Ok(())
+    }
+
+    /// Microbench of one prefill-unit gather (2,752 tokens x 24 rows, strided
+    /// 264 B rows): `cached` = every row already in the row cache (the look-ahead
+    /// landed it); otherwise the row cache misses and the rows are page-cache
+    /// hot (the 64K warm path). Run in release:
+    /// `cargo test --release -p cuteafd-loader --lib engram_gather_microbench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "CPU microbench, run in release"]
+    fn engram_gather_microbench() -> Result<()> {
+        let tokens = 2752usize;
+        let repeats: usize = std::env::var("ENGRAM_BENCH_REPEATS").ok().and_then(|v| v.parse().ok()).unwrap_or(10);
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let ids: Vec<Option<u32>> = (0..tokens).map(|_| {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            Some((rng % 99_000) as u32)
+        }).collect();
+        let batch = cuteafd_core::EngramHistory::new(0)?.prepare(0, &ids, tokens)?;
+        let dir = tempfile::tempdir_in(std::env::var("ENGRAM_BENCH_DIR").unwrap_or_else(|_| ".".into()))?;
+        let path = dir.path().join("strided.bin");
+        let file = std::fs::File::create(&path)?;
+        file.set_len(ENGRAM_ROWS[0] * 264)?;
+        for hashes in batch.hashes() {
+            for &address in &hashes[0] {
+                file.write_all_at(&[(address % 251) as u8; 264], address * 264)?;
+            }
+        }
+        drop(file);
+        // SAFETY: the bench owns the immutable fixture file for the table's lifetime.
+        let rows = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
+        let mut table = EngramTable::new_strided(rows)?;
+        let mut staging = EngramBatchStaging::new(tokens)?;
+        for (label, shares) in [("row-cache hit", [2 * tokens * 24, 1024]), ("page-cache hot", [24, 1024])] {
+            table.set_cache_shares(shares)?;
+            // Warm: the page cache (and, when it fits, the row cache).
+            for _ in 0..2 { staging.gather(&table, &[&batch], 0)?; }
+            let mut times = Vec::new();
+            for _ in 0..repeats {
+                let started = std::time::Instant::now();
+                let view = staging.gather(&table, &[&batch], 0)?;
+                std::hint::black_box(view.weights.len());
+                times.push(started.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(f64::total_cmp);
+            println!("engram gather {label}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms",
+                times[times.len() / 2], times[0], times[times.len() - 1]);
         }
         Ok(())
     }

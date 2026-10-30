@@ -822,11 +822,16 @@ impl MappedTable {
         priority: ReadPriority, window: usize) -> Result<PreparedTableGather> {
         if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
         let width = self.row_bytes();
-        let mut unique = BTreeSet::new();
+        // Dense slots 0..n (every row read into its own buffer) are distinct by
+        // construction; other layouts are checked with one bitmap pass.
+        let dense = slots.iter().enumerate().all(|(index, &slot)| index == slot);
+        let mut unique = if dense { Vec::new() } else { vec![false; output.len() / width.max(1)] };
         let locations = rows.iter().zip(slots).map(|(&row, &slot)| {
             let (part, local) = self.locate(row)?;
             if slot.checked_add(1).and_then(|n| n.checked_mul(width)).is_none_or(|n| n > output.len())
-                || !unique.insert(slot) { return Err(invalid("invalid or overlapping gather slots")); }
+                || (!dense && std::mem::replace(&mut unique[slot], true)) {
+                return Err(invalid("invalid or overlapping gather slots"));
+            }
             Ok((part, local, slot))
         }).collect::<Result<Vec<_>>>()?;
         let mut prepared = PreparedTableGather { misses: Vec::new(), stream: None,
