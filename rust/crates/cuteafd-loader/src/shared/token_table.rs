@@ -1,34 +1,7 @@
 //! Shared bounded token-table work: priority gathers and completion-held staging.
 use anyhow::{ensure, Context, Result};
-use crate::{GatherLease, GatherTicket, GatherWorker, MappedTable, GatherPool};
+use crate::{GatherLease, GatherTicket, GatherWorker};
 use std::sync::Mutex;
-
-/// Small gathers stay on the persistent owner; large mmap gathers retain fault
-/// parallelism. io_uring retains its batched backend at either size.
-pub const PARALLEL_GATHER_BYTES: usize = 1 << 20;
-
-pub struct RowGather { pool: GatherPool, priority: crate::formats::mapped_table::ReadPriority }
-impl RowGather {
-    pub fn new(name: &str, threads: usize) -> Result<Self> { Ok(Self { pool: GatherPool::new(name, threads)?, priority: Default::default() }) }
-    pub(crate) fn priority(&self) -> crate::formats::mapped_table::ReadPriority { self.priority }
-    pub fn with_priority(mut self, priority: crate::formats::mapped_table::ReadPriority) -> Self { self.priority = priority; self }
-    pub fn parallel(bytes: usize) -> bool { bytes >= PARALLEL_GATHER_BYTES }
-    pub fn gather(&self, table: &MappedTable, rows: &[u64], output: &mut [u8]) -> Result<()> {
-        if self.priority == crate::formats::mapped_table::ReadPriority::Prefill && Self::parallel(output.len()) { self.pool.gather(table, rows, output)?; }
-        else {
-            let started = std::time::Instant::now();
-            table.gather_into_priority(rows, output, self.priority)?;
-            table.stats().record_gather(rows.len(), output.len(), started.elapsed(), [0; 3]);
-        }
-        Ok(())
-    }
-    pub fn gather_slots(&self, table: &MappedTable, rows: &[u64], slots: &[usize], output: &mut [u8]) -> Result<()> {
-        if self.priority == crate::formats::mapped_table::ReadPriority::Prefill && Self::parallel(rows.len().saturating_mul(table.row_bytes())) { self.pool.gather_slots(table, rows, slots, output)?; }
-        else { table.gather_slots_priority(rows, slots, output, self.priority)?; }
-        Ok(())
-    }
-
-}
 
 /// Inclusive upper bound for device-ordered mapped-pinned metadata copies.
 /// Larger payloads use the host-triggered copy engine after the previous reader.

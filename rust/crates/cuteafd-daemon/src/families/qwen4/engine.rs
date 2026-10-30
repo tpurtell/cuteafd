@@ -2163,14 +2163,55 @@ impl<'a> Qwen4Engine<'a> {
         Ok(out)
     }
 
-    /// Advises the page cache of a mapped PLE table about the rows of
-    /// `tokens` appended after `history` (a later step's, e.g. the next
-    /// prefill chunk); best effort: never blocks, failures only log.
-    pub fn prefetch_ple(&self, history: &NgramHistory, tokens: &[u32]) {
+    /// Read the PLE rows of `tokens[resume..]` (after `history`, the n-gram
+    /// history at `resume`) into the table's row cache ahead of its gathers,
+    /// in the units the prefill runs: each scheduler chunk (ends `chunk_ends`)
+    /// cut as `prefill_units` cuts it, `waves` deep. None without a mapped table.
+    pub fn read_ahead_ple(&self, history: &NgramHistory, tokens: &[u32], resume: usize, chunk_ends: &[usize])
+        -> Option<cuteafd_loader::LookaheadHandle> {
+        let (ple, mapped) = self.ple.as_ref().map(|p| (p, p.mapped()))?;
+        if resume >= tokens.len() { return None; }
+        let units = match self.ple_units(resume, tokens.len(), chunk_ends) {
+            Ok(units) => units,
+            Err(error) => { tracing::warn!("PLE look-ahead not started: {error:#}"); return None; }
+        };
+        let (hasher, mut history) = (ple.hasher.clone(), history.clone());
+        let source = cuteafd_loader::formats::mapped_table::token_table::HashedSource {
+            tokens: tokens[resume..].to_vec(),
+            hash: move |tokens: &[u32], rows: &mut Vec<u64>| {
+                let mut ids = Vec::with_capacity(tokens.len() * hasher.heads());
+                hasher.hash(&mut history, tokens, &mut ids)?;
+                rows.extend(ids.into_iter().map(|id| id as u64));
+                Ok(())
+            },
+        };
+        Some(mapped.start_lookahead(self.request_id.get(), resume as u64, Box::new(source), units))
+    }
+
+    /// The prefill units of `tokens[resume..end]` (absolute ends) and their depth.
+    fn ple_units(&self, resume: usize, end: usize, chunk_ends: &[usize]) -> Result<cuteafd_loader::TableUnitPlan> {
+        let (unit_rows, waves) = self.prefill_shape.map_or((self.prefill_rows, 1),
+            |shape| (shape.unit_rows as usize, shape.waves as usize));
+        let mut ends = Vec::new();
+        let mut at = resume;
+        for &chunk_end in chunk_ends.iter().filter(|&&e| e > resume).chain(std::iter::once(&end)) {
+            if chunk_end <= at { continue; }
+            if self.prefill_shape.is_some() {
+                let units = crate::shared::prefill_pipeline::sequence_units(chunk_end - at, unit_rows, 1, 1)?;
+                ends.extend(units.iter().map(|unit| (at + unit.rows.end) as u64));
+            } else { ends.push(chunk_end as u64); }
+            at = chunk_end;
+        }
+        Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1) })
+    }
+
+    /// Read the PLE rows `token` adds after `tokens` into the row cache now.
+    pub fn prefetch_ple_decode(&self, tokens: &[u32], token: u32) {
         let Some((ple, mapped)) = self.ple.as_ref().map(|p| (p, p.mapped())) else { return };
-        let mut ids = Vec::with_capacity(tokens.len() * self.cfg.ple_rows());
-        if let Err(error) = ple.hasher.hash(&mut history.clone(), tokens, &mut ids).and_then(|()| mapped.prefetch(&ids)) {
-            tracing::warn!("PLE prefetch: {error:#}");
+        let mut ids = Vec::with_capacity(self.cfg.ple_rows());
+        if let Err(error) = ple.hasher.hash(&mut history_of(&self.cfg, tokens), &[token], &mut ids)
+            .and_then(|()| mapped.prefetch_decode(&ids)) {
+            tracing::warn!("PLE decode prefetch: {error:#}");
         }
     }
 
@@ -3949,8 +3990,9 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
         let engine = self.engine;
         if let Some(mapped) = engine.ple.as_ref().map(|p| p.mapped()) {
             let batch = self.ple_batch.as_ref().context("PLE prefill batch ownership")?;
-            // Fill the mandatory lookahead before enqueueing this unit.
-            for index in unit.index..(unit.index + mapped.lookahead()).min(self.pending.len()) {
+            // Stage the units in flight before enqueueing this one (their rows
+            // are already in the row cache when the look-ahead reached them).
+            for index in unit.index..(unit.index + mapped.depth()).min(self.pending.len()) {
                 if self.pending[index].is_none() {
                     self.pending[index] = Some(mapped.begin_unit(batch, index, false)?);
                 }

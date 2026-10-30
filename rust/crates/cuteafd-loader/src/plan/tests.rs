@@ -576,6 +576,12 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                 let runtime = MappedStaging::new(unit * cfg.ple_rows(), k, 64 * cfg.ple_rows(), row_bytes).unwrap();
                 assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.workspace_bytes);
                 assert_eq!(staging[0].bytes as usize, 2 * (k * unit + 64) * cfg.ple_rows() * row_bytes + runtime.workspace_bytes);
+                // The row cache matches the runtime's shares: the look-ahead window plus decode.
+                use crate::formats::mapped_table::token_table::TokenTable;
+                let cache = host.items.iter().find(|item| item.group == "mapped-table/row-cache").expect("PLE row cache");
+                let shares = TokenTable::shares(unit, k, 64, cfg.ple_rows());
+                assert_eq!(cache.bytes as usize, TokenTable::cache_bytes(row_bytes, shares));
+                assert_eq!(shares, [(2 * k + 1) * unit * cfg.ple_rows(), 2 * 64 * cfg.ple_rows()]);
             }
         }
     }

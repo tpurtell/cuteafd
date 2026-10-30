@@ -649,26 +649,6 @@ fn checkpoint_tensors_validate_dtype_width_payload_and_paths() -> TestResult {
 }
 
 #[test]
-fn prefetcher_bounds_rows_reports_pages_and_detaches() -> TestResult {
-    let (_dir, parts) = parted([3, 3, 2])?;
-    let table: Arc<MappedTable> = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
-    let worker = TablePrefetcher::new("test-prefetch", 1, 4, 8)?;
-    assert!(worker.try_submit(table.clone(), &[8]).is_err());
-    assert!(worker.try_submit(table.clone(), &[0; 5]).is_err());
-    let ticket = worker.try_submit(table.clone(), &[1, 0, 1])?.expect("queue has room");
-    assert_eq!(ticket.wait()?, TablePrefetchOutcome::Advised(vec![1]));
-    let cancelled = worker.try_submit(table.clone(), &[7])?.expect("queue has room");
-    cancelled.cancel();
-    assert!(matches!(cancelled.wait()?, TablePrefetchOutcome::Cancelled | TablePrefetchOutcome::Advised(_)));
-    // Detached advice truncates to the row cap instead of failing.
-    while !worker.submit_detached(table.clone(), &[0, 1, 2, 3, 4, 5])? {}
-    drop(worker);
-    let stats = table.stats().snapshot();
-    assert!(stats.prefetch_jobs >= 2 && stats.prefetch_pages >= 2);
-    Ok(())
-}
-
-#[test]
 fn gather_worker_recycles_slots_and_cancels() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     let table = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
@@ -912,25 +892,6 @@ fn residency_overhead_measurement() -> TestResult {
     assert_eq!(delta.page_misses, 0, "warm benchmark must not measure table I/O");
     assert_eq!(delta.late_major_faults, 0, "resident pages faulted during copies");
     assert_eq!(delta.page_hits, (count * repeats) as u64);
-    if std::env::var_os("MAPPED_BENCH_WRAPPER").is_some() {
-        let gather = crate::shared::token_table::RowGather::new("mapped-bench", 16)?;
-        gather.gather_slots(&table, &ids, &slots, &mut output)?;
-        let before = table.stats().snapshot();
-        let wrapped = Instant::now();
-        for _ in 0..repeats {
-            gather.gather_slots(&table, black_box(&ids), &slots, black_box(&mut output))?;
-        }
-        let wrapped = wrapped.elapsed();
-        let wrapped_delta = table.stats().snapshot().since(&before);
-        assert_eq!(wrapped_delta.page_misses, 0, "wrapper benchmark must not measure table I/O");
-        assert_eq!(wrapped_delta.late_major_faults, 0);
-        assert_eq!(wrapped_delta.page_hits, (count * repeats) as u64);
-        eprintln!("mapped_wrapper backend={:?} rows={count} width={width} repeats={repeats} parallel={} direct_us={:.3} wrapped_us={:.3} residency_us={:.3} hits={} misses={} late_faults={}",
-            table.backend(), crate::shared::token_table::RowGather::parallel(count * width),
-            full.as_secs_f64() * 1e6 / repeats as f64, wrapped.as_secs_f64() * 1e6 / repeats as f64,
-            wrapped_delta.residency_ns as f64 / repeats as f64 / 1e3,
-            wrapped_delta.page_hits, wrapped_delta.page_misses, wrapped_delta.late_major_faults);
-    }
     let copying = Instant::now();
     for _ in 0..repeats {
         for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
@@ -1108,35 +1069,6 @@ fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
     assert!(second.resident.is_none());
     assert_ne!(first.backend(), TableBackend::Resident);
     assert_ne!(second.backend(), TableBackend::Resident);
-    Ok(())
-}
-
-#[test]
-fn shared_table_small_and_large_gathers_preserve_native_order() -> TestResult {
-    use crate::shared::token_table::{RowGather, PARALLEL_GATHER_BYTES};
-    let mut shard = tempfile::NamedTempFile::new()?;
-    let width = 256;
-    let count = PARALLEL_GATHER_BYTES / width + 1;
-    let bytes: Vec<u8> = (0..count * width).map(|i| ((i / width) % 251) as u8).collect();
-    shard.write_all(&bytes)?;
-    // SAFETY: this test retains the immutable shard for the mapping lifetime.
-    let table = unsafe { MappedTable::single(shard.path(), 0, count as u64, u8_rows(width))? };
-    // The shared size dispatch preserves canonical row slots on either backend.
-    let gather = RowGather::new("table-size-test", 2)?;
-    for n in [32, count] {
-        let ids: Vec<_> = (0..n).map(|i| ((n - 1 - i) / 2) as u64).collect();
-        let mut output = vec![0; n * width];
-        assert_eq!(RowGather::parallel(output.len()), n == count);
-        gather.gather(&table, &ids, &mut output)?;
-        for (&id, actual) in ids.iter().zip(output.chunks_exact(width)) {
-            assert_eq!(actual, &bytes[id as usize * width..(id as usize + 1) * width]);
-        }
-        let slots: Vec<_> = (0..n).rev().collect();
-        gather.gather_slots(&table, &ids, &slots, &mut output)?;
-        for (&id, &slot) in ids.iter().zip(&slots) {
-            assert_eq!(&output[slot * width..(slot + 1) * width], &bytes[id as usize * width..(id as usize + 1) * width]);
-        }
-    }
     Ok(())
 }
 

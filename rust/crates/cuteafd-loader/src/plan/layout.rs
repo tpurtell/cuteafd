@@ -1595,6 +1595,12 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
                 usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?,
                 usize::try_from(decode)?, usize::try_from(row_bytes)?)?;
             push(Category::Staging, "staging/mapped-table", "PLE active/lookahead rows and worker workspace", staging.total_bytes as u64, Basis::Formula);
+            let waves = usize::try_from(report.prefill_waves.unwrap_or(options.prefill_waves))?;
+            let shares = crate::formats::mapped_table::token_table::TokenTable::shares(usize::try_from(unit_rows.max(64))?,
+                waves, 64, cfg.ple_rows());
+            push(Category::Workspace, "mapped-table/row-cache", "PLE bounded row cache (look-ahead window + decode)",
+                crate::formats::mapped_table::token_table::TokenTable::cache_bytes(usize::try_from(row_bytes)?, shares) as u64,
+                Basis::Formula);
         }
     }
     let score_lanes = if matches!(family, "glm5" | "glm5_flash") { lanes } else { 1 };

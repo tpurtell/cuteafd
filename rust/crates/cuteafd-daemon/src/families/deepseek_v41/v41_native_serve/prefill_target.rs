@@ -96,7 +96,7 @@ pub(crate) struct V41PrefillTimes {
 /// `chunk_rows` from its end, each call cut by [`stream_units`]; units run
 /// `waves` deep in pipeline order.
 pub(super) fn prompt_units(start: usize, replay_end: usize, tokens: usize, chunk_rows: usize, waves: usize)
-    -> Result<cuteafd_loader::EngramUnitPlan> {
+    -> Result<cuteafd_loader::TableUnitPlan> {
     let call_rows = (waves * chunk_rows).max(1);
     let mut ends = Vec::new();
     let mut at = replay_end.clamp(start, tokens);
@@ -106,7 +106,7 @@ pub(super) fn prompt_units(start: usize, replay_end: usize, tokens: usize, chunk
         ends.extend(stream_units(rows, chunk_rows.max(1), waves.max(1))?.iter().map(|unit| (at + unit.end) as u64));
         at += rows;
     }
-    Ok(cuteafd_loader::EngramUnitPlan { ends, depth: waves.max(1) })
+    Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1) })
 }
 
 fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
