@@ -2726,9 +2726,14 @@ def test_cold_window_drops_page_cache_when_the_timed_sweep_opens(entry, tmp_path
     with pytest.raises(ValueError, match='--cold-window drops the page cache'):
         cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
                        cold_hosts=['raptor'])
-    job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'a', dict(instance='p', slot='s'), tmp_path,
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path,
                          tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
     assert job['entry']['window']['open']['argv'] == ['/opt/bin/nest', 'drop-caches', '--host', 'raptor']
+    # Prefill points purge per point (before warm-up and timed request), not via the window.
+    job = cards.generate({**entry, 'prefill_lengths': [8192, 65536], 'levels': [1]}, 'e', dict(instance='t', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+    assert job['entry']['prefill_purge']['argv'] == ['/opt/bin/nest', 'drop-caches', '--host', 'raptor']
+    assert 'window' not in job['entry']
     # With PROFILE=nsys the purge runs first, then the nsys sessions start.
     job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'b', dict(instance='q', slot='s'), tmp_path,
                          tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1, cold_hosts=['raptor'])
