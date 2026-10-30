@@ -653,7 +653,7 @@ fn worker(
         .enable_all()
         .build()?;
     let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some())?;
-    scheduler::publish_capacity(&requests, &prefixes);
+    scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     vision.connect()?;
     admission::startup_phase(&lib, "v41/ready", device_total)?;
     ready

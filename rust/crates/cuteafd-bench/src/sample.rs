@@ -73,7 +73,7 @@ pub fn report(failed: bool) -> Report {
                 .collect(),
             prefill: Some(PrefillRate { prompt_tokens: 8192, tok_s: 2415.0, ttft_s: 3.392, runs: vec![] }),
             warmup_s: Some(14.2), prompt_token_ratio: None,
-            capacity: Some(Capacity { kv_tokens: Some(14_710_000), kv_pages: Some(28_728),
+            capacity: Some(Capacity { kv_tokens: Some(14_710_000), max_tokens: None, kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
                 max_context: Some(1 << 20), max_output: Some(393_216), host_cache_bytes: Some(64 << 30) }) },
         quality, seconds: 151.0, thermal: None, fabric: vec![],
@@ -98,7 +98,7 @@ pub fn report(failed: bool) -> Report {
 #[cfg(test)]
 mod tests {
     use crate::render;
-    use crate::report::Setting;
+    use crate::report::{Capacity, Report, Setting};
 
     #[test]
     fn obsolete_single_point_reports_are_refused_and_migrated_history_keeps_c8() {
@@ -199,11 +199,14 @@ mod tests {
         }
         // Health evidence must not steal the second chip row.
         report.fabric.push(crate::fabric::Phase { timed: true, ports: vec![crate::fabric::Port {
-            health: Some(Default::default()), ..Default::default()
+            health: Some(cuteafd_transport::fabric_health::Health {
+                verdict: cuteafd_transport::fabric_health::Verdict::Warn,
+                retransmit_pct: Some(1.2), retransmit_judged: true, ..Default::default()
+            }), ..Default::default()
         }], ..Default::default() });
         let card = render::card::card_svg(&report);
         assert!(card.contains("POWER-CAPPED"));
-        assert!(card.contains("Fabric: retransmit rate unavailable"));
+        assert!(card.contains("Fabric: peak retransmits 1.2% of packets (above 0.5%)"));
         assert!(card.contains(r#"x="56" y="516""#));
         // Last bar ends at 496; health text starts no higher than 504 (12px font).
         let last_bar_bottom = 416.0 + 2.0 * 30.0 + 4.0 + 16.0;
@@ -240,7 +243,76 @@ mod tests {
         report.baseline = None;
         assert_eq!(report.capacity_line(), "11 RTX expert layers · 16 req max");
         report.server.hardware.sparks.clear();
-        assert_eq!(report.capacity_line(), "16 req max");
+        assert_eq!(report.capacity_line(), "all RTX · 16 req max");
+    }
+
+    #[test]
+    fn kv_capacity_line_shows_only_a_larger_maximum() {
+        let mut capacity = Capacity { kv_tokens: Some(1_800_000), max_tokens: Some(2_100_000),
+            ..Default::default() };
+        assert_eq!(capacity.line(), "KV 1.8M tok (max 2.1M)");
+        for max in [Some(1_800_000), Some(1_000_000), None] {
+            capacity.max_tokens = max;
+            assert_eq!(capacity.line(), "KV 1.8M tok");
+        }
+        capacity.kv_tokens = Some(0);
+        capacity.max_tokens = Some(2_100_000);
+        assert_eq!(capacity.line(), "");
+        capacity.kv_tokens = None;
+        assert_eq!(capacity.line(), "");
+    }
+
+    #[test]
+    fn spark_capacity_keeps_maximum_before_resolved_expert_count() {
+        let mut report = super::report(false);
+        assert!(!report.server.hardware.sparks.is_empty());
+        report.server.configuration.settings.push(Setting { name: "rtx-expert-layers".into(),
+            value: Some("20".into()), source: "resolved".into(), ..Default::default() });
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(1_800_000), max_tokens: Some(2_100_000),
+            kv_format: Some("FP8 MLA latent".into()), ..Default::default() });
+        let expected = "KV 1.8M tok (max 2.1M) · 20 RTX expert layers · FP8 MLA latent";
+        assert_eq!(report.capacity_line(), expected);
+        let restored: Report = serde_json::from_str(&serde_json::to_string(&report).unwrap()).unwrap();
+        assert_eq!(restored.capacity_line(), expected);
+        report.baseline.as_mut().unwrap().card.capacity.as_mut().unwrap().kv_tokens = Some(0);
+        assert_eq!(report.capacity_line(), "20 RTX expert layers · FP8 MLA latent");
+    }
+
+    #[test]
+    fn old_reports_without_maximum_still_load() {
+        let original = super::report(false);
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(!json.contains("max_tokens"));
+        let restored: Report = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.capacity().max_tokens, None);
+        assert_eq!(restored.capacity_line(), original.capacity_line());
+    }
+
+    #[test]
+    fn no_spark_moe_capacity_is_all_rtx_without_onboarding_tradeoff() {
+        let mut report = super::report(false);
+        report.server.hardware.sparks.clear();
+        report.server.family = Some("glm5_flash".into());
+        report.server.configuration.settings.push(Setting { name: "rtx-expert-layers".into(),
+            value: Some("45".into()), source: "resolved".into(), ..Default::default() });
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(1_800_000), max_tokens: Some(2_100_000),
+            kv_format: Some("FP8 MLA latent + KDA state".into()), max_requests: Some(16),
+            ..Default::default() });
+        assert_eq!(report.capacity_line(), "KV 1.8M tok · all RTX · FP8 MLA latent + KDA state · 16 req max");
+    }
+
+    #[test]
+    fn no_spark_dense_capacity_is_all_rtx_without_resolved_expert_count() {
+        let mut report = super::report(false);
+        report.server.hardware.sparks.clear();
+        report.server.family = Some("qwen3_5".into());
+        report.baseline.as_mut().unwrap().card.capacity = Some(Capacity {
+            kv_tokens: Some(260_000), max_tokens: Some(300_000), ..Default::default() });
+        assert_eq!(report.capacity_line(), "KV 260K tok · all RTX");
+        report.baseline.as_mut().unwrap().card.capacity.as_mut().unwrap().kv_tokens = Some(0);
+        assert_eq!(report.capacity_line(), "all RTX");
     }
 
     #[test]

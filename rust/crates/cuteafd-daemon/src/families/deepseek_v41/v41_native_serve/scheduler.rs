@@ -2194,7 +2194,7 @@ pub(super) fn console_round(tally: console::Tally, lane: usize, shared: bool, st
 
 /// Publishes the resolved KV pool (the compressed source with the fewest
 /// tokens) and host-cache bytes for the benchmark's capacity record.
-pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'_>) {
+pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'_>, max_tokens: u64) {
     // A unit is one page of each ratio-two source (the binding ones): same tokens and pages as
     // the per-source report before units.
     let units = requests.cache().unit_capacity() as u64;
@@ -2202,7 +2202,7 @@ pub(crate) fn publish_capacity(requests: &Requests<'_>, prefixes: &PrefixCache<'
         units));
     let host = prefixes.host_config().map_or(0, |config| config.bytes as u64);
     if let Some((tokens, pages)) = tokens {
-        cuteafd_bench::context::set_kv(tokens, pages, "FP4 compressed (CSA/HCA) + FP8 window", host);
+        cuteafd_bench::context::set_kv(tokens, Some(max_tokens), pages, "FP4 compressed (CSA/HCA) + FP8 window", host);
     }
 }
 

@@ -98,6 +98,7 @@ pub(crate) struct Engine<'a> {
     pub embedding: TokenEmbedding<'a>,
     /// Benchmarks and token gates only: MoE layers run the shared expert alone.
     pub skip_routed: bool,
+    pub max_pool_tokens_no_onboard: Option<u64>,
     /// This engine's GPU (rank 0 of a head split).
     pub device: i32,
     /// Program family of one GPU's share under a head split (`dsv4f2`, `dsv4p2`).
@@ -561,6 +562,7 @@ impl<'a> Engine<'a> {
         ensure!(parts.context.is_none() || (split_family.is_some() && parts.shape.units % 2 == 0),
             "C4 context attention needs the head-split programs and an even unit pool, not {} units", parts.shape.units);
         Ok(Self {
+            max_pool_tokens_no_onboard: None,
             device: parts.library.cuda_get_device()?,
             split_family,
             peer: None,
