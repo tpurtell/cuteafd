@@ -6318,3 +6318,24 @@ reviewed GPTQModel pin are frozen. The HF account is authenticated as
 recover the existing run rather than starting another producer. Report layer
 progress and ETA every 30 minutes after it is stable. Public target remains
 `wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6`.
+
+The first full producer stopped before exporting layer 0 because the native
+RowParallelLinear wrapper has no nn.Linear.in_features attribute. Both widths
+now come from the reviewed weight shapes. That stopped attempt is archived
+as `production-failed-native-api-1793350843718029823`; its obsolete activations
+are retired while three projection results and original evidence remain.
+No producer identity or receipt was rewritten to reuse incompatible state.
+
+The strengthened short pilot passed in 268.75 seconds with the same 105
+format rows plus a real seven-projection dense-layer production transaction.
+It verified assembly, rolling retirement and byte-exact native replay from
+that assembled shard for all three calibration prompts. All six native
+checks and the independent receipt audit passed; probe weight/activation
+payloads are retired. The integrated CPU gate passes 129 cases.
+
+Current full production unit: `step5-core-k6-1793352607963307063` (launched
+2026-10-30 09:30 UTC). Its automatic publication/import/six-Spark placement
+and cleanup are enabled. Earlier pilot/producer units are disabled. The
+current numerical source/pin is frozen; only publication metadata was
+extended to explain native tokenizer loading while preserving source assets.
+Continue this run and recover its latest durable frontier if needed.
