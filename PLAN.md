@@ -6225,3 +6225,66 @@ The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
 Do not replay publication against the deliberately retired standalone paths.
 Full-model generation/serving qualification and K6 engine shape support remain
 separate work; this task branch is pushed for review, not merged.
+
+## Step-5 Preview BF16 to mixed EXL3 K4 / Core K6 (MaxQ, 2026-10-30)
+
+TJ authorized a shortened format pilot, autonomous recipe decisions, full
+quantization and publication as `wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6`,
+then a zero-copy Sparknest import, one file copy spread across the six RDMA
+Sparks, and removal of standalone/intermediate payloads after verification.
+This supersedes the Step brief's recipe/upload approval stops. Work stays on
+`quant/step5-k4-core-k6`; implementation checkout is
+`~/Developer/cute-worktrees/step5-quant-integration`. No engine changes or
+maxq serving/performance work are included.
+
+Pinned source `stepfun-ai/Step-5-Preview-BF16` at
+`7734b7ffac118d70d8398bfa3eb0fab007eb45b1` is local in Sparknest on maxq.
+All 48 release files passed actual Hub LFS/Git checksum verification,
+including nested inference sources. The authoritative index covers 2,449
+tensors / 1,205,950,680,832 bytes. Explicit reviewed redundant header aliases
+and unindexed release copies are counted only at their indexed locations.
+The fail-closed recipe produces 375,913 tensors / 315,357,147,520 bytes
+(293.699 GiB), 96 shards and 93,600 quantized matrices: target core/head K6,
+routed experts K4 on layers 3–87 and K6 on 88–90, and all three MTP cores
+including their actual independent output heads at K4. Preserve all 1,513
+native tensors byte-for-byte, including 667 vision tensors, gates, indexers,
+routers and norms. Both source StepFun license files are copied verbatim.
+
+GPTQModel main is pushed at `2f126a60c296fe0e62d3e843af9090046355d947`.
+The adapter uses the existing verified Step-5 native reference, windowed
+attention and sparse kernels, observes packed QKV without extra products,
+and preserves FP32 residual/native BF16 GEMM and SwiGLU boundaries. Each
+fused expert is loaded by slice; only one layer is resident. MTP starts from
+the final target's raw residual, with three successive teacher-forced token
+and absolute-position shifts, stage-local heads and rolling recovery.
+
+The source's historical Llama tokenizer label causes AutoTokenizer to
+replace its ByteLevel backend. Preparation now uses the existing fidelity
+loader and attests the exact serialized backend plus ten raw/plain-chat
+encoding comparisons. No regex heuristic changes are applied. The corrected
+full native calibration panel has 1,426 prompts and 1,105,269 tokens, longest
+1,041 tokens. A task-owned uv environment uses the pinned Transformers
+source and compatible Hub/tokenizers packages, borrowing existing Torch
+read-only; the main checkout's .venv remains untouched. The 106 integrated
+CPU cases passed in the matching SM120 image, including publication,
+recovery, source mutation and tokenizer/backend regressions.
+
+The bounded pilot compares 21 representative matrices across five formats,
+with a short eight-layer BF16 prefix, real prompt boundaries, >512-token
+window witness, measured native sparse metadata, serialized replay and
+independent three-stage MTP wiring. Late-layer expert comparison explicitly
+uses a layer-7 input witness and makes no actual layer-88 calibration claim.
+Production uses its real causal stream. This short panel does not exercise
+long-context top-k pruning; full-model quality/serving qualification remains
+separate. Expected pilot work is bounded to one inventory, no repeated arms.
+
+The enabled user service wraps the existing fair maxq lease on raptor,
+bounded preflight/run, rolling front-edge retirement and crash recovery.
+After GPU teardown/lease release it uploads and audits remote bytes, adopts
+through a mandatory Btrfs reflink bridge plus Sparknest --no-copy import,
+verifies managed bytes, places one copy on the six fabric hosts, and removes
+standalone export/cache/staging before retiring redundant off-grid copies
+through Sparknest. Sources, logs, metrics and audit receipts remain.
+Run root: `~/.cache/cuteafd/quantization/step5-k4-core-k6/`.
+Evidence: `~/.cache/cuteafd/builds/step5-core-k6/`.
+Recipe/prior-art and engine follow-up report: `~/step5-core-quant.md`.
