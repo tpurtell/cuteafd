@@ -1442,8 +1442,10 @@ impl TableStats {
         read.fetch_add(fallback as u64, Ordering::Relaxed);
         waited.fetch_add(pending as u64, Ordering::Relaxed);
     }
-    pub fn record_lookahead(&self, rows: usize) {
-        self.lookahead_pieces.fetch_add(1, Ordering::Relaxed);
+    /// Rows a look-ahead read published; `piece` when it completed a piece's
+    /// share of this table (or a decode round's).
+    pub fn record_lookahead(&self, rows: usize, piece: bool) {
+        if piece { self.lookahead_pieces.fetch_add(1, Ordering::Relaxed); }
         self.lookahead_rows.fetch_add(rows as u64, Ordering::Relaxed);
     }
     pub fn record_prefetch(&self, pages: usize) {

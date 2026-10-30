@@ -217,6 +217,31 @@ mod tests {
         Ok(())
     }
 
+    /// The look-ahead reserves a batch only as it submits its read: rows of a
+    /// piece it has not reached yet are free for a demand gather to read itself.
+    #[test]
+    fn look_ahead_never_reserves_rows_ahead_of_its_reads() -> Result<()> {
+        // 160 B rows: one batch is 2048 rows; a piece of 384 tokens x 16 rows is 6144.
+        let (_file, table) = fixture(1 << 16, 160, [1 << 16, 1024])?;
+        let ahead = TokenTableLookahead::new("test-ple", Arc::clone(&table))?;
+        let hash = |t: &[u32], rows: &mut Vec<u64>| -> Result<()> {
+            rows.extend(t.iter().flat_map(|&t| (0..16u64).map(move |h| u64::from(t) * 16 + h)));
+            Ok(())
+        };
+        let tokens: Vec<u32> = (0..384).collect();
+        let _handle = ahead.start(1, 0, Box::new(HashedSource { tokens, hash }), UnitPlan { ends: vec![384], depth: 1 });
+        // Whatever the planner has done so far, at most one batch per in-flight read is Filling.
+        for _ in 0..50 {
+            let rows: Vec<u64> = (0..384 * 16).collect();
+            let (pins, lookups) = table.cache().acquire(&rows, RowClass::Decode);
+            let waiting = lookups.iter().filter(|l| matches!(l, Lookup::Wait(_))).count();
+            assert!(waiting <= 3 * 2048, "{waiting} rows reserved but not being read");
+            drop(pins);
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        Ok(())
+    }
+
     /// Qwen PLE prefill-unit gathers on the real table (QWEN_BENCH_SNAPSHOT):
     /// per-unit gather time, direct (the old path: rows read at gather time) vs
     /// through the row cache after the look-ahead, cold (QWEN_BENCH_DROP runs a

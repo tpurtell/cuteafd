@@ -14,9 +14,12 @@
 //! admit. Across requests it follows admission order, which is execution order.
 //! Reads go through each table's mapped-table reader (copy first, then the
 //! residency split and the shared read reactor) and never block for a reactor
-//! buffer: the planner polls. Pieces stay pinned until commits pass them.
-//! Whoever reserves a row first reads it, so the look-ahead, the gathers and
-//! decode share one fetch.
+//! buffer: the planner polls. A piece reserves its rows one reactor batch at a
+//! time, only as it submits that batch's read, so it never holds rows nobody is
+//! reading: a demand gather that starts on a unit reads the unreserved rest of
+//! it itself and joins only reads actually in flight. Pieces stay pinned until
+//! commits pass them. Whoever reserves a row first reads it, so the look-ahead,
+//! the gathers and decode share one fetch.
 use super::row_cache::{Lookup, Pins, RowCache, RowClass};
 use super::{ReadPriority, TableStats};
 use anyhow::{Context, Result};
@@ -125,21 +128,28 @@ type Read = (Box<dyn RowLanding>, Vec<u32>);
 /// A decode round's pins and reads, one per table.
 struct DecodePiece { pins: Vec<Pins>, reads: Vec<Option<Read>> }
 
-/// One prefill piece: per table, its rows until their deadline turn, then their
-/// pins and read.
+/// One table's share of a prefill piece: its distinct rows not yet reserved
+/// (until its deadline turn, `started` is false), the pins of the batches
+/// reserved so far and the batch being read.
+struct Step { started: bool, queue: VecDeque<u64>, pins: Vec<Pins>, read: Option<Read> }
+impl Step {
+    /// Every row reserved, read and settled (published here or by another reader).
+    fn landed(&self) -> bool { self.started && self.queue.is_empty() && self.read.is_none() && self.pins.iter().all(Pins::settled) }
+}
+
+/// One prefill piece: a step per table.
 struct PlanPiece {
     end: u64,
     /// Index of the prefill unit this piece lies in.
     unit: usize,
-    rows: Vec<Option<Vec<u64>>>,
-    pins: Vec<Option<Pins>>,
-    reads: Vec<Option<Read>>,
+    steps: Vec<Step>,
 }
 impl PlanPiece {
-    fn reading(&self) -> usize { self.reads.iter().filter(|read| read.is_some()).count() }
-    /// Table `table`'s rows have landed (read here or by another reader).
-    fn landed(&self, table: usize) -> bool {
-        self.rows[table].is_none() && self.reads[table].is_none() && self.pins[table].as_ref().is_none_or(Pins::settled)
+    fn reading(&self) -> usize { self.steps.iter().filter(|step| step.read.is_some()).count() }
+    fn landed(&self, table: usize) -> bool { self.steps[table].landed() }
+    /// A started step with rows still to reserve and no read in flight.
+    fn next_batch(&self) -> Option<usize> {
+        self.steps.iter().position(|step| step.started && step.read.is_none() && !step.queue.is_empty())
     }
 }
 
@@ -245,7 +255,7 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
                     match read.poll() {
                         Ok(true) => {
                             let read = piece.reads[index].take().expect("landed");
-                            if publish(&mut piece.pins[index], read, table.as_ref()).is_ok() { progressed = true; }
+                            if publish(&mut piece.pins[index], read, table.as_ref(), true).is_ok() { progressed = true; }
                         }
                         Ok(false) => {}
                         Err(error) => {
@@ -262,9 +272,7 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
             // Committed pieces release their rows; unread later-table rows are no longer needed.
             while plan.pieces.front().is_some_and(|piece| piece.end <= committed && piece.reading() == 0) {
                 let piece = plan.pieces.pop_front().expect("checked front");
-                for rows in piece.rows.into_iter().flatten() {
-                    plan.skipped += distinct(rows).len() as u64;
-                }
+                plan.skipped += piece.steps.iter().map(|step| step.queue.len() as u64).sum::<u64>();
             }
             match poll(plan, &tables) {
                 Ok(landed) => progressed |= landed,
@@ -272,7 +280,16 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
             }
         }
         let reading = |plans: &[Plan]| plans.iter().flat_map(|plan| &plan.pieces).map(PlanPiece::reading).sum::<usize>();
-        // Later-table reads that are due go first: their deadline is earlier
+        // The next batch of a started step goes first (oldest piece of the
+        // earliest-admitted request): its deadline is the earliest.
+        while reading(&plans) < MAX_INFLIGHT {
+            let Some((plan, index, table)) = plans.iter_mut().find_map(|plan| plan.pieces.iter().enumerate()
+                .find_map(|(index, piece)| piece.next_batch().map(|table| (index, table))).map(|(index, table)| (plan, index, table)))
+                else { break };
+            if let Err(error) = next_batch(plan, index, table, &tables) { abandon(plan, &error); }
+            progressed = true;
+        }
+        // Later-table reads that are due go next: their deadline is earlier
         // than any table-0 piece not yet started. `plans` is in admission order.
         while reading(&plans) < MAX_INFLIGHT {
             let Some((plan, index, table)) = plans.iter_mut()
@@ -294,7 +311,7 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
         // Reads in flight, or later-table rows waiting on rows a gather is
         // reading: check again shortly, staying responsive to decode commands.
         let busy = decode.is_some() || plans.iter().any(|plan| plan.pieces.iter()
-            .any(|piece| piece.reading() > 0 || piece.rows.iter().any(Option::is_some)));
+            .any(|piece| piece.steps.iter().any(|step| step.read.is_some() || !step.queue.is_empty() || !step.started)));
         let command = if busy {
             match receive.recv_timeout(std::time::Duration::from_micros(if decode.is_some() { 50 } else { 200 })) {
                 Ok(command) => Some(command),
@@ -373,7 +390,7 @@ fn ready_to_plan(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> bool {
 /// window or the caches stop it).
 fn due(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> Option<(usize, usize)> {
     let (index, table) = plan.pieces.iter().enumerate()
-        .find_map(|(index, piece)| (1..piece.rows.len()).find(|&t| piece.rows[t].is_some()).map(|t| (index, t)))?;
+        .find_map(|(index, piece)| (1..piece.steps.len()).find(|&t| !piece.steps[t].started).map(|t| (index, t)))?;
     let last = (plan.pieces[index].unit + plan.units.depth - 1).min(plan.units.ends.len() - 1);
     let horizon = plan.units.ends[last];
     let planned_end = plan.start + plan.next as u64;
@@ -382,12 +399,21 @@ fn due(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> Option<(usize, usize)
         .then_some((index, table))
 }
 
-/// Pin `rows` and start reading the ones nobody holds. Also returns (distinct
-/// rows, already cached, being filled by another reader).
-fn reserve(table: &dyn LookaheadTable, rows: Vec<u64>, class: RowClass, priority: ReadPriority)
-    -> Result<(Pins, Option<Read>, [u64; 3])> {
-    let rows = distinct(rows);
-    let (held, lookups) = table.cache().acquire(&rows, class);
+/// Rows one look-ahead read reserves and submits: one reactor batch.
+fn batch_rows(table: &dyn LookaheadTable) -> usize {
+    super::uring::MAX_BATCH.min(super::reactor::BUFFER_BYTES / table.cache().width().max(1)).max(1)
+}
+
+/// Reserve rows from the front of `step`'s queue until one reactor batch needs
+/// reading (or the queue empties), and start that read. Rows already cached or
+/// being filled by another reader are pinned, not read. Returns (rows taken,
+/// already cached, being filled elsewhere).
+fn reserve_batch(step: &mut Step, table: &dyn LookaheadTable) -> Result<[u64; 3]> {
+    // One acquire per batch (its read publishes through these pins): at most a
+    // batch of rows, fewer read when some are cached or filled elsewhere.
+    let take = batch_rows(table).min(step.queue.len());
+    let rows: Vec<u64> = step.queue.drain(..take).collect();
+    let (held, lookups) = table.cache().acquire(&rows, RowClass::Prefill);
     let (mut ids, mut slots, mut counts) = (Vec::new(), Vec::new(), [rows.len() as u64, 0, 0]);
     for (lookup, &row) in lookups.iter().zip(&rows) {
         match *lookup {
@@ -397,8 +423,11 @@ fn reserve(table: &dyn LookaheadTable, rows: Vec<u64>, class: RowClass, priority
             Lookup::Uncached => {}
         }
     }
-    let read = if ids.is_empty() { None } else { Some((table.start_read(&ids, priority)?, slots)) };
-    Ok((held, read, counts))
+    step.pins.push(held);
+    // Look-ahead reads are never due before a demand gather (which reads its
+    // first table at PrefillFirst): every table's batches queue at Prefill.
+    if !ids.is_empty() { step.read = Some((table.start_read(&ids, ReadPriority::Prefill)?, slots)); }
+    Ok(counts)
 }
 
 fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
@@ -407,32 +436,27 @@ fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()
     let unit = plan.unit_of(position);
     let unit_end = (plan.units.ends[unit] - plan.start) as usize;
     let end = (plan.next + piece_tokens(tables)).min(unit_end).min(plan.source.tokens());
-    let mut rows = plan.source.rows(plan.next..end)?;
+    let rows = plan.source.rows(plan.next..end)?;
     anyhow::ensure!(rows.len() == tables.len(), "row source gave {} tables, the look-ahead has {}", rows.len(), tables.len());
     plan.next = end;
-    let first = std::mem::take(&mut rows[0]);
-    // Look-ahead reads are never due before a demand gather (which reads its
-    // first table at PrefillFirst): every table's pieces queue at Prefill.
-    let (pins, read, counts) = reserve(tables[0].as_ref(), first, RowClass::Prefill, ReadPriority::Prefill)?;
-    plan.tally(0, counts);
-    let mut piece = PlanPiece { end: plan.start + end as u64, unit, rows: rows.into_iter().map(Some).collect(),
-        pins: (0..tables.len()).map(|_| None).collect(), reads: (0..tables.len()).map(|_| None).collect() };
-    piece.rows[0] = None;
-    piece.pins[0] = Some(pins);
-    piece.reads[0] = read;
-    if tables.len() == 1 { plan.reserved.fetch_max(piece.end, Ordering::Release); }
-    plan.pieces.push_back(piece);
-    Ok(())
+    let steps = rows.into_iter().map(|rows| Step { started: false, queue: distinct(rows).into(), pins: Vec::new(), read: None })
+        .collect();
+    plan.pieces.push_back(PlanPiece { end: plan.start + end as u64, unit, steps });
+    let index = plan.pieces.len() - 1;
+    start_table(plan, index, 0, tables)
 }
 
+/// Start table `table`'s step of piece `index`: its first batch.
 fn start_table(plan: &mut Plan, index: usize, table: usize, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
-    let rows = plan.pieces[index].rows[table].take().expect("due rows");
-    let (pins, read, counts) = reserve(tables[table].as_ref(), rows, RowClass::Prefill, ReadPriority::Prefill)?;
+    plan.pieces[index].steps[table].started = true;
+    if table + 1 == tables.len() { plan.reserved.fetch_max(plan.pieces[index].end, Ordering::Release); }
+    next_batch(plan, index, table, tables)
+}
+
+/// Reserve and read the next batch of a started step.
+fn next_batch(plan: &mut Plan, index: usize, table: usize, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
+    let counts = reserve_batch(&mut plan.pieces[index].steps[table], tables[table].as_ref())?;
     plan.tally(table, counts);
-    let piece = &mut plan.pieces[index];
-    piece.pins[table] = Some(pins);
-    piece.reads[table] = read;
-    if table + 1 == tables.len() { plan.reserved.fetch_max(piece.end, Ordering::Release); }
     Ok(())
 }
 
@@ -459,10 +483,12 @@ fn poll(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<bool> {
     let mut landed = vec![0u64; tables.len()];
     for piece in &mut plan.pieces {
         for (index, table) in tables.iter().enumerate() {
-            if let Some((read, _)) = piece.reads[index].as_mut() {
+            let step = &mut piece.steps[index];
+            if let Some((read, _)) = step.read.as_mut() {
                 if read.poll()? {
-                    let read = piece.reads[index].take().expect("landed");
-                    landed[index] += publish(piece.pins[index].as_mut().expect("pins of a read"), read, table.as_ref())?;
+                    let read = step.read.take().expect("landed");
+                    let last = step.queue.is_empty();
+                    landed[index] += publish(step.pins.last_mut().expect("pins of a read"), read, table.as_ref(), last)?;
                 }
             }
         }
@@ -471,9 +497,9 @@ fn poll(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<bool> {
     Ok(landed.iter().any(|&rows| rows > 0))
 }
 
-fn publish(pins: &mut Pins, (read, slots): Read, table: &dyn LookaheadTable) -> Result<u64> {
+fn publish(pins: &mut Pins, (read, slots): Read, table: &dyn LookaheadTable, piece: bool) -> Result<u64> {
     let rows = pins.publish_all(slots.iter().enumerate().map(|(i, &slot)| (slot, read.row(i))))?;
-    table.stats().record_lookahead(rows);
+    table.stats().record_lookahead(rows, piece);
     Ok(rows as u64)
 }
 
