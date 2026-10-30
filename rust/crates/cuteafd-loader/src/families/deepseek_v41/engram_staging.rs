@@ -478,11 +478,18 @@ mod tests {
         // SAFETY: the bench owns the immutable fixture file for the table's lifetime.
         let rows = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
         let mut table = EngramTable::new_strided(rows)?;
+        let hint = std::env::var_os("ENGRAM_BENCH_HINT").is_some();
         let mut staging = EngramBatchStaging::new(tokens)?;
         for (label, shares) in [("row-cache hit", [2 * tokens * 24, 1024]), ("page-cache hot", [24, 1024])] {
             table.set_cache_shares(shares)?;
             // Warm: the page cache (and, when it fits, the row cache).
             for _ in 0..2 { staging.gather(&table, &[&batch], 0)?; }
+            if hint {
+                table.weights().enable_residency_hint();
+                let (mut at, mut scratch, started) = (0, Vec::new(), std::time::Instant::now());
+                while let Ok(swept @ 1..) = table.weights().sweep_residency(at, 1 << 20, &mut scratch) { at += swept; }
+                println!("residency sweep: {at} pages in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            }
             let mut times = Vec::new();
             for _ in 0..repeats {
                 let started = std::time::Instant::now();
@@ -491,8 +498,9 @@ mod tests {
                 times.push(started.elapsed().as_secs_f64() * 1e3);
             }
             times.sort_by(f64::total_cmp);
-            println!("engram gather {label}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms",
-                times[times.len() / 2], times[0], times[times.len() - 1]);
+            println!("engram gather {label}{}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, late faults {}",
+                if hint { " (residency hint)" } else { "" }, times[times.len() / 2], times[0], times[times.len() - 1],
+                table.weights().stats().snapshot().late_major_faults);
         }
         Ok(())
     }

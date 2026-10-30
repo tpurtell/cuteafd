@@ -148,6 +148,10 @@ pub struct MappedRows {
     file_offset: u64,
     nowait: AtomicBool,
     fuse: bool,
+    /// Optional residency hint, one bit per mapping page: set from a periodic
+    /// whole-mapping `mincore` sweep and by our own reads; trusted instead of
+    /// a per-gather `mincore`. A stale bit costs a counted synchronous fault.
+    hint: std::sync::OnceLock<Box<[AtomicU64]>>,
 }
 
 // SAFETY: Only immutable access is exposed; munmap runs after the final owner drops.
@@ -202,7 +206,7 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file), hint: std::sync::OnceLock::new() };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         // SAFETY: advice over exactly the mapping created above.
         if unsafe { libc::madvise(raw, mapped_len, libc::MADV_RANDOM) } != 0 {
@@ -216,6 +220,35 @@ impl MappedRows {
     }
     pub fn row_bytes(&self) -> usize {
         self.row_bytes
+    }
+
+    fn page_count(&self) -> usize { self.mapped_len.div_ceil(self.page_bytes) }
+    fn hint_get(&self, hint: &[AtomicU64], page: usize) -> bool {
+        hint[page / 64].load(Ordering::Relaxed) >> (page % 64) & 1 != 0
+    }
+    fn hint_set(&self, page: usize) {
+        if let Some(hint) = self.hint.get() { hint[page / 64].fetch_or(1 << (page % 64), Ordering::Relaxed); }
+    }
+    /// Refresh pages `start..start + count` of the hint from one `mincore`;
+    /// returns the pages swept (0 when the hint is off or `start` is past the end).
+    fn sweep_hint(&self, start: usize, count: usize, scratch: &mut Vec<u8>) -> Result<usize> {
+        let Some(hint) = self.hint.get() else { return Ok(0) };
+        let pages = self.page_count();
+        if start >= pages { return Ok(0); }
+        // Whole 64-page words, so each word is replaced at once.
+        let start = start / 64 * 64;
+        let end = (start + count).min(pages);
+        scratch.resize(end - start, 0);
+        let length = (end * self.page_bytes).min(self.mapped_len) - start * self.page_bytes;
+        // SAFETY: the range lies inside this live mapping; one byte per page.
+        if unsafe { libc::mincore(self.base.as_ptr().add(start * self.page_bytes).cast(), length, scratch.as_mut_ptr()) } != 0 {
+            return Err(os_error("sweeping mapped-table residency"));
+        }
+        for (word, chunk) in scratch.chunks(64).enumerate() {
+            let bits = chunk.iter().enumerate().fold(0u64, |bits, (bit, &byte)| bits | u64::from(byte & 1) << bit);
+            hint[start / 64 + word].store(bits, Ordering::Relaxed);
+        }
+        Ok(end - start)
     }
 
     fn payload_bytes(&self) -> u64 {
@@ -878,6 +911,19 @@ impl MappedTable {
     /// bounded query per page, never a scan of the hundreds-of-GB table.
     fn residency(&self, rows: &[u64], prefetch: bool) -> Result<Vec<bool>> {
         let started = Instant::now();
+        // With residency hints, each row is one or two bit lookups: no page
+        // collection, sort or search.
+        if self.parts.iter().all(|part| part.hint.get().is_some()) {
+            let hits = rows.iter().map(|&row| {
+                let (part, local) = self.locate(row)?;
+                let part = &self.parts[part];
+                let hint = part.hint.get().expect("checked hint");
+                Ok(part.pages(local)?.all(|page| part.hint_get(hint, page)))
+            }).collect::<Result<Vec<_>>>()?;
+            (if prefetch { &self.stats.prefetch_residency_ns } else { &self.stats.residency_ns })
+                .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return Ok(hits);
+        }
         let hits = RESIDENCY.with(|workspace| {
             let mut workspace = workspace.borrow_mut();
             let ResidencyWorkspace { pages, resident, mincore } = &mut *workspace;
@@ -893,7 +939,12 @@ impl MappedTable {
             while at < pages.len() {
                 let part = pages[at].0;
                 let end = at + pages[at..].partition_point(|&(index, _)| index == part);
-                uring::resident(&self.parts[part], &pages[at..end], &mut resident[at..end], mincore)?;
+                match self.parts[part].hint.get() {
+                    Some(hint) => for (slot, &(_, page)) in resident[at..end].iter_mut().zip(&pages[at..end]) {
+                        *slot = self.parts[part].hint_get(hint, page);
+                    },
+                    None => uring::resident(&self.parts[part], &pages[at..end], &mut resident[at..end], mincore)?,
+                }
                 at = end;
             }
             rows.iter().map(|&row| {
@@ -970,6 +1021,15 @@ impl MappedTable {
         Ok(stats)
     }
 
+    /// Rows just read (buffered, so now page-cached) are resident in the hint.
+    fn mark_resident(&self, misses: &[(usize, u64, usize)]) {
+        for &(part, row, _) in misses {
+            let part = &self.parts[part];
+            if part.hint.get().is_none() { continue; }
+            if let Ok(pages) = part.pages(row) { for page in pages { part.hint_set(page); } }
+        }
+    }
+
     fn uring_fallback(&self, error: &MappedTableError) {
         // Only this batch falls back. The shared owner retries a failed ring
         // with bounded backoff instead of permanently disabling a table.
@@ -1004,6 +1064,30 @@ impl MappedTable {
                 else { "caller resident memcpy and process-wide miss reactor" },
             locality_note = if self.stats.approximate.load(Ordering::Relaxed) { "FUSE residency is approximate and does not count physical device reads" } else { "mincore residency is a snapshot, not a physical-read counter" },
             "mapped table backend");
+    }
+
+    /// Trust a residency hint (a periodic whole-mapping `mincore` sweep plus our
+    /// own reads) instead of a `mincore` per gather. Call before sharing; sweep
+    /// with [`Self::sweep_residency`].
+    pub fn enable_residency_hint(&self) {
+        if self.resident.is_some() { return; }
+        for part in &self.parts {
+            let _ = part.hint.set((0..part.page_count().div_ceil(64)).map(|_| AtomicU64::new(0)).collect());
+        }
+    }
+    /// Pages in the hint across parts (0 when it is off).
+    pub fn residency_pages(&self) -> usize {
+        self.parts.iter().filter(|part| part.hint.get().is_some()).map(MappedRows::page_count).sum()
+    }
+    /// Refresh `count` hint pages starting at table-wide page `start` (parts back
+    /// to back); returns the pages swept.
+    pub fn sweep_residency(&self, mut start: usize, count: usize, scratch: &mut Vec<u8>) -> Result<usize> {
+        for part in &self.parts {
+            let pages = part.page_count();
+            if start < pages { return part.sweep_hint(start, count, scratch); }
+            start -= pages;
+        }
+        Ok(0)
     }
 
     /// Register a weak stats reference; endpoint reads neither own nor touch
@@ -1872,6 +1956,7 @@ impl PreparedTableGather {
                 self.stats.miss_max_ns = stats.miss_max_ns;
                 self.stats.miss_histogram = stats.miss_histogram;
                 table.stats.record_reads(self.stats, false);
+                table.mark_resident(&self.misses);
                 self.misses.clear();
                 self.stream = None;
                 self.stats = Default::default();
@@ -1882,6 +1967,7 @@ impl PreparedTableGather {
             output[slot * self.width..(slot + 1) * self.width].copy_from_slice(table.parts[part].row(row)?);
         }
         table.stats.record_reads(self.stats, false);
+        table.mark_resident(&self.misses);
         self.misses.clear();
         self.stats = Default::default();
         Ok(true)

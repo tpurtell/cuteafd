@@ -1376,3 +1376,40 @@ fn split_cancel_and_shutdown_recycle_prepared_and_queued_jobs() -> TestResult {
     assert_eq!(slots.free.lock().unwrap().len(), 4);
     Ok(())
 }
+
+#[test]
+fn residency_hint_tracks_reads_sweeps_and_survives_stale_bits() -> TestResult {
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let rows = 4096u64;
+    let payload: Vec<u8> = (0..rows * 264).map(|i| (i % 251) as u8).collect();
+    file.write_all(&payload)?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test owns the immutable file for the table's lifetime.
+    let table = unsafe { MappedTable::single(file.path(), 0, rows, RowFormat::of(DType::U8, 264)?)? };
+    table.prepare_reads();
+    table.enable_residency_hint();
+    let ids: Vec<u64> = (0..rows).step_by(37).collect();
+    let slots: Vec<usize> = (0..ids.len()).collect();
+    let expect = |output: &[u8]| {
+        for (index, &row) in ids.iter().enumerate() {
+            assert_eq!(&output[index * 264..(index + 1) * 264], &payload[row as usize * 264..(row as usize + 1) * 264]);
+        }
+    };
+    // Unswept: every row takes the read path, and its pages are then marked.
+    let mut output = vec![0; ids.len() * 264];
+    table.gather_slots(&ids, &slots, &mut output)?;
+    expect(&output);
+    assert!(table.residency(&ids, false)?.iter().all(|&hit| hit), "reads mark their pages resident");
+    // A sweep anchors the hint to the kernel's view.
+    let mut scratch = Vec::new();
+    let mut at = 0;
+    while let swept @ 1.. = table.sweep_residency(at, 64, &mut scratch)? { at += swept; }
+    assert_eq!(at, table.residency_pages());
+    // Stale bits: evict, gather without re-sweeping; bytes stay exact (a stale
+    // hit copy faults synchronously and is counted, never wrong).
+    assert_eq!(super::uring::dontneed(&table.parts[0]), 0);
+    let mut stale = vec![0; ids.len() * 264];
+    table.gather_slots(&ids, &slots, &mut stale)?;
+    expect(&stale);
+    Ok(())
+}

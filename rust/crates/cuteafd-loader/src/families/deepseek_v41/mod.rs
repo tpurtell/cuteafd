@@ -5,6 +5,7 @@ pub(crate) mod engram_gather;
 pub(crate) mod engram_lookahead;
 pub(crate) mod engram_pipeline;
 pub(crate) mod engram_prefetch;
+pub(crate) mod engram_residency;
 pub(crate) mod engram_staging;
 pub(crate) mod engram_tokenizer;
 pub(crate) mod v41_catalog;
