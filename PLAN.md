@@ -6378,3 +6378,23 @@ projections and the layer-2 frontier. It uses GPTQModel main 25dd11c39 and
 the v2 plan with explicit historical per-module origins. Upload, no-copy
 Sparknest import, six-Spark placement and cleanup remain enabled. Wait for
 layer 3 to complete, then report progress and ETA every 30 minutes.
+
+The mixed-accumulator producer above is SUPERSEDED. TJ correctly challenged
+retaining early matrices merely because factorization passed: that does not
+establish accurate Hessians, and later layers depend on the early quantized
+stream. The old unit step5-core-k6-1793358846411772718 is stopped/disabled.
+All its 72.63 GiB of weight/activation payloads were retired, while JSON
+receipts, metrics, plans and logs remain in
+production-superseded-mixed-accumulation-1793358846411772718. Neither source
+checkpoint nor Sparknest-managed data was changed.
+
+CURRENT RUN: enabled step5-core-k6-1793362893146861204, launched 2026-10-30
+12:21 UTC from layer 0. The fresh production root and fresh export contain
+no predecessor lineage and reuse no old quantized matrix or activation.
+All Hessians and the causal quantized stream are rebuilt using K128 FP32
+accumulation. The same sealed GPTQModel 25dd11c39, 217 CPU checks and passed
+324.35-second GPU pilot qualify this unchanged numerical producer; another
+pilot is unnecessary. Publication, no-copy Sparknest import, six-Spark
+placement and cleanup stay enabled. Estimate approximately 42 hours of
+quantization, refined by completed full MoE layers. Continue 30-minute
+status checks once the clean run is stable.
