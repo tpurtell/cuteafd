@@ -1,10 +1,11 @@
 //! Native paired or row-interleaved engram tables on the shared mapped-table
-//! infrastructure (`formats::mapped_table`): mapping, bounded background
-//! page-in and per-table stats.
-use crate::{AdviseRows, MappedTable, MappedTableError, RowFormat, TablePrefetchOutcome, TablePrefetchTicket,
-    TablePrefetcher};
+//! infrastructure (`formats::mapped_table`): mapping, the layer's bounded row
+//! cache, row reads through the shared read reactor, and per-table stats.
+use crate::formats::mapped_table::row_cache::RowCache;
+use crate::formats::mapped_table::{GatherMode, PreparedTableGather, ReadPriority};
+use crate::{MappedTable, RowFormat};
 use anyhow::{ensure, Context, Result};
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngramEncoding { Fp8, Nvfp4 }
@@ -18,16 +19,109 @@ pub struct EngramTable {
     scales: Option<MappedTable>,
     encoding: EngramEncoding,
     global_scale: f32,
+    /// The layer's bounded row cache: every gather and look-ahead read lands here.
+    cache: Arc<RowCache>,
+}
+
+/// A small cache for tables built outside the serving pipeline (tests, tools);
+/// [`EngramTable::set_cache_shares`] sizes the serving one.
+const DEFAULT_SHARES: [usize; 2] = [4096, 1024];
+
+/// Rows of one table read into private buffers through the mapped-table hybrid
+/// (resident rows copied now, misses on the shared read reactor).
+pub(crate) struct RowRead {
+    weight: PreparedTableGather,
+    scale: Option<PreparedTableGather>,
+    weights: Vec<u8>,
+    scales: Vec<u8>,
+    widths: [usize; 2],
+    /// Rows not resident when the read started (a device read for each).
+    misses: usize,
+}
+
+impl RowRead {
+    /// Block until every row has landed.
+    pub(crate) fn finish(&mut self, table: &EngramTable) -> Result<()> {
+        let (mut weight_done, mut scale_done) = (false, self.scale.is_none());
+        while !weight_done || !scale_done {
+            if !weight_done { weight_done = self.weight.step(&table.weights, &mut self.weights)?; }
+            if !scale_done {
+                let scales = table.scales.as_ref().context("paired engram has no scale table")?;
+                scale_done = self.scale.as_mut().expect("paired read").step(scales, &mut self.scales)?;
+            }
+        }
+        Ok(())
+    }
+    /// Row `index` as the cache stores it: weight bytes, then scale bytes.
+    pub(crate) fn row(&self, index: usize) -> [&[u8]; 2] {
+        let [w, s] = self.widths;
+        [&self.weights[index * w..(index + 1) * w], &self.scales[index * s..(index + 1) * s]]
+    }
+    pub(crate) fn misses(&self) -> usize { self.misses }
+    /// Land whatever has completed without waiting; true once every row is here.
+    pub(crate) fn poll(&mut self, table: &EngramTable) -> Result<bool> {
+        let weight_done = self.weight.poll(&table.weights, &mut self.weights)?;
+        let scale_done = match self.scale.as_mut() {
+            None => true,
+            Some(scale) => scale.poll(table.scales.as_ref().context("paired engram has no scale table")?, &mut self.scales)?,
+        };
+        Ok(weight_done && scale_done)
+    }
 }
 
 impl EngramTable {
+    fn assemble(weights: MappedTable, scales: Option<MappedTable>, encoding: EngramEncoding, global_scale: f32)
+        -> Result<Self> {
+        let width = weights.row_bytes() + scales.as_ref().map_or(0, MappedTable::row_bytes);
+        let cache = RowCache::new(width, DEFAULT_SHARES, weights.shared_stats())?;
+        Ok(Self { weights, scales, encoding, global_scale, cache })
+    }
+    /// Replace the row cache with one of `shares` (prefill, decode) rows, before
+    /// the table is shared.
+    pub fn set_cache_shares(&mut self, shares: [usize; 2]) -> Result<()> {
+        self.cache = RowCache::new(self.cache.width(), shares, self.weights.shared_stats())?;
+        Ok(())
+    }
+    pub(crate) fn cache(&self) -> &Arc<RowCache> { &self.cache }
+    /// Bytes of one cached row: weight then scale.
+    pub fn row_width(&self) -> usize { self.cache.width() }
+
+    /// Start reading `rows` (distinct) into private buffers; resident rows are
+    /// copied on this thread, misses go to the shared read reactor.
+    pub(crate) fn start_read(&self, rows: &[u64], priority: ReadPriority, mode: GatherMode) -> Result<RowRead> {
+        self.start_read_window(rows, priority, 2, mode)
+    }
+    /// [`Self::start_read`] holding at most `window` reactor buffers per plane
+    /// (a paired table reads two planes, each with its own buffer).
+    pub(crate) fn start_read_window(&self, rows: &[u64], priority: ReadPriority, window: usize, mode: GatherMode)
+        -> Result<RowRead> {
+        let slots: Vec<usize> = (0..rows.len()).collect();
+        let weight_width = self.weights.row_bytes();
+        let mut weights = vec![0; rows.len() * weight_width];
+        match &self.scales {
+            None => {
+                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, window.clamp(1, 2), mode)?;
+                let misses = weight.misses();
+                Ok(RowRead { weight, scale: None, weights, scales: Vec::new(), widths: [weight_width, 0], misses })
+            }
+            Some(table) => {
+                let mut scales = vec![0; rows.len() * table.row_bytes()];
+                // Both tables start before either is waited for; one buffer window each.
+                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, 1, mode)?;
+                let scale = table.prepare_gather(rows, &slots, &mut scales, priority, 1, mode)?;
+                let misses = weight.misses().max(scale.misses());
+                Ok(RowRead { weight, scale: Some(scale), weights, scales, widths: [weight_width, table.row_bytes()],
+                    misses })
+            }
+        }
+    }
     pub fn encoding(&self) -> EngramEncoding { self.encoding }
     pub fn global_scale(&self) -> f32 { self.global_scale }
     pub fn new_nvfp4(weights: MappedTable, scales: MappedTable, global_scale: f32) -> Result<Self> {
         ensure!(weights.rows() == scales.rows() && weights.row_bytes() == 128 && scales.row_bytes() == 16,
             "NVFP4 engram requires paired 128-byte weight and 16-byte scale rows");
         ensure!(global_scale.is_finite() && global_scale > 0.0, "invalid NVFP4 engram global scale");
-        Ok(Self { weights, scales: Some(scales), encoding: EngramEncoding::Nvfp4, global_scale })
+        Self::assemble(weights, Some(scales), EngramEncoding::Nvfp4, global_scale)
     }
     pub fn weights(&self) -> &MappedTable {
         &self.weights
@@ -41,7 +135,7 @@ impl EngramTable {
     pub fn new_strided(rows: MappedTable) -> Result<Self> {
         ensure!(rows.row_bytes() == 264 && rows.format().dtype == cuteafd_core::DType::U8,
             "strided engram requires opaque U8 rows of 264 bytes");
-        Ok(Self { weights: rows, scales: None, encoding: EngramEncoding::Fp8, global_scale: 1.0 })
+        Self::assemble(rows, None, EngramEncoding::Fp8, 1.0)
     }
     /// Gather stats are kept on the weight table (scales share its rows).
     pub fn stats(&self) -> crate::TableStatsSnapshot {
@@ -132,101 +226,7 @@ impl EngramTable {
             weights.row_bytes() == 256 && scales.row_bytes() == 8,
             "native engram rows require 256 FP8 bytes and eight UE8M0 scale bytes"
         );
-        Ok(Self { weights, scales: Some(scales), encoding: EngramEncoding::Fp8, global_scale: 1.0 })
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrefetchOutcome {
-    Cancelled,
-    Advised {
-        weight_pages: usize,
-        scale_pages: usize,
-    },
-}
-
-/// Weights and scales are advised as one unit, cancellable between them.
-impl AdviseRows for EngramTable {
-    fn row_count(&self) -> u64 {
-        self.weights.rows()
-    }
-    fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool)
-        -> Result<Option<Vec<usize>>, MappedTableError> {
-        let Some(weights) = self.weights.advise(rows, max_pages, cancelled)? else { return Ok(None) };
-        let scale_pages = if let Some(scales) = &self.scales {
-            let Some(pages) = scales.advise(rows, max_pages, cancelled)? else { return Ok(None) };
-            pages[0]
-        } else { 0 };
-        Ok(Some(vec![weights[0], scale_pages]))
-    }
-}
-
-/// Request-owned completion, independent of recycled scheduler slot numbers.
-/// Dropping it cancels queued work; advice already issued to the OS is harmless.
-pub struct PrefetchTicket(TablePrefetchTicket);
-
-impl PrefetchTicket {
-    pub fn cancel(&self) {
-        self.0.cancel();
-    }
-    pub fn wait(&self) -> Result<PrefetchOutcome> {
-        Ok(match self.0.wait().context("engram prefetch worker stopped")? {
-            TablePrefetchOutcome::Cancelled => PrefetchOutcome::Cancelled,
-            TablePrefetchOutcome::Advised(pages) => PrefetchOutcome::Advised {
-                weight_pages: pages[0],
-                scale_pages: pages[1],
-            },
-        })
-    }
-}
-
-/// The shared table prefetcher (one worker, bounded queue; submission never
-/// waits for disk or queue space) over paired engram weight/scale tables.
-pub struct EngramPrefetcher {
-    inner: TablePrefetcher,
-}
-
-impl EngramPrefetcher {
-    pub fn new(queue_depth: usize, max_rows: usize, max_pages_per_table: usize) -> Result<Self> {
-        Ok(Self { inner: TablePrefetcher::new("engram-prefetch", queue_depth, max_rows, max_pages_per_table)? })
-    }
-
-    /// Submit the address batch prepared from decode, prefill, or verification IDs.
-    /// Image rows are omitted, and the layer's official table identity is checked.
-    pub fn try_submit_batch(
-        &self,
-        table: Arc<EngramTable>,
-        batch: &cuteafd_core::EngramBatch,
-        layer_index: usize,
-    ) -> Result<Option<PrefetchTicket>> {
-        let expected_rows = cuteafd_core::ENGRAM_ROWS
-            .get(layer_index)
-            .context("invalid engram layer index")?;
-        ensure!(
-            table.weights.rows() == *expected_rows,
-            "prefetch table belongs to another engram layer"
-        );
-        let text_rows = (0..batch.hashes().len())
-            .filter(|&row| batch.is_image(row) == Some(false))
-            .count();
-        ensure!(
-            text_rows <= self.inner.max_rows() / 24,
-            "engram hash batch exceeds prefetch row capacity"
-        );
-        self.try_submit(table, &batch.prefetch_rows(layer_index)?)
-    }
-
-    /// None means backpressure: the caller may gather on demand or retry later.
-    pub fn try_submit(
-        &self,
-        table: Arc<EngramTable>,
-        rows: &[u64],
-    ) -> Result<Option<PrefetchTicket>> {
-        let ticket = self.inner.try_submit(table.clone(), rows)?;
-        if ticket.is_none() {
-            table.weights.stats().record_prefetch_dropped();
-        }
-        Ok(ticket.map(PrefetchTicket))
+        Self::assemble(weights, Some(scales), EngramEncoding::Fp8, 1.0)
     }
 }
 
@@ -292,31 +292,6 @@ mod tests {
         assert!(unsafe { EngramTable::from_catalog(&catalog, 2) }.is_err());
         catalog.tensors[1].dtype = DType::U8;
         assert!(unsafe { EngramTable::from_catalog(&catalog, 1) }.is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn background_prefetch_owns_mapping_and_advises_both_tables() -> Result<()> {
-        let mut weights = tempfile::NamedTempFile::new()?;
-        let mut scales = tempfile::NamedTempFile::new()?;
-        weights.write_all(&[0x38; 512])?;
-        scales.write_all(&[127; 16])?;
-        let table = Arc::new(EngramTable::new(
-            unsafe { MappedTable::single(weights.path(), 0, 2, RowFormat::of(cuteafd_core::DType::F8E4M3, 256)?)? },
-            unsafe { MappedTable::single(scales.path(), 0, 2, RowFormat::of(cuteafd_core::DType::F8E8M0, 8)?)? },
-        )?);
-        let worker = EngramPrefetcher::new(1, 16, 2)?;
-        assert!(worker.try_submit(table.clone(), &[2]).is_err());
-        assert!(worker.try_submit(table.clone(), &[0; 17]).is_err());
-        let ticket = worker.try_submit(table.clone(), &[1, 0, 1])?.unwrap();
-        drop(table);
-        assert_eq!(
-            ticket.wait()?,
-            PrefetchOutcome::Advised {
-                weight_pages: 1,
-                scale_pages: 1
-            }
-        );
         Ok(())
     }
 }

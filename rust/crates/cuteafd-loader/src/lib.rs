@@ -32,7 +32,8 @@ pub use families::deepseek_v41::v41_config::{
     V41TextConfig, V41VisionConfig,
 };
 pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
-pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
+pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramTable};
+pub use families::deepseek_v41::engram_lookahead::{EngramLookahead, LookaheadHandle, UnitPlan as EngramUnitPlan};
 pub use formats::mapped_table::{
     AdviseRows, GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
     GatherWorker, MappedRows, PendingGather, MappedTable, MappedTableError, RowFormat, TablePart, TablePrefetchOutcome,

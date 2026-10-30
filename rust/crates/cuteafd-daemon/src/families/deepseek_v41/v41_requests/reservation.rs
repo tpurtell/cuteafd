@@ -57,7 +57,7 @@ impl Requests<'_> {
                 cursor.advance_full(&wave.batches()[0])?;
             } else {
                 let wave = self.pipeline.prepare(&[EngramRequestTokens {
-                    history: cursor.history(), token_ids: tokens, image_mask: None }])?;
+                    history: cursor.history(), token_ids: tokens, image_mask: None, l14_gate: self.l14_gate(lease) }])?;
                 cursor.advance_full(&wave.batches()[0])?;
                 self.prefetched.hold(key, wave);
             }
@@ -92,6 +92,7 @@ impl Requests<'_> {
         let inputs = requests.iter().zip(&prepared).enumerate().map(|(i, (r, p))| EngramRequestTokens {
             history: p.history(), token_ids: r.tokens,
             image_mask: masks.as_ref().map_or(r.image_mask, |m| m[i].as_deref()),
+            l14_gate: self.l14_gate(r.lease),
         }).collect::<Vec<_>>();
         // Adopt this reservation's exact wave, or cancel only its participants'
         // stale lookahead; unrelated requests retain their mandatory burst.

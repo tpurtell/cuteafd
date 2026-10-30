@@ -35,7 +35,7 @@ fn main() -> Result<()> {
         let lengths = [[1, 1], [6, 3], [96, 31]][wave_index % 3];
         let tokens: Vec<Vec<u32>> = lengths.iter().map(|&n| (0..n).map(|_| next()).collect()).collect();
         let requests: Vec<_> = histories.iter().zip(&tokens)
-            .map(|(history, token_ids)| EngramRequestTokens { history, token_ids, image_mask: None }).collect();
+            .map(|(history, token_ids)| EngramRequestTokens { history, token_ids, image_mask: None, l14_gate: None }).collect();
         let mut wave = pipeline.prepare(&requests)?;
         for layer in 0..2 {
             let view_histories: Vec<_> = histories.iter().collect();

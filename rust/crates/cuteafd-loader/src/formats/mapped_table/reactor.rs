@@ -77,9 +77,11 @@ pub(super) fn global() -> Result<Arc<Reactor>> {
 }
 /// Owns every submitted buffer until its CQEs have drained. A split gather
 /// never lends its caller's destination to the reactor.
+/// A non-waiting stream (`wait: false`) never blocks for a buffer: it takes
+/// one only when one is free and otherwise stays idle until it is polled again.
 pub(super) struct ReadStream {
     owner: Arc<Reactor>, reads: Vec<Read>, next: usize, width: usize,
-    priority: ReadPriority, window: usize, pending: VecDeque<mpsc::Receiver<Reply>>,
+    priority: ReadPriority, window: usize, wait: bool, pending: VecDeque<mpsc::Receiver<Reply>>,
     stats: uring::ReadStats,
 }
 impl Reactor {
@@ -87,12 +89,12 @@ impl Reactor {
     pub(super) fn wake(&self) -> Result<()> { signal(&self.shared.wake) }
 
     pub(super) fn start(self: &Arc<Self>, reads: Vec<Read>, width: usize,
-        priority: ReadPriority, window: usize) -> Result<ReadStream> {
+        priority: ReadPriority, window: usize, wait: bool) -> Result<ReadStream> {
         if width == 0 || width > BUFFER_BYTES || !(1..=2).contains(&window) {
             return Err(invalid("table reactor row/window exceeds buffer budget"));
         }
         let mut stream = ReadStream { owner: Arc::clone(self), reads, next: 0, width,
-            priority, window, pending: VecDeque::new(), stats: Default::default() };
+            priority, window, wait, pending: VecDeque::new(), stats: Default::default() };
         stream.fill()?;
         Ok(stream)
     }
@@ -100,7 +102,7 @@ impl Reactor {
         priority: ReadPriority) -> Result<uring::ReadStats> {
         let reads = reads.iter().map(|read| Read { file: Arc::clone(&read.part.file),
             offset: read.part.file_offset + read.row * width as u64, slot: read.slot }).collect();
-        let mut stream = self.start(reads, width, priority, 2)?;
+        let mut stream = self.start(reads, width, priority, 2, true)?;
         while !stream.finished() { stream.step(output)?; }
         Ok(stream.stats)
     }
@@ -111,11 +113,11 @@ impl ReadStream {
         let decode = self.priority.is_decode();
         while self.next < self.reads.len() && self.pending.len() < self.window {
             let mut queue = shared.queue.lock().unwrap_or_else(|p| p.into_inner());
-            if decode { queue.decode_waiters += 1; }
+            if decode && self.wait { queue.decode_waiters += 1; }
             while queue.borrowed == SLOTS || (!decode &&
                 (queue.prefill_borrowed == SLOTS - DECODE_SLOTS || queue.decode_waiters > 0)) {
-                if !self.pending.is_empty() {
-                    if decode { queue.decode_waiters -= 1; }
+                if !self.pending.is_empty() || !self.wait {
+                    if decode && self.wait { queue.decode_waiters -= 1; }
                     return Ok(());
                 }
                 if shared.failed.load(Ordering::Acquire) {
@@ -124,7 +126,8 @@ impl ReadStream {
                 }
                 queue = shared.available.wait(queue).unwrap_or_else(|p| p.into_inner());
             }
-            if decode { queue.decode_waiters -= 1; } else { queue.prefill_borrowed += 1; }
+            if decode && self.wait { queue.decode_waiters -= 1; }
+            if !decode { queue.prefill_borrowed += 1; }
             queue.borrowed += 1;
             let mut buffer = queue.buffers.pop().unwrap_or_default();
             drop(queue);
@@ -162,9 +165,31 @@ impl ReadStream {
         self.owner.shared.available.notify_all();
     }
     pub(super) fn step(&mut self, output: &mut [u8]) -> Result<()> {
+        // A blocking step waits for its buffer even on a non-waiting stream.
+        self.wait = true;
         self.fill()?;
         let Some(receive) = self.pending.pop_front() else { return Ok(()); };
         let reply = receive.recv().map_err(|_| invalid("table read reactor exited"))?;
+        self.land(reply, output)
+    }
+    /// [`Self::step`] without waiting: lands the oldest buffer only when its
+    /// reads have completed. True when it landed one (or refilled an idle stream).
+    pub(super) fn try_step(&mut self, output: &mut [u8]) -> Result<bool> {
+        let Some(receive) = self.pending.front() else {
+            self.fill()?;
+            return Ok(!self.pending.is_empty());
+        };
+        match receive.try_recv() {
+            Ok(reply) => {
+                self.pending.pop_front();
+                self.land(reply, output)?;
+                Ok(true)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => Err(invalid("table read reactor exited")),
+        }
+    }
+    fn land(&mut self, reply: Reply, output: &mut [u8]) -> Result<()> {
         if reply.result.is_ok() {
             for (read, bytes) in reply.buffer.reads.iter().zip(reply.buffer.bytes.chunks_exact(self.width)) {
                 output[read.slot * self.width..(read.slot + 1) * self.width].copy_from_slice(bytes);
@@ -436,8 +461,16 @@ mod tests {
             }));
         }
         for thread in threads { thread.join().expect("read caller panic")?; }
-        let queue = owner.shared.queue.lock().unwrap();
-        assert_eq!((queue.borrowed, queue.prefill_borrowed, queue.decode_waiters), (0, 0, 0));
+        // Other tests in this process share the owner (e.g. Engram look-ahead
+        // reads): every credit returns once their reads drain.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut queue = owner.shared.queue.lock().unwrap();
+        while (queue.borrowed, queue.prefill_borrowed, queue.decode_waiters) != (0, 0, 0) {
+            assert!(Instant::now() < deadline, "reactor credits never returned");
+            drop(queue);
+            std::thread::sleep(Duration::from_millis(5));
+            queue = owner.shared.queue.lock().unwrap();
+        }
         assert!(queue.buffers.iter().map(|buffer| buffer.bytes.len()).sum::<usize>() <= SLOTS * BUFFER_BYTES);
         Ok(())
     }
@@ -470,11 +503,11 @@ mod tests {
         if !owner.ready() { return Ok(()); }
         let file = Arc::new(File::open("/dev/zero").map_err(|source| error("test zero", source))?);
         let reads = || (0..8192).map(|slot| Read { file: Arc::clone(&file), offset: 0, slot }).collect();
-        let first = owner.start(reads(), 1, ReadPriority::Prefill, 2)?;
-        let second = owner.start(reads(), 1, ReadPriority::Prefill, 2)?;
+        let first = owner.start(reads(), 1, ReadPriority::Prefill, 2, true)?;
+        let second = owner.start(reads(), 1, ReadPriority::Prefill, 2, true)?;
         // Hold both finishers' completed-but-unreaped windows. Decode must
         // acquire and complete without either prefill caller making progress.
-        let mut decode = owner.start(vec![Read { file, offset: 0, slot: 0 }], 1, ReadPriority::Decode, 2)?;
+        let mut decode = owner.start(vec![Read { file, offset: 0, slot: 0 }], 1, ReadPriority::Decode, 2, true)?;
         let mut output = [255];
         while !decode.finished() { decode.step(&mut output)?; }
         assert_eq!(output, [0]);

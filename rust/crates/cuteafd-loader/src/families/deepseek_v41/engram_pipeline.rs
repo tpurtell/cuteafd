@@ -11,6 +11,9 @@ pub struct EngramRequestTokens<'a> {
     pub history: &'a EngramHistory,
     pub token_ids: &'a [u32],
     pub image_mask: Option<&'a [bool]>,
+    /// The request's look-ahead layer-14 reservation frontier
+    /// ([`crate::LookaheadHandle::l14_gate`]), when one runs.
+    pub l14_gate: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 enum LayerIo {
     AwaitingAdmission,
@@ -28,6 +31,8 @@ pub struct EngramWave {
     finished: bool,
     waiting: [Option<std::time::Instant>; 2],
     decode: bool,
+    /// Per batch with a look-ahead: its frontier and the batch's end position.
+    l14_gates: Vec<(Arc<std::sync::atomic::AtomicU64>, u64)>,
 }
 impl EngramWave {
     pub fn copy_capacity_stalled(&self, layer: usize) -> Result<bool> {
@@ -69,7 +74,14 @@ impl EngramWave {
         };
         Ok(())
     }
+    /// Layer 14 is admitted early only behind the look-ahead's layer-14
+    /// reservations (one deadline order for both readers); at the consumer's
+    /// wait it is admitted regardless.
+    fn l14_due(&self) -> bool {
+        self.l14_gates.iter().all(|(gate, end)| gate.load(std::sync::atomic::Ordering::Acquire) >= *end)
+    }
     fn admit(&mut self, layer: usize) -> Result<()> {
+        if layer == 1 && !self.l14_due() { return Ok(()); }
         if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
             if let Some(ticket) = self.gatherer.try_submit(Arc::clone(&self.tables[layer]),
                 &self.batches, layer)? {
@@ -126,6 +138,8 @@ pub struct EngramPipeline {
     shape: crate::EngramStagingShape,
     /// Opt-in background page-cache warm; dropping the pipeline stops it.
     warm: Option<crate::formats::mapped_warm::TableWarm>,
+    /// Prompt rows read into the row caches ahead of the gathers.
+    lookahead: crate::EngramLookahead,
 }
 impl EngramPipeline {
     /// # Safety
@@ -146,7 +160,7 @@ impl EngramPipeline {
             tracing::warn!(%error, "cannot admit mapped table preload; keeping all tables mapped");
             0
         });
-        let host_budget = shape.preload_budget(host_budget);
+        let host_budget = shape.preload_budget(host_budget, tables[0].row_width());
         let scales = tables.iter().filter_map(|table| table.scales()).count();
         let scale_bytes = tables.iter().filter_map(|table| table.scales()).map(|table| table.bytes()).sum();
         let table_bytes = tables.iter().map(|table| table.weights().bytes()).sum::<u64>() + scale_bytes;
@@ -168,11 +182,13 @@ impl EngramPipeline {
             elapsed_ms = elapsed.as_millis(),
             gb_per_s = placement.preloaded_bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9,
             "mapped scale preload admission");
-        for table in &tables {
+        for table in &mut tables {
             table.weights().prepare_reads();
             if let Some(scales) = table.scales() { scales.prepare_reads(); }
+            table.set_cache_shares(shape.cache_shares())?;
         }
         let tables = tables.map(Arc::new);
+        let lookahead = crate::EngramLookahead::new(tables.clone())?;
         Ok(Self {
             identity: Arc::new(()),
             tables,
@@ -182,10 +198,13 @@ impl EngramPipeline {
             capacity,
             placement, shape,
             warm: None,
+            lookahead,
         })
     }
     pub fn placement(&self) -> &crate::formats::mapped_preload::MappedPlacement { &self.placement }
     pub fn shape(&self) -> crate::EngramStagingShape { self.shape }
+    /// Both layers' row caches (rows, index and slot metadata).
+    pub fn cache_bytes(&self) -> usize { self.shape.cache_bytes(self.tables[0].row_width()) }
     pub fn reclaim_copies(&self) -> Result<()> {
         self.gatherer.reclaim_copies()?; self.decode_gatherer.reclaim_copies()
     }
@@ -201,6 +220,27 @@ impl EngramPipeline {
             |[first, second]| first.scales().into_iter().chain(second.scales())
                 .chain([first.weights(), second.weights()]).collect(),
             readers, ready)?);
+        Ok(())
+    }
+    /// Read the Engram rows of `tokens` (the prompt from `history`'s frontier on)
+    /// into the row caches ahead of the gathers; publish commits on the handle.
+    /// `units` are the prompt's prefill units (absolute ends) and their depth.
+    pub fn start_lookahead(&self, request_id: u64, history: &EngramHistory, tokens: &[u32],
+        units: crate::EngramUnitPlan) -> Result<crate::LookaheadHandle> {
+        let compressed = tokens.iter().map(|&token| self.token_map.compress(token, false)).collect::<Result<Vec<_>>>()?;
+        Ok(self.lookahead.start_tagged(request_id, history.fork()?, compressed, units))
+    }
+    /// Read a decode round's proposed rows (anchor and drafts, per request from
+    /// its committed history) into the row caches as soon as the drafter emits them.
+    pub fn prefetch_drafts(&self, requests: &[(&EngramHistory, &[u32])]) -> Result<()> {
+        let mut rows = [Vec::new(), Vec::new()];
+        for &(history, tokens) in requests {
+            if tokens.is_empty() { continue; }
+            let compressed = tokens.iter().map(|&t| self.token_map.compress(t, false)).collect::<Result<Vec<_>>>()?;
+            let batch = history.prepare(history.position(), &compressed, compressed.len())?;
+            for (layer, rows) in rows.iter_mut().enumerate() { rows.extend(batch.prefetch_rows(layer)?); }
+        }
+        if !rows[0].is_empty() { self.lookahead.decode(rows); }
         Ok(())
     }
     pub fn new_history(&self) -> Result<EngramHistory> {
@@ -267,15 +307,19 @@ impl EngramPipeline {
                     .map(Arc::new)
             })
             .collect();
+        let batches = batches?;
+        let l14_gates = requests.iter().zip(&batches).filter_map(|(request, batch)| request.l14_gate.as_ref()
+            .map(|gate| (Arc::clone(gate), request.history.position() + batch.hashes().len() as u64))).collect();
         let mut wave = EngramWave {
             pipeline: Arc::clone(&self.identity),
             gatherer: Arc::clone(if decode { &self.decode_gatherer } else { &self.gatherer }),
             tables: self.tables.clone(),
-            batches: batches?,
+            batches,
             layers: [LayerIo::AwaitingAdmission, LayerIo::AwaitingAdmission],
             finished: false,
             waiting: [None; 2],
             decode,
+            l14_gates,
         };
         // Both layers' host gathers start now (L14 right after L1, for prefill
         // and decode alike); the gather worker runs every queued L1 before any
@@ -379,6 +423,8 @@ fn preload_tables(tables: &mut [EngramTable], include_rows: bool) -> Result<()> 
 fn record_layer_wait(table: &EngramTable, elapsed: std::time::Duration, decode: bool) {
     table.weights().stats().record_stall(elapsed);
     if decode { table.weights().stats().record_decode_stall(elapsed); }
+    // An await of rows already landed costs microseconds; a stall is a real wait.
+    if elapsed >= std::time::Duration::from_micros(100) { table.weights().stats().record_consumer_stall(decode, elapsed); }
 }
 
 #[cfg(test)]
@@ -479,7 +525,7 @@ mod wait_tests {
         EngramWave { pipeline: Arc::new(()), gatherer, tables: [table.clone(), table],
             batches: vec![batch],
             layers: [LayerIo::AwaitingAdmission, LayerIo::Consumed], finished: false,
-            waiting: [None; 2], decode: false }
+            waiting: [None; 2], decode: false, l14_gates: Vec::new() }
     }
 
     #[test]

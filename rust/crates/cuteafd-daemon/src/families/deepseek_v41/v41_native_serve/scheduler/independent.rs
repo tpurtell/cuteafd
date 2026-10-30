@@ -115,6 +115,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }).collect::<Result<Vec<_>>>()?
             };
             let drafting = seeds;
+            // The anchors' rows are known since the last commit: fetch them across the draft phase.
+            super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members,
+                &drafting.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
             let copied = vec![false; members.len()];
             let mut clock = RoundClock::at(started);
             let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
@@ -134,6 +137,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             if let Some(draft) = draft.borrow_mut().as_deref_mut() {
                 extend_inputs(draft, &active.borrow(), &members, &mut inputs)?;
             }
+            super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members, &inputs);
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane() != lane);
             let (inputs, mut batch, capture, retain_shapes) = {

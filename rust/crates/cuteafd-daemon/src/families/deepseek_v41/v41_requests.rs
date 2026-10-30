@@ -24,6 +24,9 @@ struct Request {
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
+    /// The prompt's Engram rows being read ahead (`Requests::start_lookahead`):
+    /// commits move its window; release or the prompt's last commit ends it.
+    lookahead: Option<cuteafd_loader::LookaheadHandle>,
 }
 /// A request's part of a prefix snapshot besides its device mark: the backbone's frontiers and
 /// the Engram lookback, as plain data.
@@ -111,10 +114,13 @@ impl<'a> Requests<'a> {
         [("v41/engram-prefill", shape.host_resident_bytes() as u64),
          ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)]
     }
-    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 2] {
+    /// Future host consumers: the gather workers' scratch and the row caches,
+    /// whose anonymous pages fill as rows are read.
+    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 3] {
         let shape = self.pipeline.shape();
         [("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64),
-         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64)]
+         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64),
+         ("v41/engram-row-cache", self.pipeline.cache_bytes() as u64)]
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -167,6 +173,10 @@ impl<'a> Requests<'a> {
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
     }
+    /// The request's look-ahead layer-14 gate, while its look-ahead runs.
+    pub(super) fn l14_gate(&self, lease: CacheLease) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        self.request(lease).ok()?.lookahead.as_ref().map(|ahead| ahead.l14_gate())
+    }
     fn request(&self, lease: CacheLease) -> Result<&Request> {
         self.cache.request_id(lease)?;
         self.slots
@@ -182,7 +192,8 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default() });
+        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(),
+            lookahead: None });
         Ok(lease)
     }
     pub fn attach_images(&mut self, lease: CacheLease, images: RequestImages) -> Result<()> {
@@ -208,6 +219,36 @@ impl<'a> Requests<'a> {
                 else { &request.history };
             request.images.resolve_mask(history.position(), r.tokens.len(), r.image_mask)
         }).collect::<Result<Vec<_>>>().map(Some)
+    }
+    /// Read the Engram rows of `prompt` past the request's committed frontier
+    /// ahead of its gathers (text prompts; image rows have no table reads).
+    /// `units(start)` gives the prompt's prefill units from `start` (absolute
+    /// ends) and their pipeline depth.
+    pub fn start_lookahead(&mut self, lease: CacheLease, prompt: &[u32],
+        units: impl FnOnce(usize) -> Result<cuteafd_loader::EngramUnitPlan>) -> Result<()> {
+        let request = self.request(lease)?;
+        if !request.images.is_empty() || request.lookahead.is_some() { return Ok(()); }
+        let start = usize::try_from(request.history.position())?;
+        if start >= prompt.len() { return Ok(()); }
+        let id = self.cache.request_id(lease).unwrap_or(0);
+        let handle = self.pipeline.start_lookahead(id, &request.history, &prompt[start..], units(start)?)?;
+        self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
+        Ok(())
+    }
+    /// Fetch a decode round's rows into the Engram row caches as early as they
+    /// are known: the anchors as the round starts (overlapping the draft phase),
+    /// then anchor + drafts the moment the drafter returns (before trimming);
+    /// rows already cached or in flight are not read again.
+    /// Advisory: the verify gather reads whatever has not landed.
+    pub fn prefetch_drafts(&self, proposals: &[(CacheLease, &[u32])]) {
+        // Image requests keep their masks at gather time; drafts never carry images,
+        // but a request's own image history is resolved there, not here.
+        if self.image_requests > 0 { return; }
+        let inputs: Result<Vec<_>> = proposals.iter().filter(|(_, tokens)| !tokens.is_empty())
+            .map(|&(lease, tokens)| Ok((&self.request(lease)?.history, tokens))).collect();
+        if let Err(error) = inputs.and_then(|inputs| self.pipeline.prefetch_drafts(&inputs)) {
+            tracing::debug!(%error, "Engram draft look-ahead skipped");
+        }
     }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
         self.prefetched.cancel_owner(&lease);
@@ -481,6 +522,7 @@ impl<'a> Requests<'a> {
                 history,
                 token_ids: r.tokens,
                 image_mask,
+                l14_gate: (r.kind == ExpertV2SourceKind::Prefill).then(|| request.lookahead.as_ref().map(|a| a.l14_gate())).flatten(),
             });
             tokens.extend_from_slice(r.tokens);
             mask.extend((0..r.tokens.len()).map(|i| u8::from(image_mask.is_some_and(|m| m[i]))));
@@ -740,7 +782,13 @@ impl<'a> Requests<'a> {
                 .collect::<Vec<_>>();
             histories.sort_by_key(|(i, _)| *i);
             let mut histories = histories.into_iter().map(|(_, h)| h).collect::<Vec<_>>();
-            if let Some(engram) = &mut batch.engram { engram.commit(&mut histories, &counts) } else { Ok(()) }
+            if let Some(engram) = &mut batch.engram { engram.commit(&mut histories, &counts)?; }
+            for request in self.slots.iter_mut().flatten().filter(|r| batch.leases.contains(&r.lease)) {
+                if request.lookahead.as_ref().is_some_and(|ahead| !ahead.commit(request.history.position())) {
+                    request.lookahead = None;
+                }
+            }
+            Ok(())
         })();
         batch.cancel();
         if let Err(error) = result {

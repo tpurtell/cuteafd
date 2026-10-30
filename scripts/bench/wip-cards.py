@@ -366,8 +366,13 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
                 close=dict(argv=window_argv([s + ['stop', '--session=' + NSYS_SESSION] for s in sessions]), timeout_s=1800, required=True))
     elif 'PROFILE_DIR' in values:
         raise ValueError(card + ': PROFILE_DIR is owned by the driver; set PROFILE only')
-    if cold_hosts and not entry.get('window'):
-        if not (entry.get('levels') or entry.get('prefill_lengths')):
+    if cold_hosts and entry.get('prefill_lengths'):
+        # Every prefill point starts cold: the purge runs before its warm-up and
+        # again before its timed request. Decode levels after them are
+        # post-prefill, not cold.
+        entry['prefill_purge'] = dict(argv=cold_purge_argv(cold_hosts), timeout_s=300, required=True)
+    elif cold_hosts and not entry.get('window'):
+        if not entry.get('levels'):
             raise ValueError(card + ': --cold-window drops the page cache before the timed sweep; pass --levels or --prefill-lengths')
         if exact_state:
             raise ValueError(card + ': --cold-window and --exact-state both use the measurement window')
@@ -1377,6 +1382,10 @@ def summarize_job(job, exit_code):
             for point in sweep.get('prefill', []):
                 row[f"prefill {point['length']}"] = point['tok_s']
                 row[f"prefill {point['length']} TTFT s"] = point['ttft_s']
+            row['mapped_tables'] = {**{f"prefill {p['length']}": p['mapped_tables'] for p in sweep.get('prefill', [])
+                                       if p.get('mapped_tables')},
+                                    **{f"{p['phase']} C{p['c']}": p['mapped_tables'] for p in sweep.get('points', [])
+                                       if p.get('mapped_tables')}}
     row['peaks'] = peaks(dest)
     row['ledger'] = ledger(dest)
     coordinator = {k: v for k, v in row['ledger']['device_used_peak_bytes'].items() if '.coordinator.log:' in k}
@@ -2267,13 +2276,17 @@ def main():
     parser.add_argument('--context-lengths', metavar='N,N', help='shared base contexts for context_load (256..1048576; default 32768,131072)')
     parser.add_argument('--context-levels', metavar='C,C', help='context_load concurrency levels (distinct 1..256; default 1,8,16)')
     parser.add_argument('--context-suffix', type=int, metavar='N', help='additional fresh context_load suffix tokens per request (0..1048576; default 0)')
+    parser.add_argument('--prefill-repeat', action='store_true', help='each prefill point\'s timed request re-sends its '
+                        'warm-up\'s corpus behind a fresh nonce (nominal warm: the same mapped-table rows, no prefix-cache reuse)')
     parser.add_argument('--prefill-lengths', metavar='N,N', help='client-side cold prefill at these prompt lengths (one untimed warm '
                         'request each, then one measured), e.g. 8192')
     parser.add_argument('--trace', action='store_true', help='every job writes SPECULATION_TRACE to <job>/speculation-trace.jsonl; '
                         'checked after warm-up and recorded in result.json')
     parser.add_argument('--cold-window', metavar='HOSTS', help='drop the clean page cache on these comma-separated hosts '
-                        '(nest drop-caches) when the timed sweep opens, after warm-up; under the card\'s held locks, so only '
-                        'hosts the card owns; composes with PROFILE=nsys')
+                        '(nest drop-caches): with --prefill-lengths before every prefill point\'s warm-up and again before '
+                        'its timed request (decode levels after them are post-prefill, not cold); otherwise once when the '
+                        'timed sweep opens, after warm-up. Under the card\'s held locks, so only hosts the card owns; '
+                        'composes with PROFILE=nsys')
     parser.add_argument('--exact-state', metavar='ARGV', help='run this exact prefix-state golden (shell-split argv; gets '
                         '--resume-url URL --output JOB/exact-state) against the live server at the end of the sweep; needs --levels')
     parser.add_argument('--resume', action='store_true', help='reuse --state (or --task): keep passed jobs, rerun failed or missing '
@@ -2371,6 +2384,8 @@ def main():
         parser.error('--post-load-c1 needs --levels')
     if args.post_load_repeat and not args.post_load_c1:
         parser.error('--post-load-repeat needs --post-load-c1')
+    if args.prefill_repeat and not args.prefill_lengths:
+        parser.error('--prefill-repeat needs --prefill-lengths')
     if args.sweep_tokens is not None and not (args.levels and 1 <= args.sweep_tokens <= 8192):
         parser.error('--sweep-tokens needs --levels and 1..8192 tokens')
     levels = None
@@ -2434,6 +2449,8 @@ def main():
             card['lossless_dump'] = lossless_dump
         if prefill_lengths:
             card['prefill_lengths'] = prefill_lengths
+            if args.prefill_repeat:
+                card['prefill_repeat'] = True
         if levels:
             card['levels'] = levels
             if args.sweep_tokens is not None:
@@ -2567,6 +2584,8 @@ def main():
         if kept:
             print(f'wip-cards: resume keeps {len(kept)} passed job(s), reruns {len(jobs) - len(kept)}', file=sys.stderr)
     fields = ['fabric'] + (['levels', 'post_load_c1'] + (['post_load_repeat'] if args.post_load_repeat else []) if args.levels else []) + (['prefill_lengths'] if prefill_lengths else []) + \
+        (['prefill_repeat'] if args.prefill_repeat else []) + \
+        (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
