@@ -93,7 +93,7 @@ pub(crate) struct V41PrefillTimes {
 /// The prefill units the encoder runs a prompt in from `start`, as the
 /// stream path cuts them: calls of `waves` units of `chunk_rows`, each call
 /// cut by [`stream_units`]; units run `waves` deep in pipeline order.
-fn prompt_units(start: usize, tokens: usize, chunk_rows: usize, waves: usize)
+pub(super) fn prompt_units(start: usize, tokens: usize, chunk_rows: usize, waves: usize)
     -> Result<cuteafd_loader::EngramUnitPlan> {
     let call_rows = (waves * chunk_rows).max(1);
     let mut ends = Vec::new();

@@ -706,6 +706,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             (prepared, id, lease, slot, image_keys, hit, restore)
             };
             held_slots.insert(slot);
+            // Its rows depend only on its tokens and restored frontier, both known
+            // now: fetch them while it waits behind earlier members, packed or not.
+            start_admission_lookahead(requests, lease, &prepared.prompt, args);
             admitted.push((prepared, id, lease, slot, image_keys, hit, restore));
         }
         prefix_waiters.extend(next_wave);
@@ -1589,6 +1592,20 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
         kind: if speculative { ExpertV2SourceKind::MtpVerify } else { ExpertV2SourceKind::Decode },
     }).collect();
     requests.prepare(&work)
+}
+
+/// Start a newly admitted request's Engram look-ahead with the units it will
+/// prefill in: one unit when the prompt fits a unit (packed or single), else
+/// the encoder's stream cut. Advisory: a failure leaves rows to load on demand.
+fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, prompt: &[u32],
+    args: &crate::cli::NativeServeArgs) {
+    let shape = super::PrefillShape::from_args(args);
+    let result = requests.start_lookahead(lease, prompt, |start| {
+        if prompt.len() - start <= shape.rows {
+            Ok(cuteafd_loader::EngramUnitPlan { ends: vec![prompt.len() as u64], depth: 1 })
+        } else { super::prefill_target::prompt_units(start, prompt.len(), shape.rows, shape.waves) }
+    });
+    if let Err(error) = result { tracing::warn!(%error, "Engram look-ahead not started; rows load on demand"); }
 }
 
 /// Start the proposal's Engram row reads the moment drafts exist, before

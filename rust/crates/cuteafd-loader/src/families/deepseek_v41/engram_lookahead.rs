@@ -201,9 +201,11 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
             progressed = true;
         }
         if reading(&plans) < MAX_INFLIGHT {
-            // Start pieces for the request closest to needing them first.
+            // Deadline order across requests: fewest units ahead of its committed
+            // unit first, then admission order (queue order is execution order).
             if let Some(plan) = plans.iter_mut().filter(|plan| ready_to_plan(plan, &tables))
-                .min_by_key(|plan| plan.start + plan.next as u64 - plan.committed.load(Ordering::Acquire)) {
+                .min_by_key(|plan| (plan.unit_of(plan.start + plan.next as u64)
+                    - plan.unit_of(plan.committed.load(Ordering::Acquire).max(plan.start)), plan.id)) {
                 match start_piece(plan, &tables) {
                     Ok(()) => progressed = true,
                     Err(error) => abandon(plan, &error),
