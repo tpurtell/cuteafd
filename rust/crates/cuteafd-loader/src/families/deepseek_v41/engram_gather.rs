@@ -62,11 +62,12 @@ impl EngramStagingShape {
             + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64)
     }
     pub fn device_bytes(self) -> usize { self.units * self.rows * ENGRAM_DEVICE_ROW_BYTES }
-    /// Row-cache slots per layer: prefill (the look-ahead's window, two full
-    /// prefills of this shape: `2 d` units) and decode (two verify windows of
-    /// every decode lane), in rows of 24 per token.
+    /// Row-cache slots per layer: prefill holds the look-ahead's window (two
+    /// full prefills of this shape, [`window_units`](super::engram_lookahead::window_units))
+    /// plus the unit being gathered and committed; decode holds two verify
+    /// windows of every decode lane. Rows of 24 per token.
     pub fn cache_shares(self) -> [usize; 2] {
-        let prefill = 2 * self.units * self.rows;
+        let prefill = (super::engram_lookahead::window_units(self.units) + 1) * self.rows;
         let decode = 2 * cuteafd_core::V41_VERIFY_ROWS * crate::plan::decode_lanes::MAX_DECODE_LANES as usize;
         [prefill * 24, decode * 24]
     }

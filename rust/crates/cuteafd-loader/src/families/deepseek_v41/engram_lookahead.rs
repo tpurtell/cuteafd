@@ -25,6 +25,11 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
+/// Units the look-ahead runs past the request's committed unit: two full
+/// prefills of `depth` units. The row cache's prefill share is sized from the
+/// same function (plus the unit being gathered), so the two cannot drift.
+pub const fn window_units(depth: usize) -> usize { 2 * depth }
+
 /// Tokens per piece: both layers' rows of a piece fit one reactor buffer per table.
 const PIECE_TOKENS: usize = 128;
 /// Layer reads (one piece, one layer) in flight at once; each holds up to one
@@ -318,7 +323,7 @@ fn ready_to_plan(plan: &Plan, tables: &[Arc<EngramTable>; 2]) -> bool {
     let position = plan.start + plan.next as u64;
     let committed = plan.committed.load(Ordering::Acquire).max(plan.start);
     plan.next < plan.tokens.len()
-        && plan.unit_of(position) < plan.unit_of(committed) + 2 * plan.units.depth
+        && plan.unit_of(position) < plan.unit_of(committed) + window_units(plan.units.depth)
         && tables.iter().all(|table| table.cache().room(RowClass::Prefill) >= 2 * PIECE_TOKENS * 24)
 }
 
