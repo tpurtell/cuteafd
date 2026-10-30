@@ -112,6 +112,8 @@ impl RowCache {
         self.shares[c].saturating_sub(inner.held[c]).min(self.capacity() - inner.held[0] - inner.held[1])
     }
     pub fn capacity(&self) -> usize { self.shares[0] + self.shares[1] }
+    /// Slots `class` may hold.
+    pub fn share(&self, class: RowClass) -> usize { self.shares[class as usize] }
 
     fn lock(&self) -> MutexGuard<'_, Inner> { self.inner.lock().unwrap_or_else(|p| p.into_inner()) }
 

@@ -30,8 +30,19 @@ use std::sync::{mpsc, Arc};
 /// function (plus the unit in flight), so the two cannot drift.
 pub const fn window_units(depth: usize) -> usize { 2 * depth }
 
-/// Tokens per piece.
-const PIECE_TOKENS: usize = 128;
+/// Fewest tokens per piece (V4.1 Engram: 128 x 24 rows x 264 B ~ 0.8 MiB).
+const MIN_PIECE_TOKENS: usize = 128;
+
+/// Tokens per piece: the most whose rows still fit one reactor buffer in every
+/// table (so each read streams at full-buffer efficiency), in 64-token steps
+/// and never fewer than [`MIN_PIECE_TOKENS`]; and at most a quarter of the
+/// smallest prefill share, so two pieces always fit beside what is pinned.
+fn piece_tokens(tables: &[Arc<dyn LookaheadTable>]) -> usize {
+    let row_bytes = tables.iter().map(|table| table.rows_per_token() * table.cache().width()).max().unwrap_or(1).max(1);
+    let share = tables.iter().map(|table| table.cache().share(RowClass::Prefill) / (4 * table.rows_per_token().max(1)))
+        .min().unwrap_or(usize::MAX);
+    (super::reactor::BUFFER_BYTES / row_bytes / 64 * 64).min(share / 64 * 64).max(MIN_PIECE_TOKENS)
+}
 /// Prefill table reads (one piece, one table) in flight at once. A read holds
 /// one reactor buffer per plane (two for a paired weight and scale table) and
 /// at most one decode piece runs; reads never wait for a buffer, so the planner
@@ -354,7 +365,7 @@ fn ready_to_plan(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> bool {
     let committed = plan.committed.load(Ordering::Acquire).max(plan.start);
     plan.next < plan.source.tokens()
         && plan.unit_of(position) < plan.unit_of(committed) + window_units(plan.units.depth)
-        && tables.iter().all(|table| table.cache().room(RowClass::Prefill) >= 2 * PIECE_TOKENS * table.rows_per_token())
+        && tables.iter().all(|table| table.cache().room(RowClass::Prefill) >= 2 * piece_tokens(tables) * table.rows_per_token())
 }
 
 /// The oldest piece and later table whose rows are due: the previous table has
@@ -395,7 +406,7 @@ fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()
     let position = plan.start + plan.next as u64;
     let unit = plan.unit_of(position);
     let unit_end = (plan.units.ends[unit] - plan.start) as usize;
-    let end = (plan.next + PIECE_TOKENS).min(unit_end).min(plan.source.tokens());
+    let end = (plan.next + piece_tokens(tables)).min(unit_end).min(plan.source.tokens());
     let mut rows = plan.source.rows(plan.next..end)?;
     anyhow::ensure!(rows.len() == tables.len(), "row source gave {} tables, the look-ahead has {}", rows.len(), tables.len());
     plan.next = end;
@@ -473,5 +484,41 @@ impl Drop for Plan {
             unplanned_tokens = unplanned, needed = ?self.needed, cached = ?self.cached, joined = ?self.joined,
             read = ?self.read, read_waiting = ?self.read_waiting, later_tables_skipped = self.skipped,
             lifetime_ms = self.admitted.elapsed().as_millis() as u64, "token-table look-ahead request");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Shape { cache: Arc<RowCache>, rows: usize, stats: Arc<TableStats> }
+    impl LookaheadTable for Shape {
+        fn cache(&self) -> &Arc<RowCache> { &self.cache }
+        fn start_read(&self, _: &[u64], _: ReadPriority) -> Result<Box<dyn RowLanding>> { unreachable!() }
+        fn stats(&self) -> &TableStats { &self.stats }
+        fn rows_per_token(&self) -> usize { self.rows }
+    }
+    fn shape(width: usize, rows: usize, shares: [usize; 2]) -> Arc<dyn LookaheadTable> {
+        let stats = Arc::new(TableStats::default());
+        Arc::new(Shape { cache: RowCache::new(width, shares, Arc::clone(&stats)).unwrap(), rows, stats })
+    }
+
+    /// One read fills at most a reactor buffer in every table; at the admitted
+    /// 2752 x 3 shape the window (2 d units) and a planning step's two pieces fit
+    /// the prefill share, so the look-ahead never stops early on room.
+    #[test]
+    fn pieces_fill_a_reactor_buffer_and_fit_the_admitted_share() {
+        let (unit, depth) = (2752, 3);
+        for (width, rows, expected) in [(264, 24, 128), (160, 16, 384)] {
+            let share = (window_units(depth) + 1) * unit * rows;
+            let tables = vec![shape(width, rows, [share, 2 * 64 * rows])];
+            let tokens = piece_tokens(&tables);
+            assert_eq!(tokens, expected, "{width} B x {rows} rows");
+            assert!(tokens * rows * width <= super::super::reactor::BUFFER_BYTES || tokens == MIN_PIECE_TOKENS);
+            assert!(window_units(depth) * unit * rows + 2 * tokens * rows <= share, "{width} B: window plus a step fits");
+        }
+        // Several tables: the widest row decides.
+        let both = vec![shape(160, 16, [1 << 20, 1024]), shape(264, 24, [1 << 20, 1024])];
+        assert_eq!(piece_tokens(&both), 128);
     }
 }
