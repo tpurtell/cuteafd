@@ -470,7 +470,6 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         }).sum())
     }
     fn history(&self, _placement: &Placement) {}
-    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
         self.state.retire(); self.execution.require_live()
     }

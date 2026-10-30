@@ -175,7 +175,7 @@ impl<'a> Requests<'a> {
     }
     /// The request's look-ahead layer-14 gate, while its look-ahead runs.
     pub(super) fn l14_gate(&self, lease: CacheLease) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
-        self.request(lease).ok()?.lookahead.as_ref().map(|ahead| ahead.l14_gate())
+        self.request(lease).ok()?.lookahead.as_ref().map(|ahead| ahead.last_table_gate())
     }
     fn request(&self, lease: CacheLease) -> Result<&Request> {
         self.cache.request_id(lease)?;
@@ -225,7 +225,7 @@ impl<'a> Requests<'a> {
     /// `units(start)` gives the prompt's prefill units from `start` (absolute
     /// ends) and their pipeline depth.
     pub fn start_lookahead(&mut self, lease: CacheLease, prompt: &[u32],
-        units: impl FnOnce(usize) -> Result<cuteafd_loader::EngramUnitPlan>) -> Result<()> {
+        units: impl FnOnce(usize) -> Result<cuteafd_loader::TableUnitPlan>) -> Result<()> {
         let request = self.request(lease)?;
         if !request.images.is_empty() || request.lookahead.is_some() { return Ok(()); }
         let start = usize::try_from(request.history.position())?;
@@ -234,6 +234,11 @@ impl<'a> Requests<'a> {
         let handle = self.pipeline.start_lookahead(id, &request.history, &prompt[start..], units(start)?)?;
         self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
         Ok(())
+    }
+    /// The request's prefill is starting: its running call's rows belong to its
+    /// demand gathers (a remote table's look-ahead then reads only later calls).
+    pub fn lookahead_running(&self, lease: CacheLease) {
+        if let Some(ahead) = self.request(lease).ok().and_then(|request| request.lookahead.as_ref()) { ahead.running(); }
     }
     /// Fetch a decode round's rows into the Engram row caches as early as they
     /// are known: the anchors as the round starts (overlapping the draft phase),
@@ -522,7 +527,7 @@ impl<'a> Requests<'a> {
                 history,
                 token_ids: r.tokens,
                 image_mask,
-                l14_gate: (r.kind == ExpertV2SourceKind::Prefill).then(|| request.lookahead.as_ref().map(|a| a.l14_gate())).flatten(),
+                l14_gate: (r.kind == ExpertV2SourceKind::Prefill).then(|| request.lookahead.as_ref().map(|a| a.last_table_gate())).flatten(),
             });
             tokens.extend_from_slice(r.tokens);
             mask.extend((0..r.tokens.len()).map(|i| u8::from(image_mask.is_some_and(|m| m[i]))));

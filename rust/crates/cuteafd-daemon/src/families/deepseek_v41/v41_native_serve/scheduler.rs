@@ -1604,7 +1604,7 @@ fn start_admission_lookahead(requests: &mut Requests<'_>, lease: CacheLease, pro
     let replay_end = requests.cache().committed_end(lease).map_or(0, |end| end as usize);
     let result = requests.start_lookahead(lease, prompt, |start| {
         if prompt.len() - start <= shape.rows {
-            Ok(cuteafd_loader::EngramUnitPlan { ends: vec![prompt.len() as u64], depth: 1 })
+            Ok(cuteafd_loader::TableUnitPlan::new(vec![prompt.len() as u64], 1))
         } else { super::prefill_target::prompt_units(start, replay_end, prompt.len(), shape.rows, shape.waves) }
     });
     if let Err(error) = result { tracing::warn!(%error, "Engram look-ahead not started; rows load on demand"); }

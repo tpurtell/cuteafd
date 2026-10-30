@@ -7,10 +7,9 @@
 //! POSIX_FADV_RANDOM; a process-wide reactor reads only mincore misses without O_DIRECT.
 //! Rows reach the GPU in three steps, each bounded:
 //!
-//! - prefetch: as soon as row ids are known (a prefill chunk ahead, a wave's
-//!   hashes before its layer), [`TablePrefetcher`] reads the touched rows with
-//!   the hybrid on a background worker; unavailable-ring fallback uses
-//!   `MADV_WILLNEED`. Queue, rows and pages are bounded; a full queue drops work;
+//! - look-ahead: as soon as row ids are known (a prompt at admission, a decode
+//!   token), [`lookahead`] reads them into the table's bounded [`row_cache`] in
+//!   deadline order; gathers then copy cached rows and read only the rest;
 //! - gather: rows are copied in request order into caller storage, either on
 //!   a [`GatherPool`] (parallel page faults, the caller waits) or on a
 //!   [`GatherWorker`] (request-owned tickets and recycled staging slots);
@@ -31,7 +30,11 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 
 mod uring;
 mod reactor;
+mod affinity;
 pub mod row_cache;
+pub mod lookahead;
+pub mod placement;
+pub mod token_table;
 
 /// How a gather may use the shared read reactor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -166,6 +169,11 @@ pub struct MappedRows {
     file_offset: u64,
     nowait: AtomicBool,
     fuse: bool,
+    /// Where this file's copies live (`placement::file_placement`), read at open.
+    placement: placement::Placement,
+    /// Remote-only FUSE files: (connection, its max_background); the reactor
+    /// keeps at most that many of the connection's reads in flight.
+    read_cap: Option<(u32, u32)>,
 }
 
 // SAFETY: Only immutable access is exposed; munmap runs after the final owner drops.
@@ -220,7 +228,11 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
+        let (fuse, at) = (uring::is_fuse(&file), placement::file_placement(&file));
+        placement::note(at);
+        let read_cap = placement::remote_read_cap(&file, at, fuse);
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse,
+            placement: at, read_cap, file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         #[cfg(test)]
         let advice = if std::env::var_os("MAPPED_BENCH_DEFAULT_ADVICE").is_some() { libc::MADV_NORMAL } else { libc::MADV_RANDOM };
@@ -648,6 +660,13 @@ impl MappedTable {
     pub fn part_count(&self) -> usize {
         self.parts.len()
     }
+    /// Local when rows are read from this host: the table is held in memory, or
+    /// every part's file has a local copy ([`placement::file_placement`]).
+    pub fn placement(&self) -> placement::Placement {
+        if self.resident.is_some() || self.parts.iter().all(|part| part.placement == placement::Placement::Local) {
+            placement::Placement::Local
+        } else { placement::Placement::Remote }
+    }
     /// Mapped payload bytes (not resident bytes).
     pub fn bytes(&self) -> u64 {
         self.rows() * self.format.row_bytes as u64
@@ -940,7 +959,8 @@ impl MappedTable {
         prepared.stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
         if !prepared.misses.is_empty() {
             let reads = prepared.misses.iter().map(|&(part, row, slot)| reactor::Read {
-                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot }).collect();
+                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot,
+                cap: self.parts[part].read_cap }).collect();
             match uring::start(reads, width, priority, window, !mode.no_wait) {
                 Ok(stream) => prepared.stream = Some(stream),
                 Err(error) => self.uring_fallback(&error),
@@ -1191,9 +1211,6 @@ pub struct TableStats {
     minor_faults: AtomicU64,
     major_faults: AtomicU64,
     input_blocks: AtomicU64,
-    prefetch_jobs: AtomicU64,
-    prefetch_pages: AtomicU64,
-    prefetch_dropped: AtomicU64,
     nowait: AtomicBool,
     approximate: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
@@ -1273,10 +1290,6 @@ pub struct TableStatsSnapshot {
     /// Page-cache misses that read the device (disk or network).
     pub major_faults: u64,
     pub input_blocks: u64,
-    pub prefetch_jobs: u64,
-    pub prefetch_pages: u64,
-    /// Prefetch batches refused by a full queue.
-    pub prefetch_dropped: u64,
     /// Classified misses timed from initial batch submission through completion/retry.
     pub miss_histogram: [u64; 7],
     pub unclassified_rows: u64,
@@ -1441,16 +1454,11 @@ impl TableStats {
         read.fetch_add(fallback as u64, Ordering::Relaxed);
         waited.fetch_add(pending as u64, Ordering::Relaxed);
     }
-    pub fn record_lookahead(&self, rows: usize) {
-        self.lookahead_pieces.fetch_add(1, Ordering::Relaxed);
+    /// Rows a look-ahead read published; `piece` when it completed a piece's
+    /// share of this table (or a decode round's).
+    pub fn record_lookahead(&self, rows: usize, piece: bool) {
+        if piece { self.lookahead_pieces.fetch_add(1, Ordering::Relaxed); }
         self.lookahead_rows.fetch_add(rows as u64, Ordering::Relaxed);
-    }
-    pub fn record_prefetch(&self, pages: usize) {
-        self.prefetch_jobs.fetch_add(1, Ordering::Relaxed);
-        self.prefetch_pages.fetch_add(pages as u64, Ordering::Relaxed);
-    }
-    pub fn record_prefetch_dropped(&self) {
-        self.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_reads(&self, reads: uring::ReadStats, prefetch: bool) {
@@ -1518,9 +1526,6 @@ impl TableStats {
             minor_faults: get(&self.minor_faults),
             major_faults: get(&self.major_faults),
             input_blocks: get(&self.input_blocks),
-            prefetch_jobs: get(&self.prefetch_jobs),
-            prefetch_pages: get(&self.prefetch_pages),
-            prefetch_dropped: get(&self.prefetch_dropped),
             miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
             unclassified_rows: get(&self.unclassified_rows),
             unclassified_bytes: get(&self.unclassified_bytes),
@@ -1595,9 +1600,6 @@ impl TableStatsSnapshot {
             minor_faults: d(self.minor_faults, earlier.minor_faults),
             major_faults: d(self.major_faults, earlier.major_faults),
             input_blocks: d(self.input_blocks, earlier.input_blocks),
-            prefetch_jobs: d(self.prefetch_jobs, earlier.prefetch_jobs),
-            prefetch_pages: d(self.prefetch_pages, earlier.prefetch_pages),
-            prefetch_dropped: d(self.prefetch_dropped, earlier.prefetch_dropped),
             miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
             unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
             unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),
@@ -1665,148 +1667,6 @@ impl TableStatsSnapshot {
         self.page_hits as f64 / rows as f64
     }
 
-}
-
-/// Anything whose rows can be advised as a unit (one table, or V4.1's paired
-/// weight and scale tables).
-pub trait AdviseRows: Send + Sync + 'static {
-    fn row_count(&self) -> u64;
-    /// Pages advised per member table, or None once `cancelled` is set
-    /// between tables. Advice already issued to the OS is harmless.
-    fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool) -> Result<Option<Vec<usize>>>;
-}
-
-impl AdviseRows for MappedTable {
-    fn row_count(&self) -> u64 {
-        self.rows()
-    }
-    fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool) -> Result<Option<Vec<usize>>> {
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let pages = self.prefetch(rows, max_pages)?;
-        self.stats.record_prefetch(pages);
-        Ok(Some(vec![pages]))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TablePrefetchOutcome {
-    Cancelled,
-    /// Pages advised per member table.
-    Advised(Vec<usize>),
-}
-
-struct PrefetchJob {
-    table: Arc<dyn AdviseRows>,
-    rows: Vec<u64>,
-    cancelled: Arc<AtomicBool>,
-    completion: Option<mpsc::SyncSender<Result<TablePrefetchOutcome>>>,
-}
-
-/// Request-owned completion, independent of recycled scheduler slot numbers.
-/// Dropping it cancels queued work; advice already issued to the OS is harmless.
-pub struct TablePrefetchTicket {
-    cancelled: Arc<AtomicBool>,
-    completion: mpsc::Receiver<Result<TablePrefetchOutcome>>,
-}
-
-impl TablePrefetchTicket {
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-    pub fn wait(&self) -> Result<TablePrefetchOutcome> {
-        self.completion.recv().map_err(|_| MappedTableError::Stopped("table prefetch worker stopped"))?
-    }
-}
-
-impl Drop for TablePrefetchTicket {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-/// One worker and a bounded queue; submission never waits for disk or queue
-/// space. The row cap bounds job memory independently of page deduplication.
-pub struct TablePrefetcher {
-    sender: Option<mpsc::SyncSender<PrefetchJob>>,
-    worker: Option<JoinHandle<()>>,
-    max_rows: usize,
-}
-
-impl TablePrefetcher {
-    pub fn new(name: &str, queue_depth: usize, max_rows: usize, max_pages_per_table: usize) -> Result<Self> {
-        if queue_depth == 0 || max_rows == 0 || max_pages_per_table == 0 {
-            return Err(invalid("table prefetch capacities must be nonzero"));
-        }
-        let (sender, receiver) = mpsc::sync_channel::<PrefetchJob>(queue_depth);
-        let worker = thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let result = job
-                        .table
-                        .advise(&job.rows, max_pages_per_table, &job.cancelled)
-                        .map(|pages| pages.map_or(TablePrefetchOutcome::Cancelled, TablePrefetchOutcome::Advised));
-                    if let Some(completion) = job.completion {
-                        let _ = completion.send(result);
-                    } else if let Err(error) = result {
-                        tracing::debug!(%error, "table prefetch advice failed");
-                    }
-                }
-            })
-            .map_err(|source| MappedTableError::Io { context: "starting table prefetch worker".into(), source })?;
-        Ok(Self { sender: Some(sender), worker: Some(worker), max_rows })
-    }
-
-    pub fn max_rows(&self) -> usize {
-        self.max_rows
-    }
-
-    fn job(&self, table: &Arc<dyn AdviseRows>, rows: &[u64]) -> Result<()> {
-        if rows.len() > self.max_rows {
-            return Err(invalid("table prefetch exceeds row capacity"));
-        }
-        if let Some(&row) = rows.iter().find(|&&row| row >= table.row_count()) {
-            return Err(MappedTableError::RowRange { row, rows: table.row_count() });
-        }
-        Ok(())
-    }
-
-    fn send(&self, job: PrefetchJob) -> Result<bool> {
-        match self.sender.as_ref().ok_or(MappedTableError::Stopped("table prefetcher stopped"))?.try_send(job) {
-            Ok(()) => Ok(true),
-            Err(mpsc::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(MappedTableError::Stopped("table prefetch worker disconnected")),
-        }
-    }
-
-    /// None means backpressure: the caller may gather on demand or retry later.
-    pub fn try_submit(&self, table: Arc<dyn AdviseRows>, rows: &[u64]) -> Result<Option<TablePrefetchTicket>> {
-        self.job(&table, rows)?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (completion, receiver) = mpsc::sync_channel(1);
-        let job = PrefetchJob { table, rows: rows.to_vec(), cancelled: cancelled.clone(), completion: Some(completion) };
-        Ok(self.send(job)?.then_some(TablePrefetchTicket { cancelled, completion: receiver }))
-    }
-
-    /// Fire-and-forget advice (rows past the row cap are truncated); false
-    /// when the queue was full and the advice was dropped.
-    pub fn submit_detached(&self, table: Arc<dyn AdviseRows>, rows: &[u64]) -> Result<bool> {
-        let rows = &rows[..rows.len().min(self.max_rows)];
-        self.job(&table, rows)?;
-        let job = PrefetchJob { table, rows: rows.to_vec(), cancelled: Arc::new(AtomicBool::new(false)), completion: None };
-        self.send(job)
-    }
-}
-
-impl Drop for TablePrefetcher {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 
 /// What a [`GatherPool`] gather did.

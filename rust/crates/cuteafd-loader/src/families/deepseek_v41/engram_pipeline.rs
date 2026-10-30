@@ -226,7 +226,7 @@ impl EngramPipeline {
     /// into the row caches ahead of the gathers; publish commits on the handle.
     /// `units` are the prompt's prefill units (absolute ends) and their depth.
     pub fn start_lookahead(&self, request_id: u64, history: &EngramHistory, tokens: &[u32],
-        units: crate::EngramUnitPlan) -> Result<crate::LookaheadHandle> {
+        units: crate::TableUnitPlan) -> Result<crate::LookaheadHandle> {
         let compressed = tokens.iter().map(|&token| self.token_map.compress(token, false)).collect::<Result<Vec<_>>>()?;
         Ok(self.lookahead.start_tagged(request_id, history.fork()?, compressed, units))
     }

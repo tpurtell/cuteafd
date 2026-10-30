@@ -520,6 +520,11 @@ release_serving_docker_args() {
   if [[ -d /srv/sparknest/run ]]; then
     RELEASE_SERVING_ARGS+=(--mount type=bind,src=/srv/sparknest/run,dst=/srv/sparknest/run,readonly)
   fi
+  # FUSE connection limits (max_background): mapped tables read from a remote
+  # FUSE copy keep at most that many reads in flight. Read-only, host uid owned.
+  if [[ -d /sys/fs/fuse/connections ]]; then
+    RELEASE_SERVING_ARGS+=(--mount type=bind,src=/sys/fs/fuse/connections,dst=/sys/fs/fuse/connections,readonly)
+  fi
   # Docker's numeric --user otherwise drops groups used by host access checks.
   for group in "${groups[@]}"; do
     [[ "$group" == "$primary_group" ]] || RELEASE_SERVING_ARGS+=(--group-add "$group")

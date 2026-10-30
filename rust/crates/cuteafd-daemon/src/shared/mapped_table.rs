@@ -1,19 +1,16 @@
-//! Token-table adapter: early bounded gather, host-triggered H2D at the consumer.
+//! Token-table adapter: rows read ahead into the table's bounded row cache
+//! (from admission for prompts, as soon as decode tokens are known), each step's
+//! gather a cache lookup plus copy into pinned staging, and a host-triggered
+//! H2D at the consumer.
 use anyhow::{ensure, Context, Result};
 use super::memory::device::{Device, Stream};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, PinnedBytes};
-use cuteafd_loader::{GatherFailure, GatherPoll, GatherTicket, MappedTable, TablePrefetcher, TableStatsSnapshot};
-use cuteafd_loader::shared::token_table::{RowGather, TablePipeline};
+use cuteafd_loader::{GatherFailure, GatherPoll, GatherTicket, MappedTable, TableStatsSnapshot};
+use cuteafd_loader::formats::mapped_table::ReadPriority;
+use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, RowSource as AheadSource, UnitPlan};
+use cuteafd_loader::formats::mapped_table::token_table::{TokenTable, TokenTableLookahead};
+use cuteafd_loader::shared::token_table::TablePipeline;
 use std::{cell::{Cell, RefCell}, ffi::c_void, sync::{Arc, Mutex}, time::Duration};
-
-#[derive(Debug, Clone, clap::Args)]
-pub(crate) struct MappedTableArgs {
-    /// Host threads for large mapped-row gathers; small gathers run on the owner.
-    #[arg(long = "table-threads", alias = "ple-threads", default_value_t = 16)]
-    pub threads: usize,
-    #[arg(long = "table-prefetch", default_value_t = true, action = clap::ArgAction::Set)]
-    pub prefetch: bool,
-}
 pub(crate) trait RowSource: Send + Sync {
     fn units(&self) -> usize;
     fn rows(&self, unit: usize) -> &[i64];
@@ -35,33 +32,39 @@ pub(crate) struct MappedTableDevice<'a> {
     library: &'a NativeLibrary,
     device: i32,
     name: &'static str,
-    table: Arc<MappedTable>,
-    prefetcher: Option<TablePrefetcher>,
+    lookahead: TokenTableLookahead,
     prefill: Arc<Pipeline>,
     decode: Arc<Pipeline>,
     prefill_rows: usize,
     decode_rows: usize,
     prefill_slots: usize,
     host_workspace_bytes: usize,
+    cache_bytes: usize,
     logged: Cell<TableStatsSnapshot>,
-    ahead: RefCell<Vec<(Vec<i64>, PendingRows)>>,
     destinations: RefCell<Vec<Destination>>,
     active_destination: Cell<usize>,
     upload: Stream<'a>,
     landed: *mut c_void,
 }
 impl<'a> MappedTableDevice<'a> {
-    pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable, args: &MappedTableArgs,
-        prefill_rows: usize, prefill_slots: usize, decode_rows: usize) -> Result<Self> {
+    /// `prefill_rows`/`decode_rows` are table rows per staged prefill unit and
+    /// decode step; `prefill_slots` units run in flight; `rows_per_token`
+    /// table rows per token size the row cache.
+    pub fn new(library: &'a NativeLibrary, name: &'static str, table: MappedTable,
+        prefill_rows: usize, prefill_slots: usize, decode_rows: usize, rows_per_token: usize) -> Result<Self> {
         table.prepare_reads();
         let _scope = cuteafd_ffi::memory_ledger::scope("mapped-table");
         let staging = cuteafd_loader::formats::mapped_table::MappedStaging::new(prefill_rows, prefill_slots, decode_rows, table.row_bytes())?;
-        super::memory::budget::admit_host_memory(0, &[("staging/mapped-table", staging.total_bytes as u64)], 0, 0)?;
+        let shares = TokenTable::shares(prefill_rows / rows_per_token.max(1), prefill_slots,
+            decode_rows / rows_per_token.max(1), rows_per_token);
+        let cache_bytes = TokenTable::cache_bytes(table.row_bytes(), shares);
+        super::memory::budget::admit_host_memory(0, &[("staging/mapped-table", staging.total_bytes as u64),
+            ("mapped-table/row-cache", cache_bytes as u64)], 0, 0)?;
         let device = library.cuda_get_device()?;
         table.name_stats(name);
-        let table = Arc::new(table);
-        let pipeline = |rows: usize, slots: usize, suffix: &str, priority| -> Result<Arc<Pipeline>> {
-            let gather = RowGather::new(&format!("{name}-{suffix}-pages"), args.threads)?.with_priority(priority);
+        let logged = Cell::new(table.stats().snapshot());
+        let table = TokenTable::new(table, shares, rows_per_token)?;
+        let pipeline = |rows: usize, slots: usize, suffix: &str, priority: ReadPriority| -> Result<Arc<Pipeline>> {
             let table = Arc::clone(&table);
             let storage = (0..slots).map(|_| Ok(RowSlot { bytes: library.pinned_bytes(rows * table.row_bytes())? }))
                 .collect::<Result<Vec<_>>>()?;
@@ -69,22 +72,35 @@ impl<'a> MappedTableDevice<'a> {
                 let ids = job.batch.source.rows(job.unit);
                 let rows = ids.iter().map(|&id| u64::try_from(id)).collect::<std::result::Result<Vec<_>, _>>()?;
                 let bytes = rows.len() * table.row_bytes();
-                gather.gather(&table, &rows, &mut slot.bytes.bytes_mut()[..bytes])
+                table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority)
             }, |slot| Ok(slot.bytes.copy_ready()?))?))
         };
-        let prefill = pipeline(prefill_rows, 2 * prefill_slots, "prefill", cuteafd_loader::formats::mapped_table::ReadPriority::Prefill)?;
-        let decode = pipeline(decode_rows, 2, "decode", cuteafd_loader::formats::mapped_table::ReadPriority::Decode)?;
-        let max_rows = prefill_rows.max(decode_rows);
-        let prefetcher = if args.prefetch { Some(TablePrefetcher::new(&format!("{name}-prefetch"), 16, max_rows, 2 * max_rows)?) } else { None };
-        Ok(Self { library, device, name, logged: Cell::new(table.stats().snapshot()), table, prefetcher,
+        let prefill = pipeline(prefill_rows, 2 * prefill_slots, "prefill", ReadPriority::Prefill)?;
+        let decode = pipeline(decode_rows, 2, "decode", ReadPriority::Decode)?;
+        let lookahead = TokenTableLookahead::new(name, table)?;
+        Ok(Self { library, device, name, logged, lookahead,
             prefill, decode, prefill_rows, decode_rows, prefill_slots, host_workspace_bytes: staging.workspace_bytes,
-            ahead: RefCell::new(Vec::new()),
+            cache_bytes,
             destinations: RefCell::new(Vec::new()), active_destination: Cell::new(0),
             upload: Stream::new(Device { library, id: device })?,
             landed: library.cuda_event_create_ordering()? })
     }
     pub fn host_workspace_bytes(&self) -> usize { self.host_workspace_bytes }
-    pub fn lookahead(&self) -> usize { self.prefill_slots }
+    /// The row cache's host bytes (admitted at construction).
+    pub fn cache_bytes(&self) -> usize { self.cache_bytes }
+    /// Prefill units staged ahead of the one running.
+    pub fn depth(&self) -> usize { self.prefill_slots }
+    /// Read a prompt's rows (`source`, from absolute position `start`) into the
+    /// row cache ahead of its gathers, in its prefill units.
+    pub fn start_lookahead(&self, tag: u64, start: u64, source: Box<dyn AheadSource>, units: UnitPlan) -> LookaheadHandle {
+        self.lookahead.start(tag, start, source, units)
+    }
+    /// Read a decode step's rows into the row cache now. Never blocks.
+    pub fn prefetch_decode(&self, ids: &[i64]) -> Result<()> {
+        let rows = ids.iter().map(|&id| u64::try_from(id).context("negative table row")).collect::<Result<Vec<_>>>()?;
+        self.lookahead.decode(rows);
+        Ok(())
+    }
     pub fn batch(&self, source: Arc<dyn RowSource>) -> Arc<RowBatch> {
         Arc::new(RowBatch { begun: Mutex::new(vec![false; source.units()]), source })
     }
@@ -95,25 +111,13 @@ impl<'a> MappedTableDevice<'a> {
         ensure!(!*entry, "table unit already begun");
         let ids = batch.source.rows(unit);
         let capacity = if decode { self.decode_rows } else { self.prefill_rows };
-        ensure!(ids.len() <= capacity && ids.iter().all(|&id| id >= 0 && (id as u64) < self.table.rows()), "invalid table rows");
-        if !decode {
-            let mut ahead = self.ahead.borrow_mut();
-            if let Some(index) = ahead.iter().position(|(rows, _)| rows == ids) {
-                *entry = true;
-                return Ok(ahead.remove(index).1);
-            }
-        }
+        let table = self.lookahead.table();
+        ensure!(ids.len() <= capacity && ids.iter().all(|&id| id >= 0 && (id as u64) < table.table().rows()), "invalid table rows");
         let pipeline = Arc::clone(if decode { &self.decode } else { &self.prefill });
         let job = RowJob { batch: Arc::clone(batch), unit };
-        let mut ticket = pipeline.try_submit(job.clone(), true)?;
-        // Interleaved requests may leave both bursts cached for another history.
-        // Demand must displace unused lookahead rather than wait on its tickets.
-        while ticket.is_none() && !decode && !self.ahead.borrow().is_empty() {
-            self.ahead.borrow_mut().remove(0);
-            ticket = pipeline.try_submit(job.clone(), true)?;
-        }
+        let ticket = pipeline.try_submit(job.clone(), true)?;
         *entry = true;
-        Ok(PendingRows { ticket, job, pipeline, bytes: ids.len() * self.table.row_bytes() })
+        Ok(PendingRows { ticket, job, pipeline, bytes: ids.len() * table.row_bytes() })
     }
     pub fn begin(&self, source: Arc<dyn RowSource>, decode: bool) -> Result<PendingRows> {
         self.begin_unit(&self.batch(source), 0, decode)
@@ -137,7 +141,7 @@ impl<'a> MappedTableDevice<'a> {
             Err(GatherFailure::Job(error)) => return Err(error),
             Err(GatherFailure::Worker(error)) => return Err(error.into()),
         };
-        self.table.stats().record_stall(started.elapsed());
+        self.lookahead.table().table().stats().record_stall(started.elapsed());
         let slot = lease.slot_mut().context("empty table lease")?;
         let mut destinations = self.destinations.borrow_mut();
         let index = match destinations.iter().position(|entry| entry.pointer == dst.ptr as usize) {
@@ -196,37 +200,20 @@ impl<'a> MappedTableDevice<'a> {
         destination.recorded = true;
         Ok(())
     }
-    pub fn prefetch(&self, ids: &[i64]) -> Result<()> {
-        let _device = Device { library: self.library, id: self.device }.enter()?;
-        if ids.is_empty() { return Ok(()); }
-        // Immutable ID equality makes this safe across interleaved requests and
-        // prefix restores. Stale lookahead is cancelled, never published as state.
-        // The scheduler calls this for the next chunk before executing this one.
-        if ids.len() > self.decode_rows {
-            for unit in ids.chunks(self.prefill_rows).take(self.prefill_slots) {
-                if self.ahead.borrow().iter().any(|(rows, _)| rows == unit) { continue; }
-                // The scheduler announces the following chunk before consuming
-                // this one's cached rows. Retain both bursts through that handoff.
-                if self.ahead.borrow().len() >= 2 * self.prefill_slots { self.ahead.borrow_mut().remove(0); }
-                let batch = self.batch(Arc::new(unit.to_vec()));
-                let job = RowJob { batch, unit: 0 };
-                if let Some(ticket) = self.prefill.try_submit(job.clone(), false)? {
-                    self.ahead.borrow_mut().push((unit.to_vec(), PendingRows { ticket: Some(ticket), job, pipeline: Arc::clone(&self.prefill),
-                        bytes: unit.len() * self.table.row_bytes() }));
-                }
-            }
-        }
-        let Some(prefetcher) = &self.prefetcher else { return Ok(()) };
-        let rows = ids.iter().map(|&id| u64::try_from(id).context("negative table row")).collect::<Result<Vec<_>>>()?;
-        if !prefetcher.submit_detached(self.table.clone(), &rows)? { self.table.stats().record_prefetch_dropped(); }
-        Ok(())
-    }
     pub fn log_interval(&self, event: &str) {
-        let now = self.table.stats().snapshot();
+        let now = self.lookahead.table().table().stats().snapshot();
         let d = now.since(&self.logged.replace(now));
-        if d.rows == 0 && d.prefetch_jobs == 0 { return; }
-        tracing::info!(table = self.name, event, rows = d.rows, gathers = d.gathers,
-            gather_ms = d.gather_ns as f64 / 1e6, stall_ms = d.stall_ns as f64 / 1e6, "mapped table");
+        if d.cache_hit_rows + d.cache_wait_rows + d.lookahead_rows + d.stall_prefill_fallback_rows
+            + d.stall_decode_fallback_rows == 0 { return; }
+        // Gather side: rows the gathers read themselves (fallback) or waited for
+        // another reader to fill (pending); cache_wait_rows also counts the
+        // look-ahead finding a gather ahead of it. Device side: rows read from
+        // the table and their summed service time.
+        tracing::info!(table = self.name, event, cache_hit_rows = d.cache_hit_rows, cache_wait_rows = d.cache_wait_rows,
+            lookahead_rows = d.lookahead_rows, prefill_fallback_rows = d.stall_prefill_fallback_rows,
+            prefill_pending_rows = d.stall_prefill_pending_rows, decode_fallback_rows = d.stall_decode_fallback_rows,
+            decode_pending_rows = d.stall_decode_pending_rows, device_rows = d.page_misses,
+            device_ms = d.miss_ns as f64 / 1e6, stall_ms = d.stall_ns as f64 / 1e6, "mapped table");
     }
 }
 
@@ -268,21 +255,20 @@ mod tests {
             .split("/// Size every unit-table upload").next().unwrap();
         assert!(demands.contains("ple.mapped().host_workspace_bytes() as u64"));
         assert!(demands.contains("staging/mapped-table-worker"));
+        assert!(demands.contains("(\"mapped-table/row-cache\".to_owned(), ple.mapped().cache_bytes() as u64)"));
     }
 
     #[test]
-    fn scheduler_lookahead_is_gathered_before_current_chunk_and_cannot_starve_demand() {
+    fn prompts_read_ahead_from_admission_and_gathers_go_through_the_row_cache() {
         let scheduler = include_str!("qwen/scheduler.rs");
-        let round = scheduler.split("let chunk = &p.tokens[p.done..end];").nth(1).unwrap();
-        assert!(round.find("engine.prefetch(&p.tokens[..end], &p.tokens[end..next])").unwrap()
-            < round.find("engine.prefill_device(&mut p.placement, chunk").unwrap());
+        let admit = scheduler.split("// Family table rows for the whole prompt are read from admission").nth(1).unwrap();
+        assert!(admit.find("engine.read_ahead(&placement, &tokens, resume, &plan.chunks)").unwrap()
+            < admit.find("prefills.push(Prefill {").unwrap());
+        assert!(!scheduler.contains("engine.prefetch("), "per-chunk bursts are gone");
         let source = include_str!("mapped_table.rs");
-        let prefetch = source.split("pub fn prefetch(&self").nth(1).unwrap().split("pub fn log_interval").next().unwrap();
-        assert!(prefetch.contains("2 * self.prefill_slots"), "both current and next bursts survive scheduler handoff");
-        assert!(prefetch.contains("self.prefill.try_submit(job.clone(), false)"));
-        let begin = source.split("pub fn begin_unit(&self").nth(1).unwrap().split("pub fn begin(&self").next().unwrap();
-        assert!(begin.contains("while ticket.is_none() && !decode && !self.ahead.borrow().is_empty()"));
-        assert!(begin.contains("self.ahead.borrow_mut().remove(0)"));
+        let new = source.split("pub fn new(library:").nth(1).unwrap().split("pub fn host_workspace_bytes").next().unwrap();
+        assert!(new.contains("table.gather(&rows, &mut slot.bytes.bytes_mut()[..bytes], priority)"));
+        assert!(new.contains("(\"mapped-table/row-cache\", cache_bytes as u64)"));
     }
 
     #[test]

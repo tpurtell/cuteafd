@@ -410,8 +410,7 @@ mod tests {
             engine: super::super::EngineArgs,
         }
         let argv = ["serve", "--snapshot", "/absent/checkpoint", "--native-lib", "/absent/native.so"];
-        let args = Cli::try_parse_from(argv)?.engine;
-        assert!(args.table.prefetch);
+        Cli::try_parse_from(argv)?;
         let mut config = cuteafd_loader::plan::testing::qwen4_config(48);
         config["text_config"]["ple_layer_ids"] = serde_json::json!([24]);
         config["text_config"]["ple_embed_dim"] = serde_json::json!(2560);
@@ -466,7 +465,8 @@ mod tests {
                 assert!(!planned.items.iter().flatten().any(|i| i.bytes == resident.ple_table_bytes));
             }
         }
-        for (option, value) in [("--table-placement", "mapped"), ("--ple", "mapped"), ("--table-cache-mib", "0")] {
+        for (option, value) in [("--table-placement", "mapped"), ("--ple", "mapped"), ("--table-cache-mib", "0"),
+            ("--table-threads", "16"), ("--table-prefetch", "true")] {
             assert!(Cli::try_parse_from(argv.into_iter().chain([option, value])).is_err());
         }
         Ok(())

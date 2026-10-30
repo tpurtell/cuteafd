@@ -11,7 +11,11 @@ pub(super) const BUFFER_BYTES: usize = 1 << 20;
 const WAKE: u64 = u64::MAX;
 
 #[derive(Clone)]
-pub(super) struct Read { pub file: Arc<File>, pub offset: u64, pub slot: usize }
+pub(super) struct Read {
+    pub file: Arc<File>, pub offset: u64, pub slot: usize,
+    /// (FUSE connection, reads it takes at once) for a remote-only file.
+    pub cap: Option<(u32, u32)>,
+}
 #[derive(Default)]
 struct Buffer { bytes: Vec<u8>, reads: Vec<Read> }
 struct Reply { buffer: Buffer, result: Result<uring::ReadStats> }
@@ -100,7 +104,7 @@ impl Reactor {
     }
     pub(super) fn read(self: &Arc<Self>, reads: &[uring::Read<'_>], output: &mut [u8], width: usize,
         priority: ReadPriority) -> Result<uring::ReadStats> {
-        let reads = reads.iter().map(|read| Read { file: Arc::clone(&read.part.file),
+        let reads = reads.iter().map(|read| Read { file: Arc::clone(&read.part.file), cap: read.part.read_cap,
             offset: read.part.file_offset + read.row * width as u64, slot: read.slot }).collect();
         let mut stream = self.start(reads, width, priority, 2, true)?;
         while !stream.finished() { stream.step(output)?; }
@@ -223,12 +227,15 @@ struct Active { job: usize, row: usize, done: usize, submitted: Instant }
 struct Engine {
     ring: IoUring, jobs: Vec<Option<Job>>, active: Vec<Option<Active>>,
     retry: VecDeque<Active>, free: Vec<usize>, outstanding: usize, wake_armed: bool, decode_streak: usize,
+    /// Reads in flight per capped FUSE connection (remote-only files).
+    per_connection: std::collections::HashMap<u32, u32>,
 }
 impl Engine {
     fn new(ring: IoUring) -> Self {
         let capacity = (ring.params().sq_entries() as usize - 1).min(uring::worker_limit().expect("validated ring worker limit") as usize);
         Self { ring, jobs: (0..SLOTS).map(|_| None).collect(), active: vec![None; capacity],
-            retry: VecDeque::new(), free: (0..capacity).rev().collect(), outstanding: 0, wake_armed: false, decode_streak: 0 }
+            retry: VecDeque::new(), free: (0..capacity).rev().collect(), outstanding: 0, wake_armed: false, decode_streak: 0,
+            per_connection: std::collections::HashMap::new() }
     }
     fn arm(&mut self, fd: &OwnedFd) -> Result<()> {
         if !self.wake_armed {
@@ -252,10 +259,15 @@ impl Engine {
             self.jobs[index] = Some(Job { request, next: 0, left, error: None, stats: Default::default() });
         }
     }
+    /// A read's connection is at its cap.
+    fn blocked(&self, read: &Read) -> bool {
+        read.cap.is_some_and(|(connection, limit)| self.per_connection.get(&connection).copied().unwrap_or(0) >= limit)
+    }
     fn enqueue(&mut self, active: Active) -> Result<()> {
         let index = self.free.pop().ok_or_else(|| invalid("reactor capacity exceeded"))?;
         let job = self.jobs[active.job].as_mut().expect("live read job");
         let read = &job.request.buffer.reads[active.row];
+        if let Some((connection, _)) = read.cap { *self.per_connection.entry(connection).or_insert(0) += 1; }
         let width = job.request.width;
         // SAFETY: only this owner touches the buffer, it never resizes while in
         // flight, and each active row is disjoint. Engine::drop drains all SQEs
@@ -272,10 +284,14 @@ impl Engine {
     fn schedule(&mut self) -> Result<()> {
         let reserve = (self.active.len() / 8).clamp(1, 64);
         while self.outstanding < self.active.len() {
+            // A read on a connection at its cap waits here, in priority order,
+            // rather than in the kernel's queue behind read-ahead.
             let candidate = |priority| self.retry.iter().find(|active|
-                self.jobs[active.job].as_ref().is_some_and(|job| job.request.priority == priority))
+                self.jobs[active.job].as_ref().is_some_and(|job| job.request.priority == priority
+                    && !self.blocked(&job.request.buffer.reads[active.row])))
                 .map(|active| active.job).or_else(|| self.jobs.iter().position(|job| job.as_ref().is_some_and(|job|
-                    job.request.priority == priority && job.next < job.request.buffer.reads.len())));
+                    job.request.priority == priority && job.next < job.request.buffer.reads.len()
+                    && !self.blocked(&job.request.buffer.reads[job.next]))));
             let decode = candidate(ReadPriority::DecodeFirst).or_else(|| candidate(ReadPriority::Decode));
             let prefill = candidate(ReadPriority::PrefillFirst).or_else(|| candidate(ReadPriority::Prefill));
             // Bound starvation under a continuous decode stream, without using
@@ -288,7 +304,8 @@ impl Engine {
             // L14 fills capacity whenever L1 is waiting for CQEs or refill.
             let retry = selected.and_then(|id| self.retry.iter().position(|active|
                 self.jobs[active.job].as_ref().is_some_and(|job|
-                    job.request.priority == self.jobs[id].as_ref().unwrap().request.priority)));
+                    job.request.priority == self.jobs[id].as_ref().unwrap().request.priority
+                    && !self.blocked(&job.request.buffer.reads[active.row]))));
             if let Some(at) = retry {
                 let active = self.retry.remove(at).expect("selected retry");
                 if self.jobs[active.job].as_ref().unwrap().request.priority.is_decode() {
@@ -317,6 +334,9 @@ impl Engine {
             self.outstanding -= 1;
             self.free.push(id);
             let job = self.jobs[active.job].as_mut().expect("completion job retained");
+            if let Some((connection, _)) = job.request.buffer.reads[active.row].cap {
+                if let Some(count) = self.per_connection.get_mut(&connection) { *count = count.saturating_sub(1); }
+            }
             let count = cqe.result();
             if count > 0 && count as usize <= job.request.width - active.done {
                 active.done += count as usize;
@@ -386,6 +406,10 @@ fn run(shared: Arc<Shared>, started: mpsc::SyncSender<()>) {
     supervise(&shared, || run_owner(&shared, started));
 }
 fn run_owner(shared: &Shared, started: mpsc::SyncSender<()>) {
+    // The ring's io-uring workers inherit this thread's CPUs; later changes
+    // to the mapped tables' placement re-pin both.
+    let mut pinning = super::affinity::Pinning::new();
+    pinning.before_ring();
     let mut engine = match uring::new_ring() {
         Ok(ring) => { shared.ready.store(true, Ordering::Release); Some(Engine::new(ring)) },
         Err(error) => { tracing::warn!(%error, "table reactor setup failed; batches can retry"); None },
@@ -394,6 +418,7 @@ fn run_owner(shared: &Shared, started: mpsc::SyncSender<()>) {
     let mut retry_after = Instant::now() + Duration::from_secs(1);
     loop {
         if let Some(owner) = engine.as_mut() {
+            pinning.update(Some(&owner.ring));
             let step = owner.complete(&shared).and_then(|()| {
                 owner.accept(&shared);
                 owner.arm(&shared.wake)?;
@@ -502,12 +527,12 @@ mod tests {
         let owner = global()?;
         if !owner.ready() { return Ok(()); }
         let file = Arc::new(File::open("/dev/zero").map_err(|source| error("test zero", source))?);
-        let reads = || (0..8192).map(|slot| Read { file: Arc::clone(&file), offset: 0, slot }).collect();
+        let reads = || (0..8192).map(|slot| Read { file: Arc::clone(&file), offset: 0, slot, cap: None }).collect();
         let first = owner.start(reads(), 1, ReadPriority::Prefill, 2, true)?;
         let second = owner.start(reads(), 1, ReadPriority::Prefill, 2, true)?;
         // Hold both finishers' completed-but-unreaped windows. Decode must
         // acquire and complete without either prefill caller making progress.
-        let mut decode = owner.start(vec![Read { file, offset: 0, slot: 0 }], 1, ReadPriority::Decode, 2, true)?;
+        let mut decode = owner.start(vec![Read { file, offset: 0, slot: 0, cap: None }], 1, ReadPriority::Decode, 2, true)?;
         let mut output = [255];
         while !decode.finished() { decode.step(&mut output)?; }
         assert_eq!(output, [0]);
@@ -527,7 +552,7 @@ mod tests {
                 let (reply, receiver) = mpsc::sync_channel(1);
                 drop(receiver);
                 Job { request: Request { buffer: Buffer { bytes: vec![0; count],
-                    reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0 }).collect() },
+                    reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0, cap: None }).collect() },
                     width: 1, priority, reply }, next: 0, left: count, error: None, stats: Default::default() }
             };
             // A later-layer retry is already queued. Ready first-layer reads
@@ -555,7 +580,7 @@ mod tests {
         let request = |priority, count| {
             let (reply, receiver) = mpsc::sync_channel(1);
             drop(receiver); // caller cancellation must never free in-flight storage
-            let buffer = Buffer { bytes: vec![0; count], reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0 }).collect() };
+            let buffer = Buffer { bytes: vec![0; count], reads: (0..count).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0, cap: None }).collect() };
             Job { request: Request { buffer, width: 1, priority, reply }, next: 0, left: count, error: None, stats: Default::default() }
         };
         let limit = engine.active.len();
@@ -598,6 +623,33 @@ mod tests {
         Ok(())
     }
 
+    /// A remote-only file's connection never has more reads in flight than its
+    /// cap; the rest wait in the reactor, and other files' reads still fill the ring.
+    #[test]
+    fn capped_connections_hold_at_most_their_limit_in_flight() -> Result<()> {
+        let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
+        let mut engine = Engine::new(ring);
+        let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
+        let job = |priority, rows, cap| {
+            let (reply, receiver) = mpsc::sync_channel(1);
+            let buffer = Buffer { bytes: vec![0; rows],
+                reads: (0..rows).map(|slot| Read { file: Arc::clone(&file), offset: 0, slot, cap }).collect() };
+            (Job { request: Request { buffer, width: 1, priority, reply }, next: 0, left: rows, error: None,
+                stats: Default::default() }, receiver)
+        };
+        let (capped, _capped_reply) = job(ReadPriority::PrefillFirst, 32, Some((9, 4)));
+        let (free, _free_reply) = job(ReadPriority::Prefill, 8, None);
+        engine.jobs[0] = Some(capped);
+        engine.jobs[1] = Some(free);
+        engine.schedule()?;
+        let in_flight = |engine: &Engine, job| engine.active.iter().flatten().filter(|a| a.job == job).count();
+        assert_eq!(in_flight(&engine, 0), 4, "the capped connection holds its limit");
+        assert_eq!(in_flight(&engine, 1), 8, "the uncapped file is not held back");
+        assert_eq!(engine.per_connection.get(&9), Some(&4));
+        drop(engine);
+        Ok(())
+    }
+
     #[test]
     fn retries_preserve_first_submit_time_and_decode_fairness() -> Result<()> {
         let ring = match uring::new_ring() { Ok(ring) => ring, Err(_) => return Ok(()) };
@@ -605,7 +657,7 @@ mod tests {
         let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
         let (send, _reply) = mpsc::sync_channel(1);
         engine.jobs[0] = Some(Job { request: Request { buffer: Buffer { bytes: vec![0; 2],
-            reads: vec![Read { file, offset: 0, slot: 0 }] }, width: 2, priority: ReadPriority::Decode, reply: send },
+            reads: vec![Read { file, offset: 0, slot: 0, cap: None }] }, width: 2, priority: ReadPriority::Decode, reply: send },
             next: 1, left: 1, error: None, stats: Default::default() });
         let first = Instant::now() - Duration::from_millis(20);
         engine.retry.push_back(Active { job: 0, row: 0, done: 1, submitted: first });
@@ -631,7 +683,7 @@ mod tests {
         let file = Arc::new(File::open("/dev/zero").map_err(|source| error("opening test data", source))?);
         let request = |priority, rows| {
             let (reply, receiver) = mpsc::sync_channel(1);
-            let buffer = Buffer { bytes: vec![0; rows], reads: (0..rows).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0 }).collect() };
+            let buffer = Buffer { bytes: vec![0; rows], reads: (0..rows).map(|_| Read { file: Arc::clone(&file), offset: 0, slot: 0, cap: None }).collect() };
             (Request { buffer, width: 1, priority, reply }, receiver)
         };
         let (prefill, _prefill_reply) = request(ReadPriority::Prefill, engine.active.len() * 2);

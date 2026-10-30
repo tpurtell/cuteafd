@@ -109,7 +109,6 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         !neural || saved.draft == Some((0, frontier))
     }
 
-    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,

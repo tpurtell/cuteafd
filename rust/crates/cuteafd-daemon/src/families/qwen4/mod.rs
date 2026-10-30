@@ -101,9 +101,6 @@ pub(crate) struct EngineArgs {
     pub fp8_scales: crate::shared::fp8_linear::Fp8Scales,
     #[command(flatten)]
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
-    /// Gather and prefetch options for the mapped PLE n-gram table.
-    #[command(flatten)]
-    pub table: crate::shared::mapped_table::MappedTableArgs,
     /// Spark ranks in TP order (HOST:PORT,...) serving the routed experts.
     #[arg(long, conflicts_with_all = ["local_experts", "shared_only"])]
     pub peers: Option<String>,
@@ -692,7 +689,7 @@ impl Opened {
             "Qwen 3.8 Flash Next coordinator weights resident (one representation per weight)");
         let ple = match self.cfg.ple_layers.first() {
             Some(&layer) if layer < layers => Some(ple::PleTable::load(&self.library, &self.checkpoint, &self.cfg,
-                layer, &args.table, args.prefill_wave_rows(), prefill_shape.map_or(1, |shape| shape.waves as usize),
+                layer, args.prefill_wave_rows(), prefill_shape.map_or(1, |shape| shape.waves as usize),
                 engine::DECODE_ROWS)?),
             _ => None,
         };

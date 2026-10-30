@@ -184,7 +184,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia, _tokens: &[u32], _resume: usize) -> Result<()> { Ok(()) }
     fn history(&self, _placement: &Placement) {}
-    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
         // A selection failure releases the requests without calling accept.
         // The next round boundary must retire that verify before reusing slots.
