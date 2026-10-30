@@ -1082,9 +1082,15 @@ impl MappedTable {
     /// Refresh `count` hint pages starting at table-wide page `start` (parts back
     /// to back); returns the pages swept.
     pub fn sweep_residency(&self, mut start: usize, count: usize, scratch: &mut Vec<u8>) -> Result<usize> {
+        let started = Instant::now();
         for part in &self.parts {
             let pages = part.page_count();
-            if start < pages { return part.sweep_hint(start, count, scratch); }
+            if start < pages {
+                let swept = part.sweep_hint(start, count, scratch)?;
+                self.stats.residency_sweep_ns.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                self.stats.residency_sweep_pages.fetch_add(swept as u64, Ordering::Relaxed);
+                return Ok(swept);
+            }
             start -= pages;
         }
         Ok(0)
@@ -1242,6 +1248,8 @@ pub struct TableStats {
     pub(crate) stall_decode_ns: AtomicU64,
     pub(crate) stall_decode_fallback_rows: AtomicU64,
     pub(crate) stall_decode_pending_rows: AtomicU64,
+    pub(crate) residency_sweep_ns: AtomicU64,
+    pub(crate) residency_sweep_pages: AtomicU64,
 }
 
 /// A point-in-time copy of [`TableStats`]; `since` gives an interval.
@@ -1364,6 +1372,11 @@ pub struct TableStatsSnapshot {
     /// Rows decode gathers waited for while another reader filled them.
     #[serde(default)]
     pub stall_decode_pending_rows: u64,
+    /// CPU time of the background residency-hint sweep, and the pages it swept.
+    #[serde(default)]
+    pub residency_sweep_ns: u64,
+    #[serde(default)]
+    pub residency_sweep_pages: u64,
 }
 
 impl TableStats {
@@ -1558,6 +1571,8 @@ impl TableStats {
             stall_decode_ns: get(&self.stall_decode_ns),
             stall_decode_fallback_rows: get(&self.stall_decode_fallback_rows),
             stall_decode_pending_rows: get(&self.stall_decode_pending_rows),
+            residency_sweep_ns: get(&self.residency_sweep_ns),
+            residency_sweep_pages: get(&self.residency_sweep_pages),
         }
     }
 }
@@ -1634,6 +1649,8 @@ impl TableStatsSnapshot {
             stall_decode_ns: d(self.stall_decode_ns, earlier.stall_decode_ns),
             stall_decode_fallback_rows: d(self.stall_decode_fallback_rows, earlier.stall_decode_fallback_rows),
             stall_decode_pending_rows: d(self.stall_decode_pending_rows, earlier.stall_decode_pending_rows),
+            residency_sweep_ns: d(self.residency_sweep_ns, earlier.residency_sweep_ns),
+            residency_sweep_pages: d(self.residency_sweep_pages, earlier.residency_sweep_pages),
         }
     }
     /// Fraction classified resident by NOWAIT or an approximate mincore snapshot.
