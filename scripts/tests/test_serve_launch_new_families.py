@@ -427,7 +427,7 @@ def test_step5_gate_cards_list_and_generate_wip_launches(tmp_path: Path, name, g
     values = cards.config(Path(job["entry"]["config"]))
     assert job["entry"]["run_args"] == ["--wip", "s"]
     assert (values["SPARK_COUNT"], values["RTX_GPUS"]) == (str(len(sparks)), str(len(gpus)))
-    assert values["COORDINATOR_GPU"] == str(gpus[0])
+    assert values["COORDINATOR_GPUS"] == ",".join(map(str, gpus))
 
 
 @pytest.mark.parametrize("family", ["kimi", "step5"])

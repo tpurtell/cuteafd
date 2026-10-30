@@ -25,7 +25,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "3",
         "ADDR": "0.0.0.0:8800",
         "EXPERT_PORT": "19900",
@@ -58,7 +58,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8801",
         "EXPERT_PORT": "19901",
@@ -95,7 +95,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8804",
         "EXPERT_PORT": "19904",
@@ -121,7 +121,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8805",
         "EXPERT_PORT": "19905",
@@ -150,7 +150,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8806",
         "EXPERT_PORT": "19906",
@@ -182,7 +182,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8807",
         "EXPERT_PORT": "19907",
@@ -215,7 +215,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8808",
         "EXPERT_PORT": "19908",
@@ -245,7 +245,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8809",
         "EXPERT_PORT": "19909",
@@ -272,7 +272,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8810",
         "EXPERT_PORT": "19910",
@@ -293,7 +293,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8811",
         "EXPERT_PORT": "19911",
@@ -313,7 +313,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8812",
         "EXPERT_PORT": "19912",
@@ -337,7 +337,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8813",
         "EXPERT_PORT": "19913",
@@ -361,7 +361,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8814",
         "EXPERT_PORT": "19914",
@@ -385,7 +385,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8815",
         "EXPERT_PORT": "19915",
@@ -409,7 +409,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8816",
         "EXPERT_PORT": "19916",
@@ -435,7 +435,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8817",
         "EXPERT_PORT": "19917",
@@ -466,7 +466,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8818",
         "EXPERT_PORT": "19918",
@@ -502,7 +502,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8819",
         "EXPERT_PORT": "19919",
@@ -530,7 +530,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8820",
         "EXPERT_PORT": "19920",
@@ -548,7 +548,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8821",
         "EXPERT_PORT": "19921",
@@ -568,7 +568,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8822",
         "EXPERT_PORT": "19922",
@@ -590,7 +590,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8823",
         "EXPERT_PORT": "19923",
@@ -612,7 +612,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8824",
         "EXPERT_PORT": "19924",
@@ -641,7 +641,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8828",
         "EXPERT_PORT": "19928",
@@ -673,7 +673,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8825",
         "EXPERT_PORT": "19925",
@@ -709,7 +709,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8829",
         "EXPERT_PORT": "19929",
@@ -742,7 +742,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8826",
         "EXPERT_PORT": "19926",
@@ -774,7 +774,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8827",
         "EXPERT_PORT": "19927",

@@ -131,7 +131,7 @@ model_config() { # model_config glmf|pro ARM FILE
   [[ "$arm" == base ]] && image=cuteafd-coordinator:intake-base || intake="$arm"
   local hosts=(ostrich dodo emu kiwi rhea moa)
   {
-    echo "COORDINATOR_GPU=0"; echo "EXPERT_PORT=$port"; echo "SPARK_COUNT=$count"
+    echo "EXPERT_PORT=$port"; echo "SPARK_COUNT=$count"
     echo "SPARK_DEVICE_BUDGET_BYTES=110000000000"; echo "CONCURRENCY=4"
     echo "MAX_CONTEXT_TOKENS=32768"; echo "MAX_OUTPUT_TOKENS=4096"; echo "SPARK_INTAKE=$intake"
     for ((r = 0; r < count; r++)); do echo "SPARK_${r}_HOST=${hosts[$r]}"; echo "SPARK_${r}_LANE_A=10.55.0.$((r + 1))"; done

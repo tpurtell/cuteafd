@@ -318,7 +318,7 @@ SIX = '\n'.join([f'SPARK_{i}_HOST={h}\nSPARK_{i}_LANE_A=10.55.0.{i + 1}\nSPARK_{
 
 def _wip_dry_run(tmp_path, spark_lines, count, extra_args=(), env=None):
     config = tmp_path / 'build.config'
-    config.write_text(f'FAMILY=mimo_v2\nMODEL_ID=XiaomiMiMo/MiMo-V2.6-Pro\nSPARK_COUNT={count}\nCOORDINATOR_GPU=1\nRTX_GPUS=1\n{spark_lines}\n')
+    config.write_text(f'FAMILY=mimo_v2\nMODEL_ID=XiaomiMiMo/MiMo-V2.6-Pro\nSPARK_COUNT={count}\nCOORDINATOR_GPUS=1\nRTX_GPUS=1\n{spark_lines}\n')
     stub = tmp_path / 'bin'
     stub.mkdir(exist_ok=True)
     marker = tmp_path / 'called'

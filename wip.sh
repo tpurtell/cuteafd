@@ -165,7 +165,6 @@ case "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" in on|off) ;; *) release_die "CUTEAFD_WIP
 wip_export_locks=off
 if [[ "${CUTEAFD_WIP_EXPORT_LOCKS:-on}" == on ]]; then
   wip_export_locks=on
-  [[ "$COORDINATOR_GPU" =~ ^[01]$ ]] || release_die "export locking needs COORDINATOR_GPU=0 or 1"
   # Rust takes no hardware mutex. Native misses queue only after the seed
   # lease and Cargo build slot have been released.
 fi
@@ -307,7 +306,10 @@ wip_build_resource_acquire() {
 }
 
 docker info >/dev/null 2>&1 || release_die "local Docker daemon is unavailable"
-release_resolve_coordinator_gpu_identity
+# The WIP container binds the primary coordinator GPU (the shared resolution).
+release_resolve_coordinator_gpus "$COORDINATOR_GPUS" auto
+[[ "$wip_export_locks" == off || "$RELEASE_COORDINATOR_GPU_HOST_INDEX" =~ ^[01]$ ]] ||
+  release_die "export locking needs the primary coordinator GPU to be host GPU 0 or 1 (COORDINATOR_GPUS)"
 
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
@@ -1204,7 +1206,7 @@ wip_remote_export() {
 # wip_capped_export BUILD...: the native phase on a raptor GPU we hold: one
 # whose lock the caller already holds, else a fair-queued GPU turn (the first
 # configured GPU, held only for the export). A one-off container on
-# that GPU (the WIP container is bound to COORDINATOR_GPU), admitted by the
+# that GPU (the WIP container is bound to the primary COORDINATOR_GPUS), admitted by the
 # host's nvidia-smi and stopped by the watchdog if it outgrows its cap.
 wip_capped_export() {
   local status=0

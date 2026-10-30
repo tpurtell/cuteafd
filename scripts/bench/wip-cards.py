@@ -297,11 +297,9 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     if 'CUTEAFD_API_KEY' in values:
         raise ValueError('inline API keys are forbidden')
     # The sanitized base also removes publication-only keys from original configs.
-    gpus = [int(x) for x in values.get('COORDINATOR_GPUS', '').split(',') if x]
-    if not gpus:
-        first = int(values.get('COORDINATOR_GPU', entry.get('gpus', [0])[0]))
-        gpus = [first] if int(values.get('RTX_GPUS', len(entry.get('gpus', [first])))) == 1 else [0, 1]
-    if len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
+    # The card's GPUs, primary first, unless its config or --set names them.
+    gpus = [int(x) for x in values.get('COORDINATOR_GPUS', '').split(',') if x] or list(entry.get('gpus', [0]))
+    if not 1 <= len(gpus) <= 2 or len(set(gpus)) != len(gpus) or not set(gpus) <= {0, 1}:
         raise ValueError('invalid coordinator GPUs')
     hosts = list(entry.get('sparks', []))
     values.pop('SPARK_HOSTS', None)
@@ -321,7 +319,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
         values.update({f'SPARK_{i}_HOST': host, f'SPARK_{i}_LANE_A': f'10.55.0.{index}'})
         if lane_b:
             values[f'SPARK_{i}_LANE_B'] = f'10.55.1.{index}'
-    values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPU=str(gpus[0]))
+    values.update(API_KEY_FILE=str(key_file), ENABLE_BENCH='on', WIP_INSTANCE=arm.get('wip_instance', arm['instance']), INSTANCE=arm['instance'], SPARK_COUNT=str(count), RTX_GPUS=str(len(gpus)), COORDINATOR_GPUS=','.join(map(str, gpus)))
     run_args = ['--wip', arm['slot']]
     if 'release' in arm:
         values.pop('WIP_INSTANCE', None)
@@ -1925,8 +1923,8 @@ def toolchain_hash(revision):
 
 
 # Serving-only keys never belong in a build (staging) config.
-BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING', 'COORDINATOR_GPUS',
-              'COORDINATOR_GPU_UUID', 'COORDINATOR_GPU_PCI_BUS_ID', 'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
+BUILD_DROP = {'SPARK_HOSTS', 'BENCH_SIMULATED', 'BENCH_HARDWARE_CLASS', 'BENCH_EXPECT_GLM_RING',
+              'SPARK_TP', 'SPARK_EP', 'API_KEY_FILE', 'INSTANCE',
               'WIP_INSTANCE', 'WIP_ROOT', 'ADDR', 'EXPERT_PORT', 'PROFILE', 'PROFILE_DIR', 'SPECULATION_TRACE',
               'PROFILE_NCU_KERNEL', 'PROFILE_NCU_COUNT', 'PROFILE_NCU_SET', 'PROFILE_NSYS_GPU_METRICS',
               'PROFILE_NCU_SKIP', 'PROFILE_SPARK', 'PROFILE_SPARK_RANKS', 'PROFILE_SPARK_NCU_KERNEL', 'PROFILE_SPARK_NCU_COUNT',
@@ -2151,12 +2149,12 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         for key in list(values):
             if key in BUILD_DROP or re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
                 del values[key]
-        # The staging container binds to the card's own coordinator GPU (default
-        # 1), so a build can stay off a GPU another session holds.
-        gpu = values.get('COORDINATOR_GPU', '1')
+        # The staging container binds to the card's primary coordinator GPU
+        # (default 1), so a build can stay off a GPU another session holds.
+        gpu = values.get('COORDINATOR_GPUS', '1').split(',')[0]
         if gpu not in ('0', '1'):
-            raise ValueError(f'staging COORDINATOR_GPU must be 0 or 1, got {gpu}')
-        values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPU=gpu, RTX_GPUS='1')
+            raise ValueError(f'staging COORDINATOR_GPUS must start with GPU 0 or 1, got {gpu}')
+        values.update(SPARK_COUNT=str(len(hosts)), COORDINATOR_GPUS=gpu, RTX_GPUS='1')
         if len(hosts) in (2, 3):
             # Two or three ranks without explicit keys are the compact EXL3 layout.
             values.update(EXPERT_FORMAT='exl3', SPARKINFER_EXL3='force')
