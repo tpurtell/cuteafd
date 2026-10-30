@@ -763,6 +763,7 @@ def make_identity(source, tokens, calibration, heldout, witness, reviewed):
     relatives = ["quantization/step5/core_k6/pilot.py", "quantization/step5/core_k6/recipe.py",
         "quantization/step5/core_k6/run.py", "quantization/step5/core_k6/finalize.py",
         "quantization/step5/core_k6/storage.py", "quantization/step5/core_k6/export.py",
+        "quantization/step5/core_k6/compat.py",
         "quantization/glm5_flash/core_k6/run.py", "quantization/glm5_flash/core_k6/storage.py",
         "quantization/glm5/core_k6/storage.py", "quantization/glm5/core_k6/recipe.py",
         "quantization/kimi_k3/core_k6/storage.py", "quantization/kimi_k3/core_k6/run.py",

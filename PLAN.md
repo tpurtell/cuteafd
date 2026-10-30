@@ -6339,3 +6339,23 @@ and cleanup are enabled. Earlier pilot/producer units are disabled. The
 current numerical source/pin is frozen; only publication metadata was
 extended to explain native tokenizer loading while preserving source assets.
 Continue this run and recover its latest durable frontier if needed.
+
+The producer above is stopped and its unit disabled after layer 3 expert 217
+exposed unsafe long-K sequential FP32 XTX accumulation. This is an accumulation
+bug, not source corruption or a need to increase damping. Controlled GPU arms
+show the legacy result fails SPD after unchanged sigma=.025; bounded K=128
+FP32 accumulation passes the existing regularization/congruence/block-LDL
+path on both the rare expert (1,955 rows, relative Frobenius error 7.00e-8)
+and the busiest expert (253,367 rows, 6.58e-7). GPTQModel main is pushed at
+25dd11c391ce6bf3ceadf8722e8274c3cde7079a; shared GLM helpers and generic EXL3
+quantization are unchanged. GPU comparison receipts are under
+~/.cache/cuteafd/builds/step5-core-k6/expert217-busy/.
+
+Recovery is being qualified with explicit producer lineage: preserve the
+original 679 projection evidence records, 658 remaining packed candidates,
+three exported layers and layer-2 frontier byte-for-byte. Audit all retained
+payload checksums and the restricted source delta before activating a v2
+plan. Keep original producer identities on historical receipts; record the
+bounded-XTX producer for subsequent matrices and carry both origins into
+publication metadata. Re-run the short native/serialized production pilot
+before resuming this production root; do not start an independent full run.

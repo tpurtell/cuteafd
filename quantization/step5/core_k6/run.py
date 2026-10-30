@@ -20,12 +20,13 @@ os.environ.setdefault('PYTORCH_ALLOC_CONF','expandable_segments:True')
 import torch
 from torch import nn
 from glm5_flash.core_k6.run import Engine as FlashEngine,Progress as FlashProgress,compact,commit_batch
-from kimi_k3.uniform_k2.storage import RollingBoundary,atomic_json,canonical,commit_safetensors,fsync_directory,sha256_file
+from kimi_k3.uniform_k2.storage import atomic_json,canonical,commit_safetensors,fsync_directory,sha256_file
 from kimi_k3.core_k6.run import exclusive_run,hardlink_frontier
-from .storage import ProjectionStore,RouteSpool,StageStore,load_tensors
+from .storage import ProjectionStore,RouteSpool,StageStore,RollingBoundary,load_tensors
+from .compat import load_module_origins
 from .recipe import BASE_REPO,BASE_REVISION,TARGET_REPO,TARGET_PAYLOAD_BYTES,MODULE_COUNT,reviewed_modules,inventory
 GIB=1024**3
-RECIPE=dict(codebook='mcg',multiplier='0xCBAC1FED',core_bits=6,expert_bits=4,late_expert_bits=6,
+RECIPE=dict(hessian_accumulation='step5-native-fp32-XTX-k128-v1',codebook='mcg',multiplier='0xCBAC1FED',core_bits=6,expert_bits=4,late_expert_bits=6,
     late_expert_layers=[88,89,90],mtp_bits=4,seed=787,sigma_reg=.025,out_scales='auto',
     capture='full-native-Step5-calibration-raw-XTX-FP32',core_identity_rows=0,
     hessian='signed-block-hadamard-congruence-fp64-v1',
@@ -45,6 +46,12 @@ class Engine(FlashEngine):
         if numerical is None:
             from gptqmodel.utils import step5_core as numerical
         super().__init__(*args,numerical=numerical,**kwargs)
+        self.boundary=RollingBoundary(self.root/"frontier",self.identity)
+
+    def checkpoints(self,layer):
+        return ProjectionStore(self.root/'head/projections' if layer=='head' else self.root/f'layers/{layer:03d}/projections',
+            self.evidence_root/('head' if layer=='head' else f'layer-{layer:03d}'),self.identity,
+            self.selection,self.progress,self.math,self.device)
 
     def _context(self,state):
         value=state.get('hidden',state.get('attn_input'))
@@ -261,20 +268,28 @@ def make_plan(source,tokens,root,export):
     summary=inventory(source);manifest=json.loads((tokens/'manifest.json').read_text())
     if source.snapshot.name!=BASE_REVISION or manifest['splits']['calibration']['count']!=1426:
         raise ValueError('pinned full BF16 source/full calibration panel required')
-    code=[*(Path(__file__).with_name(n) for n in ('run.py','storage.py','recipe.py','export.py')),
+    code=[*(Path(__file__).with_name(n) for n in ('run.py','storage.py','recipe.py','export.py','compat.py','migrate.py')),
         REPO/'quantization/step5/prepare_corpus.py',REPO/'quantization/glm5_flash/core_k6/run.py',
         REPO/'quantization/glm5/core_k6/storage.py',REPO/'quantization/kimi_k3/core_k6/run.py',
         REPO/'quantization/kimi_k3/core_k6/storage.py',REPO/'quantization/kimi_k3/uniform_k2/storage.py',
         REPO/'python/reference/families/step5/golden.py',REPO/'python/reference/families/step5/mtp.py',
         REPO/'python/reference/shape_invariant.py',REPO/'third_party/transformers.lock.json']
     fork=REPO/'third_party/gptqmodel';code += [fork/'gptqmodel/utils/step5_core.py',fork/'gptqmodel/utils/glm5_core.py']
-    identity=dict(runtime=source.reference.verify_runtime_source(),schema='cuteafd-step5-k4-core-k6-production-v1',source_repo=BASE_REPO,source_revision=BASE_REVISION,
+    identity=dict(runtime=source.reference.verify_runtime_source(),schema='cuteafd-step5-k4-core-k6-production-v2',source_repo=BASE_REPO,source_revision=BASE_REVISION,
         source_config_sha256=sha256_file(source.snapshot/'config.json'),source_index_sha256=sha256_file(source.snapshot/'model.safetensors.index.json'),
         token_manifest_sha256=sha256_file(tokens/'manifest.json'),recipe=RECIPE,
         calibration=dict(samples=manifest['splits']['calibration']['count'],tokens=manifest['splits']['calibration']['tokens']),
         code={str(p.relative_to(REPO)):sha256_file(p) for p in code},
         gptqmodel_commit=subprocess.check_output(['git','-C',str(fork),'rev-parse','HEAD'],text=True).strip(),
         packages={p:importlib.metadata.version(p) for p in ('torch','transformers','numpy','safetensors','huggingface-hub','tokenizers')})
+    lineage_path=root/'producer-lineage.json'
+    if lineage_path.exists():
+        if lineage_path.is_symlink():raise ValueError('symlink producer lineage')
+        lineage=json.loads(lineage_path.read_text())
+        identity.update(predecessor_identities=lineage['predecessor_identities'],
+            resume_lineage_audit_sha256=lineage['resume_lineage_audit_sha256'],
+            resume_lineage_manifest_sha256=sha256_file(lineage_path))
+        load_module_origins(root,identity)
     temporary=192*GIB
     return dict(identity=identity,source=str(source.snapshot),tokens=str(tokens),root=str(root),export=str(export),inventory=summary,
         temporary_reserve_bytes=temporary,required_free_bytes=TARGET_PAYLOAD_BYTES+temporary+64*GIB,publication_repo=TARGET_REPO)
