@@ -6300,3 +6300,21 @@ predecessor evidence. The failed attempt is archived as
 Pilot units do not restart automatically; production still resumes on failure.
 Receipt-backed CPU fault injection now covers a crash after MTP EH seed commit
 and after a completed MTP successor, including envelope/older-frontier retirement.
+
+The corrected short GPU pilot passed in 247.47 seconds: 105 metric rows,
+all native sliding/sparse, serialized-projection and three-stage MTP checks.
+Worst K6 weighted NMSE is 3.6057144e-4, below the declared 1e-3 bound.
+CPU finalization audited 87 candidate payloads and 42 Hessians before retiring
+pilot activation and candidate weight banks. The integrated gate passes
+116 cases. Independent pinned vLLM target/runner/MTP source inspection confirms
+the initial target tap and interstage chain are raw residuals before head norm.
+Actual tables and source call sites are appended to `~/step5-core-quant.md`.
+
+Full production launched under enabled user unit
+`step5-core-k6-1793350843718029823`, with automatic upload, zero-copy import,
+six-Spark placement and cleanup enabled. Numerical source identities and the
+reviewed GPTQModel pin are frozen. The HF account is authenticated as
+`wrldsuksgo2mars`. Source/pilot/production markers live under the run root;
+recover the existing run rather than starting another producer. Report layer
+progress and ETA every 30 minutes after it is stable. Public target remains
+`wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6`.
