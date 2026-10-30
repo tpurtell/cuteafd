@@ -6288,3 +6288,15 @@ through Sparknest. Sources, logs, metrics and audit receipts remain.
 Run root: `~/.cache/cuteafd/quantization/step5-k4-core-k6/`.
 Evidence: `~/.cache/cuteafd/builds/step5-core-k6/`.
 Recipe/prior-art and engine follow-up report: `~/step5-core-quant.md`.
+
+The first GPU pilot stopped during layer-7 capture because the native sparse
+indexer computes W with a functional linear call, bypassing its module hook.
+GPTQModel main `ed84937b20ab3ccbfc7d06c3b001fc24e545b37a` adds an observation-only
+wrapper with no extra GEMM or arithmetic changes; 22 helper CPU cases pass.
+The pilot now labels W's original FP32 storage and its actual BF16 effective
+operand separately, and recovers partial captures without replacing committed
+predecessor evidence. The failed attempt is archived as
+`pilot-failed-capture-1793349721997881557`; its user unit is disabled.
+Pilot units do not restart automatically; production still resumes on failure.
+Receipt-backed CPU fault injection now covers a crash after MTP EH seed commit
+and after a completed MTP successor, including envelope/older-frontier retirement.

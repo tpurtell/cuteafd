@@ -99,3 +99,64 @@ def test_completed_no_copy_import_can_have_unknown_initial_byte_total():
     with pytest.raises(ValueError):
         handoff.successful({'job':{'finished':True,'pending':0,'hosts':{'maxq':{
             'finished':True,'done_files':2,'total_files':2,'done_bytes':90,'total_bytes':100}}}})
+
+
+def test_mtp_recovers_verified_seed_and_latest_stage_after_two_crash_barriers(monkeypatch,tmp_path):
+    """Real safetensors receipts/frontiers survive both MTP retirement barriers."""
+    class H:
+        def __init__(self,width,device):self.H=torch.zeros(width,width);self.count=0
+        def add(self,x):x=x.float();self.H.addmm_(x.T,x);self.count+=len(x)
+        def raw_dict(self,minimum_rows):
+            assert self.count==minimum_rows
+            return {'H':self.H,'count':self.count}
+    math=SimpleNamespace(DenseRawHessian=H,mtp_envelope=lambda block,e,h:torch.cat((e,h.bfloat16()),-1))
+    def block(*args,**kwargs):
+        linear=torch.nn.Linear(4,2,bias=False,dtype=torch.bfloat16)
+        linear.weight.data.fill_(.25)
+        return SimpleNamespace(eh_proj=linear)
+    source=SimpleNamespace(config={'hidden_size':2},close=lambda:None,load_block=block,
+        tensor=lambda *args:torch.arange(12,dtype=torch.bfloat16).reshape(6,2))
+    records=[{'id':'teacher','input_ids':[1,2,3,4,5]}]
+    parent=run.Engine(source,records,tmp_path/'run',tmp_path/'export',{'test':'barriers'}, {},
+        SimpleNamespace(emit=lambda *args,**kwargs:None),numerical=math,device='cpu')
+    target=parent.initial()
+    original_engine=run.Engine;original_clear=run.StageStore.clear
+    crashes={'seed':True,'stage93':True};ensured=[];decoded=[]
+    class Sub(original_engine):
+        def __init__(self,*args,**kwargs):kwargs['numerical']=math;super().__init__(*args,**kwargs)
+        def checkpoints(self,layer):
+            def ensure(name,weight,factory):
+                raw=factory();assert raw['count']==self.tokens
+                ensured.append((layer,raw['count']))
+            return SimpleNamespace(ensure=ensure,install=lambda *a:None)
+        def layer(self,layer,current,**kwargs):
+            assert current['layer']==-1
+            entries=[];directory=self.boundary.directory(0)
+            for i,row in enumerate(self.records):
+                state=self.boundary_batch(current,i)
+                assert state['hidden'].dtype==torch.float32
+                entry=run.commit_batch(directory,i,row,{'hidden':state['hidden']+1,'position_ids':state['position_ids']})
+                entries.append({k:v for k,v in entry.items() if k!='kind'})
+            result=self.boundary.commit(0,entries);decoded.append(layer)
+            if layer==93 and crashes['stage93']:
+                crashes['stage93']=False;raise RuntimeError('crash after final-stage frontier')
+            return result
+    def clear(store):
+        if store.root.name=='input' and store.root.parent.name=='092' and crashes['seed']:
+            seed=run.RollingBoundary(store.root.parent/'frontier',parent.identity).current(checksum=True)
+            assert seed['layer']==-1 and store.load('i',checksum=True)
+            crashes['seed']=False;raise RuntimeError('crash after EH seed')
+        return original_clear(store)
+    monkeypatch.setattr(run,'Engine',Sub);monkeypatch.setattr(run.StageStore,'clear',clear)
+    monkeypatch.setattr(run,'compact',lambda:None)
+    with pytest.raises(RuntimeError,match='after EH seed'):run.run_mtp(parent,target)
+    with pytest.raises(RuntimeError,match='final-stage frontier'):run.run_mtp(parent,target)
+    # The committed seed consumed its envelope bank even through a restart.
+    assert list((parent.root/'mtp/092/input').iterdir())==[]
+    run.run_mtp(parent,target)
+    assert ensured==[(92,4),(93,3),(94,2)]
+    assert decoded==[92,93,94]
+    assert not (parent.root/'mtp/092/frontier').exists()
+    assert not (parent.root/'mtp/093/frontier').exists()
+    latest=run.RollingBoundary(parent.root/'mtp/094/frontier',parent.identity).current(checksum=True)
+    assert latest['layer']==0 and latest['manifest']['batches'][0]['tokens']==2

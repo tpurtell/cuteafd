@@ -182,7 +182,7 @@ def main():
     content="\n".join(["[Unit]","Description=Step-5 quantization and publication",
         "After=basic.target","StartLimitIntervalSec=600","StartLimitBurst=3","[Service]",
         "Type=simple","WorkingDirectory="+str(REPO),
-        "ExecStart="+shlex.join(supervisor),"Restart=on-failure","RestartSec=30",
+        "ExecStart="+shlex.join(supervisor),"Restart="+("no" if args.pilot else "on-failure"),"RestartSec=30",
         "TimeoutStopSec=180","[Install]","WantedBy=default.target",""])
     unit_path.write_text(content)
     subprocess.run(["systemctl","--user","daemon-reload"],check=True)
