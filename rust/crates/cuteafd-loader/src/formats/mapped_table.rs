@@ -1104,6 +1104,24 @@ impl MappedTable {
         tracing::info!("mapped table residency hint went stale (late fault); using mincore until the next full sweep");
     }
     pub fn residency_hint_trusted(&self) -> bool { self.hint_trusted.load(Ordering::Acquire) }
+    /// Bench/test only: reclaim this table's mapped pages (`MADV_PAGEOUT`, then
+    /// drop the file's page cache) and return how many stayed resident.
+    #[cfg(test)]
+    pub(crate) fn evict_for_test(&self) -> usize {
+        let mut resident = 0;
+        for part in &self.parts {
+            // SAFETY: advice over exactly this live mapping; fadvise only drops clean pages.
+            unsafe {
+                libc::madvise(part.base.as_ptr().cast(), part.mapped_len, 21 /* MADV_PAGEOUT */);
+                libc::posix_fadvise(part.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+            let mut flags = vec![0u8; part.page_count()];
+            // SAFETY: one byte per page of this live mapping.
+            unsafe { libc::mincore(part.base.as_ptr().cast(), part.mapped_len, flags.as_mut_ptr()) };
+            resident += flags.iter().filter(|&&f| f & 1 != 0).count();
+        }
+        resident
+    }
     /// Pages in the hint across parts (0 when it is off).
     pub fn residency_pages(&self) -> usize {
         self.parts.iter().filter(|part| part.hint.get().is_some()).map(MappedRows::page_count).sum()

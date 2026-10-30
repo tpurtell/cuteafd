@@ -494,12 +494,14 @@ mod tests {
                 println!("residency sweep: {at} pages in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
             let mut times = Vec::new();
+            let mut cold_left = 0;
+            let before = table.weights().stats().snapshot();
             for _ in 0..repeats {
                 if cold {
-                    // Evict the fixture's pages: every row is a device read.
-                    let file = std::fs::File::open(&path)?;
-                    // SAFETY: fadvise only asks the kernel to drop clean cached pages of this file.
-                    unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(&file), 0, 0, libc::POSIX_FADV_DONTNEED) };
+                    // Evict the fixture's pages (including our own mapping's): every
+                    // row is a device read. The hint stays armed: the stale case.
+                    let left = table.weights().evict_for_test();
+                    cold_left = cold_left.max(left);
                     if hint { table.weights().trust_residency_hint(); }
                 }
                 let started = std::time::Instant::now();
@@ -511,9 +513,11 @@ mod tests {
             let mode = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() {
                 if std::env::var_os("MAPPED_BENCH_INLINE").is_some() { " (all rows via reactor, no ASYNC)" } else { " (all rows via reactor, ASYNC)" }
             } else if hint { " (residency hint)" } else { " (mincore)" };
-            println!("engram gather {label}{}{mode}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, late faults {}, distrusts {}",
+            let after = table.weights().stats().snapshot().since(&before);
+            println!("engram gather {label}{}{mode}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, \
+                late faults/gather {:.0}, distrusts/gather {:.1}, pages left resident after eviction <= {cold_left}",
                 if cold { " COLD" } else { "" }, times[times.len() / 2], times[0], times[times.len() - 1],
-                table.weights().stats().snapshot().late_major_faults, table.weights().stats().snapshot().residency_hint_distrusts);
+                after.late_major_faults as f64 / repeats as f64, after.residency_hint_distrusts as f64 / repeats as f64);
         }
         Ok(())
     }
