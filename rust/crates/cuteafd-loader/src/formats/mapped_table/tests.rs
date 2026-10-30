@@ -1417,6 +1417,16 @@ fn copy_first_copies_resident_batches_and_switches_cold_ones_to_the_split() -> T
     if delta.late_major_faults > 0 {
         assert_eq!(delta.copy_switches, 1);
         assert!(delta.page_hits <= COPY_CHECK_ROWS as u64, "at most one check interval copied before the switch");
+        // Faulted copies count as device reads, not hits.
+        assert!(delta.page_misses >= 1);
+        // The next COLD_SKIPS - 1 gathers start with the split; then one probes the copy again.
+        for _ in 1..COLD_SKIPS {
+            let before = table.stats().snapshot();
+            table.gather_into(&ids, &mut cold)?;
+            expect(&cold);
+            assert_eq!(table.stats().snapshot().since(&before).copy_switches, 0);
+        }
+        assert_eq!(table.cold_skips.load(Ordering::Relaxed), 0);
     }
     Ok(())
 }

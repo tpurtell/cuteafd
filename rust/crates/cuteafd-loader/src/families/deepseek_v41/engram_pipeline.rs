@@ -160,7 +160,7 @@ impl EngramPipeline {
             tracing::warn!(%error, "cannot admit mapped table preload; keeping all tables mapped");
             0
         });
-        let host_budget = shape.preload_budget(host_budget);
+        let host_budget = shape.preload_budget(host_budget, tables[0].row_width());
         let scales = tables.iter().filter_map(|table| table.scales()).count();
         let scale_bytes = tables.iter().filter_map(|table| table.scales()).map(|table| table.bytes()).sum();
         let table_bytes = tables.iter().map(|table| table.weights().bytes()).sum::<u64>() + scale_bytes;

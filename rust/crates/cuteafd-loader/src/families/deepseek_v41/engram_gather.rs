@@ -57,8 +57,9 @@ impl EngramStagingShape {
     pub fn host_bytes(self) -> usize { self.host_resident_bytes() + self.host_workspace_bytes() }
     /// Preload runs before either staging pool or its lazy worker scratch is
     /// allocated. Keep their complete working set and the shared read owner.
-    pub fn preload_budget(self, available: u64) -> u64 {
-        available.saturating_sub((self.host_bytes() + self.decode_host_bytes() + self.cache_bytes(264)
+    /// `row_width` is one cached Engram row (weight + scale bytes).
+    pub fn preload_budget(self, available: u64, row_width: usize) -> u64 {
+        available.saturating_sub((self.host_bytes() + self.decode_host_bytes() + self.cache_bytes(row_width)
             + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64)
     }
     pub fn device_bytes(self) -> usize { self.units * self.rows * ENGRAM_DEVICE_ROW_BYTES }
@@ -265,11 +266,13 @@ mod lifecycle_tests {
     fn preload_budget_reserves_every_staging_owner_and_lazy_workspace() -> Result<()> {
         for (rows, units) in [(2752, 3), (4096, 2), (2048, 4)] {
             let shape = EngramStagingShape::new(rows, units)?;
-            let future = (shape.host_bytes() + shape.decode_host_bytes() + shape.cache_bytes(264)
-                + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
-            assert_eq!(shape.preload_budget(future - 1), 0);
-            assert_eq!(shape.preload_budget(future), 0);
-            assert_eq!(shape.preload_budget(future + 123), 123);
+            for width in [264, 144] {
+                let future = (shape.host_bytes() + shape.decode_host_bytes() + shape.cache_bytes(width)
+                    + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
+                assert_eq!(shape.preload_budget(future - 1, width), 0);
+                assert_eq!(shape.preload_budget(future, width), 0);
+                assert_eq!(shape.preload_budget(future + 123, width), 123);
+            }
         }
         Ok(())
     }

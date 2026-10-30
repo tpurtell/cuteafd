@@ -33,6 +33,14 @@ mod uring;
 mod reactor;
 pub mod row_cache;
 
+/// How a gather may use the shared read reactor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GatherMode {
+    /// Never block for a reactor buffer (the look-ahead planner, which polls):
+    /// take one when free, else on a later poll.
+    pub no_wait: bool,
+}
+
 /// Explicit priority from the decode/prefill pipeline, never inferred from row count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReadPriority { DecodeFirst, Decode, PrefillFirst, #[default] Prefill }
@@ -77,6 +85,10 @@ pub enum MappedTableError {
 }
 
 pub type Result<T, E = MappedTableError> = std::result::Result<T, E>;
+
+/// After a gather's copy faulted, the table's next gathers skip the plain
+/// copy (their rows are likely cold too); every this-many-th one probes it again.
+const COLD_SKIPS: u32 = 8;
 
 /// Rows a gather copies straight from the mapping before its first check of
 /// the thread's major faults, and the interval the checks double to while the
@@ -530,6 +542,8 @@ pub struct MappedTable {
     /// Tests of the residency split route every row through it.
     #[cfg(test)]
     split_only: AtomicBool,
+    /// Gathers left that skip the plain copy after one faulted.
+    cold_skips: std::sync::atomic::AtomicU32,
     resident: Option<ResidentBytes>,
     /// First global row of each part, then the total.
     starts: Vec<u64>,
@@ -564,7 +578,7 @@ impl MappedTable {
         } else {
             0
         };
-        let table = Self { parts: mapped, #[cfg(test)] split_only: AtomicBool::new(false), resident: None, starts, uniform,
+        let table = Self { parts: mapped, #[cfg(test)] split_only: AtomicBool::new(false), cold_skips: Default::default(), resident: None, starts, uniform,
             format, stats: Arc::new(TableStats::default()) };
         {
             use std::os::unix::fs::MetadataExt;
@@ -826,14 +840,14 @@ impl MappedTable {
         self.gather_slots_priority(rows, slots, output, ReadPriority::Prefill)
     }
     pub fn gather_slots_priority(&self, rows: &[u64], slots: &[usize], output: &mut [u8], priority: ReadPriority) -> Result<()> {
-        let pending = self.prepare_gather(rows, slots, output, priority, 2)?;
+        let pending = self.prepare_gather(rows, slots, output, priority, 2, GatherMode::default())?;
         pending.finish(self, output)
     }
 
     /// Copy hits now and submit only misses. The returned ticket owns its I/O
     /// buffers/files, not the destination, so another table can start first.
     pub(crate) fn prepare_gather(&self, rows: &[u64], slots: &[usize], output: &mut [u8],
-        priority: ReadPriority, window: usize) -> Result<PreparedTableGather> {
+        priority: ReadPriority, window: usize, mode: GatherMode) -> Result<PreparedTableGather> {
         if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
         let width = self.row_bytes();
         // Dense slots 0..n (every row read into its own buffer) are distinct by
@@ -861,13 +875,17 @@ impl MappedTable {
         // thread's major faults are checked every COPY_CHECK_ROWS rows; the first
         // one (a row read from the device) sends the rest of the batch to the
         // residency split, so its misses go to the read reactor instead of
-        // faulting one at a time here. Switches are counted.
+        // faulting one at a time here. Switches are counted. After a switch the
+        // table's next COLD_SKIPS - 1 gathers start with the split.
         let mut copied = 0;
+        let warm = self.cold_skips.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err();
         #[cfg(test)]
-        let copy_first = !self.split_only.load(Ordering::Relaxed) && std::env::var_os("MAPPED_BENCH_ALL_MISS").is_none()
-            && std::env::var_os("MAPPED_BENCH_SPLIT").is_none();
+        let copy_first = warm && !self.split_only.load(Ordering::Relaxed)
+            && std::env::var_os("MAPPED_BENCH_ALL_MISS").is_none() && std::env::var_os("MAPPED_BENCH_SPLIT").is_none();
         #[cfg(not(test))]
-        let copy_first = true;
+        let copy_first = warm;
+        // Copied rows that faulted: a device read on this thread, not a hit.
+        let mut faulted = 0;
         if copy_first {
             let mut checked = before;
             // The first check comes after COPY_FIRST_CHECK rows (a cold small
@@ -879,17 +897,25 @@ impl MappedTable {
                 for &(part, row, slot) in &locations[copied..end] {
                     output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
                 }
+                let rows = end - copied;
                 copied = end;
                 let now = thread_faults();
-                if checked.zip(now).is_some_and(|(a, b)| b[1] > a[1]) {
+                if let Some(faults) = checked.zip(now).map(|(a, b)| b[1] - a[1]).filter(|&faults| faults > 0) {
+                    // Each fault read at least one row of this group.
+                    faulted += (faults as usize).min(rows);
                     self.stats.copy_switches.fetch_add(1, Ordering::Relaxed);
+                    self.cold_skips.store(COLD_SKIPS - 1, Ordering::Relaxed);
                     break;
                 }
                 checked = now;
                 group = (group * 2).min(COPY_CHECK_ROWS);
             }
-            prepared.stats.hits += copied as u64;
-            prepared.stats.hit_bytes += (copied * width) as u64;
+            let hits = copied - faulted;
+            prepared.stats.hits += hits as u64;
+            prepared.stats.hit_bytes += (hits * width) as u64;
+            prepared.stats.misses += faulted as u64;
+            prepared.stats.miss_bytes += (faulted * width) as u64;
+            prepared.stats.device_bytes_estimate += (faulted * width.max(self.parts[0].page_bytes)) as u64;
         }
         let rest = &locations[copied..];
         let rest_rows: Vec<u64> = rest.iter().map(|&(part, local, _)| self.starts[part] + local).collect();
@@ -915,7 +941,7 @@ impl MappedTable {
         if !prepared.misses.is_empty() {
             let reads = prepared.misses.iter().map(|&(part, row, slot)| reactor::Read {
                 file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot }).collect();
-            match uring::start(reads, width, priority, window) {
+            match uring::start(reads, width, priority, window, !mode.no_wait) {
                 Ok(stream) => prepared.stream = Some(stream),
                 Err(error) => self.uring_fallback(&error),
             }

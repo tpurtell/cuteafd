@@ -2,7 +2,7 @@
 //! infrastructure (`formats::mapped_table`): mapping, the layer's bounded row
 //! cache, row reads through the shared read reactor, and per-table stats.
 use crate::formats::mapped_table::row_cache::RowCache;
-use crate::formats::mapped_table::{PreparedTableGather, ReadPriority};
+use crate::formats::mapped_table::{GatherMode, PreparedTableGather, ReadPriority};
 use crate::{MappedTable, RowFormat};
 use anyhow::{ensure, Context, Result};
 use std::sync::Arc;
@@ -88,26 +88,27 @@ impl EngramTable {
 
     /// Start reading `rows` (distinct) into private buffers; resident rows are
     /// copied on this thread, misses go to the shared read reactor.
-    pub(crate) fn start_read(&self, rows: &[u64], priority: ReadPriority) -> Result<RowRead> {
-        self.start_read_window(rows, priority, 2)
+    pub(crate) fn start_read(&self, rows: &[u64], priority: ReadPriority, mode: GatherMode) -> Result<RowRead> {
+        self.start_read_window(rows, priority, 2, mode)
     }
-    /// [`Self::start_read`] holding at most `window` reactor buffers per table
-    /// (the look-ahead holds one, so it can never starve the gathers).
-    pub(crate) fn start_read_window(&self, rows: &[u64], priority: ReadPriority, window: usize) -> Result<RowRead> {
+    /// [`Self::start_read`] holding at most `window` reactor buffers per plane
+    /// (a paired table reads two planes, each with its own buffer).
+    pub(crate) fn start_read_window(&self, rows: &[u64], priority: ReadPriority, window: usize, mode: GatherMode)
+        -> Result<RowRead> {
         let slots: Vec<usize> = (0..rows.len()).collect();
         let weight_width = self.weights.row_bytes();
         let mut weights = vec![0; rows.len() * weight_width];
         match &self.scales {
             None => {
-                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, window.clamp(1, 2))?;
+                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, window.clamp(1, 2), mode)?;
                 let misses = weight.misses();
                 Ok(RowRead { weight, scale: None, weights, scales: Vec::new(), widths: [weight_width, 0], misses })
             }
             Some(table) => {
                 let mut scales = vec![0; rows.len() * table.row_bytes()];
                 // Both tables start before either is waited for; one buffer window each.
-                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, 1)?;
-                let scale = table.prepare_gather(rows, &slots, &mut scales, priority, 1)?;
+                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, 1, mode)?;
+                let scale = table.prepare_gather(rows, &slots, &mut scales, priority, 1, mode)?;
                 let misses = weight.misses().max(scale.misses());
                 Ok(RowRead { weight, scale: Some(scale), weights, scales, widths: [weight_width, table.row_bytes()],
                     misses })

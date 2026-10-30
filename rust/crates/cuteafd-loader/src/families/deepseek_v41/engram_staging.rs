@@ -3,7 +3,7 @@
 //! (and cached when the class has room); rows another reader is filling are waited for.
 use super::engram_prefetch::RowRead;
 use crate::formats::mapped_table::row_cache::{Lookup, Pins, RowClass};
-use crate::formats::mapped_table::ReadPriority;
+use crate::formats::mapped_table::{GatherMode, ReadPriority};
 use crate::{EngramEncoding, EngramTable};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramBatch, ENGRAM_ROWS};
@@ -35,7 +35,10 @@ pub(crate) struct PreparedEngram {
     /// Rows this gather reads itself (row-cache misses), with each one's cache
     /// slot when it reserved one and its canonical staging slot.
     read: Option<(RowRead, Vec<(Option<u32>, usize)>)>,
-    rows: usize, layer: usize, encoding: EngramEncoding, global_scale: f32,
+    rows: usize, layer: usize,
+    /// The gather's read priority (layer 0's first-layer rank included).
+    priority: ReadPriority,
+    encoding: EngramEncoding, global_scale: f32,
 }
 /// Copy one cached row (weight bytes then scale bytes) into its canonical slot.
 fn place(weights: &mut [u8], scales: &mut [u8], scale_base: usize, encoding: EngramEncoding, slot: usize, row: &[u8]) {
@@ -211,25 +214,26 @@ impl EngramBatchStaging {
         for ((lookup, &address), &slot) in lookups.iter().zip(&addresses).zip(&slots) {
             match *lookup {
                 Lookup::Ready(cached) => place(weights, scales, scale_base, encoding, slot, pins.row(cached)),
-                // Decode never waits on another reader: its own hybrid read is a
-                // copy when the row is resident and joins the device read when not.
-                Lookup::Wait(_) if class == RowClass::Decode => misses.push((address, None, slot)),
+                // Prefill and decode both join a row another reader is filling
+                // rather than read it again (its pages are already in flight).
                 Lookup::Wait(cached) => pending.push((cached, slot, address)),
                 Lookup::Fill(cached) => misses.push((address, Some(cached), slot)),
                 Lookup::Uncached => misses.push((address, None, slot)),
             }
         }
+        let priority = if layer_index == 0 { priority.first() } else { priority };
         let read = if misses.is_empty() { None } else {
             let ids: Vec<u64> = misses.iter().map(|m| m.0).collect();
-            let priority = if layer_index == 0 { priority.first() } else { priority };
-            Some((table.start_read(&ids, priority)?, misses.into_iter().map(|(_, cached, slot)| (cached, slot)).collect()))
+            Some((table.start_read(&ids, priority, GatherMode::default())?,
+                misses.into_iter().map(|(_, cached, slot)| (cached, slot)).collect()))
         };
-        Ok(PreparedEngram { pins, pending, read, rows, layer: layer_index, encoding, global_scale: table.global_scale() })
+        Ok(PreparedEngram { pins, pending, read, rows, layer: layer_index, priority, encoding,
+            global_scale: table.global_scale() })
     }
     /// Land this gather's reads (publishing the ones it reserved), wait for rows
     /// filled elsewhere, then scatter duplicates to their token/head slots.
     pub(crate) fn finish(&mut self, table: &EngramTable, prepared: PreparedEngram) -> Result<()> {
-        let PreparedEngram { mut pins, pending, read, rows, layer, encoding, global_scale } = prepared;
+        let PreparedEngram { mut pins, pending, read, rows, layer, priority, encoding, global_scale } = prepared;
         let (weight_bytes, scale_bytes) = (encoding.weight_bytes(), encoding.scale_bytes());
         let scale_base = self.capacity * 24 * 128;
         let (weights, rest) = self.payload.bytes_mut().split_at_mut(self.capacity * 24 * 256);
@@ -256,7 +260,7 @@ impl EngramBatchStaging {
         if !failed.is_empty() {
             // Their filler stopped (cancelled request or failed read): read them here.
             let ids: Vec<u64> = failed.iter().map(|f| f.1).collect();
-            let mut read = table.start_read(&ids, ReadPriority::Prefill)?;
+            let mut read = table.start_read(&ids, priority, GatherMode::default())?;
             read.finish(table)?;
             let mut row = [0u8; 280];
             for (i, &(slot, _)) in failed.iter().enumerate() {
@@ -537,7 +541,7 @@ mod tests {
         let table = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
         let mut table = EngramTable::new_strided(table)?;
         table.set_cache_shares([24, 1024])?;
-        let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill)?;
+        let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill, GatherMode::default())?;
         read.finish(&table)?;
         let mut t = [0f64; 4];
         for _ in 0..10 {
@@ -545,7 +549,7 @@ mod tests {
             let (pins, _) = table.cache().acquire(&rows, RowClass::Prefill);
             drop(pins);
             let b = std::time::Instant::now();
-            let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill)?;
+            let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill, GatherMode::default())?;
             let c = std::time::Instant::now();
             read.finish(&table)?;
             let d = std::time::Instant::now();

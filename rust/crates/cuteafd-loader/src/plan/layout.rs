@@ -1409,6 +1409,24 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
 
 /// Offline host owners are future allocations, unlike the runtime's live pinned
 /// ledger. The OS sample excludes external consumers, not this unstarted server.
+/// One V4.1 Engram row as the row cache stores it (weight then scale bytes),
+/// from the first engram layer's tensor headers: strided rows carry both.
+pub(crate) fn engram_row_bytes(checkpoint: &super::Checkpoint) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    let mut layer = None;
+    let mut bytes = 0;
+    for tensor in &checkpoint.tensors {
+        let Some((stem, suffix)) = tensor.meta.name.split_once(".engram.embed.") else { continue };
+        if layer.is_some_and(|layer| layer != stem) || tensor.meta.shape.len() != 2 { continue; }
+        layer = Some(stem);
+        if suffix.starts_with("strided_") { return Ok(tensor.meta.shape[1]); }
+        if suffix == "weight" || suffix == "scale" { bytes += tensor.meta.shape[1]; }
+    }
+    anyhow::ensure!(bytes > 0, "V4.1 checkpoint has no engram table headers");
+    layer.context("V4.1 checkpoint has no engram layer")?;
+    Ok(bytes)
+}
+
 pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, checkpoint: &super::Checkpoint, native: bool) -> anyhow::Result<()> {
     use anyhow::{Context, ensure};
     use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress, SparkRings};
@@ -1560,7 +1578,7 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
         push(Category::Workspace, "v41/engram-decode-worker", "preparer + two finishers",
             shape.decode_host_workspace_bytes() as u64, Basis::Formula);
         push(Category::Workspace, "v41/engram-row-cache", "two layers' bounded row caches",
-            shape.cache_bytes(264) as u64, Basis::Formula);
+            shape.cache_bytes(engram_row_bytes(checkpoint)?) as u64, Basis::Formula);
     }
 
     if family == "qwen4" {

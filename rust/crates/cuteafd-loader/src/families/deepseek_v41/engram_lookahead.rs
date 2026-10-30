@@ -17,7 +17,7 @@
 //! and decode share one fetch.
 use super::engram_prefetch::RowRead;
 use crate::formats::mapped_table::row_cache::{Lookup, Pins, RowClass};
-use crate::formats::mapped_table::ReadPriority;
+use crate::formats::mapped_table::{GatherMode, ReadPriority};
 use crate::EngramTable;
 use anyhow::{Context, Result};
 use cuteafd_core::EngramHistory;
@@ -32,12 +32,16 @@ pub const fn window_units(depth: usize) -> usize { 2 * depth }
 
 /// Tokens per piece: both layers' rows of a piece fit one reactor buffer per table.
 const PIECE_TOKENS: usize = 128;
-/// Prefill layer reads (one piece, one layer) in flight at once. Every
-/// look-ahead read holds one reactor buffer, and at most one decode piece (two
-/// layers) runs: 5 of the reactor's 16 buffers, so with the gathers' own
-/// windows (two prefill and two decode jobs, two buffers each) every holder
-/// always gets a buffer and none can block while another waits on it.
+/// Prefill layer reads (one piece, one layer) in flight at once. A read holds
+/// one reactor buffer per plane (two for the paired weight and scale tables),
+/// and at most one decode piece (both layers) runs: up to (3 + 2) x 2 = 10 of
+/// the reactor's 16 buffers. Look-ahead reads never wait for a buffer (they
+/// take one when free and otherwise on a later poll), so the planner can never
+/// block holding buffers while a gather (two permits per pipeline, a buffer per
+/// plane each) waits for one.
 const MAX_INFLIGHT: usize = 3;
+/// Look-ahead reads poll; they never block on the reactor.
+const NO_WAIT: GatherMode = GatherMode { no_wait: true };
 
 /// The prefill units a request's prompt runs in: absolute end positions, in
 /// order, and the pipeline depth (units in flight at once).
@@ -359,7 +363,7 @@ fn reserve(table: &EngramTable, rows: &[u64], class: RowClass, priority: ReadPri
             Lookup::Uncached => {}
         }
     }
-    let read = if ids.is_empty() { None } else { Some((table.start_read_window(&ids, priority, 1)?, slots)) };
+    let read = if ids.is_empty() { None } else { Some((table.start_read_window(&ids, priority, 1, NO_WAIT)?, slots)) };
     Ok((held, read, counts))
 }
 
@@ -406,7 +410,7 @@ fn start_decode(rows: &[Vec<u64>; 2], tables: &[Arc<EngramTable>; 2]) -> Result<
         }
         if !ids.is_empty() {
             let priority = if layer == 0 { ReadPriority::DecodeFirst } else { ReadPriority::Decode };
-            reads[layer] = Some((table.start_read_window(&ids, priority, 1)?, slots));
+            reads[layer] = Some((table.start_read_window(&ids, priority, 1, NO_WAIT)?, slots));
         }
         pins.push(held);
     }

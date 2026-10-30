@@ -283,7 +283,7 @@ fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Cat
     crate::shared::memory::budget::admit_host_memory(0,
         &[("v41/engram-prefill", shape.host_bytes() as u64),
           ("v41/engram-decode", shape.decode_host_bytes() as u64),
-          ("v41/engram-row-cache", shape.cache_bytes(264) as u64)], 0, 0)?;
+          ("v41/engram-row-cache", shape.cache_bytes(catalog.engram_row_bytes()?) as u64)], 0, 0)?;
     // SAFETY: the checkpoint remains immutable for all mapping lifetimes.
     let mut pipeline = unsafe { cuteafd_loader::EngramPipeline::new(lib, catalog, map, shape,
         cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };

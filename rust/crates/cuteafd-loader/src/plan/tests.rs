@@ -3889,7 +3889,7 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
         let options = PlanOptions { mapped_scale_preload_bytes: tables,
             mapped_scale_host_budget_bytes: Some(budget), ..two(96, 0, 0) };
         let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
-        assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget));
+        assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget, 264));
         assert_eq!(report.mapped_placement.tables_preloaded(), all);
     }
 }
