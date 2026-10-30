@@ -38,7 +38,7 @@ const MAX_INFLIGHT: usize = 3;
 pub struct UnitPlan { pub ends: Vec<u64>, pub depth: usize }
 
 enum Command {
-    Start { id: u64, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan, committed: Arc<AtomicU64> },
+    Start { id: u64, tag: u64, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan, committed: Arc<AtomicU64> },
     /// A decode round's drafted rows per layer: read into the decode share now,
     /// published and left evictable for the verify gather.
     Decode([Vec<u64>; 2]),
@@ -90,6 +90,13 @@ impl PlanPiece {
 
 struct Plan {
     id: u64,
+    /// The caller's request id, for the per-request debug summary.
+    tag: u64,
+    admitted: std::time::Instant,
+    /// Rows read per layer in total, and before the request's first commit
+    /// (while it waited for its prefill).
+    rows: [u64; 2],
+    waiting_rows: [u64; 2],
     history: EngramHistory,
     tokens: Vec<Option<u32>>,
     /// Absolute position of `tokens[0]`.
@@ -129,10 +136,15 @@ impl EngramLookahead {
     /// `units` are the prompt's prefill units (absolute ends, the last at the
     /// prompt's end) and their pipeline depth.
     pub fn start(&self, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan) -> LookaheadHandle {
+        self.start_tagged(0, history, tokens, units)
+    }
+    /// [`Self::start`] with the caller's request id for the per-request debug summary.
+    pub fn start_tagged(&self, tag: u64, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan)
+        -> LookaheadHandle {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let committed = Arc::new(AtomicU64::new(history.position()));
         let end = history.position() + tokens.len() as u64;
-        let _ = self.send.send(Command::Start { id, history, tokens, units, committed: Arc::clone(&committed) });
+        let _ = self.send.send(Command::Start { id, tag, history, tokens, units, committed: Arc::clone(&committed) });
         LookaheadHandle { id, end, committed, send: self.send.clone() }
     }
 }
@@ -249,14 +261,15 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
 
 fn apply(plans: &mut Vec<Plan>, command: Command) {
     match command {
-        Command::Start { id, history, tokens, mut units, committed } => {
+        Command::Start { id, tag, history, tokens, mut units, committed } => {
             let start = history.position();
             let end = start + tokens.len() as u64;
             // Malformed or short plans degrade to one unit through the prompt's end.
             units.ends.retain(|&e| e > start && e < end);
             units.ends.push(end);
             units.depth = units.depth.max(1);
-            plans.push(Plan { id, history, tokens, start, next: 0, units, committed, pieces: VecDeque::new() });
+            plans.push(Plan { id, tag, admitted: std::time::Instant::now(), rows: [0; 2], waiting_rows: [0; 2],
+                history, tokens, start, next: 0, units, committed, pieces: VecDeque::new() });
         }
         Command::Wake | Command::Stop | Command::Decode(_) => {}
         // Dropping the plan drains its reads, then fails unread rows and unpins.
@@ -363,42 +376,59 @@ fn start_decode(rows: &[Vec<u64>; 2], tables: &[Arc<EngramTable>; 2]) -> Result<
 
 /// Publish every read that has landed, without waiting.
 fn poll(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<bool> {
-    let mut landed = false;
+    let mut landed = [0u64; 2];
     for piece in &mut plan.pieces {
         if let Some((read, _)) = piece.l1_read.as_mut() {
             if read.poll(&tables[0])? {
-                publish_read(&mut piece.l1, piece.l1_read.take().expect("landed"), &tables[0])?;
-                landed = true;
+                landed[0] += publish_read(&mut piece.l1, piece.l1_read.take().expect("landed"), &tables[0])?;
             }
         }
         if let Some((read, _)) = piece.l14_read.as_mut() {
             if read.poll(&tables[1])? {
                 let pins = piece.l14.as_mut().expect("layer-14 pins");
-                publish_read(pins, piece.l14_read.take().expect("landed"), &tables[1])?;
-                landed = true;
+                landed[1] += publish_read(pins, piece.l14_read.take().expect("landed"), &tables[1])?;
             }
         }
     }
-    Ok(landed)
+    plan.count(0, landed[0]);
+    plan.count(1, landed[1]);
+    Ok(landed != [0, 0])
 }
 
 /// Wait for the oldest outstanding read (layer 1 first) and publish it.
 fn land_oldest(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<()> {
     let piece = plan.pieces.iter_mut().find(|piece| piece.reading() > 0).expect("an in-flight read");
-    if let Some((mut read, slots)) = piece.l1_read.take() {
+    let landed = if let Some((mut read, slots)) = piece.l1_read.take() {
         read.finish(&tables[0])?;
-        publish_read(&mut piece.l1, (read, slots), &tables[0])?;
+        (0, publish_read(&mut piece.l1, (read, slots), &tables[0])?)
     } else if let Some((mut read, slots)) = piece.l14_read.take() {
         read.finish(&tables[1])?;
-        publish_read(piece.l14.as_mut().expect("layer-14 pins"), (read, slots), &tables[1])?;
-    }
+        (1, publish_read(piece.l14.as_mut().expect("layer-14 pins"), (read, slots), &tables[1])?)
+    } else { (0, 0) };
+    plan.count(landed.0, landed.1);
     Ok(())
 }
 
-fn publish_read(pins: &mut Pins, (read, slots): (RowRead, Vec<u32>), table: &EngramTable) -> Result<()> {
+fn publish_read(pins: &mut Pins, (read, slots): (RowRead, Vec<u32>), table: &EngramTable) -> Result<u64> {
     let rows = pins.publish_all(slots.iter().enumerate().map(|(i, &slot)| (slot, read.row(i))))?;
     table.weights().stats().record_lookahead(rows);
-    Ok(())
+    Ok(rows as u64)
+}
+
+impl Plan {
+    fn count(&mut self, layer: usize, rows: u64) {
+        self.rows[layer] += rows;
+        if self.committed.load(Ordering::Acquire) <= self.start { self.waiting_rows[layer] += rows; }
+    }
+}
+
+impl Drop for Plan {
+    fn drop(&mut self) {
+        tracing::info!(request_id = self.tag, prompt_tokens = self.tokens.len(),
+            units = self.units.ends.len(), l1_rows = self.rows[0], l14_rows = self.rows[1],
+            l1_rows_waiting = self.waiting_rows[0], l14_rows_waiting = self.waiting_rows[1],
+            lifetime_ms = self.admitted.elapsed().as_millis() as u64, "engram look-ahead request");
+    }
 }
 
 fn publish(piece: &mut Piece, layer: usize, table: &EngramTable) -> Result<()> {

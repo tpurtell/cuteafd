@@ -226,7 +226,8 @@ impl<'a> Requests<'a> {
         if !request.images.is_empty() || request.lookahead.is_some() { return Ok(()); }
         let start = usize::try_from(request.history.position())?;
         if start >= prompt.len() { return Ok(()); }
-        let handle = self.pipeline.start_lookahead(&request.history, &prompt[start..], units(start)?)?;
+        let id = self.cache.request_id(lease).unwrap_or(0);
+        let handle = self.pipeline.start_lookahead(id, &request.history, &prompt[start..], units(start)?)?;
         self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
         Ok(())
     }
