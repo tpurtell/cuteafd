@@ -309,6 +309,8 @@ _WS_S14_M256 = dict(route_block=32, dynamic=True, tile=TILE_RTX_MIXED)
 _WS_S14 = dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED)
 # Prerotated 256-wide FC1 arm: the WS kernel hoists the token-major rotation
 # ahead of the block loop and keeps dynamic claims with 64-row route blocks.
+# The hoist is the SparkInfer default on SM120 only; SM121 (GB10) exports rotate
+# in tile, which measures 1.05-1.53x faster on every Spark WS cell (#912).
 _WS_K3_PREROTATE = dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256))
 
 # Coordinator (RTX SM120) warp-specialized prefill cells, keyed by
