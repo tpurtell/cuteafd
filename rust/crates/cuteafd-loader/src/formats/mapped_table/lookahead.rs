@@ -411,7 +411,9 @@ fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()
     anyhow::ensure!(rows.len() == tables.len(), "row source gave {} tables, the look-ahead has {}", rows.len(), tables.len());
     plan.next = end;
     let first = std::mem::take(&mut rows[0]);
-    let (pins, read, counts) = reserve(tables[0].as_ref(), first, RowClass::Prefill, ReadPriority::PrefillFirst)?;
+    // Look-ahead reads are never due before a demand gather (which reads its
+    // first table at PrefillFirst): every table's pieces queue at Prefill.
+    let (pins, read, counts) = reserve(tables[0].as_ref(), first, RowClass::Prefill, ReadPriority::Prefill)?;
     plan.tally(0, counts);
     let mut piece = PlanPiece { end: plan.start + end as u64, unit, rows: rows.into_iter().map(Some).collect(),
         pins: (0..tables.len()).map(|_| None).collect(), reads: (0..tables.len()).map(|_| None).collect() };

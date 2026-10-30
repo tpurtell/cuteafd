@@ -55,7 +55,9 @@ impl TokenTable {
     /// Gather `ids` (in order, duplicates allowed) into `output`, `row_bytes`
     /// each: cached rows are copied, rows another reader is filling are waited
     /// for, and the rest are read here (and published when the cache admits them).
+    /// A demand gather of the first table reads ahead of look-ahead reads.
     pub fn gather(&self, ids: &[u64], output: &mut [u8], priority: ReadPriority) -> Result<()> {
+        let priority = priority.first();
         let width = self.table.row_bytes();
         ensure!(output.len() == ids.len() * width, "token-table gather destination differs from its rows");
         // Distinct rows in order; duplicates are copied from their first slot.
