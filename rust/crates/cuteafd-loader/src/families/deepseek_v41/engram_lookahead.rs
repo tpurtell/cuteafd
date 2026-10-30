@@ -662,8 +662,11 @@ mod tests {
             });
             let _ = send.send(result.map_err(|error| error.to_string()));
         });
-        let outcome = receive.recv_timeout(std::time::Duration::from_secs(20))
-            .map_err(|_| anyhow::anyhow!("a decode gather starved behind the look-ahead's reactor buffers"))?;
+        let Ok(outcome) = receive.recv_timeout(std::time::Duration::from_secs(20)) else {
+            // A starved planner never stops: fail without joining it.
+            std::mem::forget(ahead);
+            anyhow::bail!("a decode gather starved behind the look-ahead's reactor buffers");
+        };
         outcome.map_err(anyhow::Error::msg)?;
         drop(ahead);
         Ok(())
