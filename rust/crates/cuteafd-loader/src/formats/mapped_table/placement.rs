@@ -33,7 +33,11 @@ pub(super) fn remote_read_cap(file: &File, placement: Placement, fuse: bool) -> 
     if placement != Placement::Remote || !fuse { return None; }
     use std::os::unix::fs::MetadataExt;
     let dev = file.metadata().ok()?.dev();
-    fuse_max_background(std::path::Path::new(FUSE_CONNECTIONS), dev).map(|limit| (libc::minor(dev), limit))
+    let limit = fuse_max_background(std::path::Path::new(FUSE_CONNECTIONS), dev);
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| tracing::info!(connection = libc::minor(dev), ?limit,
+        "remote table reads capped at the FUSE connection's max_background (None: not visible, no cap)"));
+    limit.map(|limit| (libc::minor(dev), limit))
 }
 
 /// Every mapped table file's placement so far: whether any is remote, and a

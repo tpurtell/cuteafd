@@ -137,8 +137,8 @@ pub(crate) trait Backend<'a> {
     /// plan), from admission on. The handle's commits move its window.
     fn read_ahead(&self, _placement: &Self::Placement, _tokens: &[u32], _resume: usize, _chunk_ends: &[usize])
         -> Option<cuteafd_loader::LookaheadHandle> { None }
-    /// Read the table rows `token` adds after `history` as soon as it is known.
-    fn prefetch_decode(&self, _history: &[u32], _token: u32) {}
+    /// Read the table rows `tokens` add after `history` as soon as they are known.
+    fn prefetch_decode(&self, _history: &[u32], _tokens: &[u32]) {}
     fn require_live(&self) -> Result<()>;
     fn log_table_stats(&self, phase: &str);
     // Family write validation uses the actual cache pool after admission/COW.
@@ -988,6 +988,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 let timer = Instant::now();
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
+                // Its demand gathers own the running chunk from here on.
+                if let Some(ahead) = &p.ahead { ahead.running(); }
                 let (result, phases) = isolated_phases(engine.profile(), || -> Result<()> {
                     let start = p.placement.len();
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
@@ -1120,6 +1122,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 match admitted {
                     Ok(mut request) => {
                         let token = request.next;
+                        // The first decode round's anchor: read its rows now.
+                        engine.prefetch_decode(&request.history, &[token]);
                         let emitted = request.emit(token);
                         request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
@@ -1309,6 +1313,14 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         }
         Ok(rows)
     }).collect::<Result<_>>()?;
+    // The drafts' table rows, read as soon as they exist (the anchor's already were).
+    for (a, rows) in active.iter().zip(&sequences) {
+        if rows.len() > 1 {
+            let mut history = a.history.clone();
+            history.push(rows[0]);
+            engine.prefetch_decode(&history, &rows[1..]);
+        }
+    }
     let diagnostic = active.iter().any(|a| a.job.probe.is_some());
     let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
     let spec = sequences.iter().any(|rows| rows.len() > 1);
@@ -1378,9 +1390,13 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             probe::decode_row(engine.library(), &request.job.probe, &logits, offset + j, request.generated,
                 request.history.len());
             match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| {
-                // Family table reads overlap emission, commit and drafting.
-                engine.prefetch_decode(&request.history, t);
-                Ok((t, request.emit(t)?))
+                // The next round's anchor (a correction or the bonus token, not a
+                // draft this verify already read) overlaps emission, commit and drafting.
+                let next_anchor = rows.get(j + 1) != Some(&t);
+                let history_len = request.history.len();
+                let done = request.emit(t)?;
+                if next_anchor && !done { engine.prefetch_decode(&request.history[..history_len], &[t]); }
+                Ok((t, done))
             }) {
                 Ok((token, done)) => {
                     last = Some((j + 1, token));

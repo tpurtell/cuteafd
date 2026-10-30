@@ -82,7 +82,8 @@ mod tests {
     use super::*;
     use crate::formats::mapped_table::row_cache::{Lookup, RowClass};
     use std::sync::mpsc;
-    const PIECE_TOKENS: usize = 128;
+    /// A V4.1 piece: one reactor batch of 24-row tokens (2048 / 24, in 64-token steps).
+    const PIECE_TOKENS: usize = 64;
     use std::os::unix::fs::FileExt;
 
     fn table(layer: usize, rows: &[u64]) -> Result<Arc<EngramTable>> {
@@ -116,7 +117,8 @@ mod tests {
         let units = || UnitPlan::new(vec![128, 256, 300], 3);
         let handle = ahead.start(history.fork()?, tokens.clone(), units());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while tables.iter().any(|t| t.weights().stats().snapshot().lookahead_pieces < 3) {
+        // Pieces of 64 tokens (one reactor batch of 24-row tokens): 0-64, 64-128, 128-192, 192-256, 256-300.
+        while tables.iter().any(|t| t.weights().stats().snapshot().lookahead_pieces < 5) {
             assert!(std::time::Instant::now() < deadline, "look-ahead did not finish");
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
@@ -131,10 +133,13 @@ mod tests {
                 assert_eq!(pins.row(slot)[256], (row % 13) as u8);
             }
         }
-        // A second request over the same prompt pins the cached rows, reading none.
+        // A second request over the same prompt pins the cached rows, reading none
+        // (its pieces complete without a read).
+        let read = tables[0].weights().stats().snapshot().lookahead_rows;
         let stale = ahead.start(history.fork()?, tokens.clone(), units());
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(tables[0].weights().stats().snapshot().lookahead_pieces, 3);
+        assert_eq!(tables[0].weights().stats().snapshot().lookahead_rows, read);
+        assert_eq!(tables[0].weights().stats().snapshot().lookahead_pieces, 10);
         // Commits past the end release every piece; the handle reports the end.
         assert!(!handle.commit(300));
         drop(handle);
@@ -185,11 +190,12 @@ mod tests {
         let handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![128, 256, 384, 512, 640], 1));
         let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while pieces() < 2 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
+        // Two units of 128 tokens are four 64-token pieces.
+        while pieces() < 4 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert_eq!(pieces(), 2, "two units past the frontier, no more");
+        assert_eq!(pieces(), 4, "two units past the frontier, no more");
         assert!(handle.commit(128));
-        while pieces() < 3 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
+        while pieces() < 6 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
         Ok(())
     }
 
@@ -231,7 +237,7 @@ mod tests {
         while pieces() < 1 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(pieces(), 1, "no room until the first piece commits");
-        assert!(handle.commit(128));
+        assert!(handle.commit(PIECE_TOKENS as u64));
         while pieces() < 2 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }
         Ok(())
     }

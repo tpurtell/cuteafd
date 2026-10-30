@@ -1387,6 +1387,7 @@ impl<'a> Qwen4Engine<'a> {
         let mut demands = Vec::new();
         if let Some(ple) = &self.ple {
             demands.push(("staging/mapped-table-worker".to_owned(), ple.mapped().host_workspace_bytes() as u64));
+            demands.push(("mapped-table/row-cache".to_owned(), ple.mapped().cache_bytes() as u64));
         }
         let ple_ids = self.ple.as_ref().map(|ple| ple.mapped()).is_none();
         for owner in 0..self.gdn_banks.len() {
@@ -2207,11 +2208,12 @@ impl<'a> Qwen4Engine<'a> {
         Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1), calls })
     }
 
-    /// Read the PLE rows `token` adds after `tokens` into the row cache now.
-    pub fn prefetch_ple_decode(&self, tokens: &[u32], token: u32) {
+    /// Read the PLE rows `tokens` add after `history` into the row cache now.
+    pub fn prefetch_ple_decode(&self, history: &[u32], tokens: &[u32]) {
         let Some((ple, mapped)) = self.ple.as_ref().map(|p| (p, p.mapped())) else { return };
-        let mut ids = Vec::with_capacity(self.cfg.ple_rows());
-        if let Err(error) = ple.hasher.hash(&mut history_of(&self.cfg, tokens), &[token], &mut ids)
+        if tokens.is_empty() { return; }
+        let mut ids = Vec::with_capacity(tokens.len() * self.cfg.ple_rows());
+        if let Err(error) = ple.hasher.hash(&mut history_of(&self.cfg, history), tokens, &mut ids)
             .and_then(|()| mapped.prefetch_decode(&ids)) {
             tracing::warn!("PLE decode prefetch: {error:#}");
         }

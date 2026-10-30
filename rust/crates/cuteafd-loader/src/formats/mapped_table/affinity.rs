@@ -26,12 +26,16 @@ pub(super) struct Topology { pub core: usize, pub l3: usize }
 /// per L3 domain), not CPU 0's while another has CPUs, and ties to the higher
 /// domain; in it one CPU per core (its lowest), at most [`READER_CPUS`].
 /// Empty when nothing qualifies (the caller then leaves the affinity alone).
-pub(super) fn reader_cpus(allowed: &[usize], pinned: &BTreeSet<usize>, at: impl Fn(usize) -> Topology,
+pub(super) fn reader_cpus(allowed: &[usize], pinned: &BTreeSet<usize>, at: impl Fn(usize) -> Option<Topology>,
     irqs: &std::collections::HashMap<usize, u64>) -> Vec<usize> {
-    let home = at(0);
+    // Without last-level cache ids (e.g. GB10) there is no domain to keep reads in.
+    let Some(places) = allowed.iter().map(|&cpu| at(cpu).map(|place| (cpu, place))).collect::<Option<Vec<_>>>()
+        else { return Vec::new() };
+    // The housekeeping CPU: the host's CPU 0 when allowed, else the first allowed.
+    let home = places.iter().find(|&&(cpu, _)| cpu == 0).or_else(|| places.first()).map(|&(_, place)| place)
+        .expect("allowed CPUs");
     let mut domains: std::collections::BTreeMap<usize, std::collections::BTreeMap<usize, usize>> = Default::default();
-    for &cpu in allowed {
-        let place = at(cpu);
+    for &(cpu, place) in &places {
         if place.core == home.core || pinned.contains(&cpu) { continue; }
         domains.entry(place.l3).or_default().entry(place.core)
             .and_modify(|first| *first = (*first).min(cpu)).or_insert(cpu);
@@ -44,15 +48,15 @@ pub(super) fn reader_cpus(allowed: &[usize], pinned: &BTreeSet<usize>, at: impl 
     cpus
 }
 
-fn topology(cpu: usize) -> Topology {
+/// A CPU's core and L3 domain; None without an L3 id.
+fn topology(cpu: usize) -> Option<Topology> {
     let read = |path: String| std::fs::read_to_string(path).ok().and_then(|text| text.trim().parse().ok());
     let base = format!("/sys/devices/system/cpu/cpu{cpu}");
-    Topology { core: read(format!("{base}/topology/core_id")).unwrap_or(cpu),
-        l3: read(format!("{base}/cache/index3/id")).unwrap_or(0) }
+    Some(Topology { core: read(format!("{base}/topology/core_id")).unwrap_or(cpu), l3: read(format!("{base}/cache/index3/id"))? })
 }
 
 /// Each L3 domain's network (mlx5) and NVMe interrupt count from /proc/interrupts.
-fn domain_irqs(at: impl Fn(usize) -> Topology) -> std::collections::HashMap<usize, u64> {
+fn domain_irqs(at: impl Fn(usize) -> Option<Topology>) -> std::collections::HashMap<usize, u64> {
     let mut load = std::collections::HashMap::new();
     let Ok(text) = std::fs::read_to_string("/proc/interrupts") else { return load };
     let mut lines = text.lines();
@@ -63,7 +67,7 @@ fn domain_irqs(at: impl Fn(usize) -> Topology) -> std::collections::HashMap<usiz
         let name = fields[cpus + 1..].join(" ");
         if !(name.contains("mlx5") || name.contains("nvme")) { continue; }
         for (cpu, count) in fields[1..=cpus].iter().enumerate() {
-            if let Ok(count) = count.parse::<u64>() { *load.entry(at(cpu).l3).or_insert(0) += count; }
+            if let (Ok(count), Some(place)) = (count.parse::<u64>(), at(cpu)) { *load.entry(place.l3).or_insert(0) += count; }
         }
     }
     load
@@ -151,7 +155,7 @@ mod tests {
     }
 
     /// raptor: 32 cores in four L3 domains of 8; CPU n and n + 32 are one core.
-    fn raptor(cpu: usize) -> Topology { Topology { core: cpu % 32, l3: (cpu % 32) / 8 } }
+    fn raptor(cpu: usize) -> Option<Topology> { Some(Topology { core: cpu % 32, l3: (cpu % 32) / 8 }) }
 
     #[test]
     fn the_quietest_l3_domain_other_than_cpu0s() {
@@ -173,12 +177,24 @@ mod tests {
     }
 
     #[test]
+    fn no_l3_ids_means_no_pin_and_an_offset_cpuset_keeps_its_first_cpu_free() {
+        // GB10 exposes no cache ids: nothing to confine reads to.
+        assert!(reader_cpus(&(0..20).collect::<Vec<_>>(), &BTreeSet::new(), |_| None, &HashMap::new()).is_empty());
+        // A container on CPUs 16-31: its first CPU (16) is the housekeeping one, and
+        // its own two domains remain; the higher wins without interrupt data.
+        assert_eq!(reader_cpus(&(16..32).collect::<Vec<_>>(), &BTreeSet::new(), raptor, &HashMap::new()), (24..32).collect::<Vec<_>>());
+        let quiet2: HashMap<usize, u64> = [(2, 1), (3, 9)].into_iter().collect();
+        assert_eq!(reader_cpus(&(16..32).collect::<Vec<_>>(), &BTreeSet::new(), raptor, &quiet2), (24..32).collect::<Vec<_>>(),
+            "domain 2 holds the housekeeping CPU");
+    }
+
+    #[test]
     fn pinned_cpus_are_avoided_and_cores_are_not_split() {
         let all: Vec<usize> = (0..64).collect();
         let pinned: BTreeSet<usize> = (28..32).collect();
         // Domain 3 keeps cores 28..31 through their siblings 60..63.
         assert_eq!(reader_cpus(&all, &pinned, raptor, &HashMap::new()), vec![24, 25, 26, 27, 60, 61, 62, 63]);
-        // A cpuset of SMT siblings only: one CPU per core.
-        assert_eq!(reader_cpus(&[4, 36, 5, 37], &BTreeSet::new(), raptor, &HashMap::new()), vec![4, 5]);
+        // A cpuset of SMT siblings only: one CPU per core, its first core kept free.
+        assert_eq!(reader_cpus(&[4, 36, 5, 37], &BTreeSet::new(), raptor, &HashMap::new()), vec![5]);
     }
 }

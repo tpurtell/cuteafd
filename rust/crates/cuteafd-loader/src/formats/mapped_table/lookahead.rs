@@ -33,8 +33,8 @@ use std::sync::{mpsc, Arc};
 /// function (plus the unit in flight), so the two cannot drift.
 pub const fn window_units(depth: usize) -> usize { 2 * depth }
 
-/// Fewest tokens per piece (V4.1 Engram: 128 x 24 rows x 264 B ~ 0.8 MiB).
-const MIN_PIECE_TOKENS: usize = 128;
+/// Fewest tokens per piece.
+const MIN_PIECE_TOKENS: usize = 64;
 
 /// Tokens per piece: the most whose rows still fit one reactor buffer in every
 /// table (so each read streams at full-buffer efficiency), in 64-token steps
@@ -46,7 +46,10 @@ fn piece_tokens(tables: &[Arc<dyn LookaheadTable>]) -> usize {
         .min().unwrap_or(usize::MAX);
     #[cfg(test)]
     if let Some(tokens) = bench_override("LOOKAHEAD_BENCH_PIECE") { return tokens; }
-    (super::reactor::BUFFER_BYTES / row_bytes / 64 * 64).min(share / 64 * 64).max(MIN_PIECE_TOKENS)
+    // One reactor batch per table and piece: rows of a piece are reserved and
+    // read in one submission (never sliced before the cache is consulted).
+    let batch = tables.iter().map(|table| super::uring::MAX_BATCH / table.rows_per_token().max(1)).min().unwrap_or(usize::MAX);
+    (super::reactor::BUFFER_BYTES / row_bytes / 64 * 64).min(share / 64 * 64).min(batch / 64 * 64).max(MIN_PIECE_TOKENS)
 }
 
 /// Placement microbenches only: a profile parameter from the environment.
@@ -112,7 +115,7 @@ impl UnitPlan {
 
 enum Command {
     Start { id: u64, tag: u64, start: u64, source: Box<dyn RowSource>, units: UnitPlan,
-        committed: Arc<AtomicU64>, reserved: Arc<AtomicU64> },
+        committed: Arc<AtomicU64>, reserved: Arc<AtomicU64>, running: Arc<std::sync::atomic::AtomicBool> },
     /// A decode round's rows per table: read into the decode shares now,
     /// published and left evictable for the verify gather.
     Decode(Vec<Vec<u64>>),
@@ -126,6 +129,9 @@ enum Command {
 pub struct LookaheadHandle {
     id: u64,
     end: u64,
+    /// The request's prefill has started: a remote table's running call is
+    /// left to its demand gathers from here on.
+    running: Arc<std::sync::atomic::AtomicBool>,
     committed: Arc<AtomicU64>,
     reserved: Arc<AtomicU64>,
     send: mpsc::Sender<Command>,
@@ -137,6 +143,10 @@ impl LookaheadHandle {
     /// last-table gathers early does so only behind it, so both readers follow
     /// one deadline order.
     pub fn last_table_gate(&self) -> Arc<AtomicU64> { Arc::clone(&self.reserved) }
+    /// The request's prefill is starting (its demand gathers own its running call).
+    pub fn running(&self) {
+        if !self.running.swap(true, Ordering::AcqRel) { let _ = self.send.send(Command::Wake); }
+    }
     /// The request committed through `position`; false once that is the prompt's end.
     pub fn commit(&self, position: u64) -> bool {
         self.committed.fetch_max(position, Ordering::Release);
@@ -174,7 +184,8 @@ impl PlanPiece {
     fn reading(&self) -> usize { self.steps.iter().filter(|step| step.read.is_some()).count() }
     fn landed(&self, table: usize) -> bool { self.steps[table].landed() }
     /// A started step with rows still to reserve and no read in flight.
-    fn next_batch(&self) -> Option<usize> {
+    fn next_batch(&self, committed: u64) -> Option<usize> {
+        if self.end <= committed { return None; }
         self.steps.iter().position(|step| step.started && step.read.is_none() && !step.queue.is_empty())
     }
 }
@@ -186,6 +197,8 @@ struct Plan {
     admitted: std::time::Instant,
     /// Read only from the call after the one running (a remote table).
     remote: bool,
+    /// The request's prefill has started ([`LookaheadHandle::running`]).
+    running: Arc<std::sync::atomic::AtomicBool>,
     source: Box<dyn RowSource>,
     /// Absolute position of the source's token 0.
     start: u64,
@@ -250,9 +263,10 @@ impl Lookahead {
         let committed = Arc::new(AtomicU64::new(start));
         let end = start + source.tokens() as u64;
         let reserved = Arc::new(AtomicU64::new(start));
+        let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _ = self.send.send(Command::Start { id, tag, start, source, units, committed: Arc::clone(&committed),
-            reserved: Arc::clone(&reserved) });
-        LookaheadHandle { id, end, committed, reserved, send: self.send.clone() }
+            reserved: Arc::clone(&reserved), running: Arc::clone(&running) });
+        LookaheadHandle { id, end, running, committed, reserved, send: self.send.clone() }
     }
 }
 
@@ -317,14 +331,21 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, r
                 Ok(landed) => progressed |= landed,
                 Err(error) => { abandon(plan, &error); continue; }
             }
+            // Pieces the commit passed while their read was in flight go now.
+            while plan.pieces.front().is_some_and(|piece| piece.end <= committed && piece.reading() == 0) {
+                let piece = plan.pieces.pop_front().expect("checked front");
+                plan.skipped += piece.steps.iter().map(|step| step.queue.len() as u64).sum::<u64>();
+            }
         }
         let reading = |plans: &[Plan]| plans.iter().flat_map(|plan| &plan.pieces).map(PlanPiece::reading).sum::<usize>();
         // The next batch of a started step goes first (oldest piece of the
         // earliest-admitted request): its deadline is the earliest.
         while reading(&plans) < max_inflight() {
-            let Some((plan, index, table)) = plans.iter_mut().find_map(|plan| plan.pieces.iter().enumerate()
-                .find_map(|(index, piece)| piece.next_batch().map(|table| (index, table))).map(|(index, table)| (plan, index, table)))
-                else { break };
+            let Some((plan, index, table)) = plans.iter_mut().find_map(|plan| {
+                let committed = plan.committed.load(Ordering::Acquire);
+                plan.pieces.iter().enumerate().find_map(|(index, piece)| piece.next_batch(committed).map(|table| (index, table)))
+                    .map(|(index, table)| (plan, index, table))
+            }) else { break };
             if let Err(error) = next_batch(plan, index, table, &tables) { abandon(plan, &error); }
             progressed = true;
         }
@@ -371,14 +392,14 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, r
 
 fn apply(plans: &mut Vec<Plan>, command: Command, tables: usize, remote: bool) {
     match command {
-        Command::Start { id, tag, start, source, mut units, committed, reserved } => {
+        Command::Start { id, tag, start, source, mut units, committed, reserved, running } => {
             let end = start + source.tokens() as u64;
             // Malformed or short plans degrade to one unit through the prompt's end.
             units.ends.retain(|&e| e > start && e < end);
             units.ends.push(end);
             units.depth = units.depth.max(1);
             units.calls.retain(|&first| first < units.ends.len());
-            plans.push(Plan { id, tag, admitted: std::time::Instant::now(), source, start, next: 0, units, remote,
+            plans.push(Plan { id, tag, admitted: std::time::Instant::now(), source, start, next: 0, units, remote, running,
                 committed, reserved, pieces: VecDeque::new(), needed: vec![0; tables], cached: vec![0; tables],
                 joined: vec![0; tables], read: vec![0; tables], read_waiting: vec![0; tables], skipped: 0, skipped_tokens: 0 });
         }
@@ -429,7 +450,8 @@ fn ready_to_plan(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> bool {
 /// landed through unit `u + d - 1` (or as far as planning has gone when the
 /// window or the caches stop it).
 fn due(plan: &Plan, tables: &[Arc<dyn LookaheadTable>]) -> Option<(usize, usize)> {
-    let (index, table) = plan.pieces.iter().enumerate()
+    let committed = plan.committed.load(Ordering::Acquire);
+    let (index, table) = plan.pieces.iter().enumerate().filter(|(_, piece)| piece.end > committed)
         .find_map(|(index, piece)| (1..piece.steps.len()).find(|&t| !piece.steps[t].started).map(|t| (index, t)))?;
     let last = (plan.pieces[index].unit + plan.units.depth - 1).min(plan.units.ends.len() - 1);
     let horizon = plan.units.ends[last];
@@ -471,9 +493,10 @@ fn reserve_batch(step: &mut Step, table: &dyn LookaheadTable) -> Result<[u64; 3]
 }
 
 fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
-    if plan.remote {
-        // A remote table's current call belongs to its demand gathers: pass its
+    if plan.remote && plan.running.load(Ordering::Acquire) {
+        // A remote table's running call belongs to its demand gathers: pass its
         // tokens (the source hashes them, nothing is read) and its gate opens.
+        // A queued request's call 0 is read like any other.
         let committed = plan.committed.load(Ordering::Acquire).max(plan.start);
         let first = plan.units.next_call(plan.unit_of(committed));
         let from = if first == 0 { 0 } else { (plan.units.ends[first - 1] - plan.start) as usize };
@@ -504,15 +527,31 @@ fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()
 /// Start table `table`'s step of piece `index`: its first batch.
 fn start_table(plan: &mut Plan, index: usize, table: usize, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
     plan.pieces[index].steps[table].started = true;
-    if table + 1 == tables.len() { plan.reserved.fetch_max(plan.pieces[index].end, Ordering::Release); }
     next_batch(plan, index, table, tables)
 }
 
 /// Reserve and read the next batch of a started step.
 fn next_batch(plan: &mut Plan, index: usize, table: usize, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
-    let counts = reserve_batch(&mut plan.pieces[index].steps[table], tables[table].as_ref())?;
+    let step = &mut plan.pieces[index].steps[table];
+    let counts = reserve_batch(step, tables[table].as_ref())?;
+    // A piece whose last batch needed no read is complete now.
+    if step.queue.is_empty() && step.read.is_none() { tables[table].stats().record_lookahead(0, true); }
     plan.tally(table, counts);
+    if table + 1 == tables.len() { advance_gate(plan); }
     Ok(())
+}
+
+/// The last table's gate: the end of the latest piece through which every
+/// piece's last-table rows are reserved (pinned and landed or being read), so
+/// a last-table demand gather admitted behind it only finds rows in flight.
+fn advance_gate(plan: &mut Plan) {
+    let mut through = None;
+    for piece in &plan.pieces {
+        let step = piece.steps.last().expect("a table");
+        if !(step.started && step.queue.is_empty()) { break; }
+        through = Some(piece.end);
+    }
+    if let Some(end) = through { plan.reserved.fetch_max(end, Ordering::Release); }
 }
 
 /// Reserve a decode round's rows in the decode shares and start reading the ones
@@ -594,7 +633,8 @@ mod tests {
     #[test]
     fn pieces_fill_a_reactor_buffer_and_fit_the_admitted_share() {
         let (unit, depth) = (2752, 3);
-        for (width, rows, expected) in [(264, 24, 128), (160, 16, 384)] {
+        // One reactor batch (2048 rows) per piece and table bounds both.
+        for (width, rows, expected) in [(264, 24, 64), (160, 16, 128)] {
             let share = (window_units(depth) + 1) * unit * rows;
             let tables = vec![shape(width, rows, [share, 2 * 64 * rows])];
             let tokens = piece_tokens(&tables);
@@ -604,6 +644,6 @@ mod tests {
         }
         // Several tables: the widest row decides.
         let both = vec![shape(160, 16, [1 << 20, 1024]), shape(264, 24, [1 << 20, 1024])];
-        assert_eq!(piece_tokens(&both), 128);
+        assert_eq!(piece_tokens(&both), 64);
     }
 }

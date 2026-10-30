@@ -235,6 +235,11 @@ impl<'a> Requests<'a> {
         self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
         Ok(())
     }
+    /// The request's prefill is starting: its running call's rows belong to its
+    /// demand gathers (a remote table's look-ahead then reads only later calls).
+    pub fn lookahead_running(&self, lease: CacheLease) {
+        if let Some(ahead) = self.request(lease).ok().and_then(|request| request.lookahead.as_ref()) { ahead.running(); }
+    }
     /// Fetch a decode round's rows into the Engram row caches as early as they
     /// are known: the anchors as the round starts (overlapping the draft phase),
     /// then anchor + drafts the moment the drafter returns (before trimming);

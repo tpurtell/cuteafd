@@ -198,6 +198,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
             |start| prompt_units(start, replay_end, tokens, chunk_rows, waves)) {
             tracing::warn!(%error, "Engram look-ahead not started; rows load on demand");
         }
+        self.requests.lookahead_running(self.lease);
         let end = self.tokens.len() as u64;
         let cached = self.requests.cache().committed_end(self.lease)? as usize;
         let stage = self.requests.cache().stage(self.lease)?;

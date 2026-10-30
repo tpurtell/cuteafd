@@ -255,6 +255,7 @@ mod tests {
             .split("/// Size every unit-table upload").next().unwrap();
         assert!(demands.contains("ple.mapped().host_workspace_bytes() as u64"));
         assert!(demands.contains("staging/mapped-table-worker"));
+        assert!(demands.contains("(\"mapped-table/row-cache\".to_owned(), ple.mapped().cache_bytes() as u64)"));
     }
 
     #[test]

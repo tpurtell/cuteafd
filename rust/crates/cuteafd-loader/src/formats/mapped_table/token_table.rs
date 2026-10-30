@@ -213,6 +213,8 @@ mod tests {
         // Two calls of one unit: tokens 0..128 (running), 128..256 (next).
         let handle = ahead.start(1, 0, Box::new(HashedSource { tokens: (0..256).collect(), hash }),
             UnitPlan { ends: vec![128, 256], depth: 1, calls: vec![0, 1] });
+        // Its prefill is running: call 0 belongs to its demand gathers.
+        handle.running();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while table.stats().snapshot().lookahead_rows < 512 {
             assert!(std::time::Instant::now() < deadline, "the next call was not read ahead");

@@ -1211,9 +1211,6 @@ pub struct TableStats {
     minor_faults: AtomicU64,
     major_faults: AtomicU64,
     input_blocks: AtomicU64,
-    prefetch_jobs: AtomicU64,
-    prefetch_pages: AtomicU64,
-    prefetch_dropped: AtomicU64,
     nowait: AtomicBool,
     approximate: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
@@ -1293,10 +1290,6 @@ pub struct TableStatsSnapshot {
     /// Page-cache misses that read the device (disk or network).
     pub major_faults: u64,
     pub input_blocks: u64,
-    pub prefetch_jobs: u64,
-    pub prefetch_pages: u64,
-    /// Prefetch batches refused by a full queue.
-    pub prefetch_dropped: u64,
     /// Classified misses timed from initial batch submission through completion/retry.
     pub miss_histogram: [u64; 7],
     pub unclassified_rows: u64,
@@ -1467,13 +1460,6 @@ impl TableStats {
         if piece { self.lookahead_pieces.fetch_add(1, Ordering::Relaxed); }
         self.lookahead_rows.fetch_add(rows as u64, Ordering::Relaxed);
     }
-    pub fn record_prefetch(&self, pages: usize) {
-        self.prefetch_jobs.fetch_add(1, Ordering::Relaxed);
-        self.prefetch_pages.fetch_add(pages as u64, Ordering::Relaxed);
-    }
-    pub fn record_prefetch_dropped(&self) {
-        self.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
-    }
 
     fn record_reads(&self, reads: uring::ReadStats, prefetch: bool) {
         let (copied, late) = if prefetch { (&self.prefetch_resident_copy_rows, &self.prefetch_late_major_faults) }
@@ -1540,9 +1526,6 @@ impl TableStats {
             minor_faults: get(&self.minor_faults),
             major_faults: get(&self.major_faults),
             input_blocks: get(&self.input_blocks),
-            prefetch_jobs: get(&self.prefetch_jobs),
-            prefetch_pages: get(&self.prefetch_pages),
-            prefetch_dropped: get(&self.prefetch_dropped),
             miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
             unclassified_rows: get(&self.unclassified_rows),
             unclassified_bytes: get(&self.unclassified_bytes),
@@ -1617,9 +1600,6 @@ impl TableStatsSnapshot {
             minor_faults: d(self.minor_faults, earlier.minor_faults),
             major_faults: d(self.major_faults, earlier.major_faults),
             input_blocks: d(self.input_blocks, earlier.input_blocks),
-            prefetch_jobs: d(self.prefetch_jobs, earlier.prefetch_jobs),
-            prefetch_pages: d(self.prefetch_pages, earlier.prefetch_pages),
-            prefetch_dropped: d(self.prefetch_dropped, earlier.prefetch_dropped),
             miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
             unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
             unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),
