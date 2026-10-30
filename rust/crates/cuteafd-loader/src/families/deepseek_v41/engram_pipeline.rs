@@ -212,9 +212,11 @@ impl EngramPipeline {
     }
     /// Read the Engram rows of `tokens` (the prompt from `history`'s frontier on)
     /// into the row caches ahead of the gathers; publish commits on the handle.
-    pub fn start_lookahead(&self, history: &EngramHistory, tokens: &[u32]) -> Result<crate::LookaheadHandle> {
+    /// `units` are the prompt's prefill units (absolute ends) and their depth.
+    pub fn start_lookahead(&self, history: &EngramHistory, tokens: &[u32], units: crate::EngramUnitPlan)
+        -> Result<crate::LookaheadHandle> {
         let compressed = tokens.iter().map(|&token| self.token_map.compress(token, false)).collect::<Result<Vec<_>>>()?;
-        Ok(self.lookahead.start(history.fork()?, compressed))
+        Ok(self.lookahead.start(history.fork()?, compressed, units))
     }
     /// Read a decode round's proposed rows (anchor and drafts, per request from
     /// its committed history) into the row caches as soon as the drafter emits them.

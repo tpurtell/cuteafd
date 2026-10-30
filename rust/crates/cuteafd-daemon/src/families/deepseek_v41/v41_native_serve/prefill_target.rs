@@ -90,6 +90,22 @@ pub(crate) struct V41PrefillTimes {
 /// One stream call's units: the shared cut for page-aligned unit widths;
 /// test geometries below a page (2-RTX fixture: 3 and 16 rows) keep plain
 /// `chunk_rows` units, as `V41PrefillTimes::encoder_unit` streams them.
+/// The prefill units the encoder runs a prompt in from `start`, as the
+/// stream path cuts them: calls of `waves` units of `chunk_rows`, each call
+/// cut by [`stream_units`]; units run `waves` deep in pipeline order.
+fn prompt_units(start: usize, tokens: usize, chunk_rows: usize, waves: usize)
+    -> Result<cuteafd_loader::EngramUnitPlan> {
+    let call_rows = (waves * chunk_rows).max(1);
+    let mut ends = Vec::new();
+    let mut at = start;
+    while at < tokens {
+        let rows = (tokens - at).min(call_rows);
+        ends.extend(stream_units(rows, chunk_rows.max(1), waves.max(1))?.iter().map(|unit| (at + unit.end) as u64));
+        at += rows;
+    }
+    Ok(cuteafd_loader::EngramUnitPlan { ends, depth: waves.max(1) })
+}
+
 fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
     if chunk_rows % 64 != 0 {
         ensure!(rows > 0 && chunk_rows > 0, "empty prefill stream units");
@@ -172,7 +188,9 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
         if !matches!(cursor.state, PrefillState::Start) { return Ok(()); }
         // The whole uncached prompt is known: read its Engram rows into the row
         // caches ahead of the gathers. A failure only leaves rows to load on demand.
-        if let Err(error) = self.requests.start_lookahead(self.lease, self.tokens) {
+        let (tokens, chunk_rows, waves) = (self.tokens.len(), self.chunk_rows, self.waves);
+        if let Err(error) = self.requests.start_lookahead(self.lease, self.tokens,
+            |start| prompt_units(start, tokens, chunk_rows, waves)) {
             tracing::warn!(%error, "Engram look-ahead not started; rows load on demand");
         }
         let end = self.tokens.len() as u64;
@@ -677,6 +695,15 @@ mod stream_tests {
     /// A call's last units prefetch the next call's first units (#762 window
     /// cycles; prof39: each cycle's first Engram layer-1 gathers waited
     /// 40-150 ms cold, ~2.3 s of a 64K prefill on max).
+    #[test]
+    fn engram_look_ahead_units_follow_the_encoder_cut() {
+        let plan = super::prompt_units(100, 100 + 8256 + 4000, 2752, 3).unwrap();
+        assert_eq!(plan.depth, 3);
+        assert_eq!(plan.ends[..3], [100 + 2752, 100 + 5504, 100 + 8256]);
+        assert_eq!(*plan.ends.last().unwrap(), 100 + 8256 + 4000);
+        assert!(plan.ends.windows(2).all(|w| w[0] < w[1]));
+    }
+
     #[test]
     fn calls_look_ahead_at_the_next_calls_first_units() {
         assert_eq!(super::lookahead(8256..20000, 2752, 3).collect::<Vec<_>>(), [8256..11008, 11008..13760, 13760..16512]);

@@ -218,12 +218,15 @@ impl<'a> Requests<'a> {
     }
     /// Read the Engram rows of `prompt` past the request's committed frontier
     /// ahead of its gathers (text prompts; image rows have no table reads).
-    pub fn start_lookahead(&mut self, lease: CacheLease, prompt: &[u32]) -> Result<()> {
+    /// `units(start)` gives the prompt's prefill units from `start` (absolute
+    /// ends) and their pipeline depth.
+    pub fn start_lookahead(&mut self, lease: CacheLease, prompt: &[u32],
+        units: impl FnOnce(usize) -> Result<cuteafd_loader::EngramUnitPlan>) -> Result<()> {
         let request = self.request(lease)?;
         if !request.images.is_empty() || request.lookahead.is_some() { return Ok(()); }
         let start = usize::try_from(request.history.position())?;
         if start >= prompt.len() { return Ok(()); }
-        let handle = self.pipeline.start_lookahead(&request.history, &prompt[start..])?;
+        let handle = self.pipeline.start_lookahead(&request.history, &prompt[start..], units(start)?)?;
         self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
         Ok(())
     }

@@ -2,18 +2,19 @@
 //! each layer's row cache ahead of the gathers, bounded by the cache.
 //!
 //! One planner thread hashes forward from each request's frontier (a forked
-//! history: nothing is committed), reserves the rows of the next piece in the
-//! layers' caches and starts their reads in deadline order: layer 1 runs ahead,
-//! and a piece's layer-14 reads start only once every layer-1 row through one
-//! prefill call ([`L14_LAG_TOKENS`]) past it has landed, whoever read it, so
-//! layer-14 reads never queue at the device ahead of an earlier layer-1 deadline.
-//! Reads: resident rows are copied on this
-//! thread, misses go to the process-wide read reactor, so the reactor is the
-//! I/O concurrency. Completed pieces are published and stay pinned until the
-//! request's commits pass them; the look-ahead never runs further than
-//! [`AHEAD_TOKENS`] past the committed frontier or past what the cache admits.
-//! Rows a gather already reserved are pinned, not read again: whoever reserves
-//! a row first reads it, so the look-ahead and the gathers share one fetch.
+//! history: nothing is committed) in pieces aligned to the request's prefill
+//! units, reserves their rows in the layers' caches and starts the reads in
+//! the units' deadline order. Units run in pipeline order (each one layer
+//! behind the previous, a new one starting when the oldest commits), so with
+//! depth `d` the deadlines are layer 1 of the `d` units in flight, then layer
+//! 14 of the oldest, then layer 1 of the next unit, then its layer 14:
+//! layer 14 of unit `u` is read once layer 1 has landed through unit
+//! `u + d - 1` (whoever read it). The look-ahead never runs past `2 d` units
+//! beyond the committed frontier (two full prefills) or past what the cache admits.
+//! Resident rows are copied on the planner; misses go to the process-wide read
+//! reactor, which is the I/O concurrency. Pieces stay pinned until commits pass
+//! them. Whoever reserves a row first reads it, so the look-ahead, the gathers
+//! and decode share one fetch.
 use super::engram_prefetch::RowRead;
 use crate::formats::mapped_table::row_cache::{Lookup, Pins, RowClass};
 use crate::formats::mapped_table::ReadPriority;
@@ -24,20 +25,20 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 
-/// Two full prefill reserves past the committed frontier (TJ, 2026-10-30).
-pub const AHEAD_TOKENS: usize = 2 * crate::serving_capacity::prefill_waves::RESERVE_ROWS as usize;
 /// Tokens per piece: both layers' rows of a piece fit one reactor buffer per table.
 const PIECE_TOKENS: usize = 128;
 /// Layer reads (one piece, one layer) in flight at once; each holds up to one
 /// reactor buffer per table (6 of the reactor's 14 prefill buffers), leaving
 /// buffers for the gathers.
 const MAX_INFLIGHT: usize = 3;
-/// A piece's layer-14 rows wait until layer 1 has landed this far past it: one
-/// full prefill call, so a unit's layer-14 reads follow its call's layer-1 reads.
-const L14_LAG_TOKENS: u64 = crate::serving_capacity::prefill_waves::RESERVE_ROWS;
+
+/// The prefill units a request's prompt runs in: absolute end positions, in
+/// order, and the pipeline depth (units in flight at once).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnitPlan { pub ends: Vec<u64>, pub depth: usize }
 
 enum Command {
-    Start { id: u64, history: EngramHistory, tokens: Vec<Option<u32>>, committed: Arc<AtomicU64> },
+    Start { id: u64, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan, committed: Arc<AtomicU64> },
     /// A decode round's drafted rows per layer: read into the decode share now,
     /// published and left evictable for the verify gather.
     Decode([Vec<u64>; 2]),
@@ -74,6 +75,8 @@ struct Piece { end: u64, pins: [Pins; 2], reads: [Option<(RowRead, Vec<u32>)>; 2
 /// their deadline turn (then their pins and read).
 struct PlanPiece {
     end: u64,
+    /// Index of the prefill unit this piece lies in.
+    unit: usize,
     l1: Pins,
     l1_read: Option<(RowRead, Vec<u32>)>,
     l14_rows: Option<Vec<u64>>,
@@ -93,6 +96,7 @@ struct Plan {
     start: u64,
     /// Index of the next token to plan.
     next: usize,
+    units: UnitPlan,
     committed: Arc<AtomicU64>,
     /// Planned pieces, oldest first, until commits pass them.
     pieces: VecDeque<PlanPiece>,
@@ -122,11 +126,13 @@ impl EngramLookahead {
 
     /// Read ahead `tokens` (compressed ids, None for image rows) that follow
     /// `history`'s frontier. `history` is a fork: its batches are never committed.
-    pub fn start(&self, history: EngramHistory, tokens: Vec<Option<u32>>) -> LookaheadHandle {
+    /// `units` are the prompt's prefill units (absolute ends, the last at the
+    /// prompt's end) and their pipeline depth.
+    pub fn start(&self, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan) -> LookaheadHandle {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let committed = Arc::new(AtomicU64::new(history.position()));
         let end = history.position() + tokens.len() as u64;
-        let _ = self.send.send(Command::Start { id, history, tokens, committed: Arc::clone(&committed) });
+        let _ = self.send.send(Command::Start { id, history, tokens, units, committed: Arc::clone(&committed) });
         LookaheadHandle { id, end, committed, send: self.send.clone() }
     }
 }
@@ -241,9 +247,14 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
 
 fn apply(plans: &mut Vec<Plan>, command: Command) {
     match command {
-        Command::Start { id, history, tokens, committed } => {
+        Command::Start { id, history, tokens, mut units, committed } => {
             let start = history.position();
-            plans.push(Plan { id, history, tokens, start, next: 0, committed, pieces: VecDeque::new() });
+            let end = start + tokens.len() as u64;
+            // Malformed or short plans degrade to one unit through the prompt's end.
+            units.ends.retain(|&e| e > start && e < end);
+            units.ends.push(end);
+            units.depth = units.depth.max(1);
+            plans.push(Plan { id, history, tokens, start, next: 0, units, committed, pieces: VecDeque::new() });
         }
         Command::Wake | Command::Stop | Command::Decode(_) => {}
         // Dropping the plan drains its reads, then fails unread rows and unpins.
@@ -257,27 +268,31 @@ fn abandon(plan: &mut Plan, error: &anyhow::Error) {
     plan.pieces.clear();
 }
 
-/// More tokens, inside the window past the committed frontier, and cache room
-/// for a whole piece in both layers (layer 14's rows follow later).
+impl Plan {
+    /// Index of the unit holding absolute position `position`.
+    fn unit_of(&self, position: u64) -> usize { self.units.ends.partition_point(|&end| end <= position) }
+}
+
+/// More tokens, inside two full prefills (`2 d` units) past the committed
+/// frontier, and cache room for a whole piece in both layers (layer 14 follows).
 fn ready_to_plan(plan: &Plan, tables: &[Arc<EngramTable>; 2]) -> bool {
     let position = plan.start + plan.next as u64;
+    let committed = plan.committed.load(Ordering::Acquire).max(plan.start);
     plan.next < plan.tokens.len()
-        && position < plan.committed.load(Ordering::Acquire) + AHEAD_TOKENS as u64
+        && plan.unit_of(position) < plan.unit_of(committed) + 2 * plan.units.depth
         && tables.iter().all(|table| table.cache().room(RowClass::Prefill) >= 2 * PIECE_TOKENS * 24)
 }
 
-/// The oldest piece whose layer-14 rows are due: every layer-1 row through
-/// [`L14_LAG_TOKENS`] past it (or the prompt's end) has landed.
+/// The oldest piece whose layer-14 rows are due: layer 1 has landed through
+/// unit `u + d - 1` (or as far as layer-1 planning has gone when the window or
+/// the cache stops it).
 fn due_l14(plan: &Plan, tables: &[Arc<EngramTable>; 2]) -> Option<usize> {
     let index = plan.pieces.iter().position(|piece| piece.l14_rows.is_some())?;
-    let horizon = plan.pieces[index].end + L14_LAG_TOKENS;
+    let last = (plan.pieces[index].unit + plan.units.depth - 1).min(plan.units.ends.len() - 1);
+    let horizon = plan.units.ends[last];
     let planned_end = plan.start + plan.next as u64;
-    let prompt_end = plan.start + plan.tokens.len() as u64;
-    // Layer 1 stops short of the horizon at the window or the cache's room:
-    // then the layer-1 rows planned so far are the ones due first.
-    if planned_end < horizon.min(prompt_end) && ready_to_plan(plan, tables) { return None; }
-    // Pieces starting before the horizon carry the layer-1 rows that are due first.
-    plan.pieces.iter().filter(|piece| piece.end.saturating_sub(PIECE_TOKENS as u64) < horizon)
+    if planned_end < horizon && ready_to_plan(plan, tables) { return None; }
+    plan.pieces.iter().filter(|piece| piece.unit <= last)
         .all(|piece| piece.l1_read.is_none() && piece.l1.settled()).then_some(index)
 }
 
@@ -296,12 +311,16 @@ fn reserve(table: &EngramTable, rows: &[u64], class: RowClass, priority: ReadPri
 }
 
 fn start_piece(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<()> {
-    let end = (plan.next + PIECE_TOKENS).min(plan.tokens.len());
+    // Pieces never cross a unit boundary.
+    let position = plan.start + plan.next as u64;
+    let unit = plan.unit_of(position);
+    let unit_end = (plan.units.ends[unit] - plan.start) as usize;
+    let end = (plan.next + PIECE_TOKENS).min(unit_end).min(plan.tokens.len());
     let batch = plan.history.prepare(plan.history.position(), &plan.tokens[plan.next..end], PIECE_TOKENS)?;
     plan.history.commit(&batch, end - plan.next)?;
     plan.next = end;
     let (l1, l1_read) = reserve(&tables[0], &batch.prefetch_rows(0)?, RowClass::Prefill, ReadPriority::PrefillFirst)?;
-    plan.pieces.push_back(PlanPiece { end: plan.start + end as u64, l1, l1_read,
+    plan.pieces.push_back(PlanPiece { end: plan.start + end as u64, unit, l1, l1_read,
         l14_rows: Some(batch.prefetch_rows(1)?), l14: None, l14_read: None });
     Ok(())
 }
@@ -420,7 +439,8 @@ mod tests {
         let rows = [batch.prefetch_rows(0)?, batch.prefetch_rows(1)?];
         let tables = [table(0, &rows[0])?, table(1, &rows[1])?];
         let ahead = EngramLookahead::new(tables.clone())?;
-        let handle = ahead.start(history.fork()?, tokens.clone());
+        let units = || UnitPlan { ends: vec![128, 256, 300], depth: 3 };
+        let handle = ahead.start(history.fork()?, tokens.clone(), units());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while tables.iter().any(|t| t.weights().stats().snapshot().lookahead_pieces < 3) {
             assert!(std::time::Instant::now() < deadline, "look-ahead did not finish");
@@ -438,7 +458,7 @@ mod tests {
             }
         }
         // A second request over the same prompt pins the cached rows, reading none.
-        let stale = ahead.start(history.fork()?, tokens.clone());
+        let stale = ahead.start(history.fork()?, tokens.clone(), units());
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(tables[0].weights().stats().snapshot().lookahead_pieces, 3);
         // Commits past the end release every piece; the handle reports the end.
@@ -454,25 +474,48 @@ mod tests {
     }
 
     #[test]
-    fn layer_14_waits_for_layer_1_through_the_lag() -> Result<()> {
-        // A prompt longer than the lag: piece 0's layer 14 is read only after
-        // layer 1 has landed through one prefill call past it.
-        let tokens: Vec<Option<u32>> = (0..(L14_LAG_TOKENS as u32 + 512)).map(|i| Some(i % 90_000)).collect();
+    fn layer_14_of_a_unit_waits_for_layer_1_of_the_units_in_flight() -> Result<()> {
+        // Five units of 256 tokens at depth 3: unit 0's layer 14 is read only
+        // after layer 1 of units 0, 1 and 2 has landed, and before unit 3's
+        // layer 1 (whose deadline comes after unit 0 commits).
+        let tokens: Vec<Option<u32>> = (0..1280u32).map(|i| Some(i % 90_000)).collect();
         let history = EngramHistory::new(2)?;
         let mut owned = [table(0, &[])?, table(1, &[])?].map(|t| Arc::try_unwrap(t).ok().expect("sole owner"));
-        for table in &mut owned { table.set_cache_shares([AHEAD_TOKENS * 24, 1024])?; }
+        for table in &mut owned { table.set_cache_shares([2 * 3 * 256 * 24, 1024])?; }
         let tables = owned.map(Arc::new);
         let ahead = EngramLookahead::new(tables.clone())?;
-        let _handle = ahead.start(history.fork()?, tokens);
-        let rows = |layer: usize| tables[layer].weights().stats().snapshot().lookahead_rows;
+        let _handle = ahead.start(history.fork()?, tokens, UnitPlan { ends: vec![256, 512, 768, 1024, 1280], depth: 3 });
+        let snapshot = |layer: usize| tables[layer].weights().stats().snapshot();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while rows(1) == 0 {
+        while snapshot(1).lookahead_rows == 0 {
             assert!(std::time::Instant::now() < deadline, "layer 14 never started");
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        // Six layer-1 pieces (units 0-2, two pieces each) precede any layer-14 read.
+        assert!(snapshot(0).lookahead_pieces >= 6, "{}", snapshot(0).lookahead_pieces);
+        // Every unit eventually lands in both layers (the window is 2 d = 6 units).
+        while snapshot(0).lookahead_pieces < 10 || snapshot(1).lookahead_pieces < 10 {
+            assert!(std::time::Instant::now() < deadline, "look-ahead did not finish");
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        // Layer 1 had landed at least one lag's worth of tokens before any layer-14 row.
-        let lag_pieces = (L14_LAG_TOKENS as usize).div_ceil(PIECE_TOKENS) as u64;
-        assert!(tables[0].weights().stats().snapshot().lookahead_pieces >= lag_pieces);
+        Ok(())
+    }
+
+    #[test]
+    fn units_bound_the_window_to_two_full_prefills() -> Result<()> {
+        // Depth 1, units of 128: the window is 2 units past the committed one.
+        let tokens: Vec<Option<u32>> = (0..640u32).map(|i| Some(i + 9)).collect();
+        let history = EngramHistory::new(2)?;
+        let tables = [table(0, &[])?, table(1, &[])?];
+        let ahead = EngramLookahead::new(tables.clone())?;
+        let handle = ahead.start(history.fork()?, tokens, UnitPlan { ends: vec![128, 256, 384, 512, 640], depth: 1 });
+        let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while pieces() < 2 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(pieces(), 2, "two units past the frontier, no more");
+        assert!(handle.commit(128));
+        while pieces() < 3 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
         Ok(())
     }
 
@@ -508,7 +551,7 @@ mod tests {
         for table in &mut owned { table.set_cache_shares([2 * PIECE_TOKENS * 24, 64])?; }
         let tables = owned.map(Arc::new);
         let ahead = EngramLookahead::new(tables.clone())?;
-        let handle = ahead.start(history.fork()?, tokens);
+        let handle = ahead.start(history.fork()?, tokens, UnitPlan { ends: vec![128, 256], depth: 3 });
         let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while pieces() < 1 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }
