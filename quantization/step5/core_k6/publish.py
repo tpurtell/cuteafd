@@ -114,6 +114,28 @@ def _source_license_metadata(export, *, frozen=False):
     _write_diagnostic_metadata(card, corrected.encode(), frozen=frozen)
 
 
+TOKENIZER_NOTE = """
+
+## Native tokenizer
+
+Calibration used the exact bundled ByteLevel tokenizer backend and the native
+max-effort chat template. Load the tokenizer with
+`PreTrainedTokenizerFast.from_pretrained(...)` to preserve that backend.
+The upstream tokenizer configuration carries a historical Llama class label;
+family-specific AutoTokenizer conversion in some Transformers versions changes
+the backend. The original tokenizer assets are preserved byte-for-byte here.
+"""
+
+
+def _native_tokenizer_metadata(export, *, frozen=False):
+    path=export/"README.md"
+    if path.is_symlink():
+        raise ValueError("refuse symlink model card")
+    text=path.read_text()
+    if TOKENIZER_NOTE not in text:
+        _write_diagnostic_metadata(path,(text+TOKENIZER_NOTE).encode(),frozen=frozen)
+
+
 def _bundle_diagnostics(export, *, frozen=False):
     """Publish complete per-layer JSONL evidence, retaining raw records locally."""
     errors=export/"quantization-errors"
@@ -266,6 +288,7 @@ def publish(export, root, repo_id):
     export, root = export.resolve(), root.resolve()
     identity = _complete_plan(export, root, repo_id)
     _source_license_metadata(export, frozen=(root/"publication-complete.json").exists())
+    _native_tokenizer_metadata(export,frozen=(root/"publication-complete.json").exists())
     _bundle_diagnostics(export,frozen=(root/"publication-complete.json").exists())
     files = _collect_local(export, identity)
     LOCAL_HUB_CACHE.mkdir(parents=True, exist_ok=True)

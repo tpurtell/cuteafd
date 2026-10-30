@@ -305,3 +305,22 @@ def test_diagnostic_layer_outside_step5_fails_before_hub(finished,fake_hub):
     with pytest.raises(ValueError,match="unreviewed diagnostic group"):
         publication.publish(finished.export,finished.root,publication.TARGET_REPO)
     assert not fake_hub["instances"]
+
+
+def test_native_tokenizer_note_is_idempotent_and_preserves_assets(tmp_path):
+    source=b'{"tokenizer_class":"LlamaTokenizer"}'
+    (tmp_path/'tokenizer_config.json').write_bytes(source)
+    card=tmp_path/'README.md';card.write_text('# Step-5\n')
+    publication._native_tokenizer_metadata(tmp_path)
+    once=card.read_bytes()
+    assert publication.TOKENIZER_NOTE.encode() in once
+    publication._native_tokenizer_metadata(tmp_path,frozen=True)
+    assert card.read_bytes()==once
+    assert (tmp_path/'tokenizer_config.json').read_bytes()==source
+
+
+def test_published_tokenizer_metadata_cannot_be_rewritten(tmp_path):
+    card=tmp_path/'README.md';card.write_text('# Sealed card\n')
+    with pytest.raises(ValueError,match='completed diagnostic bundle differs'):
+        publication._native_tokenizer_metadata(tmp_path,frozen=True)
+    assert card.read_text()=='# Sealed card\n'
