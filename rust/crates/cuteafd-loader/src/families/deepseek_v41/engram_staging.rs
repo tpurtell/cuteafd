@@ -478,7 +478,6 @@ mod tests {
         // SAFETY: the bench owns the immutable fixture file for the table's lifetime.
         let rows = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
         let mut table = EngramTable::new_strided(rows)?;
-        let hint = std::env::var_os("ENGRAM_BENCH_HINT").is_some();
         let mut staging = EngramBatchStaging::new(tokens)?;
         let cold = std::env::var_os("ENGRAM_BENCH_COLD").is_some();
         for (label, shares) in [("row-cache hit", [2 * tokens * 24, 1024]), ("page-cache hot", [24, 1024])] {
@@ -486,23 +485,15 @@ mod tests {
             table.set_cache_shares(shares)?;
             // Warm: the page cache (and, when it fits, the row cache).
             for _ in 0..2 { staging.gather(&table, &[&batch], 0)?; }
-            if hint {
-                table.weights().enable_residency_hint();
-                let (mut at, mut scratch, started) = (0, Vec::new(), std::time::Instant::now());
-                while let Ok(swept @ 1..) = table.weights().sweep_residency(at, 1 << 20, &mut scratch) { at += swept; }
-                table.weights().trust_residency_hint();
-                println!("residency sweep: {at} pages in {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
-            }
             let mut times = Vec::new();
             let mut cold_left = 0;
             let before = table.weights().stats().snapshot();
             for _ in 0..repeats {
                 if cold {
                     // Evict the fixture's pages (including our own mapping's): every
-                    // row is a device read. The hint stays armed: the stale case.
+                    // row is a device read.
                     let left = table.weights().evict_for_test();
                     cold_left = cold_left.max(left);
-                    if hint { table.weights().trust_residency_hint(); }
                 }
                 let started = std::time::Instant::now();
                 let view = staging.gather(&table, &[&batch], 0)?;
@@ -512,12 +503,12 @@ mod tests {
             times.sort_by(f64::total_cmp);
             let mode = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() {
                 if std::env::var_os("MAPPED_BENCH_INLINE").is_some() { " (all rows via reactor, no ASYNC)" } else { " (all rows via reactor, ASYNC)" }
-            } else if hint { " (residency hint)" } else { " (mincore)" };
+            } else { " (mincore)" };
             let after = table.weights().stats().snapshot().since(&before);
             println!("engram gather {label}{}{mode}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, \
-                late faults/gather {:.0}, distrusts/gather {:.1}, pages left resident after eviction <= {cold_left}",
+                late faults/gather {:.0}, pages left resident after eviction <= {cold_left}",
                 if cold { " COLD" } else { "" }, times[times.len() / 2], times[0], times[times.len() - 1],
-                after.late_major_faults as f64 / repeats as f64, after.residency_hint_distrusts as f64 / repeats as f64);
+                after.late_major_faults as f64 / repeats as f64);
         }
         Ok(())
     }

@@ -140,8 +140,6 @@ pub struct EngramPipeline {
     warm: Option<crate::formats::mapped_warm::TableWarm>,
     /// Prompt rows read into the row caches ahead of the gathers.
     lookahead: crate::EngramLookahead,
-    /// Background residency sweep feeding the tables' residency hints.
-    _residency: super::engram_residency::ResidencySweep,
 }
 impl EngramPipeline {
     /// # Safety
@@ -191,8 +189,6 @@ impl EngramPipeline {
         }
         let tables = tables.map(Arc::new);
         let lookahead = crate::EngramLookahead::new(tables.clone())?;
-        let residency = super::engram_residency::ResidencySweep::start(tables.clone())
-            .context("starting the Engram residency sweep")?;
         Ok(Self {
             identity: Arc::new(()),
             tables,
@@ -203,7 +199,6 @@ impl EngramPipeline {
             placement, shape,
             warm: None,
             lookahead,
-            _residency: residency,
         })
     }
     pub fn placement(&self) -> &crate::formats::mapped_preload::MappedPlacement { &self.placement }
