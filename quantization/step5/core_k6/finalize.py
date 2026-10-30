@@ -16,7 +16,7 @@ if __package__ in (None, ""):
     __package__ = "step5.core_k6"
 
 from .pilot import (ARMS, CHECKS, LAYERS, LATE_LAYER, modules,
-    validate_qualification, validate_report_code)
+    producer_modules, validate_producer_proof, validate_qualification, validate_report_code)
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, sha256_file, verify_receipt
 
 
@@ -26,6 +26,86 @@ def latest_event(values, kind, **fields):
     if not selected:
         raise ValueError(f"missing measured {kind} event: {fields}")
     return selected[-1]
+
+
+def audit_producer_probe(root, proof, identity, calibration):
+    """Check assembled transaction receipts and independently compare output bytes."""
+    from safetensors.torch import load_file
+    import torch
+    from .recipe import reviewed_modules, packed_specs
+    from kimi_k3.uniform_k2.storage import read_header
+    root = Path(root).resolve()
+    validate_producer_proof(proof, identity)
+    if [(r["id"],r["tokens"]) for r in proof["records"]] != [(r["id"],len(r["input_ids"])) for r in calibration[:3]]:
+        raise ValueError("producer probe used different calibration prompts")
+    verified = {}
+    def path(relative):
+        result = root / relative
+        if result.is_symlink() or not result.resolve().is_relative_to(root):
+            raise ValueError("producer-probe receipt path escapes the pilot")
+        return result
+    def receipt(relative, value):
+        result = path(relative)
+        verify_receipt(result, value, checksum=True)
+        verified[relative] = value["sha256"]
+        return result
+    def document(relative, digest):
+        result = path(relative)
+        if sha256_file(result) != digest:
+            raise ValueError("producer-probe evidence digest differs")
+        verified[relative] = digest
+        return json.loads(result.read_text())
+    shard = receipt(proof["shard_path"], proof["shard_receipt"])
+    if document(proof["export_receipt_path"], proof["export_receipt_sha256"]) != proof["shard_receipt"]:
+        raise ValueError("producer-probe export receipt differs")
+    if proof["shard_receipt"].get("identity") != identity or proof["shard_receipt"].get("layer") != 0:
+        raise ValueError("producer-probe shard identity differs")
+    header, _ = read_header(shard)
+    selection = reviewed_modules()
+    for name in producer_modules():
+        item = proof["modules"][name]
+        geometry = selection[name]
+        if item["bits"] != 6 or item["logical_shape"] != [geometry["out_features"],geometry["in_features"]]:
+            raise ValueError("producer-probe module geometry differs")
+        for key,(dtype,shape) in packed_specs(name,geometry).items():
+            if key not in header or (header[key]["dtype"],header[key]["shape"]) != (dtype,shape):
+                raise ValueError("producer-probe assembled projection geometry differs")
+        observed = document(item["evidence_path"], item["evidence_sha256"])
+        metrics, evidence = observed.get("metrics", {}), observed.get("evidence", {})
+        if (observed.get("module") != name or observed.get("bits") != 6
+                or observed.get("logical_shape") != item["logical_shape"]
+                or evidence.get("hessian_rows") != proof["tokens"] or evidence.get("identity_rows") != 0
+                or metrics.get("hessian_sample_count") != proof["tokens"]
+                or metrics.get("quantizer_path") != "hessian_ldlq" or metrics.get("hessian_metric_status") != "ok"):
+            raise ValueError("producer-probe calibrated projection evidence differs")
+    frontier = document(proof["frontier_path"],proof["frontier_sha256"])
+    if (frontier.get("identity") != identity or frontier.get("layer") != 0
+            or frontier.get("manifest", {}).get("identity") != identity
+            or frontier["manifest"].get("layer") != 0 or len(frontier["manifest"].get("batches", [])) != 3):
+        raise ValueError("producer-probe frontier commitment differs")
+    for record, entry in zip(proof["records"],frontier["manifest"]["batches"],strict=True):
+        if entry != record["output_receipt"] or (entry.get("id"),entry.get("tokens")) != (record["id"],record["tokens"]):
+            raise ValueError("producer-probe output receipt differs from frontier")
+        output = load_file(str(receipt(record["output_path"],record["output_receipt"])))
+        reference = load_file(str(receipt(record["reference_path"],record["reference_receipt"])))
+        if (set(output) != set(reference) or "hidden" not in output
+                or any(not torch.equal(output[key],reference[key]) for key in output)):
+            raise ValueError("producer-probe committed and independent native output bytes differ")
+    run_root = root / "producer-probe/run"
+    if ((run_root / "frontier/layer--01").exists()
+            or any((run_root / "layers/000/stages").rglob("*"))
+            or any((run_root / "layers/000/projections").glob("*.safetensors"))
+            or (run_root / "layers/000/routes").exists()):
+        raise ValueError("producer probe retained obsolete recovery payloads")
+    events_path = run_root / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    verified[str(events_path.relative_to(root))] = sha256_file(events_path)
+    for phase in ("a","c","d","e","f"):
+        latest_event(events,"phase_committed",phase=phase)
+    for name in producer_modules():
+        latest_event(events,"projection_committed",module=name,bits=6,hessian_rows=proof["tokens"])
+    latest_event(events,"layer_committed",layer=0,payload_bytes=proof["shard_receipt"]["payload_bytes"])
+    return verified
 
 
 def audit_evidence(root, report=None):
@@ -176,10 +256,19 @@ def audit_evidence(root, report=None):
             raise ValueError("pilot MTP candidate recovery receipt differs")
         verified[str(sidecar.relative_to(root))] = sha256_file(sidecar)
         candidate_count += 1
+    producer_path = root / "producer-proof.json"
+    producer = json.loads(producer_path.read_text())
+    if producer != report.get("producer"):
+        raise ValueError("pilot producer proof differs from qualification")
+    verified["producer-proof.json"] = sha256_file(producer_path)
+    verified.update(audit_producer_probe(root,producer,identity,selected["calibration"]))
+    one(measured,"production_layer_transaction_exact",layer=0,modules=7,prompts=3,tokens=producer["tokens"],
+        initial_frontier_retired=True,stages_retired=True,projection_payloads_retired=True)
     audit = dict(status="passed", identity=identity, native_checks=dict.fromkeys(CHECKS, True),
         sparse_scope=report["sparse_scope"],
         verified_files=verified, candidate_payloads=candidate_count, hessians=hessian_count,
         metric_rows=len(report["results"]), finalization="CPU-only-receipt-and-event-audit-no-numerical-rerun",
+        producer_projection_count=7, producer_prompt_count=3,
         time=datetime.now(timezone.utc).isoformat())
     atomic_json(root / "finalization-audit.json", audit)
     return audit
@@ -203,6 +292,18 @@ def retire_intermediates(root):
     for path in (root / "candidates").glob("*.safetensors"):
         if path.is_symlink():
             raise ValueError("refuse symlink candidate retirement")
+        path.unlink()
+        removed.append(str(path.relative_to(root)))
+    for relative in ("producer-probe/run/frontier","producer-probe/reference"):
+        path = root / relative
+        if path.is_symlink():
+            raise ValueError("refuse symlink producer-probe retirement")
+        if path.exists():
+            shutil.rmtree(path)
+            removed.append(relative)
+    for path in (root / "producer-probe/export").glob("*.safetensors"):
+        if path.is_symlink():
+            raise ValueError("refuse symlink producer-probe export retirement")
         path.unlink()
         removed.append(str(path.relative_to(root)))
     atomic_json(root / "recovery-retired.json", dict(status="passed", identity=report["identity"],

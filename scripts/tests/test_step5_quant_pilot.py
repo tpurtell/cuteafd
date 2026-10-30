@@ -18,6 +18,14 @@ def record(name, length):
     return dict(id=name, input_ids=list(range(length)))
 
 
+def complete_producer_proof(identity=None):
+    return dict(schema="cuteafd-step5-production-plumbing-probe-v1", identity=identity,
+        driver="step5.core_k6.run.Engine", layer=0, byte_exact=True,
+        initial_frontier_retired=True, stages_retired=True, projection_payloads_retired=True,
+        modules={name:dict(bits=6,logical_shape=[2,2]) for name in pilot.producer_modules()},
+        records=[dict(id=f"row{i}",tokens=2,byte_exact=True) for i in range(3)],tokens=6)
+
+
 def complete_report():
     rows = []
     for layer in (*pilot.LAYERS, pilot.LATE_LAYER):
@@ -28,7 +36,7 @@ def complete_report():
                     source_dtype="torch.float32" if name.endswith("sparse_indexer_w") else "torch.bfloat16",
                     native_effective_dtype="torch.bfloat16", reference_basis="native-effective-projection-weight"))
     return dict(status="passed", native_checks=dict.fromkeys(pilot.CHECKS, True), results=rows,
-        head_measured=False, full_model_quality_measured=False,
+        head_measured=False, full_model_quality_measured=False, producer=complete_producer_proof(),
         sparse_scope=dict(panel_modified=False, native_csa_indexer_measured=True,
             global_topk_pruning_measured=False, maximum_pilot_prompt_tokens=1050,
             pruning_requires_prompt_tokens=4105))
@@ -179,6 +187,7 @@ def test_pilot_retirement_refuses_symlink_before_removing_external_data(tmp_path
     import json
     report = complete_report()
     report["identity"] = {"captured": "same"}
+    report["producer"]["identity"] = report["identity"]
     (tmp_path / "qualification.json").write_text(json.dumps(report))
     (tmp_path / "finalization-audit.json").write_text(json.dumps(dict(status="passed", identity=report["identity"])))
     external = tmp_path / "keep"
@@ -278,3 +287,125 @@ def test_retry_event_lookup_keeps_append_only_history_and_uses_latest_success():
     assert events == before
     with pytest.raises(ValueError, match="missing measured"):
         latest_event(events,"layer_committed",layer=7)
+
+
+def producer_fixture(root, monkeypatch, *, different_reference=False):
+    """Small real safetensors/receipt fixture for the CPU finalization audit."""
+    import json
+    import torch
+    from types import ModuleType
+    from kimi_k3.uniform_k2.storage import atomic_json,commit_safetensors,sha256_file
+    identity = {"probe":"fixed-production-identity"}
+    proof = complete_producer_proof(identity)
+    records = [record(f"row{i}",2) for i in range(3)]
+    recipe = ModuleType("step5.core_k6.recipe")
+    selection = {name:dict(bits=6,in_features=2,out_features=2) for name in pilot.producer_modules()}
+    recipe.reviewed_modules = lambda: selection
+    def specs(name, geometry):
+        return {name+".trellis":("I16",[2,2]),name+".suh":("F16",[2]),
+                name+".svh":("F16",[2]),name+".mcg":("I32",[])}
+    recipe.packed_specs = specs
+    monkeypatch.setitem(sys.modules,"step5.core_k6.recipe",recipe)
+    tensors = {}
+    for name in pilot.producer_modules():
+        tensors.update({name+".trellis":torch.zeros((2,2),dtype=torch.int16),
+            name+".suh":torch.ones(2,dtype=torch.float16),name+".svh":torch.ones(2,dtype=torch.float16),
+            name+".mcg":torch.tensor(-878961171,dtype=torch.int32)})
+        relative="producer-probe/run/evidence/layer-000/"+name+".json"
+        value=dict(module=name,bits=6,logical_shape=[2,2],evidence=dict(hessian_rows=6,identity_rows=0),
+            metrics=dict(hessian_sample_count=6,quantizer_path="hessian_ldlq",hessian_metric_status="ok"))
+        atomic_json(root/relative,value)
+        proof["modules"][name].update(evidence_path=relative,evidence_sha256=sha256_file(root/relative))
+    shard="producer-probe/export/model-00001-of-00096.safetensors"
+    receipt=commit_safetensors(root/shard,tensors)
+    receipt.update(identity=identity,layer=0,filename=Path(shard).name,payload_bytes=sum(t.numel()*t.element_size() for t in tensors.values()))
+    proof.update(shard_path=shard,shard_receipt=receipt,export_receipt_path="producer-probe/export/layer-000-receipt.json")
+    atomic_json(root/proof["export_receipt_path"],receipt)
+    proof["export_receipt_sha256"]=sha256_file(root/proof["export_receipt_path"])
+    batches=[]
+    for i,r in enumerate(proof["records"]):
+        output=f"producer-probe/run/frontier/layer-000/batch-{i:05d}.safetensors"
+        reference=f"producer-probe/reference/batch-{i:05d}.safetensors"
+        hidden=torch.ones((2,2),dtype=torch.float32)*i
+        output_receipt=dict(filename=Path(output).name,id=r["id"],tokens=2,
+            **commit_safetensors(root/output,dict(hidden=hidden)))
+        reference_hidden=hidden+1 if different_reference and i==1 else hidden.clone()
+        reference_receipt=commit_safetensors(root/reference,dict(hidden=reference_hidden))
+        r.update(output_path=output,output_receipt=output_receipt,reference_path=reference,reference_receipt=reference_receipt)
+        batches.append(output_receipt)
+    frontier=dict(layer=0,identity=identity,directory="layer-000",manifest=dict(layer=0,identity=identity,batches=batches))
+    proof["frontier_path"]="producer-probe/frontier-proof.json"
+    atomic_json(root/proof["frontier_path"],frontier)
+    proof["frontier_sha256"]=sha256_file(root/proof["frontier_path"])
+    events=[dict(event="phase_committed",phase=p) for p in ("a","c","d","e","f")]
+    events.extend(dict(event="projection_committed",module=n,bits=6,hessian_rows=6) for n in pilot.producer_modules())
+    events.append(dict(event="layer_committed",layer=0,payload_bytes=receipt["payload_bytes"]))
+    (root/"producer-probe/run/events.jsonl").write_text("".join(json.dumps(r)+"\n" for r in events))
+    return proof,identity,records
+
+
+def test_producer_probe_checks_full_transaction_receipts_and_all_three_outputs(tmp_path,monkeypatch):
+    from step5.core_k6.finalize import audit_producer_probe
+    proof,identity,records=producer_fixture(tmp_path,monkeypatch)
+    verified=audit_producer_probe(tmp_path,proof,identity,records)
+    assert len(proof["modules"])==7 and len(proof["records"])==3
+    assert proof["shard_path"] in verified
+    assert all(r["output_path"] in verified and r["reference_path"] in verified for r in proof["records"])
+    assert len(complete_report()["results"])==105  # Format inventory stays unchanged.
+
+
+def test_producer_probe_does_not_accept_different_native_replay_outputs(tmp_path,monkeypatch):
+    from step5.core_k6.finalize import audit_producer_probe
+    proof,identity,records=producer_fixture(tmp_path,monkeypatch,different_reference=True)
+    with pytest.raises(ValueError,match="native output bytes differ"):
+        audit_producer_probe(tmp_path,proof,identity,records)
+
+
+def test_producer_probe_rejects_retained_recovery_and_corrupt_shard(tmp_path,monkeypatch):
+    from step5.core_k6.finalize import audit_producer_probe
+    proof,identity,records=producer_fixture(tmp_path,monkeypatch)
+    old=tmp_path/"producer-probe/run/frontier/layer--01"
+    old.mkdir()
+    with pytest.raises(ValueError,match="obsolete recovery"):
+        audit_producer_probe(tmp_path,proof,identity,records)
+    old.rmdir()
+    with (tmp_path/proof["shard_path"]).open("ab") as f:
+        f.write(b"corrupt")
+    with pytest.raises(ValueError,match="committed file changed"):
+        audit_producer_probe(tmp_path,proof,identity,records)
+
+
+def test_producer_probe_retirement_keeps_scalar_evidence_and_removes_payloads(tmp_path,monkeypatch):
+    import json
+    from step5.core_k6 import finalize
+    proof,identity,_=producer_fixture(tmp_path,monkeypatch)
+    report=complete_report()
+    report.update(identity=identity,producer=proof)
+    (tmp_path/"qualification.json").write_text(json.dumps(report))
+    (tmp_path/"finalization-audit.json").write_text(json.dumps(dict(status="passed",identity=identity)))
+    monkeypatch.setattr(finalize,"validate_report_code",lambda report:report)
+    finalize.retire_intermediates(tmp_path)
+    assert not (tmp_path/proof["shard_path"]).exists()
+    assert not (tmp_path/"producer-probe/run/frontier").exists()
+    assert not (tmp_path/"producer-probe/reference").exists()
+    assert (tmp_path/proof["frontier_path"]).is_file()
+    assert all((tmp_path/m["evidence_path"]).is_file() for m in proof["modules"].values())
+    assert (tmp_path/proof["export_receipt_path"]).is_file()
+
+
+@pytest.mark.parametrize("field",["initial_frontier_retired","stages_retired","projection_payloads_retired","byte_exact"])
+def test_producer_probe_cannot_pass_incomplete_transaction(field):
+    report=complete_report()
+    report["producer"][field]=False
+    with pytest.raises(ValueError,match="production-plumbing qualification"):
+        pilot.validate_qualification(report)
+
+
+def test_final_completion_status_does_not_mutate_audited_event_bytes(tmp_path):
+    import json
+    path=tmp_path/"events.jsonl"
+    path.write_text('{"event":"audited"}\n')
+    before=path.read_bytes()
+    pilot.progress(tmp_path,"complete",append_event=False,results=105)
+    assert path.read_bytes()==before
+    assert json.loads((tmp_path/"status.json").read_text())["event"]=="complete"

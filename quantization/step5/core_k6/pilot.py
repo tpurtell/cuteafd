@@ -39,11 +39,18 @@ PREFIX = "model."
 SCHEMA = "cuteafd-step5-short-pilot-v1"
 CHECKS = ("sliding_boundary_byte_exact", "sparse_boundary_byte_exact",
           "serialized_projection_replay", "mtp_three_stage_alignment_byte_exact",
-          "mtp_serialized_k4_byte_exact")
+          "mtp_serialized_k4_byte_exact", "production_layer_transaction_byte_exact")
 LATE_LAYER = 88
 LATE_EXPERT = 0
 WITNESS_NAME = "model.layers.7.share_expert.gate_proj"
 GIB = 1024**3
+
+
+def producer_modules():
+    """The complete seven-projection dense layer used by the production probe."""
+    return ["model.layers.0." + name for name in (
+        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+        "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")]
 
 
 def modules(layer):
@@ -167,7 +174,7 @@ def compact():
     torch.cuda.empty_cache()
 
 
-def progress(root, event, **fields):
+def progress(root, event, *, append_event=True, **fields):
     import psutil
     import torch
     root = Path(root)
@@ -176,8 +183,9 @@ def progress(root, event, **fields):
         rss_gib=psutil.Process().memory_info().rss/GIB,
         cuda_gib=torch.cuda.memory_allocated()/GIB, gpu_peak_gib=torch.cuda.max_memory_allocated()/GIB,
         free_gib=shutil.disk_usage(root).free/GIB, **fields)
-    with (root / "events.jsonl").open("a") as f:
-        f.write(canonical(row) + "\n")
+    if append_event:
+        with (root / "events.jsonl").open("a") as f:
+            f.write(canonical(row) + "\n")
     atomic_json(root / "status.json", row)
     print(canonical(row), flush=True)
     if row["rss_gib"] > 78 or row["cuda_gib"] > 86 or row["free_gib"] < 64:
@@ -583,6 +591,126 @@ def qualify_mtp(source, numerical, root, identity, row):
     return proof
 
 
+def validate_producer_proof(proof, identity=None):
+    if (proof.get("schema") != "cuteafd-step5-production-plumbing-probe-v1"
+            or proof.get("driver") != "step5.core_k6.run.Engine" or proof.get("layer") != 0
+            or proof.get("byte_exact") is not True or proof.get("initial_frontier_retired") is not True
+            or proof.get("stages_retired") is not True or proof.get("projection_payloads_retired") is not True
+            or set(proof.get("modules", {})) != set(producer_modules())
+            or len(proof.get("records", [])) != 3 or len({r["id"] for r in proof["records"]}) != 3
+            or any(r.get("byte_exact") is not True or r.get("tokens", 0) <= 0 for r in proof["records"])
+            or proof.get("tokens") != sum(r["tokens"] for r in proof["records"])):
+        raise ValueError("Step-5 production-plumbing qualification is incomplete")
+    if identity is not None and proof.get("identity") != identity:
+        raise ValueError("Step-5 production-plumbing identity differs")
+    return proof
+
+
+def qualify_producer(source, numerical, root, identity, records):
+    """Run one actual producer transaction, then replay its assembled K6 shard.
+
+    This uses the production Engine, stores, assembly and frontier retirement.
+    It is separate from the fixed format table; no arm or metric row is added.
+    """
+    import torch
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+    from . import run as producer
+    from .recipe import reviewed_modules
+    proof_path = root / "producer-proof.json"
+    if proof_path.exists():
+        return validate_producer_proof(json.loads(proof_path.read_text()), identity)
+    records = records[:3]
+    if len(records) != 3:
+        raise ValueError("production-plumbing probe needs three whole pilot calibration prompts")
+    probe = root / "producer-probe"
+    run_root, export = probe / "run", probe / "export"
+    reviewed = reviewed_modules()
+    selection = {name:reviewed[name] for name in producer_modules()}
+    del reviewed
+    progress_tracker = producer.Progress(run_root)
+    progress_tracker.state["total_projections"] = len(selection)
+    engine = producer.Engine(source, records, run_root, export, identity, selection,
+        progress_tracker, numerical=numerical, device="cuda:0")
+    current = engine.initial()
+    initial_directory = engine.boundary.directory(-1)
+    if current["layer"] == -1:
+        current = engine.layer(0, current)
+    if current["layer"] != 0 or initial_directory.exists():
+        raise ValueError("producer probe did not commit layer0 and retire the input frontier")
+    stages = run_root / "layers/000/stages"
+    projections = run_root / "layers/000/projections"
+    if (any(stages.rglob("*")) or any(projections.glob("*.safetensors"))
+            or (run_root / "layers/000/routes").exists()):
+        raise ValueError("producer probe retained obsolete layer recovery payloads")
+    export_receipt_path = export / "layer-000-receipt.json"
+    export_receipt = json.loads(export_receipt_path.read_text())
+    if export_receipt["identity"] != identity or export_receipt.get("layer") != 0:
+        raise ValueError("producer probe assembled shard identity differs")
+    shard = export / export_receipt["filename"]
+    verify_receipt(shard, export_receipt, checksum=True)
+    block = source.load_block(0, "cuda:0", include_experts=False)
+    module_proofs = {}
+    try:
+        with safe_open(str(shard), framework="pt", device="cpu") as reader:
+            for name, geometry in selection.items():
+                packed = {part:reader.get_tensor(name + "." + part) for part in ("trellis", "suh", "svh", "mcg")}
+                linear = numerical.module(block, name.removeprefix("model.layers.0."))
+                shape = [geometry["out_features"], geometry["in_features"]]
+                if list(linear.weight.shape) != shape or numerical.validate_projection(packed, shape)["bits"] != 6:
+                    raise ValueError("producer probe assembled K6 projection differs")
+                linear.weight.copy_(numerical.reconstruct_projection(packed, shape, device="cuda:0", dtype=linear.weight.dtype))
+                evidence = run_root / "evidence/layer-000" / (name + ".json")
+                module_proofs[name] = dict(bits=6, logical_shape=shape,
+                    evidence_path=str(evidence.relative_to(root)), evidence_sha256=sha256_file(evidence))
+                del packed
+        numerical.invalidate_attention(block)
+        embedding = source.tensor("model.embed_tokens.weight", "cuda:0")
+        source.close()
+        comparisons = []
+        for index, row in enumerate(records):
+            entry = current["manifest"]["batches"][index]
+            output = engine.boundary.root / current["directory"] / entry["filename"]
+            verify_receipt(output, entry, checksum=True)
+            committed = load_file(str(output), device="cuda:0")
+            ids = torch.tensor(row["input_ids"], dtype=torch.int64, device="cuda:0")
+            expected = numerical.native_forward(block, dict(hidden=embedding[ids].float(),
+                position_ids=torch.arange(len(ids), device="cuda:0")))
+            if (set(committed) - {"hidden", "position_ids"}
+                    or not torch.equal(committed["hidden"], expected["hidden"])
+                    or ("position_ids" in committed and not torch.equal(committed["position_ids"], expected["position_ids"]))):
+                raise ValueError("production transaction output differs from assembled-shard native replay")
+            reference = probe / "reference" / f"batch-{index:05d}.safetensors"
+            if reference.is_symlink():
+                raise ValueError("refuse symlink producer-probe activation")
+            reference.unlink(missing_ok=True)  # A proof interrupted before its final commitment.
+            reference_receipt = commit_safetensors(reference, {key:expected[key] for key in committed})
+            comparisons.append(dict(id=row["id"], tokens=len(ids), byte_exact=True,
+                output_path=str(output.relative_to(root)), output_receipt=entry,
+                reference_path=str(reference.relative_to(root)), reference_receipt=reference_receipt))
+            del ids, committed, expected
+        frontier_copy = probe / "frontier-proof.json"
+        atomic_json(frontier_copy, current)
+        proof = dict(schema="cuteafd-step5-production-plumbing-probe-v1", identity=identity,
+            driver="step5.core_k6.run.Engine", layer=0, byte_exact=True,
+            records=comparisons, tokens=sum(len(r["input_ids"]) for r in records), modules=module_proofs,
+            shard_path=str(shard.relative_to(root)), shard_receipt=export_receipt,
+            export_receipt_path=str(export_receipt_path.relative_to(root)),
+            export_receipt_sha256=sha256_file(export_receipt_path),
+            frontier_path=str(frontier_copy.relative_to(root)), frontier_sha256=sha256_file(frontier_copy),
+            initial_frontier_retired=True, stages_retired=True, projection_payloads_retired=True)
+        validate_producer_proof(proof, identity)
+        atomic_json(proof_path, proof)
+        progress(root, "production_layer_transaction_exact", layer=0, modules=7,
+            prompts=3, tokens=proof["tokens"], initial_frontier_retired=True,
+            stages_retired=True, projection_payloads_retired=True)
+        return proof
+    finally:
+        del block
+        source.close()
+        compact()
+
+
 def validate_qualification(report):
     if (report.get("status") != "passed" or set(report.get("native_checks", {})) != set(CHECKS)
             or any(value is not True for value in report["native_checks"].values())):
@@ -607,6 +735,7 @@ def validate_qualification(report):
             raise ValueError("Step-5 pilot causal witness label differs")
     if report.get("full_model_quality_measured") is not False or report.get("head_measured") is not False:
         raise ValueError("short Step-5 pilot cannot claim full-model/head quality")
+    validate_producer_proof(report.get("producer", {}), report.get("identity"))
     scope = report.get("sparse_scope")
     if (not isinstance(scope, dict) or scope.get("panel_modified") is not False
             or scope.get("native_csa_indexer_measured") is not True
@@ -633,6 +762,11 @@ def validate_report_code(report, repo=REPO):
 def make_identity(source, tokens, calibration, heldout, witness, reviewed):
     relatives = ["quantization/step5/core_k6/pilot.py", "quantization/step5/core_k6/recipe.py",
         "quantization/step5/core_k6/run.py", "quantization/step5/core_k6/finalize.py",
+        "quantization/step5/core_k6/storage.py", "quantization/step5/core_k6/export.py",
+        "quantization/glm5_flash/core_k6/run.py", "quantization/glm5_flash/core_k6/storage.py",
+        "quantization/glm5/core_k6/storage.py", "quantization/glm5/core_k6/recipe.py",
+        "quantization/kimi_k3/core_k6/storage.py", "quantization/kimi_k3/core_k6/run.py",
+        "quantization/kimi_k3/uniform_k2/storage.py",
         "quantization/step5/prepare_corpus.py", "quantization/kimi_k3/prepare_corpus.py",
         "quantization/glm5/core_k6/pilot.py", "quantization/kimi_k3/core_k6/pilot.py",
         "third_party/gptqmodel/gptqmodel/utils/step5_core.py",
@@ -712,7 +846,9 @@ def main(argv=None):
         checks = qualify_serialized_replay(source, numerical, root, identity)
         mtp = qualify_mtp(source, numerical, root, identity, calibration[0])
         checks.update(mtp_three_stage_alignment_byte_exact=True, mtp_serialized_k4_byte_exact=True)
-        report = dict(status="passed", identity=identity, native_checks=checks, results=rows, mtp=mtp,
+        producer_proof = qualify_producer(source, numerical, root, identity, calibration)
+        checks["production_layer_transaction_byte_exact"] = True
+        report = dict(status="passed", identity=identity, native_checks=checks, results=rows, mtp=mtp, producer=producer_proof,
             decision_policy=decision_policy(), head_measured=False, full_model_quality_measured=False,
             sparse_scope=dict(panel_modified=False, native_csa_indexer_measured=True,
                 global_topk_pruning_measured=identity["maximum_pilot_prompt_tokens"] > 4104,
@@ -727,7 +863,8 @@ def main(argv=None):
         from .finalize import audit_evidence, retire_intermediates
         audit_evidence(root, report)
         retire_intermediates(root)
-        progress(root, "complete", results=len(rows), elapsed_seconds=report["elapsed_seconds"])
+        # Keep the audit's event-log digest valid after recovery retirement.
+        progress(root, "complete", append_event=False, results=len(rows), elapsed_seconds=report["elapsed_seconds"])
     source.close()
 
 
