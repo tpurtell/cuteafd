@@ -231,14 +231,16 @@ impl<'a> Requests<'a> {
         self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
         Ok(())
     }
-    /// Fetch a decode round's proposed rows (anchor + drafts per request, before
-    /// trimming) into the Engram row caches the moment the drafter emits them.
+    /// Fetch a decode round's rows into the Engram row caches as early as they
+    /// are known: the anchors as the round starts (overlapping the draft phase),
+    /// then anchor + drafts the moment the drafter returns (before trimming);
+    /// rows already cached or in flight are not read again.
     /// Advisory: the verify gather reads whatever has not landed.
     pub fn prefetch_drafts(&self, proposals: &[(CacheLease, &[u32])]) {
         // Image requests keep their masks at gather time; drafts never carry images,
         // but a request's own image history is resolved there, not here.
         if self.image_requests > 0 { return; }
-        let inputs: Result<Vec<_>> = proposals.iter().filter(|(_, tokens)| tokens.len() > 1)
+        let inputs: Result<Vec<_>> = proposals.iter().filter(|(_, tokens)| !tokens.is_empty())
             .map(|&(lease, tokens)| Ok((&self.request(lease)?.history, tokens))).collect();
         if let Err(error) = inputs.and_then(|inputs| self.pipeline.prefetch_drafts(&inputs)) {
             tracing::debug!(%error, "Engram draft look-ahead skipped");

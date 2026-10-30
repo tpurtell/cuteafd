@@ -97,6 +97,13 @@ struct Plan {
     /// (while it waited for its prefill).
     rows: [u64; 2],
     waiting_rows: [u64; 2],
+    /// Per layer: distinct rows of the pieces planned, rows already cached when
+    /// the look-ahead reached them, and rows another reader was already filling.
+    needed: [u64; 2],
+    cached: [u64; 2],
+    joined: [u64; 2],
+    /// Layer-14 rows of pieces committed before their turn (the gathers read them).
+    l14_skipped: u64,
     history: EngramHistory,
     tokens: Vec<Option<u32>>,
     /// Absolute position of `tokens[0]`.
@@ -196,7 +203,12 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
             let committed = plan.committed.load(Ordering::Acquire);
             // Committed pieces release their rows; unread layer-14 rows are no longer needed.
             while plan.pieces.front().is_some_and(|piece| piece.end <= committed && piece.reading() == 0) {
-                plan.pieces.pop_front();
+                let piece = plan.pieces.pop_front().expect("checked front");
+                if let Some(mut rows) = piece.l14_rows {
+                    rows.sort_unstable();
+                    rows.dedup();
+                    plan.l14_skipped += rows.len() as u64;
+                }
             }
             match poll(plan, &tables) {
                 Ok(landed) => progressed |= landed,
@@ -207,17 +219,18 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
         // Layer-14 reads that are due go first: their deadline is earlier than
         // any layer-1 piece the cursor has not started.
         while reading(&plans) < MAX_INFLIGHT {
+            // `plans` is in admission order, so this is the earliest due layer-14 piece.
             let Some((plan, index)) = plans.iter_mut().find_map(|plan| due_l14(plan, &tables).map(|index| (plan, index)))
                 else { break };
             if let Err(error) = start_l14(plan, index, &tables) { abandon(plan, &error); }
             progressed = true;
         }
         if reading(&plans) < MAX_INFLIGHT {
-            // Deadline order across requests: fewest units ahead of its committed
-            // unit first, then admission order (queue order is execution order).
+            // Global deadline order: requests prefill one after another in
+            // admission order (queue order is execution order), each unit by unit,
+            // so the earliest-admitted request with room in its window goes first.
             if let Some(plan) = plans.iter_mut().filter(|plan| ready_to_plan(plan, &tables))
-                .min_by_key(|plan| (plan.unit_of(plan.start + plan.next as u64)
-                    - plan.unit_of(plan.committed.load(Ordering::Acquire).max(plan.start)), plan.id)) {
+                .min_by_key(|plan| plan.id) {
                 match start_piece(plan, &tables) {
                     Ok(()) => progressed = true,
                     Err(error) => abandon(plan, &error),
@@ -269,6 +282,7 @@ fn apply(plans: &mut Vec<Plan>, command: Command) {
             units.ends.push(end);
             units.depth = units.depth.max(1);
             plans.push(Plan { id, tag, admitted: std::time::Instant::now(), rows: [0; 2], waiting_rows: [0; 2],
+                needed: [0; 2], cached: [0; 2], joined: [0; 2], l14_skipped: 0,
                 history, tokens, start, next: 0, units, committed, pieces: VecDeque::new() });
         }
         Command::Wake | Command::Stop | Command::Decode(_) => {}
@@ -311,18 +325,25 @@ fn due_l14(plan: &Plan, tables: &[Arc<EngramTable>; 2]) -> Option<usize> {
         .all(|piece| piece.l1_read.is_none() && piece.l1.settled()).then_some(index)
 }
 
+/// Pin `rows` and start reading the ones nobody holds. Also returns (distinct
+/// rows, already cached, being filled by another reader).
 fn reserve(table: &EngramTable, rows: &[u64], class: RowClass, priority: ReadPriority)
-    -> Result<(Pins, Option<(RowRead, Vec<u32>)>)> {
+    -> Result<(Pins, Option<(RowRead, Vec<u32>)>, [u64; 3])> {
     let mut rows = rows.to_vec();
     rows.sort_unstable();
     rows.dedup();
     let (held, lookups) = table.cache().acquire(&rows, class);
-    let (mut ids, mut slots) = (Vec::new(), Vec::new());
+    let (mut ids, mut slots, mut counts) = (Vec::new(), Vec::new(), [rows.len() as u64, 0, 0]);
     for (lookup, &row) in lookups.iter().zip(&rows) {
-        if let Lookup::Fill(slot) = *lookup { ids.push(row); slots.push(slot); }
+        match *lookup {
+            Lookup::Fill(slot) => { ids.push(row); slots.push(slot); }
+            Lookup::Ready(_) => counts[1] += 1,
+            Lookup::Wait(_) => counts[2] += 1,
+            Lookup::Uncached => {}
+        }
     }
     let read = if ids.is_empty() { None } else { Some((table.start_read(&ids, priority)?, slots)) };
-    Ok((held, read))
+    Ok((held, read, counts))
 }
 
 fn start_piece(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<()> {
@@ -334,16 +355,18 @@ fn start_piece(plan: &mut Plan, tables: &[Arc<EngramTable>; 2]) -> Result<()> {
     let batch = plan.history.prepare(plan.history.position(), &plan.tokens[plan.next..end], PIECE_TOKENS)?;
     plan.history.commit(&batch, end - plan.next)?;
     plan.next = end;
-    let (l1, l1_read) = reserve(&tables[0], &batch.prefetch_rows(0)?, RowClass::Prefill, ReadPriority::PrefillFirst)?;
+    let (l1, l1_read, counts) = reserve(&tables[0], &batch.prefetch_rows(0)?, RowClass::Prefill, ReadPriority::PrefillFirst)?;
+    plan.tally(0, counts);
     plan.pieces.push_back(PlanPiece { end: plan.start + end as u64, unit, l1, l1_read,
         l14_rows: Some(batch.prefetch_rows(1)?), l14: None, l14_read: None });
     Ok(())
 }
 
 fn start_l14(plan: &mut Plan, index: usize, tables: &[Arc<EngramTable>; 2]) -> Result<()> {
+    let rows = plan.pieces[index].l14_rows.take().expect("due layer-14 rows");
+    let (pins, read, counts) = reserve(&tables[1], &rows, RowClass::Prefill, ReadPriority::Prefill)?;
+    plan.tally(1, counts);
     let piece = &mut plan.pieces[index];
-    let rows = piece.l14_rows.take().expect("due layer-14 rows");
-    let (pins, read) = reserve(&tables[1], &rows, RowClass::Prefill, ReadPriority::Prefill)?;
     piece.l14 = Some(pins);
     piece.l14_read = read;
     Ok(())
@@ -416,6 +439,11 @@ fn publish_read(pins: &mut Pins, (read, slots): (RowRead, Vec<u32>), table: &Eng
 }
 
 impl Plan {
+    fn tally(&mut self, layer: usize, [distinct, cached, joined]: [u64; 3]) {
+        self.needed[layer] += distinct;
+        self.cached[layer] += cached;
+        self.joined[layer] += joined;
+    }
     fn count(&mut self, layer: usize, rows: u64) {
         self.rows[layer] += rows;
         if self.committed.load(Ordering::Acquire) <= self.start { self.waiting_rows[layer] += rows; }
@@ -424,9 +452,17 @@ impl Plan {
 
 impl Drop for Plan {
     fn drop(&mut self) {
+        // Per layer: rows of the pieces it planned (distinct per piece), of those
+        // already cached, already being filled by another reader (a gather or an
+        // earlier request), read by the look-ahead (and before the first commit);
+        // tokens it never reached (the prompt ended or the request was released first).
+        let unplanned = self.tokens.len() - self.next;
         tracing::info!(request_id = self.tag, prompt_tokens = self.tokens.len(),
-            units = self.units.ends.len(), l1_rows = self.rows[0], l14_rows = self.rows[1],
-            l1_rows_waiting = self.waiting_rows[0], l14_rows_waiting = self.waiting_rows[1],
+            units = self.units.ends.len(), unplanned_tokens = unplanned,
+            l1_needed = self.needed[0], l1_cached = self.cached[0], l1_joined = self.joined[0],
+            l1_read = self.rows[0], l1_read_waiting = self.waiting_rows[0],
+            l14_needed = self.needed[1], l14_cached = self.cached[1], l14_joined = self.joined[1],
+            l14_read = self.rows[1], l14_read_waiting = self.waiting_rows[1], l14_skipped = self.l14_skipped,
             lifetime_ms = self.admitted.elapsed().as_millis() as u64, "engram look-ahead request");
     }
 }
