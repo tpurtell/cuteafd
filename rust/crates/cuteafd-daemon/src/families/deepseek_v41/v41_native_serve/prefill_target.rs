@@ -170,6 +170,11 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
 
     fn initialize(&mut self, cursor: &mut V41Prefill<P::Suffix>) -> Result<()> {
         if !matches!(cursor.state, PrefillState::Start) { return Ok(()); }
+        // The whole uncached prompt is known: read its Engram rows ahead of the
+        // gathers. Advisory, so a failure only leaves the rows to load on demand.
+        if let Err(error) = self.requests.advise_engram(self.lease, self.tokens) {
+            tracing::warn!(%error, "Engram read-ahead not started; rows load on demand");
+        }
         let end = self.tokens.len() as u64;
         let cached = self.requests.cache().committed_end(self.lease)? as usize;
         let stage = self.requests.cache().stage(self.lease)?;
@@ -677,6 +682,27 @@ mod stream_tests {
         assert_eq!(super::lookahead(8256..20000, 2752, 3).collect::<Vec<_>>(), [8256..11008, 11008..13760, 13760..16512]);
         assert_eq!(super::lookahead(8256..9000, 2752, 3).collect::<Vec<_>>(), [8256..9000]);
         assert_eq!(super::lookahead(9000..9000, 2752, 3).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod advice_tests {
+    /// #860: every prefill through `V41PrefillStep` starts the uncached
+    /// prompt's Engram read-ahead when it initializes, before its first unit,
+    /// replay or continuation chunk, and a failure never fails the request.
+    /// The request's commits drive the advice window and drop it at its end.
+    #[test]
+    fn prefill_start_issues_the_read_ahead_and_commits_drive_it() {
+        fn body<'s>(source: &'s str, start: &str) -> &'s str {
+            let at = &source[source.find(start).unwrap_or_else(|| panic!("{start}"))..];
+            &at[..at.find("\n    }\n").unwrap()]
+        }
+        let init = body(include_str!("prefill_target.rs"), "fn initialize(&mut self");
+        let advise = init.find("if let Err(error) = self.requests.advise_engram(self.lease, self.tokens)").unwrap();
+        assert!(advise < init.find("PrefillState::Continuation").unwrap() && advise < init.find("new_suffix(").unwrap(), "{init}");
+        let commit = body(include_str!("../v41_requests.rs"), "fn commit_with(");
+        assert!(commit.find("return Err(error);").unwrap() < commit.find("commit_to(request.history.position())").unwrap(),
+            "only a published commit moves the advice window: {commit}");
     }
 }
 

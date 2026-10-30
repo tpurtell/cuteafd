@@ -126,6 +126,8 @@ pub struct EngramPipeline {
     shape: crate::EngramStagingShape,
     /// Opt-in background page-cache warm; dropping the pipeline stops it.
     warm: Option<crate::formats::mapped_warm::TableWarm>,
+    /// Always-on per-request read-ahead of both layers ([`Self::advise`]).
+    advisor: crate::EngramAdvisor,
 }
 impl EngramPipeline {
     /// # Safety
@@ -175,6 +177,7 @@ impl EngramPipeline {
         let tables = tables.map(Arc::new);
         Ok(Self {
             identity: Arc::new(()),
+            advisor: crate::EngramAdvisor::new(tables.clone())?,
             tables,
             token_map,
             gatherer: Arc::new(EngramGatherer::new_pinned(library, shape)?),
@@ -202,6 +205,21 @@ impl EngramPipeline {
                 .chain([first.weights(), second.weights()]).collect(),
             readers, ready)?);
         Ok(())
+    }
+    /// Advisory read-ahead of a request's known tokens from `history`'s
+    /// position on (the uncached prompt, at prefill start), both layers: the
+    /// rows are read into the page cache ahead of their gathers (see
+    /// [`crate::EngramAdvisor`]). Drop the advice to cancel it, and report
+    /// commits to it ([`crate::EngramAdvice::commit_to`]). None when nothing
+    /// was queued (no text rows, resident tables or full queues).
+    pub fn advise(&self, history: &EngramHistory, token_ids: &[u32], image_mask: Option<&[bool]>)
+        -> Result<Option<crate::EngramAdvice>> {
+        ensure!(image_mask.is_none_or(|mask| mask.len() == token_ids.len()), "engram image mask length mismatch");
+        ensure!(history.pad_id() == self.token_map.pad_id(), "engram history uses a different compressed padding ID");
+        let tokens = token_ids.iter().enumerate()
+            .map(|(row, &token)| self.token_map.compress(token, image_mask.is_some_and(|mask| mask[row])))
+            .collect::<Result<Vec<_>>>()?;
+        self.advisor.advise(history, tokens)
     }
     pub fn new_history(&self) -> Result<EngramHistory> {
         Ok(EngramHistory::new(self.token_map.pad_id())?)

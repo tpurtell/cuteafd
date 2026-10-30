@@ -7,6 +7,7 @@ pub mod formats;
 pub mod shared;
 pub mod serving_capacity;
 pub use families::deepseek_v41::engram_pipeline::{EngramPipeline, EngramRequestTokens, EngramWave};
+pub use families::deepseek_v41::engram_advice::{EngramAdvice, EngramAdvisor};
 pub use families::deepseek_v41::engram_gather::{
     EngramGatherer, EngramGatherLease, EngramGatherPoll, EngramGatherTicket, EngramGatherTiming,
     EngramStagingShape, EngramStagingError, ENGRAM_DEVICE_ROW_BYTES,
@@ -35,7 +36,7 @@ pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
 pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramPrefetcher, EngramTable, PrefetchOutcome, PrefetchTicket};
 pub use formats::mapped_table::{
     AdviseRows, GatherFailure, GatherLease, GatherPool, GatherPoll, GatherReport, GatherTicket, GatherTiming,
-    GatherWorker, MappedRows, PendingGather, MappedTable, MappedTableError, RowFormat, TablePart, TablePrefetchOutcome,
+    GatherWorker, MappedRows, PendingGather, MappedTable, MappedTableError, ReadAhead, RowFormat, TablePart, TablePrefetchOutcome,
     TablePrefetchTicket, TablePrefetcher, MappedTableStatsReader, TableStats, TableStatsSnapshot, WarmReport, mapped_table_stats,
     mapped_table_stats_with_intervals,
 };

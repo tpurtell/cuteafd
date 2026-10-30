@@ -1006,9 +1006,15 @@ impl MappedTable {
     /// Advise the deduplicated pages a batch touches, with a hard page budget
     /// over all parts; returns the pages advised. Call from an I/O worker.
     pub fn prefetch(&self, rows: &[u64], max_pages: usize) -> Result<usize> {
+        Ok(self.read_ahead(rows, max_pages)?.pages)
+    }
+
+    /// [`Self::prefetch`], also reporting the rows it found outside the page
+    /// cache: an advisory reader backs off when those stay at zero.
+    pub fn read_ahead(&self, rows: &[u64], max_pages: usize) -> Result<ReadAhead> {
         if self.resident.is_some() {
             for &row in rows { self.locate(row)?; }
-            return Ok(0);
+            return Ok(ReadAhead { pages: 0, misses: Some(0) });
         }
         let mut pages = BTreeSet::new();
         for &row in rows {
@@ -1027,7 +1033,10 @@ impl MappedTable {
                 Ok(uring::Read { part: &self.parts[part], row: local, slot })
             }).collect::<Result<_>>()?;
             match self.uring_reads(rows, &reads, &mut output, true, ReadPriority::Prefill) {
-                Ok(stats) => { self.stats.record_reads(stats, true); return Ok(pages.len()); }
+                Ok(stats) => {
+                    self.stats.record_reads(stats, true);
+                    return Ok(ReadAhead { pages: pages.len(), misses: Some(stats.misses) });
+                }
                 Err(error) => self.uring_fallback(&error),
             }
         }
@@ -1044,8 +1053,20 @@ impl MappedTable {
             }
             self.parts[part].advise_pages(run.into_iter())?;
         }
-        Ok(count)
+        // MADV_WILLNEED says nothing about residency.
+        Ok(ReadAhead { pages: count, misses: rows.is_empty().then_some(0) })
     }
+}
+
+/// What a [`MappedTable::read_ahead`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadAhead {
+    /// Distinct pages the rows touch.
+    pub pages: usize,
+    /// Rows the caller's mincore snapshot found outside the page cache, read
+    /// through the table reactor; None when only advice was issued (the mmap
+    /// fallback), so residency is unknown.
+    pub misses: Option<u64>,
 }
 
 /// Page faults and block reads of the calling thread since `before`
@@ -1082,6 +1103,7 @@ pub struct TableStats {
     prefetch_jobs: AtomicU64,
     prefetch_pages: AtomicU64,
     prefetch_dropped: AtomicU64,
+    prefetch_skipped_rows: AtomicU64,
     nowait: AtomicBool,
     approximate: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
@@ -1151,6 +1173,10 @@ pub struct TableStatsSnapshot {
     pub prefetch_pages: u64,
     /// Prefetch batches refused by a full queue.
     pub prefetch_dropped: u64,
+    /// Rows an advisory reader passed over: a probe found them resident, or
+    /// the request had already consumed them.
+    #[serde(default)]
+    pub prefetch_skipped_rows: u64,
     /// Classified misses timed from initial batch submission through completion/retry.
     pub miss_histogram: [u64; 7],
     pub unclassified_rows: u64,
@@ -1261,6 +1287,9 @@ impl TableStats {
     pub fn record_prefetch_dropped(&self) {
         self.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
     }
+    pub fn record_prefetch_skipped(&self, rows: usize) {
+        self.prefetch_skipped_rows.fetch_add(rows as u64, Ordering::Relaxed);
+    }
 
     fn record_reads(&self, reads: uring::ReadStats, prefetch: bool) {
         let (copied, late) = if prefetch { (&self.prefetch_resident_copy_rows, &self.prefetch_late_major_faults) }
@@ -1330,6 +1359,7 @@ impl TableStats {
             prefetch_jobs: get(&self.prefetch_jobs),
             prefetch_pages: get(&self.prefetch_pages),
             prefetch_dropped: get(&self.prefetch_dropped),
+            prefetch_skipped_rows: get(&self.prefetch_skipped_rows),
             miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
             unclassified_rows: get(&self.unclassified_rows),
             unclassified_bytes: get(&self.unclassified_bytes),
@@ -1393,6 +1423,7 @@ impl TableStatsSnapshot {
             prefetch_jobs: d(self.prefetch_jobs, earlier.prefetch_jobs),
             prefetch_pages: d(self.prefetch_pages, earlier.prefetch_pages),
             prefetch_dropped: d(self.prefetch_dropped, earlier.prefetch_dropped),
+            prefetch_skipped_rows: d(self.prefetch_skipped_rows, earlier.prefetch_skipped_rows),
             miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
             unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
             unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),

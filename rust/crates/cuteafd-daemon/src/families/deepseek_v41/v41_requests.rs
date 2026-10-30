@@ -12,7 +12,7 @@ mod prefetch;
 mod images;
 pub(crate) use images::RequestImages;
 use cuteafd_ffi::NativeLibrary;
-use cuteafd_loader::{EngramPipeline, EngramRequestTokens, EngramWave};
+use cuteafd_loader::{EngramAdvice, EngramPipeline, EngramRequestTokens, EngramWave};
 use cuteafd_transport::ExpertV2SourceKind;
 
 /// The `slots` index of `lease`.
@@ -24,6 +24,9 @@ struct Request {
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
+    /// Read-ahead of the prompt's Engram rows (`Requests::advise_engram`):
+    /// commits move its window, and release cancels it.
+    advice: Option<EngramAdvice>,
 }
 /// A request's part of a prefix snapshot besides its device mark: the backbone's frontiers and
 /// the Engram lookback, as plain data.
@@ -111,10 +114,11 @@ impl<'a> Requests<'a> {
         [("v41/engram-prefill", shape.host_resident_bytes() as u64),
          ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)]
     }
-    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 2] {
+    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 3] {
         let shape = self.pipeline.shape();
         [("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64),
-         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64)]
+         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64),
+         ("v41/engram-advice-workers", cuteafd_loader::EngramAdvisor::workspace_bytes() as u64)]
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -182,7 +186,7 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default() });
+        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(), advice: None });
         Ok(lease)
     }
     pub fn attach_images(&mut self, lease: CacheLease, images: RequestImages) -> Result<()> {
@@ -198,6 +202,23 @@ impl<'a> Requests<'a> {
     pub fn install_image_features(&mut self, lease: CacheLease, index: usize, features: Vec<u8>) -> Result<()> {
         ensure!(self.request(lease)?.prefill.is_none(), "image preparation cannot race reserved prefill");
         self.slots.iter_mut().flatten().find(|r| r.lease == lease).unwrap().images.install(index, features)
+    }
+    /// Start the advisory Engram read-ahead of `prompt` from this request's
+    /// frontier on (both layers, `EngramPipeline::advise`), as soon as prefill
+    /// knows the prompt. It replaces earlier advice; commits move its window
+    /// and drop it once they pass its end; release cancels it.
+    pub fn advise_engram(&mut self, lease: CacheLease, prompt: &[u32]) -> Result<()> {
+        let request = self.request(lease)?;
+        let history = request.prefill.as_ref().map_or(&request.history, |p| p.history());
+        let advice = match prompt.get(usize::try_from(history.position())?..).filter(|tokens| !tokens.is_empty()) {
+            Some(tokens) => {
+                let mask = request.images.mask(history.position(), tokens.len())?;
+                self.pipeline.advise(history, tokens, mask.as_deref())?
+            }
+            None => None,
+        };
+        self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").advice = advice;
+        Ok(())
     }
     fn resolved_masks<'m>(&self, requests: &[RequestTokens<'m>], reserved: bool)
         -> Result<Option<Vec<Option<std::borrow::Cow<'m, [bool]>>>>> {
@@ -750,6 +771,12 @@ impl<'a> Requests<'a> {
                 }
             }
             return Err(error);
+        }
+        // Commits move each participant's read-ahead window; advice behind them all is done.
+        for request in self.slots.iter_mut().flatten().filter(|r| r.advice.is_some() && batch.leases.contains(&r.lease)) {
+            if !request.advice.as_ref().is_some_and(|advice| advice.commit_to(request.history.position())) {
+                request.advice = None;
+            }
         }
         Ok(())
     }

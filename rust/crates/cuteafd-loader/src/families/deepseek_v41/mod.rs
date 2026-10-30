@@ -1,6 +1,7 @@
 //! DeepSeek V4.1 (official checkpoint, EXL3/NVFP4 publications, expert
 //! catalog and staging, engram tables, image preprocessing).
 
+pub(crate) mod engram_advice;
 pub(crate) mod engram_gather;
 pub(crate) mod engram_pipeline;
 pub(crate) mod engram_prefetch;
