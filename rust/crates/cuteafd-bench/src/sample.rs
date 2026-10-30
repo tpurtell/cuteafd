@@ -199,11 +199,14 @@ mod tests {
         }
         // Health evidence must not steal the second chip row.
         report.fabric.push(crate::fabric::Phase { timed: true, ports: vec![crate::fabric::Port {
-            health: Some(Default::default()), ..Default::default()
+            health: Some(cuteafd_transport::fabric_health::Health {
+                verdict: cuteafd_transport::fabric_health::Verdict::Warn,
+                retransmit_pct: Some(1.2), retransmit_judged: true, ..Default::default()
+            }), ..Default::default()
         }], ..Default::default() });
         let card = render::card::card_svg(&report);
         assert!(card.contains("POWER-CAPPED"));
-        assert!(card.contains("Fabric: retransmit rate unavailable"));
+        assert!(card.contains("Fabric: peak retransmits 1.2% of packets (above 0.5%)"));
         assert!(card.contains(r#"x="56" y="516""#));
         // Last bar ends at 496; health text starts no higher than 504 (12px font).
         let last_bar_bottom = 416.0 + 2.0 * 30.0 + 4.0 + 16.0;
