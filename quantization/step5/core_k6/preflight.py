@@ -19,7 +19,7 @@ from kimi_k3.core_k6.container import IMAGE
 
 CHECKS = ("sliding_boundary_byte_exact", "sparse_boundary_byte_exact",
           "serialized_projection_replay", "mtp_three_stage_alignment_byte_exact",
-          "mtp_serialized_k4_byte_exact")
+          "mtp_serialized_k4_byte_exact", "production_layer_transaction_byte_exact")
 
 
 def require_local_source():
