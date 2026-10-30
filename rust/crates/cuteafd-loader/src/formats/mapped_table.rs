@@ -170,6 +170,9 @@ pub struct MappedRows {
     fuse: bool,
     /// Where this file's copies live (`placement::file_placement`), read at open.
     placement: placement::Placement,
+    /// Remote-only FUSE files: (connection, its max_background); the reactor
+    /// keeps at most that many of the connection's reads in flight.
+    read_cap: Option<(u32, u32)>,
 }
 
 // SAFETY: Only immutable access is exposed; munmap runs after the final owner drops.
@@ -224,8 +227,10 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file),
-            placement: placement::file_placement(&file), file: Arc::new(file) };
+        let (fuse, at) = (uring::is_fuse(&file), placement::file_placement(&file));
+        let read_cap = placement::remote_read_cap(&file, at, fuse);
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse,
+            placement: at, read_cap, file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         #[cfg(test)]
         let advice = if std::env::var_os("MAPPED_BENCH_DEFAULT_ADVICE").is_some() { libc::MADV_NORMAL } else { libc::MADV_RANDOM };
@@ -952,7 +957,8 @@ impl MappedTable {
         prepared.stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
         if !prepared.misses.is_empty() {
             let reads = prepared.misses.iter().map(|&(part, row, slot)| reactor::Read {
-                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot }).collect();
+                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot,
+                cap: self.parts[part].read_cap }).collect();
             match uring::start(reads, width, priority, window, !mode.no_wait) {
                 Ok(stream) => prepared.stream = Some(stream),
                 Err(error) => self.uring_fallback(&error),
