@@ -135,3 +135,42 @@ def test_committed_shard_checksum_rechecked_after_candidate_retirement(toy):
     candidates[n].unlink();p=out/receipt['filename']
     with p.open('r+b') as f:f.seek(-1,2);f.write(b'\xff')
     with pytest.raises(ValueError):export.assemble_layer(source,0,{n:candidates[n]},out,'run')
+
+
+def test_export_legacy_receipts_and_truthful_per_module_provenance(toy):
+    from test_step5_core_compat import identities,manifest
+    from step5.core_k6.compat import identity_digest
+    source,modules,candidates,out,evidence,target=toy
+    old,current=identities();old_module='model.layers.0.self_attn.q_proj'
+    manifest(evidence.parent,old,current,old_module)
+    old_receipt=export.assemble_layer(source,0,{old_module:candidates[old_module]},out,old)
+    receipt_path=out/'layer-000-receipt.json';before=receipt_path.read_bytes()
+    candidates[old_module].unlink()
+    assert export.assemble_layer(source,0,{old_module:candidates[old_module]},out,current)==old_receipt
+    for layer in range(1,95):
+        export.assemble_layer(source,layer,{n:p for n,p in candidates.items() if n.startswith(f'model.layers.{layer}.')},out,current)
+    # Legacy evidence remains byte-identical; new evidence explicitly names its
+    # active producer. These records are copies, not rewritten old controls.
+    (evidence/'observed.json').unlink()
+    legacy=evidence/'old.json';legacy.write_text(json.dumps(dict(module=old_module,bits=6)))
+    legacy_bytes=legacy.read_bytes()
+    for i,module in enumerate(n for n in modules if n!=old_module):
+        (evidence/f'new-{i}.json').write_text(json.dumps(dict(module=module,producer_identity_sha256=identity_digest(current))))
+    result=export.finalize_export(source,modules,{'lm_head':candidates['lm_head']},out,current,evidence)
+    assert result['payload_bytes']==target
+    storage=json.loads((out/'quantize_config.json').read_text())['tensor_storage']
+    assert storage[old_module]['producer_identity_sha256']==identity_digest(old)
+    assert storage['lm_head']['producer_identity_sha256']==identity_digest(current)
+    assert json.loads((out/'quantization-provenance.json').read_text())==current
+    assert (out/'producer-lineage.json').read_bytes()==(evidence.parent/'producer-lineage.json').read_bytes()
+    assert receipt_path.read_bytes()==before and legacy.read_bytes()==legacy_bytes
+    assert (out/'quantization-errors/old.json').read_bytes()==legacy_bytes
+
+
+def test_export_rejects_legacy_shard_without_explicit_origin_map(toy):
+    from test_step5_core_compat import identities
+    source,_,candidates,out,_,_=toy;old,current=identities();n='model.layers.0.self_attn.q_proj'
+    export.assemble_layer(source,0,{n:candidates[n]},out,old)
+    changed=json.loads(json.dumps(current));changed['recipe']['core_bits']=5
+    with pytest.raises(ValueError,match='identity'):export.assemble_layer(source,0,{n:candidates[n]},out,changed)
+    with pytest.raises(ValueError,match='identity'):export.assemble_layer(source,0,{n:candidates[n]},out,dict(run='unlisted'))

@@ -12,6 +12,7 @@ import struct
 
 from kimi_k3.uniform_k2.storage import (assemble_shard, atomic_json, canonical,
                                        fsync_directory, read_header, verify_receipt)
+from .compat import accepts_identity, identity_digest, load_module_origins, module_producer_digest
 from .recipe import (BASE_REPO, BASE_REVISION, BASE_PAYLOAD_BYTES, BASE_TENSOR_COUNT,
                      MCG_MULTIPLIER, TARGET_PAYLOAD_BYTES, TARGET_TENSOR_COUNT,
                      packed_specs, packed_bytes, reviewed_modules, selected_modules,
@@ -154,7 +155,7 @@ def _assemble(source, source_entries, selection, replacements, shard, receipt_pa
     expected_payload = source_payload - removed_bytes + added_bytes
     if receipt_path.exists():
         receipt = json.loads(receipt_path.read_text())
-        if receipt["identity"] != identity or receipt["filename"] != shard.name or any(receipt.get(k) != v for k, v in labels.items()):
+        if not accepts_identity(receipt["identity"], identity) or receipt["filename"] != shard.name or any(receipt.get(k) != v for k, v in labels.items()):
             raise ValueError("export shard run identity differs")
         if receipt.get("payload_bytes") != expected_payload or receipt.get("tensors") != len(entries):
             raise ValueError("export shard receipt inventory differs")
@@ -287,6 +288,10 @@ def _module_patterns():
 def finalize_export(source, selection, head_replacements, export, identity, evidence_root):
     """Audit the standard-HF inventory and commit mixed K4/K6 metadata."""
     export = Path(export)
+    evidence_root = Path(evidence_root)
+    lineage = load_module_origins(evidence_root.parent, identity)
+    if lineage is not None and set(lineage["module_origins"]) - set(selection):
+        raise ValueError("producer lineage contains an unreviewed module")
     if selection != selected_modules(source):
         raise ValueError("final quantization selection differs from reviewed source")
     extras = {name: (source.snapshot / shard, name) for name, shard in source.weight_map.items()
@@ -318,9 +323,13 @@ def finalize_export(source, selection, head_replacements, export, identity, evid
         if receipt_path.is_symlink():
             raise ValueError("refuse symlink final receipt")
         receipt = json.loads(receipt_path.read_text())
-        if (receipt["identity"] != identity or receipt.get("filename") != shard
+        if (not accepts_identity(receipt["identity"], identity) or receipt.get("filename") != shard
                 or (ordinal != SHARD_COUNT and receipt.get("layer") != ordinal - 1)):
             raise ValueError("final export shard identity differs")
+        if receipt["identity"] != identity and any(
+                module_producer_digest(module, identity, lineage) != identity_digest(receipt["identity"])
+                for module in modules_by_shard.get(shard, {})):
+            raise ValueError("legacy shard modules differ from audited producer origins")
         # Rehash the owned target, not the BF16 source payload. This verifies
         # the exact file that passed assembly's independent native-byte audit.
         verify_receipt(path, receipt, checksum=True)
@@ -353,6 +362,7 @@ def finalize_export(source, selection, head_replacements, export, identity, evid
     tensor_storage = {}
     for module, geometry in selection.items():
         tensor_storage[module] = dict(quant_format="exl3", bits_per_weight=geometry["bits"],
+            producer_identity_sha256=module_producer_digest(module, identity, lineage),
             mcg_multiplier=MCG_MULTIPLIER, in_features=geometry["in_features"],
             out_features=geometry["out_features"], stored_out_features=geometry["stored_out_features"],
             stored_tensors={name: dict(shape=shape, torch_dtype=_DTYPES[dtype])
@@ -380,9 +390,24 @@ def finalize_export(source, selection, head_replacements, export, identity, evid
     for path in evidence_root.rglob("*.json"):
         if path.is_symlink():
             raise ValueError("refuse symlink numerical evidence")
+        if lineage is not None:
+            record = json.loads(path.read_text())
+            module = record.get("module")
+            if module not in selection:
+                raise ValueError("numerical evidence module outside reviewed selection")
+            origin = module_producer_digest(module, identity, lineage)
+            declared = record.get("producer_identity_sha256")
+            if declared is not None and declared != origin:
+                raise ValueError("numerical evidence producer differs from audited module origin")
+            if declared is None and module not in lineage["module_origins"]:
+                raise ValueError("new numerical evidence lacks its producer identity")
         target = export / "quantization-errors" / path.relative_to(evidence_root)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
+    if lineage is not None:
+        # Preserve the original bytes whose checksum is carried by provenance.
+        for name in ("producer-lineage.json", "resume-lineage-audit.json"):
+            shutil.copyfile(evidence_root.parent / name, export / name)
     atomic_json(export / "quantization-provenance.json", identity)
     (export / "README.md").write_text(_model_card(identity))
     # The caller can publish completion and retire final recovery state only
@@ -460,7 +485,9 @@ tensor was independently compared byte-for-byte with the BF16 source; packed
 layouts and the complete inventory were checked. Evidence is in
 `quantization-errors/`, with producer/input hashes in
 `quantization-provenance.json`. Full-model generation, long-context quality
-and serving performance qualification are separate from this job. A runtime
+and serving performance qualification are separate from this job.
+{("This release retains audited completed projections under their original producer identities; remaining projections use bounded K128 FP32 Hessian accumulation. Each tensor_storage entry names its producer identity SHA256. The unchanged prior identities, producer-lineage.json and resume-lineage-audit.json document this resume." if identity.get("predecessor_identities") else "")}
+A runtime
 must support Step-5's mixed standard MCG K4/K6 expert and core projections,
 three MTP stages and retained native components. No EXLR8 sidecar is required.
 '''

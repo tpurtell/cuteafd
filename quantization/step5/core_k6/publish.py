@@ -10,6 +10,7 @@ import re
 
 from kimi_k3.uniform_k2.publish import install_upload_compat
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, fsync_directory, verify_receipt
+from .compat import accepts_identity, load_module_origins, module_producer_digest
 from .export import SHARD_COUNT
 from .recipe import MODULE_COUNT, TARGET_PAYLOAD_BYTES, TARGET_REPO, TARGET_TENSOR_COUNT
 
@@ -62,6 +63,23 @@ def _complete_plan(export, root, repo_id):
         raise ValueError("publication checkpoint index inventory differs")
     if json.loads((export / "quantization-provenance.json").read_text()) != identity:
         raise ValueError("export provenance differs from the completed producer")
+    lineage = load_module_origins(root, identity)
+    if lineage is not None:
+        for name,key in (("producer-lineage.json","resume_lineage_manifest_sha256"),
+                         ("resume-lineage-audit.json","resume_lineage_audit_sha256")):
+            published_lineage = export / name
+            if (published_lineage.is_symlink() or not published_lineage.is_file()
+                    or hashlib.sha256(published_lineage.read_bytes()).hexdigest() != identity[key]):
+                raise ValueError("export producer lineage differs from the audited run")
+        quant = json.loads((export / "quantize_config.json").read_text())
+        storage = quant.get("tensor_storage")
+        if not isinstance(storage,dict) or len(storage) != MODULE_COUNT:
+            raise ValueError("published module producer metadata inventory differs")
+        if set(lineage["module_origins"]) - set(storage):
+            raise ValueError("published module producer origin is absent")
+        if any(not isinstance(value,dict) or value.get("producer_identity_sha256") !=
+               module_producer_digest(module,identity,lineage) for module,value in storage.items()):
+            raise ValueError("published module producer metadata differs from audited lineage")
     return identity
 
 
@@ -201,7 +219,7 @@ def _collect_local(export, identity):
                     raise ValueError("refuse symlink publication receipt")
                 receipt = json.loads(receipt_path.read_text())
                 ordinal = int(name.split("-")[1])
-                if (receipt.get("identity") != identity or receipt.get("filename") != name
+                if (not accepts_identity(receipt.get("identity"), identity) or receipt.get("filename") != name
                         or (ordinal != SHARD_COUNT and receipt.get("layer") != ordinal - 1)
                         or not re.fullmatch(r"[0-9a-f]{64}", receipt.get("sha256", ""))):
                     raise ValueError(f"publication shard receipt differs: {relative}")
