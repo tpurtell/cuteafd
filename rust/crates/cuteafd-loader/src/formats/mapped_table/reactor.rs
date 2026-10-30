@@ -406,6 +406,8 @@ fn run(shared: Arc<Shared>, started: mpsc::SyncSender<()>) {
     supervise(&shared, || run_owner(&shared, started));
 }
 fn run_owner(shared: &Shared, started: mpsc::SyncSender<()>) {
+    // The ring's io-uring workers inherit this thread's CPUs.
+    super::affinity::pin_reader();
     let mut engine = match uring::new_ring() {
         Ok(ring) => { shared.ready.store(true, Ordering::Release); Some(Engine::new(ring)) },
         Err(error) => { tracing::warn!(%error, "table reactor setup failed; batches can retry"); None },

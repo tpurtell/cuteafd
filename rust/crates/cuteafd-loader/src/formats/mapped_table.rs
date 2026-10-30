@@ -30,6 +30,7 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 
 mod uring;
 mod reactor;
+mod affinity;
 pub mod row_cache;
 pub mod lookahead;
 pub mod placement;
