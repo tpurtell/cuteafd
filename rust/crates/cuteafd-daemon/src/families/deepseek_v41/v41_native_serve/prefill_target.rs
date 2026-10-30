@@ -170,6 +170,11 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
 
     fn initialize(&mut self, cursor: &mut V41Prefill<P::Suffix>) -> Result<()> {
         if !matches!(cursor.state, PrefillState::Start) { return Ok(()); }
+        // The whole uncached prompt is known: read its Engram rows into the row
+        // caches ahead of the gathers. A failure only leaves rows to load on demand.
+        if let Err(error) = self.requests.start_lookahead(self.lease, self.tokens) {
+            tracing::warn!(%error, "Engram look-ahead not started; rows load on demand");
+        }
         let end = self.tokens.len() as u64;
         let cached = self.requests.cache().committed_end(self.lease)? as usize;
         let stage = self.requests.cache().stage(self.lease)?;

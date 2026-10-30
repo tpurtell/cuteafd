@@ -282,7 +282,8 @@ fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Cat
     let shape = cuteafd_loader::EngramStagingShape::new(rows, slots)?;
     crate::shared::memory::budget::admit_host_memory(0,
         &[("v41/engram-prefill", shape.host_bytes() as u64),
-          ("v41/engram-decode", shape.decode_host_bytes() as u64)], 0, 0)?;
+          ("v41/engram-decode", shape.decode_host_bytes() as u64),
+          ("v41/engram-row-cache", shape.cache_bytes(264) as u64)], 0, 0)?;
     // SAFETY: the checkpoint remains immutable for all mapping lifetimes.
     let mut pipeline = unsafe { cuteafd_loader::EngramPipeline::new(lib, catalog, map, shape,
         cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?)? };
@@ -290,7 +291,8 @@ fn engram_pipeline(lib: &NativeLibrary, catalog: &cuteafd_loader::OfficialV41Cat
     // only if at least one table remained mapped, including with cache disabled.
     crate::shared::memory::budget::admit_host_memory_with_resident_formulas(0,
         &[("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64),
-          ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64)],
+          ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64),
+          ("v41/engram-row-cache", pipeline.cache_bytes() as u64)],
         &[("v41/engram-prefill", shape.host_resident_bytes() as u64),
           ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)], 0, 0)?;
     cuteafd_bench::context::set_mapped_placement(pipeline.placement().clone());

@@ -31,6 +31,7 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 
 mod uring;
 mod reactor;
+pub mod row_cache;
 
 /// Explicit priority from the decode/prefill pipeline, never inferred from row count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -626,6 +627,9 @@ impl MappedTable {
     pub fn stats(&self) -> &TableStats {
         &self.stats
     }
+    pub(crate) fn shared_stats(&self) -> Arc<TableStats> {
+        Arc::clone(&self.stats)
+    }
 
     /// Hold every table in host memory, all or none: read each payload once on
     /// `readers` threads ([`Self::read_chunks`]) into the table's own anonymous
@@ -1131,7 +1135,20 @@ pub struct TableStats {
     prefetch_residency_ns: AtomicU64,
     prefetch_resident_copy_rows: AtomicU64,
     prefetch_late_major_faults: AtomicU64,
-
+    pub(crate) cache_hit_rows: AtomicU64,
+    pub(crate) cache_wait_rows: AtomicU64,
+    pub(crate) cache_denied_rows: AtomicU64,
+    pub(crate) cache_evictions: AtomicU64,
+    pub(crate) lookahead_rows: AtomicU64,
+    pub(crate) lookahead_pieces: AtomicU64,
+    pub(crate) stall_prefill_events: AtomicU64,
+    pub(crate) stall_prefill_ns: AtomicU64,
+    pub(crate) stall_prefill_fallback_rows: AtomicU64,
+    pub(crate) stall_prefill_pending_rows: AtomicU64,
+    pub(crate) stall_decode_events: AtomicU64,
+    pub(crate) stall_decode_ns: AtomicU64,
+    pub(crate) stall_decode_fallback_rows: AtomicU64,
+    pub(crate) stall_decode_pending_rows: AtomicU64,
 }
 
 /// A point-in-time copy of [`TableStats`]; `since` gives an interval.
@@ -1212,7 +1229,48 @@ pub struct TableStatsSnapshot {
     pub prefetch_resident_copy_rows: u64,
     #[serde(default)]
     pub prefetch_late_major_faults: u64,
-
+    /// Row-cache lookups already published when a gather needed them.
+    #[serde(default)]
+    pub cache_hit_rows: u64,
+    /// Row-cache lookups still being filled by another reader when a gather needed them.
+    #[serde(default)]
+    pub cache_wait_rows: u64,
+    /// Rows a class could not reserve (its share was full); read uncached.
+    #[serde(default)]
+    pub cache_denied_rows: u64,
+    /// Published rows evicted to make room.
+    #[serde(default)]
+    pub cache_evictions: u64,
+    /// Rows the look-ahead read into the row cache.
+    #[serde(default)]
+    pub lookahead_rows: u64,
+    /// Look-ahead pieces (both tables of a few hundred tokens) completed.
+    #[serde(default)]
+    pub lookahead_pieces: u64,
+    /// Prefill consumers that needed a layer's rows before they were ready (Engram stalls).
+    #[serde(default)]
+    pub stall_prefill_events: u64,
+    /// Prefill consumer time spent waiting for those rows.
+    #[serde(default)]
+    pub stall_prefill_ns: u64,
+    /// Rows prefill gathers read themselves: the look-ahead had not fetched them.
+    #[serde(default)]
+    pub stall_prefill_fallback_rows: u64,
+    /// Rows prefill gathers waited for: queued by the look-ahead or another gather, not yet landed.
+    #[serde(default)]
+    pub stall_prefill_pending_rows: u64,
+    /// Decode consumers that needed a layer's rows before they were ready (Engram stalls).
+    #[serde(default)]
+    pub stall_decode_events: u64,
+    /// Decode consumer time spent waiting for those rows.
+    #[serde(default)]
+    pub stall_decode_ns: u64,
+    /// Rows decode gathers read themselves (not in the row cache).
+    #[serde(default)]
+    pub stall_decode_fallback_rows: u64,
+    /// Rows decode gathers waited for while another reader filled them.
+    #[serde(default)]
+    pub stall_decode_pending_rows: u64,
 }
 
 impl TableStats {
@@ -1253,6 +1311,26 @@ impl TableStats {
     pub fn record_decode_stall(&self, elapsed: Duration) {
         self.decode_steps.fetch_add(1, Ordering::Relaxed);
         self.decode_stall_ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// A consumer that needed a layer's rows before they were ready (an Engram
+    /// stall), split by phase.
+    pub fn record_consumer_stall(&self, decode: bool, elapsed: Duration) {
+        let (events, ns) = if decode { (&self.stall_decode_events, &self.stall_decode_ns) }
+            else { (&self.stall_prefill_events, &self.stall_prefill_ns) };
+        events.fetch_add(1, Ordering::Relaxed);
+        ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// One gather's rows not already in the row cache: `fallback` it read itself,
+    /// `pending` it waited for while another reader filled them.
+    pub fn record_gather_misses(&self, decode: bool, fallback: usize, pending: usize) {
+        let (read, waited) = if decode { (&self.stall_decode_fallback_rows, &self.stall_decode_pending_rows) }
+            else { (&self.stall_prefill_fallback_rows, &self.stall_prefill_pending_rows) };
+        read.fetch_add(fallback as u64, Ordering::Relaxed);
+        waited.fetch_add(pending as u64, Ordering::Relaxed);
+    }
+    pub fn record_lookahead(&self, rows: usize) {
+        self.lookahead_pieces.fetch_add(1, Ordering::Relaxed);
+        self.lookahead_rows.fetch_add(rows as u64, Ordering::Relaxed);
     }
     pub fn record_prefetch(&self, pages: usize) {
         self.prefetch_jobs.fetch_add(1, Ordering::Relaxed);
@@ -1373,7 +1451,20 @@ impl TableStats {
             prefetch_residency_ns: get(&self.prefetch_residency_ns),
             prefetch_resident_copy_rows: get(&self.prefetch_resident_copy_rows),
             prefetch_late_major_faults: get(&self.prefetch_late_major_faults),
-
+            cache_hit_rows: get(&self.cache_hit_rows),
+            cache_wait_rows: get(&self.cache_wait_rows),
+            cache_denied_rows: get(&self.cache_denied_rows),
+            cache_evictions: get(&self.cache_evictions),
+            lookahead_rows: get(&self.lookahead_rows),
+            lookahead_pieces: get(&self.lookahead_pieces),
+            stall_prefill_events: get(&self.stall_prefill_events),
+            stall_prefill_ns: get(&self.stall_prefill_ns),
+            stall_prefill_fallback_rows: get(&self.stall_prefill_fallback_rows),
+            stall_prefill_pending_rows: get(&self.stall_prefill_pending_rows),
+            stall_decode_events: get(&self.stall_decode_events),
+            stall_decode_ns: get(&self.stall_decode_ns),
+            stall_decode_fallback_rows: get(&self.stall_decode_fallback_rows),
+            stall_decode_pending_rows: get(&self.stall_decode_pending_rows),
         }
     }
 }
@@ -1436,7 +1527,20 @@ impl TableStatsSnapshot {
             prefetch_residency_ns: d(self.prefetch_residency_ns, earlier.prefetch_residency_ns),
             prefetch_resident_copy_rows: d(self.prefetch_resident_copy_rows, earlier.prefetch_resident_copy_rows),
             prefetch_late_major_faults: d(self.prefetch_late_major_faults, earlier.prefetch_late_major_faults),
-
+            cache_hit_rows: d(self.cache_hit_rows, earlier.cache_hit_rows),
+            cache_wait_rows: d(self.cache_wait_rows, earlier.cache_wait_rows),
+            cache_denied_rows: d(self.cache_denied_rows, earlier.cache_denied_rows),
+            cache_evictions: d(self.cache_evictions, earlier.cache_evictions),
+            lookahead_rows: d(self.lookahead_rows, earlier.lookahead_rows),
+            lookahead_pieces: d(self.lookahead_pieces, earlier.lookahead_pieces),
+            stall_prefill_events: d(self.stall_prefill_events, earlier.stall_prefill_events),
+            stall_prefill_ns: d(self.stall_prefill_ns, earlier.stall_prefill_ns),
+            stall_prefill_fallback_rows: d(self.stall_prefill_fallback_rows, earlier.stall_prefill_fallback_rows),
+            stall_prefill_pending_rows: d(self.stall_prefill_pending_rows, earlier.stall_prefill_pending_rows),
+            stall_decode_events: d(self.stall_decode_events, earlier.stall_decode_events),
+            stall_decode_ns: d(self.stall_decode_ns, earlier.stall_decode_ns),
+            stall_decode_fallback_rows: d(self.stall_decode_fallback_rows, earlier.stall_decode_fallback_rows),
+            stall_decode_pending_rows: d(self.stall_decode_pending_rows, earlier.stall_decode_pending_rows),
         }
     }
     /// Fraction classified resident by NOWAIT or an approximate mincore snapshot.
@@ -1741,6 +1845,8 @@ pub(crate) struct PreparedTableGather {
     stats: uring::ReadStats, output_len: usize, width: usize,
 }
 impl PreparedTableGather {
+    /// Rows that were not resident when the gather started.
+    pub(crate) fn misses(&self) -> usize { self.stats.misses as usize }
     pub(crate) fn step(&mut self, table: &MappedTable, output: &mut [u8]) -> Result<bool> {
         if output.len() != self.output_len || table.row_bytes() != self.width {
             return Err(invalid("prepared gather destination changed"));
@@ -1774,6 +1880,27 @@ impl PreparedTableGather {
     pub(crate) fn finish(mut self, table: &MappedTable, output: &mut [u8]) -> Result<()> {
         while !self.step(table, output)? {}
         Ok(())
+    }
+    /// Land whatever has completed without waiting for the device; true once
+    /// every row is in `output`.
+    pub(crate) fn poll(&mut self, table: &MappedTable, output: &mut [u8]) -> Result<bool> {
+        if let Some(stream) = &mut self.stream {
+            let failed = loop {
+                if stream.finished() { break None; }
+                match stream.try_step(output) {
+                    Ok(true) => continue,
+                    Ok(false) => return Ok(false),
+                    Err(error) => break Some(error),
+                }
+            };
+            if let Some(error) = failed {
+                // As in `step`: drain the stream, then copy every miss from the mapping.
+                drop(self.stream.take());
+                table.uring_fallback(&error);
+            }
+        }
+        // Finished: record its stats, or copy the misses after a failure.
+        self.step(table, output)
     }
 }
 

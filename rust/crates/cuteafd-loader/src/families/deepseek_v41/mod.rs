@@ -2,6 +2,7 @@
 //! catalog and staging, engram tables, image preprocessing).
 
 pub(crate) mod engram_gather;
+pub(crate) mod engram_lookahead;
 pub(crate) mod engram_pipeline;
 pub(crate) mod engram_prefetch;
 pub(crate) mod engram_staging;

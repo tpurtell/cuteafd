@@ -24,6 +24,9 @@ struct Request {
     history: EngramHistory,
     prefill: Option<EngramPrefillCursor>,
     images: RequestImages,
+    /// The prompt's Engram rows being read ahead (`Requests::start_lookahead`):
+    /// commits move its window; release or the prompt's last commit ends it.
+    lookahead: Option<cuteafd_loader::LookaheadHandle>,
 }
 /// A request's part of a prefix snapshot besides its device mark: the backbone's frontiers and
 /// the Engram lookback, as plain data.
@@ -111,10 +114,13 @@ impl<'a> Requests<'a> {
         [("v41/engram-prefill", shape.host_resident_bytes() as u64),
          ("v41/engram-decode", shape.decode_host_resident_bytes() as u64)]
     }
-    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 2] {
+    /// Future host consumers: the gather workers' scratch and the row caches,
+    /// whose anonymous pages fill as rows are read.
+    pub fn engram_host_workspace(&self) -> [(&'static str, u64); 3] {
         let shape = self.pipeline.shape();
         [("v41/engram-prefill-worker", shape.host_workspace_bytes() as u64),
-         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64)]
+         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes() as u64),
+         ("v41/engram-row-cache", self.pipeline.cache_bytes() as u64)]
     }
     pub fn new(
         library: &'a NativeLibrary,
@@ -182,7 +188,8 @@ impl<'a> Requests<'a> {
         );
         let history = self.pipeline.new_history()?;
         let lease = self.cache.begin_request(slot, id)?;
-        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default() });
+        self.slots[slot] = Some(Request { lease, history, prefill: None, images: RequestImages::default(),
+            lookahead: None });
         Ok(lease)
     }
     pub fn attach_images(&mut self, lease: CacheLease, images: RequestImages) -> Result<()> {
@@ -208,6 +215,17 @@ impl<'a> Requests<'a> {
                 else { &request.history };
             request.images.resolve_mask(history.position(), r.tokens.len(), r.image_mask)
         }).collect::<Result<Vec<_>>>().map(Some)
+    }
+    /// Read the Engram rows of `prompt` past the request's committed frontier
+    /// ahead of its gathers (text prompts; image rows have no table reads).
+    pub fn start_lookahead(&mut self, lease: CacheLease, prompt: &[u32]) -> Result<()> {
+        let request = self.request(lease)?;
+        if !request.images.is_empty() || request.lookahead.is_some() { return Ok(()); }
+        let start = usize::try_from(request.history.position())?;
+        if start >= prompt.len() { return Ok(()); }
+        let handle = self.pipeline.start_lookahead(&request.history, &prompt[start..])?;
+        self.slots.iter_mut().flatten().find(|r| r.lease == lease).expect("validated request").lookahead = Some(handle);
+        Ok(())
     }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
         self.prefetched.cancel_owner(&lease);
@@ -740,7 +758,13 @@ impl<'a> Requests<'a> {
                 .collect::<Vec<_>>();
             histories.sort_by_key(|(i, _)| *i);
             let mut histories = histories.into_iter().map(|(_, h)| h).collect::<Vec<_>>();
-            if let Some(engram) = &mut batch.engram { engram.commit(&mut histories, &counts) } else { Ok(()) }
+            if let Some(engram) = &mut batch.engram { engram.commit(&mut histories, &counts)?; }
+            for request in self.slots.iter_mut().flatten().filter(|r| batch.leases.contains(&r.lease)) {
+                if request.lookahead.as_ref().is_some_and(|ahead| !ahead.commit(request.history.position())) {
+                    request.lookahead = None;
+                }
+            }
+            Ok(())
         })();
         batch.cancel();
         if let Err(error) = result {

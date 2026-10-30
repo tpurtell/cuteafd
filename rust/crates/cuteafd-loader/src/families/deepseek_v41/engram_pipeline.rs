@@ -126,6 +126,8 @@ pub struct EngramPipeline {
     shape: crate::EngramStagingShape,
     /// Opt-in background page-cache warm; dropping the pipeline stops it.
     warm: Option<crate::formats::mapped_warm::TableWarm>,
+    /// Prompt rows read into the row caches ahead of the gathers.
+    lookahead: crate::EngramLookahead,
 }
 impl EngramPipeline {
     /// # Safety
@@ -168,11 +170,13 @@ impl EngramPipeline {
             elapsed_ms = elapsed.as_millis(),
             gb_per_s = placement.preloaded_bytes as f64 / elapsed.as_secs_f64().max(1e-9) / 1e9,
             "mapped scale preload admission");
-        for table in &tables {
+        for table in &mut tables {
             table.weights().prepare_reads();
             if let Some(scales) = table.scales() { scales.prepare_reads(); }
+            table.set_cache_shares(shape.cache_shares())?;
         }
         let tables = tables.map(Arc::new);
+        let lookahead = crate::EngramLookahead::new(tables.clone())?;
         Ok(Self {
             identity: Arc::new(()),
             tables,
@@ -182,10 +186,13 @@ impl EngramPipeline {
             capacity,
             placement, shape,
             warm: None,
+            lookahead,
         })
     }
     pub fn placement(&self) -> &crate::formats::mapped_preload::MappedPlacement { &self.placement }
     pub fn shape(&self) -> crate::EngramStagingShape { self.shape }
+    /// Both layers' row caches (rows, index and slot metadata).
+    pub fn cache_bytes(&self) -> usize { self.shape.cache_bytes(self.tables[0].row_width()) }
     pub fn reclaim_copies(&self) -> Result<()> {
         self.gatherer.reclaim_copies()?; self.decode_gatherer.reclaim_copies()
     }
@@ -202,6 +209,12 @@ impl EngramPipeline {
                 .chain([first.weights(), second.weights()]).collect(),
             readers, ready)?);
         Ok(())
+    }
+    /// Read the Engram rows of `tokens` (the prompt from `history`'s frontier on)
+    /// into the row caches ahead of the gathers; publish commits on the handle.
+    pub fn start_lookahead(&self, history: &EngramHistory, tokens: &[u32]) -> Result<crate::LookaheadHandle> {
+        let compressed = tokens.iter().map(|&token| self.token_map.compress(token, false)).collect::<Result<Vec<_>>>()?;
+        Ok(self.lookahead.start(history.fork()?, compressed))
     }
     pub fn new_history(&self) -> Result<EngramHistory> {
         Ok(EngramHistory::new(self.token_map.pad_id())?)
@@ -379,6 +392,8 @@ fn preload_tables(tables: &mut [EngramTable], include_rows: bool) -> Result<()> 
 fn record_layer_wait(table: &EngramTable, elapsed: std::time::Duration, decode: bool) {
     table.weights().stats().record_stall(elapsed);
     if decode { table.weights().stats().record_decode_stall(elapsed); }
+    // An await of rows already landed costs microseconds; a stall is a real wait.
+    if elapsed >= std::time::Duration::from_micros(100) { table.weights().stats().record_consumer_stall(decode, elapsed); }
 }
 
 #[cfg(test)]

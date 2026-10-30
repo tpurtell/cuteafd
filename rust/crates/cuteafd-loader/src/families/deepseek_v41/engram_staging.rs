@@ -1,4 +1,9 @@
-//! Bounded gathered native rows; run page-faulting gathers on an I/O worker.
+//! Bounded gathered native rows: a lookup in the layer's row cache, then a copy
+//! into the pinned upload staging. Rows the cache does not hold are read here
+//! (and cached when the class has room); rows another reader is filling are waited for.
+use super::engram_prefetch::RowRead;
+use crate::formats::mapped_table::row_cache::{Lookup, Pins, RowClass};
+use crate::formats::mapped_table::ReadPriority;
 use crate::{EngramEncoding, EngramTable};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::{EngramBatch, ENGRAM_ROWS};
@@ -18,12 +23,25 @@ pub struct EngramBatchStaging {
     order: Vec<(u64, usize)>,
     ready: Option<(usize, usize, EngramEncoding, f32)>,
 }
+/// One layer's gather between preparation and completion: the row-cache pins,
+/// rows still being filled elsewhere, and this gather's own reads.
 pub(crate) struct PreparedEngram {
-    weight: crate::formats::mapped_table::PreparedTableGather,
-    scale: Option<crate::formats::mapped_table::PreparedTableGather>,
-    packed: Option<Vec<u8>>, slots: Vec<usize>,
+    pins: Pins,
+    /// (cache slot, canonical staging slot, row) of rows another reader is filling.
+    pending: Vec<(u32, usize, u64)>,
+    /// Rows this gather reads itself (row-cache misses), with each one's cache
+    /// slot when it reserved one and its canonical staging slot.
+    read: Option<(RowRead, Vec<(Option<u32>, usize)>)>,
     rows: usize, layer: usize, encoding: EngramEncoding, global_scale: f32,
 }
+/// Copy one cached row (weight bytes then scale bytes) into its canonical slot.
+fn place(weights: &mut [u8], scales: &mut [u8], scale_base: usize, encoding: EngramEncoding, slot: usize, row: &[u8]) {
+    let (w, s) = (encoding.weight_bytes(), encoding.scale_bytes());
+    weights[slot * w..(slot + 1) * w].copy_from_slice(&row[..w]);
+    if encoding == EngramEncoding::Fp8 { scales[slot * s..(slot + 1) * s].copy_from_slice(&row[w..w + s]); }
+    else { weights[scale_base + slot * s..scale_base + (slot + 1) * s].copy_from_slice(&row[w..w + s]); }
+}
+
 /// Token-major native rows: 24 embeddings of width 256 per token.
 /// Image embeddings are zero, scales are one, and the text mask is zero.
 pub struct EngramGatherView<'a> {
@@ -106,16 +124,14 @@ impl EngramBatchStaging {
         batches: &[&EngramBatch],
         layer_index: usize,
     ) -> Result<EngramGatherView<'_>> {
-        self.gather_on(table, batches, layer_index, None)
-    }
-    pub(crate) fn gather_on(&mut self, table: &EngramTable, batches: &[&EngramBatch], layer_index: usize,
-        gather: Option<&crate::shared::token_table::RowGather>) -> Result<EngramGatherView<'_>> {
-        let prepared = self.prepare(table, batches, layer_index, gather)?;
+        let prepared = self.prepare(table, batches, layer_index, ReadPriority::Prefill)?;
         self.finish(table, prepared)?;
         self.view()
     }
+    /// Look up every distinct row of the batches: copy published rows now,
+    /// start reading the rows the cache lacks, and pin rows being filled elsewhere.
     pub(crate) fn prepare(&mut self, table: &EngramTable, batches: &[&EngramBatch], layer_index: usize,
-        gather: Option<&crate::shared::token_table::RowGather>) -> Result<PreparedEngram> {
+        priority: ReadPriority) -> Result<PreparedEngram> {
         self.ready = None;
         ensure!(
             !batches.is_empty() && batches.len() <= 16,
@@ -136,9 +152,13 @@ impl EngramBatchStaging {
             rows > 0 && rows <= self.capacity,
             "engram wave exceeds staging capacity"
         );
+        let encoding = table.encoding();
+        let (weight_bytes, scale_bytes) = (encoding.weight_bytes(), encoding.scale_bytes());
+        ensure!(table.row_width() == weight_bytes + scale_bytes, "engram row cache width differs from its encoding");
+        let capacity = self.capacity;
         let payload = self.payload.bytes_mut();
-        let (weights, rest) = payload.split_at_mut(self.capacity * 24 * 256);
-        let (scales, text_mask) = rest.split_at_mut(self.capacity * 24 * 8);
+        let (weights, rest) = payload.split_at_mut(capacity * 24 * 256);
+        let (scales, text_mask) = rest.split_at_mut(capacity * 24 * 8);
         self.order.clear();
         let mut token = 0;
         for batch in batches {
@@ -154,12 +174,9 @@ impl EngramBatchStaging {
                 token += 1;
             }
         }
-        let encoding = table.encoding();
-        let weight_bytes = encoding.weight_bytes();
-        let scale_bytes = encoding.scale_bytes();
         // FP4's packed weights and scales fit in the original FP8 weight arena.
         // Keep the FP8 allocation/budget unchanged and never expand mapped rows.
-        let scale_base = self.capacity * 24 * 128;
+        let scale_base = capacity * 24 * 128;
         weights[..rows * 24 * weight_bytes].fill(0);
         if encoding == EngramEncoding::Fp8 {
             scales[..rows * 24 * scale_bytes].fill(127);
@@ -175,55 +192,80 @@ impl EngramBatchStaging {
                 slots.push(slot);
             }
         }
-        // One buffer per table: paired tables together occupy a two-buffer
-        // window, and both start before waiting for either one's completion.
-        let priority = gather.map_or(Default::default(), |gather| gather.priority());
-        let priority = if layer_index == 0 { priority.first() } else { priority };
-        let (weight, scale, packed) = if table.is_strided() {
-            let mut packed = vec![0; addresses.len() * 264];
-            let packed_slots: Vec<_> = (0..addresses.len()).collect();
-            let pending = table.weights().prepare_gather(&addresses, &packed_slots, &mut packed, priority, 2)?;
-            (pending, None, Some(packed))
-        } else {
-            let weight = table.weights().prepare_gather(&addresses, &slots,
-                &mut weights[..rows * 24 * weight_bytes], priority, 1)?;
-            let scale_table = table.scales().context("paired engram has no scale table")?;
-            let destination = if encoding == EngramEncoding::Fp8 { &mut scales[..rows * 24 * scale_bytes] }
-                else { &mut weights[scale_base..scale_base + rows * 24 * scale_bytes] };
-            let scale = scale_table.prepare_gather(&addresses, &slots, destination, priority, 1)?;
-            (weight, Some(scale), None)
+        let class = if priority.is_decode() { RowClass::Decode } else { RowClass::Prefill };
+        let (pins, lookups) = table.cache().acquire(&addresses, class);
+        let mut pending = Vec::new();
+        let mut misses = Vec::new();
+        for ((lookup, &address), &slot) in lookups.iter().zip(&addresses).zip(&slots) {
+            match *lookup {
+                Lookup::Ready(cached) => place(weights, scales, scale_base, encoding, slot, pins.row(cached)),
+                Lookup::Wait(cached) => pending.push((cached, slot, address)),
+                Lookup::Fill(cached) => misses.push((address, Some(cached), slot)),
+                Lookup::Uncached => misses.push((address, None, slot)),
+            }
+        }
+        let read = if misses.is_empty() { None } else {
+            let ids: Vec<u64> = misses.iter().map(|m| m.0).collect();
+            let priority = if layer_index == 0 { priority.first() } else { priority };
+            Some((table.start_read(&ids, priority)?, misses.into_iter().map(|(_, cached, slot)| (cached, slot)).collect()))
         };
-        Ok(PreparedEngram { weight, scale, packed, slots, rows, layer: layer_index,
-            encoding, global_scale: table.global_scale() })
+        Ok(PreparedEngram { pins, pending, read, rows, layer: layer_index, encoding, global_scale: table.global_scale() })
     }
-    pub(crate) fn finish(&mut self, table: &EngramTable, mut prepared: PreparedEngram) -> Result<()> {
-        let PreparedEngram { rows, layer, encoding, global_scale, .. } = prepared;
-        let weight_bytes = encoding.weight_bytes();
-        let scale_bytes = encoding.scale_bytes();
+    /// Land this gather's reads (publishing the ones it reserved), wait for rows
+    /// filled elsewhere, then scatter duplicates to their token/head slots.
+    pub(crate) fn finish(&mut self, table: &EngramTable, prepared: PreparedEngram) -> Result<()> {
+        let PreparedEngram { mut pins, pending, read, rows, layer, encoding, global_scale } = prepared;
+        let (weight_bytes, scale_bytes) = (encoding.weight_bytes(), encoding.scale_bytes());
         let scale_base = self.capacity * 24 * 128;
         let (weights, rest) = self.payload.bytes_mut().split_at_mut(self.capacity * 24 * 256);
         let (scales, _) = rest.split_at_mut(self.capacity * 24 * 8);
-        if let Some(mut packed) = prepared.packed.take() {
-            prepared.weight.finish(table.weights(), &mut packed)?;
-            for (row, &slot) in packed.chunks_exact(264).zip(&prepared.slots) {
-                weights[slot * 256..(slot + 1) * 256].copy_from_slice(&row[..256]);
-                scales[slot * 8..(slot + 1) * 8].copy_from_slice(&row[256..]);
-            }
-        } else {
-            let mut scale = prepared.scale.take().context("paired gather has no scale ticket")?;
-            let scale_table = table.scales().context("paired engram has no scale table")?;
-            let (weight_output, scale_output) = if encoding == EngramEncoding::Fp8 {
-                (&mut weights[..rows * 24 * weight_bytes], &mut scales[..rows * 24 * scale_bytes])
-            } else {
-                let (weight, scale) = weights.split_at_mut(scale_base);
-                (&mut weight[..rows * 24 * weight_bytes], &mut scale[..rows * 24 * scale_bytes])
-            };
-            let (mut weight_done, mut scale_done) = (false, false);
-            while !weight_done || !scale_done {
-                if !weight_done { weight_done = prepared.weight.step(table.weights(), weight_output)?; }
-                if !scale_done { scale_done = scale.step(scale_table, scale_output)?; }
+        let (mut fallback, mut device) = (0, 0);
+        if let Some((mut read, targets)) = read {
+            read.finish(table)?;
+            fallback = targets.len();
+            device = read.misses();
+            let mut row = [0u8; 280];
+            pins.publish_all(targets.iter().enumerate().filter_map(|(i, (cached, _))| cached.map(|c| (c, read.row(i)))))?;
+            for (i, &(_, slot)) in targets.iter().enumerate() {
+                let [w, s] = read.row(i);
+                row[..w.len()].copy_from_slice(w);
+                row[w.len()..w.len() + s.len()].copy_from_slice(s);
+                place(weights, scales, scale_base, encoding, slot, &row[..w.len() + s.len()]);
             }
         }
+        let mut failed = Vec::new();
+        for &(cached, slot, address) in &pending {
+            if pins.wait(cached) { place(weights, scales, scale_base, encoding, slot, pins.row(cached)); }
+            else { failed.push((slot, address)); }
+        }
+        if !failed.is_empty() {
+            // Their filler stopped (cancelled request or failed read): read them here.
+            let ids: Vec<u64> = failed.iter().map(|f| f.1).collect();
+            let mut read = table.start_read(&ids, ReadPriority::Prefill)?;
+            read.finish(table)?;
+            let mut row = [0u8; 280];
+            for (i, &(slot, _)) in failed.iter().enumerate() {
+                let [w, s] = read.row(i);
+                row[..w.len()].copy_from_slice(w);
+                row[w.len()..w.len() + s.len()].copy_from_slice(s);
+                place(weights, scales, scale_base, encoding, slot, &row[..w.len() + s.len()]);
+            }
+            fallback += failed.len();
+            device += read.misses();
+        }
+        let waited = pending.len() - failed.len();
+        if fallback > 0 || waited > 0 {
+            let decode = pins.class() == RowClass::Decode;
+            table.weights().stats().record_gather_misses(decode, fallback, waited);
+            if device > 0 && !decode {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::warn!(layer, rows = device, "Engram prefill gather read rows the look-ahead had not \
+                        fetched; later ones are counted in stall_prefill_fallback_rows");
+                }
+            }
+        }
+        drop(pins);
         let mut previous = None;
         for &(address, slot) in &self.order {
             if let Some((last_address, source)) = previous {
@@ -320,12 +362,11 @@ mod tests {
         assert!(strided.scales().is_none());
         let mut before = EngramBatchStaging::new(8)?;
         let mut after = EngramBatchStaging::new(8)?;
-        let row_gather = crate::shared::token_table::RowGather::new("strided-test", 2)?;
         for copies in [2, 1, 2] {
             let batches = vec![&batch; copies];
             let expected = before.gather(&paired, &batches, 0)?;
-            for backend in [None, Some(&row_gather)] {
-                let actual = after.gather_on(&strided, &batches, 0, backend)?;
+            for _ in 0..2 {
+                let actual = after.gather(&strided, &batches, 0)?;
                 assert_eq!(actual.weights, expected.weights);
                 assert_eq!(actual.scales, expected.scales);
                 assert_eq!(actual.text_mask, expected.text_mask);
@@ -333,6 +374,7 @@ mod tests {
                 assert_eq!(actual.encoding, expected.encoding);
                 assert_eq!(strided.weights().stats().snapshot().gathers, 0,
                     "staging must leave logical gather accounting to its owner");
+                assert_eq!(actual.weights.len(), expected.weights.len());
             }
         }
         assert!(EngramTable::new_strided(map(&weight, 256)?).is_err());

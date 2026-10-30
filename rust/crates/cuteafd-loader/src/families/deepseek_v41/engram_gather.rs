@@ -58,10 +58,22 @@ impl EngramStagingShape {
     /// Preload runs before either staging pool or its lazy worker scratch is
     /// allocated. Keep their complete working set and the shared read owner.
     pub fn preload_budget(self, available: u64) -> u64 {
-        available.saturating_sub((self.host_bytes() + self.decode_host_bytes()
+        available.saturating_sub((self.host_bytes() + self.decode_host_bytes() + self.cache_bytes(264)
             + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64)
     }
     pub fn device_bytes(self) -> usize { self.units * self.rows * ENGRAM_DEVICE_ROW_BYTES }
+    /// Row-cache slots per layer: prefill (the look-ahead, two full prefill
+    /// reserves, and this shape's staging burst) and decode (two verify windows
+    /// of every decode lane), in rows of 24 per token.
+    pub fn cache_shares(self) -> [usize; 2] {
+        let prefill = crate::ENGRAM_AHEAD_TOKENS.max(2 * self.units * self.rows);
+        let decode = 2 * cuteafd_core::V41_VERIFY_ROWS * crate::plan::decode_lanes::MAX_DECODE_LANES as usize;
+        [prefill * 24, decode * 24]
+    }
+    /// Both layers' row caches for an encoding's row width (weight + scale bytes).
+    pub fn cache_bytes(self, row_width: usize) -> usize {
+        2 * crate::formats::mapped_table::row_cache::RowCache::host_bytes(row_width, self.cache_shares())
+    }
     pub fn validate_slots(self, available: usize) -> std::result::Result<(), EngramStagingError> {
         if available != self.host_slots() { return Err(EngramStagingError::Slots {
             required: self.host_slots(), available }); }
@@ -172,13 +184,13 @@ impl EngramGatherer {
         self.worker.copy_capacity_stalled()
     }
     fn with_staging(capacity: usize, staging: Vec<EngramBatchStaging>, decode: bool) -> Result<Self> {
-        let gather = crate::shared::token_table::RowGather::new("engram-pages", 16)?
-            .with_priority(if decode { crate::formats::mapped_table::ReadPriority::Decode } else { crate::formats::mapped_table::ReadPriority::Prefill });
+        use crate::formats::mapped_table::ReadPriority;
+        let priority = if decode { ReadPriority::Decode } else { ReadPriority::Prefill };
         let worker = TablePipeline::split("engram-gather", staging,
             move |staging: &mut EngramBatchStaging, job: &EngramGatherJob| {
                 let started = Instant::now();
                 let batches: Vec<_> = job.batches.iter().map(Arc::as_ref).collect();
-                Ok((staging.prepare(&job.table, &batches, job.layer, Some(&gather))?, started))
+                Ok((staging.prepare(&job.table, &batches, job.layer, priority)?, started))
             },
             |staging: &mut EngramBatchStaging, job: &EngramGatherJob, (prepared, started)| {
                 staging.finish(&job.table, prepared)?;
@@ -252,7 +264,7 @@ mod lifecycle_tests {
     fn preload_budget_reserves_every_staging_owner_and_lazy_workspace() -> Result<()> {
         for (rows, units) in [(2752, 3), (4096, 2), (2048, 4)] {
             let shape = EngramStagingShape::new(rows, units)?;
-            let future = (shape.host_bytes() + shape.decode_host_bytes()
+            let future = (shape.host_bytes() + shape.decode_host_bytes() + shape.cache_bytes(264)
                 + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
             assert_eq!(shape.preload_budget(future - 1), 0);
             assert_eq!(shape.preload_budget(future), 0);

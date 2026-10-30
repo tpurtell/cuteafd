@@ -1559,6 +1559,8 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             shape.host_workspace_bytes() as u64, Basis::Formula);
         push(Category::Workspace, "v41/engram-decode-worker", "preparer + two finishers",
             shape.decode_host_workspace_bytes() as u64, Basis::Formula);
+        push(Category::Workspace, "v41/engram-row-cache", "two layers' bounded row caches",
+            shape.cache_bytes(264) as u64, Basis::Formula);
     }
 
     if family == "qwen4" {

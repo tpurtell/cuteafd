@@ -165,6 +165,26 @@ impl ReadStream {
         self.fill()?;
         let Some(receive) = self.pending.pop_front() else { return Ok(()); };
         let reply = receive.recv().map_err(|_| invalid("table read reactor exited"))?;
+        self.land(reply, output)
+    }
+    /// [`Self::step`] without waiting: lands the oldest buffer only when its
+    /// reads have completed. True when it landed one (or refilled an idle stream).
+    pub(super) fn try_step(&mut self, output: &mut [u8]) -> Result<bool> {
+        let Some(receive) = self.pending.front() else {
+            self.fill()?;
+            return Ok(!self.pending.is_empty());
+        };
+        match receive.try_recv() {
+            Ok(reply) => {
+                self.pending.pop_front();
+                self.land(reply, output)?;
+                Ok(true)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => Err(invalid("table read reactor exited")),
+        }
+    }
+    fn land(&mut self, reply: Reply, output: &mut [u8]) -> Result<()> {
         if reply.result.is_ok() {
             for (read, bytes) in reply.buffer.reads.iter().zip(reply.buffer.bytes.chunks_exact(self.width)) {
                 output[read.slot * self.width..(read.slot + 1) * self.width].copy_from_slice(bytes);
