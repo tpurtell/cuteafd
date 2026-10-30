@@ -26,7 +26,7 @@ SCHEMA = "cuteafd-step5-corpus-v1"
 SOURCE_REPO = "stepfun-ai/Step-5-Preview-BF16"
 SOURCE_REVISION = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1"
 SOURCE_FILES = ("config.json", "tokenizer.json", "tokenizer_config.json",
-                "chat_template.jinja", "generation_config.json")
+                "chat_template.jinja", "special_tokens_map.json")
 CHAT_KWARGS = dict(tokenize=True, add_generation_prompt=True,
                    reasoning_effort="max", padding=False, truncation=False,
                    return_dict=False)
