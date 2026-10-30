@@ -216,6 +216,19 @@ impl EngramPipeline {
         let compressed = tokens.iter().map(|&token| self.token_map.compress(token, false)).collect::<Result<Vec<_>>>()?;
         Ok(self.lookahead.start(history.fork()?, compressed))
     }
+    /// Read a decode round's proposed rows (anchor and drafts, per request from
+    /// its committed history) into the row caches as soon as the drafter emits them.
+    pub fn prefetch_drafts(&self, requests: &[(&EngramHistory, &[u32])]) -> Result<()> {
+        let mut rows = [Vec::new(), Vec::new()];
+        for &(history, tokens) in requests {
+            if tokens.is_empty() { continue; }
+            let compressed = tokens.iter().map(|&t| self.token_map.compress(t, false)).collect::<Result<Vec<_>>>()?;
+            let batch = history.prepare(history.position(), &compressed, compressed.len())?;
+            for (layer, rows) in rows.iter_mut().enumerate() { rows.extend(batch.prefetch_rows(layer)?); }
+        }
+        if !rows[0].is_empty() { self.lookahead.decode(rows); }
+        Ok(())
+    }
     pub fn new_history(&self) -> Result<EngramHistory> {
         Ok(EngramHistory::new(self.token_map.pad_id())?)
     }

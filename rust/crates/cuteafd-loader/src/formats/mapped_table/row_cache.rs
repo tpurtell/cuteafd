@@ -304,6 +304,12 @@ impl Pins {
         }
     }
 
+    /// No pinned row is still being filled (each is published, or its filler failed).
+    pub fn settled(&self) -> bool {
+        let inner = self.cache.lock();
+        self.slots.iter().all(|&slot| inner.slots[slot as usize].state != State::Filling)
+    }
+
     /// A published row pinned here.
     pub fn row(&self, slot: u32) -> &[u8] {
         debug_assert!(self.slots.contains(&slot));

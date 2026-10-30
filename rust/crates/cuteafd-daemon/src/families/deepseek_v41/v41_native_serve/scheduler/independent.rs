@@ -134,6 +134,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             if let Some(draft) = draft.borrow_mut().as_deref_mut() {
                 extend_inputs(draft, &active.borrow(), &members, &mut inputs)?;
             }
+            super::prefetch_drafts(&requests.borrow(), &active.borrow(), &members, &inputs);
             let proposal = console::Proposal::capture(&inputs, console::live());
             let shared = active.borrow().iter().flatten().any(|r| r.lane() != lane);
             let (inputs, mut batch, capture, retain_shapes) = {

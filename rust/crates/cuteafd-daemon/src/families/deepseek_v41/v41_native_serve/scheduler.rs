@@ -1591,6 +1591,15 @@ fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<
     requests.prepare(&work)
 }
 
+/// Start the proposal's Engram row reads the moment drafts exist, before
+/// length selection and verify (rows of a trimmed proposal are a subset).
+pub(super) fn prefetch_drafts(requests: &Requests<'_>, active: &[Option<Active<'_>>], members: &[usize],
+    inputs: &[Vec<u32>]) {
+    let proposals: Vec<_> = members.iter().zip(inputs)
+        .map(|(&slot, input)| (active[slot].as_ref().unwrap().lease, input.as_slice())).collect();
+    requests.prefetch_drafts(&proposals);
+}
+
 fn bound_inputs(inputs: &mut [Vec<u32>]) {
     let mut lengths: Vec<_> = inputs.iter().map(|input| input.len() - 1).collect();
     crate::shared::draft::resource::trim_budget(&mut lengths, cuteafd_core::V41_VERIFY_ROWS);
@@ -1641,6 +1650,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         clock.draft(|| draft.propose(lib, lane, &seeds))?
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
+    prefetch_drafts(requests, active, members, &inputs);
     let copied = vec![false; members.len()];
     let proposal = console::Proposal::capture(&inputs, console::live());
     for (&slot, input) in members.iter().zip(&mut inputs) {

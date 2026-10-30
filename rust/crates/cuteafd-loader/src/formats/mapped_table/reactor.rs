@@ -456,8 +456,16 @@ mod tests {
             }));
         }
         for thread in threads { thread.join().expect("read caller panic")?; }
-        let queue = owner.shared.queue.lock().unwrap();
-        assert_eq!((queue.borrowed, queue.prefill_borrowed, queue.decode_waiters), (0, 0, 0));
+        // Other tests in this process share the owner (e.g. Engram look-ahead
+        // reads): every credit returns once their reads drain.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut queue = owner.shared.queue.lock().unwrap();
+        while (queue.borrowed, queue.prefill_borrowed, queue.decode_waiters) != (0, 0, 0) {
+            assert!(Instant::now() < deadline, "reactor credits never returned");
+            drop(queue);
+            std::thread::sleep(Duration::from_millis(5));
+            queue = owner.shared.queue.lock().unwrap();
+        }
         assert!(queue.buffers.iter().map(|buffer| buffer.bytes.len()).sum::<usize>() <= SLOTS * BUFFER_BYTES);
         Ok(())
     }
