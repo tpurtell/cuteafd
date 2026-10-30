@@ -204,8 +204,12 @@ impl MappedRows {
         };
         let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
+        #[cfg(test)]
+        let advice = if std::env::var_os("MAPPED_BENCH_DEFAULT_ADVICE").is_some() { libc::MADV_NORMAL } else { libc::MADV_RANDOM };
+        #[cfg(not(test))]
+        let advice = libc::MADV_RANDOM;
         // SAFETY: advice over exactly the mapping created above.
-        if unsafe { libc::madvise(raw, mapped_len, libc::MADV_RANDOM) } != 0 {
+        if unsafe { libc::madvise(raw, mapped_len, advice) } != 0 {
             return Err(os_error("setting random checkpoint access"));
         }
         Ok(result)

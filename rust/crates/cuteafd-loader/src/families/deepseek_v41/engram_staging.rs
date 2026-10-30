@@ -560,4 +560,85 @@ mod tests {
             rows.len(), t[0], t[1], t[2], t[3], table.weights().stats().snapshot().residency_ns as f64 / 1e6);
         Ok(())
     }
+
+    /// Cold/warm gather on the real official layer-1 table (ENGRAM_BENCH_SNAPSHOT):
+    /// (a) rows copied straight from the mappings by K threads (page faults do the
+    /// I/O, no mincore), and (b) the hybrid gather (mincore split, misses through
+    /// the reactor). Cold evicts both tables' pages (MADV_PAGEOUT + DONTNEED)
+    /// before every gather.
+    #[test]
+    #[ignore = "CPU/IO microbench on a real snapshot, run in release"]
+    fn engram_real_table_cold_microbench() -> Result<()> {
+        let Some(snapshot) = std::env::var_os("ENGRAM_BENCH_SNAPSHOT") else { return Ok(()) };
+        let tokens = 2752usize;
+        let repeats: usize = std::env::var("ENGRAM_BENCH_REPEATS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+        let cold = std::env::var_os("ENGRAM_BENCH_COLD").is_some();
+        let catalog = crate::read_official_v41_catalog(std::path::Path::new(&snapshot))?;
+        // SAFETY: the snapshot is immutable for the bench's lifetime.
+        let mut table = unsafe { catalog.map_engram(1)? };
+        table.set_cache_shares([24, 1024])?;
+        let mut rng = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos() as u64 | 1;
+        let mut batch = || -> Result<cuteafd_core::EngramBatch> {
+            let ids: Vec<Option<u32>> = (0..tokens).map(|_| { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+                Some((rng % 99_000) as u32) }).collect();
+            Ok(cuteafd_core::EngramHistory::new(0)?.prepare(0, &ids, tokens)?)
+        };
+        let evict = |table: &EngramTable| -> usize {
+            table.weights().evict_for_test() + table.scales().map_or(0, |s| s.evict_for_test())
+        };
+        let mode = std::env::var("ENGRAM_BENCH_MODE").unwrap_or_else(|_| "hybrid".into());
+        let threads: usize = std::env::var("ENGRAM_BENCH_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        let mut times = Vec::new();
+        let mut rows_read = 0usize;
+        for _ in 0..repeats {
+            // A fresh random batch each time: warm runs reuse its rows once first.
+            let b = batch()?;
+            let mut rows: Vec<u64> = b.hashes().iter().flat_map(|h| h[0]).collect();
+            rows.sort_unstable(); rows.dedup();
+            if cold {
+                evict(&table);
+                // A true cold drop (e.g. `nest drop-caches --host raptor`): a FUSE
+                // passthrough backing file keeps its page cache across our eviction.
+                if let Ok(command) = std::env::var("ENGRAM_BENCH_DROP") {
+                    let status = std::process::Command::new("sh").arg("-c").arg(&command).status()?;
+                    anyhow::ensure!(status.success(), "drop command failed: {command}");
+                }
+            } else {
+                // Warm: both tables' pages of this batch are in the page cache.
+                let scales = table.scales().context("paired official table")?;
+                for &row in &rows { std::hint::black_box((table.weights().row(row)?[0], scales.row(row)?[0])); }
+            }
+            let started = std::time::Instant::now();
+            if mode == "mmap" {
+                let chunk = rows.len().div_ceil(threads);
+                let scales = table.scales().context("paired official table")?;
+                std::thread::scope(|scope| {
+                    for part in rows.chunks(chunk) {
+                        let (weights, scales) = (table.weights(), scales);
+                        scope.spawn(move || {
+                            let mut out = vec![0u8; part.len() * 264];
+                            for (i, &row) in part.iter().enumerate() {
+                                out[i * 264..i * 264 + 256].copy_from_slice(weights.row(row).expect("row"));
+                                out[i * 264 + 256..(i + 1) * 264].copy_from_slice(scales.row(row).expect("row"));
+                            }
+                            std::hint::black_box(out.len());
+                        });
+                    }
+                });
+            } else {
+                let mut staging = EngramBatchStaging::new(tokens)?;
+                std::hint::black_box(staging.gather(&table, &[&b], 0)?.weights.len());
+            }
+            times.push(started.elapsed().as_secs_f64() * 1e3);
+            rows_read += rows.len();
+        }
+        times.sort_by(f64::total_cmp);
+        let median = times[times.len() / 2];
+        let distinct = rows_read / repeats;
+        // Cold, each distinct row costs one 4 KiB weight page and one 4 KiB scale page from the device.
+        println!("real table {} {} K={threads}: {distinct} distinct rows, median {median:.1} ms (min {:.1}, max {:.1}), {:.2} GB/s of 4 KiB pages",
+            if cold { "COLD" } else { "warm" }, mode, times[0], times[times.len() - 1],
+            distinct as f64 * 2.0 * 4096.0 / (median / 1e3) / 1e9);
+        Ok(())
+    }
 }
