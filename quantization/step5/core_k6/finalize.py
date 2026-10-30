@@ -20,6 +20,14 @@ from .pilot import (ARMS, CHECKS, LAYERS, LATE_LAYER, modules,
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, sha256_file, verify_receipt
 
 
+def latest_event(values, kind, **fields):
+    """Read the last successful observation; retries retain their prior log rows."""
+    selected = [r for r in values if r.get("event") == kind and all(r.get(k) == v for k,v in fields.items())]
+    if not selected:
+        raise ValueError(f"missing measured {kind} event: {fields}")
+    return selected[-1]
+
+
 def audit_evidence(root, report=None):
     """CPU-only independent checks; no quantization, replay or policy migration."""
     from safetensors import safe_open
@@ -61,10 +69,7 @@ def audit_evidence(root, report=None):
         verified[str(path.relative_to(root))] = sha256_file(path)
         return [json.loads(line) for line in path.read_text().splitlines()]
     def one(values, kind, **fields):
-        selected = [r for r in values if r.get("event") == kind and all(r.get(k) == v for k,v in fields.items())]
-        if len(selected) != 1:
-            raise ValueError(f"expected one measured {kind} event: {fields}")
-        return selected[0]
+        return latest_event(values, kind, **fields)
     def sparse_metadata(event):
         meta = event.get("sparse_metadata")
         if (not isinstance(meta, dict) or meta.get("tokens") != event["tokens"]
@@ -163,6 +168,13 @@ def audit_evidence(root, report=None):
             raise ValueError("pilot MTP calibrated projection evidence differs")
         one(measured, "mtp_boundary_exact", stage=stage, layer=92 + stage, origin=stage + 1, shifted_pairs=rows)
         receipt(root / "candidates" / f"mtp-stage{stage}-eh-k4.safetensors", item["projection_receipt"])
+        sidecar = root / "candidates" / f"mtp-stage{stage}-eh-k4.json"
+        candidate = json.loads(sidecar.read_text())
+        if (candidate["identity"] != identity or candidate["stage"] != stage or candidate["rows"] != rows
+                or candidate["receipt"] != item["projection_receipt"]
+                or candidate["metrics"] != metrics or candidate["evidence"] != evidence):
+            raise ValueError("pilot MTP candidate recovery receipt differs")
+        verified[str(sidecar.relative_to(root))] = sha256_file(sidecar)
         candidate_count += 1
     audit = dict(status="passed", identity=identity, native_checks=dict.fromkeys(CHECKS, True),
         sparse_scope=report["sparse_scope"],

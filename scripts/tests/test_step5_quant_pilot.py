@@ -24,7 +24,9 @@ def complete_report():
         for name in pilot.modules(layer):
             for arm in pilot.ARMS:
                 rows.append(dict(tensor=name, arm=arm, nmse=0 if arm == "bf16" else 1e-4,
-                    late_expert_format_witness=layer == 88, causal_input_layer=7 if layer == 88 else layer))
+                    late_expert_format_witness=layer == 88, causal_input_layer=7 if layer == 88 else layer,
+                    source_dtype="torch.float32" if name.endswith("sparse_indexer_w") else "torch.bfloat16",
+                    native_effective_dtype="torch.bfloat16", reference_basis="native-effective-projection-weight"))
     return dict(status="passed", native_checks=dict.fromkeys(pilot.CHECKS, True), results=rows,
         head_measured=False, full_model_quality_measured=False,
         sparse_scope=dict(panel_modified=False, native_csa_indexer_measured=True,
@@ -188,3 +190,91 @@ def test_pilot_retirement_refuses_symlink_before_removing_external_data(tmp_path
     with pytest.raises(ValueError, match="symlink"):
         finalize.retire_intermediates(tmp_path)
     assert (external / "sentinel").read_text() == "keep"
+
+
+def test_uncommitted_capture_retry_removes_only_its_partial_evidence(tmp_path):
+    from types import SimpleNamespace
+    frontier = tmp_path / "frontier"
+    current, partial = frontier / "layer-006", frontier / "layer-007"
+    for p in (current, partial, tmp_path / "proof-inputs", tmp_path / "hessians"):
+        p.mkdir(parents=True)
+    (current / "committed").write_text("keep input frontier")
+    (partial / "batch-00000.safetensors").write_text("partial")
+    keep = tmp_path / "proof-inputs/layer-004-00000.safetensors"
+    keep.write_text("keep committed earlier proof")
+    partial_proof = tmp_path / "proof-inputs/layer-007-00000.safetensors"
+    partial_proof.write_text("partial proof from failed attempt")
+    late_hessian = tmp_path / "hessians" / (pilot.modules(88)[0] + ".safetensors")
+    late_hessian.write_text("partial late witness")
+    partial_hessian = tmp_path / "hessians" / (pilot.modules(7)[0] + ".safetensors.partial")
+    partial_hessian.write_text("partial Hessian write")
+    events = tmp_path / "events.jsonl"
+    events.write_text("append-only history\n")
+    boundary = SimpleNamespace(current=lambda **kwargs: {"layer":6}, directory=lambda layer:frontier / f"layer-{layer:03d}")
+    pilot.reset_partial_capture(tmp_path, boundary, 7)
+    pilot.reset_partial_capture(tmp_path, boundary, 7)  # Retrying cleanup itself is safe.
+    assert keep.read_text() == "keep committed earlier proof"
+    assert (current / "committed").exists() and events.read_text() == "append-only history\n"
+    assert not any(p.exists() for p in (partial, partial_proof, late_hessian, partial_hessian))
+    with pytest.raises(ValueError, match="next uncommitted"):
+        pilot.reset_partial_capture(tmp_path, boundary, 6)
+
+
+def test_partial_capture_cleanup_refuses_symlink(tmp_path):
+    from types import SimpleNamespace
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "keep").write_text("keep")
+    (tmp_path / "proof-inputs").symlink_to(external, target_is_directory=True)
+    boundary = SimpleNamespace(current=lambda **kwargs: {"layer":6}, directory=lambda layer:tmp_path / "frontier" / f"layer-{layer:03d}")
+    with pytest.raises(ValueError, match="symlink"):
+        pilot.reset_partial_capture(tmp_path, boundary, 7)
+    assert (external / "keep").read_text() == "keep"
+
+
+def test_capture_inventory_error_names_the_missing_functional_projection(tmp_path):
+    raw = {name:{} for name in pilot.modules(7) if not name.endswith("sparse_indexer_w")}
+    with pytest.raises(ValueError, match='"missing":\\["model.layers.7.self_attn.sparse_indexer_w"\\]'):
+        pilot._save_hessians(tmp_path, {}, 7, raw, 3)
+
+
+def test_sparse_indexer_w_scoring_uses_native_bf16_without_mutating_source(monkeypatch):
+    import torch
+    original = torch.tensor([[1.0001, -1.0002]], dtype=torch.float32)
+    saved = original.clone()
+    monkeypatch.setattr(pilot, "_weight", lambda source,name: original)
+    value, dtype = pilot.score_weight(None, "model.layers.7.self_attn.sparse_indexer_w")
+    assert dtype == "torch.float32" and value.dtype == torch.bfloat16
+    assert torch.equal(value, original.bfloat16()) and torch.equal(original, saved)
+    report = complete_report()
+    row = next(r for r in report["results"] if r["tensor"].endswith("sparse_indexer_w"))
+    row["native_effective_dtype"] = "torch.float32"
+    with pytest.raises(ValueError, match="native BF16 operand"):
+        pilot.validate_qualification(report)
+
+
+def test_mtp_candidate_reuses_committed_payload_after_interrupted_stage(tmp_path):
+    import torch
+    from types import SimpleNamespace
+    calls = []
+    def quantize(weight, raw, *, bits):
+        calls.append(bits)
+        return {"trellis":torch.arange(8,dtype=torch.int16)}, {"measured":1}, {"bits":4}
+    numerical = SimpleNamespace(quantize_projection=quantize)
+    first = pilot.mtp_candidate(numerical, None, {"count":3}, tmp_path, {"identity":"fixed"}, 1)
+    second = pilot.mtp_candidate(numerical, None, {"count":3}, tmp_path, {"identity":"fixed"}, 1)
+    assert calls == [4] and first[1:] == second[1:]
+    assert torch.equal(first[0]["trellis"],second[0]["trellis"])
+    with pytest.raises(ValueError, match="identity differs"):
+        pilot.mtp_candidate(numerical, None, {"count":2}, tmp_path, {"identity":"fixed"}, 1)
+
+
+def test_retry_event_lookup_keeps_append_only_history_and_uses_latest_success():
+    from step5.core_k6.finalize import latest_event
+    events = [dict(event="native_boundary_exact",layer=7,attempt=1),
+              dict(event="native_boundary_exact",layer=7,attempt=2)]
+    before = copy.deepcopy(events)
+    assert latest_event(events,"native_boundary_exact",layer=7)["attempt"] == 2
+    assert events == before
+    with pytest.raises(ValueError, match="missing measured"):
+        latest_event(events,"layer_committed",layer=7)

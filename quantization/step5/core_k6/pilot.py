@@ -223,8 +223,10 @@ def _save_batch(directory, index, state):
 
 def _save_hessians(root, identity, layer, raw, expected_count):
     import torch
-    if set(raw) != set(modules(layer)):
-        raise ValueError("pilot captured projection inventory differs")
+    expected = set(modules(layer))
+    if set(raw) != expected:
+        raise ValueError("pilot captured projection inventory differs: " + canonical(dict(
+            layer=layer, missing=sorted(expected - set(raw)), unexpected=sorted(set(raw) - expected))))
     receipts = {}
     for name, entry in raw.items():
         if entry["count"] != expected_count:
@@ -232,6 +234,73 @@ def _save_hessians(root, identity, layer, raw, expected_count):
         receipts[name] = commit_safetensors(root / "hessians" / (name + ".safetensors"),
             dict(H=entry["H"], count=torch.tensor(entry["count"])))
     atomic_json(root / "hessians" / f"layer-{layer}.json", dict(identity=identity, files=receipts))
+
+
+def reset_partial_capture(root, boundary, layer):
+    """Discard only an uncommitted successor's payloads before replaying it.
+
+    Input frontier, earlier committed evidence and the append-only event log
+    remain available. A partial proof/Hessian write is not a resume barrier.
+    """
+    root = Path(root)
+    current = boundary.current(checksum=True)
+    if layer != (-1 if current is None else current["layer"] + 1):
+        raise ValueError("pilot cleanup must target only the next uncommitted layer")
+    partial = boundary.directory(layer)
+    parents = [root / "hessians", root / "proof-inputs"]
+    if (root / "frontier").is_symlink() or partial.is_symlink() or any(path.is_symlink() for path in parents):
+        raise ValueError("refuse symlink partial pilot capture")
+    paths = []
+    if layer in LAYERS:
+        for suffix in (".safetensors", ".safetensors.partial"):
+            paths.extend((root / "proof-inputs").glob(f"layer-{layer:03d}-*" + suffix))
+        paths.append(root / "proof-inputs" / f"layer-{layer}.json")
+        for target in ([layer, LATE_LAYER] if layer == 7 else [layer]):
+            paths.append(root / "hessians" / f"layer-{target}.json")
+            for name in modules(target):
+                path = root / "hessians" / (name + ".safetensors")
+                paths.extend((path, path.with_suffix(path.suffix + ".partial")))
+    if any(path.is_symlink() for path in paths):
+        raise ValueError("refuse symlink partial pilot payload")
+    for path in paths:
+        if path.exists():
+            path.unlink()
+    if partial.exists():
+        shutil.rmtree(partial)
+
+
+def score_weight(source, name):
+    """Reference the operand the native projection actually multiplies."""
+    import torch
+    weight = _weight(source, name)
+    source_dtype = str(weight.dtype)
+    if name.endswith("self_attn.sparse_indexer_w"):
+        # The checkpoint retains FP32 W. Its native functional projection casts
+        # W to the BF16 hidden dtype, bypassing its nn.Linear.forward entirely.
+        # This scoring conversion never modifies the source/export keep bytes.
+        weight = weight.to(torch.bfloat16)
+    return weight, source_dtype
+
+
+def mtp_candidate(numerical, weight, raw, root, identity, stage):
+    """Reuse a fully committed EH candidate after an interrupted stage proof."""
+    from safetensors.torch import load_file
+    path = root / "candidates" / f"mtp-stage{stage}-eh-k4.safetensors"
+    sidecar = path.with_suffix(".json")
+    if path.is_symlink() or sidecar.is_symlink() or path.with_suffix(path.suffix + ".partial").is_symlink():
+        raise ValueError("refuse symlink MTP pilot candidate")
+    if sidecar.exists():
+        item = json.loads(sidecar.read_text())
+        if item["identity"] != identity or item["stage"] != stage or item["rows"] != raw["count"]:
+            raise ValueError("MTP pilot candidate identity differs")
+        verify_receipt(path, item["receipt"], checksum=True)
+        return load_file(str(path)), item["metrics"], item["evidence"], item["receipt"]
+    path.unlink(missing_ok=True)
+    packed, metrics, evidence = numerical.quantize_projection(weight, raw, bits=4)
+    receipt = commit_safetensors(path, packed)
+    atomic_json(sidecar, dict(identity=identity, stage=stage, rows=raw["count"], receipt=receipt,
+        metrics=metrics, evidence=evidence))
+    return packed, metrics, evidence, receipt
 
 
 def capture_split(source, numerical, records, root, identity):
@@ -243,10 +312,7 @@ def capture_split(source, numerical, records, root, identity):
     current = boundary.current(checksum=True)
     if current is None:
         partial = boundary.directory(-1)
-        if partial.is_symlink():
-            raise ValueError("refuse pilot frontier symlink")
-        if partial.exists():
-            shutil.rmtree(partial)
+        reset_partial_capture(root, boundary, -1)
         embedding = source.tensor("model.embed_tokens.weight", "cuda:0")
         entries = []
         for index, record in enumerate(records):
@@ -259,10 +325,7 @@ def capture_split(source, numerical, records, root, identity):
         compact()
     for layer in range(current["layer"] + 1, max(LAYERS) + 1):
         partial = boundary.directory(layer)
-        if partial.is_symlink():
-            raise ValueError("refuse pilot successor symlink")
-        if partial.exists():
-            shutil.rmtree(partial)
+        reset_partial_capture(root, boundary, layer)
         block = source.load_block(layer, "cuda:0", include_experts=True)
         capture = Capture(numerical, block, layer) if layer in LAYERS else None
         entries, proofs = [], []
@@ -354,7 +417,7 @@ def score(source, numerical, root, identity):
     for layer in (*LAYERS, LATE_LAYER):
         for name in modules(layer):
             raw = load_hessian(root, "calibration", layer, name, identity)
-            weight = _weight(source, name)
+            weight, source_dtype = score_weight(source, name)
             shape = list(weight.shape)
             source.close()
             for arm in ARMS:
@@ -383,9 +446,9 @@ def score(source, numerical, root, identity):
                     del packed
                 heldout = load_hessian(root, "heldout", layer, name, identity)
                 tp2 = tp2_projection_bytes(name, shape, arm)
-                if arm == "bf16" and weight.element_size() == 4:
-                    tp2 = [2 * value for value in tp2]
-                row = dict(tensor=name, arm=arm, source_dtype=str(weight.dtype),
+                row = dict(tensor=name, arm=arm, source_dtype=source_dtype,
+                    native_effective_dtype=str(weight.dtype),
+                    reference_basis="native-effective-projection-weight",
                     nmse=weighted_nmse(weight, dense, heldout["H"]), payload_bytes=size,
                     bpw=size * 8 / weight.numel(), tp2_bytes=tp2,
                     calibration_tokens=identity["calibration_tokens"], heldout_tokens=identity["heldout_tokens"],
@@ -494,9 +557,8 @@ def qualify_mtp(source, numerical, root, identity, row):
         original = compare()
         x = envelope.float()
         raw = dict(H=x.T @ x, count=len(x), finalized=False)
-        packed, metrics, evidence = numerical.quantize_projection(block.eh_proj.weight, raw, bits=4)
+        packed, metrics, evidence, receipt = mtp_candidate(numerical, block.eh_proj.weight, raw, root, identity, stage)
         path = root / "candidates" / f"mtp-stage{stage}-eh-k4.safetensors"
-        receipt = commit_safetensors(path, packed)
         reloaded = load_file(str(path))
         block.eh_proj.weight.copy_(numerical.reconstruct_projection(reloaded, list(block.eh_proj.weight.shape),
             device="cuda:0", dtype=block.eh_proj.weight.dtype))
@@ -536,6 +598,10 @@ def validate_qualification(report):
             raise ValueError("Step-5 source precision control differs")
         if row["arm"] == "mcg-k6" and row["nmse"] > decision_policy()["maximum_k6_nmse"]:
             raise ValueError("Step-5 K6 error exceeds the absolute format bound: " + row["tensor"])
+        if row["tensor"].endswith("self_attn.sparse_indexer_w") and (
+                row.get("source_dtype") != "torch.float32" or row.get("native_effective_dtype") != "torch.bfloat16"
+                or row.get("reference_basis") != "native-effective-projection-weight"):
+            raise ValueError("Step-5 sparse-indexer W must be scored in its native BF16 operand basis")
         late = row["tensor"].startswith("model.layers.88.")
         if row.get("late_expert_format_witness") is not late or row.get("causal_input_layer") != (7 if late else int(row["tensor"].split(".")[2])):
             raise ValueError("Step-5 pilot causal witness label differs")
