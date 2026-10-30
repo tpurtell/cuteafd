@@ -430,9 +430,13 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         let layout = family.layout();
         let host = args.host_config(layout, shape.max_context, lanes)?.map(|config|
             CudaCopyEngine::registered_owned(self.library, family.snapshot_owners()).map(|copy| (config, copy))).transpose()?;
+        let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
-        Ok((family, PrefixCache::new(layout, config, host)?))
+        let cache = PrefixCache::new(layout, config, host)?;
+        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+            family.record_format(), host_bytes);
+        Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
         ensure!(job.media.is_empty(), "Step-5 bundled media encoder is not yet qualified");
