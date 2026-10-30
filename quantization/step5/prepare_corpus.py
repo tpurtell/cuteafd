@@ -77,10 +77,39 @@ def tokenizer_probes(tokenizer):
     return probes
 
 
+def verify_native_tokenizer(tokenizer, source_snapshot):
+    """Reject heuristic regex/model substitutions against serialized checkpoint bytes.
+
+    Some Transformers versions print a generic Mistral-regex warning for this
+    non-Mistral tokenizer. Native fidelity means retaining Step-5's own regex,
+    not applying that unrelated model family's suggested patch.
+    """
+    serialized = json.loads((Path(source_snapshot) / "tokenizer.json").read_text())
+    loaded = json.loads(tokenizer.backend_tokenizer.to_str())
+    fields = ("model", "normalizer", "pre_tokenizer", "decoder")
+    if any(loaded.get(key) != serialized.get(key) for key in fields):
+        raise ValueError("loaded Step-5 tokenizer differs from native serialized model/regex/decoder")
+    return dict(serialized_components_equal=list(fields), heuristic_regex_patch=False)
+
+
+def verify_native_encodings(tokenizer, source_snapshot, probes):
+    """Compare ordinary text and full rendered prompts to the raw Rust backend."""
+    from tokenizers import Tokenizer
+    raw = Tokenizer.from_file(str(Path(source_snapshot) / "tokenizer.json"))
+    count = 0
+    for probe in probes:
+        for text in (probe["raw_text"], probe["rendered_text"]):
+            if tokenizer.encode(text, add_special_tokens=False) != raw.encode(text, add_special_tokens=False).ids:
+                raise ValueError("Step-5 native encoding differs from raw checkpoint tokenizer.json")
+            count += 1
+    return dict(raw_checkpoint_backend_equal=True, raw_checkpoint_encoding_probes=count)
+
+
 def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
     import torch
     from safetensors.torch import save_file
-    from transformers import AutoTokenizer
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "python/reference"))
+    from checkpoint_tokenizer import load_tokenizer
 
     source_snapshot = Path(source_snapshot).expanduser().resolve()
     output = Path(output).expanduser().resolve()
@@ -93,11 +122,16 @@ def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
         raise ValueError("source snapshot is not the pinned Step-5 Preview BF16 release")
     rows, provenance = read_panel(download_corpus(corpus))
     source_identity = {name: sha256_file(source_snapshot / name) for name in SOURCE_FILES}
-    tokenizer = AutoTokenizer.from_pretrained(source_snapshot, local_files_only=True)
+    # The shared fidelity loader retains the serialized ByteLevel BPE backend.
+    # Current AutoTokenizer maps the source's historical LlamaTokenizerFast
+    # label to a new SentencePiece-oriented implementation, changing its regex.
+    tokenizer = load_tokenizer(source_snapshot, chat=True)
     if (not isinstance(tokenizer.chat_template, str)
             or hashlib.sha256(tokenizer.chat_template.encode()).hexdigest() != source_identity["chat_template.jinja"]):
         raise ValueError("loaded Step-5 chat template differs from checkpoint bytes")
+    tokenizer_identity = verify_native_tokenizer(tokenizer, source_snapshot)
     probes = tokenizer_probes(tokenizer)
+    tokenizer_identity.update(verify_native_encodings(tokenizer, source_snapshot, probes))
     manifest = dict(schema=SCHEMA, status="passed", contract=CONTRACT,
         dataset=dict(repo_id=REPO_ID, revision=REVISION, files=PAYLOAD_SHA256),
         historical_selection=provenance["selection"],
@@ -106,6 +140,7 @@ def prepare_corpus(source_snapshot, output, corpus=DEFAULT_CORPUS):
         software=shared.software_identity(),
         tokenizer=dict(class_name=type(tokenizer).__name__,
             native_class_name=type(tokenizer).__name__, native_template_encoding_equal=True,
+            **tokenizer_identity,
             vocab_size=len(tokenizer), special_tokens_map=tokenizer.special_tokens_map),
         probes=probes, splits={})
     output.parent.mkdir(parents=True, exist_ok=True)

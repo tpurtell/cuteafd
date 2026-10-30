@@ -26,22 +26,31 @@ def complete_report():
                 rows.append(dict(tensor=name, arm=arm, nmse=0 if arm == "bf16" else 1e-4,
                     late_expert_format_witness=layer == 88, causal_input_layer=7 if layer == 88 else layer))
     return dict(status="passed", native_checks=dict.fromkeys(pilot.CHECKS, True), results=rows,
-        head_measured=False, full_model_quality_measured=False)
+        head_measured=False, full_model_quality_measured=False,
+        sparse_scope=dict(panel_modified=False, native_csa_indexer_measured=True,
+            global_topk_pruning_measured=False, maximum_pilot_prompt_tokens=1050,
+            pruning_requires_prompt_tokens=4105))
 
 
 def test_whole_prompts_and_window_witness_are_not_truncated():
-    cal = [record("a", 400), record("b", 300), record("window", 4105)]
+    cal = [record("a", 400), record("b", 300), record("window", 603)]
     held = [record("held", 305)]
     actual, validation, witness = pilot.select_records(cal, held, 401, 256)
     assert actual == cal and validation == held and witness == cal[2]
-    assert len(actual[-1]["input_ids"]) == 4105
+    assert len(actual[-1]["input_ids"]) == 603
+
+
+def test_prefers_real_pruning_witness_only_if_the_panel_contains_one():
+    cal = [record("window", 603), record("pruning", 4105)]
+    actual, _, witness = pilot.select_records(cal, [record("held", 300)], 300, 256)
+    assert actual == cal and witness == cal[1]
 
 
 def test_missing_window_or_overlapping_heldout_fails():
     with pytest.raises(ValueError, match="window-crossing"):
         pilot.select_records([record("a", 500)], [record("held", 300)], 300, 256)
     with pytest.raises(ValueError, match="overlap"):
-        pilot.select_records([record("a", 4105)], [record("a", 4105)], 300, 256)
+        pilot.select_records([record("a", 603)], [record("a", 603)], 300, 256)
 
 
 def test_metric_inventory_and_absolute_bound_admit_fp8_advantage():
@@ -131,6 +140,21 @@ def test_sparse_probe_observes_pruning_and_restores_native_function():
     assert evidence["maximum_selected_regions"] == 513
     assert evidence["sparse_pruning_exercised"] is True
     assert len(evidence["metadata_sha256"]) == 64
+
+
+def test_native_tokenizer_regex_is_preserved_and_heuristic_changes_fail(tmp_path):
+    import json
+    from types import SimpleNamespace
+    original = dict(model={"vocab": {"hello":0}}, normalizer=None,
+        pre_tokenizer={"pattern":"native-step-regex"}, decoder={"type":"ByteLevel"})
+    (tmp_path / "tokenizer.json").write_text(json.dumps(original))
+    tokenizer = SimpleNamespace(backend_tokenizer=SimpleNamespace(to_str=lambda:json.dumps(original)))
+    assert corpus.verify_native_tokenizer(tokenizer, tmp_path)["heuristic_regex_patch"] is False
+    altered = copy.deepcopy(original)
+    altered["pre_tokenizer"]["pattern"] = "different-model-regex"
+    tokenizer.backend_tokenizer.to_str = lambda: json.dumps(altered)
+    with pytest.raises(ValueError, match="native serialized"):
+        corpus.verify_native_tokenizer(tokenizer, tmp_path)
 
 
 def test_three_stage_alignment_uses_successive_shift_without_repeating_target_rows():

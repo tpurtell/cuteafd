@@ -67,11 +67,14 @@ def modules(layer):
 def select_records(calibration, heldout, calibration_tokens=2048, heldout_tokens=768):
     """Whole prompt prefix plus one actual window-crossing calibration prompt."""
     cal, held = subset(calibration, calibration_tokens), subset(heldout, heldout_tokens)
-    # 512 history regions plus the forced current8-token region: the first
-    # actually pruned query is at position4104, not merely a513-token prompt.
+    # Prefer a real sparse-pruning witness if one exists. The public panel is
+    # deliberately kept unmodified; its Step-5 prompts currently stop at1050
+    # tokens, so it exercises native CSA/indexing but not global top-k pruning.
     witness = next((r for r in calibration if len(r["input_ids"]) > 4104), None)
     if witness is None:
-        raise ValueError("calibration contains no complete window-crossing and sparse-pruning prompt (>4104 tokens)")
+        witness = next((r for r in calibration if len(r["input_ids"]) > 512), None)
+    if witness is None:
+        raise ValueError("calibration contains no complete window-crossing prompt (>512 tokens)")
     if witness["id"] not in {r["id"] for r in cal}:
         cal.append(witness)
     if {r["id"] for r in cal} & {r["id"] for r in held}:
@@ -276,7 +279,9 @@ def capture_split(source, numerical, records, root, identity):
                     progress(root, "native_boundary_exact", layer=layer, row_id=records[index]["id"],
                         tokens=len(records[index]["input_ids"]), attention="sparse" if layer in (3, 7) else "sliding",
                         sparse_metadata=metadata)
-                    if metadata is not None and records[index]["id"] == identity["long_context_witness"] and not metadata["sparse_pruning_exercised"]:
+                    if (metadata is not None and len(records[index]["input_ids"]) > 4104
+                            and records[index]["id"] == identity["long_context_witness"]
+                            and not metadata["sparse_pruning_exercised"]):
                         raise ValueError("natural Step-5 long witness did not exercise actual sparse pruning")
                 else:
                     with capture if capture else nullcontext():
@@ -423,7 +428,8 @@ def qualify_serialized_replay(source, numerical, root, identity):
             if not bool(torch.isfinite(native["hidden"]).all()):
                 raise ValueError("serialized replay is nonfinite")
             progress(root, "serialized_boundary_exact", layer=layer, row_id=entry["row_id"], tokens=entry["tokens"], sparse_metadata=metadata)
-            if metadata is not None and entry["row_id"] == identity["long_context_witness"] and not metadata["sparse_pruning_exercised"]:
+            if (metadata is not None and entry["tokens"] > 4104 and entry["row_id"] == identity["long_context_witness"]
+                    and not metadata["sparse_pruning_exercised"]):
                 raise ValueError("serialized Step-5 long witness did not exercise actual sparse pruning")
             del native, state
         del block
@@ -535,6 +541,12 @@ def validate_qualification(report):
             raise ValueError("Step-5 pilot causal witness label differs")
     if report.get("full_model_quality_measured") is not False or report.get("head_measured") is not False:
         raise ValueError("short Step-5 pilot cannot claim full-model/head quality")
+    scope = report.get("sparse_scope")
+    if (not isinstance(scope, dict) or scope.get("panel_modified") is not False
+            or scope.get("native_csa_indexer_measured") is not True
+            or scope.get("global_topk_pruning_measured") is not (scope.get("maximum_pilot_prompt_tokens", 0) > 4104)
+            or scope.get("pruning_requires_prompt_tokens") != 4105):
+        raise ValueError("Step-5 pilot sparse-context scope differs")
     return report
 
 
@@ -558,8 +570,10 @@ def make_identity(source, tokens, calibration, heldout, witness, reviewed):
         "quantization/step5/prepare_corpus.py", "quantization/kimi_k3/prepare_corpus.py",
         "quantization/glm5/core_k6/pilot.py", "quantization/kimi_k3/core_k6/pilot.py",
         "third_party/gptqmodel/gptqmodel/utils/step5_core.py",
-        "python/reference/families/step5/golden.py", "python/reference/families/step5/mtp.py"]
+        "python/reference/families/step5/golden.py", "python/reference/families/step5/mtp.py",
+        "python/reference/checkpoint_tokenizer.py"]
     return dict(schema=SCHEMA, source=str(source.snapshot), arms=list(ARMS), layers=list(LAYERS),
+        reference_runtime=source.reference.verify_runtime_source(),
         source_inventory=reviewed, source_config_sha256=sha256_file(source.snapshot / "config.json"),
         source_index_sha256=sha256_file(source.snapshot / "model.safetensors.index.json"),
         token_manifest_sha256=sha256_file(tokens / "manifest.json"),
@@ -570,8 +584,9 @@ def make_identity(source, tokens, calibration, heldout, witness, reviewed):
         calibration_tokens=sum(len(r["input_ids"]) for r in calibration),
         heldout_tokens=sum(len(r["input_ids"]) for r in heldout),
         replay="fixed-native-bf16-eight-layer-prefix-no-candidate-affects-replay",
-        selection="whole-prompts-original-order-prefix-plus-first-natural-over4104",
+        selection="whole-prompts-original-order-prefix-plus-natural-window-witness-prefer-pruning-if-present",
         long_context_witness=witness["id"], late_expert=decision_policy()["late_expert"],
+        maximum_pilot_prompt_tokens=max(len(r["input_ids"]) for r in (*calibration, *heldout)),
         mtp="bounded-prefix-arithmetic-and-alignment-witness-not-final-target-calibration",
         head="unmeasured-requires-finished-92-layer-stream", code={p: sha256_file(REPO / p) for p in relatives},
         gptqmodel_commit=subprocess.check_output(["git", "-C", str(REPO / "third_party/gptqmodel"), "rev-parse", "HEAD"], text=True).strip(),
@@ -633,6 +648,11 @@ def main(argv=None):
         checks.update(mtp_three_stage_alignment_byte_exact=True, mtp_serialized_k4_byte_exact=True)
         report = dict(status="passed", identity=identity, native_checks=checks, results=rows, mtp=mtp,
             decision_policy=decision_policy(), head_measured=False, full_model_quality_measured=False,
+            sparse_scope=dict(panel_modified=False, native_csa_indexer_measured=True,
+                global_topk_pruning_measured=identity["maximum_pilot_prompt_tokens"] > 4104,
+                maximum_pilot_prompt_tokens=identity["maximum_pilot_prompt_tokens"],
+                pruning_requires_prompt_tokens=4105,
+                limitation="The unmodified public panel exercises native CSA/indexing; global top-k pruning requires more than4104 tokens."),
             elapsed_seconds=time.monotonic() - started)
         validate_qualification(report)
         atomic_json(output, report)

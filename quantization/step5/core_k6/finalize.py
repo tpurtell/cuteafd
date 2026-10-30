@@ -47,6 +47,10 @@ def audit_evidence(root, report=None):
         if (hashlib.sha256(canonical(selected[split]).encode()).hexdigest() != identity[split + "_sha256"]
                 or sum(len(r["input_ids"]) for r in selected[split]) != identity[split + "_tokens"]):
             raise ValueError("pilot selected token observations changed after capture")
+    maximum = max(len(r["input_ids"]) for records in selected.values() for r in records)
+    if (identity.get("maximum_pilot_prompt_tokens") != maximum
+            or report["sparse_scope"]["maximum_pilot_prompt_tokens"] != maximum):
+        raise ValueError("pilot context scope differs from the actual selected token rows")
     verified = {name: sha256_file(root / name) for name in ("plan.json", "results.json", "mtp-proof.json")}
     def receipt(path, value):
         path = Path(path)
@@ -61,15 +65,19 @@ def audit_evidence(root, report=None):
         if len(selected) != 1:
             raise ValueError(f"expected one measured {kind} event: {fields}")
         return selected[0]
-    def sparse_pruning(event):
+    def sparse_metadata(event):
         meta = event.get("sparse_metadata")
         if (not isinstance(meta, dict) or meta.get("tokens") != event["tokens"]
                 or meta.get("topk") != 512 or meta.get("region_size") != 8
                 or not 0 < meta.get("maximum_selected_regions", 0) <= 513
-                or meta.get("maximum_available_regions", 0) <= meta["maximum_selected_regions"]
-                or meta.get("pruned_query_rows", 0) <= 0 or meta.get("sparse_pruning_exercised") is not True
+                or meta.get("maximum_available_regions", 0) < meta["maximum_selected_regions"]
+                or not isinstance(meta.get("pruned_query_rows"), int) or meta["pruned_query_rows"] < 0
+                or meta.get("sparse_pruning_exercised") is not (meta["pruned_query_rows"] > 0)
                 or any(len(meta.get(name, "")) != 64 for name in ("metadata_sha256", "region_counts_sha256", "query_positions_sha256"))):
-            raise ValueError("Step-5 sparse pruning proof is missing or inconsistent")
+            raise ValueError("Step-5 native sparse metadata proof is missing or inconsistent")
+        expected = event["tokens"] > 4104
+        if meta["sparse_pruning_exercised"] is not expected:
+            raise ValueError("Step-5 observed pruning differs from the actual prompt scope")
     measured = events(root)
     candidate_count, hessian_count = 0, 0
     for row in report["results"]:
@@ -98,7 +106,7 @@ def audit_evidence(root, report=None):
             if not any(r.get("event") == "native_boundary_exact" and r.get("layer") == layer for r in ev):
                 raise ValueError("pilot native boundary event missing")
             if split == "calibration" and layer in (3, 7):
-                sparse_pruning(one(ev, "native_boundary_exact", layer=layer, row_id=identity["long_context_witness"]))
+                sparse_metadata(one(ev, "native_boundary_exact", layer=layer, row_id=identity["long_context_witness"]))
         one(ev, "late_expert_witness", source_layer=88, input_layer=7, expert=0,
             tokens=identity[split + "_tokens"], actual_layer88_calibration=False)
         for layer in (*LAYERS, LATE_LAYER):
@@ -135,7 +143,7 @@ def audit_evidence(root, report=None):
                     event = one(measured, "serialized_boundary_exact", layer=layer,
                         row_id=item["row_id"], tokens=item["tokens"])
                     if layer == 7 and item["row_id"] == identity["long_context_witness"]:
-                        sparse_pruning(event)
+                        sparse_metadata(event)
     mtp = json.loads((root / "mtp-proof.json").read_text())
     if (mtp != report["mtp"] or mtp.get("prefix_layers") != 8
             or mtp.get("final_target_frontier") is not False or len(mtp.get("stages", [])) != 3
@@ -157,6 +165,7 @@ def audit_evidence(root, report=None):
         receipt(root / "candidates" / f"mtp-stage{stage}-eh-k4.safetensors", item["projection_receipt"])
         candidate_count += 1
     audit = dict(status="passed", identity=identity, native_checks=dict.fromkeys(CHECKS, True),
+        sparse_scope=report["sparse_scope"],
         verified_files=verified, candidate_payloads=candidate_count, hessians=hessian_count,
         metric_rows=len(report["results"]), finalization="CPU-only-receipt-and-event-audit-no-numerical-rerun",
         time=datetime.now(timezone.utc).isoformat())
