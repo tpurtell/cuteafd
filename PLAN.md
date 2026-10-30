@@ -6359,3 +6359,22 @@ plan. Keep original producer identities on historical receipts; record the
 bounded-XTX producer for subsequent matrices and carry both origins into
 publication metadata. Re-run the short native/serialized production pilot
 before resuming this production root; do not start an independent full run.
+
+The audited K128 resume is now active. All 4,913 historical objects passed
+full checksum, exact module/scope, source-semantic and route-count checks;
+no historical object was rewritten. The original v1 plan remains archived
+byte-for-byte under production/epochs/000-plan.json. Sealed integration
+f43eec613 passed 217 CPU cases in the matching SM120 image.
+
+The fresh K128 short GPU pilot passed in 324.35 seconds with all six native
+and serialized checks, including the actual seven-matrix production-layer
+transaction and byte-exact replay from its assembled shard. The prior
+qualified pilot is retained at pilot-qualified-before-k128; its unit and
+the failed old producer unit are disabled.
+
+Current enabled production unit: step5-core-k6-1793358846411772718, resumed
+2026-10-30 11:14 UTC at layer 3 expert 217, preserving 679 completed
+projections and the layer-2 frontier. It uses GPTQModel main 25dd11c39 and
+the v2 plan with explicit historical per-module origins. Upload, no-copy
+Sparknest import, six-Spark placement and cleanup remain enabled. Wait for
+layer 3 to complete, then report progress and ETA every 30 minutes.
