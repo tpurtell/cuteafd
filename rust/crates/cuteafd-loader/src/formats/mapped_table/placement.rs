@@ -36,6 +36,18 @@ pub(super) fn remote_read_cap(file: &File, placement: Placement, fuse: bool) -> 
     fuse_max_background(std::path::Path::new(FUSE_CONNECTIONS), dev).map(|limit| (libc::minor(dev), limit))
 }
 
+/// Every mapped table file's placement so far: whether any is remote, and a
+/// generation that moves when that changes (the reader's CPUs follow it).
+static REMOTE_FILES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record a mapped file's placement.
+pub(super) fn note(placement: Placement) {
+    if placement == Placement::Remote { REMOTE_FILES.fetch_add(1, std::sync::atomic::Ordering::Release); }
+}
+
+/// Mapped remote files so far.
+pub(super) fn remote_files() -> u64 { REMOTE_FILES.load(std::sync::atomic::Ordering::Acquire) }
+
 /// Whether a file's rows are read from this host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Placement {

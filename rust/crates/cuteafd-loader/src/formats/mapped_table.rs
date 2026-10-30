@@ -229,6 +229,7 @@ impl MappedRows {
             return Err(invalid("checkpoint mapping returned a null address"));
         };
         let (fuse, at) = (uring::is_fuse(&file), placement::file_placement(&file));
+        placement::note(at);
         let read_cap = placement::remote_read_cap(&file, at, fuse);
         let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse,
             placement: at, read_cap, file: Arc::new(file) };
