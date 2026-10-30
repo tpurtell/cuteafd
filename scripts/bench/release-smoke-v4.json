@@ -1261,7 +1261,7 @@
         "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
         "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPUS": "0,1",
+        "COORDINATOR_GPUS": "1,0",
         "ADDR": "0.0.0.0:8891",
         "EXPERT_PORT": "21820",
         "SPECULATOR": "dspark",
