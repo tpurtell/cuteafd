@@ -160,3 +160,18 @@ def test_mtp_recovers_verified_seed_and_latest_stage_after_two_crash_barriers(mo
     assert not (parent.root/'mtp/093/frontier').exists()
     latest=run.RollingBoundary(parent.root/'mtp/094/frontier',parent.identity).current(checksum=True)
     assert latest['layer']==0 and latest['manifest']['batches'][0]['tokens']==2
+
+
+@pytest.mark.parametrize('phase,expected_width',[('c',12),('e',6)])
+def test_native_projection_wrapper_needs_only_checkpoint_weight_geometry(tmp_path,phase,expected_width):
+    # Official RowParallelLinear has a weight but no nn.Linear.in_features.
+    block=SimpleNamespace(moe=None,self_attn=SimpleNamespace(o_proj=SimpleNamespace(weight=torch.empty(4,12))),
+        mlp=SimpleNamespace(down_proj=SimpleNamespace(weight=torch.empty(2,6))))
+    engine=object.__new__(run.Engine);widths=[]
+    engine._new_phase=lambda *a:None
+    engine._hessian=lambda width:widths.append(width) or object()
+    engine._read=lambda *a:iter(())
+    engine._commit_phase=lambda *a:True
+    store=SimpleNamespace(retire=lambda *a:None)
+    assert getattr(engine,'_phase_'+phase)(block,0,store) is True
+    assert widths==[expected_width]

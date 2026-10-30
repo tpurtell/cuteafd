@@ -272,7 +272,7 @@ def test_conflicting_existing_snapshot_is_not_overwritten(finished,fake_hub):
 def test_changed_local_metadata_invalidates_publication_marker(finished,fake_hub):
     publication.publish(finished.export,finished.root,publication.TARGET_REPO)
     (finished.export/"README.md").write_text("changed after publication")
-    with pytest.raises(ValueError,match="completion identity or payload"):
+    with pytest.raises(ValueError,match="completion identity or payload|completed diagnostic bundle differs"):
         publication.publish(finished.export,finished.root,publication.TARGET_REPO)
     assert len(fake_hub["uploads"])==1
 

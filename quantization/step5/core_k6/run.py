@@ -79,7 +79,7 @@ class Engine(FlashEngine):
         del raw;compact()
 
     def _phase_c(self,block,layer,store):
-        self._new_phase(store,'c');h=self._hessian(block.self_attn.o_proj.in_features);entries=[]
+        self._new_phase(store,'c');h=self._hessian(block.self_attn.o_proj.weight.shape[1]);entries=[]
         for index,row,state in self._read(store,'a'):
             value=self.math.capture_linear_input(block.self_attn.o_proj,self.math.attention_forward,
                 block,state['attn_input'],self._context(state))
@@ -93,7 +93,7 @@ class Engine(FlashEngine):
         return block.share_expert if block.moe is not None else block.mlp
 
     def _phase_e(self,block,layer,store):
-        self._new_phase(store,'e');mlp=self._shared(block);h=self._hessian(mlp.down_proj.in_features)
+        self._new_phase(store,'e');mlp=self._shared(block);h=self._hessian(mlp.down_proj.weight.shape[1])
         for index,_,state in self._read(store,'d'):
             h.add(self.math.shared_down_input(mlp,state['mlp_input']));self._emit('e',layer,index)
         return self._commit_phase(store,'e',[],[('down',h)])
