@@ -3877,11 +3877,12 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
         ("v41/engram-decode", shape.decode_host_resident_bytes()),
         ("v41/engram-prefill-worker", shape.host_workspace_bytes()),
         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes()),
+        ("v41/engram-row-cache", shape.cache_bytes(264)),
     ] {
         let item = host.items.iter().find(|item| item.group == group).expect(group);
         assert_eq!(item.bytes, bytes as u64);
     }
-    let future = (shape.host_bytes() + shape.decode_host_bytes()
+    let future = (shape.host_bytes() + shape.decode_host_bytes() + shape.cache_bytes(264)
         + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
     let tables = auto.mapped_placement.table_bytes;
     for (budget, all) in [(future + tables - 1, false), (future + tables, true)] {
