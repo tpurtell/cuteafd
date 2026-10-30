@@ -32,9 +32,11 @@ pub const fn window_units(depth: usize) -> usize { 2 * depth }
 
 /// Tokens per piece: both layers' rows of a piece fit one reactor buffer per table.
 const PIECE_TOKENS: usize = 128;
-/// Layer reads (one piece, one layer) in flight at once; each holds up to one
-/// reactor buffer per table (6 of the reactor's 14 prefill buffers), leaving
-/// buffers for the gathers.
+/// Prefill layer reads (one piece, one layer) in flight at once. Every
+/// look-ahead read holds one reactor buffer, and at most one decode piece (two
+/// layers) runs: 5 of the reactor's 16 buffers, so with the gathers' own
+/// windows (two prefill and two decode jobs, two buffers each) every holder
+/// always gets a buffer and none can block while another waits on it.
 const MAX_INFLIGHT: usize = 3;
 
 /// The prefill units a request's prompt runs in: absolute end positions, in
@@ -182,21 +184,29 @@ impl Drop for EngramLookahead {
 fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
     let mut plans: Vec<Plan> = Vec::new();
     let mut decode: VecDeque<Piece> = VecDeque::new();
+    let mut next_decode: Option<[Vec<u64>; 2]> = None;
     loop {
         // Apply every queued command without waiting; decode rows start at once.
         loop {
             match receive.try_recv() {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
-                Ok(Command::Decode(rows)) => match start_decode(&rows, &tables) {
-                    Ok(Some(piece)) => decode.push_back(piece),
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(%error, "Engram draft look-ahead read failed; rows load on demand"),
-                },
+                // The latest round's rows supersede an unstarted earlier round's.
+                Ok(Command::Decode(rows)) => next_decode = Some(rows),
                 Ok(command) => apply(&mut plans, command),
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
         let mut progressed = false;
+        // One decode piece at a time (its gather reads what has not landed).
+        if decode.is_empty() {
+            if let Some(rows) = next_decode.take() {
+                match start_decode(&rows, &tables) {
+                    Ok(Some(piece)) => { decode.push_back(piece); progressed = true; }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(%error, "Engram draft look-ahead read failed; rows load on demand"),
+                }
+            }
+        }
         // Published decode rows stay cached (evictable); their pins drop here.
         for piece in &mut decode {
             for (layer, table) in tables.iter().enumerate() {
@@ -265,21 +275,13 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
         match busy {
             true => match receive.recv_timeout(std::time::Duration::from_micros(200)) {
                 Ok(Command::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => return,
-                Ok(Command::Decode(rows)) => match start_decode(&rows, &tables) {
-                    Ok(Some(piece)) => decode.push_back(piece),
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(%error, "Engram draft look-ahead read failed; rows load on demand"),
-                },
+                Ok(Command::Decode(rows)) => next_decode = Some(rows),
                 Ok(command) => apply(&mut plans, command),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             },
             false => match receive.recv() {
                 Ok(Command::Stop) | Err(_) => return,
-                Ok(Command::Decode(rows)) => match start_decode(&rows, &tables) {
-                    Ok(Some(piece)) => decode.push_back(piece),
-                    Ok(None) => {}
-                    Err(error) => tracing::warn!(%error, "Engram draft look-ahead read failed; rows load on demand"),
-                },
+                Ok(Command::Decode(rows)) => next_decode = Some(rows),
                 Ok(command) => apply(&mut plans, command),
             },
         }
@@ -357,7 +359,7 @@ fn reserve(table: &EngramTable, rows: &[u64], class: RowClass, priority: ReadPri
             Lookup::Uncached => {}
         }
     }
-    let read = if ids.is_empty() { None } else { Some((table.start_read(&ids, priority)?, slots)) };
+    let read = if ids.is_empty() { None } else { Some((table.start_read_window(&ids, priority, 1)?, slots)) };
     Ok((held, read, counts))
 }
 
@@ -404,7 +406,7 @@ fn start_decode(rows: &[Vec<u64>; 2], tables: &[Arc<EngramTable>; 2]) -> Result<
         }
         if !ids.is_empty() {
             let priority = if layer == 0 { ReadPriority::DecodeFirst } else { ReadPriority::Decode };
-            reads[layer] = Some((table.start_read(&ids, priority)?, slots));
+            reads[layer] = Some((table.start_read_window(&ids, priority, 1)?, slots));
         }
         pins.push(held);
     }
@@ -631,6 +633,39 @@ mod tests {
         assert_eq!(pieces(), 1, "no room until the first piece commits");
         assert!(handle.commit(128));
         while pieces() < 2 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }
+        Ok(())
+    }
+
+    /// The cand4 hang shape: a flood of decode commands whose rows all miss
+    /// the page cache must not leave the planner holding reactor buffers while
+    /// it blocks for more, so a gather that needs a buffer still finishes.
+    #[test]
+    fn decode_flood_never_starves_a_gather_of_reactor_buffers() -> Result<()> {
+        let history = EngramHistory::new(2)?;
+        let tables = [table(0, &[])?, table(1, &[])?];
+        let ahead = EngramLookahead::new(tables.clone())?;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+        // Far more pieces than the reactor has buffers, every row cold.
+        for _ in 0..64 {
+            let rows = [0, 1].map(|layer| (0..24).map(|_| next() % cuteafd_core::ENGRAM_ROWS[layer]).collect::<Vec<_>>());
+            ahead.decode(rows);
+        }
+        let batch = std::sync::Arc::new(history.prepare(0, &[Some(41), Some(42), Some(43)], 3)?);
+        let gather_tables = tables.clone();
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut staging = crate::EngramBatchStaging::new(3).expect("staging");
+            let result = [0, 1].into_iter().try_for_each(|layer| {
+                let prepared = staging.prepare(&gather_tables[layer], &[batch.as_ref()], layer, ReadPriority::Decode)?;
+                staging.finish(&gather_tables[layer], prepared)
+            });
+            let _ = send.send(result.map_err(|error| error.to_string()));
+        });
+        let outcome = receive.recv_timeout(std::time::Duration::from_secs(20))
+            .map_err(|_| anyhow::anyhow!("a decode gather starved behind the look-ahead's reactor buffers"))?;
+        outcome.map_err(anyhow::Error::msg)?;
+        drop(ahead);
         Ok(())
     }
 }

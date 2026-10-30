@@ -496,4 +496,52 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Phase split of the page-cache-hot gather (see `engram_gather_microbench`).
+    #[test]
+    #[ignore = "CPU microbench, run in release"]
+    fn engram_gather_phase_microbench() -> Result<()> {
+        use crate::formats::mapped_table::row_cache::RowClass;
+        let tokens = 2752usize;
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let ids: Vec<Option<u32>> = (0..tokens).map(|_| {
+            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+            Some((rng % 99_000) as u32)
+        }).collect();
+        let batch = cuteafd_core::EngramHistory::new(0)?.prepare(0, &ids, tokens)?;
+        let dir = tempfile::tempdir_in(std::env::var("ENGRAM_BENCH_DIR").unwrap_or_else(|_| ".".into()))?;
+        let path = dir.path().join("strided.bin");
+        let file = std::fs::File::create(&path)?;
+        file.set_len(ENGRAM_ROWS[0] * 264)?;
+        let mut rows: Vec<u64> = batch.hashes().iter().flat_map(|h| h[0]).collect();
+        for &address in &rows { file.write_all_at(&[(address % 251) as u8; 264], address * 264)?; }
+        drop(file);
+        rows.sort_unstable(); rows.dedup();
+        // SAFETY: the bench owns the immutable fixture file for the table's lifetime.
+        let table = unsafe { crate::MappedTable::single(&path, 0, ENGRAM_ROWS[0], crate::RowFormat::of(cuteafd_core::DType::U8, 264)?)? };
+        let mut table = EngramTable::new_strided(table)?;
+        table.set_cache_shares([24, 1024])?;
+        let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill)?;
+        read.finish(&table)?;
+        let mut t = [0f64; 4];
+        for _ in 0..10 {
+            let a = std::time::Instant::now();
+            let (pins, _) = table.cache().acquire(&rows, RowClass::Prefill);
+            drop(pins);
+            let b = std::time::Instant::now();
+            let mut read = table.start_read(&rows, crate::formats::mapped_table::ReadPriority::Prefill)?;
+            let c = std::time::Instant::now();
+            read.finish(&table)?;
+            let d = std::time::Instant::now();
+            std::hint::black_box(read.misses());
+            let mut out = vec![0u8; rows.len() * 264];
+            for i in 0..rows.len() { let [w, sc] = read.row(i); out[i*264..i*264+w.len()].copy_from_slice(w); out[i*264+w.len()..(i+1)*264].copy_from_slice(sc); }
+            let e = std::time::Instant::now();
+            std::hint::black_box(out.len());
+            for (slot, span) in t.iter_mut().zip([b - a, c - b, d - c, e - d]) { *slot += span.as_secs_f64() * 100.0; }
+        }
+        println!("engram gather phases ({} distinct rows), mean ms: acquire+release {:.2}, start_read (mincore + resident copy) {:.2}, finish {:.2}, place copy {:.2}; residency (mincore) total over all calls {:.1} ms",
+            rows.len(), t[0], t[1], t[2], t[3], table.weights().stats().snapshot().residency_ns as f64 / 1e6);
+        Ok(())
+    }
 }

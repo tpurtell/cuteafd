@@ -89,12 +89,17 @@ impl EngramTable {
     /// Start reading `rows` (distinct) into private buffers; resident rows are
     /// copied on this thread, misses go to the shared read reactor.
     pub(crate) fn start_read(&self, rows: &[u64], priority: ReadPriority) -> Result<RowRead> {
+        self.start_read_window(rows, priority, 2)
+    }
+    /// [`Self::start_read`] holding at most `window` reactor buffers per table
+    /// (the look-ahead holds one, so it can never starve the gathers).
+    pub(crate) fn start_read_window(&self, rows: &[u64], priority: ReadPriority, window: usize) -> Result<RowRead> {
         let slots: Vec<usize> = (0..rows.len()).collect();
         let weight_width = self.weights.row_bytes();
         let mut weights = vec![0; rows.len() * weight_width];
         match &self.scales {
             None => {
-                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, 2)?;
+                let weight = self.weights.prepare_gather(rows, &slots, &mut weights, priority, window.clamp(1, 2))?;
                 let misses = weight.misses();
                 Ok(RowRead { weight, scale: None, weights, scales: Vec::new(), widths: [weight_width, 0], misses })
             }

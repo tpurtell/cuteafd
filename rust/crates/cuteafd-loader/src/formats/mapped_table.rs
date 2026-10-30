@@ -842,6 +842,10 @@ impl MappedTable {
             }
             return Ok(prepared);
         }
+        #[cfg(test)]
+        let hits = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() { vec![false; rows.len()] }
+            else { self.residency(rows, false)? };
+        #[cfg(not(test))]
         let hits = self.residency(rows, false)?;
         let before = thread_faults();
         for ((part, row, slot), hit) in locations.into_iter().zip(hits) {
