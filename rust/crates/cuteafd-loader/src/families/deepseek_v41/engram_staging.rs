@@ -480,7 +480,9 @@ mod tests {
         let mut table = EngramTable::new_strided(rows)?;
         let hint = std::env::var_os("ENGRAM_BENCH_HINT").is_some();
         let mut staging = EngramBatchStaging::new(tokens)?;
+        let cold = std::env::var_os("ENGRAM_BENCH_COLD").is_some();
         for (label, shares) in [("row-cache hit", [2 * tokens * 24, 1024]), ("page-cache hot", [24, 1024])] {
+            if cold && label == "row-cache hit" { continue; }
             table.set_cache_shares(shares)?;
             // Warm: the page cache (and, when it fits, the row cache).
             for _ in 0..2 { staging.gather(&table, &[&batch], 0)?; }
@@ -493,15 +495,25 @@ mod tests {
             }
             let mut times = Vec::new();
             for _ in 0..repeats {
+                if cold {
+                    // Evict the fixture's pages: every row is a device read.
+                    let file = std::fs::File::open(&path)?;
+                    // SAFETY: fadvise only asks the kernel to drop clean cached pages of this file.
+                    unsafe { libc::posix_fadvise(std::os::fd::AsRawFd::as_raw_fd(&file), 0, 0, libc::POSIX_FADV_DONTNEED) };
+                    if hint { table.weights().trust_residency_hint(); }
+                }
                 let started = std::time::Instant::now();
                 let view = staging.gather(&table, &[&batch], 0)?;
                 std::hint::black_box(view.weights.len());
                 times.push(started.elapsed().as_secs_f64() * 1e3);
             }
             times.sort_by(f64::total_cmp);
-            println!("engram gather {label}{}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, late faults {}",
-                if hint { " (residency hint)" } else { "" }, times[times.len() / 2], times[0], times[times.len() - 1],
-                table.weights().stats().snapshot().late_major_faults);
+            let mode = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() {
+                if std::env::var_os("MAPPED_BENCH_INLINE").is_some() { " (all rows via reactor, no ASYNC)" } else { " (all rows via reactor, ASYNC)" }
+            } else if hint { " (residency hint)" } else { " (mincore)" };
+            println!("engram gather {label}{}{mode}: {tokens} tokens x 24 rows, median {:.2} ms, min {:.2} ms, max {:.2} ms, late faults {}, distrusts {}",
+                if cold { " COLD" } else { "" }, times[times.len() / 2], times[0], times[times.len() - 1],
+                table.weights().stats().snapshot().late_major_faults, table.weights().stats().snapshot().residency_hint_distrusts);
         }
         Ok(())
     }
