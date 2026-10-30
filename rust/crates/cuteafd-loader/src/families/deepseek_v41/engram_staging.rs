@@ -199,6 +199,9 @@ impl EngramBatchStaging {
         for ((lookup, &address), &slot) in lookups.iter().zip(&addresses).zip(&slots) {
             match *lookup {
                 Lookup::Ready(cached) => place(weights, scales, scale_base, encoding, slot, pins.row(cached)),
+                // Decode never waits on another reader: its own hybrid read is a
+                // copy when the row is resident and joins the device read when not.
+                Lookup::Wait(_) if class == RowClass::Decode => misses.push((address, None, slot)),
                 Lookup::Wait(cached) => pending.push((cached, slot, address)),
                 Lookup::Fill(cached) => misses.push((address, Some(cached), slot)),
                 Lookup::Uncached => misses.push((address, None, slot)),
