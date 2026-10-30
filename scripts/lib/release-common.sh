@@ -861,7 +861,7 @@ release_known_key() {
     MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|FULL_PREFILL_LOGITS|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|GATEWAY) return 0 ;;
     GLM5_FLASH_KDA_FP8|GLM5_FLASH_FP8_HEAD|GLM5_FLASH_FP8_PREFILL|GLM5_FLASH_KDA_SPLIT|GLM5_FLASH_PREFILL_LANES|GLM5_FLASH_PREFILL_LANE_ROWS|GLM5_FLASH_HEADROOM_GIB|GLM5_FLASH_GRAPH_BUDGET_MIB|GLM5_FLASH_EXL3_WORKER_PATH|GLM5_FLASH_EXL3_ROUTE_DUMP|GLM5_FLASH_EXL3_ROUTE_DUMP_CALLS|GLM5_FLASH_INDEX_CACHE|GLMF_KDA_FP8|GLMF_FP8_HEAD|GLMF_FP8_PREFILL) return 0 ;;
     MIMO_PREFIX_DRAFT|MIMO_HOST_CACHE|MIMO_PREFILL_CHUNK_S|MIMO_SNAPSHOT_WAIT) return 0 ;;
-    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|COORDINATOR_SPLIT_GPU|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
+    MIMO_WEIGHT_POLICY|MIMO_FP8_HEAD|MIMO_FP8_O_PROJ|QWEN_FP8_DECODE|QWEN_FP8_HEAD|QWEN_STARTUP_GRAPHS|POOL_TOKENS|PREFIX_PARTIAL|KV_CACHE|SWA_KV_CACHE|DECODE_GRAPHS|EXPERT_INPUT|DECODE_SHARE|L2_PREFETCH|FP8_SCALES|DRAFT_CONTEXT_SLOTS|DRAFT_SEQUENCES|DRAFT_KV_CACHE|SERVED_MODEL_ID|COORDINATOR_GPUS|COORDINATOR_SPLIT|INSTANCE|WIP_INSTANCE|WIP_ROOT|FP8_EXPERT_PREFILL|SPARK_INTAKE|CONSOLE_TEXT|THERMAL|EXPERT_BACKEND) return 0 ;;
     HOST_WAIT|IDLE_PARK_SECONDS) return 0 ;;
     VISION|VISION_REPLICAS|AUDIO|EMBEDDING|MEDIA_CACHE_BYTES|CHAT_TEMPLATE_FROM|TP2_ATTENTION|TP2_QUERY_PROJECTION|TP2_OUTPUT_PROJECTION|TP2_DSPARK_EXPERTS) return 0 ;;
     GLM5_FLASH_DRAFT_HEAD) return 0 ;;
@@ -880,7 +880,7 @@ release_known_key() {
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU|COORDINATOR_GPU_UUID|COORDINATOR_GPU_PCI_BUS_ID|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-5]_HOST|SPARK_[0-5]_LANE_A|SPARK_[0-5]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -1080,9 +1080,7 @@ release_load_config() {
   V41_FP8_HEAD=
   RTX_EXPERT_LAYERS=auto
   RTX_GPUS=auto
-  COORDINATOR_GPU=0
-  COORDINATOR_GPU_UUID=
-  COORDINATOR_GPU_PCI_BUS_ID=
+  COORDINATOR_GPUS=
   COORDINATOR_GPU_HEADROOM_GIB=8
   COORDINATOR_GPU_BUDGET_GIB=
   POOL_TOKENS=
@@ -1252,14 +1250,6 @@ release_load_config() {
     RTX_EXPERT_LAYERS="$(release_onboard "$RTX_EXPERT_LAYERS" "$MODEL_ID" "$MODEL_REVISION")" || return 2
   fi
   case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
-  [[ "$COORDINATOR_GPU" =~ ^[0-9]+$ ]] || release_die "COORDINATOR_GPU must be a non-negative host GPU index"
-  [[ -z "$COORDINATOR_GPU_UUID" || "$COORDINATOR_GPU_UUID" =~ ^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
-    release_die "COORDINATOR_GPU_UUID must be empty or a physical NVIDIA GPU UUID"
-  [[ -z "$COORDINATOR_GPU_PCI_BUS_ID" || "$COORDINATOR_GPU_PCI_BUS_ID" =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] ||
-    release_die "COORDINATOR_GPU_PCI_BUS_ID must be empty or a full PCI bus ID"
-  [[ -z "$COORDINATOR_GPU_UUID" && -z "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
-    [[ -n "$COORDINATOR_GPU_UUID" && -n "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
-    release_die "COORDINATOR_GPU_UUID and COORDINATOR_GPU_PCI_BUS_ID must be set together"
   if ((RELEASE_CONCURRENCY_EXPLICIT)); then
     if [[ "$mode" == stop ]]; then
       [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
@@ -1393,38 +1383,49 @@ release_validate_stop_config() {
   done
 }
 
-release_resolve_coordinator_gpu_identity() {
-  local selector gpu_line observed_index observed_uuid observed_pci
-  selector="${COORDINATOR_GPU_PCI_BUS_ID:-$COORDINATOR_GPU}"
-  gpu_line="$(
-    nvidia-smi --id="$selector" \
-      --query-gpu=index,uuid,pci.bus_id \
-      --format=csv,noheader,nounits
-  )" || release_die "cannot resolve coordinator GPU selector: $selector"
-  [[ -n "$gpu_line" && "$gpu_line" != *$'\n'* ]] ||
-    release_die "coordinator GPU selector did not resolve to exactly one device: $selector"
-  IFS=, read -r observed_index observed_uuid observed_pci <<<"$gpu_line"
-  observed_index="$(release_trim "$observed_index")"
-  observed_uuid="$(release_trim "$observed_uuid")"
-  observed_pci="$(release_trim "$observed_pci")"
-  [[ "$observed_index" =~ ^[0-9]+$ ]] ||
-    release_die "coordinator GPU has an invalid host index: $observed_index"
-  [[ "$observed_uuid" =~ ^GPU-[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] ||
-    release_die "coordinator GPU has an invalid physical UUID: $observed_uuid"
-  [[ "$observed_pci" =~ ^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$ ]] ||
-    release_die "coordinator GPU has an invalid PCI identity: $observed_pci"
-  if [[ -n "$COORDINATOR_GPU_UUID" ]]; then
-    [[ "$observed_uuid" == "$COORDINATOR_GPU_UUID" && "$observed_pci" == "$COORDINATOR_GPU_PCI_BUS_ID" ]] ||
-      release_die "coordinator GPU PCI selector resolved to another physical device"
-  else
-    [[ "$observed_index" == "$COORDINATOR_GPU" ]] ||
-      release_die "coordinator GPU ordinal resolved to an unexpected device"
-  fi
-  COORDINATOR_GPU_UUID="$observed_uuid"
-  COORDINATOR_GPU_PCI_BUS_ID="$observed_pci"
-  RELEASE_COORDINATOR_GPU_UUID="$observed_uuid"
-  RELEASE_COORDINATOR_GPU_HOST_INDEX="$observed_index"
-  RELEASE_COORDINATOR_GPU_PCI_BUS_ID="$observed_pci"
+# release_resolve_coordinator_gpus SELECTORS COUNT: the coordinator GPUs a
+# launch uses, primary first, for every family and ./wip.sh. SELECTORS is
+# COORDINATOR_GPUS (one or two host indices, PCI bus ids or GPU UUIDs; empty
+# selects by index); COUNT is auto, 1 or 2, and an explicit list must name that
+# many. Each named GPU must exist and the two must differ. Sets the
+# RELEASE_COORDINATOR_GPU_{INDICES,UUIDS} arrays (logical order) and the
+# primary's RELEASE_COORDINATOR_GPU_{UUID,HOST_INDEX}.
+release_resolve_coordinator_gpus() {
+  local resolved index uuid pci
+  resolved="$(python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" resolve --selectors "$1" --count "$2")" ||
+    exit 2
+  RELEASE_COORDINATOR_GPU_INDICES=() RELEASE_COORDINATOR_GPU_UUIDS=()
+  while read -r index uuid pci; do
+    RELEASE_COORDINATOR_GPU_INDICES+=("$index")
+    RELEASE_COORDINATOR_GPU_UUIDS+=("$uuid")
+  done <<<"$resolved"
+  ((${#RELEASE_COORDINATOR_GPU_UUIDS[@]})) || release_die "nvidia-smi reported no coordinator GPU"
+  RELEASE_COORDINATOR_GPU_UUID="${RELEASE_COORDINATOR_GPU_UUIDS[0]}"
+  RELEASE_COORDINATOR_GPU_HOST_INDEX="${RELEASE_COORDINATOR_GPU_INDICES[0]}"
+}
+
+# release_admit_coordinator_gpus UUID_CSV DEPLOYMENT_JSON [--reclaim-pid PID]...:
+# each selected GPU holds its logical device's planned fixed owners (the KV pool
+# sizes itself), crediting memory the container being replaced holds. Fails
+# before any container starts.
+release_admit_coordinator_gpus() {
+  local uuids="$1" deployment="$2"
+  shift 2
+  python3 "$(dirname "${BASH_SOURCE[0]}")/coordinator-gpus.py" admit --uuids "$uuids" --deployment /dev/stdin "$@" \
+    <<<"$deployment" || exit 2
+}
+
+# release_coordinator_reclaim_args CONTAINER: --reclaim-pid for each process of
+# the coordinator a --restart replaces, so GPU memory it holds counts as free.
+release_coordinator_reclaim_args() {
+  local pid
+  RELEASE_RECLAIM_ARGS=()
+  docker container inspect "$1" >/dev/null 2>&1 || return 0
+  while IFS= read -r pid; do
+    pid="$(release_trim "$pid")"
+    [[ "$pid" =~ ^[0-9]+$ ]] && RELEASE_RECLAIM_ARGS+=(--reclaim-pid "$pid")
+  done < <(docker top "$1" -eo pid 2>/dev/null | tail -n +2 || true)
+  return 0
 }
 
 release_resolve_local_model_revision() {

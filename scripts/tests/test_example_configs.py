@@ -149,11 +149,9 @@ def _stubs(tmp_path: Path) -> Path:
         (bin_dir / tool).write_text(body)
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
-    (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo 98304 ;; '
-                                        '*memory.free*) echo 97000 ;; *query-gpu=uuid*) echo GPU-00000000-0000-0000-0000-000000000000 ;; *) printf "%s\\n" 0 1 ;; esac\n')
-    for tool in ("curl", "nvidia-smi"):
-        (bin_dir / tool).chmod(0o755)
-    from launcher_sandbox import stub_cuda_python
+    (bin_dir / "curl").chmod(0o755)
+    from launcher_sandbox import fake_nvidia_smi, stub_cuda_python
+    fake_nvidia_smi(bin_dir)
     stub_cuda_python(bin_dir, 98304 * 2**20)
     return bin_dir
 
@@ -184,11 +182,14 @@ print(json.dumps(dict(report, version=1, family=family, executable=True, report=
     launch=dict(family=family, first_expert_layer=first, last_expert_layer=last),
     spark_admission="coordinator_authoritative", decode_lanes=1,
     peers=value("--deployment-peers", "").split(",")[:report["spark_ranks"]],
-    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096)))
+    speculator=value("--speculator", "off"), prefill_rows=int(value("--prefill-rows", "4096")) or 4096,
+    memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=8 << 30)])
+                                for i in range(int(value("--rtx", "1")))]))))
 """.replace("REPORT", repr(json.dumps(plan))).replace("FAMILY", repr(family))
             .replace("FIRST", first).replace("LAST", "None" if last == "-1" else last))
         docker.write_text(docker.read_text() + f'case "$*" in *"cuteafd plan"*) exec python3 "{stub}" "$@" ;; esac\n')
-    env = {**os.environ, "HF_HOME": str(hf), "HOME": str(tmp_path / "home"),
+    from launcher_sandbox import fake_gpus
+    env = {**os.environ, "HF_HOME": str(hf), "HOME": str(tmp_path / "home"), "FAKE_GPUS": json.dumps(fake_gpus(2)),
            "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     return subprocess.run(["bash", str(ROOT / "run.sh"), "--config", str(config)], cwd=ROOT, env=env,
                           capture_output=True, text=True, timeout=60)
@@ -252,7 +253,7 @@ def test_release_smoke_matrix_covers_owned_columns_with_current_defaults() -> No
             for rank in range(len(entry["sparks"])):
                 assert values[f"SPARK_{rank}_LANE_B"].startswith("10.55.1.")
         assert int(values["RTX_GPUS"]) == len(entry["gpus"])
-        assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
         assert int(values["SPARK_COUNT"]) == len(entry["sparks"])
         assert len(entry["gpus"]) == (1 if entry["name"].endswith("-min") else 2)
         for rank, host in enumerate(entry["sparks"]):
@@ -337,7 +338,7 @@ def test_v3_release_matrix_covers_shipped_quants_reference_layouts_and_real_5090
         assert entry["family"] in FAMILY_DOCS
         assert "BENCH_SIMULATED" not in values
         assert int(values["RTX_GPUS"]) == len(entry["gpus"])
-        assert int(values["COORDINATOR_GPU"]) == entry["gpus"][0]
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, entry["gpus"]))
         assert int(values["SPARK_COUNT"]) == len(entry["sparks"])
         assert values["SPECULATOR"] in {"dspark", "dflash2", "mtp"}
         assert values["POOL_TOKENS"] in {"auto", "2097152"}

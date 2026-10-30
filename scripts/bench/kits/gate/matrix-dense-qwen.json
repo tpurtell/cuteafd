@@ -14,7 +14,7 @@
       "sparks": [],
       "set": {
         "ADDR": "0.0.0.0:8740",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0"
       }
     },
@@ -26,7 +26,7 @@
       "sparks": [],
       "set": {
         "ADDR": "0.0.0.0:8741",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0"
       }
     }

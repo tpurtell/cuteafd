@@ -716,7 +716,8 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         self.assertIn('RUST_LOG=${RUST_LOG:-info}', script)
         self.assertIn('--rtx-gpus "$RELEASE_RTX_GPUS"', script)
         self.assertNotIn('--first-layer', script)
-        self.assertIn('CUDA_VISIBLE_DEVICES=$gpu_uuid_csv', script)
+        self.assertIn('release_coordinator_device_args "${release_gpu_uuids[@]}"', script)
+        self.assertIn('"${RELEASE_COORDINATOR_DEVICE_ARGS[@]}"', script)
         self.assertIn("trap cleanup EXIT", script)
 
     def test_coordinator_release_contains_both_rtx_expert_interfaces(self) -> None:

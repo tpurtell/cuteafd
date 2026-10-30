@@ -20,14 +20,6 @@ if tool == 'ssh':
     host, *command = args
     env = dict(os.environ, MOCK_HOST=host)
     sys.exit(subprocess.run(command, input=sys.stdin.read(), text=True, env=env).returncode)
-if tool == 'nvidia-smi':
-    gpu = '0, GPU-00000000-0000-0000-0000-000000000000, 00000000:11:00.0'
-    memory = os.environ.get('MOCK_GPU_MIB', '97887')
-    if '--query-gpu=memory.total' in args:
-        print(memory)
-    else:
-        print(gpu + (f', {memory}, {memory}' if 'memory.total' in ' '.join(args) else ''))
-    sys.exit(0)
 if tool == 'docker':
     if args == ['info']: sys.exit(0)
     if args[:2] == ['container', 'inspect']: sys.exit(1)
@@ -55,7 +47,9 @@ if tool == 'docker':
             speculator=value('--speculator', 'off'),
             admission=dict(kv_pool_size=value('--kv-pool-size'), memory_reservation=value('--memory-reservation')),
             peers=value('--deployment-peers', '').split(',')[:ranks],
-            spark_admission='coordinator_authoritative')))
+            spark_admission='coordinator_authoritative',
+            memory_layout=dict(devices=[dict(kind='rtx', index=i, items=[dict(category='weights', bytes=8 << 30)])
+                                        for i in range(gpus)]))))
         sys.exit(0)
 raise SystemExit('Unexpected external action: ' + tool + ' ' + repr(args))
 '''
@@ -69,11 +63,12 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
             directory = Path(temporary)
             binary = directory / 'bin'
             binary.mkdir()
-            for tool in ('docker', 'ssh', 'nvidia-smi', 'curl', 'ss'):
+            for tool in ('docker', 'ssh', 'curl', 'ss'):
                 path = binary / tool
                 path.write_text(f'#!{sys.executable}\n' + MOCK)
                 path.chmod(0o755)
-            from launcher_sandbox import stub_cuda_python
+            from launcher_sandbox import fake_gpus, fake_nvidia_smi, stub_cuda_python
+            fake_nvidia_smi(binary)
             stub_cuda_python(binary, gpu_mib * 2**20)
             snapshot = directory / 'hf/hub/models--deepseek-ai--DeepSeek-V4.1-Flash/snapshots/dba1be0a40aa45a94ad051997016db3960a90277'
             snapshot.mkdir(parents=True)
@@ -82,7 +77,7 @@ class Exl3ReleasePreflightTest(unittest.TestCase):
             env = dict(os.environ, PATH=str(binary) + os.pathsep + os.environ['PATH'],
                        HF_HOME=str(directory / 'hf'), MOCK_LOG=str(directory / 'calls.jsonl'),
                        MOCK_REVISION=json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())['revision'],
-                       MOCK_GPU_MIB=str(gpu_mib))
+                       FAKE_GPUS=json.dumps(fake_gpus(1, gpu_mib, gpu_mib)))
             config = directory / 'release.config'
             config.write_text((ROOT / 'cuteafd.config').read_text()
                               + f'\nSPARK_COUNT={spark_count}\n'

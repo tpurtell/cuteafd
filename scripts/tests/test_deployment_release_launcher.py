@@ -125,6 +125,15 @@ def test_deployment_preserves_release_container_commands(entry: dict, swa_kv: st
             if waves == "3":
                 before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"
 
+        if old["host"] == "coordinator" and entry["family"] != "deepseek_v41":
+            # Every family's coordinator now takes its GPUs as V4.1's always did: CDI by
+            # UUID and CUDA_VISIBLE_DEVICES in logical order (COORDINATOR_GPUS, primary first).
+            from launcher_sandbox import FAKE_GPU_UUIDS
+            indices = [option.split("=", 1)[1] for option in before["options"] if option.startswith("--device nvidia.com/gpu=")]
+            uuids = [FAKE_GPU_UUIDS[int(index)] for index in indices]
+            before["options"] = sorted([option for option in before["options"] if not option.startswith("--device nvidia.com/gpu=")]
+                                       + [f"--device nvidia.com/gpu={uuid}" for uuid in uuids])
+            before["env"]["CUDA_VISIBLE_DEVICES"] = ",".join(uuids)
         fingerprint = "CUTEAFD_RELEASE_CONFIG_SHA256"
         if entry["family"] == "deepseek_v41" and fingerprint in before["env"]:
             assert after["env"][fingerprint] != before["env"][fingerprint], (entry["name"], old["host"])
@@ -212,7 +221,8 @@ def test_exlr8_launcher_preserves_explicit_prefill_waves(waves: str) -> None:
 @pytest.mark.parametrize("ranks", range(1, 7))
 def test_exlr8_launcher_accepts_canonical_spark_worlds(ranks: int, gpus: str, attention: str) -> None:
     entry = exlr8_entry()
-    entry["set"].update(SPARK_COUNT=str(ranks), RTX_GPUS=gpus, ATTENTION_PLACEMENT=attention)
+    entry["set"].update(SPARK_COUNT=str(ranks), RTX_GPUS=gpus, COORDINATOR_GPUS="0,1"[:2 * int(gpus) - 1],
+                        ATTENTION_PLACEMENT=attention)
     result = capture(ROOT, f"exlr8-world-{ranks}-{gpus}-{attention}", release_entry=entry)
     coordinator = parse_run(result["containers"][0]["argv"])["command"]
     assert ("--split-device" in coordinator) == (gpus == "2")
