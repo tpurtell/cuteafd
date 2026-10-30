@@ -91,3 +91,11 @@ def test_completed_handoff_prevents_restarting_published_retired_job(tmp_path):
     (tmp_path/'handoff-complete.json').write_text(json.dumps({'status':'passed'}))
     record=tmp_path/'attempt.json';record.write_text(json.dumps({'root':str(tmp_path)}))
     assert launch.supervise(record)==0
+
+
+def test_completed_no_copy_import_can_have_unknown_initial_byte_total():
+    handoff.successful({'job':{'finished':True,'pending':0,'hosts':{'maxq':{
+        'finished':True,'done_files':2,'total_files':2,'done_bytes':100,'total_bytes':0}}}})
+    with pytest.raises(ValueError):
+        handoff.successful({'job':{'finished':True,'pending':0,'hosts':{'maxq':{
+            'finished':True,'done_files':2,'total_files':2,'done_bytes':90,'total_bytes':100}}}})

@@ -24,7 +24,7 @@ def successful(result):
     job=result.get('job')
     if not job or not job.get('finished') or job.get('error') or job.get('cancelled') or job.get('pending'):
         raise ValueError('Sparknest job did not finish successfully')
-    if any(not h.get('finished') or h.get('failed') or h.get('cancelled') or h.get('done_files')!=h.get('total_files') or h.get('done_bytes')!=h.get('total_bytes') for h in job.get('hosts',{}).values()):
+    if any(not h.get('finished') or h.get('failed') or h.get('cancelled') or h.get('done_files')!=h.get('total_files') or (h.get('total_bytes',0)>0 and h.get('done_bytes')!=h['total_bytes']) for h in job.get('hosts',{}).values()):
         raise ValueError('Sparknest host job failed')
 
 def safe_remove(path,parent):
