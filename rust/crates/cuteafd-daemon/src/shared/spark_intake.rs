@@ -123,14 +123,20 @@ impl IntakeChoice {
     }
 }
 
-/// Probes dma-buf GPU landing (64 MiB loopback sends) on the current device.
-pub(crate) fn probe_gpu_landing(library: &NativeLibrary) -> Result<GpuLandingProbe> {
+/// The RDMA device, port and source GID a landing probe binds: chosen by the
+/// address that reaches the Spark peers, never by device or GID table order.
+pub(crate) type LandingRoute<'r> = &'r dyn Fn() -> Result<cuteafd_transport::fabric::RdmaSelection>;
+
+/// Probes dma-buf GPU landing (64 MiB loopback sends) on the current device,
+/// over `route`'s device, port and source GID.
+pub(crate) fn probe_gpu_landing(library: &NativeLibrary, route: LandingRoute<'_>) -> Result<GpuLandingProbe> {
     ensure!(!std::env::var("CUTEAFD_GPU_LANDING_PROBE").is_ok_and(|v| v == "unavailable"),
         "GPU landing probe forced unavailable");
-    let probe = cuteafd_transport::gpu_landing_probe(library, None, 64 << 20, 8)?;
+    let rdma = route()?;
+    let probe = cuteafd_transport::gpu_landing_probe(library, &rdma, 64 << 20, 8)?;
     let link = landing_pcie_link(library);
-    tracing::info!(cuda_device = probe.cuda_device, gpu_gbps = probe.gpu_gbps,
-        host_gbps = probe.host_gbps, pcie_generation = ?link.as_ref().and_then(|link| link.generation),
+    tracing::info!(cuda_device = probe.cuda_device, rdma_device = %rdma.device, port = rdma.port,
+        gid_index = rdma.gid_index, gpu_gbps = probe.gpu_gbps, host_gbps = probe.host_gbps, pcie_generation = ?link.as_ref().and_then(|link| link.generation),
         pcie_width = ?link.as_ref().and_then(|link| link.width), usable = probe.usable(), "GPU landing probe");
     Ok(probe)
 }
@@ -152,18 +158,20 @@ fn preferred_choice(mut choice: IntakeChoice, preference: IntakePreference) -> I
     choice
 }
 
-pub(crate) fn choose_preferred_mode(library: &NativeLibrary, preference: IntakePreference) -> Result<IntakeChoice> {
-    choose_mode(library).map(|choice| preferred_choice(choice, preference))
+pub(crate) fn choose_preferred_mode(library: &NativeLibrary, route: LandingRoute<'_>, preference: IntakePreference)
+    -> Result<IntakeChoice> {
+    choose_mode(library, route).map(|choice| preferred_choice(choice, preference))
 }
 
-pub(crate) fn preferred_device_exchange_available(library: &NativeLibrary, preference: IntakePreference) -> Result<bool> {
-    Ok(device_choice_available(&choose_preferred_mode(library, preference)?))
+pub(crate) fn preferred_device_exchange_available(library: &NativeLibrary, route: LandingRoute<'_>,
+    preference: IntakePreference) -> Result<bool> {
+    Ok(device_choice_available(&choose_preferred_mode(library, route, preference)?))
 }
 
 /// Optional device-driven exchange must not turn a failed landing probe into
 /// a startup error. The existing pinned transport remains the fallback.
-pub(crate) fn device_exchange_available(library: &NativeLibrary) -> Result<bool> {
-    let choice = choose_mode(library)?;
+pub(crate) fn device_exchange_available(library: &NativeLibrary, route: LandingRoute<'_>) -> Result<bool> {
+    let choice = choose_mode(library, route)?;
     let available = device_choice_available(&choice);
     if !available {
         tracing::warn!(reason = %choice.reason, "GPU exchange unavailable; retaining pinned-host Spark intake");
@@ -222,9 +230,9 @@ fn resolve_landing_probe(setting: &str, probe: &Result<GpuLandingProbe>, h2d: Op
     }
 }
 
-/// Resolves `CUTEAFD_SPARK_INTAKE` (and probes dma-buf landing for `auto` and
-/// `gpu`) once per process.
-pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
+/// Resolves `CUTEAFD_SPARK_INTAKE` (and probes dma-buf landing over `route`
+/// for `auto` and `gpu`) once per process.
+pub(crate) fn choose_mode(library: &NativeLibrary, route: LandingRoute<'_>) -> Result<IntakeChoice> {
     static CHOICE: OnceLock<IntakeChoice> = OnceLock::new();
     if let Some(choice) = CHOICE.get() {
         return Ok(choice.clone());
@@ -234,7 +242,7 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
         "host" => (IntakeMode::Host, "CUTEAFD_SPARK_INTAKE=host".to_string(), None, None),
         "pinned" => (IntakeMode::Pinned, "CUTEAFD_SPARK_INTAKE=pinned".to_string(), None, None),
         "gpu" | "auto" => {
-            let probe = probe_gpu_landing(library);
+            let probe = probe_gpu_landing(library, route);
             let h2d = match (&probe, setting.as_str()) {
                 (Ok(p), "auto") if p.usable() => probe_h2d(library)
                     .map_err(|error| tracing::warn!("H2D copy probe failed: {error:#}")).ok(),
@@ -248,15 +256,6 @@ pub(crate) fn choose_mode(library: &NativeLibrary) -> Result<IntakeChoice> {
     let choice = IntakeChoice { setting, mode, reason, probe, h2d_gbps };
     tracing::info!(setting = %choice.setting, mode = choice.mode.name(), reason = %choice.reason, "Spark partial intake");
     Ok(CHOICE.get_or_init(|| choice).clone())
-}
-
-/// The intake mode for a transport of `ranks` x `capacity` rows of
-/// `row_bytes`, logged.
-pub(crate) fn transport_mode(library: &NativeLibrary, ranks: usize, capacity: usize, row_bytes: usize)
-    -> Result<IntakeMode> {
-    let (mode, reason) = choose_mode(library)?.mode_for(ranks * capacity * row_bytes);
-    tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
-    Ok(mode)
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -307,10 +306,42 @@ impl FabricLanding {
     }
 }
 
+/// The intake mode for a transport of `ranks` x `capacity` rows of
+/// `row_bytes`, logged.
+pub(crate) fn transport_mode(library: &NativeLibrary, route: LandingRoute<'_>, ranks: usize, capacity: usize,
+    row_bytes: usize) -> Result<IntakeMode> {
+    let (mode, reason) = choose_mode(library, route)?.mode_for(ranks * capacity * row_bytes);
+    tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
+    Ok(mode)
+}
+
+/// The device, port and source GID `cuteafd fabric` probes landing on: the
+/// address that reaches `peer`, or, without one, the only RoCE v2 address on
+/// the host. Several candidates and no peer is refused rather than guessed.
+fn fabric_landing_route(peer: Option<std::net::SocketAddr>) -> Result<cuteafd_transport::fabric::RdmaSelection> {
+    let ports = cuteafd_transport::fabric::discover()?.ports;
+    if let Some(peer) = peer {
+        return cuteafd_transport::fabric::select_rdma_route(&ports, peer);
+    }
+    sole_rdma_address(&ports)
+}
+
+fn sole_rdma_address(ports: &[cuteafd_transport::fabric::RdmaPort]) -> Result<cuteafd_transport::fabric::RdmaSelection> {
+    let candidates: Vec<_> = ports.iter().filter(|port| port.active && port.link_layer == "Ethernet")
+        .flat_map(|port| port.roce_v2.iter().map(move |&(gid_index, address)| (port, gid_index, address))).collect();
+    match candidates.as_slice() {
+        [(port, gid_index, _)] => Ok(cuteafd_transport::fabric::RdmaSelection {
+            device: port.device.clone(), port: port.port, gid_index: *gid_index }),
+        [] => anyhow::bail!("no active RoCE v2 IPv4 address"),
+        many => anyhow::bail!("{} RoCE v2 IPv4 addresses ({}); pass --landing-peer to pick the one that reaches the Sparks",
+            many.len(), many.iter().map(|(port, _, address)| format!("{}:{address}", port.device)).collect::<Vec<_>>().join(", ")),
+    }
+}
+
 /// Runs the GPU landing probe for `cuteafd fabric` when a native library is
 /// given (or `CUTEAFD_NATIVE_LIB` names one).
-pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool, repeats: u32)
-    -> Vec<FabricLanding> {
+pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, warmup: bool, repeats: u32,
+    peer: Option<std::net::SocketAddr>) -> Vec<FabricLanding> {
     let library = (|| -> Result<NativeLibrary> {
         let path = native_lib.map(std::path::PathBuf::from)
             .or_else(|| std::env::var_os("CUTEAFD_NATIVE_LIB").map(std::path::PathBuf::from))
@@ -325,7 +356,7 @@ pub(crate) fn fabric_probe(native_lib: Option<&std::path::Path>, device: i32, wa
         let result = (|| -> Result<(GpuLandingProbe, Option<f64>, Option<LandingPcieLink>)> {
             let library = library.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
             if warmup { warm_landing_link(library)?; }
-            let probe = probe_gpu_landing(library)?;
+            let probe = probe_gpu_landing(library, &|| fabric_landing_route(peer))?;
             let pcie_link = landing_pcie_link(library);
             let h2d = probe_h2d(library).ok();
             Ok((probe, h2d, pcie_link))
@@ -1563,7 +1594,8 @@ impl<'a> SparkLink<'a> {
         let ranks = transport.world_size();
         let capacity = transport.capacity();
         library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
-        let (mode, reason) = choose_preferred_mode(library, preference)?.mode_for(ranks * capacity as usize * row_bytes);
+        let route = || transport.rdma_route();
+        let (mode, reason) = choose_preferred_mode(library, &route, preference)?.mode_for(ranks * capacity as usize * row_bytes);
         tracing::info!(mode = mode.name(), ranks, capacity, %reason, "Spark transport intake");
         let intake = SparkIntake::with_waves(library, mode, ranks, wave_rows as usize, row_bytes, waves)?;
         // SAFETY: the link drops its transport (and its exchange's) before its
@@ -1781,8 +1813,24 @@ mod tests {
     }
 
     #[test]
+    fn fabric_landing_without_a_peer_needs_a_sole_rdma_address() {
+        use cuteafd_transport::fabric::{RdmaPort, RdmaSelection};
+        let port = |roce_v2: Vec<(u32, std::net::Ipv4Addr)>| RdmaPort { device: "mlx5_0".into(), port: 1, active: true,
+            link_layer: "Ethernet".into(), link_gbps: 400.0, netdev: Some("eno1".into()), mtu: Some(9000), roce_v2,
+            subnets: vec![], pci: None };
+        let rail = std::net::Ipv4Addr::new(10, 55, 0, 22);
+        assert_eq!(sole_rdma_address(&[port(vec![(7, rail)])]).unwrap(),
+            RdmaSelection { device: "mlx5_0".into(), port: 1, gid_index: 7 });
+        // A management address beside the rail (lower index): no guess.
+        let error = sole_rdma_address(&[port(vec![(3, std::net::Ipv4Addr::new(192, 168, 1, 50)), (7, rail)])])
+            .unwrap_err().to_string();
+        assert!(error.contains("--landing-peer") && error.contains("192.168.1.50"), "{error}");
+        assert!(sole_rdma_address(&[port(vec![])]).is_err());
+    }
+
+    #[test]
     fn fabric_probe_reports_missing_library_for_each_bounded_repeat() {
-        let reports = fabric_probe(Some(std::path::Path::new("/nonexistent-landing-probe-library.so")), 0, true, 3);
+        let reports = fabric_probe(Some(std::path::Path::new("/nonexistent-landing-probe-library.so")), 0, true, 3, None);
         assert_eq!(reports.len(), 3);
         for report in reports {
             assert!(report.probe.is_none());

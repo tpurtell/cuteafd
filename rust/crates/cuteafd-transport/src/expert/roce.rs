@@ -7,7 +7,7 @@ use crate::{
     DeviceLanding, ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2SourceKind,
     TcpTransportConfig, VerbsHostProtocolV2ResponsePayload,
 };
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -168,6 +168,14 @@ impl SparkExperts {
     }
     /// Decode/MTP owner identity, fixed at construction and kept on reconnect.
     pub fn execution_lane(&self) -> u32 { self.clients.execution_lane() }
+    /// The RDMA device, port and source GID that reach this transport's first
+    /// rank: the RoCE v2 GID of the address the kernel routes it from, as its
+    /// control connection binds. Probes that run beside the transport (GPU
+    /// landing) use it instead of any device or GID table order.
+    pub fn rdma_route(&self) -> Result<crate::fabric::RdmaSelection> {
+        let peer = *self.clients.peers().first().context("Spark transport has no ranks")?;
+        crate::fabric::select_rdma_route(&crate::fabric::discover()?.ports, peer)
+    }
     pub fn world_size(&self) -> usize {
         self.executors.len()
     }

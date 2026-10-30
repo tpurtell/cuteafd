@@ -68,6 +68,7 @@ impl LocalTp4Client {
         }
     }
     pub(crate) fn execution_lane(&self) -> u32 { self.execution_lane }
+    pub(crate) fn peers(&self) -> &[SocketAddr] { &self.peers }
     pub(crate) fn set_capacity(&mut self, capacity: u32) { self.capacity = Some(capacity); }
     pub(crate) fn bind_model_endpoint(&mut self, endpoint: u32) -> Result<()> {
         anyhow::ensure!(endpoint < 8, "ModelAdmission endpoint index must be below eight");

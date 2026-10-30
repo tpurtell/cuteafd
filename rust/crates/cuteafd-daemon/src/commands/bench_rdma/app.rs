@@ -288,6 +288,7 @@ pub(super) fn cuteafd_verbs_app_benchmark_attempt(
     )?;
     let native_probe_bytes = native_request.wire_stats().logical_payload_bytes;
     let native_rdma_probe = native_rdma_probe(
+        peer.as_deref(),
         native_probe_bytes,
         &native_request_frame,
         &native_response_frame,
@@ -469,7 +470,29 @@ fn protocol_v2_rc_endpoint_descriptor(
     }
 }
 
+/// The device, port and source GID the loopback probes bind: the address
+/// that reaches `peer` (the bench's own control peer), or the host's only
+/// RoCE v2 address. Never the first device or the first GID in its table.
+fn loopback_route(peer: Option<&str>) -> Result<cuteafd_transport::fabric::RdmaSelection> {
+    let ports = cuteafd_transport::fabric::discover()?.ports;
+    if let Some(peer) = peer.filter(|peer| !peer.trim().is_empty()) {
+        let addr = peer_control_addr(peer, 0);
+        let first = addr.to_socket_addrs().with_context(|| format!("resolving {addr}"))?
+            .next().with_context(|| format!("{addr} resolved no addresses"))?;
+        return cuteafd_transport::fabric::select_rdma_route(&ports, first);
+    }
+    let candidates: Vec<_> = ports.iter().filter(|port| port.active && port.link_layer == "Ethernet")
+        .flat_map(|port| port.roce_v2.iter().map(move |&(gid_index, _)| (port, gid_index))).collect();
+    match candidates.as_slice() {
+        [(port, gid_index)] => Ok(cuteafd_transport::fabric::RdmaSelection {
+            device: port.device.clone(), port: port.port, gid_index: *gid_index }),
+        other => anyhow::bail!("{} RoCE v2 IPv4 addresses and no --peer to choose the one that reaches it",
+            other.len()),
+    }
+}
+
 fn native_rdma_probe(
+    peer: Option<&str>,
     loopback_bytes: usize,
     request_frame: &[u8],
     response_frame: &[u8],
@@ -571,7 +594,10 @@ fn native_rdma_probe(
         }
     }
 
-    match library.rdma_rc_send_recv_loopback_probe(1, loopback_bytes) {
+    let route = loopback_route(peer);
+    let loopback = route.as_ref().map_err(|error| format!("{error:#}"));
+    match loopback.clone().and_then(|route| library.rdma_rc_send_recv_loopback_probe(
+        &route.device, route.port, route.gid_index, loopback_bytes).map_err(|error| error.to_string())) {
         Ok(loopback) => {
             probe.rc_send_recv_loopback_ok = true;
             probe.rc_send_recv_payload_matches = Some(loopback.payload_matches != 0);
@@ -580,13 +606,13 @@ fn native_rdma_probe(
             probe.rc_send_recv_poll_iterations = Some(loopback.poll_iterations);
         }
         Err(err) => {
-            let err = err.to_string();
             probe.rc_send_recv_loopback_unavailable = is_rdma_unavailable_error(&err);
             probe.rc_send_recv_loopback_error = Some(err);
         }
     }
 
-    match library.rdma_rc_protocol_v2_loopback_probe(1, request_frame, response_frame) {
+    match loopback.and_then(|route| library.rdma_rc_protocol_v2_loopback_probe(
+        &route.device, route.port, route.gid_index, request_frame, response_frame).map_err(|error| error.to_string())) {
         Ok(loopback) => {
             probe.rc_protocol_v2_loopback_ok = true;
             probe.rc_protocol_v2_request_payload_matches =
@@ -598,7 +624,6 @@ fn native_rdma_probe(
             probe.rc_protocol_v2_poll_iterations = Some(loopback.poll_iterations);
         }
         Err(err) => {
-            let err = err.to_string();
             probe.rc_protocol_v2_loopback_unavailable = is_rdma_unavailable_error(&err);
             probe.rc_protocol_v2_loopback_error = Some(err);
         }
@@ -652,13 +677,17 @@ struct NativeRdmaEndpoint<'a> {
 }
 
 impl<'a> NativeRdmaEndpoint<'a> {
+    /// An endpoint on the device, port and source GID of `stream`'s own local
+    /// address: the one the peer is reached through.
     fn create(
         library: &'a NativeLibrary,
+        stream: &TcpStream,
         role: &str,
         payload: &CuteafdVerbsAppPayload,
         local_psn: u32,
     ) -> Result<Self> {
-        let port_num = verbs_app_ib_port_num()?;
+        let rdma = cuteafd_transport::fabric::select_rdma_for_stream(
+            &cuteafd_transport::fabric::discover()?.ports, stream)?;
         let (send_frame_bytes, recv_frame_bytes, send_span, recv_span) = match role {
             "client" => (
                 payload.request_wire_bytes,
@@ -674,8 +703,10 @@ impl<'a> NativeRdmaEndpoint<'a> {
             ),
             other => anyhow::bail!("unsupported RDMA endpoint role: {other}"),
         };
-        let info = library.rdma_rc_endpoint_create(
-            port_num,
+        let info = library.rdma_rc_endpoint_create_on_gid_with_buffer_flags(
+            &rdma.device,
+            rdma.port,
+            rdma.gid_index,
             local_psn,
             send_frame_bytes,
             recv_frame_bytes,
@@ -684,6 +715,7 @@ impl<'a> NativeRdmaEndpoint<'a> {
             8,
             8,
             1,
+            0,
         )?;
         Ok(Self { library, info })
     }
@@ -890,6 +922,7 @@ fn execute_client_app_run(
     validate_payload_matches_frames(payload, &request_frame, &response_frame)?;
     let endpoint = NativeRdmaEndpoint::create(
         library,
+        stream,
         "client",
         payload,
         local_psn_for_run("client", payload_index, run_kind),
@@ -1018,6 +1051,7 @@ fn execute_server_app_run(
     validate_payload_matches_frames(payload, &request_frame, &response_frame)?;
     let endpoint = NativeRdmaEndpoint::create(
         library,
+        stream,
         "server",
         payload,
         local_psn_for_run("server", start.payload_index, &start.run_kind),
@@ -1288,10 +1322,6 @@ fn local_psn_for_run(role: &str, payload_index: usize, run_kind: &str) -> u32 {
     role_base + kind_offset + payload_index as u32 + 1
 }
 
-fn verbs_app_ib_port_num() -> Result<u32> {
-    parse_env_u32("CUTEAFD_VERBS_APP_IB_PORT_NUM", 1)
-}
-
 fn verbs_app_control_timeout() -> Duration {
     let secs = parse_env_u64("CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS", 60).unwrap_or(60);
     Duration::from_secs(secs)
@@ -1335,15 +1365,6 @@ fn parse_optional_env_usize(name: &str) -> Result<Option<usize>> {
             .map(Some)
             .with_context(|| format!("invalid {name} value {value}")),
         _ => Ok(None),
-    }
-}
-
-fn parse_env_u32(name: &str, default: u32) -> Result<u32> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => value
-            .parse::<u32>()
-            .with_context(|| format!("invalid {name} value {value}")),
-        _ => Ok(default),
     }
 }
 

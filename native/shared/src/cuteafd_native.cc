@@ -286,71 +286,16 @@ void gid_to_hex(const ibv_gid& gid, char* out, size_t out_len) {
   out[32] = '\0';
 }
 
-bool gid_is_zero(const ibv_gid& gid) {
-  for (uint8_t value : gid.raw) {
-    if (value != 0) {
-      return false;
+// The device named by a caller that chose it (and its GID) from the address
+// that reaches the peer; null when absent.
+ibv_device* find_rdma_device(ibv_device** devices, int device_count, const char* name) {
+  for (int index = 0; devices != nullptr && name != nullptr && index < device_count; ++index) {
+    const char* candidate = ibv_get_device_name(devices[index]);
+    if (candidate != nullptr && std::strcmp(candidate, name) == 0) {
+      return devices[index];
     }
   }
-  return true;
-}
-
-bool gid_is_ipv4_mapped(const ibv_gid& gid) {
-  for (int idx = 0; idx < 10; ++idx) {
-    if (gid.raw[idx] != 0) {
-      return false;
-    }
-  }
-  return gid.raw[10] == 0xff && gid.raw[11] == 0xff;
-}
-
-cuteafd_status_t select_rc_gid(ibv_context* context, const ibv_port_attr& port_attr,
-                             uint32_t port_num, ibv_gid* out_gid,
-                             uint32_t* out_gid_index) {
-  if (context == nullptr || out_gid == nullptr || out_gid_index == nullptr) {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC GID selection argument is null");
-  }
-  if (port_attr.link_layer != IBV_LINK_LAYER_ETHERNET) {
-    if (ibv_query_gid(context, static_cast<uint8_t>(port_num), 0, out_gid) != 0) {
-      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_query_gid failed for RC endpoint");
-    }
-    *out_gid_index = 0;
-    return ok();
-  }
-
-  bool have_fallback = false;
-  ibv_gid fallback_gid = {};
-  uint32_t fallback_index = 0;
-  const uint32_t gid_count = std::max<uint32_t>(1, port_attr.gid_tbl_len);
-  for (uint32_t index = 0; index < gid_count; ++index) {
-    ibv_gid_entry entry = {};
-    if (ibv_query_gid_ex(context, port_num, index, &entry, 0) != 0) {
-      continue;
-    }
-    if (gid_is_zero(entry.gid)) {
-      continue;
-    }
-    const bool ipv4_mapped = gid_is_ipv4_mapped(entry.gid);
-    if (entry.gid_type == IBV_GID_TYPE_ROCE_V2 && ipv4_mapped) {
-      *out_gid = entry.gid;
-      *out_gid_index = index;
-      return ok();
-    }
-    if (!have_fallback ||
-        (entry.gid_type == IBV_GID_TYPE_ROCE_V2 &&
-         (ipv4_mapped || !gid_is_ipv4_mapped(fallback_gid))) ||
-        (ipv4_mapped && !gid_is_ipv4_mapped(fallback_gid))) {
-      fallback_gid = entry.gid;
-      fallback_index = index;
-      have_fallback = true;
-    }
-  }
-  if (!have_fallback) {
-    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "no usable RoCE GID found for RC endpoint");
-  }
-  *out_gid = fallback_gid;
-  *out_gid_index = fallback_index;
-  return ok();
+  return nullptr;
 }
 
 cuteafd_status_t modify_rc_qp_to_init(ibv_qp* qp, uint32_t port_num) {
@@ -371,7 +316,7 @@ cuteafd_status_t modify_rc_qp_to_init(ibv_qp* qp, uint32_t port_num) {
 // `flow_label` 0 lets the kernel derive the RoCE v2 flow label (and with it
 // the UDP source port) from both QP numbers, so it changes with every new
 // pair of QPs; a nonzero label fixes it.
-cuteafd_status_t modify_rc_qp_to_rtr(ibv_context* context, ibv_qp* qp,
+cuteafd_status_t modify_rc_qp_to_rtr(ibv_qp* qp,
                                    const ibv_port_attr& port_attr, uint32_t port_num,
                                    uint32_t remote_qp_num, uint32_t remote_psn,
                                    uint32_t remote_lid, const ibv_gid* remote_gid,
@@ -388,19 +333,13 @@ cuteafd_status_t modify_rc_qp_to_rtr(ibv_context* context, ibv_qp* qp,
   attr.ah_attr.src_path_bits = 0;
   attr.ah_attr.port_num = static_cast<uint8_t>(port_num);
   if (port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
-    ibv_gid gid = {};
-    if (remote_gid != nullptr) {
-      gid = *remote_gid;
-    } else {
-      uint32_t selected_gid_index = 0;
-      const cuteafd_status_t status =
-          select_rc_gid(context, port_attr, port_num, &gid, &selected_gid_index);
-      if (status != CUTEAFD_STATUS_OK) {
-        return status;
-      }
+    // RoCE routes by GID: the peer's own (exchanged, or this port's for a
+    // loopback pair), never one picked from table order.
+    if (remote_gid == nullptr) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RoCE RTR requires the peer GID");
     }
     attr.ah_attr.is_global = 1;
-    attr.ah_attr.grh.dgid = gid;
+    attr.ah_attr.grh.dgid = *remote_gid;
     attr.ah_attr.grh.sgid_index = local_gid_index;
     attr.ah_attr.grh.hop_limit = 1;
     // Always mark RoCE as DSCP 26. An untuned fabric ignores it (switch trust
@@ -2692,9 +2631,13 @@ extern "C" cuteafd_status_t cuteafd_rdma_create_rc_qp_probe(uint32_t port_num, u
 }
 
 extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
-    uint32_t port_num, size_t bytes, cuteafd_rdma_rc_send_recv_probe_t* out) {
+    const char* device_name, uint32_t port_num, uint32_t gid_index, size_t bytes,
+    cuteafd_rdma_rc_send_recv_probe_t* out) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC send/recv probe output pointer is null");
+  }
+  if (device_name == nullptr || device_name[0] == '\0' || gid_index > 255) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC send/recv probe needs a device and GID");
   }
   if (port_num == 0 || port_num > 255) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC send/recv probe port number is invalid");
@@ -2761,10 +2704,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
     std::free(recv_buffer);
   };
 
-  ibv_device* device = devices[0];
-  const char* device_name = ibv_get_device_name(device);
-  set_fixed_string(out->device_name, sizeof(out->device_name),
-                   device_name != nullptr ? device_name : "unknown-rdma-device");
+  ibv_device* device = find_rdma_device(devices, device_count, device_name);
+  if (device == nullptr) {
+    cleanup();
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RC send/recv probe device was not found");
+  }
+  set_fixed_string(out->device_name, sizeof(out->device_name), device_name);
 
   context = ibv_open_device(device);
   if (context == nullptr) {
@@ -2776,6 +2721,11 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
   if (ibv_query_port(context, static_cast<uint8_t>(port_num), &port_attr) != 0) {
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "ibv_query_port failed for RC send/recv probe");
+  }
+  ibv_gid gid = {};
+  if (ibv_query_gid(context, static_cast<uint8_t>(port_num), static_cast<int>(gid_index), &gid) != 0) {
+    cleanup();
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RC send/recv probe GID is unavailable");
   }
 
   pd = ibv_alloc_pd(context);
@@ -2846,14 +2796,14 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
     cleanup();
     return status;
   }
-  status = modify_rc_qp_to_rtr(context, sender_qp, port_attr, port_num, receiver_qp->qp_num,
-                               receiver_psn, port_attr.lid, nullptr, 0);
+  status = modify_rc_qp_to_rtr(sender_qp, port_attr, port_num, receiver_qp->qp_num,
+                               receiver_psn, port_attr.lid, &gid, gid_index);
   if (status != CUTEAFD_STATUS_OK) {
     cleanup();
     return status;
   }
-  status = modify_rc_qp_to_rtr(context, receiver_qp, port_attr, port_num, sender_qp->qp_num,
-                               sender_psn, port_attr.lid, nullptr, 0);
+  status = modify_rc_qp_to_rtr(receiver_qp, port_attr, port_num, sender_qp->qp_num,
+                               sender_psn, port_attr.lid, &gid, gid_index);
   if (status != CUTEAFD_STATUS_OK) {
     cleanup();
     return status;
@@ -2949,12 +2899,16 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(
 }
 
 extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
-    uint32_t port_num, const void* request_frame, size_t request_bytes,
-    const void* response_frame, size_t response_bytes,
+    const char* device_name, uint32_t port_num, uint32_t gid_index, const void* request_frame,
+    size_t request_bytes, const void* response_frame, size_t response_bytes,
     cuteafd_rdma_rc_protocol_v2_loopback_probe_t* out) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
                 "RDMA RC ProtocolV2 loopback probe output pointer is null");
+  }
+  if (device_name == nullptr || device_name[0] == '\0' || gid_index > 255) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "RDMA RC ProtocolV2 loopback probe needs a device and GID");
   }
   if (port_num == 0 || port_num > 255) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
@@ -3047,10 +3001,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
     std::free(client_response_recv_buffer);
   };
 
-  ibv_device* device = devices[0];
-  const char* device_name = ibv_get_device_name(device);
-  set_fixed_string(out->device_name, sizeof(out->device_name),
-                   device_name != nullptr ? device_name : "unknown-rdma-device");
+  ibv_device* device = find_rdma_device(devices, device_count, device_name);
+  if (device == nullptr) {
+    cleanup();
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RC ProtocolV2 loopback probe device was not found");
+  }
+  set_fixed_string(out->device_name, sizeof(out->device_name), device_name);
 
   context = ibv_open_device(device);
   if (context == nullptr) {
@@ -3064,6 +3020,11 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
     cleanup();
     return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE,
                 "ibv_query_port failed for RC ProtocolV2 loopback probe");
+  }
+  ibv_gid gid = {};
+  if (ibv_query_gid(context, static_cast<uint8_t>(port_num), static_cast<int>(gid_index), &gid) != 0) {
+    cleanup();
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "RC ProtocolV2 loopback probe GID is unavailable");
   }
 
   pd = ibv_alloc_pd(context);
@@ -3159,14 +3120,14 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
     cleanup();
     return status;
   }
-  status = modify_rc_qp_to_rtr(context, client_qp, port_attr, port_num, server_qp->qp_num,
-                               server_psn, port_attr.lid, nullptr, 0);
+  status = modify_rc_qp_to_rtr(client_qp, port_attr, port_num, server_qp->qp_num,
+                               server_psn, port_attr.lid, &gid, gid_index);
   if (status != CUTEAFD_STATUS_OK) {
     cleanup();
     return status;
   }
-  status = modify_rc_qp_to_rtr(context, server_qp, port_attr, port_num, client_qp->qp_num,
-                               client_psn, port_attr.lid, nullptr, 0);
+  status = modify_rc_qp_to_rtr(server_qp, port_attr, port_num, client_qp->qp_num,
+                               client_psn, port_attr.lid, &gid, gid_index);
   if (status != CUTEAFD_STATUS_OK) {
     cleanup();
     return status;
@@ -3298,19 +3259,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
 #endif
 }
 
-extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create(
-    uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes, uint32_t max_send_wr,
-    uint32_t max_recv_wr, uint32_t max_sge, cuteafd_rdma_rc_endpoint_info_t* out) {
-  return cuteafd_rdma_rc_endpoint_create_with_buffer_flags(
-      port_num, local_psn, send_frame_bytes, recv_frame_bytes,
-      send_registered_span_bytes, recv_registered_span_bytes, max_send_wr, max_recv_wr,
-      max_sge, CUTEAFD_HOST_BUFFER_FLAG_NONE, out);
-}
-
+// The caller names the device, port and source GID: the one whose address
+// reaches the peer (the control connection's local address). Nothing here
+// picks a GID from table order.
 static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
     const char* requested_device_name, uint32_t port_num, uint32_t local_psn,
-    int requested_gid_index,
+    uint32_t requested_gid_index,
     size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
     size_t recv_registered_span_bytes, uint32_t max_send_wr, uint32_t max_recv_wr,
     uint32_t max_sge, uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out) {
@@ -3390,25 +3344,14 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   endpoint->recv_registered_span_bytes = recv_registered_span_bytes;
   endpoint->host_buffer_flags = host_buffer_flags;
 
-  ibv_device* device = nullptr;
-  if (requested_device_name == nullptr || requested_device_name[0] == '\0') {
-    device = devices[0];
-  } else {
-    for (int index = 0; index < device_count; ++index) {
-      const char* candidate_name = ibv_get_device_name(devices[index]);
-      if (candidate_name != nullptr && std::strcmp(candidate_name, requested_device_name) == 0) {
-        device = devices[index];
-        break;
-      }
-    }
-    if (device == nullptr) {
-      char message[256];
-      std::snprintf(message, sizeof(message), "RDMA RC endpoint device %s was not found",
-                    requested_device_name);
-      delete endpoint;
-      ibv_free_device_list(devices);
-      return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, message);
-    }
+  ibv_device* device = find_rdma_device(devices, device_count, requested_device_name);
+  if (device == nullptr) {
+    char message[256];
+    std::snprintf(message, sizeof(message), "RDMA RC endpoint device %s was not found",
+                  requested_device_name);
+    delete endpoint;
+    ibv_free_device_list(devices);
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, message);
   }
   const char* device_name = ibv_get_device_name(device);
   set_fixed_string(out->device_name, sizeof(out->device_name),
@@ -3431,21 +3374,13 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
   out->active_mtu = endpoint->port_attr.active_mtu;
 
   ibv_gid local_gid = {};
-  uint32_t local_gid_index = 0;
-  cuteafd_status_t status =
-      requested_gid_index < 0
-          ? select_rc_gid(endpoint->context, endpoint->port_attr, port_num, &local_gid,
-                          &local_gid_index)
-          : (ibv_query_gid(endpoint->context, static_cast<uint8_t>(port_num),
-                           requested_gid_index, &local_gid) == 0
-                 ? CUTEAFD_STATUS_OK
-                 : fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "selected RoCE GID is unavailable"));
-  if (requested_gid_index >= 0) local_gid_index = static_cast<uint32_t>(requested_gid_index);
-  if (status != CUTEAFD_STATUS_OK) {
+  if (ibv_query_gid(endpoint->context, static_cast<uint8_t>(port_num),
+                    static_cast<int>(requested_gid_index), &local_gid) != 0) {
     destroy_rdma_rc_endpoint(endpoint);
-    return status;
+    return fail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "selected RoCE GID is unavailable");
   }
-  endpoint->gid_index = local_gid_index;
+  cuteafd_status_t status = CUTEAFD_STATUS_OK;
+  endpoint->gid_index = requested_gid_index;
   gid_to_hex(local_gid, out->gid_hex, sizeof(out->gid_hex));
 
   endpoint->pd = ibv_alloc_pd(endpoint->context);
@@ -3571,32 +3506,6 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
 #endif
 }
 
-extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_with_buffer_flags(
-    uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes, uint32_t max_send_wr,
-    uint32_t max_recv_wr, uint32_t max_sge, uint64_t host_buffer_flags,
-    cuteafd_rdma_rc_endpoint_info_t* out) {
-  return create_rdma_rc_endpoint_with_buffer_flags(
-      nullptr, port_num, local_psn, -1, send_frame_bytes, recv_frame_bytes,
-      send_registered_span_bytes, recv_registered_span_bytes, max_send_wr, max_recv_wr, max_sge,
-      host_buffer_flags, out);
-}
-
-extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags(
-    const char* device_name, uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes,
-    size_t recv_frame_bytes, size_t send_registered_span_bytes,
-    size_t recv_registered_span_bytes, uint32_t max_send_wr, uint32_t max_recv_wr,
-    uint32_t max_sge, uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out) {
-  if (device_name == nullptr || device_name[0] == '\0') {
-    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
-                "RDMA RC endpoint requested device name is empty");
-  }
-  return create_rdma_rc_endpoint_with_buffer_flags(
-      device_name, port_num, local_psn, -1, send_frame_bytes, recv_frame_bytes,
-      send_registered_span_bytes, recv_registered_span_bytes, max_send_wr, max_recv_wr, max_sge,
-      host_buffer_flags, out);
-}
-
 extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
     const char* device_name, uint32_t port_num, uint32_t gid_index, uint32_t local_psn,
     size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
@@ -3606,7 +3515,7 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_f
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "invalid RDMA device or GID index");
   }
   return create_rdma_rc_endpoint_with_buffer_flags(
-      device_name, port_num, local_psn, static_cast<int>(gid_index), send_frame_bytes,
+      device_name, port_num, local_psn, gid_index, send_frame_bytes,
       recv_frame_bytes, send_registered_span_bytes, recv_registered_span_bytes,
       max_send_wr, max_recv_wr, max_sge, host_buffer_flags, out);
 }
@@ -3676,7 +3585,7 @@ static cuteafd_status_t connect_rdma_rc_endpoint(void* handle, uint32_t remote_q
   if (status != CUTEAFD_STATUS_OK) {
     return status;
   }
-  status = modify_rc_qp_to_rtr(endpoint->context, endpoint->qp, endpoint->port_attr,
+  status = modify_rc_qp_to_rtr(endpoint->qp, endpoint->port_attr,
                                endpoint->port_num, remote_qp_num, remote_psn, remote_lid,
                                &remote_gid, endpoint->gid_index, flow_label);
   if (status != CUTEAFD_STATUS_OK) {
@@ -4023,8 +3932,8 @@ extern "C" cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(
 }
 
 extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
-    const char* device_name, uint32_t port_num, size_t bytes, uint32_t iterations,
-    cuteafd_rdma_gpu_landing_probe_t* out) {
+    const char* device_name, uint32_t port_num, uint32_t gid_index, size_t bytes,
+    uint32_t iterations, cuteafd_rdma_gpu_landing_probe_t* out) {
   if (out == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing probe output is null");
   }
@@ -4052,22 +3961,15 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
   if (!out->dma_buf_supported) {
     return finish(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "CUDA reports no dma-buf support");
   }
-  if (port_num == 0 || port_num > 255 || bytes == 0 || bytes > (size_t{1} << 30)) {
+  if (device_name == nullptr || device_name[0] == '\0' || port_num == 0 || port_num > 255 ||
+      gid_index > 255 || bytes == 0 || bytes > (size_t{1} << 30)) {
     return finish(CUTEAFD_STATUS_INVALID_ARGUMENT, "GPU landing probe arguments are invalid");
   }
   constexpr size_t kHeader = 96;
   const size_t frame = kHeader + bytes;
   int device_count = 0;
   ibv_device** devices = ibv_get_device_list(&device_count);
-  ibv_device* device = nullptr;
-  for (int index = 0; devices != nullptr && index < device_count; ++index) {
-    const char* name = ibv_get_device_name(devices[index]);
-    if (device_name == nullptr || device_name[0] == '\0' ||
-        (name != nullptr && std::strcmp(name, device_name) == 0)) {
-      device = devices[index];
-      break;
-    }
-  }
+  ibv_device* device = find_rdma_device(devices, device_count, device_name);
   if (device == nullptr) {
     if (devices != nullptr) {
       ibv_free_device_list(devices);
@@ -4137,13 +4039,12 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
     return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe QP setup failed");
   }
   ibv_gid gid = {};
-  uint32_t gid_index = 0;
-  if (select_rc_gid(context, port_attr, port_num, &gid, &gid_index) != CUTEAFD_STATUS_OK) {
-    return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe found no GID");
+  if (ibv_query_gid(context, static_cast<uint8_t>(port_num), static_cast<int>(gid_index), &gid) != 0) {
+    return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe GID is unavailable");
   }
   for (int side = 0; side < 2; ++side) {
     if (modify_rc_qp_to_init(qps[side], port_num) != CUTEAFD_STATUS_OK ||
-        modify_rc_qp_to_rtr(context, qps[side], port_attr, port_num, qps[1 - side]->qp_num, 0,
+        modify_rc_qp_to_rtr(qps[side], port_attr, port_num, qps[1 - side]->qp_num, 0,
                             port_attr.lid, &gid, gid_index) != CUTEAFD_STATUS_OK ||
         modify_rc_qp_to_rts(qps[side], 0) != CUTEAFD_STATUS_OK) {
       return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe QP connect failed");

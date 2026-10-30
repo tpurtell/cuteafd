@@ -256,8 +256,7 @@ run_remote_server() {
     "${CUTEAFD_VERBS_APP_ROUNDTRIP_ITERATIONS:-__CUTEAFD_UNSET__}" \
     "${CUTEAFD_VERBS_APP_CHAIN_ITERATIONS:-__CUTEAFD_UNSET__}" \
     "${CUTEAFD_VERBS_APP_CHAIN_HOPS:-43}" \
-    "${CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS:-__CUTEAFD_UNSET__}" \
-    "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-__CUTEAFD_UNSET__}" >"$output" 2>"$log" <<'REMOTE'
+    "${CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS:-__CUTEAFD_UNSET__}" >"$output" 2>"$log" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 image="$2"
@@ -270,8 +269,7 @@ roundtrip_iterations="${1-}"
 chain_iterations="${2-}"
 chain_hops="${3-}"
 control_timeout="${4-}"
-ib_port="${5-}"
-for name in roundtrip_iterations chain_iterations control_timeout ib_port; do
+for name in roundtrip_iterations chain_iterations control_timeout; do
   if [ "${!name}" = "__CUTEAFD_UNSET__" ]; then
     printf -v "$name" ''
   fi
@@ -296,7 +294,6 @@ docker "${docker_args[@]}" \
   -e CUTEAFD_VERBS_APP_CHAIN_ITERATIONS="$chain_iterations" \
   -e CUTEAFD_VERBS_APP_CHAIN_HOPS="$chain_hops" \
   -e CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS="$control_timeout" \
-  -e CUTEAFD_VERBS_APP_IB_PORT_NUM="$ib_port" \
   -e CUTEAFD_BENCH_PEER="$peer" \
   -e CUTEAFD_BENCH_PORT="$port" \
   -e CUTEAFD_BENCH_DURATION="$duration" \
@@ -324,7 +321,6 @@ run_local_client() {
   CUTEAFD_VERBS_APP_CHAIN_ITERATIONS="${CUTEAFD_VERBS_APP_CHAIN_ITERATIONS:-}" \
   CUTEAFD_VERBS_APP_CHAIN_HOPS="${CUTEAFD_VERBS_APP_CHAIN_HOPS:-43}" \
   CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS="${CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS:-}" \
-  CUTEAFD_VERBS_APP_IB_PORT_NUM="${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" \
   RUSTFLAGS="${RUSTFLAGS:--Awarnings}" \
   scripts/launch/cuteafd bench-rdma \
     --mode app-client \

@@ -176,12 +176,12 @@ impl GpuLandingProbe {
 }
 
 /// Probes dma-buf landing on the current CUDA device with a loopback QP pair
-/// on the transport's RDMA device, timing `bytes` sends into device and into
-/// pinned host memory.
-pub fn gpu_landing_probe(library: &NativeLibrary, rdma_device: Option<&str>, bytes: usize, iterations: u32)
-    -> Result<GpuLandingProbe> {
-    let port = verbs_host_ib_port_num()?;
-    let (probe, error) = library.rdma_gpu_landing_probe(rdma_device, port, bytes, iterations)?;
+/// on `rdma` (the device, port and source GID that reach the transport's
+/// peers, [`crate::fabric::select_rdma_route`]), timing `bytes` sends into
+/// device and into pinned host memory.
+pub fn gpu_landing_probe(library: &NativeLibrary, rdma: &crate::fabric::RdmaSelection, bytes: usize,
+    iterations: u32) -> Result<GpuLandingProbe> {
+    let (probe, error) = library.rdma_gpu_landing_probe(&rdma.device, rdma.port, rdma.gid_index, bytes, iterations)?;
     Ok(GpuLandingProbe {
         rdma_device: c_char_array_to_string(&probe.device_name),
         cuda_device: probe.cuda_device,
@@ -204,7 +204,11 @@ mod tests {
     #[ignore = "requires a CUDA/RDMA container and an exclusive hardware lease"]
     fn cuda_malloc_dma_buf_landing_probe() -> Result<()> {
         let library = load_verbs_host_native_library()?;
-        let probe = gpu_landing_probe(&library, None, 64 << 20, 8)?;
+        let peer = std::env::var("CUTEAFD_LANDING_PROBE_PEER")
+            .context("set CUTEAFD_LANDING_PROBE_PEER to a Spark worker address (host:port)")?;
+        let peer = peer.to_socket_addrs()?.next().context("landing probe peer resolved no address")?;
+        let rdma = crate::fabric::select_rdma_route(&crate::fabric::discover()?.ports, peer)?;
+        let probe = gpu_landing_probe(&library, &rdma, 64 << 20, 8)?;
         println!("GPU landing probe: {}", serde_json::to_string(&probe)?);
         anyhow::ensure!(probe.usable(), "CUDA-allocated RDMA landing unavailable: {probe:?}");
         Ok(())
