@@ -397,7 +397,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, page_bytes = layout.page_bytes, pages = layout.pages, host_bytes,
         rule = ?layout.rule, points = ?args.points(), "GLM prefix cache");
-    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, engine.max_pool_tokens_no_onboard, layout.pages as u64,
         &"FP8 MLA latent + DSA index".to_string(), host_bytes);
     Ok((family, cache))
 }

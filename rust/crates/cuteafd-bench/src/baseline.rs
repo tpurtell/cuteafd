@@ -139,7 +139,7 @@ pub fn run(client: &Client, info: &ServerInfo, progress: &Progress, run_id: &str
     let started = Instant::now();
     let kv = crate::context::kv().unwrap_or_default();
     let from_settings = crate::report::Capacity::from_settings(info);
-    let capacity = crate::report::Capacity { kv_tokens: kv.tokens.or(from_settings.kv_tokens), kv_pages: kv.pages,
+    let capacity = crate::report::Capacity { kv_tokens: kv.tokens.or(from_settings.kv_tokens), max_tokens: kv.max_tokens, kv_pages: kv.pages,
         kv_format: kv.format, max_requests: from_settings.max_requests, max_context: Some(max_context),
         max_output: Some(max_output), host_cache_bytes: kv.host_bytes.or(from_settings.host_cache_bytes) };
     let mut run = Run {

@@ -159,7 +159,7 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
         let cache = PrefixCache::new_with_draft_pages(layout, config, host, family.draft_page_bytes())?;
-        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, Some((layout.pages * layout.page_rows) as u64), layout.pages as u64,
             family.record_format(), host_bytes);
         Ok((family, cache))
     }

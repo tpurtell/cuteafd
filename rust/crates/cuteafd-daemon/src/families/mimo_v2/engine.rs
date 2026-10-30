@@ -788,6 +788,7 @@ pub(crate) struct MimoEngine<'a> {
     unit_index: Cell<Option<usize>>,
     prefill_output: MimoPrefillOutput,
     pub pages: usize,
+    pub max_pool_tokens_no_onboard: Option<u64>,
     pub rings: usize,
     /// Program family of the checkpoint's geometry (`mimo`, `mimop`).
     family: &'static str,
@@ -918,7 +919,7 @@ impl<'a> MimoEngine<'a> {
             })
         }).collect::<Result<Vec<_>>>()?;
         let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
+        Ok(Self { max_pool_tokens_no_onboard: None, terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
             submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
             max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
