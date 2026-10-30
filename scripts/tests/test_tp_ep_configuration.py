@@ -446,8 +446,8 @@ resolved_decode_lanes=2
         self.assertNotIn("--spark-tp", coordinator)
         self.assertNotIn("--spark-ep", coordinator)
         # Worker positional tail ends with topology(explicit,tp,ep) then the
-        # three optional RDMA env values.
-        self.assertTrue(all(args[-8] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
+        # two optional RDMA env values.
+        self.assertTrue(all(args[-7] == "0" for tool, args in events if tool == "ssh" and "-s" in args))
 
     def test_planner_pool_is_forwarded_only_when_selected(self) -> None:
         for setting, expected in [("", None), ("auto", "0"), ("123456", "123456")]:
@@ -486,8 +486,8 @@ resolved_decode_lanes=2
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 4)
         for args in starts:
-            self.assertEqual(args[-8:-5], ["1", "2", "2"])
-            self.assertEqual(args[-9], "4")
+            self.assertEqual(args[-7:-4], ["1", "2", "2"])
+            self.assertEqual(args[-8], "4")
 
 
     def test_six_rank_explicit_topology_starts_six_workers(self) -> None:
@@ -504,8 +504,8 @@ resolved_decode_lanes=2
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         self.assertTrue(all("--first-layer" not in args for args in starts))
-        self.assertEqual([args[-9] for args in starts], ["6"] * 6)
-        self.assertEqual([args[-8:-5] for args in starts], [["1", "2", "3"]] * 6)
+        self.assertEqual([args[-8] for args in starts], ["6"] * 6)
+        self.assertEqual([args[-7:-4] for args in starts], [["1", "2", "3"]] * 6)
 
     def test_single_rtx_local_count_publishes_and_hands_off_five(self) -> None:
         # The current official 1-RTX shape on an explicit topology: 5 local
@@ -533,8 +533,8 @@ resolved_decode_lanes=2
         # Worker positional tail: ... first_layer world topology explicit,tp,ep
         for args in starts:
             self.assertEqual(args[args.index("--") + 1 + 7], str(len(starts)), args)
-            self.assertEqual(args[-9], "6")
-            self.assertEqual(args[-8:-5], ["1", "6", "1"])
+            self.assertEqual(args[-8], "6")
+            self.assertEqual(args[-7:-4], ["1", "6", "1"])
         # The boundary is acknowledged after the workers start.
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
@@ -563,8 +563,8 @@ resolved_decode_lanes=2
         self.assertEqual(len(starts), 3)
         for args in starts:
             self.assertEqual(args[args.index("--") + 1 + 7], str(len(starts)), args)
-            self.assertEqual(args[-9], "3")
-            self.assertEqual(args[-8:-5], ["1", "3", "1"])
+            self.assertEqual(args[-8], "3")
+            self.assertEqual(args[-7:-4], ["1", "3", "1"])
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
@@ -586,7 +586,7 @@ resolved_decode_lanes=2
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-9], "6", args)
+            self.assertEqual(args[-8], "6", args)
         acks = [args for tool, args in events if tool == "docker" and args[0] == "exec"]
         self.assertFalse(any("ready.json" in " ".join(a) for a in acks), acks)
 
@@ -641,7 +641,6 @@ resolved_decode_lanes=2
             hosts=["a", "b", "c", "d", "e", "f"],
             extra_env={
                 "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP": device_map,
-                "CUTEAFD_VERBS_APP_IB_PORT_NUM": "1",
                 "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES": "2",
             },
             extra_setup="DSPARK_DRAFT_POLICY=full\ndspark_draft_limit=7\n",
@@ -654,7 +653,7 @@ resolved_decode_lanes=2
         starts = [args for tool, args in events if tool == "ssh" and "-s" in args]
         self.assertEqual(len(starts), 6)
         for args in starts:
-            self.assertEqual(args[-5:-2], [device_map, "1", "2"])
+            self.assertEqual(args[-4:-2], [device_map, "2"])
 
 
 class VerbsDeviceMapTest(unittest.TestCase):

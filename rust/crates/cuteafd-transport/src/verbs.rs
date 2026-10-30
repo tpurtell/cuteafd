@@ -4463,10 +4463,6 @@ fn verbs_host_native_library_path() -> Option<PathBuf> {
     None
 }
 
-fn verbs_host_ib_port_num() -> Result<u32> {
-    parse_env_u32("CUTEAFD_VERBS_APP_IB_PORT_NUM", 1)
-}
-
 fn protocol_v2_transport_timing_enabled() -> bool {
     env::var(PROTOCOL_V2_TCP_TIMING_ENV)
         .map(|value| {
@@ -4628,15 +4624,6 @@ fn active_poll_timeout_ms(timeout: Duration) -> u32 {
 /// floor) and at most `u32::MAX`.
 fn idle_wait_timeout_ms(window: Duration) -> u32 {
     u32::try_from(window.as_millis().max(1)).unwrap_or(u32::MAX)
-}
-
-fn parse_env_u32(name: &str, default: u32) -> Result<u32> {
-    match env::var(name) {
-        Ok(value) if !value.trim().is_empty() => value
-            .parse::<u32>()
-            .with_context(|| format!("invalid {name} value {value}")),
-        _ => Ok(default),
-    }
 }
 
 fn parse_env_usize(name: &str, default: usize) -> Result<usize> {
