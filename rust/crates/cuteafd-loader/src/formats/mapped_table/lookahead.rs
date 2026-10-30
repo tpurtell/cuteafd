@@ -44,7 +44,20 @@ fn piece_tokens(tables: &[Arc<dyn LookaheadTable>]) -> usize {
     let row_bytes = tables.iter().map(|table| table.rows_per_token() * table.cache().width()).max().unwrap_or(1).max(1);
     let share = tables.iter().map(|table| table.cache().share(RowClass::Prefill) / (4 * table.rows_per_token().max(1)))
         .min().unwrap_or(usize::MAX);
+    #[cfg(test)]
+    if let Some(tokens) = bench_override("LOOKAHEAD_BENCH_PIECE") { return tokens; }
     (super::reactor::BUFFER_BYTES / row_bytes / 64 * 64).min(share / 64 * 64).max(MIN_PIECE_TOKENS)
+}
+
+/// Placement microbenches only: a profile parameter from the environment.
+#[cfg(test)]
+fn bench_override(name: &str) -> Option<usize> { std::env::var(name).ok().and_then(|v| v.parse().ok()) }
+
+/// Reads in flight (the placement microbench sweeps it).
+fn max_inflight() -> usize {
+    #[cfg(test)]
+    if let Some(reads) = bench_override("LOOKAHEAD_BENCH_INFLIGHT") { return reads.max(1); }
+    MAX_INFLIGHT
 }
 /// Prefill table reads (one piece, one table) in flight at once. A read holds
 /// one reactor buffer per plane (two for a paired weight and scale table) and
@@ -62,6 +75,9 @@ pub trait LookaheadTable: Send + Sync + 'static {
     fn stats(&self) -> &TableStats;
     /// Rows a prompt token reads from this table (an upper bound).
     fn rows_per_token(&self) -> usize;
+    /// Where the table's rows are read from ([`super::placement`]): prompts are
+    /// read ahead only when every table is local.
+    fn placement(&self) -> super::placement::Placement;
 }
 
 /// A read in flight.
@@ -80,9 +96,19 @@ pub trait RowSource: Send + 'static {
 }
 
 /// The prefill units a request's prompt runs in: absolute end positions, in
-/// order, and the pipeline depth (units in flight at once).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnitPlan { pub ends: Vec<u64>, pub depth: usize }
+/// order, the pipeline depth (units in flight at once) and the index of each
+/// call's first unit (the units one prefill call runs; empty: every `depth` units).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnitPlan { pub ends: Vec<u64>, pub depth: usize, pub calls: Vec<usize> }
+impl UnitPlan {
+    /// Calls of `depth` units each.
+    pub fn new(ends: Vec<u64>, depth: usize) -> Self { Self { ends, depth, calls: Vec::new() } }
+    /// The first unit of the call after the one holding unit `unit`.
+    fn next_call(&self, unit: usize) -> usize {
+        if self.calls.is_empty() { return (unit / self.depth.max(1) + 1) * self.depth.max(1); }
+        self.calls.iter().copied().find(|&first| first > unit).unwrap_or(self.ends.len())
+    }
+}
 
 enum Command {
     Start { id: u64, tag: u64, start: u64, source: Box<dyn RowSource>, units: UnitPlan,
@@ -158,6 +184,8 @@ struct Plan {
     /// The caller's request id, for the per-request summary.
     tag: u64,
     admitted: std::time::Instant,
+    /// Read only from the call after the one running (a remote table).
+    remote: bool,
     source: Box<dyn RowSource>,
     /// Absolute position of the source's token 0.
     start: u64,
@@ -168,6 +196,8 @@ struct Plan {
     reserved: Arc<AtomicU64>,
     /// Planned pieces, oldest first, until commits pass them.
     pieces: VecDeque<PlanPiece>,
+    /// Tokens of running calls passed without reading (remote tables).
+    skipped_tokens: u64,
     /// Per table: distinct rows planned, already cached, being filled by
     /// another reader, read here, and read before the first commit; rows of
     /// later tables committed before their turn (the gathers read them).
@@ -183,6 +213,10 @@ struct Plan {
 pub struct Lookahead {
     send: mpsc::Sender<Command>,
     ids: AtomicU64,
+    /// Some table has every copy on other hosts: prompts are read ahead only
+    /// from the call after the one running (the demand gathers own the current
+    /// call's rows on the capped remote read path).
+    remote: bool,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -190,11 +224,16 @@ impl Lookahead {
     /// `tables` in the order their consumers run within a unit.
     pub fn new(name: &str, tables: Vec<Arc<dyn LookaheadTable>>) -> Result<Self> {
         anyhow::ensure!(!tables.is_empty(), "a look-ahead needs at least one table");
+        let remote = tables.iter().any(|table| table.placement() == super::placement::Placement::Remote);
+        tracing::info!(name, remote, placements = ?tables.iter().map(|table| table.placement()).collect::<Vec<_>>(),
+            "token-table look-ahead");
         let (send, receive) = mpsc::channel();
         let thread = std::thread::Builder::new().name(format!("{name}-lookahead"))
-            .spawn(move || run(tables, receive)).context("starting a token-table look-ahead")?;
-        Ok(Self { send, ids: AtomicU64::new(1), thread: Some(thread) })
+            .spawn(move || run(tables, receive, remote)).context("starting a token-table look-ahead")?;
+        Ok(Self { send, ids: AtomicU64::new(1), remote, thread: Some(thread) })
     }
+    /// Whether prompts are read ahead only from the next call (a remote table).
+    pub fn remote(&self) -> bool { self.remote }
 
     /// Read a decode round's rows (per table) into the decode shares as soon as
     /// they are known; the verify gather then finds them landed or in flight.
@@ -226,7 +265,7 @@ impl Drop for Lookahead {
     }
 }
 
-fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
+fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>, remote: bool) {
     let mut plans: Vec<Plan> = Vec::new();
     let mut decode: Option<DecodePiece> = None;
     let mut next_decode: Option<Vec<Vec<u64>>> = None;
@@ -235,7 +274,7 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
             match receive.try_recv() {
                 Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return,
                 Ok(Command::Decode(rows)) => next_decode = Some(rows),
-                Ok(command) => apply(&mut plans, command, tables.len()),
+                Ok(command) => apply(&mut plans, command, tables.len(), remote),
                 Err(mpsc::TryRecvError::Empty) => break,
             }
         }
@@ -282,7 +321,7 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
         let reading = |plans: &[Plan]| plans.iter().flat_map(|plan| &plan.pieces).map(PlanPiece::reading).sum::<usize>();
         // The next batch of a started step goes first (oldest piece of the
         // earliest-admitted request): its deadline is the earliest.
-        while reading(&plans) < MAX_INFLIGHT {
+        while reading(&plans) < max_inflight() {
             let Some((plan, index, table)) = plans.iter_mut().find_map(|plan| plan.pieces.iter().enumerate()
                 .find_map(|(index, piece)| piece.next_batch().map(|table| (index, table))).map(|(index, table)| (plan, index, table)))
                 else { break };
@@ -291,13 +330,13 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
         }
         // Later-table reads that are due go next: their deadline is earlier
         // than any table-0 piece not yet started. `plans` is in admission order.
-        while reading(&plans) < MAX_INFLIGHT {
+        while reading(&plans) < max_inflight() {
             let Some((plan, index, table)) = plans.iter_mut()
                 .find_map(|plan| due(plan, &tables).map(|(index, table)| (plan, index, table))) else { break };
             if let Err(error) = start_table(plan, index, table, &tables) { abandon(plan, &error); }
             progressed = true;
         }
-        if reading(&plans) < MAX_INFLIGHT {
+        if reading(&plans) < max_inflight() {
             // The earliest-admitted request with room in its window goes first.
             if let Some(plan) = plans.iter_mut().filter(|plan| ready_to_plan(plan, &tables)).min_by_key(|plan| plan.id) {
                 match start_piece(plan, &tables) {
@@ -324,13 +363,13 @@ fn run(tables: Vec<Arc<dyn LookaheadTable>>, receive: mpsc::Receiver<Command>) {
         match command {
             Some(Command::Stop) => return,
             Some(Command::Decode(rows)) => next_decode = Some(rows),
-            Some(command) => apply(&mut plans, command, tables.len()),
+            Some(command) => apply(&mut plans, command, tables.len(), remote),
             None => {}
         }
     }
 }
 
-fn apply(plans: &mut Vec<Plan>, command: Command, tables: usize) {
+fn apply(plans: &mut Vec<Plan>, command: Command, tables: usize, remote: bool) {
     match command {
         Command::Start { id, tag, start, source, mut units, committed, reserved } => {
             let end = start + source.tokens() as u64;
@@ -338,9 +377,10 @@ fn apply(plans: &mut Vec<Plan>, command: Command, tables: usize) {
             units.ends.retain(|&e| e > start && e < end);
             units.ends.push(end);
             units.depth = units.depth.max(1);
-            plans.push(Plan { id, tag, admitted: std::time::Instant::now(), source, start, next: 0, units,
+            units.calls.retain(|&first| first < units.ends.len());
+            plans.push(Plan { id, tag, admitted: std::time::Instant::now(), source, start, next: 0, units, remote,
                 committed, reserved, pieces: VecDeque::new(), needed: vec![0; tables], cached: vec![0; tables],
-                joined: vec![0; tables], read: vec![0; tables], read_waiting: vec![0; tables], skipped: 0 });
+                joined: vec![0; tables], read: vec![0; tables], read_waiting: vec![0; tables], skipped: 0, skipped_tokens: 0 });
         }
         Command::Wake | Command::Stop | Command::Decode(_) => {}
         // Dropping the plan drains its reads, then fails unread rows and unpins.
@@ -431,6 +471,21 @@ fn reserve_batch(step: &mut Step, table: &dyn LookaheadTable) -> Result<[u64; 3]
 }
 
 fn start_piece(plan: &mut Plan, tables: &[Arc<dyn LookaheadTable>]) -> Result<()> {
+    if plan.remote {
+        // A remote table's current call belongs to its demand gathers: pass its
+        // tokens (the source hashes them, nothing is read) and its gate opens.
+        let committed = plan.committed.load(Ordering::Acquire).max(plan.start);
+        let first = plan.units.next_call(plan.unit_of(committed));
+        let from = if first == 0 { 0 } else { (plan.units.ends[first - 1] - plan.start) as usize };
+        let from = from.min(plan.source.tokens());
+        if plan.next < from {
+            plan.source.rows(plan.next..from)?;
+            plan.skipped_tokens += (from - plan.next) as u64;
+            plan.next = from;
+            plan.reserved.fetch_max(plan.start + from as u64, Ordering::Release);
+            if plan.next >= plan.source.tokens() { return Ok(()); }
+        }
+    }
     // Pieces never cross a unit boundary.
     let position = plan.start + plan.next as u64;
     let unit = plan.unit_of(position);
@@ -511,6 +566,7 @@ impl Drop for Plan {
         tracing::info!(request_id = self.tag, prompt_tokens = self.source.tokens(), units = self.units.ends.len(),
             unplanned_tokens = unplanned, needed = ?self.needed, cached = ?self.cached, joined = ?self.joined,
             read = ?self.read, read_waiting = ?self.read_waiting, later_tables_skipped = self.skipped,
+            remote = self.remote, running_call_tokens_passed = self.skipped_tokens,
             lifetime_ms = self.admitted.elapsed().as_millis() as u64, "token-table look-ahead request");
     }
 }
@@ -525,6 +581,7 @@ mod tests {
         fn start_read(&self, _: &[u64], _: ReadPriority) -> Result<Box<dyn RowLanding>> { unreachable!() }
         fn stats(&self) -> &TableStats { &self.stats }
         fn rows_per_token(&self) -> usize { self.rows }
+        fn placement(&self) -> super::super::placement::Placement { super::super::placement::Placement::Local }
     }
     fn shape(width: usize, rows: usize, shares: [usize; 2]) -> Arc<dyn LookaheadTable> {
         let stats = Arc::new(TableStats::default());

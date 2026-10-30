@@ -98,15 +98,16 @@ pub(crate) struct V41PrefillTimes {
 pub(super) fn prompt_units(start: usize, replay_end: usize, tokens: usize, chunk_rows: usize, waves: usize)
     -> Result<cuteafd_loader::TableUnitPlan> {
     let call_rows = (waves * chunk_rows).max(1);
-    let mut ends = Vec::new();
+    let (mut ends, mut calls) = (Vec::new(), Vec::new());
     let mut at = replay_end.clamp(start, tokens);
-    if at > start { ends.push(at as u64); }
+    if at > start { calls.push(0); ends.push(at as u64); }
     while at < tokens {
         let rows = (tokens - at).min(call_rows);
+        calls.push(ends.len());
         ends.extend(stream_units(rows, chunk_rows.max(1), waves.max(1))?.iter().map(|unit| (at + unit.end) as u64));
         at += rows;
     }
-    Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1) })
+    Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1), calls })
 }
 
 fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
@@ -711,6 +712,9 @@ mod stream_tests {
         // An encoder-prefix replay runs first; the stream cut starts at its end.
         let replay = super::prompt_units(400 - 128, 400, 400 + 8256, 2752, 3).unwrap();
         assert_eq!(replay.ends[..4], [400, 400 + 2752, 400 + 5504, 400 + 8256]);
+        // Calls: the replay window, then each stream call's units.
+        assert_eq!(replay.calls, [0, 1]);
+        assert_eq!(plan.calls, [0, 3]);
     }
 
     #[test]

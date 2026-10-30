@@ -2192,17 +2192,19 @@ impl<'a> Qwen4Engine<'a> {
     fn ple_units(&self, resume: usize, end: usize, chunk_ends: &[usize]) -> Result<cuteafd_loader::TableUnitPlan> {
         let (unit_rows, waves) = self.prefill_shape.map_or((self.prefill_rows, 1),
             |shape| (shape.unit_rows as usize, shape.waves as usize));
-        let mut ends = Vec::new();
+        let (mut ends, mut calls) = (Vec::new(), Vec::new());
         let mut at = resume;
         for &chunk_end in chunk_ends.iter().filter(|&&e| e > resume).chain(std::iter::once(&end)) {
             if chunk_end <= at { continue; }
+            // Each scheduler chunk is one prefill call.
+            calls.push(ends.len());
             if self.prefill_shape.is_some() {
                 let units = crate::shared::prefill_pipeline::sequence_units(chunk_end - at, unit_rows, 1, 1)?;
                 ends.extend(units.iter().map(|unit| (at + unit.rows.end) as u64));
             } else { ends.push(chunk_end as u64); }
             at = chunk_end;
         }
-        Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1) })
+        Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1), calls })
     }
 
     /// Read the PLE rows `token` adds after `tokens` into the row cache now.

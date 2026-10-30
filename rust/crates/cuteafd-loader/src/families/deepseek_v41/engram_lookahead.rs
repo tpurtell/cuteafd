@@ -6,7 +6,7 @@
 use super::engram_prefetch::RowRead;
 use crate::formats::mapped_table::lookahead::{self, LookaheadTable, RowLanding, RowSource};
 use crate::formats::mapped_table::row_cache::RowCache;
-use crate::formats::mapped_table::{GatherMode, ReadPriority, TableStats};
+use crate::formats::mapped_table::{placement::Placement, GatherMode, ReadPriority, TableStats};
 use crate::EngramTable;
 use anyhow::Result;
 use cuteafd_core::EngramHistory;
@@ -32,6 +32,11 @@ impl LookaheadTable for EngramLayer {
     }
     fn stats(&self) -> &TableStats { self.0.weights().stats() }
     fn rows_per_token(&self) -> usize { 24 }
+    fn placement(&self) -> Placement {
+        let weights = self.0.weights().placement();
+        let scales = self.0.scales().map_or(Placement::Local, |scales| scales.placement());
+        if weights == Placement::Local && scales == Placement::Local { Placement::Local } else { Placement::Remote }
+    }
 }
 
 /// A prompt's Engram rows: compressed ids (None for image rows) after a forked history.
@@ -108,7 +113,7 @@ mod tests {
         let rows = [batch.prefetch_rows(0)?, batch.prefetch_rows(1)?];
         let tables = [table(0, &rows[0])?, table(1, &rows[1])?];
         let ahead = EngramLookahead::new(tables.clone())?;
-        let units = || UnitPlan { ends: vec![128, 256, 300], depth: 3 };
+        let units = || UnitPlan::new(vec![128, 256, 300], 3);
         let handle = ahead.start(history.fork()?, tokens.clone(), units());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while tables.iter().any(|t| t.weights().stats().snapshot().lookahead_pieces < 3) {
@@ -153,7 +158,7 @@ mod tests {
         for table in &mut owned { table.set_cache_shares([2 * 3 * 256 * 24, 1024])?; }
         let tables = owned.map(Arc::new);
         let ahead = EngramLookahead::new(tables.clone())?;
-        let _handle = ahead.start(history.fork()?, tokens, UnitPlan { ends: vec![256, 512, 768, 1024, 1280], depth: 3 });
+        let _handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![256, 512, 768, 1024, 1280], 3));
         let snapshot = |layer: usize| tables[layer].weights().stats().snapshot();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while snapshot(1).lookahead_rows == 0 {
@@ -177,7 +182,7 @@ mod tests {
         let history = EngramHistory::new(2)?;
         let tables = [table(0, &[])?, table(1, &[])?];
         let ahead = EngramLookahead::new(tables.clone())?;
-        let handle = ahead.start(history.fork()?, tokens, UnitPlan { ends: vec![128, 256, 384, 512, 640], depth: 1 });
+        let handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![128, 256, 384, 512, 640], 1));
         let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while pieces() < 2 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2)); }
@@ -220,7 +225,7 @@ mod tests {
         for table in &mut owned { table.set_cache_shares([2 * PIECE_TOKENS * 24, 64])?; }
         let tables = owned.map(Arc::new);
         let ahead = EngramLookahead::new(tables.clone())?;
-        let handle = ahead.start(history.fork()?, tokens, UnitPlan { ends: vec![128, 256], depth: 3 });
+        let handle = ahead.start(history.fork()?, tokens, UnitPlan::new(vec![128, 256], 3));
         let pieces = || tables[0].weights().stats().snapshot().lookahead_pieces;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while pieces() < 1 { assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(5)); }

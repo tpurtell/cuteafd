@@ -32,6 +32,7 @@ mod uring;
 mod reactor;
 pub mod row_cache;
 pub mod lookahead;
+pub mod placement;
 pub mod token_table;
 
 /// How a gather may use the shared read reactor.
@@ -167,6 +168,8 @@ pub struct MappedRows {
     file_offset: u64,
     nowait: AtomicBool,
     fuse: bool,
+    /// Where this file's copies live (`placement::file_placement`), read at open.
+    placement: placement::Placement,
 }
 
 // SAFETY: Only immutable access is exposed; munmap runs after the final owner drops.
@@ -221,7 +224,8 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file),
+            placement: placement::file_placement(&file), file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
         #[cfg(test)]
         let advice = if std::env::var_os("MAPPED_BENCH_DEFAULT_ADVICE").is_some() { libc::MADV_NORMAL } else { libc::MADV_RANDOM };
@@ -648,6 +652,13 @@ impl MappedTable {
     }
     pub fn part_count(&self) -> usize {
         self.parts.len()
+    }
+    /// Local when rows are read from this host: the table is held in memory, or
+    /// every part's file has a local copy ([`placement::file_placement`]).
+    pub fn placement(&self) -> placement::Placement {
+        if self.resident.is_some() || self.parts.iter().all(|part| part.placement == placement::Placement::Local) {
+            placement::Placement::Local
+        } else { placement::Placement::Remote }
     }
     /// Mapped payload bytes (not resident bytes).
     pub fn bytes(&self) -> u64 {
