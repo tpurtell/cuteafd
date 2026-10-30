@@ -71,6 +71,7 @@ def supervise(path):
         done=json.loads((root/"handoff-complete.json").read_text())
         if done.get("status")!="passed":raise ValueError("invalid final handoff marker")
         return 0
+    path.with_name(path.stem+"-exit.json").unlink(missing_ok=True)
     result = 1
     process = None
     def forward(signum, _frame):
@@ -179,7 +180,7 @@ def main():
     units=Path.home()/".config/systemd/user";units.mkdir(parents=True,exist_ok=True)
     unit_path=units/(unit+".service")
     content="\n".join(["[Unit]","Description=Step-5 quantization and publication",
-        "After=default.target","StartLimitIntervalSec=600","StartLimitBurst=3","[Service]",
+        "After=basic.target","StartLimitIntervalSec=600","StartLimitBurst=3","[Service]",
         "Type=simple","WorkingDirectory="+str(REPO),
         "ExecStart="+shlex.join(supervisor),"Restart=on-failure","RestartSec=30",
         "TimeoutStopSec=180","[Install]","WantedBy=default.target",""])
