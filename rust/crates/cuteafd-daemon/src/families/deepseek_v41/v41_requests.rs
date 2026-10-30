@@ -173,6 +173,10 @@ impl<'a> Requests<'a> {
     fn request_identity(&self, lease: CacheLease) -> Result<&Request> {
         self.slots.iter().flatten().find(|r| r.lease == lease).context("request history missing")
     }
+    /// The request's look-ahead layer-14 gate, while its look-ahead runs.
+    pub(super) fn l14_gate(&self, lease: CacheLease) -> Option<std::sync::Arc<std::sync::atomic::AtomicU64>> {
+        self.request(lease).ok()?.lookahead.as_ref().map(|ahead| ahead.l14_gate())
+    }
     fn request(&self, lease: CacheLease) -> Result<&Request> {
         self.cache.request_id(lease)?;
         self.slots
@@ -518,6 +522,7 @@ impl<'a> Requests<'a> {
                 history,
                 token_ids: r.tokens,
                 image_mask,
+                l14_gate: (r.kind == ExpertV2SourceKind::Prefill).then(|| request.lookahead.as_ref().map(|a| a.l14_gate())).flatten(),
             });
             tokens.extend_from_slice(r.tokens);
             mask.extend((0..r.tokens.len()).map(|i| u8::from(image_mask.is_some_and(|m| m[i]))));

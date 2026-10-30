@@ -38,7 +38,8 @@ const MAX_INFLIGHT: usize = 3;
 pub struct UnitPlan { pub ends: Vec<u64>, pub depth: usize }
 
 enum Command {
-    Start { id: u64, tag: u64, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan, committed: Arc<AtomicU64> },
+    Start { id: u64, tag: u64, history: EngramHistory, tokens: Vec<Option<u32>>, units: UnitPlan,
+        committed: Arc<AtomicU64>, l14_reserved: Arc<AtomicU64> },
     /// A decode round's drafted rows per layer: read into the decode share now,
     /// published and left evictable for the verify gather.
     Decode([Vec<u64>; 2]),
@@ -53,10 +54,15 @@ pub struct LookaheadHandle {
     id: u64,
     end: u64,
     committed: Arc<AtomicU64>,
+    l14_reserved: Arc<AtomicU64>,
     send: mpsc::Sender<Command>,
 }
 
 impl LookaheadHandle {
+    /// Absolute position through which the look-ahead has reserved layer-14
+    /// rows (`u64::MAX` once it stopped): layer-14 gathers are admitted early
+    /// only behind it, so both readers follow one deadline order.
+    pub fn l14_gate(&self) -> Arc<AtomicU64> { Arc::clone(&self.l14_reserved) }
     /// The request committed through `position`; false once that is the prompt's end.
     pub fn commit(&self, position: u64) -> bool {
         self.committed.fetch_max(position, Ordering::Release);
@@ -112,6 +118,7 @@ struct Plan {
     next: usize,
     units: UnitPlan,
     committed: Arc<AtomicU64>,
+    l14_reserved: Arc<AtomicU64>,
     /// Planned pieces, oldest first, until commits pass them.
     pieces: VecDeque<PlanPiece>,
 }
@@ -151,8 +158,10 @@ impl EngramLookahead {
         let id = self.ids.fetch_add(1, Ordering::Relaxed);
         let committed = Arc::new(AtomicU64::new(history.position()));
         let end = history.position() + tokens.len() as u64;
-        let _ = self.send.send(Command::Start { id, tag, history, tokens, units, committed: Arc::clone(&committed) });
-        LookaheadHandle { id, end, committed, send: self.send.clone() }
+        let l14_reserved = Arc::new(AtomicU64::new(history.position()));
+        let _ = self.send.send(Command::Start { id, tag, history, tokens, units, committed: Arc::clone(&committed),
+            l14_reserved: Arc::clone(&l14_reserved) });
+        LookaheadHandle { id, end, committed, l14_reserved, send: self.send.clone() }
     }
 }
 
@@ -274,7 +283,7 @@ fn run(tables: [Arc<EngramTable>; 2], receive: mpsc::Receiver<Command>) {
 
 fn apply(plans: &mut Vec<Plan>, command: Command) {
     match command {
-        Command::Start { id, tag, history, tokens, mut units, committed } => {
+        Command::Start { id, tag, history, tokens, mut units, committed, l14_reserved } => {
             let start = history.position();
             let end = start + tokens.len() as u64;
             // Malformed or short plans degrade to one unit through the prompt's end.
@@ -283,7 +292,7 @@ fn apply(plans: &mut Vec<Plan>, command: Command) {
             units.depth = units.depth.max(1);
             plans.push(Plan { id, tag, admitted: std::time::Instant::now(), rows: [0; 2], waiting_rows: [0; 2],
                 needed: [0; 2], cached: [0; 2], joined: [0; 2], l14_skipped: 0,
-                history, tokens, start, next: 0, units, committed, pieces: VecDeque::new() });
+                history, tokens, start, next: 0, units, committed, l14_reserved, pieces: VecDeque::new() });
         }
         Command::Wake | Command::Stop | Command::Decode(_) => {}
         // Dropping the plan drains its reads, then fails unread rows and unpins.
@@ -295,6 +304,7 @@ fn abandon(plan: &mut Plan, error: &anyhow::Error) {
     tracing::warn!(%error, "Engram look-ahead stopped for a request; its rows load on demand");
     plan.next = plan.tokens.len();
     plan.pieces.clear();
+    plan.l14_reserved.store(u64::MAX, Ordering::Release);
 }
 
 impl Plan {
@@ -369,6 +379,7 @@ fn start_l14(plan: &mut Plan, index: usize, tables: &[Arc<EngramTable>; 2]) -> R
     let piece = &mut plan.pieces[index];
     piece.l14 = Some(pins);
     piece.l14_read = read;
+    plan.l14_reserved.fetch_max(piece.end, Ordering::Release);
     Ok(())
 }
 
@@ -438,6 +449,8 @@ impl Plan {
 
 impl Drop for Plan {
     fn drop(&mut self) {
+        // No more layer-14 reservations: the gathers read the rest themselves.
+        self.l14_reserved.store(u64::MAX, Ordering::Release);
         // Per layer: rows of the pieces it planned (distinct per piece), of those
         // already cached, already being filled by another reader (a gather or an
         // earlier request), read by the look-ahead (and before the first commit);

@@ -11,6 +11,9 @@ pub struct EngramRequestTokens<'a> {
     pub history: &'a EngramHistory,
     pub token_ids: &'a [u32],
     pub image_mask: Option<&'a [bool]>,
+    /// The request's look-ahead layer-14 reservation frontier
+    /// ([`crate::LookaheadHandle::l14_gate`]), when one runs.
+    pub l14_gate: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 enum LayerIo {
     AwaitingAdmission,
@@ -28,6 +31,8 @@ pub struct EngramWave {
     finished: bool,
     waiting: [Option<std::time::Instant>; 2],
     decode: bool,
+    /// Per batch with a look-ahead: its frontier and the batch's end position.
+    l14_gates: Vec<(Arc<std::sync::atomic::AtomicU64>, u64)>,
 }
 impl EngramWave {
     pub fn copy_capacity_stalled(&self, layer: usize) -> Result<bool> {
@@ -69,7 +74,14 @@ impl EngramWave {
         };
         Ok(())
     }
+    /// Layer 14 is admitted early only behind the look-ahead's layer-14
+    /// reservations (one deadline order for both readers); at the consumer's
+    /// wait it is admitted regardless.
+    fn l14_due(&self) -> bool {
+        self.l14_gates.iter().all(|(gate, end)| gate.load(std::sync::atomic::Ordering::Acquire) >= *end)
+    }
     fn admit(&mut self, layer: usize) -> Result<()> {
+        if layer == 1 && !self.l14_due() { return Ok(()); }
         if matches!(self.layers[layer], LayerIo::AwaitingAdmission) {
             if let Some(ticket) = self.gatherer.try_submit(Arc::clone(&self.tables[layer]),
                 &self.batches, layer)? {
@@ -295,15 +307,19 @@ impl EngramPipeline {
                     .map(Arc::new)
             })
             .collect();
+        let batches = batches?;
+        let l14_gates = requests.iter().zip(&batches).filter_map(|(request, batch)| request.l14_gate.as_ref()
+            .map(|gate| (Arc::clone(gate), request.history.position() + batch.hashes().len() as u64))).collect();
         let mut wave = EngramWave {
             pipeline: Arc::clone(&self.identity),
             gatherer: Arc::clone(if decode { &self.decode_gatherer } else { &self.gatherer }),
             tables: self.tables.clone(),
-            batches: batches?,
+            batches,
             layers: [LayerIo::AwaitingAdmission, LayerIo::AwaitingAdmission],
             finished: false,
             waiting: [None; 2],
             decode,
+            l14_gates,
         };
         // Both layers' host gathers start now (L14 right after L1, for prefill
         // and decode alike); the gather worker runs every queued L1 before any
@@ -509,7 +525,7 @@ mod wait_tests {
         EngramWave { pipeline: Arc::new(()), gatherer, tables: [table.clone(), table],
             batches: vec![batch],
             layers: [LayerIo::AwaitingAdmission, LayerIo::Consumed], finished: false,
-            waiting: [None; 2], decode: false }
+            waiting: [None; 2], decode: false, l14_gates: Vec::new() }
     }
 
     #[test]
