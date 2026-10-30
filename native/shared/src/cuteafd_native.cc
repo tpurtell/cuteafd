@@ -16,6 +16,7 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #if CUTEAFD_NATIVE_ENABLE_CUDA
@@ -304,9 +305,67 @@ bool gid_is_ipv4_mapped(const ibv_gid& gid) {
   return gid.raw[10] == 0xff && gid.raw[11] == 0xff;
 }
 
+// Render an IPv4-mapped GID as dotted-quad text ("192.0.2.10"). Returns
+// false for anything that is not IPv4-mapped.
+bool gid_ipv4_string(const ibv_gid& gid, char* out, size_t out_len) {
+  if (out == nullptr || out_len < 16 || !gid_is_ipv4_mapped(gid)) {
+    return false;
+  }
+  std::snprintf(out, out_len, "%u.%u.%u.%u", static_cast<unsigned>(gid.raw[12]),
+                static_cast<unsigned>(gid.raw[13]), static_cast<unsigned>(gid.raw[14]),
+                static_cast<unsigned>(gid.raw[15]));
+  return true;
+}
+
+// The local RoCE address this process must bind its RC queue pairs to.
+//
+// The coordinator and the management LAN share one mlx5 port, so the GID table
+// holds both the RoCE VLAN address and the (DHCP) management address. The order
+// of those two IPv4-mapped GIDs is not stable: when the management lease changes
+// the management GID can register first and take the low index. Picking "the
+// first IPv4-mapped GID" then silently binds the queue pair to the management
+// address, and every expert dispatch fails with ENOTCONN (os error 107) -> HTTP
+// 503. Callers therefore pass the intended local address explicitly.
+//
+// Resolution order: CUTEAFD_RDMA_LOCAL_IPV4, then the address whose
+// CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP entry names this device.
+std::string preferred_local_ipv4(const char* device_name) {
+  if (const char* explicit_ip = std::getenv("CUTEAFD_RDMA_LOCAL_IPV4");
+      explicit_ip != nullptr && explicit_ip[0] != '\0') {
+    return std::string(explicit_ip);
+  }
+  const char* map = std::getenv("CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP");
+  if (map == nullptr || device_name == nullptr || device_name[0] == '\0') {
+    return std::string();
+  }
+  // Entries are "ip=device" separated by commas. Only an unambiguous match is
+  // used: several Spark ranks share one device name, so a repeated device is
+  // skipped rather than guessed.
+  std::string found;
+  bool ambiguous = false;
+  std::string_view rest(map);
+  while (!rest.empty()) {
+    const size_t comma = rest.find(',');
+    const std::string_view item = rest.substr(0, comma);
+    rest = comma == std::string_view::npos ? std::string_view() : rest.substr(comma + 1);
+    const size_t eq = item.find('=');
+    if (eq == std::string_view::npos) {
+      continue;
+    }
+    if (item.substr(eq + 1) == device_name) {
+      if (!found.empty()) {
+        ambiguous = true;
+      }
+      found = std::string(item.substr(0, eq));
+    }
+  }
+  return ambiguous ? std::string() : found;
+}
+
 cuteafd_status_t select_rc_gid(ibv_context* context, const ibv_port_attr& port_attr,
                              uint32_t port_num, ibv_gid* out_gid,
-                             uint32_t* out_gid_index) {
+                             uint32_t* out_gid_index,
+                             const char* preferred_ipv4 = nullptr) {
   if (context == nullptr || out_gid == nullptr || out_gid_index == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "RDMA RC GID selection argument is null");
   }
@@ -318,10 +377,31 @@ cuteafd_status_t select_rc_gid(ibv_context* context, const ibv_port_attr& port_a
     return ok();
   }
 
+  const uint32_t gid_count = std::max<uint32_t>(1, port_attr.gid_tbl_len);
+
+  // Pass 1: an explicit local address wins over table order. This is what keeps
+  // the queue pair on the RoCE VLAN when the management GID registers first.
+  if (preferred_ipv4 != nullptr && preferred_ipv4[0] != '\0') {
+    for (uint32_t index = 0; index < gid_count; ++index) {
+      ibv_gid_entry entry = {};
+      if (ibv_query_gid_ex(context, port_num, index, &entry, 0) != 0) {
+        continue;
+      }
+      if (entry.gid_type != IBV_GID_TYPE_ROCE_V2 || !gid_is_ipv4_mapped(entry.gid)) {
+        continue;
+      }
+      char text[16] = {};
+      if (gid_ipv4_string(entry.gid, text, sizeof(text)) && std::strcmp(text, preferred_ipv4) == 0) {
+        *out_gid = entry.gid;
+        *out_gid_index = index;
+        return ok();
+      }
+    }
+  }
+
   bool have_fallback = false;
   ibv_gid fallback_gid = {};
   uint32_t fallback_index = 0;
-  const uint32_t gid_count = std::max<uint32_t>(1, port_attr.gid_tbl_len);
   for (uint32_t index = 0; index < gid_count; ++index) {
     ibv_gid_entry entry = {};
     if (ibv_query_gid_ex(context, port_num, index, &entry, 0) != 0) {
@@ -393,8 +473,10 @@ cuteafd_status_t modify_rc_qp_to_rtr(ibv_context* context, ibv_qp* qp,
       gid = *remote_gid;
     } else {
       uint32_t selected_gid_index = 0;
+      const std::string preferred_ipv4 = preferred_local_ipv4(nullptr);
       const cuteafd_status_t status =
-          select_rc_gid(context, port_attr, port_num, &gid, &selected_gid_index);
+          select_rc_gid(context, port_attr, port_num, &gid, &selected_gid_index,
+                        preferred_ipv4.c_str());
       if (status != CUTEAFD_STATUS_OK) {
         return status;
       }
@@ -3432,10 +3514,11 @@ static cuteafd_status_t create_rdma_rc_endpoint_with_buffer_flags(
 
   ibv_gid local_gid = {};
   uint32_t local_gid_index = 0;
+  const std::string preferred_ipv4 = preferred_local_ipv4(requested_device_name);
   cuteafd_status_t status =
       requested_gid_index < 0
           ? select_rc_gid(endpoint->context, endpoint->port_attr, port_num, &local_gid,
-                          &local_gid_index)
+                          &local_gid_index, preferred_ipv4.c_str())
           : (ibv_query_gid(endpoint->context, static_cast<uint8_t>(port_num),
                            requested_gid_index, &local_gid) == 0
                  ? CUTEAFD_STATUS_OK
@@ -4138,7 +4221,9 @@ extern "C" cuteafd_status_t cuteafd_rdma_gpu_landing_probe(
   }
   ibv_gid gid = {};
   uint32_t gid_index = 0;
-  if (select_rc_gid(context, port_attr, port_num, &gid, &gid_index) != CUTEAFD_STATUS_OK) {
+  const std::string preferred_ipv4 = preferred_local_ipv4(nullptr);
+  if (select_rc_gid(context, port_attr, port_num, &gid, &gid_index, preferred_ipv4.c_str()) !=
+      CUTEAFD_STATUS_OK) {
     return bail(CUTEAFD_STATUS_RDMA_UNAVAILABLE, "GPU landing probe found no GID");
   }
   for (int side = 0; side < 2; ++side) {
