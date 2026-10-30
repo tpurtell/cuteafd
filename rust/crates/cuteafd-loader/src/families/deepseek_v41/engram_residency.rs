@@ -8,10 +8,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Pages per `mincore` slice (~15 ms) and the pause between slices: a full
-/// sweep of both layers' tables every few seconds at a small fraction of a core.
-const SLICE_PAGES: usize = 1 << 20;
-const PAUSE: Duration = Duration::from_millis(100);
+/// Pages per `mincore` slice and the pause between slices. A slice walks the
+/// page tables under the serving process's mmap lock, which every page fault
+/// and mapping change in the process waits for: 64K pages hold it for about a
+/// millisecond. A full sweep of both layers' tables still takes a few seconds
+/// at a small fraction of a core.
+const SLICE_PAGES: usize = 1 << 16;
+const PAUSE: Duration = Duration::from_millis(6);
 
 pub struct ResidencySweep { stop: Arc<AtomicBool>, thread: Option<std::thread::JoinHandle<()>> }
 
