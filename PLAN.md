@@ -6451,3 +6451,13 @@ partial projections remain intact. production/paused-by-user.json records
 this pause. Do not auto-resume until TJ requests it after addressing is
 settled. The existing clean producer is resumable; no completed layers
 need rebuilding due to an IP change. Publication/handoff remain pending.
+
+RESUMED AGAIN at TJ's request (2026-10-31 04:28 UTC). Current enabled unit:
+step5-core-k6-1793420882847858742. Raptor DNS and maxq SparkNest config now
+agree on 172.22.2.12; source is local and both metadata hashes match the
+original audit. Checkpoint admission passed and new layer-34 expert-308
+through expert-315 projections confirm progress beyond the pause point.
+Layers 0–33 and all valid partial work were preserved. Numerical code and
+recipe are unchanged. The second user-pause receipt is archived under
+production/pauses/; resume-after-network-maintenance.json records the
+transition. Continue 30-minute monitoring with --publish/handoff enabled.
