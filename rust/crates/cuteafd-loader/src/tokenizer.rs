@@ -37,6 +37,21 @@ pub struct LoadedTokenizer {
 /// Byte ranges in a rendered prompt originating from literal token spellings.
 pub type LiteralSpans = Vec<std::ops::Range<usize>>;
 
+/// Whether an added token is a media marker a user or tool must not materialize
+/// from text. Each family's spellings (checked against its checkpoint's tokenizer):
+/// `<|image|>`/`<|vision_pad|>`/`<|audio_pad|>`/`<|video_pad|>` words (GLM, Qwen, MiMo,
+/// Muse, V4.1 `<｜deepseek_image｜>`), Mistral `[IMG]`/`[IMG_BREAK]`/`[IMG_END]`, Muse
+/// `<|vid_start|>`/`<|vid_frame_separator|>`/`<|patch|>`, Kimi `<|media_begin|>`..`<|media_pad|>`,
+/// Step `<im_start>`/`<im_patch>`/`<im_end>`/`<patch_start>`/`<patch_newline>`/`<patch_end>`,
+/// DeepSeek V4 `<|place_holder_mm_span_NNNN|>`. Chat tokens (`<|im_start|>`) are not media.
+pub fn is_media_marker(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    ["image", "audio", "video", "vision", "<|vid_", "<|media_", "mm_span", "<|patch|>", "<patch_", "<im_patch>"]
+        .iter().any(|word| lower.contains(word))
+        || token.starts_with("[IMG")
+        || matches!(token, "<im_start>" | "<im_end>")
+}
+
 /// Checkpoint spellings that must not become control tokens in message text.
 pub struct LiteralTokens {
     all: Option<daachorse::DoubleArrayAhoCorasick<u32>>,
@@ -68,11 +83,7 @@ impl LiteralTokens {
                 .match_kind(daachorse::MatchKind::LeftmostLongest).build(tokens)
                 .expect("nonempty distinct literal token spellings"))
         };
-        // Media markers in either spelling: `<|image|>`-style and Mistral's `[IMG]`,
-        // `[IMG_BREAK]`, `[IMG_END]`, `[AUDIO]`, `[BEGIN_AUDIO]`.
-        let media = tokens.iter().filter(|token| ["image", "audio", "video", "vision"]
-            .iter().any(|word| token.to_ascii_lowercase().contains(word))
-            || token.starts_with("[IMG")).cloned().collect();
+        let media = tokens.iter().filter(|token| is_media_marker(token)).cloned().collect();
         Self { all: matcher(tokens), media: matcher(media) }
     }
 
