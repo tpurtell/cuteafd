@@ -1,5 +1,11 @@
 {
   "schema": 1,
+  "shared_inputs": [
+    "python/tools/lib/spark_packages.py",
+    "scripts/build/spark-package-ranges.json",
+    "scripts/lib/wip_aot_scopes.py",
+    "scripts/lib/checkpoint-family.py"
+  ],
   "spark_budget_bytes": 107374182400,
   "entries": {
     "v41:mxfp4": {

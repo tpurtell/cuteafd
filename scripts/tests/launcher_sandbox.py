@@ -1,14 +1,14 @@
 """Session-owned, immutable launcher inputs; writable files never share inodes."""
 from pathlib import Path
+import json
 import shutil
 
 _ROOT = None
 _TEMPLATES = {}
 
-LAUNCHER_SHARED_INPUTS = (
-    "python/tools/lib/spark_packages.py",
-    "scripts/build/spark-package-ranges.json",
-)
+LAUNCHER_SHARED_INPUTS = tuple(json.loads(
+    (Path(__file__).resolve().parents[2] / "scripts/build/spark-package-ranges.json").read_text()
+)["shared_inputs"])
 
 
 def configure(root):

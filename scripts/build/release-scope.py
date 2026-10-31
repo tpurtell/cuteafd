@@ -410,8 +410,12 @@ def revision_requirements(repo, revision):
             'release publication requires a clean full Git revision')
     # Materialize the build revision's matrix, config and shared derivation, not
     # the publisher's potentially different checkout or environment override.
+    policy_path = 'scripts/build/spark-package-ranges.json'
+    policy = json.loads(subprocess.check_output(
+        ['git', '-C', str(repo), 'show', f'{revision}:{policy_path}']))
     archive = subprocess.check_output(['git', '-C', str(repo), 'archive', revision, '--',
-                                       'scripts/lib', 'examples/configs', 'cuteafd.config', DEFAULT_MATRIX])
+                                       'scripts/lib', 'examples/configs', 'cuteafd.config', DEFAULT_MATRIX,
+                                       *policy['shared_inputs']])
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         with tarfile.open(fileobj=io.BytesIO(archive)) as tree:

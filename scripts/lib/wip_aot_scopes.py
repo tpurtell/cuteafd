@@ -13,8 +13,11 @@ SPEC = importlib.util.spec_from_file_location('checkpoint_family', Path(__file__
 checkpoint_family = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checkpoint_family)
 # The launcher's default checkpoint when a config names none (release-common.sh).
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'python/tools/lib'))
-from spark_packages import native_spark_roles
+SPARK_SPEC = importlib.util.spec_from_file_location(
+    'wip_spark_packages', Path(__file__).resolve().parents[2] / 'python/tools/lib/spark_packages.py')
+spark_packages = importlib.util.module_from_spec(SPARK_SPEC)
+SPARK_SPEC.loader.exec_module(spark_packages)
+native_spark_roles = spark_packages.native_spark_roles
 
 DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
