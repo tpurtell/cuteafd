@@ -40,10 +40,22 @@ pub(crate) fn geometry(catalog: &OfficialV41Catalog, tensor: &str) -> Result<(us
 
 /// Whether `name` is an E4M3 matrix with its own FP32 128x128 block grid
 /// (`{name}_scale_inv`), the form whose bytes land unchanged.
+/// The FP32 128x128 block-scale grid of FP8 weight `name` (`*.weight`): the
+/// Hugging Face `weight_scale_inv`, or Mistral's consolidated `qscale_weight`
+/// (the same multiplied grid). The HF name when neither is present.
+pub(crate) fn block_grid(catalog: &OfficialV41Catalog, name: &str) -> String {
+    let hf = format!("{name}_scale_inv");
+    if catalog.tensor(&hf).is_ok() { return hf; }
+    match name.strip_suffix(".weight") {
+        Some(stem) if catalog.tensor(&format!("{stem}.qscale_weight")).is_ok() => format!("{stem}.qscale_weight"),
+        _ => hf,
+    }
+}
+
 pub(crate) fn native_fp8_block(catalog: &OfficialV41Catalog, name: &str) -> Result<bool> {
     let meta = &catalog.tensor(name)?.metadata;
     if meta.dtype != DType::F8E4M3 || meta.shape.len() != 2 { return Ok(false); }
-    let Ok(scale) = catalog.tensor(&format!("{name}_scale_inv")) else { return Ok(false) };
+    let Ok(scale) = catalog.tensor(&block_grid(catalog, name)) else { return Ok(false) };
     Ok(scale.metadata.dtype == DType::F32
         && scale.metadata.shape == [meta.shape[0].div_ceil(128), meta.shape[1].div_ceil(128)])
 }

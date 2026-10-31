@@ -5,7 +5,7 @@
 //! layer), or explicit `layers` (whole attention and owner-local KV, with
 //! split FFNs). `context` remains the default where its programs exist
 //! ([`GlmContext`]); owned attention follows the shared prefill wave policy.
-use crate::families::glm5::{GlmDsaConfig, GlmIndexer};
+use crate::families::glm5::{names::Operand, GlmDsaConfig, GlmIndexer};
 use crate::placement::*;
 use crate::serving_capacity::{glm_cache_geometry, glm_decode_graph_allowance};
 use cuteafd_core::memory_layout::{Basis, Category};
@@ -134,6 +134,21 @@ pub fn context_workspace_bytes(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u6
 pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
     lookup: impl Fn(&str) -> Option<u64>) -> anyhow::Result<GlmScratch> {
     let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
+    if !cfg.variant.is_glm() {
+        // Whole attention through the variant's stage programs (K6 core only):
+        // the sparse MLA of both record kinds is the only scratch owner.
+        let family = cfg.program_family();
+        let mut programs = 0;
+        for tag in ["", "_nope"] {
+            let name = format!("{family}_sparse_mla{tag}_{mode}_{cap}");
+            programs = programs.max(lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))?);
+        }
+        // The FP8 indexer query (a checkpoint keeping wq_b as shipped) shares the arena.
+        programs = programs.max(lookup(&format!("{family}_index_q_{cap}")).unwrap_or(0));
+        let name = format!("{family}_index_topk_{mode}_{cap}");
+        return Ok(GlmScratch { programs,
+            topk: lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))? });
+    }
     let prefix = if split { "glm2" } else { "glm" };
     let divisor = if split { 2 } else { 1 };
     let (moe, dense) = (cfg.moe_intermediate / divisor, cfg.dense_intermediate / divisor);
@@ -408,17 +423,22 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             Demand::new(0, Category::Drafter, "drafter owned storage", inputs.drafter_bytes, Basis::Formula)], 0)
             .movable(gpus)?]
     };
+    let groups = colocate_groups(cfg, inputs.layers);
+    let head_split = cfg.split_program_family().is_some();
     let layers = (0..inputs.layers).map(|layer| LayerDemand {
         kind: AttentionClass::Dsa,
         weights: ModeBytes::default(),
         kv_unit: {
-            let unit = PAGE_ROWS * 656 + if cfg.indexers[layer] == GlmIndexer::Full { 8448 } else { 0 };
+            // The layer's own latent record (GLM 5.x 656 B; Mistral Large 4
+            // 656/528, none on a layer reading another's latent) plus its index keys.
+            let latent = if cfg.owns_kv(layer) { cfg.record_bytes(layer) as u64 } else { 0 };
+            let unit = PAGE_ROWS * latent + if cfg.indexers[layer] == GlmIndexer::Full { 8448 } else { 0 };
             KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: Some([unit.div_ceil(2), unit / 2]) }
         },
         fixed_bytes: ModeBytes::default(), extra: Vec::new(),
         context_indexer: cfg.indexers[layer] == GlmIndexer::Full,
-        colocate: Some(cfg.index_source(layer) as u16),
+        colocate: Some(groups[layer]),
         // Preserve routed identity even without local kernels: Spark-free and
         // explicit local requests must fail, not turn these into dense layers.
         experts: if inputs.skip_routed_experts { None } else {
@@ -426,6 +446,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 whole: Bytes2::default(), half: [Bytes2::default(); 2], tp2: false, spark_ok: true }))
         },
         modes: match (gpus, inputs.context) {
+            // Whole-attention variants: the layers request adds the owner modes.
+            (2, _) if !head_split => Vec::new(),
             (2, Some(_)) => vec![LayerMode::HeadSplit, LayerMode::ContextSplit],
             (2, None) => vec![LayerMode::HeadSplit],
             _ => vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
@@ -488,7 +510,27 @@ pub fn attention_owners(cfg: &GlmDsaConfig, layers: usize) -> Result<Vec<u8>, Pl
         return Err(PlacementError::Inventory("GLM attention owner layer extent"));
     }
     super::super::attention::alternating_owners(
-        (0..layers).map(|layer| (true, Some(cfg.index_source(layer) as u16))), 0)
+        colocate_groups(cfg, layers).into_iter().map(|group| (true, Some(group))), 0)
+}
+
+/// The colocation group of each layer: a layer joins the full indexer layer
+/// whose top-k it reuses and (Mistral Large 4) the layer whose latent KV pages
+/// it reads. Groups are the least layer of their union; GLM's are exactly its
+/// index sources.
+pub fn colocate_groups(cfg: &GlmDsaConfig, layers: usize) -> Vec<u16> {
+    let mut parent: Vec<usize> = (0..layers).collect();
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x { parent[x] = parent[parent[x]]; x = parent[x]; }
+        x
+    }
+    for layer in 0..layers {
+        for other in [cfg.index_source(layer), cfg.kv_source(layer)] {
+            if other >= layers { continue; }
+            let (a, b) = (root(&mut parent, layer), root(&mut parent, other));
+            parent[a.max(b)] = a.min(b);
+        }
+    }
+    (0..layers).map(|layer| root(&mut parent, layer) as u16).collect()
 }
 
 /// Storage allocated for the selected Spark suffix, rather than configured peers.
@@ -497,6 +539,17 @@ pub struct GlmWorkingSet {
     pub spark: SparkWorkingSet,
     /// Family-local TP2 payload/backend costs for this selected branch.
     pub tp2_workspace: [u64; 2],
+}
+
+/// The attention placement a request resolves to before admission: the
+/// request, except that auto on two GPUs for a variant without head-split
+/// programs (Mistral Large 4) means whole-layer owners. GLM is unchanged
+/// (auto stays auto; the solver picks context on two GPUs).
+pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize)
+    -> Option<AttentionPlacement> {
+    if requested.is_none() && gpus == 2 && cfg.split_program_family().is_none() {
+        Some(AttentionPlacement::Layers)
+    } else { requested }
 }
 
 /// Evaluate each executable local prefix with its own intake, lane and TP2 costs.
@@ -509,8 +562,13 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     // run it: fail closed with what to rebuild rather than silently
     // downgrading the executor to heads (issue #202). Explicit heads is
     // unaffected.
-    let context_chosen = attention.map_or(inputs.gpus.len() == 2,
+    let context_chosen = attention.map_or(inputs.gpus.len() == 2 && inputs.cfg.split_program_family().is_some(),
         |mode| mode == AttentionPlacement::Context);
+    if inputs.cfg.split_program_family().is_none() && inputs.gpus.len() == 2
+        && attention != Some(AttentionPlacement::Layers) {
+        return Err(PlacementError::Inventory("this checkpoint's two-GPU attention runs whole-layer owners \
+            (attention placement layers or auto)"));
+    }
     if context_chosen && inputs.context.is_none() {
         return Err(PlacementError::MissingContextPrograms { family: "glm5", programs: context_program_list() });
     }
@@ -644,6 +702,23 @@ pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
 }
 
 /// Largest transient BF16 source retained while packing one draft projection.
+/// Mistral Large 4's bundled mtp_dspark on the shared MLA block-draft path: its
+/// immutable runtime layout from the checkpoint's own params.json and text
+/// config (every draft layer windowed, so the target pool does not size it).
+pub fn ml4_draft_layout(snapshot: &std::path::Path, slots: usize, sequences: usize, compiled_context: usize,
+    sms: usize) -> anyhow::Result<crate::formats::dflash::MlaDraftRuntimeLayout> {
+    use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+    use crate::families::mistral_large4::{dspark::Ml4DsparkConfig, Ml4Config};
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let target = Ml4Config::from_hf(&config)?;
+    let params = crate::plan::checkpoint::read_json(&snapshot.join("params.json"))?;
+    let dspark = Ml4DsparkConfig::from_params(&params, target.layers)?;
+    let draft = crate::formats::dflash::MlaDflashConfig::ml4(&dspark, &target)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, dspark.depth)?;
+    Ok(draft.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, compiled_context, compiled_context, sms, 0,
+        cuteafd_core::MlaCacheFormat::Fp8)?)
+}
+
 pub fn drafter_staging(snapshot: &std::path::Path, slots: usize, sequences: usize,
     bf16: bool) -> anyhow::Result<u64> {
     use crate::families::glm5::draft_representation::{draft_geometry, GlmDraftCapacity,
@@ -747,9 +822,10 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
         anyhow::ensure!(ranks == 0, "GLM empty Spark suffix must select zero ranks");
         return Ok(Vec::new());
     }
+    // The routed geometry is the checkpoint's own (its config read by its family's
+    // catalog); only the suffix and rank extents are checked here.
     let shape = catalog.routed_experts();
-    anyhow::ensure!((1..=8).contains(&ranks) && shape.hidden == 6144
-        && shape.intermediate == 2048 && shape.experts == 256 && shape.topk == 8
+    anyhow::ensure!((1..=8).contains(&ranks)
         && shape.layers > shape.first_layer && layers.last() == Some(&(shape.layers - 1))
         && layers.iter().all(|&layer| (shape.first_layer..shape.layers).contains(&layer))
         && layers.windows(2).all(|w| w[0] + 1 == w[1]), "GLM Spark rank/selected-suffix geometry");
@@ -771,24 +847,31 @@ pub fn spark_resident_bytes(catalog: &crate::OfficialV41Catalog, layers: &[usize
     })).collect()
 }
 
-pub fn local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
+pub fn local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool) -> anyhow::Result<LocalInventory> {
-    local_inventory_selected(catalog, manifest, selected_layers, rows, lanes, exchange_f32, true)
+    local_inventory_selected(cfg, catalog, manifest, selected_layers, rows, lanes, exchange_f32, true)
 }
 
 /// Explicit activation selection keeps package admission deterministic in tests.
-pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
-    selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
+/// Geometry, the package namespace and the router names are the checkpoint's
+/// own: `cfg` (its config and variant) and the catalog read from its headers.
+#[allow(clippy::too_many_arguments)]
+pub fn local_inventory_selected(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog,
+    manifest: &std::path::Path, selected_layers: usize, rows: u64, lanes: u64, exchange_f32: bool, a4: bool)
     -> anyhow::Result<LocalInventory> {
     let shape = catalog.routed_experts();
-    anyhow::ensure!(shape.hidden == 6144 && shape.intermediate == 2048 && shape.experts == 256
-        && shape.topk == 8 && (1..=4096).contains(&rows) && (1..=4).contains(&lanes)
+    anyhow::ensure!(shape.hidden == cfg.hidden && shape.intermediate == cfg.moe_intermediate
+        && shape.experts == cfg.experts && shape.topk == cfg.topk && shape.first_layer == cfg.first_moe_layer,
+        "routed expert catalog {shape:?} differs from the checkpoint config");
+    anyhow::ensure!(shape.intermediate % 2 == 0 && (1..=4096).contains(&rows) && (1..=4).contains(&lanes)
         && (shape.first_layer..=shape.layers).contains(&selected_layers), "GLM TP2 geometry/layer extent");
     let Some(exl3) = catalog.exl3() else {
+        anyhow::ensure!(cfg.variant.is_glm(), "{} routed experts serve TP2 only from its EXL3 publication",
+            cfg.program_family());
         return nvfp4_inventory(catalog, manifest, selected_layers, rows, lanes, exchange_f32, a4);
     };
     let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-    let stem = format!("exl3-glm-k{tiers}");
+    let stem = format!("exl3-{}-k{tiers}", cfg.program_family());
     let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
     let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().map(|p| p.join("rtx-tp2")).find(|p| p.is_dir())
@@ -833,9 +916,11 @@ pub fn local_inventory_selected(catalog: &crate::OfficialV41Catalog, manifest: &
         for (rank, bytes) in half.iter_mut().enumerate() {
             bytes.resident = exl3.residency(crate::V41Exl3Layer::Backbone(layer), 2, rank)?.device_arena_layout()?.1 as u64;
         }
-        for suffix in ["weight", "e_score_correction_bias"] {
-            half[1].resident += catalog.tensor(&format!("model.layers.{layer}.mlp.gate.{suffix}"))?
-                .metadata.byte_length.max(FLOOR);
+        // Rank 1 owns the router (and its bias, on variants that have one).
+        for operand in [Operand::Router, Operand::RouterBias] {
+            if let Some(name) = cfg.weight(layer, operand) {
+                half[1].resident += catalog.tensor(&name)?.metadata.byte_length.max(FLOOR);
+            }
         }
         experts.push(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half,
             tp2: true, spark_ok: true });
@@ -979,7 +1064,7 @@ struct MissingLocalPackage(String);
 
 /// Shared planner/runtime activation policy. Auto remains remote when the build lacks local exports.
 #[allow(clippy::too_many_arguments)]
-pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
+pub fn select_local_inventory(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path,
     layers: usize, gpus: usize, rows: u64, lanes: u64, exchange_f32: bool,
     onboard: Onboard, skip: bool, exlr8: Option<(&str, crate::plan::exlr8::PrefillActivations)>)
     -> anyhow::Result<Option<LocalInventory>> {
@@ -999,7 +1084,7 @@ pub fn select_local_inventory(catalog: &crate::OfficialV41Catalog, manifest: &st
     let supported = catalog.exl3().is_some() || catalog.fp8().is_some_and(|t|
         t.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4);
     if automatic && !supported { return Ok(None); }
-    match local_inventory(catalog, manifest, layers, rows, lanes, exchange_f32) {
+    match local_inventory(cfg, catalog, manifest, layers, rows, lanes, exchange_f32) {
         Ok(local) => Ok(Some(local)),
         Err(error) if automatic && error.is::<MissingLocalPackage>() => {
             tracing::info!(reason = %error, "GLM RTX TP2 package unavailable; automatic placement uses Sparks");
@@ -1031,7 +1116,7 @@ mod tests {
             index_heads: 32, index_head_dim: 128, index_topk: 2048, indexers, first_moe_layer: 3,
             dense_intermediate: 12288, experts: 256, topk: 8, moe_intermediate: 2048,
             shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
-            mtp_layers: 1, eos_tokens: vec![154820] }
+            mtp_layers: 1, eos_tokens: vec![154820], variant: crate::families::glm5::GlmVariant::Glm }
     }
 
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {
@@ -1608,6 +1693,8 @@ mod tests {
         assert_eq!(geometry.ranks[0], geometry.ranks[1]);
     }
 
+    fn glm_cfg() -> GlmDsaConfig { GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap() }
+
     fn local_fixture() -> (tempfile::TempDir, crate::OfficialV41Catalog, std::path::PathBuf) {
         use crate::plan::testing::{exl3, exl3_compact, glm5_config, glm5_tensors, write_snapshot};
         use serde_json::json;
@@ -1651,25 +1738,26 @@ mod tests {
     #[test]
     fn activation_policy_uses_exports_and_refuses_malformed_packages() {
         let (dir, catalog, manifest) = local_fixture();
+        let cfg = glm_cfg();
         for onboard in [Onboard::Auto, Onboard::ExpertsFirst { pool_floor: 65536 }, Onboard::Layers(1)] {
-            assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
+            assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().is_some());
         }
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false, None)
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(0), false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true, None)
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), true, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false, None)
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 1, 64, 3, false, Onboard::Auto, false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false, None).is_err());
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 1, 64, 3, false, Onboard::Layers(1), false, None).is_err());
         let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2");
         std::fs::remove_file(package.join("m16/libcuteafd_exl3.so")).unwrap();
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None).is_err(),
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None).is_err(),
             "present but incomplete exports must fail closed");
         std::fs::remove_dir_all(package).unwrap();
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None)
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Auto, false, None)
             .unwrap().is_none());
-        assert!(select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false, None).is_err());
+        assert!(select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, Onboard::Layers(1), false, None).is_err());
     }
 
     #[test]
@@ -1677,7 +1765,7 @@ mod tests {
         let (_dir, catalog, manifest) = local_fixture();
         let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
         for onboard in [Onboard::Auto, Onboard::Layers(1)] {
-            let local = select_local_inventory(&catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
+            let local = select_local_inventory(&cfg, &catalog, &manifest, 2, 2, 64, 3, false, onboard, false, None)
                 .unwrap().unwrap();
             let planned = GlmInputs { prefill_rows: 64, prefill_lanes: 1, experts: local.experts.clone(),
                 expert_workspace: 0, tp2_workspace: local.workspace(), drafter_bytes: 0,
@@ -1701,7 +1789,8 @@ mod tests {
     #[test]
     fn local_inventory_charges_all_retained_capacities_and_exact_rank_storage() {
         let (_dir, catalog, manifest) = local_fixture();
-        let local = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap();
+        let cfg = glm_cfg();
+        let local = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap();
         assert_eq!(local.backend_workspace, 80 * 64 + 3 * (32 + 16) + 64 * 6144 * 4);
         assert_eq!(local.experts.len(), 1);
         let exl3 = catalog.exl3().unwrap();
@@ -1714,22 +1803,23 @@ mod tests {
                 .device_arena_layout().unwrap().1 as u64 + router);
             assert_eq!(local.experts[0].half[rank].staging, 0);
         }
-        let wide = local_inventory(&catalog, &manifest, 2, 64, 3, true).unwrap();
+        let wide = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, true).unwrap();
         let widening = (DECODE_ROWS + 3 * 64) * 6144 * 2 + 4 * 3 * 64 * 6144 * 2;
         for rank in 0..2 {
             assert_eq!(wide.workspace()[rank] - local.workspace()[rank], widening);
         }
-        assert!(local_inventory(&catalog, &manifest, 0, 64, 3, false).is_err());
-        assert!(local_inventory(&catalog, &manifest, 3, 64, 3, false).is_err());
+        assert!(local_inventory(&cfg, &catalog, &manifest, 0, 64, 3, false).is_err());
+        assert!(local_inventory(&cfg, &catalog, &manifest, 3, 64, 3, false).is_err());
     }
 
     #[test]
     fn local_inventory_keeps_decode_capacity_with_short_prefill_rows() {
         let (_dir, catalog, manifest) = local_fixture();
+        let cfg = glm_cfg();
         for rows in [1, 16, 63] {
             for lanes in [1, 3, 4] {
                 for f32 in [false, true] {
-                    let local = local_inventory(&catalog, &manifest, 2, rows, lanes, f32).unwrap();
+                    let local = local_inventory(&cfg, &catalog, &manifest, 2, rows, lanes, f32).unwrap();
                     assert_eq!(local.backend_workspace, 80 * 64 + 3 * (32 + 16) + DECODE_ROWS * 6144 * 4);
                     let dtype = if f32 { 4 } else { 2 };
                     // One payload arena whose slot views serve every admitted depth (#762).
@@ -1753,6 +1843,7 @@ mod tests {
     fn local_inventory_refuses_missing_assets_and_mismatched_specializations() {
         use serde_json::json;
         let (dir, catalog, manifest) = local_fixture();
+        let cfg = glm_cfg();
         let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2/m16");
         let path = package.join("v41_exl3.json");
         let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -1762,18 +1853,18 @@ mod tests {
             let mut changed = original.clone();
             changed[field] = value;
             std::fs::write(&path, serde_json::to_vec(&changed).unwrap()).unwrap();
-            let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+            let error = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap_err();
             assert!(error.to_string().contains("capacity/geometry/tiers/output mismatch"), "{field}: {error:#}");
         }
         std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
         for asset in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
             std::fs::remove_file(package.join(asset)).unwrap();
-            let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+            let error = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap_err();
             assert!(error.to_string().contains("missing"), "{asset}: {error:#}");
             std::fs::write(package.join(asset), b"").unwrap();
         }
         std::fs::remove_dir_all(dir.path().join("exl3")).unwrap();
-        let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+        let error = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap_err();
         assert!(error.to_string().contains("missing exl3-glm-k45/rtx-tp2 package"), "{error:#}");
     }
 
@@ -1781,23 +1872,24 @@ mod tests {
     fn local_inventory_resolves_declared_route_assets() {
         use serde_json::json;
         let (dir, catalog, manifest) = local_fixture();
+        let cfg = glm_cfg();
         let package = dir.path().join("exl3/exl3-glm-k45/rtx-tp2/m16");
         let path = package.join("v41_exl3.json");
         let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         std::fs::rename(package.join("routes"), package.join("packed")).unwrap();
         value["route_preparation"]["manifest"] = json!("packed/v41_exl3_routes.json");
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(local_inventory(&catalog, &manifest, 2, 64, 3, false).is_ok());
+        assert!(local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).is_ok());
 
         value["route_preparation"] = serde_json::Value::Null;
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let error = local_inventory(&catalog, &manifest, 2, 64, 3, false).unwrap_err();
+        let error = local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).unwrap_err();
         assert!(error.to_string().contains("missing packed route export manifest"), "{error:#}");
 
         value["direct"] = json!(true);
         std::fs::remove_dir_all(package.join("packed")).unwrap();
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        assert!(local_inventory(&catalog, &manifest, 2, 64, 3, false).is_ok());
+        assert!(local_inventory(&cfg, &catalog, &manifest, 2, 64, 3, false).is_ok());
     }
 
     fn nvfp4_checkpoint_tensors() -> Vec<crate::plan::testing::Tensor> {
@@ -1864,6 +1956,7 @@ mod tests {
     fn spark_nvfp4_residency_charges_selected_suffix_and_replicated_scalars() {
         use crate::formats::fp8_experts::Slicing;
         let (_dir, catalog, _manifest) = nvfp4_fixture();
+        let cfg = glm_cfg();
         let catalog = extend_routed_fixture(&catalog, nvfp4_checkpoint_tensors());
         let scalars = 3 * 256 * 8;
         let bytes = |width| 3 * 256 * 6144 * width * (8 + 1) / 16 + scalars;
@@ -1907,6 +2000,7 @@ mod tests {
         use crate::formats::fp8_experts::Slicing;
         use crate::plan::testing::{exl3, glm5_tensors};
         let (_dir, catalog, _manifest) = local_fixture();
+        let cfg = glm_cfg();
         let mut tensors = glm5_tensors(|name, n, k| exl3(name, n, k, 4));
         for expert in 1..256 {
             for (projection, n, k) in [("gate_proj", 2048, 6144), ("up_proj", 2048, 6144),
@@ -1937,12 +2031,13 @@ mod tests {
     #[test]
     fn nvfp4_inventory_retains_native_scales_and_selects_matching_activation_package() {
         let (dir, catalog, manifest) = nvfp4_fixture();
+        let cfg = glm_cfg();
         let whole = 3 * (256 * 6144 * 2048 / 2 + 256 * 6144 * 2048 / 16 + 256 * 8);
         let half = 3 * (256 * 6144 * 1024 / 2 + 256 * 6144 * 1024 / 16 + 256 * 8);
         for rows in [1u64, 16, 63, 64, 81, 4096] {
-            assert!(local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, false).is_err());
+            assert!(local_inventory_selected(&cfg, &catalog, &manifest, 2, rows, 3, false, false).is_err());
             for a4 in [true] {
-                let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
+                let local = local_inventory_selected(&cfg, &catalog, &manifest, 2, rows, 3, false, a4).unwrap();
                 assert_eq!(local.format, GlmLocalFormat::Nvfp4 { w4a4: a4 });
                 assert_eq!(local.experts.len(), 1);
                 assert_eq!(local.experts[0].whole, Bytes2 { resident: whole, staging: 0 });
@@ -1960,13 +2055,14 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(dir.path().join("lib/fp8/fp8-glm-nvfp4a4/tp2")).unwrap();
-        assert!(local_inventory_selected(&catalog, &manifest, 2, 64, 1, false, true).is_err());
+        assert!(local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 1, false, true).is_err());
     }
 
     #[test]
     fn nvfp4_inventory_validates_every_selected_expert_header() {
         use crate::plan::testing::{t, write_snapshot};
         let (_dir, catalog, manifest) = nvfp4_fixture();
+        let cfg = glm_cfg();
         let config = crate::plan::checkpoint::read_json(&catalog.snapshot().join("config.json")).unwrap();
         let snapshot = catalog.snapshot().to_path_buf();
         let input = "model.layers.1.mlp.experts.255.up_proj.input_scale";
@@ -1980,7 +2076,7 @@ mod tests {
             write_snapshot(&snapshot, &config, &tensors, None);
             // The first gate still establishes NVFP4; the later expert must not escape admission validation.
             let error = crate::read_expert_catalog(&snapshot)
-                .and_then(|catalog| local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true))
+                .and_then(|catalog| local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 3, false, true))
                 .unwrap_err();
             assert!(format!("{error:#}").contains(name), "{name}: {error:#}");
         }
@@ -1992,7 +2088,7 @@ mod tests {
         let cfg = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
         for a4 in [true] {
             for rows in [1, 63, 4096] {
-                let local = local_inventory_selected(&catalog, &manifest, 2, rows, 3, false, a4).unwrap();
+                let local = local_inventory_selected(&cfg, &catalog, &manifest, 2, rows, 3, false, a4).unwrap();
                 let serial = local.workspace_for(&cfg, rows, 1, false);
                 for onboard in [Onboard::Auto, Onboard::Layers(0), Onboard::Layers(1), Onboard::Fraction(1.0)] {
                     let lanes = if onboard == Onboard::Layers(0) { 3 } else { 1 };
@@ -2030,7 +2126,8 @@ mod tests {
     fn nvfp4_inventory_refuses_unimplemented_exchange_and_bad_package_contracts() {
         use serde_json::json;
         let (dir, catalog, manifest) = nvfp4_fixture();
-        let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, true, true).unwrap_err();
+        let cfg = glm_cfg();
+        let error = local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 3, true, true).unwrap_err();
         assert!(error.to_string().contains("use BF16 exchange"), "{error:#}");
         let package = dir.path().join("lib/fp8/fp8-glm-nvfp4a4");
         let path = package.join("manifest.json");
@@ -2041,7 +2138,7 @@ mod tests {
             let mut changed = original.clone();
             changed["layouts"]["tp2"][field] = value;
             std::fs::write(&path, changed.to_string()).unwrap();
-            let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+            let error = local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
             assert!(error.to_string().contains("geometry/input/format mismatch"), "{field}: {error:#}");
         }
         for (field, value) in [
@@ -2053,14 +2150,14 @@ mod tests {
             let mut changed = original.clone();
             changed["layouts"]["tp2"][field] = value;
             std::fs::write(&path, changed.to_string()).unwrap();
-            assert!(local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).is_err(), "{field}");
+            assert!(local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 3, false, true).is_err(), "{field}");
         }
         std::fs::write(&path, original.to_string()).unwrap();
         std::fs::remove_file(package.join("tp2/libcuteafd_fp8moe.so")).unwrap();
-        let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+        let error = local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
         assert!(error.to_string().contains("missing binary"), "{error:#}");
         std::fs::remove_dir_all(dir.path().join("lib/fp8")).unwrap();
-        let error = local_inventory_selected(&catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
+        let error = local_inventory_selected(&cfg, &catalog, &manifest, 2, 64, 3, false, true).unwrap_err();
         assert!(error.to_string().contains("missing calibrated GLM NVFP4 W4A4 tp2 package"), "{error:#}");
     }
 
@@ -2096,6 +2193,52 @@ mod tests {
         let mut context = r;
         context.attention_placement = Some(AttentionPlacement::Context);
         assert!(matches!(solve(&context), Err(PlacementError::UnsupportedMode { .. })));
+    }
+
+    #[test]
+    fn colocation_groups_are_glm_index_sources_and_join_mistral_latent_readers() {
+        let cfg = config();
+        assert_eq!(colocate_groups(&cfg, cfg.layers),
+            (0..cfg.layers).map(|layer| cfg.index_source(layer) as u16).collect::<Vec<_>>());
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let groups = colocate_groups(&ml4, ml4.layers);
+        // Layer 35 owns the latent that 39, 43, ..., 71 read; their indexer groups join it.
+        for layer in (39..72).step_by(4) {
+            assert_eq!(ml4.kv_source(layer), 35);
+            assert_eq!(groups[layer], groups[35], "layer {layer}");
+            assert_eq!(groups[layer], groups[ml4.index_source(layer)]);
+        }
+        let owners = attention_owners(&ml4, ml4.layers).unwrap();
+        assert!(owners.contains(&0) && owners.contains(&1));
+        for layer in 0..ml4.layers {
+            assert_eq!(owners[layer], owners[ml4.kv_source(layer)]);
+            assert_eq!(owners[layer], owners[ml4.index_source(layer)]);
+        }
+    }
+
+    #[test]
+    fn mistral_large4_charges_per_layer_records_and_runs_whole_attention() {
+        let cfg = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let mut i = inputs(&cfg, &[96 * GIB; 2]);
+        i.spark_ranks = 6;
+        i.prefill_lanes = 2;
+        let req = request(&i).unwrap();
+        let units: u64 = req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum();
+        let geometry = crate::serving_capacity::mistral_large4_cache_geometry(cfg.variant.ml4().unwrap(), 1).unwrap();
+        assert_eq!(units, geometry.ranks[0].persistent_unit_bytes);
+        assert!(req.layers.iter().all(|l| l.modes.is_empty()), "no head split on two GPUs");
+        assert_eq!(resolve_attention(&cfg, None, 2), Some(AttentionPlacement::Layers));
+        assert_eq!(resolve_attention(&cfg, None, 1), None);
+        assert_eq!(resolve_attention(&config(), None, 2), None);
+        assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_err());
+        let (placed, _) = solve_working_set(&i, [0; 2], resolve_attention(&cfg, None, 2)).unwrap();
+        let owners = attention_owners(&cfg, cfg.layers).unwrap();
+        for (layer, assignment) in placed.layers.iter().enumerate() {
+            assert_eq!(assignment.mode, LayerMode::Whole { gpu: owners[layer], ffn: FfnMode::Split });
+        }
+        let one = inputs(&cfg, &[96 * GIB]);
+        let (placed, _) = solve_working_set(&one, [0; 2], None).unwrap();
+        assert!(placed.layers.iter().all(|l| matches!(l.mode, LayerMode::Whole { gpu: 0, .. })));
     }
 
     #[test]

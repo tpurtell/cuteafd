@@ -53,8 +53,10 @@ impl<'a> CorePrograms<'a> {
         programs.load_matching(|name| stage_program(name, ranks))?;
         let owned = layers.iter().any(|layer| layer.attention_owner.is_some());
         for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
-            let prefix = if ranks == 2 { "glm2" } else { "glm" };
-            programs.program(&format!("{prefix}_stage_swiglu_i{inter}"), &["gate", "up", "hidden"])?;
+            let name = if cfg.variant.is_glm() {
+                format!("{}_stage_swiglu_i{inter}", if ranks == 2 { "glm2" } else { "glm" })
+            } else { format!("{}_swiglu_i{inter}", cfg.program_family()) };
+            programs.program(&name, &["gate", "up", "hidden"])?;
         }
         let stages = [cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, super::engine::DECODE_ROWS, ranks, owned)?,
             cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, unit, ranks, owned)?];

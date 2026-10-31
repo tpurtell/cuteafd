@@ -158,7 +158,8 @@ def test_cmake_appends_exlr8_last_with_role_by_architecture():
     assert 'MATCHES "^121" AND CUTEAFD_ENABLE_EXLR8_AOT AND NOT CUTEAFD_FAMILY_PROGRAMS' in cmake
     assert 'list(APPEND CUTEAFD_DSV4_EXPORT_ARGS --exlr8-role "${CUTEAFD_EXLR8_ROLE}")' in cmake
     top = (ROOT / 'native/CMakeLists.txt').read_text()
-    assert top.count('CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)') == 2  # include + link
+    assert top.count('CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_ML4_AOT OR '
+                     'CUTEAFD_ENABLE_EXLR8_AOT)') == 2  # include + link
     assert 'CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)' in top  # SparkInfer AOT runtime
 
 
@@ -261,6 +262,26 @@ def test_kimi_switch_is_forwarded_to_coordinator_and_native_dispatch():
     block = cmake.split('if(CUTEAFD_ENABLE_KIMIK3_AOT)', 1)[1].split('if(CUTEAFD_ENABLE_EXLR8_AOT)', 1)[0]
     assert 'set(CUTEAFD_PROGRAM_GEOMETRY "kimik3,dense_trellis_k6,kimi_split")' in block
     assert 'set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")' in block
+
+
+def test_ml4_switch_is_keyed_only_when_on_and_forwarded():
+    base = {'PATH': '/usr/bin:/bin', 'CUTEAFD_WIP_GLM_AOT': 'ON'}
+    unset = build_key_lines(base)
+    assert 'ML4' not in unset
+    assert build_key_lines({**base, 'CUTEAFD_WIP_ML4_AOT': 'OFF'}) == unset
+    assert 'CUTEAFD_WIP_ML4_AOT=ON\n' in build_key_lines({**base, 'CUTEAFD_WIP_ML4_AOT': 'ON'})
+    wip = (ROOT / 'wip.sh').read_text()
+    assert '-e "CUTEAFD_WIP_ML4_AOT=${CUTEAFD_WIP_ML4_AOT:-OFF}"' in wip
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    dispatch = next(line for line in build.splitlines() if line.startswith('elif [[ ( "$role" == coordinator'))
+    assert '${CUTEAFD_WIP_ML4_AOT:-OFF}' in dispatch
+    block = build[build.index('    env | grep -E'):build.index('    printf', build.index('    env | grep -E'))]
+    keyed = lambda extra: subprocess.check_output(['bash', '-c', block], env={**base, **extra}, text=True)
+    assert keyed({'CUTEAFD_WIP_ML4_AOT': 'OFF'}) == keyed({}) != keyed({'CUTEAFD_WIP_ML4_AOT': 'ON'})
+    for script, mode in (('build-wip-artifacts.sh', 'WIP'), ('build-release-artifacts.sh', 'RELEASE')):
+        text = (ROOT / 'scripts/build' / script).read_text()
+        assert ('-DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo '
+                f'"${{CUTEAFD_{mode}_ML4_AOT:-OFF}}" || echo OFF)"') in text
 
 
 def test_kimi_native_key_preserves_off_and_keys_on():

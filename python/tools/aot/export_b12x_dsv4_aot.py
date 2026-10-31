@@ -47,6 +47,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
     "kimik3": ("moonshotai/Kimi-K3", 1048576),
+    "ml4": ("mistralai/Mistral-Large-4-1T-A52B", 1048576),
 }
 
 
@@ -538,6 +539,80 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return programs
 
 
+def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """Mistral Large 4: the shared GLM primitives at its geometry (RoPE layers on
+    the 656-byte GLM 5.3 contract, NoPE layers on the 528-byte GLM 5.3 Flash
+    one) plus the per-head query scale, the indexer's LayerNorm and the NoPE
+    index epilogue. The dense core is the shared K6 trellis (dense_trellis_k6
+    with the ml4 shapes); the FFN activation is the format-neutral SwiGLU."""
+    from b12x.integration.cuteafd import glm_ffn as ffn
+    from b12x.integration.cuteafd import glm_indexer as idx
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+    from b12x.integration.cuteafd.native_dense import compile_swiglu_split_aot
+
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+
+    rope_g = ml4.rope_attention(g)
+    index_pages = -(-max_context // PAGE_ROWS)
+    kw = g.index_head_dim + g.index_heads
+    out = [
+        ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(rope_g)),
+        # The indexer's [wk | weights_proj] over h, BF16 as shipped (modules_to_not_convert).
+        ("index_kw", "bf16_projection", {"width": g.hidden, "outputs": kw},
+         lambda: compile_bf16_projection_aot(width=g.hidden, outputs=kw)),
+        ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(rope_g)),
+        ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(rope_g)),
+    ]
+    # Whole and two-GPU (intermediate-split) widths of the dense layer and shared expert.
+    for inter in sorted({g.dense_inter, g.moe_inter, g.dense_inter // 2, g.moe_inter // 2}):
+        out.append((f"swiglu_i{inter}", "swiglu_split", {"inter": inter},
+                    lambda i=inter: compile_swiglu_split_aot(inter=i)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        for rope in (True, False):
+            tag = "" if rope else "_nope"
+            out += [
+                (f"query_scale{tag}_m{rows}", "query_scale", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_query_scale_aot(g, rope=rope, max_rows=r)),
+                (f"rank_pack{tag}_m{rows}", "rank_pack", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_rank_pack_aot(g, rope=rope, max_rows=r)),
+                (f"absorb{tag}_m{rows}", "absorb", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope, max_rows=r)),
+                (f"index_post{tag}_m{rows}", "index_post", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_index_post_aot(g, rope=rope, max_rows=r)),
+                (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
+                 # Decode exports one card plan per SM count (the exporter passes sm_count).
+                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
+                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+            ]
+        out += [
+            (f"values_m{rows}", "values", {"max_rows": rows},
+             lambda r=rows: ml4.compile_kv_b_aot(g, stage="values", rope=True, max_rows=r)),
+            (f"index_query_scale_m{rows}", "query_scale", {"rope": False, "heads": g.index_heads, "max_rows": rows},
+             lambda r=rows: ml4.compile_query_scale_aot(g, rope=False, max_rows=r, heads=g.index_heads,
+                                                        head_dim=g.index_head_dim)),
+            # The indexer query over a checkpoint keeping its FP8 block-128 wq_b as shipped.
+            (f"index_q_m{rows}", "index_q", {"mode": mode, "max_rows": rows, "fp8_weights": "only"},
+             lambda mode=mode, r=rows: ml4.compile_index_q_fp8_aot(g, mode=mode, max_rows=r)),
+            (f"index_layer_norm_m{rows}", "layer_norm", {"width": g.hidden, "max_rows": rows},
+             lambda r=rows: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=r, eps=g.index_norm_eps)),
+            (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": index_pages},
+             lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(rope_g, max_rows=rows, max_pages=index_pages,
+                                                                          mode=mode)),
+        ]
+    # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks).
+    draft = ml4.ML4_DRAFT
+    out += [
+        ("draft_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_producer_aot(draft, max_rows=64)),
+        ("draft_attention_m64", "mla_draft_attention",
+         {"max_rows": 64, "window_size": draft.window_size, "max_context": max_context, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_attention_aot(draft, max_rows=64, max_context=max_context)),
+        ("draft_output_m64", "mla_draft_output", {"max_rows": 64},
+         lambda: ml4.compile_draft_output_aot(draft, max_rows=64)),
+    ]
+    return out
+
+
 def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """Kimi KDA plus NoPE MLA at 48 heads/rank and 96 heads/context rank."""
     from b12x.integration.cuteafd import glmf, kimi_mla
@@ -893,13 +968,13 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     requested_dense = set(args.dense_trellis_families.split(","))
-    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf"}:
-        raise SystemExit("--dense-trellis-families takes kimik3, glm and/or glmf")
-    dense_families = tuple(name for name in ("kimik3", "glm", "glmf") if name in requested_dense)
+    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf", "ml4"}:
+        raise SystemExit("--dense-trellis-families takes kimik3, glm, glmf and/or ml4")
+    dense_families = tuple(name for name in ("kimik3", "glm", "glmf", "ml4") if name in requested_dense)
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "ml4") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or ml4")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -945,6 +1020,13 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "ml4":
+            from b12x.integration.cuteafd.mistral_large4 import ML4
+            extent = geometry_context(name, args.max_context)
+            manifest["families"][name] = dataclasses.asdict(ML4)
+            manifest["family_capacities"][name] = {"max_context": extent}
+            work += [(name, *item) for item in ml4_programs(ML4, args.decode_rows, args.prefill_rows, extent)]
             continue
         if name == "dense_trellis_k6":
             from export_b12x_dense_trellis_k6_aot import programs as dense_programs, row_policies

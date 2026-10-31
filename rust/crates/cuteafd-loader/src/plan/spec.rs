@@ -81,7 +81,7 @@ impl DraftOwnership {
     pub fn selected(family: &str, speculator: &str) -> Self {
         match (family, speculator) {
             ("mimo_v2" | "qwen4" | "qwen3_5" | "step5", "mtp") => Self::NativeMtp,
-            ("deepseek_v4" | "deepseek_v41", "dspark") => Self::BundledDspark,
+            ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => Self::BundledDspark,
             _ => Self::None,
         }
     }

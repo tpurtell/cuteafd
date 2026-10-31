@@ -28,7 +28,7 @@ use super::{open, Opened};
 use crate::shared::token_io::{SelectBatch, SelectPlacement, TokenSelector};
 use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{ensure, Context, Result};
-use cuteafd_api::openai::chat::glm5::{GlmEncoding, GlmThinkingOff};
+use cuteafd_api::openai::chat::{glm5::{GlmEncoding, GlmThinkingOff}, mistral::MistralEncoding};
 use cuteafd_api::openai::{
     InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
     PromptUsage,
@@ -82,6 +82,16 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
     })
 }
 
+/// The chat contract the checkpoint itself speaks: its tokenizer's control tokens
+/// and its own template (Mistral instruct for Mistral Large 4), never the engine variant.
+fn chat_encoding(snapshot: &std::path::Path, thinking_off: GlmThinkingOff) -> Result<ModelEncoding> {
+    Ok(if MistralEncoding::recognizes(snapshot)? {
+        ModelEncoding::Mistral(Arc::new(MistralEncoding::from_snapshot(snapshot)?))
+    } else {
+        ModelEncoding::Glm(Arc::new(GlmEncoding::from_snapshot(snapshot)?.with_thinking_off(thinking_off)))
+    })
+}
+
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
@@ -89,10 +99,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     }
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
-        ModelEncoding::Glm(Arc::new(encoding)),
+        chat_encoding(&snapshot, args.thinking_off)?,
     );
     let (queue, receive) = mpsc::channel::<NativeRequest>(16);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
@@ -548,7 +557,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
             d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
         engine.arm_draft_probe()?;
-        SharedPolicy::with_geometry(geometry, resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
+        let prior = if d.token_only() { resource::Prior::History }
+            else { resource::Prior::Selector(d.selector_fit("glm5", false)?) };
+        SharedPolicy::with_geometry(geometry, prior, draft_seed())
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
@@ -980,7 +991,14 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     };
     phases[0] += timer.elapsed().as_secs_f64();
     let timer = Instant::now();
-    let mut priors: Vec<_> = active.iter().zip(&drafted).map(|(a, draft)| match (&shared, draft) {
+    let token_only = engine.drafter.as_ref().is_some_and(|d| d.token_only());
+    let mut priors: Vec<_> = active.iter().enumerate().zip(&drafted).map(|((i, a), draft)| match (&shared, draft) {
+        // A token-only drafter (mtp_dspark) is judged by the pooled request history.
+        (Some(shared), Some(d)) if token_only => {
+            let pooled = a.drafts.pooled(d.tokens.len(), active.iter().enumerate()
+                .filter(|&(other, _)| other != i).map(|(_, other)| &other.drafts));
+            shared.prior(&a.drafts, &resource::DraftEvidence::History(&pooled), 0)
+        }
         (Some(shared), Some(d)) => shared.prior(&a.drafts,
             &resource::DraftEvidence::Selector(&d.features), 0),
         _ => Vec::new(),
@@ -1297,5 +1315,25 @@ mod draft_tests {
         let mut lengths = [32, 0, 0, 0];
         assert!(!trim_budget(&mut lengths, 64));
         assert_eq!(lengths, [32, 0, 0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod chat_encoding_tests {
+    /// The served checkpoint picks its own chat contract (Mistral Large 4 → Mistral
+    /// instruct; GLM 5.3 → GLM), whichever engine variant runs it.
+    #[test]
+    fn served_checkpoints_select_their_own_chat_encoding_when_present() {
+        let hub = std::path::Path::new("/mnt/sparknest/hf-home/hub");
+        for (snapshot, mistral) in [
+            ("models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d", true),
+            ("models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede", false),
+        ] {
+            let path = hub.join(snapshot);
+            if !path.exists() { continue; }
+            let encoding = super::chat_encoding(&path, Default::default()).unwrap();
+            assert_eq!(matches!(encoding, super::ModelEncoding::Mistral(_)), mistral, "{snapshot}");
+            assert_eq!(matches!(encoding, super::ModelEncoding::Glm(_)), !mistral, "{snapshot}");
+        }
     }
 }

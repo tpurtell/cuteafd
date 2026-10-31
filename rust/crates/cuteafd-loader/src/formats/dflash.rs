@@ -22,6 +22,11 @@ pub struct MlaDflashConfig {
     /// None means full context; each sliding layer keeps its own exact window.
     pub windows: Vec<Option<usize>>,
     pub rotary: DsparkRotaryPlan,
+    /// The native program set: DFlash2 (convolutions, top-16 selector) or
+    /// Mistral Large 4's mtp_dspark (plain layers, RNN Markov head of
+    /// `markov_rank`, position-specific mask rows, block-anchored windows).
+    pub kind: cuteafd_core::coordinator_programs::MlaDraftKind,
+    pub markov_rank: usize,
 }
 
 /// Named immutable allocation recipe. Admission and device storage consume the
@@ -509,8 +514,39 @@ impl MlaDflashConfig {
         Ok(Self { mla, intermediate: raw.intermediate_size, eps: raw.rms_norm_eps,
             block: d.block_size, group: d.conv_group_size, selector_rank: d.selector_rank,
             selector_top_k: d.selector_top_k, taps: d.target_layer_ids, vocab: raw.vocab_size,
-            mask_token: d.mask_token_id, max_context: raw.max_position_embeddings, windows, rotary })
+            mask_token: d.mask_token_id, max_context: raw.max_position_embeddings, windows, rotary,
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2, markov_rank: 0 })
     }
+
+    /// Mistral Large 4's bundled mtp_dspark, from the checkpoint's own params.json
+    /// (`dspark`) and text config (`target`): dense MLA layers with the target's
+    /// attention geometry (no q-LoRA) and dense FFN, YaRN without LeRoPE (the
+    /// draft's cos|sin table is the target's at alpha 0), FP32 attention scale
+    /// 128^-0.5, one block-anchored window per layer.
+    pub fn ml4(dspark: &crate::families::mistral_large4::dspark::Ml4DsparkConfig,
+        target: &crate::families::mistral_large4::Ml4Config) -> Result<Self> {
+        let rope = target.qk_rope_head_dim;
+        if (target.hidden, target.heads, target.kv_lora_rank, target.qk_nope_head_dim, rope, target.v_head_dim)
+            != (6144, 64, 512, 64, 64, 128) || dspark.depth != 3 || dspark.window != 2048 || dspark.markov_rank != 512 {
+            return Err(unsupported("mtp_dspark exports require the Mistral Large 4 geometry, depth 3, window 2048, rank 512"));
+        }
+        let inv_freq = target.inv_freq(&vec![0.0; rope / 2])
+            .map_err(|e| unsupported(&format!("mtp_dspark rotary: {e}")))?;
+        Ok(Self { mla: MlaGeometry { hidden: target.hidden, heads: target.heads, q_rank: 0,
+                kv_rank: target.kv_lora_rank, nope: target.qk_nope_head_dim, rope, value: target.v_head_dim },
+            intermediate: target.dense_intermediate, eps: target.rms_norm_eps, block: dspark.depth, group: 0,
+            selector_rank: 0, selector_top_k: 0, taps: dspark.taps.clone(), vocab: target.vocab_size,
+            mask_token: 0, max_context: target.max_position_embeddings,
+            windows: vec![Some(dspark.window); dspark.layers],
+            rotary: DsparkRotaryPlan { inv_freq, attention_factor: 1.0, softmax_factor: 1.0 },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: dspark.markov_rank })
+    }
+
+    fn is_ml4(&self) -> bool { self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark }
+
+    /// Drafted tokens per proposal: DFlash2's block holds the anchor (block - 1);
+    /// mtp_dspark predicts from the anchor too (block).
+    pub fn drafts(&self) -> usize { if self.is_ml4() { self.block } else { self.block - 1 } }
 
     pub fn attention_scale(&self) -> f32 {
         ((self.mla.nope + self.mla.rope) as f64).sqrt().recip() as f32 * self.rotary.softmax_factor
@@ -523,13 +559,22 @@ impl MlaDflashConfig {
         if compiled_context > self.max_context {
             return Err(unsupported("MLA draft export context exceeds checkpoint extent"));
         }
-        cuteafd_core::coordinator_programs::MlaDraftProgramLayout::new(compiled_context)
+        cuteafd_core::coordinator_programs::MlaDraftProgramLayout::for_kind(self.kind, compiled_context)
             .map_err(|_| unsupported("MLA draft program context outside native extent"))
     }
 
     /// Exact BF16 source shapes. Embedding and vocabulary head are borrowed
     /// from the target, matching the checkpoint's reference execution.
     pub fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
+        if self.is_ml4() {
+            // The drafter ships in the target checkpoint under mtp_dspark.* (BF16).
+            let dspark = crate::families::mistral_large4::dspark::Ml4DsparkConfig { layers: self.windows.len(),
+                depth: self.block, taps: self.taps.clone(), window: self.windows[0].unwrap_or(0),
+                markov_rank: self.markov_rank };
+            let m = &self.mla;
+            return dspark.tensors(m.hidden, m.heads, m.nope + m.rope, m.kv_rank, m.rope, m.nope, m.value,
+                self.intermediate, self.vocab);
+        }
         let h = self.mla.hidden;
         let mut shapes = vec![
             ("fc.weight".into(), vec![h, self.taps.len() * h]),
@@ -585,11 +630,15 @@ impl MlaDflashConfig {
         let overflow = || unsupported("MLA draft weight admission overflow");
         let mut layout = GlmDraftWeightLayout { bf16_values: 0, fp8_values: 0, fp8_scales: 0,
             bf16_auxiliary: 0, bf16_codebooks: 0, max_load_staging: 0 };
+        if self.is_ml4() && mode == GlmDraftRepresentation::Fp8Only {
+            return Err(unsupported("the mtp_dspark drafter is served as shipped (BF16)"));
+        }
         for (name, shape) in self.tensor_shapes() {
             let values = shape.iter().try_fold(1u64, |n, &d| n.checked_mul(d as u64))
                 .ok_or_else(overflow)?;
             let bytes = values.checked_mul(2).ok_or_else(overflow)?;
-            let codebook = name.ends_with("_codebook");
+            let codebook = name.ends_with("_codebook") || name.contains("autoregressive_head.embedding")
+                || name.contains("autoregressive_head.output");
             let matrix = name == "fc.weight" || name == "candidate_selector.hidden_projection.weight"
                 || name.contains(".kernel_projection.") || name.contains(".mlp.");
             let fp8 = matrix && mode == GlmDraftRepresentation::Fp8Only;
@@ -623,6 +672,9 @@ impl MlaDflashConfig {
             GlmDraftCapacity, GlmDraftFp8ScratchLayout, GlmDraftLinearShape, GlmDraftRepresentation};
         use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
         let invalid = || unsupported("MLA draft runtime geometry/capacity outside native limits");
+        if self.is_ml4() {
+            return self.ml4_runtime_layout(capacity, compiled_context, target_pool_tokens, sm_count, cache_format);
+        }
         if capacity != GlmDraftCapacity::new(capacity.context_slots, capacity.max_batch_sequences, self.block)
             .map_err(|_| invalid())? || capacity.max_batch_sequences > 32
             || !(1..=4096).contains(&sm_count) || fp8_mode > 2 || self.block != 8
@@ -703,6 +755,73 @@ impl MlaDflashConfig {
         let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers };
+        layout.resident_bytes()?;
+        Ok(layout)
+    }
+
+    /// mtp_dspark: the shared cache/paged layouts and native arenas, its own
+    /// layer bodies (no convolutions), head (RNN Markov, the target's head and
+    /// soft cap) and inputs (position-specific mask rows), BF16 weights. The
+    /// cos|sin table covers every compiled position (YaRN without LeRoPE).
+    fn ml4_runtime_layout(&self, capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, cache_format: MlaCacheFormat)
+        -> Result<MlaDraftRuntimeLayout> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
+        let invalid = || unsupported("mtp_dspark runtime geometry/capacity outside native limits");
+        if capacity != GlmDraftCapacity::new(capacity.context_slots, capacity.max_batch_sequences, self.block)
+            .map_err(|_| invalid())? || capacity.max_batch_sequences > 32 || !(1..=4096).contains(&sm_count)
+            || cache_format != MlaCacheFormat::Fp8 || self.windows.iter().any(|w| *w != Some(2048))
+            || self.markov_rank != 512 {
+            return Err(invalid());
+        }
+        let program = self.program_layout(compiled_context)?;
+        let cache = self.cache_layout(capacity.context_slots, compiled_context, cache_format)?;
+        let paged_cache = self.paged_cache_layout(capacity.context_slots, compiled_context, target_pool_tokens, cache_format)?;
+        let weights = self.weight_layout(GlmDraftRepresentation::Bf16Only)?;
+        let (h, inter, rows, seq) = (self.mla.hidden, self.intermediate, capacity.block_rows,
+            capacity.max_batch_sequences);
+        let tap_rows = MlaDraftRuntimeLayout::TAP_ROWS;
+        let native_rows = MlaDraftProgramLayout::ROWS;
+        let mut buffers = Vec::new();
+        let mut add = |name: String, dimensions: &[usize]| -> Result<()> {
+            let bytes = dimensions.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+                .ok_or_else(|| unsupported("mtp_dspark arena multiplication overflow"))?.max(256);
+            buffers.push(MlaDraftBuffer { name, bytes });
+            Ok(())
+        };
+        for (index, layer) in cache.layers.iter().enumerate() {
+            add(format!("layer.{index}.cache"), &[paged_cache.layer_bytes[index]])?;
+            add(format!("layer.{index}.page_table"), &[layer.table_width, layer.slots, 4])?;
+        }
+        for (name, dims) in [
+            ("taps", vec![tap_rows, self.taps.len(), h, 2]),
+            ("fused", vec![tap_rows, h, 2]), ("fused_norm", vec![tap_rows, h, 2]),
+            ("context_positions", vec![tap_rows, 8]), ("context_slots", vec![tap_rows, 8]),
+            // The producer's rotary input: here the FP32 cos|sin table [positions, rope]
+            // (the shared slot that carries DFlash2's inv_freq), and the unit query scale.
+            ("inverse_frequencies", vec![compiled_context, self.mla.rope, 4]), ("unit_scale", vec![2, self.mla.heads, 2]),
+            ("query", vec![native_rows, 64, 576, 2]),
+            ("attention", vec![native_rows, 64, 512, 2]),
+            ("lse", vec![native_rows, 64, 4]),
+            ("native_scratch", vec![program.scratch_bytes()]),
+            ("lengths", vec![seq, 4]), ("query_offsets", vec![seq + 1, 4]),
+            ("native_slots", vec![native_rows, 8]), ("native_positions", vec![native_rows, 8]),
+            ("head_workspace", vec![4 << 20]),
+            ("h", vec![rows, h, 2]), ("n", vec![rows, h, 2]), ("delta", vec![rows, h, 2]),
+            ("gate_up", vec![rows, 2 * inter, 2]), ("act", vec![rows, inter, 2]),
+            ("logits", vec![rows, self.vocab, 4]), ("markov_norms", vec![self.vocab, 4]),
+            ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4]),
+            ("anchors", vec![seq, 4]), ("ids", vec![rows, 4]), ("tokens", vec![seq * self.drafts(), 4]),
+            ("positions", vec![rows, 8]),
+            // The shared step workspace's DFlash2-only planes (convolutions, selector,
+            // q-LoRA residual): admitted at the 256-byte floor, never written.
+            ("conv", vec![1]), ("dynamic", vec![1]), ("unary", vec![1]), ("candidates", vec![1]),
+            ("projected", vec![1]), ("features", vec![1]), ("topk_workspace", vec![1]), ("q_residual", vec![1]),
+        ] { add(name.into(), &dims)?; }
+        let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
+            target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
+            fp8_scratch: None, sm_count, fp8_mode: 0, buffers };
         layout.resident_bytes()?;
         Ok(layout)
     }

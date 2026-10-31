@@ -504,7 +504,8 @@ pub(crate) struct GlmEngine<'a> {
 /// Per layer the latent record pool and (full-indexer layers) the index-key
 /// pool, zeroed, and the RoPE table, on the current device.
 #[allow(clippy::type_complexity)]
-fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize)
+fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize,
+    rope_alpha: Option<&[f32]>)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -513,15 +514,24 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
         Ok(allocation)
     };
     // One page past the pool is the scratch page padded decode rows write.
+    // A rank owns a layer's attention when it holds that layer's attention
+    // operands (whole attention on its owner, every rank under a head split).
     let owns = |layer: &GlmLayer<'_>| layer.attention_owner.is_none_or(|owner| {
-        layer.range("q_a_norm").is_some() && owner < 2
+        (layer.range("q_a_norm").is_some() || layer.range("w_uk").is_some()) && owner < 2
     });
-    let kv = layers.iter().map(|layer| zeroed(if owns(layer) { (pages + 1) * RECORD_PAGE_BYTES } else { 256 })).collect::<Result<Vec<_>>>()?;
+    // Each latent owner's records at its own size (656 B with RoPE, 528 B
+    // without); a latent-sharing layer reads its source's pool and holds none.
+    let kv = layers.iter().enumerate().map(|(index, layer)| zeroed(if owns(layer) && cfg.owns_kv(index) {
+        (pages + 1) * PAGE_ROWS * cfg.record_bytes(index) } else { 256 })).collect::<Result<Vec<_>>>()?;
     let index = layers.iter()
         .map(|l| (owns(l) && l.full_indexer).then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
         .collect::<Result<Vec<_>>>()?;
-    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
+    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq;
+    // Mistral Large 4: interleaved YaRN with the checkpoint's LeRoPE scale.
     let dim = cfg.qk_rope_head_dim;
+    let table = if let Some(ml4) = cfg.variant.ml4() {
+        ml4.rope_table(rope_alpha.context("Mistral Large 4 RoPE needs lerope.alpha")?, max_context)?
+    } else {
     let mut table = vec![0f32; max_context * dim];
     let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
     for p in 0..max_context {
@@ -531,6 +541,8 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
             table[p * dim + dim / 2 + i] = angle.sin();
         }
     }
+    table
+    };
     let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
     library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
     Ok((kv, index, cos_sin))
@@ -555,7 +567,7 @@ impl<'a> GlmEngine<'a> {
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let local = if context_mode.is_some() { pages / 2 } else { pages };
-        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
+        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_deref())?;
         let device = library.cuda_get_device()?;
         Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
@@ -681,9 +693,11 @@ impl<'a> GlmEngine<'a> {
             RankDevice { device, stream }], 4 * self.prefill_lanes.max(1),
             rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes))?;
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
-            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm", split_family: Some("glm2") };
+            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
+                split_family: self.cfg.split_program_family() };
             self.programs.load_matching(|name| selected.contains(name))?;
-            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context)?;
+            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context,
+                self.weights.rope_alpha.as_deref())?;
             let released = crate::shared::memory::device::Event::new(
                 crate::shared::memory::device::Device { library: self.library, id: device })?;
             Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
@@ -703,6 +717,9 @@ impl<'a> GlmEngine<'a> {
     /// Allocates the token-split buffers and exchange once the peer is attached; `extent`:
     /// the admitted compiled context (the staging the solver charged).
     pub fn attach_context(&mut self, extent: usize, manifest: &serde_json::Value) -> Result<()> {
+        // The context split's staging and commit planes are the 656-byte GLM 5.x
+        // record; Mistral Large 4's per-layer records run heads or layers placement.
+        ensure!(self.cfg.variant.is_glm(), "context attention placement supports GLM 5.x records only");
         let context = self.context_mode.context("this engine was built without context attention")?;
         let exchange = self.exchange()?;
         let abort = match (exchange.abort_word(0)?, exchange.abort_word(1)?) {
@@ -749,6 +766,11 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
+    /// `stem` in this variant's program namespace (`glm_norm`, `ml4_norm`).
+    fn family_program(&self, stem: &str) -> String {
+        format!("{}_{stem}", self.cfg.program_family())
+    }
+
     /// Launches `name` on rank `rank`'s stream.
     fn run_on(&self, rank: usize, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
@@ -766,7 +788,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
-        self.run_on(rank, "glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+        self.run_on(rank, &self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
             ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
@@ -815,6 +837,10 @@ impl<'a> GlmEngine<'a> {
 
     /// Program scratch of a step (`decode`: the m64 programs).
     fn step_scratch(&self, decode: bool) -> Result<usize> {
+        if !self.cfg.variant.is_glm() {
+            return Ok(cuteafd_loader::placement::families::glm5::step_scratch(&self.cfg, false, decode,
+                |name| self.scratch(name).ok().map(|n| n as u64))?.programs as usize);
+        }
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let mut scratch = 0usize;
         let split = self.weights.layers.first().is_some_and(|l| l.split);
@@ -863,7 +889,7 @@ impl<'a> GlmEngine<'a> {
         let native_head = matches!(self.weights.head, super::weights::GlmHead::K6(_));
         let head_workspace = cuteafd_loader::placement::families::glm5::head_workspace_bytes(lead, native_head)
             .map(|bytes| self.alloc(bytes as usize).map(Buf::owned)).transpose()?;
-        let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
+        let topk = self.alloc(self.scratch(&format!("{}_index_topk_{mode}_{cap}", self.cfg.program_family()))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
         Ok(SharedStep {
             scratch: Buf::owned(self.alloc(scratch)?),
@@ -1312,7 +1338,7 @@ impl<'a> GlmEngine<'a> {
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
                     self.peer_ffn(index, 0, w1, rows, cap, bytes)?;
                 }
-                None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                None => self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?,
             }
@@ -1352,7 +1378,7 @@ impl<'a> GlmEngine<'a> {
                 else { self.ffn_norm(0, index, 0, w, layer, weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -1385,6 +1411,16 @@ impl<'a> GlmEngine<'a> {
     /// Logits of the last `n` of `t` rows of the final norm's output into the workspace's logits,
     /// through the shared BF16 target-head route ([`crate::shared::target_head`]).
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
+        self.launch_head_logits(w, t, n)?;
+        if let Some(cap) = self.cfg.logit_softcap() {
+            // SAFETY: logits holds n rows of vocab F32 on this stream (checked by the head).
+            unsafe { self.library.cuda_logits_softcap_f32_async(w.logits.buffer.ptr, n, self.cfg.vocab_size,
+                self.cfg.vocab_size, cap as f32, self.stream)? };
+        }
+        Ok(())
+    }
+
+    fn launch_head_logits(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
         if let super::weights::GlmHead::K6(weights) = &self.weights.head {
             ensure!(n <= t && t * h * 2 <= w.x.buffer.bytes && n * self.cfg.vocab_size * 4 <= w.logits.buffer.bytes,
@@ -1613,7 +1649,7 @@ impl<'a> GlmEngine<'a> {
                     }
                     _ => {
                         let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
-                        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                             ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                             &[rows, Scalar::I32(deltas)])?;
                     }
@@ -1637,7 +1673,7 @@ impl<'a> GlmEngine<'a> {
                     self.projection_norm(0, index, 0, w, layer, "o", layer.ptr("post_norm")?, rows,
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
                 } else {
-                    self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                         ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                         &[rows, Scalar::I32(1)])?;
                 }
@@ -1880,17 +1916,29 @@ impl<'a> GlmEngine<'a> {
     fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
-        self.run_on(rank, "glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
-            ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        let ml4 = self.cfg.variant.ml4().is_some();
+        self.run_on(rank, &self.family_program("router_scores"), &[("x", w.x.buffer.ptr),
+            ("w", layer.ptr("gate")?), ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        if ml4 {
+            // Softmax top-k over FP32 logits, renormalized, times the routed scale
+            // (the reference router: no BF16 rounding of logits or weights).
+            // SAFETY: logits and route outputs are live buffers of `t` rows.
+            self.on(rank, || unsafe {
+                self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
+                    w.route_weights.buffer.ptr, t, self.cfg.experts, topk, self.cfg.routed_scale as f32, false,
+                    self.stream_of(rank))
+            })?;
+        } else {
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
         self.on(rank, || unsafe {
             self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
+        }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
-        self.run_on(rank, "glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+        self.run_on(rank, &self.family_program("expert_input_quant"), &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])
@@ -2227,7 +2275,7 @@ impl<'a> GlmEngine<'a> {
                 self.peer_ffn(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
                     rows, cap, bytes_of_unit(unit))?;
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -2264,7 +2312,7 @@ impl<'a> GlmEngine<'a> {
                 else { self.ffn_norm(0, index, slot, w, &layers[index], weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -2344,7 +2392,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
-        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
             ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr(weight)?), ("out", w.x.buffer.ptr)],
             &[rows, Scalar::I32(deltas)])
     }
@@ -2493,6 +2541,9 @@ impl<'a> GlmEngine<'a> {
         index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let heads = self.cfg.heads / if layer.attention_split { 2 } else { 1 };
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_attention_over(rank, w, index, layer, rows, cap, tables, kv, index_cache);
+        }
         self.producer(rank, w, layer, rows, cap, kv, w.query.buffer.ptr)?;
         if let Some(index_cache) = index_cache {
             self.index_producer(rank, w, layer, rows, cap, index_cache)?;
@@ -2534,8 +2585,49 @@ impl<'a> GlmEngine<'a> {
         self.o_proj(rank, w, layer, cap, rows)
     }
 
+    /// Mistral Large 4's attention (`GlmVariant::MistralLarge4`) on the shared
+    /// GLM structure: the direct-query K6 producer (query scale, absorb) and,
+    /// on latent owners, the record of `wkv_a`; the indexer from LayerNorm(x)
+    /// with its query scale and the shared top-k; sparse MLA on the layer's
+    /// record contract (656-byte RoPE, 528-byte NoPE) at 128^-0.5; W_UV and wo.
+    /// Latent-sharing layers read their source layer's pages (`kv`).
+    #[allow(clippy::too_many_arguments)]
+    fn ml4_attention_over(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables, kv: cuteafd_ffi::CuteafdDeviceBuffer,
+        index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        let rope = self.cfg.rope(index);
+        self.ml4_core_producer(rank, w, index, layer, scalar_rows(rows)?, cap, kv)?;
+        if let Some(index_cache) = index_cache {
+            self.ml4_core_index_producer(rank, w, index, layer, scalar_rows(rows)?, cap, index_cache)?;
+            self.run_on(rank, &format!("ml4_index_topk_{mode}_{cap}"), &[
+                ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
+                ("index_k_cache", index_cache.ptr), ("page_table", w.page_table.buffer.ptr),
+                ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
+                ("scratch", w.topk_scratch.buffer.ptr)],
+                &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
+        }
+        let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
+        let prefill_scalars = [rows];
+        let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
+        let tag = if rope { "" } else { "_nope" };
+        self.run_on(rank, &format!("ml4_sparse_mla{tag}_{mode}_{cap}"), &[
+            ("q", w.query.buffer.ptr), ("kv_cache", kv.ptr), ("indices", w.indices.buffer.ptr),
+            ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            scalars)?;
+        self.ml4_core_o_proj(rank, w, layer, scalar_rows(rows)?, cap)
+    }
+
     /// Rank `rank`'s latent and (full-indexer layers) index-key pools of layer `index`, and its RoPE table.
+    /// A latent-sharing layer (`kv_source(index) != index`) reads its source layer's latent pool.
     fn rank_caches(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
+        let latent = self.cfg.kv_source(index);
+        let (kv, index_pool, cos_sin) = self.rank_caches_of(rank, index);
+        if latent == index { return (kv, index_pool, cos_sin); }
+        (self.rank_caches_of(rank, latent).0, index_pool, cos_sin)
+    }
+
+    fn rank_caches_of(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
         match (rank, &self.peer) {
             (1, Some(peer)) => (&peer.kv[index], peer.index[index].as_ref(), &peer.cos_sin),
             _ => (&self.kv[index], self.index[index].as_ref(), &self.cos_sin),
@@ -2614,7 +2706,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
     /// programs' `fp8_rows` (1: W8A8, 0: W8A16).
-    fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
+    pub(super) fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
         if cap == "m64" {
             vec![rows]
         } else {

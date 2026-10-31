@@ -189,7 +189,8 @@ impl LayoutOptions {
         if self.concurrency > 0 { return self.concurrency; }
         match family {
             "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
-            "glm5" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            // Mistral Large 4 runs the GLM 5.3 engine.
+            "glm5" | "mistral_large4" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
@@ -299,7 +300,7 @@ pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64,
     let (lanes, ordinary_rows) = match family {
         "mimo_v2" => (1, 1),
         "qwen4" => (1, 1),
-        "glm5" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
+        "glm5" | "mistral_large4" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
         "glm5_flash" => (1, rows.min(64)),
         _ => return 0,
     };
@@ -358,8 +359,9 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         // that endpoint's rings).
         "deepseek_v41" => 3,
         "deepseek_v4" => 2,
-        // The decode link and one prefill link (its waves share that endpoint's rings).
-        "glm5" => 2,
+        // The decode link and one prefill link (its waves share that endpoint's rings);
+        // Mistral Large 4 runs the GLM 5.3 engine.
+        "glm5" | "mistral_large4" => 2,
         "glm5_flash" => 1,
         "mimo_v2" => 2,
         "qwen4" => 1,
