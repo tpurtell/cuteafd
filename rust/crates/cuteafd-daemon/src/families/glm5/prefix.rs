@@ -86,10 +86,41 @@ pub(crate) struct GlmPrefix<'e, 'a> {
     scratch: DeviceAllocation<'a>,
     /// Per rank: the prefix copy stream, fenced against that rank's engine stream.
     copies: PrefixCopies<'a>,
+    /// A window-ring MLA drafter's marks (mtp_dspark): per arena slot, a [`DRAFT_MARK_HEADER`]
+    /// then one slot's draft windows. None for every other drafter (GLM DFlash2's unpaged GQA
+    /// ring restarts cold), so their layout is unchanged.
+    draft_marks: Option<DraftMarks<'a>>,
+}
+
+/// Bytes ahead of a draft-window mark: the captured canonical frontier (u64 little endian;
+/// `u64::MAX` when the drafter's history was not canonical and the restore must start cold).
+/// Admission charges marks with it ([`cuteafd_loader::placement::families::glm5::draft_window_mark_bytes`]).
+use cuteafd_loader::placement::families::glm5::DRAFT_MARK_HEADER;
+
+struct DraftMarks<'a> {
+    storage: DeviceAllocation<'a>,
+    /// One slot's draft windows (every window layer's ring).
+    windows: usize,
+    slots: usize,
+}
+
+impl DraftMarks<'_> {
+    fn bytes(&self) -> usize { DRAFT_MARK_HEADER + self.windows }
+    fn mark(&self, slot: MarkSlot) -> Result<CuteafdDeviceBuffer> {
+        anyhow::ensure!((slot.0 as usize) < self.slots, "draft window mark outside the arena");
+        view(self.storage.buffer, slot.0 as usize * self.bytes(), self.bytes())
+    }
+}
+
+/// The prefix mark of a drafter: its window bytes per mark when its whole warm state is window
+/// rings ([`DflashDrafter::mla_windows_only`]), else none (layout unchanged).
+pub(crate) fn draft_mark_bytes(windows_only: bool, window_bytes: usize) -> usize {
+    if windows_only && window_bytes > 0 { DRAFT_MARK_HEADER + window_bytes } else { 0 }
 }
 
 impl<'e, 'a> GlmPrefix<'e, 'a> {
-    pub fn new(engine: &'e GlmEngine<'a>, partial: bool) -> Result<Self> {
+    /// `mark_slots`: the prefix arena's slots, each holding a window-ring drafter's windows.
+    pub fn new(engine: &'e GlmEngine<'a>, partial: bool, mark_slots: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
         let paged = (0..engine.ranks())
             .flat_map(|rank| engine.paged_buffers_on(rank).into_iter().map(move |(records, index)| (rank, records, index)))
@@ -97,7 +128,57 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
         let copies = PrefixCopies::new(engine.library, (0..engine.ranks())
             .map(|rank| Ok(vec![Reader { device: engine.on(rank, || engine.library.cuda_get_device())?,
                 stream: engine.stream_of(rank) }])).collect::<Result<_>>()?)?;
-        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies })
+        let draft_marks = match engine.drafter.as_ref().filter(|d| d.mla_windows_only()) {
+            Some(drafter) if mark_slots > 0 => {
+                let windows = drafter.mla_window_segments(0)?.iter().map(|w| w.bytes).sum::<usize>();
+                let bytes = draft_mark_bytes(true, windows).checked_mul(mark_slots)
+                    .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
+                Some(DraftMarks { storage: DeviceAllocation::new(engine.library, bytes.max(256))?, windows, slots: mark_slots })
+            }
+            _ => None,
+        };
+        Ok(Self { engine, paged, partial, scratch: DeviceAllocation::new(engine.library, 256)?, copies, draft_marks })
+    }
+
+    /// The bytes of one prefix mark: a window-ring drafter's windows, otherwise none.
+    pub fn mark_bytes(&self) -> usize { self.draft_marks.as_ref().map_or(0, DraftMarks::bytes) }
+
+    /// The drafter whose state a snapshot of `placement` carries (a window-ring MLA drafter
+    /// with the placement's slot), if any.
+    fn draft_of(&self, placement: &GlmPlacement)
+        -> Option<(&crate::shared::speculation::dflash::DflashDrafter<'a>, usize)> {
+        let drafter = self.engine.drafter.as_ref().filter(|d| d.mla_windows_only() || d.mla_draft_page_bytes() > 0)?;
+        Some((drafter, placement.draft_slot?))
+    }
+
+    /// Copies `slot`'s draft windows to (`capture`) or from its mark, behind a header.
+    fn move_draft_windows(&self, mark: MarkSlot, slot: usize, capture: bool) -> Result<()> {
+        let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
+        let drafter = self.engine.drafter.as_ref().ok_or_else(|| anyhow::anyhow!("no drafter"))?;
+        let whole = marks.mark(mark)?;
+        let mut offset = DRAFT_MARK_HEADER;
+        let views = drafter.mla_window_segments(slot)?.iter().map(|window| {
+            let part = view(whole, offset, window.bytes)?;
+            offset += window.bytes;
+            Ok(part)
+        }).collect::<Result<Vec<_>>>()?;
+        drafter.copy_mla_windows(slot, &views, capture)
+    }
+
+    fn write_draft_header(&self, mark: MarkSlot, frontier: Option<usize>) -> Result<()> {
+        let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
+        let mut header = [0u8; DRAFT_MARK_HEADER];
+        header[..8].copy_from_slice(&frontier.map_or(u64::MAX, |f| f as u64).to_le_bytes());
+        self.engine.library.copy_h2d(view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?, &header)?;
+        Ok(())
+    }
+
+    fn read_draft_header(&self, mark: MarkSlot) -> Result<Option<usize>> {
+        let marks = self.draft_marks.as_ref().ok_or_else(|| anyhow::anyhow!("no draft window marks"))?;
+        let mut header = [0u8; DRAFT_MARK_HEADER];
+        self.engine.library.copy_d2h(&mut header, view(marks.mark(mark)?, 0, DRAFT_MARK_HEADER)?)?;
+        let frontier = u64::from_le_bytes(header[..8].try_into().unwrap());
+        Ok((frontier != u64::MAX).then_some(frontier as usize))
     }
 
     /// Host bytes of one logical page: one complete layer set, replicated under heads,
@@ -117,6 +198,7 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
     /// copy engine's routing by owning device.
     pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
         self.paged.iter().flat_map(|&(_, records, index)| records.map(|(records, _)| records).into_iter().chain(index))
+            .chain(self.draft_marks.as_ref().map(|m| m.storage.buffer))
             .chain(std::iter::once(self.scratch.buffer)).collect()
     }
 
@@ -130,8 +212,8 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
             page_rows: PAGE_ROWS,
             pages: self.engine.pages,
             page_bytes: self.page_bytes(),
-            mark_bytes: 0,
-            draft_bytes: 0,
+            mark_bytes: self.mark_bytes(),
+            draft_bytes: self.draft_page_bytes(),
             rule: if self.partial { ReuseRule::paged(PAGE_ROWS) } else { ReuseRule::EXACT },
             mark_store: MarkStore::Arena,
             page_owners: if self.parity() { PageOwners::Parity } else { PageOwners::Uniform },
@@ -146,16 +228,105 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
         placement.len
     }
 
-    fn capture(&self, _slot: MarkSlot, _placement: &GlmPlacement, _len: usize) -> Result<(), BoxError> {
-        Err("GLM 5.3 snapshots have no mark".into())
+    /// A mark exists only for a window-ring drafter: its windows and, when its history was the
+    /// canonical `(0, len)`, the frontier a restore resumes them at.
+    fn capture(&self, slot: MarkSlot, placement: &GlmPlacement, len: usize) -> Result<(), BoxError> {
+        if self.draft_marks.is_none() { return Err("GLM 5.3 snapshots have no mark".into()); }
+        let canonical = match self.draft_of(placement) {
+            Some((drafter, draft_slot)) if drafter.mla_frontier(draft_slot)? == (0, len) => {
+                self.move_draft_windows(slot, draft_slot, true)?;
+                Some(len)
+            }
+            _ => None,
+        };
+        Ok(self.write_draft_header(slot, canonical)?)
     }
 
+    /// The target pages are the snapshot's own bytes. A window-ring drafter resumes warm from
+    /// its mark at a canonical frontier, exactly the state a fresh prefill would leave;
+    /// otherwise it starts cold at the restore point.
     fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError> {
-        if mark.is_some() || len == 0 || len.div_ceil(PAGE_ROWS) > placement.pages.len() {
+        if (mark.is_some() && self.draft_marks.is_none()) || len == 0
+            || len.div_ceil(PAGE_ROWS) > placement.pages.len() {
             return Err(format!("restore of {len} rows into {} pages", placement.pages.len()).into());
+        }
+        if let Some((drafter, draft_slot)) = self.draft_of(placement) {
+            let warm = match mark { Some(mark) => self.read_draft_header(mark)? == Some(len), None => false };
+            if warm {
+                self.move_draft_windows(mark.unwrap(), draft_slot, false)?;
+                drafter.restore_mla_windows(draft_slot, len)?;
+            } else {
+                drafter.reset_context(draft_slot, len)?;
+            }
         }
         placement.len = len;
         Ok(())
+    }
+
+    /// Every admitted placement starts its drafter slot at a fresh, empty history.
+    fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> {
+        if let Some((drafter, draft_slot)) = self.draft_of(placement) { drafter.reset_context(draft_slot, 0)?; }
+        Ok(())
+    }
+
+    fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> {
+        if let Some((drafter, draft_slot)) = self.draft_of(placement) { drafter.discard_context(draft_slot)?; }
+        Ok(())
+    }
+
+    // Pooled MLA draft pages: the shared drafter's, as Kimi's prefix family delegates them. No
+    // GLM drafter pools pages today (DFlash2 rings, mtp_dspark windows), so these stay inert.
+    fn draft_page_bytes(&self) -> usize {
+        self.engine.drafter.as_ref().map_or(0, |d| d.mla_draft_page_bytes())
+    }
+    fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError> {
+        match (self.engine.drafter.as_ref(), placement.draft_slot) {
+            (Some(drafter), Some(slot)) if drafter.mla_draft_page_bytes() > 0 => drafter.admit_mla_pages(slot, capacity),
+            _ => Ok(()),
+        }
+    }
+    fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        self.engine.drafter.as_ref().is_some_and(|d| d.mla_pages_valid(attachment))
+    }
+    fn draft_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
+        self.engine.drafter.as_ref().is_some_and(|d| d.mla_pages_revocable(attachment))
+    }
+    fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        let drafter = self.engine.drafter.as_ref().ok_or("GLM draft attachment without a drafter")?;
+        Ok(drafter.retain_mla_pages(attachment)?)
+    }
+    fn capture_draft_pages(&self, placement: &GlmPlacement, len: usize)
+        -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> {
+        match (self.engine.drafter.as_ref(), placement.draft_slot) {
+            (Some(drafter), Some(slot)) if drafter.mla_draft_page_bytes() > 0
+                && drafter.mla_frontier(slot)? == (0, len) => drafter.capture_mla_pages(slot, len, len).map(Some),
+            _ => Ok(None),
+        }
+    }
+    fn release_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> {
+        let drafter = self.engine.drafter.as_ref().ok_or("GLM draft attachment without a drafter")?;
+        Ok(drafter.release_mla_pages(attachment)?)
+    }
+    fn promote_draft_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError> {
+        self.engine.drafter.as_ref().ok_or("GLM draft attachment without a drafter")?.promote_mla_pages(saved)
+    }
+    fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange> {
+        self.engine.drafter.as_ref().and_then(|d| d.mla_page_segments(page).ok()).unwrap_or_default()
+    }
+    fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
+        placement: &mut GlmPlacement, frontier: usize) -> Result<(), BoxError> {
+        match (attachment, self.engine.drafter.as_ref(), placement.draft_slot) {
+            (Some(attachment), Some(drafter), Some(slot)) => {
+                if attachment.origin != 0 || attachment.frontier != frontier {
+                    return Err("GLM noncanonical draft snapshot".into());
+                }
+                drafter.restore_mla_pages(slot, attachment, frontier)
+            }
+            (Some(_), _, _) => Err("GLM draft attachment without a drafter slot".into()),
+            // Window-ring drafters restore with the mark (`restore`); nothing pooled here.
+            (None, _, _) => Ok(()),
+        }
     }
 
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
@@ -178,8 +349,9 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
         page_segments(&self.paged, self.parity(), self.engine.layers_kv(), page)
     }
 
-    fn mark_segments(&self, _slot: MarkSlot) -> Vec<DeviceRange> {
-        Vec::new()
+    fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
+        self.draft_marks.as_ref().and_then(|marks| marks.mark(slot).ok())
+            .map(|mark| vec![DeviceRange { addr: mark.ptr as u64, bytes: mark.bytes }]).unwrap_or_default()
     }
 
     fn host_tail(&self) -> Vec<DeviceRange> {
@@ -283,7 +455,7 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
     ensure!(at > 0 && at < n && n <= tokens.len(), "--resume-at {at} must lie inside the {n} prefilled tokens");
     let chunk = chunk.clamp(1, engine.prefill_rows);
     let embed = &tokens[..n];
-    let family = GlmPrefix::new(engine, false)?;
+    let family = GlmPrefix::new(engine, false, 0)?;
     let mut allocator = PageAllocator::new(engine);
     let err = |e: BoxError| anyhow::anyhow!("{e}");
     let (mut identical, mut states_identical, mut last) = (0, 0, None);
@@ -428,6 +600,16 @@ mod ownership_tests {
         assert_eq!(copies[0], (0x100000 + 3 * rope, 0x100000, 5 * 656));
         assert_eq!(copies[3], (0x300000 + 3 * nope, 0x300000, 5 * 528));
         assert_eq!(copies.len(), 1 + 2 + 1 + 2, "no record copy for the latent reader");
+    }
+
+    /// GLM 5.3 DFlash2 (its GQA ring is not window-only MLA) keeps today's mark-free layout:
+    /// mark bytes 0 for any drafter that is not a window ring, so no arena slots and no marks.
+    #[test]
+    fn only_window_ring_drafters_get_prefix_marks() {
+        for window_bytes in [0, 1, 7 << 20] { assert_eq!(draft_mark_bytes(false, window_bytes), 0); }
+        assert_eq!(draft_mark_bytes(true, 0), 0);
+        assert_eq!(draft_mark_bytes(true, 7 << 20), DRAFT_MARK_HEADER + (7 << 20));
+        assert_eq!(DRAFT_MARK_HEADER, 16);
     }
 
     #[test]

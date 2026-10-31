@@ -111,6 +111,13 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         engine_args.draft_context_slots = Some(cuteafd_loader::families::glm5::draft_representation::serving_draft_context_slots(
             engine_args.draft_sequences, args.max_sequences, None));
     }
+    // A window-ring drafter's prefix marks: one per arena slot, sized like the planner's.
+    if engine_args.dspark && args.prefix.prefix_cache_entries > 0 {
+        let layout = cuteafd_loader::placement::families::glm5::ml4_draft_layout(&engine_args.snapshot,
+            engine_args.draft_context_slots.unwrap_or(20), engine_args.draft_sequences, engine_args.max_context, 1)?;
+        engine_args.draft_window_marks = args.prefix.mark_rule(args.max_sequences)
+            .slots(cuteafd_loader::placement::families::glm5::draft_window_mark_bytes(&layout)?);
+    }
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     let policy = Policy { fixed: args.draft_fixed,
         decode_share: args.decode_share };
@@ -382,7 +389,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     let args = &args.with_scoring(if engine.full_prefill_logits { engine.prefill_capacity() } else { 64 },
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
-    let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On)?;
+    let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On, engine.draft_window_marks)?;
     let template = engine.paged_buffers().iter().find_map(|(records, _)| records.map(|(buffer, _)| buffer))
         .context("GLM has no latent-owning layers")?;
     // The pinned host tier: one GPU's pages, or under context each page from its owner
@@ -403,7 +410,9 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
     };
     let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
     let layout = family.layout();
-    let config = PrefixConfig { entries, mark_slots: 0, keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
+    // Arena slots only for a window-ring drafter's marks (the count admission charged).
+    let mark_slots = if layout.mark_bytes > 0 { engine.draft_window_marks } else { 0 };
+    let config = PrefixConfig { entries, mark_slots, keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
     let cache = PrefixCache::new(layout, config, host)?;
     tracing::info!(entries, page_bytes = layout.page_bytes, pages = layout.pages, host_bytes,
         rule = ?layout.rule, points = ?args.points(), "GLM prefix cache");
@@ -631,7 +640,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let admit_started = Instant::now();
             // Lookup and fork of the retained pages (byte-exact: the pages are the whole state).
             let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(&family, lookup, capacity, true, |pages| GlmPlacement { pages, len: 0 }) {
+            let admitted = match cache.admit(&family, lookup, capacity, true, |pages| GlmPlacement { pages, len: 0, draft_slot: slot }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.extend(slot);
@@ -820,7 +829,13 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         drafts: DraftHistory::default(),
                         counts: [0; 3],
                         decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
-                        job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
+                        job: p.job, constraint: p.constraint, placement: p.placement,
+                        // An MLA drafter restored warm from its prefix mark holds history from 0.
+                        draft_from: match (engine.drafter.as_ref(), slot) {
+                            (Some(drafter), Some(slot)) if drafter.mla_windows_only() =>
+                                drafter.mla_frontier(slot).map_or(resume, |(origin, _)| origin),
+                            _ => resume,
+                        }, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
                     };

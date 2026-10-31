@@ -356,7 +356,14 @@ fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
                 "sm_120", options.rtx_bytes[0]).sms) as usize;
             let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context, sms)?;
             let block = layout.capacity().block_rows / sequences;
-            (layout.resident_bytes()?, layout.weights().max_load_staging, Some(block), Some(layout.capacity().block_rows))
+            // Prefix marks of its draft windows, by the serving mark rule.
+            let marks = if options.mimo_prefix_entries == 0 { 0 } else {
+                options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+                    options.resolved_concurrency("mistral_large4"), options.mimo_prefix_entries,
+                    glm::draft_window_mark_bytes(&layout).unwrap_or(0) as u64, options.mimo_prefix_mark_bytes,
+                    options.host_cache_bytes != Some(0))) as usize };
+            (glm::ml4_draft_resident_bytes(&layout, marks)?, layout.weights().max_load_staging, Some(block),
+                Some(layout.capacity().block_rows))
         }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
@@ -551,6 +558,45 @@ mod tests {
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
     fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
+
+    /// GLM 5.3's DFlash2 drafter (an unpaged ring) carries no prefix marks or draft pages: its
+    /// charge is today's for any prefix retention, so the window-mark wiring is a no-op for it.
+    /// Mistral Large 4's window-ring drafter adds exactly its marks.
+    #[test]
+    fn prefix_draft_marks_charge_only_window_ring_drafters() {
+        let glm = tempfile::tempdir().unwrap();
+        write_snapshot(glm.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let drafter = tempfile::tempdir().unwrap();
+        std::fs::write(drafter.path().join("config.json"), serde_json::json!({"hidden_size":6144,
+            "intermediate_size":12288,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,
+            "head_dim":128,"vocab_size":154880,"dflash_config":{"target_layer_ids":[0,8,16,24,32],
+            "conv_group_size":16,"selector_rank":256,"block_size":16}}).to_string()).unwrap();
+        let checkpoint = Checkpoint::coordinator(glm.path(), false, false).unwrap();
+        let options = |entries: u64, budget: u64| LayoutOptions { rtx_bytes: vec![96 << 30],
+            glm5_drafter_snapshot: Some(drafter.path().to_path_buf()), mimo_prefix_entries: entries,
+            mimo_prefix_mark_bytes: budget, ..Default::default() };
+        let base = drafter_admission(&options(0, 0), &checkpoint).unwrap();
+        for (entries, budget) in [(20, 2 << 30), (64, 8 << 30)] {
+            assert_eq!(drafter_admission(&options(entries, budget), &checkpoint).unwrap(), base);
+        }
+        let ml4 = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_mistral_large4_snapshot(ml4.path(), Some(&[1]), true);
+        let checkpoint = Checkpoint::coordinator(ml4.path(), false, false).unwrap();
+        let mut off = options(0, 2 << 30);
+        off.glm5_drafter_snapshot = None;
+        let (cold, ..) = drafter_admission(&off, &checkpoint).unwrap();
+        let mut on = off.clone();
+        on.mimo_prefix_entries = 20;
+        on.prefix_slots = Some(7);
+        let (warm, ..) = drafter_admission(&on, &checkpoint).unwrap();
+        let layout = crate::placement::families::glm5::ml4_draft_layout(ml4.path(),
+            crate::families::glm5::draft_representation::serving_draft_context_slots(
+                on.glm_draft_sequences() as usize, on.resolved_concurrency("mistral_large4") as usize, None),
+            on.glm_draft_sequences() as usize, 1 << 20, 188).unwrap();
+        let mark = crate::placement::families::glm5::draft_window_mark_bytes(&layout).unwrap() as u64;
+        assert_eq!(mark, 16 + layout.window_mark_bytes().unwrap() as u64);
+        assert_eq!(warm - cold, 7 * mark);
+    }
 
     #[test]
     fn exlr8_explicit_stages_preserve_the_pre_namespace_fix_module_charge() {

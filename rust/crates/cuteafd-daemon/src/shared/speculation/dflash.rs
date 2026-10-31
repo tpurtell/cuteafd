@@ -525,6 +525,25 @@ impl MlaPagedState {
         Ok(())
     }
 
+    /// The rings of `slot` at a saved frontier `(origin, end)`, validated before any ownership
+    /// changes (a restore commits them only after its copies retire).
+    fn restored_rings(&self, slot: usize, origin: usize, end: usize)
+        -> Result<cuteafd_loader::formats::dflash::MlaDraftCacheState> {
+        let mut rings = self.rings.clone();
+        rings.restore_frontier(slot, origin, end)?;
+        Ok(rings)
+    }
+
+    /// A window-ring drafter's slot at the canonical frontier `(0, frontier)`: its rings carry
+    /// the saved windows, its (pageless) binding resumes producers at `frontier`.
+    fn restore_windows(&mut self, slot: usize, frontier: usize) -> Result<()> {
+        let rings = self.restored_rings(slot, 0, frontier)?;
+        self.discard(slot)?;
+        self.bindings[slot] = Some(self.pool.bind(slot, frontier)?);
+        self.rings = rings;
+        Ok(())
+    }
+
     fn discard(&mut self, slot: usize) -> Result<()> {
         let binding = self.bindings.get_mut(slot).context("MLA draft slot outside capacity")?.take();
         if let Some(binding) = binding { self.pool.release(binding)?; }
@@ -1814,8 +1833,7 @@ impl<'a> DflashDrafter<'a> {
             unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
             let mut state = context.state.borrow_mut();
             state.pool.check_attachment(attachment)?;
-            let mut rings = state.rings.clone();
-            rings.restore_frontier(slot, attachment.origin, attachment.frontier)?;
+            let rings = state.restored_rings(slot, attachment.origin, attachment.frontier)?;
             state.discard(slot)?;
             state.pool.pin_snapshot(attachment.snapshot)?;
             let (binding, copies) = match state.pool.restore_writable(slot, attachment.snapshot,
@@ -1834,6 +1852,25 @@ impl<'a> DflashDrafter<'a> {
             context.state.borrow_mut().rings = rings;
             Ok(())
         })().map_err(box_draft_page_error)
+    }
+
+    /// Binds `slot` at the canonical frontier `(0, frontier)` of a drafter whose every layer is a
+    /// window ring (no pooled pages): the caller has already copied the saved window rows back
+    /// ([`Self::copy_mla_windows`]); producers resume at `frontier`. A drafter with pooled pages
+    /// restores through [`Self::restore_mla_pages`], which validates its rings the same way.
+    pub(crate) fn restore_mla_windows(&self, slot: usize, frontier: usize) -> Result<()> {
+        let DraftContext::Mla(context) = &self.context else { anyhow::bail!("not an MLA drafter") };
+        ensure!(context.layout.paged_cache().full_layers == 0,
+            "a drafter with pooled pages restores through its page attachment");
+        // SAFETY: retire the previous request and the window copies before rebinding the slot.
+        unsafe { self.library.cuda_stream_synchronize(self.stream)?; }
+        context.state.borrow_mut().restore_windows(slot, frontier)
+    }
+
+    /// Whether this is an MLA drafter whose every layer is a window ring (its warm state is the
+    /// rings and frontier, carried in a prefix mark, not pooled pages).
+    pub(crate) fn mla_windows_only(&self) -> bool {
+        matches!(&self.context, DraftContext::Mla(context) if context.layout.paged_cache().full_layers == 0)
     }
 
     pub(crate) fn mla_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId)
@@ -2888,6 +2925,52 @@ mod checkpoint_header_tests {
     fn mla_cache_state() -> cuteafd_loader::formats::dflash::MlaDraftCacheState {
         cuteafd_loader::formats::dflash::MlaDraftCacheState::new(
             mla_config().cache_layout(2, 262144, cuteafd_core::MlaCacheFormat::Bf16).unwrap()).unwrap()
+    }
+
+    /// The page restore's ring step is the shared `restored_rings` (Kimi's path, unchanged): the
+    /// rings it returns equal the clone-and-restore it replaced, and leave the live rings alone.
+    #[test]
+    fn restored_rings_is_the_page_restores_old_ring_step() {
+        use cuteafd_loader::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let layout = mla_config().runtime_layout(GlmDraftRepresentation::Fp8Only,
+            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2, cuteafd_core::MlaCacheFormat::Bf16).unwrap();
+        let mut state = MlaPagedState::new(&layout).unwrap();
+        state.reset(0, 513).unwrap();
+        for (origin, end) in [(0, 0), (0, 4100), (513, 9000), (0, 262144)] {
+            let mut old = state.rings.clone();
+            old.restore_frontier(1, origin, end).unwrap();
+            let new = state.restored_rings(1, origin, end).unwrap();
+            assert_eq!(new.frontier(1).unwrap(), old.frontier(1).unwrap());
+            assert_eq!(new.frontier(0).unwrap(), old.frontier(0).unwrap());
+            assert_eq!(state.rings.frontier(0).unwrap(), (513, 513), "live rings untouched");
+        }
+        assert!(state.restored_rings(1, 9, 8).is_err());
+        assert!(state.restored_rings(1, 0, 262145).is_err());
+    }
+
+    /// A window-ring drafter's restore (mtp_dspark): rings at the canonical `(0, F)`, a pageless
+    /// binding that resumes producers at `F`, and the same slot later rebinds cold.
+    #[test]
+    fn window_restore_binds_the_canonical_frontier_and_resumes_at_it() {
+        use cuteafd_loader::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        let mut cfg = mla_config();
+        cfg.windows = vec![Some(4096), Some(4096)];
+        let layout = cfg.runtime_layout(GlmDraftRepresentation::Fp8Only,
+            GlmDraftCapacity::new(2, 2, 8).unwrap(), 262144, 128, 188, 2, cuteafd_core::MlaCacheFormat::Bf16).unwrap();
+        assert_eq!(layout.paged_cache().full_layers, 0);
+        let mut state = MlaPagedState::new(&layout).unwrap();
+        state.reset(0, 0).unwrap();
+        state.restore_windows(0, 5000).unwrap();
+        assert_eq!(state.rings.frontier(0).unwrap(), (0, 5000));
+        let binding = state.bindings[0].unwrap();
+        assert_eq!(state.pool.frontier(binding).unwrap(), (5000, 5000));
+        let proposal = state.reserve(0, 5000, 8).unwrap();
+        state.pool.commit(proposal, 0).unwrap();
+        assert!(state.reserve(0, 4999, 8).is_err(), "producers resume only at the restored frontier");
+        assert!(state.restore_windows(0, 262145).is_err());
+        assert_eq!(state.rings.frontier(0).unwrap(), (0, 5000), "a refused restore changes nothing");
+        state.reset(0, 6000).unwrap();
+        assert_eq!(state.rings.frontier(0).unwrap(), (6000, 6000));
     }
 
     #[test]

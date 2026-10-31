@@ -736,6 +736,23 @@ pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
 /// Mistral Large 4's bundled mtp_dspark on the shared MLA block-draft path: its
 /// immutable runtime layout from the checkpoint's own params.json and text
 /// config (every draft layer windowed, so the target pool does not size it).
+/// Bytes ahead of a draft-window prefix mark (its captured frontier; the GLM prefix family).
+pub const DRAFT_MARK_HEADER: usize = 16;
+
+/// One prefix mark of a window-ring drafter: its header and one slot's draft windows.
+pub fn draft_window_mark_bytes(layout: &crate::formats::dflash::MlaDraftRuntimeLayout) -> anyhow::Result<usize> {
+    Ok(DRAFT_MARK_HEADER + layout.window_mark_bytes()?)
+}
+
+/// The mtp_dspark drafter's resident bytes beside `marks` prefix marks of its draft windows
+/// (one slot's rings each; the warm state a prefix restore copies back).
+pub fn ml4_draft_resident_bytes(layout: &crate::formats::dflash::MlaDraftRuntimeLayout, marks: usize)
+    -> anyhow::Result<u64> {
+    let windows = (draft_window_mark_bytes(layout)? as u64).checked_mul(marks as u64)
+        .ok_or_else(|| anyhow::anyhow!("draft window marks overflow"))?;
+    layout.resident_bytes()?.checked_add(windows).ok_or_else(|| anyhow::anyhow!("drafter bytes overflow"))
+}
+
 pub fn ml4_draft_layout(snapshot: &std::path::Path, slots: usize, sequences: usize, compiled_context: usize,
     sms: usize) -> anyhow::Result<crate::formats::dflash::MlaDraftRuntimeLayout> {
     use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};

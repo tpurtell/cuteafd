@@ -110,6 +110,10 @@ pub(crate) struct EngineArgs {
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
+    /// Prefix-cache marks of a window-ring drafter (mtp_dspark): each holds one slot's draft
+    /// windows; serve sets it from the prefix mark rule (0: no retained draft windows).
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub draft_window_marks: usize,
     /// Benchmarks only: MoE layers skip the Spark exchange (routed experts
     /// contribute zero) but keep the route/wire download, the host sync, the
     /// shared expert, the plane uploads and the reduce, timing the
@@ -875,9 +879,11 @@ impl Opened {
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
-        // mtp_dspark: its admitted layout (weights, rings, arenas) and load-time staging.
+        // mtp_dspark: its admitted layout (weights, rings, arenas), the prefix marks of its
+        // draft windows, and load-time staging.
         let (drafter_bytes, drafter_staging) = match &ml4_draft {
-            Some(layout) => (layout.resident_bytes()?, layout.weights().max_load_staging),
+            Some(layout) => (cuteafd_loader::placement::families::glm5::ml4_draft_resident_bytes(layout,
+                args.draft_window_marks)?, layout.weights().max_load_staging),
             None => (drafter_bytes, drafter_staging),
         };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
@@ -1229,6 +1235,8 @@ impl Opened {
             engine.skip_routed_experts()?;
         }
         engine.drafter = drafter;
+        engine.draft_window_marks = if engine.drafter.as_ref().is_some_and(|d| d.mla_windows_only())
+            { args.draft_window_marks } else { 0 };
         engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(),

@@ -141,6 +141,8 @@ fn placement_pages(tables: &StepTables) -> Vec<u32> {
 pub(crate) struct GlmPlacement {
     pub pages: Vec<u32>,
     pub len: usize,
+    /// The sequence's drafter slot (whose draft state its prefix snapshots carry), if any.
+    pub draft_slot: Option<usize>,
 }
 
 impl GlmPlacement {
@@ -171,7 +173,7 @@ impl PageAllocator {
     /// Reserves every page a sequence of up to `capacity` tokens needs.
     pub fn admit(&mut self, capacity: usize) -> Result<GlmPlacement> {
         let pages = self.pool.alloc(self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok(GlmPlacement { pages, len: 0 })
+        Ok(GlmPlacement { pages, len: 0, draft_slot: None })
     }
 
     /// A second sequence starting as `source`'s first `len` rows: full pages shared, the
@@ -179,7 +181,7 @@ impl PageAllocator {
     pub fn fork(&mut self, source: &GlmPlacement, len: usize, capacity: usize)
         -> Result<(GlmPlacement, Option<cuteafd_engine::prefix::TailCopy>)> {
         let fork = self.pool.fork(&source.pages, len, self.pool.pages_for(capacity)).context("cache pages exhausted")?;
-        Ok((GlmPlacement { pages: fork.pages, len: 0 }, fork.copy))
+        Ok((GlmPlacement { pages: fork.pages, len: 0, draft_slot: None }, fork.copy))
     }
 
     pub fn release(&mut self, placement: GlmPlacement) {
@@ -473,6 +475,8 @@ pub(crate) struct GlmEngine<'a> {
     graph_misses: Cell<u64>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<crate::shared::speculation::dflash::DflashDrafter<'a>>,
+    /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
+    pub draft_window_marks: usize,
     draft_core_head: Option<super::core_runtime::CoreHead<'a>>,
     pub(super) attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan,
     /// L2 prefetch of the next layer's weights during decode exchanges.
@@ -613,7 +617,7 @@ impl<'a> GlmEngine<'a> {
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
-            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
+            graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
 
     pub(crate) fn bind_core(&mut self, admission: Option<cuteafd_loader::families::glm5::core::CoreCharges>) -> Result<()> {

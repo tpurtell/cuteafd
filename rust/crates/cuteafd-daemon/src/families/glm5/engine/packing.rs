@@ -302,8 +302,8 @@ mod tests {
 
     #[test]
     fn packed_tables_equal_singletons_and_ignore_partner_pages() -> Result<()> {
-        let mut a = GlmPlacement { pages: vec![3, 4, 5], len: 60 };
-        let mut b = GlmPlacement { pages: vec![11, 12], len: 1 };
+        let mut a = GlmPlacement { pages: vec![3, 4, 5], len: 60, draft_slot: None };
+        let mut b = GlmPlacement { pages: vec![11, 12], len: 1, draft_slot: None };
         let tokens_a = [1; 12];
         let tokens_b = [2; 9];
         let limits = Limits { rows: 256, chunk_rows: 256, max_context: 4096, taps: Some(2048) };
