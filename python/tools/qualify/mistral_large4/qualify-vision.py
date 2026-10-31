@@ -212,6 +212,28 @@ def official(models, name, dtype, lut, device):
         return projector(hidden.squeeze(0), sizes).float().cpu().numpy()
 
 
+def stage_states(models, name, dtype, lut, device):
+    """Official hidden states after ln_pre (0) and after every fifth layer, as F32."""
+    import torch
+    tower, _, _ = models[dtype]
+    states, hooks = {}, []
+    def keep(stage):
+        def hook(_module, _inputs, value):
+            value = value[0] if isinstance(value, tuple) else value
+            states[stage] = value.detach().float().reshape(-1, H).cpu().numpy()
+        return hook
+    hooks.append(tower.ln_pre.register_forward_hook(keep(0)))
+    for i, layer in enumerate(tower.transformer.layers):
+        if (i + 1) % 5 == 0:
+            hooks.append(layer.register_forward_hook(keep(i + 1)))
+    try:
+        official(models, name, dtype, lut, device)
+    finally:
+        for handle in hooks:
+            handle.remove()
+    return states
+
+
 def score(native, models, name, lut, device):
     import torch
     gh, gw, _ = fixture(name)
@@ -248,6 +270,21 @@ def compare(args):
         native = np.load(args.compare_native / f"{name}.npy")
         result["bf16_floor"][name], result["g2"][name] = score(native, models, name, lut, device)
         print(json.dumps(dict(event="G2", grid=name, stages=result["g2"][name])), flush=True)
+    result["stages"] = {}
+    for name in args.stages:
+        refs = {d: stage_states(models, name, d, lut, device) for d in (torch.bfloat16, torch.float32)}
+        rows = {}
+        for stage in sorted(refs[torch.float32]):
+            path = args.compare_native / f"{name}.stage{stage}.npy"
+            if path.exists():
+                value = np.load(path)
+                rows[stage] = dict(native_vs_fp32=common.metrics(value, refs[torch.float32][stage]),
+                    native_vs_bf16=common.metrics(value, refs[torch.bfloat16][stage]),
+                    bf16_vs_fp32=common.metrics(refs[torch.bfloat16][stage], refs[torch.float32][stage]))
+        result["stages"][name] = rows
+        for stage, row in rows.items():
+            print(json.dumps(dict(event="stage", grid=name, stage=stage, **{k: round(v["relative_l2"], 5)
+                for k, v in row.items()})), flush=True)
     result["g2_pass"] = bool(result["g2"]) and all(m["pass"] for m in result["g2"].values())
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     return 0 if result["g2_pass"] else 1
@@ -303,13 +340,28 @@ def run(args):
         if models:
             result["modeling_sha256"] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models[torch.float32][2]}
 
-        def encode(name):
+        cudart.cudaMemcpy.argtypes = [C.c_void_p, C.c_void_p, C.c_size_t, C.c_int]
+
+        def encode(name, stages=None):
             gh, gw, rgb = fixture(name)
             uh, uw = gh // 2, gw // 2
-            output = np.empty((uh * (uw + 1), LM), np.uint16)
+            output, errors = np.empty((uh * (uw + 1), LM), np.uint16), []
+            def callback(_ctx, stage, pointer, rows, width, _column):
+                try:
+                    if stage <= DEPTH:  # F32 hidden states; stage 31 is the BF16 span.
+                        value = np.empty((rows, width), np.float32)
+                        check(cudart.cudaMemcpy(value.ctypes.data, pointer, value.nbytes, 2))
+                        stages[stage] = value
+                    return 0
+                except BaseException as error:
+                    errors.append(repr(error))
+                    return 1
+            observer = OBSERVER(callback) if stages is not None else OBSERVER()
             started = time.perf_counter()
             check(library.cuteafd_vision_encode(owner, rgb.ctypes.data, rgb.nbytes, lut.ctypes.data,
-                gh, gw, output.ctypes.data, output.nbytes, OBSERVER(), None))
+                gh, gw, output.ctypes.data, output.nbytes, observer, None))
+            if errors:
+                raise RuntimeError(errors)
             return output, (time.perf_counter() - started) * 1000
 
         saved = {}
@@ -327,6 +379,11 @@ def run(args):
             if args.save_native:
                 args.save_native.mkdir(parents=True, exist_ok=True)
                 np.save(args.save_native / f"{name}.npy", native)
+                if name in args.stages:
+                    stages = {}
+                    encode(name, stages)
+                    for stage, value in stages.items():
+                        np.save(args.save_native / f"{name}.stage{stage}.npy", value)
             print(json.dumps(dict(event="G2", grid=name, markers=result["markers_exact"][name],
                 stages=result["g2"].get(name))), flush=True)
         initial, final = Ledger(), Ledger()
@@ -369,4 +426,6 @@ if __name__ == "__main__":
     parser.add_argument("--native-only", action="store_true")
     parser.add_argument("--save-native", type=Path, help="device half: keep each encoded span here")
     parser.add_argument("--compare-native", type=Path, help="reference half: score spans saved by --save-native")
+    parser.add_argument("--stages", nargs="*", default=[], choices=list(GRIDS),
+        help="also keep (device) / score (reference) the tower's hidden states of these grids")
     raise SystemExit(run(parser.parse_args()))
