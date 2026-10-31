@@ -8935,23 +8935,6 @@ def write_identity(destination, manifest):
     return identity
 
 
-def builders(*, widths=(256, 512, 1024, 2048), patches=(16, 6, 5, 4), output_width=8192):
-    """BF16 PCM tower entries, with geometry supplied by the checkpoint config."""
-    from b12x.integration.cuteafd import media
-    if len(widths) != len(patches) or not widths or min(*widths, *patches, output_width) <= 0:
-        raise ValueError("audio stage widths and patches must have equal positive lengths")
-    result = media.audio_programs(widths=widths, output_width=output_width)
-    projections = set()
-    previous = 1
-    for width, patch in zip(widths, patches):
-        projections.update(((previous * patch, width), (width, width * 4), (width * 4, width)))
-        previous = width
-    projections.add((previous, output_width))
-    for width, outputs in sorted(projections):
-        result[f"projection_k{width}_n{outputs}"] = lambda k=width, n=outputs: media.compile_biased_projection_aot(width=k, outputs=n)
-    return result
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -9033,6 +9016,24 @@ def main():
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
     if torch.cuda.is_initialized():
         raise RuntimeError("offline audio export initialized CUDA")
+
+
+def builders(*, widths=(256, 512, 1024, 2048), patches=(16, 6, 5, 4), output_width=8192):
+    """BF16 PCM tower entries, with geometry supplied by the checkpoint config."""
+    from b12x.integration.cuteafd import media
+    if len(widths) != len(patches) or not widths or min(*widths, *patches, output_width) <= 0:
+        raise ValueError("audio stage widths and patches must have equal positive lengths")
+    result = media.audio_programs(widths=widths, output_width=output_width)
+    projections = set()
+    previous = 1
+    for width, patch in zip(widths, patches):
+        projections.update(((previous * patch, width), (width, width * 4), (width * 4, width)))
+        previous = width
+    projections.add((previous, output_width))
+    for width, outputs in sorted(projections):
+        result[f"projection_k{width}_n{outputs}"] = lambda k=width, n=outputs: media.compile_biased_projection_aot(width=k, outputs=n)
+    return result
+
 
 
 if __name__ == "__main__":

@@ -18,37 +18,6 @@ def tile_for_head_dim(head_dim):
     return (128, 128 if head_dim <= 64 else 64)
 
 
-def builders(group, *, head_dim=96, hidden=1536, bf16_products=False,
-             learned_position=False, bf16_before_gamma=False, windowed=False):
-    """Static tower geometry only; image dimensions and rows remain launch data."""
-    from b12x.integration.cuteafd import media
-    if group == "attention":
-        return {f"attention_d{head_dim}_{'windows' if windowed else 'full'}":
-                lambda: media.compile_vision_attention_aot(dim=head_dim, windowed=windowed)}
-    if group != "pointwise":
-        raise ValueError(f"unknown vision group: {group}")
-    return media.vision_programs(dim=head_dim, hidden=hidden, bf16_products=bf16_products,
-        learned_position=learned_position, bf16_before_gamma=bf16_before_gamma)
-
-
-def export_programs(destination, prefix, declarations):
-    """Emit the shared raw-pointer ABI and validate every generated signature."""
-    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
-    records = []
-    for name, build in declarations.items():
-        stem = f"{prefix}_{name}"
-        with exportable_compilation():
-            program = build()
-        symbol = "cuteafd_" + stem
-        program.export_to_c(str(destination), stem, symbol)
-        validate_exported_header(program, destination / (stem + ".h"), symbol)
-        records.append(dict(name=stem, geometry=dict(program.geometry), abi=program.abi,
-            artifacts={stem + ext: hashlib.sha256((destination / (stem + ext)).read_bytes()).hexdigest()
-                       for ext in (".o", ".h")}))
-        print(stem, flush=True)
-    (destination / (prefix + ".json")).write_text(json.dumps(dict(schema=1, programs=records), indent=2) + "\n")
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -151,6 +120,38 @@ def main():
         print(manifest_path, flush=True)
     if torch.cuda.is_initialized():
         raise RuntimeError("offline vision export initialized CUDA")
+
+
+def builders(group, *, head_dim=96, hidden=1536, bf16_products=False,
+             learned_position=False, bf16_before_gamma=False, windowed=False):
+    """Static tower geometry only; image dimensions and rows remain launch data."""
+    from b12x.integration.cuteafd import media
+    if group == "attention":
+        return {f"attention_d{head_dim}_{'windows' if windowed else 'full'}":
+                lambda: media.compile_vision_attention_aot(dim=head_dim, windowed=windowed)}
+    if group != "pointwise":
+        raise ValueError(f"unknown vision group: {group}")
+    return media.vision_programs(dim=head_dim, hidden=hidden, bf16_products=bf16_products,
+        learned_position=learned_position, bf16_before_gamma=bf16_before_gamma)
+
+
+def export_programs(destination, prefix, declarations):
+    """Emit the shared raw-pointer ABI and validate every generated signature."""
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    records = []
+    for name, build in declarations.items():
+        stem = f"{prefix}_{name}"
+        with exportable_compilation():
+            program = build()
+        symbol = "cuteafd_" + stem
+        program.export_to_c(str(destination), stem, symbol)
+        validate_exported_header(program, destination / (stem + ".h"), symbol)
+        records.append(dict(name=stem, geometry=dict(program.geometry), abi=program.abi,
+            artifacts={stem + ext: hashlib.sha256((destination / (stem + ext)).read_bytes()).hexdigest()
+                       for ext in (".o", ".h")}))
+        print(stem, flush=True)
+    (destination / (prefix + ".json")).write_text(json.dumps(dict(schema=1, programs=records), indent=2) + "\n")
+
 
 
 if __name__ == "__main__":
