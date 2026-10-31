@@ -73,8 +73,11 @@ struct NativeOwners<'a> {
     head: Option<super::head::TargetHeadOwner<'a>>,
     arenas: Vec<Arena<'a>>,
     rope: Vec<Rc<TargetTables<'a>>>,
-    /// Onboarded routed layers' EXL3 experts, whole on the entry GPU.
+    /// Onboarded routed layers' EXL3 experts, whole on the entry GPU (one RTX).
     onboarded: Option<RefCell<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>,
+    /// Two RTX: each rank's TP2 halves of the onboarded layers, bound to the
+    /// lane streams as a shared pair at execution binding.
+    onboarded_tp2: Option<[crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>; 2]>,
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -150,7 +153,7 @@ impl<'a> NativeOwners<'a> {
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
                 programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
-            Ok(Self { ranks, head, arenas, rope: tables, onboarded: None })
+            Ok(Self { ranks, head, arenas, rope: tables, onboarded: None, onboarded_tp2: None })
         })
     }
 }
@@ -213,6 +216,7 @@ struct MainExecution<'e, 'a> {
     pending_wave: RefCell<std::collections::VecDeque<crate::shared::spark_waves::WaveTicket>>,
     transport: RefCell<Option<DeviceOwner<'a, SparkLink<'a>>>>,
     routed_reply: Allocation<'a>,
+    tp2: Option<Tp2Onboard<'a>>,
     rows: usize,
     inventory: Vec<Inventory>,
     requests: Cell<u64>,
@@ -428,6 +432,32 @@ impl<'a> LoadedNative<'a> {
         tracing::info!(layers = layers.len(), "Step-5 EXL3 routed layers onboarded on the entry RTX");
         Ok(self)
     }
+
+    /// Loads the solver's onboarded routed layers as TP2 halves over both GPUs
+    /// from the installed `rtx-tp2` package, inside each rank's TP2 arena peak.
+    pub(super) fn with_onboarded_tp2(mut self, devices: [Device<'a>; 2], catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &std::path::Path, layers: &[usize], rows: usize, budgets: [usize; 2]) -> Result<Self> {
+        if layers.is_empty() { return Ok(self); }
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
+        self.0.onboarded_tp2 = Some(Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
+            [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?);
+        tracing::info!(layers = layers.len(), "Step-5 EXL3 routed layers onboarded TP2 over both RTX");
+        Ok(self)
+    }
+}
+
+/// Two-RTX onboarded routed layers: the shared pair (routes, and for a
+/// whole-owned layer its wire rows, published by the router's rank), each
+/// rank's F32 routed partial, the peer's partial as received and the route
+/// broadcast scratch. The F32 sum rounds once to BF16 into the routed plane,
+/// as a Spark reply does; the native join then adds the shared expert.
+struct Tp2Onboard<'a> {
+    pair: crate::shared::experts::rtx::pair::Pair<'a>,
+    partial: [Allocation<'a>; 2],
+    /// The peer's partial: head-split layers, and a whole layer's owner.
+    incoming: [Allocation<'a>; 2],
+    owner_incoming: [Allocation<'a>; 2],
+    scratch: [Allocation<'a>; 2],
 }
 
 impl<'e, 'a> MainExecution<'e, 'a> {
@@ -506,8 +536,42 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             link.installed_grouping()?;
         }
         let routed_reply = Allocation::new(devices[entry], rows * H * 2)?;
+        let mut native = native;
+        let tp2 = match native.onboarded_tp2.take() {
+            None => None,
+            Some(weights) => {
+                use crate::shared::experts::rtx::{pair::Pair, ExchangeDtype, RtxExpertLayer};
+                ensure!(ownership.ranks() == 2, "Step-5 TP2 onboarding needs two ranks");
+                let spec = ownership.execution().spec();
+                let (unit, lanes) = (usize::try_from(spec.rows)?, usize::try_from(spec.lanes)?);
+                let ranks: [Box<dyn RtxExpertLayer + 'a>; 2] = [Box::new(weights[0].execution()?), Box::new(weights[1].execution()?)];
+                ensure!(ranks[0].layers() == ownership.onboarded_layers(), "Step-5 TP2 layers differ from the solved homes");
+                let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
+                let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, lanes,
+                    ExchangeDtype::F32, true))?;
+                let plane = |rank: usize, bytes: usize| Allocation::new(devices[rank], bytes.max(256));
+                let section = unit * 8 * 4;
+                let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
+                let scratch = routes + unit * (H + H / 32);
+                let onboard = Tp2Onboard {
+                    pair,
+                    partial: [plane(0, lanes * unit * H * 4)?, plane(1, lanes * unit * H * 4)?],
+                    incoming: [plane(0, lanes * unit * H * 4)?, plane(1, lanes * unit * H * 4)?],
+                    owner_incoming: [plane(0, lanes * unit * H * 4)?, plane(1, lanes * unit * H * 4)?],
+                    scratch: [plane(0, lanes * scratch)?, plane(1, lanes * scratch)?],
+                };
+                let charged = cuteafd_loader::plan::families::step5::admission::tp2_exchange_bytes(unit, lanes)?;
+                for rank in 0..2 {
+                    let planes = [&onboard.partial[rank], &onboard.incoming[rank], &onboard.owner_incoming[rank],
+                        &onboard.scratch[rank]];
+                    let bytes = planes.iter().map(|a| a.buffer.bytes as u64).sum::<u64>();
+                    ensure!(bytes <= charged, "Step-5 TP2 exchange planes exceed their admission ({bytes} > {charged})");
+                }
+                Some(onboard)
+            }
+        };
         let execution = Self { ownership, native, caches, stages, exchange,
-            sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, rows, inventory, requests: Cell::new(0), placement_version,
+            sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, tp2, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
         if count == 92 { execution.validate_replications()?; }
@@ -557,7 +621,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 attention::replicate_terminal(self.exchange.peer()?, input.buffer, self.layer(1, 0)?.input(), step.rows() * H * 4)?;
                 let mut binding = Bindings { execution: self, step, scope,
                     current: vec![None, Some(self.layer(1, 0)?.input())], input: input.buffer,
-                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory), units: false };
+                    kind: ExpertV2SourceKind::Benchmark, layer: 0, diagnostic: Some(directory), units: false, lane: 0 };
                 binding.heads(0)?;
                 binding.ffn(0, None)?;
                 for stage in &self.stages { stage.stream.drain()?; }
@@ -598,11 +662,29 @@ impl<'e, 'a> MainExecution<'e, 'a> {
         self.ownership.execution().validate_routed_replications(&copies)?;
         Ok(())
     }
+    /// Both peer exchanges this execution queues waits on.
+    fn require_live(&self) -> Result<()> {
+        self.exchange.require_live()?;
+        if let Some(tp2) = &self.tp2 { tp2.pair.routes.require_live()?; }
+        Ok(())
+    }
+
     fn shutdown(&self) -> Result<()> {
         if self.exchange.terminal_state() == TerminalState::Drained { return Ok(()); }
         let result = pair::teardown(&mut pair::Teardown {
-            abort: || self.exchange.publish_abort(),
-            ranks: || self.drain_compute(),
+            abort: || {
+                // The TP2 route exchange first: its waits block the same lane streams.
+                let routes = self.tp2.as_ref().map_or(Ok(()), |tp2| match tp2.pair.routes.terminal_state() {
+                    TerminalState::Active => tp2.pair.routes.publish_abort(),
+                    _ => Ok(()),
+                });
+                let exchange = self.exchange.publish_abort();
+                routes.and(exchange)
+            },
+            ranks: || {
+                if let Some(tp2) = &self.tp2 { tp2.pair.routes.drain_compute()?; }
+                self.drain_compute()
+            },
             links: || self.with_transport(|link| link.terminal_quiesce()),
             copies: || self.with_transport(|link| { link.terminal_drain_copies()?; link.terminal_release() }),
             graphs: || Ok(()),
@@ -653,6 +735,7 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn require_live(&self) -> Result<()> {
         check_captures(self.startup_captures, cuteafd_ffi::graph_captures())?;
         self.main.exchange.require_live()?;
+        if let Some(tp2) = &self.main.tp2 { tp2.pair.routes.require_live()?; }
         ensure!(self.main.caches.iter().all(|cache| !cache.borrow().poisoned.get()), "Step-5 poisoned cache");
         Ok(())
     }
@@ -719,10 +802,10 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(!input.buffer.ptr.is_null()
             && input.buffer.device_id == main.device(main.ownership.execution().spec().entry_gpu as usize)?.id
             && input.buffer.bytes >= step.rows() * H * 4, "Step-5 live input allocation");
-        pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
+        pair::submit_scoped(|| main.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
             step.compose(main.ownership.execution().spec().entry_gpu as usize, input, |_, _| Ok(()))?;
             let mut binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
-                input: input.buffer, kind, layer: 0, diagnostic: None, units: false };
+                input: input.buffer, kind, layer: 0, diagnostic: None, units: false, lane: 0 };
             let rows = binding.step.rows();
             attention::layer_pipeline_with(scope, main.ownership.execution(), &main.exchange,
                 LaneOrder::Independent, &[rows], std::slice::from_mut(&mut binding))?;
@@ -766,7 +849,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         step.set_units(units.iter().map(|unit| unit.rows.clone()).collect())?;
         tracing::info!(rows = step.rows(), units = units.len(), waves,
             sizes = ?units.iter().map(|unit| unit.rows.len()).collect::<Vec<_>>(), "Step-5 prefill units");
-        pair::submit_scoped(|| main.exchange.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
+        pair::submit_scoped(|| main.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
             step.compose(entry, input, |_, _| Ok(()))?;
             // Routed waves build, post and land on the main link's exchange
             // worker while this thread queues GPU work.
@@ -775,7 +858,7 @@ impl<'e, 'a> Execution<'e, 'a> {
                 ensure!(link.get_mut().exchange()?.fits(staging), "Step-5 main link staging is narrower than a unit");
             }
             let binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
-                input: input.buffer, kind, layer: 0, diagnostic: None, units: true };
+                input: input.buffer, kind, layer: 0, diagnostic: None, units: true, lane: 0 };
             let mut hooks = UnitHooks { binding, span: input.buffer,
                 current: units.iter().map(|_| vec![None; main.ownership.ranks()]).collect(),
                 consumed: vec![vec![0; main.ownership.execution().hops().len()]; units.len()] };
@@ -804,6 +887,7 @@ struct UnitHooks<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
 impl<E: CopyEngine> UnitHooks<'_, '_, '_, '_, '_, E> {
     fn select(&mut self, unit: &crate::shared::prefill_pipeline::Unit) -> Result<()> {
         self.binding.step.select_unit(unit.index)?;
+        self.binding.lane = unit.slot;
         let offset = unit.rows.start * H * 4;
         self.binding.input = CuteafdDeviceBuffer { ptr: self.span.ptr.wrapping_byte_add(offset),
             bytes: self.span.bytes - offset, ..self.span };
@@ -944,6 +1028,9 @@ struct Bindings<'s, 'b, 'e, 'a, 'g, E: CopyEngine> {
     diagnostic: Option<&'s std::path::Path>,
     /// Prefill units: residuals and hop landings are slot-owned per unit.
     units: bool,
+    /// The selected unit's in-flight slot (0 outside prefill units): its
+    /// TP2 route slots and exchange planes.
+    lane: usize,
 }
 impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
     /// Rows of the selected unit: every hook runs these, never the span.
@@ -985,6 +1072,98 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         device.run(|| device.library.copy_d2h(&mut bytes, output))?;
         self.execution.diagnostic_outputs.borrow_mut().insert(layer, bytes);
         Ok(())
+    }
+
+    /// A two-RTX onboarded layer: both ranks run their TP2 half of the layer's
+    /// EXL3 experts through the shared pair, exchange F32 routed partials over
+    /// the peer slots routed replication would otherwise use (4 head split, 5
+    /// whole), and sum them in rank order into every FFN rank's routed plane:
+    /// one F32 -> BF16 rounding, as a Spark reply. A head-split layer routes on
+    /// both ranks (replicated routes); a whole-owned layer's owner publishes its
+    /// routes and wire rows and alone receives the sum. Ticket: the routed
+    /// result's rank for `finish_ffn` (its join adds the shared expert).
+    fn tp2_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Option<usize>> {
+        let execution = self.execution;
+        let onboard = execution.tp2.as_ref().context("Step-5 TP2 onboarding not bound")?;
+        let rows = self.rows();
+        let lane = self.lane;
+        let source = execution.ownership.routed_source(layer)?;
+        ensure!(source == owner, "Step-5 TP2 routed source differs from the layer owner");
+        let routers: Vec<usize> = match source { Some(owner) => vec![owner], None => vec![0, 1] };
+        let at = |plane: &Allocation<'_>, stride: usize| CuteafdDeviceBuffer {
+            ptr: plane.buffer.ptr.wrapping_byte_add(lane * stride), bytes: stride, ..plane.buffer };
+        let unit = usize::try_from(execution.ownership.execution().spec().rows)?;
+        ensure!(rows <= unit && lane < usize::try_from(execution.ownership.execution().spec().lanes)?,
+            "Step-5 TP2 rows or lane outside admission");
+        let partial_bytes = unit * H * 4;
+        let scratch_bytes = onboard.scratch[0].buffer.bytes / usize::try_from(execution.ownership.execution().spec().lanes)?;
+        // Router, shared expert and wire rows on each rank that holds the FFN.
+        for &rank in &routers {
+            let local = execution.layer(rank, layer)?;
+            self.copy(rank, local.ffn_input(), local.post())?;
+            let Ffn::Routed(ffn) = &local.ffn else { anyhow::bail!("Step-5 TP2 layer without a routed FFN"); };
+            self.step.compose(rank, ffn, |ffn, meta| ffn.frontend_on(meta.rows, meta.stream))?;
+            self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+            self.current[rank] = Some(local.output());
+        }
+        let slot = if source.is_some() { 5 } else { 4 };
+        let peer = execution.exchange.peer()?;
+        for rank in 0..2 {
+            let partial = at(&onboard.partial[rank], partial_bytes);
+            let scratch = at(&onboard.scratch[rank], scratch_bytes);
+            let (input, routes) = match execution.layer(rank, layer).ok().map(|l| &l.ffn) {
+                Some(Ffn::Routed(ffn)) => {
+                    let [ids, weights, wire] = ffn.wave_inputs();
+                    (crate::shared::experts::rtx::ExpertInput::Fp8K32(wire.ptr),
+                        crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr })
+                }
+                // A whole layer's non-owner receives routes and wire rows.
+                _ => (crate::shared::experts::rtx::ExpertInput::Fp8K32(std::ptr::null_mut()),
+                    crate::shared::experts::rtx::Routes { ids: std::ptr::null_mut(), weights: std::ptr::null_mut() }),
+            };
+            self.step.compose(rank, execution, |_, meta| {
+                ensure!(meta.stream.raw == execution.stages[rank].stream.raw, "Step-5 TP2 lane stream");
+                let mut abort = || {
+                    let _ = onboard.pair.routes.publish_abort();
+                    let _ = peer.publish_abort();
+                };
+                // SAFETY: the router wrote WIRE/IDS/ROUTES for `rows` rows on this
+                // lane stream; the lane's scratch and partial planes are admitted
+                // and reused only after this unit's exchange completes in order.
+                unsafe {
+                    match source {
+                        None => onboard.pair.enqueue(rank, layer, lane, rows, input, routes, scratch,
+                            std::ptr::null(), partial.ptr, &mut abort),
+                        Some(owner) => onboard.pair.enqueue_from(rank, owner, layer, lane, rows, input, routes,
+                            scratch, std::ptr::null(), partial.ptr, &mut abort),
+                    }
+                }
+            })?;
+        }
+        // Exchange the F32 partials: both ways for head split, to the owner for a whole layer.
+        for from in 0..2 {
+            let to = 1 - from;
+            if source.is_some_and(|owner| owner != to) { continue; }
+            let partial = at(&onboard.partial[from], partial_bytes);
+            let incoming = at(if source.is_some() { &onboard.owner_incoming[to] } else { &onboard.incoming[to] }, partial_bytes);
+            peer.push_to(from, slot, partial.ptr, incoming.ptr, rows * H * 4)?;
+        }
+        for rank in 0..2 {
+            if source.is_some_and(|owner| owner != rank) { continue; }
+            peer.wait(rank, slot)?;
+            let mine = at(&onboard.partial[rank], partial_bytes).ptr;
+            let theirs = at(if source.is_some() { &onboard.owner_incoming[rank] } else { &onboard.incoming[rank] },
+                partial_bytes).ptr;
+            let (rank0, rank1) = if rank == 0 { (mine, theirs) } else { (theirs, mine) };
+            let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 TP2 routed receiver"); };
+            let output = ffn.routed_output();
+            self.step.compose(rank, ffn, |_, meta| meta.stream.device.run(|| {
+                // SAFETY: both partials are complete on this stream (own enqueue,
+                // peer wait); the routed plane is this rank's admitted unit view.
+                unsafe { onboard.pair.combine.sum(rank0, rank1, output.ptr.cast(), meta.rows, H, meta.stream.raw) }
+            }))?;
+        }
+        Ok(Some(source.unwrap_or(0)))
     }
 
     fn copy(&mut self, rank: usize, destination: CuteafdDeviceBuffer, source: CuteafdDeviceBuffer) -> Result<()> {
@@ -1077,6 +1256,9 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
     fn begin_ffn(&mut self, layer: usize, owner: Option<usize>) -> Result<Self::FfnTicket> {
         let execution = self.execution;
         self.select_ffn(layer)?;
+        if execution.tp2.is_some() && execution.ownership.onboarded(layer) {
+            return self.tp2_ffn(layer, owner);
+        }
         let mut wave = None;
         for rank in 0..execution.ownership.ranks() {
             if owner.is_some_and(|owner| owner != rank) { continue; }
@@ -1146,7 +1328,10 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
         let split = execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit;
         let output = if rank == entry { ffn.routed_output() } else { self.routed_reply()? };
-        if execution.ownership.onboarded(layer) {
+        let tp2 = execution.tp2.is_some() && execution.ownership.onboarded(layer);
+        if tp2 {
+            // The TP2 pair summed both halves into every FFN rank's routed plane.
+        } else if execution.ownership.onboarded(layer) {
             // The onboarded experts already wrote the BF16 reply on the entry GPU's stream.
             ensure!(rank == entry, "Step-5 onboarded routed layer off the entry GPU");
         } else {
@@ -1164,7 +1349,7 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
             }))?;
             drop(transport);
         }
-        if split || rank != entry {
+        if !tp2 && (split || rank != entry) {
             let destination_rank = 1 - entry;
             let Ffn::Routed(destination) = &execution.layer(destination_rank, layer)?.ffn else { anyhow::bail!("Step-5 routed receive owner"); };
             let binding = execution.ownership.routed_replications()?[layer].context("Step-5 routed publication binding")?;

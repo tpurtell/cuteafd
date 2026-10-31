@@ -26,6 +26,8 @@ impl StepExperts {
         Ok(Self::Native(format))
     }
 
+    pub(super) fn is_exl3(&self) -> bool { matches!(self, Self::Exl3(_)) }
+
     /// The installed package's manifest beside the native library.
     pub(super) fn package_manifest(&self, native_lib: &Path) -> Result<PathBuf> {
         let lib = native_lib.parent().context("native library directory")?;

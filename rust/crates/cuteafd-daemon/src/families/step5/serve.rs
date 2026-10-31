@@ -12,6 +12,11 @@ use cuteafd_loader::{placement::{Demand, GpuBudget, Inventory, ProgramSet, Spark
 use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission, TcpTransportConfig};
 use std::{cell::RefCell, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 
+
+/// The solved arena an onboarded routed set loads into.
+#[derive(Debug, Clone, Copy)]
+enum OnboardBudget { Whole(usize), Tp2([usize; 2]) }
+
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
     #[arg(long)]
@@ -245,8 +250,9 @@ fn with_backend<T>(args: &ServeArgs,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
         peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
-        onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::exl3(&catalog,
-            Some(&args.manifest), args.prefill_rows as usize, args.rtx_expert_layers)? };
+        onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
+            Some(&args.manifest), args.prefill_rows as usize, ids.len(), usize::from(args.prefill_waves),
+            args.rtx_expert_layers)? };
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     // Uploads convert on the host and copy synchronously. No transient device
@@ -285,9 +291,13 @@ fn with_backend<T>(args: &ServeArgs,
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
-    let onboarded_budget = admission.placement.expert_ranges.get(usize::from(
-        admission.ownership.execution().spec().entry_gpu)).filter(|range| range.layers > 0)
-        .map(|range| usize::try_from(range.peak_bytes)).transpose()?;
+    // The solved expert arenas: TP2 halves over two GPUs, else the entry GPU's whole layers.
+    let onboarded_budget = match &admission.placement.tp2 {
+        Some(range) => Some(OnboardBudget::Tp2([usize::try_from(range.peak_bytes[0])?, usize::try_from(range.peak_bytes[1])?])),
+        None => admission.placement.expert_ranges.get(usize::from(
+            admission.ownership.execution().spec().entry_gpu)).filter(|range| range.layers > 0)
+            .map(|range| usize::try_from(range.peak_bytes)).transpose()?.map(OnboardBudget::Whole),
+    };
     let predictor_budget = if args.mtp > 0 {
         let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::for_mtp(
             &checkpoint, usize::from(args.mtp))?.resident_bytes;
@@ -370,13 +380,19 @@ fn with_backend<T>(args: &ServeArgs,
                     inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
                     &available, &reserves, 92)?,
             };
-            // Onboarded EXL3 routed layers, whole on the entry GPU inside its solved expert arena.
+            // Onboarded EXL3 routed layers inside their solved expert arenas:
+            // TP2 halves over two GPUs, else whole on the entry GPU.
             let entry = usize::from(ownership.execution().spec().entry_gpu);
             let onboarded = ownership.onboarded_layers();
             if onboarded.is_empty() { return Ok(native); }
-            let peak = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
-            let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.join("rtx-tp1");
-            native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak)
+            ensure!(format.is_exl3(), "Step-5 RTX onboarding runs EXL3 experts today (FP8 follows)");
+            let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.to_path_buf();
+            match onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")? {
+                OnboardBudget::Whole(peak) => native.with_onboarded(devices[entry], &catalog, &package.join("rtx-tp1"),
+                    onboarded, inputs.unit_rows(), peak),
+                OnboardBudget::Tp2(peaks) => native.with_onboarded_tp2([devices[0], devices[1]], &catalog,
+                    &package.join("rtx-tp2"), onboarded, inputs.unit_rows(), peaks),
+            }
         })
     })?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
@@ -553,8 +569,8 @@ mod tests {
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
             startup: vec![],
-            onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::exl3(&catalog,
-                Some(&args.manifest), 256, args.rtx_expert_layers)?,
+            onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
+                Some(&args.manifest), 256, 2, 1, args.rtx_expert_layers)?,
         };
         for depth in 1..=3 {
             args.mtp = depth;

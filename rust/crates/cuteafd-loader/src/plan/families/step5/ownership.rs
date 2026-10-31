@@ -20,7 +20,7 @@ pub struct ExecutionOwnership {
     execution: LayerExecutionPlan,
     full: Vec<bool>,
     moe: Vec<bool>,
-    /// Routed layers whose experts run whole on the entry GPU (EXL3 onboarding).
+    /// Onboarded routed layers: whole on the one GPU, or TP2 halves over two.
     onboarded: Vec<usize>,
 }
 
@@ -60,10 +60,12 @@ impl ExecutionOwnership {
 
     /// Routed replies use the entry GPU intake and existing peer publication.
     /// Head exchanges between layers order reuse of the reply receive planes.
+    /// TP2-onboarded layers need none: the pair's combine leaves the routed sum
+    /// on every rank that holds the layer's FFN.
     pub fn routed_replications(&self) -> Result<Vec<Option<RoutedReplication>>> {
         let entry = self.execution.spec().entry_gpu;
         Ok(self.execution.modes().iter().enumerate().map(|(layer, mode)| {
-            if !self.moe[layer] || self.ranks == 1 { return None; }
+            if !self.moe[layer] || self.ranks == 1 || self.onboarded(layer) { return None; }
             let slot = match mode {
                 LayerMode::HeadSplit => 4,
                 LayerMode::Whole { gpu, .. } if *gpu != entry => 5,
@@ -75,12 +77,39 @@ impl ExecutionOwnership {
 
     pub fn ranks(&self) -> usize { self.ranks }
 
-    /// Binds the solved onboarded routed layers (whole on the entry GPU).
+    /// Binds the solved onboarded routed layers (whole on one GPU, TP2 over two).
     pub fn with_onboarded(mut self, layers: Vec<usize>) -> Result<Self> {
         ensure!(layers.windows(2).all(|p| p[0] < p[1]) && layers.iter().all(|&l| self.moe.get(l) == Some(&true)),
             "Step-5 onboarded layers must be sorted routed target layers");
         self.onboarded = layers;
+        self.execution.validate_routed_replications(&self.routed_replications()?)?;
+        // Two RTX: each direction of the TP2 partial exchange reuses its
+        // receive plane and flag under the same head-exchange ordering a
+        // routed replication needs (slot 4 head split, slot 5 to a whole owner).
+        if self.ranks == 2 {
+            for from in 0..2u8 {
+                let copies = self.execution.modes().iter().enumerate().map(|(layer, mode)| {
+                    if !self.onboarded(layer) { return Ok(None); }
+                    Ok(match (mode, self.routed_source(layer)?) {
+                        (LayerMode::HeadSplit, None) => Some(RoutedReplication { source: from, slot: 4, storage: 1 }),
+                        (_, Some(owner)) if usize::from(from) != owner =>
+                            Some(RoutedReplication { source: from, slot: 5, storage: 2 }),
+                        _ => None,
+                    })
+                }).collect::<Result<Vec<_>>>()?;
+                self.execution.validate_routed_replications(&copies)?;
+            }
+        }
         Ok(self)
+    }
+    /// The rank whose router, routes and wire rows a TP2-onboarded layer
+    /// broadcasts (a whole-owned layer's owner), or None when every FFN rank
+    /// routes itself (head split).
+    pub fn routed_source(&self, layer: usize) -> Result<Option<usize>> {
+        Ok(match self.execution.mode(layer)? {
+            LayerMode::Whole { gpu, .. } if self.ranks == 2 => Some(usize::from(gpu)),
+            _ => None,
+        })
     }
     pub fn onboarded(&self, layer: usize) -> bool { self.onboarded.binary_search(&layer).is_ok() }
     pub fn onboarded_layers(&self) -> &[usize] { &self.onboarded }

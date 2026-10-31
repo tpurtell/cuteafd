@@ -53,7 +53,24 @@ fn native_manifest(dir: &std::path::Path) -> std::path::PathBuf {
     let path = dir.join("PROGRAMS.json");
     std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"programs": programs,
         "capacities": {"max_context": 1048576}})).unwrap()).unwrap();
+    install_rtx_expert_packages(&path);
     path
+}
+
+/// The coordinator RTX expert packages every Step format onboards through:
+/// fp8moe (FP8, NVFP4 W4A4, BF16 tails) TP1/TP2 scratch tables and the EXL3
+/// rtx-tp1/rtx-tp2 trees, beside the program manifest as a WIP share holds them.
+fn install_rtx_expert_packages(manifest: &std::path::Path) {
+    let root = manifest.parent().unwrap();
+    for name in ["fp8-step5", "fp8-step5-nvfp4a4", "fp8-step5-bf16-weights"] {
+        let package = root.join("fp8").join(name);
+        for tp in ["tp1", "tp2"] { std::fs::create_dir_all(package.join(tp)).unwrap(); }
+        let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
+            serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
+        std::fs::write(package.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
+            "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}})).unwrap()).unwrap();
+    }
+    install_exl3_rtx_package(manifest);
 }
 
 fn report(dir: &std::path::Path, gpus: usize, gib: u64, ranks: usize, pool: Option<u64>) -> PlanReport {
@@ -1549,43 +1566,72 @@ fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<(
 
 /// The installed `exl3-step5-k46/rtx-tp1` package metadata beside PROGRAMS.json.
 fn install_exl3_rtx_package(manifest: &std::path::Path) {
-    let root = manifest.parent().unwrap().join("exl3/exl3-step5-k46/rtx-tp1");
+    for (tp, intermediate) in [(1, 1536), (2, 768)] {
+    let root = manifest.parent().unwrap().join(format!("exl3/exl3-step5-k46/rtx-tp{tp}"));
     for capacity in crate::placement::inventory::exl3_capacities(4096) {
         let path = root.join(format!("m{capacity}"));
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
-            "capacity": capacity, "hidden": 4096, "experts": 352, "intermediate": 1536, "top_k": 8,
+            "capacity": capacity, "hidden": 4096, "experts": 352, "intermediate": intermediate, "top_k": 8,
             "bits": [4, 6], "activation": "silu_post_clamp", "swiglu_limit": 7.0,
             "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
                 "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 64, "zero_on_create": false}}
         })).unwrap()).unwrap();
     }
+    }
 }
 
 #[test]
-fn exl3_two_rtx_onboards_whole_layers_and_sparks_keep_the_rest() {
+fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
+    use crate::placement::{ExpertHome, Onboard};
     let fixture = exl3_snapshot();
     let manifest = native_manifest(fixture.path());
-    install_exl3_rtx_package(&manifest);
-    let plan_with = |onboard: Option<crate::placement::Onboard>| plan::plan(fixture.path(), &PlanOptions {
+    let plan_with = |onboard: Option<Onboard>| plan::plan(fixture.path(), &PlanOptions {
         placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
             workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
         ..Default::default() }).unwrap();
     let auto = plan_with(None);
     assert!(auto.solver_placement.is_some(), "{:#?}", auto.hints);
-    let onboarded = auto.solver_placement.as_ref().unwrap().layers.iter()
-        .filter(|l| matches!(l.experts, crate::placement::ExpertHome::RtxWhole { gpu: 0 })).count();
-    assert!(onboarded > 0, "auto should onboard on a 96 GiB RTX: {:?}", auto.hints);
+    let solved = auto.solver_placement.as_ref().unwrap();
+    let onboarded = solved.layers.iter().filter(|l| l.experts == ExpertHome::RtxTp2).count();
+    assert!(onboarded > 0, "auto should onboard on two 96 GiB RTX: {:?}", auto.hints);
+    assert!(solved.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })),
+        "two RTX split every onboarded layer TP2");
+    // A contiguous routed prefix from layer 3, both GPUs charged their halves
+    // and the exchange planes.
+    let tp2 = solved.tp2.as_ref().expect("TP2 range");
+    assert_eq!((tp2.first, tp2.layers), (3, onboarded));
+    let exchange = super::admission::tp2_exchange_bytes(auto.prefill_unit_rows.unwrap() as usize,
+        auto.prefill_waves.unwrap() as usize).unwrap();
+    assert!(tp2.peak_bytes.iter().all(|&peak| peak > exchange));
     assert_eq!(auto.onboard_layers, Some(onboarded));
-    assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("onboarding")));
-    let none = plan_with(Some(crate::placement::Onboard::Layers(0)));
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("split TP2 over both RTX")));
+    let none = plan_with(Some(Onboard::Layers(0)));
     assert_eq!(none.onboard_layers, Some(0));
-    assert!(none.solver_placement.unwrap().layers.iter().all(|l|
-        !matches!(l.experts, crate::placement::ExpertHome::RtxWhole { .. })));
-    let solved = auto.solver_placement.unwrap();
+    assert!(none.solver_placement.unwrap().layers.iter().all(|l| l.experts == ExpertHome::Spark
+        || l.experts == ExpertHome::Dense));
     assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
-    eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers, pool {}", solved.pool_tokens);
+    eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
+}
+
+/// NVFP4 Step is deprecated: auto onboards nothing (with the named reason),
+/// an explicit layer count is refused.
+#[test]
+fn nvfp4_onboarding_is_refused_with_its_deprecation() {
+    let dir = snapshot("nvfp4");
+    let manifest = native_manifest(dir.path());
+    let plan_with = |onboard: Option<crate::placement::Onboard>| plan::plan(dir.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(4), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30],
+            workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
+        ..Default::default() }).unwrap();
+    let auto = plan_with(None);
+    assert_eq!(auto.onboard_layers, Some(0), "{:#?}", auto.hints);
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter()
+        .any(|n| n == super::admission::NVFP4_ONBOARDING_DEPRECATED));
+    let explicit = plan_with(Some(crate::placement::Onboard::Layers(2)));
+    assert!(explicit.hints.iter().any(|h| h.what.contains("Step-5 NVFP4 is deprecated")), "{:#?}", explicit.hints);
 }
 
 #[test]
@@ -1696,4 +1742,32 @@ fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
         .map(|r| r.key.bytes + r.value.bytes).sum::<u64>();
     assert_eq!(target(&reserve), target(&one));
     assert!(Step5CacheLayout::new(&cfg, 1, 1 << 20, 0, 4096, 2048, fp8).is_err());
+}
+
+/// Two RTX: an onboarded layer's result is summed on its FFN ranks by the TP2
+/// pair, so it never replicates; a whole layer's owner is its routed source.
+#[test]
+fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
+    use crate::placement::{FfnMode, LayerMode};
+    use super::ownership::{self, ExecutionOwnership};
+    let fixture = exl3_snapshot();
+    let cfg = Config::parse(&Checkpoint::open(fixture.path()).unwrap()).unwrap();
+    // CSA layers whole on GPU0 up to 47, then GPU1; SWA head split.
+    let modes = (0..92).map(|layer| if layer % 4 == 3 {
+        LayerMode::Whole { gpu: u8::from(layer > 47), ffn: FfnMode::Owner } } else { LayerMode::HeadSplit })
+        .collect::<Vec<_>>();
+    let owners = ExecutionOwnership::new(&cfg, 2, ownership::plan(&modes, 0, 0)).unwrap();
+    let before = owners.routed_replications().unwrap();
+    assert!(before[3].is_none() && before[4].is_some() && before[51].is_some(), "{before:?}");
+    let owners = owners.with_onboarded((3..60).collect()).unwrap();
+    let after = owners.routed_replications().unwrap();
+    assert!((3..60).all(|layer| after[layer].is_none()));
+    assert_eq!(after[60], before[60]);
+    assert_eq!(owners.routed_source(3).unwrap(), Some(0));
+    assert_eq!(owners.routed_source(51).unwrap(), Some(1));
+    assert_eq!(owners.routed_source(4).unwrap(), None);
+    // One unit, three lanes: three F32 partial planes plus routes and wire each.
+    let per_lane = 3 * 2752 * 4096 * 4 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * (4096 + 128);
+    assert_eq!(super::admission::tp2_exchange_bytes(2752, 3).unwrap(), 3 * per_lane as u64);
+    assert!(super::admission::tp2_exchange_bytes(0, 1).is_err() && super::admission::tp2_exchange_bytes(64, 5).is_err());
 }

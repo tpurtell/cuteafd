@@ -181,29 +181,76 @@ pub struct RuntimeInputs {
     pub peer_diagnostics: bool,
     pub pending_code: Vec<u64>,
     pub startup: Vec<Demand>,
-    /// RTX expert onboarding for checkpoints whose routed experts have an RTX
-    /// package (EXL3); `None` keeps every routed layer on the Sparks.
+    /// RTX expert onboarding (every routed format; pool-first `Auto` by
+    /// default); `None` only when onboarding is explicitly off.
     pub onboard: Option<OnboardInputs>,
 }
 
-/// Header-exact whole-layer costs (routed layers in order) and the entry
-/// GPU's expert arena; the solver chooses how many layers the RTX keeps.
+/// One rank's Step TP2 onboarding exchange planes beside the package arena:
+/// per prefill lane an F32 routed partial, the peer's F32 partial as received
+/// (one plane for head-split layers, one for a whole layer's owner, so the two
+/// exchanges never share storage) and the route broadcast scratch (packed
+/// top-8 routes plus FP8 K32 wire rows). The daemon allocates exactly these.
+pub fn tp2_exchange_bytes(unit_rows: usize, lanes: usize) -> Result<u64> {
+    const H: usize = 4096;
+    ensure!((1..=4096).contains(&unit_rows) && (1..=4).contains(&lanes), "Step-5 TP2 exchange geometry");
+    let plane = |bytes: usize| bytes.max(256) as u64;
+    let section = unit_rows * 8 * 4;
+    let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
+    let per_lane = 3 * plane(unit_rows * H * 4) + plane(routes + unit_rows * (H + H / 32));
+    (lanes as u64).checked_mul(per_lane).context("Step-5 TP2 exchange overflow")
+}
+
+/// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
+pub const NVFP4_ONBOARDING_DEPRECATED: &str = "Step-5 NVFP4 is deprecated (its cards retire this release): \
+    RTX expert onboarding is not built for it; its routed experts stay on the Sparks";
+/// FP8 Step onboards through the same shared pair once its fp8moe backend is
+/// bound (#925); until then the plan keeps every routed layer on the Sparks.
+pub const FP8_ONBOARDING_PENDING: &str = "Step-5 FP8 RTX expert onboarding is not bound yet (#925, after EXL3): \
+    its routed experts stay on the Sparks";
+
+/// The named reason a routed format does not onboard (yet), or None.
+pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog) -> Option<&'static str> {
+    use crate::formats::fp8_experts::ExpertFormat;
+    match catalog.fp8().map(|fp8| fp8.format()) {
+        Some(ExpertFormat::Nvfp4) => Some(NVFP4_ONBOARDING_DEPRECATED),
+        Some(_) => Some(FP8_ONBOARDING_PENDING),
+        None => None,
+    }
+}
+
+/// Header-exact costs of the routed layers in order (whole, and TP2 halves on
+/// two GPUs) and the installed package arenas; the shared solver chooses how
+/// many layers the RTX keeps (pool first).
 #[derive(Debug, Clone)]
 pub struct OnboardInputs {
     pub costs: Vec<ExpertCost>,
+    /// One GPU: the whole-layer (TP1) arena.
     pub workspace: u64,
+    /// Two GPUs: each rank's TP2 arena.
+    pub tp2_workspace: [u64; 2],
     pub mode: Onboard,
 }
 
 impl OnboardInputs {
-    /// Whole EXL3 layers on the entry GPU, from the checkpoint headers and the
-    /// installed `rtx-tp1` package at the admitted unit rows.
-    pub fn exl3(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, unit_rows: usize,
-        mode: Onboard) -> Result<Option<Self>> {
-        if catalog.exl3().is_none() || mode == Onboard::Layers(0) { return Ok(None); }
-        Ok(Some(Self { costs: crate::placement::rtx_onboard::expert_costs(catalog, false)?,
-            workspace: crate::placement::rtx_onboard::expert_workspace(catalog, manifest, unit_rows as u64, 1, "step5")?,
-            mode }))
+    /// The shared RTX onboarding inputs for any routed format: whole layers on
+    /// one GPU, TP2 halves over two, at the admitted unit rows.
+    pub fn new(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, unit_rows: usize,
+        gpus: usize, lanes: usize, mode: Onboard) -> Result<Option<Self>> {
+        use crate::placement::rtx_onboard::{expert_costs, expert_workspace};
+        ensure!(matches!(gpus, 1 | 2), "Step-5 RTX onboarding needs one or two GPUs");
+        if mode == Onboard::Layers(0) { return Ok(None); }
+        if let Some(reason) = onboarding_unavailable(catalog) {
+            ensure!(mode == Onboard::Auto, "{reason}");
+            return Ok(None);
+        }
+        let rows = unit_rows as u64;
+        let (workspace, tp2_workspace) = if gpus == 2 {
+            let half = expert_workspace(catalog, manifest, rows, 2, "step5")?
+                .checked_add(tp2_exchange_bytes(unit_rows, lanes)?).context("Step-5 TP2 workspace overflow")?;
+            (0, [half; 2])
+        } else { (expert_workspace(catalog, manifest, rows, 1, "step5")?, [0; 2]) };
+        Ok(Some(Self { costs: expert_costs(catalog, gpus == 2)?, workspace, tp2_workspace, mode }))
     }
 }
 
@@ -612,9 +659,10 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 startup: inputs.startup.clone(),
                 movables: vec![],
                 expert_workspace: inputs.onboard.as_ref().map_or(0, |o| o.workspace),
-                tp2_workspace: [0; 2],
+                tp2_workspace: inputs.onboard.as_ref().map_or([0; 2], |o| o.tp2_workspace),
                 onboard: inputs.onboard.as_ref().map_or(Onboard::Auto, |o| o.mode),
-                // Onboarded layers stay whole on the entry GPU, which owns the routed wave.
+                // One GPU holds whole layers; two split every onboarded layer
+                // TP2 (the solver's TP2 prefix takes its cap from GPU 0's).
                 expert_gpus: usize::from(inputs.onboard.is_some()),
                 minimum_expert_layers: 0,
                 policy: LayerPolicy {
@@ -666,10 +714,11 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 LayerExecutionPlan::new(&placement, inputs.hops())?,
             )?;
             let onboarded = placement.layers.iter().enumerate()
-                .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. }))
+                .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2))
                 .map(|(layer, l)| {
-                    ensure!(l.experts == ExpertHome::RtxWhole { gpu: inputs.hops().entry_gpu },
-                        "Step-5 onboarded layer {layer} is not on the routed entry GPU");
+                    ensure!(l.experts == if ranks == 2 { ExpertHome::RtxTp2 }
+                        else { ExpertHome::RtxWhole { gpu: inputs.hops().entry_gpu } },
+                        "Step-5 onboarded layer {layer}: whole on one GPU, TP2 over two");
                     Ok(layer)
                 }).collect::<Result<Vec<_>>>()?;
             let checked_ownership = checked_ownership.with_onboarded(onboarded)?;

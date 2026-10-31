@@ -58,13 +58,9 @@ pub(super) fn layout(
             && report.audio == MediaMode::Off,
         Unqualified("host embedding, draft or media owners")
     );
-    // EXL3 onboards whole routed layers on the entry GPU (planner decides how
-    // many); the official FP8/NVFP4 releases keep every routed layer on Sparks.
-    ensure!(
-        (exl3 || opts.onboard.is_none_or(|onboard| matches!(onboard, Onboard::Layers(0) | Onboard::Auto)))
-            && opts.local_expert_layers.is_none_or(|n| n == 0),
-        Unqualified("coordinator-local routed experts")
-    );
+    // Every format onboards through the shared RTX expert path (pool first by
+    // default); only all-local routed experts are unqualified.
+    ensure!(opts.local_expert_layers.is_none_or(|n| n == 0), Unqualified("coordinator-local routed experts"));
     let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;
     let checked_rows = usize::try_from(shape.unit_rows)?;
@@ -198,10 +194,8 @@ pub(super) fn layout(
         peer_diagnostics: false,
         pending_code: code,
         startup: vec![],
-        onboard: if exl3 {
-            super::admission::OnboardInputs::exl3(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
-                checked_rows, opts.onboard.unwrap_or(Onboard::Auto))?
-        } else { None },
+        onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
+            checked_rows, coordinators, waves, opts.onboard.unwrap_or(Onboard::Auto))?,
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.attention_placement = admitted.placement.attention_placement;
@@ -263,9 +257,12 @@ pub(super) fn layout(
         spark_ranks,
         prefill_lanes: 1,
     };
+    if let Some(reason) = super::admission::onboarding_unavailable(input.expert_catalog()?) {
+        memory.notes.push(reason.into());
+    }
     if !working.rtx_layers.is_empty() {
-        memory.notes.push(format!("Step-5 EXL3 onboarding: {} routed layers whole on the entry RTX {:?}",
-            working.rtx_layers.len(), working.rtx_layers));
+        memory.notes.push(format!("Step-5 RTX onboarding: {} routed layers {} {:?}", working.rtx_layers.len(),
+            if coordinators == 2 { "split TP2 over both RTX" } else { "whole on the RTX" }, working.rtx_layers));
     }
     let capacity = u32::try_from(shape.unit_rows)?;
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
