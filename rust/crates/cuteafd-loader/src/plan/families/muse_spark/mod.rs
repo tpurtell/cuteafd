@@ -6,9 +6,10 @@
 //! own config, quantization metadata and tensor headers.
 //!
 //! Routed experts are served from an EXL3 publication (K4 experts split per
-//! expert, K6 MCG core) as whole experts partitioned across Spark ranks
-//! (expert parallel): the per-expert output norm makes intermediate-sliced
-//! TP partials inexact, while whole experts keep TP's exchange and reply size.
+//! expert, K6 MCG core), intermediate-sliced across Spark ranks like every
+//! EXL3 family. The per-expert output norm needs each expert's complete
+//! output, so ranks reply per-expert partials (BF16 or NVFP4 by the
+//! per-request row cutoff) and the coordinator sums, norms and weights them.
 use std::collections::BTreeMap;
 
 use anyhow::{ensure, Result};
@@ -157,7 +158,8 @@ fn spec(cfg: &MuseSparkConfig, checkpoint: &Checkpoint) -> ModelSpec {
                 cfg.hidden, cfg.expert_hidden, cfg.experts, cfg.topk, cfg.moe_intermediate),
             format!("residual gates (temperature {}); head {} * tanh(logits * {:.4} / {})", cfg.residual_gate_temperature,
                 cfg.softcap, cfg.output_multiplier, cfg.softcap),
-            "Spark experts: whole experts partitioned across ranks (expert parallel), exact under the per-expert norm".into(),
+            "Spark experts: intermediate slices (TP); per-expert partials (BF16 at decode/verify, NVFP4 for prefill \
+                segments) normed and combined on the coordinator".into(),
             "no native MTP; external DFlash2 drafters (nvidia, RadixArk)".into(),
         ],
     }
@@ -287,7 +289,7 @@ impl FamilyModel for Model {
         (operand.exl3_bits().is_some_and(|bits| (4..=5).contains(&bits)) || norm).then(|| ExpertContract {
             package: PACKAGE.into(),
             block: 128,
-            spark_worlds: placement::EP_WORLDS.to_vec(),
+            spark_worlds: placement::SPARK_WORLDS.to_vec(),
             local: Err("Muse Spark routed experts (~400 GB at K4) cannot all be resident on the coordinators".into()),
         })
     }

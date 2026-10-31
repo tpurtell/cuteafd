@@ -7,7 +7,9 @@
 //! rings and exact sliding marks, pool first, then whole routed layers
 //! onboarded on the RTXs (the per-expert output norm needs each expert's
 //! complete output, so an onboarded layer is never TP2-halved). Sparks hold
-//! whole experts partitioned by the shared owner table (expert parallel).
+//! intermediate slices of every expert (TP, as every EXL3 family) and reply
+//! per-expert partials (BF16 or NVFP4 by the per-request row cutoff); the
+//! coordinator norms, weights and sums them (`replies.rs`).
 use crate::families::muse_spark::{core::CoreInventory, weight_layout::{GlobalLayout, LayerLayout}, MuseAttention,
     MuseSparkConfig};
 use crate::placement::*;
@@ -66,6 +68,8 @@ pub struct MuseInputs<'a> {
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub spark_budget_bytes: u64,
+    /// Rows a request may contribute to a step and still reply BF16 partials.
+    pub partial_bf16_max_rows: usize,
     /// Runtime-only exact demands (loaded code, step workspaces, peer exchange);
     /// the planner passes none until the family's PROGRAMS.json exists.
     pub fixed: Vec<Demand>,
@@ -79,7 +83,6 @@ pub struct MuseRequest {
     /// Per layer, per coordinator rank: the operands the device packs.
     pub layouts: Vec<Vec<LayerLayout>>,
     pub global: GlobalLayout,
-    pub owners: cuteafd_core::ExpertOwners,
     /// Per rank: the K6 programs it binds and their shared scratch.
     pub projections: Vec<crate::families::muse_spark::weight_layout::RankProjections>,
 }
@@ -106,18 +109,16 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
-        requested_pool, onboard, spark_budget_bytes, fixed: runtime_fixed, startup } = inputs;
+        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
     ensure!(spark_ranks > 0, "Muse Spark routed experts need Spark ranks");
     ensure!(slots > 0 && context > 0 && context <= cfg.max_position as u64,
         "Muse slots {slots} / context {context} outside 1..={}", cfg.max_position);
-    ensure!(catalog.whole_expert_outputs(), "Muse Spark experts must carry their post-expert norm");
+    ensure!(catalog.per_expert_output_norm(), "Muse Spark experts must carry their post-expert norm");
     let layouts = (0..cfg.layers).map(|layer| LayerLayout::ranks(cfg, layer, ranks, core))
         .collect::<Result<Vec<_>>>()?;
     let global = GlobalLayout::new(cfg, core)?;
-    let owners = cuteafd_core::ExpertOwners::staggered(cfg.layers, cfg.experts, spark_ranks)
-        .map_err(|error| anyhow::anyhow!("Muse whole-expert ownership: {error}"))?;
 
     // KV: full layers page BF16 K+V records; sliding layers keep a per-sequence
     // ring of window + one prefill unit (append-only, exact restores).
@@ -159,10 +160,13 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     fixed.push(Demand::new(0, Category::Embedding, "token embedding", global.embedding as u64, Basis::Exact));
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Weights, "lm head (K6)", global.head_bytes() as u64,
         Basis::Exact));
-    // Spark returns land on the coordinator: one prefill span of expert-width partials per rank.
-    fixed.push(Demand::new(0, Category::Transport, "Spark intake planes",
-        crate::serving_capacity::prefill_return_bytes(prefill.waves, prefill.unit_rows, spark_ranks as u64,
-            cfg.expert_hidden as u64), Basis::Formula));
+    // Spark partial replies land on the coordinator: per wave slot, every rank's
+    // worst-case mix of BF16 (decode/verify segments) and NVFP4 (prefill) partials.
+    let cutoff = crate::families::muse_spark::replies::Cutoff::new(partial_bf16_max_rows, 1)?;
+    let rank_reply = crate::families::muse_spark::replies::max_rank_bytes(cutoff,
+        usize::try_from(prefill.unit_rows)?, usize::try_from(slots)?, cfg.topk, cfg.expert_hidden) as u64;
+    fixed.push(Demand::new(0, Category::Transport, "Muse Spark partial reply planes",
+        rank_reply * spark_ranks as u64 * prefill.waves, Basis::Exact));
     fixed.extend(runtime_fixed);
 
     // Spark: whole experts partitioned by the shared owner table.
@@ -213,7 +217,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         executor,
     };
     spark_budget.constrain(&mut request)?;
-    Ok(MuseRequest { request, spark_budget, layouts, global, owners, projections })
+    Ok(MuseRequest { request, spark_budget, layouts, global, projections })
 }
 
 /// Admission: the same request solved and checked against the executor.

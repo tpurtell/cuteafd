@@ -43,11 +43,6 @@ pub struct V41Exl3Residency {
     /// Present only for compact runtime-width storage; legacy even splits stay unchanged.
     #[serde(skip)]
     pub unit_map: Option<cuteafd_core::tp_units::RankUnits>,
-    /// Whole-expert (expert-parallel) residency: the global ids this rank owns,
-    /// ascending; `experts` is their count and `global_to_combined` maps every
-    /// other global id to -1. `None` for intermediate-sliced TP.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owned_experts: Option<Vec<usize>>,
     pub buffers: Vec<V41Exl3ResidentBuffer>,
     pub loads: Vec<V41Exl3Load>,
 }
@@ -55,10 +50,6 @@ pub struct V41Exl3Residency {
 impl V41Exl3Residency {
     /// Installed code follows the storage contract, not a directory-name guess.
     pub fn aot_layout(&self) -> String {
-        if self.owned_experts.is_some() {
-            // One program serves every rank: owned counts are launch scalars.
-            return format!("ep{}", self.world);
-        }
         let compact = if self.unit_map.is_some() { "-compact" } else { "" };
         format!("tp{}{compact}-rank{}", self.world, self.rank)
     }
@@ -89,19 +80,13 @@ impl V41Exl3Residency {
         self.loads.iter().map(|l| l.bytes).max().unwrap_or(0)
     }
 
-    /// The checkpoint read slice: whole tensors for whole-expert residency.
-    fn read_slice(&self) -> (usize, usize) {
-        if self.owned_experts.is_some() { (1, 0) } else { (self.world, self.rank) }
-    }
-
     pub fn scratch_bytes(&self, catalog: &OfficialV41Catalog) -> Result<usize> {
-        let (world, rank) = self.read_slice();
         self.loads.iter().try_fold(0, |n, load| {
             let scratch = if let Some(map) = &self.unit_map {
                 catalog.exl3_tensor_gather(&load.tensor, map,
                     load.expert.context("compact EXL3 load lacks expert")?)?.scratch_bytes()
             } else {
-                catalog.exl3_tensor_slice(&load.tensor, world, rank)?.scratch_bytes()
+                catalog.exl3_tensor_slice(&load.tensor, self.world, self.rank)?.scratch_bytes()
             };
             Ok(n.max(scratch))
         })
@@ -121,13 +106,12 @@ impl V41Exl3Residency {
             .loads
             .get(index)
             .context("EXL3 load index out of range")?;
-        let (world, rank) = self.read_slice();
         if let Some(prefix) = load.tensor.strip_suffix(".trellis") {
             let mut mcg = [0u8; 4];
             catalog.read_exl3_tensor_into(
                 &format!("{prefix}.mcg"),
-                world,
-                rank,
+                self.world,
+                self.rank,
                 &mut mcg,
                 &mut [],
             )?;
@@ -146,7 +130,7 @@ impl V41Exl3Residency {
             staging[bytes..load.bytes].fill(0);
             load.bytes
         } else {
-            catalog.read_exl3_tensor_into(&load.tensor, world, rank, staging, scratch)?
+            catalog.read_exl3_tensor_into(&load.tensor, self.world, self.rank, staging, scratch)?
         };
         ensure!(bytes == load.bytes, "EXL3 residency/read size mismatch");
         if !load.tensor.ends_with(".trellis") {
@@ -163,10 +147,12 @@ impl V41Exl3Residency {
 }
 
 impl OfficialV41Catalog {
-    /// Whether the routed experts carry a per-expert output norm (applied to
-    /// each expert's whole output before its routing weight): such experts are
-    /// never sliced by intermediate; Spark ranks hold them whole (expert parallel).
-    pub fn whole_expert_outputs(&self) -> bool {
+    /// Whether the routed experts carry a per-expert output norm (Muse Spark's
+    /// `mlp.experts.post_expert_norm`), applied to each expert's complete output
+    /// before its routing weight. Intermediate-sliced Spark ranks cannot apply it:
+    /// they reply per-expert partials and the coordinator norms the sum. A layer
+    /// whole on one GPU (RTX onboarding) applies it in its route-norm sum.
+    pub fn per_expert_output_norm(&self) -> bool {
         // One binary search on the first routed layer's norm name (the catalog is
         // sorted); planners call this per layer and rank, so never scan.
         self.post_expert_norm_name(self.routed_experts().first_layer)
@@ -180,27 +166,20 @@ impl OfficialV41Catalog {
         down.split_once(".experts.").map(|(prefix, _)| format!("{prefix}.experts.post_expert_norm.weight"))
     }
 
-    /// The checkpoint's Spark residency for `rank` of `world`: whole experts
-    /// partitioned by the shared staggered owner table when the experts carry
-    /// a per-expert output norm, otherwise the balanced intermediate split.
+    /// The checkpoint's Spark residency for `rank` of `world`: the balanced
+    /// intermediate split (every family; a per-expert output norm moves to the
+    /// coordinator's combine).
     pub fn exl3_spark_residency(&self, layer: V41Exl3Layer, world: usize, rank: usize) -> Result<V41Exl3Residency> {
-        if self.whole_expert_outputs() {
-            let shape = self.routed_experts();
-            let owners = cuteafd_core::ExpertOwners::staggered(shape.layers, shape.experts, world)?;
-            return self.exl3_partitioned_residency(layer, &owners, rank);
-        }
         self.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?.balanced_residency(layer, world, rank)
     }
 
-    /// Whole-expert residency with the checkpoint's per-expert output norm:
-    /// when the layer stores `mlp.experts.post_expert_norm.weight` (BF16, the
-    /// expert width), its words ride as the `post_expert_norm` buffer's initial
-    /// payload, and the route-norm sum applies it. Absent, the sum is plain.
-    pub fn exl3_partitioned_residency(&self, layer: V41Exl3Layer, owners: &cuteafd_core::ExpertOwners,
-        rank: usize) -> Result<V41Exl3Residency> {
-        let manifest = self.exl3().context("whole-expert EXL3 residency needs trellis headers")?;
-        let mut plan = manifest.partitioned_residency(layer, owners, rank)?;
-        let V41Exl3Layer::Backbone(index) = layer else { unreachable!("partitioned residency is backbone-only") };
+    /// A routed layer whole on one GPU. With a per-expert output norm, the
+    /// layer's BF16 norm weight rides as the `post_expert_norm` buffer's initial
+    /// payload and the route-norm sum applies it before each routing weight.
+    pub fn exl3_whole_residency(&self, layer: V41Exl3Layer) -> Result<V41Exl3Residency> {
+        let manifest = self.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
+        let mut plan = manifest.residency(layer, 1, 0)?;
+        let V41Exl3Layer::Backbone(index) = layer else { return Ok(plan) };
         if let Some(norm) = self.post_expert_norm_name(index).filter(|norm| self.tensor(norm).is_ok()) {
             let tensor = self.tensor(&norm)?;
             ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16
@@ -299,54 +278,14 @@ impl V41Exl3Manifest {
         Ok(plan)
     }
 
-    /// Whole-expert residency of `rank` under `owners` (expert parallel): every
-    /// owned expert at its full intermediate width, packed in ascending global
-    /// id; routes to experts owned elsewhere map to -1 and are skipped.
-    pub fn partitioned_residency(&self, layer: V41Exl3Layer, owners: &cuteafd_core::ExpertOwners,
-        rank: usize) -> Result<V41Exl3Residency> {
-        let V41Exl3Layer::Backbone(index) = layer else {
-            anyhow::bail!("whole-expert EXL3 ownership covers backbone layers only");
-        };
-        ensure!(owners.experts() == self.experts.experts && index < owners.layers() && rank < owners.world,
-            "whole-expert owner table does not match the checkpoint's routed experts");
-        let owned = owners.owned(index, rank);
-        ensure!(!owned.is_empty(), "whole-expert rank {rank} owns no layer-{index} experts");
-        let mut plan = self.residency_of(layer, 1, 0, &owned)?;
-        plan.world = owners.world;
-        plan.rank = rank;
-        let map = owners.global_to_local(index, rank);
-        let buffer = plan.buffers.iter_mut().find(|b| b.name == "global_to_combined")
-            .context("EXL3 residency lacks its route map")?;
-        buffer.bytes = map.len() * 4;
-        buffer.initial_words = map;
-        plan.owned_experts = Some(owned);
-        Ok(plan)
-    }
-
     pub fn residency(
         &self,
         layer: V41Exl3Layer,
         world: usize,
         rank: usize,
     ) -> Result<V41Exl3Residency> {
-        let experts = match layer {
-            V41Exl3Layer::Backbone(_) => self.experts.experts,
-            V41Exl3Layer::Dspark(_) => self.experts.draft_experts,
-        };
-        self.residency_of(layer, world, rank, &(0..experts).collect::<Vec<_>>())
-    }
-
-    /// `selected` global experts (all of them for TP), intermediate partition
-    /// `rank` of `world`; local slots follow `selected`'s order.
-    fn residency_of(
-        &self,
-        layer: V41Exl3Layer,
-        world: usize,
-        rank: usize,
-        selected: &[usize],
-    ) -> Result<V41Exl3Residency> {
         let shape = self.experts;
-        let (draft, index, global) = match layer {
+        let (draft, index, experts) = match layer {
             V41Exl3Layer::Backbone(layer) => {
                 ensure!(layer < shape.layers, "EXL3 backbone layer out of range");
                 (false, layer, shape.experts)
@@ -356,14 +295,12 @@ impl V41Exl3Manifest {
                 (true, stage, shape.draft_experts)
             }
         };
-        let experts = selected.len();
         ensure!(
-            (1..=1024).contains(&experts) && selected.iter().all(|&e| e < global)
-                && selected.windows(2).all(|pair| pair[0] < pair[1]),
-            "EXL3 supports 1..1024 routed experts, selected ascending within the layer"
+            (1..=1024).contains(&experts),
+            "EXL3 supports 1..1024 routed experts"
         );
         let mut projections = Vec::with_capacity(experts);
-        for &expert in selected {
+        for expert in 0..experts {
             let mut row = Vec::new();
             for kind in [
                 V41Exl3ProjectionKind::Gate,
@@ -508,7 +445,6 @@ impl V41Exl3Manifest {
             tiers,
             projection_counts: counts,
             unit_map: None,
-            owned_experts: None,
             buffers,
             loads,
         })
@@ -588,56 +524,6 @@ mod tests {
                 eprintln!("EXL3 H{hidden}/I{intermediate}/E{experts} TP{world} allocated arena bytes old/compact: {allocated_bytes:?}");
             }
         }
-        Ok(())
-    }
-
-    #[test]
-    fn partitioned_whole_experts_cover_every_expert_once_at_full_width() -> Result<()> {
-        // Muse Spark geometry at fixture scale: whole experts, K4 with the empty K5 tier.
-        let manifest = fixture_geometry(&[4, 5], 4096, 4096, 256);
-        for world in [4, 6] {
-            let owners = cuteafd_core::ExpertOwners::staggered(1, 256, world)?;
-            let tp = manifest.residency(V41Exl3Layer::Backbone(0), 1, 0)?;
-            let source: usize = manifest.projections.values().map(|p| p.trellis_bytes()).sum();
-            let mut weights = 0;
-            let mut covered = vec![false; 256];
-            for rank in 0..world {
-                let plan = manifest.partitioned_residency(V41Exl3Layer::Backbone(0), &owners, rank)?;
-                let owned = plan.owned_experts.clone().unwrap();
-                assert_eq!((plan.world, plan.rank, plan.experts, plan.intermediate), (world, rank, owned.len(), 4096));
-                assert_eq!(plan.aot_layout(), format!("ep{world}"));
-                let map = &plan.buffers.iter().find(|b| b.name == "global_to_combined").unwrap().initial_words;
-                assert_eq!(map.len(), 256);
-                for (expert, &slot) in map.iter().enumerate() {
-                    if slot >= 0 {
-                        assert_eq!(owned[slot as usize], expert);
-                        assert!(!covered[expert]);
-                        covered[expert] = true;
-                    }
-                }
-                // Loads read whole tensors of owned experts only, packed contiguously per tier buffer.
-                assert_eq!(plan.loads.len(), owned.len() * 9);
-                for (local, loads) in plan.loads.chunks_exact(9).enumerate() {
-                    assert!(loads[0].tensor.starts_with(&format!("layers.0.ffn.experts.{}.", owned[local])));
-                }
-                for (buffer_id, buffer) in plan.buffers.iter().enumerate().filter(|(_, b)|
-                    b.name.ends_with("_w13") || b.name.ends_with("_w2")) {
-                    let mut spans: Vec<_> = plan.loads.iter().flat_map(|load| load.destinations.iter()
-                        .filter(move |(index, _)| *index == buffer_id)
-                        .map(move |(_, offset)| (*offset, *offset + load.bytes))).collect();
-                    spans.sort_unstable();
-                    let mut end = 0;
-                    for (start, next) in spans { assert_eq!(start, end); end = next; }
-                    assert_eq!(end, buffer.bytes);
-                    weights += buffer.bytes;
-                }
-                assert!(plan.bytes() < tp.bytes() / (world - 1));
-            }
-            assert!(covered.into_iter().all(|c| c));
-            assert_eq!(weights, source);
-        }
-        let owners = cuteafd_core::ExpertOwners::staggered(1, 255, 4)?;
-        assert!(manifest.partitioned_residency(V41Exl3Layer::Backbone(0), &owners, 0).is_err());
         Ok(())
     }
 

@@ -221,8 +221,8 @@ struct Manifest {
     /// BF16 decode pass); absent or `bf16`: BF16 rows.
     #[serde(default)]
     input_format: Option<String>,
-    /// Per-route post-expert RMSNorm epsilon: the sum normalizes each whole
-    /// expert's output before its routing weight (Muse Spark, expert parallel).
+    /// Per-route post-expert RMSNorm epsilon: the sum normalizes each expert's
+    /// complete output before its routing weight (Muse Spark layers whole on one GPU).
     #[serde(default)]
     route_norm_eps: Option<f64>,
 }
@@ -257,26 +257,19 @@ impl Manifest {
             "EXL3 compact storage/native contract mismatch");
         let descriptor = layout.buffers.iter().find(|buffer| buffer.name == "descriptor_map")
             .context("EXL3 residency lacks descriptor map")?;
-        // Descriptors are strided by the rank's own experts (the runtime tier counts).
-        let bytes = rows.checked_mul(layout.experts).and_then(|n| n.checked_mul(self.bits.len()))
+        let bytes = rows.checked_mul(self.experts).and_then(|n| n.checked_mul(self.bits.len()))
             .and_then(|n| n.checked_mul(4)).context("EXL3 descriptor extent overflow")?;
         ensure!(descriptor.bytes == bytes && descriptor.initial_words.len() == bytes / 4,
             "EXL3 resident descriptor extent mismatch");
-        // Whole-expert residency compiles the global route namespace; a rank
-        // holds (and the tier counts bound) only its owned experts.
-        let experts = layout.owned_experts.as_ref().map_or(layout.experts, |_| self.experts);
         ensure!(self.hidden == geometry.hidden as usize
                 && self.intermediate == layout.intermediate
-                && self.experts == experts && self.bits == layout.tiers
+                && self.experts == layout.experts && self.bits == layout.tiers
                 && self.swiglu_limit == geometry.swiglu_limit(),
             "EXL3 export/residency geometry mismatch");
-        ensure!(layout.owned_experts.as_ref().is_none_or(|owned| owned.len() <= self.experts
-                && owned.iter().all(|&expert| expert < self.experts)),
-            "EXL3 whole-expert ownership exceeds the export's route namespace");
         let norm = layout.buffers.iter().any(|buffer| buffer.name == "post_expert_norm");
-        ensure!(norm == self.route_norm_eps.is_some() && (!norm || layout.owned_experts.is_some()),
+        ensure!(norm == self.route_norm_eps.is_some() && (!norm || layout.world == 1),
             "EXL3 export and residency disagree on the per-route post-expert norm \
-             (it needs whole-expert residency and a route-norm export)");
+             (it needs a whole layer on one GPU and a route-norm export)");
         let topk = if matches!(layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
             && geometry.family() == Some("v41") { 3 } else { geometry.topk as usize };
         ensure!(self.top_k == topk, "EXL3 expert top-k mismatch");
@@ -701,7 +694,7 @@ impl<'a> Exl3Execution<'a> {
                 ("route_num_experts".into(), meta.experts as i32),
                 (
                     "weight_num_experts".into(),
-                    (weight.layout.experts * meta.bits.len()) as i32,
+                    (meta.experts * meta.bits.len()) as i32,
                 ),
             ]);
             for (tier, counts) in weight.layout.projection_counts.iter().enumerate() {
@@ -715,10 +708,8 @@ impl<'a> Exl3Execution<'a> {
                 ] {
                     pointers.insert(format!("t{tier}_{field}_ptr"), weight.buffer(&source)?);
                 }
-                // The combined namespace (descriptor stride) is the rank's own
-                // experts: all of them under TP, the owned ones under whole-expert residency.
                 for (name, value) in [
-                    ("num_experts", weight.layout.experts),
+                    ("num_experts", meta.experts),
                     ("fc2_experts", counts[2]),
                     ("gate_experts", counts[0]),
                     ("up_experts", counts[1]),
@@ -939,7 +930,7 @@ mod tests {
             let mut layout = V41Exl3Residency {
                 layer: V41Exl3Layer::Backbone(3), world: 6, rank: 0,
                 intermediate_start: 0, experts: geometry.experts as usize, intermediate: 384,
-                tiers: vec![4, 5], projection_counts: vec![], loads: vec![], owned_experts: None,
+                tiers: vec![4, 5], projection_counts: vec![], loads: vec![],
                 unit_map: compact.then(|| RankUnits::new(UnitRule::Rotated,
                     geometry.experts as usize, geometry.intermediate as usize, 128, 3, 6, 0)).transpose()?,
                 buffers: vec![V41Exl3ResidentBuffer { name: "descriptor_map".into(),
@@ -977,24 +968,22 @@ mod tests {
     }
 
     #[test]
-    fn whole_expert_residency_needs_the_route_norm_export_and_the_global_namespace() -> Result<()> {
+    fn route_norm_export_needs_a_whole_layer_with_its_norm_weight() -> Result<()> {
         use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
         let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
         let root = tempfile::tempdir()?;
-        let owned = (0..256).filter(|e| e % 6 == 1).collect::<Vec<_>>();
-        let layout = |norm: bool, owned: &[usize]| V41Exl3Residency {
-            layer: V41Exl3Layer::Backbone(1), world: 6, rank: 0, intermediate_start: 0,
-            experts: owned.len(), intermediate: 4096, tiers: vec![4, 5], projection_counts: vec![],
-            loads: vec![], unit_map: None, owned_experts: Some(owned.to_vec()),
-            buffers: [Some(V41Exl3ResidentBuffer { name: "descriptor_map".into(), bytes: 3 * owned.len() * 2 * 4,
-                initial_words: vec![0; 3 * owned.len() * 2] }),
+        let layout = |norm: bool, world: usize| V41Exl3Residency {
+            layer: V41Exl3Layer::Backbone(1), world, rank: 0, intermediate_start: 0,
+            experts: 256, intermediate: 4096 / world, tiers: vec![4, 5], projection_counts: vec![],
+            loads: vec![], unit_map: None,
+            buffers: [Some(V41Exl3ResidentBuffer { name: "descriptor_map".into(), bytes: 3 * 256 * 2 * 4,
+                initial_words: vec![0; 3 * 256 * 2] }),
                 norm.then(|| V41Exl3ResidentBuffer { name: "post_expert_norm".into(), bytes: 8192,
                     initial_words: vec![0; 2048] })].into_iter().flatten().collect(),
         };
-        // The export compiles the global route namespace; its descriptors use the owned stride.
-        let metadata = |route_norm: bool| serde_json::json!({
+        let metadata = |route_norm: bool, intermediate: usize| serde_json::json!({
             "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
-            "hidden":4096,"intermediate":4096,"experts":256,"capacity":16,"top_k":8,"bits":[4,5],
+            "hidden":4096,"intermediate":intermediate,"experts":256,"capacity":16,"top_k":8,"bits":[4,5],
             "swiglu_limit":null,"direct":false,"sms":48,"blocks_per_sm":1,"buffers":{},"objects":[],
             "trellis_lut":{"file":"lut","bytes":16,"sha256":"test"},
             "route_norm_eps": if route_norm { serde_json::json!(1e-8) } else { serde_json::Value::Null }
@@ -1004,13 +993,12 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&meta)?)?;
             Exl3Execution::validate_planned_residency(root.path(), layout, geometry)
         };
-        assert_eq!(layout(true, &owned).aot_layout(), "ep6");
-        check(metadata(true), &layout(true, &owned))?;
+        check(metadata(true, 4096), &layout(true, 1))?;
         // A plain sum would drop the norm; a norm export without the weight would read garbage.
-        assert!(check(metadata(false), &layout(true, &owned)).is_err());
-        assert!(check(metadata(true), &layout(false, &owned)).is_err());
-        // Owned ids must lie in the compiled route namespace.
-        assert!(check(metadata(true), &layout(true, &[3, 300])).is_err());
+        assert!(check(metadata(false, 4096), &layout(true, 1)).is_err());
+        assert!(check(metadata(true, 4096), &layout(false, 1)).is_err());
+        // An intermediate slice cannot apply the norm (partials are normed by the coordinator).
+        assert!(check(metadata(true, 1024), &layout(true, 4)).is_err());
         Ok(())
     }
 

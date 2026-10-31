@@ -36,6 +36,11 @@ pub(crate) struct ServeArgs {
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
+    /// Spark expert partial replies: a request contributing at most this many rows to a
+    /// step replies BF16, wider segments NVFP4 (the shared EXL3 worker's reply cutoff).
+    /// Must cover the widest verify step; the default keeps decode and verify lossless.
+    #[arg(long, default_value_t = cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)]
+    pub expert_partial_bf16_max_rows: usize,
     #[command(flatten)] pub prefix: crate::shared::prefix::PrefixArgs,
 }
 
@@ -60,14 +65,17 @@ impl ServeArgs {
             && self.devices.iter().collect::<std::collections::HashSet<_>>().len() == self.devices.len(),
             "Muse Spark coordinator devices must be distinct");
         let distinct = self.peers.iter().collect::<std::collections::HashSet<_>>().len();
-        ensure!((1..=8).contains(&self.peers.len()) && distinct == self.peers.len(),
-            "Muse Spark needs 1..=8 distinct Spark endpoints for its routed experts");
+        ensure!([2, 3, 4, 6].contains(&self.peers.len()) && distinct == self.peers.len(),
+            "Muse Spark serves its EXL3 TP experts on 2, 3, 4 or 6 distinct Spark endpoints");
         ensure!(self.max_context.is_none_or(|context| (1..=1 << 20).contains(&context)),
             "Muse Spark context exceeds the checkpoint's 1M extent");
         ensure!(self.spark_budget_gib.is_none_or(|gib| gib.is_finite() && gib > 0.0
             && gib < u64::MAX as f64 / (1u64 << 30) as f64),
             "Muse Spark requires a finite positive --spark-budget-gib");
         self.prefill()?;
+        // No drafter yet: a step appends at most the 64-row rollback step.
+        cuteafd_loader::families::muse_spark::replies::Cutoff::new(self.expert_partial_bf16_max_rows,
+            cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
             "Muse Spark serving requires exact prefix frontiers");
         Ok(())
@@ -99,10 +107,11 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                 .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
             max_context: args.max_context,
             pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
-            spark_budget_bytes: args.spark_budget_bytes() })?;
+            spark_budget_bytes: args.spark_budget_bytes(),
+            partial_bf16_max_rows: args.expert_partial_bf16_max_rows })?;
         tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
-            pool_tokens = placement.pool_tokens, owners = %&built.owners.fingerprint()[..12],
-            "Muse Spark admitted whole-expert ownership");
+            pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
+            "Muse Spark admitted TP experts with coordinator-combined partials");
         anyhow::bail!("Muse Spark execution engine is not built yet: admitted {} (pool {} tokens, {} RTX expert \
             layers); nothing was allocated", placement.summary(), placement.pool_tokens, placement.onboard_layers)
     });
@@ -134,6 +143,8 @@ mod tests {
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
+        assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
+        args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
         let single = args(&["--peers", PEERS, "--devices", "1"])?;
         single.validate()?;
         assert_eq!(single.devices, [1]);
@@ -162,7 +173,8 @@ mod tests {
             vec!["--peers", PEERS, "--devices", "0,1,2"], vec!["--peers", PEERS, "--devices", "0,0"],
             vec!["--peers", PEERS, "--max-context", "1048577"], vec!["--peers", PEERS, "--max-context", "0"],
             vec!["--peers", PEERS, "--spark-budget-gib", "0"], vec!["--peers", PEERS, "--spark-budget-gib", "NaN"],
-            vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"]] {
+            vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"],
+            vec!["--peers", PEERS, "--expert-partial-bf16-max-rows", "8"]] {
             assert!(args(&extra)?.validate().is_err(), "{extra:?}");
         }
         assert!(args(&["--peers", PEERS, "--max-sequences", "65"]).is_err());

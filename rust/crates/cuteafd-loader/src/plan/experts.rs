@@ -116,15 +116,14 @@ impl SparkRecipe {
         for layout in &self.required_layouts {
             let directory = root.join(layout);
             let artifact = directory.join("libcuteafd_fp8moe.so");
-            let exl3 = layout.contains("-rank") || layout.starts_with("ep");
-            let installed = if exl3 {
+            let installed = if layout.contains("-rank") {
                 // EXL3 links one module per capacity beneath each rank layout.
                 std::fs::read_dir(&directory).ok().is_some_and(|entries| entries.flatten().any(|entry|
                     entry.file_name().to_str().is_some_and(|name| name.starts_with('m'))
                         && entry.path().join("libcuteafd_exl3.so").is_file()))
             } else { artifact.is_file() };
             if !installed {
-                return Err(InstalledSparkRecipeRefusal::MissingArtifact(if exl3 {
+                return Err(InstalledSparkRecipeRefusal::MissingArtifact(if layout.contains("-rank") {
                     directory
                 } else { artifact }));
             }
@@ -215,22 +214,12 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
         && bits.bytes().all(|bit| (b'2'..=b'5').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
-        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
+        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "muse");
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
         || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
     let fp8 = format == "fp8" && matches!(family, "mimo" | "glm" | "glmf" | "qwen4" | "step5");
     let bf16 = family == "step5" && format == "bf16";
-    // Whole experts per rank (expert parallel): Muse Spark normalizes each
-    // expert's whole output before its routing weight, so nothing is sliced;
-    // every rank holds full-width experts and runs the one `ep<world>` export.
-    if family == "muse" && format.strip_prefix("exl3-k").is_some_and(|bits| bits == "45") {
-        if !(1..=8).contains(&world) || intermediate == 0 || intermediate % 128 != 0 {
-            return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block: 128 });
-        }
-        return Ok(SparkRecipe { slicing: Slicing::Blocks(128), widths: vec![intermediate; world],
-            rule: cuteafd_core::tp_units::UnitRule::Contiguous, required_layouts: vec![format!("ep{world}")] });
-    }
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
@@ -294,21 +283,13 @@ mod tests {
     }
 
     #[test]
-    fn muse_whole_experts_take_one_ep_layout_at_full_width() {
-        for world in 1..=8 {
-            let recipe = spark_recipe("muse:exl3-k45", 4096, world).unwrap();
-            assert_eq!(recipe.widths, vec![4096; world]);
-            assert_eq!(recipe.required_layouts, [format!("ep{world}")]);
-            assert_eq!(recipe.rank_for_layer(world - 1, 7), world - 1);
-        }
-        assert!(spark_recipe("muse:exl3-k45", 4096, 9).is_err());
-        assert!(spark_recipe("muse:exl3-k34", 4096, 6).is_err());
-        let root = tempfile::tempdir().unwrap();
-        let recipe = spark_recipe("muse:exl3-k45", 4096, 6).unwrap();
-        assert!(recipe.validate_installed(root.path(), 0, crate::formats::fp8_experts::Slicing::Blocks(128), 4096).is_err());
-        std::fs::create_dir_all(root.path().join("ep6/m2752")).unwrap();
-        std::fs::write(root.path().join("ep6/m2752/libcuteafd_exl3.so"), b"").unwrap();
-        recipe.validate_installed(root.path(), 5, crate::formats::fp8_experts::Slicing::Blocks(128), 4096).unwrap();
+    fn muse_slices_experts_like_every_exl3_family() {
+        // I 4096 = 32 H128 units: TP4 even, TP6 compact (5 or 6 units per rank).
+        let tp4 = spark_recipe("muse:exl3-k45", 4096, 4).unwrap();
+        assert_eq!(tp4.widths, vec![1024; 4]);
+        let tp6 = spark_recipe("muse:exl3-k45", 4096, 6).unwrap();
+        assert!(tp6.required_layouts.iter().all(|l| l.starts_with("tp6-compact-rank")), "{:?}", tp6.required_layouts);
+        assert!(spark_recipe("muse:exl3-k45", 4096, 5).is_err());
     }
 
     #[test]

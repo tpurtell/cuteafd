@@ -81,8 +81,10 @@ pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer
     let (layer, world, rank) = residency_selection(layer)?;
     let manifest = catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
     if spark { catalog.exl3_spark_residency(layer, world, rank) }
+        else if world == 1 { catalog.exl3_whole_residency(layer) }
         else {
-            anyhow::ensure!(world == 1 || !catalog.whole_expert_outputs(),
+            // A per-expert output norm needs each expert's complete output on the GPU.
+            anyhow::ensure!(!catalog.per_expert_output_norm(),
                 "experts with a per-expert output norm are whole on one GPU, never TP{world} halves");
             manifest.residency(layer, world, rank)
         }

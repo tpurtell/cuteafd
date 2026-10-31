@@ -1,8 +1,8 @@
 //! Muse Spark admission over the shared solver: header-exact coordinator
 //! weights (K6 core payload + H128 vectors, BF16/F32 rest), paged full-layer
 //! KV plus per-sequence sliding rings, pool first, then RTX expert onboarding
-//! of whole routed layers; Spark ranks hold whole experts partitioned by the
-//! shared owner table (expert parallel).
+//! of whole routed layers; Spark ranks hold intermediate slices of every expert
+//! and reply per-expert partials the coordinator combines.
 //!
 //! Header-only: coordinator graphs and step workspaces come from the family's
 //! installed PROGRAMS.json once its programs exist; until then this is a
@@ -12,9 +12,8 @@ use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-/// Spark worlds whole-expert ownership serves: every transport world whose
-/// ranks each own at least one expert (the EP program is world-independent).
-pub(super) const EP_WORLDS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+/// Spark worlds the EXL3 TP package serves (the shared EXL3 recipe's worlds).
+pub(super) const SPARK_WORLDS: [usize; 4] = [2, 3, 4, 6];
 use crate::placement::families::muse_spark::LANES;
 
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
@@ -83,6 +82,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         spark_ranks: ranks, prefill, slots, context, automatic_context: opts.context_tokens == 0,
         requested_pool: opts.pool_tokens.filter(|n| *n > 0), onboard: opts.onboard.unwrap_or(Onboard::Auto),
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
+        partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         fixed: match planned_code(opts, gpus) {
             Ok(fixed) => fixed,
             Err(error) => {
@@ -117,7 +117,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    let (spark_budget, owners) = (built.spark_budget, built.owners);
+    let spark_budget = built.spark_budget;
     memory.pool_tokens = placed.pool_tokens;
     memory.notes.push(format!("Muse selected RTX expert layers: {}; pool {} tokens; full-layer KV {} B/token over {} \
         layers; sliding rings {} B/sequence over {} layers", placed.onboard_layers, placed.pool_tokens,
@@ -139,7 +139,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         widest = widest.max(resident);
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
-            kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (whole experts, expert parallel)",
+            kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (intermediate slices)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::MUSE_SPARK,
             prefill.unit_rows as u32, false, rings, 0) {
@@ -151,8 +151,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         memory.devices.push(device);
     }
     report.spark_rank_share = if experts == 0 { 0.0 } else { widest as f64 / experts as f64 };
-    memory.notes.push(format!("Spark: whole experts over {ranks} ranks (owner table {}), widest rank {:.1} GiB of {:.1} GiB routed",
-        &owners.fingerprint()[..12], widest as f64 / GIB as f64, experts as f64 / GIB as f64));
+    memory.notes.push(format!("Spark: intermediate slices over {ranks} ranks, widest rank {:.1} GiB of {:.1} GiB routed",
+        widest as f64 / GIB as f64, experts as f64 / GIB as f64));
     memory
 }
 

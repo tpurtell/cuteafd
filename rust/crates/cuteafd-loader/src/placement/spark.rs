@@ -136,9 +136,6 @@ pub struct SparkAssignment {
 /// this same layout before allocating. Native shards may be replicated groups.
 #[derive(Debug, Clone, Copy)]
 pub enum SparkResidentLayout {
-    /// The checkpoint's EXL3 Spark residency: intermediate slices, or whole
-    /// experts partitioned across ranks when the experts carry a per-expert
-    /// output norm (`OfficialV41Catalog::exl3_spark_residency`).
     Exl3 { world: usize, rank: usize },
     Fp8 { world: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing },
     Native { world: usize, rank: usize, stored_width: usize },
@@ -163,11 +160,7 @@ impl SparkAssignment {
             let resident = match layout {
                 SparkResidentLayout::Exl3 { world, rank } => {
                     let plan = catalog.exl3_spark_residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
-                    slice.unit_map = match &plan.owned_experts {
-                        Some(_) => Some(cuteafd_core::ExpertOwners::staggered(geometry.layers as usize,
-                            geometry.experts as usize, world)?.fingerprint()),
-                        None => plan.unit_map.as_ref().map(|map| map.fingerprint()),
-                    };
+                    slice.unit_map = plan.unit_map.as_ref().map(|map| map.fingerprint());
                     slice.first = u32::try_from(plan.intermediate_start)?;
                     slice.width = u32::try_from(plan.intermediate)?;
                     slice.stored_width = slice.width;
@@ -287,7 +280,6 @@ impl SparkBudgetInventory {
     pub fn exl3(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
         endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
         budget: u64, estimated_reserve: u64) -> anyhow::Result<Self> {
-
         use anyhow::Context;
         let mut resident = Vec::new();
         let mut overhead = Vec::new();

@@ -46,6 +46,7 @@ pub(crate) struct Options<'a> {
     pub pool_tokens: Option<u64>,
     pub onboard: Onboard,
     pub spark_budget_bytes: u64,
+    pub partial_bf16_max_rows: usize,
 }
 
 /// Measured admission: the shared request with live baselines and the code the
@@ -69,7 +70,8 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
         gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill, slots: options.slots,
         mark_slots: options.mark_slots, context,
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
-        onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes, fixed, startup: Vec::new() })
+        onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
+        partial_bf16_max_rows: options.partial_bf16_max_rows, fixed, startup: Vec::new() })
 }
 
 #[cfg(test)]
@@ -141,7 +143,8 @@ mod tests {
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
                 max_context: None,
                 pool_tokens: None, onboard: Onboard::Auto,
-                spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES })?;
+                spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+                partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
             assert!(live.pool_tokens > 0);
         }
