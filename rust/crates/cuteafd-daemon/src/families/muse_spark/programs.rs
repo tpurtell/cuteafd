@@ -8,6 +8,10 @@
 use anyhow::Result;
 use cuteafd_ffi::programs::{Program, Programs};
 
+/// The shared rotary-table builder the sliding layers' tables come from
+/// (`rope_tables_bf16` at span 64; `shared/rope.rs`).
+pub(crate) const ROPE_TABLES: &str = "rope_s64_plain";
+
 /// (stem without prefix, pointer order). Head-dependent programs exist per prefix.
 pub(crate) const POINTWISE: &[(&str, &[&str])] = &[
     ("embed_norm", &["x", "out"]),
@@ -31,6 +35,7 @@ pub(crate) const POINTWISE: &[(&str, &[&str])] = &[
 
 pub(crate) const PER_HEADS: &[(&str, &[&str])] = &[
     // q plus each row's K|V record at kv_dst + kv_slots[row] * R (contract addendum 2026-10-31).
+    // cos/sin: the shared half-width table [P, 32] (contract addendum, rotary tables).
     ("qk_norm_rope_swa", &["q_raw", "k_raw", "v", "positions", "cos", "sin", "kv_slots", "q", "kv_dst"]),
     ("qk_norm_nope_full", &["q_raw", "k_raw", "v", "positions", "cos", "sin", "kv_slots", "q", "kv_dst"]),
     ("attention_output", &["attn", "gate", "out"]),

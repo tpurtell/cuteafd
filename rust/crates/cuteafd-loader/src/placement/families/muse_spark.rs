@@ -162,6 +162,12 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
                 scratch.bytes()? as u64, Basis::Exact));
         }
     }
+    // Sliding layers' RoPE tables (shared rope_tables_bf16, half width) over the context, on every GPU.
+    let rope = rope_tables(cfg, context)?;
+    for gpu in 0..ranks {
+        fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse RoPE tables",
+            rope.allocation_bytes, Basis::Exact));
+    }
     fixed.push(Demand::new(0, Category::Embedding, "token embedding", global.embedding as u64, Basis::Exact));
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Weights, "lm head (K6)", global.head_bytes() as u64,
         Basis::Exact));
@@ -230,6 +236,13 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     };
     spark_budget.constrain(&mut request)?;
     Ok(MuseRequest { request, spark_budget, layouts, global, projections })
+}
+
+/// The sliding layers' rotary tables: the module's default RoPE over the head
+/// (span 64, theta from the config), extent = the admitted context.
+pub fn rope_tables(cfg: &MuseSparkConfig, context: u64) -> Result<crate::plan::rope::Tables> {
+    crate::plan::rope::Tables::new(usize::try_from(context)?,
+        [crate::plan::rope::Recipe::new(cfg.head_dim, cfg.rope_theta, None)?])
 }
 
 /// Per GPU under TP2 onboarding: its own and its peer's BF16 partials for one

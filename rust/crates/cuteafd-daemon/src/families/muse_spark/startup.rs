@@ -15,8 +15,10 @@ pub(crate) fn preflight(manifest: &Path, gpus: usize) -> Result<serde_json::Valu
         .with_context(|| format!("Muse program manifest {}", manifest.display()))?)?;
     let names = inventory["programs"].as_array().context("Muse PROGRAMS.json has no program list")?
         .iter().filter_map(|program| program["name"].as_str()).collect::<std::collections::BTreeSet<_>>();
-    let missing = programs::required(gpus)?.into_iter().map(|(name, _)| name)
-        .filter(|name| !names.contains(name.as_str())).collect::<Vec<_>>();
+    let mut required = programs::required(gpus)?.into_iter().map(|(name, _)| name).collect::<Vec<_>>();
+    // The shared rotary-table builder (sliding layers, span 64).
+    required.push(programs::ROPE_TABLES.into());
+    let missing = required.into_iter().filter(|name| !names.contains(name.as_str())).collect::<Vec<_>>();
     ensure!(missing.is_empty(), "Muse Spark image lacks coordinator programs {missing:?}");
     Ok(inventory)
 }
@@ -82,8 +84,9 @@ mod tests {
     use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
 
     fn manifest(gpus: usize) -> serde_json::Value {
-        let programs = programs::required(gpus).unwrap().into_iter()
-            .map(|(name, _)| serde_json::json!({"name": name, "capacity_rows": 4096})).collect::<Vec<_>>();
+        let programs = programs::required(gpus).unwrap().into_iter().map(|(name, _)| name)
+            .chain([programs::ROPE_TABLES.to_string()])
+            .map(|name| serde_json::json!({"name": name, "capacity_rows": 4096})).collect::<Vec<_>>();
         serde_json::json!({"schema": 1, "programs": programs})
     }
 
