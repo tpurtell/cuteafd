@@ -4,6 +4,15 @@ use std::{ffi::c_void, fmt, marker::PhantomData, path::Path, rc::Rc};
 
 pub const ENCODER_NUMERICS: u32 = 1;
 pub const NO_VISION_OFFSET: u64 = u64::MAX;
+/// Native tower selector of Mistral Large 4's Pixtral tower (numerics 2).
+pub const MISTRAL_RESERVED: u32 = 4;
+
+/// LM rows an encode writes for a ViT patch grid: merged rows, plus one marker
+/// row per merged row for a span-writing tower.
+pub fn output_rows(grid: [usize; 2], span_markers: bool) -> usize {
+    let [h, w] = grid;
+    (h / 2) * (w / 2 + usize::from(span_markers))
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -229,6 +238,9 @@ pub struct NativeVision {
     max_tokens: usize,
     output_width: usize,
     patch_size: usize,
+    /// Mistral's Pixtral tower (reserved 4) emits its whole LM span: one
+    /// [IMG_BREAK]/[IMG_END] row after each merged row of [IMG] rows.
+    span_markers: bool,
     // CUDA and the BLAS handle never migrate away from their owner thread.
     _thread: PhantomData<Rc<()>>,
 }
@@ -281,6 +293,7 @@ impl NativeVision {
                 max_tokens: spec.max_tokens as usize,
                 output_width: spec.output_width as usize,
                 patch_size: if spec.abi_version == 1 { 16 } else { spec.patch_size as usize },
+                span_markers: spec.abi_version == 2 && spec.reserved == MISTRAL_RESERVED,
                 _thread: PhantomData,
             };
             check(create(&spec.raw()?, device, admitted_bytes, &mut result.owner))?;
@@ -315,7 +328,7 @@ impl NativeVision {
             || w % 2 != 0
             || patches > self.max_tokens * 4
             || rgb.len() != patches * self.patch_size * self.patch_size * 3
-            || output.len() != patches / 4 * self.output_width
+            || output.len() != output_rows(grid, self.span_markers) * self.output_width
         {
             return Err(VisionError::InvalidInput(
                 "vision RGB/grid/output extent mismatch",

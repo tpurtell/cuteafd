@@ -60,6 +60,7 @@ impl TowerSpec {
         let tensors = catalog(snapshot)?;
         let mut reads = Vec::new();
         let mut cursor = 0usize;
+        // Every tensor stays BF16: the shared RMS program reads BF16 gammas.
         let mut put = |name: &str, shape: &[usize], vector: bool| -> Result<u64> {
             let (path, metadata) = tensors.get(name).ok_or_else(|| VisionError::Unsupported(format!("missing {name}")))?;
             if metadata.dtype != DType::Bf16 || metadata.shape != shape
@@ -87,7 +88,7 @@ impl TowerSpec {
         }
         native.patch = put("vision_encoder.patch_conv.weight", &[HIDDEN, 3, PATCH, PATCH], false)?;
         // merger_extra: [ln_pre, merger, w_in, w_out, [IMG_BREAK] row, [IMG_END] row].
-        native.merger_extra[0] = put("vision_encoder.ln_pre.weight", &[HIDDEN], true)?;
+        native.merger_extra[0] = put("vision_encoder.ln_pre.weight", &[HIDDEN], false)?;
         for i in 0..DEPTH {
             let p = format!("vision_encoder.transformer.layers.{i}");
             // wq | wk | wv are adjacent so one GEMM produces the fused [q | k | v].
@@ -101,13 +102,13 @@ impl TowerSpec {
             let gate_up = put(&format!("{p}.feed_forward.w1.weight"), &[INTERMEDIATE, HIDDEN], false)?;
             put(&format!("{p}.feed_forward.w3.weight"), &[INTERMEDIATE, HIDDEN], false)?;
             let down = put(&format!("{p}.feed_forward.w2.weight"), &[HIDDEN, INTERMEDIATE], false)?;
-            let norm1 = put(&format!("{p}.attention_norm.weight"), &[HIDDEN], true)?;
-            let norm2 = put(&format!("{p}.ffn_norm.weight"), &[HIDDEN], true)?;
+            let norm1 = put(&format!("{p}.attention_norm.weight"), &[HIDDEN], false)?;
+            let norm2 = put(&format!("{p}.ffn_norm.weight"), &[HIDDEN], false)?;
             native.blocks[i] = VisionBlock { qkv, qkv_bias: NO_VISION_OFFSET, proj, proj_bias: NO_VISION_OFFSET,
                 gate_up, gate_up_bias: NO_VISION_OFFSET, down, down_bias: NO_VISION_OFFSET, norm1, norm2,
                 key0_bias: NO_VISION_OFFSET, window: 0, column_order: 0 };
         }
-        native.merger_norm = put("pre_mm_projector_norm.weight", &[HIDDEN], true)?;
+        native.merger_norm = put("pre_mm_projector_norm.weight", &[HIDDEN], false)?;
         native.merger_extra[1] = put("patch_merger.merging_layer.weight", &[HIDDEN, MERGED], false)?;
         native.merger_fc1 = put("vision_language_adapter.w_in.weight", &[LM_HIDDEN, HIDDEN], false)?;
         native.merger_fc2 = put("vision_language_adapter.w_out.weight", &[LM_HIDDEN, LM_HIDDEN], false)?;
@@ -150,6 +151,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_selector_and_span_rows_agree_with_the_ffi() {
+        assert_eq!(RESERVED, cuteafd_ffi::vision::MISTRAL_RESERVED);
+        let markers = Markers { image: 10, row_break: 12, end: 13 };
+        for (h, w) in [(2, 2), (6, 4), (110, 110), (2, 110)] {
+            assert_eq!(cuteafd_ffi::vision::output_rows([h, w], true), span_tokens(markers, h / 2, w / 2).len());
+            assert_eq!(cuteafd_ffi::vision::output_rows([h, w], false), h / 2 * (w / 2));
+        }
+    }
+
+    #[test]
     fn header_plan_reads_only_the_tower_and_two_marker_rows() {
         use cuteafd_loader::plan::testing;
         let dir = tempfile::tempdir().unwrap();
@@ -174,5 +185,22 @@ mod tests {
             assert_eq!(at("feed_forward.w3"), block.gate_up + 6144 * 2048 * 2);
         }
         assert_eq!(spec.image_family(), cuteafd_loader::media::ImageFamily::Mistral);
+    }
+
+    /// The planner's tower scratch (`mistral_scratch_bytes`) is the native
+    /// ledger's, byte for byte, at the full 55 x 55 capacity.
+    #[test]
+    #[ignore = "requires VISION_LIBRARY built with vision AOT (no CUDA initialization)"]
+    fn native_ledger_equals_the_planner_charge() {
+        use cuteafd_loader::plan::testing;
+        let library = std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
+        let spec = TowerSpec::from_snapshot(dir.path(), MAX_MERGED_TOKENS + 55).unwrap();
+        assert_eq!(spec.native.max_tokens as usize, MAX_MERGED_TOKENS);
+        let ledger = cuteafd_ffi::vision::NativeVision::required(&library, &spec.native).unwrap();
+        assert_eq!(ledger.weights, resident_weight_bytes());
+        assert_eq!(ledger.scratch + ledger.blas_workspace,
+            cuteafd_loader::plan::layout::mistral_scratch_bytes(MAX_MERGED_TOKENS as u64));
     }
 }

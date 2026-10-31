@@ -3,7 +3,8 @@
 //! Shared by the planner (charge, refusal) and the serving tower spec.
 use std::path::Path;
 
-/// Native tower selector (numerics 2): Qwen = 2, GLM Flash = 3, Mistral = 4.
+/// Native tower selector (numerics 2): Qwen = 2, GLM Flash = 3, Mistral = 4
+/// (`cuteafd_ffi::vision::MISTRAL_RESERVED`).
 pub const RESERVED: u32 = 4;
 pub const HIDDEN: usize = 2048;
 pub const DEPTH: usize = 30;
@@ -98,16 +99,15 @@ pub fn tower_tensors() -> Vec<(String, Vec<usize>)> {
     out
 }
 
-/// Resident arena bytes: BF16 matrices as stored, norm vectors promoted to FP32,
-/// the two marker embedding rows, and the 64 FP32 axial frequencies. Each
-/// extent is 256-byte aligned. Header-only; the planner charges this.
+/// Resident arena bytes: every tensor BF16 as stored (the shared RMS program
+/// reads BF16 gammas), the two marker embedding rows, and the 64 FP32 axial
+/// frequencies. Each extent is 256-byte aligned. Header-only; the planner charges this.
 pub fn resident_weight_bytes() -> u64 {
     let align = |n: u64| (n + 255) & !255;
     let mut bytes = 0;
     for (name, shape) in tower_tensors() {
         let _ = name;
-        let raw = shape.iter().product::<usize>() as u64 * 2;
-        bytes = align(bytes) + raw * if shape.len() == 1 { 2 } else { 1 };
+        bytes = align(bytes) + shape.iter().product::<usize>() as u64 * 2;
     }
     bytes = align(bytes) + 2 * LM_HIDDEN as u64 * 2;
     align(bytes) + (HEAD_DIM / 2) as u64 * 4
@@ -223,7 +223,7 @@ mod tests {
         let bytes = resident_weights(&checkpoint).unwrap();
         assert_eq!(bytes, resident_weight_bytes());
         // 30 x (4 x 2048^2 + 3 x 6144 x 2048) BF16 + patch, merger, adapter and two marker rows.
-        assert_eq!(bytes, 3_408_716_032);
+        assert_eq!(bytes, 3_408_462_080);
         let markers = Markers::from_snapshot(dir.path()).unwrap();
         assert_eq!(markers, Markers { image: 10, row_break: 12, end: 13 });
     }
