@@ -10,7 +10,7 @@
 //! cargo test -p cuteafd-daemon -- --ignored partial_reply_screen
 //! ```
 //!
-//! The snapshot is the Muse header fixture with real bytes in layer 0's experts
+//! The snapshot is the Muse header fixture (every layer) with real bytes in layer 0's experts
 //! 0..16 (seeded trellis payloads, small F16 rotations, the MCG marker) and its
 //! `post_expert_norm`; every other byte is a sparse hole (zero). Gates:
 //! 1. a mixed wave (decode, verify and a wide prefill segment) writes both
@@ -57,15 +57,20 @@ fn fill_layer0(dir: &Path) -> Result<()> {
         let routed = name.split(".experts.").nth(1).and_then(|t| t.split('.').next())
             .and_then(|e| e.parse::<usize>().ok()).is_some_and(|e| e < ROUTED);
         let norm = name.ends_with("post_expert_norm.weight") && layer0;
-        if !(layer0 && (routed || norm)) { continue; }
+        // Every expert of the layer loads (TP slices), so each needs the MCG marker; only routed ones carry data.
+        let marker = layer0 && name.ends_with(".mcg");
+        if !(layer0 && (routed || norm || marker)) { continue; }
         let range = meta["data_offsets"].as_array().context("offsets")?;
         let (start, end) = (range[0].as_u64().context("start")?, range[1].as_u64().context("end")?);
         let len = (end - start) as usize;
         let payload: Vec<u8> = if name.ends_with(".trellis") {
             (0..len).map(|_| (next() >> 24) as u8).collect()
         } else if name.ends_with(".suh") || name.ends_with(".svh") {
-            // F16 +/-1/64: a bounded rotation sign pattern.
-            (0..len / 2).flat_map(|_| if next() & 1 == 0 { 0x2400u16 } else { 0xa400 }.to_le_bytes()).collect()
+            // F16 +/-1/4 sign patterns: the output scales as (suh * svh)^3 over gate, up and down
+            // (1/4096 per projection gave ~1e-7), so 1/16 lands the partials near 1, in E4M3's
+            // normal range: the NVFP4 check sees real scales, not the 2^-9 floor, and nothing overflows.
+            let (plus, minus) = (0x3400u16, 0xb400u16);
+            (0..len / 2).flat_map(|_| if next() & 1 == 0 { plus } else { minus }.to_le_bytes()).collect()
         } else if name.ends_with(".mcg") {
             (0xcbac_1fedu32).to_le_bytes().to_vec()
         } else {
@@ -175,13 +180,16 @@ fn e4m3_decode(byte: u8) -> f32 {
 #[test]
 #[ignore = "requires an SM121 device, a native library with the Muse expert scope, its PROGRAMS.json and the exl3-muse-k45 package"]
 fn partial_reply_screen() -> Result<()> {
+    // First: native loading and the catalog read the process geometry (V4.1 by default once read).
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK)
+        .map_err(|other| anyhow::anyhow!("process expert geometry already {other:?}"))?;
     let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
     let programs = library.programs()?.with_manifest(Path::new(&std::env::var("CUTEAFD_PROGRAMS")?))?;
     let package = std::path::PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
     let dir = tempfile::tempdir_in(std::env::var("CUTEAFD_SCREEN_DIR")?)?;
-    cuteafd_loader::plan::testing::write_muse_spark_snapshot(dir.path(), &[0]);
+    // Every layer's expert headers (the catalog reads each indexed shard); payloads stay sparse holes.
+    cuteafd_loader::plan::testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
     fill_layer0(dir.path())?;
-    let _ = cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK);
     let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
     ensure!(catalog.per_expert_output_norm(), "screen snapshot lacks its post-expert norm");
     library.cuda_set_device(0)?;
@@ -220,42 +228,83 @@ fn partial_reply_screen() -> Result<()> {
         let (bf16, _) = screen.partial(&wave, wide, vec![0; wave.len()])?;
         let (all_wide, _) = screen.partial(&wave, wide, vec![1; wave.len()])?;
         let (mut worst, mut nonzero) = (0f32, 0usize);
+        let mut at_worst = String::new();
+        // Blocks with data and those whose scale is a normal E4M3 / non-floor UE8M0 (non-vacuous check).
+        let (mut live_blocks, mut normal_blocks, mut peak) = (0usize, 0usize, 0f32);
         for i in 0..wave.len() {
             for slot in 0..TOPK {
                 let exact: Vec<f32> = bf16[(i * TOPK + slot) * WIDTH * 2..][..WIDTH * 2].chunks_exact(2)
                     .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]]))).collect();
                 let coded = decode_wide(&all_wide[(i * TOPK + slot) * record..][..record], wide);
+                // NaN/inf would pass every max-based check below silently.
+                ensure!(exact.iter().chain(&coded).all(|v| v.is_finite()),
+                    "{wide:?}: row {i} slot {slot} has non-finite partials");
                 for block in (0..WIDTH).step_by(if wide == PartialWire::Nvfp4 { 16 } else { 32 }) {
                     let width = if wide == PartialWire::Nvfp4 { 16 } else { 32 };
                     let amax = exact[block..block + width].iter().fold(0f32, |m, v| m.max(v.abs()));
-                    // One format step at the block's scale, plus the BF16 rounding of `exact`.
-                    let step = if wide == PartialWire::Nvfp4 { amax / 6.0 } else { amax / 448.0 * 16.0 };
+                    // Half the widest grid gap at the block's decoded scale (NVFP4: gap 2 between 4
+                    // and 6; FP8: E4M3's 2^-3 relative step, and its subnormal step 2^-9 x scale),
+                    // plus the BF16 rounding of `exact`. The scale is read back, not assumed to be
+                    // amax/6: a block whose amax/6 underflows E4M3 takes the 2^-9 floor (contract).
+                    let record_bytes = &all_wide[(i * TOPK + slot) * record..][..record];
+                    let step = if wide == PartialWire::Nvfp4 {
+                        e4m3_decode(record_bytes[WIDTH / 2 + block / 16]).max(amax / 6.0)
+                    } else {
+                        let scale = (record_bytes[WIDTH + block / 32] as f32 - 127.0).exp2();
+                        (amax / 16.0).max(scale * (-9f32).exp2())
+                    };
+                    if amax > 0.0 {
+                        live_blocks += 1;
+                        peak = peak.max(amax);
+                        let byte = if wide == PartialWire::Nvfp4 { record_bytes[WIDTH / 2 + block / 16] }
+                            else { record_bytes[WIDTH + block / 32] };
+                        if if wide == PartialWire::Nvfp4 { byte & 0x78 != 0 } else { byte > 1 } { normal_blocks += 1; }
+                    }
                     for j in block..block + width {
                         let error = (coded[j] - exact[j]).abs();
-                        worst = worst.max(if step > 0.0 { error / (step + exact[j].abs() / 128.0) } else { error });
+                        let ratio = if step > 0.0 { error / (step + exact[j].abs() / 128.0) } else { error };
+                        if ratio > worst {
+                            worst = ratio;
+                            let record = &all_wide[(i * TOPK + slot) * record..][..record];
+                            let scale = if wide == PartialWire::Nvfp4 { record[WIDTH / 2 + block / 16] }
+                                else { record[WIDTH + block / 32] };
+                            at_worst = format!("row {i} slot {slot} col {j}: exact {:e} coded {:e} block amax {amax:e} \
+                                scale byte {scale:#04x}", exact[j], coded[j]);
+                        }
                     }
                 }
                 nonzero += exact.iter().filter(|v| **v != 0.0).count();
             }
         }
         ensure!(nonzero > wave.len() * TOPK * WIDTH / 2, "{wide:?}: BF16 partials are mostly zero (no data flowed)");
-        ensure!(worst <= 1.0, "{wide:?}: wide region exceeds its format step (worst {worst})");
+        ensure!(worst <= 1.0, "{wide:?}: wide region exceeds its format step (worst {worst}; {at_worst})");
+        ensure!(normal_blocks * 10 >= live_blocks * 9,
+            "{wide:?}: only {normal_blocks} of {live_blocks} blocks have normal scales (peak {peak:e}): the check is vacuous");
         // Gate 3: the routing-weighted top-k sum of BF16 partials ~ the weighted reply
         // (the package's v41_exl3_sum is the plain weighted sum; the norm is the combine's).
         let weighted = screen.weighted(&wave)?;
+        ensure!(weighted.chunks_exact(2).all(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])).is_finite()),
+            "weighted reply has non-finite values");
         let mut sum_error = 0f32;
         for (i, &row) in wave.iter().enumerate() {
             for c in 0..WIDTH {
                 let want = bf16_to_f32(u16::from_le_bytes([weighted[(i * WIDTH + c) * 2], weighted[(i * WIDTH + c) * 2 + 1]]));
-                let got: f32 = (0..TOPK).map(|k| {
+                let terms: Vec<f32> = (0..TOPK).map(|k| {
                     let at = ((i * TOPK + k) * WIDTH + c) * 2;
                     bf16_to_f32(u16::from_le_bytes([bf16[at], bf16[at + 1]])) / (2.0 + ((row + k) % 5) as f32)
-                }).sum();
-                sum_error = sum_error.max((got - want).abs() / want.abs().max(1e-3));
+                }).collect();
+                let got: f32 = terms.iter().sum();
+                // Relative to the routed magnitude: the top-k terms may cancel to ~0, where a
+                // per-element relative error is meaningless; each BF16 partial carries 2^-9.
+                let magnitude: f32 = terms.iter().map(|t| t.abs()).sum();
+                ensure!(magnitude > 0.0 || want == 0.0, "row {i} col {c}: zero partials, nonzero reply");
+                if magnitude > 0.0 { sum_error = sum_error.max((got - want).abs() / magnitude); }
             }
         }
-        ensure!(sum_error < 0.05, "{wide:?}: weighted sum of partials differs from the weighted reply ({sum_error})");
-        eprintln!("{wide:?}: rows invariant; wide/BF16 worst step ratio {worst:.3}; weighted-sum rel {sum_error:.4}");
+        // BF16 partials (2^-9 each) plus the reply's own BF16 rounding: well under 2^-6 of the magnitude.
+        ensure!(sum_error < 1.0 / 64.0, "{wide:?}: weighted sum of partials differs from the weighted reply ({sum_error})");
+        eprintln!("{wide:?}: rows invariant; wide/BF16 worst step ratio {worst:.3} over {normal_blocks}/{live_blocks} \
+            normal-scale blocks (peak {peak:e}); weighted-sum rel {sum_error:.4}");
     }
     // Gate 4: zero-row regions write nothing (all-BF16 leaves the wide area at its sentinel).
     let (payload, plan) = screen.partial(&wave, PartialWire::Nvfp4, vec![0; wave.len()])?;
