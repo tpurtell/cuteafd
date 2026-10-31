@@ -1481,7 +1481,7 @@ impl<'a> DflashDrafter<'a> {
                 let q_rows = self.cfg.heads * self.cfg.head_dim;
                 self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
                     context.kv.buffer.ptr, n, h, 2 * kv)?;
-                self.library.glm_dflash_qk_rope_width(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
+                self.library.glm_dflash_qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, context.slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
                     self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
@@ -1887,7 +1887,7 @@ impl<'a> DflashDrafter<'a> {
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-            alloc(self.library.glm_dflash_attention_workspace_width(sequences, c.kv_heads, RING + c.block, c.head_dim)?)?
+            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block, c.head_dim)?)?
         };
         Ok(Workspace {
             sequences,
@@ -2094,10 +2094,10 @@ impl<'a> DflashDrafter<'a> {
                 match (&layer.attention, &w.attention, &self.context) {
                     (DraftAttention::Gqa(a), AttentionWorkspace::Gqa(attention), DraftContext::Gqa(_)) => {
                         self.linear(w.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
-                        l.glm_dflash_qk_rope_width(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
+                        l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             rows, c.heads, c.kv_heads, c.theta, eps, false, c.head_dim, s)?;
-                        l.glm_dflash_attention_width(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
+                        l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
                             attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
