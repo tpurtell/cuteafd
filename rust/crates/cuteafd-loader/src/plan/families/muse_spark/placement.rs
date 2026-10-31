@@ -82,7 +82,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
         partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         partial_wide_format: Default::default(),
-        local_workspace: match crate::placement::families::muse_spark::local_workspace(catalog,
+        local: match crate::placement::families::muse_spark::local_workspace(catalog,
             opts.workspace_manifest.as_deref().filter(|path| path.is_file()), gpus, prefill.unit_rows) {
             Ok(workspace) => workspace,
             Err(error) => {
@@ -124,6 +124,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    if let Err(error) = built.local.check(&placed) {
+        refusal(report, format!("Muse Spark coordinator admission refused: {error:#}"),
+            "Rebuild the image with the Muse coordinator scope (its EXL3 rtx-tp1/rtx-tp2 package).");
+        return memory;
+    }
     let spark_budget = built.spark_budget;
     memory.pool_tokens = placed.pool_tokens;
     memory.notes.push(format!("Muse selected RTX expert layers: {}; pool {} tokens; full-layer KV {} B/token over {} \

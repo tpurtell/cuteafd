@@ -50,8 +50,8 @@ pub(crate) struct Options<'a> {
     pub spark_budget_bytes: u64,
     pub partial_bf16_max_rows: usize,
     pub partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
-    /// The onboarding executor's workspace (`shared::local_workspace`).
-    pub local_workspace: Option<u64>,
+    /// The coordinator EXL3 package state (`shared::local_workspace`).
+    pub local: shared::LocalPackage,
 }
 
 /// Measured admission: the shared request with live baselines and the code the
@@ -77,7 +77,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
-        local_workspace: options.local_workspace, fixed, startup: Vec::new() })
+        local: options.local, fixed, startup: Vec::new() })
 }
 
 #[cfg(test)]
@@ -123,8 +123,11 @@ mod tests {
         let checkpoint = input.checkpoint();
         let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
         let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        let mut refused = 0;
         for (gpus, sparks) in [(2, 6), (2, 4), (1, 6)] {
-            let path = dir.path().join(format!("PROGRAMS-{gpus}.json"));
+            // A complete image: the program manifest with the coordinator EXL3 package beside it.
+            let image = dir.path().join(format!("image-{gpus}"));
+            let path = testing::write_muse_exl3_capacities(&image);
             std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
             let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
             let opts = LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
@@ -153,10 +156,31 @@ mod tests {
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_wide_format: Default::default(),
-                local_workspace: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)? })?;
+                local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)? })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
             assert!(live.pool_tokens > 0);
+            // The same image without its package: startup refuses whenever the placement
+            // onboards, never serving the layers from the Sparks instead.
+            if live.onboard_layers > 0 {
+                std::fs::remove_dir_all(image.join("share/exl3"))?;
+                let local = shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?;
+                assert!(matches!(local, shared::LocalPackage::Missing(_)));
+                let error = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+                    manifest: &inventory,
+                    measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+                        untracked_bytes: arch.context_bytes }; gpus],
+                    headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+                    mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
+                        shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
+                    max_context: None, pool_tokens: None, onboard: Onboard::Auto,
+                    spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+                    partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+                    partial_wide_format: Default::default(), local }).err().expect("missing package refuses").to_string();
+                assert!(error.contains("rebuild with the Muse coordinator scope"), "{error}");
+                refused += 1;
+            }
         }
+        assert!(refused > 0, "no layout onboarded, so the missing-package refusal went unexercised");
         Ok(())
     }
 

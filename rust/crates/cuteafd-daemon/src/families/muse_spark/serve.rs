@@ -117,7 +117,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             spark_budget_bytes: args.spark_budget_bytes(),
             partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
             partial_wide_format: args.expert_partial_wide_format,
-            local_workspace: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
+            local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
                 Some(&args.manifest), gpus, args.prefill()?.unit_rows)? })?;
         tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
             pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),

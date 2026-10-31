@@ -73,10 +73,8 @@ pub struct MuseInputs<'a> {
     /// and the format of wider segments.
     pub partial_bf16_max_rows: usize,
     pub partial_wide_format: crate::families::muse_spark::replies::WideFormat,
-    /// Per GPU: the onboarded-layer EXL3 executor's workspace (`local_package`),
-    /// charged with the partial planes when a layer onboards; None leaves
-    /// onboarding out (no coordinator package in this build).
-    pub local_workspace: Option<u64>,
+    /// The coordinator EXL3 package for onboarded layers (`local_package`).
+    pub local: LocalPackage,
     /// Runtime-only exact demands (loaded code, step workspaces, peer exchange);
     /// the planner passes none until the family's PROGRAMS.json exists.
     pub fixed: Vec<Demand>,
@@ -86,6 +84,8 @@ pub struct MuseInputs<'a> {
 /// The request plus what the caller reports or uploads from it.
 pub struct MuseRequest {
     pub request: PlacementRequest,
+    /// The coordinator package state the request was built with.
+    pub local: LocalPackage,
     pub spark_budget: SparkBudgetInventory,
     /// Per layer, per coordinator rank: the operands the device packs.
     pub layouts: Vec<Vec<LayerLayout>>,
@@ -116,19 +116,18 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
-        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format, local_workspace,
+        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format, local,
         fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
-    // Without the coordinator package nothing can onboard: automatic placement
-    // keeps its pool-first solve with no expert GPU (every layer on the Sparks);
-    // an explicit layer count is refused.
-    let expert_gpus = match (local_workspace, onboard) {
-        (Some(_), _) => ranks,
-        (None, Onboard::Layers(0) | Onboard::Auto) => 0,
-        (None, other) => anyhow::bail!("Muse onboarding ({other:?}) needs the coordinator EXL3 package \
-            (exl3-muse-k45/{}): this build has none", if ranks == 2 { "rtx-tp2" } else { "rtx-tp1" }),
-    };
+    // Onboarding always enters the solve: a missing package never turns an
+    // automatic placement Spark-only (`check_package` refuses it once memory
+    // places a layer); an explicit layer count without it is refused here.
+    if let LocalPackage::Missing(package) = &local {
+        let explicit = matches!(onboard, Onboard::Layers(n) if n > 0) || matches!(onboard, Onboard::Fraction(f) if f > 0.0);
+        ensure!(!explicit, "{}", LocalPackage::refusal(package));
+    }
+    let local_workspace = local.workspace();
     let pair = ranks == 2;
     ensure!(spark_ranks > 0, "Muse Spark routed experts need Spark ranks");
     ensure!(slots > 0 && context > 0 && context <= cfg.max_position as u64,
@@ -259,13 +258,13 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         // partial combine (ranks 1), charged once the GPU holds a routed layer.
         startup, movables: Vec::new(),
         expert_workspace: if pair { 0 } else {
-            (tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) / 2) as u64 + local_workspace.unwrap_or(0) },
+            (tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) / 2) as u64 + local_workspace },
         // TP2 onboarding (opened only when a layer onboards): both GPUs' BF16 partials
         // for one unit (own + peer over P2P) feed the same partial combine (ranks 2).
         tp2_workspace: if pair {
-            [tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) as u64 + local_workspace.unwrap_or(0); 2]
+            [tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) as u64 + local_workspace; 2]
         } else { [0; 2] },
-        onboard, expert_gpus, minimum_expert_layers: 0,
+        onboard, expert_gpus: ranks, minimum_expert_layers: 0,
         policy: LayerPolicy { default: modes.to_vec(), ownership: LayerOwnership::Ranges,
             expert_ownership: ExpertOwnership::Contiguous, ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
@@ -274,7 +273,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         executor,
     };
     spark_budget.constrain(&mut request)?;
-    Ok(MuseRequest { request, spark_budget, layouts, global, projections })
+    Ok(MuseRequest { request, local, spark_budget, layouts, global, projections })
 }
 
 /// The step metadata a rank allocates: a bank per in-flight prefill slot and a
@@ -314,7 +313,40 @@ pub fn placement(inputs: MuseInputs<'_>) -> Result<(MuseRequest, Placement)> {
     let built = request(inputs)?;
     let placed = solve(&built.request)?;
     built.request.executor.check(&placed)?;
+    built.local.check(&placed)?;
     Ok((built, placed))
+}
+
+/// The coordinator EXL3 package for onboarded layers, as the image carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalPackage {
+    /// Installed; its per-GPU executor workspace (`local_package`).
+    Installed(u64),
+    /// The image's manifest is known but the package beside it is not (a
+    /// broken image): any onboarded layer the placement chooses is refused.
+    Missing(String),
+    /// No image to inspect (a plan without a manifest): onboarding is planned,
+    /// the package's workspace uncharged.
+    Unknown,
+}
+
+impl LocalPackage {
+    pub fn workspace(&self) -> u64 { if let Self::Installed(bytes) = self { *bytes } else { 0 } }
+
+    fn refusal(package: &str) -> String {
+        format!("image lacks {package}; rebuild with the Muse coordinator scope")
+    }
+
+    /// Refuses a placement that onboards a layer this image cannot run: the
+    /// solve kept onboarding in, so automatic placement lands on 0 RTX layers
+    /// only when memory says 0, never because the package is missing.
+    pub fn check(&self, placed: &Placement) -> Result<()> {
+        if let Self::Missing(package) = self {
+            ensure!(placed.onboard_layers == 0, "{} (the placement onboards {} RTX expert layers)",
+                Self::refusal(package), placed.onboard_layers);
+        }
+        Ok(())
+    }
 }
 
 /// A missing coordinator EXL3 package (onboarding unavailable in this build).
@@ -359,19 +391,18 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &std::path::
     Ok((package, workspace))
 }
 
-/// The onboarding executor workspace both the planner and startup charge: the
-/// installed package's, None when the build carries no coordinator package
-/// (or no manifest is known), any other inventory error refused.
+/// The coordinator package state both the planner and startup build from:
+/// installed (its workspace charged), missing beside a known manifest, or
+/// unknown without one; any other inventory error refused.
 pub fn local_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, gpus: usize,
-    unit_rows: u64) -> Result<Option<u64>> {
-    let Some(manifest) = manifest else { return Ok(None) };
+    unit_rows: u64) -> Result<LocalPackage> {
+    let Some(manifest) = manifest else { return Ok(LocalPackage::Unknown) };
     match local_package(catalog, manifest, gpus, unit_rows) {
-        Ok((_, workspace)) => Ok(Some(workspace)),
-        Err(error) if error.is::<MissingLocalPackage>() => {
-            tracing::info!(reason = %error, "Muse RTX onboarding package unavailable; experts stay on the Sparks");
-            Ok(None)
-        }
-        Err(error) => Err(error),
+        Ok((_, workspace)) => Ok(LocalPackage::Installed(workspace)),
+        Err(error) => match error.downcast::<MissingLocalPackage>() {
+            Ok(MissingLocalPackage(package)) => Ok(LocalPackage::Missing(package)),
+            Err(error) => Err(error),
+        },
     }
 }
 

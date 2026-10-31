@@ -214,12 +214,28 @@ fn onboarding_follows_the_installed_package() {
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let mut auto = with_layout(2, 6);
     auto.layout.as_mut().unwrap().host_cache_bytes = None;
-    let report = input.plan(&auto).unwrap();
-    assert_eq!(report.onboard_layers, Some(0), "{:?}", report.hints);
-    let mut explicit = auto.clone();
+    // An image whose manifest lacks the package beside it: the automatic placement
+    // onboards (memory says it fits), so the plan refuses rather than going Spark-only.
+    let broken = tempfile::tempdir().unwrap();
+    let manifest = broken.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, b"{}").unwrap();
+    let mut missing = auto.clone();
+    missing.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+    let refused = input.plan(&missing).unwrap();
+    assert!(refused.solver_placement.is_none(), "a missing package must refuse, not degrade");
+    assert!(refused.hints.iter().any(|h| h.what.contains("image lacks exl3-muse-k45/rtx-tp2; rebuild with the Muse \
+        coordinator scope")), "{:?}", refused.hints);
+    let mut explicit = missing.clone();
     explicit.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(2));
     let refused = input.plan(&explicit).unwrap();
-    assert!(refused.hints.iter().any(|h| h.what.contains("needs the coordinator EXL3 package")), "{:?}", refused.hints);
+    assert!(refused.hints.iter().any(|h| h.what.contains("image lacks exl3-muse-k45/rtx-tp2")), "{:?}", refused.hints);
+    // Explicit 0 is a labelled measurement arm; it needs no package.
+    let mut zero = missing.clone();
+    zero.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(0));
+    assert_eq!(input.plan(&zero).unwrap().onboard_layers, Some(0));
+    // Without any image (a bare plan) onboarding is planned as the default.
+    let report = input.plan(&auto).unwrap();
+    assert!(report.onboard_layers.is_some_and(|n| n > 0), "{:?}", report.hints);
     let package = tempfile::tempdir().unwrap();
     let manifest = testing::write_muse_exl3_capacities(package.path());
     let mut installed = auto.clone();
@@ -233,4 +249,25 @@ fn onboarding_follows_the_installed_package() {
     let partials = crate::placement::families::muse_spark::tp2_partial_bytes(&cfg, 2752) as u64;
     let tp2 = placed.tp2.as_ref().unwrap();
     assert!(tp2.peak_bytes.iter().all(|&bytes| bytes >= partials + workspace), "{:?} vs {}", tp2.peak_bytes, partials + workspace);
+}
+
+/// Automatic placement lands on 0 RTX layers only when memory says 0: with
+/// no room for an onboarded layer, an image without the package still plans
+/// (all-Spark), because the package was never the reason.
+#[test]
+fn missing_package_is_harmless_only_when_memory_onboards_nothing() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let broken = tempfile::tempdir().unwrap();
+    let manifest = broken.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, b"{}").unwrap();
+    // One RTX at the default automatic context: the pool takes the GPU (onboarding 0).
+    let mut one = with_layout(1, 6);
+    one.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+    let unpackaged = input.plan(&one).unwrap();
+    let bare = input.plan(&with_layout(1, 6)).unwrap();
+    assert_eq!(bare.onboard_layers, Some(0), "{:?}", bare.hints);
+    assert_eq!(unpackaged.onboard_layers, Some(0), "{:?}", unpackaged.hints);
+    // It plans (the manifest only adds the image's loaded-code demand).
+    assert!(unpackaged.solver_placement.as_ref().is_some_and(|p| p.pool_tokens > 0), "{:?}", unpackaged.hints);
 }
