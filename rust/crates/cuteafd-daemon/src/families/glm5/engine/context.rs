@@ -231,7 +231,11 @@ impl<'a> GlmEngine<'a> {
                 } else {
                     e.producer(self.rank, self.w, self.layer, self.rows, "m64", kv.buffer, self.w.query.buffer.ptr)?;
                 }
-                Ok(Query { values: self.w.query.buffer.ptr, row_pitch: e.cfg.heads / 2 * e.cfg.latent_dim(self.index) * 2 })
+                // Each layer's own latent width (576, or 512 on NoPE layers): the assembled
+                // [rows, 64, latent] query the layer's partial reads.
+                let half = e.cfg.heads / 2 * e.cfg.latent_dim(self.index) * 2;
+                Ok(Query { values: self.w.query.buffer.ptr, row_pitch: half,
+                    width: (!e.cfg.variant.is_glm()).then_some(half) })
             }
             fn score(&mut self) -> Result<Option<Candidates>> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);

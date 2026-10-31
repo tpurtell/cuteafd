@@ -70,14 +70,23 @@ impl CoreStageLayout {
             .ok_or_else(|| anyhow::anyhow!("GLM K6 stage extent overflow"));
         // `qkv`: the packed [q_a | kv_a] rows (direct-query variants: kv_a alone);
         // `q`: the widest K6 output staged before its crop/pack (q_b or the
-        // direct query, q_a, or the padded kv_a).
-        Ok(Self { extents: BTreeMap::from([
+        // direct query, q_a, or the padded kv_a); a direct-query variant's indexer
+        // also stages LayerNorm(x) there (hidden wide, over a head split's 32 heads).
+        let direct = cfg.q_lora_rank == 0;
+        let mut extents = BTreeMap::from([
             ("qkv", bf16(cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim)?),
             ("q", bf16((heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim))
-                .max(cfg.q_lora_rank).max((cfg.kv_lora_rank + cfg.qk_rope_head_dim).next_multiple_of(128)))?),
+                .max(cfg.q_lora_rank).max((cfg.kv_lora_rank + cfg.qk_rope_head_dim).next_multiple_of(128))
+                .max(if direct { cfg.hidden } else { 0 }))?),
             ("gate", bf16(intermediate)?), ("up", bf16(intermediate)?),
             ("hidden", bf16(intermediate)?), ("values", bf16(heads * cfg.v_head_dim)?),
-        ]) })
+        ]);
+        if direct {
+            // The direct-query indexer: its query `wq_b(LayerNorm(x))` and `[wk | weights_proj](x)`.
+            extents.insert("iq", bf16(cfg.index_heads * cfg.index_head_dim)?);
+            extents.insert("kw", bf16(cfg.index_head_dim + cfg.index_heads)?);
+        }
+        Ok(Self { extents })
     }
     pub fn bytes(&self) -> Result<usize> {
         self.extents.values().try_fold(0usize, |total, &n| total.checked_add(n)
@@ -358,6 +367,28 @@ fn policy_programs(weight: &crate::formats::trellis_core::CoreWeightLayout,
 
 #[cfg(test)]
 mod tests {
+    /// Every stage a direct-query variant's step writes is admitted at its widest: under a head
+    /// split ML4's 32 heads x 128 (4096) are narrower than the indexer's LayerNorm(x) (6144), and
+    /// its indexer query and [wk | weights_proj] have K6 stages of their own. GLM's are unchanged.
+    #[test]
+    fn direct_query_stages_cover_the_indexer_layer_norm_and_its_outputs() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        for (ranks, owned) in [(1, false), (2, false), (2, true)] {
+            let stage = CoreStageLayout::new(&ml4, 64, ranks, owned).unwrap();
+            assert!(stage.extents["q"] >= 64 * ml4.hidden * 2, "{ranks} {owned}");
+            assert_eq!(stage.extents["iq"], 64 * ml4.index_heads * ml4.index_head_dim * 2);
+            assert_eq!(stage.extents["kw"], 64 * (ml4.index_head_dim + ml4.index_heads) * 2);
+        }
+        let glm = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
+        for (ranks, owned) in [(1, false), (2, false), (2, true)] {
+            let stage = CoreStageLayout::new(&glm, 64, ranks, owned).unwrap();
+            let heads = glm.heads / if owned { 1 } else { ranks };
+            assert_eq!(stage.extents["q"], 64 * 2 * (heads * (glm.qk_nope_head_dim + glm.qk_rope_head_dim))
+                .max(glm.q_lora_rank).max((glm.kv_lora_rank + glm.qk_rope_head_dim).next_multiple_of(128)));
+            assert!(!stage.extents.contains_key("iq") && !stage.extents.contains_key("kw"));
+        }
+    }
+
     use super::*;
 
     fn checkpoint(cfg: &GlmDsaConfig) -> crate::plan::Checkpoint {

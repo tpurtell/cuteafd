@@ -322,7 +322,7 @@ impl<'a> Engine<'a> {
                 let cache = &e.caches_on(rank)[self.layer];
                 e.compress_records(rank, self.layer, self.weights, cache, None, self.tables, &self.lane.tables, w,
                     e.attention_rope(rank, 4), self.rows, self.cap)?;
-                Ok(Query { values: w.query.buffer.ptr, row_pitch: e.cfg.n_heads / 2 * 512 * 2 })
+                Ok(Query { values: w.query.buffer.ptr, row_pitch: e.cfg.n_heads / 2 * 512 * 2, width: None })
             }
             fn score(&mut self) -> Result<Option<Candidates>> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);

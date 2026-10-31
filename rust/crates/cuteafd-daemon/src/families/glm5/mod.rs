@@ -912,11 +912,17 @@ impl Opened {
         let core = checkpoint.as_ref().map(|checkpoint| -> Result<_> {
             let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&self.cfg, checkpoint)?;
             if core.projections.is_empty() { return Ok(None); }
-            let draft_rows = args.draft.as_deref().map(|snapshot| -> Result<_> {
-                let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
-                let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
-                args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")
-            }).transpose()?;
+            // Draft rows the K6 target head scores per step: DFlash2's sequences x block, or
+            // mtp_dspark's whole admitted block (the planner's drafter_admission rows).
+            let draft_rows = match (args.draft.as_deref(), &ml4_draft) {
+                (Some(snapshot), _) => Some({
+                    let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+                    let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
+                    args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")?
+                }),
+                (None, Some(layout)) => Some(layout.capacity().block_rows),
+                (None, None) => None,
+            };
             Ok(Some(cuteafd_loader::families::glm5::core::CoreCharges::from_package(&self.cfg,
                 &core, layers, devices.len(), owners.as_deref(), args.prefill_rows, prefill_lanes,
                 draft_rows, &manifest)?))

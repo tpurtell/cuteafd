@@ -136,6 +136,9 @@ mod tests {
         let dspark = Ml4DsparkConfig::from_params(&official_params(), target.layers)?;
         let cfg = MlaDflashConfig::ml4(&dspark, &target)?;
         assert_eq!((cfg.drafts(), cfg.windows.clone()), (3, vec![Some(2048); 3]));
+        // The K6 target head scores the drafter's block rows: serve admits layout.block_rows
+        // and binds sequences x block; the two must be one number.
+        assert_eq!(cfg.block, cfg.drafts());
         // The draft's rotary is the target's at alpha 0 (no LeRoPE).
         assert_eq!(cfg.rotary.inv_freq, target.inv_freq(&[0.0; 32])?);
         assert_eq!(cfg.attention_scale(), (128f32).sqrt().recip());
@@ -143,6 +146,7 @@ mod tests {
         let capacity = GlmDraftCapacity::new(20, 16, 3)?;
         let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
             cuteafd_core::MlaCacheFormat::Fp8)?;
+        assert_eq!(layout.capacity().block_rows, layout.capacity().max_batch_sequences * cfg.block);
         // Every draft layer is windowed: per-slot rings (window + block, page-rounded), no pooled layers.
         assert_eq!(layout.paged_cache().full_layers, 0);
         for layer in &layout.cache().layers {

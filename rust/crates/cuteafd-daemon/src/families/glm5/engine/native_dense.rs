@@ -503,34 +503,36 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn ml4_core_index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>,
         rows: usize, cap: &str, index_cache: Buffer) -> Result<()> {
-        let s = self.native_scratch(rank, w)?;
+        // The K6 core's own stages (no EXLR8 native scratch exists on this path).
+        let scratch = self.core_scratch(w)?;
+        let (iq, kw) = (scratch.stage("iq")?, scratch.stage("kw")?);
         let row = Scalar::I32(rows as i32);
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let rope = self.cfg.rope(index);
         // LayerNorm(x) into the q stage, then wq_b over it.
-        let normed = self.core_scratch(w)?.stage("q")?;
+        let normed = scratch.stage("q")?;
         self.run_on(rank, &format!("ml4_index_layer_norm_{cap}"), &[("x", w.x.buffer.ptr),
             ("weight", layer.ptr("index_q_norm_w")?), ("bias", layer.ptr("index_q_norm_b")?),
             ("out", normed.ptr)], &[row])?;
         // wq_b in the checkpoint's own form: the K6 core (the shared trellis path), or
         // the shipped FP8 block-128 weight through its native projection (never re-quantized).
         if layer.core.contains_key("index_q") {
-            self.core_linear(rank, w, layer, "index_q", normed, s.iq.buffer, rows, None)?;
+            self.core_linear(rank, w, layer, "index_q", normed, iq, rows, None)?;
         } else {
             let fp8 = [("x", normed.ptr), ("w_iq_fp8", layer.ptr("w_iq_fp8")?),
-                ("w_iq_scale", layer.ptr("w_iq_scale")?), ("out", s.iq.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+                ("w_iq_scale", layer.ptr("w_iq_scale")?), ("out", iq.ptr), ("scratch", w.scratch.buffer.ptr)];
             self.run_on(rank, &format!("ml4_index_q_{cap}"), &fp8, &self.projection_scalars(row, cap))?;
         }
-        self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", s.iq.buffer.ptr),
+        self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", iq.ptr),
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
             ("s", layer.ptr("index_scale_s")?), ("b", layer.ptr("index_scale_b")?),
-            ("query", s.iq.buffer.ptr)], &[row])?;
+            ("query", iq.ptr)], &[row])?;
         // [wk | weights_proj](x), BF16 [rows, 128 + I], both BF16 as shipped.
         self.run_on(rank, "ml4_index_kw", &[("x", w.x.buffer.ptr), ("w", layer.ptr("w_ik")?),
-            ("out", s.kw.buffer.ptr)], &[row])?;
+            ("out", kw.ptr)], &[row])?;
         let tag = if rope { "" } else { "_nope" };
         self.run_on(rank, &format!("ml4_index_post{tag}_{cap}"), &[
-            ("iq", s.iq.buffer.ptr), ("kw", s.kw.buffer.ptr), ("positions", w.positions.buffer.ptr),
+            ("iq", iq.ptr), ("kw", kw.ptr), ("positions", w.positions.buffer.ptr),
             ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("k_weight", layer.ptr("k_norm_w")?),
             ("k_bias", layer.ptr("k_norm_b")?), ("q_fp8", w.q_fp8.buffer.ptr),
             ("head_weights", w.head_weights.buffer.ptr), ("cache", index_cache.ptr)], &[row])

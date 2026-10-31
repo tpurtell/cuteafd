@@ -327,8 +327,16 @@ impl<'a> ContextExchange<'a> {
     /// of its own assembled buffer (the producer wrote it there), only the
     /// peer copy runs.
     pub fn push_query(&self, rank: usize, slot: usize, source: *const c_void, pitch: usize, rows: usize) -> Result<()> {
+        self.push_query_width(rank, slot, source, pitch, rows, self.layout.query_bytes as usize)
+    }
+
+    /// [`Self::push_query`] of a layer whose half is `half` bytes per row (at most the
+    /// exchange's): the assembled query is `[rows, H, D]` contiguous at that layer's width.
+    pub fn push_query_width(&self, rank: usize, slot: usize, source: *const c_void, pitch: usize, rows: usize,
+        half: usize) -> Result<()> {
         self.check_rows(rows)?;
-        let half = self.layout.query_bytes as usize;
+        ensure!(half > 0 && half <= self.layout.query_bytes as usize && half % 16 == 0 && pitch >= half,
+            "query half of {half} B outside the exchange's {} B", self.layout.query_bytes);
         let row = 2 * half;
         let column = rank * half;
         let own = self.buffers(rank, slot)?.query;
