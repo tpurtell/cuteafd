@@ -1037,8 +1037,10 @@ pub fn muse_spark_tensors(expert_layers: &[usize]) -> (Vec<Tensor>, Vec<(String,
     let p = "model.language_model";
     let mut out = vec![t(format!("{p}.embed_tokens.weight"), "BF16", &[v, h]),
         t(format!("{p}.norm.weight"), "BF16", &[h])];
-    let mut projections = vec![("lm_head".to_string(), 6, h, v)];
-    out.extend(exl3("lm_head", v, h, 6));
+    // The K6 head is stored at whole 128-row blocks: 202,112 rows for 202,048 logical.
+    let stored = v.next_multiple_of(128);
+    let mut projections = vec![("lm_head".to_string(), 6, h, stored)];
+    out.extend(exl3("lm_head", stored, h, 6));
     for layer in 0..62 {
         let b = format!("{p}.layers.{layer}");
         for norm in ["input_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm"] {
@@ -1112,5 +1114,10 @@ pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
     let mut compact = exl3_compact(4);
     for key in ["core_bits", "head_bits"] { compact[key] = json!(6.0); }
     compact["lm_head"] = json!(true);
-    write_quantize_config(dir, &exl3_manifest(&compact, &projections));
+    let mut manifest = exl3_manifest(&compact, &projections);
+    // The quantizer records the head's logical and N128-padded stored extents.
+    manifest["tensor_storage"]["lm_head"]["out_features"] = json!(202048);
+    manifest["tensor_storage"]["lm_head"]["stored_out_features"] = json!(202112);
+    manifest["tensor_storage"]["lm_head"]["in_features"] = json!(8192);
+    write_quantize_config(dir, &manifest);
 }

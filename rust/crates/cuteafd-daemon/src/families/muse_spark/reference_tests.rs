@@ -97,3 +97,26 @@ fn cpu_oracle_matches_the_official_model_on_a_tiny_checkpoint() -> Result<()> {
     assert_eq!(top1, tokens.len());
     Ok(())
 }
+
+/// Online (flash-style) softmax attention, the native kernels' arithmetic,
+/// against the official eager model: the tolerance the attention exports gate at.
+#[test]
+fn online_softmax_attention_stays_within_the_stated_tolerance() -> Result<()> {
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures().join("official.json"))?)?;
+    let cfg = MuseSparkConfig::from_hf(&record["config"])?;
+    let tokens: Vec<u32> = serde_json::from_value(record["tokens"].clone())?;
+    let official: Vec<Vec<f32>> = serde_json::from_value(record["logits"].clone())?;
+    for tile in [1, 2, 4, 64] {
+        let mut ops = reference(&cfg)?;
+        ops.online_tile = Some(tile);
+        let logits = forward(&cfg, &mut ops, &tokens, cfg.layers)?;
+        let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        let top1 = logits.iter().zip(&official).filter(|(a, b)| argmax(a) == argmax(b)).count();
+        let worst = logits.iter().zip(&official).flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+            .fold(0f32, f32::max);
+        eprintln!("online softmax tile {tile}: max |logit diff| {worst:.4}, top-1 {top1}/{}", tokens.len());
+        assert!(worst <= 0.05, "tile {tile}: {worst}");
+        assert_eq!(top1, tokens.len());
+    }
+    Ok(())
+}

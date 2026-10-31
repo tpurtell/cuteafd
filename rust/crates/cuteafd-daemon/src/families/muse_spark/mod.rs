@@ -7,3 +7,5 @@ pub(crate) mod block;
 pub(crate) mod reference;
 #[cfg(test)]
 mod reference_tests;
+#[cfg(test)]
+mod drafter_tests;

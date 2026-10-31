@@ -44,12 +44,16 @@ pub(crate) struct Reference {
     /// One sequence: per layer, every earlier position's (k, v) after norm/RoPE.
     cache: Vec<Vec<(Vec<f32>, Vec<f32>)>>,
     position: usize,
+    /// Online (flash-style) softmax: FP32 scores and PV with running max and
+    /// sum over key tiles of `tile` rows, one BF16 rounding of the output;
+    /// `None` is the eager module's normalized-BF16-probability path.
+    pub(crate) online_tile: Option<usize>,
 }
 
 impl Reference {
     pub(crate) fn new(cfg: MuseSparkConfig, embedding: Matrix, layers: Vec<Layer>, norm: Vec<f32>, head: Matrix) -> Self {
         let cache = vec![Vec::new(); cfg.layers];
-        Self { cfg, embedding, layers, norm, head, cache, position: 0 }
+        Self { cfg, embedding, layers, norm, head, cache, position: 0, online_tile: None }
     }
 
     fn layer(&self, layer: usize) -> Result<&Layer> { self.layers.get(layer).context("layer outside the reference weights") }
@@ -127,21 +131,43 @@ impl Ops for Reference {
             let mut attended = Vec::with_capacity(heads * dim);
             for (h, qrow) in qh.iter().enumerate() {
                 let kv = h / group;
-                let scores: Vec<f64> = history[first..=position].iter().map(|(k, _)| {
-                    // matmul in BF16 then * scaling (rounded), as eager attention.
-                    let dot = contract::bf16(qrow.iter().zip(&k[kv * dim..(kv + 1) * dim])
-                        .map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32);
-                    contract::bf16((dot as f64 * scale) as f32) as f64
-                }).collect();
-                let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                let exp: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
-                let total: f64 = exp.iter().sum();
-                let mut head_out = vec![0f64; dim];
-                for (p, (_, v)) in exp.iter().zip(&history[first..=position]) {
-                    let p = contract::bf16((p / total) as f32) as f64;
-                    for d in 0..dim { head_out[d] += p * v[kv * dim + d] as f64; }
-                }
-                let head_out: Vec<f32> = head_out.iter().map(|v| contract::bf16(*v as f32)).collect();
+                let keys = &history[first..=position];
+                let head_out: Vec<f32> = if let Some(tile) = self.online_tile {
+                    // FP32 scores q.k * scale (no BF16 score rounding), running max/sum per tile.
+                    let (mut max, mut sum, mut acc) = (f32::NEG_INFINITY, 0f32, vec![0f32; dim]);
+                    for block in keys.chunks(tile) {
+                        let scores: Vec<f32> = block.iter().map(|(k, _)| qrow.iter().zip(&k[kv * dim..(kv + 1) * dim])
+                            .map(|(a, b)| a * b).sum::<f32>() * scale as f32).collect();
+                        let block_max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        let next = max.max(block_max);
+                        let correction = (max - next).exp();
+                        sum *= correction;
+                        for value in acc.iter_mut() { *value *= correction; }
+                        for (score, (_, v)) in scores.iter().zip(block) {
+                            let p = (score - next).exp();
+                            sum += p;
+                            for d in 0..dim { acc[d] += p * v[kv * dim + d]; }
+                        }
+                        max = next;
+                    }
+                    acc.iter().map(|v| contract::bf16(v / sum)).collect()
+                } else {
+                    let scores: Vec<f64> = keys.iter().map(|(k, _)| {
+                        // matmul in BF16 then * scaling (rounded), as eager attention.
+                        let dot = contract::bf16(qrow.iter().zip(&k[kv * dim..(kv + 1) * dim])
+                            .map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32);
+                        contract::bf16((dot as f64 * scale) as f32) as f64
+                    }).collect();
+                    let max = scores.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                    let exp: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+                    let total: f64 = exp.iter().sum();
+                    let mut head_out = vec![0f64; dim];
+                    for (p, (_, v)) in exp.iter().zip(keys) {
+                        let p = contract::bf16((p / total) as f32) as f64;
+                        for d in 0..dim { head_out[d] += p * v[kv * dim + d] as f64; }
+                    }
+                    head_out.iter().map(|v| contract::bf16(*v as f32)).collect()
+                };
                 attended.extend(contract::rms(&head_out, eps));
             }
             let gate = l.g.apply(row);

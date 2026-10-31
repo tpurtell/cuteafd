@@ -255,9 +255,12 @@ impl FamilyModel for Model {
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
         if let Some(projection) = self.core.projections.get(stem) {
-            return super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
+            super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
-                || format!("{stem}: expected header-native K6 {:?}", projection.shape));
+                || format!("{stem}: expected header-native K6 {:?} (stored N {})", projection.shape, projection.stored_outputs))?;
+            // Report the logical extent; the head's stored N128 padding stays the loader's.
+            operand.logical = projection.shape.to_vec();
+            return Ok(());
         }
         if role.component == Component::RoutedExpert && role.expert.is_some() {
             let expected = match super::leaf(stem) {

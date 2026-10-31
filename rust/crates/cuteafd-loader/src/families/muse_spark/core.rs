@@ -52,8 +52,10 @@ impl CoreInventory {
             .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(layer, leaf)| layer.parse::<usize>().is_ok_and(|layer| layer < cfg.layers)
                 && !leaf.starts_with("mlp.experts."));
+        // The K6 head is stored at whole 128-row output blocks (202,112 for the
+        // logical 202,048 vocabulary); the engine trims logits before the softcap.
         let projections = read_projections(checkpoint, &expected(cfg), selected,
-            |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6, padded_outputs: false }))?;
+            |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6, padded_outputs: stem == HEAD }))?;
         let inventory = Self { projections };
         for layer in 0..cfg.layers {
             let root = format!("{PREFIX}{layer}");

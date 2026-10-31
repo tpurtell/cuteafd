@@ -177,7 +177,11 @@ struct RawConfig {
     rms_norm_eps: f64,
     sliding_window: usize,
     vocab_size: usize,
-    rope_parameters: RawRope,
+    /// Newer configs nest the base in `rope_parameters`; others keep a flat `rope_theta`.
+    #[serde(default)]
+    rope_parameters: Option<RawRope>,
+    #[serde(default)]
+    rope_theta: Option<f64>,
     dflash_config: RawDflash,
 }
 
@@ -243,7 +247,8 @@ impl DflashConfig {
             kv_heads: raw.num_key_value_heads,
             head_dim: raw.head_dim,
             eps: raw.rms_norm_eps as f32,
-            theta: raw.rope_parameters.rope_theta as f32,
+            theta: raw.rope_parameters.as_ref().map(|r| r.rope_theta).or(raw.rope_theta)
+                .context("DFlash2 config lacks rope_parameters.rope_theta and rope_theta")? as f32,
             block: d.block_size,
             group: d.conv_group_size,
             mask_token: d.mask_token_id,

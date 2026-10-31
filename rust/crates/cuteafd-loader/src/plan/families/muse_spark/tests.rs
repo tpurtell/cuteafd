@@ -72,6 +72,14 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
     assert!(routed.formats.contains_key("exl3-k4"), "{:?}", routed.formats);
     let experts = report.experts.as_ref().unwrap();
     assert_eq!(experts.package, super::PACKAGE);
+    // The K6 head: stored at 202,112 rows (N128), logical 202,048.
+    let checkpoint = input.checkpoint();
+    let model = crate::families::muse_spark::core::CoreInventory::from_checkpoint(
+        &crate::families::muse_spark::MuseSparkConfig::from_hf(&checkpoint.config).unwrap(), checkpoint).unwrap();
+    let head = model.get_weight("lm_head").unwrap();
+    assert_eq!((head.shape, head.stored_outputs), ([202048, 8192], 202112));
+    let o = model.get_weight("model.language_model.layers.0.self_attn.o_proj").unwrap();
+    assert_eq!(o.split, crate::families::muse_spark::core::CoreSplit::Input, "o_proj splits its input on TP2");
     assert!(experts.spark_worlds.contains(&4) && experts.spark_worlds.contains(&6));
 }
 
