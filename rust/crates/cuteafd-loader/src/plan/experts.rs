@@ -412,7 +412,7 @@ mod tests {
             // exact H128 slices where twelve blocks split evenly, compact
             // trellis widths elsewhere; one rank cannot hold every expert.
             let exl3 = spark_recipe("step5:exl3-k46", 1536, world);
-            if (2..=8).contains(&world) {
+            if (2..=6).contains(&world) {
                 let recipe = exl3.unwrap();
                 if 12 % world == 0 { assert_eq!(recipe.widths, vec![1536 / world; world]); }
                 else { assert_eq!(recipe.widths, vec![12usize.div_ceil(world) * 128; world]); }
@@ -420,7 +420,7 @@ mod tests {
             assert!(spark_recipe("step5:exl3-k47", 1536, world).is_err());
         }
         assert_eq!(spark_worlds("step5:exl3-k46", 1536), cuteafd_core::tp_units::spark_package_worlds("step5", "exl3"));
-        assert_eq!(spark_worlds("step5:exl3-k46", 1536), [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(spark_worlds("step5:exl3-k46", 1536), [2, 3, 4, 5, 6]);
         for package in ["mimo:fp8", "glm:nvfp4", "glmf:exl3-k34", "qwen4:nvfp4"] {
             assert!(spark_recipe(package, 2048, 6).is_ok());
         }

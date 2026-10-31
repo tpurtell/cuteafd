@@ -412,19 +412,17 @@
     "step5:exl3": {
       "intermediate": 1536,
       "minimum": 3,
-      "maximum": 8,
+      "maximum": 6,
       "basis": "planner",
       "worlds": [
         2,
         3,
         4,
         5,
-        6,
-        7,
-        8
+        6
       ],
       "checkpoints": [],
-      "provenance_note": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6 is not yet published; minimum 3 from the planner on the published header inventory (2 Sparks need 138.9 GiB/rank). Add the checkpoint witness when the revision lands (#925)."
+      "provenance_note": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6 is not yet published; minimum 3 from the planner on the published header inventory (2 Sparks need 138.9 GiB/rank), maximum 6 from the shared width cap (1536 / 256). Add the checkpoint witness when the revision lands (#925)."
     },
     "v41:nvfp4": {
       "intermediate": 2304,
