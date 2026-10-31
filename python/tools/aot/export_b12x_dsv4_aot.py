@@ -599,6 +599,17 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
              lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(rope_g, max_rows=rows, max_pages=index_pages,
                                                                           mode=mode)),
         ]
+    # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks).
+    draft = ml4.ML4_DRAFT
+    out += [
+        ("draft_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_producer_aot(draft, max_rows=64)),
+        ("draft_attention_m64", "mla_draft_attention",
+         {"max_rows": 64, "window_size": draft.window_size, "max_context": max_context, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_attention_aot(draft, max_rows=64, max_context=max_context)),
+        ("draft_output_m64", "mla_draft_output", {"max_rows": 64},
+         lambda: ml4.compile_draft_output_aot(draft, max_rows=64)),
+    ]
     return out
 
 
