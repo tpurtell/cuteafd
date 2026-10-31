@@ -455,3 +455,38 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod weight_tests {
+    /// Every layer operand the device layer reads by name is one the admitted
+    /// layout packs (plain operand or K6 core), for one GPU and a pair; the
+    /// release publication's gate_proj is BF16, everything projected else K6.
+    #[test]
+    fn device_reads_only_packed_layer_operands() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_muse_spark_snapshot(dir.path(), &[]);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(dir.path())?;
+        let cfg = cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let core = cuteafd_loader::families::muse_spark::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let read = ["moe.router", "moe.bias", "moe.pre_expert_norm", "moe.post_expert_norm", "norm.input", "norm.pre_ffn",
+            "norm.post_ffn", "gate.attention.alpha", "gate.attention.beta", "gate.ffn.alpha", "gate.ffn.beta"];
+        let projected = ["attn.q", "attn.k", "attn.v", "attn.gate", "attn.o", "moe.pre_expert", "moe.post_expert"];
+        for name in read.iter().chain(&projected) {
+            let stem = name.split('.').last().unwrap();
+            assert!(source.contains(&format!("\"{name}\"")) || source.contains(stem), "{name} unused by the device");
+        }
+        for ranks in [1, 2] {
+            for layer in [0, 1, 61] {
+                for layout in cuteafd_loader::families::muse_spark::weight_layout::LayerLayout::ranks(&cfg, layer, ranks, &core)? {
+                    for name in read { assert!(layout.operands.contains_key(name), "{name} not packed (ranks {ranks})"); }
+                    for name in projected {
+                        assert!(layout.core.contains_key(name) || (name == "attn.gate" && layout.operands.contains_key(name)),
+                            "{name} not packed (ranks {ranks})");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}

@@ -86,7 +86,7 @@ impl LanePlanes {
             ("hidden", bf16(h)), ("normed", bf16(h)), ("residual", bf16(h)),
             // Attention: raw projections, normed/RoPEd q and k, the step's K|V records,
             // attention output, gate, gated output and the o_proj result.
-            ("q_raw", bf16(q)), ("k_raw", bf16(kv)), ("q", bf16(q)), ("k", bf16(kv)),
+            ("q_raw", bf16(q)), ("k_raw", bf16(kv)), ("q", bf16(q)),
             ("kv_step", bf16(2 * kv)), ("attention", bf16(q)), ("gate", bf16(q)), ("gated", bf16(q)),
             ("attended", bf16(h)),
             // MoE: router logits, selected routes, the expert-width stream and its wire,

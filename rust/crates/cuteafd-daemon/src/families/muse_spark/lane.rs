@@ -9,9 +9,12 @@ use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::lane::LanePlanes;
 use std::collections::BTreeMap;
 
-/// Named views of one lane allocation.
+/// Named views of one lane allocation. Span planes (`LanePlanes::SPAN`) hold
+/// one unit's rows per in-flight slot; [`Self::slot`] views a slot's region.
+#[derive(Clone)]
 pub(crate) struct LaneViews {
     pub rows: usize,
+    waves: usize,
     views: BTreeMap<&'static str, Buffer>,
     /// Bytes per row of each plane (planes are `rows`-major).
     row_bytes: BTreeMap<&'static str, usize>,
@@ -24,11 +27,26 @@ impl LaneViews {
         let mut views = BTreeMap::new();
         let mut row_bytes = BTreeMap::new();
         for (name, (offset, bytes)) in planes.offsets()? {
-            ensure!(bytes % planes.rows == 0, "Muse lane plane {name} is not rows-major");
-            views.insert(name, Buffer { ptr: base.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..base });
-            row_bytes.insert(name, bytes / planes.rows);
+            let span = if LanePlanes::SPAN.contains(&name) { planes.waves } else { 1 };
+            ensure!(bytes % (planes.rows * span) == 0, "Muse lane plane {name} is not rows-major");
+            // A span plane's base view is slot 0's region.
+            views.insert(name, Buffer { ptr: base.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes: bytes / span, ..base });
+            row_bytes.insert(name, bytes / span / planes.rows);
         }
-        Ok(Self { rows: planes.rows, views, row_bytes })
+        Ok(Self { rows: planes.rows, waves: planes.waves, views, row_bytes })
+    }
+
+    /// The views of in-flight slot `slot`: span planes at the slot's region (a
+    /// unit's carried state: residual stream, routes, the wire), every other
+    /// plane shared (each hook reads and writes them within the hook).
+    pub(crate) fn slot(&self, slot: usize) -> Result<Self> {
+        ensure!(slot < self.waves, "Muse lane slot {slot} of {}", self.waves);
+        let mut views = self.views.clone();
+        for name in LanePlanes::SPAN {
+            let view = views.get_mut(name).with_context(|| format!("Muse lane has no span plane {name}"))?;
+            view.ptr = view.ptr.cast::<u8>().wrapping_add(slot * view.bytes).cast();
+        }
+        Ok(Self { views, ..self.clone() })
     }
 
     /// The first `rows` rows of plane `name`.
@@ -84,6 +102,20 @@ mod tests {
             assert!(views.rows("q", 0).is_err() && views.rows("q", 2753).is_err());
             assert!(views.rows("nope", 1).is_err());
         }
+        // Slots: span planes step by one unit's region; other planes are shared.
+        let span = LanePlanes::with_waves(&cfg, 2, 2752, 3)?;
+        let base = Buffer { ptr: 0x1000_0000usize as *mut _, bytes: span.bytes()?, device_id: 0, flags: 0 };
+        let views = LaneViews::carve(&span, base)?;
+        for slot in 0..3 {
+            let slot_views = views.slot(slot)?;
+            for name in LanePlanes::SPAN {
+                let unit = span.planes[name] / 3;
+                assert_eq!(slot_views.plane(name)?.ptr as usize, views.plane(name)?.ptr as usize + slot * unit);
+                assert_eq!(slot_views.plane(name)?.bytes, unit);
+            }
+            assert_eq!(slot_views.plane("q")?.ptr, views.plane("q")?.ptr);
+        }
+        assert!(views.slot(3).is_err());
         let planes = LanePlanes::new(&cfg, 1, 64)?;
         let small = Buffer { ptr: 0x1000usize as *mut _, bytes: planes.bytes()? - 1, device_id: 0, flags: 0 };
         assert!(LaneViews::carve(&planes, small).is_err());
