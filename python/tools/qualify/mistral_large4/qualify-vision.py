@@ -312,6 +312,9 @@ def compare(args):
         modeling_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models[torch.float32][2]})
     for name in args.grids:
         native = np.load(args.compare_native / f"{safe(name)}.npy")
+        pixels = args.compare_native / f"{safe(name)}.rgb.npy"
+        if pixels.exists():
+            REAL[name] = np.load(pixels)
         result["bf16_floor"][name], result["g2"][name] = score(native, models, name, lut, device)
         print(json.dumps(dict(event="G2", grid=name, stages=result["g2"][name])), flush=True)
     result["stages"] = {}
@@ -423,6 +426,8 @@ def run(args):
             if args.save_native:
                 args.save_native.mkdir(parents=True, exist_ok=True)
                 np.save(args.save_native / f"{safe(name)}.npy", native)
+                # The reference half scores these exact pixels (no second resize).
+                np.save(args.save_native / f"{safe(name)}.rgb.npy", fixture(name)[2])
                 if name in args.stages:
                     stages = {}
                     encode(name, stages)
