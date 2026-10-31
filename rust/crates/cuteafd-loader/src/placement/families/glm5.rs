@@ -2332,6 +2332,43 @@ mod tests {
         assert!(previous.0 < base.onboard_layers, "overuse never shed an onboarded layer");
     }
 
+    /// Mistral Large 4's Pixtral tower (weights + scratch at 55 x 55) placed on rtx0
+    /// before the solve: both the planned solve and the measured re-solve (tower
+    /// already loaded) shed onboarded layers for it and never refuse, at every
+    /// Spark count 5..8 on two GPUs.
+    #[test]
+    fn reserved_tower_sheds_onboarded_layers() {
+        let cfg = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let tower = crate::families::mistral_large4::vision::resident_weight_bytes()
+            + crate::plan::layout::mistral_scratch_bytes(55 * 55);
+        let layers = Some(AttentionPlacement::Layers);
+        for ranks in 5..=8 {
+            let mut planned = inputs(&cfg, &[96 * GIB; 2]);
+            planned.spark_ranks = ranks;
+            let (base, _) = solve_working_set(&planned, [0; 2], layers).unwrap();
+            assert!(base.onboard_layers > 0, "n={ranks}: the planned layout onboards");
+            let mut with_tower = planned.clone();
+            let Baseline::Planned { loaded_bytes, .. } = &mut with_tower.gpus[0].1 else { unreachable!() };
+            *loaded_bytes += tower;
+            let (reserved, _) = solve_working_set(&with_tower, [0; 2], layers)
+                .unwrap_or_else(|e| panic!("n={ranks}: the reserved tower refused the plan: {e:#}"));
+            assert!(reserved.onboard_layers < base.onboard_layers || reserved.pool_tokens < base.pool_tokens,
+                "n={ranks}: the tower took no layers or pool");
+            assert!(reserved.onboard_layers <= base.onboard_layers);
+            // Startup measures free memory with the tower loaded and re-solves.
+            let mut measured = planned.clone();
+            for (rank, (total, baseline)) in measured.gpus.iter_mut().enumerate() {
+                let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+                *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes
+                    - if rank == 0 { tower } else { 0 } };
+            }
+            let (resolved, _) = solve_working_set(&measured, [0; 2], layers)
+                .unwrap_or_else(|e| panic!("n={ranks}: measured tower overuse refused: {e:#}"));
+            assert!(resolved.onboard_layers <= base.onboard_layers && resolved.pool_tokens <= base.pool_tokens, "n={ranks}");
+            assert!(resolved.onboard_layers < base.onboard_layers || resolved.pool_tokens < base.pool_tokens, "n={ranks}");
+        }
+    }
+
     #[test]
     fn whole_attention_colocates_indexers_and_charges_one_logical_kv_copy() {
         let cfg = config();

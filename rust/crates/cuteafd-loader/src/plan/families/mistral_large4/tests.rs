@@ -1,5 +1,5 @@
 use super::*;
-use crate::plan::{self, testing, Component, ExpertPlacement, PlanOptions, Status};
+use crate::plan::{self, testing, Component, ExpertPlacement, MediaMode, PlanOptions, Status};
 
 /// Routed experts of a dense-boundary layer, a NoPE layer, a shared-KV reader
 /// and the last layer: enough to exercise every routed naming path.
@@ -33,8 +33,8 @@ fn official_fp8_release_inventory_is_complete_and_classified() {
         let expected = usize::from(c.component == Component::RoutedExpert);
         assert_eq!(c.rejected, expected, "{:?}: {:?}", c.component, c.rejections);
         // The engine serves the EXL3 publication: the official FP8 release's routed experts
-        // have no kernel; every other text component is ready.
-        assert_eq!(c.status, if matches!(c.component, Component::Vision | Component::Speculator) { Status::Disabled }
+        // have no kernel; every other component, the BF16 Pixtral tower included, is ready.
+        assert_eq!(c.status, if c.component == Component::Speculator { Status::Disabled }
             else if c.component == Component::RoutedExpert { Status::MissingKernel } else { Status::Ready },
             "{:?}", c.component);
     }
@@ -290,4 +290,58 @@ fn tp2_onboarding_inventory_reads_the_checkpoint_geometry_package_and_router() {
     let mut other = cfg.clone();
     other.topk = 8;
     assert!(glm::local_inventory(&other, &catalog, &manifest, 3, 64, 3, false).is_err());
+}
+
+/// The Pixtral tower on the 2-RTX column (full release headers, native K6
+/// programs): wherever it resolves to an RTX (`--vision rtx`, or auto when no
+/// Spark holds tower + scratch + 1 GiB, as at n=5) it is reserved before the
+/// pool and onboard solve and the plan holds, never a refused encoder; where a
+/// Spark holds it (auto at n=6..8) the RTX working set is untouched. That the
+/// reserved bytes shed onboarded layers is the solver's own contract
+/// (`placement::families::glm5` `reserved_tower_sheds_onboarded_layers`); this
+/// manifest carries no local expert package, so nothing onboards here.
+#[test]
+fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
+    use crate::plan::encoder::EncoderKind;
+    let dir = snapshot(true, None);
+    let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, testing::glm_k6_programs(&cfg, &core).unwrap().to_string()).unwrap();
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let plan = |ranks: usize, vision: MediaMode| {
+        let mut options = layout_options(ranks, 2);
+        options.vision = vision;
+        options.layout.as_mut().unwrap().workspace_manifest = Some(manifest.clone());
+        input.plan(&options).unwrap()
+    };
+    let tower = crate::families::mistral_large4::vision::resident_weight_bytes()
+        + crate::plan::layout::mistral_scratch_bytes(55 * 55);
+    for ranks in 5..=8 {
+        let off = plan(ranks, MediaMode::Off);
+        assert!(off.placement_supported, "n={ranks}: {:?}", off.hints);
+        let rtx_used = |report: &plan::PlanReport| report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).map(|d| d.used_bytes()).sum::<u64>();
+        for vision in [MediaMode::Rtx(None), MediaMode::Auto] {
+            let report = plan(ranks, vision);
+            assert!(report.placement_supported, "n={ranks} {vision:?}: {:?}", report.hints);
+            let encoder = report.encoder.as_ref().expect("an encoder placement");
+            let on_rtx = matches!(encoder.kind, EncoderKind::Rtx { .. });
+            assert_eq!(on_rtx, vision != MediaMode::Auto || ranks == 5, "n={ranks} {vision:?}: {:?}", encoder.kind);
+            assert_eq!(encoder.weights + encoder.scratch, tower);
+            let memory = report.memory_layout.as_ref().unwrap();
+            assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "n={ranks} {vision:?}");
+            if on_rtx {
+                // Reserved first: the pool gave way, the tower was not refused.
+                assert!(memory.devices.iter().any(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx
+                    && d.items.iter().any(|i| i.group == "vision tower")));
+                assert!(memory.pool_tokens <= off.memory_layout.as_ref().unwrap().pool_tokens);
+            } else {
+                assert_eq!(rtx_used(&report), rtx_used(&off), "n={ranks}: a Spark-hosted tower leaves the RTX set");
+            }
+            println!("ml4 n={ranks} 2 RTX {vision:?}: encoder {:?}, pool {} (off {})", encoder.kind,
+                memory.pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);
+        }
+    }
 }

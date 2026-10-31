@@ -103,6 +103,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         spark_ranks, prefill_lanes: lanes };
     let mut sparks = spark_devices(report, model, input, options, SPARK, &working,
         spark_endpoints(model.spec().family, lanes), &mut waste, &mut notes);
+    // A tower that lands on an RTX is loaded before serving samples admission
+    // memory: reserve it now so onboarding and the pool solve around it (and a
+    // measured overuse sheds onboarded layers), as GLM Flash does. A Spark-bound
+    // tower is charged after the solve, against the Sparks' final expert charge.
+    let towers = towers(report, checkpoint);
+    if rtx_bound_encoder(report, &towers, &devices[..ranks.max(1)], &sparks, options) {
+        resolve_encoder(report, &towers, &mut devices, &mut [], &vec![0; gpus], options, &mut notes);
+    }
     let mut pool_tokens = 0;
     let mut local_layers = 0;
     match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(),
@@ -156,10 +164,35 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     charge_spark_devices(report, model, input, options, SPARK, &working, spark_endpoints(model.spec().family, working.prefill_lanes),
         &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));
     if report.encoder.is_none() {
-        resolve_encoder(report, &Towers::checkpoint(report), &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
+        resolve_encoder(report, &towers, &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
     }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// The checkpoint's bundled tower: Mistral Large 4's Pixtral, else the generic checkpoint bytes.
+fn towers(report: &PlanReport, checkpoint: &Checkpoint) -> Towers {
+    if GlmDsaConfig::from_hf(&checkpoint.config).is_ok_and(|cfg| cfg.variant.ml4().is_some()) {
+        mistral_large4_towers(report, checkpoint)
+    } else {
+        Towers::checkpoint(report)
+    }
+}
+
+/// Whether the encoder will resolve to an RTX: requested there, or automatic
+/// with no Spark holding tower + scratch + 1 GiB beside its expert charge.
+fn rtx_bound_encoder(report: &PlanReport, towers: &Towers, rtx: &[DeviceLayout], sparks: &[DeviceLayout],
+    options: &LayoutOptions) -> bool {
+    use crate::plan::encoder::*;
+    let Ok((weights, scratch)) = towers.vision else { return false };
+    if weights == 0 || report.vision == crate::plan::MediaMode::Off { return false; }
+    let hardware = EncoderHardware { v41: towers.v41,
+        gpus: rtx.iter().map(|d| EncoderGpuBudget { free_bytes: u64::MAX / 4, kv_target_bytes: 0 }).collect(),
+        sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
+            idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
+            free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
+    matches!(encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas).kind,
+        EncoderKind::Rtx { .. })
 }
 
 pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owners: Option<&[u8]>)

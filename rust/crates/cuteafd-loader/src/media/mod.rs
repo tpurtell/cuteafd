@@ -10,7 +10,7 @@ pub use cuteafd_core::{ImageKey, MediaSpan};
 pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-pub use spans::{ExpandedMediaPrompt, SpanExpander};
+pub use spans::{ExpandedMediaPrompt, MistralSpanExpander, SpanExpander};
 use std::{path::Path, sync::Arc};
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +84,9 @@ pub enum ImageFamily {
     Mimo,
     Qwen,
     GlmFlash,
+    /// Mistral Large 4's Pixtral processor: longest edge 1540, 28-pixel merged
+    /// cells, no temporal axis and no pad canvas.
+    Mistral,
 }
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +107,11 @@ pub struct ProcessorConfig {
 }
 /// Largest Qwen merged image admitted by the calibrated BF16 tower.
 pub const QWEN_MAX_IMAGE_TOKENS: usize = 1024;
+/// Mistral Large 4's processor `size.longest_edge` (= params.json `max_image_size`).
+pub const MISTRAL_LONGEST_EDGE: u64 = 1540;
+/// Mistral's LM span at the longest edge: 55 merged rows of 55 `[IMG]` plus a
+/// `[IMG_BREAK]`/`[IMG_END]` each.
+pub const MISTRAL_MAX_IMAGE_TOKENS: usize = 55 * 56;
 const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 pub use resize::Resample;
@@ -114,6 +122,8 @@ impl ProcessorConfig {
             ImageFamily::Mimo => (16, 3136, 12_845_056, CLIP_MEAN, CLIP_STD),
             ImageFamily::Qwen => (16, 65_536, 16_777_216, [0.5; 3], [0.5; 3]),
             ImageFamily::GlmFlash => (14, 16, 8000, CLIP_MEAN, CLIP_STD),
+            // Longest edge in pixels (min/max are edge bounds for Mistral).
+            ImageFamily::Mistral => (14, 1, MISTRAL_LONGEST_EDGE, CLIP_MEAN, CLIP_STD),
         };
         Self {
             resample: Resample::Bicubic,
@@ -125,7 +135,11 @@ impl ProcessorConfig {
             std,
             min_pixels,
             max_pixels,
-            max_image_tokens: if family == ImageFamily::Qwen { QWEN_MAX_IMAGE_TOKENS } else { 4096 },
+            max_image_tokens: match family {
+                ImageFamily::Qwen => QWEN_MAX_IMAGE_TOKENS,
+                ImageFamily::Mistral => MISTRAL_MAX_IMAGE_TOKENS,
+                _ => 4096,
+            },
             decode: DecodePolicy::default(),
         }
     }
@@ -134,7 +148,7 @@ impl ProcessorConfig {
     pub fn from_snapshot(snapshot: &Path, family: ImageFamily) -> Result<Self> {
         // GLM's standard HF snapshot embeds image/video processors in this file.
         // MiMo/Qwen keep their existing AutoProcessor precedence unchanged.
-        let file = if family == ImageFamily::GlmFlash {
+        let file = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Mistral) {
             "processor_config.json"
         } else {
             "preprocessor_config.json"
@@ -143,7 +157,7 @@ impl ProcessorConfig {
             .map_err(|e| MediaError::Config(e.to_string()))?;
         let document: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| MediaError::Config(e.to_string()))?;
-        let value = if family == ImageFamily::GlmFlash {
+        let value = if matches!(family, ImageFamily::GlmFlash | ImageFamily::Mistral) {
             document.get("image_processor").filter(|v| v.is_object()).ok_or_else(|| {
                 MediaError::Config("processor_config.json requires image_processor object".into())
             })?
@@ -151,6 +165,9 @@ impl ProcessorConfig {
             &document
         };
         let mut config = Self::for_family(family);
+        if family == ImageFamily::Mistral {
+            return Self::mistral_from(&document, value, config);
+        }
         for (name, dest) in [
             ("patch_size", &mut config.patch),
             ("merge_size", &mut config.merge),
@@ -206,9 +223,39 @@ impl ProcessorConfig {
         config.validate()?;
         Ok(config)
     }
+    /// PixtralImageProcessor (HF): `patch_size`, `size.longest_edge`, mean/std,
+    /// bicubic; the processor's `spatial_merge_size` sets the 28-pixel cell.
+    fn mistral_from(document: &serde_json::Value, value: &serde_json::Value, mut config: Self) -> Result<Self> {
+        let int = |v: &serde_json::Value, name: &str| v.as_u64().and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| MediaError::Config(format!("{name} must be a positive integer")));
+        config.patch = int(&value["patch_size"], "patch_size")?;
+        config.merge = int(&document["spatial_merge_size"], "spatial_merge_size")?;
+        config.max_pixels = value["size"]["longest_edge"].as_u64()
+            .ok_or_else(|| MediaError::Config("size.longest_edge must be a positive integer".into()))?;
+        for (name, dest) in [("image_mean", &mut config.mean), ("image_std", &mut config.std)] {
+            *dest = serde_json::from_value(value[name].clone()).map_err(|e| MediaError::Config(format!("{name}: {e}")))?;
+        }
+        if value["resample"].as_u64() != Some(3) || value["do_resize"] != true || value["do_normalize"] != true
+            || value["do_rescale"] != true || value["rescale_factor"].as_f64() != Some(1.0 / 255.0)
+            || value["do_convert_rgb"] != true {
+            return Err(MediaError::Config("Pixtral processor must rescale 1/255, normalize and resize bicubic".into()));
+        }
+        // The token cap follows the checkpoint's own longest edge.
+        let cells = config.max_pixels.div_ceil(u64::from(config.patch * config.merge)) as usize;
+        config.max_image_tokens = cells * (cells + 1);
+        config.validate()?;
+        Ok(config)
+    }
     pub fn with_detail(&self, low: bool) -> Self {
         let mut config = self.clone();
-        if low {
+        if low && config.family == ImageFamily::Mistral {
+            // Pixtral bounds the edge, not the count: the largest edge whose
+            // span (cells * (cells + 1)) stays within 256 rows.
+            let cell = u64::from(config.patch * config.merge);
+            let cells = (1..).take_while(|c: &u64| c * (c + 1) <= 256).last().unwrap_or(1);
+            config.max_pixels = config.max_pixels.min(cells * cell);
+            config.max_image_tokens = (cells * (cells + 1)) as usize;
+        } else if low {
             config.max_image_tokens = config.max_image_tokens.min(256);
         }
         config
@@ -229,6 +276,9 @@ impl ProcessorConfig {
             return Err(MediaError::Config(
                 "invalid processor geometry, budget or normalization".into(),
             ));
+        }
+        if self.family == ImageFamily::Mistral {
+            return Ok(());
         }
         let budget = self.effective_max();
         if self.min_pixels > budget {
@@ -264,7 +314,9 @@ impl ProcessorConfig {
             ));
         }
         let factor = self.patch * self.merge;
-        if self.family == ImageFamily::GlmFlash {
+        if self.family == ImageFamily::Mistral {
+            Ok(mistral_resize(height, width, factor, self.max_pixels))
+        } else if self.family == ImageFamily::GlmFlash {
             glm_resize(height, width, factor, self.min_pixels, self.effective_max())
         } else {
             qwen_resize(height, width, factor, self.min_pixels, self.effective_max())
@@ -289,6 +341,26 @@ fn qwen_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Resu
     }
     Ok((rh as u32, rw as u32))
 }
+/// HF `get_resize_output_image_size` (Pixtral): scale so the longest side is
+/// at most `longest` (floor, unlike mistral_common's round), then each side to
+/// whole `factor` cells: `(side - 1) // factor + 1`.
+fn mistral_resize(height: u32, width: u32, factor: u32, longest: u64) -> (u32, u32) {
+    let (mut h, mut w) = (f64::from(height), f64::from(width));
+    let ratio = (h / longest as f64).max(w / longest as f64);
+    if ratio > 1.0 {
+        h = (h / ratio).floor();
+        w = (w / ratio).floor();
+    }
+    let cells = |side: f64| ((side as u64).saturating_sub(1) / u64::from(factor) + 1) as u32;
+    (cells(h) * factor, cells(w) * factor)
+}
+
+/// Mistral's merged grid `(rows, columns)` and LM span length `rows * (columns + 1)`.
+pub fn mistral_span(grid: ImageGrid, merge: u32) -> (usize, usize, usize) {
+    let (h, w) = ((grid.h / merge) as usize, (grid.w / merge) as usize);
+    (h, w, h * (w + 1))
+}
+
 fn glm_resize(height: u32, width: u32, factor: u32, min: u64, max: u64) -> Result<(u32, u32)> {
     let align = |v: u64| v.div_ceil(u64::from(factor)) * u64::from(factor);
     let f2 = u64::from(factor).pow(2);
@@ -334,8 +406,12 @@ impl ImageProcessor for ProcessorConfig {
         if image.data.len() != image.width as usize * image.height as usize * 3 {
             return Err(invalid("RGB byte extent differs from dimensions"));
         }
-        let tokens = (height / (self.patch * self.merge)) as usize
+        let cells = (height / (self.patch * self.merge)) as usize
             * (width / (self.patch * self.merge)) as usize;
+        // Mistral's span also carries one [IMG_BREAK]/[IMG_END] per merged row.
+        let tokens = if self.family == ImageFamily::Mistral {
+            cells + (height / (self.patch * self.merge)) as usize
+        } else { cells };
         if tokens == 0 || tokens > self.max_image_tokens {
             return Err(invalid("official resize exceeds the image token cap"));
         }

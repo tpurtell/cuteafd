@@ -169,13 +169,19 @@ impl Family for MistralLarge4 {
                 "Wire through the shared dSpark path (target taps 1,18,36,54,71 from params.json mtp).",
             ),
             Component::Vision => (
-                "Pixtral-style vision encoder + patch merger",
-                "Serve text with --vision off until the bundled tower is ported.",
+                "Pixtral tower (30 x 2048, axial RoPE), 2x2 patch merger and GELU adapter",
+                "Resident BF16 tower (native numerics 2, reserved 4) on a Spark or RTX by the shared encoder \
+                 placement; --vision off serves text only.",
             ),
             _ => return None,
         };
         Some(Hint { what: what.into(), how: how.into() })
     }
+}
+
+/// The planner charge of the bundled tower (refused for any other geometry).
+pub(crate) fn vision_resident_weights(checkpoint: &Checkpoint) -> Result<u64, String> {
+    crate::families::mistral_large4::vision::resident_weights(checkpoint)
 }
 
 pub(crate) struct Model {
@@ -269,9 +275,6 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> ModelSpec {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
 
-    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
-        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
-    }
 
     /// Mistral Large 4 runs the GLM 5.3 engine: its adapter over the shared
     /// solver, with the operands the checkpoint's variant names.

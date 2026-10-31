@@ -1194,5 +1194,13 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
     // The release's Mistral-format params.json: its mtp block describes the bundled drafter.
     fs::write(dir.join("params.json"), json!({"softmax_tanh_gating": 30.0, "mtp": {"n_layers": 3, "depth": 3,
         "ragged_attention": "2048,2048,2048", "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
-        "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}}}).to_string()).unwrap();
+        "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}},
+        // The release's vision_encoder block (@f12dabdc), which names the image markers.
+        "vision_encoder": {"image_token_id": 10, "image_break_token_id": 12, "image_end_token_id": 13,
+            "intermediate_size": 6144, "num_hidden_layers": 30, "num_attention_heads": 16,
+            "mm_projector_id": "patch_merge", "spatial_merge_size": 2, "hidden_size": 2048, "num_channels": 3,
+            "image_size": 1540, "max_image_size": 1540, "patch_size": 14, "rope_theta": 10000.0,
+            "add_pre_mm_projector_layer_norm": true, "adapter_bias": false}}).to_string()).unwrap();
+    fs::write(dir.join("processor_config.json"),
+        include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
 }

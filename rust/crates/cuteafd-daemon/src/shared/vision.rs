@@ -2,6 +2,7 @@
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
+pub mod mistral;
 mod qwen;
 pub mod local;
 pub mod remote;
@@ -197,6 +198,8 @@ impl TowerSpec {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
+            Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
@@ -205,6 +208,7 @@ impl TowerSpec {
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
+            mistral::RESERVED => ImageFamily::Mistral,
             _ => ImageFamily::Mimo,
         }
     }
@@ -322,6 +326,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
             cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+            cuteafd_loader::media::ImageFamily::Mistral => "mistral_large4",
         };
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
     }
@@ -344,6 +349,14 @@ impl TowerSpec {
             } else {
                 file.read_exact(&mut weights[start..start + m.byte_length as usize])?;
             }
+        }
+        if self.native.reserved == mistral::RESERVED {
+            // Pixtral's interleaved axial order (height half, then width half).
+            for (i, value) in mistral::axial_inv_freq().into_iter().enumerate() {
+                let start = self.native.inv_freq as usize + i * 4;
+                weights[start..start + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            return Ok(weights);
         }
         let frequencies = if self.native.abi_version == 2 { self.native.head_dim as usize / 4 } else { 16 };
         for i in 0..frequencies {

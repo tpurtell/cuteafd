@@ -1329,6 +1329,28 @@ pub(crate) fn mimo_scratch_bytes(width: u64) -> u64 {
      n*16*16*3,3*256*4,n*2*4,n*2*4,4096*4,4096*4,4*MIB].into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 
+/// Mirrors scratch_mistral (native/shared/cuda/vision_mistral.cuh) at `merged`
+/// [IMG] rows of capacity: four patches each, chunked 4096-row staging, the AOT
+/// attention LSE at its 16K capacity and the BLAS workspace. The output holds
+/// the whole LM span (one marker row per merged row, at most 55).
+pub fn mistral_scratch_bytes(merged: u64) -> u64 {
+    let n = merged * 4;
+    let span = merged + 55;
+    [n*2048*4, n*2048*4, n*2048*2, n*588*2, n*2048*2, n*2048*2, n*2048*2, n*2048*2, span*6144*2,
+     4096*6144*4, 4096*2048*4, 4096*12288*4, 4096*6144*2, 4096*6144*4, 4096*6144*2, 4096*6144*4,
+     n*588, 3*256*4, n*2*4, 16384*16*4, 2*4, 4*MIB]
+        .into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
+/// Mistral Large 4's bundled Pixtral tower at its 55 x 55 merged capacity.
+pub fn mistral_large4_towers(report: &PlanReport, checkpoint: &super::Checkpoint) -> Towers {
+    let vision = if vision_source_bytes(report) > 0 {
+        super::families::mistral_large4::vision_resident_weights(checkpoint)
+            .map(|weights| (weights, mistral_scratch_bytes(55 * 55)))
+    } else { Ok((0, 512 * MIB)) };
+    Towers { name: "Mistral Large 4", vision, v41: false, audio: no_audio() }
+}
+
 /// Mirrors scratch_qwen, including fixed staging, LSE and the BLAS workspace.
 pub(crate) fn qwen_scratch_bytes(tokens: u64) -> u64 {
     let n = tokens * 4;
