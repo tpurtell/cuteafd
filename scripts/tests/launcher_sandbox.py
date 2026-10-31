@@ -5,6 +5,11 @@ import shutil
 _ROOT = None
 _TEMPLATES = {}
 
+LAUNCHER_SHARED_INPUTS = (
+    "python/tools/lib/spark_packages.py",
+    "scripts/build/spark-package-ranges.json",
+)
+
 
 def configure(root):
     global _ROOT
@@ -17,6 +22,8 @@ def copy_input(source, destination):
     source, destination = Path(source), Path(destination)
     if destination.is_dir():
         destination /= source.name
+    if source.name == "release-common.sh":
+        copy_launcher_shared_inputs(source.resolve().parents[2], destination.parent.parent.parent)
     if _ROOT is None:
         return shutil.copy(source, destination)
     key = source.resolve()
@@ -26,6 +33,15 @@ def copy_input(source, destination):
         _TEMPLATES[key] = cached
     destination.hardlink_to(_TEMPLATES[key])
     return str(destination)
+
+
+def copy_launcher_shared_inputs(source_root, destination_root):
+    """Stage the same relative Python/data paths used by the real source tree."""
+    for relative in LAUNCHER_SHARED_INPUTS:
+        source, target = Path(source_root) / relative, Path(destination_root) / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            copy_input(source, target)
 
 
 def stub_cuda_capacity(common, total_bytes):

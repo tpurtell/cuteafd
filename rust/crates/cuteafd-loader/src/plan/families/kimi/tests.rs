@@ -79,15 +79,21 @@ fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
         let report = input.plan(&with_layout(ranks, Some(108 << 30))).unwrap();
         let expected = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, ranks);
         assert!(!report.hints.iter().any(|hint| hint.what.contains("missing projection")), "{:?}", report.hints);
-        if let Err(refusal) = expected {
+        if expected.is_err() {
             assert!(!report.fits && !report.placement_supported);
-            assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal.to_string())),
-                "TP{ranks}: expected {refusal}; {:?}", report.hints);
+            assert!(report.hints.iter().any(|hint| hint.what.contains("routed experts need")
+                && hint.what.contains("over the 108 GiB budget")),
+                "TP{ranks}: {:?}", report.hints);
         } else {
             assert!(!report.hints.iter().any(|hint| hint.what.contains("no exported width class")),
                 "TP{ranks}: {:?}", report.hints);
         }
     }
+    let refusal = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, 5).unwrap_err();
+    let report = input.plan(&with_layout(5, Some(256 << 30))).unwrap();
+    assert!(!report.placement_supported);
+    assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal.to_string())),
+        "{:?}", report.hints);
 }
 
 #[test]

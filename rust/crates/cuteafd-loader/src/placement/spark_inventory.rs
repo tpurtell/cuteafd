@@ -163,7 +163,7 @@ impl SparkExecutionInventory {
         }
         let tp = match manifest["role"].as_str() {
             Some("spark") => 4, Some("spark_tp2") => 2,
-            Some("spark_tp3") => 3, Some("spark_tp6") => 6,
+            Some("spark_tp3") => 3, Some("spark_tp6") => 6, Some("spark_tp8") => 8,
             _ => return Err(invalid("not a supported native Spark role")),
         };
         if number(manifest, "spark_tp_degree")? != tp {
@@ -733,6 +733,24 @@ mod tests {
         assert_eq!(result.serve_peak, 1000 + 60 + e.retained.total().unwrap() + 111 + 222 + 333 + 444);
         assert!(!result.device.iter().any(|i| i.group == "intake"));
         assert_eq!(result.device.iter().chain(&result.pinned).chain(&result.host).map(|i| i.bytes).sum::<u64>(), result.serve_peak);
+    }
+    #[test]
+    fn native_tp8_checks_role_degree_and_padded_geometry() {
+        let mut manifest = native();
+        manifest["role"] = json!("spark_tp8");
+        manifest["spark_tp_degree"] = json!(8);
+        manifest["geometry"]["intermediate"] = json!(288);
+        manifest["geometry"]["kernel_intermediate"] = json!(384);
+        let inventory = SparkExecutionInventory::native(&manifest,48,4096,1024,&[4096,1,80],load()).unwrap();
+        assert_eq!((inventory.logical_intermediate(), inventory.stored_intermediate()), (288,384));
+        for (field, value) in [("spark_tp_degree", json!(6)), ("role", json!("spark_tp7"))] {
+            let mut wrong = manifest.clone(); wrong[field] = value;
+            assert!(SparkExecutionInventory::native(&wrong,48,4096,1024,&[4096,1,80],load()).is_err());
+        }
+        for (field, value) in [("intermediate", 384), ("kernel_intermediate", 256)] {
+            let mut wrong = manifest.clone(); wrong["geometry"][field] = json!(value);
+            assert!(SparkExecutionInventory::native(&wrong,48,4096,1024,&[4096,1,80],load()).is_err());
+        }
     }
     #[test]
     fn native_rejects_unsupported_states_and_package_mismatches() {

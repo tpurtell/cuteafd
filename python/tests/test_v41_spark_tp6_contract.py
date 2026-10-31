@@ -161,10 +161,15 @@ def test_ordinary_exporter_routes_tp6_only_through_fp8_slices() -> None:
 
 
 def test_native_helper_selects_the_tp6_symbol_family() -> None:
+    sys.path.insert(0, str(TOOLS / "lib"))
+    from _v41_expert_native import SPARK_TP_PREFIX, expert_symbol_prefix
+    from spark_packages import native_spark_roles
+    assert set(SPARK_TP_PREFIX) == set(native_spark_roles())
+    for tp in native_spark_roles():
+        assert expert_symbol_prefix(spark_tp=tp) == f"cuteafd_v41_spark_tp{tp}_expert_"
+    assert native_spark_roles()[6] == (7, 384, 384)
     source = NATIVE_HELPER.read_text(encoding="utf-8")
-    assert '6: "cuteafd_v41_spark_tp6_expert_"' in source
-    assert "assert spark_tp is None or spark_tp in SPARK_TP_PREFIX" in source
-    assert "(7, 384, 5120, 384, 384, 6, capacity, 7) if spark_tp == 6" in source
+    assert "role_geometry = native_spark_roles().get(spark_tp)" in source
 
 
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
@@ -580,9 +585,9 @@ def test_qualifier_role_tables_cover_tp6() -> None:
     torch = pytest.importorskip("torch")
     assert torch is not None
     module = _load_qualifier(torch)
-    assert module.SPARK_TP_INTERMEDIATE == {2: 1152, 3: 768, 6: 384}
-    assert module.SPARK_TP_ROLE == {2: 5, 3: 6, 6: 7}
-    assert module.SPARK_TP_KERNEL_INTERMEDIATE == {2: 1152, 3: 768, 6: 384}
+    assert module.SPARK_TP_INTERMEDIATE == {2: 1152, 3: 768, 6: 384, 8: 288}
+    assert module.SPARK_TP_ROLE == {2: 5, 3: 6, 6: 7, 8: 8}
+    assert module.SPARK_TP_KERNEL_INTERMEDIATE == {2: 1152, 3: 768, 6: 384, 8: 384}
     # Role ids stay 3 + degree so 2->5, 3->6, 6->9 is NOT the rule; assert the
     # table is the authority rather than the arithmetic.
     assert module.SPARK_TP_ROLE[6] == 7
@@ -591,8 +596,8 @@ def test_qualifier_role_tables_cover_tp6() -> None:
 def test_qualifier_accepts_tp6_on_the_cli() -> None:
     torch = pytest.importorskip("torch")
     source = QUALIFIER.read_text(encoding="utf-8")
-    assert 'choices=(2, 3, 6)' in source
-    assert "role 7 = Spark TP6" in source
+    assert 'choices=tuple(SPARK_TP_ROLE)' in source
+    assert "SPARK_TP_GEOMETRY = native_spark_roles()" in source
 
 
 def test_role_gate_accepts_the_matching_library_and_rejects_others() -> None:

@@ -52,3 +52,20 @@ def ownership_topology(tp: int, ep: int) -> bool:
     """Wire qualification; the checkpoint still decides its own native recipe."""
     return (ep == 1 and any(tp in package_worlds(family, 'mxfp4')
                            for family in ('v41', 'dsv4f', 'dsv4p'))) or (tp, ep) in ((2, 2), (3, 2), (2, 3))
+
+
+# Stable public native ABI role ids, not a list of packaged worlds.
+NATIVE_SPARK_ROLE_IDS = {2: 5, 3: 6, 4: 1, 6: 7, 8: 8}
+
+
+def native_spark_geometry(family: str = 'v41') -> dict[int, tuple[int, int, int]]:
+    """Covered TP -> (ABI role, logical columns, stored columns)."""
+    intermediate = package_entry(family, 'mxfp4')['intermediate']
+    return {tp: (NATIVE_SPARK_ROLE_IDS[tp], intermediate // tp,
+                 -(-(intermediate // tp) // 128) * 128)
+            for tp in package_worlds(family, 'mxfp4')}
+
+
+def native_spark_roles(family: str = 'v41') -> dict[int, tuple[int, int, int]]:
+    """Namespaced Spark roles; canonical TP4 has its separate legacy entry."""
+    return {tp: geometry for tp, geometry in native_spark_geometry(family).items() if tp != 4}

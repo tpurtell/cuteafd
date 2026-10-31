@@ -1,7 +1,7 @@
 """ctypes bindings for official TP4 and local dSpark expert qualification."""
 
 import ctypes as C
-import torch
+from spark_packages import native_spark_roles
 
 P = C.c_void_p
 I = C.c_int32
@@ -61,12 +61,9 @@ class Launch(C.Structure):
 assert C.sizeof(Info) == 64 and C.sizeof(Launch) == 392
 
 
-SPARK_TP_PREFIX = {
-    2: "cuteafd_v41_spark_tp2_expert_",
-    3: "cuteafd_v41_spark_tp3_expert_",
-    6: "cuteafd_v41_spark_tp6_expert_",
-    8: "cuteafd_v41_spark_tp8_expert_",
-}
+SPARK_TP_PREFIX = {tp: f"cuteafd_v41_spark_tp{tp}_expert_"
+                   for tp in native_spark_roles()}
+
 # Only the five per-family launch-ABI entry points are namespaced. The packer
 # size query and the packer itself are canonical symbols shared by every family.
 FAMILY_SYMBOLS = frozenset({
@@ -140,16 +137,15 @@ def check(code):
 
 class Native:
     def __init__(self, lib, capacity, weights, wire, ids, routing, *, coordinator=False, full_backbone=False, tp2=False, spark_tp=None, storage=None, geometry=None):
+        import torch
         assert spark_tp is None or spark_tp in SPARK_TP_PREFIX
         assert sum((coordinator, full_backbone, tp2, spark_tp is not None)) <= 1
         self.lib = lib
         self.info = info = Info()
         self.handle = P()
         check(lib.cuteafd_v41_expert_info(capacity, C.byref(info)))
-        expected = ((5, 384, 5120, 1152, 1152, 6, capacity, 7) if spark_tp == 2 else
-                    (6, 384, 5120, 768, 768, 6, capacity, 7) if spark_tp == 3 else
-                    (7, 384, 5120, 384, 384, 6, capacity, 7) if spark_tp == 6 else
-                    (8, 384, 5120, 288, 384, 6, capacity, 7) if spark_tp == 8 else
+        role_geometry = native_spark_roles().get(spark_tp)
+        expected = ((role_geometry[0], 384, 5120, *role_geometry[1:], 6, capacity, 7) if role_geometry else
                     (3, 384, 5120, 1152, 1152, 6, capacity, 7) if tp2 else
                     (0, 128, 5120, 2304, 2304, 3, capacity, 1)
                     if coordinator else (2, 384, 5120, 2304, 2304, 6, capacity, 7)
@@ -237,6 +233,7 @@ class Native:
         )
 
     def run(self, rows):
+        import torch
         self.args.num_tokens = rows
         self.args.scatter_rows = rows * self.info.topk
         self.args.stream = torch.cuda.current_stream().cuda_stream

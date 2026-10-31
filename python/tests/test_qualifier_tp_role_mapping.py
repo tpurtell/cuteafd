@@ -44,9 +44,9 @@ def _load_qualifier():
 
 def test_role_table_is_the_authority_for_every_degree() -> None:
     module = _load_qualifier()
-    assert module.SPARK_TP_ROLE == {2: 5, 3: 6, 6: 7}
-    assert module.SPARK_TP_INTERMEDIATE == {2: 1152, 3: 768, 6: 384}
-    assert module.SPARK_TP_KERNEL_INTERMEDIATE == {2: 1152, 3: 768, 6: 384}
+    assert module.SPARK_TP_ROLE == {2: 5, 3: 6, 6: 7, 8: 8}
+    assert module.SPARK_TP_INTERMEDIATE == {2: 1152, 3: 768, 6: 384, 8: 288}
+    assert module.SPARK_TP_KERNEL_INTERMEDIATE == {2: 1152, 3: 768, 6: 384, 8: 384}
     # The legacy arithmetic must NOT reproduce the TP6 entry; if it did, this
     # test could not distinguish table-driven selection from 3 + degree.
     assert module.SPARK_TP_ROLE[6] != 3 + 6

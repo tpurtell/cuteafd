@@ -13,6 +13,9 @@ SPEC = importlib.util.spec_from_file_location('checkpoint_family', Path(__file__
 checkpoint_family = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checkpoint_family)
 # The launcher's default checkpoint when a config names none (release-common.sh).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'python/tools/lib'))
+from spark_packages import native_spark_roles
+
 DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
@@ -70,11 +73,11 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + dense_switch(values) + '_AOT'] = 'ON'
         scopes_before = set(scopes)
         scopes = set()
-        if family == 'deepseek_v41' and count in (2, 3, 6, 8):
+        if family == 'deepseek_v41' and count in native_spark_roles('v41'):
             roles.add('tp' + str(count))
         if family == 'deepseek_v4':
             tag = 'dsv4p' if 'pro' in card['name'] else 'dsv4f'
-            scopes.update({tag + ':rtx_backbone', tag + (f':spark_tp{count}' if count in (2, 3, 6, 8) else ':spark')})
+            scopes.update({tag + ':rtx_backbone', tag + (f':spark_tp{count}' if count in native_spark_roles(tag) else ':spark')})
             if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
                 scopes.add(tag + ':rtx_tp2')
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
@@ -180,7 +183,7 @@ def config_scopes(values):
     # Direct configs name their Spark TP explicitly (TP2xEP3 on six Sparks is
     # the tp2 role, not tp6); cards keep the Spark-count role.
     spark_tp = resolved.get('SPARK_TP', '')
-    if family == 'deepseek_v41' and scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] and spark_tp in ('2', '3', '6', '8'):
+    if family == 'deepseek_v41' and scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] and spark_tp in {str(tp) for tp in native_spark_roles('v41')}:
         scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] = 'tp' + spark_tp
     if family in ('glm5', 'glm5_flash'):
         scopes['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] = 'ON'

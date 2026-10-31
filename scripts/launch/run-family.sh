@@ -1691,7 +1691,7 @@ audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
 # An explicit count or host list is exact. Unspecified means the entire inventory.
 available_sparks=0
-for rank in {0..5}; do
+for rank in {0..7}; do
   [[ -n "$(get "SPARK_${rank}_HOST")" ]] || break
   available_sparks=$((available_sparks + 1))
 done

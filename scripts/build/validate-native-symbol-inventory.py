@@ -52,7 +52,7 @@ OPTIONAL_MARKERS = (".ok()", "if let Ok(")
 EXPERT_PREFIXES = (
     "cuteafd_v41", "cuteafd_v41_local", "cuteafd_v41_tp2", "cuteafd_v41_dspark_tp2",
     "cuteafd_v41_nvfp4", "cuteafd_v41_nvfp4_tp2", "cuteafd_v41_nvfp4_local",
-    "cuteafd_v41_spark_tp2", "cuteafd_v41_spark_tp3", "cuteafd_v41_spark_tp6",
+    "cuteafd_v41_spark_tp2", "cuteafd_v41_spark_tp3", "cuteafd_v41_spark_tp6", "cuteafd_v41_spark_tp8",
 )
 EXPERT_OPERATIONS = ("info", "initialize", "initialize_scratch_async", "bind_scratch",
                      "launch", "output_kind")

@@ -1342,3 +1342,29 @@ fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
         }
     }
 }
+
+
+#[test]
+fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
+    let dir = snapshot("fp8");
+    let manifest = native_manifest(dir.path());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let options = |budget| PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(5),
+        spark_budget_bytes: Some(budget),
+        draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            pool_tokens: Some(262144), context_tokens: 262144, host_cache_bytes: Some(0),
+            spark_bytes: budget, spark_allocation_budget_bytes: Some(budget),
+            workspace_manifest: Some(manifest.clone()), ..Default::default()
+        }), ..Default::default()
+    };
+    let fit = input.plan(&options(192 << 30)).unwrap();
+    assert!(fit.fits && fit.placement_supported, "{:?}", fit.hints);
+    let small = input.plan(&options(64 << 30)).unwrap();
+    assert!(!small.fits, "{:?}", small.hints);
+    assert!(small.hints.iter().any(|hint| hint.what.contains("budget") || hint.what.contains("memory")), "{:?}", small.hints);
+    assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
+        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
+}
