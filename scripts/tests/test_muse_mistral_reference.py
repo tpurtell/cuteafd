@@ -380,3 +380,16 @@ def test_muse_centered_norm_weights_keep_the_official_bf16_add(tmp_path):
         assert layer.get_parameter(name).dtype == torch.bfloat16
     assert layer.self_attn.q_proj.weight.dtype == torch.float32
     assert layer.post_attention_residual_gate.gate.dtype == torch.float32
+
+
+def test_muse_ordered_experts_equal_the_official_cpu_accumulation():
+    from transformers.models.muse_spark import modeling_muse_spark as reference
+    config = tiny_muse_config()
+    moe = reference.MuseSparkMoE(config).eval()
+    randomize(moe)
+    hidden = torch.randn(37, config.moe_hidden_size)
+    _, weights, index = moe.gate(torch.randn(37, config.hidden_size))
+    with torch.inference_mode():
+        official = moe.experts(hidden, index, weights)
+        ordered = muse.ordered_experts(moe.experts, hidden, index, weights)
+    assert torch.equal(official, ordered)

@@ -301,20 +301,85 @@ def causal_tiles(official):
     return forward
 
 
+def ordered_experts(experts, hidden_states, top_k_index, top_k_weights):
+    """MuseSparkExperts.forward with a fixed accumulation order.
+
+    Per expert the arithmetic is the official one line for line; only the final
+    ``index_add_`` (atomic, order-free on CUDA) is replaced by summing each token's
+    contributions sequentially in ascending expert order, the order the official
+    loop visits experts and CPU ``index_add_`` applies them.
+    """
+    import torch
+    import torch.nn as nn
+    tokens, slots = top_k_index.shape
+    contributions = hidden_states.new_zeros((tokens, slots, hidden_states.shape[-1]))
+    expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=experts.num_experts + 1).permute(2, 1, 0)
+    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        if expert_idx == experts.num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        gate, up = nn.functional.linear(current_state, experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        current_hidden_states = experts.act_fn(gate) * up
+        current_hidden_states = nn.functional.linear(current_hidden_states, experts.down_proj[expert_idx])
+        current_hidden_states = experts.post_expert_norm(current_hidden_states)
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        contributions[token_idx, top_k_pos] = current_hidden_states.to(contributions.dtype)
+    order = top_k_index.argsort(dim=-1, stable=True)
+    contributions = contributions.gather(1, order[..., None].expand_as(contributions))
+    final_hidden_states = torch.zeros_like(hidden_states)
+    for slot in range(slots):
+        final_hidden_states = final_hidden_states + contributions[:, slot]
+    return final_hidden_states
+
+
+def fixed_rows(forward):
+    """Run a row-local module on 128-row tiles so CUDA reduction launch shapes never
+    depend on how many rows (tokens routed to an expert, window length) it sees."""
+    def tiled(self, x):
+        import torch
+        flat = x.reshape(-1, x.shape[-1])
+        outputs = []
+        for start in range(0, flat.shape[0], ROWS):
+            chunk = flat[start:start + ROWS]
+            count = chunk.shape[0]
+            if count != ROWS:
+                padded = chunk.new_zeros((ROWS, chunk.shape[-1]))
+                padded[:count].copy_(chunk)
+                chunk = padded
+            outputs.append(forward(self, chunk)[:count])
+        out = torch.cat(outputs) if outputs else forward(self, x)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+    return tiled
+
+
+NORMS = ("MuseSparkRMSNorm", "MuseSparkTextCenteredRMSNorm", "MuseSparkTextInputScaledRMSNorm")
+
+
 @contextmanager
 def geometry(reference):
-    """Fixed-M128 linears and bounded eager attention around the official module."""
+    """Fixed-M128 linears and norms, bounded eager attention and ordered expert sums."""
     import torch.nn.functional as F
     import torch
     import shape_invariant
-    previous = F.linear, torch.einsum, reference.eager_attention_forward
+    previous = (F.linear, torch.einsum, reference.eager_attention_forward,
+                reference.MuseSparkExperts.forward)
+    norms = {name: getattr(reference, name).forward for name in NORMS}
     F.linear = shape_invariant.linear
     torch.einsum = shape_invariant.einsum
     reference.eager_attention_forward = causal_tiles(previous[2])
+    reference.MuseSparkExperts.forward = ordered_experts
+    for name, forward in norms.items():
+        getattr(reference, name).forward = fixed_rows(forward)
     try:
         yield
     finally:
-        F.linear, torch.einsum, reference.eager_attention_forward = previous
+        (F.linear, torch.einsum, reference.eager_attention_forward,
+         reference.MuseSparkExperts.forward) = previous
+        for name, forward in norms.items():
+            getattr(reference, name).forward = forward
 
 
 @contextmanager
