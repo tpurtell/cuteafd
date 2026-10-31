@@ -148,7 +148,7 @@ V2_TOOL_UNAVAILABLE = "Tool unavailable in this session; answer directly from th
 def recipe_identity(recipe):
     if recipe == "v1":
         return None
-    rules = {"id": "own-text-v2", "continue_until_generated": 512, "max_turns_per_window": V2_MAX_TURNS,
+    rules = {"id": "own-text-v2", "continue_until_scored_generated": 512, "max_turns_per_window": V2_MAX_TURNS,
              "tool_clause": "only when tools are declared", "tool_unavailable_result": V2_TOOL_UNAVAILABLE,
              "trailing_context": "checkpoint-native user turn after the final assistant turn",
              "earlier_turn_roles": "gen only where the earlier prompt+generation is an exact token prefix"}
@@ -283,7 +283,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     def continue_window(name, body, chat, tokens, roles, turns, executor, history, limit):
         """v2: answer tool calls in-window and ask again until 512 generated rows."""
         info = {"ended_with_tool_calls": False, "earlier_turns_ctx": 0, "tool_errors": 0}
-        while roles.count("gen") < 512 and chat.get("tool_calls") and len(turns) < V2_MAX_TURNS:
+        # Scored rows are the window's last 512 positions; tool results there are ctx.
+        while roles[-512:].count("gen") < 512 and chat.get("tool_calls") and len(turns) < V2_MAX_TURNS:
             calls = chat["tool_calls"]
             assistant = {"role": "assistant", "content": chat.get("content", ""),
                          "reasoning_content": chat.get("reasoning", ""), "tool_calls": calls}
