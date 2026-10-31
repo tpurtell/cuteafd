@@ -52,6 +52,8 @@ pub(crate) struct Options<'a> {
     pub partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     /// The coordinator EXL3 package state (`shared::local_workspace`).
     pub local: shared::LocalPackage,
+    /// The DFlash2 drafter's charge (`shared::drafter_inventory`), when one serves.
+    pub drafter: Option<shared::MuseDrafter>,
 }
 
 /// Measured admission: the shared request with live baselines and the code the
@@ -77,7 +79,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
-        local: options.local, fixed, startup: Vec::new() })
+        local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })
 }
 
 #[cfg(test)]
@@ -156,7 +158,8 @@ mod tests {
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_wide_format: Default::default(),
-                local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)? })?;
+                local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
+                drafter: None })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
             assert!(live.pool_tokens > 0);
             // The same image without its package: startup refuses whenever the placement
@@ -175,7 +178,7 @@ mod tests {
                     max_context: None, pool_tokens: None, onboard: Onboard::Auto,
                     spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                    partial_wide_format: Default::default(), local }).err().expect("missing package refuses").to_string();
+                    partial_wide_format: Default::default(), local, drafter: None }).err().expect("missing package refuses").to_string();
                 assert!(error.contains("rebuild with the Muse coordinator scope"), "{error}");
                 refused += 1;
             }

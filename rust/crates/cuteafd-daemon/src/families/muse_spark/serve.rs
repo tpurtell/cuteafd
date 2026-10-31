@@ -34,6 +34,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
+    /// Opt in to a DFlash2 drafter snapshot (RadixArk/Muse-Spark-Open-DFlash2); it runs
+    /// beside the target head and reads the target's exact head (softcap and multiplier).
+    #[arg(long)] pub draft: Option<PathBuf>,
+    /// Fixed draft depth; absent lets the shared policy choose up to the drafter's block.
+    #[arg(long, requires = "draft", value_parser = clap::value_parser!(u8).range(1..=15))]
+    pub draft_fixed: Option<u8>,
+    /// The drafter's ring storage (independent of weight precision).
+    #[arg(long, default_value = "fp8")]
+    pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     #[arg(long)] pub prefill_rows: Option<usize>,
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
@@ -124,7 +133,19 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
         partial_wide_format: args.expert_partial_wide_format,
         local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
-            Some(&args.manifest), gpus, args.prefill()?.unit_rows)? })?;
+            Some(&args.manifest), gpus, args.prefill()?.unit_rows)?,
+        drafter: args.draft.as_deref().map(|snapshot| -> Result<_> {
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))
+                .with_context(|| format!("Muse drafter config {}", snapshot.display()))?)?;
+            let head = core.get_weight(cuteafd_loader::families::muse_spark::core::HEAD)
+                .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+            let head_device = crate::shared::memory::device::Device { library: &library,
+                id: *args.devices.last().context("Muse devices")? };
+            let sms = head_device.run(|| library.sm_count())?;
+            cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
+                usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
+                args.draft_kv_cache)
+        }).transpose()? })?;
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
@@ -187,9 +208,21 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let served_context = usize::try_from(context.min(placement.pool_tokens))?;
     let pages = usize::try_from(placement.pool_tokens)? / super::step::PAGE_ROWS;
     let streams = engine.streams.iter().map(|stream| stream.raw).collect::<Vec<_>>();
+    // The drafter beside the target head, on the head rank's stream (admission charged it there).
+    let head_stream = *streams.last().context("Muse head stream")?;
+    let draft = match (args.draft.as_deref(), &built.drafter) {
+        (Some(snapshot), Some(admitted)) => Some(super::draft::MuseDraft::load(&cfg, ranks.last().context("Muse head rank")?,
+            head_stream, snapshot, &embedding, admitted, args.draft_kv_cache)?),
+        (None, None) => None,
+        _ => anyhow::bail!("Muse drafter admission differs from --draft"),
+    };
+    let pricing = draft.as_ref().map(|_| super::backend::DraftPricing::new(&cfg,
+        catalog.exl3().context("Muse draft pricing needs EXL3 headers")?, &onboarded, gpus, engine.link.world_size()?,
+        engine.link.installed_grouping()?)).transpose()?;
+    tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local)?;
+        served_context, pages, local, draft, pricing)?;
     run(&backend, sequences)
 }
 
@@ -200,7 +233,13 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     with_backend(args, |backend, sequences| {
         let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(0),
             crate::shared::qwen::Encoder::Off, 16);
-        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, scheduler::Drafts::None, eos,
+        let drafts = match (&args.draft, args.draft_fixed) {
+            (None, _) => scheduler::Drafts::None,
+            (Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true },
+            (Some(snapshot), None) => scheduler::Drafts::Neural {
+                depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts(), fixed: false },
+        };
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, eos,
             args.decode_share, &args.prefix, args.token_io.token_select, &mut media, None,
             || initialized(backend.geometry().max_context))
     })

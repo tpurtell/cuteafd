@@ -44,6 +44,8 @@ pub(crate) struct MusePrefill<'h, 'r, 'a> {
     pub call: PrefillCall<'h>,
     /// Each rank's onboarded experts (empty: every layer on the Sparks).
     pub local: &'h mut [super::onboard::OnboardedExperts<'a>],
+    /// The drafter: units in the call's final `TAP_ROWS` rows tap their rows there.
+    pub draft: Option<&'h super::draft::MuseDraft<'a>>,
     units: Vec<Option<UnitState>>,
     /// The call's last row's logits (set by the unit holding it).
     pub logits: Option<Buffer>,
@@ -54,10 +56,10 @@ impl<'h, 'r, 'a> MusePrefill<'h, 'r, 'a> {
     pub(crate) fn new(cfg: &'h MuseSparkConfig, ranks: &'r [RankResources<'a>], streams: Vec<*mut c_void>,
         table: &'h crate::shared::token_io::TokenEmbedding<'a>, experts: &'h mut dyn SparkExperts,
         peers: Vec<&'h mut dyn PeerExchange>, call: PrefillCall<'h>, local: &'h mut [super::onboard::OnboardedExperts<'a>],
-        units: usize) -> Result<Self> {
+        draft: Option<&'h super::draft::MuseDraft<'a>>, units: usize) -> Result<Self> {
         ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2)
             && (local.is_empty() || local.len() == ranks.len()), "Muse prefill geometry");
-        Ok(Self { cfg, ranks, streams, table, experts, peers, call, local, units: (0..units).map(|_| None).collect(),
+        Ok(Self { cfg, ranks, streams, table, experts, peers, call, local, draft, units: (0..units).map(|_| None).collect(),
             logits: None })
     }
 
@@ -84,6 +86,26 @@ impl<'h, 'r, 'a> MusePrefill<'h, 'r, 'a> {
             rank.device.run(|| body(index, &device, &state.planes[index], peer, path, &mut state.wave))?;
         }
         Ok(())
+    }
+}
+
+impl MusePrefill<'_, '_, '_> {
+    /// The call's tapped window: its last `TAP_ROWS` rows.
+    pub(crate) fn tap_window(&self) -> std::ops::Range<usize> {
+        let rows = self.call.tokens.len();
+        rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS)..rows
+    }
+
+    /// After `layer` of `unit` on every rank: its rows inside the tap window,
+    /// from the head rank's `hidden` (the unit's slot view), at their window offset.
+    fn tap(&self, layer: usize, unit: &Unit) -> Result<()> {
+        let Some(draft) = self.draft else { return Ok(()) };
+        let window = self.tap_window();
+        let (from, to) = (unit.rows.start.max(window.start), unit.rows.end.min(window.end));
+        if from >= to { return Ok(()); }
+        let state = self.units[unit.index].as_ref().context("Muse prefill unit not begun")?;
+        let hidden = state.lanes[self.ranks.len() - 1].plane("hidden")?;
+        draft.tap(layer, hidden, from - unit.rows.start, to - from, from - window.start)
     }
 }
 
@@ -138,7 +160,7 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
             let local = self.local.get_mut(index).context("Muse onboarded layer without the rank's experts")?;
             rank.device.run(|| device.layer_local(layer, &state.planes[index], local, peer))?;
         }
-        Ok(())
+        self.tap(layer, unit)
     }
 
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<()> {
@@ -154,7 +176,8 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         self.each_rank(unit, |index, device, _, peer, experts, wave| {
             let landed = if index == 0 { wave.take() } else { None };
             device.layer_back(layer, rows, landed, experts, peer)
-        })
+        })?;
+        self.tap(layer, unit)
     }
 
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
@@ -212,5 +235,36 @@ mod tests {
         assert!(begin.contains("rank.step.upload(rank.device.library, unit.slot, &meta, true"));
         assert!(begin.contains("super::forward::embed(self.cfg, rank, &lane"));
         assert!(source.contains("rank.device_with(cfg, self.streams[index], &state.lanes[index])"));
+    }
+
+    /// The drafter's tap rows are the call's last `TAP_ROWS` rows: the units
+    /// overlapping that window tap their overlap at its window offset, so the
+    /// window is tiled exactly once whatever the unit cut; every layer's back
+    /// half (Spark land or onboarded) taps after it runs.
+    #[test]
+    fn units_tile_the_draft_tap_window_once() -> anyhow::Result<()> {
+        use crate::shared::speculation::dflash::TAP_ROWS;
+        for rows in [1usize, 700, 2048, 2049, 5000, 8256] {
+            for unit in [64usize, 1024, 2752, 4096] {
+                let window = rows.saturating_sub(TAP_ROWS)..rows;
+                let mut covered = vec![0u8; window.len()];
+                for start in (0..rows).step_by(unit) {
+                    let unit_rows = start..(start + unit).min(rows);
+                    let (from, to) = (unit_rows.start.max(window.start), unit_rows.end.min(window.end));
+                    if from >= to { continue; }
+                    // (first row within the unit, rows, offset within the window), as `tap` computes it.
+                    let (first, n, at) = (from - unit_rows.start, to - from, from - window.start);
+                    assert!(first + n <= unit_rows.len() && at + n <= TAP_ROWS);
+                    for row in &mut covered[at..at + n] { *row += 1; }
+                }
+                assert!(covered.iter().all(|&c| c == 1), "rows {rows} unit {unit}");
+            }
+        }
+        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
+        for hook in ["fn local_ffn(", "fn land_experts("] {
+            let body = source.split(hook).nth(1).unwrap().split("\n    fn ").next().unwrap();
+            assert!(body.trim_end().ends_with("self.tap(layer, unit)\n    }") || body.contains("self.tap(layer, unit)"), "{hook}");
+        }
+        Ok(())
     }
 }

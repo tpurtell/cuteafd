@@ -271,3 +271,38 @@ fn missing_package_is_harmless_only_when_memory_onboards_nothing() {
     // It plans (the manifest only adds the image's loaded-code demand).
     assert!(unpackaged.solver_placement.as_ref().is_some_and(|p| p.pool_tokens > 0), "{:?}", unpackaged.hints);
 }
+
+/// The DFlash2 drafter is charged on the head GPU (it borrows the target head
+/// there): its shared DFlash2 inventory plus the head scratch its target-head
+/// launch owns. A drafter whose head softcap or multiplier differs from the
+/// target's is refused by name (its logits would not be the target head's).
+#[test]
+fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let radixark = include_str!("../../../../../cuteafd-daemon/src/families/muse_spark/fixtures/drafters/radixark.json");
+    let drafter = tempfile::tempdir().unwrap();
+    std::fs::write(drafter.path().join("config.json"), radixark).unwrap();
+    let base = with_layout(2, 6);
+    let mut with_draft = base.clone();
+    with_draft.layout.as_mut().unwrap().muse_drafter_snapshot = Some(drafter.path().to_path_buf());
+    let plain = input.plan(&base).unwrap();
+    let drafted = input.plan(&with_draft).unwrap();
+    let placed = drafted.solver_placement.as_ref().unwrap_or_else(|| panic!("{:?}", drafted.hints));
+    let group = |gpu: usize| placed.items[gpu].iter().filter(|item| item.group == "Drafter").map(|item| item.bytes).sum::<u64>();
+    assert_eq!(group(0), 0, "the drafter lives beside the head (GPU1)");
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+    let config: serde_json::Value = serde_json::from_str(radixark).unwrap();
+    let sms = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES).sms;
+    let expected = crate::placement::families::muse_spark::drafter_inventory(&cfg, &config, 16, 16, 202_112,
+        u64::from(sms), crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
+    assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch);
+    assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
+    assert!(drafted.solver_placement.as_ref().unwrap().pool_tokens < plain.solver_placement.as_ref().unwrap().pool_tokens);
+    // A drafter trained against another head refuses before placement.
+    let mut other: serde_json::Value = config.clone();
+    other["dflash_config"]["output_multiplier"] = serde_json::json!(0.125);
+    std::fs::write(drafter.path().join("config.json"), other.to_string()).unwrap();
+    let refused = input.plan(&with_draft).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("softcap/output_multiplier differ")), "{:?}", refused.hints);
+}

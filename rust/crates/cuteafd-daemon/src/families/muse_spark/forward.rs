@@ -68,7 +68,8 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
     table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], meta: &StepMetadata, prefill: bool,
     wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
-    local: &mut [super::onboard::OnboardedExperts<'_>], head_rows: std::ops::Range<usize>) -> Result<Buffer> {
+    local: &mut [super::onboard::OnboardedExperts<'_>], draft: Option<&super::draft::MuseDraft<'_>>,
+    head_rows: std::ops::Range<usize>) -> Result<Buffer> {
     ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len()
         && (local.is_empty() || local.len() == ranks.len()), "Muse step geometry");
     let planes: Vec<StepPlanes> = ranks.iter().zip(streams).map(|(rank, &stream)| {
@@ -86,6 +87,11 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
             }
             let path = if index == 0 { experts.as_deref_mut() } else { None };
             rank.device.run(|| rank.device(cfg, stream).layer(layer, &planes[index], path, peer))?;
+        }
+        // The drafter taps the head rank's hidden rows after the layer, on that rank's stream.
+        if let Some(draft) = draft {
+            let last = ranks.len() - 1;
+            draft.tap(layer, ranks[last].lane.views.plane("hidden")?, 0, tokens.len(), 0)?;
         }
     }
     let last = ranks.len() - 1;

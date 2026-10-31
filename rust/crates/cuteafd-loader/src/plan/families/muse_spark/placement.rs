@@ -8,6 +8,7 @@
 //! installed PROGRAMS.json once its programs exist; until then this is a
 //! planning lower bound (stated in the notes), not serving admission.
 use super::Model;
+use anyhow::Context as _;
 use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
@@ -87,6 +88,21 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             Ok(workspace) => workspace,
             Err(error) => {
                 refusal(report, format!("Muse coordinator EXL3 package refused: {error:#}"), "Install the matching package.");
+                return memory;
+            }
+        },
+        drafter: match opts.muse_drafter_snapshot.as_deref().map(|snapshot| -> anyhow::Result<_> {
+            let config: serde_json::Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
+            let head = model.core.get_weight(crate::families::muse_spark::core::HEAD)
+                .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
+            let sms = opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", opts.rtx_bytes[gpus - 1]).sms);
+            crate::placement::families::muse_spark::drafter_inventory(cfg, &config, usize::try_from(slots)?,
+                usize::try_from(slots)?, head, u64::from(sms), opts.draft_kv_cache)
+        }).transpose() {
+            Ok(drafter) => drafter,
+            Err(error) => {
+                refusal(report, format!("Muse DFlash2 drafter refused: {error:#}"),
+                    "Use a drafter trained for this target (RadixArk/Muse-Spark-Open-DFlash2) or drop --draft.");
                 return memory;
             }
         },

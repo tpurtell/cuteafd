@@ -1,5 +1,5 @@
 //! Muse Spark on the shared scheduler (`qwen::scheduler::Backend`), text
-//! only, no drafter yet.
+//! only, with an optional DFlash2 drafter (`draft::MuseDraft`).
 //!
 //! - Prefill: one sequence's chunk as row units on the shared pipeline
 //!   (`MusePrefill`, units interleaved per layer, each in its own slot), then
@@ -10,6 +10,11 @@
 //!   sliding rings keep one 64-row rollback step beyond the window
 //!   (`cache::swa_ring`) and full-layer records past the frontier are rewritten
 //!   by the next step, so publication is the frontier alone.
+//! - Drafter: every step taps the head rank's hidden rows after the tapped
+//!   layers; prefill commits the call's tail (its last `TAP_ROWS` rows) as
+//!   context, accept commits each sequence's kept rows, and a draft is one
+//!   block per sequence from its anchor (`valid_from` bounds the context a
+//!   restored prefix does not have).
 use super::{engine::RankResources, experts::{SparkExperts, WaveSegment, WaveStep}, forward, prefill::{MusePrefill, PrefillCall},
     prefix::{MusePrefix, Placement}, step::{StepMetadata, StepSequence}};
 use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixArgs, Toggle},
@@ -22,12 +27,47 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::muse_spark::{lane::HEAD_ROWS, MuseSparkConfig};
 use std::{cell::RefCell, ffi::c_void, path::Path};
 
-/// No drafter yet: every step is plain decode.
+/// What the draft policy prices a verify row with: every layer's expert
+/// slice bytes (onboarded layers per RTX, Spark layers per rank) and the
+/// installed groupings (the Sparks' bootstrap reports; the onboarded EXL3
+/// executors' are read at use).
+pub(crate) struct DraftPricing {
+    pub homes: Vec<crate::shared::draft::resource::LayerHome>,
+    pub grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>,
+}
+
+impl DraftPricing {
+    /// From the checkpoint's EXL3 headers: an onboarded layer's slice is the
+    /// GPU's (TP over the coordinator GPUs), a Spark layer's the rank's.
+    pub(crate) fn new(cfg: &MuseSparkConfig, manifest: &cuteafd_loader::V41Exl3Manifest, onboarded: &[usize],
+        gpus: usize, world: usize, grouping: Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>)
+        -> Result<Self> {
+        use crate::shared::draft::resource::{exl3_slice_bytes, LayerHome};
+        let homes = (0..cfg.layers).map(|layer| Ok(if onboarded.contains(&layer) {
+            LayerHome::Local { slice_bytes: exl3_slice_bytes(manifest, layer, gpus)? }
+        } else { LayerHome::Remote { slice_bytes: exl3_slice_bytes(manifest, layer, world)? } }))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { homes, grouping })
+    }
+}
+
+/// A sequence's drafter state: the next block's anchor, whether its context
+/// is current (prefilled or accepted through the frontier), and the first
+/// position the drafter's context holds for it.
 #[derive(Debug, Default)]
-pub(crate) struct NoDraft;
-impl scheduler::DraftState for NoDraft {
-    fn pending_rows(&self) -> usize { 0 }
-    fn close(&mut self, _token: u32) {}
+pub(crate) struct DraftState {
+    anchor: Option<u32>,
+    ready: bool,
+    valid_from: usize,
+}
+impl scheduler::DraftState for DraftState {
+    fn pending_rows(&self) -> usize { usize::from(self.ready && self.anchor.is_some()) }
+    fn close(&mut self, token: u32) { self.anchor = Some(token); }
+    /// A restored prefix has no drafter context: it starts cold at the frontier.
+    fn restored(&mut self, frontier: usize) {
+        self.ready = false;
+        self.valid_from = frontier;
+    }
 }
 
 pub(crate) struct MuseBackend<'r, 'a> {
@@ -48,6 +88,10 @@ pub(crate) struct MuseBackend<'r, 'a> {
     ring_rows: usize,
     /// Each rank's onboarded experts (empty: every layer on the Sparks).
     local: RefCell<Vec<super::onboard::OnboardedExperts<'a>>>,
+    /// The DFlash2 drafter on the head rank's stream (`--draft`).
+    draft: Option<super::draft::MuseDraft<'a>>,
+    /// The draft policy's expert pricing (`policy_geometry`), present with a drafter.
+    pricing: Option<DraftPricing>,
 }
 
 impl<'r, 'a> MuseBackend<'r, 'a> {
@@ -55,17 +99,39 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
     pub(crate) fn new(cfg: &'r MuseSparkConfig, ranks: &'r [RankResources<'a>], streams: Vec<*mut c_void>,
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
         unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
-        local: Vec<super::onboard::OnboardedExperts<'a>>) -> Result<Self> {
+        local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
+        pricing: Option<DraftPricing>) -> Result<Self> {
+        ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
+        ensure!(draft.as_ref().is_none_or(|draft| streams.last() == Some(&draft.stream)),
+            "Muse drafter must run on the head rank's stream");
         ensure!(!ranks.is_empty() && streams.len() == ranks.len() && (ranks.len() == 1) == peer.is_none()
             && (local.is_empty() || local.len() == ranks.len()) && table.vocab() == cfg.vocab_size && table.hidden() == cfg.hidden,
             "Muse backend geometry differs from its ranks, embedding or layers");
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
             profile: RefCell::new([0.0; 2]), unit_rows, waves, slots, context, pages, ring_rows,
-            local: RefCell::new(local) })
+            local: RefCell::new(local), draft, pricing })
     }
 
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
+
+    /// The shared policy geometry over this placement's layer homes and the
+    /// installed groupings at every verify row count up to `HEAD_ROWS`.
+    fn policy_geometry(&self, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        use crate::shared::{draft::resource::{self, LayerHome}, experts::rtx::RtxExpertLayer};
+        let pricing = self.pricing.as_ref().context("Muse draft pricing absent")?;
+        let local = self.local.borrow();
+        resource::geometry_with_grouping(&pricing.homes, self.cfg.experts, self.cfg.topk, HEAD_ROWS, width, 0,
+            |layer, rows| match pricing.homes[layer] {
+                LayerHome::Local { .. } => {
+                    let group = local.first().context("Muse onboarded layer without executors")?.executor.group_rows(rows)?;
+                    ensure!(local.iter().all(|rank| rank.executor.group_rows(rows).ok() == Some(group)),
+                        "Muse onboarded ranks disagree on grouping");
+                    Ok(group)
+                }
+                _ => resource::worker_group_rows(&pricing.grouping, layer, rows),
+            })
+    }
 
     fn logits(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize) -> DeviceLogits {
         DeviceLogits { ptr: buffer.ptr.cast_const(), rows, vocab: self.cfg.vocab_size, stride: self.cfg.vocab_size,
@@ -87,14 +153,14 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
         let mut experts = self.experts.borrow_mut();
         let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &meta, false, wave,
-            &mut **experts, peers, &mut self.local.borrow_mut(), 0..rows)?;
+            &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(), 0..rows)?;
         Ok(self.logits(logits, rows))
     }
 }
 
 impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     type Placement = Placement;
-    type Draft = NoDraft;
+    type Draft = DraftState;
     type History = ();
     type Coordinates = ();
     type Encoder = crate::shared::qwen::Encoder;
@@ -163,7 +229,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
             pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots };
         let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
-            call, &mut local, units.len())?;
+            call, &mut local, self.draft.as_ref(), units.len())?;
         crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
         let logits = hooks.logits.take();
         drop(hooks);
@@ -185,22 +251,71 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
         serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts})
     }
-    fn draft_geometry(&self, _snapshot: &Path, _width: usize) -> Result<cuteafd_core::PolicyGeometry> {
-        anyhow::bail!("Muse Spark has no drafter yet")
+    fn draft_geometry(&self, _snapshot: &Path, width: usize) -> Result<cuteafd_core::PolicyGeometry> {
+        let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
+        ensure!(width > 0 && width < draft.block, "Muse draft width {width} beyond the drafter's block {}", draft.block);
+        self.policy_geometry(width)
     }
-    fn arm_draft_probe(&self) -> Result<()> { anyhow::bail!("Muse Spark has no drafter yet") }
-    fn prefill_draft(&self, _placement: &Placement, _start: usize, _chunk: &[u32], _next: Option<u32>,
-        _draft: &mut NoDraft) -> Result<()> { Ok(()) }
-    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, NoDraft>], _timing: &mut scheduler::DraftTiming)
+    /// No route probe yet: the shared policy keeps its seeded prior (`probe_finish` is None).
+    fn arm_draft_probe(&self) -> Result<()> {
+        self.draft.as_ref().map(|_| ()).context("Muse drafter was not admitted")
+    }
+    /// The chunk's tail was tapped during its prefill call: commit it as context.
+    fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], next: Option<u32>,
+        seq: &mut DraftState) -> Result<()> {
+        let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
+        ensure!(!chunk.is_empty() && placement.len == start + chunk.len(),
+            "Muse draft prefill differs from the committed target frontier");
+        let rows = chunk.len().min(crate::shared::speculation::dflash::TAP_ROWS);
+        draft.update(placement.slot, start + chunk.len() - rows, rows)?;
+        if !seq.ready && seq.valid_from > start { seq.valid_from = start; }
+        if start == 0 { seq.valid_from = 0; }
+        seq.ready = true;
+        seq.anchor = next;
+        Ok(())
+    }
+    fn draft(&self, sequences: &mut [scheduler::DraftSeq<'_, Placement, DraftState>], timing: &mut scheduler::DraftTiming)
         -> Result<Vec<Vec<u32>>> {
-        Ok(sequences.iter().map(|_| Vec::new()).collect())
+        let draft = self.draft.as_ref().context("Muse drafter was not admitted")?;
+        let started = std::time::Instant::now();
+        let mut output = vec![Vec::new(); sequences.len()];
+        let selected = sequences.iter().enumerate().filter(|(_, seq)| seq.depth > 0).map(|(index, seq)| {
+            ensure!(seq.seq.ready && seq.depth < draft.block, "Muse draft continuation is cold or too wide");
+            Ok((index, crate::shared::speculation::dflash::DraftSeq { slot: seq.placement.slot,
+                anchor: seq.seq.anchor.context("Muse draft anchor absent")?, position: seq.placement.len,
+                valid_from: seq.seq.valid_from }))
+        }).collect::<Result<Vec<_>>>()?;
+        let last = self.ranks.len() - 1;
+        for batch in selected.chunks(draft.drafter.max_batch_sequences()) {
+            let rows = batch.iter().map(|(_, seq)| *seq).collect::<Vec<_>>();
+            let proposals = draft.draft(self.cfg, &self.ranks[last], self.table, &rows)?;
+            ensure!(proposals.len() == batch.len(), "Muse draft output count differs from its batch");
+            for ((index, _), proposal) in batch.iter().zip(proposals) {
+                output[*index] = proposal.tokens.into_iter().take(sequences[*index].depth).collect();
+            }
+            timing.steps += 1;
+        }
+        timing.seconds += started.elapsed().as_secs_f64();
+        Ok(output)
     }
-    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, NoDraft, ()>], speculative: bool) -> Result<()> {
-        ensure!(!speculative, "Muse Spark has no drafter yet");
+    /// The frontier advances by the kept rows; a drafting sequence's kept rows
+    /// (tapped by the verify step at its offset) become drafter context.
+    fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
+        ensure!(!speculative || self.draft.is_some(), "Muse speculative accept without a drafter");
         for sequence in verified.iter_mut() {
             let kept = sequence.kept.map_or(0, |(rows, _)| rows);
             ensure!(kept <= sequence.rows.len(), "Muse accepted rows exceed the step");
             sequence.placement.len = sequence.start + kept;
+        }
+        if let Some(draft) = &self.draft {
+            for sequence in verified.iter_mut() {
+                let Some((keep, after)) = sequence.neural_kept() else { continue };
+                ensure!(keep > 0 && sequence.placement.len == sequence.start + keep,
+                    "Muse draft accept differs from the committed target state");
+                draft.update_rows(sequence.placement.slot, sequence.first_row, sequence.start, keep)?;
+                sequence.seq.ready = true;
+                sequence.seq.anchor = Some(after);
+            }
         }
         Ok(())
     }

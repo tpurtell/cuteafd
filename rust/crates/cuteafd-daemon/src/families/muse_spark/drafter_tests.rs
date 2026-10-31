@@ -1,6 +1,6 @@
 //! The two candidate DFlash2 drafters' own configs (pinned revisions) against
 //! the shared DFlash2 runtime: RadixArk fits the existing 128-wide-head
-//! kernels; NVIDIA's 64-wide heads need a head_dim-64 drafter attention.
+//! kernels; NVIDIA's 64-wide heads bind the native `_d64` drafter attention.
 use crate::shared::speculation::dflash::DflashConfig;
 
 fn read(name: &str) -> anyhow::Result<DflashConfig> {

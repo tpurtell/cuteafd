@@ -116,6 +116,8 @@ pub struct LayoutOptions {
     pub glm5_attention_plan_rows: Option<usize>,
     /// Kimi MLA DFlash is opt-in and charged from its native checkpoint headers.
     pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
+    /// Muse Spark's DFlash2 drafter (opt-in), charged from its own config on the head GPU.
+    pub muse_drafter_snapshot: Option<std::path::PathBuf>,
     pub kimi_draft_fp8: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
@@ -249,6 +251,7 @@ impl Default for LayoutOptions {
             glm5_draft_bf16: false,
             glm5_attention_plan_rows: None,
             kimi_drafter_snapshot: None,
+            muse_drafter_snapshot: None,
             kimi_draft_fp8: false,
             mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,

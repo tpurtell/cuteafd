@@ -75,6 +75,8 @@ pub struct MuseInputs<'a> {
     pub partial_wide_format: crate::families::muse_spark::replies::WideFormat,
     /// The coordinator EXL3 package for onboarded layers (`local_package`).
     pub local: LocalPackage,
+    /// The DFlash2 drafter (`drafter_inventory`), charged on the head GPU.
+    pub drafter: Option<MuseDrafter>,
     /// Runtime-only exact demands (loaded code, step workspaces, peer exchange);
     /// the planner passes none until the family's PROGRAMS.json exists.
     pub fixed: Vec<Demand>,
@@ -86,6 +88,8 @@ pub struct MuseRequest {
     pub request: PlacementRequest,
     /// The coordinator package state the request was built with.
     pub local: LocalPackage,
+    /// The drafter the request charged on the head GPU.
+    pub drafter: Option<MuseDrafter>,
     pub spark_budget: SparkBudgetInventory,
     /// Per layer, per coordinator rank: the operands the device packs.
     pub layouts: Vec<Vec<LayerLayout>>,
@@ -117,7 +121,7 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
         requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format, local,
-        fixed: runtime_fixed, startup } = inputs;
+        drafter, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
     // Onboarding always enters the solve: a missing package never turns an
@@ -256,7 +260,12 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; ranks], pool_bounded: Vec::new(), fixed,
         // One RTX: an onboarded whole layer replies its own BF16 partials to the same
         // partial combine (ranks 1), charged once the GPU holds a routed layer.
-        startup, movables: Vec::new(),
+        startup,
+        // The drafter lives beside the target head it borrows (the last rank).
+        movables: match &drafter {
+            None => Vec::new(),
+            Some(drafter) => vec![drafter.demand(u8::try_from(ranks - 1)?).movable(ranks)?],
+        },
         expert_workspace: if pair { 0 } else {
             (tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) / 2) as u64 + local_workspace },
         // TP2 onboarding (opened only when a layer onboards): both GPUs' BF16 partials
@@ -273,7 +282,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         executor,
     };
     spark_budget.constrain(&mut request)?;
-    Ok(MuseRequest { request, local, spark_budget, layouts, global, projections })
+    Ok(MuseRequest { request, local, drafter, spark_budget, layouts, global, projections })
 }
 
 /// The step metadata a rank allocates: a bank per in-flight prefill slot and a
@@ -347,6 +356,59 @@ impl LocalPackage {
         }
         Ok(())
     }
+}
+
+/// A Muse DFlash2 drafter's coordinator charge: its weights, KV rings and
+/// workspaces (the shared DFlash2 inventory), and the head scratch its
+/// `TargetHead::Launch` owns to run the target's exact head (K6 head into
+/// stored-width F32 rows, trimmed, softcapped) over a draft block batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuseDrafter {
+    pub owned: u64,
+    pub scratch: u64,
+    pub head_scratch: u64,
+    pub context_slots: usize,
+    pub sequences: usize,
+    pub block: usize,
+    pub head_dim: usize,
+}
+
+impl MuseDrafter {
+    fn demand(&self, head: u8) -> crate::placement::draft::DrafterDemand {
+        crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 {
+            resident: self.owned + self.scratch + self.head_scratch, staging: 0 }], head)
+    }
+}
+
+/// The drafter's own config against the target: hidden, vocabulary, taps,
+/// and the head's softcap and output multiplier (the drafter has no head of
+/// its own and reads the target's, which applies both; a drafter trained
+/// against other values is refused by name). `stored` is the K6 head's
+/// stored vocabulary width; `sms` the head GPU's SM count.
+pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slots: usize, sequences: usize,
+    stored: usize, sms: u64, kv_cache: crate::families::qwen4::Qwen4KvCache) -> Result<MuseDrafter> {
+    use crate::families::glm5::draft_representation::{draft_geometry, draft_resident_bytes_with_mode, GlmDraftCapacity,
+        GlmDraftRepresentation};
+    let (geometry, block) = draft_geometry(config).map_err(|error| anyhow::anyhow!("Muse drafter geometry: {error}"))?;
+    let d = &config["dflash_config"];
+    let taps = d["target_layer_ids"].as_array().context("Muse drafter taps")?.iter()
+        .map(|tap| tap.as_u64().map(|t| t as usize).context("Muse drafter tap")).collect::<Result<Vec<_>>>()?;
+    ensure!(geometry.hidden as usize == cfg.hidden && geometry.vocab as usize == cfg.vocab_size
+        && taps.iter().all(|&tap| tap < cfg.layers), "Muse drafter hidden/vocab/taps do not fit the target");
+    let close = |key: &str, target: f64| d[key].as_f64().is_some_and(|value| (value - target).abs() <= 1e-9 * target.abs());
+    ensure!(close("final_logit_softcapping", cfg.softcap) && close("output_multiplier", cfg.output_multiplier),
+        "Muse drafter head softcap/output_multiplier differ from the target's ({}, {}): its logits would not be \
+         the target head's", cfg.softcap, cfg.output_multiplier);
+    let block = usize::try_from(block)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, block).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let (owned, scratch) = draft_resident_bytes_with_mode(config, capacity.context_slots, capacity.max_batch_sequences,
+        sms, GlmDraftRepresentation::Bf16Only, 2, kv_cache).map_err(|error| anyhow::anyhow!("Muse drafter: {error}"))?;
+    // Stored-width F32 rows of the K6 head and the trimmed F32 rows, per draft row.
+    ensure!(stored >= cfg.vocab_size, "Muse head stored width below the vocabulary");
+    let rows = capacity.max_batch_sequences * block;
+    let head_scratch = u64::try_from(rows * (stored + cfg.vocab_size) * 4)?;
+    Ok(MuseDrafter { owned, scratch, head_scratch, context_slots: capacity.context_slots,
+        sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize })
 }
 
 /// A missing coordinator EXL3 package (onboarding unavailable in this build).

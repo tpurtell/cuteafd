@@ -42,6 +42,17 @@ pub(crate) struct MuseSparkPath<'a> {
     terminal: bool,
 }
 
+impl MuseSparkPath<'_> {
+    /// Every Spark rank's installed expert grouping (the draft policy prices verify rows with it).
+    pub(crate) fn installed_grouping(&self) -> Result<Vec<cuteafd_transport::worker_selection::InstalledExpertGrouping>> {
+        self.link.as_ref().context("Muse Spark link released")?.installed_grouping()
+    }
+
+    pub(crate) fn world_size(&self) -> Result<usize> {
+        Ok(self.link.as_ref().context("Muse Spark link released")?.world_size())
+    }
+}
+
 impl Drop for MuseSparkPath<'_> {
     fn drop(&mut self) {
         self.stream.drain_or_abort("Muse Spark path copies and combines");
