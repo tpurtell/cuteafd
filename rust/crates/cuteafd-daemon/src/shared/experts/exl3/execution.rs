@@ -221,10 +221,6 @@ struct Manifest {
     /// BF16 decode pass); absent or `bf16`: BF16 rows.
     #[serde(default)]
     input_format: Option<String>,
-    /// Per-route post-expert RMSNorm epsilon: the sum normalizes each expert's
-    /// complete output before its routing weight (Muse Spark layers whole on one GPU).
-    #[serde(default)]
-    route_norm_eps: Option<f64>,
 }
 fn default_route_block() -> usize { 8 }
 
@@ -266,10 +262,6 @@ impl Manifest {
                 && self.experts == layout.experts && self.bits == layout.tiers
                 && self.swiglu_limit == geometry.swiglu_limit(),
             "EXL3 export/residency geometry mismatch");
-        let norm = layout.buffers.iter().any(|buffer| buffer.name == "post_expert_norm");
-        ensure!(norm == self.route_norm_eps.is_some() && (!norm || layout.world == 1),
-            "EXL3 export and residency disagree on the per-route post-expert norm \
-             (it needs a whole layer on one GPU and a route-norm export)");
         let topk = if matches!(layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
             && geometry.family() == Some("v41") { 3 } else { geometry.topk as usize };
         ensure!(self.top_k == topk, "EXL3 expert top-k mismatch");
@@ -671,9 +663,6 @@ impl<'a> Exl3Execution<'a> {
             ] {
                 pointers.insert(target.into(), weight.buffer(source)?);
             }
-            if weight.layout.buffers.iter().any(|buffer| buffer.name == "post_expert_norm") {
-                pointers.insert("norm_weight_ptr".into(), weight.buffer("post_expert_norm")?);
-            }
             for (target, source) in [("fc2_ptr", "fc2"), ("output_ptr", "output")] {
                 pointers.insert(
                     target.into(),
@@ -964,41 +953,6 @@ mod tests {
             layout.buffers[0].initial_words.pop();
             assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
         }
-        Ok(())
-    }
-
-    #[test]
-    fn route_norm_export_needs_a_whole_layer_with_its_norm_weight() -> Result<()> {
-        use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
-        let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
-        let root = tempfile::tempdir()?;
-        let layout = |norm: bool, world: usize| V41Exl3Residency {
-            layer: V41Exl3Layer::Backbone(1), world, rank: 0, intermediate_start: 0,
-            experts: 256, intermediate: 4096 / world, tiers: vec![4, 5], projection_counts: vec![],
-            loads: vec![], unit_map: None,
-            buffers: [Some(V41Exl3ResidentBuffer { name: "descriptor_map".into(), bytes: 3 * 256 * 2 * 4,
-                initial_words: vec![0; 3 * 256 * 2] }),
-                norm.then(|| V41Exl3ResidentBuffer { name: "post_expert_norm".into(), bytes: 8192,
-                    initial_words: vec![0; 2048] })].into_iter().flatten().collect(),
-        };
-        let metadata = |route_norm: bool, intermediate: usize| serde_json::json!({
-            "schema":"cuteafd.v41-exl3-aot.v1", "output_dtype":"bf16", "sparkinfer_revision":"test",
-            "hidden":4096,"intermediate":intermediate,"experts":256,"capacity":16,"top_k":8,"bits":[4,5],
-            "swiglu_limit":null,"direct":false,"sms":48,"blocks_per_sm":1,"buffers":{},"objects":[],
-            "trellis_lut":{"file":"lut","bytes":16,"sha256":"test"},
-            "route_norm_eps": if route_norm { serde_json::json!(1e-8) } else { serde_json::Value::Null }
-        });
-        let path = root.path().join("v41_exl3.json");
-        let check = |meta: serde_json::Value, layout: &V41Exl3Residency| -> Result<()> {
-            std::fs::write(&path, serde_json::to_vec(&meta)?)?;
-            Exl3Execution::validate_planned_residency(root.path(), layout, geometry)
-        };
-        check(metadata(true, 4096), &layout(true, 1))?;
-        // A plain sum would drop the norm; a norm export without the weight would read garbage.
-        assert!(check(metadata(false, 4096), &layout(true, 1)).is_err());
-        assert!(check(metadata(true, 4096), &layout(false, 1)).is_err());
-        // An intermediate slice cannot apply the norm (partials are normed by the coordinator).
-        assert!(check(metadata(true, 1024), &layout(true, 4)).is_err());
         Ok(())
     }
 

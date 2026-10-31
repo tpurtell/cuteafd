@@ -81,8 +81,6 @@ pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer
     let (layer, world, rank) = residency_selection(layer)?;
     let manifest = catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
     if spark { catalog.exl3_spark_residency(layer, world, rank) }
-        else if world == 1 { catalog.exl3_whole_residency(layer) }
-        // A per-expert output norm under TP2: each GPU replies partials, combined like the Sparks'.
         else { manifest.residency(layer, world, rank) }
 }
 

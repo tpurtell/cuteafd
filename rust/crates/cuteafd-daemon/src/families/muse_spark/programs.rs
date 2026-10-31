@@ -23,11 +23,16 @@ pub(crate) const POINTWISE: &[(&str, &[&str])] = &[
     ("router", &["x", "weight", "out"]),
     // Expert-width rows -> the shared FP8 K32 Spark wire (E 4096).
     ("expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"]),
+    // Partials -> combined expert rows (rank sum, post-expert norm, weight, top-k sum), per reply format.
+    ("tp_combine_bf16", &["data", "row_map", "weights", "norm", "out"]),
+    ("tp_combine_nvfp4", &["data", "row_map", "weights", "norm", "out"]),
+    ("tp_combine_fp8", &["data", "row_map", "weights", "norm", "out"]),
 ];
 
 pub(crate) const PER_HEADS: &[(&str, &[&str])] = &[
-    ("qk_norm_rope_swa", &["q_raw", "k_raw", "positions", "cos", "sin", "q", "k"]),
-    ("qk_norm_nope_full", &["q_raw", "k_raw", "positions", "cos", "sin", "q", "k"]),
+    // q plus each row's K|V record at kv_dst + kv_slots[row] * R (contract addendum 2026-10-31).
+    ("qk_norm_rope_swa", &["q_raw", "k_raw", "v", "positions", "cos", "sin", "kv_slots", "q", "kv_dst"]),
+    ("qk_norm_nope_full", &["q_raw", "k_raw", "v", "positions", "cos", "sin", "kv_slots", "q", "kv_dst"]),
     ("attention_output", &["attn", "gate", "out"]),
     ("gate_proj", &["x", "weight", "out"]),
     ("attention_full_prefill", &["q", "kv_cache", "positions", "page_table", "out", "scratch"]),
@@ -81,7 +86,9 @@ mod tests {
         table.extend(PER_HEADS.iter().map(|(stem, _)| *stem));
         for stem in &table {
             let named = exporter.contains(&format!("{stem}=")) || exporter.contains(&format!("\"{stem}\""))
-                || norms.contains(stem) || (stem.starts_with("attention_") && exporter.contains("attention_{kind}_{route}"));
+                || norms.contains(stem) || (stem.starts_with("attention_") && exporter.contains("attention_{kind}_{route}"))
+                || (stem.starts_with("tp_combine_") && exporter.contains("tp_combine_{format}")
+                    && exporter.contains(&format!("\"{}\"", stem.trim_start_matches("tp_combine_"))));
             assert!(named, "{stem} is not built by the exporter");
         }
         for norm in &norms { assert!(table.contains(norm), "exporter norm {norm} is not bound"); }

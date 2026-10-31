@@ -5,8 +5,9 @@
 //! Coordinator: header-exact per-rank layer weights from the shared
 //! [`LayerLayout`] the device packs, paged full-layer KV, per-sequence sliding
 //! rings and exact sliding marks, pool first, then routed layers onboarded on
-//! the RTXs: TP2 halves on a pair (both GPUs reply BF16 partials over P2P and
-//! the same partial combine norms them), whole on one RTX. Sparks hold
+//! the RTXs: TP2 halves on a pair (both GPUs reply BF16 partials over P2P),
+//! whole on one RTX (its own partials); the same partial combine norms every
+//! holder's partials (ranks 2 or 1). Sparks hold
 //! intermediate slices of every expert (TP, as every EXL3 family) and reply
 //! per-expert partials (BF16 or NVFP4 by the per-request row cutoff); the
 //! coordinator norms, weights and sums them (`replies.rs`).
@@ -212,7 +213,10 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         inventory: Inventory { gpus, spark_ranks, peer_access: pair },
         attention_placement: pair.then_some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; ranks], pool_bounded: Vec::new(), fixed,
-        startup, movables: Vec::new(), expert_workspace: 0,
+        // One RTX: an onboarded whole layer replies its own BF16 partials to the same
+        // partial combine (ranks 1), charged once the GPU holds a routed layer.
+        startup, movables: Vec::new(),
+        expert_workspace: if pair { 0 } else { (tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) / 2) as u64 },
         // TP2 onboarding (opened only when a layer onboards): both GPUs' BF16 partials
         // for one unit (own + peer over P2P) feed the same partial combine (ranks 2).
         tp2_workspace: if pair { [tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) as u64; 2] } else { [0; 2] },

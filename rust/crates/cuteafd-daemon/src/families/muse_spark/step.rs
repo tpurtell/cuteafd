@@ -36,12 +36,18 @@ pub(crate) struct StepMetadata {
     pub positions: Vec<i64>,
     pub ring_slots: Vec<i64>,
     pub seq_first: Vec<i32>,
+    /// Full layers' K|V record index per row in the paged cache
+    /// (`page * 64 + p % 64`), the `kv_slots` of `muse_qk_norm_nope_full`.
+    pub page_slots: Vec<i64>,
     /// `[rows, stride]` page ids (prefill: one sequence, a single shared row).
     pub page_table: Vec<i32>,
     pub table_stride: usize,
 }
 
 impl StepMetadata {
+    /// SWA layers write each row's record into the step's own `kv_step` row.
+    pub(crate) fn step_slots(&self) -> Vec<i64> { (0..self.positions.len() as i64).collect() }
+
     /// `ring_rows`: rows of one sequence's ring; `slots`: rings admitted.
     /// `shared_table`: the prefill route reads one table row for its one sequence.
     pub(crate) fn build(sequences: &[StepSequence<'_>], ring_rows: usize, slots: usize, step_capacity: usize,
@@ -53,7 +59,8 @@ impl StepMetadata {
         let stride = sequences.iter().map(|s| s.pages.len()).max().unwrap_or(0).max(1);
         let mut seen = std::collections::HashSet::new();
         let mut out = Self { positions: Vec::with_capacity(rows), ring_slots: Vec::with_capacity(rows),
-            seq_first: Vec::with_capacity(rows), page_table: Vec::new(), table_stride: stride };
+            seq_first: Vec::with_capacity(rows), page_slots: Vec::with_capacity(rows), page_table: Vec::new(),
+            table_stride: stride };
         for sequence in sequences {
             ensure!(sequence.rows > 0 && sequence.slot < slots && seen.insert(sequence.slot),
                 "Muse step sequence slot {} invalid or repeated", sequence.slot);
@@ -74,6 +81,7 @@ impl StepMetadata {
                 out.positions.push(i64::try_from(p)?);
                 out.ring_slots.push(base + (p % ring_rows) as i64);
                 out.seq_first.push(first);
+                out.page_slots.push(i64::from(sequence.pages[p / PAGE_ROWS]) * PAGE_ROWS as i64 + (p % PAGE_ROWS) as i64);
                 if !shared_table { out.page_table.extend_from_slice(&table); }
             }
             if shared_table { out.page_table = table; }
@@ -150,5 +158,47 @@ mod tests {
         assert!(StepMetadata::build(&[StepSequence { slot: 0, start: 0, rows: 65, pages: &many }], 2112, 4, 4096, false)
             .is_err(), "a verify step past the rollback step");
         assert!(StepMetadata::build(&[one(0, 0, 1), one(1, 0, 1)], 2112, 4, 64, true).is_err(), "prefill is one sequence");
+    }
+
+    /// Records written through `kv_slots` land where the attention reads them:
+    /// a full layer's key `k` of a row is read at `page_table[k / 64] * 64 + k % 64`,
+    /// which is the slot the row at position `k` wrote; a sliding row's own-step
+    /// keys come from `kv_step[seq_first + k - start]`, the slot the SWA record write
+    /// used. Two prefills of the same tokens on different pages write identical
+    /// records at their own slots (restore byte-identity rests on this).
+    #[test]
+    fn records_land_where_attention_and_marks_read_them() -> Result<()> {
+        let record = |p: i64| -> [u8; 4] { (p as u32).wrapping_mul(2654435761).to_le_bytes() };
+        let pages_a: Vec<u32> = vec![7, 2, 9];
+        let pages_b: Vec<u32> = vec![4, 11, 0];
+        let mut cache = vec![[0u8; 4]; 12 * 64];
+        fn write(cache: &mut [[u8; 4]], record: impl Fn(i64) -> [u8; 4], pages: &[u32], start: usize, rows: usize)
+            -> Result<StepMetadata> {
+            let meta = StepMetadata::build(&[StepSequence { slot: 0, start, rows, pages }], 2112, 1, 4096, true)?;
+            for (row, &slot) in meta.page_slots.iter().enumerate() {
+                cache[slot as usize] = record(meta.positions[row]);
+            }
+            Ok(meta)
+        }
+        let meta = write(&mut cache, record, &pages_a, 0, 130)?;
+        // Every key the last row reads (all earlier positions) is its own position's record.
+        for k in 0..130i64 {
+            let page = meta.page_table[(k / 64) as usize] as usize;
+            assert_eq!(cache[page * 64 + (k % 64) as usize], record(k));
+        }
+        // The same tokens prefilled onto other pages: identical records at their own slots.
+        write(&mut cache, record, &pages_b, 0, 100)?;
+        write(&mut cache, record, &pages_b, 100, 30)?;
+        for k in 0..130usize {
+            assert_eq!(cache[pages_a[k / 64] as usize * 64 + k % 64], cache[pages_b[k / 64] as usize * 64 + k % 64]);
+        }
+        // SWA: own-step keys at kv_step[seq_first + k - start] = the row's step slot.
+        let swa = StepMetadata::build(&[StepSequence { slot: 0, start: 500, rows: 8, pages: &[0u32; 9] }], 2112, 1, 64, false)?;
+        let slots = swa.step_slots();
+        for (row, &p) in swa.positions.iter().enumerate() {
+            let first = swa.seq_first[row] as i64;
+            assert_eq!(slots[(first + p - swa.positions[first as usize]) as usize], row as i64);
+        }
+        Ok(())
     }
 }

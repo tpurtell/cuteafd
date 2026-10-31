@@ -5,6 +5,7 @@
 pub(crate) mod block;
 pub(crate) mod core;
 pub(crate) mod experts;
+pub(crate) mod lane;
 pub(crate) mod programs;
 pub(crate) mod serve;
 pub(crate) mod startup;
