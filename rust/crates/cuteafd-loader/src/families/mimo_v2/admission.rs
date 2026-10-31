@@ -366,8 +366,8 @@ pub fn spark_endpoints(rows: usize, input: super::MimoExpertInput) -> Result<[cu
     let decode = u32::try_from(super::decode_graph::MIMO_DECODE_ROWS)?;
     let decode_ingress = if input.bf16(true) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
     let prefill_ingress = if input.bf16(false) { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
-    Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1) },
-        SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None }])
+    Ok([SparkEndpoint { capacity: decode, ingress: decode_ingress, ring_depth: Some(1), partial_reply_bytes: None },
+        SparkEndpoint { capacity: u32::try_from(rows.max(decode as usize))?, ingress: prefill_ingress, ring_depth: None, partial_reply_bytes: None }])
 }
 
 pub fn transport_reservations(cfg: &MimoV2Config, ranks: usize, rank: usize,

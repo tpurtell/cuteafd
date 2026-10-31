@@ -187,13 +187,10 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     // Spark: whole experts partitioned by the shared owner table.
     let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (0..cfg.layers).collect(),
         spark_ranks, prefill_lanes: LANES };
-    let rings_geometry = crate::plan::layout::spark_ring_geometry(LANES as usize);
-    let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(prefill.unit_rows)?,
-        ingress: cuteafd_core::SparkIngress::Fp8K32 }];
+    let (endpoint, spark_rings) = spark_endpoint(prefill, cutoff, usize::try_from(slots)?)?;
     let reserve = spark_reserve_bytes(prefill.waves, prefill.unit_rows)?;
-    let spark_budget = SparkBudgetInventory::exl3(catalog, &working, &endpoints,
-        cuteafd_core::SparkRings { max_frame_bytes: rings_geometry.max_frame_bytes, depth: rings_geometry.depth,
-            slot_bytes: rings_geometry.slot_bytes, alignment: rings_geometry.alignment }, spark_budget_bytes, reserve)?;
+    let spark_budget = SparkBudgetInventory::exl3(catalog, &working, &[endpoint], spark_rings,
+        spark_budget_bytes, reserve)?;
     // Onboarded layers: TP2 halves on a pair (partials combined like the Sparks'), whole on one RTX.
     let manifest = catalog.exl3().context("Muse Spark requires EXL3 expert headers")?;
     let layers = (0..cfg.layers).map(|layer| {
@@ -261,6 +258,37 @@ pub fn placement(inputs: MuseInputs<'_>) -> Result<(MuseRequest, Placement)> {
     let placed = solve(&built.request)?;
     built.request.executor.check(&placed)?;
     Ok((built, placed))
+}
+
+/// NIC largest RC message (ibv `max_msg_sz`, 1 GiB on the ConnectX-7 ports of
+/// raptor and every Spark); a partial-reply frame above it is refused at admission.
+pub const NIC_MAX_MESSAGE_BYTES: usize = 1 << 30;
+
+/// Muse's one persistent Spark endpoint (decode, verify and prefill share its
+/// QP) and its rings, shared by the planner, admission and the transport:
+///
+/// - the response frame is the worst partial reply one rank sends at the unit
+///   (`replies::max_rank_bytes`: BF16 decode/verify segments and the wide
+///   prefill rest, over the admitted sequences), one unchunked SEND;
+/// - the ring depth is what can be in flight on the QP: the fixed prefill
+///   waves plus the decode lane's one step. Slots are uniform, so each holds
+///   the worst frame.
+pub fn spark_endpoint(prefill: PrefillPlan, cutoff: crate::families::muse_spark::replies::Cutoff,
+    sequences: usize) -> Result<(cuteafd_core::SparkEndpoint, cuteafd_core::SparkRings)> {
+    let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
+    let unit = usize::try_from(prefill.unit_rows)?;
+    let reply = crate::families::muse_spark::replies::max_rank_bytes(cutoff, unit, sequences,
+        geometry.topk as usize, geometry.hidden as usize);
+    let depth = usize::try_from(prefill.waves)?.checked_add(1).context("Muse ring depth")?;
+    let base = crate::plan::layout::spark_ring_geometry(LANES as usize);
+    let endpoint = cuteafd_core::SparkEndpoint { ring_depth: Some(depth), capacity: u32::try_from(unit)?,
+        ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: Some(u64::try_from(reply)?) };
+    let rings = cuteafd_core::SparkRings { max_frame_bytes: base.max_frame_bytes, depth: base.depth,
+        slot_bytes: base.slot_bytes, alignment: base.alignment };
+    let frame = endpoint.frame_bytes(geometry, rings).context("Muse Spark endpoint frame")?;
+    ensure!(frame <= NIC_MAX_MESSAGE_BYTES, "Muse Spark partial reply frame of {frame} bytes exceeds the NIC's \
+        {NIC_MAX_MESSAGE_BYTES}-byte RC message limit (lower the unit, the sequences or the BF16 cutoff)");
+    Ok((endpoint, rings))
 }
 
 /// Muse's typed Spark owners on the EXL3 ladder.

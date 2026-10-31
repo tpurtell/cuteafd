@@ -69,7 +69,7 @@ pub(crate) struct ServeArgs {
 
 impl ServeArgs {
     fn endpoint(&self, bf16: bool) -> SparkEndpoint {
-        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Native } }
+        SparkEndpoint { ring_depth: None, capacity: self.prefill_rows, ingress: if bf16 { SparkIngress::Bf16 } else { SparkIngress::Native }, partial_reply_bytes: None }
     }
 
     fn shape(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
@@ -1039,7 +1039,7 @@ mod tests {
     fn planner_serve_and_golden_admit_identical_spark_owners() -> Result<()> {
         use cuteafd_loader::plan::spark_executions::SparkBackend;
         for (waves, unit) in [(1u64, 4096u32), (2, 4096), (3, 2752), (4, 2048), (3, 640)] {
-            let endpoint = SparkEndpoint { ring_depth: None, capacity: unit, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity: unit, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
             // Serve and golden share `spark_model`; the planner charges the same owners.
             assert_eq!(spark_model(&SparkBackend::Fp8.exports(), endpoint, waves, 1, 64 << 20)?.executions,
                 planned("step5", SparkBackend::Fp8, None, u64::from(unit), waves));
@@ -1054,7 +1054,7 @@ mod tests {
         assert_eq!(package_exports(&metadata)?, [1, 1024]);
         // A fixed unit inside the package's largest export is admitted there;
         // one beyond it is refused, never stretched.
-        let endpoint = |capacity| SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
+        let endpoint = |capacity| SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
         let admitted = spark_model(&package_exports(&metadata)?, endpoint(256), 1, 1, 64 << 20)?;
         assert_eq!(admitted.executions.prefill.compiled_capacity, 1024);
         let error = spark_model(&package_exports(&metadata)?, endpoint(2048), 1, 1, 64 << 20).unwrap_err();

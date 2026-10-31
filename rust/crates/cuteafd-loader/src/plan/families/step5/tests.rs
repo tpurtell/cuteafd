@@ -783,7 +783,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
         assert_eq!(result.prefill_waves, Some(3));
         let span = result.prefill_span_rows.expect("planned prefill span rows");
         assert_eq!(span, 3 * rows);
-        let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16 };
+        let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
         let rings = cuteafd_core::SparkRings { max_frame_bytes: 64 << 20,
             depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
         let lane_rings = endpoint.ring_bytes(cuteafd_core::ExpertGeometry::STEP5, rings).unwrap();
@@ -997,7 +997,7 @@ fn mixed_native_assignment_matches_each_worker_groups_exact_units() {
     use crate::formats::fp8_experts::Slicing;
     use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
     use cuteafd_core::{SparkEndpoint, SparkIngress, SparkRings};
-    let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16 }];
+    let endpoints = [SparkEndpoint { ring_depth: None, capacity: 64, ingress: SparkIngress::Bf16, partial_reply_bytes: None }];
     let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
     for kind in ["fp8", "nvfp4", "bf16"] {
         let dir = snapshot(kind);

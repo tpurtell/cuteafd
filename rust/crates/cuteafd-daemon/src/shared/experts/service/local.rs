@@ -137,7 +137,7 @@ mod selection_tests {
         let model = cuteafd_transport::worker_selection::ModelAdmission {
             executions: cuteafd_core::SparkExecutions::admit(&[80], 80, 80, 1, &[80]).unwrap(),
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
-                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 } }],
+                ingress: cuteafd_core::SparkIngress::Bf16Decode { rows: 16 }, partial_reply_bytes: None }],
             rings: cuteafd_core::SparkRings { max_frame_bytes: 32 << 20, depth: 2,
                 slot_bytes: 1 << 20, alignment: 4096 } };
         let selection = WorkerSelection::new(identity.clone(), &(13..70).collect::<Vec<_>>()).unwrap()

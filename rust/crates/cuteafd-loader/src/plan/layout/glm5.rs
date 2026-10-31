@@ -627,7 +627,7 @@ mod tests {
                     topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: spec.layers.len() as u32 };
                 // The prefill transport count excludes the separate decode endpoint.
                 let endpoints = 2;
-                let endpoint = SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Fp8K32 };
+                let endpoint = SparkEndpoint { ring_depth: None, capacity: rows as u32, ingress: SparkIngress::Fp8K32, partial_reply_bytes: None };
                 let (request, response) = endpoint.wire_bytes(expert).unwrap();
                 let rings = SparkRings { max_frame_bytes: (64 << 20).max(request).max(response),
                     depth: 8, slot_bytes: 8 << 20, alignment: 4096 };

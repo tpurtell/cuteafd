@@ -218,6 +218,26 @@ def main() -> None:
             print(f"{arm:10} {m['unit_us'] / 1e3:8.2f} {binding:>8} {m['compute_util']:5.2f} {m['egress_util']:5.2f} "
                   f"{m['s2s_util']:5.2f} {m['ingress_util']:5.2f} {m['combine_util']:5.2f} {m['reply_mb']:9.1f} "
                   f"{m['ingress_mb']:8.1f} {m['unit_us'] * LAYERS / 1e6:6.2f}")
+    mixes()
+
+
+def mixes(unit: int = 2752, cutoff: int = 64, ranks: int = 6) -> None:
+    """The BF16 cutoff's cost: one tp-<wide> prefill unit carrying `k` decode/verify
+    segments of up to `cutoff` rows (BF16 partials, lossless speculation) and the
+    rest as one wide segment, the worst mixes admission charges
+    (`replies::max_rank_bytes`). Ingress-bound once BF16 rows dominate: a
+    quality/speed knob (TJ), not a defect."""
+    print(f"\nPrefill unit {unit} rows with k BF16 segments of {cutoff} rows (cutoff), the rest wide; {ranks} ranks")
+    print(f"{'wide':6} {'k':>3} {'bf16 rows':>9} {'reply MB':>9} {'ingr MB':>8} {'ingr ms':>8} {'comp ms':>8} {'binding':>8}")
+    flops_route = 3 * E_IN * INTER * 2
+    compute = unit * TOPK * flops_route / ranks / PREFILL_TFLOPS * 1e3
+    for wide in ("nvfp4", "fp8"):
+        for k in (0, 4, 8, 15):
+            bf16 = min(k * cutoff, unit)
+            reply = TOPK * E_IN * (bf16 * 2 + (unit - bf16) * WIRE_BITS[wide] / 8)
+            ingress = reply * ranks / LINK_COORD * 1e3
+            print(f"{wide:6} {k:3d} {bf16:9d} {reply / 2**20:9.1f} {reply * ranks / 2**20:8.1f} {ingress:8.2f} "
+                  f"{compute:8.2f} {'ingress' if ingress > compute else 'compute':>8}")
 
 
 if __name__ == "__main__":

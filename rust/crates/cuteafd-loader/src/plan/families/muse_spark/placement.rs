@@ -142,9 +142,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (intermediate slices)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
-        if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::MUSE_SPARK,
-            prefill.unit_rows as u32, false, rings, 0) {
-            refusal(report, format!("Muse Spark rank {rank} I/O: {error}"), "Fix the Spark ring geometry.");
+        if let Err(error) = usize::try_from(slots).map_err(anyhow::Error::from)
+            .and_then(|slots| muse_spark_io(&mut device, &working, prefill, slots, rings)) {
+            refusal(report, format!("Muse Spark rank {rank} I/O: {error:#}"), "Fix the Spark ring geometry.");
         }
         if let Err(error) = muse_owners(&mut device, &working, prefill.unit_rows, prefill.waves) {
             refusal(report, format!("Muse Spark execution owners: {error:#}"), "Use a supported wave count.");
@@ -169,6 +169,30 @@ fn planned_code(opts: &crate::plan::layout::LayoutOptions, gpus: usize) -> anyho
             arch, Some(&programs));
         crate::placement::families::muse_spark::code_demand(rank, code.bytes)
     }).collect()
+}
+
+/// The rank's Spark I/O at the shared Muse endpoint (`spark_endpoint`): its
+/// partial-reply frame and in-flight depth, exactly as admission seals it.
+fn muse_spark_io(device: &mut DeviceLayout, working: &SparkWorkingSet,
+    prefill: crate::serving_capacity::prefill_waves::PrefillPlan, slots: usize,
+    rings: crate::placement::SparkRingGeometry) -> anyhow::Result<()> {
+    let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
+    crate::plan::layout::charge_spark_io(device, working, geometry, prefill.unit_rows as u32, false, rings, 0)?;
+    let cutoff = crate::families::muse_spark::replies::Cutoff::new(
+        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, 1)?;
+    let (endpoint, spark_rings) = crate::placement::families::muse_spark::spark_endpoint(prefill, cutoff, slots)?;
+    let exact = working.rank_endpoints_io(device.index as usize, geometry, &[endpoint], spark_rings)?;
+    for item in &mut device.items {
+        match item.group.as_str() {
+            "expert intake" => item.bytes = exact.intake,
+            "host expert exchange" => item.bytes = exact.host_exchange,
+            "expert row indices" => item.bytes = exact.row_indices,
+            "rdma rings" => item.bytes = exact.mapped_rings,
+            "endpoint response prefixes" => item.bytes = exact.endpoint_staging,
+            _ => {},
+        }
+    }
+    Ok(())
 }
 
 fn muse_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {

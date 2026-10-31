@@ -125,6 +125,36 @@ fn layout_picks_its_spark_range_and_onboards_by_default() {
     assert!(!report.executable());
 }
 
+/// Each Spark's rings carry the shared Muse endpoint: the worst partial reply
+/// per frame (one SEND), depth = prefill waves + the decode step, exactly the
+/// bytes the endpoint seals; the frame stays under the NIC message limit.
+#[test]
+fn spark_rings_carry_the_worst_partial_reply_frame() {
+    use crate::families::muse_spark::replies::{max_rank_bytes, Cutoff, WideFormat};
+    use crate::placement::families::muse_spark::{spark_endpoint, NIC_MAX_MESSAGE_BYTES};
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let report = input.plan(&with_layout(2, 6)).unwrap();
+    let memory = report.memory_layout.as_ref().unwrap();
+    let spark = memory.devices.iter().find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).unwrap();
+    let rings = spark.items.iter().find(|item| item.group == "rdma rings").unwrap().bytes;
+    let prefill = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 };
+    let (endpoint, base) = spark_endpoint(prefill, Cutoff::new(64, 1).unwrap(), 16).unwrap();
+    let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
+    assert_eq!(rings, endpoint.ring_bytes(geometry, base).unwrap() as u64, "planner charges the sealed endpoint");
+    let reply = max_rank_bytes(Cutoff::new(64, 1).unwrap(), 2752, 16, 8, 4096);
+    assert_eq!(endpoint.partial_reply_bytes, Some(reply as u64));
+    assert_eq!(endpoint.ring_depth, Some(4));
+    let frame = endpoint.frame_bytes(geometry, base).unwrap();
+    assert!(frame > 64 << 20 && frame < 100 << 20, "NVFP4 worst mix at 16 sequences: {frame}");
+    // FP8 above the cutoff: the widest release mix still fits one RC message.
+    let fp8 = spark_endpoint(prefill, Cutoff::with_wide(64, 1, WideFormat::Fp8).unwrap(), 16).unwrap().0;
+    let fp8_frame = fp8.frame_bytes(geometry, base).unwrap();
+    assert!(fp8_frame > frame && fp8_frame < NIC_MAX_MESSAGE_BYTES, "{fp8_frame}");
+    eprintln!("muse Spark endpoint: NVFP4 frame {:.1} MiB, FP8 {:.1} MiB, rings {:.0} MiB per Spark",
+        frame as f64 / 1048576.0, fp8_frame as f64 / 1048576.0, rings as f64 / 1048576.0);
+}
+
 #[test]
 fn fused_bf16_experts_name_the_publication_to_serve() {
     // The BF16 release fuses each layer's experts into [256, ...] stacks.

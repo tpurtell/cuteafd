@@ -248,8 +248,7 @@ pub(super) fn layout(
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity,
-            ingress: if nvfp4 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Native }
-        })
+            ingress: if nvfp4 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Native }, partial_reply_bytes: None })
         .collect::<Vec<_>>();
     let rings = cuteafd_core::SparkRings {
         max_frame_bytes: 64 << 20,
