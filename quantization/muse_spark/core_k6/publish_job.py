@@ -7,20 +7,20 @@ import sys
 REPO=Path(__file__).resolve().parents[3]
 sys.path.insert(0,str(REPO/'quantization'))
 if __package__ in (None,''):__package__='muse_spark.core_k6'
-from kimi_k3.uniform_k2.storage import atomic_json
-from .recipe import TARGET_REPO
-from .publish import publish
+from .finish import finish
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',type=Path,required=True);parser.add_argument('--export',type=Path,required=True)
     args=parser.parse_args()
-    audit=json.loads((args.root/'completed-export-audit.json').read_text())
-    complete=json.loads((args.root/'quantization-complete.json').read_text())
-    if audit.get('status')!='passed' or audit.get('identity')!=complete.get('identity'):
-        raise ValueError('independent completed export audit is required before upload')
-    result=publish(args.export,args.root,TARGET_REPO)
-    print(json.dumps(dict(event='publication_job_complete',result=result)),flush=True)
+    # The finisher owns the audit gate and publication/ingest/retirement
+    # recovery barriers. Repeating the CPU continuation after local weights
+    # retire must not replay a publisher that requires those deleted files.
+    result=finish(args.root,args.export)
+    print(json.dumps(dict(event='publication_job_complete',result=result['revision'],
+        managed_ingest_complete=True,local_retirement_complete=True,
+        retired_weight_shards=result['retired_weight_shards'])),flush=True)
+
 
 if __name__=='__main__':main()
