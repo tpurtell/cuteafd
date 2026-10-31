@@ -6442,3 +6442,12 @@ original audit. No numerical code, quantized tensor, activation or recipe
 changed. Older failed units are disabled. Resume-after-connectivity.json
 records downtime; monitor excludes partial-resume layer timings from its
 ETA baseline. Continue the clean run with publication and handoff enabled.
+
+USER-REQUESTED PAUSE AGAIN (2026-10-31 04:21 UTC): stop for IP/network
+maintenance. Unit step5-core-k6-1793418663022857522 is stopped and disabled;
+its GPU container is stopped/removed. Layers 0–33 are complete, with
+committed partial expert work in layer 34. All checkpoints, activations and
+partial projections remain intact. production/paused-by-user.json records
+this pause. Do not auto-resume until TJ requests it after addressing is
+settled. The existing clean producer is resumable; no completed layers
+need rebuilding due to an IP change. Publication/handoff remain pending.
