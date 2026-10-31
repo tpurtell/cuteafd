@@ -171,14 +171,21 @@ class LazyExperts:
 
 
 EXPERT_STACKS = ("mlp.experts.gate_up_proj", "mlp.experts.down_proj")
+# The official centered/input-scaled norms add (1.0 + weight) on the stored BF16
+# parameter before upcasting; keep those weights in checkpoint dtype so the F32
+# reference reproduces that BF16 add exactly. Residual gates are F32 (official
+# _keep_in_fp32_modules_strict), as are the router weight and bias as shipped.
+NATIVE_DTYPE = ("input_layernorm.weight", "pre_feedforward_layernorm.weight",
+                "post_feedforward_layernorm.weight", "mlp.pre_expert_norm.weight",
+                "mlp.experts.post_expert_norm.weight")
 
 
 def load_layer(checkpoint, config, index, *, device="cuda", dtype=None):
     """Build the official layer on meta and fill it from the checkpoint.
 
-    ``dtype=torch.float32`` upcasts every stored tensor exactly (BF16 -> F32 is
-    lossless; expert stacks per expert call); ``None`` keeps checkpoint dtypes
-    (BF16 weights, F32 router/bias).
+    ``dtype=torch.float32`` upcasts stored tensors exactly (BF16 -> F32 is lossless;
+    expert stacks per expert call) except the (1 + w) norm weights, which keep the
+    official BF16 add; ``None`` keeps checkpoint dtypes (BF16, F32 router/bias).
     """
     import torch
     layer = check_layer(checkpoint, config, index)
@@ -190,7 +197,7 @@ def load_layer(checkpoint, config, index, *, device="cuda", dtype=None):
             del owner._parameters[leaf]
             object.__setattr__(owner, leaf, LazyExperts(value, dtype))
             continue
-        if dtype is not None:
+        if dtype is not None and name not in NATIVE_DTYPE:
             value = value.to(dtype)
         if leaf in owner._parameters:
             owner._parameters[leaf] = torch.nn.Parameter(value, requires_grad=False)

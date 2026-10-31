@@ -443,6 +443,35 @@ def causal_tiles(official):
 
 
 @contextmanager
+def stable_ties(reference):
+    """Untiled official indexer and attention; only top-k tie order is fixed.
+
+    Used for the independent official-geometry arm so it differs from the tiled
+    arm in geometry alone (relu scores tie at exactly 0.0, and official ``topk``
+    leaves tie order to the kernel and tensor width).
+    """
+    import torch
+    original, previous = reference.MistralLarge4TextIndexer.forward, torch.Tensor.topk
+
+    def topk(self, k, dim=-1, largest=True, sorted=True):
+        if dim in (-1, self.ndim - 1) and largest and self.dtype == torch.float32:
+            return fixed_index_topk(self, k)
+        return previous(self, k, dim=dim, largest=largest, sorted=sorted)
+
+    def forward(self, *args, **kwargs):
+        torch.Tensor.topk = topk
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            torch.Tensor.topk = previous
+    reference.MistralLarge4TextIndexer.forward = forward
+    try:
+        yield
+    finally:
+        reference.MistralLarge4TextIndexer.forward = original
+
+
+@contextmanager
 def geometry(reference):
     """Fixed-M128 linears, tiled attention and tiled indexer around the official module."""
     import torch
