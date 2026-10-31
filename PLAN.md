@@ -6297,7 +6297,17 @@ checks pass. Target GPU witnesses pass all four cases with relative errors
 2.67e-8 (expert 56, 152,454 rows) and 3.08e-8 (full dense 1,248,980 rows).
 All four unchanged factorizations pass with the original 0.025 damping.
 Evidence: `muse-quant-work/numerical-1793466485064710216/accurate-sum-witness/`.
-Fresh short pilot and clean production are next; no upload has occurred.
+The fresh short pilot exits zero at 2026-10-31 18:36:13 UTC after about
+7.4 minutes. All 21 source outputs match the original teacher byte for byte;
+the three native/staged proofs and separate sliding-window witness also pass.
+Worst selected K6 heldout NMSE is 0.000295418; padded head 0.0000475735;
+worst sampled K4 expert 0.00541509. Existing 1e-3/1e-2 stop bars remain.
+
+Clean production started under durable user unit
+`muse-quant-1793471787847848991` with automatic CPU upload/managed ingest/cleanup.
+Active paths are `muse-quant-work/production-k128` and `export-k128`; the old
+producer/export stay isolated as forensic evidence. Numerical code and fork pin
+are frozen while this producer runs. No upload has occurred yet.
 
 Final CPU continuation now includes publication, supported native SparkNest
 streamed placement directly to six Sparks, verification, and removal of only
