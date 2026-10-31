@@ -327,4 +327,6 @@ def test_length_cut_tool_call_is_rendered_verbatim_and_never_executed(api):
                                         "function": {"name": "read_file", "arguments": "{\"path\": \"a"}}]}
     result = client(body())
     assert result["tool_calls"] == []
-    assert '{\\"path\\": \\"a' in bytes(result["probe"]["generated"]).decode() or "path" in bytes(result["probe"]["generated"]).decode()
+    text = bytes(result["probe"]["generated"]).decode()
+    # Only the text both bounding renders share: never the partial arguments.
+    assert text.startswith("<reasoning>r") and "path" not in text

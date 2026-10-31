@@ -274,6 +274,44 @@ class APIClient(TextGenerator):
             record = self.cache.find(request)
         return request, record
 
+    def cut_completion(self, body, message):
+        """Reconstructible prefix of a turn cut inside a tool call's arguments.
+
+        The partial arguments cannot be rendered exactly, so keep the calls before
+        the cut and stop where a render with the cut call omitted and a render with
+        a complete placeholder call first diverge: everything before that point is
+        identical model text in both, nothing after it is claimed.
+        """
+        calls = message["tool_calls"]
+        first = next(i for i, call in enumerate(calls) if not valid_arguments(call))
+        kept = {**message, "tool_calls": calls[:first]}
+        if not kept["tool_calls"]:
+            kept.pop("tool_calls")
+        placeholder = copy.deepcopy(calls[first])
+        placeholder["function"]["arguments"] = "{}"
+        probe = {**message, "tool_calls": calls[:first] + [placeholder]}
+        if not kept.get("content") and not kept.get("reasoning_content") and "tool_calls" not in kept:
+            kept["content"] = ""
+        prompt = self.renderer.prompt(body)
+        renders = []
+        for candidate in (kept, probe):
+            try:
+                renders.append(self.renderer.completion(body, candidate))
+            except ValueError:
+                renders.append(None)
+        if renders[1] is None:
+            raise ValueError("cut tool call cannot be bounded by a placeholder render")
+        if renders[0] is None:
+            renders[0] = []
+        common = 0
+        for left, right in zip(renders[0], renders[1]):
+            if left != right:
+                break
+            common += 1
+        if not common or not prompt:
+            raise ValueError("cut tool-call turn has no reconstructible prefix")
+        return renders[1][:common]
+
     def rendering_body(self, request):
         rendered = copy.deepcopy(request)
         if self.family == "kimi_k3" and not (request.get("reasoning_effort")
@@ -314,7 +352,11 @@ class APIClient(TextGenerator):
         message["reasoning_content"] = reasoning
         if not message.get("content") and not reasoning and not message.get("tool_calls"):
             raise ValueError("API returned no accessible text or tool calls")
-        generated_full = self.renderer.completion(rendered_body, message)
+        cut = [call for call in message.get("tool_calls") or [] if not valid_arguments(call)]
+        if cut:
+            generated_full = self.cut_completion(rendered_body, message)
+        else:
+            generated_full = self.renderer.completion(rendered_body, message)
         generated = generated_full[:body["max_tokens"]]
         visible_message = message
         if len(generated) < len(generated_full) or not all(
