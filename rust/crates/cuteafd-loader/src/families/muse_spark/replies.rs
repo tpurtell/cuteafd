@@ -64,6 +64,9 @@ impl Cutoff {
     }
 
     pub fn with_wide(bf16_max_rows: usize, max_verify_rows: usize, wide: WideFormat) -> Result<Self> {
+        // Every decode step is at least one row: 0 would reply decode as a wide format.
+        ensure!(bf16_max_rows >= 1, "expert_partial_bf16_max_rows 0 would reply single-row decode steps \
+            in the wide format: speculation and plain decode must stay BF16 (lossless)");
         ensure!(bf16_max_rows >= max_verify_rows,
             "expert_partial_bf16_max_rows {bf16_max_rows} is below the {max_verify_rows}-row verify step: \
              verify replies would be NVFP4 while plain decode is BF16, so speculation would not be lossless");
@@ -151,6 +154,8 @@ mod tests {
         // All-BF16 (cutoff at the unit) and all-NVFP4 above the verify step.
         assert_eq!(Cutoff::new(4096, 8)?.format(2752), PartialFormat::Bf16);
         assert_eq!(Cutoff::new(8, 8)?.format(9), PartialFormat::Nvfp4);
+        assert!(Cutoff::new(0, 0).is_err() && Cutoff::new(0, 1).is_err());
+        assert!(Cutoff::new(1, 0).is_ok());
         let error = Cutoff::new(4, 8).unwrap_err().to_string();
         assert!(error.contains("verify") && error.contains("lossless"), "{error}");
         Ok(())

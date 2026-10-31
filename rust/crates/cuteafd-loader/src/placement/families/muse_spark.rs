@@ -4,9 +4,9 @@
 //!
 //! Coordinator: header-exact per-rank layer weights from the shared
 //! [`LayerLayout`] the device packs, paged full-layer KV, per-sequence sliding
-//! rings and exact sliding marks, pool first, then whole routed layers
-//! onboarded on the RTXs (the per-expert output norm needs each expert's
-//! complete output, so an onboarded layer is never TP2-halved). Sparks hold
+//! rings and exact sliding marks, pool first, then routed layers onboarded on
+//! the RTXs: TP2 halves on a pair (both GPUs reply BF16 partials over P2P and
+//! the same partial combine norms them), whole on one RTX. Sparks hold
 //! intermediate slices of every expert (TP, as every EXL3 family) and reply
 //! per-expert partials (BF16 or NVFP4 by the per-request row cutoff); the
 //! coordinator norms, weights and sums them (`replies.rs`).
@@ -115,6 +115,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
+    let pair = ranks == 2;
     ensure!(spark_ranks > 0, "Muse Spark routed experts need Spark ranks");
     ensure!(slots > 0 && context > 0 && context <= cfg.max_position as u64,
         "Muse slots {slots} / context {context} outside 1..={}", cfg.max_position);
@@ -182,10 +183,15 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let spark_budget = SparkBudgetInventory::exl3(catalog, &working, &endpoints,
         cuteafd_core::SparkRings { max_frame_bytes: rings_geometry.max_frame_bytes, depth: rings_geometry.depth,
             slot_bytes: rings_geometry.slot_bytes, alignment: rings_geometry.alignment }, spark_budget_bytes, reserve)?;
-    // An onboarded layer is whole on one GPU (exact per-expert norm).
+    // Onboarded layers: TP2 halves on a pair (partials combined like the Sparks'), whole on one RTX.
     let manifest = catalog.exl3().context("Muse Spark requires EXL3 expert headers")?;
     let layers = (0..cfg.layers).map(|layer| {
-        let whole = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 1, 0)?.device_arena_layout()?.1 as u64;
+        let backbone = crate::V41Exl3Layer::Backbone(layer);
+        let whole = if pair { 0 } else { manifest.residency(backbone, 1, 0)?.device_arena_layout()?.1 as u64 };
+        let half = if pair {
+            let arena = |rank| -> Result<u64> { Ok(manifest.residency(backbone, 2, rank)?.device_arena_layout()?.1 as u64) };
+            [Bytes2 { resident: arena(0)?, staging: 0 }, Bytes2 { resident: arena(1)?, staging: 0 }]
+        } else { [Bytes2::default(); 2] };
         let full = cfg.attention[layer] == MuseAttention::Full;
         let unit = record * PAGE_ROWS;
         Ok(LayerDemand {
@@ -195,25 +201,24 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
                 KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit / 2; 2], unit_bytes_context: None }
             } else { KvDemand::default() },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 },
-                half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
+            experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 }, half, tp2: pair, spark_ok: true }),
             modes: modes.to_vec(),
         })
     }).collect::<Result<Vec<_>>>()?;
     let capacities = gpus.iter().map(|gpu| gpu.capacity_bytes).collect::<Vec<_>>();
     let pool = PoolPolicy::resolve(&capacities, context, requested_pool, PAGE_ROWS, false)
         .with_automatic_context(automatic_context);
-    let pair = ranks == 2;
     let mut request = PlacementRequest {
         inventory: Inventory { gpus, spark_ranks, peer_access: pair },
         attention_placement: pair.then_some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(),
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; ranks], pool_bounded: Vec::new(), fixed,
-        startup, movables: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2],
+        startup, movables: Vec::new(), expert_workspace: 0,
+        // TP2 onboarding (opened only when a layer onboards): both GPUs' BF16 partials
+        // for one unit (own + peer over P2P) feed the same partial combine (ranks 2).
+        tp2_workspace: if pair { [tp2_partial_bytes(cfg, usize::try_from(prefill.unit_rows)?) as u64; 2] } else { [0; 2] },
         onboard, expert_gpus: ranks, minimum_expert_layers: 0,
-        // Whole onboarded layers alternate between the GPUs.
         policy: LayerPolicy { default: modes.to_vec(), ownership: LayerOwnership::Ranges,
-            expert_ownership: if pair { ExpertOwnership::AlternatingWhole } else { ExpertOwnership::Contiguous },
-            ..Default::default() },
+            expert_ownership: ExpertOwnership::Contiguous, ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
             entry_gpu: 0, head_gpu: u8::try_from(ranks - 1)?,
             terminal: if pair { TerminalHome::Replicated } else { TerminalHome::AttentionOwner } },
@@ -221,6 +226,12 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     };
     spark_budget.constrain(&mut request)?;
     Ok(MuseRequest { request, spark_budget, layouts, global, projections })
+}
+
+/// Per GPU under TP2 onboarding: its own and its peer's BF16 partials for one
+/// unit (`rows x topk x E`), the combine's two ranks.
+pub fn tp2_partial_bytes(cfg: &MuseSparkConfig, unit_rows: usize) -> usize {
+    2 * unit_rows * cfg.topk * crate::families::muse_spark::replies::PartialFormat::Bf16.row_bytes(cfg.expert_hidden)
 }
 
 /// Admission: the same request solved and checked against the executor.
