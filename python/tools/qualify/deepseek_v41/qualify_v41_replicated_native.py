@@ -61,21 +61,22 @@ import subprocess
 import time
 from pathlib import Path
 
-import torch
-
-import _pinned_sparkinfer  # noqa: F401
+from spark_packages import native_spark_roles
 from _v41_expert_native import Info, L, Native, P, check, library
-from tests.moe.test_v41_grouped_slices import _check_grouped_slices
 from v41_spark_tp3_launch_geometry import LaunchGeometryError, manifest_geometry
 
-# Role 5 = Spark TP2 (I=1152), role 6 = Spark TP3 (I=768), role 7 = Spark TP6
-# (I=384). TP2/TP3/TP6 are unpadded; the legacy TP4 shard stores 640 for a 576
-# logical intermediate.
-SPARK_TP_INTERMEDIATE = {2: 1152, 3: 768, 6: 384}
-# Native `cuteafd_expert_info_t.role` per TP degree, and the per-rank storage
-# extent that role's exported variants must declare.
-SPARK_TP_ROLE = {2: 5, 3: 6, 6: 7}
-SPARK_TP_KERNEL_INTERMEDIATE = {2: 1152, 3: 768, 6: 384}
+
+def _load_native_dependencies():
+    global torch, _check_grouped_slices
+    import torch
+    import _pinned_sparkinfer  # noqa: F401
+    from tests.moe.test_v41_grouped_slices import _check_grouped_slices
+
+# Stable role ids and checkpoint-derived geometry share the package policy.
+SPARK_TP_GEOMETRY = native_spark_roles()
+SPARK_TP_ROLE = {tp: geometry[0] for tp, geometry in SPARK_TP_GEOMETRY.items()}
+SPARK_TP_INTERMEDIATE = {tp: geometry[1] for tp, geometry in SPARK_TP_GEOMETRY.items()}
+SPARK_TP_KERNEL_INTERMEDIATE = {tp: geometry[2] for tp, geometry in SPARK_TP_GEOMETRY.items()}
 LEGACY_TP4_ROLE = 1
 LEGACY_TP4_LOGICAL, LEGACY_TP4_STORAGE = 576, 640
 ARENA_EXPERTS = 384
@@ -200,6 +201,7 @@ def _tensor_sha256(tensor):
     never collide.
     """
     cpu = tensor.detach().to("cpu").contiguous()
+    import torch
     dtype = str(cpu.dtype)
     if cpu.dtype == torch.bfloat16:
         payload = cpu.to(torch.float32).numpy().tobytes()
@@ -279,7 +281,7 @@ def verify_manifest_identity(manifest, expected_intermediate, expected_degree):
     if geometry.get("experts") != ARENA_EXPERTS:
         raise SystemExit(f"manifest experts={geometry.get('experts')!r} != {ARENA_EXPERTS}")
     role = manifest.get("role")
-    if expected_degree in (2, 3, 6) and role is not None and role != f"spark_tp{expected_degree}":
+    if expected_degree in SPARK_TP_ROLE and role is not None and role != f"spark_tp{expected_degree}":
         raise SystemExit(
             f"manifest role={role!r} is not the requested spark_tp{expected_degree}")
     return manifest
@@ -1323,7 +1325,7 @@ def aggregate_results(options):
     return summary
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--native-lib",
                         help="built libcuteafd_native.so (not needed with --aggregate)")
@@ -1338,8 +1340,8 @@ def main():
                              "this flag a uniform-weight comparison is rejected")
     parser.add_argument("--output", type=Path, default=None,
                         help="write the emitted timing/comparison records to this file")
-    parser.add_argument("--spark-tp", type=int, choices=(2, 3, 6),
-                        help="Spark TP degree: 2 (I=1152), 3 (I=768) or 6 (I=384)")
+    parser.add_argument("--spark-tp", type=int, choices=tuple(SPARK_TP_ROLE),
+                        help="Covered namespaced native Spark TP degree")
     parser.add_argument("--tp4-legacy", action="store_true",
                         help="Use role 1 TP4 (I=576, pad 640) for the timing baseline")
     parser.add_argument("--width", type=parse_width, default="auto",
@@ -1392,15 +1394,14 @@ def main():
                         help="exact allowed hex clocks_event_reasons.active bits; "
                              "only 0x0 is implemented, so empty or nonzero values "
                              "fail closed (default 0x0)")
-    options = parser.parse_args()
+    options = parser.parse_args(argv)
     if options.aggregate:
-        aggregate_results(options)
-        return
+        return options
     if options.native_lib is None:
         parser.error("--native-lib is required unless --aggregate is used")
     options.snapshot = Path(options.snapshot)
     if (options.spark_tp is None) == (not options.tp4_legacy):
-        parser.error("select exactly one of --spark-tp 2|3 or --tp4-legacy")
+        parser.error(f"select exactly one of --spark-tp {tuple(SPARK_TP_ROLE)} or --tp4-legacy")
     if options.timing and options.checkpoint:
         parser.error("--timing and --checkpoint are mutually exclusive")
     if not (options.timing or options.checkpoint):
@@ -1412,6 +1413,15 @@ def main():
         assert_rows_covered(parse_timing_rows(options.timing_rows),
                             sorted({int(x) for x in options.capacities.split(",")}))
 
+    return options
+
+
+def main():
+    options = parse_args()
+    if options.aggregate:
+        aggregate_results(options)
+        return
+    _load_native_dependencies()
     lib = library(options.native_lib, spark_tp=options.spark_tp)
     if options.checkpoint or options.timing:
         run_checkpoint(options, torch, lib)

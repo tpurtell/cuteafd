@@ -191,9 +191,9 @@ fn run(args: GoldenArgs) -> Result<()> {
     full.release_geometry()?;
     let cfg = admission::prefix(&full, last.checked_add(1).context("Kimi last-layer overflow")?)?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
-    ensure!(args.peers.len() == 6 && hosted == cfg.dense.iter().enumerate()
+    ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
         .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
-        "Kimi diagnostic needs exactly the selected routed layers on six real ranks");
+        "Kimi diagnostic needs exactly the selected routed layers on the selected real ranks");
     if args.check_headers {
         println!("Kimi diagnostic reference/header binding valid: layers=0..{} rows={}; no numerical qualification",
             last, reference.tokens.len());
@@ -229,9 +229,9 @@ fn full_run(args: GoldenArgs) -> Result<()> {
     let cfg = KimiK3Config::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     let hosted = hosted_layers(&std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
-    ensure!(args.peers.len() == 6 && hosted == cfg.dense.iter().enumerate()
+    ensure!((1..=8).contains(&args.peers.len()) && hosted == cfg.dense.iter().enumerate()
         .filter_map(|(layer, dense)| (!dense).then_some(layer)).skip(args.rtx_expert_layers).collect::<Vec<_>>(),
-        "Kimi full-forward needs the planned Spark routed subset on six real ranks");
+        "Kimi full-forward needs the planned Spark routed subset on the selected real ranks");
     println!("Kimi all-layer run provenance: {}", args.provenance());
     println!("Kimi F32 reference: config={} revision={} windows={} scored_rows={}",
         cuteafd_bench::fidelity_dataset::KIMI_K3_CONFIG, cuteafd_bench::fidelity_dataset::KIMI_K3_REVISION,

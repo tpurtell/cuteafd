@@ -19,13 +19,13 @@ endif()
 
 set(CUTEAFD_V41_SPARK_TP_SELECTED)
 foreach(tp IN LISTS CUTEAFD_SPARK_TP_ROLES)
-  if(tp STREQUAL "tp2" OR tp STREQUAL "tp3" OR tp STREQUAL "tp6")
+  if(tp STREQUAL "tp2" OR tp STREQUAL "tp3" OR tp STREQUAL "tp6" OR tp STREQUAL "tp8")
     if(tp IN_LIST CUTEAFD_V41_SPARK_TP_SELECTED)
       message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES lists ${tp} more than once")
     endif()
     list(APPEND CUTEAFD_V41_SPARK_TP_SELECTED "${tp}")
   else()
-    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts only tp2, tp3 and tp6, got ${tp}")
+    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts only tp2, tp3, tp6 and tp8, got ${tp}")
   endif()
 endforeach()
 
@@ -47,6 +47,8 @@ set(CUTEAFD_V41_SPARK_TP2_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096
   "Spark TP2 expert slice width: scalar 64/128/192 or capacity:width map")
 set(CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP3 expert slice width: scalar 64/128/192 or capacity:width map")
+set(CUTEAFD_V41_SPARK_TP8_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
+  "Spark TP8 expert slice width: scalar 64/128/192 or capacity:width map")
 set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH "1:192,16:192,80:192,256:192,1024:192,4096:192" CACHE STRING
   "Spark TP6 expert slice width: scalar 64/128/192 or capacity:width map")
 
@@ -61,6 +63,11 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
     set(width_map "${CUTEAFD_V41_SPARK_TP3_SLICE_WIDTH}")
     set(wrapper_src families/deepseek_v41/src/v41_spark_tp3_experts.cc)
     set(variant_header v41_spark_tp3_expert_variants.h)
+  elseif(tp STREQUAL "tp8")
+    set(role spark_tp8)
+    set(width_map "${CUTEAFD_V41_SPARK_TP8_SLICE_WIDTH}")
+    set(wrapper_src families/deepseek_v41/src/v41_spark_tp8_experts.cc)
+    set(variant_header v41_spark_tp8_expert_variants.h)
   else()
     set(role spark_tp6)
     set(width_map "${CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH}")

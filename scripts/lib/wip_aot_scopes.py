@@ -13,6 +13,12 @@ SPEC = importlib.util.spec_from_file_location('checkpoint_family', Path(__file__
 checkpoint_family = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(checkpoint_family)
 # The launcher's default checkpoint when a config names none (release-common.sh).
+SPARK_SPEC = importlib.util.spec_from_file_location(
+    'wip_spark_packages', Path(__file__).resolve().parents[2] / 'python/tools/lib/spark_packages.py')
+spark_packages = importlib.util.module_from_spec(SPARK_SPEC)
+SPARK_SPEC.loader.exec_module(spark_packages)
+native_spark_roles = spark_packages.native_spark_roles
+
 DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
@@ -70,24 +76,22 @@ def family_scopes(cards, config_reader):
             env['CUTEAFD_WIP_' + dense_switch(values) + '_AOT'] = 'ON'
         scopes_before = set(scopes)
         scopes = set()
-        if family == 'deepseek_v41' and count in (2, 3, 6):
+        if family == 'deepseek_v41' and count in native_spark_roles('v41'):
             roles.add('tp' + str(count))
         if family == 'deepseek_v4':
             tag = 'dsv4p' if 'pro' in card['name'] else 'dsv4f'
-            scopes.update({tag + ':rtx_backbone', tag + (':spark_tp2' if count == 2 else ':spark')})
+            scopes.update({tag + ':rtx_backbone', tag + (f':spark_tp{count}' if count in native_spark_roles(tag) else ':spark')})
             if int(values.get('RTX_GPUS', len(card.get('gpus', [0])))) == 2:
                 scopes.add(tag + ':rtx_tp2')
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             if tag == 'dsv4p' and 'exl3' in card['name']:
                 scopes.add(tag + ':exl3-k23')
         if family == 'kimi_k3':
-            # The max card only: TP6 width 512 EXL3 K2 experts (#273); no local-only layout.
             tp = int(values.get('SPARK_TP', count))
-            if tp != 6:
-                raise ValueError(f'kimi_k3 has no Spark layout for SPARK_TP={tp} (TP6 only)')
             env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
             scopes.add('kimik3:exl3-k23')
-            counts.add('kimik3=6')
+            if count:
+                counts.add(f'kimik3={tp}')
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
@@ -182,7 +186,7 @@ def config_scopes(values):
     # Direct configs name their Spark TP explicitly (TP2xEP3 on six Sparks is
     # the tp2 role, not tp6); cards keep the Spark-count role.
     spark_tp = resolved.get('SPARK_TP', '')
-    if family == 'deepseek_v41' and scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] and spark_tp in ('2', '3', '6'):
+    if family == 'deepseek_v41' and scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] and spark_tp in {str(tp) for tp in native_spark_roles('v41')}:
         scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] = 'tp' + spark_tp
     if family in ('glm5', 'glm5_flash'):
         scopes['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] = 'ON'

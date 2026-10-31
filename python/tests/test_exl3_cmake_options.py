@@ -56,6 +56,7 @@ set_target_properties(CUDA::cudart PROPERTIES IMPORTED_LOCATION /unused/libcudar
 add_library(CUDA::cuda_driver SHARED IMPORTED)
 set_target_properties(CUDA::cuda_driver PROPERTIES IMPORTED_LOCATION /unused/libcuda.so)
 add_custom_target(cuteafd_verify_sparkinfer_source)
+set(CMAKE_CURRENT_SOURCE_DIR "{RULES.parents[2]}")
 include("{RULES}")
 '''
 
@@ -86,7 +87,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
 
     def test_default_families_declare_all_disjoint_layouts(self):
         for architecture, layouts in (
-            ('121', DISJOINT_SPARK_LAYOUTS + [f'tp6-rank{i}' for i in range(6)]),
+            ('121', [f'tp{world}-rank{rank}' for world in range(2, 9) for rank in range(world)]),
             ('120', ['rtx-tp1', 'rtx-tp2']),
             ('120f', ['rtx-tp1', 'rtx-tp2']),
         ):
@@ -109,7 +110,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
         build: every declared Spark rank, including the exact width-768 TP3 group.
         """
         expected = {
-            '121': ','.join(DISJOINT_SPARK_LAYOUTS + [f'tp6-rank{i}' for i in range(6)]),
+            '121': ','.join([f'tp{world}-rank{rank}' for world in range(2, 9) for rank in range(world)]),
             '120': 'rtx-tp1,rtx-tp2',
         }
         for architecture, layouts in expected.items():
@@ -123,7 +124,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
 
     def test_qwen_tp1_layout_is_required_and_stamped_on_sparks_only(self):
         for architecture, layouts in (
-            ('121', DISJOINT_SPARK_LAYOUTS + ['tp1-rank0']),
+            ('121', [f'tp{world}-rank{rank}' for world in range(1, 5) for rank in range(world)]),
             ('120', ['rtx-tp1']),
         ):
             with self.subTest(architecture=architecture), tempfile.TemporaryDirectory() as temporary:
@@ -158,8 +159,8 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                     self.assertNotIn('--compact-companions', rules)
 
     def test_kimi_only_declares_qualified_roles(self):
-        for architecture, layouts in (('120', ['rtx-tp1']),
-                                      ('121', [f'tp6-rank{i}' for i in range(6)])):
+        for architecture, layouts in (('120', ['rtx-tp1', 'rtx-tp2']),
+                                      ('121', [f'tp{world}-rank{rank}' for world in (6, 7, 8) for rank in range(world)])):
             with self.subTest(architecture=architecture):
                 result, rules = self.configure(f'-DCUTEAFD_CUDA_ARCHITECTURES={architecture}',
                                                '-DCUTEAFD_EXPERT_FAMILIES=kimik3:exl3-k23')
@@ -170,8 +171,7 @@ class Exl3CmakeOptionsTests(unittest.TestCase):
                     self.assertIn('--profile tp6-width512', rules)
         result, _ = self.configure('-DCUTEAFD_EXPERT_FAMILIES=kimik3:exl3-k23',
                                    '-DCUTEAFD_GENERIC_SPARK_COUNTS=kimik3:exl3=4')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('supports TP6 only', result.stderr)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_tile_override_reaches_export_and_is_a_build_dependency(self):
         """An A/B override is a dependency, not just a command-line detail.

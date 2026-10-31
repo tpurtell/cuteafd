@@ -7,6 +7,7 @@ _sys.path[:0] = [str(_Path(__file__).resolve().parents[2] / _d) for _d in ("lib"
 
 import argparse
 import json
+from spark_packages import native_spark_roles
 
 
 CAPACITIES = (1, 16, 80, 256, 1024, 4096)
@@ -37,7 +38,7 @@ def parse_args(argv=None):
     parser.add_argument("--full-backbone", action="store_true", help="Check full-width RTX backbone geometry")
     parser.add_argument("--local-entrypoints", action="store_true", help="Use namespaced full-backbone symbols in a combined library")
     family = parser.add_mutually_exclusive_group()
-    family.add_argument("--spark-tp", type=int, choices=(2, 3, 6))
+    family.add_argument("--spark-tp", type=int, choices=tuple(native_spark_roles()))
     family.add_argument("--tp2", action="store_true")
     parser.add_argument("--require-ordered", action="store_true",
                         help="Reject token-atomic ABI 3 (candidate correctness gate)")

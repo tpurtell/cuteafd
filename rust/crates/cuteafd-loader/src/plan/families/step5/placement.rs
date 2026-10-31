@@ -11,7 +11,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use WIP FP8 on 2 RTX PRO 6000 + 6 Sparks or NVFP4 on 1 RTX PRO 6000 + 4 Sparks")]
+#[error("Step-5 layout is unqualified: {0}; use two RTX PRO 6000 for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
 struct Unqualified(&'static str);
 
 pub(super) fn layout(
@@ -26,15 +26,18 @@ pub(super) fn layout(
         "Step-5 admission requires complete safetensors headers; missing safetensors headers"
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
-    let (coordinators, spark_ranks) = if nvfp4 { (1, 4) } else { (2, 6) };
-    report.min_spark_ranks = Some(spark_ranks);
+    let coordinators = if nvfp4 { 1 } else { 2 };
+    let spark_ranks = requested.spark_ranks();
+    let format = if nvfp4 { "nvfp4" } else { "fp8" };
+    let worlds = cuteafd_core::tp_units::spark_package_worlds("step5", format);
+    crate::plan::experts::spark_recipe(&format!("step5:{format}"), 1536, spark_ranks)?;
     ensure!(
         nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
         Unqualified("BF16 target format")
     );
     ensure!(
         opts.rtx_bytes.len() == coordinators
-            && requested.spark_ranks() == spark_ranks
+            && worlds.contains(&spark_ranks)
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
     );

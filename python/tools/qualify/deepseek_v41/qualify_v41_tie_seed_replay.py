@@ -269,13 +269,11 @@ def artifact_slug(tp: int, ep: int) -> str:
 def _topology_config(export: dict) -> tuple[int | None, int]:
     """Map the exported topology to (`_v41_expert_native.library` spark_tp, I)."""
     tp, ep = int(export["tp"]), int(export["ep"])
-    if (tp, ep) == (2, 2):
-        return 2, 1152
-    if (tp, ep) == (4, 1):
-        return None, 576
-    if (tp, ep) == (3, 2):
-        return 3, 768
-    raise ValueError(f"unsupported exported topology tp={tp} ep={ep}")
+    from spark_packages import native_spark_geometry, ownership_topology
+    geometry = native_spark_geometry()
+    if not ownership_topology(tp, ep) or tp not in geometry:
+        raise ValueError(f"unsupported exported topology tp={tp} ep={ep}")
+    return (None if tp == 4 else tp), geometry[tp][1]
 
 
 # --------------------------------------------------------------------------- #

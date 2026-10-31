@@ -1143,11 +1143,6 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
-            // New generic counts require nonempty H128 ownership; a 16-row
-            // NVFP4 fallback remains valid only for previously calibrated layouts.
-            if matches!(ranks, 1 | 5) && (i % 128 != 0 || i / 128 < ranks) {
-                return None;
-            }
             experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
@@ -1165,30 +1160,31 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                     report.fits = false;
                     report.hints.push(Hint {
                         what: format!("geometry-invalid: {} intermediate {} cannot give each of {ranks} Spark ranks a nonempty whole-{} row slice",
-                            contract.package, intermediate.unwrap_or(0), if matches!(ranks, 1 | 5) { 128 } else { contract.block }),
+                            contract.package, intermediate.unwrap_or(0), contract.block),
                         how: format!("{advice}; adding a package cannot repair empty or unaligned expert slices."),
-                    });
-                } else if !contract.spark_worlds.contains(&ranks) {
-                    report.placement_supported = false;
-                    report.hints.push(Hint {
-                        what: format!("no {} layout for {ranks} Spark ranks (this build packages {:?}{})",
-                            contract.package, contract.spark_worlds,
-                            intermediate.map_or(String::new(), |i| format!(", intermediate {i} in {}-row blocks", contract.block))),
-                        how: match share(ranks) {
-                            Some(_) => format!("{advice}, or build a tp{ranks} layout (python/tools/aot/\
-                                package_fp8_moe_aot.py --layouts / package_exl3_aot.py)."),
-                            None => format!("{advice}: {ranks} ranks cannot each own whole {}-row blocks.",
-                                contract.block),
-                        },
                     });
                 } else if !fits_on(ranks) {
                     report.fits = false;
+                    report.placement_supported &= contract.spark_worlds.contains(&ranks);
                     report.hints.push(Hint {
                         what: format!("routed experts need {:.1} GiB on the widest of {ranks} Spark ranks, over the \
                             {:.0} GiB budget", gib(routed as f64 * report.spark_rank_share),
                             gib(options.spark_budget() as f64)),
                         how: format!("{advice}, keep bottom layers' experts resident on the RTX cards, or quantize \
                             the experts further (EXL3 K2-K3)."),
+                    });
+                } else if !contract.spark_worlds.contains(&ranks) {
+                    report.placement_supported = false;
+                    let refusal = intermediate.and_then(|i| experts::spark_recipe(&contract.package, i, ranks).err());
+                    report.hints.push(Hint {
+                        what: refusal.as_ref().map(ToString::to_string).unwrap_or_else(||
+                            format!("no {} layout for {ranks} Spark ranks (this build packages {:?})",
+                                contract.package, contract.spark_worlds)),
+                        how: if matches!(refusal, Some(experts::SparkRecipeRefusal::Deprecated { .. })) {
+                            format!("{advice}; choose a supported quantization for other Spark counts.")
+                        } else {
+                            format!("{advice}; add the native geometry or width-class export named by the refusal.")
+                        },
                     });
                 }
             }

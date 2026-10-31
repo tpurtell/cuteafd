@@ -26,6 +26,33 @@ scope = module('spark_count_release_scope', ROOT / 'scripts/build/release-scope.
 CAPACITIES = (1, 16, 80, 256, 1024, 4096)
 
 
+def test_every_planner_width_covered_world_has_a_package_alias():
+    packages = module('spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    entries = json.loads(packages.RANGES_PATH.read_text())['entries']
+    for key, entry in entries.items():
+        family, format = key.split(':')
+        if entry.get('deprecated'):
+            assert packages.package_worlds(family, format) == entry['worlds']
+            continue
+        exl3 = format == 'exl3'
+        native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
+        unit = 32 if native or family in ('mimof', 'mimop') else 128
+        intermediate = entry['intermediate']
+        options = dict(exl3=exl3, native=native)
+        available = set().union(*(packages.width_keys(intermediate, unit, n, **options)
+                                  for n in entry['worlds']))
+        emitted = packages.package_worlds(family, format)
+        for world in range(1, 9):
+            needed = packages.width_keys(intermediate, unit, world, **options)
+            admitted = bool(needed) and needed <= available and (not native or intermediate % (32 * world) == 0)
+            assert (world in emitted) == admitted, (key, world, needed, available)
+    # TP5 needs no new CUDA class: its H128 program is already TP4's narrow
+    # extent. The old default exporter omitted this metadata alias.
+    assert 5 not in entries['qwen4:fp8']['worlds']
+    assert 5 in packages.geometry_worlds('qwen4')
+
+
+
 def count_objects(geometry, worlds, intermediate, unit=128):
     """Today's tp-keyed jobs versus proposed compact width-class jobs.
 
@@ -86,7 +113,7 @@ def test_width_class_count_is_not_rank_count():
     full = count_objects('glm', set(range(1, 9)), 2048)
     assert full['width_columns'] == [256, 384, 512, 640, 768, 1024, 2048]
     assert full['after_objects'] == 84
-    assert full['before_objects'] == 108  # current exporter stops at TP6
+    assert full['before_objects'] == 144  # all geometric count-keyed jobs
     assert full['full_range_count_keyed_objects'] == 144
     assert full['full_range_width_keyed_objects'] == 84
     for world in (5, 7, 8):
@@ -126,6 +153,14 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
     for entry in entries:
         for column in entry.get('columns', []):
             package = column['package'].split()[0]
+            family, format = package.split(':')
+            packages = module('spark_matrix_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+            emitted = packages.package_worlds(family, format)
+            for row in column['counts']:
+                # Resolved widths are supplied by Rust spark_recipe, while
+                # aliases here come from the production Python packager policy.
+                if row['sparks'] and row.get('resolved_width_columns') is not None:
+                    assert row['sparks'] in emitted, (package, row['sparks'], emitted)
             keys.append(dict(model=entry['model'], package=package, rtx_gpus=column['rtx_gpus'],
                              geometric_minimum=(column.get('range') or {}).get('minimum'),
                              policy_only=column.get('range') is None, **count_layout_keys(column['counts'])))
@@ -141,3 +176,34 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
     output = os.environ.get('CUTEAFD_SPARK_RANGE_EXPORT_RESULTS')
     if output:
         Path(output).write_text(json.dumps(dict(exl3_objects=results, layout_keys=keys), indent=2) + '\n')
+
+
+def test_variable_world_harness_tables_and_fixed_tile_refusals_without_cuda():
+    import argparse
+    import ast
+    from spark_packages import native_spark_geometry, package_worlds
+    expected = native_spark_geometry()
+    for relative, symbol in [("python/tools/bench/bench_tp_ep_kernel.py", "TP_GEOMETRIES"),
+                             ("python/tools/bench/benchmark_v41_ep_groups.py", "TP_DEGREES")]:
+        path = ROOT / relative
+        tree = ast.parse(path.read_text())
+        nodes = [node for node in tree.body if
+                 (isinstance(node, ast.ImportFrom) and node.module == "spark_packages") or
+                 (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                  and target.id in (symbol, "SUPPORTED_SLICE_WIDTHS") for target in node.targets)) or
+                 (isinstance(node, ast.FunctionDef) and node.name == "parse_args")]
+        namespace = {"argparse": argparse, "Path": Path, "__doc__": "CPU parser proof"}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+        if symbol == "TP_DEGREES":
+            assert namespace[symbol] == (1, *package_worlds("v41", "mxfp4"))
+        else:
+            assert namespace[symbol] == tuple((tp, row[1], f"tp{tp}") for tp, row in expected.items())
+            for world in range(1, 10):
+                argv = ["--topologies", f"tp{world}", "--widths", "192", "--rows", "1", "--output", "/unused.json"]
+                if world in expected and expected[world][1] % 192 == 0:
+                    assert namespace["parse_args"](argv).topologies == f"tp{world}"
+                else:
+                    # TP8 is packaged but its logical 288-column shard does not
+                    # tile this exact-tile-only diagnostic's widths.
+                    with pytest.raises(SystemExit):
+                        namespace["parse_args"](argv)
