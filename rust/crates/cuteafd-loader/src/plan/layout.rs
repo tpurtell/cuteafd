@@ -387,6 +387,10 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
+        // Mistral Large 4 K4.5 TP6 (its smallest fitting world; wider worlds' slices are
+        // narrower): eight retained capacity manifests plus 4096-row K32 wire/routes,
+        // 533,876,812 bytes (see census test).
+        "mistral_large4" => 510 * MIB,
         _ => 0,
     };
     at_4096.saturating_mul(unit_rows.max(4096)).div_ceil(4096)
@@ -504,6 +508,21 @@ mod selected_spark_io_tests {
         assert_eq!(retained + wire_routes, 674_287_636);
         for rows in [64, 2048, 2752, 4096] {
             assert!(spark_slot_bytes("qwen4", rows) >= retained + wire_routes);
+        }
+    }
+
+    #[test]
+    fn mistral_large4_slot_covers_its_tp6_retained_manifest_census() {
+        // The WIP image's Spark package exl3-ml4-k45/tp6-rank0 (every tp6 rank is equal).
+        let manifests: Vec<serde_json::Value> = serde_json::from_str(
+            include_str!("../families/mistral_large4/spark-tp6-rank0-exl3-manifests.json")).unwrap();
+        assert_eq!(manifests.iter().map(|m| m["capacity"].as_u64().unwrap()).collect::<Vec<_>>(),
+            cuteafd_core::expert_geometry::EXL3_CAPACITIES.map(u64::from));
+        let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true).unwrap();
+        let wire_routes = 4096 * (6144 + 6144 / 32 + 8 * 4);
+        assert_eq!(retained + wire_routes, 533_876_812);
+        for rows in [64, 2048, 2752, 4096] {
+            assert!(spark_slot_bytes("mistral_large4", rows) >= retained + wire_routes);
         }
     }
 

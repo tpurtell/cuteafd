@@ -32,8 +32,11 @@ fn official_fp8_release_inventory_is_complete_and_classified() {
         // The FP8 release is the quantization source: the Spark service names it unserved.
         let expected = usize::from(c.component == Component::RoutedExpert);
         assert_eq!(c.rejected, expected, "{:?}: {:?}", c.component, c.rejections);
+        // The engine serves the EXL3 publication: the official FP8 release's routed experts
+        // have no kernel; every other text component is ready.
         assert_eq!(c.status, if matches!(c.component, Component::Vision | Component::Speculator) { Status::Disabled }
-            else { Status::Planned }, "{:?}", c.component);
+            else if c.component == Component::RoutedExpert { Status::MissingKernel } else { Status::Ready },
+            "{:?}", c.component);
     }
     assert!(component(&report, Component::RoutedExpert).rejections[0].reason.contains("EXL3 K4 + Core-K6"));
     // Official FP8 core forms as the reference loads them.
@@ -41,8 +44,8 @@ fn official_fp8_release_inventory_is_complete_and_classified() {
     assert_eq!(attention.formats.get("fp8-block128x128/f32"), Some(&144), "{:?}", attention.formats);
     assert_eq!(component(&report, Component::Indexer).formats.get("fp8-block128x128/f32"), Some(&44));
     assert_eq!(component(&report, Component::RoutedExpert).formats.get("fp8-block128x128/f32"), Some(&(4 * 128 * 3)));
-    // Planned family: an inventory, not a serving fit.
-    assert!(!report.fits && !report.executable());
+    // The official FP8 release is the quantization source, never served: not executable.
+    assert!(!report.executable());
 }
 
 #[test]
@@ -164,7 +167,7 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         assert_eq!(report.prefill_waves, Some(3), "{ranks}+{gpus}");
         let rtx = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count();
         assert_eq!(rtx, gpus);
-        // No head-split programs: whole attention, one GPU's heads or two GPUs' layer owners.
+        // auto: one GPU's heads, or two GPUs' whole-layer owners until context measures faster.
         assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
             else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
@@ -173,9 +176,8 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         }
         println!("ml4 {ranks} Sparks + {gpus} RTX: pool {} tokens, onboard {:?}, fits {}",
             memory.pool_tokens, report.onboard_layers, report.fits);
-        // Before the build: the K6 core charges need the built PROGRAMS.json and
-        // the Spark scratch its package census; the planner names both.
-        assert!(memory.notes.iter().any(|n| n.contains("no calibrated Spark EXL3 scratch for mistral_large4")));
+        // The Spark scratch is its TP6 package census (spark_slot_bytes), never unknown.
+        assert!(!memory.notes.iter().any(|n| n.contains("no calibrated Spark EXL3 scratch")), "{:?}", memory.notes);
     }
 }
 
@@ -196,7 +198,7 @@ fn bundled_drafter_is_admitted_on_the_glm_layout() {
     let report = input.plan(&options).unwrap();
     assert!(!report.hints.iter().any(|h| h.what.contains("drafter config unavailable")), "{:?}", report.hints);
     // SPECULATOR=dspark owns the checkpoint's own mtp_dspark.* tensors; off leaves them disabled.
-    for (speculator, status) in [("dspark", Status::Planned), ("off", Status::Disabled)] {
+    for (speculator, status) in [("dspark", Status::Ready), ("off", Status::Disabled)] {
         let mut options = layout_options(6, 1);
         options.draft_ownership = Some(plan::spec::DraftOwnership::selected("mistral_large4", speculator));
         let report = input.plan(&options).unwrap();

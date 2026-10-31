@@ -2282,6 +2282,39 @@ mod tests {
         assert!(placed.layers.iter().all(|l| matches!(l.mode, LayerMode::Whole { gpu: 0, .. })));
     }
 
+    /// Auto onboarding is re-solved at startup on measured free memory: when the GPUs come up
+    /// fuller than planned (scratch or code over its estimate), automatic placement drops
+    /// onboarded layers and pool before it refuses, down to no onboarding at a one-page floor.
+    #[test]
+    fn measured_overuse_drops_onboarded_layers_before_failing() {
+        let cfg = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let mut planned = inputs(&cfg, &[96 * GIB; 2]);
+        planned.spark_ranks = 6;
+        let layers = Some(AttentionPlacement::Layers);
+        let (base, _) = solve_working_set(&planned, [0; 2], layers).unwrap();
+        assert!(base.onboard_layers > 0, "the planned layout onboards");
+        let measured = |extra: u64| {
+            let mut runtime = planned.clone();
+            for (total, baseline) in &mut runtime.gpus {
+                let Baseline::Planned { context_bytes, loaded_bytes } = *baseline else { unreachable!() };
+                *baseline = Baseline::Measured { free_bytes: *total - context_bytes - loaded_bytes - extra };
+            }
+            runtime
+        };
+        let mut previous = (base.onboard_layers, base.pool_tokens);
+        for extra in [2 * GIB, 8 * GIB, 16 * GIB, 24 * GIB] {
+            match solve_working_set(&measured(extra), [0; 2], layers) {
+                Ok((placed, _)) => {
+                    assert!(placed.onboard_layers <= previous.0 && placed.pool_tokens <= previous.1, "{extra}");
+                    previous = (placed.onboard_layers, placed.pool_tokens);
+                }
+                // Only once even zero onboarding cannot hold its one-page pool.
+                Err(_) => { assert_eq!(previous.0, 0, "refused at {extra} B with layers still onboard"); break; }
+            }
+        }
+        assert!(previous.0 < base.onboard_layers, "overuse never shed an onboarded layer");
+    }
+
     #[test]
     fn whole_attention_colocates_indexers_and_charges_one_logical_kv_copy() {
         let cfg = config();

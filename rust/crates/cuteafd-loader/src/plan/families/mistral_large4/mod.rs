@@ -104,7 +104,7 @@ fn routed_shape(cfg: &Ml4Config, stem: &str) -> Option<[usize; 2]> {
 
 impl Family for MistralLarge4 {
     fn id(&self) -> &'static str { "mistral_large4" }
-    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Planned }
+    fn runtime(&self) -> RuntimeStatus { RuntimeStatus::Serving }
     fn decode_lanes(&self) -> crate::plan::decode_lanes::LaneSupport {
         crate::plan::decode_lanes::LaneSupport::One {
             reason: "one lane until a two-lane A/B wins: top-4 of 128 wide (6144) experts makes each Spark \
