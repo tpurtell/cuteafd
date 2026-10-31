@@ -37,8 +37,9 @@ impl KvExtents {
 
 /// One rank's KV storage and its per-layer views.
 pub(crate) struct RankKv<'a> {
-    _pool: Allocation<'a>,
-    _rings: Allocation<'a>,
+    pub pool: Allocation<'a>,
+    /// Every sliding layer's rings for every slot (`MuseStateLayout::ring_offset`).
+    pub rings: Allocation<'a>,
     pub layers: Vec<LayerKv>,
     pub extents: KvExtents,
 }
@@ -75,7 +76,7 @@ impl<'a> RankKv<'a> {
                 LayerKv::Ring { ring: view(rings.buffer, at, extents.layer_rings) }
             }
         }).collect();
-        Ok(Self { _pool: pool, _rings: rings, layers, extents })
+        Ok(Self { pool, rings, layers, extents })
     }
 }
 

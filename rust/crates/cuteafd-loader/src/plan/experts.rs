@@ -264,7 +264,11 @@ mod tests {
         assert_eq!(tp4.widths, vec![1024; 4]);
         let tp6 = spark_recipe("muse:exl3-k45", 4096, 6).unwrap();
         assert!(tp6.required_layouts.iter().all(|l| l.starts_with("tp6-compact-rank")), "{:?}", tp6.required_layouts);
-        assert!(spark_recipe("muse:exl3-k45", 4096, 5).is_err());
+        // Odd worlds come from the shared range data (#941): a compact layout whose
+        // stored width is the widest rank's ceil(32 / 5) = 7 blocks, rotated by layer.
+        let tp5 = spark_recipe("muse:exl3-k45", 4096, 5).unwrap();
+        assert_eq!(tp5.widths, vec![896; 5]);
+        assert!(tp5.required_layouts.iter().all(|l| l.starts_with("tp5-compact-rank")), "{:?}", tp5.required_layouts);
     }
 
     #[test]

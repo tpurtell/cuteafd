@@ -165,6 +165,7 @@ mod tests {
                 ("dsv4p", "mxfp4") => testing::write_v4_pro_mxfp4_snapshot(&snapshot),
                 ("dsv4p", "exl3") => testing::write_v4_pro_exl3_snapshot(&snapshot),
                 ("kimik3", _) => testing::write_kimi_snapshot(&snapshot, true),
+                ("muse", _) => testing::write_muse_spark_snapshot(&snapshot, &(0..62).collect::<Vec<_>>()),
                 ("mimo", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None),
                 ("mimof", _) => testing::write_snapshot(&snapshot, &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), Some(4)),
                 ("mimop", _) => testing::write_snapshot(&snapshot, &testing::mimo_pro_config(), &testing::mimo_pro_tensors(), Some(8)),
@@ -192,7 +193,7 @@ mod tests {
                 }
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3") {
+            if !matches!(family, "v41" | "kimik3" | "muse") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
@@ -212,6 +213,19 @@ mod tests {
                     ..Default::default() }), ..Default::default()
             };
             let report = testing::BudgetedPlanInput::open(&snapshot)?.plan(&options)?;
+            // Coverage follows each family's own runtime status: a Planned family must
+            // be refused at deployment until it serves; flipping it to Serving puts it
+            // through the whole chain below (and requires its launch dispatch).
+            if report.runtime == Some(cuteafd_loader::plan::RuntimeStatus::Planned) {
+                let refused = DeploymentOptions { rtx_gpus: gpus,
+                    peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
+                    speculator: "off".into(), ..Default::default() };
+                let deployment = DeploymentSpec::from_report(&report, &refused)?;
+                assert!(!report.executable() && !deployment.executable, "{key}: a planned family must be refused at deployment");
+                eprintln!("N8 launch-chain: {key} planned; refused at deployment");
+                tested.push(key.clone());
+                continue;
+            }
             assert!(report.fits && report.placement_supported, "{key}: {:?}", report.hints);
             let deployment_options = DeploymentOptions { rtx_gpus: gpus,
                 peers: (0..8).map(|rank| format!("192.0.2.{}:9100", rank + 1)).collect(),
