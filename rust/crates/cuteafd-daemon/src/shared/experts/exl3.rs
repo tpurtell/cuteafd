@@ -10,6 +10,8 @@ const JOBS_PER_EXPERT: usize = 9;
 const BANKS: usize = 2;
 pub(crate) mod execution;
 pub(crate) mod partial;
+#[cfg(test)]
+mod partial_screen;
 pub(crate) mod worker;
 
 /// Family-qualified package name for one decoder-tier pair.
