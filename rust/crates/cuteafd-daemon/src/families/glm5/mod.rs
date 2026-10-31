@@ -5,6 +5,7 @@ pub(crate) mod engine;
 pub(crate) mod prefix;
 mod packed_check;
 pub(crate) mod serve;
+pub(crate) mod ml4_media;
 pub(crate) mod landing;
 pub(crate) mod native_dense;
 pub(crate) mod push;

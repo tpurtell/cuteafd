@@ -8,7 +8,7 @@ pub(crate) mod engine;
 pub(crate) mod fp8;
 pub(crate) mod prefix;
 pub(crate) mod serve;
-mod media;
+pub(crate) mod media;
 mod speculate;
 mod expert_rows;
 mod unit_check;

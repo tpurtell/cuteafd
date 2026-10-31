@@ -8,6 +8,12 @@ and by ``mistral_common``'s instruct tokenizer from ``tekken.json``; the two
 must agree byte for byte and token for token, or the script fails. The Rust
 renderer (cuteafd-api ``chat::mistral``) must reproduce the strings.
 
+Image cases: the template writes one ``[IMG]`` per image part, which the
+processor expands; ``mistral_common`` writes the expansion itself
+(``[IMG]`` x w + ``[IMG_BREAK]`` per row, last ``[IMG_END]``). Its expansion
+is collapsed to one ``[IMG]`` per image before the comparison (the expansion is
+the span oracle's, checked in cuteafd-loader).
+
 Needs transformers and mistral_common (CPU only):
 
   python3 -I scripts/qualify/mistral_large4/mistral-template-goldens.py SNAPSHOT
@@ -28,6 +34,10 @@ WEATHER = {"type": "function", "function": {
         "days": {"type": "integer", "minimum": 1, "maximum": 7}}, "required": ["city"]}}}
 RUN = {"type": "function", "function": {"name": "run_tests", "description": "Run the suite.",
                                         "parameters": {"type": "object", "properties": {}}}}
+
+# A 1x1 white PNG: its expansion is one merged row ([IMG][IMG_END] collapsed to [IMG]).
+PIXEL = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4"
+         "//8/AAX+Av4N70a4AAAAAElFTkSuQmCC")
 
 CASES = {
     "single_user": {"messages": [{"role": "user", "content": "What is 2 + 2?"}]},
@@ -58,6 +68,13 @@ CASES = {
                                      {"type": "text", "text": "a [b] {c}\n\n  d"}]}]},
     "consecutive_users": {"messages": [{"role": "user", "content": "First."},
                                        {"role": "user", "content": "Second."}]},
+    "image_then_text": {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": PIXEL}}, {"type": "text", "text": "What is this?"}]}]},
+    "text_then_image_reordered": {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Describe:"}, {"type": "image_url", "image_url": {"url": PIXEL}}]}]},
+    "two_images_and_literal_marker_text": {"messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": PIXEL}}, {"type": "text", "text": "versus"},
+        {"type": "image_url", "image_url": {"url": PIXEL}}, {"type": "text", "text": "Compare."}]}]},
     "assistant_prefix_history": {"messages": [
         {"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi! How can I help?"},
         {"role": "user", "content": "Tell me a joke."}], "reasoning_effort": "high"},
@@ -92,7 +109,26 @@ def mistral_render(tokenizer, body):
             message.pop("name", None)
     request["messages"] = messages
     encoded = tokenizer.encode_chat_completion(ChatCompletionRequest(**request))
-    return encoded.text, encoded.tokens
+    return collapse_images(tokenizer, encoded.text, encoded.tokens)
+
+
+def collapse_images(tokenizer, text, tokens):
+    """One [IMG] per image span, as the template writes before the processor expands it."""
+    import re
+    special = tokenizer.instruct_tokenizer.tokenizer
+    ids = {name: special.get_special_token(name) for name in ("[IMG]", "[IMG_BREAK]", "[IMG_END]")}
+    collapsed, inside = [], False
+    for token in tokens:
+        if token in (ids["[IMG]"], ids["[IMG_BREAK]"]):
+            if not inside:
+                collapsed.append(ids["[IMG]"])
+            inside = True
+        elif token == ids["[IMG_END]"]:
+            inside = False
+        else:
+            collapsed.append(token)
+    text = re.sub(r"(?:\[IMG\]|\[IMG_BREAK\])+\[IMG_END\]", "[IMG]", text)
+    return text, collapsed
 
 
 def main():
@@ -100,6 +136,10 @@ def main():
     parser.add_argument("snapshot", type=pathlib.Path)
     args = parser.parse_args()
     from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    import mistral_common.tokens.tokenizers.image as image_tokenizer
+    # Only the token layout is compared: skip mistral_common's cv2 pixel transform.
+    image_tokenizer.transform_image = lambda image, size: None
+    image_tokenizer.assert_opencv_installed = lambda: None
     from tokenizers import Tokenizer
     from transformers import PreTrainedTokenizerFast
     hf = PreTrainedTokenizerFast.from_pretrained(args.snapshot, local_files_only=True)

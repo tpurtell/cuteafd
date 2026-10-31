@@ -13,7 +13,7 @@ fn options(body: &Value) -> MistralPromptOptions {
 #[test]
 fn own_template_matches_transformers_and_mistral_common_goldens() {
     let goldens: Vec<Value> = serde_json::from_str(GOLDENS).unwrap();
-    assert!(goldens.len() >= 9);
+    assert!(goldens.len() >= 12 && goldens.iter().filter(|c| c["name"].as_str().unwrap().contains("image")).count() == 3);
     for case in goldens {
         let body = &case["request"];
         assert_eq!(encoding().render(body, &options(body)).unwrap(), case["expected"].as_str().unwrap(), "{}", case["name"]);

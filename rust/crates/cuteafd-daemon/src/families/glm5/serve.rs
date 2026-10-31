@@ -38,6 +38,8 @@ use crate::shared::console;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaKeys, MediaPoll, MediaWaiter, RequestMedia};
+use super::ml4_media;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -72,6 +74,12 @@ pub(crate) struct ServeArgs {
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
+    /// Resolved global vision policy, assigned before dispatch (Mistral Large 4's tower).
+    #[arg(skip = cuteafd_loader::plan::MediaMode::Auto)]
+    pub vision: cuteafd_loader::plan::MediaMode,
+    /// Host embedding-cache quota; default min(8 GiB, 5% RAM).
+    #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
+    pub media_cache_bytes: Option<u64>,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -123,9 +131,15 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         decode_share: args.decode_share };
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
+    let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
-    let max_context = ready_rx.await.context("engine failed before it was ready")??;
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes));
+    let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
+    let mut profile = profile;
+    if let Some((preparer, health)) = media {
+        profile = profile.with_loaded_vision(preparer);
+        profile.vision_health = health;
+    }
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
@@ -177,9 +191,12 @@ struct Policy {
     decode_share: DecodeShareArgs,
 }
 
+type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Option<Arc<std::sync::atomic::AtomicBool>>)>;
+
+#[allow(clippy::too_many_arguments)]
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
-    ready: tokio::sync::oneshot::Sender<Result<usize>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    policy: Policy, prefix: PrefixArgs) -> Result<()> {
+    ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
+    policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -187,23 +204,43 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
             return Ok(());
         }
     };
+    // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
+    let (vision, prefix) = match ml4_media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes) {
+        Ok(vision) => vision,
+        Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
+    };
+    let preparer = vision.as_ref().map(|v| v.preparer.clone());
+    let expander = vision.as_ref().map(|v| v.expander);
+    let (encoder, bytes) = vision.map_or((ml4_media::Encoder::Off, 0), |v| (v.encoder, v.cache_bytes));
+    let health = encoder.health_handle();
+    let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine(&args, |engine, transport, runtime| {
         anyhow::ensure!(transport.is_some() || engine.skip_routed() || engine.has_tp2(), "serve-glm needs Spark peers, local TP2 or --skip-routed-experts");
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
+        anyhow::ensure!(preparer.is_none() || media.encoder().available(), "vision encoder unavailable before readiness");
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
-            ranks, &prefix, args.token_io.token_select, || {
+            ranks, &prefix, args.token_io.token_select, &mut media, expander.as_ref(), || {
                 if let Some(ready) = ready.take() {
-                    let _ = ready.send(Ok(engine.max_context));
+                    let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }
             })
     });
     if let Some(ready) = ready.take() {
-        let _ = ready.send(result.as_ref().map(|_| args.max_context).map_err(|e| anyhow::anyhow!("{e:#}")));
+        let _ = ready.send(result.as_ref().map(|_| (args.max_context, preparer.map(|p| (p, health))))
+            .map_err(|e| anyhow::anyhow!("{e:#}")));
     }
     result
+}
+
+/// A prompt ready for prefix-cache admission: its keyed tokens and features.
+struct Admit<'a> {
+    prompt: ml4_media::Prompt,
+    media: RequestMedia,
+    /// Kept across a KV deferral.
+    constraint: Option<crate::shared::constraints::State<'a>>,
 }
 
 /// An admitted prompt waiting for its remaining prefill chunks.
@@ -211,6 +248,10 @@ struct Prefill<'a> {
     job: NativeRequest,
     constraint: Option<crate::shared::constraints::State<'a>>,
     tokens: Vec<u32>,
+    /// The prefix cache's keyed copy of `tokens` (image rows keyed by their image; text: the tokens).
+    keys: MediaKeys,
+    /// The prompt's image features, injected where its chunks embed them.
+    media: RequestMedia,
     /// Prompt tokens prefilled so far (from the prefix cache's restore point).
     done: usize,
     /// Rows restored from the prefix cache.
@@ -238,6 +279,8 @@ struct Prefill<'a> {
 
 struct Active<'a> {
     job: NativeRequest,
+    /// The prompt's image spans (the turn snapshot keys its rows like the prompt's).
+    spans: Vec<cuteafd_loader::media::MediaSpan>,
     /// Serial number (the trace's request id).
     id: u64,
     prompt_tokens: usize,
@@ -432,7 +475,9 @@ fn release(family: &GlmPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'_
 
 /// A queued chunk eligible for immediate shared admission.
 fn packed_chunk(p: &Prefill<'_>) -> Option<(usize, usize)> {
-    if p.job.events.is_closed() || p.done == p.tokens.len() || p.logits.is_some() { return None; }
+    // A prompt with images prefills alone, where its chunks inject the features.
+    if p.job.events.is_closed() || p.done == p.tokens.len() || p.logits.is_some()
+        || !p.media.spans().is_empty() { return None; }
     Some((p.placement.len, p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len()) - p.done))
 }
 
@@ -496,7 +541,8 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
         outcome?;
         for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
             cache.capture_session(p.ticket.session());
-            if let Err(error) = cache.capture(family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement, After::default()) {
+            if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point], p.keys.spans(),
+                &p.placement, After::default()) {
                 tracing::warn!("snapshot point {point} not retained: {error:#}");
             }
         }
@@ -543,7 +589,8 @@ fn draft_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
     max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement,
-    ready: impl FnOnce()) -> Result<()> {
+    media: &mut MediaAdmission<ml4_media::Prompt, ml4_media::Encoder>,
+    expander: Option<&cuteafd_loader::media::MistralSpanExpander>, ready: impl FnOnce()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
         &crate::families::glm5_flash::serve::MESSAGE_STARTS)?;
@@ -581,7 +628,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let mut phases = [0f64; 8];
     let mut trace = Trace::open()?;
     let mut prefills = policy.decode_share.queue::<Prefill<'_>>()?;
-    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<NativeRequest>::default();
+    // A request waits here for KV (and before that, with images, in `media` for its features).
+    let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<Admit>::default();
     // GLM's only decode lane (`LaneSupport::One`), polled on this thread.
     let lanes = LaneSet::default();
     // Prefix capacity and all fallible scheduler initialization precede readiness.
@@ -593,42 +641,94 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         while active.len() + prefills.len() < max_sequences {
             let busy = !active.is_empty() || !prefills.is_empty();
-            let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
+            let admit = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy,
+                |admit| admit.prompt.job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
-                cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
-                cuteafd_engine::prefix::AdmissionPoll::Empty => {
-                    if !busy {
-                        // Idle: publish the state the server waits in (captures and releases done).
-                        cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache);
-                        console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                        match receive.blocking_recv() {
-                            Some(job) => job,
-                            None => return Ok(()),
+                cuteafd_engine::prefix::AdmissionPoll::Ready(admit) => admit,
+                cuteafd_engine::prefix::AdmissionPoll::Empty => match media.poll(|prompt| prompt.job.events.is_closed()) {
+                    MediaPoll::Ready(ready) => {
+                        let (prompt, request_media) = ready.into_parts();
+                        Admit { prompt, media: request_media, constraint: None }
+                    }
+                    MediaPoll::Failed(prompt, error) => {
+                        let _ = prompt.job.events.send(Err(ml4_media::failure(error)));
+                        continue;
+                    }
+                    MediaPoll::Pending | MediaPoll::Empty => {
+                        let job = if !busy && media.is_empty() {
+                            // Idle: publish the state the server waits in (captures and releases done).
+                            cache.tick();
+                            publish(stats, requests, generated_total, 0, 0, &cache);
+                            console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
+                            match receive.blocking_recv() {
+                                Some(job) => job,
+                                None => return Ok(()),
+                            }
+                        } else {
+                            match receive.try_recv() {
+                                Ok(job) => job,
+                                Err(_) => break,
+                            }
+                        };
+                        let reject = |job: &NativeRequest, message: String| {
+                            let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
+                        };
+                        if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
+                            reject(&job, format!("scoring: {error:#}"));
+                            continue;
                         }
-                    } else {
-                        match receive.try_recv() {
-                            Ok(job) => job,
-                            Err(_) => break,
+                        if !job.media.is_empty() && probe::scoring(&job.probe).is_some() {
+                            reject(&job, "teacher-forced scoring takes text prompts".into());
+                            continue;
+                        }
+                        if !job.media.is_empty() && !media.encoder().available() {
+                            let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
+                            continue;
+                        }
+                        let tokens = match probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?)) {
+                            Ok(tokens) => tokens,
+                            Err(error) => { reject(&job, format!("{error:#}")); continue; }
+                        };
+                        let events = job.events.clone();
+                        let (prompt, request_media, jobs) = match ml4_media::prepare(job, tokens, expander,
+                            engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
+                            Ok(prepared) => prepared,
+                            Err(error) => {
+                                let _ = events.send(Err(NativeFailure::BadRequest(format!("{error:#}"))));
+                                continue;
+                            }
+                        };
+                        if jobs.is_empty() {
+                            Admit { prompt, media: request_media, constraint: None }
+                        } else {
+                            // Encode first; the prefix lookup this waiter peeks only orders its encodes.
+                            let resume = cache.peek_media(prompt.keys.tokens(), prompt.keys.spans(), true);
+                            let waiter = match MediaWaiter::new(prompt, request_media, jobs, resume) {
+                                Ok(waiter) => waiter,
+                                Err(error) => { let _ = events.send(Err(ml4_media::failure(error))); continue; }
+                            };
+                            if let Err((_, error)) = media.enqueue(waiter) {
+                                let _ = events.send(Err(ml4_media::failure(error)));
+                            }
+                            continue;
                         }
                     }
                 },
             };
+            let Admit { prompt: ml4_media::Prompt { job, tokens, keys }, media: request_media, constraint } = admit;
             let reject = |job: &NativeRequest, message: String| {
                 let _ = job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            if let Err(error) = probe::validate_scoring(&job.probe, engine.full_prefill_logits) {
-                reject(&job, format!("scoring: {error:#}"));
-                continue;
-            }
-            let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
-                Ok(constraint) => constraint,
-                Err(error) => {
-                    reject(&job, format!("{error:#}"));
-                    continue;
-                }
+            let constraint = match constraint {
+                Some(constraint) => Some(constraint),
+                None => match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
+                    Ok(constraint) => constraint,
+                    Err(error) => {
+                        reject(&job, format!("{error:#}"));
+                        continue;
+                    }
+                },
             };
-            let tokens = probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))?;
             let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
@@ -638,17 +738,21 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let slot = free_slots.pop();
             cache.tick();
             let admit_started = Instant::now();
-            // Lookup and fork of the retained pages (byte-exact: the pages are the whole state).
-            let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(&family, lookup, capacity, true, |pages| GlmPlacement { pages, len: 0, draft_slot: slot }) {
+            // Lookup and fork of the retained pages (byte-exact: the pages are the whole state);
+            // image rows match only the same image (keyed rows, verified identities).
+            let (lookup, spans): (&[u32], &[cuteafd_loader::media::MediaSpan]) =
+                if cold { (&[], &[]) } else { (keys.tokens(), keys.spans()) };
+            let admitted = match cache.admit_media(&family, lookup, spans, capacity, true,
+                |pages| GlmPlacement { pages, len: 0, draft_slot: slot }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.extend(slot);
                     // Running requests keep their pages pinned. Delay a request
                     // that fits alone instead of rejecting transient KV pressure.
-                    match kv_waiter.defer(job, &error, busy, cache.pool().release_epoch()) {
+                    let admit = Admit { prompt: ml4_media::Prompt { job, tokens, keys }, media: request_media, constraint };
+                    match kv_waiter.defer(admit, &error, busy, cache.pool().release_epoch()) {
                         Ok(()) => break,
-                        Err(job) => reject(&job, format!("{error:#}")),
+                        Err(admit) => reject(&admit.prompt.job, format!("{error:#}")),
                     }
                     continue;
                 }
@@ -699,9 +803,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             // A cold probe keeps the same chunk plan (identical numerics); it only skips the captures.
             let plan = if cache.enabled() {
-                cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(),
+                cuteafd_engine::prefix::plan_media_points(resume, tokens.len(), engine.prefill_capacity(),
                     &crate::shared::prefix::boundaries(&tokens, &markers), family.capture_reach(),
-                    prefix.prefix_cache_min_tokens, prefix.points())
+                    prefix.prefix_cache_min_tokens, prefix.points(), keys.spans())
             } else {
                 cuteafd_engine::prefix::plan_points(resume, tokens.len(), engine.prefill_capacity(), &[], 0, 0,
                     PointPolicy { gap: 0, boundaries: 0, per_request: 0 })
@@ -709,7 +813,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             // A whole-prompt hit brings its first token's logits: nothing to prefill.
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = if logits.is_some() { PointPlan::default() } else { plan };
-            prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
+            prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 id: admitted_total, ticket });
         }
@@ -737,8 +841,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         let chunk = &p.tokens[p.done..end];
                         let start = p.placement.len;
                         cuteafd_transport::route_log::step(|| vec![(p.id, chunk.len() as u32)]);
-                        let logits = engine.prefill_device(&mut p.placement, chunk,
-                            transport.as_deref_mut().map(|t| (t, runtime)), usize::from(end == p.tokens.len()))?;
+                        let logits = engine.prefill_media_device(&mut p.placement, chunk,
+                            transport.as_deref_mut().map(|t| (t, runtime)), usize::from(end == p.tokens.len()),
+                            Some(&p.media))?;
                         if end == p.tokens.len() {
                             // The first token, while this prompt's logits are the workspace's; the
                             // prompt snapshot keeps that row (downloaded only when the cache retains).
@@ -767,8 +872,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         // Intermediate snapshot points this chunk ends at (off unless configured).
                         for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                             cache.capture_session(p.ticket.session());
-                            if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, &p.tokens[..point], &p.placement,
-                                After::default()) {
+                            if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
+                                p.keys.spans(), &p.placement, After::default()) {
                                 tracing::warn!("snapshot point {point} not retained: {error:#}");
                             }
                         }
@@ -784,7 +889,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     // Park it before either the error or missing-logits path.
                     if placement.len > resume && !probe::cold(&p.job.probe) {
                         cache.capture_session(p.ticket.session());
-                        if let Err(error) = cache.park(&family, &p.tokens[..placement.len], &placement) {
+                        if let Err(error) = cache.park_media(&family, &p.keys.tokens()[..placement.len], p.keys.spans(),
+                            &placement) {
                             tracing::warn!("parking a cancelled prefill: {error:#}");
                         }
                     }
@@ -808,12 +914,13 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         elapsed_ms = p.started.elapsed().as_millis() as u64, busy_ms = (1e3 * p.busy) as u64, "prefill");
                 }
                 // The prompt snapshot, taken once the first token is out (it only enqueues copies).
-                let prompt = (resume < p.tokens.len()).then(|| p.tokens.clone());
+                let prompt = (resume < p.tokens.len()).then(|| p.keys.tokens().to_vec());
+                let spans = p.keys.spans().to_vec();
                 let session = p.ticket.session();
                 let retain_prompt = |cache: &mut PrefixCache<CudaCopyEngine<'_>>, placement: &GlmPlacement| {
                     if let (Some(prompt), Some(logits)) = (&prompt, &logits) {
                         cache.capture_session(session.clone());
-                        if let Err(error) = cache.capture(&family, SnapshotKind::Prompt, prompt, placement,
+                        if let Err(error) = cache.capture_media(&family, SnapshotKind::Prompt, prompt, &spans, placement,
                             After::from_logits(logits, true)) {
                             tracing::warn!("prompt snapshot not retained: {error:#}");
                         }
@@ -822,6 +929,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
                     let mut request = Active {
+                        spans: spans.clone(),
                         id: p.id,
                         prompt_tokens: p.tokens.len(),
                         history: p.tokens,
@@ -912,9 +1020,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 "host step phases since the last completed request (ms per step)");
             if let Some(row) = &request.turn {
                 // The conversation so far: every committed row (the last token is not in it).
-                let rows = &request.history[..request.placement.len];
+                // Keyed like its prompt: image rows by their image identity.
+                let keys = MediaKeys::new(&request.history, engine.cfg.vocab_size as u32, &request.spans)?;
+                let rows = &keys.tokens()[..request.placement.len];
                 cache.capture_session(request.ticket.session());
-                if let Err(error) = cache.capture(&family, SnapshotKind::Turn, rows, &request.placement,
+                if let Err(error) = cache.capture_media(&family, SnapshotKind::Turn, rows, &request.spans, &request.placement,
                     After::from_logits(row, true)) {
                     tracing::warn!("turn snapshot not retained: {error:#}");
                 }
@@ -923,7 +1033,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(),
+            receive.len() + kv_waiter.len() + media.len()));
+        // Encodes in flight: wake for their completion without spinning.
+        if active.is_empty() && prefills.is_empty() && !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
@@ -1197,6 +1310,24 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
 }
 
 #[cfg(test)]
+mod media_tests {
+    /// Text prompts key and admit exactly as before: no spans, the keyed copy is the tokens, and
+    /// the prefix calls are the media forms the text forms already delegate to.
+    #[test]
+    fn text_prompts_take_the_text_prefix_path() {
+        let tokens = vec![3u32, 1, 4, 1, 5];
+        let keys = cuteafd_engine::media::MediaKeys::new(&tokens, 10, &[]).unwrap();
+        assert_eq!(keys.tokens(), tokens.as_slice());
+        let policy = cuteafd_engine::prefix::PointPolicy { gap: 4, boundaries: 1, per_request: 2 };
+        assert_eq!(cuteafd_engine::prefix::plan_media_points(0, 5, 2, &[2], 1, 1, policy, &[]),
+            cuteafd_engine::prefix::plan_points(0, 5, 2, &[2], 1, 1, policy));
+        let engine = include_str!("../../../../cuteafd-engine/src/prefix/cache.rs");
+        assert!(engine.contains("self.admit_native(family, tokens, tokens, &[], capacity, sampled, build)"));
+        assert!(engine.contains("self.capture_media(family, kind, tokens, &[], placement, after)"));
+    }
+}
+
+#[cfg(test)]
 mod lane_tests {
     #[test]
     fn final_chunk_cancellation_parks_before_error_or_missing_head() {
@@ -1204,7 +1335,7 @@ mod lane_tests {
         let finish = source.split_once(concat!("for (mut p, pre", "filled) in finished {")).unwrap().1
             .split_once("let logits = p.logits.clone();").unwrap().0;
         let cancel = finish.find("if p.cancelled || p.job.events.is_closed()").unwrap();
-        let park = finish.find("cache.park(").unwrap();
+        let park = finish.find("cache.park_media(").unwrap();
         let error = finish.find("if let Err(error) = &prefilled").unwrap();
         let missing_head = finish.find("prefill produced no logits").unwrap();
         assert!(cancel < park && park < error && error < missing_head);

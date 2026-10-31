@@ -273,6 +273,43 @@ struct Workspace<'a> {
     core_rows: Option<[Buf<'a>; 3]>,
 }
 
+/// The rows of a prefill call's media chunk (indices relative to the call)
+/// that one embed of `t` rows at call offset `begin` covers, rebased to that
+/// embed, with their feature rows (`row` bytes each).
+fn unit_media(chunk: &cuteafd_engine::media::MediaChunk, begin: usize, t: usize, row: usize) -> (Vec<u32>, Vec<u8>) {
+    let (mut indices, mut features) = (Vec::new(), Vec::new());
+    for (i, &index) in chunk.indices.iter().enumerate() {
+        let index = index as usize;
+        if (begin..begin + t).contains(&index) {
+            indices.push((index - begin) as u32);
+            features.extend_from_slice(&chunk.features[i * row..(i + 1) * row]);
+        }
+    }
+    (indices, features)
+}
+
+#[cfg(test)]
+mod media_unit_tests {
+    /// A call's media rows split across its units exactly once each, rebased to each unit.
+    #[test]
+    fn units_partition_the_call_media_rows() {
+        let row = 4;
+        let chunk = cuteafd_engine::media::MediaChunk { indices: vec![1, 2, 5, 9, 10],
+            features: (0..5u8).flat_map(|i| [i; 4]).collect(), mask: Vec::new() };
+        let mut seen = Vec::new();
+        for (begin, t) in [(0, 3), (3, 4), (7, 5)] {
+            let (indices, features) = super::unit_media(&chunk, begin, t, row);
+            assert_eq!(features.len(), indices.len() * row);
+            assert!(indices.iter().all(|&i| (i as usize) < t));
+            for (k, &i) in indices.iter().enumerate() {
+                seen.push((begin + i as usize, features[k * row]));
+            }
+        }
+        assert_eq!(seen, [(1, 0), (2, 1), (5, 2), (9, 3), (10, 4)]);
+        assert_eq!(super::unit_media(&chunk, 3, 2, row).0, Vec::<u32>::new());
+    }
+}
+
 /// A GPU's prefill slots: one view per slot into the same arenas.
 type SlotViews<'a> = Vec<Workspace<'a>>;
 
@@ -1125,16 +1162,8 @@ impl<'a> GlmEngine<'a> {
         let pending = self.pending_media.borrow();
         let Some((call, chunk)) = pending.as_ref() else { return Ok(()); };
         let (Some(&first), t) = (tables.positions.first(), tables.positions.len()) else { return Ok(()); };
-        let (begin, row) = (usize::try_from(first)?.checked_sub(*call).context("media rows before the call")?,
-            self.cfg.hidden * 2);
-        let (mut indices, mut features) = (Vec::new(), Vec::new());
-        for (i, &index) in chunk.indices.iter().enumerate() {
-            let index = index as usize;
-            if (begin..begin + t).contains(&index) {
-                indices.push((index - begin) as u32);
-                features.extend_from_slice(&chunk.features[i * row..(i + 1) * row]);
-            }
-        }
+        let begin = usize::try_from(first)?.checked_sub(*call).context("media rows before the call")?;
+        let (indices, features) = unit_media(chunk, begin, t, self.cfg.hidden * 2);
         if indices.is_empty() { return Ok(()); }
         self.library.embedding_injection()?.inject_host(&features, &indices, w.delta.buffer, w.indices.buffer,
             w.h.buffer, t, self.cfg.hidden, 1, self.stream)?;

@@ -691,6 +691,150 @@
   ]
  },
  {
+  "name": "image_then_text",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      },
+      {
+       "type": "text",
+       "text": "What is this?"
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST][IMG]What is this?[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   10,
+   14603,
+   1460,
+   1769,
+   1063,
+   4
+  ]
+ },
+ {
+  "name": "text_then_image_reordered",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "text",
+       "text": "Describe:"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST][IMG]Describe:[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   10,
+   159287,
+   1058,
+   4
+  ]
+ },
+ {
+  "name": "two_images_and_literal_marker_text",
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": [
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      },
+      {
+       "type": "text",
+       "text": "versus"
+      },
+      {
+       "type": "image_url",
+       "image_url": {
+        "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4//8/AAX+Av4N70a4AAAAAElFTkSuQmCC"
+       }
+      },
+      {
+       "type": "text",
+       "text": "Compare."
+      }
+     ]
+    }
+   ]
+  },
+  "expected": "<s>[MODEL_SETTINGS]{\"reasoning_effort\": \"high\"}[/MODEL_SETTINGS][INST][IMG]versus[IMG]Compare.[/INST]",
+  "token_ids": [
+   1,
+   36,
+   3745,
+   69242,
+   1322,
+   7435,
+   1719,
+   1449,
+   1557,
+   1418,
+   34037,
+   23665,
+   37,
+   3,
+   10,
+   3084,
+   1334,
+   10,
+   58705,
+   1046,
+   4
+  ]
+ },
+ {
   "name": "assistant_prefix_history",
   "request": {
    "messages": [

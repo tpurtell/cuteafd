@@ -187,7 +187,7 @@ fn rtx_bound_encoder(report: &PlanReport, towers: &Towers, rtx: &[DeviceLayout],
     let Ok((weights, scratch)) = towers.vision else { return false };
     if weights == 0 || report.vision == crate::plan::MediaMode::Off { return false; }
     let hardware = EncoderHardware { v41: towers.v41,
-        gpus: rtx.iter().map(|d| EncoderGpuBudget { free_bytes: u64::MAX / 4, kv_target_bytes: 0 }).collect(),
+        gpus: rtx.iter().map(|_| EncoderGpuBudget { free_bytes: u64::MAX / 4, kv_target_bytes: 0 }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
             idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
             free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
