@@ -103,17 +103,25 @@ impl<'a> NativeOwners<'a> {
                 .collect::<Result<Vec<_>>>()?;
             for rank in 0..ownership.ranks() {
                 let device = devices[rank];
-                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)?)?;
+                let rank_layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
+                let native_layout = native_scratch_layout(&rank_layout, rows, count)?;
+                let native_bytes = native_layout.as_ref().map(|l| l.bytes()).transpose()?.unwrap_or(0);
+                // The arena holds attention and FFN regions; the native scratch is its own admitted owner.
+                let arena = Arena::new(device, usize::try_from(admission[rank].workspace)? - native_bytes)?;
+                let native_scratch = native_layout.map(|layout| super::native::NativeScratch::allocate(device, &layout)
+                    .map(Rc::new)).transpose()?;
                 let rope = Rc::new(TargetTables::load(device, programs, &contract, "step5_", available[rank], &[])?);
                 tables.push(rope.clone());
                 for layer in 0..count {
                     if ownership.layer(layer, rank)?.query_heads == 0 { ranks[rank].push(None); continue; }
                     let attention = if contract.layers[layer].sliding.is_some() {
                         Attention::Sliding(SwaLayer::for_execution(device, programs, checkpoint, layer,
-                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format)?)
+                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
+                            native_scratch.clone())?)
                     } else {
                         Attention::Sparse(CsaLayer::for_execution(device, programs, checkpoint, layer,
-                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format)?)
+                            rows, Some(rope.clone()), available[rank], &[], rank, &arena, ownership, kv_format,
+                            native_scratch.clone())?)
                     };
                     // Every FFN kind lives in one region after this rank's largest
                     // attention region: no attention or other FFN kind overwrites a
@@ -122,13 +130,15 @@ impl<'a> NativeOwners<'a> {
                     let ffn = if contract.layers[layer].dense_activation.is_some() {
                         let plan = DensePlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
                             .with_span(span)?;
-                        Ffn::Dense(DenseFfn::load_plan_in(device, programs, checkpoint, plan, Some((&arena, offset)))?)
+                        Ffn::Dense(DenseFfn::load_plan_shared(device, programs, checkpoint, plan, Some((&arena, offset)),
+                            native_scratch.clone())?)
                     } else {
                         let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
                             .with_span(span)?
                             .with_expert_format(catalog.as_ref().and_then(|c| c.fp8())
                                 .context("Step-5 native expert headers missing")?.layer_format(layer)?);
-                        Ffn::Routed(RoutedFfn::load_in(device, programs, checkpoint, layer, plan, Some((&arena, offset)))?)
+                        Ffn::Routed(RoutedFfn::load_shared(device, programs, checkpoint, layer, plan, Some((&arena, offset)),
+                            native_scratch.clone())?)
                     };
                     ranks[rank].push(Some(Layer { attention, ffn }));
                 }
@@ -139,6 +149,23 @@ impl<'a> NativeOwners<'a> {
             Ok(Self { ranks, head, arenas, rope: tables })
         })
     }
+}
+
+/// The one serialized native projection scratch shared by a rank's layers.
+fn native_scratch_layout(layout: &RankWeightLayout, rows: usize, count: usize)
+    -> Result<Option<cuteafd_loader::formats::trellis_core::ProjectionScratchLayout>> {
+    let mut merged: Option<cuteafd_loader::formats::trellis_core::ProjectionScratchLayout> = None;
+    for (name, core) in &layout.core {
+        if !(0..count).any(|layer| name.starts_with(&format!("model.layers.{layer}."))) { continue; }
+        let [n, k] = core.shape;
+        let next = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
+        match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
+    }
+    Ok(merged)
+}
+
+fn native_scratch_bytes(layout: &RankWeightLayout, rows: usize, count: usize) -> Result<u64> {
+    Ok(native_scratch_layout(layout, rows, count)?.map(|l| l.bytes()).transpose()?.unwrap_or(0) as u64)
 }
 
 /// The rank's FFN region starts after its largest loaded attention region.
@@ -274,8 +301,11 @@ impl<'e, 'a> Execution<'e, 'a> {
         ensure!(rows as u64 <= ownership.execution().spec().rows, "Step-5 native row admission");
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layout = RankWeightLayout::for_execution(checkpoint, rank, ownership)?;
-        let immutable = layout.operands.iter().filter(|w| (0..count).any(|layer| w.name.starts_with(&format!("model.layers.{layer}."))))
+        let in_count = |name: &str| (0..count).any(|layer| name.starts_with(&format!("model.layers.{layer}.")));
+        let immutable = layout.operands.iter().filter(|w| in_count(&w.name))
             .try_fold(contract.rope_tables.allocation_bytes, |n, w| n.checked_add(w.allocation_bytes))
+            .and_then(|n| layout.core.iter().filter(|(name, _)| in_count(name))
+                .try_fold(n, |n, (_, core)| n.checked_add(core.bytes as u64)))
             .context("Step-5 native rank weight overflow")?;
         // Plans validate every owned layer's ABI and shapes; the arena is one
         // attention region plus one FFN region shared by every FFN kind.
@@ -298,6 +328,7 @@ impl<'e, 'a> Execution<'e, 'a> {
         let workspace = if !owned { 0 } else {
             ffn_offset(checkpoint, ownership, rank, rows, count)?
                 .checked_add(cuteafd_loader::plan::families::step5::native::ffn_region_bytes(rows, span)?)
+                .and_then(|n| n.checked_add(native_scratch_bytes(&layout, rows, count).ok()?))
                 .context("Step-5 native rank workspace overflow")?
         };
         Ok(RankAdmission { immutable, workspace })
