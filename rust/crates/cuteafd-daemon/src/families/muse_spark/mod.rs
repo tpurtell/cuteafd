@@ -3,6 +3,7 @@
 //! coordinator backend on the shared lane/prefill/decode design.
 #![allow(dead_code)]
 pub(crate) mod block;
+pub(crate) mod programs;
 #[cfg(test)]
 pub(crate) mod reference;
 #[cfg(test)]
