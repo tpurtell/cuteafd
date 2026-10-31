@@ -6409,3 +6409,14 @@ plan and latest frontier. Local pause receipt: production/paused-by-user.json.
 No publication/import has begun. After TJ resumes, preserve this clean
 run and use the existing launcher --resume --publish after admission checks;
 never restart the superseded mixed-accumulator units.
+
+RESUMED at TJ's request after the SparkNest upgrade (2026-10-31 01:27 UTC).
+Current enabled unit: step5-core-k6-1793410012476226221. Admission confirmed
+the source is local/accessible, the pinned numerical code and qualification
+remain unchanged, and the existing layer-30 frontier/partial layer-31
+receipts verify. New expert-76/77 projections in layer 31 confirm progress
+beyond the pause point. Original clean numerical identity is unchanged;
+no matrices or activations were discarded. The pause receipt is archived
+under production/pauses/, with resume-after-sparknest.json recording the
+transition. Publication, no-copy import, six-Spark placement and cleanup
+remain enabled. Continue the 30-minute progress/ETA monitoring.
