@@ -140,6 +140,24 @@ impl<'a> LayerWeights<'a> {
     pub(crate) fn core(&self, name: &str) -> Option<&CoreWeights<'a>> { self.core.get(name) }
 }
 
+/// Every layer of one coordinator rank: read through the shared checkpoint
+/// reader, packed to the admitted layout and uploaded. `charged[layer]` is the
+/// rank's layer bytes admission accepted (`LayerLayout::bytes`).
+pub(crate) fn load_rank<'a>(device: Device<'a>, cfg: &MuseSparkConfig, checkpoint: &cuteafd_loader::plan::Checkpoint,
+    layouts: &[Vec<LayerLayout>], rank: usize) -> Result<Vec<LayerWeights<'a>>> {
+    let ranks = layouts.first().map_or(0, Vec::len);
+    ensure!(layouts.len() == cfg.layers && rank < ranks, "Muse rank {rank} of {ranks} over {} layers", layouts.len());
+    layouts.iter().enumerate().map(|(layer, per_rank)| {
+        let layout = &per_rank[rank];
+        let core = layout.core.iter().map(|(&name, shared)| (name, CoreWeightLayout::from_shared(shared.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let packed = PackedLayer::pack(cfg, layer, rank, ranks, layout, &core,
+            |name| crate::shared::checkpoint_read::read_tensor(checkpoint, name))
+            .with_context(|| format!("Muse layer {layer} rank {rank}"))?;
+        LayerWeights::upload(device, packed, layout, layout.bytes()?)
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

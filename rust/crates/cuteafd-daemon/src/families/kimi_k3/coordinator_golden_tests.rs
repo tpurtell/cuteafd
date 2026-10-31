@@ -10,6 +10,7 @@ use crate::shared::memory::device::Device;
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::{placement::FfnMode, plan::Checkpoint};
 use sha2::{Digest, Sha256};
+use std::os::unix::fs::FileExt;
 
 pub(crate) type Digests = BTreeMap<String, String>;
 

@@ -2,6 +2,7 @@
 //! oracle (checked against the official transformers modules) and, next, the
 //! coordinator backend on the shared lane/prefill/decode design.
 #![allow(dead_code)]
+pub(crate) mod admission;
 pub(crate) mod block;
 pub(crate) mod core;
 pub(crate) mod device;
