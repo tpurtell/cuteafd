@@ -57,6 +57,18 @@ impl PartialReplies {
     }
 }
 
+/// The combine launches one wave needs: one per non-empty region, by format
+/// (`muse_tp_combine_{bf16,nvfp4,fp8}`), each with its region's row count. A
+/// region with no rows is skipped here, never launched with zero rows.
+pub(crate) fn combine_launches(plan: &cuteafd_loader::families::muse_spark::replies::ReplyPlan)
+    -> Vec<(&'static str, usize)> {
+    use cuteafd_loader::families::muse_spark::replies::PartialFormat;
+    let wide = match plan.wide { PartialFormat::Bf16 => "tp_combine_bf16", PartialFormat::Nvfp4 => "tp_combine_nvfp4",
+        PartialFormat::Fp8 => "tp_combine_fp8" };
+    [("tp_combine_bf16", plan.bf16_rows.len()), (wide, plan.wide_rows.len())]
+        .into_iter().filter(|(_, rows)| *rows > 0).collect()
+}
+
 /// One wave in flight: the layer and rows it carries, in send order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Wave { pub layer: usize, pub rows: usize, pub sequence: u64 }
@@ -87,6 +99,20 @@ mod tests {
         assert_eq!(fp8.rank_bytes(2752)?, 2752 * 8 * 4224);
         assert!(PartialWire::Nvfp4.row_bytes(4100).is_err());
         assert!(nvfp4.rank_bytes(0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_regions_are_never_launched() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::{Cutoff, ReplyPlan, WideFormat};
+        let cutoff = Cutoff::with_wide(64, 8, WideFormat::Nvfp4)?;
+        assert_eq!(combine_launches(&ReplyPlan::new(cutoff, &[1, 8])), [("tp_combine_bf16", 9)]);
+        assert_eq!(combine_launches(&ReplyPlan::new(cutoff, &[2752])), [("tp_combine_nvfp4", 2752)]);
+        assert_eq!(combine_launches(&ReplyPlan::new(cutoff, &[1, 2000])),
+            [("tp_combine_bf16", 1), ("tp_combine_nvfp4", 2000)]);
+        let fp8 = Cutoff::with_wide(64, 8, WideFormat::Fp8)?;
+        assert_eq!(combine_launches(&ReplyPlan::new(fp8, &[100])), [("tp_combine_fp8", 100)]);
+        assert!(combine_launches(&ReplyPlan::new(cutoff, &[])).is_empty());
         Ok(())
     }
 }
