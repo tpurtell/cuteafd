@@ -196,3 +196,20 @@ fn bundled_drafter_is_admitted_on_the_glm_layout() {
     let report = input.plan(&options).unwrap();
     assert!(!report.hints.iter().any(|h| h.what.contains("drafter config unavailable")), "{:?}", report.hints);
 }
+
+#[test]
+#[ignore = "prints the RTX resident accounting of the EXL3 K4 + Core-K6 publication form"]
+fn print_resident_fit() {
+    let dir = snapshot(true, None);
+    let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+    for ranks in [1, 2] {
+        let groups = crate::plan::layout::glm5::resident_owned(&checkpoint, ranks, 72, None).unwrap();
+        for (rank, items) in groups.iter().enumerate() {
+            let total: u64 = items.iter().map(|(_, _, b)| b).sum();
+            let mut by: std::collections::BTreeMap<String, u64> = Default::default();
+            for (group, format, bytes) in items { *by.entry(format!("{group}/{format}")).or_default() += bytes; }
+            println!("ranks={ranks} rank{rank}: total {:.2} GiB {:?}", total as f64 / (1u64 << 30) as f64,
+                by.iter().map(|(k, v)| format!("{k} {:.2}", *v as f64 / (1u64 << 30) as f64)).collect::<Vec<_>>());
+        }
+    }
+}
