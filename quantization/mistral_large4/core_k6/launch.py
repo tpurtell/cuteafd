@@ -58,7 +58,8 @@ def supervise(path):
                 failure=json.loads(failure_path.read_text()) if failure_path.exists() else {}
                 fresh=(failure.get('time',0)>=started_ns and failure.get('attempt')==record['container'])
                 category=failure.get('category') if fresh else None
-                if category=='numerical' or not (category=='oom' or container_state.get('OOMKilled') is True):
+                if (category not in (None,'oom')
+                        or not (category=='oom' or container_state.get('OOMKilled') is True)):
                     break
                 if '--resume' not in command:
                     command=[*command,'--resume']
@@ -129,7 +130,7 @@ def main():
     stamp=str(time.time_ns())
     container='mistral-core-k6-'+stamp
     publication=['timeout','--foreground','--signal=TERM','--kill-after=120','7d',python,
-                 str(here/'run.py'),*common,'--publish-only']
+                 str(here/'finish.py'),*common,'--publish-only']
     if args.publish_only:
         command=publication
     else:

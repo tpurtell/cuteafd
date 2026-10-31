@@ -6280,3 +6280,25 @@ target is `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`. Keep the source
 Mistral Ecosystem Open-Weight License intact. Serving, full-model quality and
 engine-format qualification are separate from projection/native math checks.
 Local run/evidence/export: `~/Developer/cute-worktrees/mistral-quant-work/`.
+
+Tracking: issue #937, draft PR #938. Initial implementation is sealed at
+`e7bb052f9`; 141 focused CPU cases pass and the affected native/pilot26
+pass again after removing a false-positive class-name secret-scanner trigger.
+All68 source files (1,060,613,131,585 bytes including assets) match their
+published Hub hashes. The bounded GPU pilot runs under user unit
+`mistral-core-k6-1793465295342526983`; final pilot/production results are
+not yet claimed.
+
+The CPU finalizer is `finish.py`: publish first, then `archive.py`. Native
+SparkNest cannot adopt a Developer file directly into its D2/D3 disk stores
+without copying to the primary disk. Instead, finalization sends disjoint
+published shards to the six Sparks, one network copy per shard, then imports
+each partial HF snapshot offline using hardlinks on that Spark's primary
+filesystem. The shared namespace joins those additive snapshots. No storage
+policy changes are needed. Check all managed hashes and exactly one assigned
+sealed Spark copy per weight before recording `archive-complete.json` and
+removing this task's staging and standalone weight hardlinks. Keep metadata,
+scalar evidence, model card, receipts, corpus, logs and the managed revision.
+A completed-archive retry verifies the managed snapshot without replaying the
+publisher against its retired standalone paths. Storage/finalizer/lifecycle
+checks add17+3+43 CPU cases, with no actual import or transfer yet.

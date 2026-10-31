@@ -462,3 +462,10 @@ def test_extension_compiler_records_exact_binary_identity_without_gpu_lease(tmp_
     assert receipt["fork_commit"] == "fork-pin"
     assert receipt["sha256"] == hashlib.sha256(binary.read_bytes()).hexdigest()
     assert receipt["binary"] == str(binary)
+
+
+def test_any_fresh_non_oom_failure_overrides_ambiguous_container_oom_state(supervision):
+    fixture=supervision
+    fixture.outcomes.append(dict(returncode=1,category='other',oom_killed=True))
+    assert launch.supervise(fixture.path)==1
+    assert len([event for event in fixture.events if event[0]=='start'])==1
