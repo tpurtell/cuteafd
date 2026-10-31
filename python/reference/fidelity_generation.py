@@ -78,6 +78,9 @@ class ChatRenderer:
         effort = nested if nested is not None else effort
         if self.native:
             return {"thinking_effort": effort} if effort is not None else {}
+        if self.encoder:
+            # Checkpoint encoders take effort/thinking directly in render(); no Jinja options.
+            return {}
         template = self.tokenizer.get_chat_template()
         options = {key: effort for key in ("thinking_effort", "reasoning_effort")
                    if effort is not None and re.search(r"\b" + key + r"\b", template)}
@@ -109,8 +112,14 @@ class ChatRenderer:
         """Render a full conversation (no generation prompt) to checkpoint token ids."""
         rendered = copy.deepcopy(body)
         rendered["messages"] = messages
-        if self.encoder or self.native:
-            raise ValueError("recipe v2 trailing context needs a Jinja chat template")
+        if self.native:
+            raise ValueError("recipe v2 trailing context needs a Jinja template or checkpoint encoder")
+        if self.encoder:
+            text = self.render(rendered)
+            ids = token_ids(self.tokenizer, text)
+            if self.tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False) != text:
+                raise ValueError("conversation does not re-tokenize losslessly")
+            return ids
         text = self.tokenizer.apply_chat_template(
             normalized_messages(messages), tools=body.get("tools"), tokenize=False,
             add_generation_prompt=False, **self.template_options(rendered))
