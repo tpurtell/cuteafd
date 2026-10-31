@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export full-image BF16 MHA from the verified b12x varlen kernel, offline."""
+"""Export shared BF16 vision operations by tower geometry, offline."""
 from pathlib import Path
 import argparse
 import hashlib
@@ -18,10 +18,48 @@ def tile_for_head_dim(head_dim):
     return (128, 128 if head_dim <= 64 else 64)
 
 
+def builders(group, *, head_dim=96, hidden=1536, bf16_products=False,
+             learned_position=False, bf16_before_gamma=False, windowed=False):
+    """Static tower geometry only; image dimensions and rows remain launch data."""
+    from b12x.integration.cuteafd import media
+    if group == "attention":
+        return {f"attention_d{head_dim}_{'windows' if windowed else 'full'}":
+                lambda: media.compile_vision_attention_aot(dim=head_dim, windowed=windowed)}
+    if group != "pointwise":
+        raise ValueError(f"unknown vision group: {group}")
+    return media.vision_programs(dim=head_dim, hidden=hidden, bf16_products=bf16_products,
+        learned_position=learned_position, bf16_before_gamma=bf16_before_gamma)
+
+
+def export_programs(destination, prefix, declarations):
+    """Emit the shared raw-pointer ABI and validate every generated signature."""
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    records = []
+    for name, build in declarations.items():
+        stem = f"{prefix}_{name}"
+        with exportable_compilation():
+            program = build()
+        symbol = "cuteafd_" + stem
+        program.export_to_c(str(destination), stem, symbol)
+        validate_exported_header(program, destination / (stem + ".h"), symbol)
+        records.append(dict(name=stem, geometry=dict(program.geometry), abi=program.abi,
+            artifacts={stem + ext: hashlib.sha256((destination / (stem + ext)).read_bytes()).hexdigest()
+                       for ext in (".o", ".h")}))
+        print(stem, flush=True)
+    (destination / (prefix + ".json")).write_text(json.dumps(dict(schema=1, programs=records), indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--capability", type=int, choices=(120, 121), required=True)
+    parser.add_argument("--group", choices=("legacy", "pointwise", "attention"), default="legacy")
+    parser.add_argument("--head-dim", type=int, default=96)
+    parser.add_argument("--hidden", type=int, default=1536)
+    parser.add_argument("--bf16-products", action="store_true")
+    parser.add_argument("--learned-position", action="store_true")
+    parser.add_argument("--bf16-before-gamma", action="store_true")
+    parser.add_argument("--windowed", action="store_true")
     args = parser.parse_args()
     # No driver/runtime access or initialized device context is permitted here.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -67,6 +105,14 @@ def main():
 
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
+    if args.group != "legacy":
+        declarations = builders(args.group, head_dim=args.head_dim, hidden=args.hidden,
+            bf16_products=args.bf16_products, learned_position=args.learned_position,
+            bf16_before_gamma=args.bf16_before_gamma, windowed=args.windowed)
+        export_programs(destination, "vision", declarations)
+        if torch.cuda.is_initialized():
+            raise RuntimeError("offline vision export initialized CUDA")
+        return
     for dim in (64, 72):
         stem = f"vision_attention_d{dim}"
         symbol = "cuteafd_" + stem

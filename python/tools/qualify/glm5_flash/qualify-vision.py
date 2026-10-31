@@ -24,14 +24,7 @@ Block, Ledger, OBSERVER = common.Block, common.Ledger, common.OBSERVER
 NO_OFFSET = (1 << 64) - 1
 
 
-class Spec(C.Structure):
-    _fields_ = common.Spec._fields_ + [(name, C.c_uint32) for name in (
-        "hidden", "depth", "heads", "kv_heads", "head_dim", "intermediate", "patch_size", "merger_width")]
-    _fields_ += [("norm_eps", C.c_float), ("geometry_reserved", C.c_uint32)]
-    _fields_ += [(name, C.c_uint64) for name in (
-        "patch_bias", "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias")]
-    _fields_ += [("merger_extra", C.c_uint64 * 8)]
-    _fields_ += [(name, C.c_uint64 * 28) for name in ("norm1_bias", "norm2_bias", "q_norm", "k_norm")]
+Spec = common.Spec
 
 
 def read_visual(snapshot):
@@ -73,7 +66,7 @@ def pack_spec(config, tensors):
         patch_size=14, merger_width=4096, norm_eps=1e-5)
     for name in ("patch_bias", "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias"):
         setattr(spec, name, NO_OFFSET)
-    for name, count in (("merger_extra", 8), ("norm1_bias", 28), ("norm2_bias", 28), ("q_norm", 28), ("k_norm", 28)):
+    for name, count in (("merger_extra", 8), ("norm1_bias", spec.depth), ("norm2_bias", spec.depth), ("q_norm", spec.depth), ("k_norm", spec.depth)):
         for i in range(count):
             getattr(spec, name)[i] = NO_OFFSET
     chunks, mapped, size = [], set(), 0

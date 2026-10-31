@@ -23,9 +23,27 @@ class Block(C.Structure):
     _fields_ = [(k, C.c_uint64) for k in FIELDS] + [("window", C.c_int32), ("column_order", C.c_int32)]
 
 class Spec(C.Structure):
-    _fields_ = [(k, C.c_uint32) for k in ("abi_version", "max_tokens", "output_width", "reserved")]
+    _fields_ = [(k, C.c_uint32) for k in ("storage_abi", "abi_version", "max_tokens", "output_width", "reserved")]
     _fields_ += [(k, C.c_uint64) for k in ("weight_bytes", "patch", "merger_norm", "merger_fc1", "merger_fc2", "inv_freq")]
-    _fields_ += [("blocks", Block * 28)]
+    _fields_ += [("blocks", C.POINTER(Block))]
+    _fields_ += [(k, C.c_uint32) for k in (
+        "hidden", "depth", "heads", "kv_heads", "head_dim", "intermediate", "patch_size", "merger_width")]
+    _fields_ += [("norm_eps", C.c_float), ("geometry_reserved", C.c_uint32)]
+    _fields_ += [(k, C.c_uint64) for k in (
+        "patch_bias", "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias")]
+    _fields_ += [("merger_extra", C.c_uint64 * 8)]
+    _fields_ += [(k, C.POINTER(C.c_uint64)) for k in ("norm1_bias", "norm2_bias", "q_norm", "k_norm")]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.storage_abi = 3
+        # Keep every backing allocation alive through required/create. Native
+        # registration copies these arrays before the synchronous call returns.
+        self._layer_storage = {"blocks": (Block * self.depth)()}
+        self._layer_storage.update({k: (C.c_uint64 * self.depth)()
+            for k in ("norm1_bias", "norm2_bias", "q_norm", "k_norm")})
+        for name, backing in self._layer_storage.items():
+            setattr(self, name, backing)
 
 class Ledger(C.Structure):
     _fields_ = [(k, C.c_uint64) for k in ("weights", "scratch", "blas_workspace", "device_allocations", "encodes")]
@@ -63,7 +81,7 @@ def pack_spec(cfg, tensors):
         assert vc[k] == expected, (k, vc[k])
     assert vc.get("qk_channels", 64) == 64
     assert vc["out_hidden_size"] in (4096, 6144)
-    spec = Spec(abi_version=1, max_tokens=4096, output_width=vc["out_hidden_size"])
+    spec = Spec(abi_version=1, max_tokens=4096, output_width=vc["out_hidden_size"], depth=vc["depth"])
     chunks = []
     size = 0
     def put(a):
@@ -78,7 +96,8 @@ def pack_spec(cfg, tensors):
         assert list(a.shape) == list(shape), (name, a.shape, shape)
         return (a.astype(np.uint32) << 16).view(np.float32) if vector else a
     spec.patch = put(get("patch_embed.proj.weight", [1280,3,2,16,16]))
-    for i, b in enumerate(spec.blocks):
+    for i in range(spec.depth):
+        b = spec.blocks[i]
         p = f"blocks.{i}."
         for field, name, shape, vector in [
             ("qkv", "attn.qkv.weight", [3072,1280], False),

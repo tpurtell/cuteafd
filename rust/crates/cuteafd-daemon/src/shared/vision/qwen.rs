@@ -26,6 +26,7 @@ impl TowerSpec {
         {
             return Err(VisionError::Unsupported("Qwen tower config/merger geometry or image capacity".into()));
         }
+        let depth = v["depth"].as_u64().unwrap() as usize;
         let tensors = tower_catalog(snapshot, "model.visual.")?;
         let mut reads = Vec::new();
         let mut cursor = 0usize;
@@ -50,14 +51,14 @@ impl TowerSpec {
             abi_version: 2, reserved: 2, max_tokens: max_tokens as u32, output_width: 2560,
             hidden: 1152, depth: 27, heads: 16, kv_heads: 16, head_dim: 72,
             intermediate: 4304, patch_size: 16, merger_width: 4608, norm_eps: 1e-6,
-            merger_extra: [NO_VISION_OFFSET; 8], q_norm: [NO_VISION_OFFSET; 28],
-            k_norm: [NO_VISION_OFFSET; 28], ..Default::default()
-        };
+            merger_extra: [NO_VISION_OFFSET; 8], q_norm: vec![NO_VISION_OFFSET; depth],
+            k_norm: vec![NO_VISION_OFFSET; depth], ..Default::default()
+        }.with_depth(depth);
         native.patch = put("patch_embed.proj.weight", &[1152, 3, 2, 16, 16], false)?;
         native.patch_bias = put("patch_embed.proj.bias", &[1152], true)?;
         // Position table stays BF16 just like the official learned embedding.
         native.pos_embed = put("pos_embed.weight", &[2304, 1152], false)?;
-        for i in 0..27 {
+        for i in 0..depth {
             let mut field = |suffix: &str, shape: &[usize], vector: bool| {
                 put(&format!("blocks.{i}.{suffix}"), shape, vector)
             };
@@ -148,6 +149,7 @@ mod tests {
     fn qwen_headers_match_biased_head72_tower_without_lm_reads() {
         let dir = snapshot();
         let spec = TowerSpec::from_snapshot(dir.path(), 4096).unwrap();
+        super::super::tests::assert_ctypes_spec(dir.path(), "qwen4", &spec);
         assert_eq!(spec.image_family(), cuteafd_loader::media::ImageFamily::Qwen);
         assert_eq!(spec.reads.len(), 333);
         assert_eq!(spec.native.head_dim, 72);

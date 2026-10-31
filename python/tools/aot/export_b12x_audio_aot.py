@@ -8935,10 +8935,31 @@ def write_identity(destination, manifest):
     return identity
 
 
+def builders(*, widths=(256, 512, 1024, 2048), patches=(16, 6, 5, 4), output_width=8192):
+    """BF16 PCM tower entries, with geometry supplied by the checkpoint config."""
+    from b12x.integration.cuteafd import media
+    if len(widths) != len(patches) or not widths or min(*widths, *patches, output_width) <= 0:
+        raise ValueError("audio stage widths and patches must have equal positive lengths")
+    result = media.audio_programs(widths=widths, output_width=output_width)
+    projections = set()
+    previous = 1
+    for width, patch in zip(widths, patches):
+        projections.update(((previous * patch, width), (width, width * 4), (width * 4, width)))
+        previous = width
+    projections.add((previous, output_width))
+    for width, outputs in sorted(projections):
+        result[f"projection_k{width}_n{outputs}"] = lambda k=width, n=outputs: media.compile_biased_projection_aot(width=k, outputs=n)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--capability", type=int, choices=(120, 121))
+    parser.add_argument("--group", choices=("legacy", "pcm"), default="legacy")
+    parser.add_argument("--stage-widths", default="256,512,1024,2048")
+    parser.add_argument("--patches", default="16,6,5,4")
+    parser.add_argument("--output-width", type=int, default=8192)
     parser.add_argument("--capture-official-rotary", type=Path,
                         help="one-time official GPU table capture from this pinned snapshot")
     args = parser.parse_args()
@@ -8968,6 +8989,14 @@ def main():
     from b12x.norm.audio import AudioQuery, AudioSupport
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
+    if args.group == "pcm":
+        from export_b12x_vision_aot import export_programs
+        declarations = builders(widths=tuple(map(int, args.stage_widths.split(","))),
+            patches=tuple(map(int, args.patches.split(","))), output_width=args.output_width)
+        export_programs(destination, "audio_pcm", declarations)
+        if torch.cuda.is_initialized():
+            raise RuntimeError("offline audio export initialized CUDA")
+        return
     manifest_path = destination / "audio_support.json"
     manifest_path.unlink(missing_ok=True)
     pointers = [make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, assumed_align=4) for _ in range(5)]

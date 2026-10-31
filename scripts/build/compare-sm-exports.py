@@ -228,7 +228,13 @@ def jobs(scope):
                 ((2048, 2624), (576, 2624), (128, 160), (32, 160))]
              + ["bf16_index_weights"])]),
         ("audio", "export_b12x_audio_aot.py", ["--capability", "120"]),
-        ("vision-attention", "export_b12x_vision_attention_aot.py", ["--capability", "120"]),
+        ("vision-attention", "export_b12x_vision_aot.py", ["--capability", "120"]),
+        ("vision-d96-pointwise", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "pointwise", "--learned-position"]),
+        ("vision-d128-pointwise", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "pointwise", "--head-dim", "128", "--hidden", "2048", "--bf16-products", "--bf16-before-gamma"]),
+        ("vision-d96-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention"]),
+        ("vision-d96-windows", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--windowed"]),
+        ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
+        ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
     return result
 
@@ -441,7 +447,7 @@ def worker(payload):
         export_exl3_routes(payload["args"], output)
     else:
         sys.argv = [str(path), "--output-dir", str(output), *payload["args"]]
-        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_attention_aot.py"):
+        if payload["exporter"] in ("export_b12x_audio_aot.py", "export_b12x_vision_aot.py"):
             # Standalone exporters initialize a one-SM offline target themselves.
             # Retain this worker's synthetic target so the comparison is meaningful.
             from b12x._lib import compile_pool
