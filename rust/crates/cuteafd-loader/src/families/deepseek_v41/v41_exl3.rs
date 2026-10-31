@@ -132,7 +132,8 @@ pub enum V41Exl3Naming {
     /// Flash Next): backbone as [`Self::HfLanguageModel`], draft stage `S` at
     /// `mtp.layers.{S}.mlp.experts.{E}.gate_proj|up_proj|down_proj`.
     HfLanguageModelMtp,
-    /// Prefix, routed module and gate/up/down stems discovered from tensor names.
+    /// Prefix, routed module (empty for Mistral's `layers.L.experts.E.w1`) and
+    /// gate/up/down stems discovered from tensor names.
     HeaderDerived { prefix: String, module: String, stems: [String; 3] },
 }
 
@@ -183,7 +184,9 @@ impl V41Exl3Naming {
                     V41Exl3ProjectionKind::Down => 2,
                 }];
                 let prefix = if draft { "mtp" } else { prefix.as_str() };
-                format!("{prefix}.{layer}.{module}.experts.{expert}.{stem}")
+                // Mistral consolidated naming has no module segment (`layers.L.experts.E.w1`).
+                if module.is_empty() { format!("{prefix}.{layer}.experts.{expert}.{stem}") }
+                else { format!("{prefix}.{layer}.{module}.experts.{expert}.{stem}") }
             }
         }
     }
@@ -282,7 +285,11 @@ fn header_naming(routed: &BTreeMap<&str, &Exl3Module>) -> Result<V41Exl3Naming> 
     let mut stems = BTreeSet::new();
     for name in routed.keys().filter(|name| !name.starts_with("mtp.")) {
         let (left, _) = name.split_once(".experts.").context("EXL3 expert ordinal absent")?;
-        let (layer, module) = left.rsplit_once('.').context("EXL3 expert module absent")?;
+        // `{prefix}.{L}.{module}.experts` or, with no module, `{prefix}.{L}.experts`.
+        let (layer, module) = match left.rsplit_once('.').context("EXL3 expert module absent")? {
+            (_, last) if last.parse::<usize>().is_ok() => (left, ""),
+            split => split,
+        };
         let (prefix, ordinal) = layer.rsplit_once('.').context("EXL3 layer prefix absent")?;
         ordinal.parse::<usize>().context("EXL3 layer ordinal is not an integer")?;
         ensure!(prefix.ends_with(".layers") || prefix == "layers", "EXL3 layer prefix lacks layers segment");

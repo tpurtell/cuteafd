@@ -5,7 +5,8 @@ use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 
 fn head(name: &str) -> bool {
-    name == "lm_head" || name.ends_with(".lm_head")
+    // Mistral consolidated checkpoints name the vocabulary head `output`.
+    name == "lm_head" || name.ends_with(".lm_head") || name == "output"
 }
 
 pub(crate) fn routed(name: &str) -> bool {
@@ -14,7 +15,8 @@ pub(crate) fn routed(name: &str) -> bool {
 }
 
 fn mtp(name: &str, backbone_layers: usize) -> bool {
-    name.starts_with("mtp.") || name.contains(".mtp.") || name.split_once(".layers.")
+    // `mtp_dspark.`: Mistral Large 4's bundled dSpark drafter.
+    name.starts_with("mtp.") || name.starts_with("mtp_dspark.") || name.contains(".mtp.") || name.split_once(".layers.")
         .and_then(|(_, tail)| tail.split('.').next()?.parse::<usize>().ok())
         .is_some_and(|layer| layer >= backbone_layers)
 }
@@ -160,6 +162,24 @@ mod tests {
             assert!(error.contains(stem) && error.contains(key), "{error}");
             assert!(check_header_widths(&compact, &wrong, 2).is_err());
         }
+    }
+
+    #[test]
+    fn mistral_consolidated_head_and_dspark_drafter_widths() {
+        let module = |bits| Exl3Module { codebook: Exl3Codebook::Mcg, bits,
+            input_features: 128, output_features: 128, tensors: BTreeMap::new() };
+        let storage: Exl3StorageMap = BTreeMap::from([
+            ("layers.0.attention.wq".into(), module(6)),
+            ("layers.1.shared_experts.w2".into(), module(6)),
+            ("layers.1.experts.0.w1".into(), module(4)),
+            ("mtp_dspark.backbone.layers.0.attention.wq".into(), module(4)),
+            ("output".into(), module(6)),
+        ]);
+        let (compact, manifest) = publication();
+        check_gptqmodel_manifest(&compact, &manifest, &storage, 72).unwrap();
+        let mut wrong = storage.clone();
+        wrong.get_mut("output").unwrap().bits = 4;
+        assert!(check_header_widths(&compact, &wrong, 72).unwrap_err().to_string().contains("head_bits"));
     }
 
     #[test]

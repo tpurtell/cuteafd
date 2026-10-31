@@ -6,6 +6,7 @@ pub mod glm5;
 pub mod glm5_flash;
 pub mod kimi_k3;
 pub mod mimo_v2;
+pub mod mistral_large4;
 pub mod qwen4;
 pub mod qwen;
 pub mod qwen3_5;

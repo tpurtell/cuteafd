@@ -164,6 +164,9 @@ fn manifest_from_files(snapshot: &Path, role: String, mut files: BTreeSet<String
         "chat_template.json", "inference/config.json"] {
         if snapshot.join(name).is_file() { files.insert(name.into()); }
     }
+    // A checkpoint-declared index (config.json transformers_weights) is opened instead.
+    let index = super::checkpoint::index_name(snapshot)?;
+    if snapshot.join(&index).is_file() { files.insert(index); }
     let files: Vec<_> = files.into_iter().map(|path| {
         let bytes = std::fs::metadata(snapshot.join(&path)).ok().filter(|m| m.is_file()).map(|m| m.len());
         RequiredFile { path, bytes }

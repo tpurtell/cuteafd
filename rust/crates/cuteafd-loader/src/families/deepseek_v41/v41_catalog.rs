@@ -674,7 +674,7 @@ pub fn read_official_v41_role_catalog(snapshot: &Path, role: &str, needed: impl 
         weight_map: BTreeMap<String, String>,
     }
     let mut bytes = Vec::new();
-    File::open(snapshot.join("model.safetensors.index.json"))?
+    File::open(crate::plan::checkpoint::index_path(snapshot)?)?
         .take(64 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)?;
     ensure!(
@@ -848,6 +848,9 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("qwen4_exp") {
         return read_qwen4_expert_catalog(snapshot, config, checkpoint);
     }
+    if config.get("model_type").and_then(serde_json::Value::as_str) == Some("mistral_large4") {
+        return read_mistral_large4_expert_catalog(snapshot, config, checkpoint);
+    }
     if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
         let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
         let cfg = crate::plan::families::step5::Config::parse(&checkpoint)?;
@@ -885,7 +888,7 @@ fn exl3_catalog_or_read(snapshot: &Path, shape: RoutedExpertShape, tiers: &[usiz
     #[derive(Deserialize)]
     struct Index { weight_map: BTreeMap<String, String> }
     let index: Index = serde_json::from_value(crate::families::deepseek_v41::v41_exl3::read_json(
-        &snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)?)?;
+        &crate::plan::checkpoint::index_path(snapshot)?, 64 * 1024 * 1024)?)?;
     deepseek_v4_exl3_catalog(snapshot, &index.weight_map, shape, tiers)
 }
 
@@ -1037,6 +1040,33 @@ fn read_qwen4_expert_catalog(snapshot: &Path, config: &serde_json::Value,
         FP8 (Qwen/Qwen3.8-Flash-Next-FP8) or EXL3 (wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-*) release")
 }
 
+/// Mistral Large 4 routed experts in consolidated naming
+/// (`layers.{L}.experts.{E}.w1|w3|w2`), layers 1..72. Spark ranks serve the
+/// EXL3 K4 + Core-K6 publication (ml4:exl3-k45); the official FP8 block-128
+/// release is only the quantization source and fidelity root.
+fn read_mistral_large4_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::mistral_large4::Ml4Config::from_hf(config)?;
+    let shape = RoutedExpertShape {
+        layers: cfg.layers,
+        first_layer: cfg.first_moe_layer,
+        experts: cfg.experts,
+        topk: cfg.topk,
+        hidden: cfg.hidden,
+        intermediate: cfg.moe_intermediate,
+        // The bundled mtp_dspark drafter is dense: no draft experts.
+        draft_stages: 0,
+        draft_experts: 0,
+    };
+    match config["quantization_config"]["quant_method"].as_str() {
+        Some("exl3") => exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint),
+        Some("fp8") => anyhow::bail!("Mistral Large 4 serves from the EXL3 K4 + Core-K6 publication \
+            (wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6); the official FP8 release is the \
+            quantization source and fidelity root, with no Spark expert package"),
+        other => anyhow::bail!("Mistral Large 4 routed experts stored as {other:?} have no expert package"),
+    }
+}
+
 /// MiMo V2 (mimo_v2_flash) routed experts: the checkpoint's FP8 E4M3 weights
 /// with FP32 128x128 block scales (`model.layers.{l}.mlp.experts.{e}.
 /// {gate,up,down}_proj.weight[_scale_inv]`); layer 0 is dense. V2.6 Pro
@@ -1089,7 +1119,7 @@ fn fp8_catalog(snapshot: &Path, shape: RoutedExpertShape) -> Result<OfficialV41C
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"),
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&crate::plan::checkpoint::index_path(snapshot)?,
         64 * 1024 * 1024).and_then(|value| Ok(serde_json::from_value(value)?))?;
     let mut coordinator: Vec<V41Tensor> = read_index_headers(snapshot, &index.weight_map)?.into_iter()
         .filter(|(_, tensor)| !(tensor.name.contains(".mlp.experts.")
@@ -1138,7 +1168,7 @@ fn read_deepseek_v4_expert_catalog(snapshot: &Path,
     struct Index {
         weight_map: BTreeMap<String, String>,
     }
-    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&snapshot.join("model.safetensors.index.json"), 64 * 1024 * 1024)
+    let index: Index = crate::families::deepseek_v41::v41_exl3::read_json(&crate::plan::checkpoint::index_path(snapshot)?, 64 * 1024 * 1024)
         .and_then(|value| Ok(serde_json::from_value(value)?))?;
     let draft_stages = index.weight_map.keys()
         .filter_map(|name| name.strip_prefix("mtp.")?.split('.').next()?.parse::<usize>().ok())

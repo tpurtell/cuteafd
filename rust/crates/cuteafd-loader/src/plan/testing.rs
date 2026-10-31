@@ -995,3 +995,99 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
     path
 }
+
+/// Mistral Large 4's real header inventory (the official FP8 release @f12dabdc,
+/// 56,563 tensors) from the checked-in templates, keeping the routed experts of
+/// `expert_layers` only (`None`: every layer). `quantized`: the K4 experts + K6 core
+/// publication form instead (wq, wkv_a padded to 640, wo, shared expert,
+/// dense FFN and output at K6; wkv_b, indexer wk/weights_proj, norms, router,
+/// embeddings, drafter and vision byte for byte; indexer wq_b kept FP8).
+pub fn mistral_large4_tensors(expert_layers: Option<&[usize]>, quantized: bool) -> Vec<Tensor> {
+    #[derive(serde::Deserialize)]
+    struct Template { pattern: String, axes: Vec<Vec<usize>>, dtype: String, shape: Vec<usize> }
+    let templates: Vec<Template> = serde_json::from_str(include_str!("../families/mistral_large4/official-tensors.json")).unwrap();
+    let dtype = |d: &str| -> &'static str { match d { "BF16" => "BF16", "F32" => "F32", "F8_E4M3" => "F8_E4M3", other => panic!("{other}") } };
+    let mut out = Vec::new();
+    for template in templates {
+        let mut names = vec![template.pattern.clone()];
+        for axis in &template.axes {
+            names = names.into_iter().flat_map(|name| axis.iter().map(move |i| name.replacen("{}", &i.to_string(), 1))).collect();
+        }
+        for name in names {
+            if let Some((layer, _)) = name.strip_prefix("layers.").and_then(|r| r.split_once(".experts."))
+                .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest))) {
+                if expert_layers.is_some_and(|keep| !keep.contains(&layer)) { continue; }
+            }
+            out.push(t(name, dtype(&template.dtype), &template.shape));
+        }
+    }
+    if !quantized { return out; }
+    let core = |stem: &str| -> Option<bool> {
+        if stem == "output" { return Some(false); }
+        let rest = stem.strip_prefix("layers.")?.split_once('.')?.1;
+        match rest {
+            "attention.wq" | "attention.wo" | "shared_experts.w1" | "shared_experts.w2" | "shared_experts.w3"
+            | "feed_forward.w1" | "feed_forward.w2" | "feed_forward.w3" => Some(false),
+            "attention.wkv_a_with_mqa" => Some(true),
+            _ if rest.starts_with("experts.") => Some(false),
+            _ => None,
+        }
+    };
+    let mut quantized = Vec::new();
+    let mut shapes = std::collections::BTreeMap::new();
+    for tensor in &out {
+        if let Some(stem) = tensor.0.strip_suffix(".weight") { shapes.insert(stem.to_owned(), tensor.2.clone()); }
+    }
+    for tensor in out {
+        let (stem, suffix) = crate::plan::format::split_stem(&tensor.0);
+        let Some(pad) = core(stem) else { quantized.push(tensor); continue };
+        if suffix == "qscale_weight" { continue; }
+        let shape = &shapes[stem];
+        let bits = if stem.contains(".experts.") { 4 } else { 6 };
+        let n = if pad { shape[0].next_multiple_of(128) } else { shape[0] };
+        quantized.extend(exl3(stem, n, shape[1], bits));
+    }
+    quantized
+}
+
+/// The compact and full EXL3 K4 + Core-K6 metadata of a Mistral Large 4
+/// publication (GLM 5.3 K4-Core-K6 contract).
+pub fn mistral_large4_exl3_config(tensors: &[Tensor]) -> (Value, Value) {
+    let compact = json!({"bits": 4.0, "checkpoint_format": "exl3", "core_bits": 6.0, "format": "exl3",
+        "head_bits": 6.0, "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3"});
+    let mut full = compact.clone();
+    full.as_object_mut().unwrap().extend(json!({"codebook": "mcg", "desc_act": false, "group_size": -1,
+        "lm_head": true, "method": "exl3", "out_scales": "auto", "sym": true}).as_object().unwrap().clone());
+    let projections: Vec<(String, usize, usize, usize)> = tensors.iter().filter_map(|(name, _, shape)| {
+        let stem = name.strip_suffix(".trellis")?;
+        Some((stem.to_owned(), shape[2] / 16, shape[0] * 16, shape[1] * 16))
+    }).collect();
+    (compact, exl3_manifest(&full, &projections))
+}
+
+/// A Mistral Large 4 header snapshot in the release's own layout: config.json,
+/// `consolidated-NNNNN.safetensors` shards (one per layer, sparse payloads)
+/// and the index config.json's `transformers_weights` names.
+pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>, quantized: bool) {
+    let tensors = mistral_large4_tensors(expert_layers, quantized);
+    let mut config: Value = serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap();
+    if quantized {
+        let (compact, manifest) = mistral_large4_exl3_config(&tensors);
+        config["quantization_config"] = compact;
+        write_quantize_config(dir, &manifest);
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.strip_prefix("layers.").and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("consolidated-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::write(dir.join("consolidated.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+}
