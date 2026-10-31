@@ -765,6 +765,8 @@ def main(argv=None):
     p.add_argument("--snapshot", type=pathlib.Path, help="local HF checkpoint for generation")
     p.add_argument("--bench-token")
     p.add_argument("--timeout", type=float, default=1800)
+    p.add_argument("--template-date", help="YYYY-MM-DD (UTC) for templates that render the current date; "
+                   "every cached response must carry that request date")
     p.add_argument("--recipe", choices=RECIPES, default="v1",
                    help="own-text recipe; v2 continues tool turns in-window and wraps trailing context")
     p.add_argument("--out", type=pathlib.Path)
@@ -840,7 +842,7 @@ def main(argv=None):
                 p.error("--tokenizer must match the generation snapshot")
             config = json.loads((snapshot / "config.json").read_text())
             tokenizer = load_tokenizer(a.tokenizer, chat=True)
-            renderer = ChatRenderer(tokenizer)
+            renderer = ChatRenderer(tokenizer, template_date=a.template_date)
             identity = {**tokenizer_pin,
                         "config_sha256": hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest(),
                         "snapshot_revision": snapshot.name,

@@ -295,3 +295,36 @@ def test_cached_rerender_keeps_original_tool_key_order(api):
     assert len(state["calls"]) == 1
     assert second["probe"]["prompt_ids"] == first["probe"]["prompt_ids"] == client.prompt(request)["probe"]["prompt_ids"]
     assert bytes(second["probe"]["prompt_ids"]).decode().startswith('[{"type": "function"')
+
+
+class DateTokenizer(Tokenizer):
+    def get_chat_template(self):
+        return "{{ current_date }} template"
+
+    def apply_chat_template(self, messages, tools=None, tokenize=False, add_generation_prompt=False, current_date=None):
+        return f"date={current_date}:" + super().apply_chat_template(messages, tokenize=tokenize,
+                                                                       add_generation_prompt=add_generation_prompt)
+
+
+def test_template_date_is_pinned_and_checked_against_cached_requests(api):
+    import datetime
+    client, state = api
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    client.renderer = ChatRenderer(DateTokenizer(), template_date=today)
+    result = client(body())
+    assert bytes(result["probe"]["prompt_ids"]).decode().startswith(f"date={today}:")
+    client.renderer = ChatRenderer(DateTokenizer(), template_date="2000-01-01")
+    with pytest.raises(ValueError, match="differs from template date"):
+        client(body())
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        ChatRenderer(DateTokenizer(), template_date="yesterday")
+
+
+def test_length_cut_tool_call_is_rendered_verbatim_and_never_executed(api):
+    client, state = api
+    state["message"] = {"role": "assistant", "content": "", "reasoning_content": "r",
+                        "tool_calls": [{"id": "c", "type": "function",
+                                        "function": {"name": "read_file", "arguments": "{\"path\": \"a"}}]}
+    result = client(body())
+    assert result["tool_calls"] == []
+    assert '{\\"path\\": \\"a' in bytes(result["probe"]["generated"]).decode() or "path" in bytes(result["probe"]["generated"]).decode()

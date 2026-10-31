@@ -29,15 +29,34 @@ def normalized_messages(messages):
         for call in message.get("tool_calls", []):
             function = call.get("function", call)
             if isinstance(function.get("arguments"), str):
-                function["arguments"] = json.loads(function["arguments"])
+                try:
+                    function["arguments"] = json.loads(function["arguments"])
+                except json.JSONDecodeError:
+                    pass  # A length-cut call keeps the provider's exact partial text.
     return messages
 
 
+def valid_arguments(call):
+    arguments = (call.get("function") or {}).get("arguments")
+    if not isinstance(arguments, str):
+        return True
+    try:
+        json.loads(arguments)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 class ChatRenderer:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, template_date=None):
         self.tokenizer = tokenizer
+        # Templates that print a "current date" (Muse Spark: strftime_now) render the
+        # provider's request date; pin it so local re-renders are date-independent.
+        self.template_date = template_date
         self.native = getattr(tokenizer, "_fidelity_identity", None)
         self.encoder = getattr(tokenizer, "_fidelity_encode_messages", None)
+        if template_date is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", template_date):
+            raise ValueError("template date must be YYYY-MM-DD")
         if self.encoder:
             self.identity = tokenizer._fidelity_chat_identity
         elif self.native:
@@ -48,6 +67,8 @@ class ChatRenderer:
             if not template:
                 raise ValueError("generation requires the checkpoint's own chat template")
             self.identity = {"chat_template_sha256": hashlib.sha256(template.encode()).hexdigest()}
+            if template_date is not None and re.search(r"\bcurrent_date\b", template):
+                self.identity["template_current_date"] = template_date
 
     def template_options(self, body):
         effort = body.get("reasoning_effort")
@@ -60,6 +81,8 @@ class ChatRenderer:
         template = self.tokenizer.get_chat_template()
         options = {key: effort for key in ("thinking_effort", "reasoning_effort")
                    if effort is not None and re.search(r"\b" + key + r"\b", template)}
+        if self.template_date is not None and re.search(r"\bcurrent_date\b", template):
+            options["current_date"] = self.template_date
         if body.get("response_format") is not None and re.search(r"\bresponse_format\b", template):
             # Templates that render the response format (Mistral [MODEL_SETTINGS]) must
             # see it, as the provider's own renderer does.
@@ -278,6 +301,10 @@ class APIClient(TextGenerator):
                                 if key in request and request[key] == cached.get(key)}}
         rendered_body = self.rendering_body(ordered)
         raw = record["response"]
+        pinned = self.renderer.identity.get("template_current_date")
+        if pinned is not None and record["date"][:10] != pinned:
+            # The provider rendered its own date; a different day is a different prompt.
+            raise ValueError(f"cached response date {record['date'][:10]} differs from template date {pinned}")
         if raw.get("error") or not raw.get("choices"):
             raise ValueError("API returned an error or no choices (raw response cached)")
         choice = raw["choices"][0]
@@ -290,7 +317,8 @@ class APIClient(TextGenerator):
         generated_full = self.renderer.completion(rendered_body, message)
         generated = generated_full[:body["max_tokens"]]
         visible_message = message
-        if len(generated) < len(generated_full):
+        if len(generated) < len(generated_full) or not all(
+                valid_arguments(call) for call in message.get("tool_calls") or []):
             # A cut response is unfinished; never execute calls from its discarded suffix.
             visible_message = {**message, "tool_calls": []}
         return self.result(rendered_body, generated, visible_message, {
