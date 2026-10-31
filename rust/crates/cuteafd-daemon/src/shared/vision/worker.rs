@@ -18,6 +18,15 @@ pub fn parse_plan_hash(value: &str) -> Result<[u8; 32]> {
     for (i, byte) in hash.iter_mut().enumerate() { *byte = u8::from_str_radix(&value[i*2..i*2+2], 16).context("encoder plan hash")?; }
     Ok(hash)
 }
+/// The image handshake a tower serves (and a coordinator expects): its merged-row
+/// capacity in patches, output width, patch/merge geometry and marker rows.
+pub fn image_handshake(spec: &TowerSpec, processor: &ProcessorConfig, encoder_id: cuteafd_loader::media::EncoderId,
+    plan_hash: [u8; 32]) -> EncoderHandshake {
+    EncoderHandshake { encoder_id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
+        output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge,
+        row_markers: spec.row_markers(), plan_hash }
+}
+
 pub(crate) fn architecture(library: &Path) -> Result<u32> {
     // SAFETY: this is the user-selected, architecture-matching native library.
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
@@ -33,8 +42,7 @@ pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, bu
     let ledger = NativeVision::required(&library, &spec.native)?;
     ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
-    let handshake = EncoderHandshake { encoder_id: id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
-        output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash: config.plan_hash };
+    let handshake = image_handshake(&spec, &processor, id, config.plan_hash);
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
     let server = EncoderServer::start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -89,12 +97,8 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         let backend = cuteafd_ffi::audio::NativeAudio::backend(&library)?;
         let image_spec = TowerSpec::from_snapshot(snapshot, image_config.max_tokens)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, image_spec.image_family())?;
-        let image_handshake = EncoderHandshake {
-            encoder_id: image_spec.encoder_id(&image_config.revision, sm),
-            max_patches: image_spec.native.max_tokens * processor.merge.pow(2),
-            output_width: image_spec.native.output_width, patch_size: processor.patch,
-            merge_size: processor.merge, plan_hash: image_config.plan_hash,
-        };
+        let image_handshake = image_handshake(&image_spec, &processor,
+            image_spec.encoder_id(&image_config.revision, sm), image_config.plan_hash);
         let audio_spec = super::audio::AudioTowerSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
         let audio_handshake = super::remote::AudioHandshake {
             encoder_id: audio_spec.plan().encoder_id(&audio_config.revision, sm, &backend),
@@ -180,6 +184,24 @@ mod tests {
         for text in ["cudaMemGetInfo", "allocatable", "MemAvailable", "file cache", "another encoder owner"] {
             assert!(error.contains(text), "{error}");
         }
+    }
+
+    /// A Mistral Large 4 Spark replica and its coordinator agree on the span handshake:
+    /// both build it from the checkpoint (`--encoder-max-tokens` = the plan's span cap).
+    #[test]
+    fn mistral_replica_and_coordinator_agree_on_the_span_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
+        let processor = ProcessorConfig::from_snapshot(dir.path(), cuteafd_loader::media::ImageFamily::Mistral).unwrap();
+        let worker = TowerSpec::from_snapshot(dir.path(), processor.max_image_tokens).unwrap();
+        let coordinator = TowerSpec::mistral_large4(dir.path(),
+            super::super::mistral::merged_capacity(processor.max_image_tokens)).unwrap();
+        let id = coordinator.encoder_id("rev", 121);
+        assert_eq!(worker.encoder_id("rev", 121), id);
+        let replica = image_handshake(&worker, &processor, id, [5; 32]);
+        let expected = image_handshake(&coordinator, &processor, id, [5; 32]);
+        assert_eq!(replica, expected);
+        assert_eq!((replica.row_markers, replica.max_patches, replica.output_width), (1, 55 * 55 * 4, 6144));
     }
 
     #[test]

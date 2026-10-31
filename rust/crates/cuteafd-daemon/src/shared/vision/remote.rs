@@ -15,6 +15,9 @@ use std::{
     time::{Duration, Instant},
 };
 const MAGIC: &[u8; 8] = b"CAFDVI01";
+/// Merge-2 towers that also emit marker rows (Mistral's `[IMG_BREAK]`/`[IMG_END]`):
+/// the CAFDVI01 fields plus the marker rows after each merged row.
+const MAGIC_ROW_MARKERS: &[u8; 8] = b"CAFDVI02";
 const MAX_PATCHES: u32 = 16_384;
 const MAX_WIDTH: u32 = 16_384;
 const MAX_ERROR: usize = 1024;
@@ -30,6 +33,9 @@ pub struct EncoderHandshake {
     pub output_width: u32,
     pub patch_size: u32,
     pub merge_size: u32,
+    /// Marker rows the encoder writes after each merged row of image rows (0, or 1 for
+    /// a span-writing tower: Mistral's `[IMG_BREAK]`/`[IMG_END]`); merge 2 only.
+    pub row_markers: u32,
     /// The placement contract, shared by coordinator and every replica.
     pub plan_hash: [u8; 32],
 }
@@ -42,6 +48,7 @@ impl EncoderHandshake {
             || ![14, 16].contains(&self.patch_size)
             || ![2, 3].contains(&self.merge_size)
             || (self.merge_size == 3 && (self.patch_size != 14 || self.output_width != 5120))
+            || self.row_markers > 1 || (self.row_markers == 1 && self.merge_size != 2)
         {
             return Err(error("invalid encoder capacity/geometry"));
         }
@@ -55,6 +62,7 @@ impl EncoderHandshake {
             || self.output_width != expected.output_width
             || self.patch_size != expected.patch_size
             || self.merge_size != expected.merge_size
+            || self.row_markers != expected.row_markers
             || self.max_patches < expected.max_patches
         {
             return Err(error("vision encoder identity/placement/capacity mismatch"));
@@ -62,7 +70,8 @@ impl EncoderHandshake {
         Ok(())
     }
     fn write(&self, stream: &mut Wire) -> Result<()> {
-        stream.write_all(if self.merge_size == 3 { b"CAFDV401" } else { MAGIC }).map_err(error)?;
+        stream.write_all(if self.merge_size == 3 { b"CAFDV401" } else if self.row_markers > 0 { MAGIC_ROW_MARKERS }
+            else { MAGIC }).map_err(error)?;
         stream.write_all(&self.encoder_id.0).map_err(error)?;
         stream.write_all(&self.plan_hash).map_err(error)?;
         for value in [
@@ -73,11 +82,12 @@ impl EncoderHandshake {
         ] {
             put_u32(stream, value)?;
         }
+        if self.row_markers > 0 { put_u32(stream, self.row_markers)?; }
         Ok(())
     }
     fn tokens(&self, h: u32, w: u32) -> u64 {
         if self.merge_size == 3 { u64::from(h.div_ceil(3)) * (u64::from(w.div_ceil(3)) + 1) + 2 }
-        else { u64::from(h) * u64::from(w) / 4 }
+        else { cuteafd_ffi::vision::output_rows([h as usize, w as usize], self.row_markers == 1) as u64 }
     }
     fn input_bytes(&self, patches: u64) -> u64 {
         patches.saturating_mul(u64::from(self.patch_size).pow(2)).saturating_mul(3)
@@ -174,7 +184,7 @@ impl Handshake {
     }
     fn read(stream: &mut Wire) -> Result<Self> {
         let magic = read_array::<8>(stream)?;
-        if &magic != MAGIC && &magic != b"CAFDV401" && &magic != b"CAFDAU01" {
+        if &magic != MAGIC && &magic != MAGIC_ROW_MARKERS && &magic != b"CAFDV401" && &magic != b"CAFDAU01" {
             return Err(error("unsupported encoder wire version"));
         }
         let encoder_id = EncoderId(read_array(stream)?);
@@ -185,7 +195,12 @@ impl Handshake {
             get_u32(stream)?,
             get_u32(stream)?,
         ];
-        let value = if (&magic == MAGIC && merge == 2) || (&magic == b"CAFDV401" && merge == 3) {
+        let value = if (&magic == MAGIC && merge == 2) || (&magic == b"CAFDV401" && merge == 3)
+            || (&magic == MAGIC_ROW_MARKERS && merge == 2) {
+            let row_markers = if &magic == MAGIC_ROW_MARKERS { get_u32(stream)? } else { 0 };
+            if &magic == MAGIC_ROW_MARKERS && row_markers == 0 {
+                return Err(error("row-marker wire without marker rows"));
+            }
             Self::Image(EncoderHandshake {
                 encoder_id,
                 plan_hash,
@@ -193,6 +208,7 @@ impl Handshake {
                 output_width,
                 patch_size: patch,
                 merge_size: merge,
+                row_markers,
             })
         } else if &magic == b"CAFDAU01" && patch == 24000 && merge == 4 {
             Self::Audio(AudioHandshake {
@@ -911,6 +927,33 @@ mod tests {
             exchange(&mut wire, &job).unwrap(); owner.join().unwrap();
         }
     }
+    /// Mistral's Pixtral span: (h/2) x (w/2 + 1) rows on its own wire tag; existing towers keep
+    /// CAFDVI01 byte for byte, and a client of the other geometry is refused.
+    #[test]
+    fn row_marker_spans_count_their_breaks_on_their_own_wire_tag() {
+        let mut h = handshake(); h.patch_size = 14; h.output_width = 6144; h.max_patches = 12_100; h.row_markers = 1;
+        h.validate().unwrap();
+        assert_eq!(h.tokens(110, 110), 55 * 56);
+        assert_eq!(h.tokens(6, 4), 3 * 3);
+        let job = EncodeJob::image(ImageKey([3; 32]), [1, 6, 4], vec![0; 24 * 588].into(), 9, 6144);
+        assert_eq!(h.validate_job(&job).unwrap(), 9 * 6144 * 2);
+        let merged_only = EncodeJob::image(ImageKey([3; 32]), [1, 6, 4], vec![0; 24 * 588].into(), 6, 6144);
+        assert!(h.validate_job(&merged_only).is_err());
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut writer = Wire::new(socket, Duration::from_secs(2)).unwrap();
+        let mut reader = Wire::new(peer, Duration::from_secs(2)).unwrap();
+        h.write(&mut writer).unwrap();
+        assert!(matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back == h));
+        let plain = handshake();
+        plain.write(&mut writer).unwrap();
+        assert!(matches!(Handshake::read(&mut reader).unwrap(), Handshake::Image(back) if back.row_markers == 0));
+        assert!(plain.compatible(&h).is_err() && h.compatible(&plain).is_err());
+        let mut bad = h.clone(); bad.merge_size = 3; bad.output_width = 5120;
+        assert!(bad.validate().is_err());
+    }
+
     #[test]
     fn v41_bf16_patch_frames_count_complete_spans_and_refuse_1058() {
         let mut h = handshake(); h.merge_size=3; h.patch_size=14; h.output_width=5120; h.max_patches=9216;
@@ -936,6 +979,7 @@ mod tests {
             output_width: 4096,
             patch_size: 16,
             merge_size: 2,
+            row_markers: 0,
             plan_hash: [9; 32],
         }
     }

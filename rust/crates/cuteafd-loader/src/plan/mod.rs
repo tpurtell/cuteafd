@@ -763,6 +763,12 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     if family.id() == "qwen4" && checkpoint.config.get("vision_config").is_some() {
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
+    // Mistral Large 4: its processor's span cap (merged rows plus one marker row each),
+    // which the coordinator's preparer and every Spark replica's tower are built to.
+    if family.id() == "mistral_large4" && checkpoint.config.get("vision_config").is_some() {
+        report.max_image_tokens = crate::media::ProcessorConfig::from_snapshot(&checkpoint.snapshot,
+            crate::media::ImageFamily::Mistral).ok().map(|config| config.max_image_tokens);
+    }
     report.runtime = Some(family.runtime());
     let model = match family.open(&checkpoint).and_then(|mut model| {
         model.configure(options)?;
@@ -780,7 +786,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             return Ok(report);
         }
     };
-    report.vision = model.vision_mode_placed(options.vision, options.placement);
+    report.vision = model.vision_mode(options.vision);
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
     // shared default); an explicit --spark-budget-gib always wins.
     let mut resolved = options.clone();
@@ -1419,6 +1425,7 @@ pub fn render(report: &PlanReport) -> String {
         let attention = match report.family.as_deref() {
             Some("qwen4") => "Qwen full-image head72 attention",
             Some("glm5_flash") => "GLM Flash full-image head64 attention",
+            Some("mistral_large4") => "Pixtral full-image head128 attention",
             _ => "MiMo key-0 attention",
         };
         let _ = writeln!(out, "vision     {:?}: {}; weights {} scratch {} bytes; {} ({attention}); shortfall {} bytes", encoder.kind, encoder.reason, encoder.weights, encoder.scratch, arch, encoder.shortfall);

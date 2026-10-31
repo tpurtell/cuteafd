@@ -203,6 +203,8 @@ impl TowerSpec {
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
+    /// Marker rows this tower writes after each merged row (Mistral's span: 1).
+    pub fn row_markers(&self) -> u32 { u32::from(self.native.reserved == mistral::RESERVED) }
     pub fn image_family(&self) -> cuteafd_loader::media::ImageFamily {
         use cuteafd_loader::media::ImageFamily;
         match self.native.reserved {

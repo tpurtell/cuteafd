@@ -1632,6 +1632,33 @@ def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, ex
             f"PREFILL_SPAN_ROWS={span}") in result.stdout
 
 
+@pytest.mark.parametrize("mode,kind", [(None, "spark"), ("auto", "rtx"), ("spark:0", "spark"), ("rtx:0", "rtx"),
+                                       ("off", "off")])
+def test_mistral_large4_launch_places_its_pixtral_encoder_where_the_plan_does(tmp_path, mode, kind):
+    """VISION (default auto) follows the plan's encoder placement on the shared path: a Spark
+    replica starts its encoder at the plan's span cap (3080 rows: 55 merged rows of 55 plus a
+    marker each) and serve-glm connects to it; an RTX tower loads in serve-glm; off is text."""
+    config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
+              "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1},
+              "vision_config": {"model_type": "pixtral", "num_hidden_layers": 30}}
+    placement = {"kind": kind, **({"rank": 0} if kind == "spark" else {"gpu": 0} if kind == "rtx" else {})}
+    plan = {"placement_supported": True, "fits": True, "spark_ranks": 1, "max_image_tokens": 55 * 56,
+            "encoder_plan_hash": "ab" * 32, "encoder": {"kind": placement, "replicas": []}}
+    keys = "RTX_GPUS=1\nSPECULATOR=off\nAUDIO=off\n" + (f"VISION={mode}\n" if mode else "")
+    result = _family_launch_result(tmp_path, config, "test/ml4", keys, encoder_plan=plan)
+    assert result.returncode == 0, result.stderr
+    lines = result.stderr.splitlines()
+    launch = next(line for line in lines if "docker run -d" in line and "serve-glm" in line) + " "
+    worker = next(line for line in lines if "cuteafd expertd-native" in line)
+    assert (" --vision off " in launch) if kind == "off" else (f" --vision {kind}:0 " in launch), launch
+    assert ("--vision-peers 10.0.0.1:19442" in launch) == (kind == "spark")
+    assert ("--encoder-listen" in worker) == (kind == "spark")
+    if kind == "spark":
+        assert f"--encoder-plan-hash {'ab' * 32}" in worker and f"--encoder-plan-hash {'ab' * 32}" in launch
+        assert "--encoder-max-tokens 3080" in worker
+        assert "--encoder-revision abc" in worker and "--encoder-revision abc" in launch
+
+
 @pytest.mark.parametrize("gpus", [1, 2])
 def test_mistral_large4_serves_on_the_glm_engine_with_an_opt_in_bundled_drafter(tmp_path, gpus):
     config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",

@@ -276,15 +276,6 @@ impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
 
 
-    /// Automatic vision with Spark experts would host the tower on a Spark, which
-    /// serving does not wire yet: plan text only there (serving warns and does the
-    /// same); explicit placements are kept (`rtx` plans the RTX tower).
-    fn vision_mode_placed(&self, mode: crate::plan::MediaMode, placement: crate::plan::ExpertPlacement)
-        -> crate::plan::MediaMode {
-        crate::families::mistral_large4::vision::auto_vision(mode, matches!(placement,
-            crate::plan::ExpertPlacement::Sparks { ranks } if ranks > 0))
-    }
-
     /// Mistral Large 4 runs the GLM 5.3 engine: its adapter over the shared
     /// solver, with the operands the checkpoint's variant names.
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,

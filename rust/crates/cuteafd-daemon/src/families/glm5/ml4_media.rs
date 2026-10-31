@@ -24,36 +24,51 @@ pub(crate) struct ReadyVision {
 }
 
 impl ReadyVision {
-    /// The resident tower on its RTX (`--vision rtx`, or auto without Spark experts).
-    /// A Spark-hosted encoder (planner-resolved `--vision-peers`) is not wired for
-    /// Mistral Large 4 yet: its span rows need their own remote handshake geometry.
+    /// The resident tower: on a Spark (planner-resolved `--vision-peers`, the remote
+    /// encoder with Mistral's span rows in its handshake) or on this coordinator.
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
-        prefix: &crate::shared::prefix::PrefixArgs, cache_bytes: Option<u64>)
+        prefix: &crate::shared::prefix::PrefixArgs, cache_bytes: Option<u64>,
+        remote: Option<crate::families::glm5_flash::media::RemoteVision>)
         -> Result<(Option<Self>, crate::shared::prefix::PrefixArgs)> {
-        // The planner's rule: automatic vision with Spark experts serves text only.
-        let resolved = cuteafd_loader::families::mistral_large4::vision::auto_vision(mode, args.peers.is_some());
-        if resolved != mode {
-            tracing::warn!("Mistral Large 4 VISION=auto with Spark experts serves text only: a Spark-hosted \
-                Pixtral encoder is not wired yet; set VISION=rtx to serve images from the coordinator");
-        }
-        let mode = resolved;
         let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
-        let gpu = match mode {
-            MediaMode::Rtx(_) | MediaMode::Auto =>
-                crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?,
-            MediaMode::Spark(_) => anyhow::bail!("Mistral Large 4 Spark-hosted vision is not wired yet; set VISION=rtx"),
-            MediaMode::Off => unreachable!(),
-        };
         let processor = ProcessorConfig::from_snapshot(&args.snapshot, ImageFamily::Mistral)?;
         let markers = crate::shared::vision::mistral::Markers::from_snapshot(&args.snapshot)
             .map_err(anyhow::Error::msg)?;
         let vocabulary = u32::try_from(config["text_config"]["vocab_size"].as_u64().context("vocab_size")?)?;
         let expander = MistralSpanExpander { image: markers.image, row_break: markers.row_break, end: markers.end,
             merge: processor.merge, vocabulary };
-        let spec = crate::shared::vision::TowerSpec::mistral_large4(&args.snapshot,
-            crate::shared::vision::mistral::merged_capacity(processor.max_image_tokens))?;
         let width = crate::shared::vision::mistral::LM_HIDDEN;
         let (prefix, cache_bytes) = prefix.with_media_headroom(cache_bytes)?;
+        if let Some(remote) = remote {
+            anyhow::ensure!(matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),
+                "--vision-peers requires Spark/auto vision placement");
+            // Header-only here: the tower payload stays on its Spark.
+            let spec = crate::shared::vision::TowerSpec::mistral_large4(&args.snapshot,
+                crate::shared::vision::mistral::merged_capacity(processor.max_image_tokens))?;
+            let id = spec.encoder_id(remote.revision(), 121);
+            let preparer = Arc::new(MediaPreparer::for_loaded_encoder(processor.clone(), id, 4)?);
+            let expected = crate::shared::vision::remote::EncoderHandshake {
+                encoder_id: id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
+                output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge,
+                row_markers: spec.row_markers(), plan_hash: remote.plan_hash(),
+            };
+            anyhow::ensure!(expected.output_width as usize == width, "Pixtral tower/LM output width mismatch");
+            let encoder = remote.connect(expected)?;
+            tracing::info!(cache_bytes, "Mistral Large 4 remote vision encoder ready");
+            return Ok((Some(Self { encoder, preparer, cache_bytes, expander }), prefix));
+        }
+        let gpu = match mode {
+            MediaMode::Rtx(_) => crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?,
+            MediaMode::Auto => {
+                anyhow::ensure!(args.peers.is_none(),
+                    "auto vision with Spark experts requires planner-resolved --vision-peers");
+                crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?
+            }
+            MediaMode::Spark(_) => anyhow::bail!("Spark vision placement requires --vision-peers, --encoder-plan-hash and --encoder-revision"),
+            MediaMode::Off => unreachable!(),
+        };
+        let spec = crate::shared::vision::TowerSpec::mistral_large4(&args.snapshot,
+            crate::shared::vision::mistral::merged_capacity(processor.max_image_tokens))?;
         let info = library.cuda_device_info(gpu)?;
         let sm = u32::try_from(info.compute_capability_major * 10 + info.compute_capability_minor)?;
         let revision = args.snapshot.file_name().and_then(|v| v.to_str()).context("snapshot revision")?;

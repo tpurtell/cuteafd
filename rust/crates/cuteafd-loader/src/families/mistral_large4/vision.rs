@@ -113,17 +113,6 @@ pub fn resident_weight_bytes() -> u64 {
     align(bytes) + (HEAD_DIM / 2) as u64 * 4
 }
 
-/// Where automatic vision resolves for this tower: on the coordinator when no
-/// Spark serves experts, otherwise off (a Spark-hosted Pixtral encoder needs its
-/// span geometry in the remote handshake first). Explicit modes are kept; one
-/// rule for the planner and for serving.
-pub fn auto_vision(mode: crate::plan::MediaMode, spark_experts: bool) -> crate::plan::MediaMode {
-    match mode {
-        crate::plan::MediaMode::Auto if spark_experts => crate::plan::MediaMode::Off,
-        mode => mode,
-    }
-}
-
 /// Planner charge: every tower tensor present, BF16 at its official shape, and
 /// the geometry the native tower supports.
 pub fn resident_weights(checkpoint: &crate::plan::Checkpoint) -> Result<u64, String> {

@@ -68,12 +68,6 @@ pub trait FamilyModel: Send + Sync {
     /// Resolve automatic vision to the mode this executor can actually admit.
     fn vision_mode(&self, mode: super::MediaMode) -> super::MediaMode { mode }
 
-    /// [`Self::vision_mode`] knowing the expert placement (a tower whose
-    /// automatic home depends on it).
-    fn vision_mode_placed(&self, mode: super::MediaMode, _placement: super::ExpertPlacement) -> super::MediaMode {
-        self.vision_mode(mode)
-    }
-
     /// The family's memory layout: its own adapter over the shared solver,
     /// solving the same request its runtime admits. `None` means the family
     /// has no adapter: `plan` refuses its layout.

@@ -24,6 +24,13 @@ pub(crate) struct RemoteVision {
     revision: String,
 }
 impl RemoteVision {
+    pub(crate) fn revision(&self) -> &str { &self.revision }
+    pub(crate) fn plan_hash(&self) -> [u8; 32] { self.plan_hash }
+    /// Connects every replica with the coordinator's expected handshake.
+    pub(crate) fn connect(self, expected: crate::shared::vision::remote::EncoderHandshake) -> Result<Encoder> {
+        Ok(Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect(self.addresses, expected,
+            std::time::Duration::from_secs(60))?))
+    }
     pub fn from_args(args: &super::serve::ServeArgs) -> Result<Option<Self>> {
         Self::from_parts(args.vision, args.vision_peers.as_deref(), args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())
     }
@@ -70,7 +77,7 @@ impl ReadyVision {
             anyhow::ensure!(preparer.config().max_image_tokens <= 4096, "GLM Flash tower capacity is 4096 tokens per image");
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "GLM Flash tower/LM output width mismatch");
             let encoder = crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,

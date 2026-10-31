@@ -102,7 +102,7 @@ impl ReadyVision {
             anyhow::ensure!(preparer.as_ref().unwrap().config().max_image_tokens <= 4096, "MiMo tower capacity is 4096 tokens per image");
             let expected = crate::shared::vision::remote::EncoderHandshake {
                 encoder_id: id, max_patches: 4096 * processor.merge.pow(2), output_width: spec.native.output_width,
-                patch_size: processor.patch, merge_size: processor.merge, plan_hash: remote.plan_hash,
+                patch_size: processor.patch, merge_size: processor.merge, row_markers: 0, plan_hash: remote.plan_hash,
             };
             anyhow::ensure!(expected.output_width as usize == width, "MiMo tower/LM output width mismatch");
             image_encoder = Encoder::Remote(crate::shared::vision::remote::RemoteEncoder::connect(remote.addresses, expected,

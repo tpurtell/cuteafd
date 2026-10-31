@@ -80,6 +80,15 @@ pub(crate) struct ServeArgs {
     /// Host embedding-cache quota; default min(8 GiB, 5% RAM).
     #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
     pub media_cache_bytes: Option<u64>,
+    /// Admitted resident Spark encoder endpoints, in replica order (planner-resolved).
+    #[arg(long)]
+    pub vision_peers: Option<String>,
+    /// Shared planner admission hash (required with --vision-peers).
+    #[arg(long, requires = "vision_peers")]
+    pub encoder_plan_hash: Option<String>,
+    /// Checkpoint revision the Spark encoders identify their tower with.
+    #[arg(long, requires = "vision_peers")]
+    pub encoder_revision: Option<String>,
 }
 
 fn model_id(snapshot: &std::path::Path) -> Option<String> {
@@ -132,8 +141,11 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let (vision, media_cache_bytes) = (args.vision, args.media_cache_bytes);
+    let remote = crate::families::glm5_flash::media::RemoteVision::from_parts(args.vision, args.vision_peers.as_deref(),
+        args.encoder_plan_hash.as_deref(), args.encoder_revision.as_deref())?;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix, vision, media_cache_bytes,
+            remote));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
     let mut profile = profile;
     if let Some((preparer, health)) = media {
@@ -196,7 +208,8 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>) -> Result<()> {
+    policy: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>,
+    remote: Option<crate::families::glm5_flash::media::RemoteVision>) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -205,7 +218,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         }
     };
     // The tower loads before the LM so its admitted bytes are in the LM's live baseline.
-    let (vision, prefix) = match ml4_media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes) {
+    let (vision, prefix) = match ml4_media::ReadyVision::load(&args, &opened.library, vision, &prefix, media_cache_bytes, remote) {
         Ok(vision) => vision,
         Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
     };

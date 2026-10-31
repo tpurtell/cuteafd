@@ -2849,7 +2849,8 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
     fi
   done
 fi
-if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
+          || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   selected="$(python3 -c '
