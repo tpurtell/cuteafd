@@ -423,57 +423,7 @@ mod tests {
     }
 
     fn package(cfg: &GlmDsaConfig, core: &CoreInventory) -> Result<serde_json::Value> {
-        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
-        use serde_json::json;
-        let mut weights = Vec::new();
-        for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
-            for layer in 0..cfg.layers { weights.extend(core.layer_weights(cfg, layer, ranks, owner)?.into_iter()
-                .flat_map(BTreeMap::into_values)); }
-        } }
-        if let Some(head) = core.get_weight("lm_head") {
-            weights.push(CoreWeightLayout::new(head, TrellisSide::Output, 0, 1)?);
-        }
-        let mut policies = BTreeMap::new();
-        let mut programs = BTreeMap::new();
-        for w in weights {
-            let [n, k] = w.shape;
-            let side = if w.side == TrellisSide::Input { 2 } else { 1 };
-            let book = w.codebook.marker();
-            let shape = format!("k{k}_n{n}_s{side}_{book}");
-            let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
-            policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
-                "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
-                "output_program":routes[2]}));
-            let output = if w.stem == "lm_head" { "f32" } else { "bf16" };
-            let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
-                json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
-                    "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
-                    "splits":k.div_ceil(1024),"ctas_per_sm":4}),
-                json!({"features":n,"output_dtype":output,"max_rows":4096})];
-            let pointers = [vec!["input", "suh", "rotated", "input_block_scales"],
-                vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
-                vec!["input", "svh", "output"]];
-            for i in 0..3 {
-                let name = format!("dense_trellis_k6_{}", routes[i]);
-                programs.insert(name.clone(), json!({"name":name,"capacity_rows":4096,"geometry":geometries[i],
-                    "pointers":pointers[i].iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
-                    "scalars":vec![json!({"type":"int32"}); if i == 1 { 3 } else { 2 }],
-                    "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
-            }
-        }
-        for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
-            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
-                let name = format!("{prefix}_stage_swiglu_i{inter}");
-                programs.insert(name.clone(), json!({"name":name}));
-            }
-            for cap in ["m64", "m4096"] { for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16",
-                "absorb_bf16_context", "query_rope_context"] {
-                let name = format!("{prefix}_stage_{stage}_{cap}");
-                programs.insert(name.clone(), json!({"name":name}));
-            } }
-        }
-        Ok(json!({"families":{"dense_trellis_k6":{"abi_version":1,
-            "row_policies":policies.into_values().collect::<Vec<_>>()}},"programs":programs.into_values().collect::<Vec<_>>()}))
+        crate::plan::testing::glm_k6_programs(cfg, core)
     }
 
     #[test]

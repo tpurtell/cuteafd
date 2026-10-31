@@ -398,6 +398,91 @@ pub fn glm5_native_programs() -> Value {
         json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()})
 }
 
+/// A native K6 package manifest for `core`: one row policy and its three
+/// dense_trellis_k6 programs per weight geometry, plus the stage programs each
+/// variant's admission checks (GLM's `glm{,2}_stage_*`; Mistral Large 4's
+/// `ml4_*`, its `ml42_*` head-split share and its context-split extras).
+pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::families::glm5::core::CoreInventory)
+    -> anyhow::Result<Value> {
+    use anyhow::Context as _;
+    use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+    let mut weights = Vec::new();
+    for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+        for layer in 0..cfg.layers { weights.extend(core.layer_weights(cfg, layer, ranks, owner)?.into_iter()
+            .flat_map(std::collections::BTreeMap::into_values)); }
+    } }
+    if let Some(head) = core.get_weight(cfg.head()) {
+        weights.push(CoreWeightLayout::new(head, TrellisSide::Output, 0, 1)?);
+    }
+    let mut policies = std::collections::BTreeMap::new();
+    let mut programs = std::collections::BTreeMap::new();
+    for w in weights {
+        let [n, k] = w.shape;
+        let side = if w.side == TrellisSide::Input { 2 } else { 1 };
+        let book = w.codebook.marker();
+        let shape = format!("k{k}_n{n}_s{side}_{book}");
+        let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
+        policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
+            "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
+            "output_program":routes[2]}));
+        let output = if w.stem == cfg.head() { "f32" } else { "bf16" };
+        let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
+            json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
+                "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
+                "splits":k.div_ceil(1024),"ctas_per_sm":4}),
+            json!({"features":n,"output_dtype":output,"max_rows":4096})];
+        let pointers = [vec!["input", "suh", "rotated", "input_block_scales"],
+            vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
+            vec!["input", "svh", "output"]];
+        for i in 0..3 {
+            let name = format!("dense_trellis_k6_{}", routes[i]);
+            programs.insert(name.clone(), json!({"name":name,"capacity_rows":4096,"geometry":geometries[i],
+                "pointers":pointers[i].iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
+                "scalars":vec![json!({"type":"int32"}); if i == 1 { 3 } else { 2 }],
+                "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
+        }
+    }
+    for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
+        for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+            let name = format!("{prefix}_stage_swiglu_i{inter}");
+            programs.insert(name.clone(), json!({"name":name}));
+        }
+        for cap in ["m64", "m4096"] { for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16",
+            "absorb_bf16_context", "query_rope_context"] {
+            let name = format!("{prefix}_stage_{stage}_{cap}");
+            programs.insert(name.clone(), json!({"name":name}));
+        } }
+    }
+    if cfg.variant.ml4().is_some() {
+        // export_b12x_dsv4_aot --geometry ml4: whole-attention stages and their
+        // 32-head share under a head split (`ml42_*`).
+        let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
+        let mut names = vec!["ml4_index_kw".to_string(), "ml4_norm".into(), "ml4_router_scores".into(),
+            "ml4_expert_input_quant".into(), "ml4_index_topk_decode_m64".into(), "ml4_index_topk_prefill_m4096".into(),
+            "ml4_sparse_mla_decode_m64".into(), "ml4_sparse_mla_nope_decode_m64".into(),
+            "ml4_sparse_mla_prefill_m4096".into(), "ml4_sparse_mla_nope_prefill_m4096".into()];
+        for ranks in [1, 2] {
+            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                names.push(format!("ml4_swiglu_i{inter}"));
+            }
+        }
+        for cap in ["m64", "m4096"] {
+            names.extend([format!("ml4_values_{cap}"), format!("ml4_index_query_scale_{cap}"),
+                format!("ml4_index_layer_norm_{cap}"), format!("ml4_index_q_{cap}"), format!("{split}_values_{cap}")]);
+            for tag in ["", "_nope"] {
+                for stage in ["query_scale", "rank_pack", "absorb", "index_post"] {
+                    names.push(format!("ml4_{stage}{tag}_{cap}"));
+                }
+                names.extend([format!("{split}_query_scale{tag}_{cap}"), format!("{split}_absorb{tag}_{cap}")]);
+            }
+        }
+        for name in names { programs.insert(name.clone(), json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})); }
+    }
+    Ok(json!({"families":{"dense_trellis_k6":{"abi_version":1,
+        "row_policies":policies.into_values().collect::<Vec<_>>()}},"programs":programs.into_values().collect::<Vec<_>>()}))
+}
+
+
 /// GLM 5.3 Flash's config with `layers` layers (KDA / MLA alternating, the
 /// first dense).
 pub fn glm5_flash_config(layers: usize) -> Value {
