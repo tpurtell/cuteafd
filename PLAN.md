@@ -6420,3 +6420,13 @@ no matrices or activations were discarded. The pause receipt is archived
 under production/pauses/, with resume-after-sparknest.json recording the
 transition. Publication, no-copy import, six-Spark placement and cleanup
 remain enabled. Continue the 30-minute progress/ETA monitoring.
+
+CONNECTIVITY INTERRUPTION (2026-10-31 02:31 UTC): raptor disconnected and
+its fleet DNS name stopped resolving. Known fabric/Tailscale addresses
+also timed out; SparkNest reports raptor offline. The launcher stopped its
+maxq container and exhausted bounded SSH retries (exit 255), with no
+quantizer/numerical error. Layers 0–32 and 315 complete experts in layer 33
+remain committed. Preserve this clean run. User's resume authorization is
+still active: wait for raptor to return, then resume under the canonical
+maxq lease with --resume --publish. Do not bypass or relocate the hardware
+lock. Connectivity receipt: production/connectivity-interruption.json.
