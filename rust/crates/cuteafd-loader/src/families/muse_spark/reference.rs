@@ -215,6 +215,56 @@ pub fn expert(x: &[f32], gate_up: &[f32], down: &[f32], intermediate: usize, nor
     input_scaled(&linear(down, hidden, intermediate, &act), norm, eps)
 }
 
+/// `muse_tp_combine` for one row under TP residency. `partials[route][rank]`
+/// are each rank's dequantized F32 partial down-proj outputs (E wide) for the
+/// row's routed experts in route order; `weights` the routing weights; `norm`
+/// the layer's one `post_expert_norm` weight. Per route: sum the ranks in
+/// ascending order in F32, round to BF16 (the official BF16 down linear's
+/// output), apply the input-scaled norm, multiply by the routing weight (F32,
+/// then BF16, as the module's BF16 tensor op), then sum the routes in route
+/// order in F32 and round to BF16 (`index_add_` into BF16 `final_hidden_states`
+/// accumulates in route order; each add rounds to BF16).
+pub fn tp_combine(partials: &[Vec<Vec<f32>>], weights: &[f32], norm: &[f32], eps: f64) -> Vec<f32> {
+    let width = norm.len();
+    let mut out = vec![0f32; width];
+    for (ranks, &weight) in partials.iter().zip(weights) {
+        let summed: Vec<f32> = (0..width).map(|i| bf16(ranks.iter().fold(0f32, |acc, p| acc + p[i]))).collect();
+        let normed = input_scaled(&summed, norm, eps);
+        for i in 0..width {
+            out[i] = bf16(out[i] + bf16(normed[i] * weight));
+        }
+    }
+    out
+}
+
+/// NVFP4 (E2M1, E4M3 scale per 16 = amax / 6): the dequantized value of `x`
+/// as the Spark epilogue writes it and the combine reads it. The contract
+/// grid for the kernels' bit tests.
+pub fn nvfp4_roundtrip(x: &[f32]) -> Vec<f32> {
+    const GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+    let e4m3 = |v: f32| -> f32 {
+        let a = v.abs().min(448.0);
+        if a == 0.0 { return 0.0; }
+        let exp = a.log2().floor().max(-6.0);
+        let step = (exp - 3.0).exp2();
+        ((a / step).round_ties_even() * step).copysign(v)
+    };
+    x.chunks(16).flat_map(|block| {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let scale = if amax > 0.0 { e4m3(amax / 6.0).max((-9f32).exp2()) } else { 1.0 };
+        block.iter().map(move |v| {
+            let a = (v / scale).abs().min(6.0);
+            // Round to nearest grid value, ties to the even mantissa (lower index on exact halves).
+            let mut best = 0;
+            for (i, g) in GRID.iter().enumerate() {
+                let (d, db) = ((a - g).abs(), (a - GRID[best]).abs());
+                if d < db || (d == db && i % 2 == 0 && best % 2 == 1) { best = i; }
+            }
+            (GRID[best] * scale).copysign(*v)
+        }).collect::<Vec<_>>()
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +331,33 @@ mod tests {
         let divided = bf16(0.5f32 / 20.0);
         assert_eq!(softcap(1.0, 0.5, 20.0), bf16(bf16(divided.tanh()) * 20.0));
         assert_ne!(divided, 0.025f32, "the divide rounds to BF16");
+    }
+
+    /// BF16 and NVFP4 partials take the same combine: identical partials give
+    /// identical output, and a format's effect is only its dequantized values.
+    #[test]
+    fn tp_combine_rounds_the_rank_sum_once_and_is_format_neutral() {
+        let width = 32;
+        let norm: Vec<f32> = (0..width).map(|i| (i as f32 - 16.0) / 64.0).collect();
+        let partial = |seed: u32| -> Vec<f32> {
+            (0..width).map(|i| ((((i as u32).wrapping_mul(2654435761) ^ seed) % 1000) as f32 - 500.0) / 997.0).collect()
+        };
+        let routes: Vec<Vec<Vec<f32>>> = (0..3).map(|r| (0..6).map(|k| partial(r * 7 + k)).collect()).collect();
+        let weights = [0.5f32, 0.3, 0.2];
+        let a = tp_combine(&routes, &weights, &norm, 1e-8);
+        assert_eq!(a, tp_combine(&routes, &weights, &norm, 1e-8));
+        // One rank holding the whole sum equals six ranks whose F32 sum is the same bits.
+        let whole: Vec<Vec<Vec<f32>>> = routes.iter().map(|ranks| {
+            vec![(0..width).map(|i| ranks.iter().fold(0f32, |acc, p| acc + p[i])).collect()]
+        }).collect();
+        assert_eq!(tp_combine(&whole, &weights, &norm, 1e-8), a);
+        // The single-expert contract is the combine of one route with weight 1.
+        let one = tp_combine(&routes[..1], &[1.0], &norm, 1e-8);
+        let summed: Vec<f32> = (0..width).map(|i| bf16(routes[0].iter().fold(0f32, |acc, p| acc + p[i]))).collect();
+        assert_eq!(one, input_scaled(&summed, &norm, 1e-8).iter().map(|v| bf16(bf16(*v) + 0.0)).collect::<Vec<_>>());
+        // NVFP4 round trip is idempotent and on its grid.
+        let q = nvfp4_roundtrip(&routes[0][0]);
+        assert_eq!(nvfp4_roundtrip(&q), q);
+        assert!(q.iter().zip(&routes[0][0]).all(|(a, b)| (a - b).abs() <= b.abs().max(1e-3)));
     }
 }

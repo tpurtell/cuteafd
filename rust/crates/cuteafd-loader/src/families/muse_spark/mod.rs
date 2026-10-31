@@ -5,6 +5,7 @@ pub mod core;
 pub mod reference;
 pub mod weight_layout;
 pub mod lane;
+pub mod replies;
 
 pub use config::{MuseAttention, MuseSparkConfig};
 
