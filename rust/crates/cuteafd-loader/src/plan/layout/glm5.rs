@@ -168,15 +168,23 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         *groups[rank].entry((group.into(), format.into())).or_default() += bytes.max(256);
     };
     let native = std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native");
+    use crate::families::glm5::names::Operand as Op;
+    // Operand names come from the checkpoint's variant (GLM HF names, Mistral
+    // consolidated names); a variant without an operand has no such tensor.
+    let w = |layer: usize, op: Op| cfg.weight(layer, op);
     for layer in 0..layers {
-        let p = format!("model.layers.{layer}");
-        let attn = format!("{p}.self_attn");
-        let qkv = [format!("{attn}.q_a_proj.weight"), format!("{attn}.kv_a_proj_with_mqa.weight")];
-        let attention = [qkv[0].clone(), qkv[1].clone(), format!("{attn}.q_b_proj.weight"),
-            format!("{attn}.kv_b_proj.weight"), format!("{attn}.o_proj.weight")];
-        let core_attention = core.get_weight(&qkv[0]).is_some();
+        // Direct-query variants project the query straight from the hidden
+        // state (no q-LoRA); latent-sharing layers carry no wkv_a / kv_a norm.
+        let kv_a = w(layer, Op::KvA);
+        let q_in = w(layer, Op::QA).unwrap_or_else(|| w(layer, Op::QB).expect("every variant has a query projection"));
+        let qkv: Vec<String> = [Some(q_in.clone()), kv_a.clone()].into_iter().flatten().collect();
+        let q_b = w(layer, Op::QA).and(w(layer, Op::QB));
+        let mut attention = qkv.clone();
+        attention.extend(q_b.iter().cloned());
+        attention.extend([w(layer, Op::KvB).unwrap(), w(layer, Op::O).unwrap()]);
+        let core_attention = core.get_weight(&q_in).is_some();
         let bf16 = native && attention.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16))
-            || core_attention && tensor(&format!("{attn}.kv_b_proj.weight"))?.dtype == DType::Bf16;
+            || core_attention && tensor(&w(layer, Op::KvB).unwrap())?.dtype == DType::Bf16;
         let qkv_rows: u64 = if core_attention { 0 } else {
             qkv.iter().map(|n| tensor(n).map(|t| t.shape[0] as u64)).sum::<anyhow::Result<_>>()?
         };
@@ -187,54 +195,66 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
             Ok((t.shape[0] as u64 * t.shape[1] as u64, (t.shape[0] as u64).div_ceil(128) * (t.shape[1] as u64).div_ceil(128) * 4))
         };
         for rank in 0..ranks {
-            for name in [format!("{p}.input_layernorm.weight"), format!("{p}.post_attention_layernorm.weight")] {
+            for name in [w(layer, Op::InputNorm).unwrap(), w(layer, Op::PostAttentionNorm).unwrap()] {
                 put(rank, "norm", "bf16", tensor(&name)?.byte_length);
             }
             if owners.is_none_or(|owners| owners[layer] as usize == rank) {
                 let attention_ranks = if owners.is_some() { 1 } else { ranks };
-                for name in [format!("{attn}.q_a_layernorm.weight"), format!("{attn}.kv_a_layernorm.weight")] {
+                for name in [w(layer, Op::QANorm), w(layer, Op::KvANorm), w(layer, Op::QueryScaleS), w(layer, Op::QueryScaleB)]
+                    .into_iter().flatten() {
                     put(rank, "norm", "bf16", tensor(&name)?.byte_length);
                 }
                 if core_attention {
-                    for name in [&qkv[0], &qkv[1], &format!("{attn}.q_b_proj.weight"), &format!("{attn}.o_proj.weight")] {
+                    for name in qkv.iter().chain(q_b.iter()).chain([w(layer, Op::O).unwrap()].iter()) {
                         let projection = core.get_weight(name).context("complete GLM native attention group")?;
                         put(rank, "attention", "exl3-k6", projection.resident_bytes(attention_ranks)?);
                     }
                 } else {
-                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, qkv_rows * h * if bf16 { 2 } else { 1 });
+                    // The q-LoRA / latent down projections stay whole; the query up
+                    // (or direct query) and output split by heads.
+                    let whole = if q_b.is_some() { qkv.clone() } else { kv_a.iter().cloned().collect() };
+                    let whole_rows: u64 = whole.iter().map(|n| tensor(n).map(|t| t.shape[0] as u64)).sum::<anyhow::Result<_>>()?;
+                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, whole_rows * h * if bf16 { 2 } else { 1 });
                     if !bf16 {
-                        let grid = qkv.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
+                        let grid = whole.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
                         put(rank, "attention", "fp8-scale", grid);
-                        put(rank, "attention", "fp8-scale", qkv_rows * h.div_ceil(128) * 4);
+                        put(rank, "attention", "fp8-scale", whole_rows * h.div_ceil(128) * 4);
                     }
-                    for name in [format!("{attn}.q_b_proj.weight"), format!("{attn}.o_proj.weight")] {
+                    let split = [q_b.clone().unwrap_or(q_in.clone()), w(layer, Op::O).unwrap()];
+                    for name in split {
                         let (values, scales) = projection(&name)?;
                         put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values / attention_ranks as u64 * if bf16 { 2 } else { 1 });
                         if !bf16 { put(rank, "attention", "fp8-scale", scales / attention_ranks as u64); }
                     }
+                    let _ = qkv_rows;
                 }
-                for width in [cfg.qk_nope_head_dim, cfg.v_head_dim] {
+                for width in [cfg.nope_dim(layer), cfg.v_head_dim] {
                     let values = cfg.heads as u64 / attention_ranks as u64 * cfg.kv_lora_rank as u64 * width as u64;
                     put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values * if bf16 { 2 } else { 1 });
                     if !bf16 { put(rank, "attention", "fp8-scale", values / 64 * 4); }
                 }
                 if cfg.indexers[layer] == GlmIndexer::Full {
-                    let name = format!("{attn}.indexer.wq_b.weight");
+                    let name = w(layer, Op::IndexQ).unwrap();
                     let index_bf16 = (native || trellis) && tensor(&name)?.dtype == DType::Bf16;
                     let (values, scales) = projection(&name)?;
                     put(rank, "indexer", if index_bf16 { "bf16" } else { "fp8" }, values * if index_bf16 { 2 } else { 1 });
                     if !index_bf16 { put(rank, "indexer", "fp8-scale", scales); }
-                    let ik = ["wk.weight", "weights_proj.weight"].into_iter().map(|suffix| tensor(&format!("{attn}.indexer.{suffix}"))
+                    let ik = [Op::IndexK, Op::IndexWeights].into_iter().map(|op| tensor(&w(layer, op).unwrap())
                         .map(|t| t.shape.iter().product::<usize>() as u64 * 2)).sum::<anyhow::Result<u64>>()?;
                     put(rank, "indexer", "bf16", ik);
-                    for suffix in ["k_norm.weight", "k_norm.bias"] {
-                        put(rank, "indexer", "bf16", tensor(&format!("{attn}.indexer.{suffix}"))?.byte_length);
+                    let k_norm = cfg.stem(layer, Op::IndexKNorm).unwrap();
+                    let mut vectors = vec![format!("{k_norm}.weight"), format!("{k_norm}.bias")];
+                    if let Some(q_norm) = cfg.stem(layer, Op::IndexQNorm) {
+                        vectors.extend([format!("{q_norm}.weight"), format!("{q_norm}.bias")]);
+                    }
+                    vectors.extend([w(layer, Op::IndexQueryScaleS), w(layer, Op::IndexQueryScaleB)].into_iter().flatten());
+                    for name in vectors {
+                        put(rank, "indexer", "bf16", tensor(&name)?.byte_length);
                     }
                 }
             }
             let dense = layer < cfg.first_moe_layer;
-            let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-            let names = [format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight"), format!("{mlp}.down_proj.weight")];
+            let names = [w(layer, Op::Gate).unwrap(), w(layer, Op::Up).unwrap(), w(layer, Op::Down).unwrap()];
             let shared_bf16 = !dense && native && names.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16));
             let group = if dense { "dense" } else { "shared_expert" };
             if core.get_weight(&names[0]).is_some() {
@@ -256,13 +276,14 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
                 put(rank, group, "fp8-tensor-scale", 48);
             }
             if !dense && rank == 0 {
-                for suffix in ["weight", "e_score_correction_bias"] {
-                    put(rank, "router", "bf16", tensor(&format!("{p}.mlp.gate.{suffix}"))?.byte_length);
+                for name in [w(layer, Op::Router), w(layer, Op::RouterBias)].into_iter().flatten() {
+                    put(rank, "router", "bf16", tensor(&name)?.byte_length);
                 }
             }
         }
     }
-    for (name, group) in [("model.embed_tokens.weight", "embedding"), ("model.norm.weight", "norm"), ("lm_head.weight", "lm_head")] {
+    let head = format!("{}.weight", cfg.head());
+    for (name, group) in [(cfg.embedding(), "embedding"), (cfg.final_norm(), "norm"), (head.as_str(), "lm_head")] {
         if let Some(projection) = core.get_weight(name) {
             put(0, group, "exl3-k6", projection.resident_bytes(1)?);
             continue;
@@ -270,6 +291,9 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         let t = tensor(name)?;
         let bytes = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 { t.shape.iter().product::<usize>() as u64 * 2 } else { t.byte_length };
         put(0, group, "bf16", bytes);
+    }
+    if let Some(alpha) = cfg.variant.ml4().map(|_| "lerope.alpha") {
+        put(0, "norm", "bf16", tensor(alpha)?.byte_length);
     }
     Ok(groups.into_iter().map(|g| g.into_iter().map(|((group, format), bytes)| (group, format, bytes)).collect()).collect())
 }
@@ -861,4 +885,37 @@ mod tests {
         assert!(resident_owned(&checkpoint, 2, layers, Some(&[])).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod resident_golden {
+    use super::*;
+    use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
+
+    /// Every (rank, group, format, bytes) of the GLM fixture at one and two
+    /// ranks and owned attention, pinned so a refactor of the accounting is
+    /// byte-for-byte neutral for GLM 5.x.
+    pub(super) fn glm_resident_fingerprint() -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        let owners = crate::placement::families::glm5::attention_owners(&cfg, 2).unwrap();
+        let mut out = Vec::new();
+        for (label, ranks, owned) in [("tp1", 1, false), ("tp2", 2, false), ("owned", 2, true)] {
+            let resident = resident_owned(&checkpoint, ranks, cfg.layers, owned.then_some(owners.as_slice())).unwrap();
+            for (rank, groups) in resident.iter().enumerate() {
+                for (group, format, bytes) in groups {
+                    out.push(format!("{label} {rank} {group} {format} {bytes}"));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "prints the fingerprint; run on a base commit to regenerate"]
+    fn print_glm_resident_fingerprint() {
+        for line in glm_resident_fingerprint() { println!("FP {line}"); }
+    }
 }
