@@ -345,3 +345,44 @@ def test_wire_body_keeps_request_key_order_and_keys_its_cache(api, tmp_path):
                               base=client.endpoint.removesuffix("/chat/completions"), model="official-model",
                               key_file=client.key_file, wire_order="sorted")
     assert sorted_client.cache.find({**copy.deepcopy(request), "model": "official-model"}) is None
+
+
+def test_engine_client_sends_local_prompt_ids_and_keeps_engine_ids(tmp_path):
+    from fidelity_generation import EngineClient
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(payload)
+            ids = payload["spec"]["prompt_ids"]
+            text = "<reasoning>r" + "answer"
+            out = {"probe": {"engine": "fake", "cold": True, "no_speculation": True, "cached_tokens": 0,
+                             "prompt_ids": ids, "generated": list(text.encode())}}
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(out).encode())
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    tokenizer = Tokenizer()
+    tokenizer._fidelity_parse_completion = lambda text, mode: {"role": "assistant", "reasoning_content": "r", "content": "answer", "tool_calls": []}
+    try:
+        client = EngineClient(ChatRenderer(tokenizer), tmp_path / "cache", checkpoint="m", family="deepseek_v41",
+                              base=f"http://127.0.0.1:{server.server_port}", token=None, identity={})
+        request = {**body(), "response_format": {"type": "json_object"}}
+        result = client(request)
+        assert seen[0]["spec"]["prompt_ids"] == client.renderer.prompt(request)
+        assert seen[0]["spec"]["cold"] and seen[0]["spec"]["no_speculation"]
+        assert "response_format" not in seen[0]["body"] and seen[0]["body"]["temperature"] == 0
+        assert result["probe"]["generated"] == list("<reasoning>ranswer".encode())
+        client(request)
+        assert len(seen) == 1
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()

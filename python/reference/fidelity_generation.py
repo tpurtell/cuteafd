@@ -411,6 +411,92 @@ class APIClient(TextGenerator):
             "reconstructed_tokens": len(generated), "retokenization": "lossless full completion; checkpoint chat template; recipe ID prefix"})
 
 
+class EngineClient(TextGenerator):
+    """Greedy text from our engine serving the official checkpoint (bench probe).
+
+    The prompt is rendered locally exactly as for the API backend and sent as
+    ``prompt_ids``; the engine returns the generated ids, which are kept verbatim.
+    The assistant message for tool execution and history comes from the
+    checkpoint's own completion parser; it must re-render to exactly those ids,
+    else the turn is treated as unfinished (no calls executed).
+    """
+
+    def __init__(self, renderer, cache, *, checkpoint, family, base, token, identity, timeout=1800):
+        parts = urllib.parse.urlsplit(base)
+        if parts.username or parts.password or parts.query or parts.fragment:
+            raise ValueError("engine base must not contain credentials, query or fragment")
+        self.url, self.token, self.timeout = base.rstrip("/") + "/v1/bench/probe", token, timeout
+        self.parse = getattr(renderer.tokenizer, "_fidelity_parse_completion", None)
+        if self.parse is None:
+            raise ValueError("engine generation needs the checkpoint's own completion parser")
+        super().__init__(renderer, cache, checkpoint=checkpoint, family=family,
+                         identity={**identity, "text_source": "engine", "do_sample": False})
+
+    def generate(self, body, prompt_ids):
+        spec = {"cold": True, "no_speculation": True, "prompt_ids": prompt_ids,
+                "output_dependent": True, "record_rows": 0, "top_k": 1}
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["x-cuteafd-bench"] = self.token
+            headers["Authorization"] = "Bearer " + self.token
+        # The engine samples nothing and applies no provider JSON mode; the window prompt
+        # itself asks for JSON (as in the staged API set, where response_format was dropped).
+        wire = {k: v for k, v in body.items() if k not in ("seed", "response_format")}
+        wire["temperature"] = 0
+        request = urllib.request.Request(self.url, canonical({"body": wire, "spec": spec}), headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            chat = json.load(response)
+        record = chat.get("probe") or {}
+        if record.get("error") or not record.get("generated") or record.get("prompt_ids") != prompt_ids:
+            raise ValueError("engine did not run the given prompt ids or returned no tokens")
+        if not record.get("cold") or not record.get("no_speculation") or record.get("cached_tokens", 0):
+            raise ValueError("engine generation must be cold and speculation-free")
+        server = chat.get("server", {})
+        for setting in server.get("settings", []) if isinstance(server.get("settings"), list) else []:
+            if (setting.get("name") in ("CUTEAFD_V41_FP8_HEAD", "fp8-head")
+                    and str(setting.get("value")).lower() not in ("off", "false", "0", "none", "bf16")):
+                raise ValueError("engine reports an enabled FP8 head, not the checkpoint-precision arm")
+        return {"generated": record["generated"], "engine": record.get("engine"), "server": server}
+
+    def __call__(self, body):
+        rendered = self.rendering_body(body) if hasattr(self, "rendering_body") else body
+        prompt_ids = self.renderer.prompt(rendered)
+        record = self.cache.get({**body, "prompt_ids_sha256": hashlib.sha256(canonical(prompt_ids)).hexdigest()},
+                                lambda: self.generate(body, prompt_ids))
+        generated = list(record["response"]["generated"])[:body["max_tokens"]]
+        text = self.renderer.tokenizer.decode(generated, skip_special_tokens=False)
+        mode = "chat" if body.get("thinking", {}).get("type") == "disabled" else "thinking"
+        message, finished = {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []}, False
+        try:
+            message = self.parse(text, mode)
+            for k, call in enumerate(message.get("tool_calls") or []):
+                # The checkpoint format has no call ids; tool results pair by position.
+                call.setdefault("id", f"call_{len(body['messages'])}_{k}")
+                call.setdefault("type", "function")
+            finished = self.renderer.completion(rendered, message) == generated
+        except (AssertionError, ValueError, KeyError):
+            pass
+        if not finished:
+            # A length cut or an unparsed turn: keep the exact ids, never execute calls.
+            prefix = text.split("</think>", 1)
+            message = {"role": "assistant", "content": "", "tool_calls": [],
+                       "reasoning_content": prefix[0] if len(prefix) == 1 else prefix[0]}
+        return self.result(rendered, generated, message, {
+            **self.identity, "date": record["date"], "engine": record["response"].get("engine"),
+            "engine_server": record["response"].get("server", {}),
+            "finished_turn": finished, "generated_ids": len(generated),
+            "reasoning_content": message.get("reasoning_content", ""), "content": message.get("content", ""),
+            "tool_calls": message.get("tool_calls") or [],
+            "raw_response_sha256": hashlib.sha256(canonical(record["response"])).hexdigest(),
+            "retokenization": "none: engine ids kept verbatim; checkpoint parser re-render checked"})
+
+    def rendering_body(self, body):
+        return copy.deepcopy(body)
+
+    def conversation(self, body, messages):
+        return self.renderer.conversation_ids(self.rendering_body(body), messages)
+
+
 def parse_qwen_response(text, tools, *, thinking_prefix=False):
     """Parse the checkpoint's Qwen XML envelope; the fixture validates and executes calls."""
     reasoning = ""

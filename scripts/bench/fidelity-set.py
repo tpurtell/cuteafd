@@ -184,9 +184,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
               legacy_provenance: dict | None = None, recipe: str = "v1", topup_b: int = 0) -> dict:
     if recipe not in RECIPES:
         raise ValueError("unknown fidelity text recipe")
-    if recipe == "v2" and (getattr(probe, "identity", {}).get("text_source") not in ("api", "hf") or recordings):
+    if recipe == "v2" and (getattr(probe, "identity", {}).get("text_source") not in ("api", "hf", "engine") or recordings):
         raise ValueError("recipe v2 is defined for own-text api/hf generation without recordings")
-    if getattr(probe, "identity", {}).get("text_source") not in ("api", "hf"):
+    if getattr(probe, "identity", {}).get("text_source") not in ("api", "hf", "engine"):
         arm_policy(arm, checkpoint)
     elif arm.get("checkpoint") != checkpoint:
         raise ValueError("generation checkpoint differs from requested checkpoint")
@@ -531,7 +531,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             for kind in ("native user turn", "raw repository text (renderer rewrites the scored turn)")}
         manifest["recipe"].update(version=recipe_identity(recipe),
             prompt_roles="conditioning history and tool results ctx; this window's assistant turns gen")
-    if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
+    if getattr(probe, "identity", {}).get("text_source") in ("api", "hf", "engine"):
         manifest["reference_snapshot"] = {
             key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}
         for key in ("tokenizer_kind", "tokenizer_files"):
@@ -831,7 +831,9 @@ def main(argv=None):
     p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
-    p.add_argument("--backend", choices=("probe", "api", "hf"), default="probe")
+    p.add_argument("--backend", choices=("probe", "api", "hf", "engine"), default="probe",
+                   help="engine: greedy text from our engine on the official checkpoint, prompts rendered locally")
+    p.add_argument("--engine-base", help="engine server base URL for --backend engine")
     p.add_argument("--api-base", help="OpenAI-compatible API base, including /v1 if required")
     p.add_argument("--api-model")
     p.add_argument("--api-key-file", type=pathlib.Path)
@@ -933,6 +935,12 @@ def main(argv=None):
                     base=a.api_base, model=a.api_model, key_file=a.api_key_file, timeout=a.timeout,
                     extra_body=json.loads(a.api_options.read_text()) if a.api_options else None, identity=identity,
                     wire_order=a.api_wire_order)
+            elif a.backend == "engine":
+                if not a.engine_base:
+                    p.error("engine backend requires --engine-base")
+                from fidelity_generation import EngineClient
+                probe = EngineClient(renderer, a.response_cache, checkpoint=a.checkpoint, family=a.family,
+                                     base=a.engine_base, token=a.bench_token, identity=identity, timeout=a.timeout)
             else:
                 if a.family != "qwen3_5" or config.get("model_type") != "qwen3_5":
                     p.error("HF backend requires the official dense Qwen3.5 reference")
