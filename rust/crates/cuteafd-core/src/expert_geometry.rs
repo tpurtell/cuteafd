@@ -276,6 +276,10 @@ impl ExpertGeometry {
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
+    /// Muse Spark: experts see the 4096-wide `pre_expert_proj` stream (not the
+    /// 8192 residual); 62 routed layers, sigmoid top-8, each expert's output
+    /// RMS-normalized before its routing weight.
+    pub const MUSE_SPARK: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 4096, layers: 62 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -332,19 +336,20 @@ impl ExpertGeometry {
             (Self::QWEN4, "qwen4"),
             (Self::STEP5, "step5"),
             (Self::KIMI_K3, "kimik3"),
+            (Self::MUSE_SPARK, "muse"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
-    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo
-    /// and Qwen 3.8 Flash Next are unclamped (`None`).
+    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
+    /// Qwen 3.8 Flash Next and Muse Spark are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         if self.same_shape(&Self::STEP5) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
-            && !self.same_shape(&Self::KIMI_K3)).then_some(10.0)
+            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK)).then_some(10.0)
     }
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
@@ -581,5 +586,11 @@ mod tests {
         assert_eq!(kimi.row_bytes(), 7168);
         assert_eq!(kimi.compact_wire_bytes(1, true), Some((336 + 3584 * 2, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
+        let muse = ExpertGeometry::MUSE_SPARK;
+        assert_eq!(muse.family(), Some("muse"));
+        assert_eq!(muse.swiglu_limit(), None);
+        assert_eq!(muse.activation(), crate::FfnActivation::SiluBf16Product { limit: None });
+        // Rows on the wire are the 4096-wide pre-expert stream, not the 8192 residual.
+        assert_eq!(muse.row_bytes(), 8192);
     }
 }

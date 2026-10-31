@@ -135,8 +135,10 @@ pub struct SparkAssignment {
 /// Selected storage policy; runtime validates its installed package against
 /// this same layout before allocating. Native shards may be replicated groups.
 #[derive(Debug, Clone, Copy)]
-pub enum SparkResidentLayout {
+pub enum SparkResidentLayout<'a> {
     Exl3 { world: usize, rank: usize },
+    /// Whole EXL3 experts partitioned across ranks (expert parallel).
+    Exl3Experts { owners: &'a cuteafd_core::ExpertOwners, rank: usize },
     Fp8 { world: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing },
     Native { world: usize, rank: usize, stored_width: usize },
 }
@@ -163,6 +165,18 @@ impl SparkAssignment {
                     let plan = manifest.balanced_residency(crate::V41Exl3Layer::Backbone(layer), world, rank)?;
                     slice.unit_map = plan.unit_map.as_ref().map(|map| map.fingerprint());
                     slice.first = u32::try_from(plan.intermediate_start)?;
+                    slice.width = u32::try_from(plan.intermediate)?;
+                    slice.stored_width = slice.width;
+                    slice.tiers = plan.tiers.iter().map(|&tier| u32::try_from(tier)).collect::<Result<_, _>>()?;
+                    slice.projection_counts = plan.projection_counts.iter().map(|counts| {
+                        Ok([u32::try_from(counts[0])?, u32::try_from(counts[1])?, u32::try_from(counts[2])?])
+                    }).collect::<Result<_, std::num::TryFromIntError>>()?;
+                    plan.device_arena_layout()?.1 as u64
+                }
+                SparkResidentLayout::Exl3Experts { owners, rank } => {
+                    let manifest = catalog.exl3().context("Spark EXL3 layout needs checkpoint trellis headers")?;
+                    let plan = manifest.partitioned_residency(crate::V41Exl3Layer::Backbone(layer), owners, rank)?;
+                    slice.unit_map = Some(owners.fingerprint());
                     slice.width = u32::try_from(plan.intermediate)?;
                     slice.stored_width = slice.width;
                     slice.tiers = plan.tiers.iter().map(|&tier| u32::try_from(tier)).collect::<Result<_, _>>()?;
@@ -281,6 +295,15 @@ impl SparkBudgetInventory {
     pub fn exl3(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
         endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
         budget: u64, estimated_reserve: u64) -> anyhow::Result<Self> {
+        Self::exl3_with(catalog, working, endpoints, rings, budget, estimated_reserve, None)
+    }
+
+    /// `owners`: whole experts partitioned across the ranks instead of
+    /// intermediate slices (expert parallel).
+    pub fn exl3_with(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
+        endpoints: &[cuteafd_core::SparkEndpoint], rings: cuteafd_core::SparkRings,
+        budget: u64, estimated_reserve: u64, owners: Option<&cuteafd_core::ExpertOwners>)
+        -> anyhow::Result<Self> {
         use anyhow::Context;
         let mut resident = Vec::new();
         let mut overhead = Vec::new();
@@ -288,8 +311,11 @@ impl SparkBudgetInventory {
             let mut costs = Vec::new();
             for &layer in &working.spark_layers {
                 let one = SparkWorkingSet { spark_layers: vec![layer], ..working.clone() };
-                costs.push(SparkAssignment::from_catalog(catalog, &one, rank,
-                    SparkResidentLayout::Exl3 { world: working.spark_ranks, rank }, endpoints, rings)?.resident_bytes);
+                let layout = match owners {
+                    Some(owners) => SparkResidentLayout::Exl3Experts { owners, rank },
+                    None => SparkResidentLayout::Exl3 { world: working.spark_ranks, rank },
+                };
+                costs.push(SparkAssignment::from_catalog(catalog, &one, rank, layout, endpoints, rings)?.resident_bytes);
             }
             let io = working.rank_endpoints_io(rank, catalog.routed_experts().geometry()?, endpoints, rings)?;
             let bytes = [io.intake, io.host_exchange, io.row_indices, io.mapped_rings,
