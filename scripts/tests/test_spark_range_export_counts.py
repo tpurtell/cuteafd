@@ -33,7 +33,10 @@ def test_every_planner_width_covered_world_has_a_package_alias():
         family, format = key.split(':')
         if entry.get('deprecated'):
             assert packages.package_worlds(family, format) == entry['worlds']
+            # A frozen format admits only the worlds it shipped on, never new ones.
+            assert entry['admitted_worlds'] and set(entry['admitted_worlds']) <= set(entry['worlds']), key
             continue
+        assert 'admitted_worlds' not in entry, key
         exl3 = format == 'exl3'
         native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
         unit = 32 if native or family in ('mimof', 'mimop') else 128

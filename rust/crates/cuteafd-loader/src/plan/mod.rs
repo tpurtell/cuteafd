@@ -1155,7 +1155,15 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
             (_, None) => {} // the routed-expert component already reports its missing kernel
             (ExpertPlacement::Sparks { ranks }, Some(contract)) => {
                 report.spark_rank_share = share(ranks).unwrap_or(0.0);
-                if share(ranks).is_none() {
+                if let Some(worlds) = experts::frozen_refusal(&contract.package, ranks) {
+                    // Frozen formats admit only the worlds they shipped on, for every family.
+                    report.placement_supported = false;
+                    report.fits = false;
+                    report.hints.push(Hint {
+                        what: worlds.to_string(),
+                        how: format!("{advice}; choose a supported quantization for other Spark counts."),
+                    });
+                } else if share(ranks).is_none() {
                     report.placement_supported = false;
                     report.fits = false;
                     report.hints.push(Hint {
