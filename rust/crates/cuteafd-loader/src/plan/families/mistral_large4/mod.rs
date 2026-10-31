@@ -240,7 +240,8 @@ fn spec(cfg: &Ml4Config, checkpoint: &Checkpoint) -> ModelSpec {
             routed_scaling: Some(cfg.routed_scale),
             groups: None,
         }),
-        // The bundled mtp_dspark drafter is not wired yet (optional component).
+        // The bundled mtp_dspark drafter (SPECULATOR=dspark, BundledDspark ownership) is charged by
+        // the GLM layout's drafter admission from params.json mtp, not as native MTP stages.
         speculator: None,
         tables: Vec::new(),
         vision: checkpoint.config.get("vision_config").is_some(),

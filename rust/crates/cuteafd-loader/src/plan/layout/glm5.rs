@@ -70,6 +70,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
+    // The program namespace (glm, ml4) is the checkpoint's own variant.
+    let program_family = GlmDsaConfig::from_hf(&checkpoint.config).map_or("glm", |cfg| cfg.program_family());
     let core = (|| -> anyhow::Result<_> {
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
         let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
@@ -86,11 +88,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let item = match (core.as_ref().ok().and_then(Option::as_ref), shape.manifest.as_ref()) {
             (Some(core), Some(manifest)) => {
                 let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[index], None);
-                let allowance = crate::placement::inventory::loaded_code_allowance("glm-k6", local_package(report), split,
+                let allowance = crate::placement::inventory::loaded_code_allowance(&format!("{program_family}-k6"), local_package(report), split,
                     index as u8, &arch, Some(&core.program_set(manifest, split)));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
             }
-            _ => runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
+            _ => runtime_item(shape.manifest.as_ref(), &program_families(program_family, split),
                 local_package(report), split, index, options.rtx_bytes[index]),
         };
         device.items.push(item);
@@ -414,7 +416,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let catalog = input.expert_catalog()?;
-    let local = glm::select_local_inventory(&catalog, manifest_path, cfg.layers, devices.len(),
+    let local = glm::select_local_inventory(&cfg, &catalog, manifest_path, cfg.layers, devices.len(),
         rows, lanes, exchange_f32, onboard, false, None)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
@@ -509,7 +511,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers, rows, lanes,
                 glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
         } else {
-            glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
+            glm::select_local_inventory(&cfg, &catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
                 glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
         }
     } else { None };

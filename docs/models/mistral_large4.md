@@ -34,8 +34,23 @@ names.
   one GPU, or on two GPUs as whole-layer owners (`ATTENTION_PLACEMENT=auto` or
   `layers`). A layer stays on the GPU of the layer whose latent and top-k it
   reads.
-- **Not yet:** the bundled `mtp_dspark` drafter (`SPECULATOR=off`), the vision
-  encoder, and context attention placement.
+- **Chat:** the server reads the chat contract from the checkpoint itself,
+  from its tokenizer's control tokens and its `chat_template.jinja`, not from
+  the engine variant. Prompts match `mistral_common`'s v15 instruct rendering
+  exactly. That covers `[AVAILABLE_TOOLS]`, plus `[MODEL_SETTINGS]` with the
+  JSON schema and a `reasoning_effort` of low, medium or high (default high).
+  There is no thinking-off; the server refuses it rather than rendering
+  another effort. Output parsing handles an optional `[THINK]…[/THINK]` block
+  and back-to-back `[TOOL_CALLS]name[ARGS]{json}` calls. Strict tools, required
+  or named `tool_choice`, and `response_format` are enforced by constrained
+  decoding, because the template has no tool-choice text.
+- **Drafter:** `SPECULATOR=dspark` serves the bundled `mtp_dspark` drafter
+  through the shared MLA block-draft path. It has three BF16 non-causal MLA
+  layers with block-anchored 2048-record windows, taps target layers 1, 18,
+  36, 54 and 71, and uses an RNN Markov head. It stays opt-in
+  (`SPECULATOR=off` is the default) until the lossless and delivered-tok/s
+  gates pass on hardware.
+- **Not yet:** the vision encoder and context attention placement.
 
 ## References
 

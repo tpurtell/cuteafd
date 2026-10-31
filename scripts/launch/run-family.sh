@@ -1635,12 +1635,16 @@ family="$detected"
 # The checkpoint's own family names its deployment plan; Mistral Large 4 runs
 # the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant,
 # with whole attention on each GPU (two GPUs: layer owners, resolved by plan and
-# server from auto) and no drafter until its bundled dSpark is ported.
+# server from auto). SPECULATOR=dspark serves its bundled mtp_dspark drafter; it
+# stays opt-in (default off) until its lossless gate passes on hardware.
 checkpoint_family="$family"
 if [[ "$family" == mistral_large4 ]]; then
   family=glm5
   [[ -n "${cfg[SPECULATOR]+set}" ]] || cfg[SPECULATOR]=off
-  [[ "$(get SPECULATOR off)" == off ]] || release_die "Mistral Large 4 serves without a drafter for now (SPECULATOR=off)"
+  case "$(get SPECULATOR off)" in
+    off|dspark) ;;
+    *) release_die "Mistral Large 4 drafts only with its bundled mtp_dspark (SPECULATOR=dspark or off)" ;;
+  esac
   case "$(get ATTENTION_PLACEMENT auto)" in
     auto|layers|heads) ;;
     *) release_die "Mistral Large 4 runs whole attention: ATTENTION_PLACEMENT auto, layers (two GPUs) or heads (one GPU)" ;;
@@ -1911,7 +1915,9 @@ if [[ -z "$speculator" ]]; then
   fi
 fi
 case "$family:$speculator" in
-  qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
+  qwen4:mtp) ;;
+  glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
+    { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
   *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
@@ -2006,7 +2012,7 @@ case "$speculator" in
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
-    if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
+    if [[ $speculator == dspark && ( $family == deepseek_v4 || $checkpoint_family == mistral_large4 ) ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"

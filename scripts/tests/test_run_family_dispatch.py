@@ -1562,7 +1562,7 @@ def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, ex
 
 
 @pytest.mark.parametrize("gpus", [1, 2])
-def test_mistral_large4_serves_on_the_glm_engine_without_a_drafter(tmp_path, gpus):
+def test_mistral_large4_serves_on_the_glm_engine_with_an_opt_in_bundled_drafter(tmp_path, gpus):
     config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
               "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
     result = _family_launch_result(tmp_path, config, "test/ml4",
@@ -1573,12 +1573,22 @@ def test_mistral_large4_serves_on_the_glm_engine_without_a_drafter(tmp_path, gpu
     assert plan[plan.index("--attention-placement") + 1] == "auto"
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and "serve-glm" in line)
-    assert "--draft" not in serve and "dflash2" not in " ".join(serve)
+    assert "--draft" not in serve and "--dspark" not in serve and "dflash2" not in " ".join(serve)
     assert ("--split-device" in serve) == (gpus == 2)
     for flag in ("--prefill-rows", "--prefill-waves", "--prefill-span-rows"):
         assert serve.count(flag) == 1
+    # The bundled mtp_dspark drafts from the target checkpoint itself: no drafter snapshot.
+    drafted = _family_launch_result(tmp_path / "dspark", config, "test/ml4",
+                                    f"RTX_GPUS={gpus}\nSPECULATOR=dspark\nVISION=off\nAUDIO=off\n")
+    assert drafted.returncode == 0, drafted.stderr
+    serve = next(shlex.split(line) for line in drafted.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    assert "--dspark" in serve and "--draft" not in serve
+    plan = next(shlex.split(line) for line in drafted.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    assert plan[plan.index("--speculator") + 1] == "dspark"
     refused = _family_launch_result(tmp_path / "spec", config, "test/ml4", "SPECULATOR=dflash2\nVISION=off\nAUDIO=off\n")
-    assert refused.returncode != 0 and "without a drafter" in refused.stderr
+    assert refused.returncode != 0 and "bundled mtp_dspark" in refused.stderr
     refused = _family_launch_result(tmp_path / "ctx", config, "test/ml4", "ATTENTION_PLACEMENT=context\nVISION=off\nAUDIO=off\n")
     assert refused.returncode != 0 and "whole attention" in refused.stderr
 

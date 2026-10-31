@@ -808,7 +808,8 @@ fn native_mtp_selection_preserves_checkpoint_ownership() {
         for selected in ["off", "mtp", "dspark", "dflash2", "unknown"] {
             let previous = match (family.id(), selected) {
                 ("mimo_v2" | "qwen4" | "qwen3_5", "mtp") => DraftOwnership::NativeMtp,
-                ("deepseek_v4" | "deepseek_v41", "dspark") => DraftOwnership::BundledDspark,
+                // Mistral Large 4's mtp_dspark ships in its own checkpoint.
+                ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => DraftOwnership::BundledDspark,
                 _ => DraftOwnership::None,
             };
             assert_eq!(DraftOwnership::selected(family.id(), selected), previous,

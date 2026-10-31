@@ -920,9 +920,9 @@ impl Opened {
             .unwrap_or_else(|| dense_programs.program_set(&manifest, true));
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
-                if core.is_some() { "glm-k6" } else { "glm" }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
+                &if core.is_some() { format!("{}-k6", self.cfg.program_family()) } else { self.cfg.program_family().to_owned() }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
         let exchange_f32 = glm::local_exchange_f32()?;
-        let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
+        let local = glm::select_local_inventory(&self.cfg, &self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
             args.skip_routed_experts, args.exlr8_manifest.as_deref()
                 .map(|selected| (selected, args.exlr8_prefill_activations)))?;

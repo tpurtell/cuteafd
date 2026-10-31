@@ -195,6 +195,28 @@ fn bundled_drafter_is_admitted_on_the_glm_layout() {
     options.layout.as_mut().unwrap().glm5_drafter_disabled = false;
     let report = input.plan(&options).unwrap();
     assert!(!report.hints.iter().any(|h| h.what.contains("drafter config unavailable")), "{:?}", report.hints);
+    // SPECULATOR=dspark owns the checkpoint's own mtp_dspark.* tensors; off leaves them disabled.
+    for (speculator, status) in [("dspark", Status::Planned), ("off", Status::Disabled)] {
+        let mut options = layout_options(6, 1);
+        options.draft_ownership = Some(plan::spec::DraftOwnership::selected("mistral_large4", speculator));
+        let report = input.plan(&options).unwrap();
+        assert_eq!(component(&report, Component::Speculator).status, status, "{speculator}");
+    }
+}
+
+/// The complete header witness for plan matrices: every release tensor (56,563, all 72 layers'
+/// experts) shaped to the EXL3 K4 + Core-K6 contract, as sparse safetensors plus config.json,
+/// quantize_config.json and params.json. Writes into `CUTEAFD_ML4_WITNESS_DIR` (must be empty).
+#[test]
+#[ignore = "writes the full ML4 EXL3 header witness to CUTEAFD_ML4_WITNESS_DIR"]
+fn write_header_witness() {
+    let dir = std::path::PathBuf::from(std::env::var("CUTEAFD_ML4_WITNESS_DIR").expect("CUTEAFD_ML4_WITNESS_DIR"));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none(), "{} is not empty", dir.display());
+    testing::write_mistral_large4_snapshot(&dir, None, true);
+    let checkpoint = crate::plan::Checkpoint::open(&dir).unwrap();
+    assert!(checkpoint.missing_shards.is_empty());
+    assert_eq!(checkpoint.tensors.len(), testing::mistral_large4_tensors(None, true).len());
 }
 
 #[test]
@@ -212,4 +234,57 @@ fn print_resident_fit() {
                 by.iter().map(|(k, v)| format!("{k} {:.2}", *v as f64 / (1u64 << 30) as f64)).collect::<Vec<_>>());
         }
     }
+}
+
+/// TP2 RTX onboarding reads Mistral Large 4's own geometry (6144 / 6144 / 128 / top-4), its
+/// `exl3-ml4-k45` package and its consolidated router names (`layers.L.gate`, no bias),
+/// never GLM's constants, package or `mlp.gate.e_score_correction_bias`.
+#[test]
+fn tp2_onboarding_inventory_reads_the_checkpoint_geometry_package_and_router() {
+    use crate::placement::families::glm5 as glm;
+    // The catalog reads every routed layer's headers; the inventory walks the first two.
+    let dir = snapshot(true, None);
+    let checkpoint = crate::plan::Checkpoint::open(dir.path()).unwrap();
+    let cfg = crate::families::glm5::GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+    let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+    let shape = catalog.routed_experts().clone();
+    assert_eq!((shape.hidden, shape.intermediate, shape.experts, shape.topk), (6144, 6144, 128, 4));
+    let tiers = catalog.exl3().unwrap().decoder_tiers().iter().map(usize::to_string).collect::<String>();
+    let root = tempfile::tempdir().unwrap();
+    let manifest = root.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, b"{\"programs\":[]}").unwrap();
+    let write_package = |family: &str| for capacity in cuteafd_core::EXL3_CAPACITIES {
+        let package = root.path().join(format!("exl3/exl3-{family}-k{tiers}/rtx-tp2/m{capacity}"));
+        std::fs::create_dir_all(package.join("routes")).unwrap();
+        std::fs::write(package.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "hidden": 6144, "intermediate": 3072, "experts": 128, "top_k": 4, "capacity": capacity,
+            "bits": catalog.exl3().unwrap().decoder_tiers(), "output_dtype": "fp32", "input_format": "e4m3_k32",
+            "direct": false, "route_preparation": {"manifest": "routes/v41_exl3_routes.json"},
+            "trellis_lut": {"file": "lut.bin", "bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "bytes": capacity * 64, "dtype": "f32", "zero_on_create": false},
+                "state": {"allocation": "state", "bytes": 0, "dtype": "i32", "zero_on_create": true}}})).unwrap()).unwrap();
+        for file in ["libcuteafd_exl3.so", "lut.bin", "routes/v41_exl3_routes.json", "routes/libv41_exl3_routes.so"] {
+            std::fs::write(package.join(file), b"").unwrap();
+        }
+    };
+    // A GLM-named package is not this checkpoint's.
+    write_package("glm");
+    let missing = glm::local_inventory(&cfg, &catalog, &manifest, 3, 64, 3, false).unwrap_err();
+    assert!(missing.to_string().contains(&format!("exl3-ml4-k{tiers}/rtx-tp2")), "{missing:#}");
+    write_package("ml4");
+    let local = glm::local_inventory(&cfg, &catalog, &manifest, 3, 64, 3, false).unwrap();
+    assert!(local.package.ends_with(format!("exl3-ml4-k{tiers}/rtx-tp2")));
+    assert_eq!(local.experts.len(), 2);
+    let exl3 = catalog.exl3().unwrap();
+    for (index, layer) in [1, 2].into_iter().enumerate() {
+        let half = |rank| exl3.residency(crate::V41Exl3Layer::Backbone(layer), 2, rank).unwrap()
+            .device_arena_layout().unwrap().1 as u64;
+        // Rank 1 holds the router: BF16 [128, 6144], no correction bias.
+        assert_eq!(local.experts[index].half[0].resident, half(0));
+        assert_eq!(local.experts[index].half[1].resident, half(1) + 128 * 6144 * 2);
+    }
+    // The catalog and config must agree on the routed geometry.
+    let mut other = cfg.clone();
+    other.topk = 8;
+    assert!(glm::local_inventory(&other, &catalog, &manifest, 3, 64, 3, false).is_err());
 }
