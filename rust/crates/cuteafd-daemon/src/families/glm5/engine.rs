@@ -504,7 +504,8 @@ pub(crate) struct GlmEngine<'a> {
 /// Per layer the latent record pool and (full-indexer layers) the index-key
 /// pool, zeroed, and the RoPE table, on the current device.
 #[allow(clippy::type_complexity)]
-fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize)
+fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer<'_>], pages: usize, max_context: usize,
+    rope_alpha: Option<&[f32]>)
     -> Result<(Vec<Dev<'a>>, Vec<Option<Dev<'a>>>, Dev<'a>)> {
     let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
     let zeroed = |bytes: usize| -> Result<Dev<'a>> {
@@ -513,15 +514,24 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
         Ok(allocation)
     };
     // One page past the pool is the scratch page padded decode rows write.
+    // A rank owns a layer's attention when it holds that layer's attention
+    // operands (whole attention on its owner, every rank under a head split).
     let owns = |layer: &GlmLayer<'_>| layer.attention_owner.is_none_or(|owner| {
-        layer.range("q_a_norm").is_some() && owner < 2
+        (layer.range("q_a_norm").is_some() || layer.range("w_uk").is_some()) && owner < 2
     });
-    let kv = layers.iter().map(|layer| zeroed(if owns(layer) { (pages + 1) * RECORD_PAGE_BYTES } else { 256 })).collect::<Result<Vec<_>>>()?;
+    // Each latent owner's records at its own size (656 B with RoPE, 528 B
+    // without); a latent-sharing layer reads its source's pool and holds none.
+    let kv = layers.iter().enumerate().map(|(index, layer)| zeroed(if owns(layer) && cfg.owns_kv(index) {
+        (pages + 1) * PAGE_ROWS * cfg.record_bytes(index) } else { 256 })).collect::<Result<Vec<_>>>()?;
     let index = layers.iter()
         .map(|l| (owns(l) && l.full_indexer).then(|| zeroed((pages + 1) * INDEX_PAGE_BYTES)).transpose())
         .collect::<Result<Vec<_>>>()?;
-    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq.
+    // cos | sin of position * theta^(-2i/64), FP32 like the reference's inv_freq;
+    // Mistral Large 4: interleaved YaRN with the checkpoint's LeRoPE scale.
     let dim = cfg.qk_rope_head_dim;
+    let table = if let Some(ml4) = cfg.variant.ml4() {
+        ml4.rope_table(rope_alpha.context("Mistral Large 4 RoPE needs lerope.alpha")?, max_context)?
+    } else {
     let mut table = vec![0f32; max_context * dim];
     let inv: Vec<f32> = (0..dim / 2).map(|i| 1.0 / (cfg.rope_theta as f32).powf((2 * i) as f32 / dim as f32)).collect();
     for p in 0..max_context {
@@ -531,6 +541,8 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
             table[p * dim + dim / 2 + i] = angle.sin();
         }
     }
+    table
+    };
     let cos_sin = DeviceAllocation::new(library, table.len() * 4)?;
     library.copy_h2d(cos_sin.buffer, bytes_of(&table))?;
     Ok((kv, index, cos_sin))
@@ -555,7 +567,7 @@ impl<'a> GlmEngine<'a> {
         let quantize_grid = Fp8QuantizeGrid::new(library.sm_count()?, None)?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         let local = if context_mode.is_some() { pages / 2 } else { pages };
-        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context)?;
+        let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_deref())?;
         let device = library.cuda_get_device()?;
         Ok(Self { max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
             context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
@@ -683,7 +695,8 @@ impl<'a> GlmEngine<'a> {
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
             let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm", split_family: Some("glm2") };
             self.programs.load_matching(|name| selected.contains(name))?;
-            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context)?;
+            let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context,
+                self.weights.rope_alpha.as_deref())?;
             let released = crate::shared::memory::device::Event::new(
                 crate::shared::memory::device::Device { library: self.library, id: device })?;
             Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
@@ -703,6 +716,9 @@ impl<'a> GlmEngine<'a> {
     /// Allocates the token-split buffers and exchange once the peer is attached; `extent`:
     /// the admitted compiled context (the staging the solver charged).
     pub fn attach_context(&mut self, extent: usize, manifest: &serde_json::Value) -> Result<()> {
+        // The context split's staging and commit planes are the 656-byte GLM 5.x
+        // record; Mistral Large 4's per-layer records run heads or layers placement.
+        ensure!(self.cfg.variant.is_glm(), "context attention placement supports GLM 5.x records only");
         let context = self.context_mode.context("this engine was built without context attention")?;
         let exchange = self.exchange()?;
         let abort = match (exchange.abort_word(0)?, exchange.abort_word(1)?) {
@@ -1385,6 +1401,16 @@ impl<'a> GlmEngine<'a> {
     /// Logits of the last `n` of `t` rows of the final norm's output into the workspace's logits,
     /// through the shared BF16 target-head route ([`crate::shared::target_head`]).
     fn launch_head(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
+        self.launch_head_logits(w, t, n)?;
+        if let Some(cap) = self.cfg.logit_softcap() {
+            // SAFETY: logits holds n rows of vocab F32 on this stream (checked by the head).
+            unsafe { self.library.cuda_logits_softcap_f32_async(w.logits.buffer.ptr, n, self.cfg.vocab_size,
+                self.cfg.vocab_size, cap as f32, self.stream)? };
+        }
+        Ok(())
+    }
+
+    fn launch_head_logits(&self, w: &Workspace<'_>, t: usize, n: usize) -> Result<()> {
         let h = self.cfg.hidden;
         if let super::weights::GlmHead::K6(weights) = &self.weights.head {
             ensure!(n <= t && t * h * 2 <= w.x.buffer.bytes && n * self.cfg.vocab_size * 4 <= w.logits.buffer.bytes,
@@ -1880,14 +1906,26 @@ impl<'a> GlmEngine<'a> {
     fn moe_front_on(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, t: usize) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
-        self.run_on(rank, "glm_router_scores", &[("x", w.x.buffer.ptr), ("w", layer.ptr("gate")?),
-            ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        let ml4 = self.cfg.variant.ml4().is_some();
+        self.run_on(rank, if ml4 { "ml4_router_scores" } else { "glm_router_scores" }, &[("x", w.x.buffer.ptr),
+            ("w", layer.ptr("gate")?), ("logits", w.router_logits.buffer.ptr)], &[rows])?;
+        if ml4 {
+            // Softmax top-k over FP32 logits, renormalized, times the routed scale
+            // (the reference router: no BF16 rounding of logits or weights).
+            // SAFETY: logits and route outputs are live buffers of `t` rows.
+            self.on(rank, || unsafe {
+                self.library.router_select_softmax(w.router_logits.buffer.ptr, w.route_ids.buffer.ptr,
+                    w.route_weights.buffer.ptr, t, self.cfg.experts, topk, self.cfg.routed_scale as f32, false,
+                    self.stream_of(rank))
+            })?;
+        } else {
         // SAFETY: logits, bias and route outputs are live buffers of `t` rows.
         self.on(rank, || unsafe {
             self.library.router_select(w.router_logits.buffer.ptr, layer.ptr("gate.bias")?, std::ptr::null(),
                 std::ptr::null(), w.route_ids.buffer.ptr, w.route_weights.buffer.ptr, t, self.cfg.experts, topk,
                 self.cfg.routed_scale as f32, true, self.stream_of(rank))
         })?;
+        }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
         self.run_on(rank, "glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),

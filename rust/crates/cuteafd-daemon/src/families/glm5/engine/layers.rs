@@ -58,7 +58,8 @@ impl<'a> GlmEngine<'a> {
                 ensure!(layer.split && !layer.attention_split && layer.attention_owner == Some(gpu)
                     && layer.range("q_a_norm").is_some() == (gpu as usize == rank), "GLM layer {index} owner differs from loaded weights");
                 let (kv, index_cache, _) = self.rank_caches(rank, index);
-                ensure!(kv.buffer.bytes == if rank == gpu as usize { (self.pages + 1) * RECORD_PAGE_BYTES } else { 256 },
+                let owned = rank == gpu as usize && self.cfg.owns_kv(index);
+                ensure!(kv.buffer.bytes == if owned { (self.pages + 1) * PAGE_ROWS * self.cfg.record_bytes(index) } else { 256 },
                     "GLM layer {index} KV ownership differs from placement");
                 ensure!(index_cache.is_some() == (rank == gpu as usize && layer.full_indexer), "GLM index ownership");
             }

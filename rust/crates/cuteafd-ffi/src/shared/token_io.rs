@@ -36,6 +36,21 @@ impl NativeLibrary {
     ///
     /// # Safety
     /// Every pointer is live device memory of those shapes on `stream`'s device.
+    /// Final-logit soft cap in place over `rows` FP32 rows (`stride` floats
+    /// apart): `x = tanh(x / cap) * cap` in FP32, the reference's arithmetic.
+    ///
+    /// # Safety
+    /// `logits` is live device memory of `rows * stride` floats on `stream`'s device.
+    pub unsafe fn cuda_logits_softcap_f32_async(&self, logits: *mut c_void, rows: usize, vocab: usize, stride: usize,
+        cap: f32, stream: *mut c_void) -> Result<()> {
+        type F = unsafe extern "C" fn(*mut f32, usize, usize, usize, f32, *mut c_void) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_cuda_logits_softcap_f32_async") }?;
+        // SAFETY: the caller's contract.
+        let code = unsafe { f(logits.cast(), rows, vocab, stride, cap, stream) };
+        ensure!(code == 0, "logit soft cap of {rows} rows x {vocab} failed with {code}");
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn cuda_logits_greedy_f32_async(&self, logits: *const c_void, rows: usize, vocab: usize, stride: usize,
         ids: *mut c_void, logprob: *mut c_void, status: *mut c_void, stream: *mut c_void) -> Result<()> {

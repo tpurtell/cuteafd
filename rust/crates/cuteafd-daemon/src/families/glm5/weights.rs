@@ -154,6 +154,9 @@ pub(crate) struct GlmWeights<'a> {
     pub layers: Vec<GlmLayer<'a>>,
     pub norm: DeviceAllocation<'a>,
     pub head: GlmHead<'a>,
+    /// LeRoPE `exp`-scale of each RoPE frequency (`lerope.alpha`, F32), for
+    /// variants whose RoPE table carries it; the table is built from it.
+    pub rope_alpha: Option<Vec<f32>>,
 }
 
 /// The vocabulary head rank 0 owns: the checkpoint's BF16 head (the shared
@@ -1063,6 +1066,11 @@ impl<'a> GlmLoader<'a> {
                         cuteafd_loader::formats::dense_trellis::TrellisSide::Output, 0, 1)?, 0)?),
                 None => GlmHead::Bf16(self.one(&format!("{}.weight", cfg.head()))?),
             },
+            rope_alpha: cfg.variant.ml4().map(|_| -> Result<Vec<f32>> {
+                let (bytes, dtype, shape) = self.raw("lerope.alpha")?;
+                ensure!(dtype == DType::Bf16 && shape == [cfg.qk_rope_head_dim / 2], "lerope.alpha must be BF16 [rope/2]");
+                Ok(bytes.chunks_exact(2).map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16)).collect())
+            }).transpose()?,
         };
         crate::shared::memory::staging::release_staging();
         split.log("glm5 dense");
@@ -1130,7 +1138,8 @@ impl<'a> GlmLoader<'a> {
             allocation
         };
         let mut shares = shares.into_iter();
-        let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary) };
+        let weights = GlmWeights { layers: shares.next().context("rank 0")?, norm, head: GlmHead::RowFp8(vocabulary),
+            rope_alpha: None };
         split.log("glm5 native dense");
         Ok((weights, shares.collect()))
     }

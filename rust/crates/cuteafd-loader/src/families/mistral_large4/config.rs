@@ -344,3 +344,74 @@ pub(crate) mod tests {
         assert!(Ml4Config::from_hf(&bad).is_err());
     }
 }
+
+impl Ml4Config {
+    /// FP32 inverse frequencies of the RoPE slice: interleaved YaRN over the
+    /// pretraining window (`truncate`d correction range, no magnitude factor)
+    /// times `exp(alpha)` (LeRoPE, `lerope.alpha [rope/2]`). The reference's
+    /// `_compute_yarn_parameters` + `MistralLarge4TextRotaryEmbedding.forward`.
+    pub fn inv_freq(&self, alpha: &[f32]) -> anyhow::Result<Vec<f32>> {
+        let dim = self.qk_rope_head_dim;
+        anyhow::ensure!(alpha.len() == dim / 2, "lerope.alpha has {} entries for a {dim}-wide RoPE", alpha.len());
+        let r = &self.rope_scaling;
+        let (theta, factor) = (r.theta as f32, r.factor as f32);
+        let correction = |rotations: f64| (dim as f64 * (r.original_max_position as f64
+            / (rotations * 2.0 * std::f64::consts::PI)).ln()) / (2.0 * r.theta.ln());
+        let low = correction(r.beta_fast).floor().max(0.0);
+        let mut high = correction(r.beta_slow).ceil().min(dim as f64 - 1.0);
+        if low == high { high += 0.001; }
+        Ok((0..dim / 2).map(|i| {
+            // torch: base ** (arange(0, dim, 2) / dim) in FP32.
+            let pos = theta.powf((2 * i) as f32 / dim as f32);
+            let extrapolation = 1.0 / pos;
+            let interpolation = 1.0 / (factor * pos);
+            let ramp = ((i as f32 - low as f32) / (high as f32 - low as f32)).clamp(0.0, 1.0);
+            let extrapolation_factor = 1.0 - ramp;
+            let inv = interpolation * (1.0 - extrapolation_factor) + extrapolation * extrapolation_factor;
+            inv * alpha[i].exp()
+        }).collect())
+    }
+
+    /// The engine's FP32 `[positions, rope]` table: cos of every frequency then
+    /// its sin, angle `position * inv_freq` in FP32 (the reference's).
+    pub fn rope_table(&self, alpha: &[f32], positions: usize) -> anyhow::Result<Vec<f32>> {
+        let inv = self.inv_freq(alpha)?;
+        let half = inv.len();
+        let mut table = vec![0f32; positions * 2 * half];
+        for p in 0..positions {
+            for (i, f) in inv.iter().enumerate() {
+                let angle = p as f32 * f;
+                table[p * 2 * half + i] = angle.cos();
+                table[p * 2 * half + half + i] = angle.sin();
+            }
+        }
+        Ok(table)
+    }
+}
+
+#[cfg(test)]
+mod rope_tests {
+    use super::*;
+
+    /// python/reference/families/mistral_large4/ops.yarn_lerope_inv_freq (bit-exact
+    /// against the official rotary module) at alpha = 0 and a fixed alpha.
+    #[test]
+    fn inv_freq_matches_the_reference() -> anyhow::Result<()> {
+        let cfg = Ml4Config::from_hf(&tests::official())?;
+        // ops.yarn_lerope_inv_freq bit patterns (FP32), alpha 0 and alpha = 0.01 i - 0.15.
+        let zero: [i32; 32] = [1065353216,1061157137,1058010522,1054337179,1049982415,1045265688,1040979999,1035803942,1031545713,1025865237,1020574959,1015347323,1008703429,1001626761,993248925,981941589,916707082,913684912,909657244,906636919,902774328,899377421,896079144,892258702,889393775,885298316,882076182,878516005,874892128,871933973,867858259,864801906];
+        let alpha_bits: [i32; 32] = [1063016284,1059513515,1056756214,1052737127,1048962108,1043984143,1040189783,1034851064,1030428578,1025233751,1019894999,1014989688,1008394316,1001393679,993131694,981941589,916814995,914010231,910025018,907006495,903470686,900007224,897186729,893212743,890202726,886653242,883199538,880363355,876400569,873399030,869835913,866391941];
+        let bits = |v: Vec<f32>| v.iter().map(|f| f.to_bits() as i32).collect::<Vec<_>>();
+        assert_eq!(bits(cfg.inv_freq(&[0.0; 32])?), zero);
+        // With alpha the only difference is exp's last bit: torch's CPU FP32 exp is
+        // not correctly rounded (exp(0.04) 1.0408107 vs 1.0408108). Within one ulp.
+        let alpha: Vec<f32> = (0..32).map(|i| i as f32 * 0.01 - 0.15).collect();
+        for (actual, expected) in bits(cfg.inv_freq(&alpha)?).into_iter().zip(alpha_bits) {
+            assert!((actual - expected).abs() <= 1, "{actual} vs {expected}");
+        }
+        let table = cfg.rope_table(&[0.0; 32], 3)?;
+        assert_eq!(table.len(), 3 * 64);
+        assert_eq!((table[0], table[32]), (1.0, 0.0));
+        Ok(())
+    }
+}
