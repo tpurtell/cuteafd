@@ -6225,3 +6225,50 @@ The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
 Do not replay publication against the deliberately retired standalone paths.
 Full-model generation/serving qualification and K6 engine shape support remain
 separate work; this task branch is pushed for review, not merged.
+
+
+## Muse Spark Open K4 experts / Core K6 (2026-11-01)
+
+TJ authorized the short pilot, full quantization, direct Hub publication and
+SparkNest placement on `quant/muse-spark-k4-core-k6`; no recipe or upload
+approval stop remains. Existing checkout: `~/Developer/cute-worktrees/muse-quant`.
+GPU work uses raptor GPU 0 alone, by UUID under the unchanged fair queue;
+GPU 1 and serving/default/kernel infrastructure are outside this task.
+
+Pinned BF16 source `meta-models/Muse-Spark-Open-816B-A42B` revision
+`0fb02478b02565b2ce7fc57e6051c91172774ac9` contains 2,000 tensors and
+1,644,333,137,920 payload bytes. Files are sealed and local across raptor,
+raptor (D2) and raptor (D3); readiness checks the local-store union because
+`nest where` reports each store separately. Source hashes are checked against
+the actual Hub LFS/Git hashes before GPU admission, without replication.
+
+Implementation: `quantization/muse_spark/`. Quantize 373 attention/bridge/head
+matrices at K6 and 47,616 individual routed matrices at K4 using the pinned
+MCG codec and FP64-congruence calibrated LDLQ. Gate/up expert fusion splits
+axis 1, gate first. Keep 1,503 native tensors byte for byte, including attention
+output gates and bundled vision/audio. Residual gates ship BF16 but promote
+to FP32 in the official native execution. The head stores 202,112 output rows
+with 202,048 logical rows; all whole operands record side 1. Expected output:
+193,459 tensors, 427,855,788,244 payload bytes, 63 shards.
+
+The native xhigh template renders all 1,426 calibration prompts (1,248,980
+tokens), with date frozen to 2026-10-31 and no sorting/truncation/packing.
+The bounded pilot uses 4,764 calibration / 1,812 heldout tokens, layers
+0/1/61, and a separate 2,345-token sliding-window witness. Expected K6 error
+is below the 1e-3 heldout activation-weighted NMSE stop bar; native/staged
+boundaries must be byte-exact and expert error finite and at most 1e-2.
+One pilot launch is enough unless a specific failure needs diagnosis.
+
+Production stages advance causally: quantized QKV -> O inputs -> attention
+residual -> pre-expert projection -> per-expert gate/up -> down inputs ->
+normalized routed outputs -> post-expert projection -> successor layer.
+The official Transformers 5.22.1 modules own all norms, routing and masking.
+The durable user supervisor caps host memory at 78 GiB and owns GPU0 only
+until its container stops; authorized publication is CPU-only afterward.
+Run/tokens/pilot/export state: `~/Developer/cute-worktrees/muse-quant-work/`.
+Use its launcher with `--resume` after OOM; retain checksum-verified stage
+and projection commitments. A numerical failure requires diagnosis of the
+first affected producer/input and its descendants before invalidation; never
+blindly delete cached work or resume across changed numerical identities.
+The independent completed-export reload and native-byte audit precedes upload
+to `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6`.
