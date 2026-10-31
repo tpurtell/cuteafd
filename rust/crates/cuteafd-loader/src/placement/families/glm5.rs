@@ -161,11 +161,16 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
         // Attention through the variant's stage programs (K6 core only): the sparse
         // MLA of both record kinds is the only scratch owner, whole or a head split's share.
         let family = cfg.program_family();
-        let attention = if split { cfg.split_program_family().unwrap_or(family) } else { family };
         let mut programs = 0;
         for tag in ["", "_nope"] {
-            let name = format!("{attention}_sparse_mla{tag}_{mode}_{cap}");
+            let name = format!("{family}_sparse_mla{tag}_{mode}_{cap}");
             programs = programs.max(lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))?);
+            // Two GPUs share the step arena between whole-layer owners and, where the build
+            // carries them, the head split's share programs (heads and context require them
+            // through their own program checks).
+            if let (true, Some(split)) = (split, cfg.split_program_family()) {
+                programs = programs.max(lookup(&format!("{split}_sparse_mla{tag}_{mode}_{cap}")).unwrap_or(0));
+            }
         }
         // The FP8 indexer query (a checkpoint keeping wq_b as shipped) shares the arena.
         programs = programs.max(lookup(&format!("{family}_index_q_{cap}")).unwrap_or(0));
