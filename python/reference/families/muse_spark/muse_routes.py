@@ -18,7 +18,14 @@ SCHEMA = "cuteafd.muse.routes/1"
 
 
 def layer_dirs(root: Path) -> list[Path]:
-    return sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("layer"))
+    """The route directories under ``root``; an unreadable or empty root refuses
+    (a caller that asked for real routes never falls back to synthetic ones)."""
+    if not root.is_dir():
+        raise SystemExit(f"--routes {root}: not a readable directory")
+    dirs = sorted(p for p in root.iterdir() if p.is_dir() and p.name.startswith("layer"))
+    if not dirs:
+        raise SystemExit(f"--routes {root}: no layerNNN route directories")
+    return dirs
 
 
 def load_layer(path: Path, weights: bool = False) -> tuple[int, dict[str, np.ndarray]]:
