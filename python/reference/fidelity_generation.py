@@ -162,8 +162,12 @@ class ResponseCache:
         if backend.get("text_source") == "api":
             # Hosted responses depend on wire inputs, not local rendering code.
             request = binding["request"]
-            return {"endpoint": backend["endpoint"], "model": request["model"],
-                    "provider": request.get("provider"), "request": request}
+            key = {"endpoint": backend["endpoint"], "model": request["model"],
+                   "provider": request.get("provider"), "request": request}
+            if backend.get("wire_order", "sorted") != "sorted":
+                # Key order on the wire is a provider input (tojson templates render it).
+                key["wire_order"] = backend["wire_order"]
+            return key
         return binding
 
     def find(self, body):
@@ -225,7 +229,10 @@ class TextGenerator:
 
 class APIClient(TextGenerator):
     def __init__(self, renderer, cache, *, checkpoint, family, base, model, key_file,
-                 timeout=1800, retries=4, extra_body=None, identity=None):
+                 timeout=1800, retries=4, extra_body=None, identity=None, wire_order="request"):
+        if wire_order not in ("request", "sorted"):
+            raise ValueError("wire order must be request or sorted")
+        self.wire_order = wire_order
         parts = urllib.parse.urlsplit(base)
         if parts.username or parts.password or parts.query or parts.fragment:
             raise ValueError("API base must not contain credentials, query or fragment")
@@ -237,7 +244,8 @@ class APIClient(TextGenerator):
         if set(self.extra_body) & {"model", "messages", "temperature", "max_tokens", "stream", "tools"}:
             raise ValueError("API options may not override the fixed generation recipe")
         super().__init__(renderer, cache, checkpoint=checkpoint, family=family,
-                         identity={**(identity or {}), "text_source": "api", "endpoint": self.endpoint, "model_id": model})
+                         identity={**(identity or {}), "text_source": "api", "endpoint": self.endpoint, "model_id": model,
+                                   **({"wire_order": wire_order} if wire_order != "sorted" else {})})
 
     def request(self, body):
         if stat.S_IMODE(self.key_file.stat().st_mode) != 0o600:
@@ -245,7 +253,10 @@ class APIClient(TextGenerator):
         key = self.key_file.read_text().strip()
         if not key:
             raise ValueError("empty API key file")
-        request = urllib.request.Request(self.endpoint, canonical(body),
+        # Providers render tools/messages in the order received; send what we render.
+        payload = (canonical(body) if self.wire_order == "sorted"
+                   else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
+        request = urllib.request.Request(self.endpoint, payload,
             {"Content-Type": "application/json", "Authorization": "Bearer " + key})
         for attempt in range(self.retries + 1):
             try:

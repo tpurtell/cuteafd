@@ -762,6 +762,8 @@ def main(argv=None):
     p.add_argument("--api-key-file", type=pathlib.Path)
     p.add_argument("--api-options", type=pathlib.Path, help="JSON provider controls/deviations, recorded in provenance")
     p.add_argument("--response-cache", type=pathlib.Path, help="required resumable private cache for api/hf")
+    p.add_argument("--api-wire-order", choices=("request", "sorted"), default="request",
+                   help="JSON key order sent to the provider; 'sorted' only to reuse a verified pre-2026-10-31 cache")
     p.add_argument("--snapshot", type=pathlib.Path, help="local HF checkpoint for generation")
     p.add_argument("--bench-token")
     p.add_argument("--timeout", type=float, default=1800)
@@ -852,7 +854,8 @@ def main(argv=None):
                     p.error("API backend requires --api-base, --api-model and --api-key-file")
                 probe = APIClient(renderer, a.response_cache, checkpoint=a.checkpoint, family=a.family,
                     base=a.api_base, model=a.api_model, key_file=a.api_key_file, timeout=a.timeout,
-                    extra_body=json.loads(a.api_options.read_text()) if a.api_options else None, identity=identity)
+                    extra_body=json.loads(a.api_options.read_text()) if a.api_options else None, identity=identity,
+                    wire_order=a.api_wire_order)
             else:
                 if a.family != "qwen3_5" or config.get("model_type") != "qwen3_5":
                     p.error("HF backend requires the official dense Qwen3.5 reference")

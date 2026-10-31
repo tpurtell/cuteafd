@@ -330,3 +330,18 @@ def test_length_cut_tool_call_is_rendered_verbatim_and_never_executed(api):
     text = bytes(result["probe"]["generated"]).decode()
     # Only the text both bounding renders share: never the partial arguments.
     assert text.startswith("<reasoning>r") and "path" not in text
+
+
+def test_wire_body_keeps_request_key_order_and_keys_its_cache(api, tmp_path):
+    client, state = api
+    request = body()
+    request["tools"] = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+    client(copy.deepcopy(request))
+    sent = state["calls"][-1]
+    assert list(sent["tools"][0]) == ["type", "function"] and list(sent["tools"][0]["function"]) == ["name", "parameters"]
+    assert client.identity["wire_order"] == "request"
+    # A sorted-wire record never satisfies a request-order client, and vice versa.
+    sorted_client = APIClient(client.renderer, client.cache.directory, checkpoint="official-model", family="qwen3_5",
+                              base=client.endpoint.removesuffix("/chat/completions"), model="official-model",
+                              key_file=client.key_file, wire_order="sorted")
+    assert sorted_client.cache.find({**copy.deepcopy(request), "model": "official-model"}) is None
