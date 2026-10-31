@@ -1,8 +1,9 @@
 //! Per-rank coordinator weight layout of one Muse Spark layer and the
 //! globals: the operand inventory and byte extents the device packs and the
-//! planner charges (one definition, so plan == runtime). Attention heads split
-//! across a head-split pair (64 query / 8 KV heads per GPU); everything else
-//! is whole on each GPU. K6 projections keep their payload + H128 vectors;
+//! planner charges (one definition, so plan == runtime). Across a head-split
+//! pair, attention heads split (64 query / 8 KV heads per GPU) and the MoE
+//! projections split over E (pre_expert by outputs, post_expert by inputs);
+//! the router, norms and gates are whole on each GPU. K6 projections keep their payload + H128 vectors;
 //! the residual gates are packed as host-computed F32 alpha/beta.
 use super::{core::{CoreInventory, CoreSplit, PREFIX}, MuseSparkConfig};
 use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
@@ -44,6 +45,9 @@ impl LayerLayout {
             let mut matrix = |name: &'static str, stem: &str, n: usize, k: usize, split: Option<CoreSplit>| -> Result<()> {
                 match core.projections.get(&format!("{root}.{stem}")) {
                     Some(projection) => {
+                        // One source for TP2 ownership: the inventory's contract (`core::split`).
+                        ensure!(Some(projection.split) == split, "{root}.{stem}: inventory split {:?} differs from the layout's {split:?}",
+                            projection.split);
                         let side = match (split, ranks) {
                             (Some(CoreSplit::Input), 2) => TrellisSide::Input,
                             _ => TrellisSide::Output,

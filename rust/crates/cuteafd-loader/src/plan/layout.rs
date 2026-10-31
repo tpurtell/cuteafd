@@ -118,6 +118,10 @@ pub struct LayoutOptions {
     pub kimi_drafter_snapshot: Option<std::path::PathBuf>,
     /// Muse Spark's DFlash2 drafter (opt-in), charged from its own config on the head GPU.
     pub muse_drafter_snapshot: Option<std::path::PathBuf>,
+    /// Muse Spark's partial-reply cutoff and wide format (serve-muse's
+    /// `--expert-partial-bf16-max-rows` / `--expert-partial-wide-format`).
+    pub muse_partial_bf16_max_rows: usize,
+    pub muse_partial_wide_format: crate::families::muse_spark::replies::WideFormat,
     pub kimi_draft_fp8: bool,
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
@@ -252,6 +256,8 @@ impl Default for LayoutOptions {
             glm5_attention_plan_rows: None,
             kimi_drafter_snapshot: None,
             muse_drafter_snapshot: None,
+            muse_partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+            muse_partial_wide_format: Default::default(),
             kimi_draft_fp8: false,
             mla_kv: Default::default(),
             headroom_bytes: 2 * GIB,
@@ -366,6 +372,8 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         "glm5_flash" => 1,
         "mimo_v2" => 2,
         "qwen4" => 1,
+        // One persistent endpoint: decode, verify and the prefill waves share its QP.
+        "muse_spark" => 1,
         _ => 0,
     }
 }
@@ -1498,7 +1506,21 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
             push(category, &name, "pinned", bytes, Basis::Formula);
         }
     } else {
-        if ranks > 0 {
+        if ranks > 0 && family == "muse_spark" {
+            // Muse's sealed endpoint (partial-reply frames, waves + 1 deep) and its
+            // own wire width: the transport the link registers (`host_transport`).
+            let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&checkpoint.config)?;
+            let unit_rows = options.prefill_unit_rows.context("Muse host transport without a unit")?;
+            let prefill = crate::serving_capacity::prefill_waves::PrefillPlan { unit_rows, waves: options.prefill_waves,
+                span_rows: unit_rows * options.prefill_waves };
+            let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(options.muse_partial_bf16_max_rows,
+                crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, options.muse_partial_wide_format)?;
+            let sequences = usize::try_from(options.state_slots.unwrap_or(if options.concurrency > 0 { options.concurrency } else { 16 }))?;
+            let host = crate::placement::families::muse_spark::host_transport(&cfg, prefill, cutoff, sequences, ranks)?;
+            push(Category::Transport, "transport/rdma-rings", "registered", host.rings, Basis::Exact);
+            push(Category::Transport, "transport/egress", "registered request slots", host.egress, Basis::Exact);
+            push(Category::Transport, "spark-intake", "host-mode upper bound", host.intake, Basis::Estimated);
+        } else if ranks > 0 {
             let geometry = ExpertGeometry { hidden: u32::try_from(hidden)?,
                 experts: u32::try_from(spec.moe.as_ref().context("Spark layout without MoE geometry")?.experts)?,
                 topk: u32::try_from(topk)?, intermediate: u32::try_from(spec.moe.as_ref().unwrap().intermediate)?,

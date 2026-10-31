@@ -70,7 +70,7 @@ pub(crate) fn combine_launches(plan: &cuteafd_loader::families::muse_spark::repl
 }
 
 /// Most expert holders one combine reads (Spark ranks 2..8, an RTX pair, one RTX).
-pub(crate) const MAX_RANKS: usize = 8;
+pub(crate) const MAX_RANKS: usize = cuteafd_loader::placement::families::muse_spark::MAX_COMBINE_RANKS;
 
 /// Device layout of one wave's combine operands, written in one upload: the
 /// BF16 and wide `rank_regions` tables (i64 device addresses, `MAX_RANKS`
@@ -80,7 +80,8 @@ pub(crate) struct CombineTables { pub capacity: usize }
 
 impl CombineTables {
     pub(crate) const TABLE_BYTES: usize = MAX_RANKS * 8;
-    pub(crate) fn bytes(self) -> usize { 2 * Self::TABLE_BYTES + 2 * self.capacity * 4 }
+    /// The admitted extent (`shared::combine_tables_bytes`, charged where allocated).
+    pub(crate) fn bytes(self) -> usize { cuteafd_loader::placement::families::muse_spark::combine_tables_bytes(self.capacity) }
     /// Byte offsets of (bf16 table, wide table, bf16 map, wide map).
     pub(crate) fn offsets(self) -> [usize; 4] {
         let maps = 2 * Self::TABLE_BYTES;

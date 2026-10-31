@@ -2733,6 +2733,10 @@ audio_encoder_hash=""
   if [[ "$family" == muse_spark ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+    # The serve command's partial-reply overrides and drafter rings, so plan == serve admission.
+    [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || plan_draft_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
+    [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || plan_draft_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")
+    [[ "$speculator" != dflash2 ]] || plan_draft_args+=(--draft-kv-cache "${muse_draft_kv:-fp8}")
   fi
   if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")

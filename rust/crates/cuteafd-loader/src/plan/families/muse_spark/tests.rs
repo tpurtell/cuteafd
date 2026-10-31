@@ -296,7 +296,8 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let sms = crate::placement::ArchContext::for_device("sm_120", crate::placement::inventory::PRO_TOTAL_BYTES).sms;
     let expected = crate::placement::families::muse_spark::drafter_inventory(&cfg, &config, 16, 16, 202_112,
         u64::from(sms), crate::families::qwen4::Qwen4KvCache::Fp8).unwrap();
-    assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch);
+    assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch + expected.runtime);
+    assert_eq!(expected.runtime, (16 * 8 * 4 + 62 * 64 * 8 * 4) as u64, "draft ids + probe ring");
     assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
     assert!(drafted.solver_placement.as_ref().unwrap().pool_tokens < plain.solver_placement.as_ref().unwrap().pool_tokens);
     // A drafter trained against another head refuses before placement.

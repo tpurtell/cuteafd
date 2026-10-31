@@ -122,6 +122,8 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glm5_draft_bf16: args.glm5_draft_bf16,
                 kimi_drafter_snapshot: None,
                 muse_drafter_snapshot: None,
+                muse_partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
+                muse_partial_wide_format: args.expert_partial_wide_format,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
                 kimi_draft_fp8: args.draft_fp8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
@@ -872,6 +874,8 @@ mod tests {
     fn args(model: &std::path::Path, spark_ranks: usize, require_ready: bool) -> PlanArgs {
         PlanArgs {
             draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            expert_partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+            expert_partial_wide_format: Default::default(),
             exlr8_manifest: None,
             exlr8_prefill_activations: None,
             mapped_scale_preload_gib: 0.0,

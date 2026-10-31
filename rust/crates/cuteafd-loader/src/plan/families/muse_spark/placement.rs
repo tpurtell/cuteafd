@@ -81,8 +81,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         spark_ranks: ranks, prefill, slots, context, automatic_context: opts.context_tokens == 0,
         requested_pool: opts.pool_tokens.filter(|n| *n > 0), onboard: opts.onboard.unwrap_or(Onboard::Auto),
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
-        partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-        partial_wide_format: Default::default(),
+        partial_bf16_max_rows: opts.muse_partial_bf16_max_rows,
+        partial_wide_format: opts.muse_partial_wide_format,
         local: match crate::placement::families::muse_spark::local_workspace(catalog,
             opts.workspace_manifest.as_deref().filter(|path| path.is_file()), gpus, prefill.unit_rows) {
             Ok(workspace) => workspace,
@@ -162,6 +162,15 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let working = SparkWorkingSet { rtx_layers: Vec::new(), spark_layers: spark_budget.layers[onboarded..].to_vec(),
         spark_ranks: ranks, prefill_lanes: LANES };
     let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
+    // serve-muse's cutoff: the same overrides, the same widest verify step.
+    let cutoff = match crate::families::muse_spark::replies::Cutoff::with_wide(opts.muse_partial_bf16_max_rows,
+        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, opts.muse_partial_wide_format) {
+        Ok(cutoff) => cutoff,
+        Err(error) => {
+            refusal(report, format!("Muse partial-reply cutoff refused: {error:#}"), "Use a cutoff of at least 64 rows.");
+            return memory;
+        }
+    };
     let mut widest = 0;
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
@@ -170,7 +179,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (intermediate slices)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = usize::try_from(slots).map_err(anyhow::Error::from)
-            .and_then(|slots| muse_spark_io(&mut device, &working, prefill, slots, rings)) {
+            .and_then(|slots| muse_spark_io(&mut device, &working, prefill, slots, rings, cutoff)) {
             refusal(report, format!("Muse Spark rank {rank} I/O: {error:#}"), "Fix the Spark ring geometry.");
         }
         if let Err(error) = muse_owners(&mut device, &working, prefill.unit_rows, prefill.waves) {
@@ -202,12 +211,10 @@ fn planned_code(opts: &crate::plan::layout::LayoutOptions, gpus: usize) -> anyho
 /// partial-reply frame and in-flight depth, exactly as admission seals it.
 fn muse_spark_io(device: &mut DeviceLayout, working: &SparkWorkingSet,
     prefill: crate::serving_capacity::prefill_waves::PrefillPlan, slots: usize,
-    rings: crate::placement::SparkRingGeometry) -> anyhow::Result<()> {
+    rings: crate::placement::SparkRingGeometry, cutoff: crate::families::muse_spark::replies::Cutoff)
+    -> anyhow::Result<()> {
     let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
     crate::plan::layout::charge_spark_io(device, working, geometry, prefill.unit_rows as u32, false, rings, 0)?;
-    // The planner's serving defaults, as the request builder (`MuseInputs`) gets them.
-    let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(
-        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, 1, Default::default())?;
     let (endpoint, spark_rings) = crate::placement::families::muse_spark::spark_endpoint(prefill, cutoff, slots)?;
     let exact = working.rank_endpoints_io(device.index as usize, geometry, &[endpoint], spark_rings)?;
     for item in &mut device.items {

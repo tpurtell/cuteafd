@@ -198,6 +198,10 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
                 exchange as u64, Basis::Exact));
         }
     }
+    // The Spark path's combine tables on the entry GPU (rank 0 combines every landed
+    // wave): one image per return slot, so a slot is never rewritten under a combine.
+    fixed.push(Demand::new(0, Category::Workspace, "Muse Spark combine tables",
+        combine_tables_bytes(usize::try_from(prefill.unit_rows)?) as u64 * prefill.waves, Basis::Exact));
     // Sliding layers' RoPE tables (shared rope_tables_bf16, half width) over the context, on every GPU.
     let rope = rope_tables(cfg, context)?;
     for gpu in 0..ranks {
@@ -367,6 +371,9 @@ pub struct MuseDrafter {
     pub owned: u64,
     pub scratch: u64,
     pub head_scratch: u64,
+    /// The draft batch's input ids and the policy probe's device route ring
+    /// (`layers x HEAD_ROWS x topk` ids) on the head GPU.
+    pub runtime: u64,
     pub context_slots: usize,
     pub sequences: usize,
     pub block: usize,
@@ -376,7 +383,7 @@ pub struct MuseDrafter {
 impl MuseDrafter {
     fn demand(&self, head: u8) -> crate::placement::draft::DrafterDemand {
         crate::placement::draft::DrafterDemand::local(MovableId::Drafter, vec![Bytes2 {
-            resident: self.owned + self.scratch + self.head_scratch, staging: 0 }], head)
+            resident: self.owned + self.scratch + self.head_scratch + self.runtime, staging: 0 }], head)
     }
 }
 
@@ -407,9 +414,17 @@ pub fn drafter_inventory(cfg: &MuseSparkConfig, config: &serde_json::Value, slot
     ensure!(stored >= cfg.vocab_size, "Muse head stored width below the vocabulary");
     let rows = capacity.max_batch_sequences * block;
     let head_scratch = u64::try_from(rows * (stored + cfg.vocab_size) * 4)?;
-    Ok(MuseDrafter { owned, scratch, head_scratch, context_slots: capacity.context_slots,
+    let probe = (cfg.layers * crate::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4) as u64;
+    let runtime = u64::try_from(rows * 4)? + probe;
+    Ok(MuseDrafter { owned, scratch, head_scratch, runtime, context_slots: capacity.context_slots,
         sequences: capacity.max_batch_sequences, block, head_dim: geometry.head_dim as usize })
 }
+
+/// The combine's rank tables the coordinator uploads per wave: a BF16 and a
+/// wide `rank_regions` table (`MAX_COMBINE_RANKS` i64 addresses each) and their
+/// two row maps (`capacity` u32 each).
+pub const MAX_COMBINE_RANKS: usize = 8;
+pub fn combine_tables_bytes(capacity: usize) -> usize { 2 * MAX_COMBINE_RANKS * 8 + 2 * capacity * 4 }
 
 /// A missing coordinator EXL3 package (onboarding unavailable in this build).
 #[derive(Debug, thiserror::Error)]
@@ -449,7 +464,7 @@ pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &std::path::
     }).collect::<Result<Vec<_>>>()?;
     let workspace = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)
         .map_err(|error| anyhow::anyhow!("{error}"))? + compiled * shape.hidden as u64 * 4
-        + 2 * rows * 4 + (2 * 8 * 8 + 2 * rows * 4);
+        + 2 * rows * 4 + combine_tables_bytes(usize::try_from(rows)?) as u64;
     Ok((package, workspace))
 }
 
@@ -510,6 +525,27 @@ pub fn spark_endpoint(prefill: PrefillPlan, cutoff: crate::families::muse_spark:
     ensure!(frame <= NIC_MAX_MESSAGE_BYTES, "Muse Spark partial reply frame of {frame} bytes exceeds the NIC's \
         {NIC_MAX_MESSAGE_BYTES}-byte RC message limit (lower the unit, the sequences or the BF16 cutoff)");
     Ok((endpoint, rings))
+}
+
+/// The coordinator host's Spark transport for Muse's one endpoint, as the
+/// link registers it: every rank's rings at the sealed endpoint (`spark_endpoint`),
+/// the request egress (one bootstrap-wide FP8 wire per wave slot), and the
+/// intake planes' host-mode upper bound (`intake`; GPU landing uses less).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostTransport { pub rings: u64, pub egress: u64, pub intake: u64 }
+
+pub fn host_transport(cfg: &MuseSparkConfig, prefill: PrefillPlan, cutoff: crate::families::muse_spark::replies::Cutoff,
+    sequences: usize, spark_ranks: usize) -> Result<HostTransport> {
+    let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
+    let (endpoint, rings) = spark_endpoint(prefill, cutoff, sequences)?;
+    let per_rank = endpoint.ring_bytes(geometry, rings).context("Muse host ring geometry")?;
+    let unit = u32::try_from(prefill.unit_rows)?;
+    let egress = geometry.compact_wire_bytes(unit, false).context("Muse egress geometry")?.0 as u64;
+    let (_, intake) = intake(cfg, prefill, cutoff, sequences, spark_ranks)?;
+    Ok(HostTransport {
+        rings: (per_rank as u64).checked_mul(spark_ranks as u64).context("Muse host rings overflow")?,
+        egress: egress.checked_mul(prefill.waves).context("Muse host egress overflow")?,
+        intake })
 }
 
 /// Muse's typed Spark owners on the EXL3 ladder.

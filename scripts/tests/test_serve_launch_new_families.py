@@ -496,10 +496,13 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
 
 
 def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
-    serve = _line(_muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
-                                  "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"
-                                  "SPARK_DEVICE_BUDGET_BYTES=107374182400\n"),
-                  "cuteafd serve-muse --snapshot")
+    result = _muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
+                             "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"
+                             "SPARK_DEVICE_BUDGET_BYTES=107374182400\n")
+    serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
+    # The planner admits the same partial-reply overrides the server runs with.
+    assert _flag(plan, "--expert-partial-bf16-max-rows") == "128"
+    assert _flag(plan, "--expert-partial-wide-format") == "fp8"
     assert _flag(serve, "--rtx-expert-layers") == "3"
     assert _flag(serve, "--pool-tokens") == "1048576"
     assert _flag(serve, "--max-context") == "262144"
@@ -523,7 +526,7 @@ def test_muse_dflash2_resolves_one_snapshot_for_plan_and_serve(tmp_path: Path, d
     snapshot = str(tmp_path / f"hf/hub/models--{drafter.replace('/', '--')}/snapshots/{revision}")
     assert _flag(serve, "--draft") == _flag(plan, "--drafter-snapshot") == snapshot
     assert _flag(plan, "--speculator") == "dflash2"
-    assert _flag(serve, "--draft-kv-cache") == (cache or "fp8")
+    assert _flag(serve, "--draft-kv-cache") == _flag(plan, "--draft-kv-cache") == (cache or "fp8")
     assert _flag(serve, "--draft-fixed") == "5"
     assert "--draft-fp8" not in serve.split()
 

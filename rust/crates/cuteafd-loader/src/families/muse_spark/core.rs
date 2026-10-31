@@ -14,8 +14,9 @@ pub const HEAD: &str = "lm_head";
 /// Attention projections that must be native together when any one is.
 const ATTENTION: [&str; 4] = ["q_proj", "k_proj", "v_proj", "o_proj"];
 
-/// TP2 ownership of each eligible projection: attention heads split, the MoE
-/// frontend/backend projections stay whole (like Kimi's latent projections).
+/// TP2 ownership of each eligible projection: attention heads split; the MoE
+/// frontend splits its outputs over E and the backend its inputs (single
+/// residency, a rank-ordered K-split reduction). The LM head stays whole.
 pub fn split(cfg: &MuseSparkConfig, stem: &str) -> Option<CoreSplit> {
     if stem == HEAD { return Some(CoreSplit::Whole); }
     let (layer, leaf) = stem.strip_prefix(PREFIX)?.split_once('.')?;
@@ -23,7 +24,8 @@ pub fn split(cfg: &MuseSparkConfig, stem: &str) -> Option<CoreSplit> {
     match leaf {
         "self_attn.q_proj" | "self_attn.k_proj" | "self_attn.v_proj" | "self_attn.gate_proj" => Some(CoreSplit::Output),
         "self_attn.o_proj" => Some(CoreSplit::Input),
-        "mlp.pre_expert_proj" | "mlp.post_expert_proj" => Some(CoreSplit::Whole),
+        "mlp.pre_expert_proj" => Some(CoreSplit::Output),
+        "mlp.post_expert_proj" => Some(CoreSplit::Input),
         _ => None,
     }
 }

@@ -59,6 +59,9 @@ impl<'a> MuseDraft<'a> {
         let rows = admitted.sequences * admitted.block;
         ensure!(admitted.head_scratch == (rows * (stored_width + cfg.vocab_size) * 4) as u64,
             "Muse drafter head scratch differs from its admission");
+        // The ids below and the backend's route probe ring (`RoundProbe::new` at HEAD_ROWS).
+        let probe = cfg.layers * cuteafd_loader::families::muse_spark::lane::HEAD_ROWS * cfg.topk * 4;
+        ensure!(admitted.runtime == (rows * 4 + probe) as u64, "Muse drafter runtime buffers differ from their admission");
         let _scope = cuteafd_ffi::memory_ledger::scope("drafter/head");
         Ok(Self { drafter, stored: Allocation::new(device, rows * stored_width * 4)?,
             trimmed: Allocation::new(device, rows * cfg.vocab_size * 4)?, ids: Allocation::new(device, rows * 4)?,

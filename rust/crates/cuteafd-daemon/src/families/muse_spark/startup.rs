@@ -114,6 +114,95 @@ mod tests {
         Ok(())
     }
 
+    /// Plan == serve admission for every override serve-muse takes: the
+    /// partial-reply cutoff and wide format, the drafter (none, RadixArk d128,
+    /// NVIDIA d64) and its ring format. The coordinator ledgers match item by
+    /// item; the Spark rings and the coordinator intake are what the serve
+    /// path seals (`admission::spark_plan`, `shared::intake`); the host
+    /// transport is `shared::host_transport` at the serve cutoff, nonzero.
+    #[test]
+    fn plan_equals_serve_admission_for_every_override() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::{Cutoff, WideFormat, DEFAULT_BF16_MAX_ROWS};
+        use cuteafd_loader::families::qwen4::Qwen4KvCache;
+        let dir = tempfile::tempdir()?;
+        testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+        let input = testing::BudgetedPlanInput::open(dir.path())?;
+        let checkpoint = input.checkpoint();
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        let drafters = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/muse_spark/fixtures/drafters");
+        let (gpus, sparks, total) = (2usize, 6usize, cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES);
+        let image = dir.path().join("image");
+        let path = testing::write_muse_exl3_capacities(&image);
+        std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
+        let cases = [(DEFAULT_BF16_MAX_ROWS, WideFormat::Nvfp4, None, Qwen4KvCache::Fp8),
+            (128, WideFormat::Nvfp4, None, Qwen4KvCache::Fp8), (512, WideFormat::Fp8, None, Qwen4KvCache::Fp8),
+            (DEFAULT_BF16_MAX_ROWS, WideFormat::Fp8, Some("radixark.json"), Qwen4KvCache::Fp8),
+            (DEFAULT_BF16_MAX_ROWS, WideFormat::Nvfp4, Some("radixark.json"), Qwen4KvCache::Bf16),
+            (128, WideFormat::Nvfp4, Some("nvidia.json"), Qwen4KvCache::Fp8)];
+        let mut host_rings = std::collections::BTreeSet::new();
+        for (cutoff_rows, wide, drafter, draft_kv) in cases {
+            let label = format!("cutoff {cutoff_rows} {wide:?} drafter {drafter:?} {draft_kv:?}");
+            let snapshot = drafter.map(|name| -> Result<_> {
+                let dir = tempfile::tempdir()?;
+                std::fs::copy(drafters.join(name), dir.path().join("config.json"))?;
+                Ok(dir)
+            }).transpose()?;
+            let opts = LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
+                head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
+                muse_partial_bf16_max_rows: cutoff_rows, muse_partial_wide_format: wide, draft_kv_cache: draft_kv,
+                muse_drafter_snapshot: snapshot.as_ref().map(|d| d.path().to_path_buf()), ..Default::default() };
+            let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
+                layout: Some(opts.clone()), ..Default::default() })?;
+            let planned = report.solver_placement.clone().unwrap_or_else(|| panic!("{label}: {:?}", report.hints));
+            let descriptor = cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK);
+            let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(sparks, descriptor, Default::default())?;
+            // serve-muse's own derivations from the same flags.
+            let cutoff = Cutoff::with_wide(cutoff_rows, DEFAULT_BF16_MAX_ROWS, wide)?;
+            let served_drafter = snapshot.as_ref().map(|d| -> Result<_> {
+                let config: serde_json::Value = serde_json::from_slice(&std::fs::read(d.path().join("config.json"))?)?;
+                let sms = cuteafd_loader::placement::ArchContext::for_device("sm_120", total).sms;
+                shared::drafter_inventory(&cfg, &config, 16, 16, 202_112, u64::from(sms), draft_kv)
+            }).transpose()?;
+            let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
+            let (_, live) = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+                manifest: &preflight(&path, gpus)?,
+                measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+                    untracked_bytes: arch.context_bytes }; gpus],
+                headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+                mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
+                    shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
+                max_context: None, pool_tokens: None, onboard: Onboard::Auto,
+                spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+                partial_bf16_max_rows: cutoff_rows, partial_wide_format: wide,
+                local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
+                drafter: served_drafter })?;
+            // Coordinator ledgers, item by item (then the whole placement).
+            for gpu in 0..gpus {
+                assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");
+            }
+            assert_eq!(live, planned, "{label}");
+            // The Spark side: the planner's rings are the sealed endpoint's.
+            let spark = super::super::admission::spark_plan(&live, prefill, cutoff, 16, sparks)?;
+            let layout = report.memory_layout.as_ref().context("layout")?;
+            for device in layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark) {
+                let rings = device.items.iter().find(|item| item.group == "rdma rings").context("rings")?.bytes;
+                assert_eq!(rings, spark.model.ring_bytes(cuteafd_core::ExpertGeometry::MUSE_SPARK)? as u64, "{label}");
+            }
+            // The coordinator host transport: what the link registers at this cutoff.
+            let host = shared::host_transport(&cfg, prefill, cutoff, 16, sparks)?;
+            let ledger = report.host_ledger.as_ref().context("host ledger")?;
+            let bytes = |group: &str| ledger.items.iter().filter(|item| item.group == group).map(|item| item.bytes).sum::<u64>();
+            assert_eq!((bytes("transport/rdma-rings"), bytes("transport/egress"), bytes("spark-intake")),
+                (host.rings, host.egress, host.intake), "{label}");
+            assert!(host.rings > 0 && host.egress > 0 && host.intake > 0, "{label}");
+            host_rings.insert((cutoff_rows, format!("{wide:?}"), host.rings));
+        }
+        // The overrides move the transport (they are not ignored by either side).
+        assert!(host_rings.iter().map(|(_, _, rings)| rings).collect::<std::collections::BTreeSet<_>>().len() > 1);
+        Ok(())
+    }
+
     /// The planner and measured startup build one request: on a sample whose
     /// free bytes are the planner's context-only baseline and with no code yet
     /// resident, both solve to the identical placement.
