@@ -6315,3 +6315,17 @@ the task-owned local final-weight links. It creates no extra full checkpoint
 on raptor. Source weights, shared stores, receipts and forensic evidence stay.
 Targeted terminal-flow tests pass 54 CPU cases. Issue #940 and draft PR #939
 track continuation; full-model serving qualification remains separate.
+
+TJ requested progress, remaining time and completion status every 30 minutes.
+The user timer `cuteafd-muse-progress.timer` queues an update into this same
+Codex task (`01a192c3-c219-7950-89d1-6efa3f197a15`) through the existing CLI;
+first delivery succeeds at 2026-10-31 21:29 UTC, next at 21:59 UTC. Operational
+script/receipts: `muse-quant-work/progress-updates/`. It reads only task receipts
+and supervisor status; it never probes either GPU or changes numerical source.
+ETA uses the latest six completed layers and elapsed current-layer time; head,
+audit, upload and placement remain separately unestimated until measurable.
+The timer stops after queuing final success only when all completion markers
+match the producer and the durable supervisor exits zero. Failure updates keep
+the original OOM-resume versus numerical-diagnosis recovery instructions.
+At setup, six layers and 5,201/47,989 projections are committed with no new
+crash; remaining layer time is about 23.6 hours (mean 25.61 minutes/layer).
