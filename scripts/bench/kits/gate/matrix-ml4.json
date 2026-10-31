@@ -1,0 +1,69 @@
+{
+ "build": "ml4-candidate",
+ "profile": "smoke",
+ "defaults": {
+  "timeout_s": 2400,
+  "run_timeout_s": 3600
+ },
+ "entries": [
+  {
+   "name": "ml4-exl3-min",
+   "family": "mistral_large4",
+   "config": "cfg/ml4-exl3-k4core6.config",
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8750",
+    "EXPERT_PORT": "19850",
+    "COORDINATOR_GPUS": "1",
+    "RTX_GPUS": "1",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  },
+  {
+   "name": "ml4-exl3-max",
+   "family": "mistral_large4",
+   "config": "cfg/ml4-exl3-k4core6.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8751",
+    "EXPERT_PORT": "19851",
+    "COORDINATOR_GPUS": "0,1",
+    "RTX_GPUS": "2",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa"
+   }
+  }
+ ]
+}

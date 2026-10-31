@@ -189,13 +189,13 @@ use cuteafd_loader::plan::spark_executions::SparkBackend;
 /// The decode link plus one prefill link carrying every wave in flight, over
 /// typed owners from the shared admission (one prefill scratch at the ladder
 /// maximum, waves only buffer per-unit I/O).
-fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
+fn spark_model(family: &str, backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(waves > 0, "GLM Spark admission requires at least one prefill wave");
     let native = backend == SparkBackend::Exlr8;
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
-    let executions = cuteafd_loader::plan::spark_executions::admit_family("glm5", &backend.exports(), None,
+    let executions = cuteafd_loader::plan::spark_executions::admit_family(family, &backend.exports(), None,
         u64::from(unit_rows), waves as u64)?;
     let rings = crate::shared::placement::spark_rings(if native {
         cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
@@ -203,12 +203,12 @@ fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress },
             cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)?;
-    validate_spark_endpoint_count(model.endpoints.len(), waves)?;
+    validate_spark_endpoint_count(family, model.endpoints.len(), waves)?;
     Ok(model)
 }
 
-fn validate_spark_endpoint_count(endpoints: usize, waves: usize) -> Result<()> {
-    ensure!(endpoints == cuteafd_loader::plan::layout::spark_endpoints("glm5", waves as u64),
+fn validate_spark_endpoint_count(family: &str, endpoints: usize, waves: usize) -> Result<()> {
+    ensure!(endpoints == cuteafd_loader::plan::layout::spark_endpoints(family, waves as u64),
         "GLM Spark endpoint count differs from the planner");
     Ok(())
 }
@@ -258,9 +258,14 @@ mod draft_cli_tests {
         let k4 = SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest);
         for backend in [SparkBackend::Fp8, SparkBackend::Exlr8, k4] {
             for (waves, unit) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
-                assert_eq!(spark_model(backend, waves, unit, false)?.executions,
+                assert_eq!(spark_model("glm5", backend, waves, unit, false)?.executions,
                     planned("glm5", backend, None, u64::from(unit), waves as u64), "{backend:?} k{waves}");
             }
+        }
+        // Mistral Large 4 runs this engine under its own descriptor.
+        for (waves, unit) in [(1, 4096), (3, 2752)] {
+            assert_eq!(spark_model("mistral_large4", k4, waves, unit, false)?.executions,
+                planned("mistral_large4", k4, None, u64::from(unit), waves as u64), "ml4 k{waves}");
         }
         Ok(())
     }
@@ -269,7 +274,7 @@ mod draft_cli_tests {
     fn spark_contract_matches_decode_link_and_parallel_prefill_lanes() -> Result<()> {
         for (waves, unit) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
             for bf16 in [false, true] {
-                let model = spark_model(SparkBackend::Fp8, waves, unit, bf16)?;
+                let model = spark_model("glm5", SparkBackend::Fp8, waves, unit, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
                 // The decode link and one prefill link carrying every wave in flight.
                 assert_eq!(model.endpoints.len(), 2);
@@ -285,7 +290,7 @@ mod draft_cli_tests {
             }
         }
         for waves in 1..=4 {
-            let native = spark_model(SparkBackend::Exlr8, waves, 4096, false)?;
+            let native = spark_model("glm5", SparkBackend::Exlr8, waves, 4096, false)?;
             native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
             assert_eq!(native.endpoints.len(), 2);
             assert_eq!(native.endpoints[0].capacity, engine::DECODE_ROWS as u32);
@@ -297,10 +302,10 @@ mod draft_cli_tests {
             assert_eq!(native.rings.max_frame_bytes,
                 cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity())?);
         }
-        assert!(spark_model(SparkBackend::Fp8, 0, 4096, false).is_err());
-        assert!(validate_spark_endpoint_count(1, 1).is_err());
-        assert!(validate_spark_endpoint_count(3, 3).is_err());
-        assert!(validate_spark_endpoint_count(2, 1).is_ok());
+        assert!(spark_model("glm5", SparkBackend::Fp8, 0, 4096, false).is_err());
+        assert!(validate_spark_endpoint_count("glm5", 1, 1).is_err());
+        assert!(validate_spark_endpoint_count("glm5", 3, 3).is_err());
+        assert!(validate_spark_endpoint_count("glm5", 2, 1).is_ok());
         let source = include_str!("mod.rs");
         let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
             .split("let runtime = tokio::runtime::Builder").next().unwrap();
@@ -741,13 +746,16 @@ impl Opened {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
         // GLM 5.3's own programs (`glm_*`, and the head split's `glm2_*`), sampled as the runtime
         // inventory; the image's other families are never launched here.
-        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
-            split_family: args.split_device.map(|_| "glm2") };
+        // Mistral Large 4 runs its own `ml4_*` programs (whole attention on each GPU).
+        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
+            split_family: args.split_device.and(self.cfg.split_program_family()) };
         let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
         let split_device = match args.split_device {
+            // Whole-attention variants pair GPUs as whole-layer owners, not a head split.
+            Some(device) if !self.cfg.variant.is_glm() => Some(device),
             Some(device) if programs.spec("glm2_o_m64").is_ok() => Some(device),
             Some(device) => {
                 tracing::info!(device, "no head-split programs (glm2) in this build; serving from --device alone");
@@ -785,6 +793,7 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(anyhow::Error::msg)?;
+        let requested = cuteafd_loader::placement::families::glm5::resolve_attention(&self.cfg, requested, devices.len());
         ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
             "GLM layers attention requires two coordinator GPUs");
         let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
@@ -855,7 +864,7 @@ impl Opened {
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
-        let mut context = (devices.len() == 2).then(|| glm::context_programs(names.iter().copied(),
+        let mut context = (devices.len() == 2 && self.cfg.variant.is_glm()).then(|| glm::context_programs(names.iter().copied(),
             |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
         if let Some(context) = &mut context {
             let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
@@ -969,7 +978,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, spark_model(SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
+                peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
             // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
             // two more ranks; planning failure leaves them on the mount.

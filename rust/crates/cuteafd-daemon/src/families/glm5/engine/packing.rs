@@ -7,7 +7,7 @@ impl<'a> GlmEngine<'a> {
         self.packed_fallback_reason.borrow_mut().clear();
         if mode == PackingMode::Unrestricted { self.packed_row_cap.set(None); return Ok(()); }
         let mut reasons = Vec::new();
-        let inventory = coordinator_inventory(self.programs.names(), self.peer.is_some())?;
+        let inventory = coordinator_inventory(&self.cfg, self.programs.names(), self.peer.is_some())?;
         let mut cap = exact_program_cap(self.programs,
             inventory.iter().map(|(name, role)| (name.as_str(), *role)), self.prefill_rows, &mut reasons)?;
         for owner in self.native_dense.iter().flatten() {
@@ -145,9 +145,12 @@ fn program_fallback_reason(name: &str, geometry: &serde_json::Value) -> Option<S
 
 /// Classify the startup catalogue explicitly; new prefill exports fail closed
 /// until their row ownership is reviewed. Decode-only exports never see packs.
-fn coordinator_inventory<'n>(names: impl IntoIterator<Item = &'n str>, split: bool)
+fn coordinator_inventory<'n>(cfg: &GlmDsaConfig, names: impl IntoIterator<Item = &'n str>, split: bool)
     -> Result<Vec<(String, prefill_packing::ProgramRows)>> {
     use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    if !cfg.variant.is_glm() {
+        return variant_inventory(cfg.program_family(), names);
+    }
     let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms {
         family: "glm", split_family: split.then_some("glm2") };
     let required = names.into_iter().filter(|name| {
@@ -179,6 +182,34 @@ fn coordinator_inventory<'n>(names: impl IntoIterator<Item = &'n str>, split: bo
                     PackedRows
                 } else { anyhow::bail!("GLM packed program {name} has no reviewed row role"); }
             }
+        };
+        inventory.push((name.to_owned(), role));
+    }
+    let classified = inventory.iter().map(|(name, role)| (name.as_str(), *role)).collect::<Vec<_>>();
+    prefill_packing::validate_program_inventory(required, &classified)?;
+    Ok(inventory)
+}
+
+/// A whole-attention variant's own namespace (`ml4_*`): per-row transforms
+/// pack, the latent/index stages and attention stay sequence-local.
+fn variant_inventory<'n>(family: &str, names: impl IntoIterator<Item = &'n str>)
+    -> Result<Vec<(String, prefill_packing::ProgramRows)>> {
+    use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+    let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family, split_family: None };
+    let required = names.into_iter().filter(|name| selected.contains(name)
+        && !name.ends_with("_m64") && !name.contains("_decode_")).collect::<Vec<_>>();
+    let mut inventory = Vec::new();
+    for &name in &required {
+        let suffix = &name[family.len() + 1..];
+        let stem = suffix.strip_suffix("_m4096").unwrap_or(suffix);
+        let role = match stem {
+            "norm" | "router_scores" | "expert_input_quant" | "index_kw" | "index_layer_norm"
+                | "index_query_scale" | "query_scale" | "query_scale_nope" => PackedRows,
+            "rank_pack" | "rank_pack_nope" | "absorb" | "absorb_nope" | "values" | "index_post"
+                | "index_post_nope" | "index_topk_prefill" | "sparse_mla_prefill" | "sparse_mla_nope_prefill"
+                => SequenceLocal,
+            _ if stem.strip_prefix("swiglu_i").is_some_and(|n| n.parse::<usize>().is_ok_and(|n| n > 0)) => PackedRows,
+            _ => anyhow::bail!("{family} packed program {name} has no reviewed row role"),
         };
         inventory.push((name.to_owned(), role));
     }
@@ -220,6 +251,30 @@ fn packed_tables(sequences: &[(&mut GlmPlacement, &[u32])], segments: &[Segment]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn glm_cfg() -> GlmDsaConfig {
+        GlmDsaConfig::from_hf(&cuteafd_loader::plan::testing::glm5_config()).expect("GLM 5.3 test config")
+    }
+
+    #[test]
+    fn mistral_large4_inventory_classifies_its_own_namespace() -> Result<()> {
+        use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
+        let cfg = GlmDsaConfig::from_hf(&serde_json::from_str(include_str!(
+            "../../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?)?;
+        let names = ["ml4_norm", "ml4_index_kw", "ml4_query_scale_nope_m4096", "ml4_swiglu_i3072",
+            "ml4_absorb_m4096", "ml4_sparse_mla_nope_prefill_m4096", "ml4_index_topk_prefill_m4096",
+            "ml4_sparse_mla_decode_m64", "glm_norm"];
+        let inventory = coordinator_inventory(&cfg, names, false)?;
+        for name in ["ml4_norm", "ml4_index_kw", "ml4_query_scale_nope_m4096", "ml4_swiglu_i3072"] {
+            assert!(inventory.contains(&(name.to_owned(), PackedRows)), "{name}");
+        }
+        for name in ["ml4_absorb_m4096", "ml4_sparse_mla_nope_prefill_m4096", "ml4_index_topk_prefill_m4096"] {
+            assert!(inventory.contains(&(name.to_owned(), SequenceLocal)), "{name}");
+        }
+        assert!(!inventory.iter().any(|(n, _)| n.ends_with("_m64") || n.starts_with("glm_")));
+        assert!(coordinator_inventory(&cfg, ["ml4_new_stage_m4096"], false).is_err());
+        Ok(())
+    }
 
     #[test]
     fn native_owner_dispatch_cap_preserves_smaller_program_caps() {
@@ -280,7 +335,7 @@ mod tests {
             "glm_index_topk_prefill_m4096", "glm_stage_swiglu_i2048",
             "glm2_ffn_i1024_bf16_m4096", "glm2_stage_query_rope_context_m4096",
             "glm_sparse_mla_decode_m64"];
-        let inventory = coordinator_inventory(names, true)?;
+        let inventory = coordinator_inventory(&glm_cfg(), names, true)?;
         for name in ["glm_norm", "glm_router_scores", "glm_expert_input_quant",
             "glm_ffn_i2048_m4096", "glm_ffn_i12288_pt_m4096", "glm_stage_swiglu_i2048",
             "glm2_ffn_i1024_bf16_m4096"] {
@@ -289,8 +344,8 @@ mod tests {
         assert!(inventory.contains(&("glm_producer_m4096".into(), SequenceLocal)));
         assert!(inventory.contains(&("glm2_stage_query_rope_context_m4096".into(), SequenceLocal)));
         assert!(!inventory.iter().any(|(n, _)| n.ends_with("_m64")));
-        assert!(coordinator_inventory(["glm_new_projection_m4096"], false).is_err());
-        assert!(coordinator_inventory(["glm_stage_new_transform_m4096"], false).is_err());
+        assert!(coordinator_inventory(&glm_cfg(), ["glm_new_projection_m4096"], false).is_err());
+        assert!(coordinator_inventory(&glm_cfg(), ["glm_stage_new_transform_m4096"], false).is_err());
         let limits = Limits { rows: 64, chunk_rows: 4096, max_context: 4096, taps: None };
         let chunks = [(0, 29), (0, 200), (100, 40), (0, 24)];
         assert_eq!(prefill_packing::groups(4, |r| prefill_packing::plan(&chunks[r], &limits).is_ok()),

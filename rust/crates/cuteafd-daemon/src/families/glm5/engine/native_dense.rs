@@ -550,8 +550,12 @@ impl<'a> GlmEngine<'a> {
         self.core_linear(rank, w, layer, "gate", w.x.buffer, gate, rows, None)?;
         self.core_linear(rank, w, layer, "up", w.x.buffer, up, rows, None)?;
         let intermediate = layer.core["gate"].shape[0];
-        let prefix = if layer.split { "glm2" } else { "glm" };
-        self.run_on(rank, &format!("{prefix}_stage_swiglu_i{intermediate}"), &[("gate", gate.ptr),
+        let name = match self.cfg.variant.ml4() {
+            // Mistral Large 4's format-neutral SwiGLU (whole and two-GPU widths).
+            Some(_) => format!("ml4_swiglu_i{intermediate}"),
+            None => format!("{}_stage_swiglu_i{intermediate}", if layer.split { "glm2" } else { "glm" }),
+        };
+        self.run_on(rank, &name, &[("gate", gate.ptr),
             ("up", up.ptr), ("hidden", hidden.ptr)], &[Scalar::I32(rows as i32)])?;
         self.core_linear(rank, w, layer, "down", hidden, out, rows,
             w.core_rows.as_ref().map(|rows| rows[1].buffer))

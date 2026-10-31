@@ -164,6 +164,9 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         assert_eq!(report.prefill_waves, Some(3), "{ranks}+{gpus}");
         let rtx = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count();
         assert_eq!(rtx, gpus);
+        // No head-split programs: whole attention, one GPU's heads or two GPUs' layer owners.
+        assert_eq!(report.attention_placement, if gpus == 2 { crate::placement::AttentionPlacement::Layers }
+            else { crate::placement::AttentionPlacement::Heads }, "{ranks}+{gpus}");
         let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
         for group in ["attention", "indexer", "embedding", "lm_head"] {
             assert!(groups.iter().any(|g| g.contains(group)), "{ranks}+{gpus}: no {group} in {groups:?}");

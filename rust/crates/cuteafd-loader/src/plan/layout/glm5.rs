@@ -14,6 +14,14 @@ const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    if let Ok(cfg) = GlmDsaConfig::from_hf(&checkpoint.config) {
+        let gpus = options.rtx_bytes.len().clamp(1, 2);
+        let resolved = crate::placement::families::glm5::resolve_attention(&cfg, report.requested_attention, gpus);
+        if resolved != report.requested_attention {
+            report.requested_attention = resolved;
+            report.attention_placement = resolved.unwrap_or(report.attention_placement);
+        }
+    }
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let layers = report.requested_attention == Some(crate::placement::AttentionPlacement::Layers);
     let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
@@ -366,8 +374,8 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
         let mut selected = m.clone();
-        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
-            split_family: (devices.len() == 2).then_some("glm2") };
+        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: cfg.program_family(),
+            split_family: if devices.len() == 2 { cfg.split_program_family() } else { None } };
         cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
             |name| family.contains(name))?;
         Ok(selected)

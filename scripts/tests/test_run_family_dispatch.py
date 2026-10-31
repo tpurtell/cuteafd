@@ -945,7 +945,7 @@ if family == "mimo_v2":
     report["prefill_lanes"] = 3
 gpus = int(value("--rtx", "1"))
 placement_ready = report.get("placement_supported", True) and report.get("fits", True)
-shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4"}
+shared = family in {"step5", "kimi_k3", "glm5", "glm5_flash", "deepseek_v4", "qwen4", "mistral_large4"}
 # The planner's fixed depth (prefill_waves::depth): three units with Sparks.
 waves = int(value("--prefill-waves", "0")) or (1 if not shared or ranks == 0 else 3)
 if family == "mimo_v2":
@@ -1559,6 +1559,28 @@ def test_glm53_units_span_forwards_the_planned_units_waves_and_span(tmp_path, ex
     assert "--prefill-slots" not in serve
     assert (f"Resolved prefill: PREFILL_ROWS={unit} PREFILL_WAVES={waves} "
             f"PREFILL_SPAN_ROWS={span}") in result.stdout
+
+
+@pytest.mark.parametrize("gpus", [1, 2])
+def test_mistral_large4_serves_on_the_glm_engine_without_a_drafter(tmp_path, gpus):
+    config = {"architectures": ["MistralLarge4ForConditionalGeneration"], "model_type": "mistral_large4",
+              "text_config": {"model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
+    result = _family_launch_result(tmp_path, config, "test/ml4",
+                                   f"RTX_GPUS={gpus}\nVISION=off\nAUDIO=off\n")
+    assert result.returncode == 0, result.stderr
+    plan = next(shlex.split(line) for line in result.stderr.splitlines()
+                if "cuteafd plan" in line and "--deployment" in line)
+    assert plan[plan.index("--attention-placement") + 1] == "auto"
+    serve = next(shlex.split(line) for line in result.stderr.splitlines()
+                 if "docker run -d" in line and "serve-glm" in line)
+    assert "--draft" not in serve and "dflash2" not in " ".join(serve)
+    assert ("--split-device" in serve) == (gpus == 2)
+    for flag in ("--prefill-rows", "--prefill-waves", "--prefill-span-rows"):
+        assert serve.count(flag) == 1
+    refused = _family_launch_result(tmp_path / "spec", config, "test/ml4", "SPECULATOR=dflash2\nVISION=off\nAUDIO=off\n")
+    assert refused.returncode != 0 and "without a drafter" in refused.stderr
+    refused = _family_launch_result(tmp_path / "ctx", config, "test/ml4", "ATTENTION_PLACEMENT=context\nVISION=off\nAUDIO=off\n")
+    assert refused.returncode != 0 and "whole attention" in refused.stderr
 
 
 def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):

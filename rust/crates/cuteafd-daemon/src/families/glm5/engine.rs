@@ -693,7 +693,8 @@ impl<'a> GlmEngine<'a> {
             RankDevice { device, stream }], 4 * self.prefill_lanes.max(1),
             rows * self.cfg.hidden * (self.tp2_exchange.element_bytes() + core_bytes))?;
         let peer = exchange.on(1, || -> Result<GlmPeer<'a>> {
-            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm", split_family: Some("glm2") };
+            let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
+                split_family: self.cfg.split_program_family() };
             self.programs.load_matching(|name| selected.contains(name))?;
             let (kv, index, cos_sin) = caches(self.library, &self.cfg, &layers, self.local_pages(), self.max_context,
                 self.weights.rope_alpha.as_deref())?;
@@ -765,6 +766,11 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
+    /// `stem` in this variant's program namespace (`glm_norm`, `ml4_norm`).
+    fn family_program(&self, stem: &str) -> String {
+        format!("{}_{stem}", self.cfg.program_family())
+    }
+
     /// Launches `name` on rank `rank`'s stream.
     fn run_on(&self, rank: usize, name: &str, pointers: &[(&str, *mut c_void)], scalars: &[Scalar]) -> Result<()> {
         let names: Vec<&str> = pointers.iter().map(|(n, _)| *n).collect();
@@ -782,7 +788,7 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn norm_full(&self, rank: usize, w: &Workspace<'_>, weight: *mut c_void, deltas: i32, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
-        self.run_on(rank, "glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
+        self.run_on(rank, &self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", first), ("delta1", second),
             ("weight", weight), ("out", w.x.buffer.ptr)], &[rows, Scalar::I32(deltas)])
     }
 
@@ -831,6 +837,10 @@ impl<'a> GlmEngine<'a> {
 
     /// Program scratch of a step (`decode`: the m64 programs).
     fn step_scratch(&self, decode: bool) -> Result<usize> {
+        if !self.cfg.variant.is_glm() {
+            return Ok(cuteafd_loader::placement::families::glm5::step_scratch(&self.cfg, false, decode,
+                |name| self.scratch(name).ok().map(|n| n as u64))?.programs as usize);
+        }
         let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
         let mut scratch = 0usize;
         let split = self.weights.layers.first().is_some_and(|l| l.split);
@@ -879,7 +889,7 @@ impl<'a> GlmEngine<'a> {
         let native_head = matches!(self.weights.head, super::weights::GlmHead::K6(_));
         let head_workspace = cuteafd_loader::placement::families::glm5::head_workspace_bytes(lead, native_head)
             .map(|bytes| self.alloc(bytes as usize).map(Buf::owned)).transpose()?;
-        let topk = self.alloc(self.scratch(&format!("glm_index_topk_{mode}_{cap}"))?)?;
+        let topk = self.alloc(self.scratch(&format!("{}_index_topk_{mode}_{cap}", self.cfg.program_family()))?)?;
         self.library.cuda_zero_bytes(topk.buffer, topk.buffer.bytes)?;
         Ok(SharedStep {
             scratch: Buf::owned(self.alloc(scratch)?),
@@ -1328,7 +1338,7 @@ impl<'a> GlmEngine<'a> {
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
                     self.peer_ffn(index, 0, w1, rows, cap, bytes)?;
                 }
-                None => self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                None => self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?,
             }
@@ -1368,7 +1378,7 @@ impl<'a> GlmEngine<'a> {
                 else { self.ffn_norm(0, index, 0, w, layer, weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -1639,7 +1649,7 @@ impl<'a> GlmEngine<'a> {
                     }
                     _ => {
                         let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
-                        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                             ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                             &[rows, Scalar::I32(deltas)])?;
                     }
@@ -1663,7 +1673,7 @@ impl<'a> GlmEngine<'a> {
                     self.projection_norm(0, index, 0, w, layer, "o", layer.ptr("post_norm")?, rows,
                         w.delta.buffer.ptr, self.recv(0, attended)?)?;
                 } else {
-                    self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                    self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                         ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                         &[rows, Scalar::I32(1)])?;
                 }
@@ -1907,7 +1917,7 @@ impl<'a> GlmEngine<'a> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let rows = Scalar::I32(t as i32);
         let ml4 = self.cfg.variant.ml4().is_some();
-        self.run_on(rank, if ml4 { "ml4_router_scores" } else { "glm_router_scores" }, &[("x", w.x.buffer.ptr),
+        self.run_on(rank, &self.family_program("router_scores"), &[("x", w.x.buffer.ptr),
             ("w", layer.ptr("gate")?), ("logits", w.router_logits.buffer.ptr)], &[rows])?;
         if ml4 {
             // Softmax top-k over FP32 logits, renormalized, times the routed scale
@@ -1928,7 +1938,7 @@ impl<'a> GlmEngine<'a> {
         }
         if self.spark_bf16 && !self.tp2.as_ref().is_some_and(|p| p.uses_fp8_input()) { return Ok(()); }
         let grid = self.quantize_grid.blocks(t, h);
-        self.run_on(rank, "glm_expert_input_quant", &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
+        self.run_on(rank, &self.family_program("expert_input_quant"), &[("source_ptr", w.x.buffer.ptr), ("values_ptr", w.wire.buffer.ptr),
             // SAFETY: the scale rows follow the payload inside each wire row.
             ("scale_rows_ptr", unsafe { w.wire.buffer.ptr.cast::<u8>().add(h) }.cast()),
             ("scale_mma_ptr", w.delta.buffer.ptr)], &[rows, Scalar::I32(grid as i32)])
@@ -2265,7 +2275,7 @@ impl<'a> GlmEngine<'a> {
                 self.peer_ffn(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
                     rows, cap, bytes_of_unit(unit))?;
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -2302,7 +2312,7 @@ impl<'a> GlmEngine<'a> {
                 else { self.ffn_norm(0, index, slot, w, &layers[index], weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
             } else {
-                self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+                self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
                     ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
                     &[rows, Scalar::I32(1)])?;
             }
@@ -2382,7 +2392,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn norm(&self, w: &Workspace<'_>, layer: &GlmLayer<'_>, weight: &str, deltas: i32, rows: Scalar) -> Result<()> {
-        self.run("glm_norm", &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
+        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
             ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr(weight)?), ("out", w.x.buffer.ptr)],
             &[rows, Scalar::I32(deltas)])
     }

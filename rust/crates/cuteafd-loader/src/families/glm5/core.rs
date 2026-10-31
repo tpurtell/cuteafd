@@ -182,7 +182,13 @@ impl CoreRankLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreCharges { pub ranks: Vec<CoreRankLayout>, pub programs: Vec<String> }
+pub struct CoreCharges {
+    pub ranks: Vec<CoreRankLayout>,
+    pub programs: Vec<String>,
+    /// The variant's own program namespace (`ml4`) when it has one beside the
+    /// neutral policies; GLM selects `glm`/`glm_stage` (None).
+    pub family: Option<&'static str>,
+}
 impl CoreCharges {
     pub fn from_package(cfg: &GlmDsaConfig, core: &CoreInventory, layers: usize,
         ranks: usize, owners: Option<&[u8]>, unit: usize, slots: usize,
@@ -283,7 +289,8 @@ impl CoreCharges {
                 body, target_head, draft_head,
             });
         }
-        let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
+        let result = Self { ranks: layouts, programs: programs.into_iter().collect(),
+            family: (!cfg.variant.is_glm()).then(|| cfg.program_family()) };
         result.bytes(cfg.hidden)?;
         Ok(result)
     }
@@ -293,7 +300,10 @@ impl CoreCharges {
     /// Native GLM explicitly selects its BF16 stages. Add only the neutral
     /// policies actually selected by the checkpoint, not every Kimi export.
     pub fn program_set(&self, manifest: &serde_json::Value, split: bool) -> crate::placement::ProgramSet {
-        let mut set = super::DensePrograms::Trellis.program_set(manifest, split);
+        let mut set = match self.family {
+            Some(family) => crate::placement::ProgramSet::from_manifest(manifest, &[family]),
+            None => super::DensePrograms::Trellis.program_set(manifest, split),
+        };
         set.names.extend(self.programs.iter().cloned());
         set.names.sort(); set.names.dedup();
         set

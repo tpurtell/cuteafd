@@ -1632,6 +1632,20 @@ read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
+# The checkpoint's own family names its deployment plan; Mistral Large 4 runs
+# the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant,
+# with whole attention on each GPU (two GPUs: layer owners, resolved by plan and
+# server from auto) and no drafter until its bundled dSpark is ported.
+checkpoint_family="$family"
+if [[ "$family" == mistral_large4 ]]; then
+  family=glm5
+  [[ -n "${cfg[SPECULATOR]+set}" ]] || cfg[SPECULATOR]=off
+  [[ "$(get SPECULATOR off)" == off ]] || release_die "Mistral Large 4 serves without a drafter for now (SPECULATOR=off)"
+  case "$(get ATTENTION_PLACEMENT auto)" in
+    auto|layers|heads) ;;
+    *) release_die "Mistral Large 4 runs whole attention: ATTENTION_PLACEMENT auto, layers (two GPUs) or heads (one GPU)" ;;
+  esac
+fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
@@ -2769,7 +2783,7 @@ audio_encoder_hash=""
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
-  release_validate_deployment "$plan_json" "$family"
+  release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()
   ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"
   release_admit_coordinator_gpus "$(IFS=,; printf '%s' "${coordinator_uuids[*]}")" "$plan_json" \

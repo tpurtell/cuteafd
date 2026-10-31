@@ -223,6 +223,24 @@ impl GlmDsaConfig {
     }
 
     /// The head's tanh soft cap, if any.
+    /// The plan family descriptor this checkpoint is admitted under.
+    pub fn family_id(&self) -> &'static str {
+        if self.variant.is_glm() { "glm5" } else { "mistral_large4" }
+    }
+
+    /// The coordinator program namespace of this variant's own exports
+    /// (`glm_*`, or `ml4_*` from `export_b12x_dsv4_aot --geometry ml4`).
+    pub fn program_family(&self) -> &'static str {
+        if self.variant.is_glm() { "glm" } else { "ml4" }
+    }
+
+    /// The namespace of a head split's share programs (`glm2_*`); a variant
+    /// without them runs whole attention on each GPU (heads on one GPU,
+    /// whole-layer owners on two).
+    pub fn split_program_family(&self) -> Option<&'static str> {
+        self.variant.is_glm().then_some("glm2")
+    }
+
     pub fn logit_softcap(&self) -> Option<f64> {
         self.variant.ml4().map(|cfg| cfg.logit_softcap)
     }

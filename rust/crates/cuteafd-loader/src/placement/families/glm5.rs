@@ -134,6 +134,19 @@ pub fn context_workspace_bytes(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u6
 pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
     lookup: impl Fn(&str) -> Option<u64>) -> anyhow::Result<GlmScratch> {
     let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
+    if !cfg.variant.is_glm() {
+        // Whole attention through the variant's stage programs (K6 core only):
+        // the sparse MLA of both record kinds is the only scratch owner.
+        let family = cfg.program_family();
+        let mut programs = 0;
+        for tag in ["", "_nope"] {
+            let name = format!("{family}_sparse_mla{tag}_{mode}_{cap}");
+            programs = programs.max(lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))?);
+        }
+        let name = format!("{family}_index_topk_{mode}_{cap}");
+        return Ok(GlmScratch { programs,
+            topk: lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))? });
+    }
     let prefix = if split { "glm2" } else { "glm" };
     let divisor = if split { 2 } else { 1 };
     let (moe, dense) = (cfg.moe_intermediate / divisor, cfg.dense_intermediate / divisor);
@@ -408,17 +421,22 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
             Demand::new(0, Category::Drafter, "drafter owned storage", inputs.drafter_bytes, Basis::Formula)], 0)
             .movable(gpus)?]
     };
+    let groups = colocate_groups(cfg, inputs.layers);
+    let head_split = cfg.split_program_family().is_some();
     let layers = (0..inputs.layers).map(|layer| LayerDemand {
         kind: AttentionClass::Dsa,
         weights: ModeBytes::default(),
         kv_unit: {
-            let unit = PAGE_ROWS * 656 + if cfg.indexers[layer] == GlmIndexer::Full { 8448 } else { 0 };
+            // The layer's own latent record (GLM 5.x 656 B; Mistral Large 4
+            // 656/528, none on a layer reading another's latent) plus its index keys.
+            let latent = if cfg.owns_kv(layer) { cfg.record_bytes(layer) as u64 } else { 0 };
+            let unit = PAGE_ROWS * latent + if cfg.indexers[layer] == GlmIndexer::Full { 8448 } else { 0 };
             KvDemand { unit_bytes_whole: unit, unit_bytes_split: [unit; 2],
                 unit_bytes_context: Some([unit.div_ceil(2), unit / 2]) }
         },
         fixed_bytes: ModeBytes::default(), extra: Vec::new(),
         context_indexer: cfg.indexers[layer] == GlmIndexer::Full,
-        colocate: Some(cfg.index_source(layer) as u16),
+        colocate: Some(groups[layer]),
         // Preserve routed identity even without local kernels: Spark-free and
         // explicit local requests must fail, not turn these into dense layers.
         experts: if inputs.skip_routed_experts { None } else {
@@ -426,6 +444,8 @@ pub fn request(inputs: &GlmInputs<'_>) -> Result<PlacementRequest, PlacementErro
                 whole: Bytes2::default(), half: [Bytes2::default(); 2], tp2: false, spark_ok: true }))
         },
         modes: match (gpus, inputs.context) {
+            // Whole-attention variants: the layers request adds the owner modes.
+            (2, _) if !head_split => Vec::new(),
             (2, Some(_)) => vec![LayerMode::HeadSplit, LayerMode::ContextSplit],
             (2, None) => vec![LayerMode::HeadSplit],
             _ => vec![LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }],
@@ -488,7 +508,27 @@ pub fn attention_owners(cfg: &GlmDsaConfig, layers: usize) -> Result<Vec<u8>, Pl
         return Err(PlacementError::Inventory("GLM attention owner layer extent"));
     }
     super::super::attention::alternating_owners(
-        (0..layers).map(|layer| (true, Some(cfg.index_source(layer) as u16))), 0)
+        colocate_groups(cfg, layers).into_iter().map(|group| (true, Some(group))), 0)
+}
+
+/// The colocation group of each layer: a layer joins the full indexer layer
+/// whose top-k it reuses and (Mistral Large 4) the layer whose latent KV pages
+/// it reads. Groups are the least layer of their union; GLM's are exactly its
+/// index sources.
+pub fn colocate_groups(cfg: &GlmDsaConfig, layers: usize) -> Vec<u16> {
+    let mut parent: Vec<usize> = (0..layers).collect();
+    fn root(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x { parent[x] = parent[parent[x]]; x = parent[x]; }
+        x
+    }
+    for layer in 0..layers {
+        for other in [cfg.index_source(layer), cfg.kv_source(layer)] {
+            if other >= layers { continue; }
+            let (a, b) = (root(&mut parent, layer), root(&mut parent, other));
+            parent[a.max(b)] = a.min(b);
+        }
+    }
+    (0..layers).map(|layer| root(&mut parent, layer) as u16).collect()
 }
 
 /// Storage allocated for the selected Spark suffix, rather than configured peers.
@@ -497,6 +537,17 @@ pub struct GlmWorkingSet {
     pub spark: SparkWorkingSet,
     /// Family-local TP2 payload/backend costs for this selected branch.
     pub tp2_workspace: [u64; 2],
+}
+
+/// The attention placement a request resolves to before admission: the
+/// request, except that auto on two GPUs for a variant without head-split
+/// programs (Mistral Large 4) means whole-layer owners. GLM is unchanged
+/// (auto stays auto; the solver picks context on two GPUs).
+pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize)
+    -> Option<AttentionPlacement> {
+    if requested.is_none() && gpus == 2 && cfg.split_program_family().is_none() {
+        Some(AttentionPlacement::Layers)
+    } else { requested }
 }
 
 /// Evaluate each executable local prefix with its own intake, lane and TP2 costs.
@@ -509,8 +560,13 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
     // run it: fail closed with what to rebuild rather than silently
     // downgrading the executor to heads (issue #202). Explicit heads is
     // unaffected.
-    let context_chosen = attention.map_or(inputs.gpus.len() == 2,
+    let context_chosen = attention.map_or(inputs.gpus.len() == 2 && inputs.cfg.split_program_family().is_some(),
         |mode| mode == AttentionPlacement::Context);
+    if inputs.cfg.split_program_family().is_none() && inputs.gpus.len() == 2
+        && attention != Some(AttentionPlacement::Layers) {
+        return Err(PlacementError::Inventory("this checkpoint's two-GPU attention runs whole-layer owners \
+            (attention placement layers or auto)"));
+    }
     if context_chosen && inputs.context.is_none() {
         return Err(PlacementError::MissingContextPrograms { family: "glm5", programs: context_program_list() });
     }
@@ -2096,6 +2152,52 @@ mod tests {
         let mut context = r;
         context.attention_placement = Some(AttentionPlacement::Context);
         assert!(matches!(solve(&context), Err(PlacementError::UnsupportedMode { .. })));
+    }
+
+    #[test]
+    fn colocation_groups_are_glm_index_sources_and_join_mistral_latent_readers() {
+        let cfg = config();
+        assert_eq!(colocate_groups(&cfg, cfg.layers),
+            (0..cfg.layers).map(|layer| cfg.index_source(layer) as u16).collect::<Vec<_>>());
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let groups = colocate_groups(&ml4, ml4.layers);
+        // Layer 35 owns the latent that 39, 43, ..., 71 read; their indexer groups join it.
+        for layer in (39..72).step_by(4) {
+            assert_eq!(ml4.kv_source(layer), 35);
+            assert_eq!(groups[layer], groups[35], "layer {layer}");
+            assert_eq!(groups[layer], groups[ml4.index_source(layer)]);
+        }
+        let owners = attention_owners(&ml4, ml4.layers).unwrap();
+        assert!(owners.contains(&0) && owners.contains(&1));
+        for layer in 0..ml4.layers {
+            assert_eq!(owners[layer], owners[ml4.kv_source(layer)]);
+            assert_eq!(owners[layer], owners[ml4.index_source(layer)]);
+        }
+    }
+
+    #[test]
+    fn mistral_large4_charges_per_layer_records_and_runs_whole_attention() {
+        let cfg = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        let mut i = inputs(&cfg, &[96 * GIB; 2]);
+        i.spark_ranks = 6;
+        i.prefill_lanes = 2;
+        let req = request(&i).unwrap();
+        let units: u64 = req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum();
+        let geometry = crate::serving_capacity::mistral_large4_cache_geometry(cfg.variant.ml4().unwrap(), 1).unwrap();
+        assert_eq!(units, geometry.ranks[0].persistent_unit_bytes);
+        assert!(req.layers.iter().all(|l| l.modes.is_empty()), "no head split on two GPUs");
+        assert_eq!(resolve_attention(&cfg, None, 2), Some(AttentionPlacement::Layers));
+        assert_eq!(resolve_attention(&cfg, None, 1), None);
+        assert_eq!(resolve_attention(&config(), None, 2), None);
+        assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_err());
+        let (placed, _) = solve_working_set(&i, [0; 2], resolve_attention(&cfg, None, 2)).unwrap();
+        let owners = attention_owners(&cfg, cfg.layers).unwrap();
+        for (layer, assignment) in placed.layers.iter().enumerate() {
+            assert_eq!(assignment.mode, LayerMode::Whole { gpu: owners[layer], ffn: FfnMode::Split });
+        }
+        let one = inputs(&cfg, &[96 * GIB]);
+        let (placed, _) = solve_working_set(&one, [0; 2], None).unwrap();
+        assert!(placed.layers.iter().all(|l| matches!(l.mode, LayerMode::Whole { gpu: 0, .. })));
     }
 
     #[test]

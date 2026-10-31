@@ -29,6 +29,7 @@ CASES = [
     ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
     ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
+    ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45'),
 ]
 
 
@@ -247,6 +248,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
+    ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45', 'ml4:exl3-k45', 'ml4=6', '', {}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
         coordinator, spark, counts, roles, extra):
@@ -409,3 +411,27 @@ def test_kimi_builds_always_package_k6_programs(tmp_path):
     assert '"kimik3,dense_trellis_k6,kimi_split"' in table
     for exporter in ['export_b12x_dense_trellis_k6_aot.py', 'export_b12x_kimi_split_aot.py']:
         assert exporter in table
+
+
+@pytest.mark.parametrize('glm,kimi', [(False, False), (True, False), (False, True)])
+def test_ml4_exports_its_programs_and_k6_shapes_beside_other_families(tmp_path, glm, kimi):
+    cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
+    (tmp_path / 'CMakeLists.txt').write_text('\n'.join([
+        'cmake_minimum_required(VERSION 3.18)', 'project(ml4_scope NONE)',
+        'set(CUTEAFD_CUDA_ARCHITECTURES 120)', 'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)',
+        'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")', 'set(CUTEAFD_ENABLE_ML4_AOT ON)',
+        f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
+        f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
+        'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
+        'file(WRITE "${CMAKE_BINARY_DIR}/args.txt" "${CUTEAFD_DSV4_EXPORT_ARGS}")',
+    ]))
+    build = tmp_path / 'build'
+    result = subprocess.run(['cmake', '-S', str(tmp_path), '-B', str(build)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (build / 'args.txt').read_text().split(';')
+    geometries = args[args.index('--geometry') + 1].split(',')
+    assert geometries.count('ml4') == 1 and geometries.count('dense_trellis_k6') == 1
+    families = args[args.index('--dense-trellis-families') + 1].split(',')
+    assert families[-1] == 'ml4' and ('glm' in families) == glm and ('kimik3' in families) == kimi
+    assert ('glm_stage' in geometries) == glm
