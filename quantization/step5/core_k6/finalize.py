@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Audit completed Step-5 pilot receipts, then retire only recoverable payloads."""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+from pathlib import Path
+import shutil
+import sys
+
+REPO = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO / "quantization"))
+if __package__ in (None, ""):
+    __package__ = "step5.core_k6"
+
+from .pilot import (ARMS, CHECKS, LAYERS, LATE_LAYER, modules,
+    producer_modules, validate_producer_proof, validate_qualification, validate_report_code)
+from kimi_k3.uniform_k2.storage import atomic_json, canonical, sha256_file, verify_receipt
+
+
+def latest_event(values, kind, **fields):
+    """Read the last successful observation; retries retain their prior log rows."""
+    selected = [r for r in values if r.get("event") == kind and all(r.get(k) == v for k,v in fields.items())]
+    if not selected:
+        raise ValueError(f"missing measured {kind} event: {fields}")
+    return selected[-1]
+
+
+def audit_producer_probe(root, proof, identity, calibration):
+    """Check assembled transaction receipts and independently compare output bytes."""
+    from safetensors.torch import load_file
+    import torch
+    from .recipe import reviewed_modules, packed_specs
+    from kimi_k3.uniform_k2.storage import read_header
+    root = Path(root).resolve()
+    validate_producer_proof(proof, identity)
+    if [(r["id"],r["tokens"]) for r in proof["records"]] != [(r["id"],len(r["input_ids"])) for r in calibration[:3]]:
+        raise ValueError("producer probe used different calibration prompts")
+    verified = {}
+    def path(relative):
+        result = root / relative
+        if result.is_symlink() or not result.resolve().is_relative_to(root):
+            raise ValueError("producer-probe receipt path escapes the pilot")
+        return result
+    def receipt(relative, value):
+        result = path(relative)
+        verify_receipt(result, value, checksum=True)
+        verified[relative] = value["sha256"]
+        return result
+    def document(relative, digest):
+        result = path(relative)
+        if sha256_file(result) != digest:
+            raise ValueError("producer-probe evidence digest differs")
+        verified[relative] = digest
+        return json.loads(result.read_text())
+    shard = receipt(proof["shard_path"], proof["shard_receipt"])
+    if document(proof["export_receipt_path"], proof["export_receipt_sha256"]) != proof["shard_receipt"]:
+        raise ValueError("producer-probe export receipt differs")
+    if proof["shard_receipt"].get("identity") != identity or proof["shard_receipt"].get("layer") != 0:
+        raise ValueError("producer-probe shard identity differs")
+    header, _ = read_header(shard)
+    selection = reviewed_modules()
+    for name in producer_modules():
+        item = proof["modules"][name]
+        geometry = selection[name]
+        if item["bits"] != 6 or item["logical_shape"] != [geometry["out_features"],geometry["in_features"]]:
+            raise ValueError("producer-probe module geometry differs")
+        for key,(dtype,shape) in packed_specs(name,geometry).items():
+            if key not in header or (header[key]["dtype"],header[key]["shape"]) != (dtype,shape):
+                raise ValueError("producer-probe assembled projection geometry differs")
+        observed = document(item["evidence_path"], item["evidence_sha256"])
+        metrics, evidence = observed.get("metrics", {}), observed.get("evidence", {})
+        if (observed.get("module") != name or observed.get("bits") != 6
+                or observed.get("logical_shape") != item["logical_shape"]
+                or evidence.get("hessian_rows") != proof["tokens"] or evidence.get("identity_rows") != 0
+                or metrics.get("hessian_sample_count") != proof["tokens"]
+                or metrics.get("quantizer_path") != "hessian_ldlq" or metrics.get("hessian_metric_status") != "ok"):
+            raise ValueError("producer-probe calibrated projection evidence differs")
+    frontier = document(proof["frontier_path"],proof["frontier_sha256"])
+    if (frontier.get("identity") != identity or frontier.get("layer") != 0
+            or frontier.get("manifest", {}).get("identity") != identity
+            or frontier["manifest"].get("layer") != 0 or len(frontier["manifest"].get("batches", [])) != 3):
+        raise ValueError("producer-probe frontier commitment differs")
+    for record, entry in zip(proof["records"],frontier["manifest"]["batches"],strict=True):
+        if entry != record["output_receipt"] or (entry.get("id"),entry.get("tokens")) != (record["id"],record["tokens"]):
+            raise ValueError("producer-probe output receipt differs from frontier")
+        output = load_file(str(receipt(record["output_path"],record["output_receipt"])))
+        reference = load_file(str(receipt(record["reference_path"],record["reference_receipt"])))
+        if (set(output) != set(reference) or "hidden" not in output
+                or any(not torch.equal(output[key],reference[key]) for key in output)):
+            raise ValueError("producer-probe committed and independent native output bytes differ")
+    run_root = root / "producer-probe/run"
+    if ((run_root / "frontier/layer--01").exists()
+            or any((run_root / "layers/000/stages").rglob("*"))
+            or any((run_root / "layers/000/projections").glob("*.safetensors"))
+            or (run_root / "layers/000/routes").exists()):
+        raise ValueError("producer probe retained obsolete recovery payloads")
+    events_path = run_root / "events.jsonl"
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    verified[str(events_path.relative_to(root))] = sha256_file(events_path)
+    for phase in ("a","c","d","e","f"):
+        latest_event(events,"phase_committed",phase=phase)
+    for name in producer_modules():
+        latest_event(events,"projection_committed",module=name,bits=6,hessian_rows=proof["tokens"])
+    latest_event(events,"layer_committed",layer=0,payload_bytes=proof["shard_receipt"]["payload_bytes"])
+    return verified
+
+
+def audit_evidence(root, report=None):
+    """CPU-only independent checks; no quantization, replay or policy migration."""
+    from safetensors import safe_open
+    root = Path(root).resolve()
+    report = json.loads((root / "qualification.json").read_text()) if report is None else report
+    validate_report_code(validate_qualification(report))
+    identity = report["identity"]
+    if json.loads((root / "plan.json").read_text()) != identity:
+        raise ValueError("pilot qualification differs from captured plan")
+    result = json.loads((root / "results.json").read_text())
+    if result != dict(identity=identity, results=report["results"]):
+        raise ValueError("pilot result observations differ from qualification")
+    source, tokens = Path(identity["source"]), Path(identity["tokens"])
+    for filename, key in (("config.json", "source_config_sha256"),
+                          ("model.safetensors.index.json", "source_index_sha256")):
+        if sha256_file(source / filename) != identity[key]:
+            raise ValueError("pilot source metadata changed after capture")
+    if sha256_file(tokens / "manifest.json") != identity["token_manifest_sha256"]:
+        raise ValueError("pilot corpus manifest changed after capture")
+    from step5.prepare_corpus import load_token_records
+    selected = {}
+    for split in ("calibration", "heldout"):
+        records = {r["id"]:r for r in load_token_records(tokens, split)}
+        selected[split] = [records[name] for name in identity[split + "_ids"]]
+        if (hashlib.sha256(canonical(selected[split]).encode()).hexdigest() != identity[split + "_sha256"]
+                or sum(len(r["input_ids"]) for r in selected[split]) != identity[split + "_tokens"]):
+            raise ValueError("pilot selected token observations changed after capture")
+    maximum = max(len(r["input_ids"]) for records in selected.values() for r in records)
+    if (identity.get("maximum_pilot_prompt_tokens") != maximum
+            or report["sparse_scope"]["maximum_pilot_prompt_tokens"] != maximum):
+        raise ValueError("pilot context scope differs from the actual selected token rows")
+    verified = {name: sha256_file(root / name) for name in ("plan.json", "results.json", "mtp-proof.json")}
+    def receipt(path, value):
+        path = Path(path)
+        verify_receipt(path, value, checksum=True)
+        verified[str(path.relative_to(root))] = value["sha256"]
+    def events(directory):
+        path = directory / "events.jsonl"
+        verified[str(path.relative_to(root))] = sha256_file(path)
+        return [json.loads(line) for line in path.read_text().splitlines()]
+    def one(values, kind, **fields):
+        return latest_event(values, kind, **fields)
+    def sparse_metadata(event):
+        meta = event.get("sparse_metadata")
+        if (not isinstance(meta, dict) or meta.get("tokens") != event["tokens"]
+                or meta.get("topk") != 512 or meta.get("region_size") != 8
+                or not 0 < meta.get("maximum_selected_regions", 0) <= 513
+                or meta.get("maximum_available_regions", 0) < meta["maximum_selected_regions"]
+                or not isinstance(meta.get("pruned_query_rows"), int) or meta["pruned_query_rows"] < 0
+                or meta.get("sparse_pruning_exercised") is not (meta["pruned_query_rows"] > 0)
+                or any(len(meta.get(name, "")) != 64 for name in ("metadata_sha256", "region_counts_sha256", "query_positions_sha256"))):
+            raise ValueError("Step-5 native sparse metadata proof is missing or inconsistent")
+        expected = event["tokens"] > 4104
+        if meta["sparse_pruning_exercised"] is not expected:
+            raise ValueError("Step-5 observed pruning differs from the actual prompt scope")
+    measured = events(root)
+    candidate_count, hessian_count = 0, 0
+    for row in report["results"]:
+        event = one(measured, "pilot_result", tensor=row["tensor"], arm=row["arm"])
+        if any(event.get(key) != value for key,value in row.items()):
+            raise ValueError("pilot score and measured event differ")
+        if row["arm"] == "bf16":
+            continue
+        path = root / "candidates" / (row["tensor"] + "." + row["arm"] + ".safetensors")
+        item = json.loads(path.with_suffix(".json").read_text())
+        if item["identity"] != identity:
+            raise ValueError("pilot candidate identity differs")
+        receipt(path, item["receipt"])
+        with safe_open(str(path), framework="pt", device="cpu") as reader:
+            import math
+            widths = {"I16":2, "I32":4, "F16":2, "BF16":2, "F32":4, "U8":1}
+            size = sum(math.prod(reader.get_slice(key).get_shape()) * widths[reader.get_slice(key).get_dtype()]
+                       for key in reader.keys())
+            if size != row["payload_bytes"]:
+                raise ValueError("pilot candidate byte accounting differs")
+        candidate_count += 1
+    for split in ("calibration", "heldout"):
+        ev = events(root / split)
+        for layer in range(8):
+            one(ev, "layer_committed", layer=layer)
+            if not any(r.get("event") == "native_boundary_exact" and r.get("layer") == layer for r in ev):
+                raise ValueError("pilot native boundary event missing")
+            if split == "calibration" and layer in (3, 7):
+                sparse_metadata(one(ev, "native_boundary_exact", layer=layer, row_id=identity["long_context_witness"]))
+        one(ev, "late_expert_witness", source_layer=88, input_layer=7, expert=0,
+            tokens=identity[split + "_tokens"], actual_layer88_calibration=False)
+        for layer in (*LAYERS, LATE_LAYER):
+            path = root / split / "hessians" / f"layer-{layer}.json"
+            manifest = json.loads(path.read_text())
+            verified[str(path.relative_to(root))] = sha256_file(path)
+            if manifest["identity"] != identity or set(manifest["files"]) != set(modules(layer)):
+                raise ValueError("pilot Hessian inventory/identity differs")
+            for name,value in manifest["files"].items():
+                path = root / split / "hessians" / (name + ".safetensors")
+                receipt(path, value)
+                with safe_open(str(path), framework="pt", device="cpu") as reader:
+                    if (set(reader.keys()) != {"H", "count"}
+                            or int(reader.get_tensor("count")) != identity[split + "_tokens"]
+                            or reader.get_slice("H").get_dtype() != "F32"):
+                        raise ValueError("pilot Hessian observations differ")
+                hessian_count += 1
+            if layer == LATE_LAYER:
+                continue
+            manifest = json.loads((root / split / "proof-inputs" / f"layer-{layer}.json").read_text())
+            if manifest["identity"] != identity or not manifest["entries"]:
+                raise ValueError("pilot native proof inputs missing")
+            records = selected[split]
+            expected_rows = {records[0]["id"]: records[0]}
+            expected_rows.update({r["id"]:r for r in records if r["id"] == identity["long_context_witness"]})
+            if {item["row_id"] for item in manifest["entries"]} != set(expected_rows):
+                raise ValueError("pilot native proof row inventory differs")
+            for item in manifest["entries"]:
+                if item["tokens"] != len(expected_rows[item["row_id"]]["input_ids"]):
+                    raise ValueError("pilot native proof row length differs")
+                receipt(root / split / item["file"], item["receipt"])
+                one(ev, "native_boundary_exact", layer=layer, row_id=item["row_id"], tokens=item["tokens"])
+                if split == "calibration":
+                    event = one(measured, "serialized_boundary_exact", layer=layer,
+                        row_id=item["row_id"], tokens=item["tokens"])
+                    if layer == 7 and item["row_id"] == identity["long_context_witness"]:
+                        sparse_metadata(event)
+    mtp = json.loads((root / "mtp-proof.json").read_text())
+    if (mtp != report["mtp"] or mtp.get("prefix_layers") != 8
+            or mtp.get("final_target_frontier") is not False or len(mtp.get("stages", [])) != 3
+            or mtp.get("source_row") != selected["calibration"][0]["id"]
+            or mtp.get("tokens") != len(selected["calibration"][0]["input_ids"])):
+        raise ValueError("pilot MTP proof identity/scope differs")
+    for stage, item in enumerate(mtp["stages"]):
+        rows = mtp["tokens"] - stage - 1
+        if (item.get("stage") != stage or item.get("layer") != stage + 92 or item.get("origin") != stage + 1
+                or item.get("shifted_pairs") != rows or item.get("byte_exact") is not True
+                or item.get("serialized_k4_byte_exact") is not True or item.get("final_target_frontier") is not False):
+            raise ValueError("pilot MTP teacher-stage contract differs")
+        evidence, metrics = item["projection_evidence"], item["projection_metrics"]
+        if (evidence.get("bits") != 4 or evidence.get("identity_rows") != 0
+                or evidence.get("hessian_rows") != rows or metrics.get("hessian_sample_count") != rows
+                or metrics.get("quantizer_path") != "hessian_ldlq" or metrics.get("hessian_metric_status") != "ok"):
+            raise ValueError("pilot MTP calibrated projection evidence differs")
+        one(measured, "mtp_boundary_exact", stage=stage, layer=92 + stage, origin=stage + 1, shifted_pairs=rows)
+        receipt(root / "candidates" / f"mtp-stage{stage}-eh-k4.safetensors", item["projection_receipt"])
+        sidecar = root / "candidates" / f"mtp-stage{stage}-eh-k4.json"
+        candidate = json.loads(sidecar.read_text())
+        if (candidate["identity"] != identity or candidate["stage"] != stage or candidate["rows"] != rows
+                or candidate["receipt"] != item["projection_receipt"]
+                or candidate["metrics"] != metrics or candidate["evidence"] != evidence):
+            raise ValueError("pilot MTP candidate recovery receipt differs")
+        verified[str(sidecar.relative_to(root))] = sha256_file(sidecar)
+        candidate_count += 1
+    producer_path = root / "producer-proof.json"
+    producer = json.loads(producer_path.read_text())
+    if producer != report.get("producer"):
+        raise ValueError("pilot producer proof differs from qualification")
+    verified["producer-proof.json"] = sha256_file(producer_path)
+    verified.update(audit_producer_probe(root,producer,identity,selected["calibration"]))
+    one(measured,"production_layer_transaction_exact",layer=0,modules=7,prompts=3,tokens=producer["tokens"],
+        initial_frontier_retired=True,stages_retired=True,projection_payloads_retired=True)
+    audit = dict(status="passed", identity=identity, native_checks=dict.fromkeys(CHECKS, True),
+        sparse_scope=report["sparse_scope"],
+        verified_files=verified, candidate_payloads=candidate_count, hessians=hessian_count,
+        metric_rows=len(report["results"]), finalization="CPU-only-receipt-and-event-audit-no-numerical-rerun",
+        producer_projection_count=7, producer_prompt_count=3,
+        time=datetime.now(timezone.utc).isoformat())
+    atomic_json(root / "finalization-audit.json", audit)
+    return audit
+
+
+def retire_intermediates(root):
+    root = Path(root).resolve()
+    audit = json.loads((root / "finalization-audit.json").read_text())
+    report = validate_report_code(validate_qualification(json.loads((root / "qualification.json").read_text())))
+    if audit.get("status") != "passed" or audit["identity"] != report["identity"]:
+        raise ValueError("pilot recovery retirement requires the final audited identity")
+    removed = []
+    for split in ("calibration", "heldout"):
+        for name in ("frontier", "proof-inputs"):
+            path = root / split / name
+            if path.is_symlink():
+                raise ValueError("refuse symlink pilot retirement")
+            if path.exists():
+                shutil.rmtree(path)
+                removed.append(str(path.relative_to(root)))
+    for path in (root / "candidates").glob("*.safetensors"):
+        if path.is_symlink():
+            raise ValueError("refuse symlink candidate retirement")
+        path.unlink()
+        removed.append(str(path.relative_to(root)))
+    for relative in ("producer-probe/run/frontier","producer-probe/reference"):
+        path = root / relative
+        if path.is_symlink():
+            raise ValueError("refuse symlink producer-probe retirement")
+        if path.exists():
+            shutil.rmtree(path)
+            removed.append(relative)
+    for path in (root / "producer-probe/export").glob("*.safetensors"):
+        if path.is_symlink():
+            raise ValueError("refuse symlink producer-probe export retirement")
+        path.unlink()
+        removed.append(str(path.relative_to(root)))
+    atomic_json(root / "recovery-retired.json", dict(status="passed", identity=report["identity"],
+        removed=removed, finalization_audit_sha256=sha256_file(root / "finalization-audit.json"),
+        time=datetime.now(timezone.utc).isoformat()))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--retire", action="store_true")
+    args = parser.parse_args(argv)
+    audit = audit_evidence(args.root)
+    if args.retire:
+        retire_intermediates(args.root)
+    print(json.dumps({key:value for key,value in audit.items() if key not in ("identity", "verified_files")}))
+
+
+if __name__ == "__main__":
+    main()
