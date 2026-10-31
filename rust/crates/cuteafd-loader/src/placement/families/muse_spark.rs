@@ -132,6 +132,12 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         fixed.push(Demand::new(gpu, Category::Prefix, "Muse exact sliding marks", marks * slots / ranks as u64,
             Basis::Formula));
     }
+    // The lane's activation planes at one prefill unit (the decode width is smaller).
+    let lane = crate::families::muse_spark::lane::LanePlanes::new(cfg, ranks, usize::try_from(prefill.unit_rows)?)?;
+    for gpu in 0..ranks {
+        fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse lane planes", lane.bytes()? as u64,
+            Basis::Exact));
+    }
     // One lane-private K6 scratch set per rank (serial projections; the head's on the head rank).
     let projections = crate::families::muse_spark::weight_layout::projections(cfg, core, ranks,
         usize::try_from(prefill.unit_rows)?)?;
