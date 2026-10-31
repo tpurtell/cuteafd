@@ -31,6 +31,9 @@ def copy_input(source, destination):
         cached = _ROOT / str(len(_TEMPLATES))
         shutil.copy(source, cached)
         _TEMPLATES[key] = cached
+    # A shared dependency may already have been staged before an explicit copy.
+    if destination.exists():
+        destination.unlink()
     destination.hardlink_to(_TEMPLATES[key])
     return str(destination)
 

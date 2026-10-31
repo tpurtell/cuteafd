@@ -502,3 +502,17 @@ def test_release_image_stages_the_shared_scope_inputs(tmp_path):
                    check=True, capture_output=True, text=True, timeout=30)
     for relative in json.loads((source / 'scripts/build/spark-package-ranges.json').read_text())['shared_inputs']:
         assert (destination / relative).read_bytes() == (REPO / relative).read_bytes()
+
+
+def test_shared_input_staging_can_precede_explicit_copy(tmp_path):
+    import launcher_sandbox
+    root = tmp_path / 'repo'
+    target = root / 'scripts/lib/release-common.sh'
+    target.parent.mkdir(parents=True)
+    launcher_sandbox.copy_input(REPO / 'scripts/lib/release-common.sh', target)
+    path = root / 'scripts/lib/checkpoint-family.py'
+    other = tmp_path / 'other.py'
+    other.hardlink_to(path)
+    launcher_sandbox.copy_input(REPO / 'scripts/lib/checkpoint-family.py', path)
+    assert path.read_bytes() == other.read_bytes() == (REPO / 'scripts/lib/checkpoint-family.py').read_bytes()
+    assert path.stat().st_ino == other.stat().st_ino
