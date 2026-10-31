@@ -8,6 +8,11 @@ checkpoint's dtype; an FP32 run of the same modules gives the BF16 floor, and
 the native tower passes when it is within that floor (the shared calibrated
 metrics). Marker rows of the span must equal tok_embeddings byte for byte.
 G3 repeats interleaved shapes on the native allocation ledger.
+
+Two halves, so a Spark container needs no Transformers: `--native-only
+--save-native DIR` encodes on the device (ledger, markers, G3) and saves each
+span; `--compare-native DIR` runs the official modules (CPU or CUDA) over the
+same fixtures and scores the saved spans.
 """
 from __future__ import annotations
 import argparse
@@ -165,7 +170,7 @@ def fixture(name):
     return gh, gw, np.ascontiguousarray(rgb)
 
 
-def reference(config, tensors, dtype):
+def reference(config, tensors, dtype, device="cuda"):
     """Official modules, loaded from consolidated names (HF's converter mapping)."""
     import torch
     from transformers.models.pixtral.configuration_pixtral import PixtralVisionConfig
@@ -193,12 +198,66 @@ def reference(config, tensors, dtype):
         "linear_2.weight": t("vision_language_adapter.w_out.weight")}, strict=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    return tower.cuda().to(dtype).eval(), projector.cuda().to(dtype).eval(), [Path(ml4.__file__)]
+    return tower.to(device, dtype).eval(), projector.to(device, dtype).eval(), [Path(ml4.__file__)]
+
+
+def official(models, name, dtype, lut, device):
+    import torch
+    tower, projector, _ = models[dtype]
+    gh, gw, rgb = fixture(name)
+    pixels = np.stack([lut[c, rgb[:, :, c]] for c in range(3)])[None]
+    sizes = torch.tensor([[gh * 14, gw * 14]], device=device)
+    with torch.inference_mode(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        hidden = tower(torch.from_numpy(pixels).to(device, dtype), image_sizes=sizes).last_hidden_state
+        return projector(hidden.squeeze(0), sizes).float().cpu().numpy()
+
+
+def score(native, models, name, lut, device):
+    import torch
+    gh, gw, _ = fixture(name)
+    uh, uw = gh // 2, gw // 2
+    images = (native.reshape(uh, uw + 1, LM)[:, :uw].reshape(uh * uw, LM).astype(np.uint32) << 16).view(np.float32)
+    bf16, fp32 = official(models, name, torch.bfloat16, lut, device), official(models, name, torch.float32, lut, device)
+    floor = common.metrics(bf16, fp32)
+    measured = common.calibrated_metrics(common.metrics(images, fp32), floor)
+    measured["vs_official_bf16"] = common.metrics(images, bf16)
+    return floor, measured
+
+
+def compare(args):
+    """Reference half: score spans saved by a device run (no native library)."""
+    import torch
+    import torch.nn.functional as F
+    config = json.loads((args.snapshot / "config.json").read_text())
+    tensors = read_tower(args.snapshot)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    models = {d: reference(config, tensors, d, device) for d in (torch.bfloat16, torch.float32)}
+    original = F.scaled_dot_product_attention
+    # Independent query blocks bound the official math path's score matrix.
+    def bounded(q, k, v, attn_mask=None, **kwargs):
+        if attn_mask is not None and not bool((attn_mask == 0).all()):
+            raise ValueError("one image per call: the block mask must be all-visible")
+        return torch.cat([original(q[:, :, start:start + 512], k, v, **kwargs)
+            for start in range(0, q.shape[-2], 512)], dim=-2)
+    F.scaled_dot_product_attention = bounded
+    lut = normalization_lut(args.snapshot)
+    saved = json.loads((args.compare_native / "native.json").read_text())
+    result = dict(saved, reference_device=device, g2={}, bf16_floor={},
+        modeling_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models[torch.float32][2]})
+    for name in args.grids:
+        native = np.load(args.compare_native / f"{name}.npy")
+        result["bf16_floor"][name], result["g2"][name] = score(native, models, name, lut, device)
+        print(json.dumps(dict(event="G2", grid=name, stages=result["g2"][name])), flush=True)
+    result["g2_pass"] = bool(result["g2"]) and all(m["pass"] for m in result["g2"].values())
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    return 0 if result["g2_pass"] else 1
 
 
 def run(args):
     import torch
     import torch.nn.functional as F
+    if args.compare_native:
+        return compare(args)
     config = json.loads((args.snapshot / "config.json").read_text())
     tensors = read_tower(args.snapshot)
     spec, blob, rows = pack_spec(config, tensors, args.snapshot)
@@ -253,15 +312,6 @@ def run(args):
                 gh, gw, output.ctypes.data, output.nbytes, OBSERVER(), None))
             return output, (time.perf_counter() - started) * 1000
 
-        def official(name, dtype):
-            tower, projector, _ = models[dtype]
-            gh, gw, rgb = fixture(name)
-            pixels = np.stack([lut[c, rgb[:, :, c]] for c in range(3)])[None]
-            sizes = torch.tensor([[gh * 14, gw * 14]], device="cuda")
-            with torch.inference_mode(), torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
-                hidden = tower(torch.from_numpy(pixels).cuda().to(dtype), image_sizes=sizes).last_hidden_state
-                return projector(hidden.squeeze(0), sizes).float().cpu().numpy()
-
         saved = {}
         for name in args.grids:
             encode(name)
@@ -273,12 +323,10 @@ def run(args):
             result["markers_exact"][name] = bool(np.array_equal(span[:-1, uw], np.broadcast_to(rows[0], (uh - 1, LM)))
                 and np.array_equal(span[-1, uw], rows[1]))
             if models:
-                images = (span[:, :uw].reshape(uh * uw, LM).astype(np.uint32) << 16).view(np.float32)
-                bf16, fp32 = official(name, torch.bfloat16), official(name, torch.float32)
-                floor = common.metrics(bf16, fp32)
-                result["bf16_floor"][name] = floor
-                result["g2"][name] = common.calibrated_metrics(common.metrics(images, fp32), floor)
-                result["g2"][name]["vs_official_bf16"] = common.metrics(images, bf16)
+                result["bf16_floor"][name], result["g2"][name] = score(native, models, name, lut, "cuda")
+            if args.save_native:
+                args.save_native.mkdir(parents=True, exist_ok=True)
+                np.save(args.save_native / f"{name}.npy", native)
             print(json.dumps(dict(event="G2", grid=name, markers=result["markers_exact"][name],
                 stages=result["g2"].get(name))), flush=True)
         initial, final = Ledger(), Ledger()
@@ -301,6 +349,9 @@ def run(args):
             g2_pass=bool(result["g2"]) and all(m["pass"] for m in result["g2"].values()),
             g3_pass=bool(result["g3"]) and all(result["g3"].values()))
         args.output.write_text(json.dumps(result, indent=2) + "\n")
+        if args.save_native:
+            (args.save_native / "native.json").write_text(json.dumps({k: v for k, v in result.items()
+                if k not in ("g2", "bf16_floor")}, indent=2) + "\n")
         print(json.dumps(result), flush=True)
         return 0 if (result["no_encode_device_allocation"] and result["g3_pass"] and result["markers_pass"]
                      and (result["g2_pass"] or args.native_only)) else 1
@@ -316,4 +367,6 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--grids", nargs="+", default=list(GRIDS), choices=list(GRIDS))
     parser.add_argument("--native-only", action="store_true")
+    parser.add_argument("--save-native", type=Path, help="device half: keep each encoded span here")
+    parser.add_argument("--compare-native", type=Path, help="reference half: score spans saved by --save-native")
     raise SystemExit(run(parser.parse_args()))
