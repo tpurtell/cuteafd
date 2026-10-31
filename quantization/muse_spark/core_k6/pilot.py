@@ -117,7 +117,7 @@ def stored_shapes():
         for name, g in reviewed_core_modules().items()}
 
 
-def make_plan(source, tokens):
+def make_plan(source, tokens, native_reference_root=None):
     from transformers import AutoTokenizer
     from muse_spark.prepare_corpus import CHAT_KWARGS
     summary = inventory(source)
@@ -133,6 +133,9 @@ def make_plan(source, tokens):
         Path(__file__).with_name("recipe.py"), REPO / "quantization/muse_spark/prepare_corpus.py",
         REPO / "quantization/kimi_k3/prepare_corpus.py", REPO / "quantization/kimi_k3/core_k6/pilot.py",
         REPO / "quantization/kimi_k3/uniform_k2/storage.py"]
+    paths += [Path(__file__).with_name("requalify.py")]
+    paths += [REPO / "third_party/gptqmodel/gptqmodel/utils" / name for name in
+              ("exl3_hessian.py",)]
     paths += list((REPO / "third_party/gptqmodel/gptqmodel/exllamav3").rglob("*.py"))
     paths += [p for p in (REPO / "third_party/gptqmodel/gptqmodel_ext/exllamav3").rglob("*") if p.is_file()]
     code = {str(p.relative_to(REPO)): sha256_file(p) for p in sorted(paths) if "__pycache__" not in p.parts}
@@ -149,7 +152,10 @@ def make_plan(source, tokens):
                 tokens=len(witness), use="native-sliding-window-proof-only-excluded-from-all-Hessians"),
         recipe=dict(seed=787, sigma_reg=.025, codebook="mcg", core_bits=6,
             native_reference=True, attention_gate="keep-BF16", head_bits=6,
-            expert_bits=4, absolute_k6_nmse_bound=LIMIT))
+            expert_bits=4, absolute_k6_nmse_bound=LIMIT, hessian_accumulation=codec.ACCUMULATION_CONTRACT))
+    if native_reference_root is not None:
+        from .requalify import native_origin
+        identity["native_reference_origin"] = native_origin(native_reference_root, identity, repo=REPO)
     return identity, records, summary
 
 
@@ -322,7 +328,8 @@ def hessian(root, layer, split, relative, identity):
     if manifest["identity"] != identity:
         raise ValueError("pilot Hessian producer differs")
     return dict(H=read_tensor(directory / (relative + ".safetensors"), identity)["H"],
-        count=manifest["counts"][relative], finalized=False, identity_rows=0)
+        count=manifest["counts"][relative], finalized=False, identity_rows=0,
+        accumulation_contract=codec.ACCUMULATION_CONTRACT)
 
 
 def raw_identity(raw):
@@ -461,7 +468,8 @@ def score(source, records, root, identity, current):
                 os.rename(path, path.with_name(path.name + ".incomplete-" + str(time.time_ns())))
             save_tensor(path, dict(H=H), identity)
             del accumulator, raw
-        head[split] = dict(H=H, count=count, finalized=False, identity_rows=0)
+        head[split] = dict(H=H, count=count, finalized=False, identity_rows=0,
+            accumulation_contract=codec.ACCUMULATION_CONTRACT)
         compact()
     weight = source.tensor("lm_head.weight")
     observation, dense = candidate(root, "lm_head", weight, head["calibration"], head["heldout"], 6,
@@ -486,6 +494,8 @@ def validate_report(value):
     if (identity.get("schema") != SCHEMA or identity.get("source_repo") != BASE_REPO
             or identity.get("source_revision") != BASE_REVISION):
         raise ValueError("pilot source/numerical identity absent")
+    if report.get("identity", {}).get("recipe", {}).get("hessian_accumulation") != codec.ACCUMULATION_CONTRACT:
+        raise ValueError("pilot must qualify the bounded K128 covariance producer")
     proofs = report.get("native_proofs", {})
     for key in (*map(str, LAYERS), "sliding_window"):
         if proofs.get(key, {}).get("status") != "passed" or proofs[key].get("byte_exact") is not True:
@@ -541,12 +551,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("source-snapshot", "tokens", "root", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--native-reference-root", type=Path)
     parser.add_argument("--preflight", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     args.root = args.root.expanduser().resolve()
     source = MuseSource(args.source_snapshot)
-    identity, records, summary = make_plan(source, args.tokens)
+    identity, records, summary = make_plan(source, args.tokens, args.native_reference_root)
     path = args.root / "identity.json"
     if path.exists() and json.loads(path.read_text()) != identity:
         raise ValueError("pilot immutable numerical producer/input identity differs; assess cached work before a new run")
@@ -574,7 +585,11 @@ def main():
         numerical.configure_math()
         torch.cuda.set_per_process_memory_fraction(86 * GIB / torch.cuda.get_device_properties(0).total_memory)
         try:
-            current = capture(source, records, args.root, identity)
+            if args.native_reference_root is None:
+                current = capture(source, records, args.root, identity)
+            else:
+                from .requalify import capture_from_native
+                current = capture_from_native(source, records, args.root, identity, args.native_reference_root)
             report = score(source, records, args.root, identity, current)
             # Preserve all numerical evidence even if the decision fails.
             atomic_json(args.root / "observations.json", report)

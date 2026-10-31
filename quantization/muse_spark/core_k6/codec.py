@@ -8,9 +8,10 @@ import types
 import torch
 
 FORK = Path(__file__).resolve().parents[3] / 'third_party/gptqmodel/gptqmodel'
+ACCUMULATION_CONTRACT = 'fp32-products-k128-fp64-sum-fp32-storage-v1'
 
 
-def _quantizer():
+def _namespaces():
     # These namespaces expose unmodified pinned implementation files. The top
     # level package initializer installs unrelated model/Transformers patches;
     # this isolated runner needs only the EXL3 codec and its JIT loader.
@@ -21,7 +22,21 @@ def _quantizer():
             package.__path__ = [str(path)]
             package.__file__ = str(path/'__init__.py')
             sys.modules[name] = package
+
+
+def _quantizer():
+    _namespaces()
     return importlib.import_module('gptqmodel.exllamav3.modules.quant.exl3_lib.quantize')
+
+
+def covariance_accumulator(width, device='cuda:0'):
+    # Preserve a single FP64 sum across the complete native observation stream.
+    # Each product uses at most 128 real rows; exported covariance stays FP32.
+    _namespaces()
+    from gptqmodel.utils.exl3_hessian import BoundedHessianAccumulator, HESSIAN_ACCUMULATION_CONTRACT
+    if HESSIAN_ACCUMULATION_CONTRACT != ACCUMULATION_CONTRACT:
+        raise ValueError('fork covariance contract differs')
+    return BoundedHessianAccumulator(width, device=device, max_rows=128)
 
 
 def validate_projection(packed, shape):
@@ -53,6 +68,8 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
             or raw_hessian.get('finalized') is not False or type(raw_hessian.get('count')) is not int
             or raw_hessian['count']<=0):
         raise ValueError('invalid projection or raw calibrated Hessian')
+    if raw_hessian.get('accumulation_contract') != ACCUMULATION_CONTRACT:
+        raise ValueError('Muse quantization requires verified K128 covariance capture')
     identity_rows=raw_hessian.get('identity_rows',0)
     if type(identity_rows) is not int or not 0<=identity_rows<=raw_hessian['count']:
         raise ValueError('invalid declared synthetic row count')
@@ -88,6 +105,7 @@ def quantize_projection(weight, raw_hessian, *, bits=6, seed=787, sigma=.025, de
     if evidence['bits']!=bits:
         raise ValueError('codec bitrate differs')
     evidence.update(hessian_rows=raw_hessian['count'],identity_rows=raw_hessian.get('identity_rows',0),
+        accumulation_contract=ACCUMULATION_CONTRACT,
         replay='serialized-exl3-fp16-scales-reconstructed-then-native-output-crop')
     return packed,metrics,evidence
 
@@ -101,18 +119,18 @@ def reconstruct_projection(packed, logical_shape, *, device='cuda:0',dtype=torch
 
 class DenseRawHessian:
     def __init__(self,width,device='cuda:0'):
-        self.H=torch.zeros((width,width),device=device,dtype=torch.float32)
-        self.count=0
+        self._state=covariance_accumulator(width,device)
+    @property
+    def H(self):
+        return self._state.snapshot()
+    @property
+    def count(self):
+        return self._state.count
     def add(self,x):
-        if x.ndim<2 or x.shape[-1]!=self.H.shape[0] or not x.is_floating_point():
-            raise ValueError("Hessian input width/dtype differs")
-        rows=x.reshape(-1,self.H.shape[0])
-        if not torch.isfinite(rows).all():
-            raise ValueError('nonfinite Hessian observations')
-        for chunk in rows.split(2048):
-            f=chunk.float();self.H.addmm_(f.T,f)
-        self.count+=len(rows)
+        self._state.add(x)
     def raw_dict(self,minimum_rows=1):
-        if self.count<minimum_rows or not torch.isfinite(self.H).all() or self.H.diagonal().sum()<=0:
+        H=self.H
+        if self.count<minimum_rows or H.diagonal().sum()<=0:
             raise ValueError('invalid or insufficient Hessian observations')
-        return dict(H=self.H,count=self.count,finalized=False,identity_rows=0)
+        return dict(H=H,count=self.count,finalized=False,identity_rows=0,
+            accumulation_contract=ACCUMULATION_CONTRACT)

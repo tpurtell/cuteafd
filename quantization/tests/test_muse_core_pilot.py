@@ -34,7 +34,8 @@ def report():
     proofs["sliding_window"] = dict(status="passed", byte_exact=True, tokens=2345,
         visible_tail_tokens=2048, hessian_rows=0)
     return dict(schema=pilot.SCHEMA, status="passed", identity=dict(schema=pilot.SCHEMA,
-        source_repo=pilot.BASE_REPO, source_revision=pilot.BASE_REVISION),
+        source_repo=pilot.BASE_REPO, source_revision=pilot.BASE_REVISION,
+        recipe=dict(hessian_accumulation=pilot.codec.ACCUMULATION_CONTRACT)),
         observations=rows, native_proofs=proofs, experts=experts,
         stored_shapes=pilot.stored_shapes(), attention_gate_decision="keep-BF16")
 
@@ -124,3 +125,32 @@ def test_receipt_rejects_corrupt_cache_and_preserves_incomplete(tmp_path):
     old = list(tmp_path.glob("partial.incomplete-*"))
     assert len(old) == 1 and (old[0] / "evidence").read_bytes() == b"keep me"
     assert not list(partial.iterdir())
+
+
+def test_legacy_covariance_report_cannot_qualify_bounded_production():
+    value=report()
+    del value['identity']['recipe']['hessian_accumulation']
+    with pytest.raises(ValueError,match='bounded K128'):
+        pilot.validate_report(value)
+
+
+def test_reloaded_head_covariance_keeps_current_numerical_contract(tmp_path,monkeypatch):
+    from types import SimpleNamespace
+    identity={'producer':'current'}
+    records={split:[{'input_ids':[1,2,3]}] for split in ('calibration','heldout')}
+    for split in records:
+        pilot.save_tensor(tmp_path/f'head-hessian-{split}.safetensors',{'H':torch.eye(8)},identity)
+    monkeypatch.setattr(pilot,'LAYERS',())
+    monkeypatch.setattr(pilot,'compact',lambda:None)
+    calls=[]
+    def candidate(root,name,weight,calibration,heldout,bits,identity,**kwargs):
+        assert name=='lm_head' and bits==6
+        for raw in (calibration,heldout):
+            assert raw['count']==3 and raw['finalized'] is False
+            assert raw['accumulation_contract']==pilot.codec.ACCUMULATION_CONTRACT
+        calls.append(name)
+        return {'name':name},weight
+    monkeypatch.setattr(pilot,'candidate',candidate)
+    source=SimpleNamespace(tensor=lambda name:torch.ones(8,8,dtype=torch.bfloat16))
+    result=pilot.score(source,records,tmp_path,identity,{'proofs':{},'directory':'unused'})
+    assert calls==['lm_head'] and result['observations']==[{'name':'lm_head'}]

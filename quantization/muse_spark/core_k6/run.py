@@ -33,7 +33,7 @@ GIB=1024**3
 PREFIX='model.language_model.'
 RECIPE=dict(codebook='mcg',multiplier='0xCBAC1FED',core_bits=6,head_bits=6,expert_bits=4,
     seed=787,sigma_reg=.025,out_scales='auto',capture='causal-all-native-prompt-rows-raw-FP32-XTX',
-    hessian='signed-block-hadamard-congruence-fp64-v1',core_identity_rows=0,
+    hessian='signed-block-hadamard-congruence-fp64-v1',hessian_accumulation=codec.ACCUMULATION_CONTRACT,core_identity_rows=0,
     cold_experts=dict(minimum=1024,ranks=[9,16],order='rank-major-then-corpus-row',
         floor='raw-XTX-missing-times-I-equivalent-to-normalized-2I'),
     replay='serialized-MCG-FP16-scales-reconstructed-BF16-official-Muse-block',
@@ -113,15 +113,17 @@ class Engine:
             if raw['count']!=self.tokens:raise ValueError('dense Hessian loses/duplicates native rows')
             entries.append(dict(filename='hessian.safetensors',kind='hessian',count=self.tokens,
                 **commit_safetensors(stages.directory(phase)/'hessian.safetensors',dict(H=raw['H']))))
-        result=stages.commit(phase,entries,dict(tokens=self.tokens,batches=len(self.records)))
+        result=stages.commit(phase,entries,dict(tokens=self.tokens,batches=len(self.records),
+            hessian_accumulation=codec.ACCUMULATION_CONTRACT))
         self.progress.emit('phase_committed',phase=phase)
         return result
     def raw(self,stages,phase):
         manifest=stages.load(phase)
         entries=[] if manifest is None else [e for e in manifest['entries'] if e.get('kind')=='hessian']
-        if len(entries)!=1 or entries[0]['count']!=self.tokens:raise ValueError('raw Hessian unavailable or stale')
+        if (len(entries)!=1 or entries[0]['count']!=self.tokens
+                or manifest['metadata'].get('hessian_accumulation')!=codec.ACCUMULATION_CONTRACT):raise ValueError('raw Hessian unavailable or stale')
         return dict(H=load_tensors(stages.directory(phase)/entries[0]['filename'])['H'],
-            count=self.tokens,finalized=False,identity_rows=0)
+            count=self.tokens,finalized=False,identity_rows=0,accumulation_contract=codec.ACCUMULATION_CONTRACT)
     def group(self,block,layer,checkpoints,names,stages,phase):
         prefix=f'{PREFIX}layers.{layer}.'
         for relative in names:
@@ -287,6 +289,8 @@ def code_identity():
     paths+=list((REPO/'third_party/gptqmodel/gptqmodel_ext/exllamav3').rglob('*'))
     paths+=[REPO/'third_party/gptqmodel/gptqmodel/utils'/n for n in ('cpp.py','env.py','logger.py','jit_compile_baselines.py')]
     paths+=[REPO/'third_party/gptqmodel/gptqmodel/extension.py']
+    paths+=[REPO/'third_party/gptqmodel/gptqmodel/utils'/n for n in
+        ('exl3_hessian.py',)]
     paths=[p for p in paths if p.is_file() and '__pycache__' not in p.parts]
     return {str(p.relative_to(REPO)):sha256_file(p) for p in sorted(paths)}
 
@@ -306,7 +310,7 @@ def make_plan(source,tokens,root,export):
     for relative,digest in qualification['identity']['code'].items():
         if sha256_file(REPO/relative)!=digest:
             raise ValueError('pilot numerical source changed: '+relative)
-    identity=dict(schema='cuteafd-muse-spark-k4-core-k6-production-v1',source_repo=BASE_REPO,
+    identity=dict(schema='cuteafd-muse-spark-k4-core-k6-production-k128-v2',source_repo=BASE_REPO,
         source_revision=BASE_REVISION,qualification_sha256=sha256_file(qualification_path),source_config_sha256=sha256_file(source.snapshot/'config.json'),
         source_index_sha256=sha256_file(source.snapshot/'model.safetensors.index.json'),
         token_manifest_sha256=sha256_file(tokens/'manifest.json'),recipe=RECIPE,

@@ -6273,15 +6273,35 @@ blindly delete cached work or resume across changed numerical identities.
 The independent completed-export reload and native-byte audit precedes upload
 to `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6`.
 
-The short pilot finished successfully at 2026-10-31 17:07 UTC (about
-16.6 minutes including admission). All four native/staged proofs pass,
-including the long sliding-window cutoff. Worst selected K6 heldout NMSE
-is 0.000294125 (last-layer pre-expert projection); its K5 arm is 0.00109192,
-which supports retaining K6. Padded-head K6 NMSE is 0.0000478371. Worst
-sampled K4 expert NMSE is 0.00542748, below the 0.01 bar. The accepted
-recipe is unchanged. Report: `~/Developer/muse-spark-core-quant.md`; full
-per-module errors: `muse-quant-work/per-module-error.csv`. Issue #940 and
-draft PR #939 track continuation. Full production with authorized automatic
-CPU publication launched under `muse-quant-1793466485064710216`; numerical
-producer inputs remain frozen. Native/checkpoint artifact validation still
-precedes publication; engine serving qualification is separate.
+The original pilot completed native/staged byte proofs, but its covariance
+producer is superseded. Production attempt `muse-quant-1793466485064710216`
+stopped at layer 1 expert 2 on a Cholesky numerical failure, not OOM. Independent
+FP64 oracles show the original long FP32 covariance product error is 7.97e-6;
+the represented regularized matrix itself is indefinite, so a factorization
+retry or more damping would conceal an inaccurate input. All 785 old quantized
+commitments and their dependent activation stream remain preserved for diagnosis
+and will not seed the clean producer. Source weights, tokens and byte-verified
+original BF16 teacher states are reusable.
+
+Products bounded to 128 real rows pass expert oracles but a full 1,248,980-row
+dense stream still has 1.785e-6 error from the FP32 outer sum. The candidate
+uses unchanged bounded FP32 products with a persistent FP64 outer sum and FP32
+stored covariance. It must clear the unchanged 1e-6 matrix-oracle bar on the
+failed expert, two busy experts and the full dense stream, then a fresh short
+pilot before clean production. Native activation GEMM shapes, row order,
+calibration corpus, damping, Hadamard and packed quantizer are unchanged.
+The GPTQModel helper `05689b25ffc8b27401a4291ab2b8a71c43a83151` is
+published on fork main and pinned here. All 20 independent CPU oracle/boundary
+checks pass. Target GPU witnesses pass all four cases with relative errors
+2.85e-8 (failed expert 2, 1,690 rows), 2.71e-8 (expert 0, 22,028 rows),
+2.67e-8 (expert 56, 152,454 rows) and 3.08e-8 (full dense 1,248,980 rows).
+All four unchanged factorizations pass with the original 0.025 damping.
+Evidence: `muse-quant-work/numerical-1793466485064710216/accurate-sum-witness/`.
+Fresh short pilot and clean production are next; no upload has occurred.
+
+Final CPU continuation now includes publication, supported native SparkNest
+streamed placement directly to six Sparks, verification, and removal of only
+the task-owned local final-weight links. It creates no extra full checkpoint
+on raptor. Source weights, shared stores, receipts and forensic evidence stay.
+Targeted terminal-flow tests pass 54 CPU cases. Issue #940 and draft PR #939
+track continuation; full-model serving qualification remains separate.

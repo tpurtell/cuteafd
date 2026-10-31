@@ -83,6 +83,7 @@ def fixture(tmp_path, monkeypatch):
     real_hessian = run.codec.DenseRawHessian
 
     class Codec:
+        ACCUMULATION_CONTRACT = run.codec.ACCUMULATION_CONTRACT
         @staticmethod
         def DenseRawHessian(width):
             return real_hessian(128, device="cpu")

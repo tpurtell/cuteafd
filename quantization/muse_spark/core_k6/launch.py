@@ -44,7 +44,7 @@ def supervise(path):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    for name in ('source-snapshot','tokens','root','export','output','qualification-report','source-audit'):
+    for name in ('source-snapshot','tokens','root','export','output','qualification-report','source-audit','native-reference-root'):
         parser.add_argument('--'+name,type=Path)
     for name in ('pilot','resume','publish','publish-only'):parser.add_argument('--'+name,action='store_true')
     parser.add_argument('--supervise',type=Path,help=argparse.SUPPRESS)
@@ -64,6 +64,9 @@ def main():
     common=[]
     for name in required:common+=['--'+name.replace('_','-'),str(getattr(args,name).expanduser().resolve())]
     if args.resume:common+=['--resume']
+    if args.native_reference_root:
+        if not args.pilot:parser.error('native reference reuse is pilot-only')
+        common+=['--native-reference-root',str(args.native_reference_root.expanduser().resolve())]
     python=str(REPO/'.venv/bin/python');here=Path(__file__).resolve().parent
     stamp=str(time.time_ns());container='muse-quant-'+stamp;unit=container
     audit=args.source_audit or root.parent/'source-audit.json'
