@@ -1,7 +1,11 @@
 //! One coordinator rank's lane planes: every activation a layer step reads or
-//! writes, at the lane's row capacity, as one exact extent the planner charges
-//! and the device allocates (plan == runtime). Prefill units in flight share
-//! the lane; the Spark return planes are charged separately (`prefill_return_bytes`).
+//! writes, as one exact extent the planner charges and the device allocates
+//! (plan == runtime). Planes live for one hook at the unit's rows, except the
+//! ones a unit carries across hooks while other units are in flight (the
+//! residual stream, the attention residual, the routes and the expert wire the
+//! transport reads after `send`): those are sized at the span (`waves` units)
+//! and each in-flight unit uses its slot's rows (`PrefillHooks`: anything a
+//! hook leaves for a later hook lives in the unit's slot).
 //!
 //! Head-split TP2: q/k/v, attention output and gate hold this rank's heads; the
 //! residual stream and everything outside attention is whole on each GPU.
@@ -13,16 +17,26 @@ use std::collections::BTreeMap;
 /// are deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LanePlanes {
+    /// One unit's rows.
     pub rows: usize,
+    /// Units in flight: span planes hold `waves * rows` rows.
+    pub waves: usize,
     pub planes: BTreeMap<&'static str, usize>,
 }
 
 pub const ALIGN: usize = 256;
 
 impl LanePlanes {
-    /// `rows`: the lane's capacity (one prefill unit, or the decode/verify width).
+    /// `rows`: one unit's capacity; `waves`: units in flight (span = `rows * waves`).
     pub fn new(cfg: &MuseSparkConfig, ranks: usize, rows: usize) -> Result<Self> {
-        ensure!(matches!(ranks, 1 | 2) && (1..=4096).contains(&rows), "Muse lane geometry");
+        Self::with_waves(cfg, ranks, rows, 1)
+    }
+
+    /// Planes carried across hooks, sized at the span.
+    pub const SPAN: [&'static str; 5] = ["hidden", "residual", "route_ids", "route_weights", "expert_wire"];
+
+    pub fn with_waves(cfg: &MuseSparkConfig, ranks: usize, rows: usize, waves: usize) -> Result<Self> {
+        ensure!(matches!(ranks, 1 | 2) && (1..=4096).contains(&rows) && (1..=4).contains(&waves), "Muse lane geometry");
         let (h, e, d) = (cfg.hidden, cfg.expert_hidden, cfg.head_dim);
         let (q, kv) = (cfg.heads * d / ranks, cfg.kv_heads * d / ranks);
         let k = cfg.topk;
@@ -48,7 +62,11 @@ impl LanePlanes {
             // The TP2 o_proj F32 partial lands from the peer.
             planes.insert("o_peer", f32(h));
         }
-        let lane = Self { rows, planes };
+        for name in Self::SPAN {
+            let unit = planes[name];
+            planes.insert(name, unit.checked_mul(waves).context("Muse span plane overflow")?);
+        }
+        let lane = Self { rows, waves, planes };
         lane.bytes()?;
         Ok(lane)
     }
@@ -89,6 +107,11 @@ mod tests {
         let end = offsets.values().map(|(at, n)| at + n).max().unwrap();
         assert!(end <= pair.bytes()?);
         assert!(LanePlanes::new(&cfg, 3, 64).is_err() && LanePlanes::new(&cfg, 1, 4097).is_err());
+        // Three waves: span planes triple, per-hook planes stay one unit.
+        let span = LanePlanes::with_waves(&cfg, 2, 2752, 3)?;
+        assert_eq!(span.planes["hidden"], 3 * pair.planes["hidden"]);
+        assert_eq!(span.planes["expert_wire"], 3 * pair.planes["expert_wire"]);
+        assert_eq!(span.planes["q"], pair.planes["q"]);
         Ok(())
     }
 }

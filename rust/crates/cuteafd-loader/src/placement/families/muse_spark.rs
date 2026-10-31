@@ -148,7 +148,8 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         }
     }
     // The lane's activation planes at one prefill unit (the decode width is smaller).
-    let lane = crate::families::muse_spark::lane::LanePlanes::new(cfg, ranks, usize::try_from(prefill.unit_rows)?)?;
+    let lane = crate::families::muse_spark::lane::LanePlanes::with_waves(cfg, ranks,
+        usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?)?;
     for gpu in 0..ranks {
         fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse lane planes", lane.bytes()? as u64,
             Basis::Exact));
