@@ -1090,4 +1090,8 @@ pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>
     }
     fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
     fs::write(dir.join("consolidated.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+    // The release's Mistral-format params.json: its mtp block describes the bundled drafter.
+    fs::write(dir.join("params.json"), json!({"softmax_tanh_gating": 30.0, "mtp": {"n_layers": 3, "depth": 3,
+        "ragged_attention": "2048,2048,2048", "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+        "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}}}).to_string()).unwrap();
 }

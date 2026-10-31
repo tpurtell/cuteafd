@@ -548,7 +548,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         let geometry = resource::geometry_with_grouping(&homes, engine.cfg.experts, engine.cfg.topk, DECODE_ROWS,
             d.cfg.drafts(), resource::COPY_EXTENSION, |layer, rows| engine.draft_group_rows(layer, rows, &remote))?;
         engine.arm_draft_probe()?;
-        SharedPolicy::with_geometry(geometry, resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
+        let prior = if d.token_only() { resource::Prior::History }
+            else { resource::Prior::Selector(d.selector_fit("glm5", false)?) };
+        SharedPolicy::with_geometry(geometry, prior, draft_seed())
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
@@ -980,7 +982,14 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     };
     phases[0] += timer.elapsed().as_secs_f64();
     let timer = Instant::now();
-    let mut priors: Vec<_> = active.iter().zip(&drafted).map(|(a, draft)| match (&shared, draft) {
+    let token_only = engine.drafter.as_ref().is_some_and(|d| d.token_only());
+    let mut priors: Vec<_> = active.iter().enumerate().zip(&drafted).map(|((i, a), draft)| match (&shared, draft) {
+        // A token-only drafter (mtp_dspark) is judged by the pooled request history.
+        (Some(shared), Some(d)) if token_only => {
+            let pooled = a.drafts.pooled(d.tokens.len(), active.iter().enumerate()
+                .filter(|&(other, _)| other != i).map(|(_, other)| &other.drafts));
+            shared.prior(&a.drafts, &resource::DraftEvidence::History(&pooled), 0)
+        }
         (Some(shared), Some(d)) => shared.prior(&a.drafts,
             &resource::DraftEvidence::Selector(&d.features), 0),
         _ => Vec::new(),

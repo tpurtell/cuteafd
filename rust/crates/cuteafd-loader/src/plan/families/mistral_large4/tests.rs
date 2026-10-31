@@ -178,3 +178,21 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         assert!(memory.notes.iter().any(|n| n.contains("no calibrated Spark EXL3 scratch for mistral_large4")));
     }
 }
+
+
+#[test]
+fn bundled_drafter_is_admitted_on_the_glm_layout() {
+    let dir = snapshot(true, None);
+    // The planner's GLM drafter admission reads the release's own params.json mtp
+    // block (never the GLM DFlash2 snapshot).
+    let layout = crate::placement::families::glm5::ml4_draft_layout(dir.path(), 20, 16, 1 << 20, 188).unwrap();
+    let bytes = layout.resident_bytes().unwrap();
+    // BF16 weights (3 dense MLA layers + target projection + the 204800 x 512 Markov tables) and arenas.
+    assert!(bytes > 4 << 30 && bytes < 8 << 30, "{bytes}");
+    assert_eq!((layout.capacity().block_rows, layout.target_taps()), (48, &[1, 18, 36, 54, 71][..]));
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = layout_options(6, 1);
+    options.layout.as_mut().unwrap().glm5_drafter_disabled = false;
+    let report = input.plan(&options).unwrap();
+    assert!(!report.hints.iter().any(|h| h.what.contains("drafter config unavailable")), "{:?}", report.hints);
+}

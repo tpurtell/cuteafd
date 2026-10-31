@@ -75,7 +75,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         if core.projections.is_empty() { return Ok(None); }
         let owners = layers.then(|| crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)).transpose()?;
-        let (_, _, _, draft_rows) = drafter_admission(options)?;
+        let (_, _, _, draft_rows) = drafter_admission(options, checkpoint)?;
         anyhow::ensure!(options.glm5_drafter_disabled || draft_rows.is_some(),
             "native K6 drafter head needs its actual DFlash config, not a bytes-only override");
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
@@ -338,10 +338,24 @@ fn failure_hint(mode: crate::placement::AttentionPlacement) -> String {
     }
 }
 
-fn drafter_admission(options: &LayoutOptions) -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>)> {
+fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
+    -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>)> {
     use crate::placement::families::glm5 as glm;
     Ok(if options.glm5_drafter_disabled { (0, 0, None, None) }
         else if options.drafter_bytes > 0 { (options.drafter_bytes, 0, None, None) }
+        else if checkpoint.model_type() == Some("mistral_large4") {
+            // The bundled mtp_dspark: its own immutable layout, drafting its whole block.
+            let sequences = usize::try_from(options.glm_draft_sequences())?;
+            let slots = crate::families::glm5::draft_representation::serving_draft_context_slots(
+                sequences, usize::try_from(options.resolved_concurrency("mistral_large4"))?,
+                options.draft_context_slots.map(usize::try_from).transpose()?);
+            let context = if options.context_tokens == 0 { 1 << 20 } else { usize::try_from(options.context_tokens)? };
+            let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+                "sm_120", options.rtx_bytes[0]).sms) as usize;
+            let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context, sms)?;
+            let block = layout.capacity().block_rows / sequences;
+            (layout.resident_bytes()?, layout.weights().max_load_staging, Some(block), Some(layout.capacity().block_rows))
+        }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
@@ -374,7 +388,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
-    let (draft, draft_staging, active_drafts, _) = drafter_admission(options)?;
+    let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
@@ -440,7 +454,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
-    let (draft, draft_staging, active_drafts, _) = drafter_admission(options)?;
+    let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();

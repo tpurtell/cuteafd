@@ -1077,6 +1077,10 @@ fn check_checkpoint_headers(cfg: &DflashConfig, tensors: &HashMap<String, Safete
 impl<'a> DflashDrafter<'a> {
     /// The keyed selector prior (`family/dflash2/numerics`), or the generic
     /// GLM-5.3 fit when the drafter ships none for this key.
+    /// Drafts carry no per-token evidence (mtp_dspark's Markov head): the
+    /// draft policy uses the pooled request-history prior.
+    pub fn token_only(&self) -> bool { matches!(self.head_ops, DraftHeadOps::RnnMarkov { .. }) }
+
     pub fn selector_fit(&self, family: &str, fp8_head: bool) -> Result<crate::shared::draft_confidence::SelectorFit> {
         crate::shared::draft_confidence::SelectorFit::load(&self.confidence_directory,
             &self.confidence_key(family, fp8_head))

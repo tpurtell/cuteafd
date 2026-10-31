@@ -702,6 +702,23 @@ pub fn drafter_bytes(snapshot: &std::path::Path, slots: usize, sequences: usize,
 }
 
 /// Largest transient BF16 source retained while packing one draft projection.
+/// Mistral Large 4's bundled mtp_dspark on the shared MLA block-draft path: its
+/// immutable runtime layout from the checkpoint's own params.json and text
+/// config (every draft layer windowed, so the target pool does not size it).
+pub fn ml4_draft_layout(snapshot: &std::path::Path, slots: usize, sequences: usize, compiled_context: usize,
+    sms: usize) -> anyhow::Result<crate::formats::dflash::MlaDraftRuntimeLayout> {
+    use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+    use crate::families::mistral_large4::{dspark::Ml4DsparkConfig, Ml4Config};
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let target = Ml4Config::from_hf(&config)?;
+    let params = crate::plan::checkpoint::read_json(&snapshot.join("params.json"))?;
+    let dspark = Ml4DsparkConfig::from_params(&params, target.layers)?;
+    let draft = crate::formats::dflash::MlaDflashConfig::ml4(&dspark, &target)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, dspark.depth)?;
+    Ok(draft.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, compiled_context, compiled_context, sms, 0,
+        cuteafd_core::MlaCacheFormat::Fp8)?)
+}
+
 pub fn drafter_staging(snapshot: &std::path::Path, slots: usize, sequences: usize,
     bf16: bool) -> anyhow::Result<u64> {
     use crate::families::glm5::draft_representation::{draft_geometry, GlmDraftCapacity,

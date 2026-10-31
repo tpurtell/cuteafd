@@ -86,6 +86,10 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on the coordinator GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
+    /// Mistral Large 4: draft with the checkpoint's bundled mtp_dspark (params.json
+    /// mtp; mtp_dspark.* tensors) on the shared MLA block-draft path.
+    #[arg(long, conflicts_with = "draft")]
+    pub dspark: bool,
     /// Maximum members of one draft batch, independent of context slots.
     #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_DRAFT_SEQUENCES)]
     pub draft_sequences: usize,
@@ -703,6 +707,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             && args.exlr8_prefill_activations == Exlr8PrefillActivations::A16,
             "EXLR8 options require a native EXLR8 checkpoint");
     }
+    if args.dspark {
+        ensure!(cfg.variant.ml4().is_some(), "--dspark drafts with Mistral Large 4's bundled mtp_dspark");
+        dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?;
+    }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
         if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?; }
@@ -736,8 +744,14 @@ impl Opened {
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
         }
+        // The bundled mtp_dspark drafts its whole block (anchor-as-first).
+        let ml4_draft = args.dspark.then(|| cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
+            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, args.max_context,
+            self.library.sm_count()? as usize)).transpose()?;
+        let draft_width = provisional_drafter.as_ref().map(|cfg| cfg.drafts())
+            .or(ml4_draft.as_ref().map(|layout| layout.capacity().block_rows / layout.capacity().max_batch_sequences));
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-            engine::DECODE_ROWS, provisional_drafter.as_ref().map(|cfg| cfg.drafts()), args.attention_plan_rows)?;
+            engine::DECODE_ROWS, draft_width, args.attention_plan_rows)?;
         let legacy_manifest = args.manifest.with_file_name("DSV4_PROGRAMS.json");
         let manifest_path = if !args.manifest.exists()
             && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && legacy_manifest.exists() {
@@ -861,6 +875,11 @@ impl Opened {
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
+        // mtp_dspark: its admitted layout (weights, rings, arenas) and load-time staging.
+        let (drafter_bytes, drafter_staging) = match &ml4_draft {
+            Some(layout) => (layout.resident_bytes()?, layout.weights().max_load_staging),
+            None => (drafter_bytes, drafter_staging),
+        };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
@@ -1142,6 +1161,28 @@ impl Opened {
             drafter.prepare_workspace()?;
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
                 draft_head = "tensor", "DFlash2 drafter resident");
+            Some(drafter)
+        } else if let Some(layout) = ml4_draft.clone() {
+            let started = Instant::now();
+            let ml4 = self.cfg.variant.ml4().context("mtp_dspark needs the Mistral Large 4 config")?;
+            let params = cuteafd_loader::plan::checkpoint::read_json(&args.snapshot.join("params.json"))?;
+            let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
+            let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4(&dspark, ml4)?;
+            let catalog = &self.catalog;
+            let read = |name: &str, shape: &[usize]| -> Result<Vec<u8>> {
+                let tensor = catalog.tensor(name)?;
+                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape,
+                    "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
+                let mut bytes = vec![0u8; tensor.metadata.byte_length as usize];
+                use std::os::unix::fs::FileExt;
+                std::fs::File::open(catalog.snapshot().join(&tensor.shard))?.read_exact_at(&mut bytes, tensor.metadata.byte_offset)
+                    .with_context(|| format!("reading {name}"))?;
+                Ok(bytes)
+            };
+            let drafter = dflash::DflashDrafter::load_ml4(&self.library, &programs, native, ml4,
+                ml4.logit_softcap as f32, stream, layout, &read)?;
+            drafter.prepare_workspace()?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
             Some(drafter)
         } else { None };
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
