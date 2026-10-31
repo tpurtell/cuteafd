@@ -112,7 +112,7 @@ def family_scopes(cards, config_reader):
                     # the K6 core and K4 MTP run the shared dense trellis programs.
                     scopes.add('step5:exl3-k46')
                     if count:
-                        counts.add(f"step5={int(values.get('SPARK_TP', count))}")
+                        counts.add(f"step5:exl3={int(values.get('SPARK_TP', count))}")
                     card_scopes, scopes = scopes, scopes_before | scopes
                     if count:
                         spark_scopes |= card_scopes

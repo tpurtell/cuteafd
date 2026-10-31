@@ -1575,3 +1575,26 @@ fn exl3_two_rtx_onboards_whole_layers_and_sparks_keep_the_rest() {
     assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
     eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers, pool {}", solved.pool_tokens);
 }
+
+#[test]
+fn exl3_card_columns_fit_from_headers() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let fit = |gpus: usize, sparks: usize| plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(sparks), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
+            workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+        ..Default::default() }).unwrap();
+    for (gpus, sparks) in [(1, 2), (1, 3), (1, 4), (2, 4), (2, 6)] {
+        let report = fit(gpus, sparks);
+        let summary = report.memory_layout.as_ref().map(|m| {
+            let spark = m.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+                .map(|d| d.used_bytes() >> 30).max().unwrap_or(0);
+            format!("pool {} onboard {:?} spark_max {spark} GiB", m.pool_tokens, report.onboard_layers)
+        });
+        eprintln!("Step-5 EXL3 {gpus} RTX + {sparks} Sparks: launchable={} {summary:?} {:?}",
+            report.wip_launchable(), report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+    }
+    assert!(fit(2, 6).wip_launchable());
+}

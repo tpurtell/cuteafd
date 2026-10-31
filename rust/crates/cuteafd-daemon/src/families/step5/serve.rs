@@ -89,7 +89,7 @@ impl ServeArgs {
         let shape = self.shape()?;
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
-        ensure!(matches!(self.peers.len(), 4 | 6), "Step-5 requires TP4 or TP6 Spark experts");
+        ensure!(matches!(self.peers.len(), 2 | 3 | 4 | 6), "Step-5 Spark experts run TP2, TP3, TP4 or TP6 (packages decide)");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
         ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");

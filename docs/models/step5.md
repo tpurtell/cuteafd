@@ -5,6 +5,28 @@ The release layouts are official FP8 on two RTX PRO 6000 GPUs plus six Sparks,
 and official NVFP4 on one RTX PRO 6000 plus four Sparks. NVFP4 experts
 use the checkpoint's calibrated W4A4 math, including decode.
 
+## EXL3 K4 + Core K6
+
+`wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6` is quantized from the BF16
+release. Its K4 routed experts (K6 for the last three routed layers, 88-90) run
+on the Sparks from the shared `exl3-step5-k46` package, with Step's own
+post-SiLU clamp at 7. The target attention q/k/v/o, shared and dense FFNs, and
+lm_head are EXL3 K6 and run natively on the RTX through the shared dense
+trellis programs. Gate and up stay separate projections, and the head-split
+o_proj reduces its F32 partials before one output rotation. Head-wise
+attention gates, the sparse indexer, routers, norms, embeddings and the vision
+tower stay BF16/F32 exactly as shipped. The three MTP stages are K4
+throughout, including each stage's own vocabulary head.
+
+Everything is read from `config.json` and the safetensors headers;
+`quantize_config.json` is only cross-checked. `cuteafd plan` finds the
+fit: the minimum is 1 RTX PRO 6000 + 3 Sparks, and the maximum is 2 RTX PRO
+6000 + 6 Sparks. Routed layers are onboarded to the RTX by default
+(`RTX_EXPERT_LAYERS` unset is pool-first auto). Once the 2M KV pool fits,
+whole routed layers run on the entry RTX from the `rtx-tp1` package; on the
+maximum card that is about 20 layers. Start from
+`examples/configs/step5-exl3-k6core-{min,max}.config`.
+
 ## Native MTP
 
 Native MTP is enabled by default at depth 3 for both layouts. The three

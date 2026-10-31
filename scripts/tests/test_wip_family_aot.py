@@ -28,6 +28,7 @@ CASES = [
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3-K4.25', 0, 'QWEN4', 'qwen4:exl3-k45'),
     ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
     ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
+    ('step5', 'Step-5-Preview-EXL3-K4-Core-K6', 6, 'STEP5', 'step5:exl3-k46'),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
 ]
 
@@ -58,7 +59,12 @@ def test_config_scopes_match_equivalent_single_card(tmp_path, family, model, cou
         assert derived['CUTEAFD_WIP_CONTEXT_SPLIT_AOT'] == 'ON'
     if count == 0:
         assert derived['CUTEAFD_WIP_EXPERT_FAMILIES'] == ''
-    if family == 'step5':
+    if family == 'step5' and 'exl3' in scope:
+        # EXL3 K4 experts carry K6 tails in the same package: no BF16 tail scope.
+        assert set(derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')) == {scope}
+        assert set(derived['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')) == {scope}
+        assert set(derived['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {f'step5:exl3={count}'}
+    elif family == 'step5':
         assert set(derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'].split(';')) == {scope, 'step5:bf16'}
         assert set(derived['CUTEAFD_WIP_EXPERT_FAMILIES'].split(';')) == {scope, 'step5:bf16'}
         assert set(derived['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'].split(';')) == {f'{scope}={count}', f'step5:bf16={count}'}
