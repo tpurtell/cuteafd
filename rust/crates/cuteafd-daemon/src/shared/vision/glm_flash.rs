@@ -137,6 +137,7 @@ impl TowerSpec {
             });
             Ok(destination as u64)
         };
+        let depth = config["vision_config"]["depth"].as_u64().unwrap() as usize;
         let mut native = VisionSpec {
             abi_version: 2,
             reserved: 3,
@@ -157,12 +158,12 @@ impl TowerSpec {
             merger_fc1_bias: NO_VISION_OFFSET,
             merger_fc2_bias: NO_VISION_OFFSET,
             merger_extra: [NO_VISION_OFFSET; 8],
-            norm1_bias: [NO_VISION_OFFSET; 28],
-            norm2_bias: [NO_VISION_OFFSET; 28],
-            q_norm: [NO_VISION_OFFSET; 28],
-            k_norm: [NO_VISION_OFFSET; 28],
+            norm1_bias: vec![NO_VISION_OFFSET; depth],
+            norm2_bias: vec![NO_VISION_OFFSET; depth],
+            q_norm: vec![NO_VISION_OFFSET; depth],
+            k_norm: vec![NO_VISION_OFFSET; depth],
             ..Default::default()
-        };
+        }.with_depth(depth);
         native.patch = put(
             "patch_embed.proj.weight",
             &[1024, 3, 2, 14, 14],
@@ -170,7 +171,7 @@ impl TowerSpec {
             true,
         )?;
         native.patch_bias = put("patch_embed.proj.bias", &[1024], true, true)?;
-        for i in 0..24 {
+        for i in 0..depth {
             let mut field = |suffix: &str, shape: &[usize], vector: bool, align: bool| {
                 put(&format!("blocks.{i}.{suffix}"), shape, vector, align)
             };
@@ -334,6 +335,7 @@ mod tests {
             spec.image_family(),
             cuteafd_loader::media::ImageFamily::GlmFlash
         );
+        super::super::tests::assert_ctypes_spec(dir.path(), "glm5_flash", &spec);
         assert_eq!(spec.reads.len(), 347);
         assert_eq!(spec.native.reserved, 3);
         for i in 0..24 {

@@ -7,8 +7,8 @@ role export has been validated against the build that produced it:
 
 * the export manifest declares ``schema == 1`` and ``capability == [12, 1]``;
 * its geometry matches the official checkpoint (experts 384, hidden 5120,
-  intermediate 1152 for tp2 / 768 for tp3 / 384 for tp6, topk 6) with no kernel
-  padding (``kernel_intermediate == intermediate``);
+  intermediate 1152 for tp2 / 768 for tp3 / 384 for tp6 / 288 for tp8, topk 6);
+  tp8 stores 384 columns, while other roles need no kernel padding;
 * its non-empty ``variants`` cover capacities 1/16/80/256/1024/4096;
 * every file named in ``artifact_sha256`` exists in the role export directory
   and hashes to the declared value, so a stale or partial JSON cannot be
@@ -39,17 +39,19 @@ import shutil
 import subprocess
 import sys
 
-ROLE_TP_DEGREE = {"tp2": 2, "tp3": 3, "tp6": 6}
-ROLE_INTERMEDIATE = {"tp2": 1152, "tp3": 768, "tp6": 384}
+ROLE_TP_DEGREE = {"tp2": 2, "tp3": 3, "tp6": 6, "tp8": 8}
+ROLE_INTERMEDIATE = {"tp2": 1152, "tp3": 768, "tp6": 384, "tp8": 288}
 ROLE_INFO_SYMBOL = {
     "tp2": "cuteafd_v41_spark_tp2_expert_info",
     "tp3": "cuteafd_v41_spark_tp3_expert_info",
     "tp6": "cuteafd_v41_spark_tp6_expert_info",
+    "tp8": "cuteafd_v41_spark_tp8_expert_info",
 }
 ROLE_LAUNCH_SYMBOL = {
     "tp2": "cuteafd_v41_spark_tp2_expert_launch",
     "tp3": "cuteafd_v41_spark_tp3_expert_launch",
     "tp6": "cuteafd_v41_spark_tp6_expert_launch",
+    "tp8": "cuteafd_v41_spark_tp8_expert_launch",
 }
 EXPECTED_EXPERTS = 384
 EXPECTED_HIDDEN = 5120
@@ -77,7 +79,7 @@ def parse_roles(value: str) -> list[str]:
         fail(f"duplicate Spark TP role in {value!r}")
     for role in roles:
         if role not in ROLE_TP_DEGREE:
-            fail(f"unsupported Spark TP role {role!r}; expected tp2, tp3 or tp6")
+            fail(f"unsupported Spark TP role {role!r}; expected tp2, tp3, tp6 or tp8")
     return roles
 
 
@@ -128,7 +130,7 @@ def validate_role_export(role: str, manifest_path: Path, export_dir: Path, *, nv
         "experts": EXPECTED_EXPERTS,
         "hidden": EXPECTED_HIDDEN,
         "intermediate": expected_intermediate,
-        "kernel_intermediate": expected_intermediate,
+        "kernel_intermediate": (expected_intermediate + 127) // 128 * 128,
         "topk": EXPECTED_TOPK,
     }
     for key, expected in expected_geometry.items():

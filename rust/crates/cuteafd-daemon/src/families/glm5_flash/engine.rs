@@ -5577,6 +5577,7 @@ mod prefill_lane_tests {
             // const_expr, original order kept for q_rank > 0) and GlmIndexPost rope=False (default
             // True); projection routes and thresholds untouched. SM188/170 vs the master-pinned
             // baseline: glm, glm2, glmf, glm-stage programs byte-identical including SASS.
+            // Re-audit shared with Mistral commit a14370e52.
             ("integration/cuteafd/_glm_kernels.py", 0x481c_c910_48bc_d648),
             // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
             // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a

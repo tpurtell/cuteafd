@@ -133,7 +133,7 @@ mod selection_tests {
         let mut config = NativeExpertServiceConfig { encoder: None, audio_encoder: None,
             library: "/native.so".into(), exl3_aot_dir: None, exl3_schedule: Default::default(), fp8_package: None,
             snapshot: dir.path().into(), exlr8_manifest: None, exlr8_prefill_activations: Default::default(), rank: 0, world: 6, model_admission: None, selected_layers: None, capacity: 4096, device_budget: 121 << 30, max_frame_bytes: 64 << 20,
-            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_tp2: false, bf16_ingress: false };
+            rdma_endpoints: 3, declared_world: cuteafd_transport::expert::SparkWorld::canonical(6).unwrap(), native_spark_roles: false, bf16_ingress: false };
         let model = cuteafd_transport::worker_selection::ModelAdmission {
             executions: cuteafd_core::SparkExecutions::admit(&[80], 80, 80, 1, &[80]).unwrap(),
             endpoints: vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 80,
@@ -254,8 +254,7 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::None)?;
     crate::shared::spark_topology::require_wire(config.spark_world()?, &catalog)?;
     let geometry = catalog.routed_experts().geometry()?;
-    config.native_spark_tp2 = config.world == 2 && geometry.family() == Some("dsv4f")
-        && catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
+    config.native_spark_roles = catalog.exl3().is_none() && catalog.nvfp4().is_none() && catalog.fp8().is_none();
     cuteafd_core::set_expert_geometry(geometry).map_err(|fixed| {
         anyhow::anyhow!("expert geometry is already {fixed:?}; the checkpoint needs {geometry:?}")
     })?;

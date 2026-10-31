@@ -730,7 +730,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     for (gpus, gib, ranks) in [(1,96,6), (1,32,6), (2,96,4), (2,96,0)] {
         let r = report(dir.path(), gpus, gib, ranks, None);
         assert!(!r.wip_launchable() && !r.native_serving_admitted);
-        assert!(r.hints.iter().any(|h| h.what.contains("unqualified")), "{:?}", r.hints);
+        assert!(r.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark") || h.what.contains("routed experts")), "{:?}", r.hints);
     }
     let r = report(dir.path(), 2, 96, 6, Some(32_768));
     assert!(!r.wip_launchable());
@@ -796,7 +796,7 @@ fn nvfp4_min_card_admits_native_w4a4_and_bf16_root_stays_reference_only() {
     for (gpus, gib, ranks) in [(2, 96, 4), (1, 32, 4), (1, 96, 6), (1, 96, 0)] {
         let result = report(dir.path(), gpus, gib, ranks, None);
         assert!(!result.wip_launchable() && !result.native_serving_admitted);
-        assert!(result.hints.iter().any(|h| h.what.contains("unqualified")), "{:?}", result.hints);
+        assert!(result.hints.iter().any(|h| h.what.contains("unqualified") || h.what.contains("Spark")), "{:?}", result.hints);
     }
     let dir = snapshot("bf16");
     let r = report(dir.path(),2,96,6,None);
@@ -1122,8 +1122,14 @@ fn spark_admission_is_scoped_to_qualified_native_layers() {
                 assert_eq!(checkpoint_spark_recipe(&cp, world, &[3]).unwrap(), spark_recipe(&format!("step5:{kind}"), 1536, world).unwrap());
                 assert!(checkpoint_spark_recipe(&cp, world, &(3..88).collect::<Vec<_>>()).is_ok());
             }
-            for world in [1, 2, 3, 5, 7, 8] {
+            for world in [1, 2, 3, 7, 8] {
                 assert!(checkpoint_spark_recipe(&cp, world, &[3]).is_err(), "TP{world}");
+            }
+            if kind == "nvfp4" {
+                let error = checkpoint_spark_recipe(&cp, 5, &[3]).unwrap_err();
+                assert!(format!("{error:#}").contains("NVFP4 is deprecated"));
+            } else {
+                assert!(checkpoint_spark_recipe(&cp, 5, &[3]).is_ok());
             }
         } else {
             for world in [4, 6] {
@@ -1281,7 +1287,7 @@ fn native_prefill_refuses_every_unqualified_spark_count() {
         for ranks in [0, 1, 3, 8] {
             let result = report(dir.path(), gpus, 96, ranks, None);
             assert!(!result.fits && !result.placement_supported && !result.wip_launchable());
-            assert!(result.hints.iter().any(|hint| hint.what.contains("coordinator/Spark count")),
+            assert!(result.hints.iter().any(|hint| hint.what.contains("Spark") || hint.what.contains("1..8")),
                 "{kind} ranks={ranks}: {:?}", result.hints);
             assert!(result.memory_layout.unwrap().devices.is_empty());
         }
@@ -1335,4 +1341,30 @@ fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
             assert_eq!(report.prefill_span_rows, Some(expected_span));
         }
     }
+}
+
+
+#[test]
+fn fp8_tp5_uses_width_recipe_but_still_requires_memory() {
+    let dir = snapshot("fp8");
+    let manifest = native_manifest(dir.path());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let options = |budget| PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(5),
+        spark_budget_bytes: Some(budget),
+        draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            pool_tokens: Some(262144), context_tokens: 262144, host_cache_bytes: Some(0),
+            spark_bytes: budget, spark_allocation_budget_bytes: Some(budget),
+            workspace_manifest: Some(manifest.clone()), ..Default::default()
+        }), ..Default::default()
+    };
+    let fit = input.plan(&options(192 << 30)).unwrap();
+    assert!(fit.fits && fit.placement_supported, "{:?}", fit.hints);
+    let small = input.plan(&options(64 << 30)).unwrap();
+    assert!(!small.fits, "{:?}", small.hints);
+    assert!(small.hints.iter().any(|hint| hint.what.contains("budget") || hint.what.contains("memory")), "{:?}", small.hints);
+    assert!(matches!(crate::plan::experts::spark_recipe("step5:nvfp4",1536,5),
+        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
 }

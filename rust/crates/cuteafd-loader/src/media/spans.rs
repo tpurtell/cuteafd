@@ -82,7 +82,7 @@ impl SpanExpander {
         if let Some(markers) = audio_markers {
             let mut rows = Vec::new();
             for clip in audio {
-                let geometry = super::audio::AudioGeometry::for_samples(clip.pcm.len())
+                let geometry = super::audio::AudioGeometry::for_policy(clip.pcm.len(), clip.geometry.policy)
                     .map_err(|e| invalid(e.to_string()))?;
                 if geometry != clip.geometry { return Err(invalid("audio geometry differs from PCM")); }
                 rows.push((geometry.tokens, clip.key.into()));

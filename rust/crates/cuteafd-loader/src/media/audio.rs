@@ -1,6 +1,6 @@
 //! Bounded, CPU-only MiMo audio preparation. No tokenizer decoder or CUDA is involved.
 use super::{EncoderId, PreprocessId};
-use cuteafd_core::AudioKey;
+use cuteafd_core::{AudioKey, media::AudioTokenGeometry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{io::Cursor, sync::Arc};
@@ -66,6 +66,8 @@ impl Default for AudioDecodeLimits {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioGeometry {
+    #[serde(default, skip_serializing_if = "AudioTokenGeometry::is_mimo")]
+    pub policy: AudioTokenGeometry,
     pub mel_frames: usize,
     pub segments: Vec<usize>,
     pub codes: usize,
@@ -73,6 +75,14 @@ pub struct AudioGeometry {
 }
 impl AudioGeometry {
     pub fn for_samples(samples: usize) -> Result<Self> {
+        Self::for_policy(samples, AudioTokenGeometry::MimoRvq)
+    }
+    pub fn for_policy(samples: usize, policy: AudioTokenGeometry) -> Result<Self> {
+        if samples > MAX_CLIP_SAMPLES { return Err(AudioError::TooLong); }
+        if let AudioTokenGeometry::PcmPatches { .. } = policy {
+            let tokens = policy.tokens(samples).ok_or_else(|| invalid("empty PCM or zero patch stride"))?;
+            return Ok(Self { policy, mel_frames: 0, segments: Vec::new(), codes: 0, tokens });
+        }
         if samples <= FFT / 2 {
             return Err(AudioError::TooShort(samples));
         }
@@ -89,6 +99,7 @@ impl AudioGeometry {
             .map(|n| n.div_ceil(2).div_ceil(2))
             .sum::<usize>();
         Ok(Self {
+            policy,
             mel_frames,
             segments,
             codes,
@@ -128,14 +139,28 @@ pub fn preprocess_id() -> PreprocessId {
 }
 
 pub fn prepare_pcm(pcm: Vec<f32>, encoder: EncoderId) -> Result<PreparedAudio> {
-    let geometry = AudioGeometry::for_samples(pcm.len())?;
+    prepare_pcm_with_geometry(pcm, encoder, AudioTokenGeometry::MimoRvq)
+}
+
+/// The PCM stays canonical FP32; a native tower owns its specified BF16 boundary.
+pub fn prepare_pcm_with_geometry(pcm: Vec<f32>, encoder: EncoderId, policy: AudioTokenGeometry) -> Result<PreparedAudio> {
+    let geometry = AudioGeometry::for_policy(pcm.len(), policy)?;
     if pcm.iter().any(|v| !v.is_finite()) {
         return Err(invalid("nonfinite PCM"));
     }
     let mut hash = Sha256::new();
     hash.update(b"cuteafd-audio-v1");
     hash.update(encoder.0);
-    hash.update(preprocess_id().0);
+    match policy {
+        AudioTokenGeometry::MimoRvq => hash.update(preprocess_id().0),
+        AudioTokenGeometry::PcmPatches { samples_per_token } => {
+            hash.update(concat!("cuteafd-pcm-patch-preprocess-v1;pcm=f32le,24000,mono,finite;",
+                "channels=resample_then_mean;resample=sinc_interp_hann,width6,rolloff0.99,zero_pad,ceil_length;",
+                "decode=hound3.5.1,claxon0.4.3,nanomp3_0.2.0_gapless;cpu_decode_numerics=2;",
+                "features=ceil_valid_samples/stride;right_pad_final_only").as_bytes());
+            hash.update((samples_per_token as u64).to_le_bytes());
+        }
+    }
     hash.update((pcm.len() as u64).to_le_bytes());
     for sample in &pcm {
         hash.update(sample.to_le_bytes());
@@ -216,12 +241,22 @@ impl Pcm {
         if self.samples.len() % self.channels != 0 {
             return Err(invalid("incomplete interleaved PCM frame"));
         }
-        resample_mono(&self.samples, self.rate, self.channels)
+        resample_pcm(&self.samples, self.rate, self.channels)
     }
 }
 
 /// The encoded extent and decoded accumulator are checked before allocation.
 pub fn decode(encoded: &[u8], format: AudioFormat, limits: AudioDecodeLimits) -> Result<Vec<f32>> {
+    decode_with_geometry(encoded, format, limits, AudioTokenGeometry::MimoRvq)
+}
+
+pub fn decode_with_geometry(encoded: &[u8], format: AudioFormat, limits: AudioDecodeLimits, policy: AudioTokenGeometry) -> Result<Vec<f32>> {
+    let pcm = decode_pcm(encoded, format, limits)?;
+    AudioGeometry::for_policy(pcm.len(), policy)?;
+    Ok(pcm)
+}
+
+fn decode_pcm(encoded: &[u8], format: AudioFormat, limits: AudioDecodeLimits) -> Result<Vec<f32>> {
     if encoded.is_empty() || encoded.len() > limits.encoded_bytes {
         return Err(invalid("encoded audio is empty or exceeds byte limit"));
     }
@@ -450,6 +485,12 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 /// Torchaudio's default Hann-windowed sinc geometry, resampling each channel
 /// before averaging. Sparse phases avoid unbounded coprime-rate filter tables.
 pub fn resample_mono(interleaved: &[f32], rate: u32, channels: usize) -> Result<Vec<f32>> {
+    let pcm = resample_pcm(interleaved, rate, channels)?;
+    AudioGeometry::for_samples(pcm.len())?;
+    Ok(pcm)
+}
+
+fn resample_pcm(interleaved: &[f32], rate: u32, channels: usize) -> Result<Vec<f32>> {
     if !(8_000..=192_000).contains(&rate)
         || !(1..=8).contains(&channels)
         || interleaved.len() % channels != 0
@@ -464,7 +505,8 @@ pub fn resample_mono(interleaved: &[f32], rate: u32, channels: usize) -> Result<
         return Err(AudioError::TooLong);
     }
     let count = (frames * SAMPLE_RATE as usize).div_ceil(rate as usize);
-    AudioGeometry::for_samples(count)?;
+    if count == 0 { return Err(invalid("empty PCM")); }
+    if count > MAX_CLIP_SAMPLES { return Err(AudioError::TooLong); }
     let mut output = vec![0f32; count];
     if rate == SAMPLE_RATE {
         for (out, frame) in output.iter_mut().zip(interleaved.chunks_exact(channels)) {
@@ -754,5 +796,35 @@ mod tests {
                 decode(&encoded, AudioFormat::Wav, AudioDecodeLimits::default()).unwrap()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod patch_geometry_tests {
+    use super::*;
+    #[test]
+    fn short_pcm_patch_clips_and_identity_are_geometry_specific() {
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        for samples in [1, 480, 481, 1920, 1921, 24000] {
+            let clip = prepare_pcm_with_geometry(vec![0.25; samples], EncoderId([1; 32]), policy).unwrap();
+            assert_eq!(clip.geometry.tokens, samples.div_ceil(1920));
+            assert_eq!(clip.geometry.policy, policy);
+            assert!(clip.geometry.segments.is_empty());
+        }
+        let pcm = vec![0.25; 24000];
+        let old = prepare_pcm(pcm.clone(), EncoderId([1; 32])).unwrap();
+        let explicit = prepare_pcm_with_geometry(pcm.clone(), EncoderId([1; 32]), AudioTokenGeometry::MimoRvq).unwrap();
+        assert_eq!(old.key, explicit.key);
+        let json = serde_json::to_string(&old.geometry).unwrap();
+        assert_eq!(json, r#"{"mel_frames":101,"segments":[101],"codes":26,"tokens":7}"#);
+        let patch = prepare_pcm_with_geometry(pcm, EncoderId([1; 32]), policy).unwrap();
+        assert_ne!(old.key, patch.key);
+        assert!(prepare_pcm_with_geometry(vec![], EncoderId([1;32]), policy).is_err());
+        let mut data = Cursor::new(Vec::new());
+        { let mut w = hound::WavWriter::new(&mut data, hound::WavSpec { channels:1, sample_rate:24000,
+              bits_per_sample:16, sample_format:hound::SampleFormat::Int }).unwrap();
+          for _ in 0..16 { w.write_sample(123i16).unwrap(); } w.finalize().unwrap(); }
+        assert_eq!(decode_with_geometry(data.get_ref(), AudioFormat::Wav, Default::default(), policy).unwrap().len(), 16);
+        assert!(decode(data.get_ref(), AudioFormat::Wav, Default::default()).is_err());
     }
 }

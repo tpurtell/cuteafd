@@ -1,4 +1,4 @@
-//! Ordinary six-rank Spark exchange in latent space. Shared staging, transport,
+//! Ordinary Spark exchange in latent space. Shared staging, transport,
 //! intake and ordered FP32 plane reduction are reused without a device proxy.
 use super::device::LocalLane;
 use crate::shared::{
@@ -16,27 +16,14 @@ use cuteafd_transport::{expert::SparkWorld, ExpertProtocolV2Request,
 use cuteafd_transport::protocol_v2::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
 use std::{net::SocketAddr, rc::Rc, sync::Arc};
 
-const RANKS: usize = 6;
 const LATENT: usize = 3584;
 const TOPK: usize = 16;
 
-/// The intake owns six full-capacity BF16 planes on the dispatch device.
-/// Pinned route storage is host memory; all device planes precede admission.
-/// `rows` is the lane's whole in-flight span: `waves` units, one return slot each.
-pub(crate) fn demand(rows: usize, waves: usize, lane: usize) -> Result<Demand> {
-    demand_with(rows, waves, None, lane)
-}
-
-pub(crate) fn demand_with(rows: usize, waves: usize, unit: Option<usize>, lane: usize) -> Result<Demand> {
-    ensure!((1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&rows), "Kimi Spark row capacity");
-    let shape = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(rows, waves, unit)?;
-    Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane))
-}
-
 /// The admitted intake: `waves` return slots of `unit` rows per rank.
-pub(crate) fn admitted_demand(waves: usize, unit: usize, lane: usize) -> Result<Demand> {
+pub(crate) fn admitted_demand(waves: usize, unit: usize, lane: usize, ranks: usize) -> Result<Demand> {
+    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks), "Kimi Spark intake requires 1..8 ranks");
     let shape = cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }.validate()?;
-    Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane))
+    Ok(cuteafd_loader::families::kimi_k3::allocation::spark_demand(shape, lane, ranks))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,8 +66,9 @@ impl<'a> RoutedLane<'a> {
             "Kimi Spark library owner differs from admitted device");
         ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3,
             "Kimi Spark helpers require the process latent expert geometry before native loading");
-        ensure!(peers.len() == RANKS, "Kimi routed exchange requires six real Spark ranks");
-        let charge = admitted_demand(waves, unit, local.lane_index())?;
+        let ranks = peers.len();
+        ensure!((1..=8).contains(&ranks), "Kimi routed exchange requires 1..8 real Spark ranks");
+        let charge = admitted_demand(waves, unit, local.lane_index(), ranks)?;
         let charges = placement.items[1].iter().filter(|item| item.group == charge.group).collect::<Vec<_>>();
         ensure!(charges.len() == 1 && charges[0].category == charge.category
             && charges[0].basis == charge.basis && charges[0].bytes == charge.bytes,
@@ -89,23 +77,27 @@ impl<'a> RoutedLane<'a> {
         // Each wave is one unit's rows: every exchange slot stages a unit.
         let library = library_owner.as_ref();
         let mut link = stream.device.run(|| {
-            library.v41_compact_reducer()?.require_plane_reduction(RANKS as u32)?;
+            library.v41_compact_reducer()?.require_plane_reduction(ranks as u32)?;
             // `waves` return slots of `unit` rows per rank.
             let mut link = SparkLink::new_waves(library, world, &peers, u32::try_from(unit)?, config, LATENT * 2,
                 waves, u32::try_from(unit)?)?;
             link.enable_terminal_ownership(Arc::clone(library_owner))?;
             Ok(link)
         })?;
-        ensure!(link.world_size() == RANKS, "Kimi Spark transport world differs from admission");
+        ensure!(link.world_size() == ranks, "Kimi Spark transport world differs from admission");
         if let Some(layer) = placement.layers.iter().position(|assignment|
             assignment.experts == cuteafd_loader::placement::ExpertHome::Spark) {
             stream.device.run(|| link.bootstrap(&bootstrap_request(layer, unit)?))?;
-            ensure!(link.installed_grouping()?.len() == RANKS,
-                "Kimi bootstrap requires installed grouping from all six ranks");
+            ensure!(link.installed_grouping()?.len() == ranks,
+                "Kimi bootstrap requires installed grouping from all admitted ranks");
         }
         Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner),
             terminal: false, capacity: unit, waves, unit, sequence: std::cell::Cell::new(0),
             outstanding: std::collections::VecDeque::new() })
+    }
+
+    pub(crate) fn world_size(&self) -> Result<usize> {
+        Ok(self.link.as_ref().context("Kimi Spark link retired")?.world_size())
     }
 
     pub(crate) fn installed_grouping(&self)
@@ -180,7 +172,7 @@ impl<'a> RoutedLane<'a> {
 
     pub(crate) fn has_link(&self) -> bool { self.link.is_some() }
 
-    /// All six latent partials are reduced once with FP32 accumulation and one
+    /// All admitted latent partials are reduced once with FP32 accumulation and one
     /// BF16 rounding. No hidden-space shared FFN participates in this reduction.
     /// The lane stream waits (on the device) for the wave's planes.
     pub(crate) fn finish(&mut self, local: &LocalLane<'a>, ticket: Ticket) -> Result<()> {
@@ -196,7 +188,7 @@ impl<'a> RoutedLane<'a> {
         self.stream.device.run(|| {
             let exchange = link.exchange()?;
             exchange.land(wave, stream)?;
-            // SAFETY: `land` orders all six live planes before this exact lane
+            // SAFETY: `land` orders all live rank planes before this exact lane
             // stream; the output is a disjoint admitted latent allocation.
             unsafe { exchange.reduce(slot, std::ptr::null(), output.ptr.cast(), rows, stream) }
         })
@@ -279,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn request_is_latent_fp8_k16_with_compact_six_rank_returns() -> Result<()> {
+    fn request_is_latent_fp8_k16_with_compact_rank_returns() -> Result<()> {
         for rows in [1, 16, 4096] {
             let layout = RouteStaging::new(rows, TOPK, KimiExpertInput::ROW_BYTES)?;
             let mut bytes = vec![0; layout.bytes];
@@ -299,12 +291,26 @@ mod tests {
             assert_eq!(request.hidden_payload.len(), rows * KimiExpertInput::ROW_BYTES);
             assert!(request.hidden_payload.iter().all(|byte| *byte == 0x71));
             assert_eq!(request.rows.last().unwrap().route_offset, ((rows - 1) * TOPK) as u32);
-            if rows % 2 == 0 && rows >= 128 {
-                assert_eq!(demand(rows, 2, 1)?.gpu, 1);
-                assert_eq!(demand(rows, 2, 1)?.bytes, (6 * rows * 3584 * 2) as u64);
+            for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+                if rows % 2 == 0 && rows >= 128 {
+                    let charge = admitted_demand(2, rows / 2, 1, ranks)?;
+                    assert_eq!(charge.gpu, 1);
+                    assert_eq!(charge.bytes, (ranks * rows * LATENT * 2) as u64);
+                }
+                let unit = rows.max(64).next_multiple_of(64);
+                assert_eq!(admitted_demand(1, unit, 1, ranks)?.bytes,
+                    (ranks * unit * LATENT * 2) as u64);
             }
-            assert_eq!(demand(rows.max(64).next_multiple_of(64), 1, 1)?.bytes,
-                (6 * rows.max(64).next_multiple_of(64) * 3584 * 2) as u64);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_intake_charges_every_actual_rank() -> Result<()> {
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            let charge = admitted_demand(3, 2752, 1, ranks)?;
+            assert_eq!(charge.gpu, 1);
+            assert_eq!(charge.bytes, (3 * 2752 * ranks * LATENT * 2) as u64);
         }
         Ok(())
     }
@@ -322,15 +328,18 @@ mod tests {
         bytes[layout.route_bytes..][..4].fill(0);
         bytes[..4].copy_from_slice(&896u32.to_le_bytes());
         assert!(request(1, 1, 1, ExpertV2SourceKind::Decode, &layout, &bytes).is_err());
-        assert!(demand(0, 1, 0).is_err());
-        assert!(demand(8257, 1, 0).is_err());
-        for (rows, waves, unit) in [(8192, 2, 4096), (8256, 3, 2752), (8192, 4, 2048)] {
-            let charge = demand_with(rows, waves, Some(unit), 0)?;
-            assert_eq!(charge.bytes, (rows * 6 * LATENT * 2) as u64);
-            assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
-                cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }, 0));
+        assert!(admitted_demand(1, 0, 0, 1).is_err());
+        assert!(admitted_demand(0, 64, 0, 1).is_err());
+        assert!(admitted_demand(1, 64, 0, 0).is_err());
+        assert!(admitted_demand(1, 64, 0, cuteafd_core::MAX_SPARK_WORLD + 1).is_err());
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            for (rows, waves, unit) in [(8192, 2, 4096), (8256, 3, 2752), (8192, 4, 2048)] {
+                let charge = admitted_demand(waves, unit, 0, ranks)?;
+                assert_eq!(charge.bytes, (rows * ranks * LATENT * 2) as u64);
+                assert_eq!(charge, cuteafd_loader::families::kimi_k3::allocation::spark_demand(
+                    cuteafd_loader::serving_capacity::PrefillShape { unit_rows: unit as u64, waves: waves as u64 }, 0, ranks));
+            }
         }
-        assert!(demand(8256, 3, 0).is_ok() && demand(4096, 3, 0).is_err() && demand(128, 3, 0).is_err());
         Ok(())
     }
 }

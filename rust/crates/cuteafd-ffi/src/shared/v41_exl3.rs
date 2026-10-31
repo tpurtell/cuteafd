@@ -28,8 +28,7 @@ pub struct V41Exl3Info {
 /// split of three H128 blocks per rank (384 rows), alongside TP3's six blocks.
 pub fn exl3_shard_widths(geometry: cuteafd_core::ExpertGeometry) -> Vec<u32> {
     let blocks = geometry.intermediate / 128;
-    let mut widths: Vec<u32> = [1u32, 2, 3, 4, 6]
-        .into_iter()
+    let mut widths: Vec<u32> = (1..=cuteafd_core::MAX_SPARK_WORLD as u32)
         .filter(|&world| geometry.intermediate % 128 == 0 && blocks >= world)
         .flat_map(|world| [blocks / world, blocks.div_ceil(world)])
         .map(|count| count * 128)
@@ -332,14 +331,14 @@ mod info_tests {
     #[test]
     fn native_info_accepts_every_published_shard_width() {
         let base = [2u32, 5120, 768, 384, 16, 6, 2, 44, 18, 7, 3, 2, 3, 0, 0, 2];
-        for intermediate in [384u32, 512, 640, 768, 1152, 2304] {
+        for intermediate in [256u32, 384, 512, 640, 768, 1152, 2304] {
             let mut words = base;
             words[2] = intermediate;
             let info = V41Exl3Info::from_words(words)
                 .unwrap_or_else(|error| panic!("shard width {intermediate} must be accepted: {error}"));
             assert_eq!(info.intermediate, intermediate as usize);
         }
-        for intermediate in [0u32, 256, 576, 896, 1024, 1280] {
+        for intermediate in [0u32, 128, 576, 896, 1024, 1280] {
             let mut words = base;
             words[2] = intermediate;
             assert!(
@@ -390,8 +389,8 @@ mod info_tests {
     #[test]
     fn shard_widths_follow_the_expert_geometry() {
         use cuteafd_core::ExpertGeometry;
-        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [384, 512, 640, 768, 1152, 2304]);
-        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [512, 768, 1024, 1536, 3072]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V41), [256, 384, 512, 640, 768, 1152, 2304]);
+        assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_PRO), [384, 512, 640, 768, 1024, 1536, 3072]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::DEEPSEEK_V4_FLASH), [256, 384, 512, 640, 768, 1024, 2048]);
         assert_eq!(exl3_shard_widths(ExpertGeometry::QWEN4), [128, 256, 384, 640]);
     }

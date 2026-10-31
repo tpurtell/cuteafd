@@ -404,14 +404,28 @@ mod tests {
             assert_eq!(deployment.topology.tp, ranks);
             for unqualified in [7, 8] {
                 report.spark_ranks = unqualified;
-                assert!(DeploymentSpec::from_report(&report, &options).is_err());
+                let result = DeploymentSpec::from_report(&report, &options);
+                if package == "v41:mxfp4" && unqualified == 8 {
+                    assert!(result.is_ok());
+                } else {
+                    assert!(result.is_err());
+                    if package.ends_with(":nvfp4") {
+                        assert!(format!("{:#}", result.unwrap_err()).contains("NVFP4 is deprecated"));
+                    }
+                }
             }
         }
         for package in ["qwen4:nvfp4", "qwen4:fp8", "qwen4:exl3-k45"] {
             report.family = Some("qwen4".into());
             report.experts.as_mut().unwrap().package = package.into();
+            report.spec.as_mut().unwrap().moe.as_mut().unwrap().intermediate = 640;
             report.spark_ranks = 5;
-            assert!(DeploymentSpec::from_report(&report, &options).is_err());
+            let result = DeploymentSpec::from_report(&report, &options);
+            if package == "qwen4:fp8" {
+                assert!(result.is_ok());
+            } else {
+                assert!(result.is_err());
+            }
         }
         report.family = Some("deepseek_v41".into());
         report.experts.as_mut().unwrap().package = "v41:exl3-k23".into();

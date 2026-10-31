@@ -35,7 +35,8 @@ impl LocalEncoder {
         job.validate()?;
         if job.hidden_width != self.width { return Err(MediaError::Features); }
         let EncodeInput::Image { grid: [t, h, w], rgb8 } = &job.input else {
-            return if self.service.audio_ledger.is_some() { Ok(()) }
+            return if matches!(&job.input, EncodeInput::Audio { geometry, .. } if geometry.is_mimo())
+                && self.service.audio_ledger.is_some() { Ok(()) }
                 else { Err(MediaError::Encoder("audio encoder not loaded".into())) };
         };
         let (t, h, w) = (*t, *h, *w);
@@ -69,7 +70,7 @@ impl EncoderClient for LocalEncoder {
                 EncodeInput::Image { grid, rgb8 } => self.service.submit(EncodeJob {
                     rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
                     lut: self.lut.clone(), output }),
-                EncodeInput::Audio { pcm } => self.service.submit_audio(super::audio::AudioEncodeJob {
+                EncodeInput::Audio { pcm, .. } => self.service.submit_audio(super::audio::AudioEncodeJob {
                     pcm: pcm.clone(), fp32_scratch: vec![0.0; output.len()], output }),
             };
             match submitted {

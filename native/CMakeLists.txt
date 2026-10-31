@@ -22,7 +22,7 @@ option(CUTEAFD_V41_SPARK_COMPACT_EXPERIMENT "Use experimental compact Spark expe
 # `spark_tp_degree` manifest field, so byte identity of exported JSON is not
 # claimed either way.)
 set(CUTEAFD_SPARK_TP_ROLES "" CACHE STRING
-  "Extra replicated-group Spark expert TP roles to build (tp2;tp3;tp6); empty builds only TP4")
+  "Extra replicated-group Spark expert TP roles to build (tp2;tp3;tp6;tp8); empty builds only TP4")
 # Deprecated spelling, accepted for one release.
 if(DEFINED CUTEAFD_V41_SPARK_TP_ROLES AND NOT CUTEAFD_V41_SPARK_TP_ROLES STREQUAL "")
   message(DEPRECATION "CUTEAFD_V41_SPARK_TP_ROLES is deprecated; use CUTEAFD_SPARK_TP_ROLES")

@@ -2,45 +2,12 @@
 //! slice arithmetic the expert staging uses. The planner's placement check
 //! reads these, so it accepts exactly the layouts an image can carry.
 //!
-//! - FP8 (`python/tools/aot/package_fp8_moe_aot.py`, b12x fp8_moe): Spark
-//!   layouts tp4, tp2 and tp6 where they split the intermediate into whole
-//!   128-row blocks (TP6 of any intermediate of at least six blocks, unequal
-//!   exact-width packages); a tp1 coordinator package.
-//! - MXFP4 through the same programs (MiMo V2.6 Pro `mimop:fp8`): Spark tp6
-//!   and tp2, a tp1 coordinator package.
-//! - NVFP4 (ModelOpt) through the same programs (`glmf:nvfp4`, `qwen4:nvfp4`,
-//!   `glm:nvfp4`): Spark tp4, tp2, tp3 and tp6 in whole 16-value blocks, a tp1
-//!   coordinator package. GLM Flash also has padded K16 TP5.
-//! - EXL3 (`python/tools/aot/package_exl3_aot.py`): Spark worlds 4, 2, 3, and
-//!   6 when the intermediate has at least six 128-row blocks; Qwen also has TP1.
-//! - DeepSeek native experts (expertd-native MXFP4 / EXL3): 2, 3, 4 and 6.
-//!
-//! The expert transport (RoCE verbs, TCP) runs one through eight Spark ranks.
-//! Package coverage below is independent of transport capacity.
+//! Export coverage is checkpoint-provenanced data shared with the packagers.
+//! Admission compares descriptor ABI and native-unit width classes, retaining
+//! real native-role geometry restrictions and deprecated NVFP4 coverage.
 
 /// Spark worlds the expert transport runs.
 pub const TRANSPORT_WORLDS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-
-/// Default Spark layouts of an FP8 (E4M3, 128x128 scales) expert package.
-pub fn fp8_spark_worlds(intermediate: usize) -> Vec<usize> {
-    spark_worlds("mimo:fp8", intermediate)
-}
-
-/// Default Spark layouts of an MXFP4 package on the fp8_moe programs.
-pub fn mxfp4_spark_worlds() -> Vec<usize> {
-    spark_worlds("mimop:fp8", 2048)
-}
-
-/// Default Spark layouts of an NVFP4 package on the fp8_moe programs: the
-/// transport worlds whose ranks each own a 16-value block.
-pub fn nvfp4_spark_worlds(intermediate: usize) -> Vec<usize> {
-    spark_worlds("glm:nvfp4", intermediate)
-}
-
-/// Spark worlds of an EXL3 package (`package_exl3_aot.py` profiles).
-pub fn exl3_spark_worlds(intermediate: usize) -> Vec<usize> {
-    spark_worlds("glm:exl3-k34", intermediate)
-}
 
 /// The stored intermediate slice of the widest rank of `tp`: whole `block`-row
 /// blocks, as evenly as the blocks allow, padded to 128 rows. `None` when the
@@ -138,6 +105,10 @@ pub enum SparkRecipeRefusal {
     GeometryInvalid { intermediate: usize, world: usize, block: usize },
     #[error("missing Spark package recipe: {package} TP{world}; export its balanced per-rank widths in package_exl3_aot.py (EXL3) or package_fp8_moe_aot.py (FP8/NVFP4), register spark_recipe, and include those layouts in the Spark image")]
     MissingPackage { package: String, world: usize },
+    #[error("NVFP4 is deprecated; worlds {worlds:?}; requested {package} TP{world}")]
+    Deprecated { package: String, world: usize, worlds: Vec<usize> },
+    #[error("native MXFP4 requires equal whole-K32 shards for intermediate {intermediate}, TP{world}; add native roles taking unequal whole-K32 shards, rotated by layer, and rank-sized staging")]
+    NativeUnequal { intermediate: usize, world: usize },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
     #[error("{0}")]
@@ -203,6 +174,8 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, lay
     selected.context("Spark admission: missing routed expert storage recipe")
 }
 
+use cuteafd_core::tp_units::package_width_keys;
+
 /// Registered recipes only: optional installation checks cannot widen this set.
 /// Step-5 TP6 geometry is registered for qualification; its hardware gate is pending.
 /// Package availability is separate from the CPU-qualified transport range.
@@ -223,10 +196,6 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    // Kimi K3's only Spark layout is TP6 width 512 (#273: TP4 needs 160 GiB/rank).
-    if family == "kimik3" && world != 6 {
-        return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
-    }
     let block = if nvfp4 { 16 } else if mxfp4 { 32 } else { 128 };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
@@ -234,15 +203,21 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     // Native family roles and staging require equal whole-K32 shards. Generic
     // MXFP4 tail exports do not make those native roles executable by themselves.
     if native && mxfp4 && (intermediate % world != 0 || intermediate / world % 32 != 0) {
-        return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block: 32 });
+        return Err(SparkRecipeRefusal::NativeUnequal { intermediate, world });
     }
-    let packaged = if family == "step5" { matches!(world, 4 | 6) }
-        else if native { matches!(world, 2 | 3 | 4 | 6) }
-        else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
-        else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
-        else if mxfp4 { if family == "mimof" { matches!(world, 2 | 3 | 4) } else { matches!(world, 2 | 6) } }
-        else { matches!(world, 2 | 4 | 6) && (intermediate % (128 * world) == 0 || world == 6) };
-    if !packaged {
+    let coverage_key = format!("{family}:{}", if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { format });
+    let coverage = cuteafd_core::tp_units::spark_package_entry(&coverage_key);
+    let worlds = coverage["worlds"].as_array().map(|values| values.iter()
+        .filter_map(|value| value.as_u64().map(|value| value as usize)).collect::<Vec<_>>()).unwrap_or_default();
+    if coverage["deprecated"].as_bool() == Some(true) && !worlds.contains(&world) {
+        return Err(SparkRecipeRefusal::Deprecated { package: key.into(), world, worlds });
+    }
+    let packaged_intermediate = coverage["intermediate"].as_u64().unwrap_or(0) as usize;
+    let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4);
+    let available = worlds.iter().flat_map(|&count|
+        package_width_keys(packaged_intermediate, block, count, exl3, native, nvfp4))
+        .collect::<std::collections::BTreeSet<_>>();
+    if required.is_empty() || !required.iter().all(|width| available.contains(width)) {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
     }
     let compact = exl3 && intermediate / block % world != 0;
@@ -380,7 +355,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fixture::write_snapshot(root.path(), &fixture::mimo_flash_config(), &fixture::mimo_flash_tensors(), None);
         let mut checkpoint = Checkpoint::open(root.path()).unwrap();
-        assert!(format!("{:#}", checkpoint_spark_recipe(&checkpoint, 3).unwrap_err()).contains("missing Spark package recipe"));
+        assert!(format!("{:#}", checkpoint_spark_recipe(&checkpoint, 9).unwrap_err()).contains("geometry-invalid"));
         let index = checkpoint.tensors.iter().position(|tensor| tensor.meta.name.contains(".experts.")
             && tensor.meta.name.ends_with("weight_scale_inv")).unwrap();
         let removed = checkpoint.tensors.remove(index);
@@ -418,10 +393,10 @@ mod tests {
         assert_eq!(step5_tp6.widths, [256; 6]);
         assert_eq!(step5_tp6.widths.iter().sum::<usize>(), 1536);
         assert_eq!(step5_tp6.required_layouts, ["tp6"]);
-        assert_eq!(spark_worlds("step5:fp8", 1536), [4, 6]);
+        assert_eq!(spark_worlds("step5:fp8", 1536), [4, 5, 6]);
         for world in 0..=8 {
-            if !matches!(world, 4 | 6) { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
-            if matches!(world, 4 | 6) {
+            if !matches!(world, 4 | 5 | 6) { assert!(spark_recipe("step5:fp8", 1536, world).is_err()); }
+            if matches!(world, 4 | 5 | 6) {
                 assert_eq!(spark_recipe("step5:bf16", 1536, world).unwrap(),
                     spark_recipe("step5:fp8", 1536, world).unwrap());
             } else { assert!(spark_recipe("step5:bf16", 1536, world).is_err()); }
@@ -439,18 +414,22 @@ mod tests {
         }
         assert!(spark_worlds("v41:exl3-k23", 2304).is_empty());
         assert!(spark_worlds("dsv4f:exl3-k23", 2048).is_empty());
-        assert_eq!(spark_worlds("v41:mxfp4", 2304), [2, 3, 4, 6]);
+        assert_eq!(spark_worlds("v41:mxfp4", 2304), [2, 3, 4, 6, 8]);
         assert_eq!(spark_worlds("v41:nvfp4", 2304), [2, 3, 4, 6]);
         for package in ["qwen4:nvfp4", "qwen4:exl3-k45", "qwen4:fp8"] {
             for world in [7, 8] {
                 let refusal = spark_recipe(package, 640, world).unwrap_err();
                 if package == "qwen4:nvfp4" {
-                    assert!(matches!(refusal, SparkRecipeRefusal::MissingPackage { .. }));
+                    assert!(matches!(refusal, SparkRecipeRefusal::Deprecated { .. }));
                 } else {
                     assert!(matches!(refusal, SparkRecipeRefusal::GeometryInvalid { .. }));
                 }
             }
-            assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. })));
+            match package {
+                "qwen4:fp8" => assert!(spark_recipe(package, 640, 5).is_ok()),
+                "qwen4:nvfp4" => assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::Deprecated { .. }))),
+                _ => assert!(matches!(spark_recipe(package, 640, 5), Err(SparkRecipeRefusal::MissingPackage { .. }))),
+            }
         }
     }
 
@@ -524,27 +503,27 @@ mod tests {
         use crate::formats::fp8_experts::Slicing;
         use cuteafd_core::tp_units::{RankUnits, UnitRule};
         let cases: &[(&str, usize, &[usize])] = &[
-            ("v41:mxfp4", 2304, &[2, 3, 4, 6]),
+            ("v41:mxfp4", 2304, &[2, 3, 4, 6, 8]),
             ("v41:nvfp4", 2304, &[2, 3, 4, 6]),
-            ("dsv4f:mxfp4", 2048, &[2, 4]),
-            ("dsv4p:mxfp4", 3072, &[2, 3, 4, 6]),
-            ("dsv4p:exl3-k23", 3072, &[2, 3, 4, 6]),
-            ("glm:fp8", 2048, &[2, 4, 6]),
+            ("dsv4f:mxfp4", 2048, &[2, 4, 8]),
+            ("dsv4p:mxfp4", 3072, &[2, 3, 4, 6, 8]),
+            ("dsv4p:exl3-k23", 3072, &[2, 3, 4, 5, 6, 7, 8]),
+            ("glm:fp8", 2048, &[2, 3, 4, 5, 6, 7, 8]),
             ("glm:nvfp4", 2048, &[2, 3, 4, 6]),
-            ("glm:exl3-k45", 2048, &[2, 3, 4, 6]),
-            ("glmf:fp8", 2048, &[2, 4, 6]),
+            ("glm:exl3-k45", 2048, &[2, 3, 4, 5, 6, 7, 8]),
+            ("glmf:fp8", 2048, &[2, 3, 4, 5, 6, 7, 8]),
             ("glmf:nvfp4", 2048, &[2, 3, 4, 5, 6]),
-            ("glmf:exl3-k34", 2048, &[2, 3, 4, 6]),
-            ("mimo:fp8", 2048, &[2, 4, 6]),
-            ("mimof:fp8", 2048, &[2, 3, 4]),
-            ("mimop:fp8", 2048, &[2, 6]),
+            ("glmf:exl3-k34", 2048, &[2, 3, 4, 5, 6, 7, 8]),
+            ("mimo:fp8", 2048, &[2, 3, 4, 5, 6, 7, 8]),
+            ("mimof:fp8", 2048, &[2, 3, 4, 5, 6, 7, 8]),
+            ("mimop:fp8", 2048, &[2, 6, 7, 8]),
             ("qwen4:exl3-k45", 640, &[1, 2, 3, 4]),
-            ("qwen4:nvfp4", 640, &[2, 3, 4, 6]),
-            ("qwen4:fp8", 640, &[]),
-            ("step5:fp8", 1536, &[4, 6]),
-            ("step5:bf16", 1536, &[4, 6]),
+            ("qwen4:nvfp4", 640, &[1, 2, 3, 4, 6]),
+            ("qwen4:fp8", 640, &[1, 2, 3, 4, 5]),
+            ("step5:fp8", 1536, &[4, 5, 6]),
+            ("step5:bf16", 1536, &[4, 5, 6]),
             ("step5:nvfp4", 1536, &[4, 6]),
-            ("kimik3:exl3-k23", 3072, &[6]),
+            ("kimik3:exl3-k23", 3072, &[6, 7, 8]),
         ];
         // Spark ownership is independent of the number of coordinator GPUs.
         for rtx in [1, 2] {
@@ -581,7 +560,7 @@ mod tests {
     fn native_mxfp4_admission_matches_equal_k32_reader_and_exporter() {
         for world in [3, 6] {
             assert!(matches!(spark_recipe("dsv4f:mxfp4", 2048, world),
-                Err(SparkRecipeRefusal::GeometryInvalid { block: 32, .. })));
+                Err(SparkRecipeRefusal::NativeUnequal { .. })));
         }
         for world in [2, 4] {
             assert!(spark_recipe("dsv4f:mxfp4", 2048, world).is_ok());
@@ -600,8 +579,10 @@ mod tests {
                 "glmf:nvfp4a4", "glm:exl3-k34", "glmf:exl3-k34", "v41:mxfp4",
                 "dsv4p:exl3-k23", "qwen4:exl3-k45", "qwen4:nvfp4"] {
                 let worlds = spark_worlds(package, intermediate);
-                assert!(!worlds.iter().any(|world| matches!(world, 7 | 8)));
-                if package != "glmf:nvfp4a4" { assert!(!worlds.contains(&5)); }
+                if package.contains("nvfp4") {
+                    assert!(!worlds.iter().any(|world| matches!(world, 7 | 8)));
+                    if package != "glmf:nvfp4a4" { assert!(!worlds.contains(&5)); }
+                }
                 for world in worlds {
                     let recipe = spark_recipe(package, intermediate, world).unwrap();
                     assert_eq!(recipe.widths.len(), world);
@@ -613,11 +594,11 @@ mod tests {
                 }
             }
         }
-        assert_eq!(spark_worlds("mimof:fp8", 2048), [2, 3, 4]);
+        assert_eq!(spark_worlds("mimof:fp8", 2048), [2, 3, 4, 5, 6, 7, 8]);
         assert!(spark_recipe("mimof:fp8", 2048, 3).is_ok());
-        assert_eq!(spark_worlds("mimop:fp8", 2048), [2, 6]);
+        assert_eq!(spark_worlds("mimop:fp8", 2048), [2, 6, 7, 8]);
         assert_eq!(spark_worlds("qwen4:exl3-k45", 640), [1, 2, 3, 4]);
-        assert_eq!(spark_worlds("qwen4:nvfp4", 640), [2, 3, 4, 6]);
+        assert_eq!(spark_worlds("qwen4:nvfp4", 640), [1, 2, 3, 4, 6]);
         assert!(matches!(spark_recipe("unknown:fp8", 2048, 4),
             Err(SparkRecipeRefusal::UnknownPackage(_))));
     }
@@ -625,16 +606,16 @@ mod tests {
     #[test]
     fn package_layouts_follow_the_packagers() {
         // Only exact-even or explicitly qualified uneven kernels are admitted.
-        assert_eq!(fp8_spark_worlds(2048), [2, 4, 6]);
-        assert!(fp8_spark_worlds(640).is_empty());
-        assert_eq!(exl3_spark_worlds(2048), [2, 3, 4, 6]);
-        assert_eq!(exl3_spark_worlds(640), [2, 3, 4]);
+        assert_eq!(spark_worlds("mimo:fp8", 2048), [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(spark_worlds("qwen4:fp8", 640), [1, 2, 3, 4, 5]);
+        assert_eq!(spark_worlds("glm:exl3-k34", 2048), [2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(spark_worlds("qwen4:exl3-k45", 640), [1, 2, 3, 4]);
         assert_eq!(stored_slice(2048, 128, 6), Some(384));
         assert_eq!(stored_slice(2048, 32, 6), Some(384));
         assert_eq!(stored_slice(2304, 128, 4), Some(640));
         assert_eq!(stored_slice(640, 128, 6), None);
         assert_eq!(stored_slice(2048, 128, 0), None);
-        assert_eq!(nvfp4_spark_worlds(640), [2, 3, 4, 6]);
+        assert_eq!(spark_worlds("qwen4:nvfp4", 640), [1, 2, 3, 4, 6]);
         assert_eq!(stored_slice(640, 16, 6), Some(128));
         assert_eq!(stored_slice(2048, 16, 6), Some(384));
     }

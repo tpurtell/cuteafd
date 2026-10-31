@@ -177,7 +177,7 @@ fn save_diagnostics(
 
 fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
     ensure!((3..=91).contains(&last), "Step-5 golden supports target layers 3..91");
-    ensure!([4, 6].contains(&peers), "Step-5 golden needs canonical TP4 or TP6 real experts");
+    ensure!(cuteafd_core::tp_units::spark_package_worlds("step5", "fp8").contains(&peers), "Step-5 golden needs a shared width-class Spark recipe");
     let final_routed = last.min(90);
     ensure!(hosted == (3..=final_routed).collect::<Vec<_>>(),
         "Step-5 golden hosted experts must exactly cover layers 3..{final_routed}");

@@ -1,5 +1,5 @@
 //! Shared native startup for serving and diagnostics. Admission precedes all
-//! retained operands and ordinary six-rank transport connection.
+//! retained operands and ordinary admitted-rank transport connection.
 use super::{admission, device::NativePrograms, engine::Engine};
 use crate::shared::{inventory::{InventoryPhase, RuntimeInventory}, memory::device::{Device, Stream},
     peer_split::{hop::HopLink, PeerExchange, RankDevice}};
@@ -54,6 +54,9 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     cfg: &KimiK3Config, options: Options<'_>) -> Result<Loaded<'a>> {
     ensure!(options.draft.as_ref().is_none_or(|draft| draft.cache_format == options.cache_format),
         "Kimi target/draft cache records differ");
+    let spark_ranks = options.peers.len();
+    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&spark_ranks),
+        "Kimi startup requires 1..8 Spark peers");
     let core = cuteafd_loader::plan::families::kimi::core_inventory(checkpoint)?;
     core.validate_runtime_groups(full)?;
     ensure!(crate::shared::peer_split::probed_device(library, options.devices[0], Some(options.devices[1]))?
@@ -86,7 +89,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
     let model = crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?;
     let working = cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![],
         spark_layers: cfg.dense.iter().enumerate().filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(),
-        spark_ranks: 6, prefill_lanes: 1 };
+        spark_ranks, prefill_lanes: 1 };
     let spark_budget = cuteafd_loader::placement::SparkBudgetInventory::exl3(&catalog, &working,
         &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
         model, (spark_budget_gib * (1u64 << 30) as f64) as u64,
@@ -112,7 +115,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
         library.peer_exchange_initialize()?;
         library.peer_abort_initialize()?;
         if diagnostics { library.peer_diagnostic_initialize()?; }
-        library.v41_compact_reducer()?.require_plane_reduction(6)?;
+        library.v41_compact_reducer()?.require_plane_reduction(spark_ranks as u32)?;
         Ok(())
     })?;
     let lane_layouts = vec![[native[0].lane_layout(full, 0, rows, unit, options.max_context)?,
@@ -145,7 +148,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
             baseline: cuteafd_loader::placement::Baseline::Measured { free_bytes: sample.free_bytes } }
     }).collect::<Vec<_>>().try_into().map_err(|_| anyhow::anyhow!("Kimi GPU sample count"))?;
     let mut admitted = admission::admit(admission::Inputs { cfg, core, cache_format: options.cache_format, gpus, devices: [options.devices[0], options.devices[1]],
-        peer_access: true, spark_ranks: 6, attention: None, requested_pool: options.pool_tokens,
+        peer_access: true, spark_ranks, attention: None, requested_pool: options.pool_tokens,
         state_slots: options.slots, prefix_marks: options.marks, rows, lanes: 1, waves: options.waves,
         unit_rows: options.prefill_rows, lane_layouts, fixed,
         startup: graph_set.as_ref().map_or_else(Vec::new, |set|

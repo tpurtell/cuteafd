@@ -80,6 +80,7 @@ def _export(tp, ep, *, differing, cross_identical=False):
 
 def test_reducer_selfcheck_matches_ordered_semantics() -> None:
     module = _load()
+    pytest.importorskip("torch")
     result = module.reducer_selfcheck()
     assert result["cancellation_ordered_bf16"] == 1.0
     assert result["six_slot_compact"] == 260.0
@@ -325,3 +326,16 @@ def test_artifact_slug_is_filesystem_safe() -> None:
     assert module.artifact_slug(3, 2) == "tp3ep2"
     for slug in ("tp2ep2", "tp4ep1"):
         assert " " not in slug and "{" not in slug and "/" not in slug
+
+
+@pytest.mark.parametrize("tp", range(1, 10))
+@pytest.mark.parametrize("ep", (1, 2, 3))
+def test_topology_decoder_uses_shared_native_coverage(tp, ep):
+    from spark_packages import native_spark_geometry, ownership_topology
+    module = _load()
+    if ownership_topology(tp, ep):
+        assert module._topology_config({"tp": tp, "ep": ep}) == (
+            None if tp == 4 else tp, native_spark_geometry()[tp][1])
+    else:
+        with pytest.raises(ValueError, match="unsupported exported topology"):
+            module._topology_config({"tp": tp, "ep": ep})

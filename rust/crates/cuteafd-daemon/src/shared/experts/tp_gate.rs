@@ -248,7 +248,7 @@ fn native_tp_rank_sum() -> Result<()> {
     let family = std::env::var("CUTEAFD_GOLDEN_FAMILY")?;
     let format = std::env::var("CUTEAFD_GOLDEN_FORMAT")?;
     let world: usize = std::env::var("CUTEAFD_GOLDEN_SPARK_WORLD")?.parse()?;
-    ensure!(matches!(world, 2 | 3 | 4 | 6), "rank-sum requires TP2/3/4/6");
+    ensure!((1..=cuteafd_core::MAX_SPARK_WORLD).contains(&world), "rank-sum requires 1..8 ranks; checkpoint recipe validates widths");
     let layers = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?.split(',')
         .map(str::parse).collect::<std::result::Result<Vec<usize>, _>>()?;
     ensure!(layers.len() >= world && layers.windows(2).all(|w| w[1] == w[0] + 1),

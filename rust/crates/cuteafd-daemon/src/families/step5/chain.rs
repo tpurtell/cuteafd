@@ -548,8 +548,8 @@ mod tests {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let world = SparkWorld::canonical(peers.len())?;
         ensure!(
-            [4, 6].contains(&peers.len()),
-            "chain gate requires canonical TP4 or TP6"
+            cuteafd_core::tp_units::spark_package_worlds("step5", "fp8").contains(&peers.len()),
+            "chain gate requires a shared width-class Spark recipe"
         );
         let hosted = std::env::var("CUTEAFD_GOLDEN_EXPERT_LAYERS")?
             .split(',').map(str::parse).collect::<std::result::Result<Vec<usize>, _>>()?;

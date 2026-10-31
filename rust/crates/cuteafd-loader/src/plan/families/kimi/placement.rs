@@ -57,16 +57,6 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let experts = *model.bytes.get(&Component::RoutedExpert).unwrap_or(&0);
     let routed_layers = cfg.dense.iter().filter(|d| !**d).count() as u64;
     let layer_bytes = experts / routed_layers;
-    // TP6 width 512: 1/6 of every trellis and of the 3072-wide rotations, whole
-    // copies of the 3584-wide input (w1/w3 suh) and output (w2 svh) rotations.
-    let replicated_rotations = cfg.experts as u64 * 3 * cfg.latent as u64 * 2;
-    let rank_layer = |world: u64| (layer_bytes - replicated_rotations).div_ceil(world) + replicated_rotations;
-    if ranks != 6 {
-        refusal(report, format!("Kimi K3 missing Spark recipe kimik3:exl3-k23 TP{ranks}: estimated routed experts \
-            need {:.1} GiB/rank", (rank_layer(ranks.max(1) as u64) * routed_layers) as f64 / GIB as f64),
-            "Export balanced H128 widths in package_exl3_aot.py, register spark_recipe, and parameterize Kimi Spark intake/admission by rank count; TP6 width 512 is currently installed.");
-        return memory;
-    }
     if gpus != 2 || !opts.head_split {
         refusal(report, "Kimi K3 targets two coordinator GPUs with split KDA and FFNs".into(),
             "Use --rtx 2; one RTX cannot hold 105.7 GiB of BF16 text weights.");
@@ -145,7 +135,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
             let mut demands = allocation::baseline_demands(cfg, manifest, rows, shape, context as usize,
-                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads))?;
+                usize::try_from(slots)?, verify, &model.core, report.requested_attention == Some(AttentionPlacement::Heads), ranks)?;
             let families = if model.core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] };
             let programs = ProgramSet::from_manifest(manifest, families);
             for rank in 0..2 {
@@ -367,7 +357,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     for rank in 0..ranks {
         let resident = spark_budget.resident[rank][onboarded..].iter().sum::<u64>();
         let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32, capacity_bytes: opts.spark_bytes,
-            kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (TP6 width 512, replicated 3584 rotations)",
+            kv_tokens: 0, items: vec![Item::new(Category::Experts, "routed experts (balanced H128, replicated 3584 rotations)",
                 model.expert_formats.join("+"), resident, Basis::Exact)] };
         if let Err(error) = crate::plan::layout::charge_spark_io(&mut device, &working, cuteafd_core::ExpertGeometry::KIMI_K3,
             unit as u32, false, rings, 0) {
@@ -378,7 +368,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         }
         memory.devices.push(device);
     }
-    memory.notes.push(format!("Spark budget {} B/rank includes exact TP6 header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",
+    memory.notes.push(format!("Spark budget {} B/rank includes rank-specific header arenas, endpoint I/O, runtime residual and typed execution owners (one prefill scratch, {} x {}-row units)",
         spark_budget.budget, admitted.waves, admitted.unit_rows));
     memory
 }

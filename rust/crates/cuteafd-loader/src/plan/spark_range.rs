@@ -159,6 +159,12 @@ fn geometry(report: &PlanReport, contract: &super::family::ExpertContract) -> Op
     let moe = report.spec.as_ref()?.moe.as_ref()?;
     let routed = report.components.iter().filter(|component| component.component == Component::RoutedExpert)
         .map(|component| component.bytes).sum();
+    // Deprecated NVFP4 retains its historical H128 storage policy. Selecting a
+    // newly exposed full-width alias must not change the native K16 ownership.
+    if contract.package.split_whitespace().next().is_some_and(|key|
+        key.split(':').nth(1).is_some_and(|format| matches!(format, "nvfp4" | "nvfp4a4"))) {
+        return Some((routed, moe.intermediate, 128));
+    }
     let recipe = (1..=MAX_SPARKS).find_map(|world|
         super::experts::spark_recipe(&contract.package, moe.intermediate, world).ok())?;
     let unit = match recipe.slicing {
@@ -168,6 +174,15 @@ fn geometry(report: &PlanReport, contract: &super::family::ExpertContract) -> Op
         crate::formats::fp8_experts::Slicing::Padded => 128,
     };
     Some((routed, moe.intermediate, unit))
+}
+
+fn source_block_columns(package: &str, padded: bool, count_unit: usize, contract_block: usize) -> usize {
+    if !padded { return count_unit; }
+    // Native MXFP4 pads kernels to H128 but partitions the checkpoint in K32.
+    match package.split_whitespace().next().and_then(|key| key.split_once(':')).map(|(_, format)| format) {
+        Some("mxfp4") => 32,
+        _ => contract_block,
+    }
 }
 
 /// Missing recipes may refuse execution after constructing a complete ledger.
@@ -194,6 +209,11 @@ impl PlanInput {
     /// Open headers once, then ask the same complete planner for both card columns.
     /// No GPU queries, tensor payloads, or package-coverage assumptions are made.
     pub fn spark_ranges(&self, options: &PlanOptions) -> Result<Vec<ColumnRange>, PlanError> {
+        self.spark_ranges_with_source_units(options, source_block_columns)
+    }
+
+    fn spark_ranges_with_source_units(&self, options: &PlanOptions,
+        source_units: impl Fn(&str, bool, usize, usize) -> usize) -> Result<Vec<ColumnRange>, PlanError> {
         let mut columns = Vec::new();
         let mut one_rtx_minimum = None;
         for rtx_gpus in [1, 2] {
@@ -235,9 +255,10 @@ impl PlanInput {
                         crate::formats::fp8_experts::Slicing::Blocks(unit) => unit,
                         crate::formats::fp8_experts::Slicing::Padded => unit_columns,
                     }).unwrap_or(unit_columns);
-                    let source_block_columns = if padded { contract.block } else { count_unit };
-                    let rule = if padded || sparks == 0 { UnitRule::Contiguous }
-                        else { balanced_rule(intermediate, count_unit, sparks) };
+                    let source_block_columns = source_units(package, padded, count_unit, contract.block);
+                    let rule = if sparks == 0 { UnitRule::Contiguous }
+                        else { recipe.as_ref().map(|recipe| recipe.rule)
+                            .unwrap_or_else(|| balanced_rule(intermediate, count_unit, sparks)) };
                     let classes = if sparks == 0 { vec![] } else if padded {
                         let mut classes = recipe.as_ref().unwrap().widths.iter().map(|width| width / count_unit).collect::<Vec<_>>();
                         classes.sort_unstable(); classes.dedup(); classes
@@ -402,6 +423,106 @@ mod tests {
         let unqualified = SparkRange::new(0, 16 << 30, 640, 128, 0).unwrap();
         assert_eq!(unqualified.maximum, 2);
         assert_eq!(unqualified.binding, [BindingCap::Width]);
+    }
+
+    #[test]
+    fn padded_native_source_units_are_not_kernel_alignment() {
+        use cuteafd_core::tp_units::RankUnits;
+        for (package, intermediate, world, stored) in [
+            ("v41:mxfp4 (expertd-native)", 2304, 8, 384),
+            ("dsv4p:mxfp4 (expertd-native)", 3072, 3, 1024),
+        ] {
+            let recipe = super::super::experts::spark_recipe(package, intermediate, world).unwrap();
+            let block = source_block_columns(package, true, 128, 128);
+            assert_eq!(block, 32);
+            assert_eq!(recipe.widths, vec![stored; world]);
+            for rank in 0..world {
+                let map = RankUnits::new(recipe.rule, 1, intermediate, block, 0, world, rank).unwrap();
+                assert_eq!(map.resident_units() * block, intermediate / world);
+            }
+        }
+        assert_eq!(source_block_columns("qwen4:nvfp4", true, 128, 16), 16);
+        assert_eq!(source_block_columns("mimop:fp8", false, 32, 128), 32);
+        assert_eq!(source_block_columns("glm:exl3-k45", false, 128, 128), 128);
+    }
+
+    fn direct_layout_is_independent_of_range_source_units(case: usize) {
+        use super::super::{layout::LayoutOptions, testing};
+        let dir = tempfile::tempdir().unwrap();
+        let world = match case {
+            0 => { testing::write_v41_snapshot(dir.path()); 8 },
+            1 => { testing::write_v4_pro_mxfp4_snapshot(dir.path()); 3 },
+            2 => {
+                testing::write_snapshot(dir.path(), &testing::glm5_config(),
+                    &testing::glm5_tensors(|stem, n, k| testing::exl3(stem, n, k, 4)), None);
+                5
+            },
+            3 => {
+                testing::write_snapshot(dir.path(), &testing::mimo_flash_config(),
+                    &testing::mimo_flash_tensors(), None);
+                5
+            },
+            _ => unreachable!(),
+        };
+        let options = PlanOptions {
+            placement: ExpertPlacement::from_spark_ranks(world),
+            mapped_scale_host_budget_bytes: Some(64 << 30),
+            layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+                host_cache_bytes: Some(0), rtx_bytes: vec![96 << 30; 2],
+                pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default() }),
+            ..Default::default()
+        };
+        let input = PlanInput::open(dir.path()).unwrap();
+        let old_ranges = input.spark_ranges_with_source_units(&options,
+            |_, padded, count_unit, contract_block| if padded { contract_block } else { count_unit }).unwrap();
+        let direct = input.plan(&options).unwrap();
+        let package = &direct.experts.as_ref().unwrap().package;
+        assert!(package.starts_with(match case {
+            0 => "v41:mxfp4", 1 => "dsv4p:mxfp4", 2 => "glm:exl3", 3 => "mimo:fp8",
+            _ => unreachable!(),
+        }), "case {case}: wrong fixture package {package}");
+        let old_direct = serde_json::to_vec(&direct).unwrap();
+        let corrected_ranges = input.spark_ranges(&options).unwrap();
+        let corrected_direct = serde_json::to_vec(&input.plan(&options).unwrap()).unwrap();
+        assert_eq!(old_direct, corrected_direct, "case {case}: direct-layout JSON changed");
+        let mut old = serde_json::to_value(old_ranges).unwrap();
+        let corrected = serde_json::to_value(corrected_ranges).unwrap();
+        let mut changes = 0;
+        for (before, after) in old.as_array_mut().unwrap().iter_mut().zip(corrected.as_array().unwrap()) {
+            for (before, after) in before["counts"].as_array_mut().unwrap().iter_mut()
+                .zip(after["counts"].as_array().unwrap()) {
+                if before["source_block_columns"] != after["source_block_columns"] {
+                    assert!(case <= 1);
+                    assert_eq!(before["padded"], true);
+                    assert_eq!(before["source_block_columns"], 128);
+                    assert_eq!(after["source_block_columns"], 32);
+                    before["source_block_columns"] = after["source_block_columns"].clone();
+                    changes += 1;
+                }
+            }
+        }
+        assert_eq!(old, corrected, "case {case}: non-source-unit range metadata changed");
+        assert_eq!(changes > 0, case <= 1);
+    }
+
+    #[test]
+    fn native_tp8_direct_layout_is_independent_of_range_source_units() {
+        direct_layout_is_independent_of_range_source_units(0);
+    }
+
+    #[test]
+    fn pro_tp3_direct_layout_is_independent_of_range_source_units() {
+        direct_layout_is_independent_of_range_source_units(1);
+    }
+
+    #[test]
+    fn exl3_direct_layout_is_independent_of_range_source_units() {
+        direct_layout_is_independent_of_range_source_units(2);
+    }
+
+    #[test]
+    fn fp8_direct_layout_is_independent_of_range_source_units() {
+        direct_layout_is_independent_of_range_source_units(3);
     }
 
     #[test]

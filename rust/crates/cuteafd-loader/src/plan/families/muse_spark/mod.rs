@@ -289,7 +289,7 @@ impl FamilyModel for Model {
         (operand.exl3_bits().is_some_and(|bits| (4..=5).contains(&bits)) || norm).then(|| ExpertContract {
             package: PACKAGE.into(),
             block: 128,
-            spark_worlds: placement::SPARK_WORLDS.to_vec(),
+            spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, self.cfg.moe_intermediate),
             local: Err("Muse Spark routed experts (~400 GB at K4) cannot all be resident on the coordinators".into()),
         })
     }

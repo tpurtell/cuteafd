@@ -259,3 +259,24 @@ fn png_xmp_orientation_matches_pillow_fallback() {
     let unrotated = decode(&encoded, DecodePolicy { exif_transpose: false, ..Default::default() }).unwrap();
     assert_eq!((unrotated.width, unrotated.height), (2, 1));
 }
+
+
+#[test]
+fn legacy_processor_serialization_and_ids_stay_bicubic() {
+    for family in [ImageFamily::Mimo, ImageFamily::Qwen, ImageFamily::GlmFlash] {
+        let config = ProcessorConfig::for_family(family);
+        let serialized = serde_json::to_vec(&config).unwrap();
+        assert!(!String::from_utf8_lossy(&serialized).contains("resample"));
+        let mut legacy = Sha256::new();
+        legacy.update(b"cuteafd-preprocess-v1:pillow-bicubic");
+        legacy.update(&serialized);
+        assert_eq!(config.id(), PreprocessId(legacy.finalize().into()));
+        let restored: ProcessorConfig = serde_json::from_slice(&serialized).unwrap();
+        assert_eq!(restored.resample, Resample::Bicubic);
+        assert_eq!(restored.id(), config.id());
+        let mut lanczos = config.clone();
+        lanczos.resample = Resample::Lanczos;
+        assert_ne!(lanczos.id(), config.id());
+        assert!(String::from_utf8_lossy(&serde_json::to_vec(&lanczos).unwrap()).contains("Lanczos"));
+    }
+}

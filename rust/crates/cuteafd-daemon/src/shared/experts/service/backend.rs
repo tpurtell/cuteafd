@@ -791,9 +791,10 @@ mod tests {
         let directory = root.path().join("tp3");
         std::fs::create_dir(&directory)?;
         std::fs::write(directory.join("libcuteafd_fp8moe.so"), b"present")?;
-        let error = validate_fp8_recipe("qwen4:fp8", 640, 3, &directory, 0,
-            Slicing::Padded, 256).unwrap_err();
-        assert!(error.downcast_ref::<SparkRecipeRefusal>().is_some(), "{error:#}");
+        let error = validate_fp8_recipe("qwen4:nvfp4", 640, 7, &directory, 0,
+            Slicing::Padded, 128).unwrap_err();
+        assert!(matches!(error.downcast_ref::<SparkRecipeRefusal>(),
+            Some(SparkRecipeRefusal::Deprecated { .. })), "{error:#}");
         Ok(())
     }
 

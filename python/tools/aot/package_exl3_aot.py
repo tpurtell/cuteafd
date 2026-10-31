@@ -733,7 +733,7 @@ def shard_profiles(geometry: str, role: str) -> list[tuple]:
     profiles = []
     # Every transport count with at least one whole rotation block per rank.
     # Qwen's five H128 blocks intentionally exclude TP6.
-    worlds = range(1, min(6, blocks) + 1)
+    worlds = range(1, min(8, blocks) + 1)
     for world in worlds:
         widths: dict[int, list[str]] = {}
         for rank in range(world):
@@ -752,20 +752,16 @@ def profiles_for_role(role: str, geometry: str = 'dsv4p') -> list[tuple]:
     split exactly, each compiling one export per capacity shared by its ranks.
     Other geometries derive the same H128 split from their own intermediate.
     """
-    if geometry == 'kimik3':
-        return [profile for profile in shard_profiles(geometry, role)
-                if role != 'spark' or profile[0] == 'tp6-width512']
     return shard_profiles(geometry, role)
 
 
 def build_profiles(role: str, geometry: str, *, all_spark_counts: bool = False) -> list[tuple]:
     profiles = profiles_for_role(role, geometry)
-    if all_spark_counts or role != 'spark':
+    if role != 'spark' or all_spark_counts:
         return profiles
-    worlds = {2, 3, 4, 6} if GEOMETRIES[geometry][1] // 128 >= 6 else {2, 3, 4}
-    if geometry == 'qwen4':
-        worlds.add(1)
-    return [profile for profile in profiles if int(profile[0].split('-')[0][2:]) in worlds]
+    from spark_packages import package_worlds
+    worlds = set(package_worlds(geometry, 'exl3'))
+    return [entry for entry in profiles if int(entry[0].split('-')[0][2:]) in worlds]
 
 
 def compact_profiles(geometry: str, profiles: list[tuple]) -> list[tuple]:
@@ -1098,16 +1094,32 @@ def build(args: argparse.Namespace) -> None:
         # The planner's context idles while its workers run; free its host lease.
         park_context_lease()
         print(f'EXL3 variants: {len(pending)} independent exports, {jobs} workers', flush=True)
-        payloads = [(args, expected_compute, *item[:7]) for item in pending]
-        # Spawn never inherits a CUDA context; successful manifests retain order.
-        for item, (meta, runtime_files) in zip(pending, compile_variants(payloads, jobs)):
+        # World and rank destinations do not determine generated code. Keep all
+        # arithmetic/schedule options in the key, including compact descriptor ABI.
+        unique = {}
+        keys = []
+        for item in pending:
+            key = (*item[1:6], json.dumps(item[6], sort_keys=True))
+            keys.append(key)
+            unique.setdefault(key, item)
+        # Stable width/options cache identity, independent of the first world
+        # that happened to request this variant. ABI and schedule are in options.
+        for key, item in list(unique.items()):
+            identity = json.dumps([geometry, args.role, args.bits, expected_compute, key], sort_keys=True)
+            raw = args.build_dir / f'width{item[1]}-{hashlib.sha256(identity.encode()).hexdigest()[:20]}' / f'm{item[3]}'
+            unique[key] = (raw, *item[1:])
+        payloads = [(args, expected_compute, *item[:7]) for item in unique.values()]
+        compiled = dict(zip(unique, compile_variants(payloads, jobs)))
+        for item, key in zip(pending, keys):
+            meta, runtime_files = compiled[key]
+            source = unique[key][0]
             raw, width, experts, capacity, topk, dtype, run_options, destinations, schedule, requested = item
             for destination in destinations:
                 directory = f'{destination}/m{capacity}' + ('' if schedule is None else f'-{schedule}')
                 for name in runtime_files:
                     target = stage / directory / name
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(raw / name, target)
+                    shutil.copy2(source / name, target)
                 variant = {'directory': directory, **{key: meta[key] for key in
                     ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
                 for key in ('descriptor_rows', 'native_info_version'):
@@ -1176,7 +1188,7 @@ def main() -> None:
     create.add_argument('--geometry', choices=sorted(GEOMETRIES), default='dsv4p',
                         help='Routed-expert geometry (cuteafd_core::ExpertGeometry::family)')
     create.add_argument('--all-spark-counts', action='store_true',
-                        help='Opt in to all nonempty H128 Spark TP profiles (1..6)')
+                        help='Opt in to all nonempty H128 Spark TP profiles (1..8)')
     create.add_argument('--compact-companions', action='store_true',
                         help='Add compact two-tier exports for selected uneven Spark worlds only')
     create.add_argument('--profile', action='append', default=[],

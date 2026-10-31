@@ -21,8 +21,8 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertEqual(tool.activation("kimik3"), "situ")
         self.assertIsNone(tool.swiglu_limit("kimik3"))
         self.assertEqual(tool.package_name("kimik3", [2, 3]), "exl3-kimik3-k23")
-        spark = {p[0]: p[1:] for p in tool.profiles_for_role("spark", "kimik3")}
-        self.assertEqual(set(spark), {"tp6-width512"})
+        spark = {p[0]: p[1:] for p in tool.build_profiles("spark", "kimik3")}
+        self.assertEqual(set(spark), {"tp6-width512", "tp7-width512", "tp7-width384", "tp8-width384"})
         self.assertEqual(spark["tp6-width512"],
                          (512, 896, 16, "bf16", [f"tp6-rank{i}" for i in range(6)]))
         coordinator = {p[0]: p[1:] for p in tool.profiles_for_role("coordinator", "kimik3")}

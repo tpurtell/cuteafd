@@ -9,7 +9,6 @@ extern "C" {
  * matrices: BF16; vectors (norm/bias/sinks/inv_freq): FP32. */
 #define CUTEAFD_VISION_NUMERICS 1
 #define CUTEAFD_VISION_NO_OFFSET UINT64_MAX
-#define CUTEAFD_VISION_DEPTH 28
 
 typedef struct {
   uint64_t qkv, qkv_bias, proj, proj_bias, gate_up, gate_up_bias;
@@ -18,17 +17,18 @@ typedef struct {
 } cuteafd_vision_block;
 
 typedef struct {
+  uint32_t storage_abi; /* 3: host pointer/count storage, copied during registration. */
   uint32_t abi_version, max_tokens, output_width, reserved;
   uint64_t weight_bytes, patch, merger_norm, merger_fc1, merger_fc2, inv_freq;
-  cuteafd_vision_block blocks[CUTEAFD_VISION_DEPTH];
-  /* ABI 2 only: reserved selects Qwen=2 or GLM Flash=3. ABI 1's prefix
-   * and numerics are unchanged; native code must not read this suffix. */
+  const cuteafd_vision_block* blocks;
+  /* Numerics 1 = MiMo; numerics 2: reserved Qwen=2 or GLM Flash=3.
+   * Every array below contains exactly depth host entries. */
   uint32_t hidden, depth, heads, kv_heads, head_dim, intermediate, patch_size, merger_width;
   float norm_eps;
   uint32_t geometry_reserved;
   uint64_t patch_bias, pos_embed, merger_norm_bias, merger_fc1_bias, merger_fc2_bias;
   uint64_t merger_extra[8];
-  uint64_t norm1_bias[28], norm2_bias[28], q_norm[28], k_norm[28];
+  const uint64_t *norm1_bias, *norm2_bias, *q_norm, *k_norm;
 } cuteafd_vision_spec;
 
 typedef struct {

@@ -378,8 +378,9 @@ def test_spark_builds_without_a_spark_need_have_no_program_table(tmp_path):
 @pytest.mark.parametrize('geometry,count', [('glm', 6), ('glmf', 4), ('qwen4', 2), ('dsv4p', 6), ('kimik3', 6),
                                             ('muse', 6), ('muse', 4), ('muse', 3), ('muse', 2)])
 def test_generic_spark_count_profiles_exist_in_the_package(tmp_path, geometry, count):
-    """exl3.cmake's per-count width profiles must be ones package_exl3_aot builds for the
-    geometry (a hardcoded block count once requested GLM widths for Muse)."""
+    """exl3.cmake's per-count width profiles (blocks from the shared range data) must be ones
+    package_exl3_aot builds for the geometry (a hardcoded block count once requested GLM widths
+    for Muse)."""
     cmake = (ROOT / 'native/cmake/shared/exl3.cmake').read_text()
     start = cmake.index('  set(CUTEAFD_EXL3_PROFILE_ARGS)')
     end = cmake.index('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', start)
@@ -387,7 +388,9 @@ def test_generic_spark_count_profiles_exist_in_the_package(tmp_path, geometry, c
     script.write_text(f'set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY {geometry})\n'
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{geometry}={count}")\nset(CUTEAFD_EXL3_GEOMETRY_LAYOUTS)\n'
                       + cmake[start:end] + 'message(STATUS "PROFILES=${CUTEAFD_EXL3_PROFILE_ARGS}")\n')
-    result = subprocess.run(['cmake', '-P', str(script)], capture_output=True, text=True, timeout=60)
+    # The fragment reads the shared range data relative to the native source dir.
+    result = subprocess.run(['cmake', '-P', str(script)], capture_output=True, text=True, timeout=60,
+                            cwd=ROOT / 'native')
     assert result.returncode == 0, result.stderr
     line = next(l for l in (result.stdout + result.stderr).splitlines() if 'PROFILES=' in l)
     requested = {p for p in line.split('PROFILES=', 1)[1].split(';') if p and p != '--profile'}

@@ -84,7 +84,7 @@ pub(crate) async fn run(args: crate::cli::NativeExpertDaemonArgs) -> Result<()> 
         max_frame_bytes: 0,
         rdma_endpoints: 0,
         declared_world: crate::shared::spark_topology::world(topology, args.world as usize)?,
-        native_spark_tp2: false,
+        native_spark_roles: false,
         bf16_ingress: false,
         encoder,
         audio_encoder,
@@ -121,7 +121,7 @@ pub(crate) struct NativeExpertServiceConfig {
     pub declared_world: SparkWorld,
     /// Native Flash's TP2 kernel uses the Spark shard role with legacy wire
     /// requests. Set only after catalog validation, never from a CLI override.
-    native_spark_tp2: bool,
+    native_spark_roles: bool,
     bf16_ingress: bool,
 }
 
@@ -608,7 +608,7 @@ mod tests {
             max_frame_bytes: 64 << 20,
             rdma_endpoints: 2,
             declared_world: crate::shared::spark_topology::world(topology, world).unwrap(),
-            native_spark_tp2: false,
+            native_spark_roles: false,
             bf16_ingress: false,
             encoder: None,
             audio_encoder: None,
@@ -915,15 +915,21 @@ mod tests {
     }
 
     #[test]
-    fn flash_native_tp2_selects_spark_role_without_changing_wire_protocol() {
-        for rank in 0..2 {
-            let mut flash = config(2, rank, None);
-            flash.native_spark_tp2 = true;
-            let layer = flash.selection(7).unwrap();
-            assert_eq!(layer, ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world: 2 });
-            assert_eq!(layer.role(), crate::shared::spark_topology::SPARK_TP2_ROLE);
-            assert!(flash.declared_world.ownership_topology().is_none());
-            assert_eq!(flash.native_group().unwrap(), None);
+    fn native_canonical_worlds_select_native_roles_without_changing_wire_protocol() {
+        for family in ["v41", "dsv4f", "dsv4p"] {
+            for world in cuteafd_core::tp_units::spark_package_worlds(family, "mxfp4") {
+                for rank in 0..world {
+                    let mut native = config(world, rank, None);
+                    native.native_spark_roles = true;
+                    let layer = native.selection(7).unwrap();
+                    let expected = if world == 4 { ExpertLayer::Backbone { layer: 7, rank } }
+                        else { ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world } };
+                    assert_eq!(layer, expected, "{family} TP{world} rank {rank}");
+                    assert!(layer.role() <= 8);
+                    assert!(native.declared_world.ownership_topology().is_none());
+                    assert_eq!(native.native_group().unwrap(), None);
+                }
+            }
         }
     }
 
@@ -1401,12 +1407,12 @@ impl NativeExpertServiceConfig {
         let rank = topology.tp_rank(self.rank)? as usize;
         Ok(match (topology.tp(), world.wire()) {
             (4, _) => ExpertLayer::Backbone { layer, rank },
-            (2, cuteafd_transport::expert::SparkWire::Canonical) if !self.native_spark_tp2 =>
+            (2, cuteafd_transport::expert::SparkWire::Canonical) if !self.native_spark_roles =>
                 ExpertLayer::BackboneTp2 { layer, rank },
             (tp, cuteafd_transport::expert::SparkWire::NativeOwnership) =>
                 ExpertLayer::BackboneReplicatedTp { layer, rank, world: tp as usize },
-            (2, _) if self.native_spark_tp2 =>
-                ExpertLayer::BackboneReplicatedTp { layer, rank, world: 2 },
+            (tp, _) if self.native_spark_roles =>
+                ExpertLayer::BackboneReplicatedTp { layer, rank, world: tp as usize },
             (tp, _) => ExpertLayer::BackboneExl3Tp { layer, rank, world: tp as usize },
         })
     }

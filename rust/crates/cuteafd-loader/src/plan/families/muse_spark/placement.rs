@@ -12,8 +12,6 @@ use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-/// Spark worlds the EXL3 TP package serves (the shared EXL3 recipe's worlds).
-pub(super) const SPARK_WORLDS: [usize; 4] = [2, 3, 4, 6];
 use crate::placement::families::muse_spark::LANES;
 
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,

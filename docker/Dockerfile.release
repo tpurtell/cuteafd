@@ -146,6 +146,8 @@ COPY .cuteafd-release-image/XGRAMMAR_PROVENANCE.json /opt/cuteafd/share/XGRAMMAR
 COPY .cuteafd-release-image/XGRAMMAR_LICENSE /opt/cuteafd/share/XGRAMMAR_LICENSE
 COPY .cuteafd-release-image/XGRAMMAR_SHA256SUMS /opt/cuteafd/share/XGRAMMAR_SHA256SUMS
 COPY python /opt/cuteafd/python
+# The archive, image and fixture staging share the scope derivation dependency closure.
+RUN --mount=type=bind,target=/cuteafd-source python3 -c 'import json, pathlib, shutil, sys; source, destination = map(pathlib.Path, sys.argv[1:]); inputs = json.loads((source / "scripts/build/spark-package-ranges.json").read_text())["shared_inputs"]; [( (destination / name).parent.mkdir(parents=True, exist_ok=True), shutil.copyfile(source / name, destination / name)) for name in inputs]' /cuteafd-source /opt/cuteafd
 COPY scripts/build/kernel-cache-identity.py /opt/cuteafd/scripts/build/kernel-cache-identity.py
 COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 

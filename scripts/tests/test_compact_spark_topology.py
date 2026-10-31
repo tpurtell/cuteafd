@@ -169,15 +169,15 @@ release_stop_wip_containers
             ('SPARK_COUNT=3\nSPARK_TP=3\nSPARK_EP=2', 'must equal SPARK_COUNT'),
             ('SPARK_COUNT=3\nSPARK_TP=1\nSPARK_EP=3', 'unsupported native Spark topology TP1EP3'),
             ('SPARK_COUNT=3\nSPARK_TP=2\nSPARK_EP=1', 'must equal SPARK_COUNT'),
-            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..6'),
+            ('SPARK_COUNT=9', 'SPARK_COUNT must be in 0..8'),
         ]:
             with self.subTest(settings=settings):
                 result = self.config(settings)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
 
-    def test_deleted_worlds_are_refused_before_launch(self):
-        for count in (7, 8):
+    def test_out_of_range_worlds_are_refused_before_launch(self):
+        for count in (9, 10):
             for topology in ('', f'\nSPARK_TP={count}\nSPARK_EP=1'):
                 with self.subTest(count=count, topology=topology):
                     result = self.config(f'SPARK_COUNT={count}{topology}')
@@ -185,7 +185,7 @@ release_stop_wip_containers
                     self.assertIn('must be in', result.stderr)
         # TP1 and NVFP4 TP5 remain canonical package contracts, not native
         # ownership layouts.
-        for count in (1, 5):
+        for count in (1, 5, 7):
             result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1')
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn('unsupported native Spark topology', result.stderr)

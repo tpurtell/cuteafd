@@ -103,14 +103,27 @@ fn whole_expert_ranks_split_the_routed_bytes_evenly() {
 }
 
 #[test]
-fn layout_picks_its_spark_range_and_onboards_by_default() {
+fn layout_picks_its_spark_range_and_onboards_by_default() { plan_matrix(2); }
+
+#[test]
+fn layout_plans_every_spark_world_on_one_rtx() { plan_matrix(1); }
+
+/// The plan matrix (#923) of one coordinator column: every Spark world the
+/// shared range data gives the width; each packages (no 'no layout' hint),
+/// and the worlds at or above the minimum fit.
+fn plan_matrix(column: usize) {
     let dir = snapshot(&all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
-    for (rtx, ranks) in [(2, 6), (2, 5), (2, 4), (1, 6), (1, 5), (1, 4)] {
+    let worlds = crate::plan::experts::spark_worlds(super::PACKAGE, 4096);
+    assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8], "range data for muse:exl3-k45");
+    for (rtx, ranks) in worlds.iter().map(|&ranks| (column, ranks)) {
         let report = input.plan(&with_layout(rtx, ranks)).unwrap();
         eprintln!("muse {rtx} RTX + {ranks} Sparks: fits {} onboard {:?} pool {:?} hints {:?}", report.fits,
             report.onboard_layers, report.memory_layout.as_ref().map(|m| m.pool_tokens),
             report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+        assert!(!report.hints.iter().any(|h| h.what.contains("no muse:exl3-k45 layout")), "{rtx} RTX + {ranks}: {:?}",
+            report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+        if ranks >= 4 { assert!(report.fits, "{rtx} RTX + {ranks} must fit (minimum 4): {:?}", report.hints); }
         if (rtx, ranks) == (2, 6) {
             assert!(report.fits && report.placement_supported, "{:?}", report.hints);
             let memory = report.memory_layout.as_ref().unwrap();
@@ -121,7 +134,7 @@ fn layout_picks_its_spark_range_and_onboards_by_default() {
         }
     }
     // Planned family: the inventory is not a serving claim.
-    let report = input.plan(&with_layout(2, 6)).unwrap();
+    let report = input.plan(&with_layout(column, 6)).unwrap();
     assert!(!report.executable());
 }
 

@@ -79,10 +79,8 @@ impl SparkWorld {
         );
         ensure!(
             wire != SparkWire::NativeOwnership
-                || matches!(
-                    (topology.tp(), topology.ep()),
-                    (2, 1) | (3, 1) | (4, 1) | (6, 1) | (2, 2) | (3, 2) | (2, 3)
-                ),
+                || cuteafd_core::tp_units::spark_ownership_topology(
+                    topology.tp() as usize, topology.ep() as usize),
             "unqualified Spark ownership topology"
         );
         ensure!(
