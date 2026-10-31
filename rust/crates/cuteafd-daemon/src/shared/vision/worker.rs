@@ -204,6 +204,44 @@ mod tests {
         assert_eq!((replica.row_markers, replica.max_patches, replica.output_width), (1, 55 * 55 * 4, 6144));
     }
 
+    /// Hardware (matching CUDA container): a Mistral Large 4 replica serves its Pixtral span over
+    /// the shared remote channel byte for byte as the same tower encodes it in-process, marker
+    /// rows included. `VISION_SNAPSHOT` (official checkpoint) and `VISION_LIBRARY` (vision AOT).
+    #[test]
+    #[ignore = "requires matching CUDA container, VISION_SNAPSHOT and VISION_LIBRARY"]
+    fn mistral_remote_span_matches_the_local_tower() {
+        use cuteafd_engine::media::{EncodeJob, EncoderClient};
+        let snapshot = std::path::PathBuf::from(std::env::var("VISION_SNAPSHOT").unwrap());
+        let library = std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        let processor = ProcessorConfig::from_snapshot(&snapshot, cuteafd_loader::media::ImageFamily::Mistral).unwrap();
+        let config = EncoderWorkerConfig { listen: "127.0.0.1:0".into(), plan_hash: [9; 32], revision: "rev".into(),
+            max_tokens: processor.max_image_tokens };
+        let (server, _) = start(&config, &snapshot, library.clone(), 64 << 30).unwrap();
+        let coordinator = TowerSpec::mistral_large4(&snapshot,
+            super::super::mistral::merged_capacity(processor.max_image_tokens)).unwrap();
+        let expected = image_handshake(&coordinator, &processor, coordinator.encoder_id("rev", architecture(&library).unwrap()),
+            [9; 32]);
+        let mut client = super::super::remote::RemoteEncoder::connect(vec![server.address], expected,
+            Duration::from_secs(60)).unwrap();
+        let (gh, gw) = (16usize, 24usize);
+        let rgb: Vec<u8> = (0..gh * 14 * gw * 14 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let rows = cuteafd_ffi::vision::output_rows([gh, gw], true);
+        let job = EncodeJob::image(cuteafd_core::ImageKey([4; 32]), [1, gh as u32, gw as u32], rgb.clone().into(), rows, 6144);
+        let ticket = client.submit(job).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let remote = loop {
+            if let Some(result) = client.poll(ticket) { break result.unwrap().features; }
+            assert!(std::time::Instant::now() < deadline, "remote encode timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop((client, server));
+        let mut local = super::super::VitRuntime::load(coordinator, &library, 0, 64 << 30).unwrap();
+        let mut output = vec![0u16; rows * 6144];
+        local.encode_into(&rgb, [gh, gw], &normalization_lut(&processor), &mut output).unwrap();
+        let local: Vec<u8> = output.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(&remote[..], &local[..], "remote and in-process Pixtral spans differ");
+    }
+
     #[test]
     fn hash_parser_fails_closed() {
         assert_eq!(parse_plan_hash(&"ab".repeat(32)).unwrap(), [0xab; 32]);
