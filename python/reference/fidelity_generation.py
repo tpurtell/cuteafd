@@ -271,7 +271,12 @@ class APIClient(TextGenerator):
         request, record = self.resolved_request(body)
         if record is None:
             record = self.cache.get(request, lambda: self.request(request))
-        rendered_body = self.rendering_body(record["binding"]["request"])
+        cached = record["binding"]["request"]
+        # Cached records are canonical (sorted-key) JSON; templates that serialize
+        # tools or messages with tojson must see the caller's original key order.
+        ordered = {**cached, **{key: copy.deepcopy(request[key]) for key in ("messages", "tools")
+                                if key in request and request[key] == cached.get(key)}}
+        rendered_body = self.rendering_body(ordered)
         raw = record["response"]
         if raw.get("error") or not raw.get("choices"):
             raise ValueError("API returned an error or no choices (raw response cached)")

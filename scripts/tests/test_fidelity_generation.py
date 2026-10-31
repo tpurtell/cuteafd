@@ -273,3 +273,25 @@ def test_api_renders_cached_wire_effort_and_default_without_calls(api, monkeypat
 def test_truncated_thinking_is_not_mistaken_for_final_content():
     message = parse_qwen_response("still thinking", [], thinking_prefix=True)
     assert message["reasoning_content"] == "still thinking" and message["content"] == ""
+
+
+class ToolOrderTokenizer(Tokenizer):
+    """A template that serializes tools in their given key order (Mistral tojson)."""
+
+    def apply_chat_template(self, messages, tools=None, tokenize=False, add_generation_prompt=False):
+        return json.dumps(tools) + super().apply_chat_template(messages, tokenize=tokenize,
+                                                               add_generation_prompt=add_generation_prompt)
+
+
+def test_cached_rerender_keeps_original_tool_key_order(api):
+    client, state = api
+    client.renderer = ChatRenderer(ToolOrderTokenizer())
+    request = body()
+    request["tools"] = [{"type": "function", "function": {"name": "read_file", "description": "d",
+                                                          "parameters": {"type": "object"}}}]
+    first = client(copy.deepcopy(request))
+    # A second identical request is a cache hit read back from canonical JSON.
+    second = client(copy.deepcopy(request))
+    assert len(state["calls"]) == 1
+    assert second["probe"]["prompt_ids"] == first["probe"]["prompt_ids"] == client.prompt(request)["probe"]["prompt_ids"]
+    assert bytes(second["probe"]["prompt_ids"]).decode().startswith('[{"type": "function"')
