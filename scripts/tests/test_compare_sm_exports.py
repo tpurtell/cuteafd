@@ -368,6 +368,16 @@ def test_step5_export_groups_bind_native_geometry(heads, suffix, group):
     assert job == (f"step5-{group}{suffix}", "export_b12x_step5_aot.py", expected)
 
 
+@pytest.mark.parametrize("heads,suffix", [(128, ""), (64, "-tp2")])
+@pytest.mark.parametrize("group", ["pointwise", "projections", "attention"])
+def test_muse_export_groups_bind_native_geometry(heads, suffix, group):
+    job = next(job for job in compare_sm.jobs("all") if job[0] == f"muse-{group}{suffix}")
+    assert job == (f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
+                   ["--heads", str(heads), "--group", group])
+    dense = next(job for job in compare_sm.jobs("all") if job[0] == "muse-k6-dense")
+    assert dense[2] == ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
     import types
