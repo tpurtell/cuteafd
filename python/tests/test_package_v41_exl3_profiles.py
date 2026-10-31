@@ -85,6 +85,14 @@ spec.loader.exec_module(package)
 
 
 class PackageProfileTests(unittest.TestCase):
+    def test_muse_uses_shared_tp_profiles_for_spark_and_rtx(self):
+        for role in ('spark', 'coordinator'):
+            profiles = package.profiles_for_role(role, 'muse')
+            self.assertEqual(profiles, package.shard_profiles('muse', role))
+            self.assertTrue(all('ep' not in dest for p in profiles for dest in p[-1]))
+        profiles = package.profiles_for_role('coordinator', 'muse')
+        self.assertIn(('rtx-tp2', 2048, 256, 8, 'fp32', ['rtx-tp2']), profiles)
+
     @staticmethod
     def expected_policy_tile(variant):
         """Ask the pinned planner; never restate its numbers in a test."""

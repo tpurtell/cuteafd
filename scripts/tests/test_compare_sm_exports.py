@@ -378,6 +378,12 @@ def test_muse_export_groups_bind_native_geometry(heads, suffix, group):
     assert dense[2] == ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]
 
 
+def test_tp_partial_groups_are_generic_and_combine_ranks_are_runtime():
+    jobs = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    assert jobs["expert-partial"] == ("export_b12x_expert_partial_aot.py", [])
+    assert jobs["muse-tp-combine"] == ("export_b12x_muse_aot.py", ["--group", "tp-combine"])
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
     import types
