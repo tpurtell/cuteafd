@@ -34,6 +34,7 @@ FAMILIES = {
     "step5_vl": "step5",
     "step5": "step5",
     "kimi_k3": "kimi_k3",
+    "muse_spark": "muse_spark",
 }
 
 
@@ -91,7 +92,7 @@ def describe(config: dict) -> tuple[str, str, int, int]:
     if family is None:
         raise SystemExit(f"unsupported model_type {kind!r}; known: {', '.join(sorted(FAMILIES))}")
     first, last = 0, -1
-    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3"):
+    if family in ("glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "muse_spark"):
         layers = text.get("num_hidden_layers")
         if not isinstance(layers, int) or layers <= 0:
             raise SystemExit("config lacks num_hidden_layers")
@@ -125,6 +126,11 @@ def describe(config: dict) -> tuple[str, str, int, int]:
         if type(first) is not int or not 0 <= first < layers or text.get("moe_layer_freq", 1) != 1:
             raise SystemExit("unsupported kimi_k3 MoE layer pattern")
         last = layers - 1
+    elif family == "muse_spark":
+        # Every decoder layer is a MoE (mlp_layer_types all sparse).
+        if _pattern(text, layers, {"mlp_layer_types": {"sparse": False}}) is None:
+            raise SystemExit("config lacks mlp_layer_types")
+        last = layers - 1
     elif family in ("qwen4", "qwen3_5"):
         kinds = {"linear_attention": "gdn", "full_attention": "full"}
         if _pattern(text, layers, {"layer_types": kinds}) is None:
@@ -149,6 +155,9 @@ def routed_layers(config: dict) -> int | None:
         return len(_step5_routed(text))
     if family in ("deepseek_v41", "deepseek_v4", "qwen4"):
         return layers
+    if family == "muse_spark":
+        _, _, first, last = describe(config)
+        return last - first + 1
     if family == "glm5":
         first = _dense_prefix(text, layers)
         if not 0 <= first <= layers:
