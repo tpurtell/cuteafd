@@ -250,6 +250,11 @@ impl FamilyModel for Model {
     fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
+    fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
+        -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
+        crate::families::muse_spark::cache::MuseCacheLayout::new(&self.cfg, options.coordinator_ranks,
+            options.prefill_rows.max(crate::families::muse_spark::cache::PAGE_ROWS)).map(|layout| Some(layout.geometry))
+    }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then_some(FfnActivation::SiluBf16Product { limit: None })
     }
