@@ -149,13 +149,14 @@ mod tests {
             assert_eq!((layer.window(), layer.rows_per_slot()), (Some(2048), 2112));
         }
         let names: Vec<&str> = layout.buffers().iter().map(|b| b.name.as_str()).collect();
-        for name in ["cos_sin", "unit_scale", "markov_norms", "markov_workspace", "logits"] {
+        for name in ["inverse_frequencies", "unit_scale", "markov_norms", "markov_workspace", "logits"] {
             assert!(names.contains(&name), "{name}");
         }
-        for absent in ["conv", "dynamic", "candidates", "projected", "q_residual"] {
-            assert!(!names.contains(&absent), "{absent}");
+        // DFlash2-only planes of the shared step workspace sit at the allocation floor.
+        for unused in ["conv", "dynamic", "candidates", "projected", "q_residual", "topk_workspace"] {
+            assert_eq!(layout.buffers().iter().find(|b| b.name == unused).unwrap().bytes, 256, "{unused}");
         }
-        let cos_sin = layout.buffers().iter().find(|b| b.name == "cos_sin").unwrap();
+        let cos_sin = layout.buffers().iter().find(|b| b.name == "inverse_frequencies").unwrap();
         assert_eq!(cos_sin.bytes, (1 << 20) * 64 * 4);
         assert!(cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
             cuteafd_core::MlaCacheFormat::Bf16).is_err(), "the ML4 draft records are the FP8 656-byte ones");

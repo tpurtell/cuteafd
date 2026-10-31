@@ -220,6 +220,9 @@ pub(crate) struct DflashConfig {
     /// `|p - q| < window`); off, every block row sees the last `window`
     /// context entries (the GLM 5.3 port's measured behavior).
     pub row_window: bool,
+    /// Every block row is a prediction (dSpark's anchor-as-first: `block`
+    /// drafts); off, the anchor row only carries context (`block - 1`).
+    pub sample_from_anchor: bool,
 }
 
 impl DflashConfig {
@@ -252,6 +255,7 @@ impl DflashConfig {
             vocab: raw.vocab_size,
             window: raw.sliding_window,
             row_window: false,
+            sample_from_anchor: false,
         })
     }
 
@@ -260,11 +264,11 @@ impl DflashConfig {
             heads: cfg.mla.heads, kv_heads: cfg.mla.heads, head_dim: cfg.mla.nope + cfg.mla.rope,
             eps: cfg.eps as f32, theta: 0.0, block: cfg.block, group: cfg.group,
             mask_token: cfg.mask_token, rank: cfg.selector_rank, taps: cfg.taps.clone(), vocab: cfg.vocab,
-            window: 0, row_window: false }
+            window: 0, row_window: false, sample_from_anchor: cfg.drafts() == cfg.block }
     }
 
     pub fn drafts(&self) -> usize {
-        self.block - 1
+        if self.sample_from_anchor { self.block } else { self.block - 1 }
     }
 
     fn kv_width(&self) -> usize {
@@ -333,13 +337,25 @@ enum DraftWeight<'a> {
 struct DraftLayer<'a> {
     input_norm: Dev<'a>,
     post_norm: Dev<'a>,
-    attn_conv: DraftWeight<'a>,
-    attn_base: Dev<'a>,
-    mlp_conv: DraftWeight<'a>,
-    mlp_base: Dev<'a>,
+    body: LayerBody<'a>,
     attention: DraftAttention<'a>,
     gate_up: DraftWeight<'a>,
     down: DraftWeight<'a>,
+}
+
+/// What surrounds a draft layer's attention and MLP: DFlash2's two-tap grouped
+/// dynamic convolutions, or (mtp_dspark) plain pre-norm residual blocks.
+enum LayerBody<'a> {
+    Dflash { attn_conv: DraftWeight<'a>, attn_base: Dev<'a>, mlp_conv: DraftWeight<'a>, mlp_base: Dev<'a> },
+    Plain,
+}
+
+/// The drafted rows' head after the target's vocabulary head: DFlash2's top-16
+/// candidate selector, or mtp_dspark's soft cap and recurrent Markov head.
+enum DraftHeadOps<'a> {
+    Selector { projection: DraftWeight<'a>, predecessor: Dev<'a>, successor: Dev<'a> },
+    RnnMarkov { softcap: f32, embedding: Dev<'a>, joint_w: Dev<'a>, joint_b: Dev<'a>, output: Dev<'a>,
+        norms: Dev<'a>, rank: usize },
 }
 
 #[allow(dead_code)]
@@ -859,9 +875,7 @@ pub(crate) struct DflashDrafter<'a> {
     fc: DraftWeight<'a>,
     hidden_norm: Dev<'a>,
     norm: Dev<'a>,
-    projection: DraftWeight<'a>,
-    predecessor: Dev<'a>,
-    successor: Dev<'a>,
+    head_ops: DraftHeadOps<'a>,
     layers: Vec<DraftLayer<'a>>,
     /// [TAP_ROWS, taps * hidden] BF16: the last step's tapped rows.
     pub taps: Dev<'a>,
@@ -872,6 +886,11 @@ pub(crate) struct DflashDrafter<'a> {
     context: DraftContext<'a>,
     /// The mask token's embedding row.
     mask_row: Vec<u8>,
+    /// Position-specific mask rows [block - 1, hidden] BF16 (mtp_dspark); None
+    /// for drafters with one mask token.
+    mask_rows: Option<Dev<'a>>,
+    /// The recurrent Markov head's workspace (mtp_dspark).
+    markov_workspace: Option<Dev<'a>>,
     workspace: RefCell<Option<Workspace<'a>>>,
     startup_primed: Cell<bool>,
     representation: GlmDraftRepresentation,
@@ -1132,12 +1151,14 @@ impl<'a> DflashDrafter<'a> {
             Ok(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
-                    cfg.conv_width(), h)?,
-                attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
-                    cfg.conv_width(), h)?,
-                mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
+                body: LayerBody::Dflash {
+                    attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
+                        cfg.conv_width(), h)?,
+                    attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
+                    mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?,
+                        cfg.conv_width(), h)?,
+                    mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
+                },
                 attention: DraftAttention::Gqa(GqaAttention {
                     qkv: matrix(concat(&[(&format!("{a}.q_proj.weight"), cfg.heads * cfg.head_dim),
                         (&format!("{a}.k_proj.weight"), kv), (&format!("{a}.v_proj.weight"), kv)], h)?, cfg.qkv_width(), h)?,
@@ -1166,9 +1187,11 @@ impl<'a> DflashDrafter<'a> {
             fc: matrix(tensor("fc.weight", &[h, taps])?, h, taps)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?,
             norm: tensor("norm.weight", &[h])?,
-            projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
-            predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-            successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
+            head_ops: DraftHeadOps::Selector {
+                projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
+                predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
+                successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
+            },
             layers,
             taps: zeroed(TAP_ROWS * taps * 2)?,
             fused: zeroed(TAP_ROWS * h * 2)?,
@@ -1178,6 +1201,8 @@ impl<'a> DflashDrafter<'a> {
                 kv: zeroed(TAP_ROWS * 2 * kv * 2)?, slots: zeroed(TAP_ROWS * 4)?,
             }),
             mask_row,
+            mask_rows: None,
+            markov_workspace: None,
             workspace: RefCell::new(None),
             startup_primed: Cell::new(false),
             representation,
@@ -1253,10 +1278,12 @@ impl<'a> DflashDrafter<'a> {
             layers.push(DraftLayer {
                 input_norm: tensor(&format!("{p}.input_layernorm.weight"), &[h])?,
                 post_norm: tensor(&format!("{p}.post_attention_layernorm.weight"), &[h])?,
-                attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?, cfg.conv_width(), h)?,
-                attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
-                mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?, cfg.conv_width(), h)?,
-                mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
+                body: LayerBody::Dflash {
+                    attn_conv: matrix(tensor(&format!("{p}.attention_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?, cfg.conv_width(), h)?,
+                    attn_base: tensor(&format!("{p}.attention_conv.base_kernel"), &[2, 2, h])?,
+                    mlp_conv: matrix(tensor(&format!("{p}.mlp_conv.kernel_projection.weight"), &[cfg.conv_width(), h])?, cfg.conv_width(), h)?,
+                    mlp_base: tensor(&format!("{p}.mlp_conv.base_kernel"), &[2, 2, h])?,
+                },
                 attention: DraftAttention::Mla(MlaAttention { program,
                     qkv_a: operand(MlaOperand::QkvA)?, q_norm: operand(MlaOperand::QNorm)?,
                     kv_norm: operand(MlaOperand::KvNorm)?, q_b: operand(MlaOperand::QB)?,
@@ -1277,20 +1304,141 @@ impl<'a> DflashDrafter<'a> {
             max_sequences: layout.capacity().max_batch_sequences,
             fc: matrix(tensor("fc.weight", &[h, cfg.taps.len() * h])?, h, cfg.taps.len() * h)?,
             hidden_norm: tensor("hidden_norm.weight", &[h])?, norm: tensor("norm.weight", &[h])?,
-            projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
-            predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
-            successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?, layers,
+            head_ops: DraftHeadOps::Selector {
+                projection: matrix(tensor("candidate_selector.hidden_projection.weight", &[cfg.rank, h])?, cfg.rank, h)?,
+                predecessor: tensor("candidate_selector.predecessor_codebook", &[cfg.vocab, cfg.rank])?,
+                successor: tensor("candidate_selector.successor_codebook", &[cfg.vocab, cfg.rank])?,
+            }, layers,
             taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
             context_positions: owners.take("context_positions")?,
             context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
                 layout, slots: owners.take("context_slots")? }),
-            mask_row: Vec::new(), workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
+            mask_row: Vec::new(), mask_rows: None, markov_workspace: None, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
             confidence_directory: snapshot.into(), confidence_scales: scales,
             timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
+        owners.finish()?;
+        Ok(result)
+    }
+
+    /// Mistral Large 4's bundled mtp_dspark on the shared MLA block-draft path,
+    /// called inside the admitted `device.own` callback like [`Self::load_mla`].
+    /// `read(name)` returns a BF16 tensor of the target checkpoint (the drafter
+    /// ships under `mtp_dspark.*`); `embedding`/head stay the target's. Plain
+    /// pre-norm layers (attention_norm, MLA, ffn_norm, SwiGLU), position-specific
+    /// mask rows, the target's soft-capped head and the RNN Markov head.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn load_ml4(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
+        native: cuteafd_loader::formats::dflash::MlaDflashConfig,
+        target: &cuteafd_loader::families::mistral_large4::Ml4Config, softcap: f32, stream: *mut c_void,
+        layout: cuteafd_loader::formats::dflash::MlaDraftRuntimeLayout,
+        read: &dyn Fn(&str, &[usize]) -> Result<Vec<u8>>) -> Result<Self> {
+        use cuteafd_ffi::mla_draft::MlaDraft;
+        use cuteafd_loader::families::mistral_large4::dspark::PREFIX;
+        let _scope = cuteafd_ffi::memory_ledger::scope("drafter");
+        ensure!(native.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark,
+            "load_ml4 takes the mtp_dspark draft kind");
+        ensure!(native.runtime_layout(GlmDraftRepresentation::Bf16Only, layout.capacity(), layout.program().context,
+            layout.paged_cache().target_tokens, library.sm_count()?, 0, layout.cache_format())? == layout,
+            "mtp_dspark checkpoint/runtime differs from admitted immutable layout");
+        let cfg = DflashConfig::mla(&native);
+        let mut owners = MlaDraftStorage::allocate(library, layout.clone())?.into_owners()?;
+        let upload = |bytes: &[u8]| -> Result<Dev<'a>> {
+            let allocation = DeviceAllocation::new(library, bytes.len().max(256))?;
+            library.copy_h2d(allocation.buffer, bytes)?;
+            Ok(allocation)
+        };
+        let tensor = |name: &str, shape: &[usize]| read(&format!("{PREFIX}{name}"), shape).and_then(|b| upload(&b));
+        let (h, inter, heads) = (cfg.hidden, cfg.intermediate, native.mla.heads);
+        let (nope, v, c) = (native.mla.nope, native.mla.value, native.mla.kv_rank);
+        let mut layers = Vec::with_capacity(cfg.layers);
+        for index in 0..cfg.layers {
+            let p = format!("backbone.layers.{index}");
+            let a = format!("{p}.attention");
+            let program = MlaDraft::load_ml4(programs)?;
+            ensure!(program.max_context() >= layout.program().context && program.splits() == layout.program().splits
+                && program.scratch_bytes() == layout.program().scratch,
+                "mtp_dspark draft program differs from admitted scratch/context");
+            // W_UK [heads, 512, nope] (k rows transposed per head) and W_UV [heads, v, 512].
+            let kv_b = read(&format!("{PREFIX}{a}.wkv_b.weight"), &[heads * (nope + v), c])?;
+            let (mut uk, mut uv) = (vec![0u8; heads * c * nope * 2], vec![0u8; heads * v * c * 2]);
+            for head in 0..heads {
+                let base = head * (nope + v);
+                for d in 0..nope {
+                    let src = &kv_b[(base + d) * c * 2..][..c * 2];
+                    for col in 0..c {
+                        uk[((head * c + col) * nope + d) * 2..][..2].copy_from_slice(&src[col * 2..col * 2 + 2]);
+                    }
+                }
+                uv[head * v * c * 2..(head + 1) * v * c * 2].copy_from_slice(&kv_b[(base + nope) * c * 2..(base + nope + v) * c * 2]);
+            }
+            // The unit query scale: s = 0 then b = 1 per head (BF16).
+            let mut unit = vec![0u8; heads * 2];
+            unit.extend(std::iter::repeat_n(0x3f80u16.to_le_bytes(), heads).flatten());
+            let mut gate_up = read(&format!("{PREFIX}{p}.feed_forward.w1.weight"), &[inter, h])?;
+            gate_up.extend(read(&format!("{PREFIX}{p}.feed_forward.w3.weight"), &[inter, h])?);
+            layers.push(DraftLayer {
+                input_norm: tensor(&format!("{p}.attention_norm.weight"), &[h])?,
+                post_norm: tensor(&format!("{p}.ffn_norm.weight"), &[h])?,
+                body: LayerBody::Plain,
+                attention: DraftAttention::Mla(MlaAttention { program,
+                    qkv_a: tensor(&format!("{a}.wq.weight"), &[heads * (nope + native.mla.rope), h])?,
+                    q_norm: upload(&unit)?,
+                    kv_norm: tensor(&format!("{a}.kv_a_norm.weight"), &[c])?,
+                    q_b: tensor(&format!("{a}.wkv_a_with_mqa.weight"), &[c + native.mla.rope, h])?,
+                    uk: upload(&uk)?, uv: upload(&uv)?,
+                    output: tensor(&format!("{a}.wo.weight"), &[h, heads * v])?,
+                    cache: owners.take(&format!("layer.{index}.cache"))?,
+                    page_table: owners.take(&format!("layer.{index}.page_table"))?,
+                }),
+                gate_up: DraftWeight::Bf16(upload(&gate_up)?),
+                down: DraftWeight::Bf16(tensor(&format!("{p}.feed_forward.w2.weight"), &[h, inter])?),
+            });
+        }
+        let workspace = Workspace::admitted_mla(library, &cfg, layout.capacity().max_batch_sequences, &mut owners)?;
+        let AttentionWorkspace::Mla(attention) = &workspace.attention else { unreachable!() };
+        // The draft's FP32 cos|sin table (YaRN, no LeRoPE) in the producer's rotary slot.
+        let table = target.rope_table(&vec![0.0; native.mla.rope / 2], layout.program().context)?;
+        library.copy_h2d(draft_view(attention.inverse_frequencies.buffer, 0, table.len() * 4)?, bytes_of(&table))?;
+        let _unit = owners.take("unit_scale")?;
+        let rank = native.markov_rank;
+        let output = tensor("autoregressive_head.output.weight", &[cfg.vocab, rank])?;
+        let norms = owners.take("markov_norms")?;
+        // SAFETY: both live allocations hold [vocab, rank] BF16 / [vocab] FP32; the stream drains below.
+        unsafe { library.ml4_dspark_markov_norms(output.buffer.ptr, norms.buffer.ptr, cfg.vocab, rank, stream)?; }
+        let markov_workspace = owners.take("markov_workspace")?;
+        ensure!(markov_workspace.buffer.bytes >= library.ml4_dspark_markov_workspace(
+            layout.capacity().max_batch_sequences, cfg.block)?, "mtp_dspark Markov workspace below its native size");
+        let masks = tensor("backbone.mask_embedding", &[cfg.block - 1, h])?;
+        let result = Self { kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16, library, stream,
+            slots: layout.capacity().context_slots, max_sequences: layout.capacity().max_batch_sequences,
+            fc: DraftWeight::Bf16(tensor("backbone.target_projection.weight", &[h, cfg.taps.len() * h])?),
+            hidden_norm: tensor("backbone.target_norm.weight", &[h])?,
+            norm: tensor("backbone.final_norm.weight", &[h])?,
+            head_ops: DraftHeadOps::RnnMarkov { softcap,
+                embedding: tensor("autoregressive_head.embedding.weight", &[cfg.vocab, rank])?,
+                joint_w: tensor("autoregressive_head.joint_proj.weight", &[3 * rank, h + 2 * rank])?,
+                joint_b: tensor("autoregressive_head.joint_proj.bias", &[3 * rank])?,
+                output, norms, rank },
+            layers,
+            taps: owners.take("taps")?, fused: owners.take("fused")?, fused_norm: owners.take("fused_norm")?,
+            context_positions: owners.take("context_positions")?,
+            context: DraftContext::Mla(MlaContext { cfg: native, state: RefCell::new(MlaPagedState::new(&layout)?),
+                layout, slots: owners.take("context_slots")? }),
+            mask_row: Vec::new(), mask_rows: Some(masks), markov_workspace: Some(markov_workspace),
+            workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false),
+            representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
+            head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_linear::Fp8Rows::default()),
+            fp8_admitted: fp8_linear::Fp8Rows::default(), confidence_directory: std::path::PathBuf::new(),
+            confidence_scales: fp8_linear::Fp8Scales::Amax,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "ml4-dspark")?, cfg,
+            round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
+        };
+        // SAFETY: the norms launch was queued on this live stream above.
+        unsafe { library.cuda_stream_synchronize(stream)?; }
         owners.finish()?;
         Ok(result)
     }
@@ -2071,6 +2219,16 @@ impl<'a> DflashDrafter<'a> {
                 input(&ids, w.h.buffer, self.stream)?;
             }
         }
+        if let Some(masks) = &self.mask_rows {
+            // Position-specific masks (mtp_dspark): block row k > 0 of every sequence is
+            // mask_embedding[k - 1], replacing the placeholder token's embedding.
+            let bytes = (block - 1) * h * 2;
+            for i in 0..s_count {
+                let to = draft_view(w.h.buffer, (i * block + 1) * h * 2, bytes)?;
+                // SAFETY: both ranges are checked views of live owners; the drafter stream orders them.
+                unsafe { self.library.copy_d2d_async(to, masks.buffer, bytes, self.stream)?; }
+            }
+        }
         let (s, l) = (self.stream, self.library);
         let (eps, group, inter) = (c.eps, c.group, c.intermediate);
         let attention_width = c.heads * c.head_dim;
@@ -2081,10 +2239,17 @@ impl<'a> DflashDrafter<'a> {
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
             for (index, layer) in self.layers.iter().enumerate() {
                 let layer_span = self.timing.begin("layer", Some(index), rows, s)?;
-                self.linear(w.n.buffer.ptr, &layer.attn_conv, 0, w.dynamic.buffer.ptr,
-                    rows, h, c.conv_width())?;
-                l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr, w.conv.buffer.ptr,
-                    rows, block, h, group, s)?;
+                // The attention input: DFlash2's convolved rows, or (plain) the normed rows.
+                let attention_input = match &layer.body {
+                    LayerBody::Dflash { attn_conv, attn_base, .. } => {
+                        self.linear(w.n.buffer.ptr, attn_conv, 0, w.dynamic.buffer.ptr,
+                            rows, h, c.conv_width())?;
+                        l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, attn_base.buffer.ptr, w.conv.buffer.ptr,
+                            rows, block, h, group, s)?;
+                        w.conv.buffer
+                    }
+                    LayerBody::Plain => w.n.buffer,
+                };
                 match (&layer.attention, &w.attention, &self.context) {
                     (DraftAttention::Gqa(a), AttentionWorkspace::Gqa(attention), DraftContext::Gqa(_)) => {
                         self.linear(w.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
@@ -2109,27 +2274,41 @@ impl<'a> DflashDrafter<'a> {
                             let chunk_rows = chunk.positions.len();
                             let offset = chunk.first_sequence * block * h * 2;
                             let batch = attention.batch(context, a, chunk_rows, chunk.lengths.len(), chunk.page_table_width,
-                                draft_view(w.conv.buffer, offset, chunk_rows * h * 2)?,
+                                draft_view(attention_input, offset, chunk_rows * h * 2)?,
                                 draft_view(w.delta.buffer, offset, chunk_rows * h * 2)?, attention.slots.buffer, attention.positions.buffer);
                             a.program.launch(a.weights(), batch, s)?;
                         }
                     }
                     _ => anyhow::bail!("DFlash layer/workspace mismatch"),
                 }
-                l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.attn_base.buffer.ptr,
-                    w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
-                self.linear(w.n.buffer.ptr, &layer.mlp_conv, 0, w.dynamic.buffer.ptr,
-                    rows, h, c.conv_width())?;
-                l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr, w.conv.buffer.ptr,
-                    rows, block, h, group, s)?;
-                self.linear(w.conv.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
-                    rows, h, 2 * inter)?;
-                l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
-                self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
-                    inter, h)?;
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
-                l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, layer.mlp_base.buffer.ptr,
-                    w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                match &layer.body {
+                    LayerBody::Dflash { attn_base, mlp_conv, mlp_base, .. } => {
+                        l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, attn_base.buffer.ptr,
+                            w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                        self.linear(w.n.buffer.ptr, mlp_conv, 0, w.dynamic.buffer.ptr,
+                            rows, h, c.conv_width())?;
+                        l.glm_dflash_conv(w.n.buffer.ptr, w.dynamic.buffer.ptr, mlp_base.buffer.ptr, w.conv.buffer.ptr,
+                            rows, block, h, group, s)?;
+                        self.linear(w.conv.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
+                            rows, h, 2 * inter)?;
+                        l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
+                        self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
+                            inter, h)?;
+                        l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dynamic.buffer.ptr, mlp_base.buffer.ptr,
+                            w.h.buffer.ptr, next, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                    }
+                    LayerBody::Plain => {
+                        // h += attn; n = ffn_norm(h); h += w2(silu(w1 n) * w3 n); n = next norm(h).
+                        l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, layer.post_norm.buffer.ptr,
+                            w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+                        self.linear(w.n.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr, rows, h, 2 * inter)?;
+                        l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
+                        self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows, inter, h)?;
+                        l.glmf_dspark_add_rmsnorm(w.h.buffer.ptr, w.delta.buffer.ptr, next,
+                            w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
+                    }
+                }
                 self.timing.end(layer_span, s)?;
             }
             self.timing.end(forward_span, s)?;
@@ -2141,16 +2320,33 @@ impl<'a> DflashDrafter<'a> {
                     w.logits.buffer.ptr.cast(), rows, h, c.vocab, s, self.head_mode.get())?,
                 HeadCall::Launch(launch) => launch(w.n.buffer.ptr.cast_const(), w.logits.buffer.ptr.cast(), rows, s)?,
             }
-            l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
-                w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
-            self.timing.end(head_span, s)?;
-            let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
-            self.linear(w.n.buffer.ptr, &self.projection, 0,
-                w.projected.buffer.ptr, rows, h, c.rank)?;
-            l.glm_dflash_select(self.predecessor.buffer.ptr, self.successor.buffer.ptr, w.projected.buffer.ptr,
-                w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
-                w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
-            self.timing.end(select_span, s)?;
+            match &self.head_ops {
+                DraftHeadOps::Selector { projection, predecessor, successor } => {
+                    l.glm_dflash_topk(w.logits.buffer.ptr, w.unary.buffer.ptr, w.candidates.buffer.ptr,
+                        w.topk_workspace.buffer.ptr, s_count, block, c.drafts(), c.vocab, s)?;
+                    self.timing.end(head_span, s)?;
+                    let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
+                    self.linear(w.n.buffer.ptr, projection, 0,
+                        w.projected.buffer.ptr, rows, h, c.rank)?;
+                    l.glm_dflash_select(predecessor.buffer.ptr, successor.buffer.ptr, w.projected.buffer.ptr,
+                        w.candidates.buffer.ptr, w.unary.buffer.ptr, w.anchors.buffer.ptr, w.tokens.buffer.ptr,
+                        w.features.buffer.ptr, s_count, block, c.drafts(), c.rank, s)?;
+                    self.timing.end(select_span, s)?;
+                }
+                DraftHeadOps::RnnMarkov { softcap, embedding, joint_w, joint_b, output, norms, rank } => {
+                    // The target's soft cap on the base logits, then the recurrent Markov
+                    // head draws every block row greedily (its bias is not capped).
+                    l.cuda_logits_softcap_f32_async(w.logits.buffer.ptr, rows, c.vocab, c.vocab, *softcap, s)?;
+                    self.timing.end(head_span, s)?;
+                    let markov_span = self.timing.begin("markov", None, rows, s)?;
+                    let workspace = self.markov_workspace.as_ref().context("mtp_dspark Markov workspace")?;
+                    l.ml4_dspark_markov(w.logits.buffer.ptr, w.n.buffer.ptr, embedding.buffer.ptr,
+                        joint_w.buffer.ptr, joint_b.buffer.ptr, output.buffer.ptr, norms.buffer.ptr,
+                        w.anchors.buffer.ptr, w.tokens.buffer.ptr, workspace.buffer.ptr, s_count, block, c.vocab,
+                        *rank, h, s)?;
+                    self.timing.end(markov_span, s)?;
+                }
+            }
             let drafted = s_count * c.drafts();
             // The round's results download on its stream; one host wait then
             // covers the round and both copies (no second, synchronous drain).
@@ -2160,8 +2356,10 @@ impl<'a> DflashDrafter<'a> {
                 ptr: w.landing.buffer.ptr.cast::<u8>().add(offset).cast(), bytes, ..w.landing.buffer };
             l.copy_d2h_host_buffer_async(landing(0, drafted * 4),
                 CuteafdDeviceBuffer { bytes: drafted * 4, ..w.tokens.buffer }, drafted * 4, s)?;
-            l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
-                CuteafdDeviceBuffer { bytes: drafted * 16, ..w.features.buffer }, drafted * 16, s)?;
+            if matches!(self.head_ops, DraftHeadOps::Selector { .. }) {
+                l.copy_d2h_host_buffer_async(landing(drafted * 4, drafted * 16),
+                    CuteafdDeviceBuffer { bytes: drafted * 16, ..w.features.buffer }, drafted * 16, s)?;
+            }
             self.round.borrow_mut().wait(s)?;
         }
         if let Some(mut lease) = mla_lease.take() {
@@ -2176,12 +2374,14 @@ impl<'a> DflashDrafter<'a> {
         let drafted = s_count * c.drafts();
         let (tokens, features) = w.landing.bytes()[..drafted * 20].split_at(drafted * 4);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
+        let selector = matches!(self.head_ops, DraftHeadOps::Selector { .. });
         Ok((0..s_count).map(|i| Draft {
             tokens: (0..c.drafts()).map(|j| word(&tokens, i * c.drafts() + j)).collect(),
-            features: (0..c.drafts()).map(|j| {
+            // A token-only drafter (mtp_dspark) carries no selector features.
+            features: if !selector { Vec::new() } else { (0..c.drafts()).map(|j| {
                 let n = (i * c.drafts() + j) * 4;
                 [0, 1, 2, 3].map(|k| f32::from_bits(word(&features, n + k)))
-            }).collect(),
+            }).collect() },
             confidence: Vec::new(),
         }).collect())
     }
@@ -2676,7 +2876,8 @@ mod checkpoint_header_tests {
             intermediate: 14336, eps: 1e-5, block: 8, group: 16, selector_rank: 256,
             selector_top_k: 16, taps: vec![19, 37, 66, 78, 90], vocab: 163840,
             mask_token: 163592, max_context: 1048576, windows: vec![Some(4096), None],
-            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. } };
+            rotary: DsparkRotaryPlan { inv_freq: vec![1.; 32], attention_factor: 1., softmax_factor: 1. },
+            kind: cuteafd_core::coordinator_programs::MlaDraftKind::Dflash2, markov_rank: 0 };
         cfg
     }
 
@@ -2844,7 +3045,7 @@ mod checkpoint_header_tests {
     fn small_config() -> DflashConfig {
         DflashConfig { hidden: 128, intermediate: 128, layers: 2, heads: 1, kv_heads: 1, head_dim: 128,
             eps: 1e-6, theta: 10000., block: 8, group: 16, mask_token: 0, rank: 256,
-            taps: vec![0], vocab: 16, window: RING, row_window: false }
+            taps: vec![0], vocab: 16, window: RING, row_window: false, sample_from_anchor: false }
     }
 
     fn complete_headers(cfg: &DflashConfig) -> (HashMap<String, SafetensorsTensorMetadata>, u64) {

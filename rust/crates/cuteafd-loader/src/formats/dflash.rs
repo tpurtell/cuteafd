@@ -798,8 +798,9 @@ impl MlaDflashConfig {
             ("taps", vec![tap_rows, self.taps.len(), h, 2]),
             ("fused", vec![tap_rows, h, 2]), ("fused_norm", vec![tap_rows, h, 2]),
             ("context_positions", vec![tap_rows, 8]), ("context_slots", vec![tap_rows, 8]),
-            // FP32 cos|sin [positions, rope] (the draft's own table) and the unit query scale.
-            ("cos_sin", vec![compiled_context, self.mla.rope, 4]), ("unit_scale", vec![2, self.mla.heads, 2]),
+            // The producer's rotary input: here the FP32 cos|sin table [positions, rope]
+            // (the shared slot that carries DFlash2's inv_freq), and the unit query scale.
+            ("inverse_frequencies", vec![compiled_context, self.mla.rope, 4]), ("unit_scale", vec![2, self.mla.heads, 2]),
             ("query", vec![native_rows, 64, 576, 2]),
             ("attention", vec![native_rows, 64, 512, 2]),
             ("lse", vec![native_rows, 64, 4]),
@@ -813,6 +814,10 @@ impl MlaDflashConfig {
             ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4]),
             ("anchors", vec![seq, 4]), ("ids", vec![rows, 4]), ("tokens", vec![seq * self.drafts(), 4]),
             ("positions", vec![rows, 8]),
+            // The shared step workspace's DFlash2-only planes (convolutions, selector,
+            // q-LoRA residual): admitted at the 256-byte floor, never written.
+            ("conv", vec![1]), ("dynamic", vec![1]), ("unary", vec![1]), ("candidates", vec![1]),
+            ("projected", vec![1]), ("features", vec![1]), ("topk_workspace", vec![1]), ("q_residual", vec![1]),
         ] { add(name.into(), &dims)?; }
         let layout = MlaDraftRuntimeLayout { cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
