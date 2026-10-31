@@ -120,7 +120,14 @@
           "routed_expert_bytes": 171228556800
         }
       ],
-      "deprecated": true
+      "deprecated": true,
+      "admitted_worlds": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
     },
     "mimof:fp8": {
       "intermediate": 2048,
@@ -201,7 +208,14 @@
           "routed_expert_bytes": 67948314624
         }
       ],
-      "deprecated": true
+      "deprecated": true,
+      "admitted_worlds": [
+        1,
+        2,
+        3,
+        4,
+        6
+      ]
     },
     "glm:exl3": {
       "intermediate": 2048,
@@ -243,7 +257,13 @@
           "routed_expert_bytes": 407686809600
         }
       ],
-      "deprecated": true
+      "deprecated": true,
+      "admitted_worlds": [
+        2,
+        3,
+        4,
+        6
+      ]
     },
     "kimik3:exl3": {
       "intermediate": 3072,
@@ -402,7 +422,13 @@
       ],
       "checkpoints": [],
       "deprecated": true,
-      "provenance_note": "Historical native NVFP4 roles from dev 34b0d33b1985441746df5e2fe02c2ae3a9a29f6f; no checkpoint fit witness and no new width classes."
+      "provenance_note": "Historical native NVFP4 roles from dev 34b0d33b1985441746df5e2fe02c2ae3a9a29f6f; no checkpoint fit witness and no new width classes.",
+      "admitted_worlds": [
+        2,
+        3,
+        4,
+        6
+      ]
     },
     "step5:nvfp4": {
       "intermediate": 1536,
@@ -420,7 +446,10 @@
           "routed_expert_bytes": 604721627136
         }
       ],
-      "deprecated": true
+      "deprecated": true,
+      "admitted_worlds": [
+        4
+      ]
     },
     "dsv4p:mxfp4": {
       "intermediate": 3072,
