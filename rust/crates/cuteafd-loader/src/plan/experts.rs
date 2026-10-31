@@ -115,7 +115,7 @@ pub enum SparkRecipeRefusal {
     GeometryInvalid { intermediate: usize, world: usize, block: usize },
     #[error("missing Spark package recipe: {package} TP{world}; export its balanced per-rank widths in package_exl3_aot.py (EXL3) or package_fp8_moe_aot.py (FP8/NVFP4), register spark_recipe, and include those layouts in the Spark image")]
     MissingPackage { package: String, world: usize },
-    #[error("NVFP4 is deprecated; worlds {worlds:?}; requested {package} TP{world}")]
+    #[error("NVFP4 is deprecated; Spark worlds {worlds:?}; requested {package} TP{world}")]
     Deprecated { package: String, world: usize, worlds: Vec<usize> },
     #[error("native MXFP4 requires equal whole-K32 shards for intermediate {intermediate}, TP{world}; add native roles taking unequal whole-K32 shards, rotated by layer, and rank-sized staging")]
     NativeUnequal { intermediate: usize, world: usize },
