@@ -384,6 +384,21 @@ def test_tp_partial_groups_are_generic_and_combine_ranks_are_runtime():
     assert jobs["muse-tp-combine"] == ("export_b12x_muse_aot.py", ["--group", "tp-combine"])
 
 
+def test_muse_tp_combine_exports_only_once(monkeypatch):
+    module_path = ROOT / "python/tools/aot/export_b12x_muse_aot.py"
+    spec = importlib.util.spec_from_file_location("muse_unique_combine_exports", module_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "builders", lambda heads, group, max_rows=4096:
+                        {group: lambda: None})
+    whole = [name for name, *_ in module.programs(128)]
+    tp2 = [name for name, *_ in module.programs(64)]
+    assert whole.count("tp-combine") == 1
+    assert "tp-combine" not in tp2
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
     import types
