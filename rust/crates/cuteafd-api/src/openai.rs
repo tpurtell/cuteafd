@@ -872,15 +872,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    // Muse has no native grammar for its recipient-addressed messages and atem
-    // calls: decoding stays unconstrained, and requests that need it refuse.
-    // (`ToolConstraints` refuses constrained tool calls for its syntax.)
-    if matches!(profile.encoding, ModelEncoding::Muse(_)) && response_format.as_ref().is_some_and(|v| v["type"] != "text") {
-        return Err(Rejection::bad("Muse Spark serves without native decoding constraints: \
-            response_format other than text is not supported"));
-    }
-    let constraint = if matches!(profile.encoding, ModelEncoding::Muse(_)) { None }
-        else { match profile.encoding.think_close_token_id() {
+    let constraint = if matches!(profile.encoding, ModelEncoding::Muse(_)) {
+        constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref())
+            .map_err(Rejection::bad)?
+    } else { match profile.encoding.think_close_token_id() {
         Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
         None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
@@ -1722,28 +1717,45 @@ mod tests {
         }
     }
 
-    /// Requests Muse cannot honour without a native grammar refuse before
-    /// admission: thinking off, strict or required tools, structured formats.
+    /// Constrained Muse requests carry the native recipient-turn grammar:
+    /// strict or required tools (atem `muse_tool_schema` tags), assistance and
+    /// structured response formats; unconstrained ones carry none. Thinking off
+    /// still refuses (the template always reasons).
     #[tokio::test]
-    async fn muse_refuses_constrained_requests_before_admission() {
+    async fn muse_constrained_requests_carry_the_native_turn_grammar() {
         let weather = json!({"type": "function", "function": {"name": "get_weather",
             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}});
         let mut strict = weather.clone();
         strict["function"]["strict"] = json!(true);
-        for extra in [json!({"enable_thinking": false}), json!({"tools": [weather.clone()], "tool_choice": "required"}),
-            json!({"tools": [strict]}), json!({"tools": [weather.clone()], "tool_decoding_assistance": true}),
-            json!({"response_format": {"type": "json_object"}})] {
+        let send = |extra: Value| async move {
             let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
             let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
             let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
                 std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
-            let mut body = json!({"model": "muse-test", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 8});
+            let mut body = json!({"model": "muse-test", "messages": [{"role": "user", "content": "Reply in JSON"}],
+                "max_tokens": 8});
             for (key, value) in extra.as_object().unwrap() { body[key] = value.clone(); }
-            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
-                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{extra}");
-            assert!(rx.try_recv().is_err(), "{extra}");
+            let task = tokio::spawn(app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()));
+            let job = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.ok().flatten();
+            let response = if job.is_none() { task.await.ok().and_then(Result::ok) } else { task.abort(); None };
+            let status = response.map(|response| response.status());
+            (job.map(|job| job.constraint.map(|c| c.0)), status)
+        };
+        for extra in [json!({"tools": [weather.clone()], "tool_choice": "required"}), json!({"tools": [strict.clone()]}),
+            json!({"tools": [weather.clone()], "tool_decoding_assistance": true}),
+            json!({"response_format": {"type": "json_object"}})] {
+            let (job, status) = send(extra.clone()).await;
+            let grammar = job.flatten().unwrap_or_else(|| panic!("{extra}: no native constraint (status {status:?})"));
+            assert!(grammar.contains(" to=self<|message|>") && grammar.contains("<|eom|><|start|>assistant"), "{extra}");
+            if extra.get("tools").is_some() {
+                assert!(grammar.contains("muse_tool_schema") && grammar.contains(" to=get_weather<|message|>"), "{extra}");
+            }
         }
+        let (job, _) = send(json!({"tools": [weather]})).await;
+        assert_eq!(job, Some(None), "plain auto tools stay unconstrained");
+        let (job, status) = send(json!({"enable_thinking": false})).await;
+        assert!(job.is_none() && status == Some(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]

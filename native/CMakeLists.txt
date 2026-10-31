@@ -186,10 +186,10 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
     message(FATAL_ERROR "Pinned XGrammar schema factory no longer matches the V4.1 extension")
   endif()
   string(REPLACE "#include \"json_schema_converter.h\""
-    "#include \"json_schema_converter.h\"\n#include \"xgrammar_v41_tools.h\""
+    "#include \"json_schema_converter.h\"\n#include \"xgrammar_v41_tools.h\"\n#include \"xgrammar_muse_tools.h\""
     CUTEAFD_SCHEMA_SOURCE "${CUTEAFD_SCHEMA_SOURCE}")
   string(REPLACE "${CUTEAFD_SCHEMA_FACTORY}"
-    "switch (json_format) {\n    case static_cast<JSONFormat>(5): {\n      V41ToolCallingConverter converter(ref_resolver);\n      return converter.Convert(spec);\n    }\n    case JSONFormat::kJSON:"
+    "switch (json_format) {\n    case static_cast<JSONFormat>(5): {\n      V41ToolCallingConverter converter(ref_resolver);\n      return converter.Convert(spec);\n    }\n    case static_cast<JSONFormat>(6): {\n      MuseToolCallingConverter converter(ref_resolver);\n      return converter.Convert(spec);\n    }\n    case JSONFormat::kJSON:"
     CUTEAFD_SCHEMA_SOURCE "${CUTEAFD_SCHEMA_SOURCE}")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_schema.cc" "${CUTEAFD_SCHEMA_SOURCE}")
   list(FILTER CUTEAFD_XGRAMMAR_SOURCES EXCLUDE REGEX "/cpp/json_schema_converter\\.cc$")
@@ -208,7 +208,8 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
   list(APPEND CUTEAFD_XGRAMMAR_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_unicode.cc")
   list(APPEND CUTEAFD_XGRAMMAR_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_schema.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_regular.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_v41_tools.cc")
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_v41_tools.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_muse_tools.cc")
   add_library(cuteafd_xgrammar STATIC ${CUTEAFD_XGRAMMAR_SOURCES})
   target_include_directories(cuteafd_xgrammar PRIVATE
     "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp" "${CMAKE_CURRENT_SOURCE_DIR}/shared/src")

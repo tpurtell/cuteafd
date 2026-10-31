@@ -75,6 +75,36 @@ pub(super) fn kimi_response_constraint(format: Option<Value>, thinking: bool,
     Ok(Some(NativeConstraint(json!({"type":"structural_tag", "format":wire}).to_string())))
 }
 
+/// Muse's recipient-addressed turn, from after `<|start|>assistant`: its
+/// private reasoning (` to=self`), optional commentary, then the constrained
+/// part: a ` to=user` answer in the requested format, or the tool messages
+/// (`tools.format`, `<|eom|>`-joined). The turn's `<|eot|>` is a stop token,
+/// accepted where the grammar completes. Without a constraint, `Ok(None)`.
+pub(super) fn muse_response_constraint(format: Option<Value>, tools: Option<&super::tools::ToolConstraints>)
+    -> Result<Option<NativeConstraint>> {
+    let answer = response_constraint(format, false, None, 0)?
+        .map(|constraint| serde_json::from_str::<Value>(&constraint.0).map(|mut v| v["format"].take()))
+        .transpose()?;
+    let tools = tools.filter(|tools| tools.format.is_some());
+    if answer.is_none() && tools.is_none() { return Ok(None); }
+    let text = |value: &str| json!({"type":"const_string", "value":value});
+    let message_text = json!({"type":"any_text", "excludes":["<|eom|>", "<|eot|>", "<|start|>"]});
+    let next = "<|eom|><|start|>assistant";
+    // Reasoning first (the template always reasons), then any commentary messages.
+    let reasoning = json!({"type":"sequence", "elements":[text(" to=self<|message|>"), message_text.clone(), text(next)]});
+    let commentary = json!({"type":"star", "content":{"type":"sequence", "elements":[
+        text(" to=commentary<|message|>"), message_text.clone(), text(next)]}});
+    let reply = json!({"type":"sequence", "elements":[text(" to=user<|message|>"),
+        answer.unwrap_or_else(|| message_text.clone())]});
+    let body = match tools {
+        Some(tools) if tools.required => tools.format.clone().expect("filtered"),
+        Some(tools) => json!({"type":"or", "elements":[reply, tools.format.clone().expect("filtered")]}),
+        None => reply,
+    };
+    let turn = json!({"type":"sequence", "elements":[reasoning, commentary, body]});
+    Ok(Some(NativeConstraint(json!({"type":"structural_tag", "format":turn}).to_string())))
+}
+
 pub(super) fn response_validator(format: Option<&Value>) -> Result<Option<jsonschema::JSONSchema>> {
     let Some(format) = format else { return Ok(None); };
     let schema = match format.get("type").and_then(Value::as_str) {
