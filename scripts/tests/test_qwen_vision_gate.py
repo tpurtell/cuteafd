@@ -118,7 +118,7 @@ def test_qwen_bucket_projection_registry_matches_pinned_fork():
 
 
 def test_head72_uses_the_b12x_le128_tile():
-    export = module("python/tools/aot/export_b12x_vision_attention_aot.py", "vision_export")
+    export = module("python/tools/aot/export_b12x_vision_aot.py", "vision_export")
     assert export.tile_for_head_dim(64) == (128,128)
     assert export.tile_for_head_dim(72) == (128,64)
     assert export.tile_for_head_dim(128) == (128,64)
@@ -126,14 +126,15 @@ def test_head72_uses_the_b12x_le128_tile():
         with pytest.raises(ValueError): export.tile_for_head_dim(dim)
 
 
-def test_qwen_abi_keeps_mimo_prefix_and_matches_c_rust_suffix():
+def test_vision_pointer_count_abi_matches_c_rust():
     gate = module("python/tools/qualify/qwen4/qualify-vision.py", "qwen_vision_gate")
     assert ctypes.sizeof(gate.Block) == 96
-    assert ctypes.sizeof(gate.common.Spec) == 2752
-    assert ctypes.sizeof(gate.Spec) == 3792
-    assert gate.Spec.hidden.offset == 2752
-    assert gate.Spec.patch_bias.offset == 2792
-    assert gate.Spec.norm1_bias.offset == 2896
+    assert ctypes.sizeof(gate.common.Spec) == 256
+    assert ctypes.sizeof(gate.Spec) == 256
+    assert gate.Spec.blocks.offset == 72
+    assert gate.Spec.hidden.offset == 80
+    assert gate.Spec.patch_bias.offset == 120
+    assert gate.Spec.norm1_bias.offset == 224
 
 
 def test_qwen_patch_lut_uses_host_f64_rescale_then_f32_normalize():
@@ -418,3 +419,160 @@ def test_qwen_dead_pool_map_and_route_staging_are_not_retained():
     assert "map_pools(" not in prefix
     assert "pub router:" not in admission
     assert "host.router" not in engine
+
+
+def packed_spec_fields(snapshot, family, placements=None):
+    """Execute the actual ctypes packer without allocating checkpoint payloads."""
+    import json
+    snapshot = Path(snapshot)
+    gate = module(f"python/tools/qualify/{family}/qualify-vision.py", f"storage_{family}")
+    config = json.loads((snapshot / "config.json").read_text())
+    prefix = "visual." if family == "mimo_v2" else "model.visual."
+    with (snapshot / "vision.safetensors").open("rb") as source:
+        header = json.loads(source.read(int.from_bytes(source.read(8), "little")))
+
+    arena, cursor = {}, [0]
+
+    class SizedBytes(bytes):
+        def __new__(cls, size):
+            result = super().__new__(cls, b"")
+            result.size = size
+            return result
+        def __len__(self):
+            return self.size
+
+    # Exercise the actual elementwise packer operations on every BF16 bit
+    # pattern, without materializing the towers' multi-GiB matrix payloads.
+    patterns = np.arange(65536, dtype=np.uint16)
+
+    class ShapeOnly:
+        def __init__(self, shape, dtype=np.uint16, pieces=(), sample=None):
+            self.shape, self.dtype = tuple(shape), np.dtype(dtype)
+            self.nbytes = int(np.prod(shape)) * self.dtype.itemsize
+            self.pieces = pieces
+            self.sample = patterns if sample is None else sample
+        def astype(self, dtype):
+            return ShapeOnly(self.shape, dtype, self.pieces, self.sample.astype(dtype))
+        def __lshift__(self, bits):
+            return ShapeOnly(self.shape, self.dtype, self.pieces, self.sample << bits)
+        def view(self, dtype):
+            return ShapeOnly(self.shape, dtype, self.pieces, self.sample.view(dtype))
+        def tobytes(self):
+            expected = patterns.tobytes() if self.dtype == np.uint16 else (patterns.astype(np.uint32) << 16).tobytes()
+            assert self.sample.tobytes() == expected, self.pieces
+            cursor[0] = (cursor[0] + 255) & ~255
+            offset = cursor[0]
+            for name, count in self.pieces:
+                length = count * self.dtype.itemsize
+                arena[name] = (offset, length)
+                offset += length
+            assert offset == cursor[0] + self.nbytes
+            cursor[0] = offset
+            return SizedBytes(self.nbytes)
+
+    tensors = {name.removeprefix(prefix): ShapeOnly(entry["shape"], pieces=((name.removeprefix(prefix), int(np.prod(entry["shape"]))),))
+               for name, entry in header.items() if name.startswith(prefix)}
+    concatenate = np.concatenate
+    def shapes_only(values, *args, **kwargs):
+        if isinstance(values[0], ShapeOnly):
+            assert all(value.sample.tobytes() == values[0].sample.tobytes() for value in values)
+            return ShapeOnly((sum(value.shape[0] for value in values), *values[0].shape[1:]), values[0].dtype,
+                tuple(piece for value in values for piece in value.pieces), values[0].sample)
+        return concatenate(values, *args, **kwargs)
+    np.concatenate = shapes_only
+    try:
+        spec, _ = gate.pack_spec(config, tensors)
+        # Evaluate the unmodified pre-change packer and fixed-array declaration
+        # from this branch's base. No checkpoint allocation or CUDA imports.
+        old_common_source = subprocess.check_output(["git", "-C", str(ROOT), "show",
+            "34b0d33b1985441746df5e2fe02c2ae3a9a29f6f:python/tools/qualify/mimo_v2/qualify-vision.py"], text=True)
+        common_ast = ast.parse(old_common_source)
+        selected = [node for node in common_ast.body if isinstance(node, ast.ClassDef)
+                    and node.name in ("Block", "Spec")]
+        # The second packing run records old placements independently.
+        new_arena = dict(arena)
+        cursor[0] = 0
+        arena.clear()
+        scope = {"C": ctypes, "np": np, "NO_OFFSET": (1 << 64) - 1,
+                 "FIELDS": gate.common.FIELDS if hasattr(gate, "common") else gate.FIELDS}
+        exec(compile(ast.Module(body=selected, type_ignores=[]), "old fixed vision ABI", "exec"), scope)
+        import types
+        old_common = types.SimpleNamespace(Spec=scope["Spec"], Block=scope["Block"], NO_OFFSET=(1 << 64) - 1)
+        old_source = subprocess.check_output(["git", "-C", str(ROOT), "show",
+            f"34b0d33b1985441746df5e2fe02c2ae3a9a29f6f:python/tools/qualify/{family}/qualify-vision.py"], text=True)
+        nodes = ast.parse(old_source).body
+        scope.update(common=old_common, Block=old_common.Block)
+        if family != "mimo_v2":
+            declaration = next(node for node in nodes if isinstance(node, ast.ClassDef) and node.name == "Spec")
+            exec(compile(ast.Module(body=[declaration], type_ignores=[]), "old tower ABI", "exec"), scope)
+        pack = next(node for node in nodes if isinstance(node, ast.FunctionDef) and node.name == "pack_spec")
+        exec(compile(ast.Module(body=[pack], type_ignores=[]), "old tower packer", "exec"), scope)
+        fixed, _ = scope["pack_spec"](config, tensors)
+        assert arena == new_arena
+        # Compare every old scalar, complete live block bytes and layer offsets;
+        # only storage representation (pointers vs arrays) is allowed to change.
+        for name, kind in fixed._fields_:
+            if name == "blocks":
+                assert bytes(fixed.blocks)[:spec.depth * 96] == ctypes.string_at(spec.blocks, spec.depth * 96)
+            elif name in ("norm1_bias", "norm2_bias", "q_norm", "k_norm"):
+                assert list(getattr(fixed, name))[:spec.depth] == [getattr(spec, name)[i] for i in range(spec.depth)]
+            elif issubclass(kind, ctypes.Array):
+                assert bytes(getattr(fixed, name)) == bytes(getattr(spec, name))
+            else:
+                assert getattr(fixed, name) == getattr(spec, name), name
+    finally:
+        np.concatenate = concatenate
+    # Qwen's probe admits 4096 while serving intentionally admits 1024. Compare
+    # the same admitted request capacity rather than changing probe behavior.
+    if family == "qwen4":
+        spec.max_tokens = 1024
+    remap = {}
+    if placements is not None:
+        # No numerical data is materialized here: BF16 matrices are copied and
+        # BF16 vectors are widened identically. Each tensor's full byte extent
+        # and destination are checked, including the second fused gate/up part.
+        assert set(placements) == set(arena)
+        for name, (offset, length) in arena.items():
+            destination, expected_length = placements[name]
+            assert length == expected_length, name
+            remap[offset] = destination
+    values = []
+    layers = ("blocks", "norm1_bias", "norm2_bias", "q_norm", "k_norm")
+    for name, _ in spec._fields_:
+        if name in layers or name == "storage_abi":
+            continue
+        value = getattr(spec, name)
+        if name == "norm_eps":
+            import struct
+            values.append(int.from_bytes(struct.pack("<f", value), "little"))
+        elif name == "merger_extra":
+            values.extend(value)
+        else:
+            if name in ("patch", "merger_norm", "merger_fc1", "merger_fc2", "patch_bias",
+                        "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias"):
+                value = remap.get(value, value)
+            values.append(value)
+    # Merger extras are offsets, not geometry.
+    values[25:33] = [remap.get(value, value) for value in values[25:33]]
+    for i in range(spec.depth):
+        block = spec.blocks[i]
+        values.extend(remap.get(getattr(block, name), getattr(block, name))
+                      if name not in ("window", "column_order") else getattr(block, name)
+                      for name, _ in block._fields_)
+    for name in layers[1:]:
+        values.extend(remap.get(getattr(spec, name)[i], getattr(spec, name)[i]) for i in range(spec.depth))
+    return values
+
+
+@pytest.mark.parametrize("depth", [24, 27, 28, 30, 50])
+def test_ctypes_storage_is_owned_at_tower_depth(depth):
+    import gc
+    gate = module("python/tools/qualify/qwen4/qualify-vision.py", "owned_depth")
+    spec = gate.Spec(depth=depth)
+    spec.blocks[depth - 1].norm1 = 1234
+    spec.q_norm[depth - 1] = gate.common.NO_OFFSET
+    gc.collect()
+    assert spec.storage_abi == 3
+    assert len(spec._layer_storage["blocks"]) == depth
+    assert spec.blocks[depth - 1].norm1 == 1234
+    assert spec.q_norm[depth - 1] == gate.common.NO_OFFSET

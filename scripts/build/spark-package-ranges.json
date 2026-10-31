@@ -1,0 +1,500 @@
+{
+  "schema": 1,
+  "shared_inputs": [
+    "python/tools/lib/spark_packages.py",
+    "scripts/build/spark-package-ranges.json",
+    "scripts/lib/wip_aot_scopes.py",
+    "scripts/lib/checkpoint-family.py"
+  ],
+  "spark_budget_bytes": 107374182400,
+  "entries": {
+    "v41:mxfp4": {
+      "intermediate": 2304,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "lower_bound",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+          "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+          "routed_expert_bytes": 288777830400
+        }
+      ]
+    },
+    "dsv4f:mxfp4": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+          "revision": "9e165c30e2704aec5d9d593cce3eebd58bbef1cb",
+          "routed_expert_bytes": 147169738752
+        }
+      ]
+    },
+    "dsv4p:exl3": {
+      "intermediate": 3072,
+      "minimum": 4,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+          "revision": "7a63f24905223aff19212d65226be708950823ac",
+          "routed_expert_bytes": 388288498176
+        }
+      ]
+    },
+    "glmf:exl3": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+          "revision": "0490d2f708b12145f6516555ab066aaeb401cd21",
+          "routed_expert_bytes": 124110911232
+        },
+        {
+          "model": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
+          "revision": "a5fee929cf4888b1824323e33e8a19b60129e025",
+          "routed_expert_bytes": 152648955648
+        }
+      ]
+    },
+    "glmf:nvfp4": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 6,
+      "basis": "deprecated",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "nvidia/GLM-5.3-Flash-NVFP4",
+          "revision": "09b04e5e74bca08ca8549fc736d4cdd8624bfde3",
+          "routed_expert_bytes": 171228556800
+        }
+      ],
+      "deprecated": true,
+      "admitted_worlds": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    "mimof:fp8": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+          "revision": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
+          "routed_expert_bytes": 160859947008
+        }
+      ]
+    },
+    "mimop:fp8": {
+      "intermediate": 2048,
+      "minimum": 6,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
+          "revision": "adea8e2c5373181e5a973fa1ecb343cb31af214b",
+          "routed_expert_bytes": 531351207936
+        }
+      ]
+    },
+    "qwen4:exl3": {
+      "intermediate": 640,
+      "minimum": 1,
+      "maximum": 4,
+      "basis": "planner",
+      "worlds": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+          "revision": "888306bd3996d6317758c07df50622829259ad17",
+          "routed_expert_bytes": 64645005312
+        }
+      ]
+    },
+    "qwen4:nvfp4": {
+      "intermediate": 640,
+      "minimum": 1,
+      "maximum": 6,
+      "basis": "deprecated",
+      "worlds": [
+        1,
+        2,
+        3,
+        4,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+          "revision": "2061e0b0c5d92bdf7c8fbd4241bbc2af239d7e2d",
+          "routed_expert_bytes": 67948314624
+        }
+      ],
+      "deprecated": true,
+      "admitted_worlds": [
+        1,
+        2,
+        3,
+        4,
+        6
+      ]
+    },
+    "glm:exl3": {
+      "intermediate": 2048,
+      "minimum": 4,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+          "revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
+          "routed_expert_bytes": 363331814400
+        }
+      ]
+    },
+    "glm:nvfp4": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 6,
+      "basis": "deprecated",
+      "worlds": [
+        2,
+        3,
+        4,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "nvidia/GLM-5.3-NVFP4",
+          "revision": "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
+          "routed_expert_bytes": 407686809600
+        }
+      ],
+      "deprecated": true,
+      "admitted_worlds": [
+        2,
+        3,
+        4,
+        6
+      ]
+    },
+    "kimik3:exl3": {
+      "intermediate": 3072,
+      "minimum": 6,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/Kimi-K3-EXL3-K2",
+          "revision": "acba35b61a672561652b16a96fca1be85c1bd875",
+          "routed_expert_bytes": 683978201088
+        }
+      ]
+    },
+    "step5:bf16": {
+      "intermediate": 1536,
+      "minimum": 5,
+      "maximum": 6,
+      "basis": "lower_bound",
+      "worlds": [
+        4,
+        5,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "stepfun-ai/Step-5-Preview",
+          "revision": "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc",
+          "routed_expert_bytes": 604721627136
+        }
+      ]
+    },
+    "mimo:fp8": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "companion",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "XiaomiMiMo/MiMo-V2.6-Flash-MOPD",
+          "revision": "2479e2d0029eca9a34cc7e7f55a121925f81908e",
+          "routed_expert_bytes": 160859947008
+        }
+      ]
+    },
+    "glm:fp8": {
+      "intermediate": 2048,
+      "minimum": 4,
+      "maximum": 8,
+      "basis": "companion",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-v1",
+          "revision": "47af23347db743b4666d952e2eb48f2b01c3fede",
+          "routed_expert_bytes": 363331814400
+        }
+      ]
+    },
+    "glmf:fp8": {
+      "intermediate": 2048,
+      "minimum": 2,
+      "maximum": 8,
+      "basis": "companion",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-v1",
+          "revision": "0490d2f708b12145f6516555ab066aaeb401cd21",
+          "routed_expert_bytes": 124110911232
+        },
+        {
+          "model": "brandonmusic/GLM-5.3-Flash-tr3-4bpw",
+          "revision": "a5fee929cf4888b1824323e33e8a19b60129e025",
+          "routed_expert_bytes": 152648955648
+        }
+      ]
+    },
+    "qwen4:fp8": {
+      "intermediate": 640,
+      "minimum": 1,
+      "maximum": 4,
+      "basis": "companion",
+      "worlds": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
+          "revision": "888306bd3996d6317758c07df50622829259ad17",
+          "routed_expert_bytes": 64645005312
+        }
+      ]
+    },
+    "step5:fp8": {
+      "intermediate": 1536,
+      "minimum": 5,
+      "maximum": 6,
+      "basis": "companion",
+      "worlds": [
+        4,
+        5,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "stepfun-ai/Step-5-Preview",
+          "revision": "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc",
+          "routed_expert_bytes": 604721627136
+        }
+      ]
+    },
+    "step5:exl3": {
+      "intermediate": 1536,
+      "minimum": 3,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [],
+      "provenance_note": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6 is not yet published; minimum 3 from the planner on the published header inventory (2 Sparks need 138.9 GiB/rank). Add the checkpoint witness when the revision lands (#925)."
+    },
+    "v41:nvfp4": {
+      "intermediate": 2304,
+      "minimum": 2,
+      "maximum": 6,
+      "basis": "deprecated",
+      "worlds": [
+        2,
+        3,
+        4,
+        6
+      ],
+      "checkpoints": [],
+      "deprecated": true,
+      "provenance_note": "Historical native NVFP4 roles from dev 34b0d33b1985441746df5e2fe02c2ae3a9a29f6f; no checkpoint fit witness and no new width classes.",
+      "admitted_worlds": [
+        2,
+        3,
+        4,
+        6
+      ]
+    },
+    "step5:nvfp4": {
+      "intermediate": 1536,
+      "minimum": 4,
+      "maximum": 6,
+      "basis": "deprecated",
+      "worlds": [
+        4,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "stepfun-ai/Step-5-Preview",
+          "revision": "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc",
+          "routed_expert_bytes": 604721627136
+        }
+      ],
+      "deprecated": true,
+      "admitted_worlds": [
+        4
+      ]
+    },
+    "dsv4p:mxfp4": {
+      "intermediate": 3072,
+      "minimum": 4,
+      "maximum": 8,
+      "basis": "companion",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/DeepSeek-V4-Pro-0813-EXL3-K2-calibrated-v1",
+          "revision": "7a63f24905223aff19212d65226be708950823ac",
+          "routed_expert_bytes": 388288498176
+        }
+      ]
+    }
+  },
+  "provenance_notes": {
+    "planner": "Minimum from a complete planner allocation witness; worlds also retain shipped package layouts.",
+    "lower_bound": "No complete fit witness: export-only floor(routed_expert_bytes / spark_budget_bytes), at least one. This does not admit serving layouts.",
+    "companion": "Geometry and export range inherited from the listed checkpoint, not a measured byte size for this companion quantization.",
+    "deprecated": "Frozen shipped package coverage; checkpoint byte counts, if present, are provenance only and do not widen it."
+  }
+}

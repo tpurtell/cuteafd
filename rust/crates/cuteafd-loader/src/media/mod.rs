@@ -88,6 +88,8 @@ pub enum ImageFamily {
 /// Reference processor parameters; all identity-affecting choices live here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProcessorConfig {
+    #[serde(default, skip_serializing_if = "Resample::is_bicubic")]
+    pub resample: Resample,
     pub family: ImageFamily,
     pub patch: u32,
     pub merge: u32,
@@ -104,6 +106,8 @@ pub struct ProcessorConfig {
 pub const QWEN_MAX_IMAGE_TOKENS: usize = 1024;
 const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub use resize::Resample;
+
 impl ProcessorConfig {
     pub fn for_family(family: ImageFamily) -> Self {
         let (patch, min_pixels, max_pixels, mean, std) = match family {
@@ -112,6 +116,7 @@ impl ProcessorConfig {
             ImageFamily::GlmFlash => (14, 16, 8000, CLIP_MEAN, CLIP_STD),
         };
         Self {
+            resample: Resample::Bicubic,
             family,
             patch,
             merge: 2,
@@ -191,10 +196,12 @@ impl ProcessorConfig {
                 })?;
             }
         }
-        if value.get("resample").is_some_and(|v| v.as_u64() != Some(3)) {
-            return Err(MediaError::Config(
-                "only the gated Pillow bicubic resampler is supported".into(),
-            ));
+        if let Some(value) = value.get("resample") {
+            config.resample = match value.as_u64() {
+                Some(3) => Resample::Bicubic,
+                Some(1) => Resample::Lanczos,
+                _ => return Err(MediaError::Config("unsupported Pillow resampler".into())),
+            };
         }
         config.validate()?;
         Ok(config)
@@ -242,7 +249,10 @@ impl ProcessorConfig {
     }
     pub fn id(&self) -> PreprocessId {
         let mut hash = Sha256::new();
-        hash.update(b"cuteafd-preprocess-v1:pillow-bicubic");
+        hash.update(match self.resample {
+            Resample::Bicubic => b"cuteafd-preprocess-v1:pillow-bicubic".as_slice(),
+            Resample::Lanczos => b"cuteafd-preprocess-v1:pillow-lanczos".as_slice(),
+        });
         hash.update(serde_json::to_vec(self).expect("processor parameters serialize"));
         PreprocessId(hash.finalize().into())
     }
@@ -347,7 +357,7 @@ impl ImageProcessor for ProcessorConfig {
                 .floor()
                 .max(1.0)
                 .min(f64::from(width)) as u32;
-            let content = resize::resize_bicubic(&image, cw, ch);
+            let content = resize::resize(&image, cw, ch, self.resample);
             let mut data = vec![0; width as usize * height as usize * 3];
             for y in 0..ch as usize {
                 data[y * width as usize * 3..y * width as usize * 3 + cw as usize * 3]
@@ -359,7 +369,7 @@ impl ImageProcessor for ProcessorConfig {
                 data,
             }
         } else {
-            resize::resize_bicubic(&image, width, height)
+            resize::resize(&image, width, height, self.resample)
         };
         let grid = ImageGrid {
             t: 1,

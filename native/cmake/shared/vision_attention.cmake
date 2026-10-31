@@ -22,9 +22,9 @@ add_custom_command(
   OUTPUT ${CUTEAFD_VISION_ATTENTION_OUTPUTS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
   COMMAND "${CMAKE_COMMAND}" -E env ${CUTEAFD_SPARKINFER_PYTHON_ENV}
-    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_attention_aot.py"
+    "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
     --output-dir "${CUTEAFD_VISION_ATTENTION_DIR}" --capability ${CUTEAFD_VISION_CAPABILITY}
-  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_attention_aot.py"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_vision_aot.py"
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting full-image head64/head72 BF16 vision attention offline"
   VERBATIM)

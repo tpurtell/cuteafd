@@ -11,9 +11,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use WIP FP8 on 2 RTX PRO 6000 + 6 Sparks or NVFP4 on 1 RTX PRO 6000 + 4 Sparks")]
+#[error("Step-5 layout is unqualified: {0}; use one or two RTX PRO 6000 for EXL3, two for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
 struct Unqualified(&'static str);
-// EXL3 qualifies 1-2 RTX PRO 6000 with TP2/3/4/6 Sparks (planner fit decides).
 
 pub(super) fn layout(
     model: &Model,
@@ -28,19 +27,28 @@ pub(super) fn layout(
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
     let exl3 = model.is_exl3();
-    // EXL3 K4 experts fit at every packaged Spark world; the planner's fit decides
-    // the card columns. The official releases keep their qualified pairs.
-    let (coordinators, spark_ranks) = if exl3 {
-        (opts.rtx_bytes.len(), requested.spark_ranks())
-    } else if nvfp4 { (1, 4) } else { (2, 6) };
-    report.min_spark_ranks = Some(if exl3 { 2 } else { spark_ranks });
+    // Coordinator GPUs are a placement qualification: EXL3 runs on one or two
+    // RTX; the official releases keep their qualified GPU counts. Spark worlds
+    // come from the shared width-class package ranges for every format, and a
+    // frozen format admits only the worlds it shipped on.
+    let coordinators = if exl3 { opts.rtx_bytes.len() } else if nvfp4 { 1 } else { 2 };
+    let spark_ranks = requested.spark_ranks();
+    let format = if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { "fp8" };
+    let package = if exl3 { format!("step5:{}", model.exl3_package().context("Step-5 EXL3 expert tiers")?) }
+        else { format!("step5:{format}") };
+    let worlds = cuteafd_core::tp_units::frozen_admitted_worlds("step5", format)
+        .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
+    if let Some(refusal) = crate::plan::experts::frozen_refusal(&package, spark_ranks) {
+        anyhow::bail!("Step-5 layout is unqualified: {refusal}");
+    }
+    crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
     ensure!(
         exl3 || nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
         Unqualified("BF16 target format")
     );
     ensure!(
-        (if exl3 { matches!(coordinators, 1 | 2) && matches!(spark_ranks, 2 | 3 | 4 | 6) }
-            else { opts.rtx_bytes.len() == coordinators && requested.spark_ranks() == spark_ranks })
+        matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
+            && worlds.contains(&spark_ranks)
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
     );

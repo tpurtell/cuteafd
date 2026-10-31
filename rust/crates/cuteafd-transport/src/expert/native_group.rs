@@ -1037,7 +1037,7 @@ mod tests {
 
         for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let topology = SparkTopology::new(world as u8, 1)?;
-            if matches!(world, 2 | 3 | 4 | 6) {
+            if cuteafd_core::tp_units::spark_ownership_topology(world, 1) {
                 let client = SparkExperts::new_world(crate::expert::SparkWorld::owned(topology)?, &peers[..world], 80, config.clone(), 0)?;
                 assert_eq!(client.world_size(), world);
             }

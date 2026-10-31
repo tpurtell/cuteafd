@@ -584,14 +584,18 @@ pub fn write_v4_snapshot(path: &Path) {
 }
 
 pub fn write_v4_snapshot_with_dspark(path: &Path, stages: usize) {
-    write_v4_snapshot_format(path, stages, false);
+    write_v4_snapshot_format(path, stages, false, false);
 }
 
 pub fn write_v4_pro_exl3_snapshot(path: &Path) {
-    write_v4_snapshot_format(path, 0, true);
+    write_v4_snapshot_format(path, 0, true, true);
 }
 
-fn write_v4_snapshot_format(path: &Path, stages: usize, pro_exl3: bool) {
+pub fn write_v4_pro_mxfp4_snapshot(path: &Path) {
+    write_v4_snapshot_format(path, 0, true, false);
+}
+
+fn write_v4_snapshot_format(path: &Path, stages: usize, pro: bool, exl3_experts: bool) {
     // serve-dsv4 reads inference/config.json when the snapshot has one; so does the plan.
     let mut hf = json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4", "max_position_embeddings": 1048576});
     let mut ratios = vec![0, 0];
@@ -606,12 +610,12 @@ fn write_v4_snapshot_format(path: &Path, stages: usize, pro_exl3: bool) {
         "compress_ratios": ratios[1..].to_vec(), "dspark_block_size": if stages > 0 { 5 } else { 0 },
         "dspark_target_layer_ids": [1, 2, 3], "dspark_markov_rank": 256
     });
-    if pro_exl3 {
+    if pro {
         args["dim"] = json!(7168);
         args["moe_inter_dim"] = json!(3072);
         args["n_routed_experts"] = json!(384);
-        hf["quantization_config"] = exl3_compact(2);
     }
+    if exl3_experts { hf["quantization_config"] = exl3_compact(2); }
     let cfg = crate::families::deepseek_v4::DeepseekV4Config::from_model_args(&args, stages).unwrap();
     let mut tensors = vec![t("embed.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
         t("head.weight", "BF16", &[cfg.vocab_size, cfg.dim]),
@@ -640,7 +644,7 @@ fn write_v4_snapshot_format(path: &Path, stages: usize, pro_exl3: bool) {
             for (projection, rows, cols) in [("w1", cfg.moe_inter_dim, cfg.dim),
                 ("w2", cfg.dim, cfg.moe_inter_dim), ("w3", cfg.moe_inter_dim, cfg.dim)] {
                 let name = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
-                if pro_exl3 {
+                if exl3_experts {
                     tensors.extend(exl3(&name, rows, cols, 2));
                 } else {
                     tensors.push(t(format!("{name}.weight"), "I8", &[rows, cols / 2]));
@@ -970,8 +974,12 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
     let path = root.join("share/PROGRAMS.json");
     std::fs::write(&path, json!({"schema":1,"sparkinfer_revision":revision,"programs":programs}).to_string()).unwrap();
     let package = root.join("lib/exl3/exl3-kimik3-k23");
-    let layouts = if spark { (0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>() }
-        else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
+    let layouts = if spark {
+        crate::plan::experts::spark_worlds("kimik3:exl3-k23", 3072).into_iter().flat_map(|world| {
+            let recipe = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, world).unwrap();
+            recipe.required_layouts.into_iter().zip(recipe.widths)
+        }).collect::<Vec<_>>()
+    } else { vec![("rtx-tp1".into(), 3072), ("rtx-tp2".into(), 1536)] };
     let mut variants = Vec::new();
     for (layout, intermediate) in layouts {
         for capacity in [1, 80, 256, 1024, 2048, 2752, 4096] {
@@ -979,6 +987,8 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
             let meta = json!({"directory":directory,"capacity":capacity,"intermediate":intermediate,
                 "experts":896,"top_k":16,"bits":[2,3],"output_dtype":if spark {"bf16"} else {"fp32"},
                 "hidden":3584,"activation":"situ","descriptor_bits":10,"sparkinfer_revision":revision,
+                "descriptor_rows":if layout.contains("-compact-") {7} else {3},
+                "native_info_version":if layout.contains("-compact-") {3} else {2},
                 "trellis_lut":{"bytes":4096},"buffers":{"scratch":{"allocation":"scratch",
                     "bytes":capacity * 4096,"dtype":"f32","zero_on_create":false}}});
             let target = package.join(&directory);

@@ -310,7 +310,7 @@ def generate(entry, arm_name, arm, state, key_file, overrides, probes, expected_
     if len(set(hosts)) != count or not set(hosts) <= set(HOSTS):
         raise ValueError('invalid Spark inventory')
     for key in list(values):
-        if re.fullmatch(r'SPARK_[0-5]_(HOST|LANE_A|LANE_B)', key):
+        if re.fullmatch(r'SPARK_[0-7]_(HOST|LANE_A|LANE_B)', key):
             del values[key]
     # Only V4.1's launcher reads a secondary rail; other families reject the key.
     lane_b = entry.get('family') == 'deepseek_v41'

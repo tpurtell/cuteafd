@@ -255,7 +255,7 @@ impl TowerSpec {
             max_tokens: max_tokens as u32,
             output_width: cfg.hidden_size,
             ..Default::default()
-        };
+        }.with_depth(cfg.vision_config.depth);
         native.patch = put(
             "patch_embed.proj.weight",
             &[1280, 3, 2, 16, 16],
@@ -649,6 +649,47 @@ impl Drop for EncoderService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn assert_ctypes_spec(snapshot: &Path, family: &str, tower: &TowerSpec) {
+        let spec = &tower.native;
+        let mut values = vec![spec.abi_version as u64, spec.max_tokens as u64,
+            spec.output_width as u64, spec.reserved as u64, spec.weight_bytes,
+            spec.patch, spec.merger_norm, spec.merger_fc1, spec.merger_fc2, spec.inv_freq,
+            spec.hidden as u64, spec.depth as u64, spec.heads as u64, spec.kv_heads as u64,
+            spec.head_dim as u64, spec.intermediate as u64, spec.patch_size as u64,
+            spec.merger_width as u64, spec.norm_eps.to_bits() as u64,
+            spec.geometry_reserved as u64, spec.patch_bias, spec.pos_embed,
+            spec.merger_norm_bias, spec.merger_fc1_bias, spec.merger_fc2_bias];
+        values.extend(spec.merger_extra);
+        for block in &spec.blocks {
+            values.extend([block.qkv, block.qkv_bias, block.proj, block.proj_bias,
+                block.gate_up, block.gate_up_bias, block.down, block.down_bias,
+                block.norm1, block.norm2, block.key0_bias,
+                block.window as u64, block.column_order as u64]);
+        }
+        for layer in [&spec.norm1_bias, &spec.norm2_bias, &spec.q_norm, &spec.k_norm] {
+            assert_eq!(layer.len(), spec.depth as usize);
+            values.extend(layer);
+        }
+        // Cargo's CPU-only gate needs no Python. The script gate additionally
+        // executes each real ctypes packer over these same header-only fixtures.
+        if let Some(python) = std::env::var_os("CUTEAFD_MEDIA_PARITY_PYTHON") {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+            let prefix = if family == "mimo_v2" { "visual." } else { "model.visual." };
+            let placements: BTreeMap<_, _> = tower.reads.iter().map(|read| (
+                read.metadata.name.strip_prefix(prefix).unwrap(),
+                (read.destination, read.metadata.byte_length * if read.vector { 2 } else { 1 })
+            )).collect();
+            let output = std::process::Command::new(python)
+                .args(["-c", "import importlib.util,json,sys; p=sys.argv[1]; s=importlib.util.spec_from_file_location('parity',p); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(json.dumps(m.packed_spec_fields(sys.argv[2],sys.argv[3],json.loads(sys.argv[4]))))"])
+                .arg(root.join("scripts/tests/test_qwen_vision_gate.py"))
+                .arg(snapshot).arg(family).arg(serde_json::to_string(&placements).unwrap()).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let ctypes: Vec<u64> = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(values, ctypes, "Rust/ctypes tower spec differs for {family}");
+        }
+    }
+
     #[test]
     fn owner_exit_and_panic_publish_health_without_scheduler_polling() {
         for panic in [false, true] {
@@ -849,6 +890,7 @@ mod tests {
         for width in [4096, 6144] {
             let snapshot = sparse_snapshot(width);
             let tower = TowerSpec::mimo(snapshot.path(), 4096).unwrap();
+            assert_ctypes_spec(snapshot.path(), "mimo_v2", &tower);
             assert_eq!(tower.native.output_width, width as u32);
             assert_eq!(
                 tower.native.weight_bytes,

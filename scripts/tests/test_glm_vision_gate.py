@@ -17,14 +17,14 @@ def load_gate():
     return module
 
 
-def test_glm_abi_preserves_mimo_prefix():
+def test_glm_pointer_count_abi_matches_rust():
     gate = load_gate()
     assert ctypes.sizeof(gate.Block) == 96
-    assert gate.Spec.blocks.offset == 64
-    assert gate.Spec.hidden.offset == 2752
-    assert gate.Spec.patch_bias.offset == 2792
-    assert gate.Spec.norm1_bias.offset == 2896
-    assert ctypes.sizeof(gate.Spec) == 3792
+    assert gate.Spec.blocks.offset == 72
+    assert gate.Spec.hidden.offset == 80
+    assert gate.Spec.patch_bias.offset == 120
+    assert gate.Spec.norm1_bias.offset == 224
+    assert ctypes.sizeof(gate.Spec) == 256
 
 
 def test_glm_patch_order_duplicates_temporal_axis_and_keeps_merge_units():

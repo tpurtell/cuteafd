@@ -134,9 +134,6 @@ def test_kimi_explicit_spark_budget_reaches_plan_and_workers(tmp_path: Path) -> 
     ("ATTENTION_PLACEMENT=context\n", "kimi_k3 supports only ATTENTION_PLACEMENT=auto"),
     ("VISION=rtx\n", "kimi_k3 bundled media execution is not qualified"),
     ("AUDIO=spark\n", "kimi_k3 bundled media execution is not qualified"),
-    ("SPARK_COUNT=4\n", "no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission"),
-    ("SPARK_COUNT=0\n", "no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission"),
-    ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission"),
     ("RTX_GPUS=1\n", "TP2 attention on two RTX GPUs"),
     ("COORDINATOR_SPLIT=off\n", "TP2 attention on two RTX GPUs"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),
@@ -295,7 +292,7 @@ def _step5(tmp_path: Path, keys: str, *, wip: bool = True, model: str = STEP5_FP
                                  encoder_plan=kwargs.pop("encoder_plan", STEP5_PLANNED), **kwargs)
 
 
-@pytest.mark.parametrize("model,gpus,sparks", [(STEP5_FP8, 2, 6), (STEP5_NVFP4, 1, 4)])
+@pytest.mark.parametrize("model,gpus,sparks", [(STEP5_FP8, 2, ranks) for ranks in (4, 5, 6)] + [(STEP5_NVFP4, 1, 4)])
 def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, sparks: int) -> None:
     result = _step5(tmp_path, f"SPARK_COUNT={sparks}\nRTX_GPUS={gpus}\n" + _hosts(sparks), model=model)
     serve = _line(result, "cuteafd serve-step5 --snapshot")
@@ -328,7 +325,7 @@ def test_step5_fixed_rtx_expert_layers_reach_serve(tmp_path: Path) -> None:
     assert result.returncode != 0
 
 
-@pytest.mark.parametrize("model,gpus,sparks", [(STEP5_FP8, 2, 6), (STEP5_NVFP4, 1, 4)])
+@pytest.mark.parametrize("model,gpus,sparks", [(STEP5_FP8, 2, ranks) for ranks in (4, 5, 6)] + [(STEP5_NVFP4, 1, 4)])
 @pytest.mark.parametrize("value,expected", [(None, "fp8"), ("bf16", "bf16"), ("fp8", "fp8")])
 def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, sparks, value, expected) -> None:
     keys = f"SPARK_COUNT={sparks}\nRTX_GPUS={gpus}\n" + _hosts(sparks)
@@ -446,3 +443,24 @@ def test_qualifying_family_capacity_uses_cuda_total(tmp_path, family):
     plan = _line(result, "cuteafd plan")
     assert float(_flag(plan, "--coordinator-gpu-budget-gib")) == total / 2**30
     assert float(_flag(plan, "--coordinator-weight-budget-gib")) == total / 2**30
+
+
+@pytest.mark.parametrize("ranks", (6, 7, 8))
+def test_kimi_launches_every_covered_rank_count_from_planner(tmp_path, ranks):
+    hosts = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\nSPARK_{i}_LANE_B=\n"
+                    for i in range(ranks))
+    result = _kimi(tmp_path, f"SPARK_COUNT={ranks}\n" + hosts)
+    serve = _line(result, "cuteafd serve-kimi --snapshot")
+    assert _flag(serve, "--peers") == ",".join(f"10.0.0.{i+1}:19441" for i in range(ranks))
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == ranks
+    assert all(f"--world {ranks} " in worker for worker in workers)
+
+
+@pytest.mark.parametrize("ranks", (1, 2, 3, 4, 5))
+def test_kimi_delegates_unservable_counts_to_planner(tmp_path, ranks):
+    result = _kimi(tmp_path, f"SPARK_COUNT={ranks}\n",
+                   encoder_plan={**PLANNED, "fits": False, "placement_supported": False})
+    assert result.returncode != 0
+    assert "invalid deployment specification" in result.stderr
+    assert "cuteafd expertd-native" not in result.stderr

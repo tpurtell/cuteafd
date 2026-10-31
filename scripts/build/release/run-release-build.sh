@@ -28,13 +28,13 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 usage() {
   cat <<'EOF'
 Usage: scripts/build/release/run-release-build.sh --config FILE --source DIR --evidence DIR
-                                            [--roles tp2;tp3;tp6] [--allow-dirty]
+                                            [--roles tp2;tp3;tp6;tp8] [--allow-dirty]
                                             [--label NAME] [--help]
 
   --config FILE   release build config (release tag derives from its image pair)
   --source DIR    frozen standalone clone to build from (default: repo root)
   --evidence DIR  evidence directory (required); logs and identity files go here
-  --roles LIST    Spark expert roles; default tp2;tp3;tp6 (universal)
+  --roles LIST    Spark expert roles; default tp2;tp3;tp6;tp8 (universal)
   --allow-dirty   build a dirty tree (records the automatic source manifest)
   --label NAME    evidence prefix (default: the release tag)
 
@@ -50,7 +50,7 @@ die() { echo "run-release-build: $*" >&2; exit 2; }
 config=""
 source_dir="$repo_root"
 evidence=""
-roles="tp2;tp3;tp6"
+roles="tp2;tp3;tp6;tp8"
 allow_dirty=0
 label=""
 while [[ $# -gt 0 ]]; do

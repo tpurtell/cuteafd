@@ -211,12 +211,13 @@ impl Handshake {
         match self {
             Self::Image(value) => value.validate_job(job),
             Self::Audio(value) => {
-                let cuteafd_engine::media::EncodeInput::Audio { pcm } = &job.input else {
+                let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
                 let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(pcm.len())
                     .map_err(error)?;
-                if !job.key.is_audio()
+                if !matches!(&job.input, cuteafd_engine::media::EncodeInput::Audio { geometry, .. } if geometry.is_mimo())
+                    || !job.key.is_audio()
                     || pcm.len() > value.max_samples as usize
                     || pcm.iter().any(|v| !v.is_finite())
                     || job.tokens != geometry.tokens
@@ -520,7 +521,7 @@ fn exchange(s: &mut Wire, job: &EncodeJob) -> Result<EncodeOutput> {
             put_u64(s, rgb8.len() as u64)?;
             s.write_all(rgb8).map_err(error)?;
         }
-        cuteafd_engine::media::EncodeInput::Audio { pcm } => {
+        cuteafd_engine::media::EncodeInput::Audio { pcm, .. } => {
             put_u32(s, 2)?;
             s.write_all(job.key.bytes()).map_err(error)?;
             put_u32(s, pcm.len() as u32)?;
@@ -634,7 +635,7 @@ impl EncoderServer {
             move || health.healthy(),
             move |job| {
                 let started = Instant::now();
-                let cuteafd_engine::media::EncodeInput::Audio { pcm } = &job.input else {
+                let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
                 let rows = job.tokens * job.hidden_width;
@@ -1041,7 +1042,7 @@ mod tests {
         invalid.tokens += 1;
         assert!(client.submit(invalid).is_err());
         let mut invalid = audio_job();
-        if let cuteafd_engine::media::EncodeInput::Audio { pcm } = &mut invalid.input {
+        if let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &mut invalid.input {
             *pcm = vec![f32::NAN; 24000].into();
         }
         assert!(client.submit(invalid).is_err());

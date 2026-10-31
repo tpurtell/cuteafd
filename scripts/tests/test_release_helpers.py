@@ -83,7 +83,7 @@ DOCKER_STUB = textwrap.dedent(
           *io.cuteafd.sparkinfer.revision*) value="4b0954148523b5a2e93813f963d483ffd350b9c9" ;;
           *io.cuteafd.role*) case "$ref" in *spark-expert*) value="expert" ;; *) value="coordinator" ;; esac ;;
           *io.cuteafd.cuda_arch*) case "$ref" in *spark-expert*) value="121" ;; *) value="120" ;; esac ;;
-          *io.cuteafd.v41.spark_tp_roles*) case "$ref" in *spark-expert*) value="tp2;tp3;tp6" ;; *) value="" ;; esac ;;
+          *io.cuteafd.v41.spark_tp_roles*) case "$ref" in *spark-expert*) value="tp2;tp3;tp6;tp8" ;; *) value="" ;; esac ;;
           *io.cuteafd.source-manifest.sha256*) value="" ;;
           *Architecture*) value="amd64" ;;
           *) value="" ;;
@@ -109,7 +109,7 @@ def host_record(host: str, *, image_id: str = SPARK_ID, status: str = "present")
             f"label.io.cuteafd.sparkinfer.revision={SPARKINFER_REVISION}",
             "label.io.cuteafd.cuda_arch=121",
             "label.io.cuteafd.role=expert",
-            "label.io.cuteafd.spark_tp_roles=tp2;tp3;tp6",
+            "label.io.cuteafd.spark_tp_roles=tp2;tp3;tp6;tp8",
             "label.io.cuteafd.source-manifest.sha256=",
         ]
     return "\n".join(lines) + "\n"

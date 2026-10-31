@@ -155,8 +155,8 @@ impl<'a> Engine<'a> {
         use crate::shared::placement::{spark_rings, SparkAdmission};
         use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
         use cuteafd_transport::{expert::SparkWorld, worker_selection::ModelAdmission};
-        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && peers.len() == 6,
-            "Kimi startup needs process latent geometry and six real expert ranks");
+        ensure!(cuteafd_core::expert_geometry() == ExpertGeometry::KIMI_K3 && (1..=8).contains(&peers.len()),
+            "Kimi startup needs process latent geometry and 1..8 real expert ranks");
         let coordinator_packing_cap = programs.iter().map(|programs| programs.packing_cap).min().unwrap_or(0);
         let plan = admission.execution_plan()?;
         cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
@@ -177,7 +177,7 @@ impl<'a> Engine<'a> {
         let model = ModelAdmission::new(endpoints, spark_rings(config.max_frame_bytes)?, executions)?;
         model.validate(ExpertGeometry::KIMI_K3)?;
         let spark = SparkAdmission::plan(&checkpoint.snapshot, ExpertGeometry::KIMI_K3,
-            Some(&catalog), &admission.working_set(), 6, None, model)?;
+            Some(&catalog), &admission.working_set(), peers.len(), None, model)?;
         // Dense operands and TP2 halves land inside the Spark load (pushed as
         // coordinator ranks when the group pushes, else through the mount).
         let (pending, expert_weights, weights) = admission.start_and_load(spark, &peers, devices, checkpoint, &catalog,
@@ -214,7 +214,7 @@ impl<'a> Engine<'a> {
         if let Some(draft) = draft.as_mut() { draft.bind_target(weights.global.clone(), programs[1].clone())?; }
         drop((weights, kda, mla));
         pending.wait()?;
-        let world = SparkWorld::canonical(6)?;
+        let world = SparkWorld::canonical(peers.len())?;
         let routed = local.iter().map(|pair| admission.connect_spark(library, &pair[1],
             world, peers.clone(), config.clone())).collect::<Result<Vec<_>>>()?;
         let prefill = PrefillUnits { unit_rows: admission.unit_rows(), waves: admission.waves() };
@@ -403,7 +403,7 @@ impl<'a> Engine<'a> {
             let resident = local[0].as_ref().is_some_and(|rank| rank.layers().contains(&layer));
             ensure!(resident == local[1].as_ref().is_some_and(|rank| rank.layers().contains(&layer)),
                 "Kimi TP2 draft policy layer homes disagree");
-            let bytes = resource::exl3_slice_bytes(manifest, layer, if resident { 2 } else { 6 })?;
+            let bytes = resource::exl3_slice_bytes(manifest, layer, if resident { 2 } else { lanes.routed[0].world_size()? })?;
             Ok(if resident { LayerHome::Local { slice_bytes: bytes } }
                 else { LayerHome::Remote { slice_bytes: bytes } })
         }).collect::<Result<Vec<_>>>()?;

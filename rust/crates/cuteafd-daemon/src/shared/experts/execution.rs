@@ -37,11 +37,11 @@ fn validate_live_rows(rows: usize, live: u32) -> std::result::Result<(), NativeE
 
 /// Native roles that publish token-major FP32 routed partials and therefore
 /// need the compact output buffer plus the compact reducer: legacy grouped
-/// Spark TP4 (role 1) and the Spark shard families TP2/TP3/pure-TP6 (roles
-/// 5/6/7). The full-width RTX backbone (role 2) owns its separate local reducer
+/// Spark TP4 (role 1) and the Spark shard families TP2/TP3/TP6/TP8 (roles
+/// 5/6/7/8). The full-width RTX backbone (role 2) owns its separate local reducer
 /// and never enters this execution.
-fn compact_output_role(role: u32) -> bool {
-    matches!(role, 1 | 5 | 6 | 7)
+pub(super) fn compact_output_role(role: u32) -> bool {
+    matches!(role, 1 | 5 | 6 | 7 | 8)
 }
 
 /// Admit the exact states owned by this wave before allocating their scratch.
@@ -931,15 +931,15 @@ mod capacity_tests {
 #[cfg(test)]
 mod timing_role_tests {
     /// The timing gate is the same predicate that selects the compact output
-    /// and reducer, so the Spark shard families (roles 5/6/7) and the legacy
+    /// and reducer, so the Spark shard families (roles 5/6/7/8) and the legacy
     /// grouped Spark TP4 (role 1) all publish the routed breakdown; the dSpark,
     /// full-width RTX and RTX TP2 roles do not.
     #[test]
     fn routed_timing_is_enabled_for_the_compact_output_roles() {
-        for role in [1u32, 5, 6, 7] {
+        for role in [1u32, 5, 6, 7, 8] {
             assert!(super::compact_output_role(role), "role {role} must be timed");
         }
-        for role in [0u32, 2, 3, 4, 8, u32::MAX] {
+        for role in [0u32, 2, 3, 4, 9, u32::MAX] {
             assert!(!super::compact_output_role(role), "role {role} must not be timed");
         }
     }

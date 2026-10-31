@@ -33,6 +33,13 @@ CASES = [
 ]
 
 
+def test_local_kimi_scope_does_not_request_zero_rank_spark_exports():
+    _, scopes = aot.config_scopes({'FAMILY': 'kimi_k3', 'MODEL_ID': 'test/Kimi-K3-EXL3-K2', 'SPARK_COUNT': '0'})
+    assert scopes['CUTEAFD_WIP_EXPERT_FAMILIES'] == ''
+    assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == ''
+    assert scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'kimik3:exl3-k23'
+
+
 def config_file(tmp_path, family, model, count):
     path = tmp_path / 'model.config'
     hosts = '\n'.join(f'SPARK_{i}_HOST=spark{i}\nSPARK_{i}_LANE_A=192.0.2.{i + 1}\n'
@@ -179,7 +186,7 @@ def test_missing_or_malformed_programs_are_refused(tmp_path, contents):
         aot.check_programs('qwen4', tmp_path / 'missing.json')
 
 
-@pytest.mark.parametrize('count,tp,role', [('6', '2', 'tp2'), ('6', '6', 'tp6'), ('3', '3', 'tp3'), ('6', '', 'tp6')])
+@pytest.mark.parametrize('count,tp,role', [('6', '2', 'tp2'), ('6', '6', 'tp6'), ('3', '3', 'tp3'), ('6', '', 'tp6'), ('8', '8', 'tp8')])
 def test_v41_direct_config_uses_explicit_spark_tp_role(count, tp, role):
     values = {'FAMILY': 'deepseek_v41', 'SPARK_COUNT': count, 'SPARK_TP': tp}
     _, scopes = aot.config_scopes(values)
@@ -219,11 +226,11 @@ def test_dense_cards_and_direct_configs_use_checkpoint_geometry(tmp_path, monkey
         aot.config_scopes(values)
 
 
-@pytest.mark.parametrize('count', [0, 4])
-def test_kimi_k3_refuses_every_layout_but_tp6(count):
+@pytest.mark.parametrize('count', [4, 5, 6, 7, 8])
+def test_kimi_k3_scopes_use_the_requested_world(count):
     values = dict(MODEL_ID='test/Kimi-K3-EXL3-K2', SPARK_COUNT=str(count), RTX_GPUS='2')
-    with pytest.raises(ValueError, match='TP6 only'):
-        aot.family_scopes([dict(family='kimi_k3', name='kimi-k3-exl3-k2', config=None)], lambda _: values)
+    result = aot.family_scopes([dict(family='kimi_k3', name='kimi-k3-exl3-k2', config=None)], lambda _: values)
+    assert result['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == f'kimik3={count}'
 
 
 def test_kimi_k3_routed_range_from_its_own_config():

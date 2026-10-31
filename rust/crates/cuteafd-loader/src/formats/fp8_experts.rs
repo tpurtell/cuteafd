@@ -1617,7 +1617,13 @@ mod tests {
                     .write_all_at(&bytes, located.offset)?;
             }
             for world in [2, 3, 4, 5, 6] {
-                let package = if world == 5 { "glmf:nvfp4" } else { "glm:nvfp4" };
+                let package = if intermediate == 640 { "qwen4:nvfp4" }
+                    else if world == 5 { "glmf:nvfp4" } else { "glm:nvfp4" };
+                if intermediate == 640 && world == 5 {
+                    assert!(matches!(spark_recipe(package, intermediate, world),
+                        Err(crate::plan::experts::SparkRecipeRefusal::Deprecated { .. })));
+                    continue;
+                }
                 let recipe = spark_recipe(package, intermediate, world)?;
                 for layer in 0..world {
                     tensors.slice_layer = layer;

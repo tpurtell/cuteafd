@@ -94,7 +94,11 @@ impl ServeArgs {
         let shape = self.shape()?;
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
-        ensure!(matches!(self.peers.len(), 2 | 3 | 4 | 6), "Step-5 Spark experts run TP2, TP3, TP4 or TP6 (packages decide)");
+        // Transport check only: the checkpoint's own format and the shared
+        // width-class ranges decide the world in admission (spark_recipe).
+        ensure!(["exl3", "fp8", "nvfp4"].iter().any(|format|
+            cuteafd_core::tp_units::spark_package_worlds("step5", format).contains(&self.peers.len())),
+            "Step-5 requires a shared width-class Spark recipe");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
         ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");
@@ -502,6 +506,17 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn spark_count_admission_matches_shared_width_coverage() {
+        let worlds = cuteafd_core::tp_units::spark_package_worlds("step5", "fp8");
+        for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            let mut args = args();
+            args.peers = (0..world).map(|rank| format!("127.0.0.1:{}", rank + 1).parse().unwrap()).collect();
+            let admitted = args.validate();
+            assert_eq!(admitted.is_ok(), worlds.contains(&world), "TP{world}: {admitted:?}");
+        }
     }
 
     fn live_mtp_args() -> ServeArgs {

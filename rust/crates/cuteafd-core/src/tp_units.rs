@@ -19,6 +19,67 @@ pub enum UnitMapError {
     Index,
 }
 
+/// Checkpoint-provenanced export coverage, shared by planner and wire admission.
+pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
+    static DATA: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    &DATA.get_or_init(|| serde_json::from_str(include_str!(
+        "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
+}
+
+/// A frozen (deprecated) format's admitted Spark worlds: the cards it shipped
+/// or was admitted on before it froze. Its packaged worlds may be wider (a
+/// historical role or a tail sibling's layout), but a frozen format never
+/// admits a new world. `None` for formats that are not frozen.
+pub fn frozen_admitted_worlds(family: &str, format: &str) -> Option<Vec<usize>> {
+    let format = if format.starts_with("exl3") { "exl3" } else { format.strip_suffix("a4").unwrap_or(format) };
+    let entry = spark_package_entry(&format!("{family}:{format}"));
+    (entry["deprecated"].as_bool() == Some(true)).then(|| entry["admitted_worlds"].as_array()
+        .expect("a frozen package range names its admitted worlds").iter()
+        .filter_map(|world| world.as_u64().map(|world| world as usize)).collect())
+}
+
+/// Descriptor ABI and stored columns determine code, not rank identity.
+pub fn package_width_keys(intermediate: usize, unit: usize, world: usize,
+    exl3: bool, native: bool, nvfp4: bool) -> Vec<(bool, usize)> {
+    if !(1..=crate::MAX_SPARK_WORLD).contains(&world) || unit == 0 || intermediate == 0
+        || intermediate % unit != 0 || intermediate / unit < world { return vec![]; }
+    let units = intermediate / unit;
+    if exl3 && units % world != 0 { return vec![(true, units.div_ceil(world) * unit)]; }
+    if native || (nvfp4 && intermediate % (128 * world) != 0) {
+        return vec![(false, (units.div_ceil(world) * unit).div_ceil(128) * 128)];
+    }
+    let mut widths = vec![(false, units / world * unit)];
+    if units % world != 0 { widths.push((false, units.div_ceil(world) * unit)); }
+    widths
+}
+
+pub fn spark_package_worlds(family: &str, format: &str) -> Vec<usize> {
+    let format = if format.starts_with("exl3") { "exl3" } else { format.strip_suffix("a4").unwrap_or(format) };
+    let entry = spark_package_entry(&format!("{family}:{format}"));
+    let seeds = entry["worlds"].as_array().map(|items| items.iter()
+        .filter_map(|item| item.as_u64().map(|n| n as usize)).collect::<Vec<_>>()).unwrap_or_default();
+    if entry["deprecated"].as_bool() == Some(true) { return seeds; }
+    let intermediate = entry["intermediate"].as_u64().unwrap_or(0) as usize;
+    let exl3 = format == "exl3";
+    let native = matches!(family, "v41" | "dsv4f" | "dsv4p") && !exl3;
+    let unit = if native || matches!(family, "mimof" | "mimop") { 32 } else { 128 };
+    let available = seeds.into_iter().flat_map(|world|
+        package_width_keys(intermediate, unit, world, exl3, native, false)).collect::<std::collections::BTreeSet<_>>();
+    (1..=crate::MAX_SPARK_WORLD).filter(|&world| {
+        let needed = package_width_keys(intermediate, unit, world, exl3, native, false);
+        (!native || intermediate % (32 * world) == 0) && !needed.is_empty()
+            && needed.iter().all(|key| available.contains(key))
+    }).collect()
+}
+
+/// Wire topology qualification is format-independent; checkpoint admission still
+/// checks the selected family's recipe and native whole-K32 ownership.
+pub fn spark_ownership_topology(tp: usize, ep: usize) -> bool {
+    (ep == 1 && ["v41", "dsv4f", "dsv4p"].iter()
+        .any(|family| spark_package_worlds(family, "mxfp4").contains(&tp)))
+        || matches!((tp, ep), (2, 2) | (3, 2) | (2, 3))
+}
+
 /// Exact-even ownership stays contiguous; uneven units balance across layers
 /// (native K32) or experts and layers (H128).
 pub fn balanced_rule(unit_columns: usize, units: usize, world: usize) -> UnitRule {

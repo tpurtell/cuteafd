@@ -84,7 +84,23 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
         "/../../../third_party/sparkinfer.lock.json")))?;
     ensure!(lock["revision"] == revision, "Kimi K3 package/source revision mismatch");
     let (layouts, output) = match package["role"].as_str() {
-        Some("spark") => ((0..6).map(|r| (format!("tp6-rank{r}"), 512)).collect::<Vec<_>>(), "bf16"),
+        Some("spark") => {
+            // A scoped WIP package need only carry its declared worlds, but each
+            // world must have all recipe ranks and capacities before native load.
+            let variants = package["variants"].as_array().context("Kimi K3 package lacks variants")?;
+            let worlds = variants.iter().filter_map(|entry| entry["directory"].as_str())
+                .filter_map(|directory| directory.strip_prefix("tp")?.split('-').next()?.parse::<usize>().ok())
+                .collect::<std::collections::BTreeSet<_>>();
+            ensure!(!worlds.is_empty(), "Kimi K3 Spark package lacks rank layouts");
+            let mut layouts = Vec::new();
+            for world in worlds {
+                let recipe = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, world)?;
+                for (rank, layout) in recipe.required_layouts.into_iter().enumerate() {
+                    layouts.push((layout, recipe.widths[rank]));
+                }
+            }
+            (layouts, "bf16")
+        },
         Some("coordinator") => {
             ensure!(programs["sparkinfer_revision"] == revision, "Kimi K3 program/package revision mismatch");
             let inventory = programs["programs"].as_array().unwrap();
@@ -122,8 +138,8 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
             }
             ensure!(meta["sparkinfer_revision"] == revision && meta["hidden"] == 3584
                 && meta["activation"] == "situ" && meta["descriptor_bits"] == 10
-                && meta["descriptor_rows"].as_u64().is_none_or(|n| n == 3)
-                && meta["native_info_version"].as_u64().is_none_or(|n| n == 2)
+                && meta["descriptor_rows"].as_u64().is_none_or(|n| n == if layout.contains("-compact-") { 7 } else { 3 })
+                && meta["native_info_version"].as_u64().is_none_or(|n| n == if layout.contains("-compact-") { 3 } else { 2 })
                 && meta["decode_schedule"].is_null(), "Kimi K3 EXL3 native contract mismatch: {directory}");
             for artifact in ["libcuteafd_exl3.so", "routes/libv41_exl3_routes.so", "trellis_lut.bin"] {
                 ensure!(root.join(&directory).join(artifact).is_file(),

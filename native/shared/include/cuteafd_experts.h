@@ -72,7 +72,8 @@ typedef struct cuteafd_expert_info_t {
   uint32_t abi_version;
   uint32_t role; /* 0: coordinator dSpark; 1: Spark TP4 shard; 2: full RTX backbone; 3: backbone TP2;
                     4: dSpark TP2; 5: Spark TP2 shard (intermediate 1152); 6: Spark TP3 shard (intermediate 768);
-                    7: Spark TP6 shard (intermediate 384, no padding) */
+                    7: Spark TP6 shard (intermediate 384, no padding)
+// 8: Spark TP8 shard (intermediate 288, stored 384) */
   uint32_t experts;
   uint32_t hidden_size;
   uint32_t logical_intermediate;
@@ -102,6 +103,7 @@ int32_t cuteafd_v41_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_r
 int32_t cuteafd_v41_spark_tp2_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp3_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 int32_t cuteafd_v41_spark_tp6_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_info_reduction(int32_t capacity, cuteafd_expert_reduction_t* out);
 
 /* Prewarm before graph capture. Quantize BF16 [rows,5120] into contiguous
  * 5280-byte rows: 5120 E4M3 bytes then 160 UE8M0 K32 scales, amax floor 1e-4.
@@ -163,6 +165,15 @@ int32_t cuteafd_v41_spark_tp6_expert_bind_scratch(void* kernel, void* storage,
 int32_t cuteafd_v41_spark_tp6_expert_initialize_scratch_async(void* kernel, void* storage,
     uint64_t bytes, void* stream);
 int32_t cuteafd_v41_spark_tp6_expert_output_kind(int32_t capacity, uint32_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_info(int32_t capacity, cuteafd_expert_info_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_group_rows(int32_t capacity, int32_t rows, uint32_t* out);
+int32_t cuteafd_v41_spark_tp8_expert_initialize(int32_t capacity, void** out_kernel);
+int32_t cuteafd_v41_spark_tp8_expert_launch(void* kernel, const cuteafd_expert_launch_t* args);
+int32_t cuteafd_v41_spark_tp8_expert_bind_scratch(void* kernel, void* storage,
+    uint64_t bytes, void* tensors[CUTEAFD_V41_EXPERT_POINTERS]);
+int32_t cuteafd_v41_spark_tp8_expert_initialize_scratch_async(void* kernel, void* storage,
+    uint64_t bytes, void* stream);
+int32_t cuteafd_v41_spark_tp8_expert_output_kind(int32_t capacity, uint32_t* out);
 
 /* Reduce contiguous FP32 [rows,topk,5120] route planes into BF16 [rows,5120].
  * Supported geometries: ranks=1 or 2/topk=3 (RTX dSpark), ranks=4/topk=6 (backbone).
