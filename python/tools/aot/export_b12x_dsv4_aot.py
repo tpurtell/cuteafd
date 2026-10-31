@@ -580,7 +580,9 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
                 (f"index_post{tag}_m{rows}", "index_post", {"rope": rope, "max_rows": rows},
                  lambda r=rows, rope=rope: ml4.compile_index_post_aot(g, rope=rope, max_rows=r)),
                 (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
-                 lambda r=rows, rope=rope, mode=mode: ml4.compile_sparse_mla_aot(g, rope=rope, route=mode, max_rows=r)),
+                 # Decode exports one card plan per SM count (the exporter passes sm_count).
+                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
+                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
             ]
         out += [
             (f"values_m{rows}", "values", {"max_rows": rows},
