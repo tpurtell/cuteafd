@@ -1113,8 +1113,6 @@ def main() -> None:
             manifest["family_capacities"]["ml42"] = {"max_context": geometry_context("ml42", args.max_context)}
             work += [("ml42", *item) for item in ml4_head_split_programs(ML4_TP2, args.decode_rows,
                                                                          args.prefill_rows, extent)]
-            if args.context_split == "on":
-                work += [("ml4", *item) for item in ml4_context_split_programs(ML4, args.decode_rows, extent)]
             continue
         if name == "dense_trellis_k6":
             from export_b12x_dense_trellis_k6_aot import programs as dense_programs, row_policies
@@ -1206,6 +1204,11 @@ def main() -> None:
         for name in (n for n in geometries if n in bases):
             work += [(families[name], *item) for item in context_split_programs(
                 bases[name], args.decode_rows, geometry_context(name, args.max_context))]
+        if "ml4" in geometries:
+            # Mistral Large 4's token-split extras: both record contracts' partials and gathers.
+            from b12x.integration.cuteafd.mistral_large4 import ML4
+            work += [("ml4", *item) for item in ml4_context_split_programs(
+                ML4, args.decode_rows, geometry_context("ml4", args.max_context))]
         if "glmf2" in geometries:
             # GLM Flash context keeps the compact index cache on two GPUs: each GPU's share commits
             # its KDA heads and rebuilds the (replicated) index tails in one launch.
