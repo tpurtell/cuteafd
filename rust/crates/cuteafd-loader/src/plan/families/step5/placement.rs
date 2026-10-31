@@ -58,9 +58,10 @@ pub(super) fn layout(
             && report.audio == MediaMode::Off,
         Unqualified("host embedding, draft or media owners")
     );
+    // EXL3 onboards whole routed layers on the entry GPU (planner decides how
+    // many); the official FP8/NVFP4 releases keep every routed layer on Sparks.
     ensure!(
-        opts.onboard
-            .is_none_or(|onboard| matches!(onboard, Onboard::Layers(0) | Onboard::Auto))
+        (exl3 || opts.onboard.is_none_or(|onboard| matches!(onboard, Onboard::Layers(0) | Onboard::Auto)))
             && opts.local_expert_layers.is_none_or(|n| n == 0),
         Unqualified("coordinator-local routed experts")
     );
@@ -197,6 +198,10 @@ pub(super) fn layout(
         peer_diagnostics: false,
         pending_code: code,
         startup: vec![],
+        onboard: if exl3 {
+            super::admission::OnboardInputs::exl3(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
+                checked_rows, opts.onboard.unwrap_or(Onboard::Auto))?
+        } else { None },
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.attention_placement = admitted.placement.attention_placement;
@@ -248,12 +253,20 @@ pub(super) fn layout(
             kv_tokens: memory.pool_tokens,
         });
     }
+    // The solver's homes are the plan: onboarded layers leave the Spark working set.
+    let rtx_layers = admitted.placement.layers.iter().enumerate()
+        .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2))
+        .map(|(layer, _)| layer).collect::<Vec<_>>();
     let working = SparkWorkingSet {
-        rtx_layers: vec![],
-        spark_layers: (3..91).collect(),
+        spark_layers: (3..91).filter(|layer| !rtx_layers.contains(layer)).collect(),
+        rtx_layers,
         spark_ranks,
         prefill_lanes: 1,
     };
+    if !working.rtx_layers.is_empty() {
+        memory.notes.push(format!("Step-5 EXL3 onboarding: {} routed layers whole on the entry RTX {:?}",
+            working.rtx_layers.len(), working.rtx_layers));
+    }
     let capacity = u32::try_from(shape.unit_rows)?;
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,

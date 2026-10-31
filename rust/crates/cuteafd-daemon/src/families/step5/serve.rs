@@ -43,6 +43,10 @@ pub(crate) struct ServeArgs {
     /// Pack queued short prompts, optionally preserving singleton arithmetic routes.
     #[arg(long, value_enum, default_value = "unrestricted")]
     prefill_packing: crate::shared::prefill_packing::PackingMode,
+    /// Routed layers whose EXL3 experts run whole on the entry RTX: auto lets the
+    /// planner keep as many as fit beside the pool; FP8/NVFP4 releases onboard none.
+    #[arg(long, default_value = "auto")]
+    rtx_expert_layers: cuteafd_loader::placement::Onboard,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -240,7 +244,9 @@ fn with_backend<T>(args: &ServeArgs,
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
-        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
+        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
+        onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::exl3(&catalog,
+            Some(&args.manifest), args.prefill_rows as usize, args.rtx_expert_layers)? };
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     // Uploads convert on the host and copy synchronously. No transient device
@@ -536,6 +542,8 @@ mod tests {
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
                 "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
             startup: vec![],
+            onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::exl3(&catalog,
+                Some(&args.manifest), 256, args.rtx_expert_layers)?,
         };
         for depth in 1..=3 {
             args.mtp = depth;

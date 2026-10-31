@@ -181,6 +181,30 @@ pub struct RuntimeInputs {
     pub peer_diagnostics: bool,
     pub pending_code: Vec<u64>,
     pub startup: Vec<Demand>,
+    /// RTX expert onboarding for checkpoints whose routed experts have an RTX
+    /// package (EXL3); `None` keeps every routed layer on the Sparks.
+    pub onboard: Option<OnboardInputs>,
+}
+
+/// Header-exact whole-layer costs (routed layers in order) and the entry
+/// GPU's expert arena; the solver chooses how many layers the RTX keeps.
+#[derive(Debug, Clone)]
+pub struct OnboardInputs {
+    pub costs: Vec<ExpertCost>,
+    pub workspace: u64,
+    pub mode: Onboard,
+}
+
+impl OnboardInputs {
+    /// Whole EXL3 layers on the entry GPU, from the checkpoint headers and the
+    /// installed `rtx-tp1` package at the admitted unit rows.
+    pub fn exl3(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, unit_rows: usize,
+        mode: Onboard) -> Result<Option<Self>> {
+        if catalog.exl3().is_none() || mode == Onboard::Layers(0) { return Ok(None); }
+        Ok(Some(Self { costs: crate::placement::exl3_onboard::expert_costs(catalog, false)?,
+            workspace: crate::placement::exl3_onboard::rtx_workspace(catalog, manifest, unit_rows as u64, 1)?,
+            mode }))
+    }
 }
 
 pub struct Admission {
@@ -551,12 +575,14 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                     extra: vec![],
                     context_indexer: false,
                     colocate: None,
-                    experts: cfg.moe[layer].then_some(ExpertCost {
-                        whole: Bytes2::default(),
-                        half: [Bytes2::default(); 2],
-                        tp2: false,
-                        spark_ok: true,
-                    }),
+                    experts: cfg.moe[layer].then(|| inputs.onboard.as_ref()
+                        .and_then(|onboard| onboard.costs.get(layer - 3).copied())
+                        .unwrap_or(ExpertCost {
+                            whole: Bytes2::default(),
+                            half: [Bytes2::default(); 2],
+                            tp2: false,
+                            spark_ok: true,
+                        })),
                     modes: vec![mode],
                 })
                 .collect();
@@ -581,10 +607,11 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 fixed: fixed.clone(),
                 startup: inputs.startup.clone(),
                 movables: vec![],
-                expert_workspace: 0,
+                expert_workspace: inputs.onboard.as_ref().map_or(0, |o| o.workspace),
                 tp2_workspace: [0; 2],
-                onboard: Onboard::Auto,
-                expert_gpus: 0,
+                onboard: inputs.onboard.as_ref().map_or(Onboard::Auto, |o| o.mode),
+                // Onboarded layers stay whole on the entry GPU, which owns the routed wave.
+                expert_gpus: usize::from(inputs.onboard.is_some()),
                 minimum_expert_layers: 0,
                 policy: LayerPolicy {
                     attention: if ranks == 2 {
@@ -728,7 +755,7 @@ mod tests {
             },
             peer_diagnostics: false,
             pending_code: vec![1 << 20; ranks],
-            startup: vec![],
+            startup: vec![], onboard: None,
         }
     }
     fn run(inputs: &RuntimeInputs) -> Result<Admission> {

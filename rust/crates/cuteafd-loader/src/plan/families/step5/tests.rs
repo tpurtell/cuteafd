@@ -197,7 +197,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
-            peer_diagnostics: false, startup: vec![],
+            peer_diagnostics: false, startup: vec![], onboard: None,
         };
         for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
             || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {
@@ -1533,4 +1533,45 @@ fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<(
         assert!(!layout.core.contains_key("lm_head.weight"));
     }
     Ok(())
+}
+
+/// The installed `exl3-step5-k46/rtx-tp1` package metadata beside PROGRAMS.json.
+fn install_exl3_rtx_package(manifest: &std::path::Path) {
+    let root = manifest.parent().unwrap().join("exl3/exl3-step5-k46/rtx-tp1");
+    for capacity in crate::placement::inventory::exl3_capacities(4096) {
+        let path = root.join(format!("m{capacity}"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": capacity, "hidden": 4096, "experts": 352, "intermediate": 1536, "top_k": 8,
+            "bits": [4, 6], "activation": "silu_post_clamp", "swiglu_limit": 7.0,
+            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 64, "zero_on_create": false}}
+        })).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn exl3_two_rtx_onboards_whole_layers_and_sparks_keep_the_rest() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let plan_with = |onboard: Option<crate::placement::Onboard>| plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
+        ..Default::default() }).unwrap();
+    let auto = plan_with(None);
+    assert!(auto.solver_placement.is_some(), "{:#?}", auto.hints);
+    let onboarded = auto.solver_placement.as_ref().unwrap().layers.iter()
+        .filter(|l| matches!(l.experts, crate::placement::ExpertHome::RtxWhole { gpu: 0 })).count();
+    assert!(onboarded > 0, "auto should onboard on a 96 GiB RTX: {:?}", auto.hints);
+    assert_eq!(auto.onboard_layers, Some(onboarded));
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("onboarding")));
+    let none = plan_with(Some(crate::placement::Onboard::Layers(0)));
+    assert_eq!(none.onboard_layers, Some(0));
+    assert!(none.solver_placement.unwrap().layers.iter().all(|l|
+        !matches!(l.experts, crate::placement::ExpertHome::RtxWhole { .. })));
+    let solved = auto.solver_placement.unwrap();
+    assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
+    eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers, pool {}", solved.pool_tokens);
 }
