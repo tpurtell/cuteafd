@@ -106,6 +106,8 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
             slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: HEAD_ROWS,
             full_prefill_logits: false }
     }
+    /// Every Muse message opens with `<|start|>` (turn boundaries for prefix marks).
+    fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }
     fn library(&self) -> &'a NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
     fn prefix_cache(&self, args: &PrefixArgs, lanes: usize) -> Result<(Self::Prefix, PrefixCache<CudaCopyEngine<'a>, ()>)> {
@@ -205,4 +207,20 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn probe_begin(&self, _rows: usize) {}
     fn probe_end(&self) {}
     fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Prefix turn marks key on the checkpoint's `<|start|>` (not Qwen's
+    /// `<|im_start|>`), resolved from the served snapshot when present.
+    #[test]
+    fn message_starts_are_the_checkpoints() {
+        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(source.contains("fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }"));
+        assert_eq!(cuteafd_api::openai::chat::muse::START, "<|start|>");
+        let snapshots = std::path::Path::new(
+            "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
+        let Some(Ok(snapshot)) = std::fs::read_dir(snapshots).ok().and_then(|mut entries| entries.next()) else { return };
+        assert_eq!(crate::shared::prefix::marker_ids(&snapshot.path(), &["<|start|>"]).unwrap(), vec![200_022]);
+    }
 }

@@ -1,9 +1,10 @@
 //! Muse Spark serving entry: validated arguments, program preflight, the
 //! measured pre-weight inventory and shared admission, then the bring-up:
 //! Spark worker admission (the sealed endpoint), every coordinator rank's
-//! resident state loaded while the workers admit, the pair's exchange and the
-//! Spark link. The step executor and the scheduler backend are not built yet,
-//! so a launch stops after bring-up with the loaded layout (nothing serves).
+//! resident state (and onboarded experts) loaded while the workers admit, the
+//! pair's exchange and the Spark link. The shared scheduler then serves the
+//! text path over `MuseBackend` (no drafter yet) behind the OpenAI router with
+//! the checkpoint's own chat encoding.
 use super::startup;
 use crate::shared::inventory::{InventoryPhase, RuntimeInventory};
 use anyhow::{ensure, Context, Result};
@@ -47,6 +48,9 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "nvfp4")]
     pub expert_partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     #[command(flatten)] pub prefix: crate::shared::prefix::PrefixArgs,
+    #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
+    #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
+    #[command(flatten)] pub api: crate::shared::api::ApiArgs,
 }
 
 impl ServeArgs {
@@ -89,98 +93,164 @@ impl ServeArgs {
     }
 }
 
+/// Bring the engine up and hand `run` the backend and its admitted sequences.
+fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize) -> Result<T>)
+    -> Result<T> {
+    ensure!(args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu,
+        "Muse Spark keeps its embedding on the entry GPU");
+    cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK)
+        .map_err(|_| anyhow::anyhow!("Muse Spark serving needs an isolated process"))?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
+    let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+    cfg.release_geometry()?;
+    let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
+    let gpus = args.devices.len();
+    let manifest = startup::preflight(&args.manifest, gpus)?;
+    let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
+    // SAFETY: every native owner drops on this worker before the library.
+    let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
+    let inventory = RuntimeInventory::measure(&library, &args.devices, InventoryPhase::PreWeight, |_| Ok(()))?;
+    let (built, placement) = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
+        manifest: &manifest,
+        measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
+            free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
+        headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
+        slots: u64::from(args.max_sequences),
+        mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
+            .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
+        max_context: args.max_context,
+        pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
+        spark_budget_bytes: args.spark_budget_bytes(),
+        partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
+        partial_wide_format: args.expert_partial_wide_format,
+        local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
+            Some(&args.manifest), gpus, args.prefill()?.unit_rows)? })?;
+    tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
+        pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
+        "Muse Spark admitted TP experts with coordinator-combined partials");
+    let prefill = args.prefill()?;
+    let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
+        cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, args.expert_partial_wide_format)?;
+    let sequences = usize::from(args.max_sequences);
+    let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
+    let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
+        cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
+        spark.model.clone())?.start(&args.peers)?;
+    let devices = args.devices.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
+        .collect::<Vec<_>>();
+    let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
+        .collect::<Result<Vec<_>>>()?;
+    let context = args.max_context.unwrap_or(cfg.max_position as u64);
+    // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
+    // peer access), filled in the background while the layers load.
+    let name = "model.language_model.embed_tokens.weight";
+    let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
+        .with_context(|| format!("Muse checkpoint lacks {name}"))?;
+    let source = crate::shared::token_io::EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta,
+        cfg.hidden)?;
+    // Onboarded layers (experts on the RTXs): the installed coordinator package, each GPU's
+    // half (a pair) or whole layer, loaded after the dense weights inside the same admission window.
+    let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)| matches!(assignment.experts,
+        cuteafd_loader::placement::ExpertHome::RtxTp2 | cuteafd_loader::placement::ExpertHome::RtxWhole { .. })
+        .then_some(layer)).collect::<Vec<_>>();
+    let package = if onboarded.is_empty() { None } else {
+        Some(cuteafd_loader::placement::families::muse_spark::local_package(&catalog, &args.manifest, gpus,
+            prefill.unit_rows)?.0)
+    };
+    let program_refs = programs.iter().collect::<Vec<_>>();
+    let (embedding, (ranks, local)) = crate::shared::placement::load_while_admitting(Some(admission), || {
+        devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
+            crate::shared::memory::EmbedPlacement::Gpu, || {
+            devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
+                super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
+                    checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
+                    unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
+                .collect::<Result<Vec<_>>>()
+                .and_then(|ranks| Ok((ranks, match &package {
+                    None => Vec::new(),
+                    Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, &placement,
+                        onboarded.clone(), usize::try_from(prefill.unit_rows)?)?,
+                })))
+        }))
+    })?;
+    tracing::info!(layers = ?onboarded, gpus = local.len(), "Muse onboarded expert layers loaded");
+    let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
+        .collect::<Result<Vec<_>>>()?;
+    let (intake_row_bytes, _) = cuteafd_loader::placement::families::muse_spark::intake(&cfg, prefill, cutoff,
+        sequences, args.peers.len())?;
+    let mut engine = super::engine::MuseEngine::connect(&library, &cfg, &ranks, streams, args.peers.clone(),
+        super::engine::LinkPlan { spark, cutoff, unit_rows: usize::try_from(prefill.unit_rows)?,
+            waves: usize::try_from(prefill.waves)?, intake_row_bytes }, !local.is_empty())?;
+    tracing::info!(ranks = engine.ranks.len(), peer = engine.peer.is_some(), vocab = embedding.vocab(),
+        placement = %placement.summary(), pool_tokens = placement.pool_tokens, "Muse Spark brought up");
+    // The admitted context: the pool clamps an automatic one.
+    let served_context = usize::try_from(context.min(placement.pool_tokens))?;
+    let pages = usize::try_from(placement.pool_tokens)? / super::step::PAGE_ROWS;
+    let streams = engine.streams.iter().map(|stream| stream.raw).collect::<Vec<_>>();
+    let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
+        engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
+        served_context, pages, local)?;
+    run(&backend, sequences)
+}
+
+fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
+    stats: &Arc<std::sync::Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>)
+    -> Result<()> {
+    use crate::shared::qwen::scheduler::{self, Backend as _};
+    with_backend(args, |backend, sequences| {
+        let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(0),
+            crate::shared::qwen::Encoder::Off, 16);
+        scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, scheduler::Drafts::None, eos,
+            args.decode_share, &args.prefix, args.token_io.token_select, &mut media, None,
+            || initialized(backend.geometry().max_context))
+    })
+}
+
 pub(crate) async fn run(args: ServeArgs) -> Result<()> {
+    use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile, NativeLimits};
     args.validate()?;
-    let worker = tokio::task::spawn_blocking(move || -> Result<()> {
-        cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MUSE_SPARK)
-            .map_err(|_| anyhow::anyhow!("Muse Spark serving needs an isolated process"))?;
-        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&args.snapshot, false, false)?;
-        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
-        cfg.release_geometry()?;
-        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
-        let gpus = args.devices.len();
-        let manifest = startup::preflight(&args.manifest, gpus)?;
-        let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-        // SAFETY: every native owner drops on this worker before the library.
-        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
-        let inventory = RuntimeInventory::measure(&library, &args.devices, InventoryPhase::PreWeight, |_| Ok(()))?;
-        let (built, placement) = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
-            manifest: &manifest,
-            measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
-                free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
-            headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
-            slots: u64::from(args.max_sequences),
-            mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
-                .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
-            max_context: args.max_context,
-            pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
-            spark_budget_bytes: args.spark_budget_bytes(),
-            partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
-            partial_wide_format: args.expert_partial_wide_format,
-            local: cuteafd_loader::placement::families::muse_spark::local_workspace(&catalog,
-                Some(&args.manifest), gpus, args.prefill()?.unit_rows)? })?;
-        tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
-            pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
-            "Muse Spark admitted TP experts with coordinator-combined partials");
-        let prefill = args.prefill()?;
-        let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
-            cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, args.expert_partial_wide_format)?;
-        let sequences = usize::from(args.max_sequences);
-        let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
-        let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
-            cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
-            spark.model.clone())?.start(&args.peers)?;
-        let devices = args.devices.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
-            .collect::<Vec<_>>();
-        let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
-            .collect::<Result<Vec<_>>>()?;
-        let context = args.max_context.unwrap_or(cfg.max_position as u64);
-        // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
-        // peer access), filled in the background while the layers load.
-        let name = "model.language_model.embed_tokens.weight";
-        let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
-            .with_context(|| format!("Muse checkpoint lacks {name}"))?;
-        let source = crate::shared::token_io::EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta,
-            cfg.hidden)?;
-        // Onboarded layers (experts on the RTXs): the installed coordinator package, each GPU's
-        // half (a pair) or whole layer, loaded after the dense weights inside the same admission window.
-        let onboarded = placement.layers.iter().enumerate().filter_map(|(layer, assignment)| matches!(assignment.experts,
-            cuteafd_loader::placement::ExpertHome::RtxTp2 | cuteafd_loader::placement::ExpertHome::RtxWhole { .. })
-            .then_some(layer)).collect::<Vec<_>>();
-        let package = if onboarded.is_empty() { None } else {
-            Some(cuteafd_loader::placement::families::muse_spark::local_package(&catalog, &args.manifest, gpus,
-                prefill.unit_rows)?.0)
-        };
-        let program_refs = programs.iter().collect::<Vec<_>>();
-        let (embedding, (ranks, local)) = crate::shared::placement::load_while_admitting(Some(admission), || {
-            devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
-                crate::shared::memory::EmbedPlacement::Gpu, || {
-                devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
-                    super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
-                        checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
-                        unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
-                    .collect::<Result<Vec<_>>>()
-                    .and_then(|ranks| Ok((ranks, match &package {
-                        None => Vec::new(),
-                        Some(package) => super::onboard::load(&devices, &program_refs, &cfg, &catalog, package, &placement,
-                            onboarded.clone(), usize::try_from(prefill.unit_rows)?)?,
-                    })))
-            }))
-        })?;
-        tracing::info!(layers = ?onboarded, gpus = local.len(), "Muse onboarded expert layers loaded");
-        let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
-            .collect::<Result<Vec<_>>>()?;
-        let (intake_row_bytes, _) = cuteafd_loader::placement::families::muse_spark::intake(&cfg, prefill, cutoff,
-            sequences, args.peers.len())?;
-        let engine = super::engine::MuseEngine::connect(&library, &cfg, &ranks, streams, args.peers.clone(),
-            super::engine::LinkPlan { spark, cutoff, unit_rows: usize::try_from(prefill.unit_rows)?,
-                waves: usize::try_from(prefill.waves)?, intake_row_bytes }, !local.is_empty())?;
-        tracing::info!(ranks = engine.ranks.len(), peer = engine.peer.is_some(), vocab = embedding.vocab(),
-            "Muse Spark brought up");
-        anyhow::bail!("Muse Spark step executor is not built yet: brought up {} (pool {} tokens); nothing serves",
-            placement.summary(), placement.pool_tokens)
+    let api = args.api.load()?;
+    let snapshot = args.snapshot.clone();
+    let encoding = Arc::new(MuseEncoding::from_snapshot(&snapshot)?);
+    let eos = encoding.tokens().eos.clone();
+    let model = args.model_id.clone().or_else(|| snapshot.ancestors().find_map(|path| {
+        let name = path.file_name()?.to_str()?.strip_prefix("models--")?;
+        let (organization, model) = name.split_once("--")?;
+        Some(format!("{organization}/{model}"))
+    })).context("Muse Spark requires --model-id for a snapshot without HF identity")?;
+    let profile = ModelProfile::new(model, ModelEncoding::Muse(encoding));
+    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
+    let stats = Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
+    let worker_stats = stats.clone();
+    let engine_args = args.clone();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut ready = Some(ready_tx);
+        let result = worker(&engine_args, &mut receive, &worker_stats, eos, |context| {
+            if let Some(ready) = ready.take() { let _ = ready.send(Ok(context)); }
+            Ok(())
+        });
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(Err(anyhow::anyhow!("Muse Spark initialization failed: {:#}",
+                result.as_ref().err().context("worker exited before readiness")?)));
+        }
+        result
     });
-    worker.await.context("Muse Spark startup worker")?
+    let context = ready_rx.await.context("Muse Spark worker exited before readiness")??;
+    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output)?;
+    let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
+        "muse_spark", profile.id.clone(), snapshot.clone())));
+    let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
+        hub.clone(), api.serve(profile, &snapshot)?);
+    let listener = tokio::net::TcpListener::bind(&args.listen).await?;
+    cuteafd_bench::ready(&listener);
+    crate::shared::memory_report::log("ready");
+    tokio::select! {
+        served = axum::serve(listener, api.app(router, hub)
+            .into_make_service_with_connect_info::<SocketAddr>()) => served?,
+        _ = crate::shared::api::watch_scheduler(handle) => unreachable!(),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -220,6 +290,26 @@ mod tests {
             args(&["--peers", peers])?.validate()?;
         }
         Ok(())
+    }
+
+    /// Bring-up order: admission seals the Spark endpoint before the coordinator
+    /// loads (onboarded experts inside the same window), the link connects
+    /// after the load, and the backend serves the shared scheduler with no
+    /// drafter, text-only media, and the readiness callback last.
+    #[test]
+    fn serve_brings_up_then_schedules_the_backend() {
+        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
+        let body = source.split("fn with_backend<T>").nth(1).unwrap().split("\nfn worker(").next().unwrap();
+        let order = ["startup::admit(", "SparkAdmission::plan(", "load_while_admitting(Some(admission)",
+            "super::onboard::load(", "MuseEngine::connect(", "MuseBackend::new(", "run(&backend, sequences)"];
+        let at: Vec<usize> = order.iter().map(|needle| body.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+        assert!(!body.contains("bail!(\"Muse Spark step executor"), "serving no longer stops after bring-up");
+        let worker = source.split("\nfn worker(").nth(1).unwrap().split("\npub(crate) async fn run(").next().unwrap();
+        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("Encoder::Off"));
+        let run = source.split("\npub(crate) async fn run(").nth(1).unwrap();
+        assert!(run.contains("MuseEncoding::from_snapshot(") && run.contains("ModelEncoding::Muse("));
+        assert!(run.find("ready_rx.await").unwrap() < run.find("TcpListener::bind").unwrap());
     }
 
     #[test]
