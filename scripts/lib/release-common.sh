@@ -904,7 +904,7 @@ release_spark_host_rows() {
     release_die "SPARK_HOSTS must be a comma-separated Spark pool host list"
   IFS=, read -r -a hosts <<<"$csv"
   if [[ "$mode" == launch ]]; then
-    [[ "$count" =~ ^[0-6]$ && "${#hosts[@]}" == "$count" ]] ||
+    [[ "$count" =~ ^[0-8]$ && "${#hosts[@]}" == "$count" ]] ||
       release_die "SPARK_HOSTS must name exactly SPARK_COUNT=$count hosts"
   fi
   for host in "${hosts[@]}"; do
@@ -1311,7 +1311,7 @@ release_load_config() {
   if [[ "$mode" == launch ]]; then
     release_validate_spark_topology
 
-    [[ "$SPARK_COUNT" =~ ^[0-6]$ ]] || release_die "SPARK_COUNT must be in 0..6"
+    [[ "$SPARK_COUNT" =~ ^[0-8]$ ]] || release_die "SPARK_COUNT must be in 0..8"
 
     local missing_b=0 present_b=0 spark_required="$SPARK_COUNT"
     for ((release_i = 0; release_i < spark_required; release_i++)); do
@@ -1995,13 +1995,9 @@ release_select_build_hosts() {
   done
 }
 
-# Native per-TP-rank routed weight for one 40-layer backbone layer, in bytes.
-# These are the exact tensor windows from the official checkpoint geometry:
-# 1,804,861,440 B/rank at TP4 raw, padded to a 640-wide kernel extent
-# (2,005,401,600 B); TP6 (384), TP2 (1152) and TP3 (768) need no padding, so
-# their values are the exact 2304/TP window times the uniform per-column cost
-# (1,804,861,440 * TP4/TP = 7,219,445,760 / TP). They are weight arithmetic only
-# and do not include workspace, staging or runtime headroom.
+# V4.1 routed weight per layer and rank, excluding runtime headroom.
+# Native K32 tensors cost 3,133,440 bytes per stored intermediate column;
+# use the package's padded geometry, not the unpadded 2304/TP tensor window.
 release_spark_layer_bytes() {
   local tp="$1" format="${2:-native}"
   if [[ "$format" == nvfp4 ]]; then
@@ -2016,13 +2012,15 @@ release_spark_layer_bytes() {
     return
   fi
   [[ "$format" == native ]] || release_die "unsupported Spark weight format: $format"
-  case "$tp" in
-    2) printf '%s\n' 3609722880 ;;
-    3) printf '%s\n' 2406481920 ;;
-    4) printf '%s\n' 2005401600 ;;
-    6) printf '%s\n' 1203240960 ;;
-    *) release_die "unsupported Spark TP degree: $1 (expected 2, 3, 4, or 6)" ;;
-  esac
+  local packages="$(dirname "${BASH_SOURCE[0]}")/../../python/tools/lib/spark_packages.py"
+  python3 -I - "$packages" "$tp" <<'PYWEIGHTS' || release_die "unsupported native Spark TP degree: $tp"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('spark_packages', sys.argv[1])
+packages = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packages)
+_, _, stored = packages.native_spark_geometry()[int(sys.argv[2])]
+print(stored * 3133440)
+PYWEIGHTS
 }
 
 # Validate booleans independently of resolved GPU selection. Called again after

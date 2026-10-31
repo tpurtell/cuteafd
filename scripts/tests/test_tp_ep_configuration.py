@@ -59,6 +59,21 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
+    def test_native_layer_bytes_follow_shared_padded_geometry(self) -> None:
+        import importlib.util
+        path = ROOT / "python/tools/lib/spark_packages.py"
+        spec = importlib.util.spec_from_file_location("weight_packages", path)
+        packages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packages)
+        geometry = packages.native_spark_geometry()
+        for count in range(1, 10):
+            with self.subTest(count=count):
+                result = source_common(f"release_spark_layer_bytes {count}")
+                self.assertEqual(result.returncode == 0, count in geometry, result.stderr)
+                if count in geometry:
+                    self.assertEqual(int(result.stdout), geometry[count][2] * 3133440)
+        self.assertEqual(geometry[8], (8, 288, 384))
+
     def test_retained_canonical_and_owned_tp_counts_use_configured_hosts(self) -> None:
         for explicit, counts in [(False, range(1, 9)), (True, (2, 3, 4, 6, 8))]:
             for count in counts:
@@ -1548,7 +1563,8 @@ SPARK_EXPERT_DOCKER_INFERENCE=registry.example/spark:v9
 
     def wip_gate(self, *, roles: list[str], verified: bool = True,
                  corrupt_hash: bool = False, corrupt_host: bool = False,
-                 expert_format: str = 'native', nvfp4_roles: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+                 expert_format: str = 'native', nvfp4_roles: list[str] | None = None,
+                 tp: int = 3) -> subprocess.CompletedProcess[str]:
         block = run_sh_block('spark_advertised_roles=""', "\n# Zero-Spark deployments")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1585,7 +1601,7 @@ spark_tp_roles_required=tp3
 wip_slot=slot
 wip_spark_container=wip-test
 SPARK_EXPERT_DOCKER_INFERENCE=unused
-''' + f'expert_format={expert_format}\n' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
+''' + f'expert_format={expert_format}\nspark_tp={tp}\nspark_tp_roles_required=tp{tp}\n' + block + '\nprintf "advertised=%s\\n" "$spark_advertised_roles"\n'
             return subprocess.run(['bash', '-c', script], cwd=ROOT, text=True,
                                   capture_output=True, timeout=20,
                                   env={**os.environ, 'MOCK_SLOTS': str(root)})
@@ -1594,6 +1610,14 @@ SPARK_EXPERT_DOCKER_INFERENCE=unused
         result = self.wip_gate(roles=['tp3', 'tp6'])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('advertised=tp3;tp6', result.stdout)
+
+    def test_wip_accepts_verified_tp8_and_refuses_missing_or_malformed_role(self) -> None:
+        result = self.wip_gate(roles=['tp3', 'tp8'], tp=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for roles in (['tp3'], ['tp3', 'tp9'], ['tp3', 'tpword']):
+            with self.subTest(roles=roles):
+                result = self.wip_gate(roles=roles, tp=8)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_wip_nvfp4_requires_its_own_verified_role(self) -> None:
         result = self.wip_gate(roles=['tp3'], expert_format='nvfp4')

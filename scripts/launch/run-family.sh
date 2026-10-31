@@ -904,16 +904,10 @@ topology_explicit=0
 release_spark_topology_explicit && topology_explicit=1
 spark_tp="$(release_spark_tp)"
 spark_ep="$(release_spark_ep)"
-# Extra SM121 expert roles the image must have been built with. Legacy TP4EP1
-# and the shipped default require none, so a prebuilt v8 image without any role
-# label keeps working unchanged.
+# Canonical TP4 has no namespaced role; every other admitted native TP does.
 spark_tp_roles_required=""
-if ((topology_explicit)); then
-  case "$spark_tp" in
-    2) spark_tp_roles_required=tp2 ;;
-    3) spark_tp_roles_required=tp3 ;;
-    6) spark_tp_roles_required=tp6 ;;
-  esac
+if ((topology_explicit)) && [[ "$spark_tp" != 4 ]]; then
+  spark_tp_roles_required="tp$spark_tp"
 fi
 [[ -z "$HTTP_QUEUE_DEPTH" || ( "$HTTP_QUEUE_DEPTH" =~ ^[1-9][0-9]*$ && "$HTTP_QUEUE_DEPTH" -le 4096 ) ]] || release_die "HTTP_QUEUE_DEPTH must be in 1..4096"
 [[ "$HTTP_QUEUE_WAIT_MS" =~ ^[0-9]+$ ]] || release_die "HTTP_QUEUE_WAIT_MS must be non-negative"
@@ -1279,7 +1273,7 @@ try:
     assert hashlib.sha256(manifest_bytes).hexdigest() == meta.get('v41_expert_tp_manifest_sha256'), 'TP manifest hash mismatch'
     manifest = json.loads(manifest_bytes)
     roles = manifest.get('spark_tp_roles')
-    assert manifest.get('schema') == 1 and isinstance(roles, list) and all(role in ('tp2', 'tp3', 'tp6') for role in roles), 'invalid TP roles'
+    assert manifest.get('schema') == 1 and isinstance(roles, list) and all(isinstance(role, str) and role.startswith('tp') and role[2:].isdigit() and 1 <= int(role[2:]) <= 8 for role in roles), 'invalid TP roles'
     assert roles == meta.get('spark_tp_roles'), 'slot and artifact roles differ'
     assert manifest.get('symbols_verified') is True, 'TP symbols are not verified'
     if sys.argv[2] == 'nvfp4':
@@ -1701,7 +1695,16 @@ ranks="$(get SPARK_COUNT "$available_sparks")"
 if [[ -n "$(get SPARK_HOSTS)" ]]; then
   IFS=, read -r -a count_hosts <<<"$(get SPARK_HOSTS)"
   ranks="$(get SPARK_COUNT "${#count_hosts[@]}")"
-  host_rows="$(release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks")" || exit 2
+  host_rows="$(
+    # The shared resolver reads shell variables; generic launch config lives in cfg.
+    for rank in {0..7}; do
+      for field in HOST LANE_A LANE_B; do
+        key="SPARK_${rank}_${field}"
+        printf -v "$key" '%s' "$(get "$key")"
+      done
+    done
+    release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks"
+  )" || exit 2
   while read -r rank host lane_a lane_b; do
     cfg[SPARK_${rank}_HOST]="$host"
     cfg[SPARK_${rank}_LANE_A]="$lane_a"
