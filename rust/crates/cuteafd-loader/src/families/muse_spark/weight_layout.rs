@@ -98,6 +98,59 @@ impl GlobalLayout {
     pub fn head_bytes(&self) -> usize { self.head.as_ref().map_or(self.head_bf16, |h| h.bytes) }
 }
 
+/// A K6 projection program's package geometry: (K, N stored, side 1/2, codebook).
+pub type ProjectionKey = (usize, usize, usize, &'static str);
+
+/// Output dtype a K6 geometry runs with: BF16 rows, or F32 (the head, and the
+/// TP2 side-2 o_proj partial whose F32 core result is reduced across GPUs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProjectionOutput { Bf16, F32 }
+
+pub fn projection_key(layout: &CoreWeightLayout) -> ProjectionKey {
+    (layout.shape[1], layout.shape[0], match layout.side { TrellisSide::Output => 1, TrellisSide::Input => 2 },
+        match layout.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
+            crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" })
+}
+
+/// Every K6 program one coordinator rank binds, and the lane-private scratch
+/// they share (projections run serially on a lane; one scratch set per lane).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RankProjections {
+    pub programs: BTreeMap<(ProjectionKey, ProjectionOutput), usize>,
+    pub scratch: Option<crate::formats::trellis_core::ProjectionScratchLayout>,
+}
+
+/// Per rank: the K6 geometries of every layer plus the head on the head rank
+/// (`ranks - 1`), with the scratch planned at `rows` (head at most 64 rows:
+/// the decode/verify width; prefill scores only its last row per unit).
+pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, rows: usize)
+    -> Result<Vec<RankProjections>> {
+    let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None }; ranks];
+    for layer in 0..cfg.layers {
+        for (rank, layout) in LayerLayout::ranks(cfg, layer, ranks, core)?.into_iter().enumerate() {
+            for (name, weight) in &layout.core {
+                let dtype = if *name == "attn.o" && weight.side == TrellisSide::Input { ProjectionOutput::F32 }
+                    else { ProjectionOutput::Bf16 };
+                *out[rank].programs.entry((projection_key(weight), dtype)).or_insert(rows) = rows;
+            }
+        }
+    }
+    if let Some(head) = GlobalLayout::new(cfg, core)?.head {
+        out[ranks - 1].programs.insert((projection_key(&head), ProjectionOutput::F32), rows.min(64));
+    }
+    for rank in &mut out {
+        let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
+        for (&((k, n, _, _), _), &program_rows) in &rank.programs {
+            let mut layout = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, program_rows)?;
+            // One scratch set serves the body's full row capacity.
+            layout.rows = rows;
+            match &mut merged { Some(m) => m.merge(&layout)?, None => merged = Some(layout) }
+        }
+        rank.scratch = merged;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +181,30 @@ mod tests {
         assert!(pair_total - whole.attention_bytes().unwrap() < 1 << 20);
         let global = GlobalLayout::new(&cfg, &core).unwrap();
         assert_eq!(global.head.as_ref().unwrap().shape, [202112, 8192]);
+    }
+
+    #[test]
+    fn k6_programs_per_rank_and_their_shared_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_muse_spark_snapshot(dir.path(), &[]);
+        let checkpoint = crate::plan::Checkpoint::inventory(dir.path()).unwrap();
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config).unwrap();
+        let core = CoreInventory::from_checkpoint(&cfg, &checkpoint).unwrap();
+        let whole = projections(&cfg, &core, 1, 2752).unwrap();
+        let keys = |rank: &RankProjections| rank.programs.keys().copied().collect::<Vec<_>>();
+        use ProjectionOutput::*;
+        assert_eq!(keys(&whole[0]), [((4096, 8192, 1, "mcg"), Bf16), ((8192, 1024, 1, "mcg"), Bf16),
+            ((8192, 4096, 1, "mcg"), Bf16), ((8192, 8192, 1, "mcg"), Bf16), ((8192, 202112, 1, "mcg"), F32)]);
+        let pair = projections(&cfg, &core, 2, 2752).unwrap();
+        // q/k/v halve as output units; o_proj halves its input and returns an F32 partial.
+        assert!(pair[0].programs.contains_key(&((4096, 8192, 2, "mcg"), F32)));
+        assert!(pair[0].programs.contains_key(&((8192, 512, 1, "mcg"), Bf16)));
+        assert!(!pair[0].programs.keys().any(|(key, _)| key.1 == 202112), "head on the last rank only");
+        assert!(pair[1].programs.contains_key(&((8192, 202112, 1, "mcg"), F32)));
+        let scratch = pair[1].scratch.as_ref().unwrap();
+        assert_eq!(scratch.rows, 2752);
+        // The head's accumulator dominates at 64 rows; the body's rotated input at 2752.
+        assert!(scratch.extents["accumulator"] >= 64 * 202112 * 4);
+        assert_eq!(scratch.extents["rotated"], 2752 * 8192 * 2);
     }
 }

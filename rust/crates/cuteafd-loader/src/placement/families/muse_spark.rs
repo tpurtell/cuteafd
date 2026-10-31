@@ -77,6 +77,8 @@ pub struct MuseRequest {
     pub layouts: Vec<Vec<LayerLayout>>,
     pub global: GlobalLayout,
     pub owners: cuteafd_core::ExpertOwners,
+    /// Per rank: the K6 programs it binds and their shared scratch.
+    pub projections: Vec<crate::families::muse_spark::weight_layout::RankProjections>,
 }
 
 impl MuseRequest {
@@ -129,6 +131,15 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         // One exact retained sliding window per slot (prompt end + turn end marks).
         fixed.push(Demand::new(gpu, Category::Prefix, "Muse exact sliding marks", marks * slots / ranks as u64,
             Basis::Formula));
+    }
+    // One lane-private K6 scratch set per rank (serial projections; the head's on the head rank).
+    let projections = crate::families::muse_spark::weight_layout::projections(cfg, core, ranks,
+        usize::try_from(prefill.unit_rows)?)?;
+    for (gpu, rank) in projections.iter().enumerate() {
+        if let Some(scratch) = &rank.scratch {
+            fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse K6 projection scratch",
+                scratch.bytes()? as u64, Basis::Exact));
+        }
     }
     fixed.push(Demand::new(0, Category::Embedding, "token embedding", global.embedding as u64, Basis::Exact));
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Weights, "lm head (K6)", global.head_bytes() as u64,
@@ -187,7 +198,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         executor,
     };
     spark_budget.constrain(&mut request)?;
-    Ok(MuseRequest { request, spark_budget, layouts, global, owners })
+    Ok(MuseRequest { request, spark_budget, layouts, global, owners, projections })
 }
 
 /// Admission: the same request solved and checked against the executor.
