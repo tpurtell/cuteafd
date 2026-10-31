@@ -164,7 +164,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry],
                     "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
-    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
+    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"), ("step5", "4,6")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
@@ -179,6 +179,8 @@ def jobs(scope):
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glm"]),
         ("glmf-k6-dense", "export_b12x_dsv4_aot.py",
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glmf"]),
+        ("step5-dense-trellis", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "step5"]),
         ("glmf-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf_stage"]),
         ("glmf2-stage", "export_b12x_dsv4_aot.py", ["--geometry", "glmf2_stage"]),
         ("exlr8", "export_b12x_dsv4_aot.py", ["--geometry", "exlr8"]),
