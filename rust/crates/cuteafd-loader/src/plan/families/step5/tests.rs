@@ -1503,8 +1503,11 @@ fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
     // Every shared width-class world; the evenly splitting ones are exact.
     for world in cuteafd_core::tp_units::spark_package_worlds("step5", "exl3") {
         let recipe = crate::plan::experts::checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).unwrap();
-        if 12 % world == 0 { assert_eq!(recipe.widths, vec![1536 / world; world]); }
-        assert_eq!(recipe.required_layouts, (0..world).map(|r| format!("tp{world}-rank{r}")).collect::<Vec<_>>());
+        let compact = if 12 % world == 0 {
+            assert_eq!(recipe.widths, vec![1536 / world; world]);
+            ""
+        } else { "-compact" };
+        assert_eq!(recipe.required_layouts, (0..world).map(|r| format!("tp{world}{compact}-rank{r}")).collect::<Vec<_>>());
     }
 }
 

@@ -510,7 +510,12 @@ mod tests {
 
     #[test]
     fn spark_count_admission_matches_shared_width_coverage() {
-        let worlds = cuteafd_core::tp_units::spark_package_worlds("step5", "fp8");
+        // Any Step format's shared width-class coverage; the checkpoint's own
+        // format decides the exact world in admission.
+        let worlds = ["exl3", "fp8", "nvfp4"].iter()
+            .flat_map(|format| cuteafd_core::tp_units::spark_package_worlds("step5", format))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(worlds.contains(&2) && worlds.contains(&6) && !worlds.contains(&1));
         for world in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let mut args = args();
             args.peers = (0..world).map(|rank| format!("127.0.0.1:{}", rank + 1).parse().unwrap()).collect();
