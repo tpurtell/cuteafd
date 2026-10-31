@@ -70,6 +70,8 @@ impl PackedLayer {
         operands.insert("moe.router", tensor(&mut read, "mlp.gate.weight", DType::F32)?);
         operands.insert("moe.bias", tensor(&mut read, "mlp.gate.e_score_correction_bias", DType::F32)?);
         operands.insert("moe.pre_expert_norm", tensor(&mut read, "mlp.pre_expert_norm.weight", DType::Bf16)?);
+        // The routed experts' shared post_expert_norm: the coordinator combine applies it.
+        operands.insert("moe.post_expert_norm", tensor(&mut read, "mlp.experts.post_expert_norm.weight", DType::Bf16)?);
         for (name, stem) in [("norm.input", "input_layernorm"), ("norm.pre_ffn", "pre_feedforward_layernorm"),
             ("norm.post_ffn", "post_feedforward_layernorm")] {
             operands.insert(name, tensor(&mut read, &format!("{stem}.weight"), DType::Bf16)?);

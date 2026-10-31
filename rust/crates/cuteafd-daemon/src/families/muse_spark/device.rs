@@ -70,6 +70,8 @@ pub(crate) struct RankDevice<'a, 'w> {
     pub rope: (Buffer, Buffer),
     pub kv: &'w [LayerKv],
     pub ranks: usize,
+    /// The wire quantizer's device-sized grid (cached at startup).
+    pub wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
     pub stream: *mut c_void,
 }
 
@@ -221,9 +223,50 @@ impl RankDevice<'_, '_> {
         self.norm(layer, "pre_expert_norm", Some("moe.pre_expert_norm"), rows, staged, lane.rows("expert_input", rows)?)
     }
 
+    /// The expert-width rows onto the shared FP8 K32 Spark wire (`expert_wire`,
+    /// 4224-byte rows: values then the UE8M0 scales), read by `SparkExperts::send`.
+    pub(crate) fn expert_wire(&self, rows: usize) -> Result<()> {
+        let wire = self.lane.rows("expert_wire", rows)?;
+        let scales = Buffer { ptr: wire.ptr.cast::<u8>().wrapping_add(self.cfg.expert_hidden).cast(), ..wire };
+        // SAFETY: as `project`; scale_mma is unused in wire mode (the exporter's contract).
+        unsafe {
+            self.programs.launch("expert_input_quant", &[self.lane.rows("expert_input", rows)?, wire, scales, wire],
+                &[rows_i32(rows)?, Scalar::I32(i32::try_from(self.wire_grid.blocks(rows, self.cfg.expert_hidden))?)],
+                self.stream)
+        }
+    }
+
     /// The MoE backend after the experts landed: post_expert_proj into `moe`.
     pub(crate) fn moe_backend(&self, layer: usize, rows: usize) -> Result<()> {
         self.project(layer, "moe.post_expert", rows, self.lane.rows("combined", rows)?, self.lane.rows("moe", rows)?)
+    }
+
+    /// `muse_tp_combine_*` for one landed wave into `combined`: the layer's
+    /// post_expert_norm and the step's routing weights over every holder's
+    /// partials, read in place through the wave's `rank_regions` tables.
+    /// `tables` is the fixed device copy of [`CombineTables::image`], written
+    /// on this stream before the launch (graph-capturable: contents change,
+    /// addresses do not). Empty regions are skipped (`combine_plan`).
+    ///
+    /// [`CombineTables::image`]: super::experts::CombineTables::image
+    pub(crate) fn combine(&self, layer: usize, rows: usize, ranks: usize, tables: Buffer,
+        layout: super::experts::CombineTables,
+        plan: &cuteafd_loader::families::muse_spark::replies::ReplyPlan) -> Result<()> {
+        ensure!((1..=super::experts::MAX_RANKS).contains(&ranks) && tables.bytes >= layout.bytes()
+            && plan.bf16_rows.len() + plan.wide_rows.len() == rows, "Muse combine geometry");
+        let norm = self.weights(layer)?.buffer("moe.post_expert_norm")?;
+        let (weights, out) = (self.lane.rows("route_weights", rows)?, self.lane.rows("combined", rows)?);
+        for (stem, table, map, region) in super::experts::combine_plan(layout, plan) {
+            let at = |offset: usize, bytes: usize| Buffer { ptr: tables.ptr.cast::<u8>().wrapping_add(offset).cast(),
+                bytes, ..tables };
+            // SAFETY: as `project`; the tables were uploaded on this stream before
+            // this launch and every rank region they name is a landed, unconsumed plane.
+            unsafe {
+                self.programs.launch(stem, &[at(table, ranks * 8), at(map, region * 4), weights, norm, out],
+                    &[Scalar::I32(i32::try_from(ranks)?), rows_i32(region)?, rows_i32(rows)?], self.stream)?;
+            }
+        }
+        Ok(())
     }
 
     /// One decoder layer, in `block::forward_layer` order, on `hidden` (in place).
@@ -238,8 +281,11 @@ impl RankDevice<'_, '_> {
         self.residual_gate(layer, "attention", rows, hidden, normed, residual)?;
         self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, residual, normed)?;
         self.moe_frontend(layer, rows)?;
+        self.expert_wire(rows)?;
         let wave = experts.send(layer, rows)?;
-        experts.land(wave)?;
+        let landed = experts.land(wave)?;
+        self.combine(layer, rows, landed.ranks, landed.tables, landed.layout, &landed.plan)?;
+        experts.consumed(wave)?;
         self.moe_backend(layer, rows)?;
         let moe = lane.rows("moe", rows)?;
         self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;

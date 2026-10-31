@@ -27,10 +27,11 @@ pub(crate) const POINTWISE: &[(&str, &[&str])] = &[
     ("router", &["x", "weight", "out"]),
     // Expert-width rows -> the shared FP8 K32 Spark wire (E 4096).
     ("expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"]),
-    // Partials -> combined expert rows (rank sum, post-expert norm, weight, top-k sum), per reply format.
-    ("tp_combine_bf16", &["data", "row_map", "weights", "norm", "out"]),
-    ("tp_combine_nvfp4", &["data", "row_map", "weights", "norm", "out"]),
-    ("tp_combine_fp8", &["data", "row_map", "weights", "norm", "out"]),
+    // Partials -> combined expert rows (rank sum, post-expert norm, weight, top-k sum), per reply format;
+    // `rank_regions` is an i64 device table of each rank's region base (contract addendum 2026-11-01).
+    ("tp_combine_bf16", &["rank_regions", "row_map", "weights", "norm", "out"]),
+    ("tp_combine_nvfp4", &["rank_regions", "row_map", "weights", "norm", "out"]),
+    ("tp_combine_fp8", &["rank_regions", "row_map", "weights", "norm", "out"]),
 ];
 
 pub(crate) const PER_HEADS: &[(&str, &[&str])] = &[

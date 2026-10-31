@@ -67,6 +67,8 @@ impl LayerLayout {
             operands.insert("moe.router", cfg.experts * h * 4);
             operands.insert("moe.bias", cfg.experts * 4);
             operands.insert("moe.pre_expert_norm", e * 2);
+            // The routed experts' one post_expert_norm, applied by the coordinator combine.
+            operands.insert("moe.post_expert_norm", e * 2);
             for norm in ["norm.input", "norm.pre_ffn", "norm.post_ffn"] { operands.insert(norm, h * 2); }
             // Residual gates as host-computed F32 (alpha, beta).
             for gate in ["gate.attention.alpha", "gate.attention.beta", "gate.ffn.alpha", "gate.ffn.beta"] {

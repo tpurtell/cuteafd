@@ -9,6 +9,7 @@ pub(crate) mod experts;
 pub(crate) mod lane;
 pub(crate) mod programs;
 pub(crate) mod serve;
+pub(crate) mod spark;
 pub(crate) mod startup;
 pub(crate) mod step;
 pub(crate) mod weights;

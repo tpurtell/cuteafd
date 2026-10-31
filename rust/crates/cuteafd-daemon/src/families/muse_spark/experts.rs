@@ -13,7 +13,7 @@
 //! program `muse_tp_combine` dequantizes, sums the ranks per expert, applies
 //! post_expert_norm and the routing weight, and sums the top-k into `combined`.
 //! FP8 (E4M3, UE8M0 per 32) is the documented fallback wire.
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 
 /// The wire of one rank's per-(row, expert) partial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,70 @@ pub(crate) fn combine_launches(plan: &cuteafd_loader::families::muse_spark::repl
         .into_iter().filter(|(_, rows)| *rows > 0).collect()
 }
 
+/// Most expert holders one combine reads (Spark ranks 2..8, an RTX pair, one RTX).
+pub(crate) const MAX_RANKS: usize = 8;
+
+/// Device layout of one wave's combine operands, written in one upload: the
+/// BF16 and wide `rank_regions` tables (i64 device addresses, `MAX_RANKS`
+/// each), then the BF16 and wide row maps (`capacity` u32 each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CombineTables { pub capacity: usize }
+
+impl CombineTables {
+    pub(crate) const TABLE_BYTES: usize = MAX_RANKS * 8;
+    pub(crate) fn bytes(self) -> usize { 2 * Self::TABLE_BYTES + 2 * self.capacity * 4 }
+    /// Byte offsets of (bf16 table, wide table, bf16 map, wide map).
+    pub(crate) fn offsets(self) -> [usize; 4] {
+        let maps = 2 * Self::TABLE_BYTES;
+        [0, Self::TABLE_BYTES, maps, maps + self.capacity * 4]
+    }
+
+    /// The upload image of one wave: each rank's BF16 region base (its plane)
+    /// and wide region base (plane + `wide_at`), then the region row maps in
+    /// ascending wave-row order. Every base is 16-byte aligned (the kernel's
+    /// vector loads rely on it): planes are allocation-aligned and `wide_at`
+    /// a multiple of the 256-byte region alignment.
+    pub(crate) fn image(self, planes: &[u64], plan: &ReplyPlanView<'_>) -> Result<Vec<u8>> {
+        ensure!((1..=MAX_RANKS).contains(&planes.len()), "Muse combine reads 1..={MAX_RANKS} rank planes");
+        let (bf16, wide) = (plan.bf16_rows, plan.wide_rows);
+        ensure!(bf16.len() + wide.len() <= self.capacity, "Muse combine wave exceeds its {}-row maps", self.capacity);
+        ensure!(plan.wide_at % 256 == 0, "Muse wide region offset {} is not region aligned", plan.wide_at);
+        let mut out = vec![0u8; self.bytes()];
+        let [bf16_table, wide_table, bf16_map, wide_map] = self.offsets();
+        for (rank, &base) in planes.iter().enumerate() {
+            ensure!(base % 16 == 0 && base != 0, "Muse rank {rank} plane {base:#x} is not 16-byte aligned");
+            out[bf16_table + rank * 8..][..8].copy_from_slice(&(base as i64).to_le_bytes());
+            let wide_base = base.checked_add(plan.wide_at as u64).context("Muse wide region address")?;
+            out[wide_table + rank * 8..][..8].copy_from_slice(&(wide_base as i64).to_le_bytes());
+        }
+        for (at, rows) in [(bf16_map, bf16), (wide_map, wide)] {
+            for (i, &row) in rows.iter().enumerate() { out[at + i * 4..][..4].copy_from_slice(&row.to_le_bytes()); }
+        }
+        Ok(out)
+    }
+}
+
+/// One wave's regions as the combine reads them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReplyPlanView<'p> {
+    pub bf16_rows: &'p [u32],
+    pub wide_rows: &'p [u32],
+    /// Byte offset of the wide region in every rank's payload.
+    pub wide_at: usize,
+}
+
+/// The combine launches of one wave over the uploaded tables: per non-empty
+/// region, (program stem, table offset, map offset, region rows).
+pub(crate) fn combine_plan(tables: CombineTables, plan: &cuteafd_loader::families::muse_spark::replies::ReplyPlan)
+    -> Vec<(&'static str, usize, usize, usize)> {
+    let [bf16_table, wide_table, bf16_map, wide_map] = tables.offsets();
+    combine_launches(plan).into_iter().map(|(stem, rows)| if stem == "tp_combine_bf16" {
+        (stem, bf16_table, bf16_map, rows)
+    } else {
+        (stem, wide_table, wide_map, rows)
+    }).collect()
+}
+
 /// Expert width, top-k and the FP8 K32 wire row of a Muse expert request.
 pub(crate) const WIDTH: usize = 4096;
 pub(crate) const TOPK: usize = 8;
@@ -115,14 +179,36 @@ pub(crate) fn wave_request(layer: usize, sequence: u64, kind: cuteafd_transport:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Wave { pub layer: usize, pub rows: usize, pub sequence: u64 }
 
-/// The engine's view of the Spark experts. `send` enqueues the expert-width
-/// rows' wire quantization and the routes' copies on the lane stream and posts
-/// the request once they land (the host never waits on the GPU); `land` makes
-/// the lane stream wait for the wave's replies and leaves the combined expert
-/// output in the lane's `combined` plane. Waves land in send order.
+/// The engine's view of the Spark experts. `begin_step` names the step's
+/// requests (their identities and row counts, in row order, and the source
+/// kind), from which every layer's reply regions follow (`ReplyPlan`: a
+/// request's format depends on its own rows, never on the wave). `send`
+/// enqueues the expert-width rows' wire quantization and the routes' copies
+/// on the lane stream and posts the request once they land (the host never
+/// waits on the GPU); `land` makes the lane stream wait for the wave's replies
+/// and leaves the combined expert output in the lane's `combined` plane.
+/// Waves land in send order.
+///
+/// The combine runs on the engine's side (`RankDevice::combine`, which owns the
+/// programs, the layer's norm and the lane): `land` orders the lane stream
+/// after the wave's planes and uploads the wave's `rank_regions` tables and
+/// row maps; the engine combines into `combined`, then calls `consumed` so the
+/// slot's planes are released to the next wave behind the combine.
 pub(crate) trait SparkExperts {
+    fn begin_step(&mut self, segments: &[WaveSegment], kind: cuteafd_transport::ExpertV2SourceKind) -> Result<()>;
     fn send(&mut self, layer: usize, rows: usize) -> Result<Wave>;
-    fn land(&mut self, wave: Wave) -> Result<()>;
+    fn land(&mut self, wave: Wave) -> Result<LandedWave>;
+    fn consumed(&mut self, wave: Wave) -> Result<()>;
+}
+
+/// A landed wave, ready for `RankDevice::combine`.
+#[derive(Debug, Clone)]
+pub(crate) struct LandedWave {
+    /// The fixed device tables ([`CombineTables`]) holding this wave's image.
+    pub tables: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub layout: CombineTables,
+    pub ranks: usize,
+    pub plan: cuteafd_loader::families::muse_spark::replies::ReplyPlan,
 }
 
 #[cfg(test)]
@@ -155,6 +241,46 @@ mod tests {
         let fp8 = Cutoff::with_wide(64, 8, WideFormat::Fp8)?;
         assert_eq!(combine_launches(&ReplyPlan::new(fp8, &[100])), [("tp_combine_fp8", 100)]);
         assert!(combine_launches(&ReplyPlan::new(cutoff, &[])).is_empty());
+        Ok(())
+    }
+
+    /// The upload image: rank bases at any (non-contiguous, non-monotonic)
+    /// addresses, wide bases at plane + wide_at, row maps in wave order; the
+    /// launch plan points each region at its own table and map.
+    #[test]
+    fn combine_tables_point_every_rank_at_its_regions_in_place() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::{Cutoff, ReplyPlan};
+        let tables = CombineTables { capacity: 2752 };
+        let plan = ReplyPlan::new(Cutoff::new(64, 8)?, &[1, 8, 70]);
+        let bf16_bytes = plan.bf16_rows.len() * TOPK * WIDTH * 2;
+        let wide_at = bf16_bytes.next_multiple_of(256);
+        // The engine's offset is the wire's (`PartialReplyPlan::payload`).
+        let mut regions = vec![0u8; 79];
+        for &row in &plan.wide_rows { regions[row as usize] = 1; }
+        assert_eq!(cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4, regions }
+            .payload(TOPK, WIDTH)?.1, wide_at);
+        let view = ReplyPlanView { bf16_rows: &plan.bf16_rows, wide_rows: &plan.wide_rows, wide_at };
+        // Rank 2 below rank 0, gaps between (separate intake allocations).
+        let planes = [0x7f00_0000_0000u64, 0x7f10_0000_0000, 0x7e00_0000_1000];
+        let image = tables.image(&planes, &view)?;
+        assert_eq!(image.len(), tables.bytes());
+        let [bf16_table, wide_table, bf16_map, wide_map] = tables.offsets();
+        let i64_at = |at: usize| i64::from_le_bytes(image[at..at + 8].try_into().unwrap());
+        let u32_at = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        for (rank, &plane) in planes.iter().enumerate() {
+            assert_eq!(i64_at(bf16_table + rank * 8), plane as i64);
+            assert_eq!(i64_at(wide_table + rank * 8), (plane + wide_at as u64) as i64);
+        }
+        assert_eq!(i64_at(bf16_table + 3 * 8), 0, "unused ranks stay null");
+        assert_eq!((0..9).map(|i| u32_at(bf16_map + i * 4)).collect::<Vec<_>>(), (0..9).collect::<Vec<_>>());
+        assert_eq!((0..70).map(|i| u32_at(wide_map + i * 4)).collect::<Vec<_>>(), (9..79).collect::<Vec<_>>());
+        assert_eq!(combine_plan(tables, &plan), [("tp_combine_bf16", bf16_table, bf16_map, 9),
+            ("tp_combine_nvfp4", wide_table, wide_map, 70)]);
+        // Misaligned planes, a misaligned wide region and an overfull wave are refused.
+        assert!(tables.image(&[0x7f00_0000_0008], &view).is_err());
+        assert!(tables.image(&planes, &ReplyPlanView { wide_at: wide_at + 16, ..view }).is_err());
+        assert!(CombineTables { capacity: 64 }.image(&planes, &view).is_err());
+        assert!(tables.image(&[0x1000; 9], &view).is_err());
         Ok(())
     }
 
