@@ -68,8 +68,10 @@ pub struct MuseInputs<'a> {
     pub requested_pool: Option<u64>,
     pub onboard: Onboard,
     pub spark_budget_bytes: u64,
-    /// Rows a request may contribute to a step and still reply BF16 partials.
+    /// Rows a request may contribute to a step and still reply BF16 partials,
+    /// and the format of wider segments.
     pub partial_bf16_max_rows: usize,
+    pub partial_wide_format: crate::families::muse_spark::replies::WideFormat,
     /// Runtime-only exact demands (loaded code, step workspaces, peer exchange);
     /// the planner passes none until the family's PROGRAMS.json exists.
     pub fixed: Vec<Demand>,
@@ -109,7 +111,8 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
-        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, fixed: runtime_fixed, startup } = inputs;
+        requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format,
+        fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
     ensure!(spark_ranks > 0, "Muse Spark routed experts need Spark ranks");
@@ -162,7 +165,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         Basis::Exact));
     // Spark partial replies land on the coordinator: per wave slot, every rank's
     // worst-case mix of BF16 (decode/verify segments) and NVFP4 (prefill) partials.
-    let cutoff = crate::families::muse_spark::replies::Cutoff::new(partial_bf16_max_rows, 1)?;
+    let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(partial_bf16_max_rows, 1, partial_wide_format)?;
     let rank_reply = crate::families::muse_spark::replies::max_rank_bytes(cutoff,
         usize::try_from(prefill.unit_rows)?, usize::try_from(slots)?, cfg.topk, cfg.expert_hidden) as u64;
     fixed.push(Demand::new(0, Category::Transport, "Muse Spark partial reply planes",

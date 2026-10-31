@@ -83,6 +83,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         requested_pool: opts.pool_tokens.filter(|n| *n > 0), onboard: opts.onboard.unwrap_or(Onboard::Auto),
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
         partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
+        partial_wide_format: Default::default(),
         fixed: match planned_code(opts, gpus) {
             Ok(fixed) => fixed,
             Err(error) => {

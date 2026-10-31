@@ -19,54 +19,86 @@ use anyhow::{ensure, Result};
 pub const DEFAULT_BF16_MAX_ROWS: usize = super::cache::SWA_RING_STEP as usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartialFormat { Bf16, Nvfp4 }
+pub enum PartialFormat { Bf16, Nvfp4, Fp8 }
 
 impl PartialFormat {
-    /// Bytes of one E-wide partial row (NVFP4: values, then the per-16 scales).
+    /// Bytes of one E-wide partial record: values, then the trailing scales.
+    /// BF16 `2E`; NVFP4 `E/2 + E/16` (E4M3 per 16); FP8 `E + E/32` (UE8M0 per 32).
     pub fn row_bytes(self, width: usize) -> usize {
-        match self { Self::Bf16 => width * 2, Self::Nvfp4 => width / 2 + width / 16 }
+        match self { Self::Bf16 => width * 2, Self::Nvfp4 => width / 2 + width / 16, Self::Fp8 => width + width / 32 }
     }
 }
 
-/// The validated cutoff.
+/// The format of segments above the cutoff (`expert_partial_wide_format`):
+/// NVFP4 by default; FP8 E4M3 per-32 selectable. The fidelity run decides the final default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WideFormat { #[default] Nvfp4, Fp8 }
+
+impl WideFormat {
+    pub fn format(self) -> PartialFormat {
+        match self { Self::Nvfp4 => PartialFormat::Nvfp4, Self::Fp8 => PartialFormat::Fp8 }
+    }
+}
+
+impl std::str::FromStr for WideFormat {
+    type Err = anyhow::Error;
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "nvfp4" => Ok(Self::Nvfp4),
+            "fp8" => Ok(Self::Fp8),
+            other => anyhow::bail!("expert_partial_wide_format is nvfp4 or fp8, not {other}"),
+        }
+    }
+}
+
+/// The validated cutoff and the format above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Cutoff(usize);
+pub struct Cutoff(usize, WideFormat);
 
 impl Cutoff {
     /// `max_verify_rows`: the widest decode/verify step a request appends (1
     /// without a drafter). A lower cutoff would reply a verify step in NVFP4
     /// and make speculation lossy against plain BF16 decode.
     pub fn new(bf16_max_rows: usize, max_verify_rows: usize) -> Result<Self> {
+        Self::with_wide(bf16_max_rows, max_verify_rows, WideFormat::default())
+    }
+
+    pub fn with_wide(bf16_max_rows: usize, max_verify_rows: usize, wide: WideFormat) -> Result<Self> {
         ensure!(bf16_max_rows >= max_verify_rows,
             "expert_partial_bf16_max_rows {bf16_max_rows} is below the {max_verify_rows}-row verify step: \
              verify replies would be NVFP4 while plain decode is BF16, so speculation would not be lossless");
-        Ok(Self(bf16_max_rows))
+        Ok(Self(bf16_max_rows, wide))
     }
 
     pub fn rows(self) -> usize { self.0 }
 
     /// The format of a request contributing `rows` rows to a step.
     pub fn format(self, rows: usize) -> PartialFormat {
-        if rows <= self.0 { PartialFormat::Bf16 } else { PartialFormat::Nvfp4 }
+        if rows <= self.0 { PartialFormat::Bf16 } else { self.1.format() }
     }
+
+    pub fn wide(self) -> WideFormat { self.1 }
 }
 
-/// One wave's reply regions: for each region, the wave rows it carries in order.
+/// One wave's reply regions: for each region, the wave rows it carries in
+/// order. `wide_rows` are in the cutoff's wide format (NVFP4 or FP8); a wave
+/// carries at most the BF16 region and one wide region.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyPlan {
     pub bf16_rows: Vec<u32>,
-    pub nvfp4_rows: Vec<u32>,
+    pub wide_rows: Vec<u32>,
+    pub wide: PartialFormat,
 }
 
 impl ReplyPlan {
     /// `segments`: each request's row count, in wave order (rows consecutive).
     pub fn new(cutoff: Cutoff, segments: &[usize]) -> Self {
-        let mut plan = Self { bf16_rows: Vec::new(), nvfp4_rows: Vec::new() };
+        let mut plan = Self { bf16_rows: Vec::new(), wide_rows: Vec::new(), wide: cutoff.wide().format() };
         let mut row = 0u32;
         for &rows in segments {
             let region = match cutoff.format(rows) {
                 PartialFormat::Bf16 => &mut plan.bf16_rows,
-                PartialFormat::Nvfp4 => &mut plan.nvfp4_rows,
+                _ => &mut plan.wide_rows,
             };
             region.extend(row..row + rows as u32);
             row += rows as u32;
@@ -77,7 +109,7 @@ impl ReplyPlan {
     /// Reply bytes one rank sends (top-`topk` partials per row).
     pub fn rank_bytes(&self, topk: usize, width: usize) -> usize {
         topk * (self.bf16_rows.len() * PartialFormat::Bf16.row_bytes(width)
-            + self.nvfp4_rows.len() * PartialFormat::Nvfp4.row_bytes(width))
+            + self.wide_rows.len() * self.wide.row_bytes(width))
     }
 }
 
@@ -86,7 +118,7 @@ impl ReplyPlan {
 /// each, and (with a slot left) the remaining rows as one NVFP4 segment; the
 /// maximum over `k`. Admission charges this, never all-BF16 at the unit.
 pub fn max_rank_bytes(cutoff: Cutoff, unit_rows: usize, sequences: usize, topk: usize, width: usize) -> usize {
-    let (bf16, nvfp4) = (PartialFormat::Bf16.row_bytes(width), PartialFormat::Nvfp4.row_bytes(width));
+    let (bf16, nvfp4) = (PartialFormat::Bf16.row_bytes(width), cutoff.wide().format().row_bytes(width));
     (0..=sequences.min(unit_rows)).map(|k| {
         let bf16_rows = (k * cutoff.rows()).min(unit_rows);
         let rest = unit_rows - bf16_rows;
@@ -112,7 +144,7 @@ mod tests {
                 let plan = ReplyPlan::new(cutoff, &segments);
                 let first = others.iter().sum::<usize>() as u32;
                 let mine: Vec<u32> = (first..first + rows as u32).collect();
-                let region = if expected == PartialFormat::Bf16 { &plan.bf16_rows } else { &plan.nvfp4_rows };
+                let region = if expected == PartialFormat::Bf16 { &plan.bf16_rows } else { &plan.wide_rows };
                 assert!(mine.iter().all(|r| region.contains(r)), "{rows} rows beside {others:?}");
             }
         }
@@ -128,8 +160,8 @@ mod tests {
     #[test]
     fn max_rank_bytes_bounds_every_wave() -> Result<()> {
         let (unit, sequences, topk, width) = (12usize, 3usize, 2usize, 32usize);
-        for c in [1usize, 2, 4, 12, 64] {
-            let cutoff = Cutoff::new(c, 1)?;
+        for (c, wide) in [1usize, 2, 4, 12, 64].into_iter().flat_map(|c| [(c, WideFormat::Nvfp4), (c, WideFormat::Fp8)]) {
+            let cutoff = Cutoff::with_wide(c, 1, wide)?;
             let bound = max_rank_bytes(cutoff, unit, sequences, topk, width);
             let mut worst = 0;
             // Every composition of up to `sequences` segments totalling at most `unit` rows.
@@ -141,13 +173,19 @@ mod tests {
             walk(unit, sequences, &mut Vec::new(), &mut |segments| {
                 worst = worst.max(ReplyPlan::new(cutoff, segments).rank_bytes(topk, width));
             });
-            assert_eq!(worst, bound, "cutoff {c}");
+            assert_eq!(worst, bound, "cutoff {c} {wide:?}");
         }
         // Release numbers: 2752-row unit, 16 sequences, top-8, E 4096.
         let release = max_rank_bytes(Cutoff::new(64, 8)?, 2752, 16, 8, 4096);
         // 15 decode/verify segments of 64 BF16 rows beside one 1792-row NVFP4 prefill segment.
         assert_eq!(release, 8 * (960 * 8192 + 1792 * 2304));
         assert_eq!(max_rank_bytes(Cutoff::new(4096, 8)?, 2752, 16, 8, 4096), 8 * 2752 * 8192);
+        // FP8 above the cutoff: 4224-byte records (4096 E4M3 + 128 UE8M0).
+        assert_eq!(PartialFormat::Fp8.row_bytes(4096), 4224);
+        assert_eq!(max_rank_bytes(Cutoff::with_wide(64, 8, WideFormat::Fp8)?, 2752, 16, 8, 4096),
+            8 * (960 * 8192 + 1792 * 4224));
+        assert_eq!("fp8".parse::<WideFormat>()?, WideFormat::Fp8);
+        assert!("bf16".parse::<WideFormat>().is_err());
         Ok(())
     }
 }

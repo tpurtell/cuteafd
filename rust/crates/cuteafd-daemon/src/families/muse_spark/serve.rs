@@ -41,6 +41,9 @@ pub(crate) struct ServeArgs {
     /// Must cover the widest verify step; the default keeps decode and verify lossless.
     #[arg(long, default_value_t = cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)]
     pub expert_partial_bf16_max_rows: usize,
+    /// Partial format of segments above the cutoff: nvfp4 (E2M1, E4M3 per 16) or fp8 (E4M3, UE8M0 per 32).
+    #[arg(long, default_value = "nvfp4")]
+    pub expert_partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
     #[command(flatten)] pub prefix: crate::shared::prefix::PrefixArgs,
 }
 
@@ -108,7 +111,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             max_context: args.max_context,
             pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
             spark_budget_bytes: args.spark_budget_bytes(),
-            partial_bf16_max_rows: args.expert_partial_bf16_max_rows })?;
+            partial_bf16_max_rows: args.expert_partial_bf16_max_rows,
+            partial_wide_format: args.expert_partial_wide_format })?;
         tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
             pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
             "Muse Spark admitted TP experts with coordinator-combined partials");
@@ -144,6 +148,9 @@ mod tests {
         assert_eq!(defaults.max_sequences, 16);
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
+        assert_eq!(defaults.expert_partial_wide_format, cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4);
+        assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "fp8"]).is_ok());
+        assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "bf16"]).is_err());
         args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
         let single = args(&["--peers", PEERS, "--devices", "1"])?;
         single.validate()?;

@@ -237,32 +237,66 @@ pub fn tp_combine(partials: &[Vec<Vec<f32>>], weights: &[f32], norm: &[f32], eps
     out
 }
 
-/// NVFP4 (E2M1, E4M3 scale per 16 = amax / 6): the dequantized value of `x`
-/// as the Spark epilogue writes it and the combine reads it. The contract
-/// grid for the kernels' bit tests.
+/// E4M3 RNE (finite, saturating at 448; subnormal step 2^-9).
+fn e4m3(v: f32) -> f32 {
+    let a = v.abs().min(448.0);
+    if a == 0.0 { return 0.0f32.copysign(v); }
+    let exp = a.log2().floor().max(-6.0);
+    let step = (exp - 3.0).exp2();
+    ((a / step).round_ties_even() * step).min(448.0).copysign(v)
+}
+
+/// NVFP4 partial record (E2M1 values, one E4M3 scale per 16): the dequantized
+/// values the Spark epilogue encodes and the combine decodes. Per block:
+/// `scale = e4m3(amax / 6)` (RNE); an all-zero block (amax 0) takes scale code
+/// 0x00 (+0.0) and values 0, dequantizing to exactly 0; a nonzero block whose
+/// rounded scale is 0 takes the smallest subnormal 2^-9. Values
+/// `e2m1(x / scale)` RNE onto {0, 0.5, 1, 1.5, 2, 3, 4, 6}, saturating at 6
+/// (ties to the even code: the lower grid value on an exact half).
 pub fn nvfp4_roundtrip(x: &[f32]) -> Vec<f32> {
     const GRID: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let e4m3 = |v: f32| -> f32 {
-        let a = v.abs().min(448.0);
-        if a == 0.0 { return 0.0; }
-        let exp = a.log2().floor().max(-6.0);
-        let step = (exp - 3.0).exp2();
-        ((a / step).round_ties_even() * step).copysign(v)
-    };
     x.chunks(16).flat_map(|block| {
         let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let scale = if amax > 0.0 { e4m3(amax / 6.0).max((-9f32).exp2()) } else { 1.0 };
-        block.iter().map(move |v| {
+        if amax == 0.0 { return vec![0.0; block.len()]; }
+        let scale = { let s = e4m3(amax / 6.0); if s == 0.0 { (-9f32).exp2() } else { s } };
+        block.iter().map(|v| {
             let a = (v / scale).abs().min(6.0);
-            // Round to nearest grid value, ties to the even mantissa (lower index on exact halves).
             let mut best = 0;
             for (i, g) in GRID.iter().enumerate() {
                 let (d, db) = ((a - g).abs(), (a - GRID[best]).abs());
                 if d < db || (d == db && i % 2 == 0 && best % 2 == 1) { best = i; }
             }
             (GRID[best] * scale).copysign(*v)
-        }).collect::<Vec<_>>()
+        }).collect()
     }).collect()
+}
+
+/// FP8 partial record (E4M3 values, one UE8M0 scale per 32): the dequantized
+/// values. Per block: `scale` is the smallest power of two with
+/// `amax / scale <= 448` (`2^ceil(log2(amax / 448))`, exponent clamped to
+/// [-127, 127]); values `e4m3(x / scale)` RNE. An all-zero block (amax 0) takes
+/// scale code 0 (2^-127) and values 0, dequantizing to exactly 0.
+pub fn fp8_roundtrip(x: &[f32]) -> Vec<f32> {
+    x.chunks(32).flat_map(|block| {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        if amax == 0.0 { return vec![0.0; block.len()]; }
+        let mut exp = (amax / 448.0).log2().ceil().clamp(-127.0, 127.0) as i32;
+        // The smallest power of two: ceil can land one high when amax/448 is a power of two's neighbour.
+        while exp > -127 && amax / (exp as f32 - 1.0).exp2() <= 448.0 { exp -= 1; }
+        while amax / (exp as f32).exp2() > 448.0 { exp += 1; }
+        let scale = (exp as f32).exp2();
+        block.iter().map(|v| e4m3(v / scale) * scale).collect()
+    }).collect()
+}
+
+/// The UE8M0 scale code of an FP8 block (exponent + 127; 0 for an all-zero block).
+pub fn fp8_scale_code(block: &[f32]) -> u8 {
+    let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if amax == 0.0 { return 0; }
+    let mut exp = (amax / 448.0).log2().ceil().clamp(-127.0, 127.0) as i32;
+    while exp > -127 && amax / (exp as f32 - 1.0).exp2() <= 448.0 { exp -= 1; }
+    while amax / (exp as f32).exp2() > 448.0 { exp += 1; }
+    (exp + 127) as u8
 }
 
 #[cfg(test)]
@@ -355,9 +389,19 @@ mod tests {
         let one = tp_combine(&routes[..1], &[1.0], &norm, 1e-8);
         let summed: Vec<f32> = (0..width).map(|i| bf16(routes[0].iter().fold(0f32, |acc, p| acc + p[i]))).collect();
         assert_eq!(one, input_scaled(&summed, &norm, 1e-8).iter().map(|v| bf16(bf16(*v) + 0.0)).collect::<Vec<_>>());
-        // NVFP4 round trip is idempotent and on its grid.
-        let q = nvfp4_roundtrip(&routes[0][0]);
-        assert_eq!(nvfp4_roundtrip(&q), q);
-        assert!(q.iter().zip(&routes[0][0]).all(|(a, b)| (a - b).abs() <= b.abs().max(1e-3)));
+        // Round trips are idempotent and bounded by their format step.
+        for (name, codec) in [("nvfp4", nvfp4_roundtrip as fn(&[f32]) -> Vec<f32>), ("fp8", fp8_roundtrip)] {
+            let q = codec(&routes[0][0]);
+            assert_eq!(codec(&q), q, "{name}");
+            assert!(q.iter().zip(&routes[0][0]).all(|(a, b)| (a - b).abs() <= b.abs().max(1e-3)), "{name}");
+            // Zero blocks dequantize to exactly zero, and identical partials combine identically.
+            assert!(codec(&[0.0; 32]).iter().all(|v| v.to_bits() == 0), "{name}");
+        }
+        assert_eq!(fp8_scale_code(&[0.0; 32]), 0);
+        // 448 fits scale 2^0 exactly; 449 needs 2^1; 1.75 (448 * 2^-8) needs 2^-8.
+        assert_eq!(fp8_scale_code(&[448.0; 32]), 127);
+        assert_eq!(fp8_scale_code(&[449.0; 32]), 128);
+        assert_eq!(fp8_scale_code(&[1.75; 32]), 127 - 8);
+        assert_eq!(fp8_roundtrip(&[449.0; 32])[0], 448.0);
     }
 }
