@@ -273,6 +273,7 @@ mod tests {
                 peer_diagnostics: false,
                 pending_code: code,
                 startup: vec![],
+                onboard: None,
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
             if !report.wip_launchable() {

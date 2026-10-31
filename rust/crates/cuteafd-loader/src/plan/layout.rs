@@ -385,6 +385,11 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
+        // Step-5 EXL3 K4/K6, widest Spark slice (TP2 width 768): eight retained
+        // capacity manifests plus 4096 rows of wire/routes, 955,543,872 bytes
+        // summed from the exl3-step5-k46 rtx-tp2 SM120 exports (SM121 tiles keep
+        // these arenas; replace with the Spark census once exported there).
+        "step5" => 912 * MIB,
         _ => 0,
     };
     at_4096.saturating_mul(unit_rows.max(4096)).div_ceil(4096)

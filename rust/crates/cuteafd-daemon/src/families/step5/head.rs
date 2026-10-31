@@ -23,6 +23,8 @@ const POINTERS: &[&str] = &["x", "weight", "bias", "cos", "sin", "positions", "o
 pub(super) struct HeadPlan {
     layout: RankWeightLayout,
     weights: Vec<WeightOperand>,
+    /// The native vocabulary head's `.weight` name (EXL3 checkpoints).
+    native: Option<String>,
     planes: [usize; 4],
     rows: usize,
     epsilon: f32,
@@ -62,9 +64,14 @@ impl HeadPlan {
             [format!("model.layers.{layer}.transformer.shared_head.norm.weight"),
                 format!("model.layers.{layer}.transformer.shared_head.output.weight")]
         } else { ["model.norm.weight".into(), "lm_head.weight".into()] };
-        let weights = [(names[0].as_str(), DType::F32, vec![H]),
-            (names[1].as_str(), DType::Bf16, vec![V, H])]
-            .into_iter().map(|(name, dtype, shape)| {
+        let native = layout.core.get(&names[1]).map(|core| {
+            ensure!(core.shape == [V, H] && core.ranks == 1, "Step-5 native head geometry");
+            Ok(names[1].clone())
+        }).transpose()?;
+        let bf16: &[(&str, DType, Vec<usize>)] = &[(names[1].as_str(), DType::Bf16, vec![V, H])];
+        let weights = [(names[0].as_str(), DType::F32, vec![H])].into_iter()
+            .chain(if native.is_some() { &[][..] } else { bf16 }.iter().cloned())
+            .map(|(name, dtype, shape)| {
                 let weight = layout.operands.iter().find(|w| w.name == name)
                     .context("Step-5 final operand missing")?;
                 ensure!(weight.dtype == dtype && weight.shape == shape,
@@ -78,10 +85,16 @@ impl HeadPlan {
             && g["width"] == H && g["heads"] == 1 && g["zero_centered"] == true
             && g["subtract_mean"] == false && g["bias"] == false && g["rotary"] == 0
             && g["epsilon"] == "runtime_float32", "Step-5 final norm ABI/geometry mismatch");
+        let native_bytes = match &native {
+            Some(name) => (layout.core[name].bytes as u64).checked_add(
+                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(H, V, kernel_rows)?.bytes()? as u64)
+                .context("Step-5 native head overflow")?,
+            None => 0,
+        };
         let bytes = weights.iter().map(|w| w.allocation_bytes)
-            .chain(planes.iter().map(|&n| n as u64))
+            .chain(planes.iter().map(|&n| n as u64)).chain([native_bytes])
             .try_fold(0u64, |n, v| n.checked_add(v)).context("Step-5 head byte overflow")?;
-        Ok(Self { layout, weights, planes, rows, epsilon: cfg.norm_eps, bytes,
+        Ok(Self { layout, weights, native, planes, rows, epsilon: cfg.norm_eps, bytes,
             predictor: stage.is_some(), kernel_rows })
     }
 
@@ -99,6 +112,8 @@ impl HeadPlan {
 struct HeadWeights<'a> {
     norm: Program<'a>,
     weights: Vec<Allocation<'a>>,
+    /// Native vocabulary projection (F32 logits) and its admitted scratch.
+    native: Option<(super::native::NativeLinear<'a>, super::native::NativeScratch<'a>)>,
     epsilon: f32,
     predictor: bool,
     kernel_rows: usize,
@@ -131,8 +146,16 @@ impl<'a> TargetHeadOwner<'a> {
             let norm = programs.program("step5_final_norm", POINTERS)?;
             let weights = plan.weights.iter().map(|w| load_operand(device, checkpoint, &plan.layout, w))
                 .collect::<Result<Vec<_>>>()?;
+            let native = plan.native.as_ref().map(|name| -> Result<_> {
+                let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
+                    plan.kernel_rows, |n| n == name)?;
+                let layout = layer.scratch_layout(plan.kernel_rows)?.context("native head scratch")?;
+                let linear = std::rc::Rc::try_unwrap(layer.linears.remove(name).context("native head")?)
+                    .map_err(|_| anyhow::anyhow!("native head aliased"))?;
+                Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
+            }).transpose()?;
             Self::workspace(device, plan.rows, std::rc::Rc::new(HeadWeights {
-                norm, weights, epsilon: plan.epsilon, predictor: plan.predictor, kernel_rows: plan.kernel_rows,
+                norm, weights, native, epsilon: plan.epsilon, predictor: plan.predictor, kernel_rows: plan.kernel_rows,
             }), arena)
         })
     }
@@ -193,8 +216,15 @@ impl<'a> TargetHeadOwner<'a> {
                 for start in (0..rows).step_by(self.immutable.kernel_rows) {
                     let count = (rows - start).min(self.immutable.kernel_rows);
                     let input = p[1].wrapping_byte_add(start * H * 2);
-                    let output = p[2].wrapping_byte_add(start * V * 4).cast();
-                    if self.immutable.predictor {
+                    let output: *mut f32 = p[2].wrapping_byte_add(start * V * 4).cast();
+                    if let Some((linear, scratch)) = &self.immutable.native {
+                        // The head's scratch is shared by lanes on this one stream; lanes run
+                        // their heads in stream order on the head rank.
+                        let buffer = |ptr: *mut std::ffi::c_void, bytes| CuteafdDeviceBuffer { ptr, bytes,
+                            device_id: stream.device.id, flags: 0 };
+                        linear.launch(count, buffer(input, count * H * 2), buffer(output.cast(), count * V * 4),
+                            &scratch.scratch, stream.raw)?;
+                    } else if self.immutable.predictor {
                         crate::shared::draft::launch_bf16_head(&self.head, input.cast(),
                             self.immutable.weights[1].buffer.ptr.cast(), output, count, stream.raw)?;
                     } else {
@@ -226,8 +256,8 @@ pub(super) mod tests {
     pub(in super::super) fn admission_plan(rows: usize) -> HeadPlan {
         let planes = HeadPlan::plane_bytes(rows).unwrap();
         HeadPlan {
-            layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], resident_bytes: 0 },
-            weights: vec![], planes, rows, epsilon: 1e-5, predictor: false, kernel_rows: rows.min(4096),
+            layout: RankWeightLayout { rank: 0, ranks: 1, operands: vec![], core: Default::default(), resident_bytes: 0 },
+            weights: vec![], native: None, planes, rows, epsilon: 1e-5, predictor: false, kernel_rows: rows.min(4096),
             bytes: ((H * 4 + V * H * 2) as u64) + planes.iter().map(|&n| n as u64).sum::<u64>(),
         }
     }

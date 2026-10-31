@@ -263,8 +263,8 @@ impl V41Exl3Manifest {
                     .get(&self.naming.projection(draft, index, expert, kind))
                     .context("missing EXL3 resident projection")?;
                 ensure!(
-                    (2..=5).contains(&p.bits),
-                    "EXL3 projection tier outside K2..K5"
+                    (2..=6).contains(&p.bits),
+                    "EXL3 projection tier outside K2..K6"
                 );
                 row.push(p);
             }

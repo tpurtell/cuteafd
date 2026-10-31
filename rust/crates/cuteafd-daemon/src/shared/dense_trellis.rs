@@ -15,13 +15,13 @@ use std::{collections::BTreeMap, ffi::c_void};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoreWeightLayout {
     pub stem: String, pub side: cuteafd_loader::formats::dense_trellis::TrellisSide,
-    pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize,
+    pub rank: usize, pub ranks: usize, pub shape: [usize;2], pub bytes: usize, pub bits: usize,
     pub codebook: cuteafd_loader::formats::exl3_storage::Exl3Codebook,
 }
 impl CoreWeightLayout {
     pub(crate) fn from_shared(layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout) -> Self {
         Self { stem: layout.stem, side: layout.side, rank: layout.rank, ranks: layout.ranks,
-            shape: layout.shape, bytes: layout.bytes, codebook: layout.codebook }
+            shape: layout.shape, bytes: layout.bytes, bits: layout.bits, codebook: layout.codebook }
     }
     pub(crate) fn new(projection: &cuteafd_loader::formats::trellis_core::CoreProjection,
         side: TrellisSide, rank: usize, ranks: usize) -> Result<Self> {
@@ -31,8 +31,8 @@ impl CoreWeightLayout {
     pub(crate) fn check(&self, loaded: &LoadedDenseTrellis) -> Result<()> {
         let shard = &loaded.shard;
         ensure!(loaded.codebook == self.codebook && shard.side == self.side && shard.shape == self.shape
-            && shard.payload.len() == self.shape[0].checked_mul(self.shape[1]).and_then(|n|n.checked_mul(6))
-                .context("native K6 payload extent overflow")? / 8
+            && shard.payload.len() == self.shape[0].checked_mul(self.shape[1]).and_then(|n|n.checked_mul(self.bits))
+                .context("native trellis payload extent overflow")? / 8
             && shard.suh.len() == self.shape[1] * 2 && shard.svh.len() == self.shape[0] * 2,
             "native K6 packed shard differs from admitted operands");
         Ok(())
@@ -84,12 +84,12 @@ impl CoreWeightLayout {
             Ok(owner)
         };
         Ok(CoreWeights{payload:upload(&shard.payload)?,suh:upload(&shard.suh)?,svh:upload(&shard.svh)?,
-            shape:self.shape,side:self.side,codebook:self.codebook})
+            shape:self.shape,side:self.side,bits:self.bits,codebook:self.codebook})
     }
 }
 pub(crate) struct CoreWeights<'a> {
     pub payload:Allocation<'a>, pub suh:Allocation<'a>, pub svh:Allocation<'a>,
-    pub shape:[usize;2], pub side:cuteafd_loader::formats::dense_trellis::TrellisSide,
+    pub shape:[usize;2], pub side:cuteafd_loader::formats::dense_trellis::TrellisSide, pub bits:usize,
     pub codebook:cuteafd_loader::formats::exl3_storage::Exl3Codebook,
 }
 
@@ -205,7 +205,12 @@ impl<'a> Projection<'a> {
     }
     pub(crate) fn load_geometry(programs:&'a Programs<'a>,input:usize,output:usize,side:usize,book:&str,
         rows:usize,dtype:TrellisDType)->Result<Self> {
-        let policy=DenseTrellisPolicy::from_package_geometry(programs,input,output,side,book)?;
+        Self::load_geometry_bits(programs,input,output,side,6,book,rows,dtype)
+    }
+    /// The width-generic form: Step-5 MTP stages store K4 beside a K6 target core.
+    pub(crate) fn load_geometry_bits(programs:&'a Programs<'a>,input:usize,output:usize,side:usize,bits:usize,
+        book:&str,rows:usize,dtype:TrellisDType)->Result<Self> {
+        let policy=DenseTrellisPolicy::from_package_geometry_bits(programs,input,output,side,bits,book)?;
         Ok(Self{program:DenseTrellisDispatch::load(programs,policy,rows,dtype)?})
     }
     pub(crate) fn core(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
@@ -216,9 +221,21 @@ impl<'a> Projection<'a> {
             cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>2};
         let book=match weights.codebook {cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mcg=>"mcg",
             cuteafd_loader::formats::exl3_storage::Exl3Codebook::Mul1=>"mul1"};
-        ensure!(weights.shape==[policy.output,policy.input] && side==policy.side && book==policy.codebook,
-            "K6 projection and resident weight geometry/codebook differ");
+        ensure!(weights.shape==[policy.output,policy.input] && side==policy.side && book==policy.codebook
+            && weights.bits==policy.bits,
+            "trellis projection and resident weight geometry/width/codebook differ");
         let b=scratch.buffers(input,weights);self.program.core(rows,b,stream)?;Ok(b.accumulator)
+    }
+    /// The F32 core written straight into a caller-owned plane (a K-split
+    /// partial that the caller exchanges and reduces before one egress).
+    pub(crate) fn core_into(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
+        accumulator:Buffer,stream:*mut c_void)->Result<()> {
+        ensure!(rows>0 && rows<=scratch.rows,"trellis scratch live-row ceiling");
+        let policy=self.program.policy();
+        ensure!(weights.shape==[policy.output,policy.input] && weights.bits==policy.bits
+            && accumulator.bytes>=rows*policy.output*4,"trellis F32 core destination geometry");
+        let b=DenseTrellisBuffers{accumulator,..scratch.buffers(input,weights)};
+        self.program.core(rows,b,stream)?;Ok(())
     }
     pub(crate) fn local(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
         output:Buffer,stream:*mut c_void)->Result<()> {
@@ -244,8 +261,8 @@ impl<'a> CoreHead<'a> {
         admitted: &cuteafd_loader::formats::trellis_core::ProjectionScratchLayout) -> Result<Self> {
         ensure!(weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Output,
             "GLM K6 head must be whole on rank 0");
-        let projection = device.run(|| Projection::load_geometry(programs, weights.shape[1], weights.shape[0],
-            1, codebook(weights), rows, TrellisDType::F32))?;
+        let projection = device.run(|| Projection::load_geometry_bits(programs, weights.shape[1], weights.shape[0],
+            1, weights.bits, codebook(weights), rows, TrellisDType::F32))?;
         let layout = ProjectionLayout::new(&projection.program, rows)?;
         ensure!(admitted.rows == layout.rows && admitted.extents == layout.extents,
             "GLM K6 head scratch differs from admission");

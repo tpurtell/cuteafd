@@ -43,6 +43,10 @@ pub(crate) struct ServeArgs {
     /// Pack queued short prompts, optionally preserving singleton arithmetic routes.
     #[arg(long, value_enum, default_value = "unrestricted")]
     prefill_packing: crate::shared::prefill_packing::PackingMode,
+    /// Routed layers whose EXL3 experts run whole on the entry RTX: auto lets the
+    /// planner keep as many as fit beside the pool; FP8/NVFP4 releases onboard none.
+    #[arg(long, default_value = "auto")]
+    rtx_expert_layers: cuteafd_loader::placement::Onboard,
     /// Native predictor depth; 0 disables speculation.
     #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(0..=3))]
     mtp: u8,
@@ -85,7 +89,7 @@ impl ServeArgs {
         let shape = self.shape()?;
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
-        ensure!(matches!(self.peers.len(), 4 | 6), "Step-5 requires TP4 or TP6 Spark experts");
+        ensure!(matches!(self.peers.len(), 2 | 3 | 4 | 6), "Step-5 Spark experts run TP2, TP3, TP4 or TP6 (packages decide)");
         ensure!(self.peers.iter().enumerate().all(|(i, peer)| !self.peers[..i].contains(peer)),
             "Step-5 Spark peers must be distinct");
         ensure!((262_144..=1_048_576).contains(&self.max_context), "Step-5 request context must be 256K..=1M");
@@ -199,16 +203,11 @@ fn with_backend<T>(args: &ServeArgs,
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");
-    let format = catalog.fp8().context("Step-5 requires native FP8 or NVFP4 expert headers")?.format();
-    ensure!(matches!(format, cuteafd_loader::formats::fp8_experts::ExpertFormat::Fp8Block128
-        | cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4),
-        "Step-5 BF16 is a fidelity reference, not a serving fallback");
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 serving requires an isolated process"))?;
-    let package = args.native_lib.parent().context("native library directory")?.join("fp8")
-        .join(format.package_name("step5")).join("manifest.json");
-    let metadata = cuteafd_loader::plan::checkpoint::read_json(&package)?;
-    let exports = package_exports(&metadata)?;
+    let metadata = cuteafd_loader::plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
+    let exports = format.exports(&metadata)?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.
     let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
     library.cuda_set_device(args.device)?;
@@ -234,7 +233,7 @@ fn with_backend<T>(args: &ServeArgs,
     })?;
     let selected_programs = ProgramSet::from_names(&["step5", "step52"], programs.names());
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
-        &library, id, rank, ids.len() == 2, "step5", &format.package_name("step5"), &selected_programs))
+        &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
     let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
@@ -245,7 +244,9 @@ fn with_backend<T>(args: &ServeArgs,
         sequences: usize::from(args.max_sequences), context: args.max_context,
         requested_pool: args.pool_tokens,
         marks: admission::prefix_marks(&args.prefix, usize::from(args.max_sequences)),
-        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![] };
+        peer_diagnostics: std::env::var("CUTEAFD_PEER_WAIT_DIAGNOSTICS").as_deref() == Ok("1"), pending_code, startup: vec![],
+        onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::exl3(&catalog,
+            Some(&args.manifest), args.prefill_rows as usize, args.rtx_expert_layers)? };
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     cuteafd_bench::context::set_rtx_expert_layers(admission.placement.onboard_layers);
     // Uploads convert on the host and copy synchronously. No transient device
@@ -258,14 +259,15 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = args.endpoint(format.bf16_input());
+    let endpoint = args.endpoint(format.bf16_endpoint());
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
     // coordinator's own allocations are admitted; the coordinator then loads
     // its weights while the Sparks load theirs (and, pushing, in one group).
     let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
-        rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
+        rtx_layers: admission.ownership.onboarded_layers().to_vec(),
+        spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
@@ -283,6 +285,9 @@ fn with_backend<T>(args: &ServeArgs,
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
+    let onboarded_budget = admission.placement.expert_ranges.get(usize::from(
+        admission.ownership.execution().spec().entry_gpu)).filter(|range| range.layers > 0)
+        .map(|range| usize::try_from(range.peak_bytes)).transpose()?;
     let predictor_budget = if args.mtp > 0 {
         let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::for_mtp(
             &checkpoint, usize::from(args.mtp))?.resident_bytes;
@@ -359,12 +364,19 @@ fn with_backend<T>(args: &ServeArgs,
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     "Step-5 coordinator dense operands landed");
             }
-            match native {
-                Some(native) => Ok(native),
+            let native = match native {
+                Some(native) => native,
                 None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
                     inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
-                    &available, &reserves, 92),
-            }
+                    &available, &reserves, 92)?,
+            };
+            // Onboarded EXL3 routed layers, whole on the entry GPU inside its solved expert arena.
+            let entry = usize::from(ownership.execution().spec().entry_gpu);
+            let onboarded = ownership.onboarded_layers();
+            if onboarded.is_empty() { return Ok(native); }
+            let peak = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
+            let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.join("rtx-tp1");
+            native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak)
         })
     })?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;
@@ -518,11 +530,9 @@ mod tests {
         let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
         catalog.select_draft(DraftOwnership::None)?;
         ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "routed geometry");
-        let format = catalog.fp8().context("native experts")?.format();
-        let package = args.native_lib.parent().context("native package")?.join("fp8")
-            .join(format.package_name("step5")).join("manifest.json");
-        let metadata = plan::checkpoint::read_json(&package)?;
-        let exports = package_exports(&metadata)?;
+        let format = super::super::experts::StepExperts::from_catalog(&catalog)?;
+        let metadata = plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
+        let exports = format.exports(&metadata)?;
         let manifest = plan::checkpoint::read_json(&args.manifest)?;
         ensure!(manifest["programs"].as_array().context("native programs")?.iter()
             .all(|program| program.get("card_plans").is_none()),
@@ -541,8 +551,10 @@ mod tests {
             rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
-                "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),
+                "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
             startup: vec![],
+            onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::exl3(&catalog,
+                Some(&args.manifest), 256, args.rtx_expert_layers)?,
         };
         for depth in 1..=3 {
             args.mtp = depth;
@@ -554,7 +566,7 @@ mod tests {
                     "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
                     cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            let endpoint = args.endpoint(format.bf16_input());
+            let endpoint = args.endpoint(format.bf16_endpoint());
             let clients = admitted.ownership.routed_endpoints()?;
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },

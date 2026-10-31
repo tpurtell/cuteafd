@@ -237,7 +237,7 @@ int main() {
 
 
 @pytest.mark.parametrize("options,message", [
-    (dict(bits=(3, 4, 5)), "export requires two distinct K2..K5 decoder tiers"),
+    (dict(bits=(3, 4, 5)), "export requires two distinct K2..K6 decoder tiers"),
     # Compact warp specialization is a measured Spark prefill cell, so the
     # remaining rejection is a contract the kernel cannot run (8-row blocks).
     (dict(warp_specialized=True, route_block=8),
@@ -256,14 +256,14 @@ def test_compact_exl3_export_rejects_unsupported_contract_before_cuda(
         exporter.export(tmp_path, 384, 256, 16, **kwargs)
 
 
-@pytest.mark.parametrize("bits", [(2, 3, 4), (2, 3, 4, 5)])
+@pytest.mark.parametrize("bits", [(2, 3, 4), (2, 3, 4, 5), (4, 5, 6)])
 def test_exl3_export_refuses_multitier_before_cuda(monkeypatch, tmp_path, bits):
     monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", ModuleType("_pinned_sparkinfer"))
     spec = importlib.util.spec_from_file_location(
         "multitier_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
     exporter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(exporter)
-    with pytest.raises(ValueError, match="requires two distinct K2..K5 decoder tiers"):
+    with pytest.raises(ValueError, match="requires two distinct K2..K6 decoder tiers"):
         exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed")
 
 

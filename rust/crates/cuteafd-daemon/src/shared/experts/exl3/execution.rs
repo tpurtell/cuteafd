@@ -206,6 +206,9 @@ struct Manifest {
     bits: Vec<usize>,
     /// `null` for an unclamped SwiGLU (GLM).
     swiglu_limit: Option<f32>,
+    /// Absent for SiLU; otherwise the family's expert arithmetic (`situ`, `silu_post_clamp`).
+    #[serde(default)]
+    activation: Option<String>,
     direct: bool,
     #[serde(default = "default_route_block")]
     route_block: usize,
@@ -223,6 +226,15 @@ struct Manifest {
     input_format: Option<String>,
 }
 fn default_route_block() -> usize { 8 }
+
+/// The exporter's activation name for a family's expert arithmetic.
+fn exl3_activation(activation: cuteafd_core::FfnActivation) -> &'static str {
+    match activation {
+        cuteafd_core::FfnActivation::SiluBf16Product { .. } => "silu",
+        cuteafd_core::FfnActivation::SiluPostClampFp32Product { .. } => "silu_post_clamp",
+        cuteafd_core::FfnActivation::Situ { .. } => "situ",
+    }
+}
 
 impl Manifest {
     fn group_rows(&self) -> Result<usize> {
@@ -262,6 +274,8 @@ impl Manifest {
                 && self.experts == layout.experts && self.bits == layout.tiers
                 && self.swiglu_limit == geometry.swiglu_limit(),
             "EXL3 export/residency geometry mismatch");
+        ensure!(self.activation.as_deref().unwrap_or("silu") == exl3_activation(geometry.activation()),
+            "EXL3 export activation {:?} differs from the checkpoint's {:?}", self.activation, geometry.activation());
         let topk = if matches!(layout.layer, cuteafd_loader::V41Exl3Layer::Dspark(_))
             && geometry.family() == Some("v41") { 3 } else { geometry.topk as usize };
         ensure!(self.top_k == topk, "EXL3 expert top-k mismatch");

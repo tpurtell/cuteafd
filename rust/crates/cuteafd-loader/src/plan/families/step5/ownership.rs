@@ -20,6 +20,8 @@ pub struct ExecutionOwnership {
     execution: LayerExecutionPlan,
     full: Vec<bool>,
     moe: Vec<bool>,
+    /// Routed layers whose experts run whole on the entry GPU (EXL3 onboarding).
+    onboarded: Vec<usize>,
 }
 
 impl ExecutionOwnership {
@@ -51,7 +53,7 @@ impl ExecutionOwnership {
                     anyhow::bail!("Step-5 split FFN has no qualified native half-width executor"),
             }
         }
-        let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone() };
+        let owners = Self { ranks, execution, full: cfg.full.clone(), moe: cfg.moe.clone(), onboarded: vec![] };
         owners.execution.validate_routed_replications(&owners.routed_replications()?)?;
         Ok(owners)
     }
@@ -72,6 +74,16 @@ impl ExecutionOwnership {
     }
 
     pub fn ranks(&self) -> usize { self.ranks }
+
+    /// Binds the solved onboarded routed layers (whole on the entry GPU).
+    pub fn with_onboarded(mut self, layers: Vec<usize>) -> Result<Self> {
+        ensure!(layers.windows(2).all(|p| p[0] < p[1]) && layers.iter().all(|&l| self.moe.get(l) == Some(&true)),
+            "Step-5 onboarded layers must be sorted routed target layers");
+        self.onboarded = layers;
+        Ok(self)
+    }
+    pub fn onboarded(&self, layer: usize) -> bool { self.onboarded.binary_search(&layer).is_ok() }
+    pub fn onboarded_layers(&self) -> &[usize] { &self.onboarded }
     pub fn execution(&self) -> &LayerExecutionPlan { &self.execution }
 
     pub fn validate_config(&self, cfg: &Config) -> Result<()> {

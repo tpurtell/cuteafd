@@ -152,10 +152,13 @@ struct SwaWeights<'a> {
     attention_rope: std::rc::Rc<crate::shared::rope::Table<'a>>,
     layer: usize,
     extent: usize,
-    weights: Vec<Allocation<'a>>,
+    weights: Vec<Option<Allocation<'a>>>,
     programs: Vec<Program<'a>>,
     epsilon: f32,
     heads: usize,
+    /// EXL3 q, k, v, o (replacing operand slots 1, 2, 3, 7, which then hold
+    /// no BF16 allocation); the o projection is K-split when heads are split.
+    native: Option<super::native::NativeAttention<'a>>,
 }
 
 pub(super) struct SwaLayer<'a> {
@@ -163,6 +166,7 @@ pub(super) struct SwaLayer<'a> {
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
+    native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
     immutable: std::rc::Rc<SwaWeights<'a>>,
 }
@@ -192,7 +196,7 @@ impl<'a> SwaLayer<'a> {
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, 64, true, None, kv_format, None)
     }
 
     pub fn for_execution(
@@ -208,11 +212,13 @@ impl<'a> SwaLayer<'a> {
         arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
         kv_format: Qwen4KvCache,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     ) -> Result<Self> {
         let heads = ownership.layer(layer, rank)?.query_heads;
         ensure!(heads > 0, "Step-5 SWA is not owned by rank {rank}");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false, Some((arena, 0)), kv_format)
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, heads, false, Some((arena, 0)),
+            kv_format, native_scratch)
     }
 
     pub(super) fn for_mtp_stage(
@@ -223,7 +229,7 @@ impl<'a> SwaLayer<'a> {
         let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
         let cfg = Config::parse(checkpoint)?;
         Self::load_layout(device, programs, checkpoint, cfg.layers + stage, rows,
-            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format)
+            Some(rope), available, reservations, layout, 64, true, Some((arena, 0)), kv_format, None)
     }
 
     fn load_layout(
@@ -240,6 +246,7 @@ impl<'a> SwaLayer<'a> {
         include_dense: bool,
         arena: Option<(&Arena<'a>, usize)>,
         kv_format: Qwen4KvCache,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     ) -> Result<Self> {
         let name = |full: &str| {
             let name = if heads == 32 { full.replacen("step5_", "step52_", 1) }
@@ -282,14 +289,22 @@ impl<'a> SwaLayer<'a> {
             "self_attn.g_proj.weight",
             "self_attn.o_proj.weight",
         ];
+        let native_slots = super::native::ATTENTION_SLOTS.iter()
+            .filter(|&&slot| layout.core.contains_key(&format!("model.layers.{layer_id}.{}", suffixes[slot])))
+            .count();
+        ensure!(native_slots == 0 || native_slots == 4, "SWA layer {layer_id} mixes native and BF16 q/k/v/o");
+        let native_layer = native_slots == 4;
+        // Native slots carry no BF16 operand; the remaining slots keep their indices.
         let weights = suffixes
             .iter()
-            .map(|suffix| {
+            .enumerate()
+            .map(|(slot, suffix)| {
+                if native_layer && super::native::ATTENTION_SLOTS.contains(&slot) { return Ok(None); }
                 layout
                     .operands
                     .iter()
                     .find(|w| w.name == format!("model.layers.{layer_id}.{suffix}"))
-                    .context("SWA operand missing")
+                    .context("SWA operand missing").map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
         let q = heads * 192;
@@ -304,6 +319,7 @@ impl<'a> SwaLayer<'a> {
             (DType::Bf16, vec![heads, H]),
             (DType::Bf16, vec![H, q]),
         ]) {
+            let Some(weight) = weight else { continue };
             ensure!(
                 weight.dtype == dtype && weight.shape == shape,
                 "SWA weight shape/dtype"
@@ -323,7 +339,10 @@ impl<'a> SwaLayer<'a> {
             heads,
             &weights
                 .iter()
+                .flatten()
                 .map(|w| w.allocation_bytes)
+                .chain(super::native::ATTENTION_SLOTS.iter().filter(|_| native_layer).map(|&slot|
+                    layout.core[&format!("model.layers.{layer_id}.{}", suffixes[slot])].bytes as u64))
                 .collect::<Vec<_>>(),
             dense.as_ref().map_or(0, DensePlan::bytes),
             if rope.is_none() {
@@ -355,7 +374,7 @@ impl<'a> SwaLayer<'a> {
             ("step5_attn_kv", H, kv),
             ("step5_attn_gate", H, heads),
             ("step5_attn_out", q, H),
-        ] {
+        ].into_iter().filter(|(full, ..)| !native_layer || *full == "step5_attn_gate") {
             let is_partial = heads == 32 && full == "step5_attn_out";
             let name = if is_partial { output.to_owned() } else { name(full) };
             let g = &programs.spec(&name)?.geometry;
@@ -431,20 +450,34 @@ impl<'a> SwaLayer<'a> {
                 DenseFfn::load_plan_in(device, programs, checkpoint, plan, ffn_arena)
             })
             .transpose()?;
+        let native = super::native::NativeAttention::load(device, programs, checkpoint, &layout, layer_id,
+            rows, q, kv, H)?;
+        ensure!(native.is_some() == native_layer, "SWA native attention inventory");
+        // Native layers keep slot indices; replaced slots hold an empty placeholder
+        // only in the index map, never a device allocation.
         let weights = weights
             .into_iter()
-            .map(|w| load_operand(device, checkpoint, &layout, w))
+            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w)).transpose())
             .collect::<Result<Vec<_>>>()?;
         let attention_rope = rope.tables.get(layer.rope)?;
-        Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { kv_format, rope, attention_rope,
+        let mut owner = Self::workspace(device, admission, std::rc::Rc::new(SwaWeights { kv_format, rope, attention_rope,
             layer: layer_id, extent: contract.rope_tables.extent as usize, weights,
-            programs: resolved, epsilon: cfg.norm_eps, heads }), ffn, arena)
+            programs: resolved, epsilon: cfg.norm_eps, heads, native }), ffn, arena)?;
+        owner.native_scratch = match (&owner.immutable.native, native_scratch) {
+            (None, _) => None,
+            (Some(_), Some(shared)) => Some(shared),
+            (Some(native), None) => Some(std::rc::Rc::new(super::native::NativeScratch::allocate(device,
+                &native.scratch_layout(rows)?)?)),
+        };
+        Ok(owner)
     }
 
     /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
     pub(super) fn new_lane(&self) -> Result<Self> {
         let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)
+        let mut lane = Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)?;
+        if let Some(shared) = &self.native_scratch { lane.native_scratch = Some(shared.sibling(self.stream.device)?); }
+        Ok(lane)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
@@ -452,7 +485,7 @@ impl<'a> SwaLayer<'a> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
         let rows = admission.rows;
-        let owner = Self { stream, ffn, planes, admission, immutable };
+        let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
             for (plane, bytes) in [
                 (
@@ -525,7 +558,7 @@ impl<'a> SwaLayer<'a> {
             "SWA rows exceed capacity"
         );
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
+        let w = |i: usize| self.weight(i);
         let scalars = [Scalar::I32(rows as i32)];
         let norm = [Scalar::I32(rows as i32), Scalar::F32(self.immutable.epsilon)];
         let (cos, sin) = self.immutable.attention_rope.buffers();
@@ -535,9 +568,18 @@ impl<'a> SwaLayer<'a> {
             &[p(X), w(0), w(0), w(0), w(0), w(0), p(NORM)],
             &norm,
         )?;
-        self.launch_on(stream, 1, &[p(NORM), w(1), p(QRAW)], &scalars)?;
-        self.launch_on(stream, 2, &[p(NORM), w(2), p(KRAW)], &scalars)?;
-        self.launch_on(stream, 2, &[p(NORM), w(3), p(VPAGES)], &scalars)?;
+        if let Some(native) = &self.immutable.native {
+            let scratch = &self.native_scratch.as_ref().context("SWA native scratch")?.scratch;
+            let view = |i: usize, width: usize| CuteafdDeviceBuffer { bytes: rows * width * 2, ..self.planes[i].buffer };
+            let (q, kv) = (self.immutable.heads * 192, self.immutable.heads / 16 * 192);
+            native.q.launch(rows, view(NORM, H), view(QRAW, q), scratch, stream.raw)?;
+            native.k.launch(rows, view(NORM, H), view(KRAW, kv), scratch, stream.raw)?;
+            native.v.launch(rows, view(NORM, H), view(VPAGES, kv), scratch, stream.raw)?;
+        } else {
+            self.launch_on(stream, 1, &[p(NORM), w(1), p(QRAW)], &scalars)?;
+            self.launch_on(stream, 2, &[p(NORM), w(2), p(KRAW)], &scalars)?;
+            self.launch_on(stream, 2, &[p(NORM), w(3), p(VPAGES)], &scalars)?;
+        }
         self.launch_on(stream, 3, &[p(NORM), w(6), p(LOGITS)], &scalars)?;
         self.launch_on(
             stream,
@@ -572,10 +614,22 @@ impl<'a> SwaLayer<'a> {
 
     pub(super) fn finish_on(&self, rows: usize, stream: &Stream<'a>) -> Result<()> {
         let p = |i: usize| self.planes[i].buffer.ptr;
-        let w = |i: usize| self.immutable.weights[i].buffer.ptr;
         let scalars = [Scalar::I32(rows as i32)];
         self.launch_on(stream, 8, &[p(ATTN), p(LOGITS), p(GATED)], &scalars)?;
-        self.launch_on(stream, 9, &[p(GATED), w(7), p(DELTA)], &scalars)?;
+        if let Some(native) = &self.immutable.native {
+            let scratch = &self.native_scratch.as_ref().context("SWA native scratch")?.scratch;
+            let q = self.immutable.heads * 192;
+            let gated = CuteafdDeviceBuffer { bytes: rows * q * 2, ..self.planes[GATED].buffer };
+            let delta = self.planes[DELTA].buffer;
+            if self.immutable.heads == 32 {
+                // K-split: F32 core partial, exchanged and reduced before one svh egress.
+                native.o.partial(rows, gated, CuteafdDeviceBuffer { bytes: rows * H * 4, ..delta }, scratch, stream.raw)?;
+            } else {
+                native.o.launch(rows, gated, CuteafdDeviceBuffer { bytes: rows * H * 2, ..delta }, scratch, stream.raw)?;
+            }
+        } else {
+            self.launch_on(stream, 9, &[p(GATED), self.weight(7), p(DELTA)], &scalars)?;
+        }
         if self.immutable.heads == 64 {
             self.launch_on(stream, 10, &[p(X), p(DELTA), p(POST)], &scalars)?;
         }
@@ -665,11 +719,17 @@ impl<'a> SwaLayer<'a> {
             super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),
                 stream.device, self.planes[POST].buffer, rows, false)?;
         }
-        stream.device.run(|| {
-            // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
-            unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
-                self.planes[NORM].buffer, rows * H, stream.raw) }
-        })?;
+        if let Some(native) = &self.immutable.native {
+            // The ordered F32 sum of the two native core partials, then one svh egress.
+            native.o.egress(rows, CuteafdDeviceBuffer { bytes: rows * H * 4, ..self.planes[POST].buffer },
+                CuteafdDeviceBuffer { bytes: rows * H * 2, ..self.planes[NORM].buffer }, stream.raw)?;
+        } else {
+            stream.device.run(|| {
+                // SAFETY: disjoint admitted same-device planes survive cache-stream drainage.
+                unsafe { stream.device.library.cuda_f32_to_bf16_async(self.planes[POST].buffer,
+                    self.planes[NORM].buffer, rows * H, stream.raw) }
+            })?;
+        }
         self.launch_on(stream, 10, &[p(X), p(NORM), p(POST)], &[Scalar::I32(rows as i32)])
     }
 
@@ -825,7 +885,13 @@ impl<'a> SwaLayer<'a> {
     }
 
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.immutable.weights)
+        let live = self.immutable.weights.iter().flatten().map(|w| w.buffer).collect::<Vec<_>>();
+        super::weights::validate_live_buffers(device.id, &live)
+    }
+
+    /// A BF16 operand slot; native slots never reach a BF16 program.
+    fn weight(&self, slot: usize) -> *mut std::ffi::c_void {
+        self.immutable.weights[slot].as_ref().map_or(std::ptr::null_mut(), |w| w.buffer.ptr)
     }
 
     pub fn input(&self) -> CuteafdDeviceBuffer {
@@ -1088,7 +1154,7 @@ mod tests {
                     stage,
                     &[
                         chain.planes[input_plane].buffer.ptr,
-                        chain.immutable.weights[weight].buffer.ptr,
+                        chain.weight(weight),
                         chain.planes[plane].buffer.ptr,
                     ],
                     &[Scalar::I32(rows as i32)],
@@ -1117,8 +1183,8 @@ mod tests {
                     stage,
                     &[
                         chain.planes[input].buffer.ptr,
-                        chain.immutable.weights[weight].buffer.ptr,
-                        chain.immutable.weights[weight].buffer.ptr,
+                        chain.weight(weight),
+                        chain.weight(weight),
                         cos.ptr,
                         sin.ptr,
                         chain.planes[POSITIONS].buffer.ptr,

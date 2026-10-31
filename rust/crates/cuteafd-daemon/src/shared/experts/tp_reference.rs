@@ -212,7 +212,7 @@ fn hadamard(values: &mut [f64]) {
 // Tail-biting MCG code and lane order, independently ported from the public
 // GPTQModel reference (Apache-2.0), as in python/tools/lib/exl3_reference.py.
 fn trellis_tile(bytes: &[u8], bits: usize) -> Result<[f64; 256]> {
-    ensure!(matches!(bits, 2..=5) && bytes.len() == 32 * bits, "invalid EXL3 tile");
+    ensure!(matches!(bits, 2..=6) && bytes.len() == 32 * bits, "invalid EXL3 tile");
     let words: Vec<_> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
     let mut symbols = [0u32; 256];
     for position in 0..16 {

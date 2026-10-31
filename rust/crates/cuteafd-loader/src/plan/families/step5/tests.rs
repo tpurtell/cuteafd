@@ -197,7 +197,7 @@ fn full_context_mtp_forecast_charges_private_predictors_before_allocation() -> a
             marks: MarkRule { lanes: 16, entries: 20, budget_bytes: 2 << 30, host: true },
             pending_code: (0..2).map(|rank| inventory::loaded_code_allowance(
                 "step5", "step5:fp8", true, rank, &arch, Some(&programs)).bytes).collect(),
-            peer_diagnostics: false, startup: vec![],
+            peer_diagnostics: false, startup: vec![], onboard: None,
         };
         for depth in [0, 1, 3].into_iter().filter(|&depth| depth != 3
             || kv_format == crate::families::qwen4::Qwen4KvCache::Bf16) {
@@ -1335,4 +1335,278 @@ fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
             assert_eq!(report.prefill_span_rows, Some(expected_span));
         }
     }
+}
+
+/// The published K4 + Core-K6 recipe as a header-only snapshot
+/// (`quantization/step5/core_k6/recipe.py`): target attention/FFN/lm_head K6,
+/// routed experts per expert K4 (3-87) and K6 (88-90), MTP dense and stage
+/// heads K4, native tensors otherwise. One shard per layer, sparse payloads.
+pub(super) fn exl3_snapshot() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, tensors) = fixture("bf16");
+    let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
+        "bits": 4.0, "core_bits": 6.0, "mtp_bits": 4.0, "head_bits": 6.0, "codebook": "mcg",
+        "mcg_multiplier": 0xCBAC1FEDu64, "out_scales": "auto", "expert_bits": 4.0,
+        "expert_bits_by_layer": {"88": 6.0, "89": 6.0, "90": 6.0},
+        "per_module_metadata": "quantize_config.json:tensor_storage"});
+    config["quantization_config"] = declaration.clone();
+    let core = |name: &str| -> Option<usize> {
+        if name == "lm_head.weight" { return Some(6); }
+        let rest = name.strip_prefix("model.layers.")?;
+        let (layer, leaf) = rest.split_once('.')?;
+        let layer: usize = layer.parse().ok()?;
+        let quantized = matches!(leaf, "self_attn.q_proj.weight" | "self_attn.k_proj.weight"
+            | "self_attn.v_proj.weight" | "self_attn.o_proj.weight")
+            || leaf.starts_with("share_expert.") || leaf.starts_with("mlp.")
+            || leaf == "eh_proj.weight" || leaf == "transformer.shared_head.output.weight";
+        quantized.then_some(if layer >= 92 { 4 } else { 6 })
+    };
+    let mut out: Vec<FixtureTensor> = Vec::new();
+    let mut storage = serde_json::Map::new();
+    let mut module = |out: &mut Vec<FixtureTensor>, stem: &str, n: usize, k: usize, bits: usize| {
+        out.extend(testing::exl3(stem, n, k, bits));
+        storage.insert(stem.to_owned(), serde_json::json!({"quant_format": "exl3", "bits_per_weight": bits,
+            "mcg_multiplier": 0xCBAC1FEDu64, "in_features": k, "out_features": n, "stored_out_features": n,
+            "stored_tensors": {
+                format!("{stem}.trellis"): {"shape": [k / 16, n / 16, 16 * bits], "torch_dtype": "int16"},
+                format!("{stem}.suh"): {"shape": [k], "torch_dtype": "float16"},
+                format!("{stem}.svh"): {"shape": [n], "torch_dtype": "float16"},
+                format!("{stem}.mcg"): {"shape": [], "torch_dtype": "int32"}}}));
+    };
+    for (name, dtype, shape) in tensors {
+        if let Some(stem) = name.strip_suffix(".weight").filter(|_| shape.len() == 3 && name.contains(".moe.")) {
+            let layer: usize = stem.split('.').nth(2).unwrap().parse().unwrap();
+            let bits = if layer >= 88 { 6 } else { 4 };
+            let (base, proj) = stem.rsplit_once('.').unwrap();
+            for expert in 0..shape[0] {
+                module(&mut out, &format!("{base}.experts.{expert}.{proj}"), shape[1], shape[2], bits);
+            }
+        } else if let Some(bits) = core(&name) {
+            module(&mut out, name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits);
+        } else {
+            out.push((name, dtype, shape));
+        }
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<FixtureTensor>>::new();
+    for tensor in out {
+        let shard = tensor.0.strip_prefix("model.layers.").and_then(|r| r.split('.').next())
+            .and_then(|l| l.parse::<usize>().ok()).map_or(96, |l| l + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}-of-00096.safetensors");
+        testing::write_safetensors(&dir.path().join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    std::fs::write(dir.path().join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap()).unwrap();
+    let mut manifest = declaration.as_object().unwrap().clone();
+    for (key, value) in [("method", Value::from("exl3")), ("group_size", Value::from(-1)),
+        ("desc_act", Value::from(false)), ("sym", Value::from(true)), ("lm_head", Value::from(true)),
+        ("tensor_storage", Value::Object(storage)), ("kept_tensors", serde_json::json!({})),
+        ("module_include", serde_json::json!([])), ("calibration", serde_json::json!({})),
+        ("meta", serde_json::json!({}))] {
+        manifest.insert(key.into(), value);
+    }
+    std::fs::write(dir.path().join("quantize_config.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn exl3_recipe_headers_classify_core_routed_mtp_and_kept_tensors() -> anyhow::Result<()> {
+    let fixture = exl3_snapshot();
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let cp = Checkpoint::inventory(path)?;
+        let model = Model::open(&cp)?;
+        assert!(model.is_exl3());
+        // 92 target layers x 7 + lm_head = 645 K6; 3 stages x (7 + eh + head) = 27 K4.
+        let (k6, k4): (Vec<_>, Vec<_>) = model.core.projections.values().partition(|p| p.bits == 6);
+        assert_eq!((k6.len(), k4.len()), (645, 27));
+        assert!(k4.iter().all(|p| p.stem.starts_with("model.layers.9") && ["92", "93", "94"]
+            .contains(&p.stem.split('.').nth(2).unwrap())));
+        assert_eq!(model.core.get("model.layers.92.transformer.shared_head.output").unwrap().bits, 4);
+        assert_eq!(model.core.get("lm_head").unwrap().bits, 6);
+        assert_eq!(model.core.get("model.layers.91.mlp.down_proj").unwrap().bits, 6);
+        assert!(model.core.get("model.layers.7.self_attn.g_proj").is_none());
+        assert_eq!(model.expert_bits.len(), 88);
+        assert!(model.expert_bits.iter().all(|(&l, &b)| b == if l >= 88 { 6 } else { 4 }));
+        assert_eq!(model.exl3_tiers(), Some(vec![4, 6]));
+        assert_eq!(model.exl3_package().as_deref(), Some("exl3-k46"));
+        assert!(model.formats.iter().any(|f| f == "exl3-k4") && model.formats.iter().any(|f| f == "exl3-k6"));
+        // Native: indexer F32 W, head-wise gate BF16, router + bias, vision.
+        for (name, dtype) in [("model.layers.3.self_attn.sparse_indexer_w.weight", DType::F32),
+            ("model.layers.3.self_attn.g_proj.weight", DType::Bf16), ("model.layers.3.moe.gate.weight", DType::Bf16),
+            ("model.layers.3.moe.router_bias", DType::F32), ("vision_model.conv1.weight", DType::Bf16)] {
+            assert_eq!(model.tensors[name].dtype, dtype, "{name}");
+        }
+        eprintln!("Step-5 EXL3 inventory: {} ms", started.elapsed().as_millis());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exl3_spark_world_admission_follows_planner_fit() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let refused = super::spark_world_admitted(fixture.path(), &manifest, 2).unwrap_err().to_string();
+    assert!(refused.contains("does not admit 2 Spark ranks"), "{refused}");
+    // 4 and 6 are the card columns (exl3_card_columns_fit_from_headers).
+    super::spark_world_admitted(fixture.path(), &manifest, 3).unwrap();
+    assert!(super::spark_world_admitted(fixture.path(), &manifest, 0).is_err());
+}
+
+#[test]
+fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
+    let fixture = exl3_snapshot();
+    let report = plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
+    for component in &report.components {
+        assert!(matches!(component.status, Status::Ready | Status::Disabled | Status::Unused),
+            "{:?}: {:?} {:?}", component.component, component.status, component.rejections);
+    }
+    let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
+    assert_eq!(routed.formats.keys().cloned().collect::<Vec<_>>(), ["exl3-k4", "exl3-k6"]);
+    assert_eq!(routed.tensors, 88 * 352 * 3 * 4);
+    let cp = Checkpoint::open(fixture.path()).unwrap();
+    for world in [2, 3, 4, 6] {
+        let recipe = crate::plan::experts::checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).unwrap();
+        assert_eq!(recipe.widths, vec![1536 / world; world]);
+        assert_eq!(recipe.required_layouts, (0..world).map(|r| format!("tp{world}-rank{r}")).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
+    use crate::plan::checkpoint::CheckpointTensor;
+    let fixture = exl3_snapshot();
+    let mut cp = Checkpoint::inventory(fixture.path()).unwrap();
+    // A K5 core module disagrees with core_bits=6.
+    let stem = "model.layers.5.self_attn.q_proj";
+    let shard = cp.weight_map[&format!("{stem}.trellis")].clone();
+    let mut headers = crate::read_safetensors_metadata(&fixture.path().join(&shard)).unwrap();
+    let trellis = headers.iter_mut().find(|m| m.name == format!("{stem}.trellis")).unwrap();
+    trellis.shape[2] = 80;
+    trellis.byte_length = trellis.byte_length / 6 * 5;
+    cp.tensors.extend(headers.into_iter().filter(|m| m.name.starts_with(stem))
+        .map(|meta| CheckpointTensor { shard: shard.clone(), meta }));
+    cp.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+    let error = format!("{:#}", Model::open(&cp).err().unwrap());
+    assert!(error.contains("core requires K6, found K5"), "{error}");
+    // A routed layer declared K6 but stored K4 fails against the declaration.
+    let mut config: Value = serde_json::from_slice(&std::fs::read(fixture.path().join("config.json")).unwrap()).unwrap();
+    config["quantization_config"]["expert_bits_by_layer"]["87"] = serde_json::json!(6.0);
+    std::fs::write(fixture.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let error = format!("{:#}", Model::open(&Checkpoint::inventory(fixture.path()).unwrap()).err().unwrap());
+    assert!(error.contains("model.layers.87") && error.contains("K4"), "{error}");
+}
+
+#[test]
+fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<()> {
+    use crate::formats::dense_trellis::TrellisSide;
+    let fixture = exl3_snapshot();
+    let cp = Checkpoint::open(fixture.path())?;
+    let whole = coordinator::RankWeightLayout::from_checkpoint(&cp, 0, 1)?;
+    // 92 target layers x 7 + lm_head; no BF16 operand duplicates a native one.
+    assert_eq!(whole.core.len(), 645);
+    for name in whole.core.keys() {
+        assert!(!whole.operands.iter().any(|o| &o.name == name), "{name} resident twice");
+    }
+    assert!(!whole.operands.iter().any(|o| o.name.ends_with(".gate_up_proj.weight")));
+    // Head-wise gates, indexer, routers and norms stay native BF16/F32 operands.
+    assert!(whole.operands.iter().any(|o| o.name == "model.layers.3.self_attn.g_proj.weight"));
+    assert!(whole.operands.iter().any(|o| o.name == "model.layers.3.self_attn.sparse_indexer_q.weight"));
+    let core_bytes: u64 = whole.core.values().map(|c| c.bytes as u64).sum();
+    let bf16: u64 = whole.operands.iter().map(|o| o.allocation_bytes).sum();
+    assert_eq!(whole.resident_bytes, core_bytes + bf16);
+    // K6 core is ~8.9 GiB in the recipe table (scales included).
+    assert!((8 << 30..10 << 30).contains(&core_bytes), "{core_bytes}");
+    let split = coordinator::RankWeightLayout::from_checkpoint(&cp, 1, 2)?;
+    let q = &split.core["model.layers.4.self_attn.q_proj.weight"];
+    let o = &split.core["model.layers.4.self_attn.o_proj.weight"];
+    assert_eq!((q.side, q.shape, q.rank, q.ranks), (TrellisSide::Output, [6144, 4096], 1, 2));
+    assert_eq!((o.side, o.shape, o.rank, o.ranks), (TrellisSide::Input, [4096, 6144], 1, 2));
+    assert_eq!(split.core["model.layers.4.share_expert.gate_proj.weight"].shape, [1536, 4096]);
+    assert_eq!(split.core["model.layers.0.mlp.down_proj.weight"].shape, [4096, 13824]);
+    // Each MTP stage owns only its K4 operands and its own vocabulary head.
+    for stage in 0..3 {
+        let layout = coordinator::RankWeightLayout::for_mtp_stage(&cp, stage)?;
+        assert_eq!(layout.core.len(), 9);
+        assert!(layout.core.values().all(|c| c.bits == 4 && c.ranks == 1));
+        assert!(layout.core.contains_key(&format!("model.layers.{}.transformer.shared_head.output.weight", 92 + stage)));
+        assert!(!layout.core.contains_key("lm_head.weight"));
+    }
+    Ok(())
+}
+
+/// The installed `exl3-step5-k46/rtx-tp1` package metadata beside PROGRAMS.json.
+fn install_exl3_rtx_package(manifest: &std::path::Path) {
+    let root = manifest.parent().unwrap().join("exl3/exl3-step5-k46/rtx-tp1");
+    for capacity in crate::placement::inventory::exl3_capacities(4096) {
+        let path = root.join(format!("m{capacity}"));
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&serde_json::json!({
+            "capacity": capacity, "hidden": 4096, "experts": 352, "intermediate": 1536, "top_k": 8,
+            "bits": [4, 6], "activation": "silu_post_clamp", "swiglu_limit": 7.0,
+            "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32}, "buffers": {
+                "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 64, "zero_on_create": false}}
+        })).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn exl3_two_rtx_onboards_whole_layers_and_sparks_keep_the_rest() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let plan_with = |onboard: Option<crate::placement::Onboard>| plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(6), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; 2],
+            workspace_manifest: Some(manifest.clone()), onboard, ..Default::default() }),
+        ..Default::default() }).unwrap();
+    let auto = plan_with(None);
+    assert!(auto.solver_placement.is_some(), "{:#?}", auto.hints);
+    let onboarded = auto.solver_placement.as_ref().unwrap().layers.iter()
+        .filter(|l| matches!(l.experts, crate::placement::ExpertHome::RtxWhole { gpu: 0 })).count();
+    assert!(onboarded > 0, "auto should onboard on a 96 GiB RTX: {:?}", auto.hints);
+    assert_eq!(auto.onboard_layers, Some(onboarded));
+    assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("onboarding")));
+    let none = plan_with(Some(crate::placement::Onboard::Layers(0)));
+    assert_eq!(none.onboard_layers, Some(0));
+    assert!(none.solver_placement.unwrap().layers.iter().all(|l|
+        !matches!(l.experts, crate::placement::ExpertHome::RtxWhole { .. })));
+    let solved = auto.solver_placement.unwrap();
+    assert!(solved.pool_tokens >= 2 << 20, "pool target first: {}", solved.pool_tokens);
+    eprintln!("Step-5 EXL3 2 RTX + 6 Sparks: onboard {onboarded} layers, pool {}", solved.pool_tokens);
+}
+
+#[test]
+fn exl3_card_columns_fit_from_headers() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let fit = |gpus: usize, sparks: usize| plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(sparks), draft_ownership: Some(spec::DraftOwnership::None),
+        layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
+            workspace_manifest: Some(manifest.clone()), ..Default::default() }),
+        ..Default::default() }).unwrap();
+    for (gpus, sparks) in [(1, 2), (1, 3), (1, 4), (2, 4), (2, 6)] {
+        let report = fit(gpus, sparks);
+        let summary = report.memory_layout.as_ref().map(|m| {
+            let spark = m.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+                .map(|d| d.used_bytes() >> 30).max().unwrap_or(0);
+            format!("pool {} onboard {:?} spark_max {spark} GiB", m.pool_tokens, report.onboard_layers)
+        });
+        eprintln!("Step-5 EXL3 {gpus} RTX + {sparks} Sparks: launchable={} {summary:?} {:?}",
+            report.wip_launchable(), report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+    }
+    assert!(fit(2, 6).wip_launchable());
 }

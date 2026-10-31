@@ -849,6 +849,7 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         return read_qwen4_expert_catalog(snapshot, config, checkpoint);
     }
     if matches!(config["model_type"].as_str(), Some("step5" | "step5_vl")) {
+        let checkpoint_arg = checkpoint;
         let checkpoint = crate::plan::Checkpoint::inventory(snapshot)?;
         let cfg = crate::plan::families::step5::Config::parse(&checkpoint)?;
         // The final target layer is dense; bundled MTP stages are separately owned.
@@ -857,6 +858,10 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
         ensure!(cfg.moe[first_layer..end].iter().all(|&moe| moe), "Step-5 routed layer set is not contiguous");
         let shape = RoutedExpertShape { layers: end, first_layer, experts: cfg.experts,
             topk: cfg.topk, hidden: cfg.hidden, intermediate: cfg.intermediate, draft_stages: 0, draft_experts: 0 };
+        if crate::plan::families::step5::exl3::is_exl3(&checkpoint) {
+            // K4 experts with K6 tails: the shared two-tier package exl3-step5-k46.
+            return exl3_catalog_or_read(snapshot, shape, &[4, 6], checkpoint_arg);
+        }
         let fp8 = crate::formats::fp8_experts::Fp8ExpertTensors::read_layers(snapshot, shape,
             &(first_layer..end).collect())?;
         return Ok(OfficialV41Catalog { reader: Default::default(), format: crate::plan::checkpoint::CheckpointFormat::HfIndexed, config: None, experts: shape, snapshot: snapshot.to_path_buf(),

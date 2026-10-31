@@ -107,6 +107,16 @@ def family_scopes(cards, config_reader):
                 checkpoint_id = values.get('MODEL_ID', values.get('MODEL', ''))
                 nvfp4 = any('nvfp4' in str(value).lower() for value in
                             (card['name'], checkpoint_id, values.get('EXPERT_FORMAT', '')))
+                if fam == 'step5' and 'exl3' in card['name']:
+                    # EXL3 K4 experts with K6 tails (layers 88-90) as one two-tier package;
+                    # the K6 core and K4 MTP run the shared dense trellis programs.
+                    scopes.add('step5:exl3-k46')
+                    if count:
+                        counts.add(f"step5:exl3={int(values.get('SPARK_TP', count))}")
+                    card_scopes, scopes = scopes, scopes_before | scopes
+                    if count:
+                        spark_scopes |= card_scopes
+                    continue
                 scopes.add(tag + (':nvfp4' if tag == 'qwen4' or nvfp4 else ':fp8'))
                 if fam == 'step5':
                     # Both official quants retain native BF16 routed layers.

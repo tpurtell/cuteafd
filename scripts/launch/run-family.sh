@@ -228,7 +228,7 @@ PROFILE_SPARK_NCU_SKIP
 PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
-    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
+    [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE RTX_EXPERT_LAYERS PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -2134,6 +2134,12 @@ fi
 # or a fixed count, which admission must then fit.
 if [[ "$family" == step5 ]]; then
   family_args+=(--kv-cache "$step5_kv_cache")
+  # EXL3 checkpoints onboard whole routed layers on the entry RTX (auto: the
+  # planner's pool-first choice); the official FP8/NVFP4 releases onboard none.
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Step-5 RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  [[ "$local_layers" == auto ]] || family_args+=(--rtx-expert-layers "$local_layers")
 fi
 if ((text_family)); then
   pool="$(get POOL_TOKENS auto)"

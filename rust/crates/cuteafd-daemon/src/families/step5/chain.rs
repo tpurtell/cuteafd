@@ -101,8 +101,10 @@ impl<'a> TargetChain<'a> {
             } else {
                 let plan =
                     RoutedPlan::prepare(programs, checkpoint, layer.layer, rows, u64::MAX, &[])?
-                        .with_expert_format(catalog.as_ref().and_then(|c| c.fp8())
-                            .context("Step-5 native expert headers missing")?.layer_format(layer.layer)?);
+                        .with_bf16_input({
+                            let catalog = catalog.as_ref().context("Step-5 routed expert headers missing")?;
+                            super::experts::StepExperts::from_catalog(catalog)?.layer_bf16_input(catalog, layer.layer)?
+                        });
                 let workspace = plan.workspace_bytes();
                 routed.push(Some(plan));
                 workspace

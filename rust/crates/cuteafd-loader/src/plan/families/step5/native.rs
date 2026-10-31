@@ -307,18 +307,61 @@ pub fn rank_admission(
             n.checked_add(w.allocation_bytes)
         })
         .context("Step-5 native rank immutable overflow")?;
+    let immutable = layout.core.values().try_fold(immutable, |n, core| n.checked_add(core.bytes as u64))
+        .context("Step-5 native core immutable overflow")?;
     let owns = (0..cfg.layers).any(|layer| ownership.layer(layer, rank).is_ok_and(|l| l.query_heads > 0));
     let mut workspace = if owns {
         rank_attention_bytes(&cfg, ownership, rank, unit)?.checked_add(ffn_region_bytes(unit, span)?)
+            .and_then(|n| n.checked_add(native_scratch_bytes(&layout, unit).ok()?))
             .context("Step-5 rank workspace overflow")?
     } else { 0 };
     if rank == ownership.execution().spec().head_gpu as usize {
-        workspace = workspace.max(plane_bytes(&head_planes(logits)?)?);
+        // The head reuses the arena after every layer drained; a native head adds its own scratch.
+        let head_scratch = layout.core.get("lm_head.weight").map(|core| {
+            let [n, k] = core.shape;
+            crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, logits)?.bytes()
+        }).transpose()?.unwrap_or(0) as u64;
+        workspace = workspace.max(plane_bytes(&head_planes(logits)?)?.checked_add(head_scratch)
+            .context("Step-5 head workspace overflow")?);
     }
     Ok(RankAdmission {
         immutable,
         workspace,
     })
+}
+
+/// The one serialized native projection scratch a rank's layers share, placed
+/// after its FFN region; zero when the rank owns no native operand.
+pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u64> {
+    let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
+    for core in layout.core.iter().filter(|(name, _)| name.as_str() != "lm_head.weight").map(|(_, core)| core) {
+        let [n, k] = core.shape;
+        let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, unit)?;
+        match &mut merged { Some(layout) => layout.merge(&next)?, None => merged = Some(next) }
+    }
+    Ok(merged.map(|layout| layout.bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
+}
+
+/// Each predictor stage's native owners (attention, dense FFN, eh_proj and its
+/// vocabulary head) hold private projection scratch; bounded at `rows`.
+pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, rows: usize) -> Result<u64> {
+    use crate::formats::trellis_core::ProjectionScratchLayout;
+    let mut total = 0u64;
+    for stage in 0..depth {
+        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let mut owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
+        for (name, core) in &layout.core {
+            let owner = if name.contains(".self_attn.") { "attention" } else if name.contains(".mlp.") { "dense" }
+                else if name.ends_with(".eh_proj.weight") { "eh" } else { "head" };
+            let [n, k] = core.shape;
+            let next = ProjectionScratchLayout::new(k, n, rows.min(4096))?;
+            match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
+        }
+        for layout in owners.values() {
+            total = total.checked_add(layout.bytes()? as u64).context("Step-5 MTP native scratch overflow")?;
+        }
+    }
+    Ok(total)
 }
 
 pub fn plane_bytes(planes: &[usize]) -> Result<u64> {

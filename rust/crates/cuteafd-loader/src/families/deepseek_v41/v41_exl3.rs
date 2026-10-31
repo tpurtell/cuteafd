@@ -212,8 +212,8 @@ pub(crate) fn decoder_family(
 ) -> Result<Vec<usize>> {
     let mut bits: BTreeSet<_> = projections.values().map(|p| p.bits).collect();
     ensure!(
-        !bits.is_empty() && bits.iter().all(|b| (2..=5).contains(b)),
-        "EXL3 decoder family must contain K2..K5 projections"
+        !bits.is_empty() && bits.iter().all(|b| (2..=6).contains(b)),
+        "EXL3 decoder family must contain K2..K6 projections"
     );
     ensure!(bits.len() <= 2,
         "unsupported: EXL3 with {} expert tiers (2 supported); tensors: {}",
@@ -222,7 +222,7 @@ pub(crate) fn decoder_family(
     // Native mixed kernels retain an empty adjacent tier for uniform models.
     if bits.len() == 1 {
         let bit = *bits.first().unwrap();
-        bits.insert(if bit == 5 { 4 } else { bit + 1 });
+        bits.insert(if bit == 6 { 5 } else { bit + 1 });
     }
     Ok(bits.into_iter().collect())
 }
@@ -236,7 +236,7 @@ pub(crate) fn decoder_family_preferring(
     let family = decoder_family(projections)?;
     let covered = preferred.len() == 2
         && preferred[0] + 1 == preferred[1]
-        && preferred.iter().all(|bits| (2..=5).contains(bits))
+        && preferred.iter().all(|bits| (2..=6).contains(bits))
         && projections.values().all(|p| preferred.contains(&p.bits));
     Ok(if covered { preferred.to_vec() } else { family })
 }
@@ -316,7 +316,11 @@ pub(crate) fn read_deepseek_v4_exl3_manifest<'a>(
 ) -> Result<V41Exl3Manifest> {
     let config = read_json(&snapshot.join("config.json"), 1024 * 1024)?;
     let derived = derive_storage_map(headers)?;
-    let source = check_storage_maps(snapshot, &config, &derived, backbone.layers)?;
+    // MTP starts after every target layer, which can exceed the routed bound
+    // (Step-5's last target layer is dense).
+    let target_layers = config.get("text_config").unwrap_or(&config)["num_hidden_layers"].as_u64()
+        .map_or(backbone.layers, |layers| (layers as usize).max(backbone.layers));
+    let source = check_storage_maps(snapshot, &config, &derived, target_layers)?;
     build_deepseek_v4_manifest(source, &derived, backbone, tiers)
 }
 
@@ -449,8 +453,8 @@ fn build_deepseek_v4_manifest(
                     ensure!(module.codebook == crate::formats::exl3_storage::Exl3Codebook::Mcg,
                         "projection {name}: routed expert kernels require MCG, found {}", module.codebook.marker());
                     ensure!(
-                        (2..=5).contains(&module.bits),
-                        "projection {name} is K{}; the expert kernels run K2..K5",
+                        (2..=6).contains(&module.bits),
+                        "projection {name} is K{}; the expert kernels run K2..K6",
                         module.bits
                     );
                     ensure!(
