@@ -42,6 +42,9 @@ pub(super) enum ToolSyntax {
     QwenXml,
     /// Kimi XTML; assisted decoding uses its native JSON-object call form.
     KimiXtml,
+    /// Muse `<atem:function_calls>` in a tool-addressed message; no native
+    /// grammar yet, so only validation applies (constrained requests refuse).
+    MuseAtem,
 }
 
 pub(super) struct ToolConstraints {
@@ -70,6 +73,7 @@ impl ToolConstraints {
             let validator = if strict { Some(super::constraints::compile_schema(&schema)
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
+            if syntax == ToolSyntax::MuseAtem { continue; }
             tags.push(match syntax {
                 ToolSyntax::KimiXtml => json!({"type":"tag",
                     "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
@@ -95,12 +99,19 @@ impl ToolConstraints {
                 ToolSyntax::QwenXml => json!({"type":"tag", "begin":format!("<tool_call>\n<function={}>\n", tool.name),
                     "content":{"type":"json_schema", "json_schema":schema, "style":"qwen_xml", "any_order":false},
                     "end":"\n</function>\n</tool_call>"}),
+                ToolSyntax::MuseAtem => unreachable!("skipped above"),
             });
         }
-        if !(assistance || strict_requested || required) {
+        // No native atem grammar: validation only; a constrained request is refused by the caller.
+        if !(assistance || strict_requested || required) || syntax == ToolSyntax::MuseAtem {
+            if syntax == ToolSyntax::MuseAtem && (assistance || strict_requested || required) {
+                anyhow::bail!("Muse Spark serves without native decoding constraints: strict or required tool \
+                    calls and tool_decoding_assistance are not supported");
+            }
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            ToolSyntax::MuseAtem => unreachable!("returned above"),
             ToolSyntax::KimiXtml => {
                 let calls = json!({"type":"tag", "begin":"<|open|>tools<|sep|>",
                     "content":{"type":"tags_with_separator", "tags":tags, "separator":"",
