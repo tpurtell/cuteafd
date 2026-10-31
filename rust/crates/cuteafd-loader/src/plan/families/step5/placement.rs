@@ -29,7 +29,13 @@ pub(super) fn layout(
     let coordinators = if nvfp4 { 1 } else { 2 };
     let spark_ranks = requested.spark_ranks();
     let format = if nvfp4 { "nvfp4" } else { "fp8" };
-    let worlds = cuteafd_core::tp_units::spark_package_worlds("step5", format);
+    // A frozen format admits only its shipped worlds (NVFP4: 1 RTX + 4), not
+    // every world its Spark package once covered.
+    let worlds = cuteafd_core::tp_units::frozen_admitted_worlds("step5", format)
+        .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
+    if let Some(refusal) = crate::plan::experts::frozen_refusal(&format!("step5:{format}"), spark_ranks) {
+        anyhow::bail!("Step-5 layout is unqualified: {refusal}");
+    }
     crate::plan::experts::spark_recipe(&format!("step5:{format}"), 1536, spark_ranks)?;
     ensure!(
         nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
