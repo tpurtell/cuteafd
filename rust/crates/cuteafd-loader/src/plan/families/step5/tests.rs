@@ -1336,3 +1336,163 @@ fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
         }
     }
 }
+
+/// The published K4 + Core-K6 recipe as a header-only snapshot
+/// (`quantization/step5/core_k6/recipe.py`): target attention/FFN/lm_head K6,
+/// routed experts per expert K4 (3-87) and K6 (88-90), MTP dense and stage
+/// heads K4, native tensors otherwise. One shard per layer, sparse payloads.
+pub(super) fn exl3_snapshot() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut config, tensors) = fixture("bf16");
+    let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
+        "bits": 4.0, "core_bits": 6.0, "mtp_bits": 4.0, "head_bits": 6.0, "codebook": "mcg",
+        "mcg_multiplier": 0xCBAC1FEDu64, "out_scales": "auto", "expert_bits": 4.0,
+        "expert_bits_by_layer": {"88": 6.0, "89": 6.0, "90": 6.0},
+        "per_module_metadata": "quantize_config.json:tensor_storage"});
+    config["quantization_config"] = declaration.clone();
+    let core = |name: &str| -> Option<usize> {
+        if name == "lm_head.weight" { return Some(6); }
+        let rest = name.strip_prefix("model.layers.")?;
+        let (layer, leaf) = rest.split_once('.')?;
+        let layer: usize = layer.parse().ok()?;
+        let quantized = matches!(leaf, "self_attn.q_proj.weight" | "self_attn.k_proj.weight"
+            | "self_attn.v_proj.weight" | "self_attn.o_proj.weight")
+            || leaf.starts_with("share_expert.") || leaf.starts_with("mlp.")
+            || leaf == "eh_proj.weight" || leaf == "transformer.shared_head.output.weight";
+        quantized.then_some(if layer >= 92 { 4 } else { 6 })
+    };
+    let mut out: Vec<FixtureTensor> = Vec::new();
+    let mut storage = serde_json::Map::new();
+    let mut module = |out: &mut Vec<FixtureTensor>, stem: &str, n: usize, k: usize, bits: usize| {
+        out.extend(testing::exl3(stem, n, k, bits));
+        storage.insert(stem.to_owned(), serde_json::json!({"quant_format": "exl3", "bits_per_weight": bits,
+            "mcg_multiplier": 0xCBAC1FEDu64, "in_features": k, "out_features": n, "stored_out_features": n,
+            "stored_tensors": {
+                format!("{stem}.trellis"): {"shape": [k / 16, n / 16, 16 * bits], "torch_dtype": "int16"},
+                format!("{stem}.suh"): {"shape": [k], "torch_dtype": "float16"},
+                format!("{stem}.svh"): {"shape": [n], "torch_dtype": "float16"},
+                format!("{stem}.mcg"): {"shape": [], "torch_dtype": "int32"}}}));
+    };
+    for (name, dtype, shape) in tensors {
+        if let Some(stem) = name.strip_suffix(".weight").filter(|_| shape.len() == 3 && name.contains(".moe.")) {
+            let layer: usize = stem.split('.').nth(2).unwrap().parse().unwrap();
+            let bits = if layer >= 88 { 6 } else { 4 };
+            let (base, proj) = stem.rsplit_once('.').unwrap();
+            for expert in 0..shape[0] {
+                module(&mut out, &format!("{base}.experts.{expert}.{proj}"), shape[1], shape[2], bits);
+            }
+        } else if let Some(bits) = core(&name) {
+            module(&mut out, name.strip_suffix(".weight").unwrap(), shape[0], shape[1], bits);
+        } else {
+            out.push((name, dtype, shape));
+        }
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<FixtureTensor>>::new();
+    for tensor in out {
+        let shard = tensor.0.strip_prefix("model.layers.").and_then(|r| r.split('.').next())
+            .and_then(|l| l.parse::<usize>().ok()).map_or(96, |l| l + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("model-{index:05}-of-00096.safetensors");
+        testing::write_safetensors(&dir.path().join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    std::fs::write(dir.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    std::fs::write(dir.path().join("model.safetensors.index.json"),
+        serde_json::to_vec(&serde_json::json!({"weight_map": weight_map})).unwrap()).unwrap();
+    let mut manifest = declaration.as_object().unwrap().clone();
+    for (key, value) in [("method", Value::from("exl3")), ("group_size", Value::from(-1)),
+        ("desc_act", Value::from(false)), ("sym", Value::from(true)), ("lm_head", Value::from(true)),
+        ("tensor_storage", Value::Object(storage)), ("kept_tensors", serde_json::json!({})),
+        ("module_include", serde_json::json!([])), ("calibration", serde_json::json!({})),
+        ("meta", serde_json::json!({}))] {
+        manifest.insert(key.into(), value);
+    }
+    std::fs::write(dir.path().join("quantize_config.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    dir
+}
+
+#[test]
+fn exl3_recipe_headers_classify_core_routed_mtp_and_kept_tensors() -> anyhow::Result<()> {
+    let fixture = exl3_snapshot();
+    let check = |path: &std::path::Path| -> anyhow::Result<()> {
+        let started = std::time::Instant::now();
+        let cp = Checkpoint::inventory(path)?;
+        let model = Model::open(&cp)?;
+        assert!(model.is_exl3());
+        // 92 target layers x 7 + lm_head = 645 K6; 3 stages x (7 + eh + head) = 27 K4.
+        let (k6, k4): (Vec<_>, Vec<_>) = model.core.projections.values().partition(|p| p.bits == 6);
+        assert_eq!((k6.len(), k4.len()), (645, 27));
+        assert!(k4.iter().all(|p| p.stem.starts_with("model.layers.9") && ["92", "93", "94"]
+            .contains(&p.stem.split('.').nth(2).unwrap())));
+        assert_eq!(model.core.get("model.layers.92.transformer.shared_head.output").unwrap().bits, 4);
+        assert_eq!(model.core.get("lm_head").unwrap().bits, 6);
+        assert_eq!(model.core.get("model.layers.91.mlp.down_proj").unwrap().bits, 6);
+        assert!(model.core.get("model.layers.7.self_attn.g_proj").is_none());
+        assert_eq!(model.expert_bits.len(), 88);
+        assert!(model.expert_bits.iter().all(|(&l, &b)| b == if l >= 88 { 6 } else { 4 }));
+        assert_eq!(model.exl3_tiers(), Some(vec![4, 6]));
+        assert_eq!(model.exl3_package().as_deref(), Some("exl3-k46"));
+        assert!(model.formats.iter().any(|f| f == "exl3-k4") && model.formats.iter().any(|f| f == "exl3-k6"));
+        // Native: indexer F32 W, head-wise gate BF16, router + bias, vision.
+        for (name, dtype) in [("model.layers.3.self_attn.sparse_indexer_w.weight", DType::F32),
+            ("model.layers.3.self_attn.g_proj.weight", DType::Bf16), ("model.layers.3.moe.gate.weight", DType::Bf16),
+            ("model.layers.3.moe.router_bias", DType::F32), ("vision_model.conv1.weight", DType::Bf16)] {
+            assert_eq!(model.tensors[name].dtype, dtype, "{name}");
+        }
+        eprintln!("Step-5 EXL3 inventory: {} ms", started.elapsed().as_millis());
+        Ok(())
+    };
+    check(fixture.path())?;
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT") {
+        check(std::path::Path::new(&snapshot))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
+    let fixture = exl3_snapshot();
+    let report = plan::plan(fixture.path(), &PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(4), ..Default::default() }).unwrap();
+    for component in &report.components {
+        assert!(matches!(component.status, Status::Ready | Status::Disabled | Status::Unused),
+            "{:?}: {:?} {:?}", component.component, component.status, component.rejections);
+    }
+    let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
+    assert_eq!(routed.formats.keys().cloned().collect::<Vec<_>>(), ["exl3-k4", "exl3-k6"]);
+    assert_eq!(routed.tensors, 88 * 352 * 3 * 4);
+    let cp = Checkpoint::open(fixture.path()).unwrap();
+    for world in [2, 3, 4, 6] {
+        let recipe = crate::plan::experts::checkpoint_spark_recipe(&cp, world, &(3..91).collect::<Vec<_>>()).unwrap();
+        assert_eq!(recipe.widths, vec![1536 / world; world]);
+        assert_eq!(recipe.required_layouts, (0..world).map(|r| format!("tp{world}-rank{r}")).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
+    use crate::plan::checkpoint::CheckpointTensor;
+    let fixture = exl3_snapshot();
+    let mut cp = Checkpoint::inventory(fixture.path()).unwrap();
+    // A K5 core module disagrees with core_bits=6.
+    let stem = "model.layers.5.self_attn.q_proj";
+    let shard = cp.weight_map[&format!("{stem}.trellis")].clone();
+    let mut headers = crate::read_safetensors_metadata(&fixture.path().join(&shard)).unwrap();
+    let trellis = headers.iter_mut().find(|m| m.name == format!("{stem}.trellis")).unwrap();
+    trellis.shape[2] = 80;
+    trellis.byte_length = trellis.byte_length / 6 * 5;
+    cp.tensors.extend(headers.into_iter().filter(|m| m.name.starts_with(stem))
+        .map(|meta| CheckpointTensor { shard: shard.clone(), meta }));
+    cp.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+    let error = format!("{:#}", Model::open(&cp).err().unwrap());
+    assert!(error.contains("core requires K6, found K5"), "{error}");
+    // A routed layer declared K6 but stored K4 fails against the declaration.
+    let mut config: Value = serde_json::from_slice(&std::fs::read(fixture.path().join("config.json")).unwrap()).unwrap();
+    config["quantization_config"]["expert_bits_by_layer"]["87"] = serde_json::json!(6.0);
+    std::fs::write(fixture.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let error = format!("{:#}", Model::open(&Checkpoint::inventory(fixture.path()).unwrap()).err().unwrap());
+    assert!(error.contains("model.layers.87") && error.contains("K4"), "{error}");
+}
