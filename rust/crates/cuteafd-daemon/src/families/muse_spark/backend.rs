@@ -46,21 +46,23 @@ pub(crate) struct MuseBackend<'r, 'a> {
     context: usize,
     pages: usize,
     ring_rows: usize,
-    /// Per layer: experts on the RTXs (onboarded).
-    onboarded: Vec<bool>,
+    /// Each rank's onboarded experts (empty: every layer on the Sparks).
+    local: RefCell<Vec<super::onboard::OnboardedExperts<'a>>>,
 }
 
 impl<'r, 'a> MuseBackend<'r, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(cfg: &'r MuseSparkConfig, ranks: &'r [RankResources<'a>], streams: Vec<*mut c_void>,
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
-        unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize, onboarded: Vec<bool>) -> Result<Self> {
+        unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
+        local: Vec<super::onboard::OnboardedExperts<'a>>) -> Result<Self> {
         ensure!(!ranks.is_empty() && streams.len() == ranks.len() && (ranks.len() == 1) == peer.is_none()
-            && onboarded.len() == cfg.layers && table.vocab() == cfg.vocab_size && table.hidden() == cfg.hidden,
+            && (local.is_empty() || local.len() == ranks.len()) && table.vocab() == cfg.vocab_size && table.hidden() == cfg.hidden,
             "Muse backend geometry differs from its ranks, embedding or layers");
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), unit_rows, waves, slots, context, pages, ring_rows, onboarded })
+            profile: RefCell::new([0.0; 2]), unit_rows, waves, slots, context, pages, ring_rows,
+            local: RefCell::new(local) })
     }
 
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
@@ -85,7 +87,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
         let mut experts = self.experts.borrow_mut();
         let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &meta, false, wave,
-            &mut **experts, peers, 0..rows)?;
+            &mut **experts, peers, &mut self.local.borrow_mut(), 0..rows)?;
         Ok(self.logits(logits, rows))
     }
 }
@@ -155,10 +157,11 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
         let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
         let mut experts = self.experts.borrow_mut();
+        let mut local = self.local.borrow_mut();
         let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
             pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots };
         let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
-            call, &self.onboarded, units.len())?;
+            call, &mut local, units.len())?;
         crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
         let logits = hooks.logits.take();
         drop(hooks);

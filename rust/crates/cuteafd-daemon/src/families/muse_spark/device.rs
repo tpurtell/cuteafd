@@ -281,6 +281,12 @@ impl RankDevice<'_, '_> {
     /// (its half left, rank 1's right) and runs the centered norm (full rows) into
     /// `expert_input`. Only rank 0 holds the Spark link.
     fn moe_frontend_split(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange) -> Result<()> {
+        self.moe_frontend_halves(layer, rows, peer, false)
+    }
+
+    /// The split frontend; `both`: an onboarded layer, whose experts run on both
+    /// GPUs, so the halves are swapped and both assemble the full expert input.
+    fn moe_frontend_halves(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
         let lane = self.lane;
         let weights = self.weights(layer)?;
         let normed = lane.rows("normed", rows)?;
@@ -294,13 +300,17 @@ impl RankDevice<'_, '_> {
         let half_bytes = self.cfg.expert_hidden; // E/2 BF16 values
         let half = lane.rows("expert_half", rows)?;
         self.project(layer, "moe.pre_expert", rows, normed, half)?;
-        if self.rank == 1 { return peer.send(Channel::ExpertInput, half, rows, half_bytes, half_bytes); }
-        let received = peer.receive(Channel::ExpertInput, rows * half_bytes)?;
+        let received = if both { peer.swap(Channel::ExpertInput, half)? } else {
+            if self.rank == 1 { return peer.send(Channel::ExpertInput, half, rows, half_bytes, half_bytes); }
+            peer.receive(Channel::ExpertInput, rows * half_bytes)?
+        };
+        // Rank order: rank 0's half is the left columns on both GPUs.
+        let (left, right_half) = if self.rank == 0 { (half, received) } else { (received, half) };
         let staged = lane.rows("combined", rows)?;
         let full = 2 * half_bytes;
-        self.copy_rows(staged, full, half, half_bytes, half_bytes, rows)?;
+        self.copy_rows(staged, full, left, half_bytes, half_bytes, rows)?;
         let right = Buffer { ptr: staged.ptr.cast::<u8>().wrapping_add(half_bytes).cast(), ..staged };
-        self.copy_rows(right, full, received, half_bytes, half_bytes, rows)?;
+        self.copy_rows(right, full, right_half, half_bytes, half_bytes, rows)?;
         self.norm(layer, "pre_expert_norm", Some("moe.pre_expert_norm"), rows, staged, lane.rows("expert_input", rows)?)
     }
 
@@ -327,10 +337,23 @@ impl RankDevice<'_, '_> {
     /// half into `expert_half`; each rank's half core is swapped and reduced in
     /// rank order into `moe` on both.
     fn moe_backend_split(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange) -> Result<()> {
+        self.moe_backend_halves(layer, rows, peer, false)
+    }
+
+    /// The K-split backend; `both`: an onboarded layer, where both ranks
+    /// combined the full rows, so each packs its own half locally (no
+    /// `Combined` exchange).
+    fn moe_backend_halves(&self, layer: usize, rows: usize, peer: &mut dyn PeerExchange, both: bool) -> Result<()> {
         let lane = self.lane;
         let half_bytes = self.cfg.expert_hidden;
         let full = 2 * half_bytes;
-        let input = if self.rank == 0 {
+        let input = if both {
+            let combined = lane.rows("combined", rows)?;
+            let own = Buffer { ptr: combined.ptr.cast::<u8>().wrapping_add(self.rank * half_bytes).cast(), ..combined };
+            let half = lane.rows("expert_half", rows)?;
+            self.copy_rows(half, half_bytes, own, full, half_bytes, rows)?;
+            half
+        } else if self.rank == 0 {
             let combined = lane.rows("combined", rows)?;
             let right = Buffer { ptr: combined.ptr.cast::<u8>().wrapping_add(half_bytes).cast(), ..combined };
             peer.send(Channel::Combined, right, rows, half_bytes, full)?;
@@ -417,6 +440,62 @@ impl RankDevice<'_, '_> {
         }
     }
 
+    /// An onboarded layer (its experts on the RTXs), whole within one hook: the
+    /// front half up to the frontend (halves swapped on a pair), the wire, this
+    /// GPU's partials (`Exl3Tp2::enqueue_partials`, all rows BF16), the
+    /// partials swap on a pair, the combine with ranks 2 (own, peer in rank
+    /// order) or 1, then the back half.
+    pub(crate) fn layer_local(&self, layer: usize, step: &StepPlanes, onboarded: &mut super::onboard::OnboardedExperts<'_>,
+        mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
+        let (rows, lane) = (step.rows, self.lane);
+        ensure!(onboarded.holds(layer), "Muse layer {layer} is not onboarded on rank {}", self.rank);
+        let (hidden, normed, residual) = (lane.rows("hidden", rows)?, lane.rows("normed", rows)?, lane.rows("residual", rows)?);
+        self.norm(layer, "input_norm", Some("norm.input"), rows, hidden, normed)?;
+        self.attention(layer, step, peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
+        let attended = lane.rows("attended", rows)?;
+        self.norm(layer, "post_attn_norm", None, rows, attended, normed)?;
+        self.residual_gate(layer, "attention", rows, hidden, normed, residual)?;
+        self.norm(layer, "pre_ffn_norm", Some("norm.pre_ffn"), rows, residual, normed)?;
+        match peer.as_mut() {
+            Some(peer) => self.moe_frontend_halves(layer, rows, &mut **peer, true)?,
+            None => self.moe_frontend(layer, rows)?,
+        }
+        self.expert_wire(rows)?;
+        let [ids, weights, wire] = self.wave_sources(rows)?;
+        // All rows BF16: the epilogue's BF16 row map is the identity prefix 0..rows, so its
+        // per-launch rewrite of the pinned map staging writes the bytes an in-flight copy
+        // already reads (no drain between layers is needed), and the combine's cached
+        // full-capacity tables (`tables_for`) serve every wave.
+        let plan = cuteafd_transport::PartialReplyPlan { wide: cuteafd_transport::PartialWire::Nvfp4, regions: vec![0; rows] };
+        let own = onboarded.own_rows(self.cfg, rows);
+        // SAFETY: the wire, routes and own plane are this GPU's, written on this stream before;
+        // the executor's sources are read by its epilogue on the same stream.
+        unsafe {
+            onboarded.executor.enqueue_partials(layer, rows, wire.ptr,
+                crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr },
+                &mut onboarded.epilogue, &plan, own, self.stream)?;
+        }
+        let planes: Vec<u64> = match peer.as_mut() {
+            Some(peer) => {
+                let received = peer.swap(Channel::Partials, own)?;
+                let (rank0, rank1) = if self.rank == 0 { (own, received) } else { (received, own) };
+                vec![rank0.ptr as u64, rank1.ptr as u64]
+            }
+            None => vec![own.ptr as u64],
+        };
+        onboarded.tables_for(self.library, &planes, self.stream)?;
+        let reply = cuteafd_loader::families::muse_spark::replies::ReplyPlan { bf16_rows: (0..rows as u32).collect(),
+            wide_rows: Vec::new(), wide: cuteafd_loader::families::muse_spark::replies::PartialFormat::Nvfp4 };
+        self.combine(layer, rows, planes.len(), onboarded.tables.buffer, onboarded.layout, &reply)?;
+        match peer {
+            Some(peer) => self.moe_backend_halves(layer, rows, peer, true)?,
+            None => self.moe_backend(layer, rows)?,
+        }
+        let moe = lane.rows("moe", rows)?;
+        self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
+        self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
+    }
+
     /// The wave's staging sources from this lane (the unit's slot views): route
     /// ids, route weights and the FP8 K32 wire.
     fn wave_sources(&self, rows: usize) -> Result<[Buffer; 3]> {
@@ -449,6 +528,32 @@ impl RankDevice<'_, '_> {
 mod tests {
     use super::*;
     use cuteafd_loader::families::muse_spark::lane::LanePlanes;
+
+    /// An onboarded layer runs the Spark layer's front half, then on the RTXs
+    /// the wire, this GPU's partials, the partials swap, the combine and the
+    /// backend with exactly the exchanges the TP2 slot model counts for a
+    /// `Local` step (`peer::hook_exchanges`): ExpertInput, Partials, Moe swaps,
+    /// never the one-way Spark-layer channels.
+    #[test]
+    fn onboarded_layer_order_and_exchanges() {
+        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
+        let body = |name: &str| source.split(&format!("fn {name}(")).nth(1).unwrap()
+            .split("\n    pub(crate) fn ").next().unwrap().split("\n    fn ").next().unwrap().to_string();
+        let local = body("layer_local");
+        let order = ["\"input_norm\"", "self.attention(", "\"pre_ffn_norm\"", "moe_frontend_halves(layer, rows, &mut **peer, true)",
+            "self.expert_wire(rows)", ".enqueue_partials(", "swap(Channel::Partials, own)", "tables_for(", "self.combine(",
+            "moe_backend_halves(layer, rows, peer, true)", "\"post_ffn_norm\"", "residual_gate(layer, \"ffn\""];
+        let at: Vec<usize> = order.iter().map(|needle| local.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+        assert!(local.contains("vec![rank0.ptr as u64, rank1.ptr as u64]") && local.contains("regions: vec![0; rows]"));
+        let front = body("moe_frontend_halves");
+        let swapped = front.split("if both {").nth(1).unwrap().split("} else {").next().unwrap();
+        assert!(swapped.contains("peer.swap(Channel::ExpertInput, half)"));
+        let back = body("moe_backend_halves");
+        let local_back = back.split("if both {").nth(1).unwrap().split("} else if self.rank == 0 {").next().unwrap();
+        assert!(!local_back.contains("Channel::Combined") && local_back.contains("self.rank * half_bytes"));
+        assert!(back.contains("self.k_split(Channel::Moe,"));
+    }
 
     /// Every plane a launch passes is at least its program operand's extent at
     /// the step's rows (rank heads under TP2): `[rows, ...]` operands by row bytes.

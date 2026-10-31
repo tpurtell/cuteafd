@@ -528,6 +528,28 @@ pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBu
     programs
 }
 
+/// The coordinator EXL3 capacity manifests Muse onboarding reads (rtx-tp1 and
+/// rtx-tp2 of `exl3-muse-k45`, F32 out) under `share/exl3`, beside a
+/// PROGRAMS.json the fixture writes too; returns that PROGRAMS.json.
+pub fn write_muse_exl3_capacities(dir: &Path) -> std::path::PathBuf {
+    let share = dir.join("share");
+    for (layout, intermediate) in [("rtx-tp1", 4096), ("rtx-tp2", 2048)] {
+        for capacity in crate::placement::inventory::exl3_capacities(4096) {
+            let path = share.join("exl3/exl3-muse-k45").join(format!("{layout}/m{capacity}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                "capacity": capacity, "hidden": 4096, "experts": 256, "intermediate": intermediate, "top_k": 8,
+                "bits": [4, 5], "output_dtype": "fp32", "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32},
+                "buffers": {"scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 4096 * 8,
+                    "zero_on_create": false}}
+            })).unwrap()).unwrap();
+        }
+    }
+    let programs = share.join("PROGRAMS.json");
+    if !programs.exists() { fs::write(&programs, b"{}").unwrap(); }
+    programs
+}
+
 /// Every Qwen routed expert of every layer as complete EXL3 projections at
 /// `bits`, a BF16 router per layer, and the storage map.
 pub fn qwen4_exl3(layers: usize, bits: usize) -> (Vec<Tensor>, Value) {

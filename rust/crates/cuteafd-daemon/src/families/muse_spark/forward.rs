@@ -67,10 +67,10 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
 pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: &[*mut c_void],
     table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], meta: &StepMetadata, prefill: bool,
     wave: super::experts::WaveStep,
-    experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>, head_rows: std::ops::Range<usize>)
-    -> Result<Buffer> {
-    ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len(),
-        "Muse step geometry");
+    experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
+    local: &mut [super::onboard::OnboardedExperts<'_>], head_rows: std::ops::Range<usize>) -> Result<Buffer> {
+    ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len()
+        && (local.is_empty() || local.len() == ranks.len()), "Muse step geometry");
     let planes: Vec<StepPlanes> = ranks.iter().zip(streams).map(|(rank, &stream)| {
         let bank = if prefill { 0 } else { rank.step.tables.decode_bank() };
         rank.device.run(|| rank.step.upload(rank.device.library, bank, meta, prefill, wave.clone(), stream))
@@ -80,6 +80,10 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
     for layer in 0..cfg.layers {
         for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {
             let peer = peers.get_mut(index).map(|end| &mut **end as &mut dyn PeerExchange);
+            if let Some(onboarded) = local.get_mut(index).filter(|onboarded| onboarded.holds(layer)) {
+                rank.device.run(|| rank.device(cfg, stream).layer_local(layer, &planes[index], onboarded, peer))?;
+                continue;
+            }
             let path = if index == 0 { experts.as_deref_mut() } else { None };
             rank.device.run(|| rank.device(cfg, stream).layer(layer, &planes[index], path, peer))?;
         }

@@ -50,6 +50,8 @@ pub(crate) struct Options<'a> {
     pub spark_budget_bytes: u64,
     pub partial_bf16_max_rows: usize,
     pub partial_wide_format: cuteafd_loader::families::muse_spark::replies::WideFormat,
+    /// The onboarding executor's workspace (`shared::local_workspace`).
+    pub local_workspace: Option<u64>,
 }
 
 /// Measured admission: the shared request with live baselines and the code the
@@ -75,13 +77,13 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
-        fixed, startup: Vec::new() })
+        local_workspace: options.local_workspace, fixed, startup: Vec::new() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cuteafd_loader::plan::{self, layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
+    use cuteafd_loader::plan::{layout::LayoutOptions, testing, ExpertPlacement, PlanOptions};
 
     fn manifest(gpus: usize) -> serde_json::Value {
         let programs = programs::required(gpus).unwrap().into_iter().map(|(name, _)| name)
@@ -150,7 +152,8 @@ mod tests {
                 pool_tokens: None, onboard: Onboard::Auto,
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                partial_wide_format: Default::default() })?;
+                partial_wide_format: Default::default(),
+                local_workspace: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)? })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
             assert!(live.pool_tokens > 0);
         }

@@ -19,6 +19,14 @@ fn with_layout(rtx: usize, ranks: usize) -> PlanOptions {
             host_cache_bytes: Some(0), ..Default::default() }), ..Default::default() }
 }
 
+/// [`with_layout`] with the coordinator EXL3 package installed beside the
+/// manifest (onboarding available, its executor workspace charged).
+fn with_package(rtx: usize, ranks: usize, dir: &std::path::Path) -> PlanOptions {
+    let mut options = with_layout(rtx, ranks);
+    options.layout.as_mut().unwrap().workspace_manifest = Some(testing::write_muse_exl3_capacities(dir));
+    options
+}
+
 #[test]
 fn detects_the_checkpoint_and_classifies_every_text_tensor() {
     let dir = snapshot(&[0]);
@@ -116,8 +124,9 @@ fn plan_matrix(column: usize) {
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let worlds = crate::plan::experts::spark_worlds(super::PACKAGE, 4096);
     assert_eq!(worlds, [2, 3, 4, 5, 6, 7, 8], "range data for muse:exl3-k45");
+    let package = tempfile::tempdir().unwrap();
     for (rtx, ranks) in worlds.iter().map(|&ranks| (column, ranks)) {
-        let report = input.plan(&with_layout(rtx, ranks)).unwrap();
+        let report = input.plan(&with_package(rtx, ranks, package.path())).unwrap();
         eprintln!("muse {rtx} RTX + {ranks} Sparks: fits {} onboard {:?} pool {:?} hints {:?}", report.fits,
             report.onboard_layers, report.memory_layout.as_ref().map(|m| m.pool_tokens),
             report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
@@ -193,4 +202,35 @@ fn fused_bf16_experts_name_the_publication_to_serve() {
     let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
     assert!(routed.rejected > 0);
     assert!(report.hints.iter().any(|h| h.what.contains("EXL3 publication")), "{:?}", report.hints);
+}
+
+/// Onboarding needs the coordinator EXL3 package: without it automatic
+/// placement keeps every layer on the Sparks and an explicit count is refused;
+/// with it, a pair's TP2 workspace charges the package's executor workspace
+/// beside the partial planes.
+#[test]
+fn onboarding_follows_the_installed_package() {
+    let dir = snapshot(&all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut auto = with_layout(2, 6);
+    auto.layout.as_mut().unwrap().host_cache_bytes = None;
+    let report = input.plan(&auto).unwrap();
+    assert_eq!(report.onboard_layers, Some(0), "{:?}", report.hints);
+    let mut explicit = auto.clone();
+    explicit.layout.as_mut().unwrap().onboard = Some(crate::placement::Onboard::Layers(2));
+    let refused = input.plan(&explicit).unwrap();
+    assert!(refused.hints.iter().any(|h| h.what.contains("needs the coordinator EXL3 package")), "{:?}", refused.hints);
+    let package = tempfile::tempdir().unwrap();
+    let manifest = testing::write_muse_exl3_capacities(package.path());
+    let mut installed = auto.clone();
+    installed.layout.as_mut().unwrap().workspace_manifest = Some(manifest.clone());
+    let report = input.plan(&installed).unwrap();
+    assert!(report.onboard_layers.is_some_and(|n| n > 0), "{:?}", report.hints);
+    let catalog = input.expert_catalog().unwrap();
+    let (_, workspace) = crate::placement::families::muse_spark::local_package(catalog, &manifest, 2, 2752).unwrap();
+    let placed = report.solver_placement.as_ref().unwrap();
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+    let partials = crate::placement::families::muse_spark::tp2_partial_bytes(&cfg, 2752) as u64;
+    let tp2 = placed.tp2.as_ref().unwrap();
+    assert!(tp2.peak_bytes.iter().all(|&bytes| bytes >= partials + workspace), "{:?} vs {}", tp2.peak_bytes, partials + workspace);
 }

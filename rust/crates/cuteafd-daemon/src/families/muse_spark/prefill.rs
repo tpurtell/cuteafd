@@ -11,7 +11,7 @@
 //! back half; `end_unit` scores the call's last row on the head rank when the
 //! unit holds it; `commit_unit` has nothing to publish (K|V records and ring
 //! rows were written by the layers; the caller commits the frontier).
-//! Onboarded layers (RTX experts, `FfnRoute::Local`) run in `local_ffn`.
+//! Onboarded layers (RTX experts, `FfnRoute::Local`) run whole in `local_ffn`.
 use super::{device::{PeerExchange, StepPlanes}, engine::RankResources, experts::{SparkExperts, Wave, WaveSegment, WaveStep},
     lane::LaneViews, step::{StepMetadata, StepSequence}};
 use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit};
@@ -42,8 +42,8 @@ pub(crate) struct MusePrefill<'h, 'r, 'a> {
     pub experts: &'h mut dyn SparkExperts,
     pub peers: Vec<&'h mut dyn PeerExchange>,
     pub call: PrefillCall<'h>,
-    /// Layers whose experts run on the RTXs (onboarded).
-    pub onboarded: &'h [bool],
+    /// Each rank's onboarded experts (empty: every layer on the Sparks).
+    pub local: &'h mut [super::onboard::OnboardedExperts<'a>],
     units: Vec<Option<UnitState>>,
     /// The call's last row's logits (set by the unit holding it).
     pub logits: Option<Buffer>,
@@ -53,10 +53,11 @@ impl<'h, 'r, 'a> MusePrefill<'h, 'r, 'a> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(cfg: &'h MuseSparkConfig, ranks: &'r [RankResources<'a>], streams: Vec<*mut c_void>,
         table: &'h crate::shared::token_io::TokenEmbedding<'a>, experts: &'h mut dyn SparkExperts,
-        peers: Vec<&'h mut dyn PeerExchange>, call: PrefillCall<'h>, onboarded: &'h [bool], units: usize) -> Result<Self> {
-        ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && onboarded.len() == cfg.layers,
-            "Muse prefill geometry");
-        Ok(Self { cfg, ranks, streams, table, experts, peers, call, onboarded, units: (0..units).map(|_| None).collect(),
+        peers: Vec<&'h mut dyn PeerExchange>, call: PrefillCall<'h>, local: &'h mut [super::onboard::OnboardedExperts<'a>],
+        units: usize) -> Result<Self> {
+        ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2)
+            && (local.is_empty() || local.len() == ranks.len()), "Muse prefill geometry");
+        Ok(Self { cfg, ranks, streams, table, experts, peers, call, local, units: (0..units).map(|_| None).collect(),
             logits: None })
     }
 
@@ -90,7 +91,7 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
     type Ticket = ();
 
     fn route(&self, layer: usize) -> FfnRoute {
-        if self.onboarded[layer] { FfnRoute::Local } else { FfnRoute::Spark }
+        if self.local.first().is_some_and(|local| local.holds(layer)) { FfnRoute::Local } else { FfnRoute::Spark }
     }
 
     fn begin_unit(&mut self, unit: &Unit) -> Result<()> {
@@ -123,8 +124,21 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
         Ok(())
     }
 
+    /// An onboarded layer whole (`RankDevice::layer_local`) on every rank in
+    /// rank order: its attention hook was a no-op like a Spark layer's.
     fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        anyhow::bail!("Muse onboarded layer {layer} (unit {}) needs the RTX expert path, not built yet", unit.index)
+        let (cfg, ranks) = (self.cfg, self.ranks);
+        let state = self.units.get_mut(unit.index).and_then(Option::as_mut).context("Muse prefill unit not begun")?;
+        for (index, rank) in ranks.iter().enumerate() {
+            let device = rank.device_with(cfg, self.streams[index], &state.lanes[index]);
+            let peer: Option<&mut (dyn PeerExchange + '_)> = match self.peers.get_mut(index) {
+                Some(end) => Some(&mut **end),
+                None => None,
+            };
+            let local = self.local.get_mut(index).context("Muse onboarded layer without the rank's experts")?;
+            rank.device.run(|| device.layer_local(layer, &state.planes[index], local, peer))?;
+        }
+        Ok(())
     }
 
     fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<()> {

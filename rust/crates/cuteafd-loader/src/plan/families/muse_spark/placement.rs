@@ -82,6 +82,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
         partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
         partial_wide_format: Default::default(),
+        local_workspace: match crate::placement::families::muse_spark::local_workspace(catalog,
+            opts.workspace_manifest.as_deref().filter(|path| path.is_file()), gpus, prefill.unit_rows) {
+            Ok(workspace) => workspace,
+            Err(error) => {
+                refusal(report, format!("Muse coordinator EXL3 package refused: {error:#}"), "Install the matching package.");
+                return memory;
+            }
+        },
         fixed: match planned_code(opts, gpus) {
             Ok(fixed) => fixed,
             Err(error) => {
