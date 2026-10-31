@@ -6272,3 +6272,16 @@ first affected producer/input and its descendants before invalidation; never
 blindly delete cached work or resume across changed numerical identities.
 The independent completed-export reload and native-byte audit precedes upload
 to `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6`.
+
+The short pilot finished successfully at 2026-10-31 17:07 UTC (about
+16.6 minutes including admission). All four native/staged proofs pass,
+including the long sliding-window cutoff. Worst selected K6 heldout NMSE
+is 0.000294125 (last-layer pre-expert projection); its K5 arm is 0.00109192,
+which supports retaining K6. Padded-head K6 NMSE is 0.0000478371. Worst
+sampled K4 expert NMSE is 0.00542748, below the 0.01 bar. The accepted
+recipe is unchanged. Report: `~/Developer/muse-spark-core-quant.md`; full
+per-module errors: `muse-quant-work/per-module-error.csv`. Issue #940 and
+draft PR #939 track continuation. Full production with authorized automatic
+CPU publication launched under `muse-quant-1793466485064710216`; numerical
+producer inputs remain frozen. Native/checkpoint artifact validation still
+precedes publication; engine serving qualification is separate.
