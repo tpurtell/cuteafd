@@ -450,6 +450,93 @@ impl<'a> GlmEngine<'a> {
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("query", query)], &[row])
     }
 
+    /// Mistral Large 4's K6 producer: the direct query `wq(x)` scaled per head
+    /// (RoPE on RoPE layers, the rotated tail written into the absorbed query),
+    /// its nope part absorbed through W_UK; on latent owners `wkv_a(x)` cropped
+    /// from its padded store and packed into the layer's FP8 record.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ml4_core_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>,
+        rows: usize, cap: &str, kv: Buffer) -> Result<()> {
+        let scratch = self.core_scratch(w)?;
+        let programs = self.core_programs(rank)?;
+        let (q, qkv) = (scratch.stage("q")?, scratch.stage("qkv")?);
+        let stream = self.stream_of(rank);
+        let rope = self.cfg.rope(index);
+        let tag = if rope { "" } else { "_nope" };
+        let row = Scalar::I32(rows as i32);
+        let (_, _, cos_sin) = self.rank_caches(rank, 0);
+        let query = w.query.buffer.ptr;
+        self.core_linear(rank, w, layer, "q_b", w.x.buffer, q, rows, None)?;
+        self.run_on(rank, &format!("ml4_query_scale{}_{cap}", if rope { "_rope" } else { "" }), &[("q", q.ptr),
+            ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
+            ("s", layer.ptr("query_scale_s")?), ("b", layer.ptr("query_scale_b")?), ("query", query)], &[row])?;
+        self.run_on(rank, &format!("ml4_absorb{tag}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
+            ("out", query)], &[row])?;
+        if layer.core.contains_key("kv_a") {
+            let width = self.cfg.kv_lora_rank + if rope { self.cfg.qk_rope_head_dim } else { 0 };
+            let stored = layer.core["kv_a"].shape[0];
+            self.core_linear(rank, w, layer, "kv_a", w.x.buffer, q, rows, None)?;
+            let (source_pitch, destination_pitch, bytes, _) = super::super::core_runtime::pack_layout(
+                rows, stored, width, width, 0)?;
+            // SAFETY: the complete stored-N output transform precedes this crop
+            // into the packed `[rows, width]` kv rows, rank-local and disjoint.
+            self.on(rank, || unsafe { programs.copy.launch_rows(qkv, q, bytes, rows,
+                destination_pitch, source_pitch, stream) })?;
+            self.run_on(rank, &format!("ml4_rank_pack{tag}_{cap}"), &[("kv", qkv.ptr),
+                ("kv_a_norm", layer.ptr("kv_a_norm")?), ("positions", w.positions.buffer.ptr),
+                ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("cache", kv.ptr)], &[row])?;
+        }
+        Ok(())
+    }
+
+    /// Mistral Large 4's index producer: `wq_b(LayerNorm(x))` scaled per index
+    /// head, `[wk(x) | weights_proj(x)]`, then the shared epilogue (RoPE skipped
+    /// on NoPE layers) into the index cache, the FP8 query and head weights.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ml4_core_index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>,
+        rows: usize, cap: &str, index_cache: Buffer) -> Result<()> {
+        let s = self.native_scratch(rank, w)?;
+        let row = Scalar::I32(rows as i32);
+        let (_, _, cos_sin) = self.rank_caches(rank, 0);
+        let rope = self.cfg.rope(index);
+        // LayerNorm(x) into the q stage, then wq_b over it.
+        let normed = self.core_scratch(w)?.stage("q")?;
+        self.run_on(rank, &format!("ml4_index_layer_norm_{cap}"), &[("x", w.x.buffer.ptr),
+            ("weight", layer.ptr("index_q_norm_w")?), ("bias", layer.ptr("index_q_norm_b")?),
+            ("out", normed.ptr)], &[row])?;
+        let n = match self.native_linear(rank, w, layer, "index_q", normed, rows, s.iq.buffer, false)? {
+            NativeOut::F32 { n } => { self.native_narrow(rank, w, rows, n, s.iq.buffer)?; n }
+            NativeOut::Bf16 { n } => n,
+        };
+        ensure!(n == self.cfg.index_heads * self.cfg.index_head_dim, "Mistral Large 4 index query width");
+        self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", s.iq.buffer.ptr),
+            ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
+            ("s", layer.ptr("index_scale_s")?), ("b", layer.ptr("index_scale_b")?),
+            ("query", s.iq.buffer.ptr)], &[row])?;
+        let x = head(w.x.buffer, rows * self.cfg.hidden * 2)?;
+        let programs = self.native_programs(rank)?;
+        let stream = self.stream_of(rank);
+        // [wk | weights_proj](x), BF16 [rows, 128 + I].
+        // SAFETY: x holds rows x hidden BF16; w_ik the concatenated BF16 rows; kw rows x (128 + I).
+        self.on(rank, || unsafe { programs.companion("exlr8_dense_bf16_index_weights")?
+            .launch(&[x.ptr, layer.ptr("w_ik")?, s.kw.buffer.ptr], rows as u32, 0, stream)
+            .map_err(anyhow::Error::from) })?;
+        self.run_on(rank, &format!("ml4_index_post{}_{cap}", if rope { "" } else { "_nope" }), &[
+            ("iq", s.iq.buffer.ptr), ("kw", s.kw.buffer.ptr), ("positions", w.positions.buffer.ptr),
+            ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("k_weight", layer.ptr("k_norm_w")?),
+            ("k_bias", layer.ptr("k_norm_b")?), ("q_fp8", w.q_fp8.buffer.ptr),
+            ("head_weights", w.head_weights.buffer.ptr), ("cache", index_cache.ptr)], &[row])
+    }
+
+    pub(super) fn ml4_core_o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
+        cap: &str) -> Result<()> {
+        let values = self.core_scratch(w)?.stage("values")?;
+        self.run_on(rank, &format!("ml4_values_{cap}"), &[("a", w.attn.buffer.ptr),
+            ("w", layer.ptr("w_uv")?), ("out", values.ptr)], &[Scalar::I32(rows as i32)])?;
+        self.core_linear(rank, w, layer, "o", values, w.delta.buffer, rows,
+            w.core_rows.as_ref().map(|rows| rows[0].buffer))
+    }
+
     pub(super) fn core_o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
         cap: &str) -> Result<()> {
         let values = self.core_scratch(w)?.stage("values")?;

@@ -57,6 +57,9 @@ impl CoreStageLayout {
         let intermediate = cfg.dense_intermediate.max(cfg.moe_intermediate * cfg.shared_experts) / ranks;
         let bf16 = |width: usize| rows.checked_mul(width).and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("GLM K6 stage extent overflow"));
+        // `qkv`: the packed [q_a | kv_a] rows (direct-query variants: kv_a alone);
+        // `q`: the widest K6 output staged before its crop/pack (q_b or the
+        // direct query, q_a, or the padded kv_a).
         Ok(Self { extents: BTreeMap::from([
             ("qkv", bf16(cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim)?),
             ("q", bf16((heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim))
@@ -193,7 +196,28 @@ impl CoreCharges {
                 for name in policy_programs(weight, manifest)? { programs.insert(name); }
             }
         }
-        if bodies.iter().any(|body| !body.is_empty()) {
+        if bodies.iter().any(|body| !body.is_empty()) && cfg.variant.ml4().is_some() {
+            // Mistral Large 4's attention stages (export_b12x_dsv4_aot --geometry ml4).
+            let entries = manifest["programs"].as_array().context("Mistral Large 4 stage program inventory")?;
+            for cap in ["m64", "m4096"] {
+                let mut names = vec![format!("ml4_values_{cap}"), format!("ml4_index_query_scale_{cap}"),
+                    format!("ml4_index_layer_norm_{cap}")];
+                for tag in ["", "_nope"] {
+                    for stage in ["query_scale", "rank_pack", "absorb", "index_post"] {
+                        names.push(format!("ml4_{stage}{tag}_{cap}"));
+                    }
+                }
+                for name in names {
+                    ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");
+                    programs.insert(name);
+                }
+            }
+            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                let name = format!("ml4_swiglu_i{inter}");
+                ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");
+                programs.insert(name);
+            }
+        } else if bodies.iter().any(|body| !body.is_empty()) {
             let entries = manifest["programs"].as_array().context("GLM K6 stage program inventory")?;
             for prefix in if owners.is_some() { vec!["glm", "glm2"] }
                 else if ranks == 2 { vec!["glm2"] } else { vec!["glm"] } {

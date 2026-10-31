@@ -2493,6 +2493,9 @@ impl<'a> GlmEngine<'a> {
         index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let heads = self.cfg.heads / if layer.attention_split { 2 } else { 1 };
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_attention_over(rank, w, index, layer, rows, cap, tables, kv, index_cache);
+        }
         self.producer(rank, w, layer, rows, cap, kv, w.query.buffer.ptr)?;
         if let Some(index_cache) = index_cache {
             self.index_producer(rank, w, layer, rows, cap, index_cache)?;
@@ -2534,8 +2537,49 @@ impl<'a> GlmEngine<'a> {
         self.o_proj(rank, w, layer, cap, rows)
     }
 
+    /// Mistral Large 4's attention (`GlmVariant::MistralLarge4`) on the shared
+    /// GLM structure: the direct-query K6 producer (query scale, absorb) and,
+    /// on latent owners, the record of `wkv_a`; the indexer from LayerNorm(x)
+    /// with its query scale and the shared top-k; sparse MLA on the layer's
+    /// record contract (656-byte RoPE, 528-byte NoPE) at 128^-0.5; W_UV and wo.
+    /// Latent-sharing layers read their source layer's pages (`kv`).
+    #[allow(clippy::too_many_arguments)]
+    fn ml4_attention_over(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
+        cap: &str, tables: &StepTables, kv: cuteafd_ffi::CuteafdDeviceBuffer,
+        index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
+        let mode = if tables.decode { "decode" } else { "prefill" };
+        let rope = self.cfg.rope(index);
+        self.ml4_core_producer(rank, w, index, layer, scalar_rows(rows)?, cap, kv)?;
+        if let Some(index_cache) = index_cache {
+            self.ml4_core_index_producer(rank, w, index, layer, scalar_rows(rows)?, cap, index_cache)?;
+            self.run_on(rank, &format!("ml4_index_topk_{mode}_{cap}"), &[
+                ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
+                ("index_k_cache", index_cache.ptr), ("page_table", w.page_table.buffer.ptr),
+                ("cache_lengths", w.cache_lengths.buffer.ptr), ("output_indices", w.indices.buffer.ptr),
+                ("scratch", w.topk_scratch.buffer.ptr)],
+                &[rows, Scalar::I32(tables.table_width as i32), Scalar::I32(tables.table_stride as i32)])?;
+        }
+        let decode_scalars = [rows, Scalar::I32(self.attention_plan.rows() as i32)];
+        let prefill_scalars = [rows];
+        let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
+        let tag = if rope { "" } else { "_nope" };
+        self.run_on(rank, &format!("ml4_sparse_mla{tag}_{mode}_{cap}"), &[
+            ("q", w.query.buffer.ptr), ("kv_cache", kv.ptr), ("indices", w.indices.buffer.ptr),
+            ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
+            scalars)?;
+        self.ml4_core_o_proj(rank, w, layer, scalar_rows(rows)?, cap)
+    }
+
     /// Rank `rank`'s latent and (full-indexer layers) index-key pools of layer `index`, and its RoPE table.
+    /// A latent-sharing layer (`kv_source(index) != index`) reads its source layer's latent pool.
     fn rank_caches(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
+        let latent = self.cfg.kv_source(index);
+        let (kv, index_pool, cos_sin) = self.rank_caches_of(rank, index);
+        if latent == index { return (kv, index_pool, cos_sin); }
+        (self.rank_caches_of(rank, latent).0, index_pool, cos_sin)
+    }
+
+    fn rank_caches_of(&self, rank: usize, index: usize) -> (&Dev<'a>, Option<&Dev<'a>>, &Dev<'a>) {
         match (rank, &self.peer) {
             (1, Some(peer)) => (&peer.kv[index], peer.index[index].as_ref(), &peer.cos_sin),
             _ => (&self.kv[index], self.index[index].as_ref(), &self.cos_sin),

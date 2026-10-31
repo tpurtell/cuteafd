@@ -557,7 +557,8 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(rope_g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(rope_g)),
     ]
-    for inter in sorted({g.dense_inter, g.moe_inter}):
+    # Whole and two-GPU (intermediate-split) widths of the dense layer and shared expert.
+    for inter in sorted({g.dense_inter, g.moe_inter, g.dense_inter // 2, g.moe_inter // 2}):
         out.append((f"swiglu_i{inter}", "swiglu_split", {"inter": inter},
                     lambda i=inter: compile_swiglu_split_aot(inter=i)))
     for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
