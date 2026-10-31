@@ -33,10 +33,12 @@ pub(super) fn layout(
     // every world its Spark package once covered.
     let worlds = cuteafd_core::tp_units::frozen_admitted_worlds("step5", format)
         .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
+    // The recipe names an impossible Spark count first; a valid count a
+    // frozen format never shipped on refuses with its deprecation.
+    crate::plan::experts::spark_recipe(&format!("step5:{format}"), 1536, spark_ranks)?;
     if let Some(refusal) = crate::plan::experts::frozen_refusal(&format!("step5:{format}"), spark_ranks) {
         anyhow::bail!("Step-5 layout is unqualified: {refusal}");
     }
-    crate::plan::experts::spark_recipe(&format!("step5:{format}"), 1536, spark_ranks)?;
     ensure!(
         nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
         Unqualified("BF16 target format")
