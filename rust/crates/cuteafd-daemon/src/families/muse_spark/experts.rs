@@ -69,6 +69,48 @@ pub(crate) fn combine_launches(plan: &cuteafd_loader::families::muse_spark::repl
         .into_iter().filter(|(_, rows)| *rows > 0).collect()
 }
 
+/// Expert width, top-k and the FP8 K32 wire row of a Muse expert request.
+pub(crate) const WIDTH: usize = 4096;
+pub(crate) const TOPK: usize = 8;
+pub(crate) const EXPERTS: u32 = 256;
+pub(crate) const WIRE_ROW_BYTES: usize = WIDTH + WIDTH / 32;
+
+/// One request's rows in a wave: its identity (`source_request_id`) and row count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WaveSegment { pub request: u64, pub rows: usize }
+
+/// The protocol request of one wave: FP8 K32 expert-width rows, top-8 routes,
+/// and each row's partial-reply region from the shared per-request rule
+/// (`ReplyPlan`), carried explicitly so the worker never derives it.
+pub(crate) fn wave_request(layer: usize, sequence: u64, kind: cuteafd_transport::ExpertV2SourceKind,
+    segments: &[WaveSegment], cutoff: cuteafd_loader::families::muse_spark::replies::Cutoff,
+    routes: Vec<cuteafd_transport::ExpertProtocolV2RouteEntry>, wire: bytes::Bytes)
+    -> Result<cuteafd_transport::ExpertProtocolV2Request> {
+    use cuteafd_loader::families::muse_spark::replies::{PartialFormat, ReplyPlan};
+    use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RowDescriptor, ExpertV2Dtype, PartialReplyPlan, PartialWire};
+    let rows = segments.iter().map(|s| s.rows).sum::<usize>();
+    ensure!(layer < 62 && (1..=4096).contains(&rows) && sequence > 0, "Muse Spark wave geometry or sequence");
+    ensure!(routes.len() == rows * TOPK && routes.iter().all(|r| r.expert_id < EXPERTS
+        && r.gate_weight.is_finite() && r.gate_weight >= 0.0), "Muse Spark route outside E256/K8 or invalid weight");
+    ensure!(wire.len() == rows * WIRE_ROW_BYTES, "Muse Spark wire rows differ from the wave");
+    let plan = ReplyPlan::new(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
+    let mut regions = vec![0u8; rows];
+    for &row in &plan.wide_rows { regions[row as usize] = 1; }
+    let wide = match plan.wide { PartialFormat::Nvfp4 => PartialWire::Nvfp4, PartialFormat::Fp8 => PartialWire::Fp8,
+        PartialFormat::Bf16 => anyhow::bail!("Muse wide partial format cannot be BF16") };
+    let mut descriptors = Vec::with_capacity(rows);
+    for segment in segments {
+        for _ in 0..segment.rows {
+            let row = descriptors.len();
+            descriptors.push(ExpertProtocolV2RowDescriptor { row_id: row as u64, source_kind: kind,
+                source_request_id: segment.request, token_position: row as u64,
+                route_offset: (row * TOPK) as u32, route_count: TOPK as u32 });
+        }
+    }
+    ExpertProtocolV2Request::new_bytes(sequence, 17, layer as u32, WIDTH as u32, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+        descriptors, routes, wire)?.with_partial_replies(PartialReplyPlan { wide, regions })
+}
+
 /// One wave in flight: the layer and rows it carries, in send order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Wave { pub layer: usize, pub rows: usize, pub sequence: u64 }
@@ -113,6 +155,36 @@ mod tests {
         let fp8 = Cutoff::with_wide(64, 8, WideFormat::Fp8)?;
         assert_eq!(combine_launches(&ReplyPlan::new(fp8, &[100])), [("tp_combine_fp8", 100)]);
         assert!(combine_launches(&ReplyPlan::new(cutoff, &[])).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wave_requests_carry_each_rows_region_and_round_trip() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::{Cutoff, WideFormat};
+        use cuteafd_transport::{ExpertProtocolV2Request, ExpertProtocolV2RouteEntry, ExpertV2SourceKind, PartialWire};
+        let segments = [WaveSegment { request: 11, rows: 1 }, WaveSegment { request: 12, rows: 70 },
+            WaveSegment { request: 13, rows: 8 }];
+        let rows = 79;
+        let routes = (0..rows * TOPK).map(|i| ExpertProtocolV2RouteEntry { row_index: (i / TOPK) as u32,
+            expert_id: (i % 256) as u32, gate_weight: 0.125 }).collect::<Vec<_>>();
+        let wire = bytes::Bytes::from(vec![0x5a; rows * WIRE_ROW_BYTES]);
+        for wide in [WideFormat::Nvfp4, WideFormat::Fp8] {
+            let request = wave_request(5, 3, ExpertV2SourceKind::Prefill, &segments, Cutoff::with_wide(64, 8, wide)?,
+                routes.clone(), wire.clone())?;
+            let plan = request.partial.as_ref().unwrap();
+            // The 70-row segment is wide; the 1- and 8-row segments (decode, verify) are BF16.
+            assert_eq!(plan.regions.iter().filter(|&&r| r == 1).count(), 70);
+            assert!(plan.regions[..1].iter().all(|&r| r == 0) && plan.regions[71..].iter().all(|&r| r == 0));
+            assert_eq!(plan.wide, if wide == WideFormat::Fp8 { PartialWire::Fp8 } else { PartialWire::Nvfp4 });
+            assert_eq!(request.rows[1].source_request_id, 12);
+            let mut bytes = Vec::new();
+            request.encode_into(&mut bytes)?;
+            assert_eq!(ExpertProtocolV2Request::decode(&bytes)?, request);
+        }
+        assert!(wave_request(5, 3, ExpertV2SourceKind::Decode, &segments, Cutoff::new(64, 8)?, routes.clone(),
+            bytes::Bytes::from(vec![0; 10])).is_err(), "wire size");
+        assert!(wave_request(62, 3, ExpertV2SourceKind::Decode, &segments, Cutoff::new(64, 8)?, routes,
+            wire).is_err(), "layer");
         Ok(())
     }
 }
