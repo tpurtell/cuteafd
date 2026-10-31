@@ -33,6 +33,9 @@ use std::{cell::RefCell, net::SocketAddr, os::unix::fs::FileExt, path::PathBuf};
 const H: usize = 4096;
 const FP8_REVISION: &str = "364b3b03fed2477aa0953fe855a2c4c8c48ee3cc";
 const NVFP4_REVISION: &str = "bc246cc2848e17b37f377eda8fd825c5b3018d1f";
+/// wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6. Set when the publication
+/// lands; until then EXL3 goldens fail closed rather than qualify an unpinned upload.
+const EXL3_REVISION: Option<&str> = None;
 const BF16_REVISION: &str = "7734b7ffac118d70d8398bfa3eb0fab007eb45b1";
 
 #[derive(Debug, Clone, clap::Args)]
@@ -456,21 +459,25 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
     let world = SparkWorld::canonical(args.peers.len())?;
     let packages = PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SPARK_PACKAGES")?);
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
     let metadata: Value = serde_json::from_slice(&std::fs::read(
-        packages.join("fp8").join(format.package_name("step5")).join("manifest.json"),
-    )?)?;
-    let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
-    ensure!(
-        layout["hidden"] == H
-            && layout["experts"] == 352
-            && layout["top_k"] == 8
-            && layout["intermediate"] == 1536
-            && layout["slice"] == 1536 / args.peers.len()
-            && layout["tp"] == args.peers.len(),
-        "sealed Step-5 FP8 TP geometry"
-    );
-    let exports = super::serve::package_exports(&serde_json::json!({"layouts": {"tp": layout.clone()}}))?;
+        format.package_manifest(&packages.join("lib"))?)?)?;
+    let exports = match &format {
+        super::experts::StepExperts::Native(_) => {
+            let layout = &metadata["layouts"][format!("tp{}", args.peers.len())];
+            ensure!(
+                layout["hidden"] == H
+                    && layout["experts"] == 352
+                    && layout["top_k"] == 8
+                    && layout["intermediate"] == 1536
+                    && layout["slice"] == 1536 / args.peers.len()
+                    && layout["tp"] == args.peers.len(),
+                "sealed Step-5 FP8 TP geometry"
+            );
+            super::serve::package_exports(&serde_json::json!({"layouts": {"tp": layout.clone()}}))?
+        }
+        super::experts::StepExperts::Exl3(_) => format.exports(&metadata)?,
+    };
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
     SparkAdmission::plan(
@@ -486,12 +493,12 @@ fn expert_admission(args: &GoldenArgs, rows: usize, layers: &[usize]) -> Result<
         args.peers.len(),
         None,
         super::serve::spark_model(&exports,
-            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: if format.bf16_input() { SparkIngress::Bf16 } else { SparkIngress::Native } },
+            SparkEndpoint { ring_depth: None, capacity: u32::try_from(unit)?, ingress: if format.bf16_endpoint() { SparkIngress::Bf16 } else { SparkIngress::Native } },
             u64::from(args.prefill_waves), 1, config.max_frame_bytes)?,
     )?
     .select(&args.peers)?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers,
-        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: if format.bf16_input() { SparkIngress::Bf16 } else { SparkIngress::Native } }, 1)?;
+        SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: if format.bf16_endpoint() { SparkIngress::Bf16 } else { SparkIngress::Native } }, 1)?;
     Ok((world, config))
 }
 
@@ -926,15 +933,19 @@ fn split_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config,
     Ok(())
 }
 
-fn checkpoint_identity(revision: Option<&str>, format: cuteafd_loader::formats::fp8_experts::ExpertFormat,
+fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExperts,
     fp8_diagnostic: bool) -> Result<()> {
+    use super::experts::StepExperts;
     use cuteafd_loader::formats::fp8_experts::ExpertFormat;
-    ensure!(matches!((revision, format),
-        (Some(FP8_REVISION), ExpertFormat::Fp8Block128)
-        | (Some(NVFP4_REVISION), ExpertFormat::Nvfp4)),
-        "Step-5 golden requires matching pinned native FP8 or NVFP4 revision and expert headers");
-    ensure!(!fp8_diagnostic || format == ExpertFormat::Fp8Block128,
-        "native-FP8 diagnostic reference cannot qualify an NVFP4 checkpoint; use the BF16 root");
+    let pinned = match format {
+        StepExperts::Native(ExpertFormat::Fp8Block128) => revision == Some(FP8_REVISION),
+        StepExperts::Native(ExpertFormat::Nvfp4) => revision == Some(NVFP4_REVISION),
+        StepExperts::Exl3(tiers) => tiers == &[4, 6] && EXL3_REVISION.is_some() && revision == EXL3_REVISION,
+        StepExperts::Native(_) => false,
+    };
+    ensure!(pinned, "Step-5 golden requires a matching pinned FP8, NVFP4 or EXL3 K4/K6 revision and expert headers");
+    ensure!(!fp8_diagnostic || format == &StepExperts::Native(ExpertFormat::Fp8Block128),
+        "native-FP8 diagnostic reference cannot qualify an NVFP4 or EXL3 checkpoint; use the BF16 root");
     Ok(())
 }
 
@@ -952,8 +963,8 @@ fn run(args: GoldenArgs) -> Result<()> {
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
     if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
-    let format = catalog.fp8().context("Step-5 golden requires native expert headers")?.format();
-    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), format,
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
+    checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
         args.fp8_diagnostic_reference)?;
     let checkpoint = Checkpoint::coordinator(&args.snapshot, false, false)?;
     let cfg = Config::parse(&checkpoint)?;
@@ -991,7 +1002,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         0,
         false,
         "step5",
-        &format.package_name("step5"),
+        &format.package_name(),
         &selected,
     )?;
     let (free, _) = library.cuda_memory_info()?;
@@ -1578,19 +1589,25 @@ mod tests {
 
     #[test]
     fn golden_checkpoint_revision_and_native_format_must_agree() -> Result<()> {
+        use super::super::experts::StepExperts;
         use cuteafd_loader::formats::fp8_experts::ExpertFormat;
-        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, false)?;
-        checkpoint_identity(Some(FP8_REVISION), ExpertFormat::Fp8Block128, true)?;
-        checkpoint_identity(Some(NVFP4_REVISION), ExpertFormat::Nvfp4, false)?;
+        let native = |format| StepExperts::Native(format);
+        checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), false)?;
+        checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), true)?;
+        checkpoint_identity(Some(NVFP4_REVISION), &native(ExpertFormat::Nvfp4), false)?;
         for (revision, format, diagnostic) in [
-            (Some(FP8_REVISION), ExpertFormat::Nvfp4, false),
-            (Some(NVFP4_REVISION), ExpertFormat::Fp8Block128, false),
-            (Some(NVFP4_REVISION), ExpertFormat::Nvfp4, true),
-            (Some(BF16_REVISION), ExpertFormat::Bf16, false),
-            (Some("unpinned"), ExpertFormat::Nvfp4, false),
-            (None, ExpertFormat::Fp8Block128, false),
+            (Some(FP8_REVISION), native(ExpertFormat::Nvfp4), false),
+            (Some(NVFP4_REVISION), native(ExpertFormat::Fp8Block128), false),
+            (Some(NVFP4_REVISION), native(ExpertFormat::Nvfp4), true),
+            (Some(BF16_REVISION), native(ExpertFormat::Bf16), false),
+            (Some("unpinned"), native(ExpertFormat::Nvfp4), false),
+            (None, native(ExpertFormat::Fp8Block128), false),
+            // The EXL3 publication fails closed until its revision is pinned.
+            (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6]), false),
+            (EXL3_REVISION, StepExperts::Exl3(vec![4, 6]), true),
+            (EXL3_REVISION, StepExperts::Exl3(vec![3, 4]), false),
         ] {
-            assert!(checkpoint_identity(revision, format, diagnostic).is_err());
+            assert!(checkpoint_identity(revision, &format, diagnostic).is_err());
         }
         Ok(())
     }

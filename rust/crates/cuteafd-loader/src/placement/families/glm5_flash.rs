@@ -428,11 +428,11 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
 /// Exact header-only layer residency for the EXL3 and fp8moe loaders.
 pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> anyhow::Result<Vec<ExpertCost>> {
     use crate::formats::fp8_experts::{Fp8Projection, Slicing};
+    if catalog.exl3().is_some() { return crate::placement::exl3_onboard::expert_costs(catalog, tp2); }
     let shape = catalog.routed_experts();
     let cost = |layer, tp, rank| -> anyhow::Result<Bytes2> {
-        let resident = if let Some(exl3) = catalog.exl3() {
-            exl3.residency(crate::V41Exl3Layer::Backbone(layer), tp, rank)?.device_arena_layout()?.1 as u64
-        } else if let Some(fp8) = catalog.fp8() {
+        let _ = layer;
+        let resident = if let Some(fp8) = catalog.fp8() {
             Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| -> anyhow::Result<u64> {
                 let (w, _) = fp8.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
                 Ok(sum + (shape.experts * w).max(256) as u64 + fp8.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
@@ -452,23 +452,8 @@ pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&s
     anyhow::ensure!((1..=4096).contains(&rows), "GLM Flash expert capacity must be 1..=4096 rows");
     let shape = catalog.routed_experts();
     let lib = inventory::image_lib(manifest);
-    if let Some(exl3) = catalog.exl3() {
-        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-        let stem = format!("exl3-glmf-k{tiers}");
-        let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent().unwrap();
-        let root = [parent.join("exl3").join(&stem), lib.join("exl3").join(&stem)]
-            .into_iter().find(|p| p.join(format!("rtx-tp{tp}")).is_dir())
-            .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp{tp} package"))?;
-        let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::GLM5_FLASH)
-            .capacities(usize::try_from(rows)?)?;
-        let manifests = capacities.into_iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
-            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("rtx-tp{tp}/m{capacity}/v41_exl3.json")))?)?;
-            anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
-                && value["intermediate"].as_u64() == Some((shape.intermediate / tp) as u64)
-                && value["experts"].as_u64() == Some(shape.experts as u64), "GLM Flash EXL3 package geometry mismatch");
-            Ok(value)
-        }).collect::<anyhow::Result<Vec<_>>>()?;
-        return Ok(cache::exl3_workspace_bytes(&manifests, true)? + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 });
+    if catalog.exl3().is_some() {
+        return crate::placement::exl3_onboard::rtx_workspace(catalog, manifest, rows, tp);
     }
     let fp8 = catalog.fp8().ok_or_else(|| anyhow::anyhow!("GLM Flash fp8moe catalog missing"))?;
     let name = fp8.format().package_name("glmf");

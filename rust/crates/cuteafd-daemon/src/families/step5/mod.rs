@@ -7,6 +7,7 @@ mod routed;
 mod csa;
 mod ffn;
 mod execution;
+mod experts;
 pub(crate) mod golden;
 pub(crate) mod serve;
 mod head;

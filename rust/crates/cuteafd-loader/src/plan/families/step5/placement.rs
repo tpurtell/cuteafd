@@ -13,6 +13,7 @@ use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Ite
 #[derive(Debug, thiserror::Error)]
 #[error("Step-5 layout is unqualified: {0}; use WIP FP8 on 2 RTX PRO 6000 + 6 Sparks or NVFP4 on 1 RTX PRO 6000 + 4 Sparks")]
 struct Unqualified(&'static str);
+// EXL3 qualifies 1-2 RTX PRO 6000 with TP2/3/4/6 Sparks (planner fit decides).
 
 pub(super) fn layout(
     model: &Model,
@@ -26,15 +27,20 @@ pub(super) fn layout(
         "Step-5 admission requires complete safetensors headers; missing safetensors headers"
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
-    let (coordinators, spark_ranks) = if nvfp4 { (1, 4) } else { (2, 6) };
-    report.min_spark_ranks = Some(spark_ranks);
+    let exl3 = model.is_exl3();
+    // EXL3 K4 experts fit at every packaged Spark world; the planner's fit decides
+    // the card columns. The official releases keep their qualified pairs.
+    let (coordinators, spark_ranks) = if exl3 {
+        (opts.rtx_bytes.len(), requested.spark_ranks())
+    } else if nvfp4 { (1, 4) } else { (2, 6) };
+    report.min_spark_ranks = Some(if exl3 { 2 } else { spark_ranks });
     ensure!(
-        nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
+        exl3 || nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
         Unqualified("BF16 target format")
     );
     ensure!(
-        opts.rtx_bytes.len() == coordinators
-            && requested.spark_ranks() == spark_ranks
+        (if exl3 { matches!(coordinators, 1 | 2) && matches!(spark_ranks, 2 | 3 | 4 | 6) }
+            else { opts.rtx_bytes.len() == coordinators && requested.spark_ranks() == spark_ranks })
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
     );
@@ -136,8 +142,12 @@ pub(super) fn layout(
         }
     }
     let catalog = input.expert_catalog()?;
-    let format = catalog.fp8().context("Step-5 requires native expert headers")?.format();
-    let package = format.package_name("step5");
+    let package = match catalog.exl3() {
+        Some(manifest) => format!("exl3-step5-k{}",
+            manifest.decoder_tiers().iter().map(usize::to_string).collect::<String>()),
+        None => catalog.fp8().context("Step-5 requires native FP8, NVFP4 or EXL3 expert headers")?
+            .format().package_name("step5"),
+    };
     let mut code = Vec::new();
     let inventory = Inventory {
         gpus: opts
@@ -248,7 +258,7 @@ pub(super) fn layout(
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity,
-            ingress: if nvfp4 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Native }
+            ingress: if nvfp4 && !exl3 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Native }
         })
         .collect::<Vec<_>>();
     let rings = cuteafd_core::SparkRings {
@@ -263,18 +273,9 @@ pub(super) fn layout(
         &working.spark_layers,
     )?;
     for rank in 0..spark_ranks {
-        let assignment = SparkAssignment::from_catalog(
-            &catalog,
-            &working,
-            rank,
-            SparkResidentLayout::Fp8 {
-                world: spark_ranks,
-                rank,
-                slicing: recipe.slicing,
-            },
-            &endpoints,
-            rings,
-        )?;
+        let layout = if exl3 { SparkResidentLayout::Exl3 { world: spark_ranks, rank } }
+            else { SparkResidentLayout::Fp8 { world: spark_ranks, rank, slicing: recipe.slicing } };
+        let assignment = SparkAssignment::from_catalog(&catalog, &working, rank, layout, &endpoints, rings)?;
         ensure!(
             assignment.resident_bytes
                 <= opts
@@ -295,8 +296,9 @@ pub(super) fn layout(
             items: vec![
                 Item::new(
                     Category::Experts,
-                    if nvfp4 { "native NVFP4 TP4 and BF16 tails" } else { "native FP8 TP6 and BF16 tails" },
-                    if nvfp4 { "W4A4" } else { "W8A16" },
+                    if exl3 { "EXL3 K4 experts and K6 tails" } else if nvfp4 { "native NVFP4 TP4 and BF16 tails" }
+                        else { "native FP8 TP6 and BF16 tails" },
+                    if exl3 { "MCG W4A16" } else if nvfp4 { "W4A4" } else { "W8A16" },
                     assignment.resident_bytes,
                     Basis::Exact,
                 ),

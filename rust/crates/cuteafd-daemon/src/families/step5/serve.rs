@@ -199,16 +199,11 @@ fn with_backend<T>(args: &ServeArgs,
     let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     catalog.select_draft(DraftOwnership::None)?;
     ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "Step-5 routed geometry mismatch");
-    let format = catalog.fp8().context("Step-5 requires native FP8 or NVFP4 expert headers")?.format();
-    ensure!(matches!(format, cuteafd_loader::formats::fp8_experts::ExpertFormat::Fp8Block128
-        | cuteafd_loader::formats::fp8_experts::ExpertFormat::Nvfp4),
-        "Step-5 BF16 is a fidelity reference, not a serving fallback");
+    let format = super::experts::StepExperts::from_catalog(&catalog)?;
     cuteafd_core::set_expert_geometry(ExpertGeometry::STEP5)
         .map_err(|_| anyhow::anyhow!("Step-5 serving requires an isolated process"))?;
-    let package = args.native_lib.parent().context("native library directory")?.join("fp8")
-        .join(format.package_name("step5")).join("manifest.json");
-    let metadata = cuteafd_loader::plan::checkpoint::read_json(&package)?;
-    let exports = package_exports(&metadata)?;
+    let metadata = cuteafd_loader::plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
+    let exports = format.exports(&metadata)?;
     // SAFETY: this owner outlives all programs, native lanes, transports and allocations.
     let library = Arc::new(unsafe { NativeLibrary::load(&args.native_lib)? });
     library.cuda_set_device(args.device)?;
@@ -234,7 +229,7 @@ fn with_backend<T>(args: &ServeArgs,
     })?;
     let selected_programs = ProgramSet::from_names(&["step5", "step52"], programs.names());
     let pending_code = ids.iter().enumerate().map(|(rank, &id)| crate::shared::inventory::pending_code(
-        &library, id, rank, ids.len() == 2, "step5", &format.package_name("step5"), &selected_programs))
+        &library, id, rank, ids.len() == 2, "step5", &format.package_name(), &selected_programs))
         .collect::<Result<Vec<_>>>()?;
     let headroom = cuteafd_loader::plan::layout::LayoutOptions::default().headroom_bytes;
     let mut inputs = RuntimeInputs { kv_format: args.kv_cache, inventory: Inventory { gpus: measured.baselines(&[]).into_iter()
@@ -258,7 +253,7 @@ fn with_backend<T>(args: &ServeArgs,
     }).collect::<Result<Vec<_>>>()?;
     let admission = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(args.mtp))?;
     measured.record("step5", &measured.gpus.iter().map(|g| g.free_bytes).collect::<Vec<_>>());
-    let endpoint = args.endpoint(format.bf16_input());
+    let endpoint = args.endpoint(format.bf16_endpoint());
     let clients = admission.ownership.routed_endpoints()?;
     let config = TcpTransportConfig { timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
     // Spark admission is planned (headers only) here and started below, once the
@@ -518,11 +513,9 @@ mod tests {
         let mut catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
         catalog.select_draft(DraftOwnership::None)?;
         ensure!(catalog.routed_experts().geometry()? == ExpertGeometry::STEP5, "routed geometry");
-        let format = catalog.fp8().context("native experts")?.format();
-        let package = args.native_lib.parent().context("native package")?.join("fp8")
-            .join(format.package_name("step5")).join("manifest.json");
-        let metadata = plan::checkpoint::read_json(&package)?;
-        let exports = package_exports(&metadata)?;
+        let format = super::super::experts::StepExperts::from_catalog(&catalog)?;
+        let metadata = plan::checkpoint::read_json(&format.package_manifest(&args.native_lib)?)?;
+        let exports = format.exports(&metadata)?;
         let manifest = plan::checkpoint::read_json(&args.manifest)?;
         ensure!(manifest["programs"].as_array().context("native programs")?.iter()
             .all(|program| program.get("card_plans").is_none()),
@@ -541,7 +534,7 @@ mod tests {
             rows: 256, waves: 1, unit: 0, full_prefill_logits: false, sequences: 16, context: args.max_context, requested_pool: None,
             marks: admission::prefix_marks(&args.prefix, 16), peer_diagnostics: false,
             pending_code: (0..2).map(|rank| placement::inventory::loaded_code_allowance(
-                "step5", &format.package_name("step5"), true, rank, &arch, Some(&selected)).bytes).collect(),
+                "step5", &format.package_name(), true, rank, &arch, Some(&selected)).bytes).collect(),
             startup: vec![],
         };
         for depth in 1..=3 {
@@ -554,7 +547,7 @@ mod tests {
                     "Step-5 retained loading peak", items.iter().map(|item| item.bytes).sum(),
                     cuteafd_core::memory_layout::Basis::Exact)).collect();
             let admitted = admission::admit_mtp(&programs, &checkpoint, &inputs, usize::from(depth))?;
-            let endpoint = args.endpoint(format.bf16_input());
+            let endpoint = args.endpoint(format.bf16_endpoint());
             let clients = admitted.ownership.routed_endpoints()?;
             SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
                 rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: 6, prefill_lanes: 1 },

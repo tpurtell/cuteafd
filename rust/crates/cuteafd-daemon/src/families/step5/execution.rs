@@ -135,8 +135,10 @@ impl<'a> NativeOwners<'a> {
                     } else {
                         let plan = RoutedPlan::for_execution(programs, checkpoint, layer, rows, u64::MAX, &[], rank, ownership)?
                             .with_span(span)?
-                            .with_expert_format(catalog.as_ref().and_then(|c| c.fp8())
-                                .context("Step-5 native expert headers missing")?.layer_format(layer)?);
+                            .with_bf16_input({
+                                let catalog = catalog.as_ref().context("Step-5 routed expert headers missing")?;
+                                super::experts::StepExperts::from_catalog(catalog)?.layer_bf16_input(catalog, layer)?
+                            });
                         Ffn::Routed(RoutedFfn::load_shared(device, programs, checkpoint, layer, plan, Some((&arena, offset)),
                             native_scratch.clone())?)
                     };

@@ -102,8 +102,9 @@ pub(super) struct RoutedPlan {
     native: Option<[String; 3]>,
 }
 impl RoutedPlan {
-    pub(super) fn with_expert_format(mut self, format: cuteafd_loader::formats::fp8_experts::ExpertFormat) -> Self {
-        self.bf16_input = format.bf16_input();
+    /// The request wire of this layer's routed experts (from the checkpoint's storage).
+    pub(super) fn with_bf16_input(mut self, bf16: bool) -> Self {
+        self.bf16_input = bf16;
         self
     }
 
