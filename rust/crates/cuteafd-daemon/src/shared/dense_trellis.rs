@@ -226,6 +226,17 @@ impl<'a> Projection<'a> {
             "trellis projection and resident weight geometry/width/codebook differ");
         let b=scratch.buffers(input,weights);self.program.core(rows,b,stream)?;Ok(b.accumulator)
     }
+    /// The F32 core written straight into a caller-owned plane (a K-split
+    /// partial that the caller exchanges and reduces before one egress).
+    pub(crate) fn core_into(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
+        accumulator:Buffer,stream:*mut c_void)->Result<()> {
+        ensure!(rows>0 && rows<=scratch.rows,"trellis scratch live-row ceiling");
+        let policy=self.program.policy();
+        ensure!(weights.shape==[policy.output,policy.input] && weights.bits==policy.bits
+            && accumulator.bytes>=rows*policy.output*4,"trellis F32 core destination geometry");
+        let b=DenseTrellisBuffers{accumulator,..scratch.buffers(input,weights)};
+        self.program.core(rows,b,stream)?;Ok(())
+    }
     pub(crate) fn local(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
         output:Buffer,stream:*mut c_void)->Result<()> {
         ensure!(self.program.policy().side!=2,"K-split output requires F32 peer reduction before egress");

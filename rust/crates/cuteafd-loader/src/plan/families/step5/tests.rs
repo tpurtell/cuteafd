@@ -1496,3 +1496,41 @@ fn exl3_contract_refuses_widths_the_recipe_does_not_declare() {
     let error = format!("{:#}", Model::open(&Checkpoint::inventory(fixture.path()).unwrap()).err().unwrap());
     assert!(error.contains("model.layers.87") && error.contains("K4"), "{error}");
 }
+
+#[test]
+fn exl3_rank_layouts_own_native_core_with_head_split_sides() -> anyhow::Result<()> {
+    use crate::formats::dense_trellis::TrellisSide;
+    let fixture = exl3_snapshot();
+    let cp = Checkpoint::open(fixture.path())?;
+    let whole = coordinator::RankWeightLayout::from_checkpoint(&cp, 0, 1)?;
+    // 92 target layers x 7 + lm_head; no BF16 operand duplicates a native one.
+    assert_eq!(whole.core.len(), 645);
+    for name in whole.core.keys() {
+        assert!(!whole.operands.iter().any(|o| &o.name == name), "{name} resident twice");
+    }
+    assert!(!whole.operands.iter().any(|o| o.name.ends_with(".gate_up_proj.weight")));
+    // Head-wise gates, indexer, routers and norms stay native BF16/F32 operands.
+    assert!(whole.operands.iter().any(|o| o.name == "model.layers.3.self_attn.g_proj.weight"));
+    assert!(whole.operands.iter().any(|o| o.name == "model.layers.3.self_attn.sparse_indexer_q.weight"));
+    let core_bytes: u64 = whole.core.values().map(|c| c.bytes as u64).sum();
+    let bf16: u64 = whole.operands.iter().map(|o| o.allocation_bytes).sum();
+    assert_eq!(whole.resident_bytes, core_bytes + bf16);
+    // K6 core is ~8.9 GiB in the recipe table (scales included).
+    assert!((8 << 30..10 << 30).contains(&core_bytes), "{core_bytes}");
+    let split = coordinator::RankWeightLayout::from_checkpoint(&cp, 1, 2)?;
+    let q = &split.core["model.layers.4.self_attn.q_proj.weight"];
+    let o = &split.core["model.layers.4.self_attn.o_proj.weight"];
+    assert_eq!((q.side, q.shape, q.rank, q.ranks), (TrellisSide::Output, [6144, 4096], 1, 2));
+    assert_eq!((o.side, o.shape, o.rank, o.ranks), (TrellisSide::Input, [4096, 6144], 1, 2));
+    assert_eq!(split.core["model.layers.4.share_expert.gate_proj.weight"].shape, [1536, 4096]);
+    assert_eq!(split.core["model.layers.0.mlp.down_proj.weight"].shape, [4096, 13824]);
+    // Each MTP stage owns only its K4 operands and its own vocabulary head.
+    for stage in 0..3 {
+        let layout = coordinator::RankWeightLayout::for_mtp_stage(&cp, stage)?;
+        assert_eq!(layout.core.len(), 9);
+        assert!(layout.core.values().all(|c| c.bits == 4 && c.ranks == 1));
+        assert!(layout.core.contains_key(&format!("model.layers.{}.transformer.shared_head.output.weight", 92 + stage)));
+        assert!(!layout.core.contains_key("lm_head.weight"));
+    }
+    Ok(())
+}
