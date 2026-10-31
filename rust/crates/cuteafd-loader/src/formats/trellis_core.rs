@@ -256,18 +256,23 @@ mod tests {
     }
 
     #[test]
-    fn native_weight_layout_rejects_invalid_and_overflowing_geometry() {
+    fn native_weight_layout_rejects_invalid_and_overflowing_geometry() -> Result<()> {
         let p = projection(640, 6144, CoreSplit::Whole);
         for (rank, ranks) in [(0, 0), (0, 3), (2, 2)] {
             assert!(CoreWeightLayout::new(&p, TrellisSide::Output, rank, ranks).is_err());
         }
         assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 2).is_err());
         let mut p = projection(128, 128, CoreSplit::Whole);
+        for bits in [1, 7] {
+            p.bits = bits;
+            assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1).is_err());
+        }
         p.bits = 4;
-        assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1).is_err());
+        assert_eq!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1)?.bytes, 128 * 128 * 4 / 8 + 256 * 2);
         p.bits = 6;
         p.stored_outputs = usize::MAX & !127;
         assert!(CoreWeightLayout::new(&p, TrellisSide::Output, 0, 1).unwrap_err().to_string().contains("overflow"));
+        Ok(())
     }
 
     #[test]
