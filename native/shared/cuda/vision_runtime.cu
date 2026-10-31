@@ -4,16 +4,18 @@
 #include <cstddef>
 #include <cstring>
 #include <type_traits>
+#include <vector>
+#include <new>
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
 #include "cuteafd_vision_attention_internal.h"
 #endif
 
 static_assert(sizeof(cuteafd_vision_block) == 96, "vision block ABI");
-static_assert(offsetof(cuteafd_vision_spec, blocks) == 64, "vision prefix ABI");
-static_assert(offsetof(cuteafd_vision_spec, hidden) == 2752, "vision ABI 1 size");
-static_assert(offsetof(cuteafd_vision_spec, patch_bias) == 2792, "vision bias ABI");
-static_assert(offsetof(cuteafd_vision_spec, norm1_bias) == 2896, "vision norm ABI");
-static_assert(sizeof(cuteafd_vision_spec) == 3792, "vision ABI 2 size");
+static_assert(offsetof(cuteafd_vision_spec, blocks) == 72, "vision blocks ABI");
+static_assert(offsetof(cuteafd_vision_spec, hidden) == 80, "vision geometry ABI");
+static_assert(offsetof(cuteafd_vision_spec, patch_bias) == 120, "vision bias ABI");
+static_assert(offsetof(cuteafd_vision_spec, norm1_bias) == 224, "vision norm ABI");
+static_assert(sizeof(cuteafd_vision_spec) == 256, "vision pointer/count ABI");
 
 namespace {
 constexpr size_t BLAS_BYTES = 4 * 1024 * 1024;
@@ -21,6 +23,8 @@ constexpr int HIDDEN = 1280, INTER = 4608, MERGED = 5120, PATCH = 1536, CHUNK = 
 size_t aligned(size_t n) { return (n + 255) & ~size_t(255); }
 struct Owner {
   cuteafd_vision_spec spec{};
+  std::vector<cuteafd_vision_block> blocks;
+  std::vector<uint64_t> norm1_bias, norm2_bias, q_norm, k_norm;
   cuteafd_vision_ledger ledger{};
   int device = 0;
   cudaStream_t stream = nullptr;
@@ -37,6 +41,20 @@ struct Owner {
   void *attention = nullptr, *workspace = nullptr;
   bool uploaded = false;
 };
+bool copy_spec(Owner& o, const cuteafd_vision_spec& s) {
+  try {
+    o.blocks.assign(s.blocks,s.blocks+s.depth);
+    o.norm1_bias.assign(s.norm1_bias,s.norm1_bias+s.depth);
+    o.norm2_bias.assign(s.norm2_bias,s.norm2_bias+s.depth);
+    o.q_norm.assign(s.q_norm,s.q_norm+s.depth);
+    o.k_norm.assign(s.k_norm,s.k_norm+s.depth);
+  } catch (const std::bad_alloc&) { return false; }
+  o.spec=s;
+  o.spec.blocks=o.blocks.data(); o.spec.norm1_bias=o.norm1_bias.data();
+  o.spec.norm2_bias=o.norm2_bias.data(); o.spec.q_norm=o.q_norm.data();
+  o.spec.k_norm=o.k_norm.data();
+  return true;
+}
 int device_ok(Owner* o) {
   int d; auto e = cudaGetDevice(&d); return e ? int(e) : d == o->device ? 0 : int(cudaErrorInvalidDevice);
 }
@@ -66,12 +84,13 @@ bool extent(const cuteafd_vision_spec& s, uint64_t offset, size_t bytes) {
   return offset % 256 == 0 && offset <= s.weight_bytes && bytes <= s.weight_bytes - offset;
 }
 bool valid_spec(const cuteafd_vision_spec& s) {
-  if (s.abi_version != 1 || s.reserved || s.max_tokens == 0 || s.max_tokens > 4096 ||
+  if (s.abi_version != 1 || s.depth != 28 || s.reserved || s.max_tokens == 0 || s.max_tokens > 4096 ||
       (s.output_width != 4096 && s.output_width != 6144) || !s.weight_bytes || s.weight_bytes > (2ULL << 30)) return false;
   if (!extent(s,s.patch,HIDDEN*PATCH*2) || !extent(s,s.merger_norm,HIDDEN*4) ||
       !extent(s,s.merger_fc1,MERGED*MERGED*2) || !extent(s,s.merger_fc2,s.output_width*MERGED*2) ||
       !extent(s,s.inv_freq,16*4)) return false;
-  for (auto& b : s.blocks) {
+  for (uint32_t layer=0;layer<s.depth;++layer) {
+    const auto& b=s.blocks[layer];
     const uint64_t offsets[] = {b.qkv,b.qkv_bias,b.proj,b.proj_bias,b.gate_up,b.gate_up_bias,b.down,b.down_bias,b.norm1,b.norm2};
     const size_t bytes[] = {VQKV*HIDDEN*2,VQKV*4,HIDDEN*VQD*2,HIDDEN*4,2*INTER*HIDDEN*2,2*INTER*4,HIDDEN*INTER*2,HIDDEN*4,HIDDEN*4,HIDDEN*4};
     for(int i=0;i<10;++i) if(!extent(s,offsets[i],bytes[i])) return false;
@@ -138,6 +157,8 @@ int mha_attention(Owner* o,int n) {
 #define CUTEAFD_HAVE_GLM_VISION 1
 #endif
 bool valid_tower(const cuteafd_vision_spec& s) {
+  if(s.storage_abi!=3 || !s.depth || !s.blocks || !s.norm1_bias ||
+     !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
   if(s.abi_version==1)return valid_spec(s);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s.reserved==2)return valid_qwen(s);
@@ -160,7 +181,7 @@ size_t scratch_tower(Owner* o) {
 extern "C" int32_t cuteafd_vision_required(const cuteafd_vision_spec* s, cuteafd_vision_ledger* out) {
   if(!s || !out || !valid_tower(*s))return cudaErrorInvalidValue;
   Owner o;
-  std::memcpy(&o.spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) : sizeof(*s));
+  if(!copy_spec(o,*s))return cudaErrorMemoryAllocation;
   size_t bytes=scratch_tower(&o);
   *out={s->weight_bytes,bytes-BLAS_BYTES,BLAS_BYTES,0,0}; return 0;
 }
@@ -187,8 +208,8 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   if(admitted < ledger.weights+ledger.scratch+ledger.blas_workspace)return cudaErrorMemoryAllocation;
   e=cudaSetDevice(device);if(e)return e;
   auto* o=new(std::nothrow)Owner; if(!o)return cudaErrorMemoryAllocation;
-  // ABI 1 callers (including old qualification clients) own only the prefix.
-  std::memcpy(&o->spec,s,s->abi_version==1 ? offsetof(cuteafd_vision_spec,hidden) : sizeof(*s));
+  // Registration owns all per-layer metadata before the Rust borrow ends.
+  if(!copy_spec(*o,*s)){delete o;return cudaErrorMemoryAllocation;}
   o->ledger=ledger; o->device=device;
   auto fail=[&](int rc){cuteafd_vision_destroy(o);return rc;};
   int low,high; e=cudaDeviceGetStreamPriorityRange(&low,&high);if(e)return fail(e);
@@ -246,7 +267,7 @@ extern "C" int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64
   for(int r0=0;r0<n;r0+=CHUNK)RUN(gemm(o,o->patches+size_t(r0)*PATCH,s.patch,std::min(CHUNK,n-r0),HIDDEN,PATCH,x+size_t(r0)*HIDDEN));
   RUN(observe(o,cb,ctx,0,x,n,HIDDEN,false));
   auto w=[&](uint64_t off){return reinterpret_cast<const float*>(o->weights+off);};
-  for(int i=0;i<28;++i) {
+  for(uint32_t i=0;i<s.depth;++i) {
     const auto& b=s.blocks[i];
     if(bool(b.column_order)!=col) {
       LAUNCH((gather_units_kernel<<<grid_for(long(n)*HIDDEN),256,0,stream>>>(x,xt,b.column_order?o->col:o->inverse,long(n)*HIDDEN,HIDDEN)));

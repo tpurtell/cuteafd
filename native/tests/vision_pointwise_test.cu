@@ -9,6 +9,25 @@ struct DeviceBuffer {
 };
 #define CHECK(expr) do { int rc=int(expr);if(rc) { std::fprintf(stderr,"%s: %d\n",#expr,rc);return 1; } } while(0)
 int main() {
+  // Registration must own every host array before Rust/ctypes releases it.
+  for(uint32_t depth : {24u,27u,28u,30u,50u}) {
+    Owner owner;
+    {
+      std::vector<cuteafd_vision_block> blocks(depth);
+      std::vector<uint64_t> n1(depth,11),n2(depth,22),q(depth,33),k(depth,44);
+      blocks.back().norm1=1234;
+      cuteafd_vision_spec spec{};
+      spec.storage_abi=3;spec.depth=depth;spec.blocks=blocks.data();
+      spec.norm1_bias=n1.data();spec.norm2_bias=n2.data();
+      spec.q_norm=q.data();spec.k_norm=k.data();
+      if(!copy_spec(owner,spec) || owner.spec.blocks==spec.blocks ||
+         owner.spec.q_norm==spec.q_norm)return 1;
+      blocks.back().norm1=0;q.back()=0;
+    }
+    if(owner.spec.depth!=depth || owner.spec.blocks[depth-1].norm1!=1234 ||
+       owner.spec.norm1_bias[depth-1]!=11 || owner.spec.norm2_bias[depth-1]!=22 ||
+       owner.spec.q_norm[depth-1]!=33 || owner.spec.k_norm[depth-1]!=44)return 1;
+  }
   int devices=0;
   if(cudaGetDeviceCount(&devices)!=cudaSuccess || !devices)return 77;
   CHECK(cudaSetDevice(0));

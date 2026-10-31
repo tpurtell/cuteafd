@@ -17,13 +17,7 @@ _spec.loader.exec_module(common)
 Block, Ledger, OBSERVER = common.Block, common.Ledger, common.OBSERVER
 
 
-class Spec(C.Structure):
-    _fields_ = common.Spec._fields_ + [(k, C.c_uint32) for k in (
-        "hidden", "depth", "heads", "kv_heads", "head_dim", "intermediate", "patch_size", "merger_width")]
-    _fields_ += [("norm_eps", C.c_float), ("geometry_reserved", C.c_uint32)]
-    _fields_ += [(k, C.c_uint64) for k in ("patch_bias", "pos_embed", "merger_norm_bias", "merger_fc1_bias", "merger_fc2_bias")]
-    _fields_ += [("merger_extra", C.c_uint64 * 8)]
-    _fields_ += [(k, C.c_uint64 * 28) for k in ("norm1_bias", "norm2_bias", "q_norm", "k_norm")]
+Spec = common.Spec
 
 
 def read_visual(snapshot):
