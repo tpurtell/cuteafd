@@ -330,15 +330,14 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
 
     def native_trailing_context(body, chat, tokens, roles, padding):
         """#431: trailing repository text as a checkpoint-native user turn (all ctx)."""
-        renderer = getattr(probe, "renderer", None)
-        if renderer is None:
-            raise ValueError("recipe v2 needs the checkpoint chat renderer")
+        if not hasattr(probe, "conversation"):
+            raise ValueError("recipe v2 needs the backend's checkpoint chat renderer")
         assistant = {"role": "assistant", "content": chat.get("content", ""),
                      "reasoning_content": chat.get("reasoning", "")}
         if chat.get("tool_calls"):
             assistant["tool_calls"] = chat["tool_calls"]
         text = corpus[:max(4096, padding * 8)]
-        rendered = renderer.conversation_ids(body, body["messages"] + [assistant, {"role": "user", "content": text}])
+        rendered = probe.conversation(body, body["messages"] + [assistant, {"role": "user", "content": text}])
         if rendered[:len(tokens)] != tokens:
             raise ValueError("native trailing context does not extend the generated window")
         suffix = rendered[len(tokens):len(tokens) + padding]

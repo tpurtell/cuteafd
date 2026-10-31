@@ -216,6 +216,10 @@ class TextGenerator:
     def prompt(self, body):
         return {"probe": {"prompt_ids": self.renderer.prompt(body)}}
 
+    def conversation(self, body, messages):
+        """Full conversation ids rendered exactly as this backend renders its prompts."""
+        return self.renderer.conversation_ids(body, messages)
+
     def result(self, body, generated, message, provenance):
         if not generated:
             raise ValueError("backend returned no generated tokens")
@@ -330,6 +334,12 @@ class APIClient(TextGenerator):
             # Official K3 API docs and native template both default to max.
             rendered["reasoning_effort"] = "max"
         return rendered
+
+    def conversation(self, body, messages):
+        lookup = copy.deepcopy(body)
+        lookup["max_tokens"] = 1024
+        request, _ = self.resolved_request(lookup)
+        return self.renderer.conversation_ids(self.rendering_body(request), messages)
 
     def prompt(self, body):
         lookup = copy.deepcopy(body)

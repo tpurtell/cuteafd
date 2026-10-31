@@ -360,6 +360,9 @@ class FakeAPI:
     def prompt(self, body):
         return {"probe": {"prompt_ids": self.renderer.render(body["messages"], True)}}
 
+    def conversation(self, body, messages):
+        return self.renderer.conversation_ids(body, messages)
+
     def __call__(self, body):
         self.requests.append(body)
         name = body["messages"][0]["content"].split("Fidelity fixture ")[-1][:3]
