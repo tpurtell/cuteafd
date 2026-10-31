@@ -64,11 +64,28 @@ fn planner_resolves_every_spark_count_before_recipe_refusal() {
             crate::plan::Family::prefill_limits(&super::KIMI_K3), Default::default()).unwrap();
         assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
             (Some(daemon.unit_rows), Some(daemon.waves), Some(daemon.span_rows)), "ranks={ranks}: {:?}", report.hints);
-        if ranks != 6 {
-            assert!(!report.fits && !report.placement_supported && !report.wip_launchable());
-            assert!(report.hints.iter().any(|hint| hint.what.contains(&format!("kimik3:exl3-k23 TP{ranks}"))),
-                "ranks={ranks}: {:?}", report.hints);
-            assert!(report.memory_layout.unwrap().devices.is_empty());
+        assert!(!report.fits && !report.placement_supported && !report.wip_launchable());
+        assert!(report.hints.iter().any(|hint| hint.what.contains("Kimi header inventory refused: missing projection")),
+            "ranks={ranks}: {:?}", report.hints);
+        assert!(report.memory_layout.unwrap().devices.is_empty());
+    }
+}
+
+#[test]
+fn complete_checkpoint_preserves_recipe_refusals_at_every_spark_count() {
+    let dir = snapshot(true);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    for ranks in 1..=8 {
+        let report = input.plan(&with_layout(ranks, Some(108 << 30))).unwrap();
+        let expected = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, ranks);
+        assert!(!report.hints.iter().any(|hint| hint.what.contains("missing projection")), "{:?}", report.hints);
+        if let Err(refusal) = expected {
+            assert!(!report.fits && !report.placement_supported);
+            assert!(report.hints.iter().any(|hint| hint.what.contains(&refusal.to_string())),
+                "TP{ranks}: expected {refusal}; {:?}", report.hints);
+        } else {
+            assert!(!report.hints.iter().any(|hint| hint.what.contains("no exported width class")),
+                "TP{ranks}: {:?}", report.hints);
         }
     }
 }
@@ -127,6 +144,27 @@ fn coordinator_inventory_requires_exact_tp2_exports() {
             }
         }
         assert!(validate_expert_inventory(&path, &package).is_err(), "accepted {corruption}");
+    }
+}
+
+#[test]
+fn scoped_spark_inventory_requires_every_rank_of_each_declared_world() {
+    for world in [6, 7, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = installed_inventory(dir.path(), true);
+        let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
+        let manifest = package.join("manifest.json");
+        let mut inventory: Value = serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+        let prefix = format!("tp{world}-");
+        inventory["variants"].as_array_mut().unwrap().retain(|entry|
+            entry["directory"].as_str().unwrap().starts_with(&prefix));
+        std::fs::write(&manifest, inventory.to_string()).unwrap();
+        validate_expert_inventory(&path, &package).unwrap();
+        let recipe = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, world).unwrap();
+        let missing = format!("{}/m80", recipe.required_layouts[world - 1]);
+        inventory["variants"].as_array_mut().unwrap().retain(|entry| entry["directory"] != missing);
+        std::fs::write(&manifest, inventory.to_string()).unwrap();
+        assert!(validate_expert_inventory(&path, &package).is_err(), "accepted incomplete TP{world}");
     }
 }
 
@@ -201,7 +239,7 @@ fn release_headers_classify_native_text_without_installed_artifacts() {
     let trellis = checkpoint.tensors.iter().filter(|t| t.meta.name.contains(".experts.0.w1.")).cloned().collect::<Vec<_>>();
     let operand = format::detect(format::group_by_stem(&trellis).values().next().unwrap()).unwrap();
     let contract = model.experts(&operand).unwrap();
-    assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.clone()), (PACKAGE, 128, vec![6]));
+    assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.clone()), (PACKAGE, 128, vec![6, 7, 8]));
     assert_eq!(experts.rejected, 0);
     assert_eq!(report.experts.as_ref().unwrap().package, PACKAGE);
     assert!(report.components.iter().filter(|c| c.component != Component::Vision).all(|c| c.rejected == 0));
@@ -365,7 +403,8 @@ fn max_card_jointly_selects_tp2_layers_marks_and_complete_spark_budget() {
     assert!(!refused.fits);
     // Other card columns are refused by name.
     let refused = input.plan(&with_layout(4, None)).unwrap();
-    assert!(refused.hints.iter().any(|h| h.what.contains("missing Spark recipe kimik3:exl3-k23 TP4")));
+    assert!(!refused.fits);
+    assert!(refused.hints.iter().any(|h| h.what.contains("budget")), "{:?}", refused.hints);
 }
 
 #[test]

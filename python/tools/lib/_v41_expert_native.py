@@ -65,6 +65,7 @@ SPARK_TP_PREFIX = {
     2: "cuteafd_v41_spark_tp2_expert_",
     3: "cuteafd_v41_spark_tp3_expert_",
     6: "cuteafd_v41_spark_tp6_expert_",
+    8: "cuteafd_v41_spark_tp8_expert_",
 }
 # Only the five per-family launch-ABI entry points are namespaced. The packer
 # size query and the packer itself are canonical symbols shared by every family.
@@ -87,15 +88,16 @@ def namespaced_symbol(name, prefix):
 def expert_symbol_prefix(*, local=False, tp2=False, spark_tp=None, family="v41"):
     """Native symbol prefix for one expert family.
 
-    `spark_tp=2|3|6` selects the replicated-group Spark TP2/TP3/TP6 AOT families
-    (roles 5/6/7); `local`/`tp2` keep the historical RTX families unchanged, and
+    `spark_tp=2|3|6|8` selects the replicated-group Spark TP2/TP3/TP6/TP8 AOT families
+    (roles 5/6/7/8); `local`/`tp2` keep the historical RTX families unchanged, and
     the default is the canonical TP4 family. At most one family may be selected.
     """
     assert family in ("v41", "dsv4f", "dsv4p")
     assert sum(bool(x) for x in (local, tp2, spark_tp is not None)) <= 1
     if spark_tp is not None:
         assert spark_tp in SPARK_TP_PREFIX, spark_tp
-        assert family == "v41" or spark_tp == 2
+        from spark_packages import package_worlds
+        assert spark_tp in package_worlds(family, "mxfp4")
         prefix = SPARK_TP_PREFIX[spark_tp]
     elif tp2:
         prefix = "cuteafd_v41_tp2_expert_"
@@ -138,7 +140,7 @@ def check(code):
 
 class Native:
     def __init__(self, lib, capacity, weights, wire, ids, routing, *, coordinator=False, full_backbone=False, tp2=False, spark_tp=None, storage=None, geometry=None):
-        assert spark_tp in (None, 2, 3, 6)
+        assert spark_tp is None or spark_tp in SPARK_TP_PREFIX
         assert sum((coordinator, full_backbone, tp2, spark_tp is not None)) <= 1
         self.lib = lib
         self.info = info = Info()
@@ -147,6 +149,7 @@ class Native:
         expected = ((5, 384, 5120, 1152, 1152, 6, capacity, 7) if spark_tp == 2 else
                     (6, 384, 5120, 768, 768, 6, capacity, 7) if spark_tp == 3 else
                     (7, 384, 5120, 384, 384, 6, capacity, 7) if spark_tp == 6 else
+                    (8, 384, 5120, 288, 384, 6, capacity, 7) if spark_tp == 8 else
                     (3, 384, 5120, 1152, 1152, 6, capacity, 7) if tp2 else
                     (0, 128, 5120, 2304, 2304, 3, capacity, 1)
                     if coordinator else (2, 384, 5120, 2304, 2304, 6, capacity, 7)

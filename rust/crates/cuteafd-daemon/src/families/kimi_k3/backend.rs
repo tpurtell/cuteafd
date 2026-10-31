@@ -550,7 +550,7 @@ mod tests {
         let crate::cli::Commands::ServeKimi(args) = crate::cli::Cli::try_parse_from(argv)?.command else {
             anyhow::bail!("packing gate needs serve-kimi arguments");
         };
-        ensure!(args.peers.len() == 6 && args.max_sequences >= 3, "Kimi native packing gate needs six peers and three slots");
+        ensure!((1..=8).contains(&args.peers.len()) && args.max_sequences >= 3, "Kimi native packing gate needs 1..8 peers and three slots");
         let source: Vec<u32> = serde_json::from_str(&std::env::var("CUTEAFD_KIMI_PACK_GATE_TOKENS")?)?;
         ensure!(!source.is_empty(), "Kimi packing gate token panel empty");
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)

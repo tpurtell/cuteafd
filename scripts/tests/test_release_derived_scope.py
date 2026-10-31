@@ -47,11 +47,44 @@ def test_union_equals_per_entry_derivation(fixture_repo):
         else:
             expected = set().union(*(SCOPE.tokens(e[key]) for e in per_entry))
             expected |= SCOPE.PREVIOUS_RELEASE_FLOOR.get(key.removeprefix(P), set())
-            assert SCOPE.tokens(value) == expected
+            if key == P + 'GENERIC_SPARK_COUNTS':
+                assert expected <= SCOPE.tokens(value)
+            elif key == P + 'SPARK_TP_ROLES':
+                assert SCOPE.tokens(value) == expected | {'tp8'}
+            else:
+                assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(union[P + 'EXPERT_FAMILIES'])
     assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
+
+
+def test_full_release_expands_width_aliases_without_widening_card_scopes(fixture_repo):
+    repo, path = fixture_repo
+    full, _ = SCOPE.derive(repo, path, 'all', {})
+    counts = SCOPE.tokens(full[P + 'GENERIC_SPARK_COUNTS'])
+    assert {f'glm:exl3={world}' for world in (5, 7, 8)} <= counts
+    assert {f'glmf:{format}={world}' for format in ('nvfp4', 'nvfp4a4')
+            for world in (2, 3, 4, 5, 6)} <= counts
+    assert not {f'glmf:{format}={world}' for format in ('nvfp4', 'nvfp4a4')
+                for world in (7, 8)} & counts
+    card, _ = SCOPE.derive(repo, path, 'glm-fp8', {})
+    assert SCOPE.tokens(card[P + 'GENERIC_SPARK_COUNTS']) == {'glm=2'}
+    explicit, _ = SCOPE.derive(repo, path, 'explicit', {
+        P + 'EXPERT_FAMILIES': 'glm:exl3-k45', P + 'GENERIC_SPARK_COUNTS': 'glm:exl3=4'})
+    assert explicit[P + 'GENERIC_SPARK_COUNTS'] == 'glm:exl3=4'
+
+
+def test_full_release_expands_native_roles_without_widening_explicit_scope(fixture_repo):
+    repo, path = fixture_repo
+    selected = 'dsv4f:spark;dsv4p:spark'
+    full, _ = SCOPE.derive(repo, path, 'all', {P + 'EXPERT_FAMILIES': selected})
+    experts = SCOPE.tokens(full[P + 'EXPERT_FAMILIES'])
+    assert {'dsv4f:spark_tp8', 'dsv4p:spark_tp8', 'dsv4p:spark_tp3'} <= experts
+    assert not {'dsv4f:spark_tp3', 'dsv4f:spark_tp6', 'dsv4p:spark_tp5',
+                'dsv4p:spark_tp7'} & experts
+    explicit, _ = SCOPE.derive(repo, path, 'explicit', {P + 'EXPERT_FAMILIES': selected})
+    assert explicit[P + 'EXPERT_FAMILIES'] == selected
 
 
 def test_raw_environment_adds_but_does_not_shrink(fixture_repo):
@@ -75,7 +108,7 @@ def test_selectors_and_explicit(fixture_repo):
     assert family[P + 'SPARK_TP_ROLES'] == ''
     both, _ = SCOPE.derive(repo, path, 'glm-fp8,flash-nvfp4', {})
     all_scope = SCOPE.derive(repo, path, 'all', {})[0]
-    assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp6'
+    assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp6;tp8'
     for key in SCOPE.PREVIOUS_RELEASE_FLOOR:
         all_scope[P + key] = both[P + key]
     assert both == all_scope

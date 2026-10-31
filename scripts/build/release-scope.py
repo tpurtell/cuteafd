@@ -163,6 +163,34 @@ def derive(repo, matrix, scope='all', environ=None):
             if key.endswith('MIMO_GEOMETRIES'):
                 value = value.replace(',', ';')
             result[key] = ';'.join(sorted(tokens(result[key]) | tokens(value)))
+    if scope == 'all':
+        # Card scopes are intentionally narrow. A complete release must instead
+        # expose every alias backed by its enabled families' width-class objects.
+        path = Path(__file__).resolve().parents[2] / 'python/tools/lib/spark_packages.py'
+        spec = importlib.util.spec_from_file_location('release_spark_packages', path)
+        packages = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(packages)
+        counts = tokens(result[PREFIX + 'GENERIC_SPARK_COUNTS'])
+        experts = tokens(result[PREFIX + 'EXPERT_FAMILIES'])
+        for expert in tuple(experts):
+            family, kind = expert.split(':', 1)
+            if family in ('dsv4f', 'dsv4p') and kind.startswith('spark'):
+                experts.update(f'{family}:spark' + ('' if world == 4 else f'_tp{world}')
+                               for world in packages.package_worlds(family, 'mxfp4'))
+                continue
+            if kind not in ('fp8', 'bf16', 'nvfp4', 'nvfp4a4') and not kind.startswith('exl3-k'):
+                continue
+            if family == 'glmfdense':
+                continue  # Dense-only MLPs have no Spark package.
+            format = 'exl3' if kind.startswith('exl3-k') else kind
+            formats = (format, 'nvfp4a4') if format == 'nvfp4' and family != 'step5' else (format,)
+            counts.update(f'{family}:{alias}={world}' for alias in formats
+                          for world in packages.package_worlds(family, format))
+        result[PREFIX + 'EXPERT_FAMILIES'] = ';'.join(sorted(experts))
+        result[PREFIX + 'GENERIC_SPARK_COUNTS'] = ';'.join(sorted(counts))
+        result[PREFIX + 'SPARK_TP_ROLES'] = ';'.join(sorted(tokens(
+            result[PREFIX + 'SPARK_TP_ROLES']) | {
+                f'tp{world}' for world in packages.package_worlds('v41', 'mxfp4') if world != 4}))
     return result, entries
 
 

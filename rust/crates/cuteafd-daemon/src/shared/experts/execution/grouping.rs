@@ -96,7 +96,7 @@ impl InstalledExpertGrouping {
         if manifest.schema != 1
             || !matches!(
                 manifest.role.as_str(),
-                "spark" | "spark_tp2" | "spark_tp3" | "spark_tp6"
+                "spark" | "spark_tp2" | "spark_tp3" | "spark_tp6" | "spark_tp8"
             )
             || !(1..=4096).contains(&capacity)
         {

@@ -74,7 +74,8 @@ def test_role7_is_unique_across_the_whole_registry() -> None:
     )
     native_ids = tables["ROLE_NATIVE_ID"]
     assert sorted(native_ids.values()) == list(range(len(native_ids))), native_ids
-    assert native_ids["spark_tp6"] == max(native_ids.values()) == 7
+    assert native_ids["spark_tp6"] == 7
+    assert native_ids["spark_tp8"] == max(native_ids.values()) == 8
     # Every role with a native id also has a plan-time geometry and, for the
     # Spark family, a TP degree.
     assert set(native_ids) == set(tables["ROLE_GEOMETRY"])
@@ -150,7 +151,7 @@ def test_exporter_plane_and_scratch_sizes_are_congruent_for_384() -> None:
 
 def test_ordinary_exporter_routes_tp6_only_through_fp8_slices() -> None:
     tables = _literal_assignments(EXPERTS_EXPORTER, {"SPARK_ROLES", "SPARK_TP_DEGREES"})
-    assert tables["SPARK_ROLES"] == ("spark", "spark_tp2", "spark_tp3", "spark_tp6")
+    assert tables["SPARK_ROLES"] == ("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8")
     assert tables["SPARK_TP_DEGREES"]["spark_tp6"] == 6
     source = EXPERTS_EXPORTER.read_text(encoding="utf-8")
     assert "Spark TP2/TP3/TP6 use the native FP8 K32 slice export only" in source
@@ -162,13 +163,13 @@ def test_ordinary_exporter_routes_tp6_only_through_fp8_slices() -> None:
 def test_native_helper_selects_the_tp6_symbol_family() -> None:
     source = NATIVE_HELPER.read_text(encoding="utf-8")
     assert '6: "cuteafd_v41_spark_tp6_expert_"' in source
-    assert "assert spark_tp in (None, 2, 3, 6)" in source
+    assert "assert spark_tp is None or spark_tp in SPARK_TP_PREFIX" in source
     assert "(7, 384, 5120, 384, 384, 6, capacity, 7) if spark_tp == 6" in source
 
 
 def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     tp = CMAKE_TP.read_text(encoding="utf-8")
-    assert "tp2, tp3 and tp6" in tp
+    assert "tp2, tp3, tp6 and tp8" in tp
     assert 'set(CUTEAFD_V41_SPARK_TP6_SLICE_WIDTH' in tp
     assert f'"{DEFAULT_WIDTH_MAP}"' in tp
     assert "v41_spark_tp6_experts.cc" in tp
@@ -176,7 +177,7 @@ def test_cmake_wiring_is_opt_in_and_precompiles_capacities() -> None:
     assert "families/deepseek_v41/src/v41_spark_tp6_experts.cc" in tp
     # The new role must not change the existing TP2/TP3 selector contract.
     assert 'CUTEAFD_V41_SPARK_TP_EXPERT_ROWS_ARG "1,16,80,256,1024,4096"' in tp
-    assert "--atomic-min-capacity 256" in tp
+    assert "--atomic-min-capacity" not in tp
     assert 'if(NOT CUTEAFD_SPARK_TP_ROLES STREQUAL "")' in CMAKE.read_text(
         encoding="utf-8"
     )
@@ -220,19 +221,19 @@ def test_build_selectors_accept_a_tp6_role() -> None:
     common = (ROOT / "scripts" / "lib" / "release-common.sh").read_text(encoding="utf-8")
     # The universal set and the role validation live in the shared release helpers.
     assert 'release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"' in build
-    assert "printf '%s\\n' 'tp2;tp3;tp6'" in common
+    assert "printf '%s\\n' 'tp2;tp3;tp6;tp8'" in common
     assert "${CUTEAFD_RELEASE_SPARK_TP_ROLES-$release_universal_spark_tp_roles}" in build
-    assert "tp2|tp3|tp6)" in common
-    assert "accepts only tp2, tp3 and tp6" in common
+    assert "tp2|tp3|tp6|tp8)" in common
+    assert "accepts only tp2, tp3, tp6 and tp8" in common
     assert "NON-UNIVERSAL expert role subset" in build
 
     release = RELEASE_ARTIFACTS.read_text(encoding="utf-8")
-    assert "tp2|tp3|tp6)" in release
-    assert "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in release
+    assert "tp2|tp3|tp6|tp8)" in release
+    assert "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3, tp6 and tp8" in release
 
     wip = WIP_ARTIFACTS.read_text(encoding="utf-8")
-    assert "tp2|tp3|tp6)" in wip
-    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3 and tp6" in wip
+    assert "tp2|tp3|tp6|tp8)" in wip
+    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp6 and tp8" in wip
 
 
 def test_tp_manifest_writer_knows_the_tp6_geometry_and_symbols() -> None:
@@ -245,7 +246,7 @@ def test_tp_manifest_writer_knows_the_tp6_geometry_and_symbols() -> None:
     assert tables["ROLE_INFO_SYMBOL"]["tp6"] == "cuteafd_v41_spark_tp6_expert_info"
     assert tables["ROLE_LAUNCH_SYMBOL"]["tp6"] == "cuteafd_v41_spark_tp6_expert_launch"
     source = MANIFEST.read_text(encoding="utf-8")
-    assert "expected tp2, tp3 or tp6" in source
+    assert "expected tp2, tp3, tp6 or tp8" in source
 
 
 # --------------------------------------------------------------------------- #

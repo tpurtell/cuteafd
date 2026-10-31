@@ -1723,15 +1723,11 @@ if [[ "$family" == qwen3_5 ]]; then
   ranks=0
   backend=local
 fi
-if [[ "$family" == kimi_k3 ]]; then
-  [[ "$backend" != local && "$ranks" == 6 ]] ||
-    release_die "Kimi K3 TP$ranks has no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission; export balanced H128 widths and parameterize the Kimi executor (currently TP6 width 512)"
-fi
 if [[ "$family" == step5 ]]; then
   step5_kv_cache="$(get KV_CACHE fp8)"
   case "$step5_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   [[ "$backend" != local && "$ranks" != 0 ]] ||
-    release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"
+    release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (the planner checks format, width coverage and memory)"
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from

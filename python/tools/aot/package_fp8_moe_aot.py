@@ -71,10 +71,7 @@ os.environ.setdefault("B12X_COMPILE_DISK_CACHE", "0")
 os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 
 SCHEMA = "cuteafd.fp8moe-package.v1"
-ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp6"), "coordinator": ("tp1", "tp2")}
-MXFP4_ROLE_LAYOUTS = {"spark": ("tp6", "tp2"), "coordinator": ("tp1", "tp2")}
-# NVFP4 slices own whole 16-value blocks: every Spark world the FP8 worker runs.
-NVFP4_ROLE_LAYOUTS = {"spark": ("tp4", "tp2", "tp3", "tp6"), "coordinator": ("tp1", "tp2")}
+ROLE_LAYOUTS = {"coordinator": ("tp1", "tp2")}
 ABI_VERSION = 5
 STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5}
 ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2}
@@ -368,19 +365,19 @@ extern "C" int32_t cuteafd_fp8moe_launch_segments(void* context, void* const* po
 def exact_widths(intermediate: int, tp: int, unit: int = 128) -> list[int]:
     """Stored widths of TP ranks owning whole 128-row blocks exactly (TP6 of
     2048: 384, 384, 384, 384, 256, 256), as the worker's exact layouts expect."""
-    if unit not in (32, 128):
+    if unit not in (16, 32, 128):
         return []
     blocks = intermediate // unit
-    if not 1 <= tp <= 6 or intermediate % unit or blocks < tp:
+    if not 1 <= tp <= 8 or intermediate % unit or blocks < tp:
         return []
     return [(blocks // tp + (rank < blocks % tp)) * unit for rank in range(tp)]
 
 
-def spark_layouts(intermediate: int, *, exact: bool = True) -> list[str]:
-    """Every meaningful TP1..6 layout, with unequal whole-H128 rank extents."""
+def spark_layouts(intermediate: int, *, exact: bool = True, unit: int = 128) -> list[str]:
+    """Every geometric TP1..8 layout, with unequal whole-H128 rank extents."""
     layouts = []
-    for tp in range(1, 7):
-        widths = exact_widths(intermediate, tp)
+    for tp in range(1, 9):
+        widths = exact_widths(intermediate, tp, unit)
         if not widths:
             continue
         layout = f"tp{tp}"
@@ -411,14 +408,14 @@ def layout_geometry(base, layout: str):
     """``tp<n>`` (padded) or ``tp<n>-w<width>`` (exact) -> (tp, geometry)."""
     tp_part, _, width = layout.partition("-w")
     tp = int(tp_part.removeprefix("tp"))
-    if tp not in range(1, 7):
-        raise SystemExit(f"{layout}: Spark TP must be in 1..6")
-    if tp in (1, 5) and not exact_widths(base.intermediate, tp):
+    if tp not in range(1, 9):
+        raise SystemExit(f"{layout}: Spark TP must be in 1..8")
+    if not exact_widths(base.intermediate, tp, 16 if base.weights == "nvfp4" else 32 if base.weights == "mxfp4" else 128):
         raise SystemExit(f"{layout}: intermediate {base.intermediate} needs a nonempty whole-H128 slice per rank")
     g = base.with_tp(tp)
     if width:
         widths = exact_widths(base.intermediate, tp)
-        if base.weights == "mxfp4" and tp in (3, 6) and base.intermediate // 128 % tp:
+        if base.weights == "mxfp4":
             widths += exact_widths(base.intermediate, tp, 32)
         if int(width) not in widths:
             raise SystemExit(f"{layout}: no rank of TP{tp} owns {width} rows of {base.intermediate} exactly")
@@ -467,34 +464,19 @@ def build(args: argparse.Namespace) -> None:
                          f"(use --cross-sm121 on an SM120 host)")
     base = GEOMETRIES[args.geometry]
     capacities = sorted({int(v) for v in args.capacities.split(",")})
-    layouts = args.layouts.split(",") if args.layouts else list(ROLE_LAYOUTS[args.role])
-    if base.weights == "mxfp4" and not args.layouts:
-        # MXFP4 slices pad to 128 (MiMo V2.6 Pro: TP6 over all six Sparks, TP2 x EP3 shards).
-        layouts = list(MXFP4_ROLE_LAYOUTS[args.role])
-        if args.geometry == "mimof" and args.role == "spark":
-            layouts = ["tp2", "tp3", "tp4"]
-    elif base.weights == "nvfp4" and not args.layouts:
-        layouts = [l for l in NVFP4_ROLE_LAYOUTS[args.role]
-                   if base.intermediate // 16 >= int(l.removeprefix("tp"))]
-    # Default Spark layouts keep the TP degrees that split the intermediate into
-    # whole 128-row blocks (Qwen 3.8 Flash Next's 640 splits into none), and
-    # TP6 of any intermediate of at least six blocks: uneven whole blocks
-    # zero-padded to the widest (2048: 3, 3, 3, 3, 2, 2 blocks stored as 384).
-    elif args.role == "spark" and not args.layouts and not getattr(args, "all_spark_counts", False):
-        def servable(tp: int) -> bool:
-            blocks = base.intermediate // 128
-            return base.intermediate % (128 * tp) == 0 or (tp == 6 and blocks >= 6)
-
-        layouts = [l for l in layouts if servable(int(l.removeprefix("tp")))]
-        if not layouts:
-            raise SystemExit(f"{args.geometry}: intermediate {base.intermediate} has no default {args.role} "
-                             "TP layout of whole 128-row blocks; pass --layouts")
-    if getattr(args, "all_spark_counts", False):
-        if args.role != "spark":
-            raise SystemExit("--all-spark-counts requires Spark role")
-        if args.layouts:
-            raise SystemExit("--all-spark-counts and --layouts are mutually exclusive")
-        layouts = spark_layouts(base.intermediate)
+    unit = 16 if base.weights == "nvfp4" else 32 if base.weights == "mxfp4" else 128
+    if getattr(args, "all_spark_counts", False) and (args.role != "spark" or args.layouts):
+        raise SystemExit("--all-spark-counts requires Spark role without --layouts")
+    from spark_packages import geometry_worlds
+    worlds = (range(1, 9) if getattr(args, "all_spark_counts", False)
+              else geometry_worlds(args.geometry)) if args.role == "spark" else ()
+    layouts = (args.layouts.split(",") if args.layouts else
+               [f"tp{world}" for world in worlds if exact_widths(base.intermediate, world, unit)]
+               if args.role == "spark" else list(ROLE_LAYOUTS[args.role]))
+    if args.role == "spark" and base.weights == "nvfp4":
+        allowed = geometry_worlds(args.geometry)
+        if any(int(layout.partition("-w")[0][2:]) not in allowed for layout in layouts):
+            raise SystemExit(f"NVFP4 is deprecated; worlds {allowed}")
     if args.geometry.startswith("glmfdense") and not args.layouts:
         layouts = ["tp1"]  # One always-selected dense expert is not an RTX TP2 backend.
     if args.exact_slices:
@@ -507,7 +489,7 @@ def build(args: argparse.Namespace) -> None:
     # Fine-unit MXFP4 programs coexist with the qualified H128 layouts while
     # balanced placement is gated. One width is selected for each rank/layer.
     if args.exact_slices and base.weights == "mxfp4" and args.role == "spark":
-        for tp in (3, 6):
+        for tp in range(1, 9):
             if f"tp{tp}" in layouts and base.intermediate // 128 % tp:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(set(exact_widths(base.intermediate, tp, 32)), reverse=True)
                             if f"tp{tp}-w{width}" not in layouts]
@@ -520,12 +502,21 @@ def build(args: argparse.Namespace) -> None:
                 "sms": props.multi_processor_count, "layouts": {}, "files": {}}
     with tempfile.TemporaryDirectory(prefix=".fp8moe-package-", dir=args.output.parent) as temporary:
         stage = Path(temporary)
+        compiled_widths = {}
         for layout in layouts:
             tp, g = layout_geometry(base, layout)
-            raw = args.build_dir / args.geometry / layout
-            if raw.exists():
-                shutil.rmtree(raw)
-            raw.mkdir(parents=True)
+            # TP is inspection metadata; kernels, routes and scratch use slice.
+            # Preserve a distinct bridge (and its TP info word) per destination.
+            compile_key = (g.slice, g.kind, wire, tuple(capacities), g.hidden, g.experts, g.top_k,
+                           g.activation, g.projection, g.swiglu_limit, ABI_VERSION,
+                           _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count)
+            identity = hashlib.sha256(json.dumps(compile_key).encode()).hexdigest()[:20]
+            reused = compiled_widths.get(compile_key)
+            raw = args.build_dir / args.geometry / f"width{g.slice}-{identity}"
+            if not reused:
+                if raw.exists():
+                    shutil.rmtree(raw)
+                raw.mkdir(parents=True)
             programs = []
             # Each capacity's default program, plus its other large-row forms where they differ.
             forms = [(c, "auto") for c in capacities]
@@ -533,8 +524,8 @@ def build(args: argparse.Namespace) -> None:
             exports = [(c, form, False) for c, form in forms]
             if args.role == "spark" and wire and g.weights in ("fp8", "mxfp4"):
                 exports += [(SEGMENT_MAX_ROWS, form, True) for form in FORMS]
-            for capacity, form, segmented in exports:
-                stem = (f"fp8moe_{args.geometry}_{layout.replace('-', '_')}_m{capacity}"
+            for capacity, form, segmented in ([] if reused else exports):
+                stem = (f"fp8moe_{args.geometry}_w{g.slice}_m{capacity}"
                         f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}")
                 with exportable_compilation():
                     program = compile_fp8_moe_aot(g, route="stream" if segmented else "auto",
@@ -553,11 +544,16 @@ def build(args: argparse.Namespace) -> None:
                                  "weight_read_grouping": program.geometry["weight_read_grouping"],
                                  "arithmetic_routes": program.geometry["arithmetic_routes"]})
                 print(f"exported {stem} (scratch {programs[-1]['scratch']} B)", flush=True)
+            if reused:
+                programs, object_root = reused
+            else:
+                object_root = raw
+                compiled_widths[compile_key] = (programs, raw)
             (raw / "fp8moe_bridge.cc").write_text(bridge_source(programs, info_words(g, capacities, wire)))
             target = stage / layout / LIBRARY
             target.parent.mkdir(parents=True)
-            subprocess.run([args.cxx, "-shared", "-fPIC", "-std=c++17", f"-I{args.cuda_include}", f"-I{raw}",
-                            str(raw / "fp8moe_bridge.cc"), *[str(raw / f"{p['stem']}.o") for p in programs],
+            subprocess.run([args.cxx, "-shared", "-fPIC", "-std=c++17", f"-I{args.cuda_include}", f"-I{object_root}",
+                            str(raw / "fp8moe_bridge.cc"), *[str(object_root / f"{p['stem']}.o") for p in programs],
                             f"-L{args.cuda_libdir}", "-lcudart", f"-L{args.runtime.parent}", "-lcute_dsl_runtime",
                             "-Wl,-z,defs", "-o", str(target)], check=True)
             manifest["layouts"][layout] = {
@@ -630,7 +626,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     create = commands.add_parser("build")
-    create.add_argument("--role", choices=sorted(ROLE_LAYOUTS), required=True)
+    create.add_argument("--role", choices=sorted(ROLE_COMPUTE), required=True)
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
                                                "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4"),

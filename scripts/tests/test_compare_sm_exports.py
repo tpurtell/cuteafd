@@ -61,6 +61,25 @@ def test_two_target_counts():
     assert compare_sm.parse_sms("188,170") == (188, 170)
 
 
+def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
+    path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
+    tree = ast.parse(path.read_text())
+    tables = {node.targets[0].id: ast.literal_eval(node.value)
+              for node in tree.body if isinstance(node, ast.Assign)
+              and isinstance(node.targets[0], ast.Name)
+              and node.targets[0].id in ("ROLE_GEOMETRY", "FAMILY_GEOMETRY", "ROLE_TP_DEGREE")}
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "role_geometry")
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), tables)
+    assert tables["role_geometry"]("dsv4p", "spark_tp3") == (384, 1024, 1024, 6)
+    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "export")
+    for node in ast.walk(function):
+        test = ast.unparse(node.test).replace("'", '"') if isinstance(node, (ast.If, ast.IfExp)) else ''
+        if isinstance(node, ast.If) and any(isinstance(child, ast.Raise) for child in node.body):
+            assert not ('family != "v41"' in test and 'spark_tp3' in test)
+        if isinstance(node, ast.IfExp) and isinstance(node.body, ast.Call) and isinstance(node.body.func, ast.Name) and node.body.func.id == "launch_geometry":
+            assert 'family == "v41"' in test
+
+
 @pytest.mark.parametrize("role,cmake", [
     ("rtx_backbone", "v41_local_experts.cmake"),
     ("rtx_tp2", "v41_tp2_experts.cmake"),
@@ -197,7 +216,7 @@ def test_compact_gate_matches_packager_spark_companions(tmp_path, monkeypatch, g
         assert options.get("swiglu_limit", 10.0) == package.swiglu_limit(geometry)
     widths = {profile[1] for profile in profiles}
     assert widths == ({256, 384} if geometry == "qwen4" else
-                      {640} if geometry == "v41" else {384, 768})
+                      {640} if geometry == "v41" else {384, 512, 768})
 
 
 def test_identical_object_ignores_context_metadata(tmp_path):
@@ -495,6 +514,7 @@ def test_multitier_exports_do_not_use_two_tier_only_schedules(tmp_path, monkeypa
         ws_dynamic_tiles=lambda *_: False, ws_tile=lambda *_: None,
         decode_tile=lambda *_: None, activation=lambda *_: "silu",
         default_decode_schedule=lambda *_: None,
+        decode_schedule_variants=lambda *_: [],
     )
     for name in ("warp_specialized", "fused_input_rotation", "token_major_rotation"):
         setattr(package, name, lambda *_, name=name: name == rotation)
@@ -538,9 +558,8 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         build_root, role, bits, geometry=geometry,
         capacities=capacities, compact=compact,
         profiles=() if compact else tuple(p[0] for p in package.profiles_for_role(role, geometry)))
-    expected = {(call.args[0].parent.name.split('+')[0], call.args[3]): call.kwargs for call in calls
-                if bool(call.kwargs.get("compact_weights")) == compact
-                and not call.args[0].parent.name.endswith("+gb10")}
+    expected = [(call.args[1], call.args[3], call.kwargs) for call in calls
+                if bool(call.kwargs.get("compact_weights")) == compact]
     recorded = []
     monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
     monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(
@@ -551,9 +570,12 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         args.append("--compact-companions")
     compare_sm._export_exl3(args, tmp_path / "gate")
     assert recorded
+    if geometry == "glmf" and role == "spark" and not compact:
+        assert any(str(values[0]).endswith("m1-gb10") for values, _ in recorded)
+        assert any(options.get("decode_schedule") == "gb10" for _, options in recorded)
     for values, options in recorded:
         assert options.pop("compile_only") is True
-        assert options == expected[(values[0].parent.name, values[3])]
+        assert (values[1], values[3], options) in expected
     if compact:
         # Qwen4 compact now carries measured warp-specialized cells at the
         # served capacities and keeps the cooperative kernel at decode ones;
@@ -806,11 +828,46 @@ def test_indirect_fp8_and_mxfp4_streams_are_in_the_sm_gate():
     assert "--row-addresses" not in ordinary
 
 
+def test_source_routed_layouts_use_checkout_policy_not_candidate_worlds(tmp_path, monkeypatch):
+    source = tmp_path / 'package.py'
+    source.write_text('''
+def build(args):
+    capacities = []
+    layouts = args.layouts.split(',')
+    if args.exact_slices:
+        layouts += [name + '-w128' for name in list(layouts)]
+    wire = False
+    raise AssertionError('must not enter compilation')
+''')
+    monkeypatch.setattr(compare_sm, 'ROOT', tmp_path)
+    scope = SimpleNamespace(PREVIOUS_RELEASE_FLOOR={'GENERIC_SPARK_COUNTS': {'mimo=2', 'mimo=4'}})
+    monkeypatch.setattr(compare_sm, 'load_file', lambda *args: scope)
+    package = SimpleNamespace(__file__=str(source))
+    assert compare_sm.routed_package_layouts(package, 'mimo', None, 'spark') == [
+        'tp2', 'tp4', 'tp2-w128', 'tp4-w128']
+
+
+def test_spark_routed_groups_follow_shared_width_aliases_and_input_formats():
+    cases = {name: args for name, _, args in compare_sm.jobs("all")}
+    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):
+        args = cases[f"routed-{geometry}-spark-bf16"]
+        assert args[args.index("--role") + 1] == "spark"
+        assert args[args.index("--input") + 1] == "bf16"
+        assert "--exact-slices" in args
+    qwen = cases["routed-qwen4-spark-bf16"]
+    assert "tp5" in qwen[qwen.index("--layouts") + 1].split(",")
+    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5"):
+        args = cases[f"routed-{geometry}-spark-wire"]
+        assert args[args.index("--input") + 1] == "wire"
+    for geometry in ("dsv4p", "kimik3"):
+        assert "--compact-companions" in cases[f"exl3-compact-{geometry}-k23"]
+
+
 @pytest.mark.parametrize("indirect", [False, True])
 def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, monkeypatch, indirect):
     from contextlib import nullcontext
 
-    geometry = SimpleNamespace()
+    geometry = SimpleNamespace(weights="fp8")
     calls = []
     program = SimpleNamespace(export_to_c=lambda *args: None)
 
@@ -838,6 +895,7 @@ def test_routed_export_only_requires_segment_api_for_row_addresses(tmp_path, mon
     monkeypatch.setitem(sys.modules, "b12x.integration.cuteafd.fp8_moe", module)
     monkeypatch.setitem(sys.modules, "package_fp8_moe_aot", SimpleNamespace(
         layout_geometry=lambda base, layout: (1, base), POINTERS=11, SEGMENT_MAX_ROWS=16384,
+        input_kind=lambda role, weights, requested: requested or ("wire" if role == "spark" else "bf16"),
     ))
     args = ["--geometry", "mimo", "--capacities", "2752"]
     compare_sm.export_routed(args + (["--row-addresses"] if indirect else []), tmp_path)

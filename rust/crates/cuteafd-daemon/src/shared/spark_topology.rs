@@ -61,10 +61,16 @@ pub(crate) fn require_supported(
     if let Some(topology) = topology {
         ensure!(catalog.fp8().is_none(),
             "generic expert programs require canonical Spark wire");
-        ensure!(catalog.exl3().is_none() && (catalog.nvfp4().is_none()
+        let nvfp4 = catalog.nvfp4().is_some();
+        ensure!(catalog.exl3().is_none() && (!nvfp4
                 || (topology.ep() == 1 && matches!(topology.tp(), 3 | 4 | 6))),
-            "unsupported Spark ownership wire {}x{} for this checkpoint; supported: native experts on TP2EP1, TP3EP1, TP4EP1, TP6EP1, TP2EP2, TP3EP2, TP2EP3; NVFP4 on TP3EP1, TP4EP1, TP6EP1",
+            "unsupported Spark ownership wire {}x{} for this checkpoint; NVFP4 on TP3EP1, TP4EP1, TP6EP1 only; EXL3 requires canonical wire",
             topology.tp(), topology.ep());
+        let geometry = catalog.routed_experts().geometry()?;
+        let family = geometry.family().unwrap_or("v41");
+        ensure!(cuteafd_core::tp_units::spark_package_worlds(family,
+                if nvfp4 { "nvfp4" } else { "mxfp4" }).contains(&(topology.tp() as usize)),
+            "checkpoint has no native Spark width-class recipe for TP{}", topology.tp());
         SparkWorld::owned(topology)?;
     }
     Ok(())
@@ -78,11 +84,13 @@ pub(crate) fn require_wire(world: SparkWorld, catalog: &OfficialV41Catalog) -> R
         return Ok(());
     }
     require_supported(world.ownership_topology(), catalog)?;
-    let family = catalog.routed_experts().geometry()?.family();
-    if world.ownership_topology().is_none() && catalog.exl3().is_none() && catalog.fp8().is_none() {
-        ensure!(world.topology().tp() == 4
-            || (family == Some("dsv4f") && world.topology().tp() == 2),
-            "native Spark experts outside TP4 require ownership wire (except V4 Flash TP2)");
+    if catalog.exl3().is_none() && catalog.fp8().is_none() {
+        let geometry = catalog.routed_experts().geometry()?;
+        let family = geometry.family().unwrap_or("v41");
+        let format = if catalog.nvfp4().is_some() { "nvfp4" } else { "mxfp4" };
+        ensure!(cuteafd_core::tp_units::spark_package_worlds(family, format)
+                .contains(&(world.topology().tp() as usize)),
+            "checkpoint has no native Spark width-class recipe for TP{}", world.topology().tp());
     }
     Ok(())
 }
@@ -126,15 +134,66 @@ mod tests {
     }
 
     #[test]
-    fn native_world_requires_owned_wire_outside_tp4() -> Result<()> {
-        let root = tempfile::tempdir()?;
-        cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
-        let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        require_world(SparkWorld::canonical(4)?, &catalog)?;
-        require_world(SparkWorld::owned(SparkTopology::NATIVE_TP3_EP1)?, &catalog)?;
-        for ranks in [3, 6] {
-            let error = require_world(SparkWorld::canonical(ranks)?, &catalog).unwrap_err();
-            assert!(error.to_string().contains("native Spark experts outside TP4 require ownership wire"));
+    fn native_worlds_share_serve_transport_and_launch_qualification() -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        for (family, write) in [
+            ("v41", testing::write_v41_snapshot as fn(&std::path::Path)),
+            ("dsv4f", testing::write_v4_snapshot),
+            ("dsv4p", testing::write_v4_pro_mxfp4_snapshot),
+        ] {
+            let root = tempfile::tempdir()?;
+            write(root.path());
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            let supported = cuteafd_core::tp_units::spark_package_worlds(family, "mxfp4");
+            for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+                let canonical = require_world(SparkWorld::canonical(ranks)?, &catalog);
+                assert_eq!(canonical.is_ok(), supported.contains(&ranks), "{family} TP{ranks}: {canonical:?}");
+                if supported.contains(&ranks) {
+                    require_world(SparkWorld::owned(SparkTopology::new(ranks as u8, 1)?)?, &catalog)?;
+                }
+                launch_check(ranks, supported.contains(&ranks), true)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn launch_check(ranks: usize, supported: bool, owned: bool) -> Result<()> {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let output = std::process::Command::new("bash")
+            .args(["-c", "source \"$1/scripts/lib/release-common.sh\"; SPARK_COUNT=$2; SPARK_TP=$3; SPARK_EP=$4; EXPERT_FORMAT=native; SPARKINFER_EXL3=disable; release_validate_spark_topology", "launch-test"])
+            .arg(source).arg(ranks.to_string())
+            .arg(if owned { ranks.to_string() } else { String::new() })
+            .arg(if owned { "1" } else { "" }).output()?;
+        // Launch checks only wire qualification; checkpoint recipes are checked
+        // by serve, so another native family's valid width may pass the shell.
+        let expected = if owned { cuteafd_core::tp_units::spark_ownership_topology(ranks, 1) } else { true };
+        assert_eq!(output.status.success(), expected, "TP{ranks} supported={supported}: {}", String::from_utf8_lossy(&output.stderr));
+        Ok(())
+    }
+
+    #[test]
+    fn generic_worlds_share_serve_and_launch_qualification() -> Result<()> {
+        use cuteafd_loader::plan::testing;
+        for family in ["mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "dsv4p", "kimik3"] {
+            let root = tempfile::tempdir()?;
+            let (format, intermediate) = match family {
+                "mimo" => { testing::write_snapshot(root.path(), &testing::mimo_flash_config(), &testing::mimo_flash_tensors(), None); ("fp8", 2048) }
+                "mimof" => { testing::write_snapshot(root.path(), &testing::mimo_flash_mopd_config(), &testing::mimo_flash_mopd_tensors(), None); ("fp8", 2048) }
+                "mimop" => { testing::write_snapshot(root.path(), &testing::mimo_pro_config(), &testing::mimo_pro_tensors(), None); ("fp8", 2048) }
+                "glm" => { testing::write_snapshot(root.path(), &testing::glm5_config(), &testing::glm5_tensors(|name, n, k| testing::fp8(name, n, k, None)), None); ("fp8", 2048) }
+                "glmf" => { let cfg = testing::glm5_flash_config(3); testing::write_snapshot(root.path(), &cfg, &testing::glm5_flash_tensors(&cfg), None); ("fp8", 2048) }
+                "qwen4" => { let (tensors, _) = testing::qwen4_exl3(3, 4); testing::write_snapshot(root.path(), &testing::qwen4_config(3), &tensors, None); ("exl3-k4", 640) }
+                "dsv4p" => { testing::write_v4_pro_exl3_snapshot(root.path()); ("exl3-k23", 3072) }
+                "kimik3" => { testing::write_kimi_snapshot(root.path(), true); ("exl3-k23", 3072) }
+                _ => unreachable!(),
+            };
+            let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+            for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+                let expected = cuteafd_loader::plan::experts::spark_recipe(&format!("{family}:{format}"), intermediate, ranks).is_ok();
+                let served = require_world(SparkWorld::canonical(ranks)?, &catalog);
+                assert_eq!(served.is_ok(), expected, "{family} TP{ranks}: {served:?}");
+                launch_check(ranks, expected, false)?;
+            }
         }
         Ok(())
     }

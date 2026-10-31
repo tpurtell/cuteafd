@@ -8,6 +8,7 @@ strict gate. Reports include exact object bytes, cubins, headers and metadata.
 from __future__ import annotations
 
 import argparse
+import ast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 import hashlib
@@ -113,6 +114,16 @@ def jobs(scope):
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
                             "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128",
                             "--atomic-min-capacity", "256", "--standard-names"]))
+    for family in ("v41", "dsv4f", "dsv4p"):
+        for role in ("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8"):
+            if family == "dsv4f" and role in ("spark_tp3", "spark_tp6"):
+                continue  # 2048 cannot split into equal whole-K32 thirds/sixths.
+            result.append((f"{family}-{role}", "export_b12x_slices_aot.py",
+                           ["--geometry", family, "--role", role, "--rows", CAPACITIES,
+                            "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128"
+                            if family != "v41" else "1:192,16:192,80:192,256:192,1024:192,4096:192",
+                            *(["--atomic-min-capacity", "256"] if family != "v41" else []),
+                            "--standard-names"]))
     result.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),
         ("v41-experts", "export_b12x_v41_experts_aot.py",
@@ -151,9 +162,19 @@ def jobs(scope):
     result.append(("routed-mimop-tp6", "package_fp8_moe_aot.py",
                    ["--geometry", "mimop", "--capacities", CAPACITIES,
                     "--layouts", "tp6", "--exact-slices"]))
-    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4")):
+    geometry_worlds = load_file("spark_packages", ROOT / "python/tools/lib/spark_packages.py").geometry_worlds
+    for geometry in ("mimo", "mimof", "mimop", "glm", "glmf", "qwen4", "step5", "step5_bf16"):
+        layouts = ",".join(f"tp{world}" for world in geometry_worlds(geometry))
+        for input_format in (("bf16",) if geometry == "step5_bf16" else ("wire", "bf16")):
+            result.append((f"routed-{geometry}-spark-{input_format}", "package_fp8_moe_aot.py",
+                           ["--geometry", geometry, "--capacities", CAPACITIES,
+                            "--layouts", layouts, "--exact-slices", "--role", "spark",
+                            "--input", input_format]))
+    for geometry, bits in (("qwen4", "4,5"), ("glm", "4,5"), ("glmf", "3,4"),
+                           ("dsv4p", "2,3"), ("kimik3", "2,3")):
+        capacities = EXL3_CAPACITIES_KIMIK3 if geometry == "kimik3" else EXL3_CAPACITIES
         result.append((f"exl3-compact-{geometry}-k{bits.replace(',', '')}", "package_exl3_aot.py",
-                       ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits,
+                       ["--geometry", geometry, "--capacities", capacities, "--bits", bits,
                         "--compact-companions"]))
     exl3_capacity_args = {geometry: EXL3_CAPACITIES_KIMIK3 if geometry == "kimik3"
                           else EXL3_CAPACITIES for geometry in EXL3_GEOMETRIES}
@@ -233,6 +254,54 @@ def jobs(scope):
     return result
 
 
+def routed_package_layouts(package, geometry, base, role):
+    """Evaluate this checkout's shipped layout policy without entering its compiler."""
+    requested = None
+    if role == "spark":
+        shared = ROOT / "python/tools/lib/spark_packages.py"
+        if shared.is_file():
+            worlds = load_file("source_spark_packages", shared).geometry_worlds(geometry)
+        else:
+            scope = load_file("source_release_scope", ROOT / "scripts/build/release-scope.py")
+            family = geometry.partition('_')[0]
+            worlds = sorted({int(item.split('=')[1])
+                             for item in scope.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS']
+                             if item.split('=')[0] == family})
+            if not worlds:
+                # A family absent from release scope must use its own planner's
+                # registered worlds, never the exporter's unused geometric defaults.
+                source = (ROOT / "rust/crates/cuteafd-loader/src/plan/experts.rs").read_text()
+                import re
+                match = re.search(r'if family == "' + re.escape(family)
+                                  + r'" \{ matches!\(world, ([0-9 |]+)\)', source)
+                if not match:
+                    raise ValueError(f"{geometry}: no shipped release or planner world witness")
+                worlds = [int(value.strip()) for value in match[1].split('|')]
+        requested = ','.join(f'tp{world}' for world in worlds)
+    path = Path(package.__file__)
+    tree = ast.parse(path.read_text())
+    build = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "build")
+    selected = []
+    for node in build.body:
+        if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "wire"
+                                               for target in node.targets):
+            break
+        if node.lineno > next(item.lineno for item in build.body if isinstance(item, ast.Assign)
+                              and any(isinstance(target, ast.Name) and target.id == "capacities"
+                                      for target in item.targets)):
+            selected.append(node)
+    else:
+        raise ValueError(f"{path}: production layout policy has no compiler boundary")
+    args = argparse.Namespace(geometry=geometry, role=role, layouts=requested, exact_slices=True,
+                              all_spark_counts=False)
+    namespace = {**vars(package), "args": args, "base": base}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"), namespace)
+    layouts = namespace.get("layouts")
+    if not isinstance(layouts, list) or not layouts:
+        raise ValueError(f"{path}: production layout policy returned no layouts")
+    return layouts
+
+
 def export_routed(extra, output):
     """Use the package's exact compiler/form policy without linking its DSOs."""
     from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
@@ -243,37 +312,48 @@ def export_routed(extra, output):
     geometry = extra[extra.index("--geometry") + 1]
     capacities = sorted({int(item) for item in extra[extra.index("--capacities") + 1].split(",")})
     base = GEOMETRIES[geometry]
-    layouts = extra[extra.index("--layouts") + 1].split(",") if "--layouts" in extra else ["tp1"]
-    if "--exact-slices" in extra:
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    source_policy = "--source-package-layouts" in extra
+    layouts = (routed_package_layouts(package, geometry, base, role) if source_policy else
+               extra[extra.index("--layouts") + 1].split(",") if "--layouts" in extra else ["tp1"])
+    if "--exact-slices" in extra and not source_policy:
         for layout in list(layouts):
             tp = int(layout.removeprefix("tp"))
             widths = sorted(set(package.exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{width}" for width in widths]
-            if base.weights == "mxfp4" and tp == 6:
+            if base.weights == "mxfp4" and base.intermediate // 128 % tp:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(
                     set(package.exact_widths(base.intermediate, tp, 32)), reverse=True)]
     indirect = "--row-addresses" in extra
-    if indirect:
+    role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
+    requested_input = extra[extra.index("--input") + 1] if "--input" in extra else None
+    wire = indirect or package.input_kind(role, base.weights, requested_input) == "wire"
+    segmented = indirect or (role == "spark" and wire and base.weights in ("fp8", "mxfp4"))
+    if segmented:
         from b12x.integration.cuteafd.fp8_moe import fp8_moe_segment_scratch_bytes
     records = []
-    for layout in layouts:
+    for layout in dict.fromkeys(layouts):
         _, g = package.layout_geometry(base, layout)
-        forms = [(rows, "auto") for rows in capacities]
-        forms += [(rows, form) for rows in capacities for form in prefill_forms(g, rows, indirect)]
-        for rows, form in forms:
+        forms = [(rows, "auto", indirect) for rows in capacities]
+        forms += [(rows, form, indirect) for rows in capacities for form in prefill_forms(g, rows, wire)]
+        if segmented and not indirect:
+            forms += [(package.SEGMENT_MAX_ROWS, form, True) for form in package.FORMS]
+        for rows, form, row_addresses in forms:
             stem = f"fp8moe_{geometry}_{layout.replace('-', '_')}_m{rows}" + ("" if form == "auto" else "_" + form)
+            if row_addresses and not indirect:
+                stem += "_segments"
             with exportable_compilation():
-                program = compile_fp8_moe_aot(g, route="stream" if indirect else "auto",
-                    max_rows=package.SEGMENT_MAX_ROWS if indirect else rows, wire=indirect, prefill=form,
-                    **({"row_addresses": True} if indirect else {}))
+                program = compile_fp8_moe_aot(g, route="stream" if row_addresses else "auto",
+                    max_rows=package.SEGMENT_MAX_ROWS if row_addresses else rows, wire=wire, prefill=form,
+                    **({"row_addresses": True} if row_addresses else {}))
             program.export_to_c(str(output), stem, "cuteafd_" + stem)
             checked = validate_exported_header(program, output / f"{stem}.h", "cuteafd_" + stem)
             if checked["argument_count"] != package.POINTERS + 2:
                 raise ValueError(f"{stem}: unexpected routed expert ABI")
             records.append({"name": stem, "layout": layout, "capacity": rows, "form": form, "abi": checked,
                             "scratch_bytes": (fp8_moe_segment_scratch_bytes(g, rows, package.SEGMENT_MAX_ROWS, form)
-                                              if indirect else fp8_moe_scratch_bytes(g, "auto", rows, False, form))})
+                                              if row_addresses else fp8_moe_scratch_bytes(g, "auto", rows, wire, form))})
             print(f"exported {stem}", flush=True)
     (output / "routed.json").write_text(json.dumps({"programs": records}, indent=2) + "\n")
 
@@ -325,7 +405,8 @@ def _export_exl3(extra, output):
         role = "spark"
         profiles = package.compact_profiles(geometry, package.build_profiles(role, geometry))
     else:
-        profiles = package.profiles_for_role(role, geometry)
+        profiles = (package.build_profiles(role, geometry) if "--source-package-layouts" in extra
+                    else package.profiles_for_role(role, geometry))
     for profile, width, experts, topk, dtype, _ in profiles:
         for rows in capacities:
             options = {"compile_only": True}
@@ -381,9 +462,14 @@ def _export_exl3(extra, output):
                 options["route_block"] = block
             if (limit := package.swiglu_limit(geometry)) != 10.0:
                 options["swiglu_limit"] = limit
+            default_options = dict(options)
             if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
-                options["decode_schedule"] = schedule
-            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)
+                default_options["decode_schedule"] = schedule
+            export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **default_options)
+            if not compact:
+                for schedule, schedule_options in package.decode_schedule_variants(geometry, role, profile, rows):
+                    export(output / profile / f"m{rows}-{schedule}", width, experts, rows, bits, "auto", topk,
+                           dtype, **{**options, **schedule_options})
 
 
 def export_exl3_routes(extra, output):
@@ -417,7 +503,15 @@ def worker(payload):
     sys.path[:0] = [str(ROOT / "python/tools/lib"), str(ROOT / "python/tools/aot")]
     import _pinned_sparkinfer
     from b12x._lib.compile_pool import _initialize_worker
-    _initialize_worker(0, (12, 0), "sm-export-comparison", "sm-export-comparison",
+    native_spark = (payload["exporter"] == "export_b12x_slices_aot.py"
+                    and any(role.startswith("spark") for role in payload["args"]))
+    exl3_spark = payload["exporter"] == "package_exl3_aot.py" and (
+        "--compact-companions" in payload["args"] or
+        ("--role" in payload["args"] and payload["args"][payload["args"].index("--role") + 1] == "spark"))
+    routed_spark = (payload["exporter"] == "package_fp8_moe_aot.py" and "--role" in payload["args"]
+                    and payload["args"][payload["args"].index("--role") + 1] == "spark")
+    capability = (12, 1) if native_spark or exl3_spark or routed_spark else (12, 0)
+    _initialize_worker(0, capability, "sm-export-comparison", "sm-export-comparison",
                        payload["sms"], 101376, 102400, multiprocessing.Array("i", [0, 0]))
     import torch
     import importlib.metadata
@@ -460,7 +554,7 @@ def worker(payload):
     if torch.cuda.is_initialized():
         raise RuntimeError("SM comparison initialized CUDA")
     (Path(payload["output"]) / "comparison-plans.json").write_text(json.dumps(plans, indent=2) + "\n")
-    summary = {"sms": payload["sms"], "capability": [12, 0], "cuda_initialized": False,
+    summary = {"sms": payload["sms"], "capability": list(capability), "cuda_initialized": False,
                "sparkinfer_revision": _pinned_sparkinfer.REVISION,
                "source_tree_sha256": _pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
                "exporter": payload["exporter"], "args": payload["args"], "toolchain": toolchain,
@@ -555,7 +649,7 @@ def compare(left, right, *, source_comparison=False):
         raise ValueError("comparison context did not prove CPU-only export")
     for context in contexts:
         sms = context.get("sms")
-        if type(sms) is not int or sms <= 0 or context.get("capability") != [12, 0]:
+        if type(sms) is not int or sms <= 0 or context.get("capability") not in ([12, 0], [12, 1]):
             raise ValueError("comparison context must identify positive SM count and compute 12.0")
     if source_comparison:
         if contexts[0]["sms"] != contexts[1]["sms"]:
@@ -685,7 +779,13 @@ def main():
             if directory.exists() and any(directory.iterdir()):
                 raise ValueError(f"output is not empty: {directory}; use --compare-only or a fresh output root")
             directory.mkdir(parents=True, exist_ok=True)
-            payload = dict(sms=sms, exporter=exporter, args=extra, output=str(directory))
+            context_args = list(extra)
+            if baseline_source and exporter in ("package_fp8_moe_aot.py", "package_exl3_aot.py"):
+                if "--layouts" in context_args:
+                    index = context_args.index("--layouts")
+                    del context_args[index:index + 2]
+                context_args.append("--source-package-layouts")
+            payload = dict(sms=sms, exporter=exporter, args=context_args, output=str(directory))
             print(f"export {name} SMs={sms}", flush=True)
             env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(source),
                        CUTEAFD_SPARKINFER_SOURCE_DIR=str(source / "third_party/sparkinfer"),
@@ -702,6 +802,8 @@ def main():
         report = compare(*directories, source_comparison=True) if baseline_source else compare(*directories)
         report["comparison_axis"] = "source" if baseline_source else "sm_count"
         report["group"] = name
+        if baseline_source and report["removed_programs"]:
+            raise ValueError(f"shipped programs removed: {report['removed_programs']}")
         (output / name / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
         for label in ("added", "removed"):
             for program in report[f"{label}_programs"]:
@@ -729,7 +831,8 @@ def main():
     different = sum(not row["object_identical"] for report in reports for row in report["programs"])
     total = sum(len(report["programs"]) for report in reports)
     inventory_delta = sum(len(report[key]) for report in reports
-                          for key in ("added_programs", "removed_programs"))
+                          for key in (("removed_programs",) if baseline_source
+                                      else ("added_programs", "removed_programs")))
     print(f"Compared {total} common programs: {total - different} identical objects, {different} different, "
           f"{inventory_delta} added/removed. Report: {output / 'comparison.json'}")
     return int(args.require_identical and (different > 0 or inventory_delta > 0))

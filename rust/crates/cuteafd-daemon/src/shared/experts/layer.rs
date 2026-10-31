@@ -84,6 +84,7 @@ impl ExpertLayer {
             Self::BackboneReplicatedTp { world: 2, .. } => 5,
             Self::BackboneReplicatedTp { world: 3, .. } => 6,
             Self::BackboneReplicatedTp { world: 6, .. } => 7,
+            Self::BackboneReplicatedTp { world: 8, .. } => 8,
             Self::BackboneReplicatedTp { .. } => 1,
             // Compressed shards have no native role; see the sentinel doc.
             Self::BackboneExl3Tp { world, .. } => EXL3_SHARD_ROLE_SENTINEL + world as u32,
@@ -109,6 +110,7 @@ impl ExpertLayer {
                 3 => library.v41_spark_tp3_expert_info(capacity),
                 4 => library.v41_expert_info(capacity),
                 6 => library.v41_spark_tp6_expert_info(capacity),
+                8 => library.v41_spark_tp8_expert_info(capacity),
                 other => anyhow::bail!("unsupported replicated Spark TP degree {other}"),
             }
         } else { library.v41_expert_info(capacity) }
@@ -129,6 +131,7 @@ impl ExpertLayer {
                 3 => library.v41_spark_tp3_expert_kernel(capacity),
                 4 => library.v41_expert_kernel(capacity),
                 6 => library.v41_spark_tp6_expert_kernel(capacity),
+                8 => library.v41_spark_tp8_expert_kernel(capacity),
                 other => anyhow::bail!("unsupported replicated Spark TP degree {other}"),
             }
         } else { library.v41_expert_kernel(capacity) }

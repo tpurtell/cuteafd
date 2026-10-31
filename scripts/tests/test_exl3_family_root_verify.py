@@ -45,7 +45,7 @@ def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
                     rank = int(destination.split("rank")[1])
                     assert rank not in ranks
                     ranks[rank] = width
-        if tp > 6 or tp > intermediate // 128:
+        if tp > intermediate // 128:
             assert not ranks
         else:
             assert sorted(ranks) == list(range(tp))
@@ -55,12 +55,44 @@ def test_generic_spark_profiles_cover_every_nonempty_whole_block_rank(geometry):
 
 
 @pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4"])
-def test_all_counts_are_opt_in_and_legacy_build_profiles_remain(geometry):
+def test_default_profiles_follow_checkpoint_package_ranges(geometry):
     tool = load_tool()
     legacy = tool.build_profiles("spark", geometry)
     worlds = {int(profile[0].split("-")[0][2:]) for profile in legacy}
-    assert worlds == ({1, 2, 3, 4} if geometry == "qwen4" else {2, 3, 4, 6})
+    ranges = json.loads((REPO / "scripts/build/spark-package-ranges.json").read_text())
+    assert worlds == set(ranges["entries"][f"{geometry}:exl3"]["worlds"])
     assert tool.build_profiles("spark", geometry, all_spark_counts=True) == tool.profiles_for_role("spark", geometry)
+
+
+@pytest.mark.parametrize("geometry", ["dsv4p", "glm", "glmf", "qwen4", "kimik3"])
+def test_cmake_spark_profiles_exist_in_production_package(tmp_path, geometry):
+    import subprocess
+    tool = load_tool()
+    script = tmp_path / 'profiles.cmake'
+    output = tmp_path / 'profiles.txt'
+    script.write_text(f'''
+cmake_minimum_required(VERSION 3.20)
+function(add_custom_command)
+  file(WRITE "{output}" "${{CUTEAFD_EXL3_PROFILE_ARGS}}")
+endfunction()
+function(add_custom_target)
+endfunction()
+function(add_dependencies)
+endfunction()
+set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")
+set(CUTEAFD_ENABLE_CUDA ON)
+set(CUTEAFD_CUDA_ARCHITECTURES 121)
+set(CUDAToolkit_INCLUDE_DIRS unused)
+set(CUTEAFD_EXPERT_FAMILIES "{geometry}:exl3-k23")
+include("{REPO}/native/cmake/shared/exl3.cmake")
+''')
+    subprocess.run(['cmake', '-P', str(script)], check=True, capture_output=True, text=True)
+    args = output.read_text().split(';')
+    requested = set(args[1::2])
+    expected = {profile[0] for profile in tool.build_profiles('spark', geometry)}
+    assert requested == expected
+    ranges = json.loads((REPO / 'scripts/build/spark-package-ranges.json').read_text())
+    assert ranges['entries'][f'{geometry}:exl3']['intermediate'] == tool.GEOMETRIES[geometry][1]
 
 
 def test_kimi_coordinator_exports_whole_and_tp2_fp32_latent_experts():
@@ -73,9 +105,9 @@ def test_kimi_coordinator_exports_whole_and_tp2_fp32_latent_experts():
     ]
     assert tool.parse_requested_layouts(["rtx-tp2"], "coordinator", "kimik3") == ["rtx-tp2"]
     assert tool.package_capacities("kimik3", "1,16,80,256,1024,4096") == [1, 80, 256, 1024, 4096]
-    assert tool.build_profiles("spark", "kimik3") == [
-        ("tp6-width512", 512, 896, 16, "bf16", [f"tp6-rank{rank}" for rank in range(6)]),
-    ]
+    profiles = tool.build_profiles("spark", "kimik3")
+    assert {p[0].split("-")[0] for p in profiles} == {"tp6", "tp7", "tp8"}
+    assert ("tp6-width512", 512, 896, 16, "bf16", [f"tp6-rank{rank}" for rank in range(6)]) in profiles
 
 
 def _manifest(path: Path, role: str = "coordinator") -> None:

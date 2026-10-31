@@ -139,7 +139,7 @@ class Checkpoint:
 
 
 def rank_sum(weights, intermediate, unit, world, expert, layer, padded=False,
-             source_block=128, activation='silu', limit=None):
+             source_block=128, activation='silu', limit=None, rule=None):
     gate, up, down = weights
     assert gate.shape == up.shape == (intermediate, 128)
     assert down.shape == (128, intermediate)
@@ -160,25 +160,29 @@ def rank_sum(weights, intermediate, unit, world, expert, layer, padded=False,
     hidden = activate(g, u)
     whole = hidden @ down.T
     partials = []
+    # Integer contributions isolate byte-exact ownership/reduction from the
+    # permitted floating-point reordering of separate rank GEMMs.
+    contributions = np.rint(np.clip(hidden[:, None, :] * down[None, :, :],
+                                     -(1 << 20), 1 << 20) * 256).astype(np.int64)
+    exact_whole = contributions.sum(axis=2)
+    exact_sum = np.zeros_like(exact_whole)
     covered = np.zeros(intermediate, dtype=np.int32)
+    source_unit = source_block if padded else unit
+    if rule is None:
+        rule = 'contiguous' if intermediate // source_unit % world == 0 else (
+            'layer-rotation' if padded or source_unit == 32 else 'rotated')
     for rank in range(world):
-        if padded:
-            # Source blocks and stored kernel tiles are distinct geometries.
-            groups = intermediate // source_block
-            start = (groups // world * rank + min(rank, groups % world)) * source_block
-            stop = start + (groups // world + (rank < groups % world)) * source_block
-            columns = np.arange(start, stop)
-        else:
-            rule = 'contiguous' if intermediate // unit % world == 0 else ('layer-rotation' if unit == 32 else 'rotated')
-            columns = np.array([column for index in range(intermediate // unit)
-                                if tp.unit_owner(rule, intermediate // unit, expert, index, layer, world) == rank
-                                for column in range(index * unit, (index + 1) * unit)])
+        columns = np.array([column for index in range(intermediate // source_unit)
+                            if tp.unit_owner(rule, intermediate // source_unit, expert, index, layer, world) == rank
+                            for column in range(index * source_unit, (index + 1) * source_unit)])
         assert columns.size > 0
         covered[columns] += 1
+        exact_sum += contributions[:, :, columns].sum(axis=2)
         rg, ru = x @ gate[columns].T, x @ up[columns].T
         rh = activate(rg, ru)
         partials.append(rh @ down[:, columns].T)
     assert np.array_equal(covered, np.ones(intermediate, dtype=np.int32))
+    assert exact_sum.tobytes() == exact_whole.tobytes(), (world, expert, 'ownership reduction bytes')
     summed = np.zeros_like(whole)
     for partial in partials:
         summed += partial
@@ -226,7 +230,7 @@ def test_real_checkpoint_rank_sums(record_property):
                 limit = checkpoint.config['swiglu_limits'][checkpoint.layer] if family == 'step5' else (
                     10 if family in ('v41', 'dsv4f', 'dsv4p', 'glmf') else None)
                 error = rank_sum(weights, intermediate, count['unit_columns'], world, expert, checkpoint.layer,
-                                 count['padded'], count['source_block_columns'], activation, limit)
+                                 count['padded'], count['source_block_columns'], activation, limit, count['rule'])
                 results.append(dict(model=entry['model'], world=world, expert=expert, relative_l2=error))
     assert results, 'no real tensor cases qualified'
     record_property('rank_sum_cases', json.dumps(results))

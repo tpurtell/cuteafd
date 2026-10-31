@@ -241,11 +241,11 @@ pub fn v41_pack_intermediate_supported(intermediate: u32) -> bool {
     intermediate > 0 && intermediate % 32 == 0 && intermediate <= 8192
 }
 
-/// Physical-rank counts the compact reduction contract defines: one through six. Library-independent; use
+/// Physical-rank counts the compact reduction contract defines: one through eight. Library-independent; use
 /// [`V41CompactReducer::supports_rank_count`] for what the loaded library can
 /// actually execute.
 pub fn v41_rank_count_supported(ranks: u32) -> bool {
-    (1..=6).contains(&ranks)
+    (1..=8).contains(&ranks)
 }
 
 /// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
@@ -268,6 +268,7 @@ fn expected_expert_geometry(
         (_, 3) | (false, 5) => 2,
         (_, 6) => 3,
         (_, 7) => 6,
+        (false, 8) => 8,
         _ => return None,
     };
     let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
@@ -366,7 +367,7 @@ impl V41CompactReducer<'_> {
         match ranks {
             2 => self.reduce_planes.is_some() || self.reduce_tp2.is_some(),
             4 => true,
-            1 | 3 | 5 | 6 => self.reduce_planes.is_some(),
+            1 | 3 | 5 | 6 | 7 | 8 => self.reduce_planes.is_some(),
             _ => false,
         }
     }
@@ -376,7 +377,7 @@ impl V41CompactReducer<'_> {
     pub fn require_rank_count(&self, ranks: u32) -> Result<()> {
         ensure!(
             v41_rank_count_supported(ranks),
-            "unsupported physical rank count {ranks}; expected 1 through 6"
+            "unsupported physical rank count {ranks}; expected 1 through 8"
         );
         ensure!(
             self.supports_rank_count(ranks),
@@ -388,7 +389,7 @@ impl V41CompactReducer<'_> {
     /// Shared Spark intake always uses the N-plane ABI, even at two/four ranks.
     /// Reject a legacy-only library before allocating its landing planes.
     pub fn require_plane_reduction(&self, ranks: u32) -> Result<()> {
-        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 6");
+        ensure!(v41_rank_count_supported(ranks), "unsupported physical rank count {ranks}; expected 1 through 8");
         ensure!(self.reduce_planes.is_some(), "native N-plane compact BF16 reduction unavailable; rebuild the native library");
         Ok(())
     }
@@ -396,7 +397,7 @@ impl V41CompactReducer<'_> {
     /// The physical-rank counts this loaded library can reduce, in ascending
     /// order. Useful for startup logging and fallback rejection.
     pub fn available_rank_counts(&self) -> Vec<u32> {
-        (1u32..=6)
+        (1u32..=8)
             .into_iter()
             .filter(|ranks| self.supports_rank_count(*ranks))
             .collect()
@@ -506,7 +507,7 @@ impl V41CompactReducer<'_> {
     /// `planes[0..ranks]` must be live non-null CUDA BF16 [rows,5120] views on the
     /// current device; `planes[ranks..N]` must be null. Output must not overlap any
     /// plane and may alias `shared` only exactly. 1 <= rows <= 4096 and ranks is
-    /// in 1..=6. Storage and this library must outlive stream completion and
+    /// in 1..=8. Storage and this library must outlive stream completion and
     /// every captured graph replay, with producer writes ordered first. The eight
     /// pointers travel to the kernel by value; no device pointer array is used.
     pub unsafe fn reduce_planes<const N: usize>(
@@ -519,8 +520,8 @@ impl V41CompactReducer<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=6).contains(&ranks),
-            "N-plane reduction requires ranks 1 through 6"
+            (1..=8).contains(&ranks),
+            "N-plane reduction requires ranks 1 through 8"
         );
         let function = self
             .reduce_planes
@@ -735,6 +736,10 @@ impl NativeLibrary {
         self.expert_info_for(capacity, 11)
     }
 
+    pub fn v41_spark_tp8_expert_info(&self, capacity: u32) -> Result<V41ExpertInfo> {
+        self.expert_info_for(capacity, 14)
+    }
+
     /// Whether this NVFP4 role uses a shared FC1 activation scale. An old
     /// artifact without policy metadata must be rebuilt before expert-scale mode.
     pub fn v41_nvfp4_shared_input(&self, role: u32) -> Result<bool> {
@@ -769,6 +774,7 @@ impl NativeLibrary {
             5 => b"cuteafd_v41_spark_tp2_expert_info_reduction",
             6 => b"cuteafd_v41_spark_tp3_expert_info_reduction",
             7 => b"cuteafd_v41_spark_tp6_expert_info_reduction",
+            8 => b"cuteafd_v41_spark_tp8_expert_info_reduction",
             _ => anyhow::bail!("native slice reduction metadata requires a routed-expert role"),
         };
         let name = family_symbol(name)?;
@@ -800,6 +806,7 @@ impl NativeLibrary {
             11 => b"cuteafd_v41_spark_tp6_expert_info",
             12 => b"cuteafd_v41_nvfp4_spark_tp3_expert_info",
             13 => b"cuteafd_v41_nvfp4_spark_tp6_expert_info",
+            14 => b"cuteafd_v41_spark_tp8_expert_info",
             _ => b"cuteafd_v41_expert_info",
         };
         let name = family_symbol(name)?;
@@ -833,11 +840,11 @@ impl NativeLibrary {
                 // inside the kernel.
                 info.input_dtype == 1
             } else {
-                info.input_dtype == 1 || (matches!(info.role, 1 | 2 | 3 | 4 | 5 | 6 | 7) && info.input_dtype == 7)
+                info.input_dtype == 1 || (matches!(info.role, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8) && info.input_dtype == 7)
             },
             "unsupported native expert input representation"
         );
-        if matches!(interface, 8 | 9 | 11) {
+        if matches!(interface, 8 | 9 | 11 | 14) {
             // Replicated-group and pure TP6 Spark shards are always exported
             // from the native FP8 K32 wire format; reject a BF16-hidden
             // artifact explicitly.
@@ -872,6 +879,7 @@ impl NativeLibrary {
             11 => Some(7),
             12 => Some(6),
             13 => Some(7),
+            14 => Some(8),
             other => Some(u32::from(other)),
         };
         match expected_role {
@@ -912,6 +920,10 @@ impl NativeLibrary {
     /// intermediate slices of every routed expert, no storage padding.
     pub fn v41_spark_tp6_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         self.expert_kernel_for(capacity, 11)
+    }
+
+    pub fn v41_spark_tp8_expert_kernel(&self, capacity: u32) -> Result<V41ExpertKernel<'_>> {
+        self.expert_kernel_for(capacity, 14)
     }
 
     /// W4A4 ModelOpt NVFP4 expert kernels. The family publishes BF16
@@ -976,6 +988,7 @@ impl NativeLibrary {
             11 => "cuteafd_v41_spark_tp6",
             12 => "cuteafd_v41_nvfp4_spark_tp3",
             13 => "cuteafd_v41_nvfp4_spark_tp6",
+            14 => "cuteafd_v41_spark_tp8",
             _ => "cuteafd_v41",
         };
         let prefix = String::from_utf8(family_symbol(prefix.as_bytes())?)?;
@@ -1014,7 +1027,7 @@ impl NativeLibrary {
                     self.lib.get::<ReduceTp2Bf16RoutesFn>(b"cuteafd_reduce_tp2_bf16_routes_async")?;
                 }
             } else {
-                ensure!(kind == V41ExpertOutputKind::Fp32Tokens && matches!(info.role, 1 | 2 | 3 | 5 | 6 | 7),
+                ensure!(kind == V41ExpertOutputKind::Fp32Tokens && matches!(info.role, 1 | 2 | 3 | 5 | 6 | 7 | 8),
                     "unsupported V4.1 ABI 3 output layout");
                 unsafe { self.lib.get::<CompactFn>(b"cuteafd_compact_tokens_bf16_async")?; }
             }
@@ -1195,11 +1208,24 @@ mod tests {
     }
 
     #[test]
-    fn rank_count_contract_is_one_through_six() {
-        for ranks in 1u32..=6 {
+    fn native_tp8_geometry_preserves_logical_k32_and_stored_h128_widths() {
+        for (geometry, experts, logical, stored) in [
+            (V41, 384, 288, 384),
+            (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH, 256, 256, 256),
+            (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO, 384, 384, 384),
+        ] {
+            assert_eq!(expected_expert_geometry(geometry, false, 8, stored),
+                Some((experts, logical, stored, 6)));
+            assert_eq!(expected_expert_geometry(geometry, true, 8, stored), None);
+        }
+    }
+
+    #[test]
+    fn rank_count_contract_is_one_through_eight() {
+        for ranks in 1u32..=8 {
             assert!(v41_rank_count_supported(ranks));
         }
-        for ranks in [0u32, 7, 8, 9, 12] {
+        for ranks in [0u32, 9, 12] {
             assert!(!v41_rank_count_supported(ranks));
         }
     }
@@ -1227,7 +1253,7 @@ mod tests {
         assert!(reducer.require_plane_reduction(9).is_err());
         // The current build must expose every count through the eight-slot path.
         assert!(
-            (1..=6).all(|ranks| reducer.supports_rank_count(ranks)),
+            (1..=8).all(|ranks| reducer.supports_rank_count(ranks)),
             "current library is missing the N-plane compact reducer"
         );
         let legacy = V41CompactReducer { reduce_planes: None, ..reducer };

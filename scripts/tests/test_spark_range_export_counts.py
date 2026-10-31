@@ -26,6 +26,33 @@ scope = module('spark_count_release_scope', ROOT / 'scripts/build/release-scope.
 CAPACITIES = (1, 16, 80, 256, 1024, 4096)
 
 
+def test_every_planner_width_covered_world_has_a_package_alias():
+    packages = module('spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    entries = json.loads(packages.RANGES_PATH.read_text())['entries']
+    for key, entry in entries.items():
+        family, format = key.split(':')
+        if entry.get('deprecated'):
+            assert packages.package_worlds(family, format) == entry['worlds']
+            continue
+        exl3 = format == 'exl3'
+        native = family in ('v41', 'dsv4f', 'dsv4p') and not exl3
+        unit = 32 if native or family in ('mimof', 'mimop') else 128
+        intermediate = entry['intermediate']
+        options = dict(exl3=exl3, native=native)
+        available = set().union(*(packages.width_keys(intermediate, unit, n, **options)
+                                  for n in entry['worlds']))
+        emitted = packages.package_worlds(family, format)
+        for world in range(1, 9):
+            needed = packages.width_keys(intermediate, unit, world, **options)
+            admitted = bool(needed) and needed <= available and (not native or intermediate % (32 * world) == 0)
+            assert (world in emitted) == admitted, (key, world, needed, available)
+    # TP5 needs no new CUDA class: its H128 program is already TP4's narrow
+    # extent. The old default exporter omitted this metadata alias.
+    assert 5 not in entries['qwen4:fp8']['worlds']
+    assert 5 in packages.geometry_worlds('qwen4')
+
+
+
 def count_objects(geometry, worlds, intermediate, unit=128):
     """Today's tp-keyed jobs versus proposed compact width-class jobs.
 
@@ -86,7 +113,7 @@ def test_width_class_count_is_not_rank_count():
     full = count_objects('glm', set(range(1, 9)), 2048)
     assert full['width_columns'] == [256, 384, 512, 640, 768, 1024, 2048]
     assert full['after_objects'] == 84
-    assert full['before_objects'] == 108  # current exporter stops at TP6
+    assert full['before_objects'] == 144  # all geometric count-keyed jobs
     assert full['full_range_count_keyed_objects'] == 144
     assert full['full_range_width_keyed_objects'] == 84
     for world in (5, 7, 8):
@@ -126,6 +153,14 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
     for entry in entries:
         for column in entry.get('columns', []):
             package = column['package'].split()[0]
+            family, format = package.split(':')
+            packages = module('spark_matrix_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+            emitted = packages.package_worlds(family, format)
+            for row in column['counts']:
+                # Resolved widths are supplied by Rust spark_recipe, while
+                # aliases here come from the production Python packager policy.
+                if row['sparks'] and row.get('resolved_width_columns') is not None:
+                    assert row['sparks'] in emitted, (package, row['sparks'], emitted)
             keys.append(dict(model=entry['model'], package=package, rtx_gpus=column['rtx_gpus'],
                              geometric_minimum=(column.get('range') or {}).get('minimum'),
                              policy_only=column.get('range') is None, **count_layout_keys(column['counts'])))

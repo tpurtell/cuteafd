@@ -107,6 +107,7 @@ pub(crate) struct Admission<'a> {
     local_bound: Vec<[bool; 2]>,
     devices: [i32; 2],
     lanes: u64,
+    spark_ranks: usize,
     waves: usize,
     unit_rows: usize,
     lane_layouts: Vec<[LaneLayout; 2]>,
@@ -201,7 +202,7 @@ impl<'a> Admission<'a> {
         SparkWorkingSet { rtx_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::RtxTp2).then_some(layer)).collect(), spark_layers: self.placement.layers.iter().enumerate()
             .filter_map(|(layer, assignment)| (assignment.experts == ExpertHome::Spark).then_some(layer)).collect(),
-            spark_ranks: 6, prefill_lanes: self.lanes }
+            spark_ranks: self.spark_ranks, prefill_lanes: self.lanes }
     }
 
     /// The caller completes shared SparkAdmission reconciliation first. Keep
@@ -524,6 +525,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let devices = inputs.devices;
     let lanes = inputs.lanes as u64;
     let inputs_waves = inputs.waves;
+    let spark_ranks = inputs.spark_ranks;
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
     let lane_layouts = inputs.lane_layouts.clone();
@@ -628,7 +630,7 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
     let lane_readers = (0..lane_layouts.len()).map(|_| std::array::from_fn(|_| Weak::new())).collect();
     let mla_layouts = [CacheLayout::new(cfg, &placement, 0, cache_format)?, CacheLayout::new(cfg, &placement, 1, cache_format)?];
     let admission = Admission { placement, mark_selection, graph_set, rtx, rtx_loaded: false, draft, draft_allocated: false, draft_marks_allocated: false, cfg: cfg.clone(), core, layouts, layer_owners, layer_uploaded, local_bound,
-        devices, lanes, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
+        devices, lanes, spark_ranks, waves: inputs_waves, unit_rows, lane_layouts, lane_allocated, lane_readers,
         kda_layout, kda_allocated: [false; 2], kda_owners: std::array::from_fn(|_| Weak::new()),
         mla_layouts, mla_allocated: [false; 2], mla_owners: std::array::from_fn(|_| Weak::new()),
         global_layouts, global_uploaded: [false; 2], global_owners: std::array::from_fn(|_| Weak::new()),
@@ -653,7 +655,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     let cfg = i.cfg;
     ensure!(cfg.layers > 0 && cfg.layers == cfg.attention.len() && cfg.layers == cfg.dense.len(),
         "Kimi admission layer inventory differs from checkpoint");
-    ensure!(i.spark_ranks == 6 && i.peer_access, "Kimi native admission requires TP2 peer access and six Spark ranks");
+    ensure!((1..=8).contains(&i.spark_ranks) && i.peer_access, "Kimi native admission requires TP2 peer access and 1..8 Spark ranks");
     ensure!(i.devices.iter().all(|device| *device >= 0) && i.devices[0] != i.devices[1],
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.attention != Some(AttentionPlacement::Context), "Kimi context attention has no query/LSE exchange ABI");
@@ -716,7 +718,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
         }
     }
     for lane in 0..i.lanes {
-        let demand = super::spark::admitted_demand(i.waves, unit, lane)?;
+        let demand = super::spark::admitted_demand(i.waves, unit, lane, i.spark_ranks)?;
         ensure!(!fixed.iter().chain(&i.startup).any(|item| item.gpu == demand.gpu && item.group == demand.group),
             "Kimi Spark intake charge supplied twice");
         fixed.push(demand);
@@ -1770,20 +1772,22 @@ pub(super) mod tests {
     fn spark_intake_planes_are_charged_once_per_lane_before_allocation() -> Result<()> {
         let cfg = cfg();
         let i = inputs(&cfg);
-        let rows = i.rows;
+        let ranks = i.spark_ranks;
         let lanes = i.lanes;
         let admitted = admit(i)?;
+        let waves = admitted.waves;
+        let unit = admitted.unit_rows;
         for lane in 0..lanes {
-            let demand = super::super::spark::demand(rows, 2, lane)?;
+            let demand = super::super::spark::admitted_demand(waves, unit, lane, ranks)?;
             let items = admitted.placement.items[1].iter().filter(|item| item.group == demand.group).collect::<Vec<_>>();
             assert_eq!(items.len(), 1);
-            assert_eq!(items[0].bytes, (6 * rows * 3584 * 2) as u64);
+            assert_eq!(items[0].bytes, (ranks * waves * unit * 3584 * 2) as u64);
             assert_eq!(items[0].basis, Basis::Exact);
             assert_eq!(items[0].category, Category::Workspace);
             assert!(!admitted.placement.items[0].iter().any(|item| item.group == demand.group));
         }
         let mut duplicate = inputs(&cfg);
-        duplicate.fixed.push(super::super::spark::demand(rows, 2, 0)?);
+        duplicate.fixed.push(super::super::spark::admitted_demand(waves, unit, 0, ranks)?);
         assert!(admit(duplicate).is_err());
         Ok(())
     }
@@ -1848,7 +1852,7 @@ pub(super) mod tests {
         for case in 0..10 {
             let mut i = inputs(&cfg);
             match case {
-                0 => i.spark_ranks = 4,
+                0 => i.spark_ranks = 9,
                 1 => i.peer_access = false,
                 2 => i.attention = Some(AttentionPlacement::Context),
                 3 => i.requested_pool = Some(262_143),

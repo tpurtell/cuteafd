@@ -1484,7 +1484,7 @@ release_spark_values() {
 # Release and WIP must advertise the same compiled extra Spark roles. TP4 is
 # built separately; keep the qualified default until new roles have exports.
 release_spark_tp_roles_default() {
-  printf '%s\n' 'tp2;tp3;tp6'
+  printf '%s\n' 'tp2;tp3;tp6;tp8'
 }
 
 release_spark_tp_roles_canonical() {
@@ -1497,8 +1497,8 @@ release_spark_tp_roles_canonical() {
   IFS=';' read -ra parts <<<"$raw"
   for entry in "${parts[@]}"; do
     case "$entry" in
-      tp2|tp3|tp6) ;;
-      *) release_die "$source_name accepts only tp2, tp3 and tp6, got: $entry" ;;
+      tp2|tp3|tp6|tp8) ;;
+      *) release_die "$source_name accepts only tp2, tp3, tp6 and tp8, got: $entry" ;;
     esac
     for prior in ${selected[@]+"${selected[@]}"}; do
       [[ "$prior" != "$entry" ]] ||
@@ -1546,8 +1546,8 @@ release_spark_rank_map() {
 
 release_validate_spark_topology() {
   case "$SPARK_TP" in
-    ""|[1-6]) ;;
-    *) release_die "SPARK_TP must be in 1..6" ;;
+    ""|[1-8]) ;;
+    *) release_die "SPARK_TP must be in 1..8" ;;
   esac
   case "$SPARK_EP" in
     ""|1|2|3) ;;
@@ -1556,19 +1556,23 @@ release_validate_spark_topology() {
   [[ -n "$SPARK_TP" && -n "$SPARK_EP" || -z "$SPARK_TP" && -z "$SPARK_EP" ]] ||
     release_die "SPARK_TP and SPARK_EP must be set together or omitted together"
   release_spark_topology_explicit || return 0
-
-  [[ "$SPARK_COUNT" =~ ^[1-6]$ ]] ||
-    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..6"
+  [[ "$SPARK_COUNT" =~ ^[1-8]$ ]] ||
+    release_die "explicit SPARK_TP/SPARK_EP requires SPARK_COUNT in 1..8"
   [[ "$EXPERT_FORMAT" == native ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires EXPERT_FORMAT=native"
   [[ "$SPARKINFER_EXL3" == disable ]] ||
     release_die "explicit SPARK_TP/SPARK_EP requires SPARKINFER_EXL3=disable"
   ((SPARK_TP * SPARK_EP == SPARK_COUNT)) ||
     release_die "SPARK_TP(${SPARK_TP}) * SPARK_EP(${SPARK_EP}) must equal SPARK_COUNT(${SPARK_COUNT})"
-  case "${SPARK_TP}x${SPARK_EP}" in
-    2x1|3x1|4x1|6x1|2x2|3x2|2x3) ;;
-    *) release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}; approved: TP2/TP3/TP4/TP6 with EP1, TP2EP2, TP3EP2, TP2EP3" ;;
-  esac
+  local packages="$(dirname "${BASH_SOURCE[0]}")/../../python/tools/lib/spark_packages.py"
+  python3 -I - "$packages" "$SPARK_TP" "$SPARK_EP" <<'PYTOPOLOGY' || release_die "unsupported native Spark topology TP${SPARK_TP}EP${SPARK_EP}"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('spark_packages', sys.argv[1])
+packages = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(packages)
+tp, ep = map(int, sys.argv[2:])
+assert packages.ownership_topology(tp, ep), 'no shared width-class ownership topology'
+PYTOPOLOGY
 }
 
 release_hosts_csv() { release_spark_values HOST | paste -sd, -; }
