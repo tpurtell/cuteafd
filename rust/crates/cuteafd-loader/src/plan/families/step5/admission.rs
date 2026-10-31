@@ -378,7 +378,10 @@ pub fn admit_mtp(checkpoint: &Checkpoint, inputs: &RuntimeInputs, depth: usize) 
     let cfg = Config::parse(checkpoint)?;
     ensure!((1..=cfg.mtp).contains(&depth) && inputs.unit_rows() > depth,
         "Step-5 predictor depth must fit checkpoint and row capacity");
-    let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes;
+    // Native K4 predictor owners keep their own projection scratch beside their weights.
+    let weights = super::coordinator::RankWeightLayout::for_mtp(checkpoint, depth)?.resident_bytes
+        .checked_add(super::native::mtp_native_scratch_bytes(checkpoint, depth, inputs.rows)?)
+        .context("Step-5 predictor native forecast overflow")?;
     let workspace = super::native::mtp_forecast_workspace(inputs.unit_rows(), depth, inputs.kv_format)?;
     admit_depth_with(&cfg, inputs, depth, |ownership| {
         (0..ownership.ranks()).map(|rank| {

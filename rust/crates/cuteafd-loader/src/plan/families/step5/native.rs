@@ -342,6 +342,28 @@ pub fn native_scratch_bytes(layout: &RankWeightLayout, unit: usize) -> Result<u6
     Ok(merged.map(|layout| layout.bytes()).transpose()?.map_or(0, |bytes| bytes as u64))
 }
 
+/// Each predictor stage's native owners (attention, dense FFN, eh_proj and its
+/// vocabulary head) hold private projection scratch; bounded at `rows`.
+pub fn mtp_native_scratch_bytes(checkpoint: &Checkpoint, depth: usize, rows: usize) -> Result<u64> {
+    use crate::formats::trellis_core::ProjectionScratchLayout;
+    let mut total = 0u64;
+    for stage in 0..depth {
+        let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
+        let mut owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
+        for (name, core) in &layout.core {
+            let owner = if name.contains(".self_attn.") { "attention" } else if name.contains(".mlp.") { "dense" }
+                else if name.ends_with(".eh_proj.weight") { "eh" } else { "head" };
+            let [n, k] = core.shape;
+            let next = ProjectionScratchLayout::new(k, n, rows.min(4096))?;
+            match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
+        }
+        for layout in owners.values() {
+            total = total.checked_add(layout.bytes()? as u64).context("Step-5 MTP native scratch overflow")?;
+        }
+    }
+    Ok(total)
+}
+
 pub fn plane_bytes(planes: &[usize]) -> Result<u64> {
     planes.iter().try_fold(0u64, |sum, &bytes| {
         let aligned = bytes.checked_add(15).context("Step-5 scratch alignment overflow")? / 16 * 16;
