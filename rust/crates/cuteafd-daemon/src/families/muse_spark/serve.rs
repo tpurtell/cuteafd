@@ -94,7 +94,10 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
             measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
                 free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
             headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
-            slots: u64::from(args.max_sequences), max_context: args.max_context,
+            slots: u64::from(args.max_sequences),
+            mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
+                .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
+            max_context: args.max_context,
             pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0), onboard: args.rtx_expert_layers,
             spark_budget_bytes: args.spark_budget_bytes() })?;
         tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,

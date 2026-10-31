@@ -40,6 +40,8 @@ pub(crate) struct Options<'a> {
     pub spark_ranks: usize,
     pub prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
     pub slots: u64,
+    /// Device mark slots from the shared prefix rule (`PrefixArgs::mark_rule`).
+    pub mark_slots: u64,
     pub max_context: Option<u64>,
     pub pool_tokens: Option<u64>,
     pub onboard: Onboard,
@@ -64,7 +66,8 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
     }).collect::<Result<Vec<_>>>()?;
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
     shared::placement(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
-        gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill, slots: options.slots, context,
+        gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill, slots: options.slots,
+        mark_slots: options.mark_slots, context,
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes, fixed, startup: Vec::new() })
 }
@@ -133,7 +136,10 @@ mod tests {
                 manifest: &inventory,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
-                headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16, max_context: None,
+                headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+                mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
+                    shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
+                max_context: None,
                 pool_tokens: None, onboard: Onboard::Auto,
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");

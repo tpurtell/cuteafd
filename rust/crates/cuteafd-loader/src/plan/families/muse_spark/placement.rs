@@ -72,7 +72,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    let inputs = crate::placement::families::muse_spark::MuseInputs { cfg, core: &model.core, catalog,
+    // GPU marks follow the shared prefix rule: host-tier retention keeps only staging slots.
+    let mark_slots = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots,
+        opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes(cfg, 1),
+        opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)));
+    let inputs = crate::placement::families::muse_spark::MuseInputs { cfg, core: &model.core, catalog, mark_slots,
         gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
             baseline: Baseline::Planned { context_bytes: ArchContext::for_device("sm_120", *bytes).context_bytes,
                 loaded_bytes: 0 } }).collect(),
@@ -103,7 +107,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
     memory.notes.push(format!("Muse K6 core: {} header-native projections ({}); payload + H128 vectors charged",
         model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
-    let rings = crate::placement::families::muse_spark::ring_rows(cfg, prefill.unit_rows).unwrap_or(0)
+    let rings = crate::placement::families::muse_spark::ring_rows(cfg).unwrap_or(0)
         * cfg.kv_record_bytes() as u64 * cfg.sliding_layers() as u64;
     let placed = match solve(&built.request) {
         Ok(placed) => placed,

@@ -60,9 +60,12 @@ impl StepMetadata {
             let end = sequence.start.checked_add(sequence.rows).context("Muse step positions")?;
             ensure!(end.div_ceil(PAGE_ROWS) <= sequence.pages.len(),
                 "Muse sequence {} lacks pages for {end} positions", sequence.slot);
-            // The ring keeps the window behind the step's first row; the step itself
-            // must not wrap onto a key some row of it still reads (AppendRing::proposal).
-            ensure!(sequence.rows <= ring_rows, "Muse step of {} rows overruns a {ring_rows}-row ring", sequence.rows);
+            // A step's own keys come from its records and the commit runs after attention,
+            // so a prefill unit may be longer than the ring (`cache::SWA_RING_STEP`). A
+            // rollback step (decode/verify, `!shared_table`) writes past the committed
+            // frontier and must leave the visible window intact.
+            ensure!(shared_table || sequence.rows as u64 <= cuteafd_loader::families::muse_spark::cache::SWA_RING_STEP,
+                "Muse decode/verify step of {} rows exceeds the ring's rollback step", sequence.rows);
             let first = i32::try_from(out.positions.len())?;
             let base = (sequence.slot * ring_rows) as i64;
             let mut table = sequence.pages.iter().map(|&p| i32::try_from(p)).collect::<Result<Vec<_>, _>>()?;
@@ -97,11 +100,11 @@ mod tests {
     fn ring_slots_agree_with_the_prefix_state_layout() -> Result<()> {
         let cfg = cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
             &cuteafd_loader::plan::testing::muse_spark_config())?;
-        let cache = MuseCacheLayout::new(&cfg, 1, 2752)?;
+        let cache = MuseCacheLayout::new(&cfg, 1)?;
         let state = MuseStateLayout::new(&cfg, &cache, 16)?;
         let ring = state.ring.rows as usize;
         let pages: Vec<u32> = (100..400).collect();
-        for (start, rows) in [(0, 1), (0, 2752), (5000, 2752), (ring * 3 - 7, 64), (10_000, 1)] {
+        for (start, rows) in [(0, 1), (0, 2752), (5000, 2752), (ring * 3 - 7, 64), (10_000, 1), (100, 4096)] {
             let meta = StepMetadata::build(&[StepSequence { slot: 5, start, rows, pages: &pages }], ring, 16, 4096, true)?;
             for (row, &p) in meta.positions.iter().enumerate() {
                 // The commit writes p's record where the mark layout expects it.
@@ -143,6 +146,9 @@ mod tests {
         assert!(StepMetadata::build(&[one(0, 0, 1), one(0, 1, 1)], 2112, 4, 64, false).is_err(), "repeated slot");
         assert!(StepMetadata::build(&[one(0, 60, 8)], 2112, 4, 64, false).is_err(), "lacks pages");
         assert!(StepMetadata::build(&[one(0, 0, 65)], 2112, 4, 64, false).is_err(), "over capacity");
+        let many: Vec<u32> = (0..2).collect();
+        assert!(StepMetadata::build(&[StepSequence { slot: 0, start: 0, rows: 65, pages: &many }], 2112, 4, 4096, false)
+            .is_err(), "a verify step past the rollback step");
         assert!(StepMetadata::build(&[one(0, 0, 1), one(1, 0, 1)], 2112, 4, 64, true).is_err(), "prefill is one sequence");
     }
 }

@@ -242,8 +242,8 @@ impl FamilyModel for Model {
     }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
-        crate::families::muse_spark::cache::MuseCacheLayout::new(&self.cfg, options.coordinator_ranks,
-            options.prefill_rows.max(crate::families::muse_spark::cache::PAGE_ROWS)).map(|layout| Some(layout.geometry))
+        crate::families::muse_spark::cache::MuseCacheLayout::new(&self.cfg, options.coordinator_ranks)
+            .map(|layout| Some(layout.geometry))
     }
     fn activation(&self, layer: usize, _shared: bool) -> Option<FfnActivation> {
         (layer < self.cfg.layers).then_some(FfnActivation::SiluBf16Product { limit: None })

@@ -55,8 +55,11 @@ pub struct MuseInputs<'a> {
     pub gpus: Vec<GpuBudget>,
     pub spark_ranks: usize,
     pub prefill: PrefillPlan,
-    /// Active sequence slots (each owns its sliding rings and one exact mark).
+    /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
+    /// Device mark slots from the shared prefix-mark rule (`mark_slots_with_host`):
+    /// staging only when the host tier holds retention.
+    pub mark_slots: u64,
     /// The compiled context floor; `automatic_context` lets the pool clamp it.
     pub context: u64,
     pub automatic_context: bool,
@@ -91,14 +94,18 @@ impl MuseRequest {
     }
 }
 
-/// Sliding-ring rows: the window plus one prefill unit, page aligned.
-pub fn ring_rows(cfg: &MuseSparkConfig, unit_rows: u64) -> Result<u64> {
-    Ok(cuteafd_core::prefix::AppendRing::new(cfg.window as u64, unit_rows.max(PAGE_ROWS), PAGE_ROWS)
-        .context("Muse sliding ring geometry")?.rows)
+/// Sliding-ring rows: the shared ring geometry (window + the rollback step).
+pub fn ring_rows(cfg: &MuseSparkConfig) -> Result<u64> {
+    Ok(crate::families::muse_spark::cache::swa_ring(cfg).map_err(|error| anyhow::anyhow!("{error}"))?.rows)
+}
+
+/// Bytes of one retained mark on one rank: each sliding layer's visible window.
+pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
+    (cfg.sliding_layers() * cfg.window * cfg.kv_record_bytes() / ranks) as u64
 }
 
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
-    let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, context, automatic_context,
+    let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
         requested_pool, onboard, spark_budget_bytes, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
@@ -115,8 +122,8 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     // KV: full layers page BF16 K+V records; sliding layers keep a per-sequence
     // ring of window + one prefill unit (append-only, exact restores).
     let record = cfg.kv_record_bytes() as u64;
-    let rings = cfg.sliding_layers() as u64 * ring_rows(cfg, prefill.unit_rows)? * record;
-    let marks = (cfg.sliding_layers() * cfg.window) as u64 * record;
+    let rings = cfg.sliding_layers() as u64 * ring_rows(cfg)? * record;
+    let marks = mark_bytes(cfg, 1);
     let mut fixed = Vec::new();
     for gpu in 0..ranks {
         let weights = layouts.iter().try_fold(0u64, |sum, ranks| sum.checked_add(ranks[gpu].bytes()? as u64)
@@ -127,10 +134,12 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
             weights, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Weights, "final norm", global.final_norm as u64, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Kv, format!("sliding rings, {slots} sequences x {} layers",
-            cfg.sliding_layers()), rings * slots / ranks as u64, Basis::Formula));
-        // One exact retained sliding window per slot (prompt end + turn end marks).
-        fixed.push(Demand::new(gpu, Category::Prefix, "Muse exact sliding marks", marks * slots / ranks as u64,
-            Basis::Formula));
+            cfg.sliding_layers()), rings * slots / ranks as u64, Basis::Exact));
+        // Device mark slots from the shared prefix rule (the host tier holds retention).
+        if mark_slots > 0 {
+            fixed.push(Demand::new(gpu, Category::Prefix, format!("Muse exact sliding marks, {mark_slots} slots"),
+                marks * mark_slots / ranks as u64, Basis::Exact));
+        }
     }
     // The lane's activation planes at one prefill unit (the decode width is smaller).
     let lane = crate::families::muse_spark::lane::LanePlanes::new(cfg, ranks, usize::try_from(prefill.unit_rows)?)?;

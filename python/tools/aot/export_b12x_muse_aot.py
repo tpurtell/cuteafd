@@ -12,6 +12,10 @@ import _pinned_sparkinfer
 
 
 EXPERT_WIDTH = 4096
+WINDOW = 2048
+# Ring rows beyond the window: the widest rollback step (decode/verify). The
+# cache (`cache.rs` swa_ring) uses the same formula; a Rust test pins it.
+SWA_RING_STEP = 64
 
 
 def compile_expert_input_quant_aot():
@@ -56,7 +60,7 @@ def builders(heads=128, group="pointwise", max_rows=4096):
                                      width=8192, outputs=heads * 64)}
     if group == "attention":
         from b12x.integration.cuteafd import _muse_attention as a
-        ring_rows = ((2048 + max_rows + 63) // 64) * 64
+        ring_rows = ((WINDOW + SWA_RING_STEP + 64 - 1) // 64) * 64
         result = {f"attention_{kind}_{route}": partial(a.compile_attention_aot,
                       heads=heads, kind=kind, route=route, max_rows=max_rows, ring_rows=ring_rows)
                   for kind in ("full", "swa") for route in ("prefill", "decode")}
