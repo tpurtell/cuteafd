@@ -6430,3 +6430,15 @@ remain committed. Preserve this clean run. User's resume authorization is
 still active: wait for raptor to return, then resume under the canonical
 maxq lease with --resume --publish. Do not bypass or relocate the hardware
 lock. Connectivity receipt: production/connectivity-interruption.json.
+
+CONNECTIVITY RECOVERED (2026-10-31 03:53 UTC): current enabled unit
+step5-core-k6-1793418663022857522 verified checkpoints and committed new
+layer-33 expert-318 through expert-328 projections beyond the interruption.
+Raptor returned on LAN IP 172.22.220.3; maxq SparkNest still targeted its
+old 172.22.2.12 address, causing source metadata EIO. Corrected only this
+address in the user-owned /srv/sparknest/node.toml, then restarted maxq's
+daemon with approved agent-sudo. Source config/index hashes match the
+original audit. No numerical code, quantized tensor, activation or recipe
+changed. Older failed units are disabled. Resume-after-connectivity.json
+records downtime; monitor excludes partial-resume layer timings from its
+ETA baseline. Continue the clean run with publication and handoff enabled.
