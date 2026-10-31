@@ -27,6 +27,34 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::muse_spark::{lane::HEAD_ROWS, MuseSparkConfig};
 use std::{cell::RefCell, ffi::c_void, path::Path};
 
+/// The committed length after a verify step of `rows` from `len`: a plain
+/// step commits every row (callers that never accept: probe scoring, cold
+/// steps); a speculative one commits nothing until `accept`.
+fn after_verify(len: usize, rows: usize, speculative: bool) -> usize { if speculative { len } else { len + rows } }
+
+/// The length `accept` publishes: the step's start plus its kept rows (none
+/// when a finished request keeps no state).
+fn committed(start: usize, rows: usize, kept: Option<usize>) -> Result<usize> {
+    let kept = kept.unwrap_or(0);
+    ensure!(kept <= rows, "Muse accepted rows exceed the step");
+    Ok(start + kept)
+}
+
+/// A drafted verify reaches the Sparks as MTP verify rows (each request's
+/// rows stay under the BF16 cutoff: lossless); a plain step as decode.
+fn verify_kind(speculative: bool) -> cuteafd_transport::ExpertV2SourceKind {
+    if speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify } else { cuteafd_transport::ExpertV2SourceKind::Decode }
+}
+
+/// Probe scoring rows are prefill-shaped teacher-forced rows; cold steps are decode.
+fn ungraphed_kind(speculative: bool, kind: scheduler::UngraphedKind) -> cuteafd_transport::ExpertV2SourceKind {
+    if speculative { return verify_kind(true); }
+    match kind {
+        scheduler::UngraphedKind::Scoring => cuteafd_transport::ExpertV2SourceKind::Prefill,
+        scheduler::UngraphedKind::Decode => cuteafd_transport::ExpertV2SourceKind::Decode,
+    }
+}
+
 /// What the draft policy prices a verify row with: every layer's expert
 /// slice bytes (onboarded layers per RTX, Spark layers per rank) and the
 /// installed groupings (the Sparks' bootstrap reports; the onboarded EXL3
@@ -120,6 +148,13 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
     }
 
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
+
+    fn verify_rows(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+        kind: cuteafd_transport::ExpertV2SourceKind) -> Result<Option<DeviceLogits>> {
+        let logits = self.step(sequences, kind)?;
+        for (placement, tokens) in sequences.iter_mut() { placement.len = after_verify(placement.len, tokens.len(), speculative); }
+        Ok(Some(logits))
+    }
 
     /// The shared policy geometry over this placement's layer homes and the
     /// installed groupings at every verify row count up to `HEAD_ROWS`.
@@ -246,14 +281,19 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         Ok(Some(self.logits(logits.context("Muse prefill scored no last row")?, 1)))
     }
 
+    /// Scores every row of every sequence (an anchor and its drafts) from its
+    /// committed length. Speculative rows commit through `accept` (the kept
+    /// rows); a plain step commits all of its rows here, as the shared
+    /// contract requires of the non-accepting callers (probe scoring, cold steps).
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool, _pool: &RefPagePool)
         -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, "Muse Spark has no drafter yet");
-        self.step(sequences, cuteafd_transport::ExpertV2SourceKind::Decode).map(Some)
+        ensure!(!speculative || self.draft.is_some(), "Muse speculative verify without a drafter");
+        self.verify_rows(sequences, speculative, verify_kind(speculative))
     }
     fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        _kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.verify_device(sequences, speculative, pool)
+        kind: scheduler::UngraphedKind, _pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+        ensure!(!speculative || self.draft.is_some(), "Muse speculative verify without a drafter");
+        self.verify_rows(sequences, speculative, ungraphed_kind(speculative, kind))
     }
     fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> serde_json::Value {
@@ -311,9 +351,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
         ensure!(!speculative || self.draft.is_some(), "Muse speculative accept without a drafter");
         for sequence in verified.iter_mut() {
-            let kept = sequence.kept.map_or(0, |(rows, _)| rows);
-            ensure!(kept <= sequence.rows.len(), "Muse accepted rows exceed the step");
-            sequence.placement.len = sequence.start + kept;
+            sequence.placement.len = committed(sequence.start, sequence.rows.len(), sequence.kept.map(|(rows, _)| rows))?;
         }
         if let Some(draft) = &self.draft {
             for sequence in verified.iter_mut() {
@@ -355,5 +393,52 @@ mod tests {
             "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
         let Some(Ok(snapshot)) = std::fs::read_dir(snapshots).ok().and_then(|mut entries| entries.next()) else { return };
         assert_eq!(crate::shared::prefix::marker_ids(&snapshot.path(), &["<|start|>"]).unwrap(), vec![200_022]);
+    }
+
+    use super::*;
+
+    /// The shared scheduler's decode round, on the host: a step of an anchor
+    /// and its drafts is verified, the round walks the rows setting the length
+    /// to each committed row and stops at the first mismatch, then accepts.
+    /// Drafts longer than one row (the round DFlash2 drives) are not refused,
+    /// commit exactly the kept rows, and a plain step's chunks (probe scoring,
+    /// cold steps) advance the frontier with no accept between them.
+    #[test]
+    fn verify_and_accept_follow_the_shared_round() -> anyhow::Result<()> {
+        for (drafted, agree) in [(0usize, 0usize), (3, 3), (7, 2), (7, 0)] {
+            let start = 1000usize;
+            let rows = drafted + 1;
+            let speculative = rows > 1;
+            assert_eq!(verify_kind(speculative), if speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify }
+                else { cuteafd_transport::ExpertV2SourceKind::Decode });
+            let mut len = after_verify(start, rows, speculative);
+            assert_eq!(len, if speculative { start } else { start + rows });
+            // `decode_round`: rows 0..=j commit; a draft the target disagrees with ends the walk.
+            let mut kept = 0;
+            for j in 0..rows {
+                len = start + j + 1;
+                kept = j + 1;
+                if j >= agree { break; }
+            }
+            assert_eq!(committed(start, rows, Some(kept))?, len, "drafted {drafted} agree {agree}");
+            assert_eq!(kept, (agree + 1).min(rows));
+        }
+        assert!(committed(0, 3, Some(4)).is_err());
+        assert_eq!(committed(10, 3, None)?, 10);
+        // Probe scoring: chunks of a teacher-forced tail, no accept between them.
+        let (mut len, mut written) = (500usize, Vec::new());
+        for chunk in [64usize, 64, 17] {
+            written.push(len);
+            len = after_verify(len, chunk, false);
+        }
+        assert_eq!(written, [500, 564, 628], "each chunk writes past the last");
+        assert_eq!(ungraphed_kind(false, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::Prefill);
+        assert_eq!(ungraphed_kind(true, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::MtpVerify);
+        // The backend routes both verify entries through the bookkeeping above, never refusing a draft.
+        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!source.contains("has no drafter yet"));
+        let verify = source.split("fn verify_rows(").nth(1).unwrap().split("\n    }").next().unwrap();
+        assert!(verify.contains("after_verify(placement.len, tokens.len(), speculative)"));
+        Ok(())
     }
 }

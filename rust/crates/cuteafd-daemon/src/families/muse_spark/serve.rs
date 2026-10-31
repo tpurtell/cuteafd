@@ -3,7 +3,7 @@
 //! Spark worker admission (the sealed endpoint), every coordinator rank's
 //! resident state (and onboarded experts) loaded while the workers admit, the
 //! pair's exchange and the Spark link. The shared scheduler then serves the
-//! text path over `MuseBackend` (no drafter yet) behind the OpenAI router with
+//! text path over `MuseBackend` (with an optional DFlash2 drafter) behind the OpenAI router with
 //! the checkpoint's own chat encoding.
 use super::startup;
 use crate::shared::inventory::{InventoryPhase, RuntimeInventory};
@@ -99,7 +99,8 @@ impl ServeArgs {
             && gib < u64::MAX as f64 / (1u64 << 30) as f64),
             "Muse Spark requires a finite positive --spark-budget-gib");
         self.prefill()?;
-        // No drafter yet: a step appends at most the 64-row rollback step.
+        // A request's widest step is a verify (anchor plus drafts, at most the 64-row
+        // rollback step); the cutoff must keep it BF16, so decode and verify stay lossless.
         cuteafd_loader::families::muse_spark::replies::Cutoff::new(self.expert_partial_bf16_max_rows,
             cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS)?;
         ensure!(self.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
@@ -354,6 +355,11 @@ mod tests {
         assert!(!body.contains("bail!(\"Muse Spark step executor"), "serving no longer stops after bring-up");
         let worker = source.split("\nfn worker(").nth(1).unwrap().split("\npub(crate) async fn run(").next().unwrap();
         assert!(worker.contains("scheduler::Drafts::None") && worker.contains("Encoder::Off"));
+        // `--draft` drives neural drafts (the policy's depth, or the fixed one); without it, none.
+        assert!(worker.contains("(Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true }"));
+        assert!(worker.contains("DflashConfig::read(snapshot)?.drafts(), fixed: false"));
+        let backend = body.split("MuseBackend::new(").nth(1).unwrap();
+        assert!(backend.contains("served_context, pages, local, draft, pricing"));
         let run = source.split("\npub(crate) async fn run(").nth(1).unwrap();
         assert!(run.contains("MuseEncoding::from_snapshot(") && run.contains("ModelEncoding::Muse("));
         assert!(run.find("ready_rx.await").unwrap() < run.find("TcpListener::bind").unwrap());
