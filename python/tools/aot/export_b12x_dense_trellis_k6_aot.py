@@ -83,8 +83,28 @@ GLMF_SHAPES = (
     ("glmf_shared_down_tp2", 1024, 4096, 2),
     ("glmf_lm_head", 4096, 154880, 1),
 )
-FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES}
-F32_OUTPUTS = (163840, 154880)
+# Mistral Large 4: MLA without q-LoRA (wq straight from the hidden state),
+# kv_a N576 padded to N640 on RoPE layers and native N512 on NoPE layers,
+# 64 heads x 128 (v 128), dense layer 0 (I 24576), one shared expert (I 6144).
+ML4_SHAPES = (
+    ("ml4_q", 6144, 8192, 1),
+    ("ml4_q_tp2", 6144, 4096, 1),
+    ("ml4_kv_a_padded", 6144, 640, 1),
+    ("ml4_kv_a_nope", 6144, 512, 1),
+    ("ml4_o", 8192, 6144, 1),
+    ("ml4_o_tp2", 4096, 6144, 2),
+    ("ml4_dense_gate_up", 6144, 24576, 1),
+    ("ml4_dense_gate_up_tp2", 6144, 12288, 1),
+    ("ml4_dense_down", 24576, 6144, 1),
+    ("ml4_dense_down_tp2", 12288, 6144, 2),
+    ("ml4_shared_gate_up", 6144, 6144, 1),
+    ("ml4_shared_gate_up_tp2", 6144, 3072, 1),
+    ("ml4_shared_down", 6144, 6144, 1),
+    ("ml4_shared_down_tp2", 3072, 6144, 2),
+    ("ml4_lm_head", 6144, 204800, 1),
+)
+FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "ml4": ML4_SHAPES}
+F32_OUTPUTS = (163840, 154880, 204800)
 
 
 def shapes_for(families):

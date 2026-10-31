@@ -268,10 +268,12 @@ GEOMETRIES = {
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
     'kimik3': (3584, 3072, 896, 16),
+    # Mistral Large 4 (mistral_large4): 128 experts, softmax top-4, unclamped SiLU.
+    'ml4': (6144, 6144, 128, 4),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'ml4': None}
 
 
 def activation(geometry: str) -> str:
