@@ -60,7 +60,7 @@ pub fn window_batch_bytes(rows: u64) -> Result<u64> {
 
 /// Coordinator-owned Spark wave planes. Pinned intake belongs to its own domain.
 pub fn transport_bytes(rows: u64, ranks: usize) -> Result<u64> {
-    ensure!((1..=4096).contains(&rows) && matches!(ranks, 2 | 3 | 4 | 6),
+    ensure!((1..=4096).contains(&rows) && (1..=cuteafd_core::MAX_SPARK_WORLD).contains(&ranks),
         "invalid V4.1 transport geometry");
     Ok(rows * (ranks as u64 * 5120 * 2 + 2 * 5120 * 2))
 }
@@ -473,12 +473,13 @@ mod tests {
         assert_eq!(phase.category, Category::Staging);
         assert!(vocabulary_load_phase(&[demand("attention", u64::MAX)], &target, 400).is_err());
         assert!(vocabulary_load_phase(&[demand("attention", 1).on(1)], &target, 400).is_err());
-        for ranks in [2, 3, 4, 6] {
+        for ranks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             assert_eq!(transport_bytes(1024, ranks)?, 1024 * (ranks as u64 + 2) * 10240);
         }
         assert!(transport_bytes(0, 4).is_err());
         assert!(transport_bytes(4097, 4).is_err());
-        assert!(transport_bytes(1024, 5).is_err());
+        assert!(transport_bytes(1024, 0).is_err());
+        assert!(transport_bytes(1024, cuteafd_core::MAX_SPARK_WORLD + 1).is_err());
         Ok(())
     }
 

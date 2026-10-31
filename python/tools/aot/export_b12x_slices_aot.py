@@ -36,6 +36,7 @@ ROLE_GEOMETRY = {
     "spark_tp2": (384, 1152, 1152, 6),
     "spark_tp3": (384, 768, 768, 6),
     "spark_tp6": (384, 384, 384, 6),
+    "spark_tp8": (384, 288, 384, 6),
     "rtx_backbone": (384, 2304, 2304, 6),
     "spark": (384, 576, 640, 6),
 }
@@ -48,6 +49,7 @@ ROLE_SM = {
     "spark_tp2": (12, 1),
     "spark_tp3": (12, 1),
     "spark_tp6": (12, 1),
+    "spark_tp8": (12, 1),
 }
 # Native `cuteafd_expert_info_t.role` values (see native/shared/include/cuteafd_experts.h).
 ROLE_NATIVE_ID = {
@@ -59,8 +61,9 @@ ROLE_NATIVE_ID = {
     "spark_tp2": 5,
     "spark_tp3": 6,
     "spark_tp6": 7,
+    "spark_tp8": 8,
 }
-SPARK_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6}
+SPARK_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6, "spark_tp8": 8}
 
 # Routed-expert shapes that share the V4.1 storage (packed FP4, E8M0 K32 scales)
 # and slice pipeline. The family names the exported symbols (`cuteafd_{family}_*`)
@@ -71,7 +74,7 @@ FAMILY_GEOMETRY = {
     "dsv4f": {"hidden": 4096, "experts": 256, "topk": 6, "intermediate": 2048},
     "dsv4p": {"hidden": 7168, "experts": 384, "topk": 6, "intermediate": 3072},
 }
-ROLE_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6,
+ROLE_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6, "spark_tp8": 8,
                   "rtx_backbone": 1, "rtx_tp2": 2}
 
 
@@ -152,8 +155,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     experts, intermediate, kernel_intermediate, topk = role_geometry(family, role)
     hidden = FAMILY_GEOMETRY[family]["hidden"]
     wire = hidden + hidden // 32  # FP8 E4M3 row, then one UE8M0 scale per 32 values
-    if family != "v41" and (compact_max_capacity is not None or role == "spark_tp3"):
-        raise ValueError("compact and TP3 launch-geometry exports are V4.1-only")
+    if family != "v41" and compact_max_capacity is not None:
+        raise ValueError("compact launch-geometry exports are V4.1-only")
     if compact_max_capacity is not None:
         if role not in ("spark", "rtx_tp2") or compact_max_capacity < 1:
             raise ValueError("compact specialization requires Spark/TP2 and positive capacity")
@@ -207,7 +210,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
                 revision=_pinned_sparkinfer.REVISION,
             )
-            if role == "spark_tp3"
+            if family == "v41" and role == "spark_tp3"
             else None
         )
         partial_cols = (selected_width // 4 + selected_width // 32) if (family == "v41" and not compact) else hidden
@@ -444,7 +447,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--role", choices=("spark", "spark_tp2", "spark_tp3", "spark_tp6", "coordinator", "rtx_backbone", "rtx_tp2", "dspark_tp2"), default="spark")
+    parser.add_argument("--role", choices=("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8", "coordinator", "rtx_backbone", "rtx_tp2", "dspark_tp2"), default="spark")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", choices=sorted(FAMILY_GEOMETRY), default="v41",
                         help="routed-expert family; names the exported symbols")

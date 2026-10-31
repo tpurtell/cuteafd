@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from launcher_sandbox import copy_launcher_shared_inputs
+
 REPO = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('release_scope', REPO / 'scripts/build/release-scope.py')
 SCOPE = importlib.util.module_from_spec(SPEC)
@@ -47,11 +49,44 @@ def test_union_equals_per_entry_derivation(fixture_repo):
         else:
             expected = set().union(*(SCOPE.tokens(e[key]) for e in per_entry))
             expected |= SCOPE.PREVIOUS_RELEASE_FLOOR.get(key.removeprefix(P), set())
-            assert SCOPE.tokens(value) == expected
+            if key == P + 'GENERIC_SPARK_COUNTS':
+                assert expected <= SCOPE.tokens(value)
+            elif key == P + 'SPARK_TP_ROLES':
+                assert SCOPE.tokens(value) == expected | {'tp8'}
+            else:
+                assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['EXPERT_FAMILIES'] <= SCOPE.tokens(union[P + 'EXPERT_FAMILIES'])
     assert SCOPE.requirements(repo, path, 'glm-fp8')[0]['spark_count'] == 4
     assert not SCOPE.requirements(repo, path, 'glm-fp8')[0]['dual']  # set wins over gpus
+
+
+def test_full_release_expands_width_aliases_without_widening_card_scopes(fixture_repo):
+    repo, path = fixture_repo
+    full, _ = SCOPE.derive(repo, path, 'all', {})
+    counts = SCOPE.tokens(full[P + 'GENERIC_SPARK_COUNTS'])
+    assert {f'glm:exl3={world}' for world in (5, 7, 8)} <= counts
+    assert {f'glmf:{format}={world}' for format in ('nvfp4', 'nvfp4a4')
+            for world in (2, 3, 4, 5, 6)} <= counts
+    assert not {f'glmf:{format}={world}' for format in ('nvfp4', 'nvfp4a4')
+                for world in (7, 8)} & counts
+    card, _ = SCOPE.derive(repo, path, 'glm-fp8', {})
+    assert SCOPE.tokens(card[P + 'GENERIC_SPARK_COUNTS']) == {'glm=2'}
+    explicit, _ = SCOPE.derive(repo, path, 'explicit', {
+        P + 'EXPERT_FAMILIES': 'glm:exl3-k45', P + 'GENERIC_SPARK_COUNTS': 'glm:exl3=4'})
+    assert explicit[P + 'GENERIC_SPARK_COUNTS'] == 'glm:exl3=4'
+
+
+def test_full_release_expands_native_roles_without_widening_explicit_scope(fixture_repo):
+    repo, path = fixture_repo
+    selected = 'dsv4f:spark;dsv4p:spark'
+    full, _ = SCOPE.derive(repo, path, 'all', {P + 'EXPERT_FAMILIES': selected})
+    experts = SCOPE.tokens(full[P + 'EXPERT_FAMILIES'])
+    assert {'dsv4f:spark_tp8', 'dsv4p:spark_tp8', 'dsv4p:spark_tp3'} <= experts
+    assert not {'dsv4f:spark_tp3', 'dsv4f:spark_tp6', 'dsv4p:spark_tp5',
+                'dsv4p:spark_tp7'} & experts
+    explicit, _ = SCOPE.derive(repo, path, 'explicit', {P + 'EXPERT_FAMILIES': selected})
+    assert explicit[P + 'EXPERT_FAMILIES'] == selected
 
 
 def test_raw_environment_adds_but_does_not_shrink(fixture_repo):
@@ -75,7 +110,7 @@ def test_selectors_and_explicit(fixture_repo):
     assert family[P + 'SPARK_TP_ROLES'] == ''
     both, _ = SCOPE.derive(repo, path, 'glm-fp8,flash-nvfp4', {})
     all_scope = SCOPE.derive(repo, path, 'all', {})[0]
-    assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp6'
+    assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp6;tp8'
     for key in SCOPE.PREVIOUS_RELEASE_FLOOR:
         all_scope[P + key] = both[P + key]
     assert both == all_scope
@@ -270,6 +305,7 @@ def test_release_requirements_use_matrix_and_configs_at_build_revision(tmp_path)
     import subprocess
     repo = tmp_path / 'revision-repo'
     shutil.copytree(REPO / 'scripts/lib', repo / 'scripts/lib', ignore=shutil.ignore_patterns('__pycache__'))
+    copy_launcher_shared_inputs(REPO, repo)
     config = repo / 'examples/configs/fixture.config'
     config.parent.mkdir(parents=True)
     config.write_text('FAMILY=glm5\nMODEL_ID=fixture/glm\nSPARK_COUNT=4\nRTX_GPUS=1\n')
@@ -282,6 +318,28 @@ def test_release_requirements_use_matrix_and_configs_at_build_revision(tmp_path)
     subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Fixture', '-c',
                     'user.email=fixture@example.invalid', 'commit', '-qm', 'Fixture'], check=True)
     revision = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    # Import only the freshly archived revision, in an isolated interpreter:
+    # neither sys.path nor an already cached helper may hide missing inputs.
+    import io
+    import sys
+    import tarfile
+    policy = json.loads((repo / 'scripts/build/spark-package-ranges.json').read_text())
+    archive = subprocess.check_output(['git', '-C', str(repo), 'archive', revision, '--',
+                                       *policy['shared_inputs']])
+    archived = tmp_path / 'archived'
+    archived.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(archive)) as tree:
+        tree.extractall(archived, filter='data')
+    subprocess.run([sys.executable, '-I', '-c',
+        "import importlib.util, sys; "
+        "spec = importlib.util.spec_from_file_location('archived_scopes', sys.argv[1]); "
+        "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
+        "assert 8 in module.native_spark_roles('v41')",
+        str(archived / 'scripts/lib/wip_aot_scopes.py')],
+        check=True, capture_output=True, text=True, timeout=30)
+    publisher_helper = repo / 'python/tools/lib/spark_packages.py'
+    publisher_helper.unlink()  # Fixture inputs can be linked to the session cache.
+    publisher_helper.write_text("raise AssertionError('publisher checkout used')\n")
     config.write_text('FAMILY=glm5\nMODEL_ID=fixture/glm\nSPARK_COUNT=0\nRTX_GPUS=2\n')
     matrix.write_text('{"entries": []}')
     wanted = SCOPE.revision_requirements(repo, revision)
@@ -427,3 +485,34 @@ def test_build_sh_forwards_every_aot_switch_to_the_coordinator_export():
     export = export.rsplit('docker run', 1)[1]
     missing = [s for s in SCOPE.SWITCHES if f'-e "{P}{s}_AOT=' not in export]
     assert not missing, missing
+
+
+def test_release_image_stages_the_shared_scope_inputs(tmp_path):
+    import subprocess
+    import sys
+    dockerfile = (REPO / 'docker/Dockerfile.release').read_text()
+    stage = next(line for line in dockerfile.splitlines()
+                 if line.startswith('RUN --mount=type=bind,target=/cuteafd-source '))
+    import shlex
+    command = shlex.split(stage.split(' python3 ', 1)[1])
+    source = tmp_path / 'source'
+    copy_launcher_shared_inputs(REPO, source)
+    destination = tmp_path / 'image'
+    subprocess.run([sys.executable, '-I', *command[:-2], str(source), str(destination)],
+                   check=True, capture_output=True, text=True, timeout=30)
+    for relative in json.loads((source / 'scripts/build/spark-package-ranges.json').read_text())['shared_inputs']:
+        assert (destination / relative).read_bytes() == (REPO / relative).read_bytes()
+
+
+def test_shared_input_staging_can_precede_explicit_copy(tmp_path):
+    import launcher_sandbox
+    root = tmp_path / 'repo'
+    target = root / 'scripts/lib/release-common.sh'
+    target.parent.mkdir(parents=True)
+    launcher_sandbox.copy_input(REPO / 'scripts/lib/release-common.sh', target)
+    path = root / 'scripts/lib/checkpoint-family.py'
+    other = tmp_path / 'other.py'
+    other.hardlink_to(path)
+    launcher_sandbox.copy_input(REPO / 'scripts/lib/checkpoint-family.py', path)
+    assert path.read_bytes() == other.read_bytes() == (REPO / 'scripts/lib/checkpoint-family.py').read_bytes()
+    assert path.stat().st_ino == other.stat().st_ino

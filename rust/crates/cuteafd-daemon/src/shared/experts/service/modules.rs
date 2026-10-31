@@ -120,7 +120,7 @@ impl<'a> WarmModules<'a> {
         let compiled = config.compiled_capacity()?;
         let info = layer.select_info(library, compiled, nvfp4)?;
         let mut capacities = vec![compiled];
-        if matches!(info.role, 1 | 5 | 6 | 7) {
+        if crate::shared::experts::execution::compact_output_role(info.role) {
             if compiled > 1 { capacities.push(1); }
             if compiled > 80 { capacities.push(80); }
         }

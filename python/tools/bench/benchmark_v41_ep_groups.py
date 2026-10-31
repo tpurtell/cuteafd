@@ -82,7 +82,8 @@ OFFICIAL_INTERMEDIATE = 2304
 # Degrees this harness can actually execute: TP4 (historical padded shard), TP2
 # and TP3 (replicated groups) and TP6 (pure). TP1 is the unsliced leg used as a
 # reference. Anything else has no exported kernel family.
-TP_DEGREES = (1, 2, 3, 4, 6)
+from spark_packages import package_worlds
+TP_DEGREES = (1, *package_worlds("v41", "mxfp4"))
 
 
 # --------------------------------------------------------------------------- #

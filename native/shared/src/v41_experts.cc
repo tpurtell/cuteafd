@@ -33,6 +33,8 @@
 #elif defined(CUTEAFD_V41_SPARK_TP6_EXPERTS)
 /* Pure TP6 Spark shards (native FP8 K32 family, SM121). */
 #include "v41_spark_tp6_expert_variants.h"
+#elif defined(CUTEAFD_V41_SPARK_TP8_EXPERTS)
+#include "v41_spark_tp8_expert_variants.h"
 #elif defined(CUTEAFD_V41_DSPARK_TP2_EXPERTS)
 #include "v41_dspark_tp2_expert_variants.h"
 #elif defined(CUTEAFD_V41_TP2_EXPERTS)
@@ -306,7 +308,7 @@ extern "C" int32_t cuteafd_expert_launch(void* kernel, const cuteafd_expert_laun
 // Every role that needs it defines these entry points in exactly one member.
 #if !defined(CUTEAFD_V41_LOCAL_EXPERTS) && !defined(CUTEAFD_V41_NVFP4_VARIANTS_HEADER) && \
     !defined(CUTEAFD_V41_SPARK_TP2_EXPERTS) && !defined(CUTEAFD_V41_SPARK_TP3_EXPERTS) && \
-    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS) && !defined(CUTEAFD_EXPERT_VARIANTS_HEADER)
+    !defined(CUTEAFD_V41_SPARK_TP6_EXPERTS) && !defined(CUTEAFD_V41_SPARK_TP8_EXPERTS) && !defined(CUTEAFD_EXPERT_VARIANTS_HEADER)
 namespace {
 struct InputQuantModule {
   cudaLibrary_t library = nullptr;

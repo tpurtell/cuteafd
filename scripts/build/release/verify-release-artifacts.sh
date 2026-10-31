@@ -217,8 +217,8 @@ if [[ -n "$anchor_host" ]]; then
     spark.role "expected expert got ${spark_role_label:-<none>}"
   record "$([[ "$spark_cuda_label" == 121 ]] && echo PASS || echo FAIL)" \
     spark.cuda_arch "expected 121 got ${spark_cuda_label:-<none>}"
-  record "$([[ "$spark_roles" == "tp2;tp3;tp6" ]] && echo PASS || echo FAIL)" \
-    spark.spark_tp_roles "expected tp2;tp3;tp6 got ${spark_roles:-<none>}"
+  record "$([[ "$spark_roles" == "tp2;tp3;tp6;tp8" ]] && echo PASS || echo FAIL)" \
+    spark.spark_tp_roles "expected tp2;tp3;tp6;tp8 got ${spark_roles:-<none>}"
 else
   record FAIL spark.identity "no scanned host carries $spark; identity/version/role checks cannot be evaluated"
 fi
@@ -310,7 +310,7 @@ if [[ -n "$dist" ]]; then
       record "$([[ -n "$manifest" && "$manifest" == "$actual" ]] && echo PASS || echo FAIL)" \
         "$role.native_library_sha256" "manifest=${manifest:-<none>} actual=${actual:-<none>}"
       roles_json="$(python3 -c "import json;print(';'.join(json.load(open('$dist/$role/V41_EXPERT_TP_AOT.json')).get('spark_tp_roles',[])))" 2>/dev/null)"
-      expected_roles=""; [[ "$role" == spark-expert ]] && expected_roles="tp2;tp3;tp6"
+      expected_roles=""; [[ "$role" == spark-expert ]] && expected_roles="tp2;tp3;tp6;tp8"
       record "$([[ "$roles_json" == "$expected_roles" ]] && echo PASS || echo FAIL)" \
         "$role.aot_spark_tp_roles" "expected '${expected_roles:-<empty>}' got '${roles_json:-<none>}'"
     done

@@ -904,16 +904,10 @@ topology_explicit=0
 release_spark_topology_explicit && topology_explicit=1
 spark_tp="$(release_spark_tp)"
 spark_ep="$(release_spark_ep)"
-# Extra SM121 expert roles the image must have been built with. Legacy TP4EP1
-# and the shipped default require none, so a prebuilt v8 image without any role
-# label keeps working unchanged.
+# Canonical TP4 has no namespaced role; every other admitted native TP does.
 spark_tp_roles_required=""
-if ((topology_explicit)); then
-  case "$spark_tp" in
-    2) spark_tp_roles_required=tp2 ;;
-    3) spark_tp_roles_required=tp3 ;;
-    6) spark_tp_roles_required=tp6 ;;
-  esac
+if ((topology_explicit)) && [[ "$spark_tp" != 4 ]]; then
+  spark_tp_roles_required="tp$spark_tp"
 fi
 [[ -z "$HTTP_QUEUE_DEPTH" || ( "$HTTP_QUEUE_DEPTH" =~ ^[1-9][0-9]*$ && "$HTTP_QUEUE_DEPTH" -le 4096 ) ]] || release_die "HTTP_QUEUE_DEPTH must be in 1..4096"
 [[ "$HTTP_QUEUE_WAIT_MS" =~ ^[0-9]+$ ]] || release_die "HTTP_QUEUE_WAIT_MS must be non-negative"
@@ -1279,7 +1273,7 @@ try:
     assert hashlib.sha256(manifest_bytes).hexdigest() == meta.get('v41_expert_tp_manifest_sha256'), 'TP manifest hash mismatch'
     manifest = json.loads(manifest_bytes)
     roles = manifest.get('spark_tp_roles')
-    assert manifest.get('schema') == 1 and isinstance(roles, list) and all(role in ('tp2', 'tp3', 'tp6') for role in roles), 'invalid TP roles'
+    assert manifest.get('schema') == 1 and isinstance(roles, list) and all(isinstance(role, str) and role.startswith('tp') and role[2:].isdigit() and 1 <= int(role[2:]) <= 8 for role in roles), 'invalid TP roles'
     assert roles == meta.get('spark_tp_roles'), 'slot and artifact roles differ'
     assert manifest.get('symbols_verified') is True, 'TP symbols are not verified'
     if sys.argv[2] == 'nvfp4':
@@ -1709,7 +1703,7 @@ audio="$(release_resolve_audio_mode "$audio" "$root/snapshots/$revision")"
 # Auto/spark placement is resolved by the encoder plan below.
 # An explicit count or host list is exact. Unspecified means the entire inventory.
 available_sparks=0
-for rank in {0..5}; do
+for rank in {0..7}; do
   [[ -n "$(get "SPARK_${rank}_HOST")" ]] || break
   available_sparks=$((available_sparks + 1))
 done
@@ -1719,7 +1713,16 @@ ranks="$(get SPARK_COUNT "$available_sparks")"
 if [[ -n "$(get SPARK_HOSTS)" ]]; then
   IFS=, read -r -a count_hosts <<<"$(get SPARK_HOSTS)"
   ranks="$(get SPARK_COUNT "${#count_hosts[@]}")"
-  host_rows="$(release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks")" || exit 2
+  host_rows="$(
+    # The shared resolver reads shell variables; generic launch config lives in cfg.
+    for rank in {0..7}; do
+      for field in HOST LANE_A LANE_B; do
+        key="SPARK_${rank}_${field}"
+        printf -v "$key" '%s' "$(get "$key")"
+      done
+    done
+    release_spark_host_rows "$(get SPARK_HOSTS)" "$ranks"
+  )" || exit 2
   while read -r rank host lane_a lane_b; do
     cfg[SPARK_${rank}_HOST]="$host"
     cfg[SPARK_${rank}_LANE_A]="$lane_a"
@@ -1741,15 +1744,11 @@ if [[ "$family" == qwen3_5 ]]; then
   ranks=0
   backend=local
 fi
-if [[ "$family" == kimi_k3 ]]; then
-  [[ "$backend" != local && "$ranks" == 6 ]] ||
-    release_die "Kimi K3 TP$ranks has no installed kimik3:exl3-k23 Spark recipe or rank-sized intake/admission; export balanced H128 widths and parameterize the Kimi executor (currently TP6 width 512)"
-fi
 if [[ "$family" == step5 ]]; then
   step5_kv_cache="$(get KV_CACHE fp8)"
   case "$step5_kv_cache" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   [[ "$backend" != local && "$ranks" != 0 ]] ||
-    release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (FP8: 6, NVFP4: 4 or 6)"
+    release_die "Step-5 has no local-expert layout; its routed experts need Spark ranks (the planner checks format, width coverage and memory)"
 fi
 coordinator_image="$(get COORDINATOR_DOCKER_INFERENCE)"
 # --wip SLOT serves a ./wip.sh slot: the development images run its artifacts, staged from

@@ -59,8 +59,9 @@ ROOT = Path(__file__).resolve().parents[3]
 # slice is, so the per-rank intermediate comes with it. `tp6` is the pure
 # six-way split of the official 2304 (384 per rank, no padding); TP2/TP3 are the
 # replicated-group degrees and TP4 is the historical padded shard.
-TP_GEOMETRIES = ((2, 1152, "tp2"), (4, 576, "tp4"), (3, 768, "tp3"),
-                 (6, 384, "tp6"))
+from spark_packages import native_spark_geometry
+TP_GEOMETRIES = tuple((tp, geometry[1], f"tp{tp}")
+                      for tp, geometry in native_spark_geometry().items())
 # The slice kernel asserts width in (64, 128, 192); anything else cannot be
 # exported, so the harness must not silently accept it.
 SUPPORTED_SLICE_WIDTHS = (64, 128, 192)

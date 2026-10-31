@@ -320,11 +320,11 @@ pub fn io_extents(vocab: usize, rank: usize, rows: usize, core_head: bool) -> [u
     else { [0, rows.min(64) * vocab * 4, if core_head { 0 } else { 4 << 20 }] }
 }
 
-/// Return slots for the prefill units, from all six ranks: `shape.waves`
+/// Return slots for the prefill units, from every admitted rank: `shape.waves`
 /// slots of `shape.unit_rows` each.
-pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize) -> Demand {
+pub fn spark_demand(shape: crate::serving_capacity::PrefillShape, lane: usize, ranks: usize) -> Demand {
     Demand::new(1, Category::Workspace, format!("Kimi Spark lane {lane} latent intake"),
-        crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows, 6, 3584), Basis::Exact)
+        crate::serving_capacity::prefill_return_bytes(shape.waves, shape.unit_rows, ranks as u64, 3584), Basis::Exact)
 }
 
 /// Row planes hold exactly the admitted units; scratch and return slots serve
@@ -381,7 +381,7 @@ pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> 
 /// Lane row planes plus `shape.waves` return slots of `shape.unit_rows` each.
 pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
     rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
-    core: &super::core::CoreInventory, heads: bool) -> Result<Vec<Demand>> {
+    core: &super::core::CoreInventory, heads: bool, ranks: usize) -> Result<Vec<Demand>> {
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
     prefill_shape_with(rows, usize::try_from(shape.waves)?, Some(unit))?;
@@ -390,7 +390,7 @@ pub fn baseline_demands(cfg: &KimiK3Config, manifest: &serde_json::Value,
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
     let graphs = graphs(cfg, 1, unit, slots, verify, |rank, layer| cfg.attention[layer] == KimiAttention::Kda
         || heads || rank == usize::from(owners[layer]))?;
-    let mut demands = vec![spark_demand(shape, 0)];
+    let mut demands = vec![spark_demand(shape, 0, ranks)];
     for rank in 0..2 {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
@@ -463,7 +463,9 @@ mod tests {
             for name in HOOK_SCRATCH { assert_eq!(lane.operands[name], one.operands[name], "{name}"); }
             assert_eq!(lane.metadata_extent("KDA slots", 0)?.1, unit as usize * 4);
             assert_eq!(lane.metadata_extent("MLA slots", 0)?.1, unit as usize * 8);
-            assert_eq!(spark_demand(shape, 0).bytes, rows * 6 * 3584 * 2);
+            for ranks in 1..=8 {
+                assert_eq!(spark_demand(shape, 0, ranks).bytes, rows * ranks as u64 * 3584 * 2);
+            }
             assert!(prefill_shape_with(rows as usize - 64, waves as usize, Some(unit as usize)).is_err());
         }
         Ok(())

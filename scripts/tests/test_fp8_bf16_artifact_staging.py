@@ -34,7 +34,7 @@ def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
     layouts = package_tool.spark_layouts(intermediate)
     for tp in range(1, 9):
         widths = package_tool.exact_widths(intermediate, tp)
-        if tp > 6 or tp > intermediate // 128:
+        if tp > intermediate // 128:
             assert not widths
             assert f"tp{tp}" not in layouts
             continue
@@ -49,11 +49,11 @@ def test_all_spark_counts_own_unequal_whole_blocks(intermediate):
     assert package_tool.exact_widths(intermediate, 9) == []
 
 
-@pytest.mark.parametrize("tp", [7, 8])
+@pytest.mark.parametrize("tp", [0, 9])
 def test_packager_rejects_deleted_world_before_geometry_or_compilation(tp):
     assert package_tool.exact_widths(2048, tp) == []
     assert not any(layout.startswith(f"tp{tp}") for layout in package_tool.spark_layouts(2048))
-    with pytest.raises(SystemExit, match="Spark TP must be in 1..6"):
+    with pytest.raises(SystemExit, match="Spark TP must be in 1..8"):
         package_tool.layout_geometry(None, f"tp{tp}")
 
 
@@ -67,7 +67,7 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
     assert package_tool.exact_widths(2048, 3) == [768, 640, 640]
     assert package_tool.exact_widths(2048, 3, 32) == [704, 672, 672]
     assert package_tool.exact_widths(2048, 6, 32) == [352, 352, 352, 352, 320, 320]
-    assert package_tool.exact_widths(2048, 6, 16) == []
+    assert package_tool.exact_widths(2048, 6, 16) == [352, 352, 336, 336, 336, 336]
     # Importing geometry is CPU-only; no exporter or CUDA context is involved.
     from dataclasses import dataclass, replace
 
@@ -150,7 +150,7 @@ def test_step5_bf16_bypasses_native_slice_exporter(tmp_path):
     assert "NATIVE=\n" in result.stderr
 
 
-@pytest.mark.parametrize("counts", ["0", "7", "8", "9", "5;bad"])
+@pytest.mark.parametrize("counts", ["0", "9", "5;bad"])
 def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
     source = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     body = source.split("  set(requested_layouts)", 1)[1].split("  set(stamp ", 1)[0]
@@ -159,24 +159,24 @@ def test_cmake_requested_counts_fail_before_compilation(tmp_path, counts):
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body)
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
     assert result.returncode != 0
-    assert "requires counts 1..6" in result.stderr
+    assert "requires counts 1..8" in result.stderr
 
 
 @pytest.mark.parametrize("geometry,blocks", [("qwen4", 5), ("glm", 16), ("glmf", 16),
-                                             ("dsv4f", 16), ("dsv4p", 24)])
+                                             ("kimik3", 24), ("dsv4p", 24)])
 @pytest.mark.parametrize("count", range(1, 9))
 def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry, blocks, count):
     source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
     body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split(
         '  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
     script = tmp_path / "select.cmake"
-    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\n'
+    script.write_text(f'set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")\nset(CUTEAFD_EXL3_ROLE spark)\n'
                       f'set(CUTEAFD_EXL3_GEOMETRY {geometry})\n'
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS {count})\n' + body
                       + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n'
                       + 'message("PROFILES=${CUTEAFD_EXL3_PROFILE_ARGS}")\n')
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
-    if count > 6 or count > blocks:
+    if count > blocks:
         assert result.returncode != 0
         assert "requires a nonempty H128 slice" in result.stderr
         return
@@ -188,12 +188,10 @@ def test_cmake_exl3_requested_counts_match_packager_profiles(tmp_path, geometry,
 
 
 def test_coordinator_exports_tp2_for_every_routed_weight_format():
-    for layouts in (package_tool.ROLE_LAYOUTS, package_tool.MXFP4_ROLE_LAYOUTS,
-                    package_tool.NVFP4_ROLE_LAYOUTS):
-        assert layouts["coordinator"] == ("tp1", "tp2")
+    assert package_tool.ROLE_LAYOUTS["coordinator"] == ("tp1", "tp2")
     assert package_tool.ROLE_INPUT["coordinator"] == "bf16"
     # Unequal coordinator slices must not pass through Spark's default filter.
-    assert 'elif args.role == "spark" and not args.layouts' in TOOL.read_text()
+    assert 'else list(ROLE_LAYOUTS[args.role])' in TOOL.read_text()
     cmake = (REPO / "native/cmake/shared/fp8_moe.cmake").read_text()
     assert 'set(exact_slices "--exact-slices")' in cmake
 
@@ -592,7 +590,7 @@ def test_cmake_exl3_family_counts_only_apply_to_their_family(tmp_path, counts, g
     source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
     body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
     script = tmp_path / "select.cmake"
-    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\n'
+    script.write_text(f'set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")\nset(CUTEAFD_EXL3_ROLE spark)\n'
                       f'set(CUTEAFD_EXL3_GEOMETRY {geometry})\nset(CUTEAFD_EXL3_GEOMETRY_LAYOUTS tp1-rank0)\n'
                       f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{counts}")\n' + body
                       + '\nmessage("LAYOUTS=${CUTEAFD_EXL3_GEOMETRY_LAYOUTS}")\n')
@@ -605,7 +603,8 @@ def test_cmake_exl3_own_family_invalid_count_still_fails(tmp_path):
     source = (REPO / "native/cmake/shared/exl3.cmake").read_text()
     body = source.split("  set(CUTEAFD_EXL3_PROFILE_ARGS)", 1)[1].split('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', 1)[0]
     script = tmp_path / "select.cmake"
-    script.write_text('set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY qwen4)\n'
+    script.write_text(f'set(CMAKE_CURRENT_SOURCE_DIR "{REPO}/native")\n'
+                      'set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY qwen4)\n'
                       'set(CUTEAFD_GENERIC_SPARK_COUNTS "qwen4=6")\n' + body)
     result = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True, timeout=30)
     assert result.returncode != 0 and "requires a nonempty H128 slice" in result.stderr

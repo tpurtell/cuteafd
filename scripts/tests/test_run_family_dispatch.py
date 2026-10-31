@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -814,7 +815,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           program_manifest: dict | None = None,
                           launcher_source: Path | None = None,
                           deployment_overrides: dict | None = None,
-                          probe_fails: bool = False, root_launcher: bool = False) -> subprocess.CompletedProcess[str]:
+                          probe_fails: bool = False, root_launcher: bool = False,
+                          checkpoint_source: Path | None = None) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch. nvidia-smi reports
     PHYSICAL_GPUS (default 0 and 1, V4.1 0 alone; BUSY_GPUS with 2 GiB free); the deployment plan charges each
@@ -855,6 +857,13 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     hf = tmp_path / "hf"
     _snapshot(hf, model, family_config, "a" * 40 if native_v41 else "abc")
+    if checkpoint_source is not None:
+        staged = hf / "hub" / f"models--{model.replace('/', '--')}" / "snapshots" / ("a" * 40 if native_v41 else "abc")
+        # Header fixtures have huge sparse tensor payloads; never materialize them.
+        for child in staged.iterdir():
+            if child.is_file():
+                child.unlink()
+        shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
     if family_config.get("model_type") == "glm_moe_dsa":
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
     bin_dir = tmp_path / "bin"
@@ -888,10 +897,11 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and previous_peers is not None else ''))
         if tool == "ssh" and native_v41:
             with (bin_dir / tool).open("a") as stream:
-                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp2"*) echo tp2 ;; *"docker container inspect"*) exit 1 ;; esac\n')
+                stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp2"*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
         if tool == "docker":
             stub = (bin_dir / tool).read_text()
-            intercept = 'case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; esac\n'
+            intercept = ('case "$*" in *" plan "*"--deployment"*) exec python3 "$STUB_DEPLOYMENT" "$@" ;; '
+                         'inspect*State.Status*) echo running; exit 0 ;; esac\n')
             if probe_fails:
                 # A slot binary that predates the family's serve command rejects it.
                 intercept += 'case "$*" in *"/opt/cuteafd-serve-probe"*) exit 2 ;; esac\n'
@@ -929,6 +939,9 @@ exec python3 -c "$code" "$@"
     deployment_stub = tmp_path / "deployment-stub.py"
     deployment_stub.write_text("""import json, os, subprocess, sys
 args = sys.argv[1:]
+if os.environ.get("STUB_REAL_DEPLOYMENT"):
+    print(open(os.environ["STUB_REAL_DEPLOYMENT"]).read())
+    sys.exit(0)
 def value(flag, default=None):
     return args[args.index(flag) + 1] if flag in args else default
 config = json.loads(os.environ["STUB_CHECKPOINT"])
@@ -1015,6 +1028,46 @@ print(json.dumps(deployment))
             break
         time.sleep(0.05)
     return subprocess.CompletedProcess(completed.args, completed.returncode, read(stdout_path), text)
+
+
+def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
+    """Rust contract supplies actual headers/deployment; only hardware is stubbed."""
+    deployment = json.loads(deployment_path.read_text())
+    config = json.loads((snapshot / "config.json").read_text())
+    family = deployment["family"]
+    keys = ("SPARK_COUNT=8\nSPECULATOR=off\nVISION=off\nAUDIO=off\nMODEL_REVISION=\n"
+            "MAX_CONTEXT_TOKENS=262144\nMAX_OUTPUT_TOKENS=32768\nHOST_CACHE_BYTES=0\nPOOL_TOKENS=262144\n"
+            f"RTX_GPUS={deployment['rtx_gpus']}\nSPARK_HOSTS=" +
+            ",".join(f"worker-{rank}" for rank in range(8)) + "\n")
+    keys += "".join(f"SPARK_{rank}_HOST=worker-{rank}\nSPARK_{rank}_LANE_A=192.0.2.{rank + 1}\n"
+                    for rank in range(8))
+    if family == "deepseek_v41":
+        keys += "SPARK_TP=8\nSPARK_EP=1\nSPARKINFER_EXL3=disable\nRTX_EXPERT_LAYERS=auto\n"
+    model = "deepseek-ai/DeepSeek-V4.1-Flash" if family == "deepseek_v41" else "test/eight-rank"
+    result = _family_launch_result(temporary, config, model, keys,
+        physical_gpus=tuple(range(deployment["rtx_gpus"])), root_launcher=True,
+        checkpoint_source=snapshot,
+        extra_env={"STUB_REAL_DEPLOYMENT": str(deployment_path),
+                   "STUB_SPARK_ROLES": "tp2;tp3;tp6;tp8", "CUTEAFD_CDI_CHECK": "off"})
+    assert result.returncode == 0, result.stderr
+    lines = [shlex.split(line) for line in result.stderr.splitlines()
+             if "serve-" in line and "docker run -d" in line]
+    assert len(lines) == 1, result.stderr
+    tokens = lines[0]
+    argv = tokens[tokens.index("cuteafd"):]
+    workers = [shlex.split(line) for line in result.stderr.splitlines()
+               if "cuteafd expertd-native" in line]
+    if family != "deepseek_v41":
+        assert len(workers) == 8, result.stderr
+        for rank, worker in enumerate(sorted(workers, key=lambda w: int(w[w.index("--rank") + 1]))):
+            assert worker[worker.index("--rank") + 1] == str(rank)
+            assert worker[worker.index("--world") + 1] == "8"
+    layer_bytes = None
+    if family == "deepseek_v41":
+        arithmetic = subprocess.run(["bash", "-euc", 'source "$1"; release_spark_layer_bytes 8',
+            "eight-rank", str(ROOT / "scripts/lib/release-common.sh")], capture_output=True, text=True, check=True)
+        layer_bytes = int(arithmetic.stdout)
+    return {"argv": argv, "layer_bytes": layer_bytes}
 
 
 @pytest.mark.parametrize("family_config,model,row_key,rtx,ranks", [
@@ -1436,7 +1489,25 @@ def test_explicit_pool_hosts_reject_invalid_selection(tmp_path: Path, hosts: str
     assert "cuteafd serve-qwen4" not in result.stderr
 
 
-@pytest.mark.parametrize("count", [1, 5])
+@pytest.mark.parametrize("count", [2, 8])
+def test_generic_custom_hosts_reach_workers_from_config(tmp_path, count):
+    hosts = [f"worker-{rank}" for rank in range(count)]
+    keys = f"SPARK_COUNT={count}\nSPARK_HOSTS={','.join(reversed(hosts))}\nSPECULATOR=off\nVISION=off\nAUDIO=off\n"
+    keys += "".join(f"SPARK_{rank}_HOST={host}\nSPARK_{rank}_LANE_A=192.0.2.{rank + 1}\n"
+                    for rank, host in enumerate(hosts))
+    result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 4},
+                                  "test/model", keys, root_launcher=True)
+    assert result.returncode == 0, result.stderr
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert len(workers) == count
+    for rank, host in enumerate(reversed(hosts)):
+        worker = next(line for line in workers if f"--rank {rank} --world {count}" in line)
+        assert host in worker
+    launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
+    assert "--peers " + ",".join(f"192.0.2.{count - rank}:" + "19441" for rank in range(count)) in launch
+
+
+@pytest.mark.parametrize("count", range(1, 9))
 def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
     hosts = [f"spark-{rank}.example" for rank in range(count)]
     script = ['set -eu', 'source "$1"']
@@ -1453,8 +1524,8 @@ def test_explicit_custom_hosts_use_configured_rails_in_csv_order(count):
         for rank, host in enumerate(reversed(hosts))]
 
 
-@pytest.mark.parametrize("count", [7, 8])
-def test_custom_hosts_reject_deleted_worlds(count):
+@pytest.mark.parametrize("count", [9, 10])
+def test_custom_hosts_reject_out_of_transport_range_worlds(count):
     hosts = ",".join(f"spark-{rank}.example" for rank in range(count))
     result = subprocess.run(["bash", "-c", 'set -eu; source "$1"; release_spark_host_rows "$2" "$3"',
                              "test", str(ROOT / "scripts/lib/release-common.sh"), hosts, str(count)],

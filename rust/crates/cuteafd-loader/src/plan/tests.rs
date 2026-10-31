@@ -1049,7 +1049,7 @@ fn deepseek_v41_components_formats_and_placement() {
     assert_eq!(component(&report, Component::MappedTable).owner, Owner::HostMapped);
     assert!(component(&report, Component::MappedTable).formats.contains_key("fp8-block1x32/ue8m0"));
     assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
-    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6]);
+    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6, 8]);
     assert!(!report.executable());
     assert!(report.hints.iter().any(|h| h.what.contains("native placement refused")));
 }
@@ -1629,7 +1629,7 @@ fn glm5_flash_mixed_exl3_tiers_share_one_package() {
     assert_eq!(experts.status, Status::Ready, "{}", render(&report));
     assert_eq!(experts.formats.len(), 2);
     let contract = report.experts.as_ref().unwrap();
-    assert_eq!((contract.package.as_str(), contract.spark_worlds.as_slice()), ("glmf:exl3-k34", &[2, 3, 4, 6][..]));
+    assert_eq!((contract.package.as_str(), contract.spark_worlds.as_slice()), ("glmf:exl3-k34", &[2, 3, 4, 5, 6, 7, 8][..]));
     assert!(report.executable(), "{}", render(&report));
     assert_eq!(report.expert_storage, Some(Exl3StorageSource::GptqModel));
     // A storage map that disagrees with the tensors is refused, by module.
@@ -1885,12 +1885,15 @@ fn mimo_flash_complete_inventory_is_ready() {
     assert!(component(&report, Component::Attention).formats.contains_key("fp8-block128x128/f32-segmented4"));
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block), ("mimo:fp8", 128));
-    assert_eq!(contract.spark_worlds, [2, 4, 6]);
+    assert_eq!(contract.spark_worlds, [2, 3, 4, 5, 6, 7, 8]);
     assert!(contract.local.is_ok());
-    // fp8-mimo has no tp3 layout (16 blocks do not split in three).
+    // Unequal whole-H128 slices are now packaged; memory still gates execution.
     let report = plan(dir.path(), &sparks(3)).unwrap();
-    assert!(!report.placement_supported && !report.executable());
-    assert!(report.hints.iter().any(|h| h.what.contains("no mimo:fp8 layout for 3 Spark ranks")));
+    assert!(report.placement_supported && report.executable(), "{}", render(&report));
+    let tight = PlanOptions { spark_budget_bytes: Some(1), ..sparks(3) };
+    let report = plan(dir.path(), &tight).unwrap();
+    assert!(!report.executable());
+    assert!(report.hints.iter().any(|h| h.what.contains("budget")), "{}", render(&report));
 }
 
 #[test]
@@ -1908,7 +1911,7 @@ fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
     let report = plan(dir.path(), &sparks(6)).unwrap();
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
-        ("mimop:fp8 (MXFP4)", 32, &[2, 6][..]));
+        ("mimop:fp8 (MXFP4)", 32, &[2, 6, 7, 8][..]));
     // TP6 of 2048 in 32-row blocks: 352 rows, stored 384 wide.
     assert!((report.spark_rank_share - 384.0 / 2048.0).abs() < 1e-12);
 }
@@ -1921,12 +1924,17 @@ fn mimo_flash_mopd_tp4_qkv_and_mxfp4_are_ready_without_multimodal_towers() {
     tensors.extend([t("visual.blocks.0.norm.weight", "BF16", &[64]),
         t("audio_encoder.norm.weight", "BF16", &[64])]);
     let dir = snapshot_tp(config, &tensors, Some(4));
-    for (ranks, executable) in [(0, false), (2, true), (3, true), (4, true), (6, false)] {
+    // This two-layer fixture is size-capped at four, unlike the full checkpoint.
+    for (ranks, executable) in [(0, false), (2, true), (3, true), (4, true), (5, false), (6, false), (7, false), (8, false)] {
         let report = plan(dir.path(), &sparks(ranks)).unwrap();
         assert_eq!(report.executable(), executable, "{ranks}: {}", render(&report));
+        if ranks > 4 {
+            assert!(report.hints.iter().any(|hint| hint.what.contains("supported range 0..=4")), "{}", render(&report));
+            continue;
+        }
         let experts = report.experts.as_ref().unwrap();
         assert_eq!((experts.package.as_str(), experts.block, experts.spark_worlds.as_slice()),
-            ("mimof:fp8 (MXFP4)", 32, &[2, 3, 4][..]));
+            ("mimof:fp8 (MXFP4)", 32, &[2, 3, 4, 5, 6, 7, 8][..]));
         assert_eq!(component(&report, Component::Vision).status, Status::Unused);
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("family mimof")));
         assert!(report.spec.as_ref().unwrap().notes.iter().any(|note| note.contains("follow checkpoint tensors")));
@@ -2409,15 +2417,20 @@ fn spark_rank_options_follow_transport_and_packages() {
             assert!(matches!(error, PlanError::InvalidOption { option: "spark ranks", .. }), "{ranks}: {error}");
             continue;
         }
-        // mimo:fp8: local, tp2/tp4/tp6; qwen4:exl3: local, 1/2/3/4; V4.1: Sparks 2/3/4/6 only.
+        // The small FP8 fixture retains its shipped six-rank ceiling; width
+        // coverage alone does not override the checkpoint size policy.
         let mimo = plan(flash.path(), &options).unwrap();
-        assert_eq!(mimo.placement_supported, matches!(ranks, 2 | 4 | 6), "mimo {ranks}");
+        assert_eq!(mimo.placement_supported, matches!(ranks, 2..=6), "mimo {ranks}");
+        if ranks > 6 {
+            assert!(mimo.hints.iter().any(|hint| hint.what.contains("supported range")), "{}", render(&mimo));
+        }
         if ranks == 0 { assert!(mimo.hints.iter().any(|h| h.what.contains("BF16 package manifest"))); }
         assert_eq!(plan(qwen.path(), &options).unwrap().placement_supported, matches!(ranks, 0..=4), "qwen {ranks}");
         let v41_options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             workspace_manifest: v41_workspace(dsv41.path()), ..Default::default()
         }), ..options.clone() };
-        assert_eq!(plan(dsv41.path(), &v41_options).unwrap().placement_supported, matches!(ranks, 2 | 3 | 4 | 6), "v41 {ranks}");
+        let v41 = plan(dsv41.path(), &v41_options).unwrap();
+        assert_eq!(v41.placement_supported, matches!(ranks, 2 | 3 | 4 | 6 | 8), "v41 {ranks}: {}", render(&v41));
     }
 }
 
@@ -2511,7 +2524,8 @@ fn qwen_nvfp4_preserves_shipped_six_and_refuses_seven_and_eight() {
         let six = column.counts.iter().find(|count| count.sparks == 6).unwrap();
         assert!(six.padded && six.shipped_exception);
         assert_eq!((six.unit_columns, six.source_block_columns), (128, 16));
-        assert_eq!(six.rule, cuteafd_core::tp_units::UnitRule::Contiguous);
+        assert_eq!(recipe.rule, cuteafd_core::tp_units::UnitRule::LayerRotation);
+        assert_eq!(six.rule, recipe.rule);
         assert_eq!(six.resolved_width_columns, Some(vec![128; 6]));
     }
     let text = spark_range::render(&columns);
