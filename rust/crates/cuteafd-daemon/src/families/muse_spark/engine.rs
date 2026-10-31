@@ -5,7 +5,7 @@
 //! loaded modules and outlive this state). `RankResources::device` lends the
 //! device layer (`RankDevice`) its view for one step.
 use super::{core::CorePrograms, device::{RankDevice, RankPrograms, StepPlanes, Tp2Ops}, lane::Lane, step::StepMetadata,
-    storage::RankKv, weights::{load_rank, LayerWeights}};
+    storage::RankKv, weights::{load_rank, GlobalWeights, LayerWeights}};
 use crate::shared::memory::device::Allocation;
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
 use cuteafd_loader::families::muse_spark::lane::StepTables;
@@ -46,6 +46,10 @@ pub(crate) struct RankResources<'a> {
     pub rank: usize,
     pub wire_grid: crate::shared::launch_grid::Fp8QuantizeGrid,
     pub step: StepStorage<'a>,
+    pub globals: GlobalWeights<'a>,
+    /// Head rank: the K6 head's F32 rows at the stored width, then the
+    /// softcapped logits trimmed to the vocabulary (`lane::head_planes`).
+    pub head: Option<(Allocation<'a>, Allocation<'a>)>,
 }
 
 /// The step metadata planes beyond the lane (`StepTables`, as admitted).
@@ -124,8 +128,21 @@ impl<'a> RankResources<'a> {
             Ok(Tp2Ops { add: library.bf16_f32_add()?, narrow: library.f32_bf16_narrow()? })
         }).transpose()?;
         let step = StepStorage::allocate(device, tables)?;
+        let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg,
+            &cuteafd_loader::families::muse_spark::core::CoreInventory::from_checkpoint(cfg, checkpoint)?)?;
+        let globals = GlobalWeights::load(device, checkpoint, &global_layout, rank, ranks)?;
+        let head = match &globals.head {
+            Some(weights) => {
+                let (stored, trimmed) = cuteafd_loader::families::muse_spark::lane::head_planes(weights.shape[0],
+                    cfg.vocab_size)?;
+                let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse head logits");
+                Some((Allocation::new(device, stored)?, Allocation::new(device, trimmed)?))
+            }
+            None => None,
+        };
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
-        Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step })
+        Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,
+            globals, head })
     }
 
     /// The device layer's view of this rank for one step on `stream`.
@@ -133,5 +150,50 @@ impl<'a> RankResources<'a> {
         RankDevice { library: self.device.library, cfg, programs: &self.programs, core: &self.core,
             layers: &self.layers, lane: &self.lane.views, rope: self.rope.buffers(), kv: &self.kv.layers,
             ranks: self.ranks, rank: self.rank, tp2: self.tp2.as_ref(), wire_grid: self.wire_grid, stream }
+    }
+}
+
+/// What the Spark link of an admitted Muse layout needs at connect.
+pub(crate) struct LinkPlan {
+    pub spark: super::admission::SparkPlan,
+    pub cutoff: cuteafd_loader::families::muse_spark::replies::Cutoff,
+    pub unit_rows: usize,
+    pub waves: usize,
+    /// Each rank's intake plane row width (`shared::intake`).
+    pub intake_row_bytes: usize,
+}
+
+/// The running Muse coordinator over its loaded ranks: the pair's exchange
+/// and the Spark link on rank 0 (the intake planes' device, where admission
+/// charged them). Ranks, peer and link drop in reverse order of this struct.
+pub(crate) struct MuseEngine<'r, 'a> {
+    pub link: super::spark::MuseSparkPath<'r>,
+    pub peer: Option<super::peer::MusePeer<'a>>,
+    pub streams: Vec<Rc<crate::shared::memory::device::Stream<'a>>>,
+    pub ranks: &'r [RankResources<'a>],
+}
+
+impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
+    /// Peer exchange (a pair: one slot set per channel, sized at the unit) and
+    /// the Spark link: its world, the coordinator frame budget the endpoint
+    /// sealed, and every rank's intake plane at the admitted row width.
+    pub(crate) fn connect(library_owner: &'r std::sync::Arc<cuteafd_ffi::NativeLibrary>, cfg: &MuseSparkConfig,
+        ranks: &'r [RankResources<'a>], streams: Vec<Rc<crate::shared::memory::device::Stream<'a>>>,
+        peers: Vec<std::net::SocketAddr>, link: LinkPlan, onboarded: bool) -> Result<Self> {
+        ensure!(!ranks.is_empty() && ranks.len() == streams.len() && ranks.iter().enumerate()
+            .all(|(rank, r)| r.rank == rank && r.ranks == ranks.len() && r.device.id == streams[rank].device.id),
+            "Muse engine ranks, streams and devices disagree");
+        let peer = (ranks.len() == 2).then(|| -> Result<super::peer::MusePeer<'a>> {
+            let sizes = super::peer::slot_sizes(cfg.hidden, cfg.expert_hidden, cfg.topk, link.unit_rows, onboarded)?;
+            super::peer::MusePeer::new(ranks[0].device.library, [0, 1].map(|rank|
+                crate::shared::peer_split::RankDevice { device: ranks[rank].device.id, stream: streams[rank].raw }), sizes)
+        }).transpose()?;
+        let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
+        let config = cuteafd_transport::TcpTransportConfig { max_frame_bytes: link.spark.max_frame_bytes,
+            timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
+        let path = super::spark::MuseSparkPath::connect(library_owner, Rc::clone(&streams[0]), &ranks[0].lane.views,
+            world, peers, config, link.cutoff, link.unit_rows, link.waves, link.intake_row_bytes,
+            link.spark.first_spark_layer)?;
+        Ok(Self { link: path, peer, streams, ranks })
     }
 }

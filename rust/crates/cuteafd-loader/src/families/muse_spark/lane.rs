@@ -39,6 +39,18 @@ impl StepTables {
     }
 }
 
+/// Rows the K6 head scores per launch (its program's capacity; wider steps run
+/// in chunks of this).
+pub const HEAD_ROWS: usize = 64;
+
+/// The head rank's logits planes: the K6 head's F32 output at its stored
+/// (N128-padded) width, and the softcapped logits trimmed to the vocabulary,
+/// each `HEAD_ROWS` rows, `ALIGN`-aligned.
+pub fn head_planes(stored: usize, vocab: usize) -> Result<(usize, usize)> {
+    ensure!(stored >= vocab && vocab > 0, "Muse head stored width below the vocabulary");
+    Ok((HEAD_ROWS * stored * 4, HEAD_ROWS * vocab * 4))
+}
+
 /// Plane name -> bytes, in a fixed order (BTreeMap) so the device's offsets
 /// are deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +95,8 @@ impl LanePlanes {
             ("expert_input", bf16(e)), ("expert_wire", rows * wire), ("combined", bf16(e)), ("moe", bf16(h)),
             // Step metadata.
             ("positions", rows * 8), ("ring_slots", rows * 8), ("seq_first", rows * 4),
+            // The step's token ids (the embedding gather's input).
+            ("token_ids", rows * 4),
         ]);
         if ranks == 2 {
             // TP2 o_proj (the shared K-split rule): this GPU's core narrowed to BF16

@@ -8,6 +8,7 @@ pub(crate) mod core;
 pub(crate) mod device;
 pub(crate) mod engine;
 pub(crate) mod experts;
+pub(crate) mod forward;
 pub(crate) mod lane;
 pub(crate) mod peer;
 pub(crate) mod programs;

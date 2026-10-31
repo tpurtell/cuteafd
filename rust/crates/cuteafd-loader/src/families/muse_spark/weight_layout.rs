@@ -133,8 +133,10 @@ pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, ro
     for layer in 0..cfg.layers {
         for (rank, layout) in LayerLayout::ranks(cfg, layer, ranks, core)?.into_iter().enumerate() {
             for (name, weight) in &layout.core {
-                let dtype = if *name == "attn.o" && weight.side == TrellisSide::Input { ProjectionOutput::F32 }
-                    else { ProjectionOutput::Bf16 };
+                // Every K-split (input-side) projection reduces its F32 core with the
+                // peer's: o_proj and, on a pair, post_expert_proj.
+                let dtype = if weight.side == TrellisSide::Input { ProjectionOutput::F32 } else { ProjectionOutput::Bf16 };
+                let _ = name;
                 *out[rank].programs.entry((projection_key(weight), dtype)).or_insert(rows) = rows;
             }
         }
@@ -209,6 +211,9 @@ mod tests {
         // q/k/v halve as output units; o_proj halves its input and returns an F32 partial.
         assert!(pair[0].programs.contains_key(&((4096, 8192, 2, "mcg"), F32)));
         assert!(pair[0].programs.contains_key(&((8192, 512, 1, "mcg"), Bf16)));
+        // The MoE split: pre_expert halves its output, post_expert its input (an F32 K-split core).
+        assert!(pair[0].programs.contains_key(&((8192, 2048, 1, "mcg"), Bf16)));
+        assert!(pair[0].programs.contains_key(&((2048, 8192, 2, "mcg"), F32)));
         assert!(!pair[0].programs.keys().any(|(key, _)| key.1 == 202112), "head on the last rank only");
         assert!(pair[1].programs.contains_key(&((8192, 202112, 1, "mcg"), F32)));
         let scratch = pair[1].scratch.as_ref().unwrap();

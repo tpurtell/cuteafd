@@ -140,6 +140,37 @@ impl<'a> LayerWeights<'a> {
     pub(crate) fn core(&self, name: &str) -> Option<&CoreWeights<'a>> { self.core.get(name) }
 }
 
+/// One rank's share of the global weights (`GlobalLayout`) beyond the token
+/// embedding (the shared `TokenEmbedding` on the entry rank): the final norm
+/// on every rank and the K6 head on the head rank (the last).
+pub(crate) struct GlobalWeights<'a> {
+    pub final_norm: Allocation<'a>,
+    pub head: Option<CoreWeights<'a>>,
+}
+
+impl<'a> GlobalWeights<'a> {
+    pub(crate) fn load(device: Device<'a>, checkpoint: &cuteafd_loader::plan::Checkpoint,
+        layout: &cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout, rank: usize, ranks: usize)
+        -> Result<Self> {
+        let root = PREFIX.trim_end_matches("layers.");
+        let name = format!("{root}norm.weight");
+        let tensor = crate::shared::checkpoint_read::read_tensor(checkpoint, &name)?;
+        ensure!(tensor.info.dtype == DType::Bf16 && tensor.bytes.len() == layout.final_norm,
+            "Muse {name}: {:?} of {} bytes, expected BF16 of {}", tensor.info.dtype, tensor.bytes.len(), layout.final_norm);
+        let final_norm = {
+            let _scope = cuteafd_ffi::memory_ledger::scope("weights/muse final norm");
+            Allocation::new(device, layout.final_norm)?
+        };
+        device.run(|| device.library.copy_h2d(final_norm.buffer, &tensor.bytes))?;
+        let head = if rank + 1 == ranks {
+            let core = CoreWeightLayout::from_shared(layout.head.clone().context("Muse serves the K6 head")?);
+            let loaded = core.read(|name| crate::shared::checkpoint_read::read_tensor(checkpoint, name))?;
+            Some(core.upload(device, loaded)?)
+        } else { None };
+        Ok(Self { final_norm, head })
+    }
+}
+
 /// Every layer of one coordinator rank: read through the shared checkpoint
 /// reader, packed to the admitted layout and uploaded. `charged[layer]` is the
 /// rank's layer bytes admission accepted (`LayerLayout::bytes`).

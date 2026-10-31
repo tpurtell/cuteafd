@@ -1,8 +1,9 @@
 //! Muse Spark serving entry: validated arguments, program preflight, the
-//! measured pre-weight inventory and shared admission. The execution engine
-//! (Backend, PrefillHooks, prefix cache, DFlash2) is not built yet, so a
-//! launch stops after admission with the admitted placement and allocates
-//! nothing: unsupported is a result, not a crash.
+//! measured pre-weight inventory and shared admission, then the bring-up:
+//! Spark worker admission (the sealed endpoint), every coordinator rank's
+//! resident state loaded while the workers admit, the pair's exchange and the
+//! Spark link. The step executor and the scheduler backend are not built yet,
+//! so a launch stops after bring-up with the loaded layout (nothing serves).
 use super::startup;
 use crate::shared::inventory::{InventoryPhase, RuntimeInventory};
 use anyhow::{ensure, Context, Result};
@@ -16,7 +17,8 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
     /// Coordinator GPUs: one RTX, or a head-split pair (attention heads halve).
     #[arg(long, value_delimiter = ',', default_values_t = [0, 1])] pub devices: Vec<i32>,
-    /// Spark expert ranks; whole experts are partitioned across them (expert parallel).
+    /// Spark expert ranks: every expert's intermediate is sliced across them (TP),
+    /// each replying per-expert partials the coordinator combines.
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
     /// Auto admission grows beyond the selected context floor while memory allows.
     #[arg(long)] pub pool_tokens: Option<u64>,
@@ -116,8 +118,49 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
             pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
             "Muse Spark admitted TP experts with coordinator-combined partials");
-        anyhow::bail!("Muse Spark execution engine is not built yet: admitted {} (pool {} tokens, {} RTX expert \
-            layers); nothing was allocated", placement.summary(), placement.pool_tokens, placement.onboard_layers)
+        ensure!(placement.onboard_layers == 0, "Muse Spark onboarded expert layers run with the RTX expert path, \
+            not built yet: launch with --rtx-expert-layers 0");
+        let prefill = args.prefill()?;
+        let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
+            cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, args.expert_partial_wide_format)?;
+        let sequences = usize::from(args.max_sequences);
+        let spark = super::admission::spark_plan(&placement, prefill, cutoff, sequences, args.peers.len())?;
+        let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
+            cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
+            spark.model.clone())?.start(&args.peers)?;
+        let devices = args.devices.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
+            .collect::<Vec<_>>();
+        let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
+            .collect::<Result<Vec<_>>>()?;
+        let context = args.max_context.unwrap_or(cfg.max_position as u64);
+        // The BF16 token embedding on the entry GPU (single residency; rank 1 gathers over
+        // peer access), filled in the background while the layers load.
+        let name = "model.language_model.embed_tokens.weight";
+        let tensor = checkpoint.tensors.iter().find(|tensor| tensor.meta.name == name)
+            .with_context(|| format!("Muse checkpoint lacks {name}"))?;
+        let source = crate::shared::token_io::EmbedSource::new(&checkpoint.snapshot, &tensor.shard, &tensor.meta,
+            cfg.hidden)?;
+        let (embedding, ranks) = crate::shared::placement::load_while_admitting(Some(admission), || {
+            devices[0].run(|| crate::shared::token_io::TokenEmbedding::load(&library, source.clone(),
+                crate::shared::memory::EmbedPlacement::Gpu, || {
+                devices.iter().zip(&programs).enumerate().map(|(rank, (&device, programs))|
+                    super::engine::RankResources::load(device, programs, super::engine::RankLoad { cfg: &cfg,
+                        checkpoint: &checkpoint, built: &built, placement: &placement, rank, slots: sequences as u64,
+                        unit_rows: usize::try_from(prefill.unit_rows)?, waves: usize::try_from(prefill.waves)?, context }))
+                    .collect::<Result<Vec<_>>>()
+            }))
+        })?;
+        let streams = devices.iter().map(|&device| crate::shared::memory::device::Stream::new(device).map(std::rc::Rc::new))
+            .collect::<Result<Vec<_>>>()?;
+        let (intake_row_bytes, _) = cuteafd_loader::placement::families::muse_spark::intake(&cfg, prefill, cutoff,
+            sequences, args.peers.len())?;
+        let engine = super::engine::MuseEngine::connect(&library, &cfg, &ranks, streams, args.peers.clone(),
+            super::engine::LinkPlan { spark, cutoff, unit_rows: usize::try_from(prefill.unit_rows)?,
+                waves: usize::try_from(prefill.waves)?, intake_row_bytes }, false)?;
+        tracing::info!(ranks = engine.ranks.len(), peer = engine.peer.is_some(), vocab = embedding.vocab(),
+            "Muse Spark brought up");
+        anyhow::bail!("Muse Spark step executor is not built yet: brought up {} (pool {} tokens); nothing serves",
+            placement.summary(), placement.pool_tokens)
     });
     worker.await.context("Muse Spark startup worker")?
 }

@@ -93,12 +93,16 @@ MUSE_SHAPES = (
     ("muse_o", 8192, 8192, 1),
     ("muse_pre_expert", 8192, 4096, 1),
     ("muse_post_expert", 4096, 8192, 1),
+    # The MoE frontend/backend split on a pair (single residency): pre_expert by output
+    # columns, post_expert by input columns (an F32 K-split core reduced in rank order).
+    ("muse_pre_expert_tp2", 8192, 2048, 1),
+    ("muse_post_expert_tp2", 2048, 8192, 2),
     ("muse_lm_head", 8192, 202112, 1),
 )
 FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES,
                  "muse": MUSE_SHAPES}
 F32_OUTPUTS = (163840, 154880, 202112)
-F32_GEOMETRIES = frozenset({(4096, 8192, 2)})
+F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
 
 
 def output_dtype(k, n, side, f32_outputs=F32_OUTPUTS):

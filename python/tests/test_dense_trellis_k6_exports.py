@@ -256,16 +256,16 @@ def test_muse_geometries_dtypes_and_existing_family_order(monkeypatch):
     geometries = {shape[1:] for shape in module["shapes_for"](("muse",))}
     assert geometries == {(8192, 4096, 1), (8192, 8192, 1), (8192, 512, 1),
                           (8192, 1024, 1), (4096, 8192, 2), (4096, 8192, 1),
-                          (8192, 202112, 1)}
+                          (8192, 2048, 1), (2048, 8192, 2), (8192, 202112, 1)}
     programs = module["programs"](families=("muse",), input_dtype="bf16")
     names = {item[0] for item in programs}
     assert {"trellis_output_n8192_bf16", "trellis_output_n8192_f32",
             "trellis_output_n202112_f32"} <= names
     policies = module["row_policies"](("muse",))
-    assert len(policies) == 14
+    assert len(policies) == 18
     for policy in policies:
         assert all(policy[field] in names for field in ("native_input", "native_program", "output_program"))
-        expected = "f32" if policy["shape"] in ("muse_o_tp2", "muse_lm_head") else "bf16"
+        expected = "f32" if policy["shape"] in ("muse_o_tp2", "muse_post_expert_tp2", "muse_lm_head") else "bf16"
         assert policy["output_program"].endswith("_" + expected)
     for family in ("kimik3", "glm", "glmf"):
         baseline = module["programs"](families=(family,), input_dtype="bf16")

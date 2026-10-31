@@ -188,6 +188,12 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
             rope.allocation_bytes, Basis::Exact));
     }
     fixed.push(Demand::new(0, Category::Embedding, "token embedding", global.embedding as u64, Basis::Exact));
+    // The head rank's logits planes: the K6 head's F32 rows at its stored width
+    // and the softcapped logits trimmed to the vocabulary.
+    let (stored, trimmed) = crate::families::muse_spark::lane::head_planes(
+        global.head.as_ref().map_or(cfg.vocab_size, |head| head.shape[0]), cfg.vocab_size)?;
+    fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Workspace, "Muse head logits",
+        (stored + trimmed) as u64, Basis::Exact));
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Weights, "lm head (K6)", global.head_bytes() as u64,
         Basis::Exact));
     // Spark partial replies land on the coordinator: per wave slot, every rank's
@@ -195,11 +201,8 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(partial_bf16_max_rows, 1, partial_wide_format)?;
     // The shared intake allocates rows x row_bytes per rank and slot; the row width
     // is the worst partial-reply mix spread over the unit (replies::intake_row_bytes).
-    let intake_row = crate::families::muse_spark::replies::intake_row_bytes(cutoff,
-        usize::try_from(prefill.unit_rows)?, usize::try_from(slots)?, cfg.topk, cfg.expert_hidden) as u64;
-    fixed.push(Demand::new(0, Category::Transport, "Muse Spark partial reply planes",
-        crate::serving_capacity::prefill_return_bytes(prefill.waves, prefill.unit_rows, spark_ranks as u64,
-            intake_row / 2), Basis::Exact));
+    let (_, planes) = intake(cfg, prefill, cutoff, usize::try_from(slots)?, spark_ranks)?;
+    fixed.push(Demand::new(0, Category::Transport, "Muse Spark partial reply planes", planes, Basis::Exact));
     fixed.extend(runtime_fixed);
 
     // Spark: whole experts partitioned by the shared owner table.
@@ -294,6 +297,19 @@ pub fn placement(inputs: MuseInputs<'_>) -> Result<(MuseRequest, Placement)> {
     let placed = solve(&built.request)?;
     built.request.executor.check(&placed)?;
     Ok((built, placed))
+}
+
+/// The coordinator intake of the Spark link: each rank's plane row width
+/// (`replies::intake_row_bytes`, the worst reply mix spread over the unit) and
+/// the bytes of every rank's planes over the in-flight waves. The runtime link
+/// allocates exactly this (`SparkIntake::with_waves(ranks, unit, row, waves)`).
+pub fn intake(cfg: &MuseSparkConfig, prefill: PrefillPlan, cutoff: crate::families::muse_spark::replies::Cutoff,
+    sequences: usize, spark_ranks: usize) -> Result<(usize, u64)> {
+    let unit = usize::try_from(prefill.unit_rows)?;
+    let row = crate::families::muse_spark::replies::intake_row_bytes(cutoff, unit, sequences, cfg.topk, cfg.expert_hidden);
+    ensure!(row % 2 == 0, "Muse intake rows are whole BF16 elements");
+    Ok((row, crate::serving_capacity::prefill_return_bytes(prefill.waves, prefill.unit_rows, spark_ranks as u64,
+        row as u64 / 2)))
 }
 
 /// NIC largest RC message (ibv `max_msg_sz`, 1 GiB on the ConnectX-7 ports of

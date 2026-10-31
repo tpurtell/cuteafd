@@ -72,7 +72,7 @@ impl<'a> RankPrograms<'a> {
     /// # Safety
     /// Every buffer is a live device allocation of the documented extent on the
     /// current device, retained until `stream` reaches the launch.
-    unsafe fn launch(&self, stem: &str, buffers: &[Buffer], scalars: &[Scalar], stream: *mut c_void) -> Result<()> {
+    pub(crate) unsafe fn launch(&self, stem: &str, buffers: &[Buffer], scalars: &[Scalar], stream: *mut c_void) -> Result<()> {
         let program = self.get(stem)?;
         let pointers: Vec<*mut c_void> = buffers.iter().map(|b| b.ptr).collect();
         // SAFETY: forwarded from the caller; counts and scalar kinds are checked by `launch`.

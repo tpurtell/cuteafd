@@ -76,6 +76,30 @@ mod tests {
         let tables = shared::step_tables(2752, 16, cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
             &testing::muse_spark_config())?.max_position as u64)?;
         assert_eq!(charged, tables.bytes() as u64);
+        // The coordinator intake the link allocates (ranks x waves x unit x row) is the charge.
+        let (row, planes) = shared::intake(&cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
+            &testing::muse_spark_config())?, prefill, Cutoff::new(64, 1)?, 16, 6)?;
+        assert_eq!(planes, (6 * 3 * 2752 * row) as u64);
+        let charged = placement.items[0].iter().find(|item| item.group == "Muse Spark partial reply planes")
+            .context("intake charge")?.bytes;
+        assert_eq!(charged, planes);
+        Ok(())
+    }
+
+    /// The coordinator transport accepts the sealed frame at every wide format
+    /// (the native budget admits partial-reply frames up to the all-BF16 bound).
+    #[test]
+    fn coordinator_frame_is_within_the_native_budget() -> Result<()> {
+        use cuteafd_loader::families::muse_spark::replies::WideFormat;
+        let budget = cuteafd_transport::expert::native_frame_budget(ExpertGeometry::MUSE_SPARK, 2752)?;
+        for wide in [WideFormat::Nvfp4, WideFormat::Fp8] {
+            for sequences in [1, 16, 64] {
+                let prefill = PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 };
+                let (endpoint, rings) = shared::spark_endpoint(prefill, Cutoff::with_wide(64, 1, wide)?, sequences)?;
+                let frame = endpoint.frame_bytes(ExpertGeometry::MUSE_SPARK, rings).context("frame")?;
+                assert!(frame <= budget, "{wide:?} x {sequences}: frame {frame} > budget {budget}");
+            }
+        }
         Ok(())
     }
 }

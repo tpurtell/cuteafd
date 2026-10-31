@@ -178,8 +178,9 @@ fn muse_spark_io(device: &mut DeviceLayout, working: &SparkWorkingSet,
     rings: crate::placement::SparkRingGeometry) -> anyhow::Result<()> {
     let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
     crate::plan::layout::charge_spark_io(device, working, geometry, prefill.unit_rows as u32, false, rings, 0)?;
-    let cutoff = crate::families::muse_spark::replies::Cutoff::new(
-        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, 1)?;
+    // The planner's serving defaults, as the request builder (`MuseInputs`) gets them.
+    let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(
+        crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, 1, Default::default())?;
     let (endpoint, spark_rings) = crate::placement::families::muse_spark::spark_endpoint(prefill, cutoff, slots)?;
     let exact = working.rank_endpoints_io(device.index as usize, geometry, &[endpoint], spark_rings)?;
     for item in &mut device.items {

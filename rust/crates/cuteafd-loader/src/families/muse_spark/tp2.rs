@@ -18,6 +18,10 @@
 //! | `Combined` | Spark layer | GPU 0 to GPU 1 | combined half, E/2 (GPU 0 holds the link and combines) |
 //! | `Moe` | every layer | swap | post_expert_proj BF16 core, H |
 //!
+//! The token embedding lives on GPU 0 only (single residency); GPU 1 gathers its
+//! step's rows from it over peer access, so no exchange channel carries them (a
+//! one-way push per unit would need `waves + 1` slots: units begin in a batch).
+//!
 //! The centered pre-expert norm and the input-scaled post-expert norm need
 //! full rows over E, so the expert input is assembled before the norm and an
 //! onboarded layer's combine runs on full partials.
