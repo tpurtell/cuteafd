@@ -129,6 +129,40 @@ mod tests {
     }
 
     #[test]
+    fn the_shared_mla_draft_layout_admits_the_mtp_dspark_kind() -> Result<()> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        use crate::formats::dflash::MlaDflashConfig;
+        let target = crate::families::mistral_large4::Ml4Config::from_hf(&super::super::config::tests::official())?;
+        let dspark = Ml4DsparkConfig::from_params(&official_params(), target.layers)?;
+        let cfg = MlaDflashConfig::ml4(&dspark, &target)?;
+        assert_eq!((cfg.drafts(), cfg.windows.clone()), (3, vec![Some(2048); 3]));
+        // The draft's rotary is the target's at alpha 0 (no LeRoPE).
+        assert_eq!(cfg.rotary.inv_freq, target.inv_freq(&[0.0; 32])?);
+        assert_eq!(cfg.attention_scale(), (128f32).sqrt().recip());
+        assert!(cfg.weight_layout(GlmDraftRepresentation::Fp8Only).is_err());
+        let capacity = GlmDraftCapacity::new(20, 16, 3)?;
+        let layout = cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
+            cuteafd_core::MlaCacheFormat::Fp8)?;
+        // Every draft layer is windowed: per-slot rings (window + block, page-rounded), no pooled layers.
+        assert_eq!(layout.paged_cache().full_layers, 0);
+        for layer in &layout.cache().layers {
+            assert_eq!((layer.window(), layer.rows_per_slot()), (Some(2048), 2112));
+        }
+        let names: Vec<&str> = layout.buffers().iter().map(|b| b.name.as_str()).collect();
+        for name in ["cos_sin", "unit_scale", "markov_norms", "markov_workspace", "logits"] {
+            assert!(names.contains(&name), "{name}");
+        }
+        for absent in ["conv", "dynamic", "candidates", "projected", "q_residual"] {
+            assert!(!names.contains(&absent), "{absent}");
+        }
+        let cos_sin = layout.buffers().iter().find(|b| b.name == "cos_sin").unwrap();
+        assert_eq!(cos_sin.bytes, (1 << 20) * 64 * 4);
+        assert!(cfg.runtime_layout(GlmDraftRepresentation::Bf16Only, capacity, 1 << 20, 1 << 21, 188, 0,
+            cuteafd_core::MlaCacheFormat::Bf16).is_err(), "the ML4 draft records are the FP8 656-byte ones");
+        Ok(())
+    }
+
+    #[test]
     fn other_drafter_variants_are_refused() {
         for (path, value) in [("/mtp/dspark/head_type", "vanilla"), ("/mtp/dspark/draft_input", "shared_mask"),
             ("/mtp/ragged_attention", "2048,1024,2048"), ("/mtp/target_activation_layers", "1,72")] {
