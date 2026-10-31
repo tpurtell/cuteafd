@@ -141,9 +141,9 @@ spark_wip_process=""
 # under the artifact bind instead of the container's /wip/run.
 wip_runtime_root="/scratch/candidate/run"
 host_artifact_root="/home/tj/.cache/cuteafd/builds/tp-ep"
-# Optional coordinator-only GPU pin. The config's COORDINATOR_GPU is a single
-# index and cannot express the ordered RTX pair, so the candidate takes the
-# exact ordered UUID CSV explicitly; it is never inferred from a hidden lookup.
+# Optional coordinator-only GPU pin. The candidate execs into an existing WIP
+# container, so it takes the exact ordered UUID CSV for that process explicitly;
+# it is never inferred from a hidden lookup.
 coordinator_cuda_visible_devices="${CUTEAFD_TPEP_COORDINATOR_CUDA_VISIBLE_DEVICES:-}"
 dspark_draft_limit=""
 host_device_map=""
@@ -369,7 +369,6 @@ candidate_env_args() {
   printf '%s\0' -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_TPEP_WORKER_READY_TIMEOUT_SECONDS:-900}"
   for forward in \
     CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP \
-    CUTEAFD_VERBS_APP_IB_PORT_NUM \
     CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES \
     CUTEAFD_PROTOCOL_V2_TCP_TIMING \
     CUTEAFD_SPARKINFER_SOURCE_DIR \

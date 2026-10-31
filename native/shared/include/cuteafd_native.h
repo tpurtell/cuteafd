@@ -491,27 +491,19 @@ cuteafd_status_t cuteafd_rdma_register_host_buffer_probe(void* ptr, size_t bytes
 cuteafd_status_t cuteafd_rdma_create_rc_qp_probe(uint32_t port_num, uint32_t send_wr,
                                              uint32_t recv_wr, uint32_t max_sge,
                                              cuteafd_rdma_rc_qp_probe_t* out);
-cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(uint32_t port_num, size_t bytes,
+// Every RC QP binds the source GID its caller names: the RoCE v2 GID whose
+// IPv4 address reaches the peer (the control connection's local address, or
+// for a loopback probe an address on the port). The library never picks a
+// GID from table order, which on a port carrying several IPv4 addresses
+// (a management LAN beside the RoCE rail) is not stable.
+cuteafd_status_t cuteafd_rdma_rc_send_recv_loopback_probe(const char* device_name,
+                                                      uint32_t port_num, uint32_t gid_index,
+                                                      size_t bytes,
                                                       cuteafd_rdma_rc_send_recv_probe_t* out);
 cuteafd_status_t cuteafd_rdma_rc_protocol_v2_loopback_probe(
-    uint32_t port_num, const void* request_frame, size_t request_bytes,
-    const void* response_frame, size_t response_bytes,
+    const char* device_name, uint32_t port_num, uint32_t gid_index, const void* request_frame,
+    size_t request_bytes, const void* response_frame, size_t response_bytes,
     cuteafd_rdma_rc_protocol_v2_loopback_probe_t* out);
-cuteafd_status_t cuteafd_rdma_rc_endpoint_create(
-    uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes, uint32_t max_send_wr,
-    uint32_t max_recv_wr, uint32_t max_sge, cuteafd_rdma_rc_endpoint_info_t* out);
-cuteafd_status_t cuteafd_rdma_rc_endpoint_create_with_buffer_flags(
-    uint32_t port_num, uint32_t local_psn, size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes, uint32_t max_send_wr,
-    uint32_t max_recv_wr, uint32_t max_sge, uint64_t host_buffer_flags,
-    cuteafd_rdma_rc_endpoint_info_t* out);
-cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags(
-    const char* device_name, uint32_t port_num, uint32_t local_psn,
-    size_t send_frame_bytes, size_t recv_frame_bytes,
-    size_t send_registered_span_bytes, size_t recv_registered_span_bytes,
-    uint32_t max_send_wr, uint32_t max_recv_wr, uint32_t max_sge,
-    uint64_t host_buffer_flags, cuteafd_rdma_rc_endpoint_info_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags(
     const char* device_name, uint32_t port_num, uint32_t gid_index, uint32_t local_psn,
     size_t send_frame_bytes, size_t recv_frame_bytes, size_t send_registered_span_bytes,
@@ -558,7 +550,8 @@ cuteafd_status_t cuteafd_rdma_rc_endpoint_post_recv_landing_at(void* handle, siz
 cuteafd_status_t cuteafd_rdma_rc_endpoint_set_recv_landing(void* handle, void* device_ptr,
                                                        size_t bytes, size_t header_bytes, size_t slot_bytes);
 cuteafd_status_t cuteafd_rdma_gpu_landing_probe(const char* device_name, uint32_t port_num,
-                                            size_t bytes, uint32_t iterations,
+                                            uint32_t gid_index, size_t bytes,
+                                            uint32_t iterations,
                                             cuteafd_rdma_gpu_landing_probe_t* out);
 cuteafd_status_t cuteafd_rdma_rc_endpoint_post_send_at(void* handle, size_t offset_bytes,
                                                    size_t bytes, uint64_t wr_id);

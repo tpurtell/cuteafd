@@ -155,9 +155,12 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
                 self.drafter.iter().cloned().map(|draft| draft as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>)
                     .chain(self.mtp.iter().cloned().map(|mtp| mtp as Rc<dyn crate::shared::prefix::cuda_copy::SnapshotOwner + 'a>))
                     .collect()).map(|copy| (config, copy))).transpose()?;
+        let host_bytes = host.as_ref().map_or(0, |(config, _)| config.bytes);
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
         let cache = PrefixCache::new_with_draft_pages(layout, config, host, family.draft_page_bytes())?;
+        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, Some((layout.pages * layout.page_rows) as u64), layout.pages as u64,
+            family.record_format(), host_bytes);
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
@@ -181,7 +184,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     }
     fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia, _tokens: &[u32], _resume: usize) -> Result<()> { Ok(()) }
     fn history(&self, _placement: &Placement) {}
-    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> {
         // A selection failure releases the requests without calling accept.
         // The next round boundary must retire that verify before reusing slots.

@@ -1346,6 +1346,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// Requested continuous-call span, bounded by context and floored at the live slots' rows.
     prefill_span_rows: usize,
     pub pages: usize,
+    pub max_pool_tokens_no_onboard: Option<u64>,
     pub slots: usize,
     /// The most rows of one decode or verify step (`--decode-rows`): [`DECODE_ROWS`], or
     /// [`WIDE_DECODE_ROWS`], where a step of more than 64 rows runs the wide `_m128` programs (fewer
@@ -1775,7 +1776,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { core: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
             prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             buckets: DecodeBuckets::new(verify_rows),

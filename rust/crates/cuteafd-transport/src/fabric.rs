@@ -115,6 +115,33 @@ pub fn select_rdma_address(ports: &[RdmaPort], address: std::net::IpAddr,
         device_hint: device_override.map(|d| format!(" on overridden device {d}")).unwrap_or_default() })
 }
 
+/// The device, port and source GID a QP on `stream`'s link binds: the RoCE v2
+/// GID of the control connection's own local address.
+pub fn select_rdma_for_stream(ports: &[RdmaPort], stream: &std::net::TcpStream) -> Result<RdmaSelection> {
+    let local = stream.local_addr().context("reading control connection local address")?;
+    Ok(select_rdma_address(ports, local.ip(), None)?)
+}
+
+/// The local address the kernel routes `peer` from: what a control connection
+/// to `peer` would bind, read from a connected UDP socket (nothing is sent).
+pub fn route_source(peer: std::net::SocketAddr) -> std::io::Result<std::net::IpAddr> {
+    let unspecified: std::net::SocketAddr = match peer {
+        std::net::SocketAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        std::net::SocketAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = std::net::UdpSocket::bind(unspecified)?;
+    socket.connect(peer)?;
+    Ok(socket.local_addr()?.ip())
+}
+
+/// The device, port and source GID that reach `peer`: the RoCE v2 GID of the
+/// address the kernel routes `peer` from. For QPs without a control
+/// connection of their own (the GPU landing loopback, bench probes).
+pub fn select_rdma_route(ports: &[RdmaPort], peer: std::net::SocketAddr) -> Result<RdmaSelection> {
+    let address = route_source(peer).with_context(|| format!("routing to RDMA peer {peer}"))?;
+    Ok(select_rdma_address(ports, address, None).with_context(|| format!("RDMA source for peer {peer}"))?)
+}
+
 /// Discovers this host's RDMA ports. A host without RDMA returns an empty report.
 pub fn discover() -> Result<FabricReport> {
     let root = Path::new(SYSFS_INFINIBAND);
@@ -378,6 +405,52 @@ mod tests {
         inactive[0].active = false;
         assert!(select_rdma_address(&inactive, address, None).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A coordinator whose RoCE rail shares its port with a DHCP management
+    /// LAN (#898): the management GID registered first and holds the lower
+    /// index. Selection follows the address that reaches the peer, never
+    /// table order, whichever way the two GIDs are ordered.
+    #[test]
+    fn management_gid_at_lower_index_is_never_chosen_for_the_rail() {
+        let root = std::env::temp_dir().join(format!("cuteafd-fabric-mgmt-{}", std::process::id()));
+        let device = root.join("mlx5_0");
+        let port_path = device.join("ports/1");
+        for directory in ["gid_attrs/types", "gid_attrs/ndevs", "gids"] {
+            fs::create_dir_all(port_path.join(directory)).unwrap();
+        }
+        // Index 0/1: link-local RoCE v1/v2; 2: management 192.168.1.50 (v1);
+        // 3: management (v2); 6/7: rail 10.55.0.22 (v1/v2).
+        for (name, value) in [("state", "4: ACTIVE"), ("rate", "400 Gb/sec"), ("link_layer", "Ethernet"),
+            ("gid_attrs/types/0", "IB/RoCE v1"), ("gids/0", "fe80:0000:0000:0000:5a95:69ff:fe0c:2c60"),
+            ("gid_attrs/types/1", "RoCE v2"), ("gids/1", "fe80:0000:0000:0000:5a95:69ff:fe0c:2c60"),
+            ("gid_attrs/types/2", "IB/RoCE v1"), ("gids/2", "0000:0000:0000:0000:0000:ffff:c0a8:0132"),
+            ("gid_attrs/types/3", "RoCE v2"), ("gids/3", "0000:0000:0000:0000:0000:ffff:c0a8:0132"),
+            ("gid_attrs/types/6", "IB/RoCE v1"), ("gids/6", "0000:0000:0000:0000:0000:ffff:0a37:0016"),
+            ("gid_attrs/types/7", "RoCE v2"), ("gids/7", "0000:0000:0000:0000:0000:ffff:0a37:0016"),
+            ("gid_attrs/ndevs/3", "eno1"), ("gid_attrs/ndevs/7", "eno1")] {
+            fs::write(port_path.join(name), value).unwrap();
+        }
+        let ports = read_device(&device, &[]).unwrap();
+        assert_eq!(ports[0].roce_v2, vec![(3, Ipv4Addr::new(192, 168, 1, 50)), (7, Ipv4Addr::new(10, 55, 0, 22))]);
+        let rail = RdmaSelection { device: "mlx5_0".into(), port: 1, gid_index: 7 };
+        assert_eq!(select_rdma_address(&ports, "10.55.0.22".parse().unwrap(), None).unwrap(), rail);
+        assert_eq!(select_rdma_address(&ports, "192.168.1.50".parse().unwrap(), None).unwrap().gid_index, 3);
+        // An address the port does not carry is refused, not mapped to index 3.
+        assert!(select_rdma_address(&ports, "10.55.1.22".parse().unwrap(), None).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn route_source_is_the_address_a_connection_to_the_peer_binds() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let peer = listener.local_addr().unwrap();
+        let stream = std::net::TcpStream::connect(peer).unwrap();
+        assert_eq!(route_source(peer).unwrap(), stream.local_addr().unwrap().ip());
+        // Loopback carries no RoCE GID: refused rather than any table entry.
+        let mut fixture = port("mlx5_0", 400.0, [192, 168, 1, 50], 16);
+        fixture.roce_v2.push((7, Ipv4Addr::new(10, 55, 0, 22)));
+        assert!(select_rdma_route(&[fixture], peer).is_err());
     }
 
     #[test]

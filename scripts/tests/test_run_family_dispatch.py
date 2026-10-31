@@ -801,7 +801,8 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
 
 
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
-                          physical_gpus: tuple[int, ...] = (0, 1), *, preflight_error: bool = False,
+                          physical_gpus: tuple[int, ...] | None = None, *, preflight_error: bool = False,
+                          busy_gpus: tuple[int, ...] = (), plan_rtx_bytes: int | None = None,
                           restart: bool = False, preferred_ranks: int | None = None,
                           gpu_free_mib: int = 97000, gpu_total_mib: int = 98304,
                           cuda_total_bytes: int | None = None,
@@ -815,7 +816,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           deployment_overrides: dict | None = None,
                           probe_fails: bool = False, root_launcher: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
-    that print their argv) and return what it would launch."""
+    that print their argv) and return what it would launch. nvidia-smi reports
+    PHYSICAL_GPUS (default 0 and 1, V4.1 0 alone; BUSY_GPUS with 2 GiB free); the deployment plan charges each
+    coordinator GPU PLAN_RTX_BYTES of fixed owners (default 8 GiB)."""
     repo = tmp_path / "repo"
     (repo / "scripts" / "lib").mkdir(parents=True)
     (repo / "scripts" / "launch").mkdir(parents=True)
@@ -829,6 +832,7 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
     stub_cuda_capacity(repo / "scripts/lib/release-common.sh",
                        cuda_total_bytes if cuda_total_bytes is not None else gpu_total_mib * 2**20)
     copy_input(ROOT / "scripts" / "lib" / "cdi-gpus.sh", repo / "scripts" / "lib")
+    copy_input(ROOT / "scripts" / "lib" / "coordinator-gpus.py", repo / "scripts" / "lib")
     capacity = Path("rust/crates/cuteafd-core/src/serving_capacity.rs")
     (repo / capacity.parent).mkdir(parents=True)
     copy_input(ROOT / capacity, repo / capacity)
@@ -837,7 +841,6 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         programs = Path("rust/crates/cuteafd-core/src/coordinator_programs.rs")
         (repo / programs.parent).mkdir(parents=True, exist_ok=True)
         copy_input(ROOT / programs, repo / programs)
-        copy_input(ROOT / "scripts" / "launch" / "select-release-gpus.py", repo / "scripts" / "launch")
         (repo / "scripts" / "build").mkdir(exist_ok=True)
         (repo / "scripts" / "build" / "verify-sparkinfer-source.py").write_text("print('test-pin')\n")
     wip = "--wip" in extra_args
@@ -913,23 +916,14 @@ exec python3 -c "$code" "$@"
         (bin_dir / tool).chmod(0o755)
     (bin_dir / "curl").write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"data":[{"id":"test/model"}]}\'\n')
     (bin_dir / "curl").chmod(0o755)
-    (bin_dir / "nvidia-smi").write_text('#!/usr/bin/env bash\ncase "$*" in *memory.total*) echo ' + str(gpu_total_mib) +
-                                         ' ;; *memory.free*) echo ' + str(gpu_free_mib) +
-                                         " ;; *query-gpu=uuid*) echo GPU-00000000-0000-0000-0000-000000000000 ;; *) printf '%s\\n' " + " ".join(map(str, physical_gpus)) +
-                                         ' ;; esac\n' if preferred_ranks is None else
-                                         '#!/usr/bin/env bash\ncase "$*" in *memory.free*) echo ' + str(gpu_free_mib) +
-                                         ' ;; *memory.total*) echo ' + str(gpu_total_mib) +
-                                         ' ;; *query-gpu=uuid*) echo GPU-00000000-0000-0000-0000-000000000000 ;; *query-compute-apps*) printf \'%s\\n\' ' +
-                                         " ".join(f"'{pid}, {mib}'" for pid, mib in gpu_allocations) +
-                                         ' ;; *) echo 0; echo 1 ;; esac\n')
-    (bin_dir / "nvidia-smi").chmod(0o755)
+    from launcher_sandbox import fake_gpus, fake_nvidia_smi
+    fake_nvidia_smi(bin_dir)
+    if physical_gpus is None:
+        physical_gpus = (0,) if native_v41 else (0, 1)
+    gpus = fake_gpus(max(physical_gpus) + 1, gpu_total_mib, gpu_free_mib, busy_gpus,
+                     tuple((0, pid, mib) for pid, mib in gpu_allocations))
+    gpus = [gpu for gpu in gpus if gpu["index"] in physical_gpus]
     if native_v41:
-        (bin_dir / "nvidia-smi").write_text(
-            '#!/usr/bin/env bash\ncase "$*" in '
-            '*index,uuid,pci.bus_id,memory.total,memory.free*) '
-            f'echo "0, GPU-00000000-0000-0000-0000-000000000000, 00000000:01:00.0, {gpu_total_mib}, {gpu_free_mib}" ;; '
-            '*index,uuid,pci.bus_id*) echo "0, GPU-00000000-0000-0000-0000-000000000000, 00000000:01:00.0" ;; '
-            f'*memory.total*) echo {gpu_total_mib} ;; *memory.free*) echo {gpu_free_mib} ;; *) echo 0 ;; esac\n')
         (bin_dir / "curl").write_text(
             '#!/usr/bin/env bash\nprintf \'%s\\n\' \'{"object":"list","data":[{"id":"deepseek-ai/DeepSeek-V4.1-Flash"}]}\'\n')
     deployment_stub = tmp_path / "deployment-stub.py"
@@ -972,7 +966,9 @@ deployment = dict(version=1, family=family, executable=family != "qwen3_5" and p
     admission=dict(kv_pool_size=value("--kv-pool-size"), memory_reservation=value("--memory-reservation")),
     spark_admission="coordinator_authoritative",
     launch=dict(family=family, first_expert_layer=int(first), last_expert_layer=None if last == "-1" else int(last)),
-    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report)
+    artifact_requirements=dict(spark_tp_role=f"tp{tp}" if family == "deepseek_v41" and explicit and tp != 4 else None), report=report,
+    memory_layout=dict(devices=[dict(kind="rtx", index=i, items=[dict(category="weights", bytes=int(os.environ["STUB_PLAN_RTX_BYTES"])),
+                                                                 dict(category="kv", bytes=64 << 30)]) for i in range(gpus)]))
 deployment.update(json.loads(os.environ["STUB_DEPLOYMENT_OVERRIDES"]))
 if deployment.get("wip_launchable") == "absent":
     deployment.pop("wip_launchable")
@@ -990,6 +986,8 @@ print(json.dumps(deployment))
            "STUB_FORCE_PREFERRED": "1" if preferred_ranks is not None and encoder_plan is None else "",
            "STUB_ENCODER_PLAN": json.dumps(encoder_plan or {"spark_ranks": exact_count}),
            "STUB_DEPLOYMENT_OVERRIDES": json.dumps(deployment_overrides or {}),
+           "STUB_PLAN_RTX_BYTES": str(plan_rtx_bytes if plan_rtx_bytes is not None else 8 << 30),
+           "FAKE_GPUS": json.dumps(gpus),
            **(extra_env or {})}
     env["HOME"] = str(tmp_path / "home")
     if not with_nest:
@@ -1490,6 +1488,16 @@ def test_explicit_custom_host_secondary_rail_is_optional():
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     assert result.stdout == "0 spark-5.example 192.0.2.6 \n"
+
+
+def _coordinator_gpus(launch: str) -> list[int]:
+    """The coordinator container's GPUs as host indices, in CUDA (logical) order."""
+    from launcher_sandbox import FAKE_GPU_UUIDS
+    argv = shlex.split(launch)
+    cdi = [FAKE_GPU_UUIDS.index(a.split("=", 1)[1]) for a in argv if a.startswith("nvidia.com/gpu=")]
+    visible = next(a.split("=", 1)[1] for a in argv if a.startswith("CUDA_VISIBLE_DEVICES="))
+    assert [FAKE_GPU_UUIDS.index(u) for u in visible.split(",")] == cdi, launch
+    return cdi
 
 
 def _family_launch_lines(tmp_path: Path, family_config: dict, model: str, keys: str) -> str:
@@ -2606,7 +2614,7 @@ def test_explicit_split_without_kernels_serves_from_the_first_gpu(
     assert result.returncode == 0, result.stderr
     assert "has no head split yet" in result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
+    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("checkpoint", ["qwen4"])
@@ -2615,7 +2623,7 @@ def test_auto_keeps_unsupported_checkpoint_on_one_gpu(tmp_path: Path, checkpoint
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS[checkpoint], model, "")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
+    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
     assert "auto selected GPU 0 alone" in result.stderr
 
 
@@ -2668,8 +2676,8 @@ def test_qwen_explicit_spark_free_dual_passes_both_owners(tmp_path: Path, keys: 
                                   keys + "SPARK_COUNT=0\nEXPERT_BACKEND=local\nSPECULATOR=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "--split-device" in launch and "--local-experts" in launch
-    assert "nvidia.com/gpu=0" in launch and "nvidia.com/gpu=1" in launch
+    assert "--device 0 --split-device 1" in launch and "--local-experts" in launch
+    assert _coordinator_gpus(launch) == ([1, 0] if "1,0" in keys else [0, 1])
     assert "has no head split yet" not in result.stderr
 
 
@@ -2701,8 +2709,10 @@ def test_dual_maps_encoder_owner_to_visible_device(tmp_path: Path, family: str,
     serve = {"qwen4": "serve-qwen4", "glm5_flash": "serve-glmf",
              "mimo_flash": "serve-mimo", "mimo_pro": "serve-mimo"}[family]
     launch = next(line for line in result.stderr.splitlines() if f"cuteafd {serve}" in line)
-    expected = owners.split(",")[encoder_owner]
-    assert f"--vision rtx:{expected}" in launch
+    # CUDA ordinals are logical: the plan's owner index reaches serving unchanged,
+    # and the container lists the GPUs primary first.
+    assert f"--vision rtx:{encoder_owner}" in launch
+    assert _coordinator_gpus(launch) == [int(x) for x in owners.split(",")]
 
 
 @pytest.mark.parametrize("family", ["mimo_flash", "mimo_pro"])
@@ -2721,7 +2731,8 @@ def test_dual_maps_audio_encoder_owner_to_visible_device(tmp_path: Path, family:
                                   "SPECULATOR=off\nVISION=off\nAUDIO=auto\n", encoder_plan=plan)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
-    assert f"--audio rtx:{owners.split(',')[encoder_owner]}" in launch
+    assert f"--audio rtx:{encoder_owner}" in launch
+    assert _coordinator_gpus(launch) == [int(x) for x in owners.split(",")]
 
 
 def test_qwen_dual_rejects_attention_head_sharding(tmp_path: Path) -> None:
@@ -2736,7 +2747,7 @@ def test_split_off_explicitly_uses_the_first_gpu(tmp_path: Path) -> None:
                                   "RTX_GPUS=2\nCOORDINATOR_GPUS=1,0\nCOORDINATOR_SPLIT=off\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "nvidia.com/gpu=1" in launch and "--split-device" not in launch
+    assert _coordinator_gpus(launch) == [1] and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=1,0\n", "COORDINATOR_SPLIT=heads\n"])
@@ -2744,7 +2755,8 @@ def test_glm_flash_explicit_split_passes_both_gpus(tmp_path: Path, keys: str) ->
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["glm5_flash"], "zai-org/GLM-5.3-Flash", keys)
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-" in line)
-    assert "--split-device" in launch and "nvidia.com/gpu=0" in launch and "nvidia.com/gpu=1" in launch
+    assert "--device 0 --split-device 1" in launch
+    assert _coordinator_gpus(launch) == ([1, 0] if "1,0" in keys else [0, 1])
 
 
 @pytest.mark.parametrize("checkpoint", ["mimo_flash", "mimo_pro"])
@@ -2753,14 +2765,14 @@ def test_both_mimo_model_types_keep_their_supported_split(tmp_path: Path, checkp
                                   "COORDINATOR_GPUS=1,0\n")
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "--device 1 --split-device 0" in launch and "nvidia.com/gpu=0" in launch and "nvidia.com/gpu=1" in launch
+    assert "--device 0 --split-device 1" in launch and _coordinator_gpus(launch) == [1, 0]
 
 
 def test_auto_uses_one_gpu_when_only_one_exists(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, SPLIT_CONFIGS["mimo_pro"], "test/model", "", physical_gpus=(0,))
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-mimo --snapshot" in line)
-    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
+    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
 
 
 def test_split_off_needs_only_the_first_physical_gpu(tmp_path: Path) -> None:
@@ -2768,7 +2780,7 @@ def test_split_off_needs_only_the_first_physical_gpu(tmp_path: Path) -> None:
                                   "RTX_GPUS=2\nCOORDINATOR_SPLIT=off\n", physical_gpus=(0,))
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-qwen4" in line)
-    assert "nvidia.com/gpu=0" in launch and "--split-device" not in launch
+    assert _coordinator_gpus(launch) == [0] and "--split-device" not in launch
 
 
 @pytest.mark.parametrize("keys", ["RTX_GPUS=2\n", "COORDINATOR_GPUS=0,1\n",

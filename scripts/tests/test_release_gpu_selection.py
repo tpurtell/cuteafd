@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SELECTOR = ROOT / "scripts/launch/select-release-gpus.py"
+SELECTOR = ROOT / "scripts/lib/coordinator-gpus.py"
 PRIMARY = "GPU-00000000-0000-0000-0000-000000000000"
 SECONDARY = "GPU-11111111-1111-1111-1111-111111111111"
 
@@ -62,18 +62,17 @@ class ReleaseGpuSelectionTest(unittest.TestCase):
                 [
                     "python3",
                     str(SELECTOR),
+                    "--nvidia-smi",
+                    str(fake),
+                    "select",
                     "--mode",
                     mode,
-                    "--primary-uuid",
-                    PRIMARY,
                     "--concurrency",
                     "16",
                     "--max-context-tokens",
                     "1048576",
                     "--retained-turns",
                     "24",
-                    "--nvidia-smi",
-                    str(fake),
                     *extra,
                 ],
                 text=True,

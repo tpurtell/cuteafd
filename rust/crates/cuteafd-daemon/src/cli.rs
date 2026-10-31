@@ -165,6 +165,11 @@ pub(crate) struct FabricArgs {
     /// Run the landing probe this many times back to back (at most five).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=5))]
     pub(crate) landing_repeats: u32,
+    /// A Spark worker (host:port) whose route picks the landing probe's RDMA
+    /// device and source GID. Needed when the host carries more than one
+    /// RoCE v2 address (for example a management LAN on the rail's port).
+    #[arg(long)]
+    pub(crate) landing_peer: Option<std::net::SocketAddr>,
     /// Also measure GPU<->GPU peer transfers (copy engine, SM pull/push,
     /// pinned-host bounce; one-way, hops and two-way exchanges, eager and
     /// graph-captured) between the two `--p2p-devices`, idle and under

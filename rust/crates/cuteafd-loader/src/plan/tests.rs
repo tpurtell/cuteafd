@@ -576,6 +576,12 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
                 let runtime = MappedStaging::new(unit * cfg.ple_rows(), k, 64 * cfg.ple_rows(), row_bytes).unwrap();
                 assert_eq!(staging[0].bytes as usize, runtime.slot_bytes().sum::<usize>() + runtime.workspace_bytes);
                 assert_eq!(staging[0].bytes as usize, 2 * (k * unit + 64) * cfg.ple_rows() * row_bytes + runtime.workspace_bytes);
+                // The row cache matches the runtime's shares: the look-ahead window plus decode.
+                use crate::formats::mapped_table::token_table::TokenTable;
+                let cache = host.items.iter().find(|item| item.group == "mapped-table/row-cache").expect("PLE row cache");
+                let shares = TokenTable::shares(unit, k, 64, cfg.ple_rows());
+                assert_eq!(cache.bytes as usize, TokenTable::cache_bytes(row_bytes, shares));
+                assert_eq!(shares, [(2 * k + 1) * unit * cfg.ple_rows(), 2 * 64 * cfg.ple_rows()]);
             }
         }
     }
@@ -3877,18 +3883,19 @@ fn v41_two_rtx_prefill_runs_three_units_and_pins_still_override() {
         ("v41/engram-decode", shape.decode_host_resident_bytes()),
         ("v41/engram-prefill-worker", shape.host_workspace_bytes()),
         ("v41/engram-decode-worker", shape.decode_host_workspace_bytes()),
+        ("v41/engram-row-cache", shape.cache_bytes(264)),
     ] {
         let item = host.items.iter().find(|item| item.group == group).expect(group);
         assert_eq!(item.bytes, bytes as u64);
     }
-    let future = (shape.host_bytes() + shape.decode_host_bytes()
+    let future = (shape.host_bytes() + shape.decode_host_bytes() + shape.cache_bytes(264)
         + crate::formats::mapped_table::TABLE_REACTOR_WORKSPACE_BYTES) as u64;
     let tables = auto.mapped_placement.table_bytes;
     for (budget, all) in [(future + tables - 1, false), (future + tables, true)] {
         let options = PlanOptions { mapped_scale_preload_bytes: tables,
             mapped_scale_host_budget_bytes: Some(budget), ..two(96, 0, 0) };
         let report = plan_spark_count(dir.path(), &options, 6, Some(4)).unwrap();
-        assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget));
+        assert_eq!(report.mapped_placement.host_budget_bytes, shape.preload_budget(budget, 264));
         assert_eq!(report.mapped_placement.tables_preloaded(), all);
     }
 }

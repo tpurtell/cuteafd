@@ -1329,7 +1329,7 @@ def test_gate_v41_sim5090_matches_pinned_tp4_reproduction():
     assert card['sparks'] == ['ostrich', 'dodo', 'emu', 'kiwi']
     assert values['MODEL_ID'] == 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
     expected = {
-        'RTX_GPUS': '1', 'COORDINATOR_GPU': '0',
+        'RTX_GPUS': '1', 'COORDINATOR_GPUS': '0',
         'COORDINATOR_GPU_BUDGET_GIB': '31.8', 'SPARK_INTAKE': 'pinned',
         'MAX_CONTEXT_TOKENS': '1048576',
         'SPECULATOR': 'dspark', 'SPARK_COUNT': '4', 'SPARK_TP': '4', 'SPARK_EP': '1',
@@ -1350,17 +1350,21 @@ def test_build_staging_follows_card_coordinator_gpu(tmp_path, monkeypatch):
     card = cards.load_cards(kit, ['v41-flash-min'])[0]
     monkeypatch.setattr(cards, 'build_lock_mode', lambda rev: 'native-phase')
     arms = cards.arms_from(['base=x:a'])
-    for sub in ('gpu0', 'default', 'bad'):
+    for sub in ('gpu0', 'pair', 'default', 'bad'):
         (tmp_path / sub).mkdir()
-    card['set']['COORDINATOR_GPU'] = '0'
+    card['set']['COORDINATOR_GPUS'] = '0'
     cards.build_arms({'base': 'HEAD'}, arms, [card], tmp_path / 'gpu0', 'task', True)
-    assert cards.config(tmp_path / 'gpu0/build-base.config')['COORDINATOR_GPU'] == '0'
-    card['set'].pop('COORDINATOR_GPU')
-    base = cards.config(ROOT / card['config']).get('COORDINATOR_GPU', '1')
+    assert cards.config(tmp_path / 'gpu0/build-base.config')['COORDINATOR_GPUS'] == '0'
+    # The staging container binds the pair's primary alone.
+    card['set']['COORDINATOR_GPUS'] = '1,0'
+    cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'pair', 'task', True)
+    assert cards.config(tmp_path / 'pair/build-base.config')['COORDINATOR_GPUS'] == '1'
+    card['set'].pop('COORDINATOR_GPUS')
+    base = cards.config(ROOT / card['config']).get('COORDINATOR_GPUS', '1').split(',')[0]
     cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'default', 'task', True)
-    assert cards.config(tmp_path / 'default/build-base.config')['COORDINATOR_GPU'] == base
-    card['set']['COORDINATOR_GPU'] = '2'
-    with pytest.raises(ValueError, match='must be 0 or 1'):
+    assert cards.config(tmp_path / 'default/build-base.config')['COORDINATOR_GPUS'] == base
+    card['set']['COORDINATOR_GPUS'] = '2'
+    with pytest.raises(ValueError, match='must start with GPU 0 or 1'):
         cards.build_arms({'base': 'HEAD'}, cards.arms_from(['base=x:a']), [card], tmp_path / 'bad', 'task', True)
 
 
@@ -2726,9 +2730,14 @@ def test_cold_window_drops_page_cache_when_the_timed_sweep_opens(entry, tmp_path
     with pytest.raises(ValueError, match='--cold-window drops the page cache'):
         cards.generate(entry, 'a', dict(instance='p', slot='s'), tmp_path, tmp_path / 'key', {}, set(), None, 1,
                        cold_hosts=['raptor'])
-    job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'a', dict(instance='p', slot='s'), tmp_path,
+    job = cards.generate({**entry, 'levels': [1]}, 'a', dict(instance='p', slot='s'), tmp_path,
                          tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
     assert job['entry']['window']['open']['argv'] == ['/opt/bin/nest', 'drop-caches', '--host', 'raptor']
+    # Prefill points purge per point (before warm-up and timed request), not via the window.
+    job = cards.generate({**entry, 'prefill_lengths': [8192, 65536], 'levels': [1]}, 'e', dict(instance='t', slot='s'),
+                         tmp_path, tmp_path / 'key', {}, set(), None, 1, cold_hosts=['raptor'])
+    assert job['entry']['prefill_purge']['argv'] == ['/opt/bin/nest', 'drop-caches', '--host', 'raptor']
+    assert 'window' not in job['entry']
     # With PROFILE=nsys the purge runs first, then the nsys sessions start.
     job = cards.generate({**entry, 'prefill_lengths': [8192]}, 'b', dict(instance='q', slot='s'), tmp_path,
                          tmp_path / 'key', {'PROFILE': 'nsys'}, set(), None, 1, cold_hosts=['raptor'])

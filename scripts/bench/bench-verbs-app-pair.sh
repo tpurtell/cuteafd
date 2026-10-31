@@ -347,14 +347,12 @@ run_remote_bench() {
   local chain_iterations="${CUTEAFD_VERBS_APP_CHAIN_ITERATIONS:-$unset_sentinel}"
   local chain_hops="${CUTEAFD_VERBS_APP_CHAIN_HOPS:-43}"
   local control_timeout="${CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS:-$unset_sentinel}"
-  local ib_port="${CUTEAFD_VERBS_APP_IB_PORT_NUM:-$unset_sentinel}"
   ssh -o BatchMode=yes "$host" bash -s -- \
     "$remote_dir" "$image" "$mode" "$peer" "$port" "$payloads" "$duration" \
     "$roundtrip_iterations" \
     "$chain_iterations" \
     "$chain_hops" \
-    "$control_timeout" \
-    "$ib_port" >"$output" <<'REMOTE'
+    "$control_timeout" >"$output" <<'REMOTE'
 set -euo pipefail
 remote_dir="$1"
 image="$2"
@@ -368,8 +366,7 @@ roundtrip_iterations="${1-}"
 chain_iterations="${2-}"
 chain_hops="${3-}"
 control_timeout="${4-}"
-ib_port="${5-}"
-for name in roundtrip_iterations chain_iterations control_timeout ib_port; do
+for name in roundtrip_iterations chain_iterations control_timeout; do
   if [ "${!name}" = "__CUTEAFD_UNSET__" ]; then
     printf -v "$name" ''
   fi
@@ -395,7 +392,6 @@ docker "${docker_args[@]}" \
   -e CUTEAFD_VERBS_APP_CHAIN_ITERATIONS="$chain_iterations" \
   -e CUTEAFD_VERBS_APP_CHAIN_HOPS="$chain_hops" \
   -e CUTEAFD_VERBS_APP_CONTROL_TIMEOUT_SECS="$control_timeout" \
-  -e CUTEAFD_VERBS_APP_IB_PORT_NUM="$ib_port" \
   -e CUTEAFD_BENCH_MODE="$mode" \
   -e CUTEAFD_BENCH_PEER="$peer" \
   -e CUTEAFD_BENCH_PORT="$port" \

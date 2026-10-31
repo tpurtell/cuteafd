@@ -74,3 +74,68 @@ def copy_tree(source, destination, **kwargs):
         return dst
 
     return shutil.copytree(_TEMPLATES[key], destination, symlinks=True, copy_function=clone)
+
+
+FAKE_GPU_UUIDS = tuple(f"GPU-{d * 8}-{d * 4}-{d * 4}-{d * 4}-{d * 12}" for d in "0123")
+FAKE_GPU_PCI = tuple(f"00000000:{bus}:00.0" for bus in ("01", "02", "41", "81"))
+
+FAKE_NVIDIA_SMI = r'''#!/usr/bin/env python3
+"""A host's nvidia-smi for launcher tests: the queries the launchers make, keyed on argv."""
+import json, os, re, sys
+gpus = json.loads(os.environ["FAKE_GPUS"])
+args = sys.argv[1:]
+joined = " ".join(args)
+selector = next((a.split("=", 1)[1] for a in args if a.startswith("--id=")), None)
+if selector is None and "-i" in args:
+    selector = args[args.index("-i") + 1]
+if selector is not None:
+    def same(gpu):
+        if selector.isdigit():
+            return gpu["index"] == int(selector)
+        if selector.startswith("GPU-"):
+            return gpu["uuid"] == selector
+        return gpu["pci"].lower().split(":", 1)[1] == selector.lower().split(":", 1)[1]
+    gpus = [gpu for gpu in gpus if same(gpu)]
+    if not gpus:
+        sys.exit("No devices were found")
+fields = {"index": "index", "uuid": "uuid", "pci.bus_id": "pci", "memory.total": "total",
+          "memory.free": "free", "name": "name"}
+if "topo" in args:
+    names = ["GPU%d" % gpu["index"] for gpu in gpus]
+    print("\t" + "\t".join(names))
+    for gpu in gpus:
+        print("GPU%d\t" % gpu["index"] + "\t".join("X" if other is gpu else "OK" if gpu.get("p2p", True) and other.get("p2p", True) else "NS"
+                                                     for other in gpus))
+elif "--query-compute-apps" in joined:
+    wanted = re.search(r"--query-compute-apps=(\S+)", joined).group(1).split(",")
+    for gpu in gpus:
+        for pid, mib in gpu.get("apps", []):
+            row = {"gpu_uuid": gpu["uuid"], "pid": pid, "used_memory": mib, "used_gpu_memory": mib}
+            print(", ".join(str(row[field]) for field in wanted))
+elif "--query-gpu" in joined:
+    wanted = re.search(r"--query-gpu=(\S+)", joined).group(1).split(",")
+    for gpu in gpus:
+        print(", ".join(str(gpu[fields[field]]) for field in wanted))
+elif "-L" in args:
+    for gpu in gpus:
+        print("GPU %d: %s (UUID: %s)" % (gpu["index"], gpu["name"], gpu["uuid"]))
+else:
+    print("CUDA Version: 13.0")
+'''
+
+
+def fake_gpus(count=2, total_mib=98304, free_mib=97000, busy=(), apps=()):
+    """FAKE_GPUS for `fake_nvidia_smi`: COUNT RTX GPUs; BUSY indices report 2 GiB free;
+    APPS are (index, pid, MiB) compute processes."""
+    return [{"index": i, "uuid": FAKE_GPU_UUIDS[i], "pci": FAKE_GPU_PCI[i], "total": total_mib,
+             "free": 2048 if i in busy else free_mib, "name": "NVIDIA RTX PRO 6000 Blackwell",
+             "apps": [[pid, mib] for index, pid, mib in apps if index == i]} for i in range(count)]
+
+
+def fake_nvidia_smi(bin_dir):
+    """Write the shared nvidia-smi stub; callers set FAKE_GPUS (json of `fake_gpus`)."""
+    import sys
+    path = Path(bin_dir) / "nvidia-smi"
+    path.write_text("#!" + sys.executable + "\n" + FAKE_NVIDIA_SMI)
+    path.chmod(0o755)
+    return path

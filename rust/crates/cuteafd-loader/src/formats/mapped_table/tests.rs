@@ -320,6 +320,7 @@ fn dontneed_produces_mincore_and_nowait_misses_then_hits() -> TestResult {
     for backend in [TableBackend::Mmap, TableBackend::MincoreRouted] {
         // SAFETY: test file is immutable while the table lives.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+        table.split_only_for_test();
         table.initialize_reads();
         if backend == TableBackend::MincoreRouted && table.backend() != backend {
             eprintln!("SKIP NOWAIT miss execution: unsupported kernel/seccomp/filesystem");
@@ -360,6 +361,7 @@ fn mincore_routing_preserves_slots_duplicates_and_prefetch_accounting() -> TestR
     let open = || -> Result<MappedTable> {
         // SAFETY: this test owns the immutable file until all tables drop.
         let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+        table.split_only_for_test();
         table.initialize_reads();
         table.parts[0].nowait.store(false, Ordering::Relaxed);
         table.stats.nowait.store(false, Ordering::Relaxed);
@@ -423,6 +425,7 @@ fn failed_misses_keep_initial_residency_and_copy_hits_only_once() -> TestResult 
     file.as_file().sync_all()?;
     // SAFETY: test-owned immutable file outlives all owned reads and mappings.
     let table = unsafe { MappedTable::single(file.path(), 0, 8, u8_rows(page))? };
+    table.split_only_for_test();
     assert_eq!(uring::dontneed(&table.parts[0]), 0);
     std::hint::black_box(table.row(1)?[0]);
     assert_eq!(table.residency(&[1, 3, 6], false)?, [true, false, false]);
@@ -441,6 +444,7 @@ fn mincore_routing_keeps_hits_on_caller_and_falls_back_safely() -> TestResult {
     let (_dir, parts) = parted([3, 3, 2])?;
     // SAFETY: test-owned shard files remain immutable through the table lifetime.
     let table = unsafe { MappedTable::open(&parts, u8_rows(4))? };
+    table.split_only_for_test();
     table.initialize_reads();
     if table.backend() == TableBackend::MincoreRouted {
         let mut output = [0; 12];
@@ -641,26 +645,6 @@ fn checkpoint_tensors_validate_dtype_width_payload_and_paths() -> TestResult {
     assert!(unsafe { MappedTable::from_tensors(dir.path(), &[(shards[0].as_str(), &short)]) }.is_err());
     assert!(unsafe { MappedTable::from_tensors(dir.path(), &[("../a.safetensors", &metas[0])]) }.is_err());
     assert!(unsafe { MappedTable::from_tensors(dir.path(), &[]) }.is_err());
-    Ok(())
-}
-
-#[test]
-fn prefetcher_bounds_rows_reports_pages_and_detaches() -> TestResult {
-    let (_dir, parts) = parted([3, 3, 2])?;
-    let table: Arc<MappedTable> = Arc::new(unsafe { MappedTable::open(&parts, u8_rows(4))? });
-    let worker = TablePrefetcher::new("test-prefetch", 1, 4, 8)?;
-    assert!(worker.try_submit(table.clone(), &[8]).is_err());
-    assert!(worker.try_submit(table.clone(), &[0; 5]).is_err());
-    let ticket = worker.try_submit(table.clone(), &[1, 0, 1])?.expect("queue has room");
-    assert_eq!(ticket.wait()?, TablePrefetchOutcome::Advised(vec![1]));
-    let cancelled = worker.try_submit(table.clone(), &[7])?.expect("queue has room");
-    cancelled.cancel();
-    assert!(matches!(cancelled.wait()?, TablePrefetchOutcome::Cancelled | TablePrefetchOutcome::Advised(_)));
-    // Detached advice truncates to the row cap instead of failing.
-    while !worker.submit_detached(table.clone(), &[0, 1, 2, 3, 4, 5])? {}
-    drop(worker);
-    let stats = table.stats().snapshot();
-    assert!(stats.prefetch_jobs >= 2 && stats.prefetch_pages >= 2);
     Ok(())
 }
 
@@ -908,25 +892,6 @@ fn residency_overhead_measurement() -> TestResult {
     assert_eq!(delta.page_misses, 0, "warm benchmark must not measure table I/O");
     assert_eq!(delta.late_major_faults, 0, "resident pages faulted during copies");
     assert_eq!(delta.page_hits, (count * repeats) as u64);
-    if std::env::var_os("MAPPED_BENCH_WRAPPER").is_some() {
-        let gather = crate::shared::token_table::RowGather::new("mapped-bench", 16)?;
-        gather.gather_slots(&table, &ids, &slots, &mut output)?;
-        let before = table.stats().snapshot();
-        let wrapped = Instant::now();
-        for _ in 0..repeats {
-            gather.gather_slots(&table, black_box(&ids), &slots, black_box(&mut output))?;
-        }
-        let wrapped = wrapped.elapsed();
-        let wrapped_delta = table.stats().snapshot().since(&before);
-        assert_eq!(wrapped_delta.page_misses, 0, "wrapper benchmark must not measure table I/O");
-        assert_eq!(wrapped_delta.late_major_faults, 0);
-        assert_eq!(wrapped_delta.page_hits, (count * repeats) as u64);
-        eprintln!("mapped_wrapper backend={:?} rows={count} width={width} repeats={repeats} parallel={} direct_us={:.3} wrapped_us={:.3} residency_us={:.3} hits={} misses={} late_faults={}",
-            table.backend(), crate::shared::token_table::RowGather::parallel(count * width),
-            full.as_secs_f64() * 1e6 / repeats as f64, wrapped.as_secs_f64() * 1e6 / repeats as f64,
-            wrapped_delta.residency_ns as f64 / repeats as f64 / 1e3,
-            wrapped_delta.page_hits, wrapped_delta.page_misses, wrapped_delta.late_major_faults);
-    }
     let copying = Instant::now();
     for _ in 0..repeats {
         for (&row, slot) in ids.iter().zip(output.chunks_exact_mut(width)) {
@@ -1104,35 +1069,6 @@ fn preload_read_failure_keeps_every_table_mapped() -> TestResult {
     assert!(second.resident.is_none());
     assert_ne!(first.backend(), TableBackend::Resident);
     assert_ne!(second.backend(), TableBackend::Resident);
-    Ok(())
-}
-
-#[test]
-fn shared_table_small_and_large_gathers_preserve_native_order() -> TestResult {
-    use crate::shared::token_table::{RowGather, PARALLEL_GATHER_BYTES};
-    let mut shard = tempfile::NamedTempFile::new()?;
-    let width = 256;
-    let count = PARALLEL_GATHER_BYTES / width + 1;
-    let bytes: Vec<u8> = (0..count * width).map(|i| ((i / width) % 251) as u8).collect();
-    shard.write_all(&bytes)?;
-    // SAFETY: this test retains the immutable shard for the mapping lifetime.
-    let table = unsafe { MappedTable::single(shard.path(), 0, count as u64, u8_rows(width))? };
-    // The shared size dispatch preserves canonical row slots on either backend.
-    let gather = RowGather::new("table-size-test", 2)?;
-    for n in [32, count] {
-        let ids: Vec<_> = (0..n).map(|i| ((n - 1 - i) / 2) as u64).collect();
-        let mut output = vec![0; n * width];
-        assert_eq!(RowGather::parallel(output.len()), n == count);
-        gather.gather(&table, &ids, &mut output)?;
-        for (&id, actual) in ids.iter().zip(output.chunks_exact(width)) {
-            assert_eq!(actual, &bytes[id as usize * width..(id as usize + 1) * width]);
-        }
-        let slots: Vec<_> = (0..n).rev().collect();
-        gather.gather_slots(&table, &ids, &slots, &mut output)?;
-        for (&id, &slot) in ids.iter().zip(&slots) {
-            assert_eq!(&output[slot * width..(slot + 1) * width], &bytes[id as usize * width..(id as usize + 1) * width]);
-        }
-    }
     Ok(())
 }
 
@@ -1374,5 +1310,55 @@ fn split_cancel_and_shutdown_recycle_prepared_and_queued_jobs() -> TestResult {
     drops.recv_timeout(Duration::from_secs(5))?;
     assert!(matches!(queued.wait_timeout(Duration::from_secs(5)), Ok(GatherPoll::Cancelled) | Err(GatherFailure::Worker(_))));
     assert_eq!(slots.free.lock().unwrap().len(), 4);
+    Ok(())
+}
+
+#[test]
+fn copy_first_copies_resident_batches_and_switches_cold_ones_to_the_split() -> TestResult {
+    let mut file = tempfile::NamedTempFile::new_in(std::env::current_dir()?)?;
+    let page = page_bytes()?;
+    let rows = 256u64;
+    let payload: Vec<u8> = (0..rows as usize * page).map(|i| (i % 251) as u8).collect();
+    file.write_all(&payload)?;
+    file.as_file().sync_all()?;
+    // SAFETY: the test owns the immutable file for the table's lifetime.
+    let table = unsafe { MappedTable::single(file.path(), 0, rows, u8_rows(page))? };
+    table.prepare_reads();
+    let ids: Vec<u64> = (0..rows).rev().collect();
+    let expect = |output: &[u8]| for (index, &row) in ids.iter().enumerate() {
+        assert_eq!(&output[index * page..(index + 1) * page], &payload[row as usize * page..(row as usize + 1) * page]);
+    };
+    // Warm: one plain copy, no residency split.
+    let mut output = vec![0; ids.len() * page];
+    table.gather_into(&ids, &mut output)?;
+    let mut warm = vec![0; ids.len() * page];
+    let before = table.stats().snapshot();
+    table.gather_into(&ids, &mut warm)?;
+    expect(&warm);
+    let delta = table.stats().snapshot().since(&before);
+    assert_eq!((delta.copy_switches, delta.page_misses), (0, 0));
+    // Cold: the first fault switches the rest of the batch to the split; bytes stay exact.
+    assert_eq!(uring::dontneed(&table.parts[0]), 0);
+    // SAFETY: advice over exactly this live mapping.
+    unsafe { libc::madvise(table.parts[0].base.as_ptr().cast(), table.parts[0].mapped_len, 21 /* MADV_PAGEOUT */) };
+    let before = table.stats().snapshot();
+    let mut cold = vec![0; ids.len() * page];
+    table.gather_into(&ids, &mut cold)?;
+    expect(&cold);
+    let delta = table.stats().snapshot().since(&before);
+    if delta.late_major_faults > 0 {
+        assert_eq!(delta.copy_switches, 1);
+        assert!(delta.page_hits <= COPY_CHECK_ROWS as u64, "at most one check interval copied before the switch");
+        // Faulted copies count as device reads, not hits.
+        assert!(delta.page_misses >= 1);
+        // The next COLD_SKIPS - 1 gathers start with the split; then one probes the copy again.
+        for _ in 1..COLD_SKIPS {
+            let before = table.stats().snapshot();
+            table.gather_into(&ids, &mut cold)?;
+            expect(&cold);
+            assert_eq!(table.stats().snapshot().since(&before).copy_switches, 0);
+        }
+        assert_eq!(table.cold_skips.load(Ordering::Relaxed), 0);
+    }
     Ok(())
 }

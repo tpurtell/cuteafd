@@ -100,6 +100,9 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         storage_run = Path("/srv/sparknest/run")
         storage = [f"mount:type=bind,src={storage_run},dst={storage_run},readonly"] \
             if storage_run.is_dir() else []
+        # FUSE connection limits for mapped tables read from a remote copy.
+        fuse = Path("/sys/fs/fuse/connections")
+        storage += [f"mount:type=bind,src={fuse},dst={fuse},readonly"] if fuse.is_dir() else []
         assert after["mounts"] == sorted(before["mounts"] + governor + fidelity + storage), where
         assert after["image"] == before["image"], where
         added = {key: value for key, value in after["env"].items() if key not in before["env"]}

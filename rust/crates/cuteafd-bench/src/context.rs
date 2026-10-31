@@ -22,6 +22,9 @@ pub struct ServerContext {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct KvCapacity {
     pub tokens: Option<u64>,
+    /// Pool ceiling without RTX-onboarded experts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     pub pages: Option<u64>,
     /// KV record format, e.g. `FP8 latent + index` or `int8 full + BF16 SWA`.
     pub format: Option<String>,
@@ -99,9 +102,9 @@ pub fn get() -> ServerContext {
 }
 
 /// The engine's resolved device KV pool (tokens, pages, record format) and host cache bytes.
-pub fn set_kv(tokens: u64, pages: u64, format: &str, host_bytes: u64) {
+pub fn set_kv(tokens: u64, max_tokens: Option<u64>, pages: u64, format: &str, host_bytes: u64) {
     if let Ok(mut slot) = state().kv.lock() {
-        *slot = Some(KvCapacity { tokens: Some(tokens), pages: Some(pages), format: Some(format.to_string()),
+        *slot = Some(KvCapacity { tokens: Some(tokens), max_tokens, pages: Some(pages), format: Some(format.to_string()),
             host_bytes: Some(host_bytes) });
     }
 }
@@ -201,6 +204,17 @@ pub const DEPLOYMENT: [&str; 16] = ["snapshot", "native-lib", "native_lib", "pee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_capacity_maximum_is_optional_in_old_records() {
+        let old = r#"{"tokens":1800000,"pages":28125,"format":"FP8","host_bytes":0}"#;
+        let mut capacity: KvCapacity = serde_json::from_str(old).unwrap();
+        assert_eq!(capacity.max_tokens, None);
+        assert!(!serde_json::to_string(&capacity).unwrap().contains("max_tokens"));
+        capacity.max_tokens = Some(2_100_000);
+        let json = serde_json::to_string(&capacity).unwrap();
+        assert_eq!(serde_json::from_str::<KvCapacity>(&json).unwrap(), capacity);
+    }
 
     #[test]
     fn process_start_is_in_the_past() {

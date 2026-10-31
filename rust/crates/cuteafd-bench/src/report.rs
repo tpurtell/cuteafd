@@ -590,6 +590,9 @@ pub struct BasicCard {
 pub struct Capacity {
     #[serde(default)]
     pub kv_tokens: Option<u64>,
+    /// Pool ceiling without RTX-onboarded experts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     #[serde(default)]
     pub kv_pages: Option<u64>,
     #[serde(default)]
@@ -636,6 +639,7 @@ impl Capacity {
         let number = |names: &[&str]| get(names).and_then(|v| v.parse::<u64>().ok());
         Self {
             kv_tokens: number(&["pool-tokens"]),
+            max_tokens: None,
             kv_pages: None,
             kv_format: None,
             max_requests: number(&["concurrency", "max-sequences"]),
@@ -648,8 +652,12 @@ impl Capacity {
     /// `KV 412K tok · int8 full · 16 req max · 128K ctx · host cache 64 GiB`.
     pub fn line(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(tokens) = self.kv_tokens {
-            parts.push(format!("KV {} tok", short_tokens(tokens)));
+        if let Some(tokens) = self.kv_tokens.filter(|&tokens| tokens > 0) {
+            let mut kv = format!("KV {} tok", short_tokens(tokens));
+            if let Some(max) = self.max_tokens.filter(|&max| max > tokens) {
+                kv.push_str(&format!(" (max {})", short_tokens(max)));
+            }
+            parts.push(kv);
         }
         if let Some(format) = &self.kv_format {
             parts.push(format.clone());
@@ -682,19 +690,23 @@ impl Capacity {
 
 impl Report {
     /// Resolved onboard count belongs beside capacity, not among tuning chips.
-    /// Old reports and GPU-only cards do not imply a zero onboard count.
+    /// Hardware-only cards have no onboarding trade-off, including dense models.
     pub fn capacity_line(&self) -> String {
-        let capacity = self.capacity();
-        let line = capacity.line();
-        let onboard = (!self.server.hardware.sparks.is_empty()).then(|| {
+        let mut capacity = self.capacity();
+        let placement = if self.server.hardware.sparks.is_empty() {
+            capacity.max_tokens = None;
+            Some("all RTX".to_string())
+        } else {
             self.server.configuration.settings.iter()
                 .find(|s| s.name == "rtx-expert-layers" && s.source == "resolved")
                 .and_then(|s| s.value.as_ref()?.parse::<usize>().ok())
-        }).flatten();
-        let Some(count) = onboard else { return line };
+                .map(|count| format!("{count} RTX expert layers"))
+        };
+        let line = capacity.line();
+        let Some(placement) = placement else { return line };
         let mut parts: Vec<_> = line.split(" · ").filter(|part| !part.is_empty()).map(str::to_owned).collect();
         // Keep placement visible even if a verbose KV format needs truncating.
-        parts.insert(usize::from(capacity.kv_tokens.is_some()), format!("{count} RTX expert layers"));
+        parts.insert(usize::from(capacity.kv_tokens.is_some_and(|tokens| tokens > 0)), placement);
         parts.join(" · ")
     }
 

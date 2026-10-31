@@ -27,7 +27,7 @@
         "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "3",
         "ADDR": "0.0.0.0:8800",
         "EXPERT_PORT": "19900",
@@ -64,7 +64,7 @@
         "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "ADDR": "0.0.0.0:8801",
         "EXPERT_PORT": "19920",
         "SPECULATOR": "dspark",
@@ -103,7 +103,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8802",
         "EXPERT_PORT": "19940",
@@ -133,7 +133,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8803",
         "EXPERT_PORT": "19960",
@@ -166,7 +166,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8804",
         "EXPERT_PORT": "19980",
@@ -189,7 +189,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8805",
         "EXPERT_PORT": "20000",
@@ -210,7 +210,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8892",
         "EXPERT_PORT": "21840",
@@ -233,7 +233,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8893",
         "EXPERT_PORT": "21860",
@@ -254,7 +254,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8806",
         "EXPERT_PORT": "20020",
@@ -279,7 +279,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8807",
         "EXPERT_PORT": "20040",
@@ -304,7 +304,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8808",
         "EXPERT_PORT": "20060",
@@ -334,7 +334,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "ADDR": "0.0.0.0:8809",
         "EXPERT_PORT": "20080",
@@ -364,7 +364,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8810",
         "EXPERT_PORT": "20100",
@@ -387,7 +387,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8811",
         "EXPERT_PORT": "20120",
@@ -418,7 +418,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8812",
         "EXPERT_PORT": "20140",
@@ -451,7 +451,7 @@
         "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "SPARK_TP": "",
         "SPARK_EP": "",
@@ -489,7 +489,7 @@
         "MODEL_ID": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "MODEL_REVISION": "1bae0e1088993b9b82de08f59de5be5a34e42170",
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "3",
         "ADDR": "0.0.0.0:8832",
         "EXPERT_PORT": "19932",
@@ -530,7 +530,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8834",
         "EXPERT_PORT": "19934",
@@ -567,7 +567,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8836",
         "EXPERT_PORT": "19936",
@@ -604,7 +604,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8837",
         "EXPERT_PORT": "19937",
@@ -641,7 +641,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8838",
         "EXPERT_PORT": "19938",
@@ -678,7 +678,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "2",
         "ADDR": "0.0.0.0:8839",
         "EXPERT_PORT": "19939",
@@ -714,7 +714,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0",
         "SPARK_COUNT": "1",
         "ADDR": "0.0.0.0:8840",
         "EXPERT_PORT": "19940",
@@ -751,7 +751,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -790,7 +790,7 @@
         "ADDR": "0.0.0.0:8822",
         "EXPERT_PORT": "20340",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -828,7 +828,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "ADDR": "0.0.0.0:8894",
         "EXPERT_PORT": "21880",
@@ -864,7 +864,7 @@
         "ADDR": "0.0.0.0:8895",
         "EXPERT_PORT": "21900",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -907,7 +907,7 @@
         "ADDR": "0.0.0.0:8823",
         "EXPERT_PORT": "20360",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -950,7 +950,7 @@
         "ADDR": "0.0.0.0:8824",
         "EXPERT_PORT": "20380",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -989,7 +989,7 @@
       "set": {
         "ADDR": "0.0.0.0:8825",
         "EXPERT_PORT": "20400",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "RTX_GPUS": "1",
         "SPARK_COUNT": "4",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
@@ -1022,7 +1022,7 @@
       ],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "4",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -1059,7 +1059,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -1102,7 +1102,7 @@
       ],
       "set": {
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "0,1",
         "SPARK_COUNT": "6",
         "SPARK_0_HOST": "REPLACE-ME-spark-0",
         "SPARK_0_LANE_A": "192.0.2.1",
@@ -1138,7 +1138,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "SPECULATOR": "off",
         "ADDR": "0.0.0.0:8830"
@@ -1154,7 +1154,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8828",
         "SPECULATOR": "dspark"
@@ -1170,7 +1170,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8829",
         "SPECULATOR": "dspark"
@@ -1186,7 +1186,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8841",
         "SPECULATOR": "off"
@@ -1202,7 +1202,7 @@
       "sparks": [],
       "set": {
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "0",
         "ADDR": "0.0.0.0:8842",
         "SPECULATOR": "off"
@@ -1224,7 +1224,7 @@
         "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
         "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
         "RTX_GPUS": "1",
-        "COORDINATOR_GPU": "1",
+        "COORDINATOR_GPUS": "1",
         "SPARK_COUNT": "3",
         "ADDR": "0.0.0.0:8890",
         "EXPERT_PORT": "21800",
@@ -1261,7 +1261,7 @@
         "MODEL_ID": "wrldsuksgo2mars/DeepSeek-V4.1-Flash-1017-StridedPLE",
         "MODEL_REVISION": "51b3391435c83db9c38e87e114abf7bcfe7fc9c3",
         "RTX_GPUS": "2",
-        "COORDINATOR_GPU": "0",
+        "COORDINATOR_GPUS": "1,0",
         "ADDR": "0.0.0.0:8891",
         "EXPERT_PORT": "21820",
         "SPECULATOR": "dspark",

@@ -37,7 +37,7 @@ def config_file(tmp_path, family, model, count):
     hosts = '\n'.join(f'SPARK_{i}_HOST=spark{i}\nSPARK_{i}_LANE_A=192.0.2.{i + 1}\n'
                       f'SPARK_{i}_LANE_B=198.51.100.{i + 1}' for i in range(count))
     path.write_text(f'FAMILY={family}\nMODEL_ID=test/{model}\nSPARK_COUNT={count}\n'
-                    f'RTX_GPUS=2\nCOORDINATOR_GPU=1\n{hosts}\n')
+                    f'RTX_GPUS=2\nCOORDINATOR_GPUS=1,0\n{hosts}\n')
     return path
 
 

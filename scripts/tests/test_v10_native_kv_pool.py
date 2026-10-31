@@ -36,7 +36,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[2]
 CONFIG = REPO / "examples" / "configs" / "tp3ep1-native.config"
 LANE_README = REPO / "runs" / "v10-native-tp3ep1" / "tool-eval-short-oom" / "README.md"
-SELECTOR = REPO / "scripts" / "launch" / "select-release-gpus.py"
+SELECTOR = REPO / "scripts" / "lib" / "coordinator-gpus.py"
 
 # The explicit pin this profile is expected to carry. Change it here and in the
 # config together; every dependent number below is re-derived.

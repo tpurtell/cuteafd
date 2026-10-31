@@ -41,7 +41,7 @@
    "set": {
     "ADDR": "0.0.0.0:8732",
     "EXPERT_PORT": "19832",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "SPARK_COUNT": "0"
    }
   },
@@ -58,7 +58,7 @@
     "ADDR": "0.0.0.0:8737",
     "EXPERT_PORT": "19837",
     "RTX_GPUS": "2",
-    "COORDINATOR_GPU": "0",
+    "COORDINATOR_GPUS": "0,1",
     "SPARK_COUNT": "0",
     "EXPERT_BACKEND": "local"
    }
@@ -168,7 +168,7 @@
     "ADDR": "0.0.0.0:8748",
     "EXPERT_PORT": "19848",
     "RTX_GPUS": "1",
-    "COORDINATOR_GPU": "0",
+    "COORDINATOR_GPUS": "0",
     "COORDINATOR_GPU_BUDGET_GIB": "31.8",
     "SPARK_INTAKE": "pinned",
     "MAX_CONTEXT_TOKENS": "1048576",
@@ -300,7 +300,7 @@
    ],
    "set": {
     "ADDR": "0.0.0.0:8747",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "EXPERT_PORT": "19847",
     "SPARK_COUNT": "4",
     "SPARK_0_HOST": "ostrich",
@@ -379,7 +379,7 @@
    "set": {
     "ADDR": "0.0.0.0:8736",
     "EXPERT_PORT": "19836",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "SPARK_COUNT": "2",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo"
@@ -457,7 +457,7 @@
    "set": {
     "ADDR": "0.0.0.0:8744",
     "EXPERT_PORT": "19844",
-    "COORDINATOR_GPU": "1",
+    "COORDINATOR_GPUS": "1",
     "SPARK_COUNT": "4",
     "SPARK_0_HOST": "ostrich",
     "SPARK_1_HOST": "dodo",

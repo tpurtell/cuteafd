@@ -7,10 +7,9 @@
 //! POSIX_FADV_RANDOM; a process-wide reactor reads only mincore misses without O_DIRECT.
 //! Rows reach the GPU in three steps, each bounded:
 //!
-//! - prefetch: as soon as row ids are known (a prefill chunk ahead, a wave's
-//!   hashes before its layer), [`TablePrefetcher`] reads the touched rows with
-//!   the hybrid on a background worker; unavailable-ring fallback uses
-//!   `MADV_WILLNEED`. Queue, rows and pages are bounded; a full queue drops work;
+//! - look-ahead: as soon as row ids are known (a prompt at admission, a decode
+//!   token), [`lookahead`] reads them into the table's bounded [`row_cache`] in
+//!   deadline order; gathers then copy cached rows and read only the rest;
 //! - gather: rows are copied in request order into caller storage, either on
 //!   a [`GatherPool`] (parallel page faults, the caller waits) or on a
 //!   [`GatherWorker`] (request-owned tickets and recycled staging slots);
@@ -31,6 +30,19 @@ use std::sync::{mpsc, Arc, Mutex, Weak};
 
 mod uring;
 mod reactor;
+mod affinity;
+pub mod row_cache;
+pub mod lookahead;
+pub mod placement;
+pub mod token_table;
+
+/// How a gather may use the shared read reactor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GatherMode {
+    /// Never block for a reactor buffer (the look-ahead planner, which polls):
+    /// take one when free, else on a later poll.
+    pub no_wait: bool,
+}
 
 /// Explicit priority from the decode/prefill pipeline, never inferred from row count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -76,6 +88,16 @@ pub enum MappedTableError {
 }
 
 pub type Result<T, E = MappedTableError> = std::result::Result<T, E>;
+
+/// After a gather's copy faulted, the table's next gathers skip the plain
+/// copy (their rows are likely cold too); every this-many-th one probes it again.
+const COLD_SKIPS: u32 = 8;
+
+/// Rows a gather copies straight from the mapping before its first check of
+/// the thread's major faults, and the interval the checks double to while the
+/// copy stays resident (a getrusage call, about 5 ns per row at 64).
+const COPY_FIRST_CHECK: usize = 4;
+const COPY_CHECK_ROWS: usize = 64;
 
 /// Bytes per positioned payload read (scale preload, page-cache warm).
 pub(crate) const PAYLOAD_CHUNK_BYTES: usize = 16 << 20;
@@ -147,6 +169,11 @@ pub struct MappedRows {
     file_offset: u64,
     nowait: AtomicBool,
     fuse: bool,
+    /// Where this file's copies live (`placement::file_placement`), read at open.
+    placement: placement::Placement,
+    /// Remote-only FUSE files: (connection, its max_background); the reactor
+    /// keeps at most that many of the connection's reads in flight.
+    read_cap: Option<(u32, u32)>,
 }
 
 // SAFETY: Only immutable access is exposed; munmap runs after the final owner drops.
@@ -201,10 +228,18 @@ impl MappedRows {
             }
             return Err(invalid("checkpoint mapping returned a null address"));
         };
-        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse: uring::is_fuse(&file), file: Arc::new(file) };
+        let (fuse, at) = (uring::is_fuse(&file), placement::file_placement(&file));
+        placement::note(at);
+        let read_cap = placement::remote_read_cap(&file, at, fuse);
+        let result = Self { base, mapped_len, data_offset, rows, row_bytes, page_bytes, file_offset: offset, nowait: AtomicBool::new(true), fuse,
+            placement: at, read_cap, file: Arc::new(file) };
         // Avoid kernel sequential read-ahead across a hundreds-of-GB hash table.
+        #[cfg(test)]
+        let advice = if std::env::var_os("MAPPED_BENCH_DEFAULT_ADVICE").is_some() { libc::MADV_NORMAL } else { libc::MADV_RANDOM };
+        #[cfg(not(test))]
+        let advice = libc::MADV_RANDOM;
         // SAFETY: advice over exactly the mapping created above.
-        if unsafe { libc::madvise(raw, mapped_len, libc::MADV_RANDOM) } != 0 {
+        if unsafe { libc::madvise(raw, mapped_len, advice) } != 0 {
             return Err(os_error("setting random checkpoint access"));
         }
         Ok(result)
@@ -516,6 +551,11 @@ thread_local! {
 /// A row space over one or more mapped parts, with its stats.
 pub struct MappedTable {
     parts: Vec<MappedRows>,
+    /// Tests of the residency split route every row through it.
+    #[cfg(test)]
+    split_only: AtomicBool,
+    /// Gathers left that skip the plain copy after one faulted.
+    cold_skips: std::sync::atomic::AtomicU32,
     resident: Option<ResidentBytes>,
     /// First global row of each part, then the total.
     starts: Vec<u64>,
@@ -550,7 +590,8 @@ impl MappedTable {
         } else {
             0
         };
-        let table = Self { parts: mapped, resident: None, starts, uniform, format, stats: Arc::new(TableStats::default()) };
+        let table = Self { parts: mapped, #[cfg(test)] split_only: AtomicBool::new(false), cold_skips: Default::default(), resident: None, starts, uniform,
+            format, stats: Arc::new(TableStats::default()) };
         {
             use std::os::unix::fs::MetadataExt;
             let mut devices = table.stats.devices.lock().unwrap_or_else(|p| p.into_inner());
@@ -619,12 +660,22 @@ impl MappedTable {
     pub fn part_count(&self) -> usize {
         self.parts.len()
     }
+    /// Local when rows are read from this host: the table is held in memory, or
+    /// every part's file has a local copy ([`placement::file_placement`]).
+    pub fn placement(&self) -> placement::Placement {
+        if self.resident.is_some() || self.parts.iter().all(|part| part.placement == placement::Placement::Local) {
+            placement::Placement::Local
+        } else { placement::Placement::Remote }
+    }
     /// Mapped payload bytes (not resident bytes).
     pub fn bytes(&self) -> u64 {
         self.rows() * self.format.row_bytes as u64
     }
     pub fn stats(&self) -> &TableStats {
         &self.stats
+    }
+    pub(crate) fn shared_stats(&self) -> Arc<TableStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Hold every table in host memory, all or none: read each payload once on
@@ -808,21 +859,26 @@ impl MappedTable {
         self.gather_slots_priority(rows, slots, output, ReadPriority::Prefill)
     }
     pub fn gather_slots_priority(&self, rows: &[u64], slots: &[usize], output: &mut [u8], priority: ReadPriority) -> Result<()> {
-        let pending = self.prepare_gather(rows, slots, output, priority, 2)?;
+        let pending = self.prepare_gather(rows, slots, output, priority, 2, GatherMode::default())?;
         pending.finish(self, output)
     }
 
     /// Copy hits now and submit only misses. The returned ticket owns its I/O
     /// buffers/files, not the destination, so another table can start first.
     pub(crate) fn prepare_gather(&self, rows: &[u64], slots: &[usize], output: &mut [u8],
-        priority: ReadPriority, window: usize) -> Result<PreparedTableGather> {
+        priority: ReadPriority, window: usize, mode: GatherMode) -> Result<PreparedTableGather> {
         if rows.len() != slots.len() { return Err(invalid("gather row/slot counts differ")); }
         let width = self.row_bytes();
-        let mut unique = BTreeSet::new();
+        // Dense slots 0..n (every row read into its own buffer) are distinct by
+        // construction; other layouts are checked with one bitmap pass.
+        let dense = slots.iter().enumerate().all(|(index, &slot)| index == slot);
+        let mut unique = if dense { Vec::new() } else { vec![false; output.len() / width.max(1)] };
         let locations = rows.iter().zip(slots).map(|(&row, &slot)| {
             let (part, local) = self.locate(row)?;
             if slot.checked_add(1).and_then(|n| n.checked_mul(width)).is_none_or(|n| n > output.len())
-                || !unique.insert(slot) { return Err(invalid("invalid or overlapping gather slots")); }
+                || (!dense && std::mem::replace(&mut unique[slot], true)) {
+                return Err(invalid("invalid or overlapping gather slots"));
+            }
             Ok((part, local, slot))
         }).collect::<Result<Vec<_>>>()?;
         let mut prepared = PreparedTableGather { misses: Vec::new(), stream: None,
@@ -833,9 +889,61 @@ impl MappedTable {
             }
             return Ok(prepared);
         }
-        let hits = self.residency(rows, false)?;
         let before = thread_faults();
-        for ((part, row, slot), hit) in locations.into_iter().zip(hits) {
+        // Copy first: a resident batch is a plain copy from the mapping. The
+        // thread's major faults are checked every COPY_CHECK_ROWS rows; the first
+        // one (a row read from the device) sends the rest of the batch to the
+        // residency split, so its misses go to the read reactor instead of
+        // faulting one at a time here. Switches are counted. After a switch the
+        // table's next COLD_SKIPS - 1 gathers start with the split.
+        let mut copied = 0;
+        let warm = self.cold_skips.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| left.checked_sub(1)).is_err();
+        #[cfg(test)]
+        let copy_first = warm && !self.split_only.load(Ordering::Relaxed)
+            && std::env::var_os("MAPPED_BENCH_ALL_MISS").is_none() && std::env::var_os("MAPPED_BENCH_SPLIT").is_none();
+        #[cfg(not(test))]
+        let copy_first = warm;
+        // Copied rows that faulted: a device read on this thread, not a hit.
+        let mut faulted = 0;
+        if copy_first {
+            let mut checked = before;
+            // The first check comes after COPY_FIRST_CHECK rows (a cold small
+            // batch faults at most that many rows here); the interval doubles
+            // while the copy stays resident, up to COPY_CHECK_ROWS.
+            let mut group = COPY_FIRST_CHECK;
+            while copied < locations.len() {
+                let end = (copied + group).min(locations.len());
+                for &(part, row, slot) in &locations[copied..end] {
+                    output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
+                }
+                let rows = end - copied;
+                copied = end;
+                let now = thread_faults();
+                if let Some(faults) = checked.zip(now).map(|(a, b)| b[1] - a[1]).filter(|&faults| faults > 0) {
+                    // Each fault read at least one row of this group.
+                    faulted += (faults as usize).min(rows);
+                    self.stats.copy_switches.fetch_add(1, Ordering::Relaxed);
+                    self.cold_skips.store(COLD_SKIPS - 1, Ordering::Relaxed);
+                    break;
+                }
+                checked = now;
+                group = (group * 2).min(COPY_CHECK_ROWS);
+            }
+            let hits = copied - faulted;
+            prepared.stats.hits += hits as u64;
+            prepared.stats.hit_bytes += (hits * width) as u64;
+            prepared.stats.misses += faulted as u64;
+            prepared.stats.miss_bytes += (faulted * width) as u64;
+            prepared.stats.device_bytes_estimate += (faulted * width.max(self.parts[0].page_bytes)) as u64;
+        }
+        let rest = &locations[copied..];
+        let rest_rows: Vec<u64> = rest.iter().map(|&(part, local, _)| self.starts[part] + local).collect();
+        #[cfg(test)]
+        let hits = if std::env::var_os("MAPPED_BENCH_ALL_MISS").is_some() { vec![false; rest_rows.len()] }
+            else if rest_rows.is_empty() { Vec::new() } else { self.residency(&rest_rows, false)? };
+        #[cfg(not(test))]
+        let hits = if rest_rows.is_empty() { Vec::new() } else { self.residency(&rest_rows, false)? };
+        for (&(part, row, slot), hit) in rest.iter().zip(hits) {
             if hit {
                 output[slot * width..(slot + 1) * width].copy_from_slice(self.parts[part].row(row)?);
                 prepared.stats.hits += 1;
@@ -851,8 +959,9 @@ impl MappedTable {
         prepared.stats.late_major_faults = thread_faults_since(before)[1].max(0) as u64;
         if !prepared.misses.is_empty() {
             let reads = prepared.misses.iter().map(|&(part, row, slot)| reactor::Read {
-                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot }).collect();
-            match uring::start(reads, width, priority, window) {
+                file: Arc::clone(&self.parts[part].file), offset: self.parts[part].file_offset + row * width as u64, slot,
+                cap: self.parts[part].read_cap }).collect();
+            match uring::start(reads, width, priority, window, !mode.no_wait) {
                 Ok(stream) => prepared.stream = Some(stream),
                 Err(error) => self.uring_fallback(&error),
             }
@@ -993,6 +1102,29 @@ impl MappedTable {
             "mapped table backend");
     }
 
+    /// Tests of the residency split: skip the plain copy.
+    #[cfg(test)]
+    pub(crate) fn split_only_for_test(&self) { self.split_only.store(true, Ordering::Relaxed); }
+    /// Bench/test only: reclaim this table's mapped pages (`MADV_PAGEOUT`, then
+    /// drop the file's page cache) and return how many stayed resident.
+    #[cfg(test)]
+    pub(crate) fn evict_for_test(&self) -> usize {
+        let mut resident = 0;
+        for part in &self.parts {
+            // SAFETY: advice over exactly this live mapping; fadvise only drops clean pages.
+            unsafe {
+                libc::madvise(part.base.as_ptr().cast(), part.mapped_len, 21 /* MADV_PAGEOUT */);
+                libc::posix_fadvise(part.file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+            }
+            let pages = part.mapped_len.div_ceil(part.page_bytes);
+            let mut flags = vec![0u8; pages];
+            // SAFETY: one byte per page of this live mapping.
+            unsafe { libc::mincore(part.base.as_ptr().cast(), part.mapped_len, flags.as_mut_ptr()) };
+            resident += flags.iter().filter(|&&f| f & 1 != 0).count();
+        }
+        resident
+    }
+
     /// Register a weak stats reference; endpoint reads neither own nor touch
     /// mapped storage. Entries disappear when their table is released.
     pub fn name_stats(&self, name: impl Into<String>) {
@@ -1079,9 +1211,6 @@ pub struct TableStats {
     minor_faults: AtomicU64,
     major_faults: AtomicU64,
     input_blocks: AtomicU64,
-    prefetch_jobs: AtomicU64,
-    prefetch_pages: AtomicU64,
-    prefetch_dropped: AtomicU64,
     nowait: AtomicBool,
     approximate: AtomicBool,
     previous: Mutex<TableStatsSnapshot>,
@@ -1131,7 +1260,21 @@ pub struct TableStats {
     prefetch_residency_ns: AtomicU64,
     prefetch_resident_copy_rows: AtomicU64,
     prefetch_late_major_faults: AtomicU64,
-
+    pub(crate) cache_hit_rows: AtomicU64,
+    pub(crate) cache_wait_rows: AtomicU64,
+    pub(crate) cache_denied_rows: AtomicU64,
+    pub(crate) cache_evictions: AtomicU64,
+    pub(crate) lookahead_rows: AtomicU64,
+    pub(crate) lookahead_pieces: AtomicU64,
+    pub(crate) stall_prefill_events: AtomicU64,
+    pub(crate) stall_prefill_ns: AtomicU64,
+    pub(crate) stall_prefill_fallback_rows: AtomicU64,
+    pub(crate) stall_prefill_pending_rows: AtomicU64,
+    pub(crate) stall_decode_events: AtomicU64,
+    pub(crate) stall_decode_ns: AtomicU64,
+    pub(crate) stall_decode_fallback_rows: AtomicU64,
+    pub(crate) stall_decode_pending_rows: AtomicU64,
+    pub(crate) copy_switches: AtomicU64,
 }
 
 /// A point-in-time copy of [`TableStats`]; `since` gives an interval.
@@ -1147,10 +1290,6 @@ pub struct TableStatsSnapshot {
     /// Page-cache misses that read the device (disk or network).
     pub major_faults: u64,
     pub input_blocks: u64,
-    pub prefetch_jobs: u64,
-    pub prefetch_pages: u64,
-    /// Prefetch batches refused by a full queue.
-    pub prefetch_dropped: u64,
     /// Classified misses timed from initial batch submission through completion/retry.
     pub miss_histogram: [u64; 7],
     pub unclassified_rows: u64,
@@ -1212,7 +1351,52 @@ pub struct TableStatsSnapshot {
     pub prefetch_resident_copy_rows: u64,
     #[serde(default)]
     pub prefetch_late_major_faults: u64,
-
+    /// Row-cache lookups already published when a gather needed them.
+    #[serde(default)]
+    pub cache_hit_rows: u64,
+    /// Row-cache lookups still being filled by another reader when a gather needed them.
+    #[serde(default)]
+    pub cache_wait_rows: u64,
+    /// Rows a class could not reserve (its share was full); read uncached.
+    #[serde(default)]
+    pub cache_denied_rows: u64,
+    /// Published rows evicted to make room.
+    #[serde(default)]
+    pub cache_evictions: u64,
+    /// Rows the look-ahead read into the row cache.
+    #[serde(default)]
+    pub lookahead_rows: u64,
+    /// Look-ahead pieces (both tables of a few hundred tokens) completed.
+    #[serde(default)]
+    pub lookahead_pieces: u64,
+    /// Prefill consumers that needed a layer's rows before they were ready (Engram stalls).
+    #[serde(default)]
+    pub stall_prefill_events: u64,
+    /// Prefill consumer time spent waiting for those rows.
+    #[serde(default)]
+    pub stall_prefill_ns: u64,
+    /// Rows prefill gathers read themselves: the look-ahead had not fetched them.
+    #[serde(default)]
+    pub stall_prefill_fallback_rows: u64,
+    /// Rows prefill gathers waited for: queued by the look-ahead or another gather, not yet landed.
+    #[serde(default)]
+    pub stall_prefill_pending_rows: u64,
+    /// Decode consumers that needed a layer's rows before they were ready (Engram stalls).
+    #[serde(default)]
+    pub stall_decode_events: u64,
+    /// Decode consumer time spent waiting for those rows.
+    #[serde(default)]
+    pub stall_decode_ns: u64,
+    /// Rows decode gathers read themselves (not in the row cache).
+    #[serde(default)]
+    pub stall_decode_fallback_rows: u64,
+    /// Rows decode gathers waited for while another reader filled them.
+    #[serde(default)]
+    pub stall_decode_pending_rows: u64,
+    /// Gathers whose plain copy hit a slow (device-read) row and switched to the
+    /// residency split for the rest of the batch.
+    #[serde(default)]
+    pub copy_switches: u64,
 }
 
 impl TableStats {
@@ -1254,12 +1438,27 @@ impl TableStats {
         self.decode_steps.fetch_add(1, Ordering::Relaxed);
         self.decode_stall_ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
-    pub fn record_prefetch(&self, pages: usize) {
-        self.prefetch_jobs.fetch_add(1, Ordering::Relaxed);
-        self.prefetch_pages.fetch_add(pages as u64, Ordering::Relaxed);
+    /// A consumer that needed a layer's rows before they were ready (an Engram
+    /// stall), split by phase.
+    pub fn record_consumer_stall(&self, decode: bool, elapsed: Duration) {
+        let (events, ns) = if decode { (&self.stall_decode_events, &self.stall_decode_ns) }
+            else { (&self.stall_prefill_events, &self.stall_prefill_ns) };
+        events.fetch_add(1, Ordering::Relaxed);
+        ns.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
     }
-    pub fn record_prefetch_dropped(&self) {
-        self.prefetch_dropped.fetch_add(1, Ordering::Relaxed);
+    /// One gather's rows not already in the row cache: `fallback` it read itself,
+    /// `pending` it waited for while another reader filled them.
+    pub fn record_gather_misses(&self, decode: bool, fallback: usize, pending: usize) {
+        let (read, waited) = if decode { (&self.stall_decode_fallback_rows, &self.stall_decode_pending_rows) }
+            else { (&self.stall_prefill_fallback_rows, &self.stall_prefill_pending_rows) };
+        read.fetch_add(fallback as u64, Ordering::Relaxed);
+        waited.fetch_add(pending as u64, Ordering::Relaxed);
+    }
+    /// Rows a look-ahead read published; `piece` when it completed a piece's
+    /// share of this table (or a decode round's).
+    pub fn record_lookahead(&self, rows: usize, piece: bool) {
+        if piece { self.lookahead_pieces.fetch_add(1, Ordering::Relaxed); }
+        self.lookahead_rows.fetch_add(rows as u64, Ordering::Relaxed);
     }
 
     fn record_reads(&self, reads: uring::ReadStats, prefetch: bool) {
@@ -1327,9 +1526,6 @@ impl TableStats {
             minor_faults: get(&self.minor_faults),
             major_faults: get(&self.major_faults),
             input_blocks: get(&self.input_blocks),
-            prefetch_jobs: get(&self.prefetch_jobs),
-            prefetch_pages: get(&self.prefetch_pages),
-            prefetch_dropped: get(&self.prefetch_dropped),
             miss_histogram: std::array::from_fn(|i| get(&self.miss_histogram[i])),
             unclassified_rows: get(&self.unclassified_rows),
             unclassified_bytes: get(&self.unclassified_bytes),
@@ -1373,7 +1569,21 @@ impl TableStats {
             prefetch_residency_ns: get(&self.prefetch_residency_ns),
             prefetch_resident_copy_rows: get(&self.prefetch_resident_copy_rows),
             prefetch_late_major_faults: get(&self.prefetch_late_major_faults),
-
+            cache_hit_rows: get(&self.cache_hit_rows),
+            cache_wait_rows: get(&self.cache_wait_rows),
+            cache_denied_rows: get(&self.cache_denied_rows),
+            cache_evictions: get(&self.cache_evictions),
+            lookahead_rows: get(&self.lookahead_rows),
+            lookahead_pieces: get(&self.lookahead_pieces),
+            stall_prefill_events: get(&self.stall_prefill_events),
+            stall_prefill_ns: get(&self.stall_prefill_ns),
+            stall_prefill_fallback_rows: get(&self.stall_prefill_fallback_rows),
+            stall_prefill_pending_rows: get(&self.stall_prefill_pending_rows),
+            stall_decode_events: get(&self.stall_decode_events),
+            stall_decode_ns: get(&self.stall_decode_ns),
+            stall_decode_fallback_rows: get(&self.stall_decode_fallback_rows),
+            stall_decode_pending_rows: get(&self.stall_decode_pending_rows),
+            copy_switches: get(&self.copy_switches),
         }
     }
 }
@@ -1390,9 +1600,6 @@ impl TableStatsSnapshot {
             minor_faults: d(self.minor_faults, earlier.minor_faults),
             major_faults: d(self.major_faults, earlier.major_faults),
             input_blocks: d(self.input_blocks, earlier.input_blocks),
-            prefetch_jobs: d(self.prefetch_jobs, earlier.prefetch_jobs),
-            prefetch_pages: d(self.prefetch_pages, earlier.prefetch_pages),
-            prefetch_dropped: d(self.prefetch_dropped, earlier.prefetch_dropped),
             miss_histogram: std::array::from_fn(|i| d(self.miss_histogram[i], earlier.miss_histogram[i])),
             unclassified_rows: d(self.unclassified_rows, earlier.unclassified_rows),
             unclassified_bytes: d(self.unclassified_bytes, earlier.unclassified_bytes),
@@ -1436,7 +1643,21 @@ impl TableStatsSnapshot {
             prefetch_residency_ns: d(self.prefetch_residency_ns, earlier.prefetch_residency_ns),
             prefetch_resident_copy_rows: d(self.prefetch_resident_copy_rows, earlier.prefetch_resident_copy_rows),
             prefetch_late_major_faults: d(self.prefetch_late_major_faults, earlier.prefetch_late_major_faults),
-
+            cache_hit_rows: d(self.cache_hit_rows, earlier.cache_hit_rows),
+            cache_wait_rows: d(self.cache_wait_rows, earlier.cache_wait_rows),
+            cache_denied_rows: d(self.cache_denied_rows, earlier.cache_denied_rows),
+            cache_evictions: d(self.cache_evictions, earlier.cache_evictions),
+            lookahead_rows: d(self.lookahead_rows, earlier.lookahead_rows),
+            lookahead_pieces: d(self.lookahead_pieces, earlier.lookahead_pieces),
+            stall_prefill_events: d(self.stall_prefill_events, earlier.stall_prefill_events),
+            stall_prefill_ns: d(self.stall_prefill_ns, earlier.stall_prefill_ns),
+            stall_prefill_fallback_rows: d(self.stall_prefill_fallback_rows, earlier.stall_prefill_fallback_rows),
+            stall_prefill_pending_rows: d(self.stall_prefill_pending_rows, earlier.stall_prefill_pending_rows),
+            stall_decode_events: d(self.stall_decode_events, earlier.stall_decode_events),
+            stall_decode_ns: d(self.stall_decode_ns, earlier.stall_decode_ns),
+            stall_decode_fallback_rows: d(self.stall_decode_fallback_rows, earlier.stall_decode_fallback_rows),
+            stall_decode_pending_rows: d(self.stall_decode_pending_rows, earlier.stall_decode_pending_rows),
+            copy_switches: d(self.copy_switches, earlier.copy_switches),
         }
     }
     /// Fraction classified resident by NOWAIT or an approximate mincore snapshot.
@@ -1446,148 +1667,6 @@ impl TableStatsSnapshot {
         self.page_hits as f64 / rows as f64
     }
 
-}
-
-/// Anything whose rows can be advised as a unit (one table, or V4.1's paired
-/// weight and scale tables).
-pub trait AdviseRows: Send + Sync + 'static {
-    fn row_count(&self) -> u64;
-    /// Pages advised per member table, or None once `cancelled` is set
-    /// between tables. Advice already issued to the OS is harmless.
-    fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool) -> Result<Option<Vec<usize>>>;
-}
-
-impl AdviseRows for MappedTable {
-    fn row_count(&self) -> u64 {
-        self.rows()
-    }
-    fn advise(&self, rows: &[u64], max_pages: usize, cancelled: &AtomicBool) -> Result<Option<Vec<usize>>> {
-        if cancelled.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let pages = self.prefetch(rows, max_pages)?;
-        self.stats.record_prefetch(pages);
-        Ok(Some(vec![pages]))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TablePrefetchOutcome {
-    Cancelled,
-    /// Pages advised per member table.
-    Advised(Vec<usize>),
-}
-
-struct PrefetchJob {
-    table: Arc<dyn AdviseRows>,
-    rows: Vec<u64>,
-    cancelled: Arc<AtomicBool>,
-    completion: Option<mpsc::SyncSender<Result<TablePrefetchOutcome>>>,
-}
-
-/// Request-owned completion, independent of recycled scheduler slot numbers.
-/// Dropping it cancels queued work; advice already issued to the OS is harmless.
-pub struct TablePrefetchTicket {
-    cancelled: Arc<AtomicBool>,
-    completion: mpsc::Receiver<Result<TablePrefetchOutcome>>,
-}
-
-impl TablePrefetchTicket {
-    pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
-    }
-    pub fn wait(&self) -> Result<TablePrefetchOutcome> {
-        self.completion.recv().map_err(|_| MappedTableError::Stopped("table prefetch worker stopped"))?
-    }
-}
-
-impl Drop for TablePrefetchTicket {
-    fn drop(&mut self) {
-        self.cancel();
-    }
-}
-
-/// One worker and a bounded queue; submission never waits for disk or queue
-/// space. The row cap bounds job memory independently of page deduplication.
-pub struct TablePrefetcher {
-    sender: Option<mpsc::SyncSender<PrefetchJob>>,
-    worker: Option<JoinHandle<()>>,
-    max_rows: usize,
-}
-
-impl TablePrefetcher {
-    pub fn new(name: &str, queue_depth: usize, max_rows: usize, max_pages_per_table: usize) -> Result<Self> {
-        if queue_depth == 0 || max_rows == 0 || max_pages_per_table == 0 {
-            return Err(invalid("table prefetch capacities must be nonzero"));
-        }
-        let (sender, receiver) = mpsc::sync_channel::<PrefetchJob>(queue_depth);
-        let worker = thread::Builder::new()
-            .name(name.into())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    let result = job
-                        .table
-                        .advise(&job.rows, max_pages_per_table, &job.cancelled)
-                        .map(|pages| pages.map_or(TablePrefetchOutcome::Cancelled, TablePrefetchOutcome::Advised));
-                    if let Some(completion) = job.completion {
-                        let _ = completion.send(result);
-                    } else if let Err(error) = result {
-                        tracing::debug!(%error, "table prefetch advice failed");
-                    }
-                }
-            })
-            .map_err(|source| MappedTableError::Io { context: "starting table prefetch worker".into(), source })?;
-        Ok(Self { sender: Some(sender), worker: Some(worker), max_rows })
-    }
-
-    pub fn max_rows(&self) -> usize {
-        self.max_rows
-    }
-
-    fn job(&self, table: &Arc<dyn AdviseRows>, rows: &[u64]) -> Result<()> {
-        if rows.len() > self.max_rows {
-            return Err(invalid("table prefetch exceeds row capacity"));
-        }
-        if let Some(&row) = rows.iter().find(|&&row| row >= table.row_count()) {
-            return Err(MappedTableError::RowRange { row, rows: table.row_count() });
-        }
-        Ok(())
-    }
-
-    fn send(&self, job: PrefetchJob) -> Result<bool> {
-        match self.sender.as_ref().ok_or(MappedTableError::Stopped("table prefetcher stopped"))?.try_send(job) {
-            Ok(()) => Ok(true),
-            Err(mpsc::TrySendError::Full(_)) => Ok(false),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(MappedTableError::Stopped("table prefetch worker disconnected")),
-        }
-    }
-
-    /// None means backpressure: the caller may gather on demand or retry later.
-    pub fn try_submit(&self, table: Arc<dyn AdviseRows>, rows: &[u64]) -> Result<Option<TablePrefetchTicket>> {
-        self.job(&table, rows)?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let (completion, receiver) = mpsc::sync_channel(1);
-        let job = PrefetchJob { table, rows: rows.to_vec(), cancelled: cancelled.clone(), completion: Some(completion) };
-        Ok(self.send(job)?.then_some(TablePrefetchTicket { cancelled, completion: receiver }))
-    }
-
-    /// Fire-and-forget advice (rows past the row cap are truncated); false
-    /// when the queue was full and the advice was dropped.
-    pub fn submit_detached(&self, table: Arc<dyn AdviseRows>, rows: &[u64]) -> Result<bool> {
-        let rows = &rows[..rows.len().min(self.max_rows)];
-        self.job(&table, rows)?;
-        let job = PrefetchJob { table, rows: rows.to_vec(), cancelled: Arc::new(AtomicBool::new(false)), completion: None };
-        self.send(job)
-    }
-}
-
-impl Drop for TablePrefetcher {
-    fn drop(&mut self) {
-        self.sender.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
-    }
 }
 
 /// What a [`GatherPool`] gather did.
@@ -1741,6 +1820,8 @@ pub(crate) struct PreparedTableGather {
     stats: uring::ReadStats, output_len: usize, width: usize,
 }
 impl PreparedTableGather {
+    /// Rows that were not resident when the gather started.
+    pub(crate) fn misses(&self) -> usize { self.stats.misses as usize }
     pub(crate) fn step(&mut self, table: &MappedTable, output: &mut [u8]) -> Result<bool> {
         if output.len() != self.output_len || table.row_bytes() != self.width {
             return Err(invalid("prepared gather destination changed"));
@@ -1774,6 +1855,27 @@ impl PreparedTableGather {
     pub(crate) fn finish(mut self, table: &MappedTable, output: &mut [u8]) -> Result<()> {
         while !self.step(table, output)? {}
         Ok(())
+    }
+    /// Land whatever has completed without waiting for the device; true once
+    /// every row is in `output`.
+    pub(crate) fn poll(&mut self, table: &MappedTable, output: &mut [u8]) -> Result<bool> {
+        if let Some(stream) = &mut self.stream {
+            let failed = loop {
+                if stream.finished() { break None; }
+                match stream.try_step(output) {
+                    Ok(true) => continue,
+                    Ok(false) => return Ok(false),
+                    Err(error) => break Some(error),
+                }
+            };
+            if let Some(error) = failed {
+                // As in `step`: drain the stream, then copy every miss from the mapping.
+                drop(self.stream.take());
+                table.uring_fallback(&error);
+            }
+        }
+        // Finished: record its stats, or copy the misses after a failure.
+        self.step(table, output)
     }
 }
 

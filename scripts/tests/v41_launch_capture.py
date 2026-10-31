@@ -163,7 +163,9 @@ if tool == "docker":
                 artifact_requirements={"spark_tp_role": f"tp{tp}" if family == "deepseek_v41" and explicit_topology and tp != 4 else None},
                 speculator=value("--speculator"),
                 admission={"kv_pool_size": value("--kv-pool-size"), "memory_reservation": value("--memory-reservation")},
-                peers=value("--deployment-peers", "").split(",")[:int(ranks)])
+                peers=value("--deployment-peers", "").split(",")[:int(ranks)],
+                memory_layout={"devices": [{"kind": "rtx", "index": i, "items": [{"category": "weights", "bytes": 8 << 30}]}
+                                           for i in range(int(value("--rtx", "1")))]})
         print(json.dumps(response))
         sys.exit(0)
     if args and args[0] == "run" and "--entrypoint" in args and "python3" in args:

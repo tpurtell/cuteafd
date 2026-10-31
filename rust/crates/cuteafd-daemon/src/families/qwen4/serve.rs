@@ -246,7 +246,7 @@ fn prefix_cache<'e, 'a>(engine: &'e Qwen4Engine<'a>, args: &PrefixArgs, lanes: u
     tracing::info!(entries, mark_slots = family.slots(), mark_bytes = family.mark_bytes(), page_bytes = layout.page_bytes,
         pages = layout.pages, page_rows = layout.page_rows, kv_format = %engine.kv_format, host_bytes, points = ?args.points(),
         "Qwen 3.8 Flash Next prefix cache");
-    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+    cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, Some((layout.pages * layout.page_rows) as u64), layout.pages as u64,
         &format!("{} full-attention + BF16 index + GDN/PLE state", engine.kv_format), host_bytes);
     Ok((family, cache))
 }
@@ -364,9 +364,11 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         Ok(())
     }
     fn history(&self, placement: &Self::Placement) -> Self::History { placement.history.clone() }
-    fn prefetch(&self, tokens: &[u32], next: &[u32]) {
-        self.engine.prefetch_ple(&super::engine::history_of(&self.engine.cfg, tokens), next);
+    fn read_ahead(&self, placement: &Self::Placement, tokens: &[u32], resume: usize, chunk_ends: &[usize])
+        -> Option<cuteafd_loader::LookaheadHandle> {
+        self.engine.read_ahead_ple(&placement.history, tokens, resume, chunk_ends)
     }
+    fn prefetch_decode(&self, history: &[u32], tokens: &[u32]) { self.engine.prefetch_ple_decode(history, tokens); }
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, phase: &str) { self.engine.log_table_stats(phase); }
     fn prefill_device(&self, placement: &mut Self::Placement, tokens: &[u32], rows: usize,

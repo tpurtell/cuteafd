@@ -138,8 +138,7 @@ WORKER_LABEL = 'cuteafd.golden-run'
 DEFAULT_EXPERT_PORT = 19451  # beside serving's 19441, so a stray serving worker is detected, not reused
 DEFAULT_WORKER_BUDGET = 107374182400
 # Forwarded to the coordinator and every worker when set (as run-family.sh does).
-RDMA_ENV = ('CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP', 'CUTEAFD_VERBS_APP_IB_PORT_NUM',
-            'CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES')
+RDMA_ENV = ('CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP', 'CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES')
 
 
 def _load(name, path):

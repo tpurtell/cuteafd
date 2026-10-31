@@ -230,7 +230,7 @@ async fn run() -> Result<()> {
         Commands::Fabric(args) => {
             let report = cuteafd_transport::fabric::discover()?;
             let landings = shared::spark_intake::fabric_probe(args.native_lib.as_deref(), args.device,
-                args.landing_warmup, args.landing_repeats);
+                args.landing_warmup, args.landing_repeats, args.landing_peer);
             let landing = &landings[0];
             let p2p = args.p2p.then(|| shared::peer_probe::run(args.native_lib.as_deref(), &args.p2p_devices,
                 &args.p2p_bytes));

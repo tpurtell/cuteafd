@@ -64,7 +64,7 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         let config = PrefixConfig { entries: args.prefix_cache_entries, mark_slots: family.slots(),
             keep_logits: true, min_tokens: args.prefix_cache_min_tokens };
         let cache = PrefixCache::new_with_draft_pages(layout, config, host, family.draft_page_bytes())?;
-        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, layout.pages as u64,
+        cuteafd_bench::context::set_kv((layout.pages * layout.page_rows) as u64, self.engine.max_pool_tokens_no_onboard, layout.pages as u64,
             family.record_format(), host_bytes);
         Ok((family, cache))
     }
@@ -109,7 +109,6 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         !neural || saved.draft == Some((0, frontier))
     }
 
-    fn prefetch(&self, _tokens: &[u32], _next: &[u32]) {}
     fn require_live(&self) -> Result<()> { self.engine.require_live() }
     fn log_table_stats(&self, _phase: &str) {}
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize,

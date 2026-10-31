@@ -426,6 +426,18 @@ impl OfficialV41Catalog {
         Ok(bytes)
     }
 
+    /// Bytes of one Engram row as the row cache stores it (weight then scale),
+    /// from the checkpoint's own headers: 264 for FP8, 144 for NVFP4.
+    pub fn engram_row_bytes(&self) -> Result<usize> {
+        let layer = *self.config().text().engram_layer_ids.first().context("checkpoint has no engram layer")?;
+        if self.config().strided_engram() { return Ok(264); }
+        ["weight", "scale"].iter().try_fold(0, |sum, suffix| {
+            let metadata = &self.tensor(&format!("layers.{layer}.engram.embed.{suffix}"))?.metadata;
+            ensure!(metadata.shape.len() == 2, "engram tensor {suffix} is not 2-D");
+            Ok(sum + metadata.shape[1])
+        })
+    }
+
     /// # Safety
     /// Checkpoint files must remain immutable for the lifetime of the returned maps.
     pub unsafe fn map_engram(&self, layer: usize) -> Result<crate::EngramTable> {

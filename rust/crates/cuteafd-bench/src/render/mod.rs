@@ -112,8 +112,8 @@ mod tests {
                 engine_sent_bytes: Some(900_000_000), engine_received_bytes: Some(0),
                 health: Some(h.clone()), health_since_start: Some(h), mtu: Some(9000), ..Default::default() }], ..Default::default() }];
         let card = super::card::card_svg(&report);
-        assert!(card.contains("Fabric: peak retransmits 0.025% of packets"));
-        assert!(card.contains("results remain valid"));
+        assert!(!card.contains("Fabric: peak retransmits"));
+        assert!(!card.contains("results remain valid"));
         let report = super::report::report_svg(&report);
         // The report draws the port as a small multiple with its loss verdict.
         assert!(report.contains("Fabric during this run") && report.contains("retransmits 0.025%"));

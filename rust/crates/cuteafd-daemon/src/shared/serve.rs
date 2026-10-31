@@ -13,6 +13,25 @@ mod readiness_tests {
     }
 
     #[test]
+    fn every_family_publishes_kv_capacity_from_its_prefix_cache_path() {
+        for (family, source, start, end) in [
+            ("V4.1", include_str!("../families/deepseek_v41/v41_native_serve/scheduler.rs"), "pub(crate) fn publish_capacity(", "\n/// Occupancy"),
+            ("V4", include_str!("../families/deepseek_v4/serve.rs"), "\nfn prefix_cache<", "\nfn schedule("),
+            ("GLM", include_str!("../families/glm5/serve.rs"), "\nfn prefix_cache<", "\nfn schedule("),
+            ("GLM Flash", include_str!("../families/glm5_flash/serve.rs"), "\nfn prefix_cache<", "\nfn schedule("),
+            ("MiMo", include_str!("../families/mimo_v2/serve.rs"), "\nfn prefix_cache_with<", "\n/// Gives a finished"),
+            ("Qwen4", include_str!("../families/qwen4/serve.rs"), "\nfn prefix_cache<", "\nstruct Qwen4Backend"),
+            ("Kimi", include_str!("../families/kimi_k3/backend.rs"), "    fn prefix_cache(", "    fn prepare("),
+            ("Step-5", include_str!("../families/step5/backend.rs"), "    fn prefix_cache(", "    fn prepare("),
+            ("dense Qwen", include_str!("../families/qwen3_5/serve.rs"), "    fn prefix_cache(", "    fn prepare("),
+        ] {
+            let prefix = source.split_once(start).unwrap_or_else(|| panic!("{family} prefix path missing")).1
+                .split_once(end).unwrap_or_else(|| panic!("{family} prefix path end missing")).0;
+            assert!(prefix.contains("cuteafd_bench::context::set_kv("), "{family} must publish resolved KV capacity");
+        }
+    }
+
+    #[test]
     fn mimo_capacity_and_all_fallible_startup_precede_readiness() {
         let source = include_str!("../families/mimo_v2/serve.rs");
         callback_follows_scheduler(source);

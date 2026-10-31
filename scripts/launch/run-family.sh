@@ -83,15 +83,15 @@ case "$(get CONSOLE_ASSETS off)" in
   off) ;;
   *) release_die "CONSOLE_ASSETS must be on or off" ;;
 esac
-# Owner-indexed plans name entry/head first; CDI exposes physical device order.
-dual_owner_media_device() {
-  local mode="$1" entry_device="$2" peer_device="$3"
-  case "$mode" in
-    rtx:0) printf 'rtx:%s' "$entry_device" ;;
-    rtx:1) printf 'rtx:%s' "$peer_device" ;;
-    rtx:*) release_die "dual encoder owner must be 0 or 1" ;;
-    *) printf '%s' "$mode" ;;
-  esac
+# release_coordinator_device_args UUID...: the coordinator container's GPUs for
+# every family. CUDA_VISIBLE_DEVICES lists them in logical order, primary first,
+# so CUDA ordinal N is logical GPU N (entry/head and V4.1's larger ownership
+# share on 0) whatever the host order, and plans' rtx:N owners need no mapping.
+release_coordinator_device_args() {
+  local csv
+  csv="$(IFS=,; printf '%s' "$*")"
+  cuteafd_cdi_gpu_args "$csv" || exit 2
+  RELEASE_COORDINATOR_DEVICE_ARGS=("${CUTEAFD_CDI_ARGS[@]}" -e "CUDA_VISIBLE_DEVICES=$csv")
 }
 # key NEW OLD [DEFAULT]: a renamed key; the pre-rename spelling works for one
 # release with a warning.
@@ -146,7 +146,6 @@ WIP_ROOT
 SPECULATOR
 EMBEDDING
 COORDINATOR_GPUS
-COORDINATOR_GPU
 CONCURRENCY
 DECODE_LANES
 DECODE_SHARE
@@ -247,7 +246,6 @@ SPARK_EXPERT_DOCKER_INFERENCE
 SPARK_EXPERT_DOCKER_DEV
 EXPERT_PORT
 SPARK_DEVICE_BUDGET_BYTES
-COORDINATOR_SPLIT_GPU
 MAX_CONTEXT_TOKENS
 RTX_EXPERT_LAYERS
 PROBE_DUMP_ROOT
@@ -448,11 +446,9 @@ CONSOLE_ASSETS
 CONSOLE_TEXT
 COORDINATOR_DOCKER_DEV
 COORDINATOR_DOCKER_INFERENCE
-COORDINATOR_GPU
+COORDINATOR_GPUS
 COORDINATOR_GPU_BUDGET_GIB
 COORDINATOR_GPU_HEADROOM_GIB
-COORDINATOR_GPU_PCI_BUS_ID
-COORDINATOR_GPU_UUID
 CUDA_MODULE_LOADING
 DRAFT_POLICY
 DRAFT_ROW_COST
@@ -1000,7 +996,10 @@ docker image inspect "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 ||
   release_die "coordinator image is missing: $COORDINATOR_DOCKER_INFERENCE (pull the published pair, or build it with a config whose COORDINATOR_DOCKER_INFERENCE names this tag)"
 hf_home="${HF_HOME:-$namespace_root/hf-home}"
 release_resolve_local_model_revision "$hf_home"
-release_resolve_coordinator_gpu_identity
+# COORDINATOR_GPUS (ordered, primary first) or the lowest-index GPU is logical
+# GPU 0; with an explicit pair, the selection below checks that pair and never
+# substitutes the free-memory pick.
+release_resolve_coordinator_gpus "$COORDINATOR_GPUS" "$RTX_GPUS"
 profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
 profile="$(release_coordinator_profile "$profile_bytes" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
@@ -1016,12 +1015,8 @@ snapshot_rel="hub/models--${RELEASE_MODEL_ID//\//--}/snapshots/$RELEASE_MODEL_RE
 coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
 [[ "$TP2_DSPARK_EXPERTS" != on || "$SPECULATOR" == dspark ]] || release_die "TP2_DSPARK_EXPERTS requires dSpark"
 
-reclaim_args=()
-if ((restart)) && docker container inspect "$coordinator" >/dev/null 2>&1; then
-  while IFS= read -r pid; do
-    [[ "$pid" =~ ^[0-9]+$ ]] && reclaim_args+=(--reclaim-pid "$pid")
-  done < <(docker top "$coordinator" -eo pid 2>/dev/null | tail -n +2 || true)
-fi
+RELEASE_RECLAIM_ARGS=()
+((restart == 0)) || release_coordinator_reclaim_args "$coordinator"
 minimum_expert_layers=1
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" == 0 ]] || minimum_expert_layers="$RTX_EXPERT_LAYERS"
 expert_format=native
@@ -1046,21 +1041,23 @@ if ((topology_explicit)) && [[ "$RTX_EXPERT_LAYERS" == auto ]]; then
   ((minimum_expert_layers >= topology_min_layers)) || minimum_expert_layers="$topology_min_layers"
 fi
 gpu_selection_mode="$RTX_GPUS"
-if [[ "$gpu_selection_mode" == auto ]] && python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
+# A 32 GB card serves V4.1 alone unless COORDINATOR_GPUS names the pair.
+if [[ "$gpu_selection_mode" == auto && "$COORDINATOR_GPUS" != *,* ]] &&
+  python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
   gpu_selection_mode=1
 fi
 compact_selection_args=()
-gpu_selection="$(python3 "$repo_root/scripts/launch/select-release-gpus.py" \
+gpu_selection="$(python3 "$repo_root/scripts/lib/coordinator-gpus.py" select \
+  --selectors "$COORDINATOR_GPUS" \
   --mode "$gpu_selection_mode" \
   --minimum-expert-layers "$minimum_expert_layers" \
-  --primary-uuid "$RELEASE_COORDINATOR_GPU_UUID" \
   --concurrency "$CONCURRENCY" \
   --max-context-tokens "$MAX_CONTEXT_TOKENS" \
   --retained-turns "$PREFIX_CACHE_ENTRIES" \
   --kv-pool-size "$KV_POOL_SIZE" \
   --memory-reservation "$MEMORY_RESERVATION" \
   --expert-format "$expert_format" \
-  "${compact_selection_args[@]}" "${reclaim_args[@]}")"
+  "${compact_selection_args[@]}" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"})" || exit 2
 RELEASE_RTX_GPUS="$(jq -r '.count' <<<"$gpu_selection")"
 ((SPARK_COUNT != 0 || RELEASE_RTX_GPUS == 2)) || release_die "SPARK_COUNT=0 requires two selected RTX GPUs"
 if release_tp2_enabled; then
@@ -1074,7 +1071,7 @@ gpu_index_csv="$(IFS=,; echo "${release_gpu_indices[*]}")"
 gpu_pci_csv="$(IFS=,; echo "${release_gpu_pci[*]}")"
 # The runtime solver, not launch-time estimates, selects and admits Spark owners.
 spark_admission="coordinator-authoritative typed admission"
-cuteafd_cdi_gpu_args "$gpu_uuid_csv" || exit 2
+release_coordinator_device_args "${release_gpu_uuids[@]}"
 
 sparkinfer_commit="$(python3 "$repo_root/scripts/build/verify-sparkinfer-source.py" --source "$repo_root/third_party/sparkinfer" --lock "$repo_root/third_party/sparkinfer.lock.json" --print-revision)"
 wip_layout=""
@@ -1142,6 +1139,7 @@ count_plan="$(docker run --rm --network none "${count_mounts[@]}" "$COORDINATOR_
   --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --host-cache-bytes "$HOST_CACHE_BYTES" \
   --spark-budget-gib "$(python3 -c "print($SPARK_DEVICE_BUDGET_BYTES / 2**30)")")"
 release_validate_deployment "$count_plan" deepseek_v41
+release_admit_coordinator_gpus "$gpu_uuid_csv" "$count_plan" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
 resolved_decode_lanes="$(jq -er ' .decode_lanes | select(. == 2)' <<<"$count_plan")" ||
   release_die "DeepSeek V4.1 deployment requires two decode lanes"
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
@@ -1326,7 +1324,7 @@ if ((SPARK_COUNT == 0)); then
 else
   peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
 fi
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "$MEMORY_RESERVATION" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "$SPECULATOR" "$DSPARK_DRAFT_POLICY" "${DRAFT_SURVIVAL_LENGTHS:-off}"${DRAFT_POLICY:+ "draft-policy=$DRAFT_POLICY"}${DRAFT_ROW_COST:+ "draft-row-cost=$DRAFT_ROW_COST"} "${dspark_draft_limit:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "$SPARK_DEVICE_BUDGET_BYTES" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-topology=${spark_tp}x${spark_ep}:explicit=${topology_explicit}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1360,7 +1358,6 @@ if ((dry_run)); then
   echo "  prefill batch tokens: $PREFILL_BATCH_TOKENS; expert capacity: $expert_capacity"
   echo "  dSpark draft: policy=$DSPARK_DRAFT_POLICY limit=${dspark_draft_limit:-5}"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" ]] || echo "  RDMA device map: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP"
-  [[ -z "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" ]] || echo "  RDMA IB port: $CUTEAFD_VERBS_APP_IB_PORT_NUM"
   [[ -z "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" ]] || echo "  RDMA execution lanes: $CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES"
   echo "  release identity: $fingerprint"
   exit 0
@@ -1411,7 +1408,7 @@ case "${RDMA_BOND_BALANCE:-off}" in
   labels|probe) rdma_env_args+=(-e "CUTEAFD_RDMA_BOND_BALANCE=$RDMA_BOND_BALANCE") ;;
   *) release_die "RDMA_BOND_BALANCE must be off, labels or probe" ;;
 esac
-for rdma_env_name in CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP CUTEAFD_VERBS_APP_IB_PORT_NUM CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
+for rdma_env_name in CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES; do
   [[ -n "${!rdma_env_name:-}" ]] && rdma_env_args+=(-e "$rdma_env_name=${!rdma_env_name}")
 done
 
@@ -1487,9 +1484,8 @@ if ((topology_explicit)); then
   args+=(--spark-tp "$spark_tp" --spark-ep "$spark_ep")
 fi
 release_serving_docker_args
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
-  -e "CUDA_VISIBLE_DEVICES=$gpu_uuid_csv" \
   -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=${RUST_LOG:-info}" \
   -e "CUTEAFD_V41_IMAGE_ADMISSIONS=${CUTEAFD_V41_IMAGE_ADMISSIONS:-2}" \
   "${rdma_env_args[@]}" "${bench_nonce_env_args[@]}" "${trace_args[@]}" "${graph_census_args[@]}" ${profile_args[@]+"${profile_args[@]}"} \
@@ -1506,7 +1502,7 @@ for i in "${!hosts[@]}"; do
   host="${hosts[$i]}"; remote="${spark_prefix}-${host}-${EXPERT_PORT}"
   # ssh joins its arguments into one remote command line, which drops empty
   # arguments and shifts every later position; quote each one explicitly.
-  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_VERBS_APP_IB_PORT_NUM:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
+  remote_args=("$SPARK_EXPERT_DOCKER_INFERENCE" "$remote" "$i" "$SPARK_DEVICE_BUDGET_BYTES" "$EXPERT_PORT" "$snapshot_rel" "$fingerprint" "$SPARK_COUNT" "$topology_explicit" "$spark_tp" "$spark_ep" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${RUST_LOG:-info}" "${WIP_LAYOUT_SLOT:-${wip_slot:-__none__}}")
   if ((encoder_rank >= 0)); then
     remote_args+=("$encoder_rank" "$encoder_port" "$encoder_hash" "$RELEASE_MODEL_REVISION")
   fi
@@ -1530,15 +1526,15 @@ topology_explicit="$9"; topology_tp="${10}"; topology_ep="${11}"
 topology_args=()
 [[ "$topology_explicit" != 1 ]] || topology_args=(--spark-tp "$topology_tp" --spark-ep "$topology_ep")
 # Optional RDMA tuning, forwarded only when the operator set it.
-rdma_env="${12:-}"; ib_port="${13:-}"; execution_lanes="${14:-}"
+rdma_env="${12:-}"; execution_lanes="${13:-}"
 # The operator's RUST_LOG reaches the worker too (a quoted heredoc does not
 # see the caller's environment).
-rust_log="${15:-info}"
-wip_slot="${16:-__none__}"
+rust_log="${14:-info}"
+wip_slot="${15:-__none__}"
 wip_layout_slot="$wip_slot"
 encoder_args=()
-if [[ "$rank" == "${17:--1}" ]]; then
-  encoder_args=(--encoder --encoder-listen "0.0.0.0:${18}" --encoder-plan-hash "${19}" --encoder-revision "${20}" --encoder-max-tokens 1024)
+if [[ "$rank" == "${16:--1}" ]]; then
+  encoder_args=(--encoder --encoder-listen "0.0.0.0:${17}" --encoder-plan-hash "${18}" --encoder-revision "${19}" --encoder-max-tokens 1024)
 fi
 wip_args=()
 if [[ "$wip_slot" != __none__ ]]; then
@@ -1566,7 +1562,6 @@ for ((profile_at = 0; profile_at + 1 < ${#profile_args[@]}; profile_at++)); do
 done
 rdma_args=()
 [[ -z "$rdma_env" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")
-[[ -z "$ib_port" ]] || rdma_args+=(-e "CUTEAFD_VERBS_APP_IB_PORT_NUM=$ib_port")
 [[ -z "$execution_lanes" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES=$execution_lanes")
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
 # A fixed INFO default makes the worker's structured startup evidence
@@ -1909,9 +1904,23 @@ esac
 draft_args=()
 embedding="$(get EMBEDDING gpu)"
 default_context=0
-profile_gpu="$(get COORDINATOR_GPUS "$(get COORDINATOR_GPU 0)")"; profile_gpu="${profile_gpu%%,*}"
-profile_uuid="$(nvidia-smi -i "$profile_gpu" --query-gpu=uuid --format=csv,noheader,nounits)"
-profile_bytes="$(release_cuda_total_bytes "$profile_uuid")" || release_die "cannot query coordinator CUDA capacity"
+# Coordinator GPUs (the shared resolution V4.1 uses too): COORDINATOR_GPUS names
+# one or two, primary first; unset takes the lowest-index GPU, plus the next for a
+# two-GPU layout. RTX_GPUS and COORDINATOR_SPLIT say how many a launch asks for;
+# COORDINATOR_SPLIT=off serves from the first alone.
+rtx_gpus="$(get RTX_GPUS auto)"
+case "$rtx_gpus" in auto|1|2) ;; *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;; esac
+split="$(get COORDINATOR_SPLIT auto)"
+case "$split" in auto|heads|off) ;; *) echo "COORDINATOR_SPLIT must be auto, heads or off" >&2; exit 2 ;; esac
+explicit_coordinator_gpus="$(get COORDINATOR_GPUS)"
+coordinator_gpu_count=auto
+if [[ "$split" != off ]]; then
+  if [[ "$rtx_gpus" == 2 || "$split" == heads ]]; then coordinator_gpu_count=2
+  elif [[ "$rtx_gpus" == 1 ]]; then coordinator_gpu_count=1
+  fi
+fi
+release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
+profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || release_die "cannot query coordinator CUDA capacity"
 profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 [[ "$family" != qwen3_5 ]] || default_concurrency=4
@@ -2238,45 +2247,18 @@ budget_default=107374182400
 budget="$(get SPARK_DEVICE_BUDGET_BYTES "$budget_default")"
 spark_budget_args=()
 [[ -z "$budget" ]] || spark_budget_args=(--spark-budget-gib "$(python3 -c 'import sys;print(int(sys.argv[1])/2**30)' "$budget")")
-gpu="$(get COORDINATOR_GPU 0)"
-# Two coordinator GPUs (RTX_GPUS=auto/2 with COORDINATOR_GPU as V4.1's two-RTX config picks
-# the other card, or an explicit COORDINATOR_GPUS=0,1): families with a
-# head split (MiMo V2 Flash/Pro, GLM 5.x, GLM 5.3 Flash, DeepSeek V4) split every layer's
+# Two coordinator GPUs (resolved above, primary first): families with a head
+# split (MiMo V2 Flash/Pro, GLM 5.x, GLM 5.3 Flash, DeepSeek V4) split every layer's
 # attention heads and dense / shared-expert MLPs over both by default (COORDINATOR_SPLIT=auto
 # or heads), one hidden all-reduce per layer over peer memory; experts, router, head and
-# drafter stay on the first GPU. COORDINATOR_SPLIT=off serves from the first GPU alone. Auto
+# drafter stay on the primary. COORDINATOR_SPLIT=off serves from the primary alone. Auto
 # selection uses one GPU for checkpoints without a split and for splits that are opt-in
 # (`split_opt_in`: measured not to pay at the reference layouts); an explicit split request
 # (RTX_GPUS=2, COORDINATOR_GPUS=a,b or COORDINATOR_SPLIT=heads) fails before containers
-# start when the checkpoint has none. The container sees both GPUs in host order.
-# COORDINATOR_SPLIT_GPU names the second GPU when only
-# COORDINATOR_GPU is set (default the other of 0/1).
-rtx_gpus="$(get RTX_GPUS auto)"
-case "$rtx_gpus" in auto|1|2) ;; *) echo "RTX_GPUS must be auto, 1 or 2" >&2; exit 2 ;; esac
-physical_gpus="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | tr -d ' ' || true)"
-coordinator_gpus="$(get COORDINATOR_GPUS)"
-explicit_coordinator_gpus="$coordinator_gpus"
-if [[ -z "$coordinator_gpus" ]]; then
-  coordinator_gpus="$gpu"
-  case "$rtx_gpus" in
-    1) ;;
-    2|auto)
-      other="$(awk -v first="$gpu" '/^[0-9]+$/ && $0 != first {print; exit}' <<<"$physical_gpus")"
-      [[ -z "$other" ]] || coordinator_gpus="$gpu,$other" ;;
-  esac
-fi
-[[ "$coordinator_gpus" =~ ^[0-9]+(,[0-9]+)?$ ]] ||
-  { echo "COORDINATOR_GPUS must name one or two GPU indices" >&2; exit 2; }
-IFS=, read -r -a coordinator_gpus <<<"$coordinator_gpus"
-gpu="${coordinator_gpus[0]}"
-split="$(get COORDINATOR_SPLIT auto)"
-case "$split" in auto|heads|off) ;; *) echo "COORDINATOR_SPLIT must be auto, heads or off" >&2; exit 2 ;; esac
+# start when the checkpoint has none.
+gpu="${RELEASE_COORDINATOR_GPU_INDICES[0]}"
 second=""
-if [[ ${#coordinator_gpus[@]} -ge 2 ]]; then
-  second="${coordinator_gpus[1]}"
-elif [[ "$split" == heads ]]; then
-  second="$(get COORDINATOR_SPLIT_GPU $((1 - gpu)))"
-fi
+((${#RELEASE_COORDINATOR_GPU_INDICES[@]} < 2)) || second="${RELEASE_COORDINATOR_GPU_INDICES[1]}"
 explicit_split=0
 if [[ "$rtx_gpus" == 2 || "$explicit_coordinator_gpus" == *,* || "$split" == heads ]]; then
   explicit_split=1
@@ -2306,25 +2288,18 @@ if [[ "$split" != off && "$explicit_split" == 1 ]]; then
   [[ -n "$second" ]] ||
     { echo "RTX_GPUS=2 requires two physical coordinator GPUs; only GPU $gpu was selected" >&2; exit 2; }
 fi
-gpus="$gpu"
+coordinator_uuids=("$RELEASE_COORDINATOR_GPU_UUID")
 head_split=0
 if [[ -n "$second" && "$split" != off ]]; then
-  [[ "$second" =~ ^[0-9]+$ ]] || { echo "COORDINATOR_SPLIT_GPU must be a GPU index" >&2; exit 2; }
-  [[ "$second" != "$gpu" ]] || { echo "the second coordinator GPU must differ from the first" >&2; exit 2; }
   if [[ -z "$split_hint" ]]; then
     if [[ "$family" == qwen4 ]]; then
       family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS all)")
       [[ "$attention_placement" != heads ]] || release_die "Qwen dual owns whole layers; head-split attention is not implemented"
       attention_placement=layers
     fi
-    for selected in "$gpu" "$second"; do
-      grep -qx "$selected" <<<"$physical_gpus" ||
-        { echo "two-GPU head split requires physical GPU $selected, but nvidia-smi did not report it" >&2; exit 2; }
-    done
-    lower=$((gpu < second ? gpu : second)) upper=$((gpu < second ? second : gpu))
-    gpus="$lower,$upper"
+    coordinator_uuids=("${RELEASE_COORDINATOR_GPU_UUIDS[@]:0:2}")
     head_split=1
-    family_args+=(--device $((gpu == lower ? 0 : 1)) --split-device $((gpu == lower ? 1 : 0)))
+    family_args+=(--device 0 --split-device 1)
   elif [[ "$explicit_split" != 1 ]]; then
     echo "note: $family ($model_type) has no head split; auto selected GPU $gpu alone" >&2
   fi
@@ -2795,6 +2770,10 @@ audio_encoder_hash=""
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
   release_validate_deployment "$plan_json" "$family"
+  RELEASE_RECLAIM_ARGS=()
+  ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"
+  release_admit_coordinator_gpus "$(IFS=,; printf '%s' "${coordinator_uuids[*]}")" "$plan_json" \
+    ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"}
   selected_ranks="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["spark_ranks"])' <<<"$plan_json")"
   if ((count_explicit)) || [[ "$backend" == local ]]; then
     [[ "$selected_ranks" == "$ranks" ]] || release_die "planner changed exact Spark count $ranks to $selected_ranks"
@@ -2871,9 +2850,6 @@ elif kind=="off": print("off",h,"-",cap)
 else: raise ValueError("idle-host launch needs an explicit inventory")
 ' "$family" <<<"$plan_json")"
   read -r vision encoder_hash rank_csv encoder_max_tokens <<<"$selected"
-  if [[ "$head_split" == 1 ]]; then
-    vision="$(dual_owner_media_device "$vision" "$((gpu == lower ? 0 : 1))" "$((gpu == lower ? 1 : 0))")"
-  fi
   if [[ "$vision" == spark:* ]]; then
     IFS=, read -r -a encoder_ranks <<<"$rank_csv"
     for encoder_rank in "${encoder_ranks[@]}"; do
@@ -2898,9 +2874,6 @@ elif kind=="off" and sys.argv[1]=="auto":
 else: raise ValueError("enabled audio has no launchable admitted owner")
 ' "$audio" <<<"$plan_json")"
     read -r audio audio_encoder_hash audio_rank_csv <<<"$selected_audio"
-    if [[ "$head_split" == 1 ]]; then
-      audio="$(dual_owner_media_device "$audio" "$((gpu == lower ? 0 : 1))" "$((gpu == lower ? 1 : 0))")"
-    fi
     if [[ "$audio" == spark:* ]]; then
       IFS=, read -r -a audio_encoder_ranks <<<"$audio_rank_csv"
       for audio_rank in "${audio_encoder_ranks[@]}"; do
@@ -3087,12 +3060,12 @@ for key in CUTEAFD_TP2_EXCHANGE CUTEAFD_ROUTE_CHECK; do
   [[ -z "${!key:-}" ]] || tp2_env_args+=(-e "$key=${!key}")
 done
 release_serving_docker_args
-cuteafd_cdi_gpu_args "$gpus" || exit 2
+release_coordinator_device_args "${coordinator_uuids[@]}"
 context_args=(--max-context "$(get MAX_CONTEXT_TOKENS "$default_context")")
 [[ "$family" != qwen3_5 ]] || context_args=()
 # Kimi K3 and Step-5: unset keeps the serve command's own context extent.
 ((text_family == 0)) || [[ -n "$(get MAX_CONTEXT_TOKENS)" ]] || context_args=()
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host \
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart no "${RELEASE_COORDINATOR_DEVICE_ARGS[@]}" --network host --ipc host \
   --security-opt "seccomp=$repo_root/docker/seccomp-code-bench.json" \
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \

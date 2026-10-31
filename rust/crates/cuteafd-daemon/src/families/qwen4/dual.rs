@@ -107,7 +107,7 @@ impl Opened {
             "Qwen dual selectable weight residency disagrees with admission");
         let ple = match self.cfg.ple_layers.first().copied().filter(|&layer| layer < layers) {
             Some(layer) => Some(devices[owners[layer]].run(|| ple::PleTable::load(&self.library, &self.checkpoint,
-                &self.cfg, layer, &args.table, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
+                &self.cfg, layer, args.prefill_rows, 1, engine::DECODE_ROWS))?), None => None,
         };
         // Load the independent full-width draft before the target halves, with
         // its admitted arena rather than a post-allocation free-memory guess.

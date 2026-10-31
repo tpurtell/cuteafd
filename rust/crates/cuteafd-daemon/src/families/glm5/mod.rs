@@ -1138,6 +1138,7 @@ impl Opened {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv))?;
+        engine.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
         engine.exlr8_prefill_activations = args.exlr8_prefill_activations;
         engine.native_experts = native_owners;
         engine.spark_bf16 = spark_bf16;

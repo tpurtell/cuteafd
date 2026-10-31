@@ -442,13 +442,13 @@ pub fn interval(name: &str, timed: bool, before: &Snapshot, after: &Snapshot) ->
 }
 
 pub fn health_header(phases: &[Phase]) -> Option<String> {
-    let states: Vec<_> = phases.iter().filter(|p| p.timed).flat_map(|p| &p.ports).filter_map(|p| p.health.as_ref()).collect();
-    if states.is_empty() && phases.iter().all(|p| p.health.is_empty()) { return None; }
-    let peak = states.iter().filter(|h| h.retransmit_judged).filter_map(|h| h.retransmit_pct).reduce(f64::max);
-    Some(match peak {
-        Some(peak) => format!("Fabric: peak retransmits {} of packets; results remain valid", cuteafd_transport::fabric_health::pct(Some(peak))),
-        None => "Fabric: retransmit rate unavailable or too little traffic; results remain valid".into(),
-    })
+    use cuteafd_transport::fabric_health::{pct, RETRANSMIT_WARN_PCT};
+    let peak = phases.iter().filter(|p| p.timed).flat_map(|p| &p.ports)
+        .filter_map(|p| p.health.as_ref()).filter(|h| h.retransmit_judged)
+        .filter_map(|h| h.retransmit_pct).filter(|&rate| rate > RETRANSMIT_WARN_PCT)
+        .reduce(f64::max)?;
+    Some(format!("Fabric: peak retransmits {} of packets (above {})",
+        pct(Some(peak)), pct(Some(RETRANSMIT_WARN_PCT))))
 }
 
 pub fn header(phases: &[Phase]) -> Option<String> {
@@ -644,13 +644,35 @@ mod tests {
         let json = serde_json::to_value(&phase).unwrap();
         // 600 gaps over 10 GB at a 4 KB RoCE MTU: 0.025% of packets.
         assert_eq!(json["ports"][0]["health"]["retransmit_events"], 600);
-        assert!(health_header(&[phase]).unwrap().contains("peak retransmits 0.025% of packets"));
+        assert_eq!(health_header(&[phase]), None);
         after.hosts.get_mut("spark").unwrap().ports[0].counters.insert("hw_counters/np_ecn_marked_roce_packets".into(), 0);
         let phase = interval("decode", true, &before, &after);
         assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Ok);
         assert!(!caveats(&[phase]).iter().any(|s| s.contains("retransmits")));
         assert!(caveats(&[interval("warmup", false, &before, &after)]).is_empty());
     }
+    #[test]
+    fn health_header_only_shows_judged_timed_retransmit_warnings() {
+        use cuteafd_transport::fabric_health::{Health, Verdict, RETRANSMIT_WARN_PCT};
+        let mut phase = Phase { timed: true, ports: vec![Port { health: Some(Health {
+            verdict: Verdict::Warn, retransmit_pct: Some(1.2), retransmit_judged: true,
+            ..Default::default()
+        }), ..Default::default() }], ..Default::default() };
+        assert_eq!(health_header(&[phase.clone()]).as_deref(),
+            Some("Fabric: peak retransmits 1.2% of packets (above 0.5%)"));
+        phase.timed = false;
+        assert_eq!(health_header(&[phase.clone()]), None);
+        phase.timed = true;
+        phase.ports[0].health.as_mut().unwrap().retransmit_judged = false;
+        assert_eq!(health_header(&[phase.clone()]), None);
+        let health = phase.ports[0].health.as_mut().unwrap();
+        health.retransmit_judged = true;
+        health.retransmit_pct = Some(RETRANSMIT_WARN_PCT);
+        health.verdict = Verdict::Ok;
+        assert_eq!(health_header(&[phase]), None);
+        assert_eq!(health_header(&[]), None);
+    }
+
     #[test]
     fn coordinator_host_load_flags_pressure_and_reclaim() {
         use cuteafd_transport::traffic::HostLoad as Sample;
@@ -704,7 +726,7 @@ mod tests {
         for phase in [interval("x", true, &before, &after), interval("x", true, &before, &Snapshot::default())] {
             assert_eq!(phase.health["spark"], cuteafd_transport::fabric_health::Verdict::Unknown);
             assert_eq!(phase.ports[0].sent_bytes, None);
-            assert!(health_header(&[phase]).unwrap().contains("unavailable"));
+            assert_eq!(health_header(&[phase]), None);
         }
     }
 

@@ -132,7 +132,13 @@ pub(crate) trait Backend<'a> {
     }
     fn needs_snapshot_filter(&self, _neural: bool) -> bool { false }
     fn snapshot_compatible(&self, _saved: &Self::Meta, _frontier: usize, _neural: bool) -> bool { true }
-    fn prefetch(&self, tokens: &[u32], next: &[u32]);
+    /// Start reading a prompt's token-table rows ahead of its prefill:
+    /// `tokens[resume..]` in chunks ending at `chunk_ends` (the scheduler's
+    /// plan), from admission on. The handle's commits move its window.
+    fn read_ahead(&self, _placement: &Self::Placement, _tokens: &[u32], _resume: usize, _chunk_ends: &[usize])
+        -> Option<cuteafd_loader::LookaheadHandle> { None }
+    /// Read the table rows `tokens` add after `history` as soon as they are known.
+    fn prefetch_decode(&self, _history: &[u32], _tokens: &[u32]) {}
     fn require_live(&self) -> Result<()>;
     fn log_table_stats(&self, phase: &str);
     // Family write validation uses the actual cache pool after admission/COW.
@@ -332,6 +338,8 @@ struct Prefill<'a, P, D> {
     first: Option<u32>,
     prompt_row: Option<Vec<f32>>,
     started: Instant,
+    /// The prompt's table rows being read ahead; commits follow `done`.
+    ahead: Option<cuteafd_loader::LookaheadHandle>,
     /// Seconds in this prompt's chunks, and their engine phases.
     busy: f64,
     phases: [f64; 2],
@@ -658,12 +666,6 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
     let timer = Instant::now();
     let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
     let counts = group.iter().zip(&ends).map(|(p, end)| end - p.done).collect::<Vec<_>>();
-    for (p, &end) in group.iter().zip(&ends) {
-        if end < p.tokens.len() {
-            let next = p.plan.chunks.get(p.chunks + 1).copied().unwrap_or(p.tokens.len());
-            engine.prefetch(&p.tokens[..end], &p.tokens[end..next]);
-        }
-    }
     let caching = cache.enabled();
     let (result, phases) = isolated_phases(engine.profile(), || {
         let mut sequences = Vec::with_capacity(group.len());
@@ -703,6 +705,7 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
     group.iter_mut().zip(&ends).zip(&counts).zip(row_shares(&counts)).zip(outcomes)
         .map(|((((p, &end), &count), share), outcome)| {
             p.done = end;
+            if let Some(ahead) = &p.ahead { ahead.commit(end as u64); }
             p.cancelled = p.job.events.is_closed();
             add_phases(&mut p.phases, phases.map(|seconds| seconds * share));
             p.busy += elapsed * share;
@@ -955,14 +958,12 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let plan = if let Some(probe) = job.probe.as_ref().filter(|p| !p.spec.cold_steps.is_empty()) {
                 PointPlan { chunks: probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new() }
             } else if logits.is_some() { PointPlan::default() } else { plan };
-            // Family table reads for the first chunk overlap earlier work.
-            if logits.is_none() {
-                let end = plan.chunks.first().copied().unwrap_or(tokens.len());
-                engine.prefetch(&tokens[..resume], &tokens[resume..end]);
-            }
+            // Family table rows for the whole prompt are read from admission
+            // on, in the plan's chunks, overlapping earlier members' work.
+            let ahead = if logits.is_none() { engine.read_ahead(&placement, &tokens, resume, &plan.chunks) } else { None };
             prefills.push(Prefill { job, constraint, tokens, keys, done: resume, resume, plan, chunks: 0, cancelled: false,
                 placement, capacity, seq, logits, first: None, prompt_row: None,
-                started: Instant::now(), busy: 0.0, phases: [0.0; 2], id: admissions, ticket });
+                started: Instant::now(), ahead, busy: 0.0, phases: [0.0; 2], id: admissions, ticket });
         }
         if prefills.due(!active.is_empty()) {
             let caching = cache.enabled();
@@ -987,11 +988,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 let timer = Instant::now();
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
-                // Family table reads for the next chunk overlap this one.
-                if end < p.tokens.len() {
-                    let next = p.plan.chunks.get(p.chunks + 1).copied().unwrap_or(p.tokens.len());
-                    engine.prefetch(&p.tokens[..end], &p.tokens[end..next]);
-                }
+                // Its demand gathers own the running chunk from here on.
+                if let Some(ahead) = &p.ahead { ahead.running(); }
                 let (result, phases) = isolated_phases(engine.profile(), || -> Result<()> {
                     let start = p.placement.len();
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
@@ -1028,6 +1026,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     Ok(())
                 });
                 p.done += chunk.len();
+                if let Some(ahead) = &p.ahead { ahead.commit(p.done as u64); }
                 add_phases(&mut p.phases, phases);
                 p.busy += timer.elapsed().as_secs_f64();
                 p.ticket.prefill(chunk.len(), p.chunks, p.plan.chunks.len(), timer);
@@ -1123,6 +1122,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 match admitted {
                     Ok(mut request) => {
                         let token = request.next;
+                        // The first decode round's anchor: read its rows now.
+                        engine.prefetch_decode(&request.history, &[token]);
                         let emitted = request.emit(token);
                         request.ticket.first(token);
                         retain_prompt(&mut cache, &request.placement);
@@ -1312,6 +1313,14 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         }
         Ok(rows)
     }).collect::<Result<_>>()?;
+    // The drafts' table rows, read as soon as they exist (the anchor's already were).
+    for (a, rows) in active.iter().zip(&sequences) {
+        if rows.len() > 1 {
+            let mut history = a.history.clone();
+            history.push(rows[0]);
+            engine.prefetch_decode(&history, &rows[1..]);
+        }
+    }
     let diagnostic = active.iter().any(|a| a.job.probe.is_some());
     let mut poisoned: Vec<Option<String>> = vec![None; sequences.len()];
     let spec = sequences.iter().any(|rows| rows.len() > 1);
@@ -1381,9 +1390,13 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             probe::decode_row(engine.library(), &request.job.probe, &logits, offset + j, request.generated,
                 request.history.len());
             match take(request.constraint.as_mut(), &selected[offset + j]).and_then(|t| {
-                // Family table reads overlap emission, commit and drafting.
-                engine.prefetch(&request.history, &[t]);
-                Ok((t, request.emit(t)?))
+                // The next round's anchor (a correction or the bonus token, not a
+                // draft this verify already read) overlaps emission, commit and drafting.
+                let next_anchor = rows.get(j + 1) != Some(&t);
+                let history_len = request.history.len();
+                let done = request.emit(t)?;
+                if next_anchor && !done { engine.prefetch_decode(&request.history[..history_len], &[t]); }
+                Ok((t, done))
             }) {
                 Ok((token, done)) => {
                     last = Some((j + 1, token));

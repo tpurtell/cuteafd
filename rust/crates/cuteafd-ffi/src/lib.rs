@@ -1444,56 +1444,21 @@ type RdmaCreateRcQpProbeFn = unsafe extern "C" fn(
     out: *mut CuteafdRdmaRcQpProbe,
 ) -> CuteafdStatus;
 type RdmaRcSendRecvLoopbackProbeFn = unsafe extern "C" fn(
+    device_name: *const c_char,
     port_num: u32,
+    gid_index: u32,
     bytes: usize,
     out: *mut CuteafdRdmaRcSendRecvProbe,
 ) -> CuteafdStatus;
 type RdmaRcProtocolV2LoopbackProbeFn = unsafe extern "C" fn(
+    device_name: *const c_char,
     port_num: u32,
+    gid_index: u32,
     request_frame: *const c_void,
     request_bytes: usize,
     response_frame: *const c_void,
     response_bytes: usize,
     out: *mut CuteafdRdmaRcProtocolV2LoopbackProbe,
-) -> CuteafdStatus;
-type RdmaRcEndpointCreateFn = unsafe extern "C" fn(
-    port_num: u32,
-    local_psn: u32,
-    send_frame_bytes: usize,
-    recv_frame_bytes: usize,
-    send_registered_span_bytes: usize,
-    recv_registered_span_bytes: usize,
-    max_send_wr: u32,
-    max_recv_wr: u32,
-    max_sge: u32,
-    out: *mut CuteafdRdmaRcEndpointInfo,
-) -> CuteafdStatus;
-type RdmaRcEndpointCreateWithBufferFlagsFn = unsafe extern "C" fn(
-    port_num: u32,
-    local_psn: u32,
-    send_frame_bytes: usize,
-    recv_frame_bytes: usize,
-    send_registered_span_bytes: usize,
-    recv_registered_span_bytes: usize,
-    max_send_wr: u32,
-    max_recv_wr: u32,
-    max_sge: u32,
-    host_buffer_flags: u64,
-    out: *mut CuteafdRdmaRcEndpointInfo,
-) -> CuteafdStatus;
-type RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn = unsafe extern "C" fn(
-    device_name: *const c_char,
-    port_num: u32,
-    local_psn: u32,
-    send_frame_bytes: usize,
-    recv_frame_bytes: usize,
-    send_registered_span_bytes: usize,
-    recv_registered_span_bytes: usize,
-    max_send_wr: u32,
-    max_recv_wr: u32,
-    max_sge: u32,
-    host_buffer_flags: u64,
-    out: *mut CuteafdRdmaRcEndpointInfo,
 ) -> CuteafdStatus;
 type RdmaRcEndpointCreateOnGidWithBufferFlagsFn = unsafe extern "C" fn(
     device_name: *const c_char,
@@ -1548,6 +1513,7 @@ type RdmaRcEndpointSetRecvLandingFn = unsafe extern "C" fn(
 type RdmaGpuLandingProbeFn = unsafe extern "C" fn(
     device_name: *const c_char,
     port_num: u32,
+    gid_index: u32,
     bytes: usize,
     iterations: u32,
     out: *mut CuteafdRdmaGpuLandingProbe,
@@ -1776,9 +1742,6 @@ native_symbols! {
     cuteafd_rdma_create_rc_qp_probe: RdmaCreateRcQpProbeFn,
     cuteafd_rdma_rc_send_recv_loopback_probe: RdmaRcSendRecvLoopbackProbeFn,
     cuteafd_rdma_rc_protocol_v2_loopback_probe: RdmaRcProtocolV2LoopbackProbeFn,
-    cuteafd_rdma_rc_endpoint_create: RdmaRcEndpointCreateFn,
-    cuteafd_rdma_rc_endpoint_create_with_buffer_flags: RdmaRcEndpointCreateWithBufferFlagsFn,
-    cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags: RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn,
     cuteafd_rdma_rc_endpoint_create_on_gid_with_buffer_flags: RdmaRcEndpointCreateOnGidWithBufferFlagsFn,
     cuteafd_rdma_rc_endpoint_buffer_view: RdmaRcEndpointBufferViewFn,
     cuteafd_rdma_rc_endpoint_connect: RdmaRcEndpointConnectFn,
@@ -4510,29 +4473,43 @@ impl NativeLibrary {
         Ok(probe)
     }
 
+    /// Loopback SEND/RECV between two QPs on `device_name`/`port_num`, bound
+    /// to the source GID at `gid_index` (chosen by address by the caller).
     pub fn rdma_rc_send_recv_loopback_probe(
         &self,
+        device_name: &str,
         port_num: u32,
+        gid_index: u32,
         bytes: usize,
     ) -> Result<CuteafdRdmaRcSendRecvProbe> {
         let probe_fn: RdmaRcSendRecvLoopbackProbeFn = self.cuteafd_rdma_rc_send_recv_loopback_probe()?;
+        let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut probe = CuteafdRdmaRcSendRecvProbe::default();
-        let status = unsafe { probe_fn(port_num, bytes, &mut probe) };
+        // SAFETY: device_name and probe outlive the synchronous native call.
+        let status = unsafe { probe_fn(device_name.as_ptr(), port_num, gid_index, bytes, &mut probe) };
         self.status_to_result("cuteafd_rdma_rc_send_recv_loopback_probe", status)?;
         Ok(probe)
     }
 
+    /// ProtocolV2 request/response loopback on `device_name`/`port_num`,
+    /// bound to the source GID at `gid_index` (chosen by address by the caller).
     pub fn rdma_rc_protocol_v2_loopback_probe(
         &self,
+        device_name: &str,
         port_num: u32,
+        gid_index: u32,
         request_frame: &[u8],
         response_frame: &[u8],
     ) -> Result<CuteafdRdmaRcProtocolV2LoopbackProbe> {
         let probe_fn: RdmaRcProtocolV2LoopbackProbeFn = self.cuteafd_rdma_rc_protocol_v2_loopback_probe()?;
+        let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut probe = CuteafdRdmaRcProtocolV2LoopbackProbe::default();
+        // SAFETY: device_name, both frames and probe outlive the synchronous native call.
         let status = unsafe {
             probe_fn(
+                device_name.as_ptr(),
                 port_num,
+                gid_index,
                 request_frame.as_ptr().cast(),
                 request_frame.len(),
                 response_frame.as_ptr().cast(),
@@ -4542,116 +4519,6 @@ impl NativeLibrary {
         };
         self.status_to_result("cuteafd_rdma_rc_protocol_v2_loopback_probe", status)?;
         Ok(probe)
-    }
-
-    pub fn rdma_rc_endpoint_create(
-        &self,
-        port_num: u32,
-        local_psn: u32,
-        send_frame_bytes: usize,
-        recv_frame_bytes: usize,
-        send_registered_span_bytes: usize,
-        recv_registered_span_bytes: usize,
-        max_send_wr: u32,
-        max_recv_wr: u32,
-        max_sge: u32,
-    ) -> Result<CuteafdRdmaRcEndpointInfo> {
-        let create_fn: RdmaRcEndpointCreateFn = self.cuteafd_rdma_rc_endpoint_create()?;
-        let mut info = CuteafdRdmaRcEndpointInfo::default();
-        let status = unsafe {
-            create_fn(
-                port_num,
-                local_psn,
-                send_frame_bytes,
-                recv_frame_bytes,
-                send_registered_span_bytes,
-                recv_registered_span_bytes,
-                max_send_wr,
-                max_recv_wr,
-                max_sge,
-                &mut info,
-            )
-        };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_create", status)?;
-        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
-        Ok(info)
-    }
-
-    pub fn rdma_rc_endpoint_create_with_buffer_flags(
-        &self,
-        port_num: u32,
-        local_psn: u32,
-        send_frame_bytes: usize,
-        recv_frame_bytes: usize,
-        send_registered_span_bytes: usize,
-        recv_registered_span_bytes: usize,
-        max_send_wr: u32,
-        max_recv_wr: u32,
-        max_sge: u32,
-        host_buffer_flags: u64,
-    ) -> Result<CuteafdRdmaRcEndpointInfo> {
-        let create_fn: RdmaRcEndpointCreateWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_with_buffer_flags()?;
-        let mut info = CuteafdRdmaRcEndpointInfo::default();
-        let status = unsafe {
-            create_fn(
-                port_num,
-                local_psn,
-                send_frame_bytes,
-                recv_frame_bytes,
-                send_registered_span_bytes,
-                recv_registered_span_bytes,
-                max_send_wr,
-                max_recv_wr,
-                max_sge,
-                host_buffer_flags,
-                &mut info,
-            )
-        };
-        self.status_to_result("cuteafd_rdma_rc_endpoint_create_with_buffer_flags", status)?;
-        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
-        Ok(info)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn rdma_rc_endpoint_create_on_device_with_buffer_flags(
-        &self,
-        device_name: &str,
-        port_num: u32,
-        local_psn: u32,
-        send_frame_bytes: usize,
-        recv_frame_bytes: usize,
-        send_registered_span_bytes: usize,
-        recv_registered_span_bytes: usize,
-        max_send_wr: u32,
-        max_recv_wr: u32,
-        max_sge: u32,
-        host_buffer_flags: u64,
-    ) -> Result<CuteafdRdmaRcEndpointInfo> {
-        let create_fn: RdmaRcEndpointCreateOnDeviceWithBufferFlagsFn = self.cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags()?;
-        let device_name = CString::new(device_name).context("RDMA device name contains NUL")?;
-        let mut info = CuteafdRdmaRcEndpointInfo::default();
-        let status = unsafe {
-            create_fn(
-                device_name.as_ptr(),
-                port_num,
-                local_psn,
-                send_frame_bytes,
-                recv_frame_bytes,
-                send_registered_span_bytes,
-                recv_registered_span_bytes,
-                max_send_wr,
-                max_recv_wr,
-                max_sge,
-                host_buffer_flags,
-                &mut info,
-            )
-        };
-        self.status_to_result(
-            "cuteafd_rdma_rc_endpoint_create_on_device_with_buffer_flags",
-            status,
-        )?;
-        record_rdma_rings(info.handle, send_registered_span_bytes + recv_registered_span_bytes);
-        Ok(info)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4867,15 +4734,13 @@ impl NativeLibrary {
     /// Probe dma-buf GPU landing on the current CUDA device and time loopback
     /// SENDs of `bytes` landing in device vs pinned host memory. The probe
     /// struct is returned even when landing is unavailable (see `status`).
-    pub fn rdma_gpu_landing_probe(&self, device_name: Option<&str>, port_num: u32, bytes: usize,
+    pub fn rdma_gpu_landing_probe(&self, device_name: &str, port_num: u32, gid_index: u32, bytes: usize,
         iterations: u32) -> Result<(CuteafdRdmaGpuLandingProbe, Option<String>)> {
         let probe_fn: RdmaGpuLandingProbeFn = self.cuteafd_rdma_gpu_landing_probe()?;
-        let name = device_name.map(std::ffi::CString::new).transpose()?;
+        let name = CString::new(device_name).context("RDMA device name contains NUL")?;
         let mut out = CuteafdRdmaGpuLandingProbe::default();
-        // SAFETY: the name is NUL-terminated or null, and `out` is a live struct.
-        let status = unsafe {
-            probe_fn(name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()), port_num, bytes, iterations, &mut out)
-        };
+        // SAFETY: the name is NUL-terminated, and `out` is a live struct.
+        let status = unsafe { probe_fn(name.as_ptr(), port_num, gid_index, bytes, iterations, &mut out) };
         let failure = self.status_to_result("cuteafd_rdma_gpu_landing_probe", status).err().map(|e| e.to_string());
         Ok((out, failure))
     }
@@ -7827,70 +7692,27 @@ mod tests {
     }
 
     #[test]
-    fn rdma_rc_send_recv_loopback_probe_reports_capability() -> Result<()> {
+    fn rdma_loopback_probes_bind_only_a_named_device_and_gid() -> Result<()> {
         let Some(library) = load_test_library()? else {
             return Ok(());
         };
-        match library.rdma_rc_send_recv_loopback_probe(1, 12_288) {
-            Ok(probe) => {
-                assert_eq!(probe.port_num, 1);
-                assert_eq!(probe.bytes, 12_288);
-                assert_eq!(probe.completed, 1);
-                assert_eq!(probe.payload_matches, 1);
-                assert_ne!(probe.sender_qp_num, 0);
-                assert_ne!(probe.receiver_qp_num, 0);
-                assert_eq!(probe.send_completions, 1);
-                assert_eq!(probe.recv_completions, 1);
-                assert!(probe.poll_iterations > 0);
-                assert!(!c_char_array_to_string(&probe.device_name).is_empty());
-                assert!(!c_char_array_to_string(&probe.status).is_empty());
-            }
-            Err(err) => {
-                let err = err.to_string();
-                assert!(
-                    err.contains(&format!("status {CUTEAFD_STATUS_RDMA_UNAVAILABLE}")),
-                    "{err}"
-                );
-                assert!(err.contains("RDMA") || err.contains("rdma"), "{err}");
-            }
-        }
+        // No device or GID is ever picked from table order: a device that is
+        // not present is refused (or the build has no RDMA at all).
+        let unavailable = format!("status {CUTEAFD_STATUS_RDMA_UNAVAILABLE}");
+        let err = library.rdma_rc_send_recv_loopback_probe("cuteafd-missing-device", 1, 0, 12_288)
+            .unwrap_err().to_string();
+        assert!(err.contains(&unavailable), "{err}");
+        let request = protocol_v2_frame(1, 12_288);
+        let response = protocol_v2_frame(2, 12_288);
+        let invalid = "status 1:"; // CUTEAFD_STATUS_INVALID_ARGUMENT
+        let err = library.rdma_rc_send_recv_loopback_probe("", 1, 0, 12_288).unwrap_err().to_string();
+        assert!(err.contains(invalid), "{err}");
+        let err = library.rdma_rc_protocol_v2_loopback_probe("x", 1, 256, &request, &response)
+            .unwrap_err().to_string();
+        assert!(err.contains(invalid), "{err}");
         Ok(())
     }
 
-    #[test]
-    fn rdma_rc_protocol_v2_loopback_probe_reports_capability() -> Result<()> {
-        let Some(library) = load_test_library()? else {
-            return Ok(());
-        };
-        let request = protocol_v2_frame(1, 12_288);
-        let response = protocol_v2_frame(2, 12_288);
-        match library.rdma_rc_protocol_v2_loopback_probe(1, &request, &response) {
-            Ok(probe) => {
-                assert_eq!(probe.port_num, 1);
-                assert_eq!(probe.request_bytes, request.len());
-                assert_eq!(probe.response_bytes, response.len());
-                assert_eq!(probe.completed, 1);
-                assert_eq!(probe.request_payload_matches, 1);
-                assert_eq!(probe.response_payload_matches, 1);
-                assert_ne!(probe.client_qp_num, 0);
-                assert_ne!(probe.server_qp_num, 0);
-                assert_eq!(probe.send_completions, 2);
-                assert_eq!(probe.recv_completions, 2);
-                assert!(probe.poll_iterations > 0);
-                assert!(!c_char_array_to_string(&probe.device_name).is_empty());
-                assert!(!c_char_array_to_string(&probe.status).is_empty());
-            }
-            Err(err) => {
-                let err = err.to_string();
-                assert!(
-                    err.contains(&format!("status {CUTEAFD_STATUS_RDMA_UNAVAILABLE}")),
-                    "{err}"
-                );
-                assert!(err.contains("RDMA") || err.contains("rdma"), "{err}");
-            }
-        }
-        Ok(())
-    }
     /// Chunk-3b FFI oracle: drive K1 -> K3/K4 -> K5 through the C ABI and
     /// compare the final token against the **production** CPU sampler
     /// (`cuteafd_core::TargetSamplingParams::select_token`) on identical logits,

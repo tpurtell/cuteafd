@@ -128,6 +128,14 @@ pub struct Entry {
     /// Cold prefill at these prompt lengths, in the same sweep (`[8192]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill_lengths: Option<Vec<u64>>,
+    /// Each prefill point's timed request re-sends its warm-up's corpus behind
+    /// a fresh nonce (nominal warm: the same table rows, no prefix-cache reuse).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_repeat: Option<bool>,
+    /// A cold purge run before each prefill point's warm-up and again before its
+    /// timed request (e.g. `nest drop-caches`); the window's own hooks are untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill_purge: Option<Hook>,
     /// Output tokens per sweep decode request (default `crate::sweep::TOKENS`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_tokens: Option<u64>,
@@ -466,6 +474,8 @@ impl Entry {
             post_load_c1: self.post_load_c1.or(defaults.post_load_c1),
             post_load_repeat: self.post_load_repeat.or(defaults.post_load_repeat),
             prefill_lengths: self.prefill_lengths.clone().or_else(|| defaults.prefill_lengths.clone()),
+            prefill_repeat: self.prefill_repeat.or(defaults.prefill_repeat),
+            prefill_purge: self.prefill_purge.clone().or_else(|| defaults.prefill_purge.clone()),
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
@@ -942,6 +952,9 @@ pub fn run(args: SmokeArgs) -> Result<()> {
         if entry.window.is_some() && entry.levels.is_none() && entry.prefill_lengths.is_none() {
             bail!("{}: window needs levels or prefill_lengths (it frames the sweep's timed requests)", entry.name);
         }
+        if (entry.prefill_repeat == Some(true) || entry.prefill_purge.is_some()) && entry.prefill_lengths.is_none() {
+            bail!("{}: prefill_repeat and prefill_purge need prefill_lengths", entry.name);
+        }
         let set = entry.lossless_set.as_ref().map(|path| crate::panels::lossless::CaseSet::load(&args.repo.join(path))
             .with_context(|| format!("{}: lossless_set", entry.name))).transpose()?;
         if let Some(dump) = &entry.lossless_dump {
@@ -975,9 +988,10 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_purge={} sweep_tokens={} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
+                e.prefill_repeat.unwrap_or(false), e.prefill_purge.is_some(),
                 e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
@@ -1375,9 +1389,14 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                     window_hook("window-open", &window.open, &url, &config_path)
                 })
             });
+            let (purge_url, purge_config) = (&url, &config_path);
+            let purge = entry.prefill_purge.as_ref()
+                .map(|hook| move || window_hook("prefill-purge", hook, purge_url, purge_config));
+            let prefill = crate::sweep::PrefillOptions { repeat: entry.prefill_repeat.unwrap_or(false),
+                purge: purge.as_ref().map(|purge| purge as &dyn Fn() -> Result<()>) };
             let sweep = crate::sweep::run_windowed(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
-                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]), entry.fabric.unwrap_or(true),
-                entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open);
+                entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
+                &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;

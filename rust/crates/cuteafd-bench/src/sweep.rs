@@ -6,7 +6,7 @@
 //! draft-policy gates read). It runs in the driver's own binary, so both arms
 //! of an A/B measure the same workload whatever their server builds contain.
 use crate::client::Client;
-use crate::panels::common::{aggregate, median, plain, wave, Timed};
+use crate::panels::common::{aggregate, mapped_counters, mapped_interval, median, plain, wave, Timed};
 use crate::panels::speed::CONTENT;
 use crate::text::{corpus, nonce};
 use anyhow::{bail, Context, Result};
@@ -34,6 +34,9 @@ pub struct Point {
     pub thermal: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric: Option<Value>,
+    /// Mapped-table counters over the timed wave alone.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapped_tables: Vec<Value>,
 }
 
 /// One cold prefill at a chosen length (after one untimed warm request there).
@@ -49,6 +52,20 @@ pub struct PrefillPoint {
     pub thermal: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fabric: Option<Value>,
+    /// Mapped-table counters over the timed request alone (`/v1/stats` before and after).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mapped_tables: Vec<Value>,
+}
+
+/// How the prefill points run beyond their lengths.
+#[derive(Default)]
+pub struct PrefillOptions<'a> {
+    /// The timed request re-sends its warm-up's corpus behind a fresh leading
+    /// nonce (no prefix-cache reuse): table rows the warm-up read are the same.
+    pub repeat: bool,
+    /// A cold purge (e.g. `nest drop-caches`), run before each point's warm-up
+    /// and again before its timed request.
+    pub purge: Option<&'a dyn Fn() -> Result<()>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -137,7 +154,9 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     timed(on_timed)?;
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
+    let tables = mapped_counters(client);
     let results = uncached(batch(&prompts.timed))?;
+    let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
@@ -148,14 +167,18 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
     let point = Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
-        ttft_s: median(&mut ttft), errors, thermal, fabric };
+        ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables };
     Ok((point, prompts))
 }
 
 /// Cold prefill at each length: fit tokens per reference token from two short
 /// requests, then per length one untimed warm request and one measured request
-/// with a fresh prefix (it must reuse no cached tokens).
-fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut OnTimed) -> Result<Vec<PrefillPoint>> {
+/// with a fresh prefix (it must reuse no cached tokens). With `options.repeat`
+/// the measured request re-sends the warm-up's corpus behind a fresh nonce;
+/// with `options.purge` the purge runs before the warm-up and again before the
+/// measured request, so both start from the same cold state.
+fn prefill(client: &Client, lengths: &[u64], max_context: u64, options: &PrefillOptions, on_timed: &mut OnTimed)
+    -> Result<Vec<PrefillPoint>> {
     let ask = |words: usize, seed: u64| -> Result<crate::client::Chat> {
         client.chat(plain(client, &format!("[{}] Summarize in one word.\n\n{}", nonce(), corpus(seed, words)), 1), None)
     };
@@ -163,23 +186,35 @@ fn prefill(client: &Client, lengths: &[u64], max_context: u64, on_timed: &mut On
     let slope = (b.timing.prompt_tokens as f64 - a.timing.prompt_tokens as f64) / 600.0;
     let intercept = a.timing.prompt_tokens as f64 - slope * 300.0;
     let (slope, intercept) = if slope.is_finite() && slope > 0.3 { (slope, intercept) } else { (1.0, 20.0) };
+    let purge = || options.purge.map_or(Ok(()), |purge| purge());
     let mut points = Vec::new();
     for &length in lengths {
         let target = length.min(max_context.saturating_sub(64)) as f64;
         let words = ((target - intercept) / slope).max(64.0) as usize;
-        ask(words, 200 + length).with_context(|| format!("{length}-token prefill warm-up"))?;
+        let (warm_seed, timed_seed) = prefill_seeds(length, options.repeat);
+        purge().with_context(|| format!("{length}-token prefill purge before warm-up"))?;
+        ask(words, warm_seed).with_context(|| format!("{length}-token prefill warm-up"))?;
         timed(on_timed)?;
+        purge().with_context(|| format!("{length}-token prefill purge before the timed request"))?;
         let mark = client.thermal_mark();
         let fabric_mark = client.fabric_mark();
-        let chat = ask(words, 300 + length).with_context(|| format!("{length}-token prefill"))?;
+        let tables = mapped_counters(client);
+        let chat = ask(words, timed_seed).with_context(|| format!("{length}-token prefill"))?;
+        let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
         let thermal = client.thermal_since(mark);
         let fabric = client.fabric_since(fabric_mark, &format!("prefill/{length}"), true).map(|p| serde_json::json!(p));
         let t = chat.timing;
         anyhow::ensure!(t.cached_tokens == 0, "{length}-token cold prefill reused {} cached tokens", t.cached_tokens);
         points.push(PrefillPoint { length, prompt_tokens: t.prompt_tokens, tok_s: t.prefill_tok_s(), ttft_s: t.ttft_s,
-            thermal, fabric });
+            thermal, fabric, mapped_tables });
     }
     Ok(points)
+}
+
+/// Corpus seeds of one length's warm-up and timed request: the same text when
+/// `repeat` (only the leading nonce differs), different texts otherwise.
+fn prefill_seeds(length: u64, repeat: bool) -> (u64, u64) {
+    (200 + length, if repeat { 200 + length } else { 300 + length })
 }
 
 /// Parses `8192,32768` (prompt lengths 256..=1M tokens).
@@ -196,7 +231,8 @@ pub fn parse_lengths(text: &str) -> Result<Vec<u64>, String> {
 /// Runs the sweep against `url`; `api_key` is the server's bearer key.
 pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool, post_load_repeat: bool,
     prefill_lengths: &[u64]) -> Result<Sweep> {
-    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, false, TOKENS, None)
+    run_windowed(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, &PrefillOptions::default(), false,
+        TOKENS, None)
 }
 
 /// [`run`], calling `on_timed` once just before the first timed request. `tokens`
@@ -204,7 +240,8 @@ pub fn run(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: boo
 /// a profiled wave more decode steps at every width).
 #[allow(clippy::too_many_arguments)]
 pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
-    post_load_repeat: bool, prefill_lengths: &[u64], fabric: bool, tokens: u64, mut on_timed: OnTimed) -> Result<Sweep> {
+    post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
+    mut on_timed: OnTimed) -> Result<Sweep> {
     if !(1..=MAX_TOKENS).contains(&tokens) {
         bail!("sweep tokens must be 1..={MAX_TOKENS}, got {tokens}");
     }
@@ -219,7 +256,7 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     if !prefill_lengths.is_empty() {
         let max_context = record["max_context_tokens"].as_u64().unwrap_or(8192);
         let mark = client.thermal_mark();
-        sweep.prefill = prefill(&client, prefill_lengths, max_context, &mut on_timed)?;
+        sweep.prefill = prefill(&client, prefill_lengths, max_context, prefill_options, &mut on_timed)?;
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("prefill".into(), window); }
     }
     let mark = client.thermal_mark();
@@ -285,6 +322,16 @@ mod tests {
             let err = run("http://127.0.0.1:1", None, levels, c1, true, &[]).unwrap_err().to_string();
             assert!(err.contains("post_load_repeat needs post_load_c1"), "{err}");
         }
+    }
+
+    #[test]
+    fn prefill_repeat_resends_the_warm_up_corpus() {
+        let (warm, timed) = prefill_seeds(8192, true);
+        assert_eq!(warm, timed);
+        assert_eq!(corpus(warm, 512), corpus(timed, 512));
+        let (warm, timed) = prefill_seeds(8192, false);
+        assert_ne!(corpus(warm, 512), corpus(timed, 512));
+        assert_ne!(prefill_seeds(8192, true), prefill_seeds(65536, true));
     }
 
     #[test]

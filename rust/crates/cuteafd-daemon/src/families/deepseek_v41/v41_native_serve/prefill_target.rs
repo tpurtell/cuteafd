@@ -90,6 +90,26 @@ pub(crate) struct V41PrefillTimes {
 /// One stream call's units: the shared cut for page-aligned unit widths;
 /// test geometries below a page (2-RTX fixture: 3 and 16 rows) keep plain
 /// `chunk_rows` units, as `V41PrefillTimes::encoder_unit` streams them.
+/// The prefill units the encoder runs a prompt in from `start`, as the
+/// stream path cuts them: an encoder-prefix replay (`start..replay_end`, at
+/// most one 128-token window) first, then calls of `waves` units of
+/// `chunk_rows` from its end, each call cut by [`stream_units`]; units run
+/// `waves` deep in pipeline order.
+pub(super) fn prompt_units(start: usize, replay_end: usize, tokens: usize, chunk_rows: usize, waves: usize)
+    -> Result<cuteafd_loader::TableUnitPlan> {
+    let call_rows = (waves * chunk_rows).max(1);
+    let (mut ends, mut calls) = (Vec::new(), Vec::new());
+    let mut at = replay_end.clamp(start, tokens);
+    if at > start { calls.push(0); ends.push(at as u64); }
+    while at < tokens {
+        let rows = (tokens - at).min(call_rows);
+        calls.push(ends.len());
+        ends.extend(stream_units(rows, chunk_rows.max(1), waves.max(1))?.iter().map(|unit| (at + unit.end) as u64));
+        at += rows;
+    }
+    Ok(cuteafd_loader::TableUnitPlan { ends, depth: waves.max(1), calls })
+}
+
 fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std::ops::Range<usize>>> {
     if chunk_rows % 64 != 0 {
         ensure!(rows > 0 && chunk_rows > 0, "empty prefill stream units");
@@ -170,6 +190,15 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
 
     fn initialize(&mut self, cursor: &mut V41Prefill<P::Suffix>) -> Result<()> {
         if !matches!(cursor.state, PrefillState::Start) { return Ok(()); }
+        // The whole uncached prompt is known: read its Engram rows into the row
+        // caches ahead of the gathers. A failure only leaves rows to load on demand.
+        let (tokens, chunk_rows, waves) = (self.tokens.len(), self.chunk_rows, self.waves);
+        let replay_end = self.requests.cache().committed_end(self.lease)? as usize;
+        if let Err(error) = self.requests.start_lookahead(self.lease, self.tokens,
+            |start| prompt_units(start, replay_end, tokens, chunk_rows, waves)) {
+            tracing::warn!(%error, "Engram look-ahead not started; rows load on demand");
+        }
+        self.requests.lookahead_running(self.lease);
         let end = self.tokens.len() as u64;
         let cached = self.requests.cache().committed_end(self.lease)? as usize;
         let stage = self.requests.cache().stage(self.lease)?;
@@ -285,10 +314,9 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                             self.prefill.slots.len());
                         let unit_rows = stream_units(rows, self.chunk_rows, waves)?;
                         let chunks: Vec<_> = unit_rows.iter().map(|range| &self.tokens[at + range.start..at + range.end]).collect();
-                        // The next call's first units at this call's unit width.
-                        let width = unit_rows.first().map_or(1, |range| range.len());
-                        let ahead: Vec<&[u32]> = lookahead(at + rows..span.end, width, waves)
-                            .map(|range| &self.tokens[range]).collect();
+                        // The next call's first units, cut as that call will cut them.
+                        let ahead: Vec<&[u32]> = lookahead(at + rows..span.end, self.chunk_rows, waves)?
+                            .into_iter().map(|range| &self.tokens[range]).collect();
                         let mut slots: Vec<(&mut P, &mut P::Transport)> = self.prefill.slots.iter_mut()
                             .map(|(pass, transport)| (pass, transport)).collect();
                         slots.truncate(waves);
@@ -660,11 +688,14 @@ mod prefill_tests {
 #[cfg(test)]
 pub(crate) use super::scheduler::exercise_distributed_decode;
 
-/// The next call's first `units` row ranges of `span` at `width` rows: the
+/// The next call's units over the rest of `span`, cut exactly as that call
+/// will cut them ([`stream_units`] of up to `waves` units of `chunk_rows`): the
 /// rows whose Engram gathers the current call's last units prefetch.
-fn lookahead(span: Range<usize>, width: usize, units: usize) -> impl Iterator<Item = Range<usize>> {
-    let width = width.max(1);
-    (span.start..span.end).step_by(width).take(units).map(move |start| start..(start + width).min(span.end))
+fn lookahead(span: Range<usize>, chunk_rows: usize, waves: usize) -> Result<Vec<Range<usize>>> {
+    if span.is_empty() { return Ok(Vec::new()); }
+    let rows = span.len().min(waves.max(1) * chunk_rows.max(1));
+    Ok(stream_units(rows, chunk_rows.max(1), waves.max(1))?.into_iter()
+        .map(|unit| span.start + unit.start..span.start + unit.end).collect())
 }
 
 #[cfg(test)]
@@ -673,10 +704,31 @@ mod stream_tests {
     /// cycles; prof39: each cycle's first Engram layer-1 gathers waited
     /// 40-150 ms cold, ~2.3 s of a 64K prefill on max).
     #[test]
+    fn engram_look_ahead_units_follow_the_encoder_cut() {
+        let plan = super::prompt_units(100, 100, 100 + 8256 + 4000, 2752, 3).unwrap();
+        assert_eq!(plan.depth, 3);
+        assert_eq!(plan.ends[..3], [100 + 2752, 100 + 5504, 100 + 8256]);
+        assert_eq!(*plan.ends.last().unwrap(), 100 + 8256 + 4000);
+        assert!(plan.ends.windows(2).all(|w| w[0] < w[1]));
+        // An encoder-prefix replay runs first; the stream cut starts at its end.
+        let replay = super::prompt_units(400 - 128, 400, 400 + 8256, 2752, 3).unwrap();
+        assert_eq!(replay.ends[..4], [400, 400 + 2752, 400 + 5504, 400 + 8256]);
+        // Calls: the replay window, then each stream call's units.
+        assert_eq!(replay.calls, [0, 1]);
+        assert_eq!(plan.calls, [0, 3]);
+    }
+
+    #[test]
     fn calls_look_ahead_at_the_next_calls_first_units() {
-        assert_eq!(super::lookahead(8256..20000, 2752, 3).collect::<Vec<_>>(), [8256..11008, 11008..13760, 13760..16512]);
-        assert_eq!(super::lookahead(8256..9000, 2752, 3).collect::<Vec<_>>(), [8256..9000]);
-        assert_eq!(super::lookahead(9000..9000, 2752, 3).count(), 0);
+        assert_eq!(super::lookahead(8256..20000, 2752, 3).unwrap(), [8256..11008, 11008..13760, 13760..16512]);
+        assert!(super::lookahead(9000..9000, 2752, 3).unwrap().is_empty());
+        // A partial tail is cut as the tail call cuts it, not at the first unit's width.
+        for rows in [2400, 6000] {
+            let tail = super::lookahead(8256..8256 + rows, 2752, 3).unwrap();
+            assert_eq!(tail, super::stream_units(rows, 2752, 3).unwrap().into_iter()
+                .map(|unit| 8256 + unit.start..8256 + unit.end).collect::<Vec<_>>());
+            assert_eq!(tail.last().unwrap().end, 8256 + rows);
+        }
     }
 }
 

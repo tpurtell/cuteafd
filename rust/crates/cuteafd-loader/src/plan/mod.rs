@@ -982,7 +982,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             })()?;
             report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
                 names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes,
-                shape.preload_budget(host_budget)).admit_tables(table_bytes);
+                shape.preload_budget(host_budget, layout::engram_row_bytes(input.checkpoint())?)).admit_tables(table_bytes);
             report.bytes_by_owner.remove("host-preloaded");
             if report.mapped_placement.preloaded_bytes > 0 {
                 report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);

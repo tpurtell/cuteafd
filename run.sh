@@ -52,7 +52,8 @@ TP2_OUTPUT_PROJECTION, TP2_DSPARK_EXPERTS. The former command-line spellings
 
 Optional RDMA tuning env values are forwarded to both roles only when set:
   CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP (local-ip=device,...),
-  CUTEAFD_VERBS_APP_IB_PORT_NUM, CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES.
+  CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES. The RDMA port and source GID
+  always follow the address that reaches each peer.
 This is how a multi-homed six-rank launch pins the rail per host.
 
 Every remote step shares one SSH option set with the release build scripts:

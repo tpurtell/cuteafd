@@ -694,7 +694,7 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmfEngine<'a>, args: &PrefixArgs, (marks, a
         mark_store = ?layout.mark_store, page_bytes = layout.page_bytes, pages,
         reserved_pages = layout.mark_store.reserved(), page_rows = layout.page_rows, host_bytes,
         points = ?args.points(), "GLM 5.3 Flash prefix cache");
-    cuteafd_bench::context::set_kv((pages * layout.page_rows) as u64, pages as u64,
+    cuteafd_bench::context::set_kv((pages * layout.page_rows) as u64, engine.max_pool_tokens_no_onboard, pages as u64,
         &"FP8 MLA latent + KDA state".to_string(), host_bytes);
     Ok((family, cache))
 }

@@ -614,6 +614,7 @@ pub(crate) fn with_engine<T>(
         skip_routed: skip,
         context: context_mode,
     })?;
+    engine.max_pool_tokens_no_onboard = Some(placement.max_pool_tokens_no_onboard);
     // Startup and inference share retirement: an error must not drop a rank
     // owner while the other rank is waiting for its missing publication.
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;

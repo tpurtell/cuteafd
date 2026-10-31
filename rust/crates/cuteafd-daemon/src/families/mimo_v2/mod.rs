@@ -1162,6 +1162,7 @@ impl Opened {
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
         let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
             args.max_context, args.prefill_rows, args.prefill_span_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
+        engine.max_pool_tokens_no_onboard = Some(preflight.placement.max_pool_tokens_no_onboard);
         engine.prefill_unit_waves = args.prefill_waves;
         // Once an engine exists, setup and body failures share the same terminal
         // retirement path. Pre-engine loader ownership is a separate boundary.
