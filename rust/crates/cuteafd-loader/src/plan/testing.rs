@@ -1069,6 +1069,11 @@ pub fn mistral_large4_exl3_config(tensors: &[Tensor]) -> (Value, Value) {
 /// A Mistral Large 4 header snapshot in the release's own layout: config.json,
 /// `consolidated-NNNNN.safetensors` shards (one per layer, sparse payloads)
 /// and the index config.json's `transformers_weights` names.
+/// Mistral Large 4's release config.json (@f12dabdc).
+pub fn mistral_large4_config() -> Value {
+    serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap()
+}
+
 pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>, quantized: bool) {
     let tensors = mistral_large4_tensors(expert_layers, quantized);
     let mut config: Value = serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap();

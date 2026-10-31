@@ -107,6 +107,16 @@ fn native_projection_ranges(name: &str, range: impl Fn(&str) -> Option<crate::sh
 
 impl GlmLayer<'_> {
     /// The device range of `operand`, when the layer has it.
+    /// Whether this rank holds the layer's attention, and with it the layer's paged KV: every
+    /// rank under a head split, the owner under whole-layer owners (it carries the layer's
+    /// attention operands: GLM's q-LoRA norm, or W_UK on direct-query variants). The cache
+    /// allocation and the prefix snapshot select layers by this one rule.
+    pub fn holds_attention(&self) -> bool {
+        self.attention_owner.is_none_or(|owner| {
+            (self.range("q_a_norm").is_some() || self.range("w_uk").is_some()) && owner < 2
+        })
+    }
+
     pub fn range(&self, operand: &str) -> Option<crate::shared::l2_prefetch::Range> {
         self.operands.get(operand).map(|a| (a.buffer.ptr.cast_const(), a.buffer.bytes))
     }

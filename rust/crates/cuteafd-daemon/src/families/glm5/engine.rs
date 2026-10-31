@@ -514,11 +514,7 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
         Ok(allocation)
     };
     // One page past the pool is the scratch page padded decode rows write.
-    // A rank owns a layer's attention when it holds that layer's attention
-    // operands (whole attention on its owner, every rank under a head split).
-    let owns = |layer: &GlmLayer<'_>| layer.attention_owner.is_none_or(|owner| {
-        (layer.range("q_a_norm").is_some() || layer.range("w_uk").is_some()) && owner < 2
-    });
+    let owns = |layer: &GlmLayer<'_>| layer.holds_attention();
     // Each latent owner's records at its own size (656 B with RoPE, 528 B
     // without); a latent-sharing layer reads its source's pool and holds none.
     let kv = layers.iter().enumerate().map(|(index, layer)| zeroed(if owns(layer) && cfg.owns_kv(index) {
@@ -551,6 +547,45 @@ fn caches<'a>(library: &'a NativeLibrary, cfg: &GlmDsaConfig, layers: &[GlmLayer
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     // SAFETY: plain-old-data slices viewed as bytes for host->device copies.
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+}
+
+#[cfg(test)]
+mod paged_layer_tests {
+    use super::paged_layers;
+    use cuteafd_loader::{families::glm5::GlmDsaConfig, plan::testing};
+
+    /// The prefix snapshot once selected Mistral Large 4's layers by GLM's q-LoRA norm and came
+    /// back empty: every family config, on every placement shape, must page the records its
+    /// cache holds, and exactly the latent owners'.
+    #[test]
+    fn every_placement_pages_every_latent_owner_once() {
+        for config in [testing::glm5_config(), testing::mistral_large4_config()] {
+            let cfg = GlmDsaConfig::from_hf(&config).unwrap();
+            let owners: Vec<u8> = (0..cfg.layers).map(|l| (l % 2) as u8).collect();
+            // One GPU, a head split (both ranks hold every layer), whole-layer owners.
+            let shapes: Vec<Vec<Vec<bool>>> = vec![vec![vec![true; cfg.layers]], vec![vec![true; cfg.layers]; 2],
+                (0..2u8).map(|rank| owners.iter().map(|&o| o == rank).collect()).collect()];
+            for ranks in shapes {
+                let paged: Vec<_> = ranks.iter().map(|holds| paged_layers(&cfg, holds)).collect();
+                for rank in &paged { assert!(!rank.is_empty(), "{}: a rank pages nothing", cfg.family_id()); }
+                for layer in 0..cfg.layers {
+                    let records: Vec<_> = paged.iter().filter_map(|rank| rank.iter().find(|(l, _)| *l == layer)).collect();
+                    assert!(!records.is_empty(), "{}: layer {layer} paged nowhere", cfg.family_id());
+                    for &&(_, bytes) in &records {
+                        assert_eq!(bytes, cfg.owns_kv(layer).then(|| cfg.record_bytes(layer)), "{} layer {layer}", cfg.family_id());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The layers a rank's paged state (cache allocation, prefix snapshots) covers, from whether it
+/// holds each layer's attention: per layer its index and its latent record row bytes (none on a
+/// layer reading another's latent, whose pages its source carries).
+pub(crate) fn paged_layers(cfg: &GlmDsaConfig, holds: &[bool]) -> Vec<(usize, Option<usize>)> {
+    holds.iter().enumerate().filter(|(_, &held)| held)
+        .map(|(layer, _)| (layer, cfg.owns_kv(layer).then(|| cfg.record_bytes(layer)))).collect()
 }
 
 impl<'a> GlmEngine<'a> {
@@ -675,12 +710,10 @@ impl<'a> GlmEngine<'a> {
             _ => (&self.kv, &self.index),
         };
         let layers = if rank == 1 { &self.peer.as_ref().unwrap().layers } else { &self.weights.layers };
-        // The rank holds the layer's attention: GLM's q-LoRA norm, or the per-head W_UK
-        // (Mistral Large 4 has no q-LoRA), exactly as the cache allocation decides.
-        kv.iter().zip(index).zip(layers).enumerate()
-            .filter(|(_, (_, layer))| layer.range("q_a_norm").is_some() || layer.range("w_uk").is_some())
-            .map(|(layer, ((kv, index), _))| (self.cfg.owns_kv(layer).then(|| (kv.buffer, self.cfg.record_bytes(layer))),
-                index.as_ref().map(|i| i.buffer))).collect()
+        let holds: Vec<bool> = layers.iter().map(GlmLayer::holds_attention).collect();
+        paged_layers(&self.cfg, &holds).into_iter()
+            .map(|(layer, records)| (records.map(|bytes| (kv[layer].buffer, bytes)), index[layer].as_ref().map(|i| i.buffer)))
+            .collect()
     }
 
     /// GPUs this engine runs on: 2 under a head split.
