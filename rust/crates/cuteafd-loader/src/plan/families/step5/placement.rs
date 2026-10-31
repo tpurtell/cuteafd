@@ -257,7 +257,7 @@ pub(super) fn layout(
         spark_ranks,
         prefill_lanes: 1,
     };
-    if let Some(reason) = super::admission::onboarding_unavailable(input.expert_catalog()?) {
+    if let Some(reason) = super::admission::onboarding_unavailable(input.expert_catalog()?, coordinators) {
         memory.notes.push(reason.into());
     }
     if !working.rtx_layers.is_empty() {

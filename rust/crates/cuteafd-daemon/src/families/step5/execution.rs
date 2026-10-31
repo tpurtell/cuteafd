@@ -75,9 +75,9 @@ struct NativeOwners<'a> {
     rope: Vec<Rc<TargetTables<'a>>>,
     /// Onboarded routed layers' EXL3 experts, whole on the entry GPU (one RTX).
     onboarded: Option<RefCell<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>,
-    /// Two RTX: each rank's TP2 halves of the onboarded layers, bound to the
-    /// lane streams as a shared pair at execution binding.
-    onboarded_tp2: Option<[crate::shared::experts::rtx::exl3::Exl3Tp2Weights<'a>; 2]>,
+    /// Two RTX: each rank's TP2 halves of the onboarded layers (EXL3 or
+    /// fp8moe), bound to the lane streams as a shared pair at execution binding.
+    onboarded_tp2: Option<crate::shared::experts::rtx::Tp2Weights<'a>>,
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -434,23 +434,30 @@ impl<'a> LoadedNative<'a> {
     }
 
     /// Loads the solver's onboarded routed layers as TP2 halves over both GPUs
-    /// from the installed `rtx-tp2` package, inside each rank's TP2 arena peak.
+    /// from the installed TP2 package (EXL3 `rtx-tp2`, or fp8moe `tp2`),
+    /// inside each rank's TP2 arena peak.
     pub(super) fn with_onboarded_tp2(mut self, devices: [Device<'a>; 2], catalog: &cuteafd_loader::OfficialV41Catalog,
         package: &std::path::Path, layers: &[usize], rows: usize, budgets: [usize; 2]) -> Result<Self> {
         if layers.is_empty() { return Ok(self); }
-        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
-        self.0.onboarded_tp2 = Some(Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
-            [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?);
-        tracing::info!(layers = layers.len(), "Step-5 EXL3 routed layers onboarded TP2 over both RTX");
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, fp8moe::Fp8MoeTp2, RtxSelectionPolicy, Tp2Weights};
+        self.0.onboarded_tp2 = Some(if catalog.exl3().is_some() {
+            Tp2Weights::Exl3(Exl3Tp2::load_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::STEP5,
+                [package, package], layers.to_vec(), rows, budgets, RtxSelectionPolicy::CanonicalDecode)?)
+        } else {
+            Tp2Weights::Fp8(Fp8MoeTp2::load_pair(devices, catalog.fp8().context("Step-5 FP8 expert tensors")?,
+                package, layers.to_vec(), rows, budgets)?)
+        });
+        tracing::info!(layers = layers.len(), "Step-5 routed layers onboarded TP2 over both RTX");
         Ok(self)
     }
 }
 
 /// Two-RTX onboarded routed layers: the shared pair (routes, and for a
-/// whole-owned layer its wire rows, published by the router's rank), each
-/// rank's F32 routed partial, the peer's partial as received and the route
-/// broadcast scratch. The F32 sum rounds once to BF16 into the routed plane,
-/// as a Spark reply does; the native join then adds the shared expert.
+/// whole-owned layer its input rows, published by the router's rank), each
+/// rank's routed partial, the peer's partial as received and the route
+/// broadcast scratch. EXL3 sums F32 partials, rounding once to BF16 into the
+/// routed plane as a Spark reply does; fp8moe halves exchange BF16 partials
+/// (as GLM Flash FP8). The native join then adds the shared expert.
 struct Tp2Onboard<'a> {
     pair: crate::shared::experts::rtx::pair::Pair<'a>,
     partial: [Allocation<'a>; 2],
@@ -544,23 +551,31 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 ensure!(ownership.ranks() == 2, "Step-5 TP2 onboarding needs two ranks");
                 let spec = ownership.execution().spec();
                 let (unit, lanes) = (usize::try_from(spec.rows)?, usize::try_from(spec.lanes)?);
-                let ranks: [Box<dyn RtxExpertLayer + 'a>; 2] = [Box::new(weights[0].execution()?), Box::new(weights[1].execution()?)];
+                use cuteafd_loader::plan::families::step5::admission::{tp2_exchange_bytes, Tp2Exchange};
+                let kind = match &weights {
+                    crate::shared::experts::rtx::Tp2Weights::Exl3(_) => Tp2Exchange::Exl3,
+                    crate::shared::experts::rtx::Tp2Weights::Fp8(_) => Tp2Exchange::Fp8,
+                    _ => anyhow::bail!("Step-5 TP2 onboarding runs EXL3 or fp8moe halves"),
+                };
+                let ranks: [Box<dyn RtxExpertLayer + 'a>; 2] = weights.execution()?;
                 ensure!(ranks[0].layers() == ownership.onboarded_layers(), "Step-5 TP2 layers differ from the solved homes");
+                let exchange_dtype = match kind { Tp2Exchange::Exl3 => ExchangeDtype::F32, Tp2Exchange::Fp8 => ExchangeDtype::Bf16 };
                 let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
                 let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, lanes,
-                    ExchangeDtype::F32, true))?;
+                    exchange_dtype, true))?;
                 let plane = |rank: usize, bytes: usize| Allocation::new(devices[rank], bytes.max(256));
                 let section = unit * 8 * 4;
                 let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
-                let scratch = routes + unit * (H + H / 32);
+                let scratch = routes + unit * kind.input_row_bytes(H);
+                let partial = lanes * unit * H * kind.partial_bytes();
                 let onboard = Tp2Onboard {
                     pair,
-                    partial: [plane(0, lanes * unit * H * 4)?, plane(1, lanes * unit * H * 4)?],
-                    incoming: [plane(0, lanes * unit * H * 4)?, plane(1, lanes * unit * H * 4)?],
-                    owner_incoming: [plane(0, lanes * unit * H * 4)?, plane(1, lanes * unit * H * 4)?],
+                    partial: [plane(0, partial)?, plane(1, partial)?],
+                    incoming: [plane(0, partial)?, plane(1, partial)?],
+                    owner_incoming: [plane(0, partial)?, plane(1, partial)?],
                     scratch: [plane(0, lanes * scratch)?, plane(1, lanes * scratch)?],
                 };
-                let charged = cuteafd_loader::plan::families::step5::admission::tp2_exchange_bytes(unit, lanes)?;
+                let charged = tp2_exchange_bytes(unit, lanes, kind)?;
                 for rank in 0..2 {
                     let planes = [&onboard.partial[rank], &onboard.incoming[rank], &onboard.owner_incoming[rank],
                         &onboard.scratch[rank]];
@@ -1095,7 +1110,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         let unit = usize::try_from(execution.ownership.execution().spec().rows)?;
         ensure!(rows <= unit && lane < usize::try_from(execution.ownership.execution().spec().lanes)?,
             "Step-5 TP2 rows or lane outside admission");
-        let partial_bytes = unit * H * 4;
+        let partial_bytes = unit * H * onboard.pair.combine.payload_bytes(1, 1);
         let scratch_bytes = onboard.scratch[0].buffer.bytes / usize::try_from(execution.ownership.execution().spec().lanes)?;
         // Router, shared expert and wire rows on each rank that holds the FFN.
         for &rank in &routers {
@@ -1113,9 +1128,12 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             let scratch = at(&onboard.scratch[rank], scratch_bytes);
             let (input, routes) = match execution.layer(rank, layer).ok().map(|l| &l.ffn) {
                 Some(Ffn::Routed(ffn)) => {
-                    let [ids, weights, wire] = ffn.wave_inputs();
-                    (crate::shared::experts::rtx::ExpertInput::Fp8K32(wire.ptr),
-                        crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr })
+                    let [ids, weights, _] = ffn.wave_inputs();
+                    // EXL3 halves read the FP8 K32 wire; fp8moe halves the BF16 rows.
+                    let input = if onboard.pair.uses_fp8_input() {
+                        crate::shared::experts::rtx::ExpertInput::Fp8K32(ffn.wire_input().ptr)
+                    } else { crate::shared::experts::rtx::ExpertInput::Bf16(ffn.bf16_input().ptr) };
+                    (input, crate::shared::experts::rtx::Routes { ids: ids.ptr, weights: weights.ptr })
                 }
                 // A whole layer's non-owner receives routes and wire rows.
                 _ => (crate::shared::experts::rtx::ExpertInput::Fp8K32(std::ptr::null_mut()),
@@ -1146,7 +1164,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             if source.is_some_and(|owner| owner != to) { continue; }
             let partial = at(&onboard.partial[from], partial_bytes);
             let incoming = at(if source.is_some() { &onboard.owner_incoming[to] } else { &onboard.incoming[to] }, partial_bytes);
-            peer.push_to(from, slot, partial.ptr, incoming.ptr, rows * H * 4)?;
+            peer.push_to(from, slot, partial.ptr, incoming.ptr, onboard.pair.combine.payload_bytes(rows, H))?;
         }
         for rank in 0..2 {
             if source.is_some_and(|owner| owner != rank) { continue; }

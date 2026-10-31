@@ -186,36 +186,56 @@ pub struct RuntimeInputs {
     pub onboard: Option<OnboardInputs>,
 }
 
+/// The Step TP2 exchange a routed format runs: EXL3 halves take FP8 K32 wire
+/// rows and exchange F32 partials (one rounding, as a Spark reply); fp8moe
+/// halves take BF16 rows and exchange BF16 partials (as GLM Flash FP8 ships:
+/// each half rounds to BF16 before the rank-order sum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tp2Exchange { Exl3, Fp8 }
+
+impl Tp2Exchange {
+    pub fn of(catalog: &crate::OfficialV41Catalog) -> Self {
+        if catalog.exl3().is_some() { Self::Exl3 } else { Self::Fp8 }
+    }
+    /// Bytes of one exchanged partial element.
+    pub fn partial_bytes(self) -> usize { match self { Self::Exl3 => 4, Self::Fp8 => 2 } }
+    /// Input bytes per row a whole layer's owner broadcasts.
+    pub fn input_row_bytes(self, hidden: usize) -> usize {
+        match self { Self::Exl3 => hidden + hidden / 32, Self::Fp8 => hidden * 2 }
+    }
+}
+
 /// One rank's Step TP2 onboarding exchange planes beside the package arena:
-/// per prefill lane an F32 routed partial, the peer's F32 partial as received
-/// (one plane for head-split layers, one for a whole layer's owner, so the two
+/// per prefill lane a routed partial, the peer's partial as received (one
+/// plane for head-split layers, one for a whole layer's owner, so the two
 /// exchanges never share storage) and the route broadcast scratch (packed
-/// top-8 routes plus FP8 K32 wire rows). The daemon allocates exactly these.
-pub fn tp2_exchange_bytes(unit_rows: usize, lanes: usize) -> Result<u64> {
+/// top-8 routes plus the input rows). The daemon allocates exactly these.
+pub fn tp2_exchange_bytes(unit_rows: usize, lanes: usize, exchange: Tp2Exchange) -> Result<u64> {
     const H: usize = 4096;
     ensure!((1..=4096).contains(&unit_rows) && (1..=4).contains(&lanes), "Step-5 TP2 exchange geometry");
     let plane = |bytes: usize| bytes.max(256) as u64;
     let section = unit_rows * 8 * 4;
     let routes = (section.next_multiple_of(16) + section).next_multiple_of(16);
-    let per_lane = 3 * plane(unit_rows * H * 4) + plane(routes + unit_rows * (H + H / 32));
+    let per_lane = 3 * plane(unit_rows * H * exchange.partial_bytes())
+        + plane(routes + unit_rows * exchange.input_row_bytes(H));
     (lanes as u64).checked_mul(per_lane).context("Step-5 TP2 exchange overflow")
 }
 
 /// Why NVFP4 Step plans onboard nothing (and refuse an explicit layer count).
 pub const NVFP4_ONBOARDING_DEPRECATED: &str = "Step-5 NVFP4 is deprecated (its cards retire this release): \
     RTX expert onboarding is not built for it; its routed experts stay on the Sparks";
-/// FP8 Step onboards through the same shared pair once its fp8moe backend is
-/// bound (#925); until then the plan keeps every routed layer on the Sparks.
-pub const FP8_ONBOARDING_PENDING: &str = "Step-5 FP8 RTX expert onboarding is not bound yet (#925, after EXL3): \
+/// FP8 Step is qualified only on two RTX (2 RTX + 6 Sparks); there its
+/// onboarded layers split TP2. No whole-layer fp8moe executor exists.
+pub const FP8_ONBOARDING_TWO_RTX: &str = "Step-5 FP8 onboards TP2 on two RTX only (its qualified card): \
     its routed experts stay on the Sparks";
 
-/// The named reason a routed format does not onboard (yet), or None.
-pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog) -> Option<&'static str> {
+/// The named reason a routed format does not onboard here, or None.
+pub fn onboarding_unavailable(catalog: &crate::OfficialV41Catalog, gpus: usize) -> Option<&'static str> {
     use crate::formats::fp8_experts::ExpertFormat;
     match catalog.fp8().map(|fp8| fp8.format()) {
         Some(ExpertFormat::Nvfp4) => Some(NVFP4_ONBOARDING_DEPRECATED),
-        Some(_) => Some(FP8_ONBOARDING_PENDING),
-        None => None,
+        Some(_) if gpus != 2 => Some(FP8_ONBOARDING_TWO_RTX),
+        _ => None,
     }
 }
 
@@ -240,14 +260,15 @@ impl OnboardInputs {
         use crate::placement::rtx_onboard::{expert_costs, expert_workspace};
         ensure!(matches!(gpus, 1 | 2), "Step-5 RTX onboarding needs one or two GPUs");
         if mode == Onboard::Layers(0) { return Ok(None); }
-        if let Some(reason) = onboarding_unavailable(catalog) {
+        if let Some(reason) = onboarding_unavailable(catalog, gpus) {
             ensure!(mode == Onboard::Auto, "{reason}");
             return Ok(None);
         }
         let rows = unit_rows as u64;
         let (workspace, tp2_workspace) = if gpus == 2 {
             let half = expert_workspace(catalog, manifest, rows, 2, "step5")?
-                .checked_add(tp2_exchange_bytes(unit_rows, lanes)?).context("Step-5 TP2 workspace overflow")?;
+                .checked_add(tp2_exchange_bytes(unit_rows, lanes, Tp2Exchange::of(catalog))?)
+                .context("Step-5 TP2 workspace overflow")?;
             (0, [half; 2])
         } else { (expert_workspace(catalog, manifest, rows, 1, "step5")?, [0; 2]) };
         Ok(Some(Self { costs: expert_costs(catalog, gpus == 2)?, workspace, tp2_workspace, mode }))

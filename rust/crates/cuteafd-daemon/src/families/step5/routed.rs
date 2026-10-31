@@ -565,6 +565,11 @@ impl<'a> RoutedFfn<'a> {
         if self.immutable.bf16_input { H * 2 } else { H + H / 32 }
     }
 
+    /// The front end's FP8 K32 wire rows (written whatever the Spark wire).
+    pub fn wire_input(&self) -> CuteafdDeviceBuffer { self.plane(WIRE) }
+    /// The front end's normalized BF16 rows.
+    pub fn bf16_input(&self) -> CuteafdDeviceBuffer { self.plane(NORM) }
+
     pub fn wave_inputs(&self) -> [CuteafdDeviceBuffer; 3] {
         [self.plane(IDS), self.plane(ROUTES), self.plane(if self.immutable.bf16_input { NORM } else { WIRE })]
     }

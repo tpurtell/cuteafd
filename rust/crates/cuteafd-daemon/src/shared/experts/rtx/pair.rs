@@ -214,7 +214,8 @@ struct Broadcast {
 
 pub(crate) struct Pair<'a> {
     pub layers: Vec<usize>,
-    /// FP8 K32 wire bytes per row a source broadcast carries; 0 when routes only.
+    /// Input bytes per row a source broadcast carries (the backends' input
+    /// dtype: FP8 K32 wire or BF16 rows); 0 when routes only.
     wire_row_bytes: usize,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     pub combine: FusedCombine<'a>,
@@ -252,8 +253,9 @@ impl<'a> Pair<'a> {
     }
 
     /// As [`Self::new`]; with `wire`, each route slot also holds `max_rows`
-    /// FP8 K32 wire rows, so a layer whose router lives on one rank can
-    /// publish its routes and input to the peer ([`Self::enqueue_from`]).
+    /// input rows in the backends' input dtype (FP8 K32 wire or BF16), so a
+    /// layer whose router lives on one rank can publish its routes and input
+    /// to the peer ([`Self::enqueue_from`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_wire(
         library: &'a NativeLibrary,
@@ -266,9 +268,8 @@ impl<'a> Pair<'a> {
         exchange: ExchangeDtype,
         wire: bool,
     ) -> Result<Self> {
-        let wire_row_bytes = if wire { hidden + hidden / 32 } else { 0 };
-        ensure!(!wire || ranks.iter().all(|backend| backend.uses_fp8_input()),
-            "a wire broadcast pair runs FP8 K32 input backends");
+        let fp8 = ranks[0].uses_fp8_input();
+        let wire_row_bytes = match (wire, fp8) { (false, _) => 0, (true, true) => hidden + hidden / 32, (true, false) => hidden * 2 };
         let layers = ranks[0].layers().to_vec();
         ensure!(
             !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
@@ -548,14 +549,14 @@ impl<'a> Pair<'a> {
         unsafe { self.enqueue_with(rank, layer, lane, rows, input, routes, scratch, shared, out, broadcast, abort) }
     }
 
-    /// As [`Self::enqueue`], for a layer whose router, routes and FP8 K32 wire
-    /// rows exist only on `source`: the source packs routes and wire into its
+    /// As [`Self::enqueue`], for a layer whose router, routes and input rows
+    /// exist only on `source`: the source packs routes and input into its
     /// `scratch` and pushes them over the peer exchange (device-driven, no host
     /// hop); the peer waits, then runs its half on the received rows.
     /// # Safety
     /// As [`Self::enqueue`]. On the peer, `input` and `routes` are ignored; on
-    /// the source, `input` is FP8 K32 wire rows and `scratch` holds
-    /// `PackedRoutes` plus the wire rows. Requires a pair built with
+    /// the source, `input` is in the backends' input dtype and `scratch` holds
+    /// `PackedRoutes` plus the input rows. Requires a pair built with
     /// [`Self::new_with_wire`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn enqueue_from(
@@ -681,9 +682,11 @@ impl<'a> Pair<'a> {
                             stream,
                         )?;
                         if wire {
-                            let ExpertInput::Fp8K32(rows_ptr) = input else {
-                                anyhow::bail!("source broadcast carries FP8 K32 wire rows");
+                            let rows_ptr = match input {
+                                ExpertInput::Fp8K32(rows) | ExpertInput::Bf16(rows) => rows,
                             };
+                            ensure!(matches!(input, ExpertInput::Fp8K32(_)) == self.uses_fp8_input(),
+                                "source broadcast input differs from the backends' input dtype");
                             self.library.copy_d2d_async(
                                 CuteafdDeviceBuffer {
                                     ptr: scratch.ptr.cast::<u8>().add(packed.bytes).cast(),
@@ -707,8 +710,9 @@ impl<'a> Pair<'a> {
                         weights: unsafe { received.cast::<u8>().add(packed.weights).cast() },
                     };
                     if wire {
-                        // SAFETY: as above; the wire rows follow the packed routes.
-                        input = ExpertInput::Fp8K32(unsafe { received.cast::<u8>().add(packed.bytes).cast() });
+                        // SAFETY: as above; the input rows follow the packed routes.
+                        let rows = unsafe { received.cast::<u8>().add(packed.bytes).cast() };
+                        input = if self.uses_fp8_input() { ExpertInput::Fp8K32(rows) } else { ExpertInput::Bf16(rows) };
                     }
                 }
             }
@@ -1207,7 +1211,7 @@ mod tests {
         let new = body("    pub(crate) fn new(\n");
         assert!(new.contains("Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, lanes, exchange, false)"));
         let with = source.split("    pub(crate) fn new_with_wire(").nth(1).unwrap();
-        assert!(with.contains("let wire_row_bytes = if wire { hidden + hidden / 32 } else { 0 };"));
+        assert!(with.contains("let wire_row_bytes = match (wire, fp8) { (false, _) => 0,"));
         assert!(with.contains("PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes"));
         let core = source.split("    unsafe fn enqueue_with(").nth(1).unwrap();
         assert!(core.contains("let wire_bytes = if wire { rows * self.wire_row_bytes } else { 0 };"));

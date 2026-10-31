@@ -385,13 +385,22 @@ fn with_backend<T>(args: &ServeArgs,
             let entry = usize::from(ownership.execution().spec().entry_gpu);
             let onboarded = ownership.onboarded_layers();
             if onboarded.is_empty() { return Ok(native); }
-            ensure!(format.is_exl3(), "Step-5 RTX onboarding runs EXL3 experts today (FP8 follows)");
-            let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.to_path_buf();
             match onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")? {
-                OnboardBudget::Whole(peak) => native.with_onboarded(devices[entry], &catalog, &package.join("rtx-tp1"),
-                    onboarded, inputs.unit_rows(), peak),
-                OnboardBudget::Tp2(peaks) => native.with_onboarded_tp2([devices[0], devices[1]], &catalog,
-                    &package.join("rtx-tp2"), onboarded, inputs.unit_rows(), peaks),
+                OnboardBudget::Whole(peak) => {
+                    ensure!(format.is_exl3(), "Step-5 whole-layer onboarding runs EXL3 experts (FP8 is TP2 on two RTX)");
+                    let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.join("rtx-tp1");
+                    native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak)
+                }
+                OnboardBudget::Tp2(peaks) => {
+                    let package = match &format {
+                        super::experts::StepExperts::Exl3(_) => format.package_manifest(&args.native_lib)?
+                            .parent().context("EXL3 package")?.join("rtx-tp2"),
+                        super::experts::StepExperts::Native(expert) => crate::shared::experts::fp8::package_directory(
+                            &args.native_lib, 2, *expert),
+                    };
+                    native.with_onboarded_tp2([devices[0], devices[1]], &catalog, &package, onboarded,
+                        inputs.unit_rows(), peaks)
+                }
             }
         })
     })?;

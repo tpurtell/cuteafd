@@ -1603,7 +1603,7 @@ fn exl3_two_rtx_onboards_tp2_halves_and_sparks_keep_the_rest() {
     let tp2 = solved.tp2.as_ref().expect("TP2 range");
     assert_eq!((tp2.first, tp2.layers), (3, onboarded));
     let exchange = super::admission::tp2_exchange_bytes(auto.prefill_unit_rows.unwrap() as usize,
-        auto.prefill_waves.unwrap() as usize).unwrap();
+        auto.prefill_waves.unwrap() as usize, super::admission::Tp2Exchange::Exl3).unwrap();
     assert!(tp2.peak_bytes.iter().all(|&peak| peak > exchange));
     assert_eq!(auto.onboard_layers, Some(onboarded));
     assert!(auto.memory_layout.as_ref().unwrap().notes.iter().any(|n| n.contains("split TP2 over both RTX")));
@@ -1768,6 +1768,32 @@ fn tp2_onboarded_layers_skip_replication_and_validate_their_exchange() {
     assert_eq!(owners.routed_source(4).unwrap(), None);
     // One unit, three lanes: three F32 partial planes plus routes and wire each.
     let per_lane = 3 * 2752 * 4096 * 4 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * (4096 + 128);
-    assert_eq!(super::admission::tp2_exchange_bytes(2752, 3).unwrap(), 3 * per_lane as u64);
-    assert!(super::admission::tp2_exchange_bytes(0, 1).is_err() && super::admission::tp2_exchange_bytes(64, 5).is_err());
+    use super::admission::{tp2_exchange_bytes, Tp2Exchange};
+    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Exl3).unwrap(), 3 * per_lane as u64);
+    // FP8: BF16 partials and BF16 input rows.
+    let fp8 = 3 * 2752 * 4096 * 2 + (2752usize * 32).next_multiple_of(16) + 2752 * 32 + 2752 * 4096 * 2;
+    assert_eq!(tp2_exchange_bytes(2752, 3, Tp2Exchange::Fp8).unwrap(), 3 * fp8 as u64);
+    assert!(tp2_exchange_bytes(0, 1, Tp2Exchange::Exl3).is_err() && tp2_exchange_bytes(64, 5, Tp2Exchange::Exl3).is_err());
+}
+
+/// FP8 Step onboards TP2 on its qualified two-RTX card (fp8moe halves, BF16
+/// exchange); one RTX keeps it on the Sparks with a named reason.
+#[test]
+fn fp8_two_rtx_onboards_tp2_halves_with_the_bf16_exchange() {
+    use crate::placement::ExpertHome;
+    use super::admission::{tp2_exchange_bytes, Tp2Exchange, FP8_ONBOARDING_TWO_RTX};
+    let dir = snapshot("fp8");
+    let report = report(dir.path(), 2, 96, 6, None);
+    assert!(report.wip_launchable(), "{:#?}", report.hints);
+    let solved = report.solver_placement.as_ref().unwrap();
+    let onboarded = solved.layers.iter().filter(|l| l.experts == ExpertHome::RtxTp2).count();
+    assert!(onboarded > 0 && solved.layers.iter().all(|l| !matches!(l.experts, ExpertHome::RtxWhole { .. })));
+    let exchange = tp2_exchange_bytes(report.prefill_unit_rows.unwrap() as usize,
+        report.prefill_waves.unwrap() as usize, Tp2Exchange::Fp8).unwrap();
+    assert!(solved.tp2.as_ref().unwrap().peak_bytes.iter().all(|&peak| peak > exchange));
+    eprintln!("Step-5 FP8 2 RTX + 6 Sparks: onboard {onboarded} layers TP2, pool {}", solved.pool_tokens);
+    let one = Checkpoint::open(dir.path()).unwrap();
+    let catalog = crate::read_expert_catalog(&one.snapshot).unwrap();
+    assert_eq!(super::admission::onboarding_unavailable(&catalog, 1), Some(FP8_ONBOARDING_TWO_RTX));
+    assert_eq!(super::admission::onboarding_unavailable(&catalog, 2), None);
 }
