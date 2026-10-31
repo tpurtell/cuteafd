@@ -180,7 +180,7 @@ fn save_diagnostics(
 
 fn selection(last: usize, peers: usize, hosted: &[usize], nll: bool) -> Result<()> {
     ensure!((3..=91).contains(&last), "Step-5 golden supports target layers 3..91");
-    ensure!([3, 4, 6].contains(&peers), "Step-5 golden needs canonical TP3/4/6 real experts");
+    ensure!(peers > 0, "Step-5 golden needs real Spark experts");
     let final_routed = last.min(90);
     ensure!(hosted == (3..=final_routed).collect::<Vec<_>>(),
         "Step-5 golden hosted experts must exactly cover layers 3..{final_routed}");
@@ -961,7 +961,11 @@ async fn on_engine_thread(work: impl FnOnce() -> Result<()> + Send + 'static) ->
 fn run(args: GoldenArgs) -> Result<()> {
     diagnostic_selection(&args)?;
     let layers = if args.dump_layer0.is_some() { vec![] } else { selected_layers()? };
-    if args.dump_layer0.is_none() { selection(args.last_layer, args.peers.len(), &layers, args.nll)?; }
+    if args.dump_layer0.is_none() {
+        selection(args.last_layer, args.peers.len(), &layers, args.nll)?;
+        // The world comes from the planner's fit for this checkpoint, not a fixed list.
+        cuteafd_loader::plan::families::step5::spark_world_admitted(&args.snapshot, &args.manifest, args.peers.len())?;
+    }
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let format = super::experts::StepExperts::from_catalog(&catalog)?;
     checkpoint_identity(args.snapshot.file_name().and_then(|s| s.to_str()), &format,
@@ -1379,8 +1383,7 @@ mod tests {
         assert!(selection(3, 6, &[3], false).is_ok());
         assert!(selection(3, 6, &[3, 4], false).is_err());
         assert!(selection(4, 6, &[4, 3], false).is_err());
-        assert!(selection(3, 2, &[3], false).is_err());
-        assert!(selection(3, 3, &[3], false).is_ok());
+        assert!(selection(3, 0, &[3], false).is_err());
         assert!(selection(3, 6, &[3], true).is_err());
     }
     fn reference_meta() -> Value {

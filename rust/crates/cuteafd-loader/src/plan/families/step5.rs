@@ -606,3 +606,30 @@ impl FamilyModel for Model {
         Some(placement::layout(self, input, report, options, requested))
     }
 }
+
+/// Whether this checkpoint admits `ranks` real Spark experts: the planner's
+/// own verdict for that world (a packaged layout, nonempty whole slices, the
+/// Spark range and every Spark device's full memory layout), so a golden
+/// accepts exactly the worlds `cuteafd plan --layout` does instead of keeping
+/// its own list. RTX columns are the caller's (golden sizes its own chain).
+pub fn spark_world_admitted(snapshot: &std::path::Path, programs: &std::path::Path, ranks: usize)
+    -> anyhow::Result<()> {
+    use cuteafd_core::memory_layout::DeviceKind;
+    anyhow::ensure!(ranks > 0, "Step-5 golden needs real Spark experts");
+    let report = crate::plan::plan(snapshot, &crate::plan::PlanOptions {
+        placement: crate::plan::ExpertPlacement::from_spark_ranks(ranks),
+        draft_ownership: Some(crate::plan::spec::DraftOwnership::None),
+        layout: Some(crate::plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
+            workspace_manifest: Some(programs.to_path_buf()), ..Default::default() }),
+        ..Default::default() })?;
+    let spark_over = report.memory_layout.as_ref().map_or(Vec::new(), |memory| memory.devices.iter()
+        .filter(|d| d.kind == DeviceKind::Spark && d.used_bytes() > d.capacity_bytes)
+        .map(|d| format!("{} needs {} of {} bytes", d.name(), d.used_bytes(), d.capacity_bytes)).collect());
+    let laid_out = report.memory_layout.as_ref().is_some_and(|m| m.devices.iter().any(|d| d.kind == DeviceKind::Spark));
+    if report.placement_supported && report.spark_range_refusal.is_none() && laid_out && spark_over.is_empty() {
+        return Ok(());
+    }
+    let hints = report.hints.iter().map(|h| h.what.as_str()).chain(spark_over.iter().map(String::as_str))
+        .collect::<Vec<_>>().join("; ");
+    anyhow::bail!("Step-5 checkpoint does not admit {ranks} Spark ranks: {hints}")
+}

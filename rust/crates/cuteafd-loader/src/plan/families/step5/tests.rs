@@ -1453,6 +1453,18 @@ fn exl3_recipe_headers_classify_core_routed_mtp_and_kept_tensors() -> anyhow::Re
 }
 
 #[test]
+fn exl3_spark_world_admission_follows_planner_fit() {
+    let fixture = exl3_snapshot();
+    let manifest = native_manifest(fixture.path());
+    install_exl3_rtx_package(&manifest);
+    let refused = super::spark_world_admitted(fixture.path(), &manifest, 2).unwrap_err().to_string();
+    assert!(refused.contains("does not admit 2 Spark ranks"), "{refused}");
+    // 4 and 6 are the card columns (exl3_card_columns_fit_from_headers).
+    super::spark_world_admitted(fixture.path(), &manifest, 3).unwrap();
+    assert!(super::spark_world_admitted(fixture.path(), &manifest, 0).is_err());
+}
+
+#[test]
 fn exl3_plan_reports_every_component_ready_and_k46_spark_recipe() {
     let fixture = exl3_snapshot();
     let report = plan::plan(fixture.path(), &PlanOptions {
