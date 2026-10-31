@@ -119,6 +119,10 @@ pub(crate) enum Commands {
     /// Serve an eager native Step-5 target with real Spark experts.
     #[command(hide = true)]
     ServeStep5(crate::families::step5::serve::ServeArgs),
+    /// Admit Muse Spark (whole experts expert-parallel on the Sparks); the
+    /// execution engine is not built yet, so startup stops after admission.
+    #[command(hide = true)]
+    ServeMuse(crate::families::muse_spark::serve::ServeArgs),
     /// Serve dense Qwen BF16 through the shared Qwen scheduler.
     #[command(hide = true)]
     ServeQwen35(crate::families::qwen3_5::serve::ServeArgs),

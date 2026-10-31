@@ -5573,7 +5573,11 @@ mod prefill_lane_tests {
             // b729115b uses canonical BF16 MMA at every positive row count.
             // Hugh Madden fork #30 (TMA fences before consumer_release): fence-only change.
             // Fork #136 adds only an optional weight TMA cache policy; MMA and K order are unchanged.
-            ("integration/cuteafd/_glm_kernels.py", 0xd327_0840_454a_bc62),
+            // Fork #200 (Mistral Large 4) adds GlmRankNormPackKV q_rank 0 (q statements behind
+            // const_expr, original order kept for q_rank > 0) and GlmIndexPost rope=False (default
+            // True); projection routes and thresholds untouched. SM188/170 vs the master-pinned
+            // baseline: glm, glm2, glmf, glm-stage programs byte-identical including SASS.
+            ("integration/cuteafd/_glm_kernels.py", 0x481c_c910_48bc_d648),
             // Fork #146 adds `fp8_gemv_tuning`/`fp8_gemv_wide`/`fp8_gemv_wide_kernel` and the
             // `NcMmaFp8Gemv` load path. Selected shapes keep the shipped `warps`; every change is a
             // grid partition (groups, cta_tiles). The (5120, 17408) wide tile's `nc` load path

@@ -18,12 +18,13 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("qwen3_5", "serve-qwen35", Some("qwen35-golden")),
     ("kimi_k3", "serve-kimi", Some("kimi-golden")),
     ("step5", "serve-step5", Some("step5-golden")),
+    ("muse_spark", "serve-muse", None),
 ];
 
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
 pub(crate) struct FamilyArgs {
-    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4, qwen3_5, kimi_k3 or step5.
+    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4, qwen3_5, kimi_k3, step5 or muse_spark.
     /// Detected from --snapshot's config.json when omitted.
     #[arg(long)]
     pub(crate) family: Option<String>,
@@ -146,7 +147,7 @@ mod tests {
             if matches!(*serve, "serve-native" | "serve-mimo" | "serve-glm" | "serve-dsv4") {
                 argv.extend(["--peers", "127.0.0.1:9,127.0.0.1:10"]);
             }
-            if *serve == "serve-step5" {
+            if matches!(*serve, "serve-step5" | "serve-muse") {
                 argv.extend(["--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]);
             }
             let cli = crate::cli::Cli::try_parse_from(argv).unwrap();

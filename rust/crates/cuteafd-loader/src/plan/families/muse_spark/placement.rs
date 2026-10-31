@@ -12,14 +12,10 @@ use crate::{placement::*, plan::{Component, ExpertPlacement, Hint, PlanReport}};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 const GIB: u64 = 1 << 30;
-const PAGE: u64 = 64;
 /// Spark worlds whole-expert ownership serves: every transport world whose
 /// ranks each own at least one expert (the EP program is world-independent).
 pub(super) const EP_WORLDS: [usize; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
-/// Prefill transport endpoints: one shared link.
-const LANES: u64 = 1;
-const MODES: &[LayerMode] = &[LayerMode::HeadSplit];
-const SINGLE: &[LayerMode] = &[LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }];
+use crate::placement::families::muse_spark::LANES;
 
 pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut PlanReport,
     opts: &mut crate::plan::layout::LayoutOptions, requested: ExpertPlacement) -> MemoryLayout {
@@ -67,133 +63,49 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         refusal(report, "Muse Spark runs on one RTX or a head-split RTX pair".into(), "Use --rtx 1 or 2.");
         return memory;
     }
-    // Coordinator text weights from the shared per-rank layout the runtime packs
-    // (head-split attention halves, the rest whole on each GPU).
-    let layouts = match (0..cfg.layers).map(|layer| crate::families::muse_spark::weight_layout::LayerLayout::ranks(
-        cfg, layer, gpus, &model.core)).collect::<anyhow::Result<Vec<_>>>() {
-        Ok(layouts) => layouts,
-        Err(error) => { refusal(report, format!("Muse Spark weight layout refused: {error:#}"), "Check the checkpoint's core headers."); return memory; }
-    };
-    let global = match crate::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &model.core) {
-        Ok(global) => global,
-        Err(error) => { refusal(report, format!("Muse Spark head layout refused: {error:#}"), "Check the head's headers."); return memory; }
-    };
-    let per_gpu: Vec<u64> = (0..gpus).map(|gpu| layouts.iter().map(|ranks| ranks[gpu].bytes().unwrap_or(0) as u64).sum()).collect();
-    let embedding = global.embedding as u64;
-    let head = global.head_bytes() as u64;
-    let experts = *model.bytes.get(&Component::RoutedExpert).unwrap_or(&0);
-    report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head
-        + global.final_norm as u64 * gpus as u64 + per_gpu.iter().sum::<u64>());
-    report.bytes_by_owner.insert("routed expert weights".into(), experts);
-    memory.notes.push(format!("Muse K6 core: {} header-native projections ({}); payload + H128 vectors charged",
-        model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
-
-    // KV: full layers page BF16 K+V records; sliding layers keep a per-sequence
-    // ring of window + one prefill unit (append-only, exact restores).
+    // One request builder for planning and serving startup (plan == runtime).
     let slots = opts.state_slots.unwrap_or(if opts.concurrency > 0 { opts.concurrency } else { 16 });
-    let record = cfg.kv_record_bytes() as u64 * PAGE;
-    let ring = cuteafd_core::prefix::AppendRing::new(cfg.window as u64, prefill.unit_rows.max(PAGE), PAGE)
-        .map_or(0, |ring| ring.rows) * cfg.kv_record_bytes() as u64;
-    let rings = cfg.sliding_layers() as u64 * ring;
-    let marks = (cfg.sliding_layers() * cfg.window * cfg.kv_record_bytes()) as u64;
-    let split_gpus = gpus as u64;
-    let mut fixed = Vec::new();
-    for gpu in 0..gpus as u8 {
-        fixed.push(Demand::new(gpu, Category::Weights,
-            "layer weights (head-split attention; MoE projections, router, norms, residual gates whole)",
-            per_gpu[usize::from(gpu)], Basis::Exact));
-        fixed.push(Demand::new(gpu, Category::Weights, "final norm", global.final_norm as u64, Basis::Exact));
-        fixed.push(Demand::new(gpu, Category::Kv, format!("sliding rings, {slots} sequences x {} layers",
-            cfg.sliding_layers()), rings * slots / split_gpus, Basis::Formula));
-        // One exact retained sliding window per slot (prompt end + turn end marks).
-        fixed.push(Demand::new(gpu, Category::Prefix, "Muse exact sliding marks", marks * slots / split_gpus, Basis::Formula));
-    }
-    fixed.push(Demand::new(0, Category::Embedding, "token embedding", embedding, Basis::Exact));
-    fixed.push(Demand::new((gpus - 1) as u8, Category::Weights, "lm head (K6)", head, Basis::Exact));
-    // Spark returns land on the coordinator: one prefill span of expert-width partials per rank.
-    fixed.push(Demand::new(0, Category::Transport, "Spark intake planes",
-        crate::serving_capacity::prefill_return_bytes(prefill.waves, prefill.unit_rows, ranks as u64,
-            cfg.expert_hidden as u64), Basis::Formula));
-
-    // Spark: whole experts partitioned by the shared owner table.
-    let owners = match cuteafd_core::ExpertOwners::staggered(cfg.layers, cfg.experts, ranks) {
-        Ok(owners) => owners,
-        Err(error) => { refusal(report, format!("Muse whole-expert ownership: {error}"), "Use 1..=8 Spark ranks."); return memory; }
-    };
-    let inventory = (|| -> anyhow::Result<_> {
-        let catalog = input.expert_catalog()?;
-        let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (0..cfg.layers).collect(),
-            spark_ranks: ranks, prefill_lanes: LANES };
-        let rings = crate::plan::layout::spark_ring_geometry(LANES as usize);
-        let endpoints = [cuteafd_core::SparkEndpoint { ring_depth: None, capacity: prefill.unit_rows as u32,
-            ingress: cuteafd_core::SparkIngress::Fp8K32 }];
-        let budget = opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES);
-        let reserve = spark_reserve_bytes(prefill.waves, prefill.unit_rows)?;
-        // The checkpoint's per-expert output norm makes the residency whole experts.
-        anyhow::ensure!(catalog.whole_expert_outputs(), "Muse Spark experts must carry their post-expert norm");
-        let spark = SparkBudgetInventory::exl3(catalog, &working, &endpoints,
-            cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
-                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget, reserve)?;
-        // An onboarded layer is whole on one GPU: the per-expert norm needs each
-        // expert's complete output, so TP2 halves would be inexact.
-        let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Muse Spark requires EXL3 expert headers"))?;
-        let mut costs = Vec::with_capacity(cfg.layers);
-        for layer in 0..cfg.layers {
-            costs.push(manifest.residency(crate::V41Exl3Layer::Backbone(layer), 1, 0)?.device_arena_layout()?.1 as u64);
-        }
-        Ok((spark, costs))
-    })();
-    let (spark_budget, costs) = match inventory {
-        Ok(value) => value,
+    let catalog = match input.expert_catalog() {
+        Ok(catalog) => catalog,
         Err(error) => {
             refusal(report, format!("Muse Spark expert inventory refused: {error:#}"), "Provide complete EXL3 expert headers.");
             return memory;
         }
     };
-    let modes = if gpus == 2 { MODES } else { SINGLE };
-    let layers = (0..cfg.layers).map(|layer| {
-        let full = cfg.attention[layer] == crate::families::muse_spark::MuseAttention::Full;
-        let whole = costs[layer];
-        LayerDemand {
-            kind: if full { AttentionClass::Gqa } else { AttentionClass::Swa },
-            weights: ModeBytes::default(),
-            kv_unit: if full {
-                KvDemand { unit_bytes_whole: record, unit_bytes_split: [record / 2; 2], unit_bytes_context: None }
-            } else { KvDemand::default() },
-            fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
-            experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 },
-                half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
-            modes: modes.to_vec(),
+    let inputs = crate::placement::families::muse_spark::MuseInputs { cfg, core: &model.core, catalog,
+        gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
+            baseline: Baseline::Planned { context_bytes: ArchContext::for_device("sm_120", *bytes).context_bytes,
+                loaded_bytes: 0 } }).collect(),
+        spark_ranks: ranks, prefill, slots, context, automatic_context: opts.context_tokens == 0,
+        requested_pool: opts.pool_tokens.filter(|n| *n > 0), onboard: opts.onboard.unwrap_or(Onboard::Auto),
+        spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
+        fixed: match planned_code(opts, gpus) {
+            Ok(fixed) => fixed,
+            Err(error) => {
+                refusal(report, format!("Muse Spark program manifest refused: {error:#}"), "Supply the image's PROGRAMS.json.");
+                return memory;
+            }
+        }, startup: Vec::new() };
+    let built = match crate::placement::families::muse_spark::request(inputs) {
+        Ok(built) => built,
+        Err(error) => {
+            refusal(report, format!("Muse Spark joint admission refused: {error:#}"),
+                "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-budget-gib.");
+            return memory;
         }
-    }).collect::<Vec<_>>();
-    let requested_pool = opts.pool_tokens.filter(|n| *n > 0);
-    // An automatic context clamps to the pool the Sparks leave room for.
-    let pool = PoolPolicy::resolve(&opts.rtx_bytes, context, requested_pool, PAGE, false)
-        .with_automatic_context(opts.context_tokens == 0);
-    let mut request = PlacementRequest {
-        inventory: Inventory { gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes,
-            headroom_bytes: opts.headroom_bytes, baseline: Baseline::Planned {
-                context_bytes: ArchContext::for_device("sm_120", *bytes).context_bytes, loaded_bytes: 0 } }).collect(),
-            spark_ranks: ranks, peer_access: gpus == 2 },
-        attention_placement: (gpus == 2).then_some(AttentionPlacement::Heads), context_buffers: ContextBuffers::default(),
-        layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; gpus], pool_bounded: Vec::new(), fixed,
-        startup: Vec::new(), movables: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2],
-        onboard: opts.onboard.unwrap_or(Onboard::Auto), expert_gpus: gpus, minimum_expert_layers: 0,
-        // Whole onboarded layers alternate between the GPUs.
-        policy: LayerPolicy { default: modes.to_vec(), ownership: LayerOwnership::Ranges,
-            expert_ownership: if gpus == 2 { ExpertOwnership::AlternatingWhole } else { ExpertOwnership::Contiguous },
-            ..Default::default() },
-        hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
-            entry_gpu: 0, head_gpu: (gpus - 1) as u8, terminal: if gpus == 2 { TerminalHome::Replicated }
-                else { TerminalHome::AttentionOwner } },
-        executor: ExecutorModes { family: "muse_spark", modes, hops: false, attention: AttentionPlacement::Heads },
     };
-    if let Err(error) = spark_budget.constrain(&mut request) {
-        refusal(report, format!("Muse Spark joint admission refused: {error:#}"),
-            "Use more Spark ranks, automatic RTX expert selection, or a larger --spark-budget-gib.");
-        return memory;
-    }
-    let placed = match solve(&request) {
+    let embedding = built.global.embedding as u64;
+    let head = built.global.head_bytes() as u64;
+    let experts = *model.bytes.get(&Component::RoutedExpert).unwrap_or(&0);
+    let layer_bytes = (0..gpus).map(|gpu| built.layer_bytes(gpu).unwrap_or(0)).sum::<u64>();
+    report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head
+        + built.global.final_norm as u64 * gpus as u64 + layer_bytes);
+    report.bytes_by_owner.insert("routed expert weights".into(), experts);
+    memory.notes.push(format!("Muse K6 core: {} header-native projections ({}); payload + H128 vectors charged",
+        model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
+    let rings = crate::placement::families::muse_spark::ring_rows(cfg, prefill.unit_rows).unwrap_or(0)
+        * cfg.kv_record_bytes() as u64 * cfg.sliding_layers() as u64;
+    let placed = match solve(&built.request) {
         Ok(placed) => placed,
         Err(error) => {
             refusal(report, format!("Muse Spark coordinator admission refused: {error}"),
@@ -201,6 +113,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    let (spark_budget, owners) = (built.spark_budget, built.owners);
     memory.pool_tokens = placed.pool_tokens;
     memory.notes.push(format!("Muse selected RTX expert layers: {}; pool {} tokens; full-layer KV {} B/token over {} \
         layers; sliding rings {} B/sequence over {} layers", placed.onboard_layers, placed.pool_tokens,
@@ -239,24 +152,22 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     memory
 }
 
-/// Muse's typed Spark owners on the EXL3 ladder.
-pub(crate) fn spark_executions(waves: u64, unit_rows: u64) -> anyhow::Result<cuteafd_core::SparkExecutions> {
-    let exports = crate::plan::spark_executions::SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest).exports();
-    crate::plan::spark_executions::admit_family("muse_spark", &exports, None, unit_rows, waves)
-}
-
-/// The pre-placement Spark reserve: the runtime residual plus the typed owners.
-fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> anyhow::Result<u64> {
-    let owners = spark_executions(waves, unit_rows)?.workspace_bytes(owner_bytes)?
-        .and_then(|bytes| bytes.total()).ok_or_else(|| anyhow::anyhow!("Muse Spark owner reserve overflow"))?;
-    Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
-}
-
-fn owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
-    crate::plan::layout::spark_slots::exl3_owner_bytes("muse_spark", cuteafd_core::ExpertGeometry::MUSE_SPARK, extent)
+/// Loaded code charged exactly as live startup charges it (the full allowance
+/// offline, nothing yet resident), once the image's program manifest is known.
+fn planned_code(opts: &crate::plan::layout::LayoutOptions, gpus: usize) -> anyhow::Result<Vec<Demand>> {
+    let Some(path) = opts.workspace_manifest.as_deref().filter(|path| path.is_file()) else { return Ok(Vec::new()) };
+    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let programs = ProgramSet::from_manifest(&manifest, crate::placement::families::muse_spark::program_families(gpus));
+    (0..gpus).map(|rank| {
+        let arch = ArchContext::for_device("sm_120", opts.rtx_bytes[rank]);
+        let code = crate::placement::inventory::loaded_code_allowance("muse", "exl3", gpus == 2, rank as u8,
+            arch, Some(&programs));
+        crate::placement::families::muse_spark::code_demand(rank, code.bytes)
+    }).collect()
 }
 
 fn muse_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
+    use crate::placement::families::muse_spark::{owner_bytes, spark_executions};
     crate::plan::layout::spark_slots::charge_owners(device, &spark_executions(waves, unit_rows)?, owner_bytes)
 }
