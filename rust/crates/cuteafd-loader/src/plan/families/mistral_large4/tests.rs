@@ -33,8 +33,9 @@ fn official_fp8_release_inventory_is_complete_and_classified() {
         let expected = usize::from(c.component == Component::RoutedExpert);
         assert_eq!(c.rejected, expected, "{:?}: {:?}", c.component, c.rejections);
         // The engine serves the EXL3 publication: the official FP8 release's routed experts
-        // have no kernel; every other component, the BF16 Pixtral tower included, is ready.
-        assert_eq!(c.status, if c.component == Component::Speculator { Status::Disabled }
+        // have no kernel; every other text component is ready. Automatic vision with the
+        // default Spark experts plans text only (`vision::auto_vision`), so the tower is disabled.
+        assert_eq!(c.status, if matches!(c.component, Component::Vision | Component::Speculator) { Status::Disabled }
             else if c.component == Component::RoutedExpert { Status::MissingKernel } else { Status::Ready },
             "{:?}", c.component);
     }
@@ -293,13 +294,23 @@ fn tp2_onboarding_inventory_reads_the_checkpoint_geometry_package_and_router() {
 }
 
 /// The Pixtral tower on the 2-RTX column (full release headers, native K6
-/// programs): wherever it resolves to an RTX (`--vision rtx`, or auto when no
-/// Spark holds tower + scratch + 1 GiB, as at n=5) it is reserved before the
-/// pool and onboard solve and the plan holds, never a refused encoder; where a
-/// Spark holds it (auto at n=6..8) the RTX working set is untouched. That the
+/// programs): `--vision rtx` reserves it on an RTX before the pool and onboard
+/// solve and the plan holds, never a refused encoder. Automatic vision with
+/// Spark experts plans text only (`vision::auto_vision`, serving's rule too:
+/// a Spark-hosted Pixtral encoder is not wired), leaving the RTX set as off. That the
 /// reserved bytes shed onboarded layers is the solver's own contract
 /// (`placement::families::glm5` `reserved_tower_sheds_onboarded_layers`); this
 /// manifest carries no local expert package, so nothing onboards here.
+#[test]
+fn auto_vision_is_coordinator_only_until_a_spark_encoder_exists() {
+    use crate::families::mistral_large4::vision::auto_vision;
+    assert_eq!(auto_vision(MediaMode::Auto, false), MediaMode::Auto);
+    assert_eq!(auto_vision(MediaMode::Auto, true), MediaMode::Off);
+    for explicit in [MediaMode::Rtx(None), MediaMode::Rtx(Some(1)), MediaMode::Off, MediaMode::Spark(None)] {
+        assert_eq!(auto_vision(explicit, true), explicit);
+    }
+}
+
 #[test]
 fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
     use crate::plan::encoder::EncoderKind;
@@ -328,8 +339,9 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
             assert!(report.placement_supported, "n={ranks} {vision:?}: {:?}", report.hints);
             let encoder = report.encoder.as_ref().expect("an encoder placement");
             let on_rtx = matches!(encoder.kind, EncoderKind::Rtx { .. });
-            assert_eq!(on_rtx, vision != MediaMode::Auto || ranks == 5, "n={ranks} {vision:?}: {:?}", encoder.kind);
-            assert_eq!(encoder.weights + encoder.scratch, tower);
+            assert_eq!(on_rtx, vision != MediaMode::Auto, "n={ranks} {vision:?}: {:?}", encoder.kind);
+            assert_eq!(report.vision, if vision == MediaMode::Auto { MediaMode::Off } else { vision });
+            if on_rtx { assert_eq!(encoder.weights + encoder.scratch, tower); }
             let memory = report.memory_layout.as_ref().unwrap();
             assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "n={ranks} {vision:?}");
             if on_rtx {
@@ -338,7 +350,8 @@ fn vision_on_two_rtx_reserves_the_tower_before_the_solve() {
                     && d.items.iter().any(|i| i.group == "vision tower")));
                 assert!(memory.pool_tokens <= off.memory_layout.as_ref().unwrap().pool_tokens);
             } else {
-                assert_eq!(rtx_used(&report), rtx_used(&off), "n={ranks}: a Spark-hosted tower leaves the RTX set");
+                assert!(matches!(encoder.kind, EncoderKind::Off), "n={ranks}: auto with Sparks plans text only");
+                assert_eq!(rtx_used(&report), rtx_used(&off), "n={ranks}: text only leaves the RTX set");
             }
             println!("ml4 n={ranks} 2 RTX {vision:?}: encoder {:?}, pool {} (off {})", encoder.kind,
                 memory.pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);

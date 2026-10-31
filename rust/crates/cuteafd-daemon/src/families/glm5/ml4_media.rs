@@ -30,15 +30,17 @@ impl ReadyVision {
     pub fn load(args: &super::EngineArgs, library: &cuteafd_ffi::NativeLibrary, mode: MediaMode,
         prefix: &crate::shared::prefix::PrefixArgs, cache_bytes: Option<u64>)
         -> Result<(Option<Self>, crate::shared::prefix::PrefixArgs)> {
+        // The planner's rule: automatic vision with Spark experts serves text only.
+        let resolved = cuteafd_loader::families::mistral_large4::vision::auto_vision(mode, args.peers.is_some());
+        if resolved != mode {
+            tracing::warn!("Mistral Large 4 VISION=auto with Spark experts serves text only: a Spark-hosted \
+                Pixtral encoder is not wired yet; set VISION=rtx to serve images from the coordinator");
+        }
+        let mode = resolved;
         let Some(config) = vision_config(mode, &args.snapshot)? else { return Ok((None, prefix.clone())); };
         let gpu = match mode {
-            MediaMode::Rtx(_) => crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?,
-            MediaMode::Auto => {
-                anyhow::ensure!(args.peers.is_none(),
-                    "Mistral Large 4 auto vision with Spark experts places the tower on a Spark, which serving \
-                     does not wire yet; set VISION=rtx (or VISION=off)");
-                crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?
-            }
+            MediaMode::Rtx(_) | MediaMode::Auto =>
+                crate::families::glm5_flash::media::local_vision_gpu(mode, args.device, args.split_device)?,
             MediaMode::Spark(_) => anyhow::bail!("Mistral Large 4 Spark-hosted vision is not wired yet; set VISION=rtx"),
             MediaMode::Off => unreachable!(),
         };

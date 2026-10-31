@@ -780,7 +780,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             return Ok(report);
         }
     };
-    report.vision = model.vision_mode(options.vision);
+    report.vision = model.vision_mode_placed(options.vision, options.placement);
     // An unset Spark budget is the family's own (Kimi K3 admits more than the
     // shared default); an explicit --spark-budget-gib always wins.
     let mut resolved = options.clone();
