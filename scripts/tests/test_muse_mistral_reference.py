@@ -393,3 +393,14 @@ def test_muse_ordered_experts_equal_the_official_cpu_accumulation():
         official = moe.experts(hidden, index, weights)
         ordered = muse.ordered_experts(moe.experts, hidden, index, weights)
     assert torch.equal(official, ordered)
+
+
+def test_mistral_ordered_experts_equal_the_official_cpu_accumulation():
+    from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
+    config = tiny_mistral_config()
+    moe = reference.MistralLarge4TextMoE(config).eval()
+    randomize(moe)
+    hidden = torch.randn(37, config.hidden_size)
+    _, weights, index = moe.gate(hidden)
+    with torch.inference_mode():
+        assert torch.equal(moe.experts(hidden, index, weights), mistral.ordered_experts(moe.experts, hidden, index, weights))

@@ -307,6 +307,7 @@ def run(a, family, *, extras_root=None):
                   torch=torch.__version__, transformers=transformers.__version__, tokenizers=tokenizers.__version__,
                   attention="eager", mtp=False, use_cache=False, prefix_qualification=proof, fixed_rows=128,
                   official_forward=comparison, arithmetic=arithmetic, **family.golden_meta(),
+                  harness_commit=os.environ.get("CUTEAFD_REFERENCE_HARNESS_COMMIT", ""),
                   platform={"capability": list(torch.cuda.get_device_capability()),
                             "gpu": torch.cuda.get_device_name(), "cuda": torch.version.cuda}
                   if DEVICE == "cuda" else {"device": DEVICE})
