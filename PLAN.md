@@ -6398,3 +6398,14 @@ pilot is unnecessary. Publication, no-copy Sparknest import, six-Spark
 placement and cleanup stay enabled. Estimate approximately 42 hours of
 quantization, refined by completed full MoE layers. Continue 30-minute
 status checks once the clean run is stable.
+
+USER-REQUESTED PAUSE (2026-10-31 01:25 UTC): stop quantization for a
+SparkNest upgrade. Unit step5-core-k6-1793362893146861204 is stopped and
+disabled; its Docker container is stopped/removed. Do not restart or resume
+monitoring until TJ says the upgrade is complete and requests continuation.
+Layers 0–30 are complete; layer 31 has committed partial expert work. All
+checkpoint/recovery payloads remain intact in production, including its
+plan and latest frontier. Local pause receipt: production/paused-by-user.json.
+No publication/import has begun. After TJ resumes, preserve this clean
+run and use the existing launcher --resume --publish after admission checks;
+never restart the superseded mixed-accumulator units.
