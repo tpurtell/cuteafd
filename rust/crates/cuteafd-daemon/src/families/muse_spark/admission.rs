@@ -74,7 +74,7 @@ mod tests {
         // Step metadata: the runtime's StepStorage extent is the charged item.
         let charged = placement.items[0].iter().find(|item| item.group == "Muse step metadata").context("charge")?.bytes;
         let tables = shared::step_tables(2752, 16, cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
-            &testing::muse_spark_config())?.max_position as u64)?;
+            &testing::muse_spark_config())?.max_position as u64, 3)?;
         assert_eq!(charged, tables.bytes() as u64);
         // The coordinator intake the link allocates (ranks x waves x unit x row) is the charge.
         let (row, planes) = shared::intake(&cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(

@@ -73,44 +73,46 @@ impl<'a> StepStorage<'a> {
         Ok(Self { owner: Allocation::new(device, tables.bytes())?, tables })
     }
 
-    /// (page_slots, step_slots, page_table) whole planes.
-    fn planes(&self) -> [Buffer; 3] {
-        let slots = self.tables.slots_bytes().next_multiple_of(cuteafd_loader::families::muse_spark::lane::ALIGN);
-        [at(self.owner.buffer, 0, self.tables.slots_bytes()), at(self.owner.buffer, slots, self.tables.slots_bytes()),
-            at(self.owner.buffer, 2 * slots, self.tables.table_bytes())]
+    /// The whole planes of `bank`, by name.
+    fn bank(&self, bank: usize) -> Result<std::collections::BTreeMap<&'static str, Buffer>> {
+        ensure!(bank < self.tables.banks(), "Muse step bank {bank} of {}", self.tables.banks());
+        let base = self.tables.bank_offset(bank);
+        Ok(self.tables.planes(bank).into_iter().map(|(name, at, bytes)| (name, self::at(self.owner.buffer, base + at, bytes)))
+            .collect())
     }
 
-    /// Upload one step's metadata on `stream` (ordered after earlier readers of
-    /// these planes, outside capture) and return the planes the layers read.
-    pub(crate) fn upload(&self, library: &cuteafd_ffi::NativeLibrary, lane: &super::lane::LaneViews,
-        meta: &StepMetadata, prefill: bool, stream: *mut c_void) -> Result<StepPlanes> {
+    /// Upload one step's metadata into `bank` (a prefill unit's slot bank, or
+    /// the decode bank) on `stream`, ordered after earlier readers of that bank
+    /// and outside capture, and return the planes the layers read.
+    pub(crate) fn upload(&self, library: &cuteafd_ffi::NativeLibrary, bank: usize, meta: &StepMetadata,
+        prefill: bool, wave: super::experts::WaveStep, stream: *mut c_void) -> Result<StepPlanes> {
         let rows = meta.positions.len();
-        ensure!(rows <= self.tables.rows && meta.page_table.len() * 4 <= self.tables.table_bytes()
+        ensure!(prefill == (bank != self.tables.decode_bank()), "Muse prefill units use slot banks, decode its own");
+        let planes = self.bank(bank)?;
+        ensure!(rows <= self.tables.rows && meta.page_table.len() * 4 <= planes["page_table"].bytes
             && meta.table_stride <= self.tables.stride, "Muse step of {rows} rows exceeds its admitted metadata");
-        let [page_slots, step_slots, page_table] = self.planes();
-        let (positions, ring_slots, seq_first) = (lane.rows("positions", rows)?, lane.rows("ring_slots", rows)?,
-            lane.rows("seq_first", rows)?);
-        for (destination, source) in [(lane.plane("positions")?, bytes_of(&meta.positions)),
-            (lane.plane("ring_slots")?, bytes_of(&meta.ring_slots)), (lane.plane("seq_first")?, bytes_of(&meta.seq_first)),
-            (page_slots, bytes_of(&meta.page_slots)), (step_slots, bytes_of(&meta.step_slots())),
-            (page_table, bytes_of(&meta.page_table))] {
-            // SAFETY: fixed admitted destinations of this device; every reader is
-            // ordered on `stream`; the ordered upload retains its own staging.
-            unsafe { library.copy_h2d_ordered(destination, source, stream)?; }
+        let step_slots = meta.step_slots();
+        for (name, source) in [("positions", bytes_of(&meta.positions)), ("ring_slots", bytes_of(&meta.ring_slots)),
+            ("seq_first", bytes_of(&meta.seq_first)), ("page_slots", bytes_of(&meta.page_slots)),
+            ("step_slots", bytes_of(&step_slots)), ("page_table", bytes_of(&meta.page_table))] {
+            // SAFETY: fixed admitted destinations of this device; every reader of the
+            // bank is ordered on `stream`; the ordered upload retains its own staging.
+            unsafe { library.copy_h2d_ordered(planes[name], source, stream)?; }
         }
-        let planes = StepPlanes { rows, positions, ring_slots, seq_first,
-            page_slots: Buffer { bytes: rows * 8, ..page_slots }, step_slots: Buffer { bytes: rows * 8, ..step_slots },
-            page_table: Buffer { bytes: meta.page_table.len() * 4, ..page_table }, table_stride: meta.table_stride,
-            prefill };
-        planes.check(meta)?;
-        Ok(planes)
+        let rows_of = |name: &str, width: usize| Buffer { bytes: rows * width, ..planes[name] };
+        let step = StepPlanes { rows, positions: rows_of("positions", 8), ring_slots: rows_of("ring_slots", 8),
+            seq_first: rows_of("seq_first", 4), page_slots: rows_of("page_slots", 8), step_slots: rows_of("step_slots", 8),
+            page_table: Buffer { bytes: meta.page_table.len() * 4, ..planes["page_table"] },
+            table_stride: meta.table_stride, prefill, wave };
+        step.check(meta)?;
+        Ok(step)
     }
 }
 
 impl<'a> RankResources<'a> {
     pub(crate) fn load(device: Device<'a>, programs: &'a Programs<'a>, load: RankLoad<'_>) -> Result<Self> {
         let RankLoad { cfg, checkpoint, built, placement, rank, slots, unit_rows, waves, context } = load;
-        let tables = shared::step_tables(unit_rows, usize::try_from(slots)?, context)?;
+        let tables = shared::step_tables(unit_rows, usize::try_from(slots)?, context, waves)?;
         let ranks = built.layouts.first().map_or(0, Vec::len);
         ensure!(rank < ranks && placement.items.len() == ranks, "Muse rank {rank} of {ranks} placement ranks");
         let library = device.library;
@@ -147,8 +149,14 @@ impl<'a> RankResources<'a> {
 
     /// The device layer's view of this rank for one step on `stream`.
     pub(crate) fn device<'w>(&'w self, cfg: &'w MuseSparkConfig, stream: *mut c_void) -> RankDevice<'a, 'w> {
+        self.device_with(cfg, stream, &self.lane.views)
+    }
+
+    /// The same view over `lane` (a prefill unit's slot views, `LaneViews::slot`).
+    pub(crate) fn device_with<'w>(&'w self, cfg: &'w MuseSparkConfig, stream: *mut c_void, lane: &'w super::lane::LaneViews)
+        -> RankDevice<'a, 'w> {
         RankDevice { library: self.device.library, cfg, programs: &self.programs, core: &self.core,
-            layers: &self.layers, lane: &self.lane.views, rope: self.rope.buffers(), kv: &self.kv.layers,
+            layers: &self.layers, lane, rope: self.rope.buffers(), kv: &self.kv.layers,
             ranks: self.ranks, rank: self.rank, tp2: self.tp2.as_ref(), wire_grid: self.wire_grid, stream }
     }
 }
@@ -191,8 +199,7 @@ impl<'r, 'a: 'r> MuseEngine<'r, 'a> {
         let world = cuteafd_transport::expert::SparkWorld::canonical(peers.len())?;
         let config = cuteafd_transport::TcpTransportConfig { max_frame_bytes: link.spark.max_frame_bytes,
             timing: cuteafd_transport::protocol_v2_timing_from_env(), ..Default::default() };
-        let path = super::spark::MuseSparkPath::connect(library_owner, Rc::clone(&streams[0]), &ranks[0].lane.views,
-            world, peers, config, link.cutoff, link.unit_rows, link.waves, link.intake_row_bytes,
+        let path = super::spark::MuseSparkPath::connect(library_owner, Rc::clone(&streams[0]), world, peers, config, link.cutoff, link.unit_rows, link.waves, link.intake_row_bytes,
             link.spark.first_spark_layer)?;
         Ok(Self { link: path, peer, streams, ranks })
     }

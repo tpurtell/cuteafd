@@ -101,7 +101,7 @@ pub(crate) struct RankDevice<'a, 'w> {
 }
 
 /// One step's device metadata planes (copied from [`StepMetadata`] before the layers).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct StepPlanes {
     pub rows: usize,
     pub positions: Buffer,
@@ -114,6 +114,8 @@ pub(crate) struct StepPlanes {
     pub table_stride: usize,
     /// Prefill (one sequence, shared table row) or decode/verify.
     pub prefill: bool,
+    /// The step's requests and kind (each Spark wave's reply regions).
+    pub wave: super::experts::WaveStep,
 }
 
 impl StepPlanes {
@@ -370,20 +372,23 @@ impl RankDevice<'_, '_> {
         Ok(())
     }
 
-    /// The Spark round trip of one layer on the link's rank: wire, send, land,
-    /// combine into `combined`, release the slot.
-    fn spark_experts(&self, layer: usize, rows: usize, experts: &mut dyn SparkExperts) -> Result<()> {
-        self.expert_wire(rows)?;
-        let wave = experts.send(layer, rows)?;
-        let landed = experts.land(wave)?;
-        self.combine(layer, rows, landed.ranks, landed.tables, landed.layout, &landed.plan)?;
-        experts.consumed(wave)
+    /// One decoder layer, in `block::forward_layer` order, on `hidden` (in place):
+    /// [`Self::layer_front`] then [`Self::layer_back`] around the Spark wave.
+    /// `experts`: the Spark path on rank 0 (absent on rank 1 of a TP2 pair).
+    pub(crate) fn layer(&self, layer: usize, step: &StepPlanes, mut experts: Option<&mut (dyn SparkExperts + '_)>,
+        mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
+        let wave = self.layer_front(layer, step, experts.as_mut().map(|e| &mut **e as &mut dyn SparkExperts),
+            peer.as_mut().map(|p| &mut **p as &mut dyn PeerExchange))?;
+        self.layer_back(layer, step.rows, wave, experts, peer)
     }
 
-    /// One decoder layer, in `block::forward_layer` order, on `hidden` (in place).
-    /// `experts`: the Spark path on rank 0 (absent on rank 1 of a TP2 pair).
-    pub(crate) fn layer(&self, layer: usize, step: &StepPlanes, experts: Option<&mut (dyn SparkExperts + '_)>,
-        mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
+    /// The layer up to the Spark wave: input norm, attention, the gated
+    /// attention residual (into `residual`), the pre-feedforward norm, the MoE
+    /// frontend (split on a pair), the wire and the send (rank 0). Everything
+    /// the back half reads is a span plane (`residual`, `hidden`, the routes,
+    /// the wire) or written by the land: other units' hooks may run between.
+    pub(crate) fn layer_front(&self, layer: usize, step: &StepPlanes, experts: Option<&mut (dyn SparkExperts + '_)>,
+        mut peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<Option<super::experts::Wave>> {
         let (rows, lane) = (step.rows, self.lane);
         let (hidden, normed, residual) = (lane.rows("hidden", rows)?, lane.rows("normed", rows)?, lane.rows("residual", rows)?);
         self.norm(layer, "input_norm", Some("norm.input"), rows, hidden, normed)?;
@@ -395,18 +400,46 @@ impl RankDevice<'_, '_> {
         match (self.ranks, self.rank, experts) {
             (1, 0, Some(experts)) => {
                 self.moe_frontend(layer, rows)?;
-                self.spark_experts(layer, rows, experts)?;
-                self.moe_backend(layer, rows)?;
+                self.expert_wire(rows)?;
+                Ok(Some(experts.send(layer, &step.wave, self.wave_sources(rows)?)?))
             }
             (2, rank, experts) if (rank == 0) == experts.is_some() => {
-                let peer = peer.context("Muse TP2 needs the peer exchange")?;
-                self.moe_frontend_split(layer, rows, &mut *peer)?;
-                if let Some(experts) = experts { self.spark_experts(layer, rows, experts)?; }
-                self.moe_backend_split(layer, rows, peer)?;
+                self.moe_frontend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?;
+                match experts {
+                    Some(experts) => {
+                        self.expert_wire(rows)?;
+                        Ok(Some(experts.send(layer, &step.wave, self.wave_sources(rows)?)?))
+                    }
+                    None => Ok(None),
+                }
             }
             _ => anyhow::bail!("Muse rank {} of {} with the wrong expert path", self.rank, self.ranks),
         }
-        let moe = lane.rows("moe", rows)?;
+    }
+
+    /// The wave's staging sources from this lane (the unit's slot views): route
+    /// ids, route weights and the FP8 K32 wire.
+    fn wave_sources(&self, rows: usize) -> Result<[Buffer; 3]> {
+        Ok([self.lane.rows("route_ids", rows)?, self.lane.rows("route_weights", rows)?, self.lane.rows("expert_wire", rows)?])
+    }
+
+    /// The layer after the Spark wave: land and combine (rank 0), the MoE
+    /// backend (K-split on a pair), the post-feedforward norm and the gated
+    /// residual back into `hidden`.
+    pub(crate) fn layer_back(&self, layer: usize, rows: usize, wave: Option<super::experts::Wave>,
+        experts: Option<&mut (dyn SparkExperts + '_)>, peer: Option<&mut (dyn PeerExchange + '_)>) -> Result<()> {
+        let lane = self.lane;
+        if let (Some(wave), Some(experts)) = (wave, experts) {
+            let landed = experts.land(wave)?;
+            self.combine(layer, rows, landed.ranks, landed.tables, landed.layout, &landed.plan)?;
+            experts.consumed(wave)?;
+        } else {
+            ensure!(self.rank == 1 && wave.is_none(), "Muse rank {} lands without its wave", self.rank);
+        }
+        if self.ranks == 1 { self.moe_backend(layer, rows)?; }
+        else { self.moe_backend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?; }
+        let (moe, normed) = (lane.rows("moe", rows)?, lane.rows("normed", rows)?);
+        let (residual, hidden) = (lane.rows("residual", rows)?, lane.rows("hidden", rows)?);
         self.norm(layer, "post_ffn_norm", Some("norm.post_ffn"), rows, moe, normed)?;
         self.residual_gate(layer, "ffn", rows, residual, normed, hidden)
     }
@@ -437,7 +470,7 @@ mod tests {
                 ("router_logits", cfg.experts * 4), ("route_ids", cfg.topk * 4), ("route_weights", cfg.topk * 4),
                 // pre_expert_proj stages in `combined` (E wide) before the experts land there.
                 ("combined", e * 2), ("expert_input", e * 2), ("moe", h * 2),
-                ("expert_wire", e + e / 32), ("positions", 8), ("ring_slots", 8), ("seq_first", 4),
+                ("expert_wire", e + e / 32), ("token_ids", 4),
             ] {
                 assert!(row(plane) >= needed, "rank layout {ranks}: plane {plane} {} < {needed}", row(plane));
             }

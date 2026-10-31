@@ -13,30 +13,53 @@ use super::MuseSparkConfig;
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
-/// The step metadata planes the attention programs read beyond the lane's
-/// per-row planes: each row's full-layer record slot (`page_slots`) and
-/// sliding record slot (`step_slots`), i64, and the page table: one shared
-/// row for a prefill unit, a row per decode/verify row otherwise, each
-/// `ceil(context / 64)` i32 pages wide.
+/// The step metadata the attention programs read, in banks: one per
+/// in-flight prefill slot (units interleave, so each keeps its own until it
+/// commits) and one for decode/verify steps. A bank holds each row's
+/// position and sliding ring slot (i64), its sequence's first step row (i32),
+/// its full-layer and sliding record slots (i64) and the page table: one
+/// shared row for a prefill unit, a row per decode/verify row, each
+/// `ceil(context / 64)` i32 pages wide. Planes are `ALIGN`-aligned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StepTables {
     pub rows: usize,
     pub decode_rows: usize,
     pub stride: usize,
+    /// Prefill slot banks (the decode bank follows them).
+    pub waves: usize,
 }
 
+/// The planes of one bank, in order.
+pub const STEP_PLANES: [&str; 6] = ["positions", "ring_slots", "seq_first", "page_slots", "step_slots", "page_table"];
+
 impl StepTables {
-    pub fn new(rows: usize, decode_rows: usize, context: u64) -> Result<Self> {
-        ensure!((1..=rows).contains(&decode_rows) && context > 0, "Muse step table geometry");
+    pub fn new(rows: usize, decode_rows: usize, context: u64, waves: usize) -> Result<Self> {
+        ensure!((1..=rows).contains(&decode_rows) && context > 0 && (1..=4).contains(&waves),
+            "Muse step table geometry");
         let stride = usize::try_from(context.div_ceil(super::cache::PAGE_ROWS))?;
-        Ok(Self { rows, decode_rows, stride })
+        Ok(Self { rows, decode_rows, stride, waves })
     }
-    pub fn slots_bytes(&self) -> usize { self.rows * 8 }
-    pub fn table_bytes(&self) -> usize { self.decode_rows.max(1) * self.stride * 4 }
-    /// page_slots + step_slots + the page table, each `ALIGN`-aligned.
-    pub fn bytes(&self) -> usize {
-        2 * self.slots_bytes().next_multiple_of(ALIGN) + self.table_bytes().next_multiple_of(ALIGN)
+    pub fn banks(&self) -> usize { self.waves + 1 }
+    /// The decode/verify bank's index.
+    pub fn decode_bank(&self) -> usize { self.waves }
+    /// Byte (offset, extent) of each plane of `bank`, relative to the bank.
+    pub fn planes(&self, bank: usize) -> Vec<(&'static str, usize, usize)> {
+        let table_rows = if bank == self.decode_bank() { self.decode_rows } else { 1 };
+        let extents = [self.rows * 8, self.rows * 8, self.rows * 4, self.rows * 8, self.rows * 8,
+            table_rows * self.stride * 4];
+        let mut at = 0;
+        STEP_PLANES.iter().zip(extents).map(|(&name, bytes)| {
+            let plane = (name, at, bytes);
+            at += bytes.next_multiple_of(ALIGN);
+            plane
+        }).collect()
     }
+    pub fn bank_bytes(&self, bank: usize) -> usize {
+        self.planes(bank).iter().map(|(_, _, bytes)| bytes.next_multiple_of(ALIGN)).sum()
+    }
+    /// Byte offset of `bank` in the step storage.
+    pub fn bank_offset(&self, bank: usize) -> usize { (0..bank).map(|b| self.bank_bytes(b)).sum() }
+    pub fn bytes(&self) -> usize { self.bank_offset(self.banks()) }
 }
 
 /// Rows the K6 head scores per launch (its program's capacity; wider steps run
@@ -94,8 +117,8 @@ impl LanePlanes {
             ("router_logits", f32(cfg.experts)), ("route_ids", rows * k * 4), ("route_weights", f32(k)),
             ("expert_input", bf16(e)), ("expert_wire", rows * wire), ("combined", bf16(e)), ("moe", bf16(h)),
             // Step metadata.
-            ("positions", rows * 8), ("ring_slots", rows * 8), ("seq_first", rows * 4),
-            // The step's token ids (the embedding gather's input).
+            // The step's token ids (the embedding gather's input); the step's
+            // metadata lives in `StepTables` banks.
             ("token_ids", rows * 4),
         ]);
         if ranks == 2 {
@@ -138,12 +161,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn step_tables_hold_a_decode_batch_of_full_page_rows() -> Result<()> {
-        let tables = StepTables::new(2752, 16, 1 << 20)?;
-        assert_eq!(tables.stride, 16384);
-        assert_eq!(tables.table_bytes(), 16 * 16384 * 4);
-        assert_eq!(tables.bytes(), 2 * 2752 * 8 + 16 * 16384 * 4);
-        assert!(StepTables::new(64, 65, 1 << 20).is_err() && StepTables::new(64, 1, 0).is_err());
+    fn step_banks_per_prefill_slot_and_one_for_decode() -> Result<()> {
+        let tables = StepTables::new(2752, 1024, 1 << 20, 3)?;
+        assert_eq!((tables.stride, tables.banks(), tables.decode_bank()), (16384, 4, 3));
+        let row_planes = |t: &StepTables, b| t.planes(b)[..5].iter().map(|(_, _, n)| n.next_multiple_of(ALIGN)).sum::<usize>();
+        assert_eq!(tables.bank_bytes(0), row_planes(&tables, 0) + 16384 * 4);
+        assert_eq!(tables.bank_bytes(3), row_planes(&tables, 3) + 1024 * 16384 * 4);
+        assert_eq!(tables.bytes(), 3 * tables.bank_bytes(0) + tables.bank_bytes(3));
+        assert_eq!(tables.bank_offset(2), 2 * tables.bank_bytes(0));
+        // Planes tile each bank without overlap.
+        for bank in 0..4 {
+            let planes = tables.planes(bank);
+            for pair in planes.windows(2) { assert!(pair[0].1 + pair[0].2 <= pair[1].1); }
+        }
+        assert!(StepTables::new(64, 65, 1 << 20, 1).is_err() && StepTables::new(64, 1, 0, 1).is_err());
+        assert!(StepTables::new(64, 1, 1 << 20, 5).is_err());
         Ok(())
     }
 

@@ -22,23 +22,21 @@ fn view(base: Buffer, offset: usize, bytes: usize) -> Buffer {
 
 /// The step's token ids gathered from the entry rank's table into `residual`,
 /// then `embed_norm` into `hidden`, on `rank`'s stream.
-pub(crate) fn embed(cfg: &MuseSparkConfig, rank: &RankResources<'_>, table: &crate::shared::token_io::TokenEmbedding<'_>,
-    tokens: &[u32], stream: *mut c_void) -> Result<()> {
+pub(crate) fn embed(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
+    table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], stream: *mut c_void) -> Result<()> {
     let rows = tokens.len();
-    let lane = &rank.lane.views;
     let (ids, gathered) = (lane.plane("token_ids")?, lane.rows("residual", rows)?);
     rank.device.run(|| table.embed(tokens, ids, 1, gathered, stream))?;
-    rank.device(cfg, stream).norm(0, "embed_norm", None, rows, gathered, lane.rows("hidden", rows)?)
+    rank.device_with(cfg, stream, lane).norm(0, "embed_norm", None, rows, gathered, lane.rows("hidden", rows)?)
 }
 
 /// The head over `rows` (a contiguous range of the step's rows) on the head rank.
-pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, rows: std::ops::Range<usize>, stream: *mut c_void)
-    -> Result<Buffer> {
+pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
+    rows: std::ops::Range<usize>, stream: *mut c_void) -> Result<Buffer> {
     let weights = rank.globals.head.as_ref().context("Muse head on a rank without the head")?;
     let (stored_plane, trimmed) = rank.head.as_ref().context("Muse head rank without logits planes")?;
     let (h, vocab, stored) = (cfg.hidden, cfg.vocab_size, weights.shape[0]);
-    let lane = &rank.lane.views;
-    let device = rank.device(cfg, stream);
+    let device = rank.device_with(cfg, stream, lane);
     let count = rows.len();
     ensure!(count > 0 && rows.end <= lane.rows, "Muse head rows {rows:?} outside the step");
     let hidden = view(lane.plane("hidden")?, rows.start * h * 2, count * h * 2);
@@ -68,14 +66,16 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, rows: std::o
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: &[*mut c_void],
     table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], meta: &StepMetadata, prefill: bool,
+    wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>, head_rows: std::ops::Range<usize>)
     -> Result<Buffer> {
     ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len(),
         "Muse step geometry");
     let planes: Vec<StepPlanes> = ranks.iter().zip(streams).map(|(rank, &stream)| {
-        rank.device.run(|| rank.step.upload(rank.device.library, &rank.lane.views, meta, prefill, stream))
+        let bank = if prefill { 0 } else { rank.step.tables.decode_bank() };
+        rank.device.run(|| rank.step.upload(rank.device.library, bank, meta, prefill, wave.clone(), stream))
     }).collect::<Result<_>>()?;
-    for (rank, &stream) in ranks.iter().zip(streams) { embed(cfg, rank, table, tokens, stream)?; }
+    for (rank, &stream) in ranks.iter().zip(streams) { embed(cfg, rank, &rank.lane.views, table, tokens, stream)?; }
     let mut experts = Some(experts);
     for layer in 0..cfg.layers {
         for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {
@@ -85,7 +85,7 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
         }
     }
     let last = ranks.len() - 1;
-    ranks[last].device.run(|| head(cfg, &ranks[last], head_rows, streams[last]))
+    ranks[last].device.run(|| head(cfg, &ranks[last], &ranks[last].lane.views, head_rows, streams[last]))
 }
 
 #[cfg(test)]
@@ -97,8 +97,8 @@ mod tests {
     fn step_order_and_head_trim() {
         let source = include_str!("forward.rs").split("#[cfg(test)]").next().unwrap();
         let step = source.split("pub(crate) fn step(").nth(1).unwrap();
-        let order = ["rank.step.upload(", "embed(cfg, rank, table, tokens, stream)", "for layer in 0..cfg.layers",
-            ".layer(layer, &planes[index], path, peer)", "head(cfg, &ranks[last], head_rows"];
+        let order = ["rank.step.upload(", "embed(cfg, rank, &rank.lane.views, table, tokens, stream)", "for layer in 0..cfg.layers",
+            ".layer(layer, &planes[index], path, peer)", "head(cfg, &ranks[last], &ranks[last].lane.views, head_rows"];
         let at: Vec<usize> = order.iter().map(|needle| step.find(needle).unwrap()).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
         assert!(step.contains("if index == 0 { experts.as_deref_mut() } else { None }"));

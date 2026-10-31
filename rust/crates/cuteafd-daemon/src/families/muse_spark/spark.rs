@@ -13,9 +13,8 @@
 //!   tables on the same stream (addresses fixed, contents per wave), so the
 //!   combine reads every rank's regions in place: no gather.
 //! - `consumed`: after `RankDevice::combine`, the slot's planes are released.
-use super::experts::{wave_request, CombineTables, LandedWave, ReplyPlanView, SparkExperts, Wave, WaveSegment,
+use super::experts::{wave_request, CombineTables, LandedWave, ReplyPlanView, SparkExperts, Wave, WaveSegment, WaveStep,
     MAX_RANKS, TOPK, WIDTH, WIRE_ROW_BYTES};
-use super::lane::LaneViews;
 use crate::shared::{experts::staging::RouteStaging, memory::device::{Allocation, Stream}, spark_intake::SparkLink,
     spark_waves::WaveTicket};
 use anyhow::{ensure, Context, Result};
@@ -26,15 +25,11 @@ use std::{collections::VecDeque, net::SocketAddr, rc::Rc, sync::Arc};
 /// A sent wave and its regions (the plan the request carried).
 struct InFlight { wave: Wave, ticket: Option<WaveTicket>, slot: usize, plan: ReplyPlan }
 
-/// The step's requests (identity and rows, row order), its kind, and the
-/// reply plan every layer's wave of the step carries.
-struct Step { segments: Vec<WaveSegment>, kind: ExpertV2SourceKind, plan: ReplyPlan }
 
 pub(crate) struct MuseSparkPath<'a> {
     stream: Rc<Stream<'a>>,
     link: Option<SparkLink<'a>>,
     library_owner: Arc<cuteafd_ffi::NativeLibrary>,
-    lane: &'a LaneViews,
     cutoff: Cutoff,
     /// The fixed combine tables (one per return slot, so a slot's image is
     /// never rewritten while an earlier wave's combine may still read it).
@@ -43,7 +38,6 @@ pub(crate) struct MuseSparkPath<'a> {
     unit: usize,
     waves: usize,
     sequence: u64,
-    step: Option<Step>,
     in_flight: VecDeque<InFlight>,
     terminal: bool,
 }
@@ -75,7 +69,7 @@ impl<'a> MuseSparkPath<'a> {
     /// (`replies::intake_row_bytes`): the same charge admission accepted.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect(library_owner: &'a Arc<cuteafd_ffi::NativeLibrary>, stream: Rc<Stream<'a>>,
-        lane: &'a LaneViews, world: SparkWorld, peers: Vec<SocketAddr>, config: TcpTransportConfig,
+        world: SparkWorld, peers: Vec<SocketAddr>, config: TcpTransportConfig,
         cutoff: Cutoff, unit: usize, waves: usize, intake_row_bytes: usize, first_spark_layer: usize) -> Result<Self> {
         ensure!(std::ptr::eq(library_owner.as_ref(), stream.device.library),
             "Muse Spark library owner differs from the lane device");
@@ -105,8 +99,8 @@ impl<'a> MuseSparkPath<'a> {
             // SAFETY: a live admitted allocation on the lane's device and stream.
             stream.device.run(|| unsafe { library.reserve_h2d_ordered(table, stream.raw) })?;
         }
-        Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner), lane, cutoff, tables, layout,
-            unit, waves, sequence: 0, step: None, in_flight: VecDeque::new(), terminal: false })
+        Ok(Self { stream, link: Some(link), library_owner: Arc::clone(library_owner), cutoff, tables, layout,
+            unit, waves, sequence: 0, in_flight: VecDeque::new(), terminal: false })
     }
 
     fn slot_tables(tables: &Allocation<'_>, layout: CombineTables, slot: usize) -> cuteafd_ffi::CuteafdDeviceBuffer {
@@ -143,33 +137,21 @@ impl<'a> MuseSparkPath<'a> {
 }
 
 impl SparkExperts for MuseSparkPath<'_> {
-    fn begin_step(&mut self, segments: &[WaveSegment], kind: ExpertV2SourceKind) -> Result<()> {
-        ensure!(self.in_flight.is_empty(), "Muse step begins with {} waves in flight", self.in_flight.len());
-        let rows = segments.iter().map(|s| s.rows).sum::<usize>();
-        ensure!(!segments.is_empty() && segments.iter().all(|s| s.rows > 0) && (1..=self.unit).contains(&rows),
-            "Muse step of {rows} rows outside its {}-row unit", self.unit);
-        let plan = ReplyPlan::new(self.cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
-        self.step = Some(Step { segments: segments.to_vec(), kind, plan });
-        Ok(())
-    }
-
-    fn send(&mut self, layer: usize, rows: usize) -> Result<Wave> {
-        let step = self.step.as_ref().context("Muse Spark wave outside a step")?;
-        ensure!(rows == step.plan.bf16_rows.len() + step.plan.wide_rows.len(),
-            "Muse Spark wave of {rows} rows differs from its step");
+    fn send(&mut self, layer: usize, step: &WaveStep, sources: [cuteafd_ffi::CuteafdDeviceBuffer; 3]) -> Result<Wave> {
+        let rows = step.rows();
+        ensure!(!step.segments.is_empty() && step.segments.iter().all(|s| s.rows > 0) && (1..=self.unit).contains(&rows),
+            "Muse Spark wave of {rows} rows outside its {}-row unit", self.unit);
         ensure!(self.in_flight.len() < self.waves, "Muse Spark path has {} waves in flight", self.waves);
         let sequence = self.sequence.checked_add(1).context("Muse Spark request sequence overflow")?;
         let (segments, kind, cutoff) = (step.segments.clone(), step.kind, self.cutoff);
-        let plan = step.plan.clone();
+        let plan = ReplyPlan::new(cutoff, &segments.iter().map(|s| s.rows).collect::<Vec<_>>());
         let layout = RouteStaging::new(rows, TOPK, WIRE_ROW_BYTES)?;
-        let sources = [self.lane.rows("route_ids", rows)?, self.lane.rows("route_weights", rows)?,
-            self.lane.rows("expert_wire", rows)?];
         let stream = self.stream.raw;
         let device = self.stream.device;
         let link = self.link()?;
         let ticket = device.run(|| {
             // SAFETY: the lane retains these planes through teardown; the routes and
-            // wire were written on this stream before this call (`RankDevice::layer`).
+            // wire were written on this stream before this call (`RankDevice::layer_front`).
             unsafe { link.exchange()?.send(rows, layout, sources, stream, Box::new(move |routes, wire|
                 wave_request(layer, sequence, kind, &segments, cutoff, routes, wire))) }
         })?;
@@ -257,18 +239,17 @@ mod tests {
         assert!(source.contains("reserve_h2d_ordered"), "upload staging reserved before readiness");
         assert!(!source.contains("block_on") && !source.contains("cuda_stream_synchronize"));
         let device = include_str!("device.rs");
-        let round_trip = device.split("fn spark_experts(").nth(1).unwrap().split("pub(crate) fn layer(").next().unwrap();
-        let order = ["self.expert_wire(rows)", "experts.send(layer, rows)", "experts.land(wave)",
-            "self.combine(layer", "experts.consumed(wave)"];
-        let at: Vec<usize> = order.iter().map(|needle| round_trip.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "Spark round trip order {order:?}");
-        // Both layouts run the round trip between the frontend and the backend.
-        let layer = device.split("pub(crate) fn layer(").nth(1).unwrap();
-        for (front, back) in [("self.moe_frontend(layer, rows)", "self.moe_backend(layer, rows)"),
-            ("self.moe_frontend_split(layer, rows", "self.moe_backend_split(layer, rows")] {
-            let (f, b) = (layer.find(front).unwrap(), layer.find(back).unwrap());
-            let trip = f + layer[f..].find("self.spark_experts(layer, rows, experts)").unwrap();
-            assert!(f < trip && trip < b, "{front} -> round trip -> {back}");
+        let front = device.split("pub(crate) fn layer_front(").nth(1).unwrap().split("pub(crate) fn layer_back(").next().unwrap();
+        let back = device.split("pub(crate) fn layer_back(").nth(1).unwrap();
+        // Front: frontend, wire, send (both layouts); back: land, combine, consume, then the backend.
+        for (front_call, wire) in [("self.moe_frontend(layer, rows)", "self.expert_wire(rows)"),
+            ("self.moe_frontend_split(layer, rows", "self.expert_wire(rows)")] {
+            let f = front.find(front_call).unwrap();
+            assert!(f < f + front[f..].find(wire).unwrap(), "{front_call} before the wire");
         }
+        assert!(front.matches("experts.send(layer, &step.wave").count() == 2);
+        let order = ["experts.land(wave)", "self.combine(layer", "experts.consumed(wave)", "self.moe_backend"];
+        let at: Vec<usize> = order.iter().map(|needle| back.find(needle).unwrap()).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "layer back order {order:?}");
     }
 }

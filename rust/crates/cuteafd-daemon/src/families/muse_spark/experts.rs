@@ -179,24 +179,27 @@ pub(crate) fn wave_request(layer: usize, sequence: u64, kind: cuteafd_transport:
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Wave { pub layer: usize, pub rows: usize, pub sequence: u64 }
 
-/// The engine's view of the Spark experts. `begin_step` names the step's
-/// requests (their identities and row counts, in row order, and the source
-/// kind), from which every layer's reply regions follow (`ReplyPlan`: a
-/// request's format depends on its own rows, never on the wave). `send`
-/// enqueues the expert-width rows' wire quantization and the routes' copies
-/// on the lane stream and posts the request once they land (the host never
-/// waits on the GPU); `land` makes the lane stream wait for the wave's replies
-/// and leaves the combined expert output in the lane's `combined` plane.
-/// Waves land in send order.
-///
-/// The combine runs on the engine's side (`RankDevice::combine`, which owns the
-/// programs, the layer's norm and the lane): `land` orders the lane stream
-/// after the wave's planes and uploads the wave's `rank_regions` tables and
-/// row maps; the engine combines into `combined`, then calls `consumed` so the
-/// slot's planes are released to the next wave behind the combine.
+/// What one wave carries beyond its rows: its requests (identity and rows, in
+/// row order: each request's reply format follows from its own rows, never the
+/// wave, `ReplyPlan`) and the source kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WaveStep { pub segments: Vec<WaveSegment>, pub kind: cuteafd_transport::ExpertV2SourceKind }
+
+impl WaveStep {
+    pub(crate) fn rows(&self) -> usize { self.segments.iter().map(|s| s.rows).sum() }
+}
+
+/// The engine's view of the Spark experts. `send` copies the wave's routes and
+/// FP8 K32 wire rows (`sources`: route ids, route weights, wire, the unit's slot
+/// planes, written on the lane stream before the call) into the transport
+/// staging on the lane stream and posts the request once they land (the host
+/// never waits on the GPU); `land` makes the lane stream wait for the wave's
+/// replies and uploads its `rank_regions` tables and row maps; the engine
+/// combines (`RankDevice::combine`, which owns the programs, the layer's norm
+/// and the lane), then calls `consumed` so the slot's planes are released to
+/// the next wave behind the combine. Waves land in send order.
 pub(crate) trait SparkExperts {
-    fn begin_step(&mut self, segments: &[WaveSegment], kind: cuteafd_transport::ExpertV2SourceKind) -> Result<()>;
-    fn send(&mut self, layer: usize, rows: usize) -> Result<Wave>;
+    fn send(&mut self, layer: usize, step: &WaveStep, sources: [cuteafd_ffi::CuteafdDeviceBuffer; 3]) -> Result<Wave>;
     fn land(&mut self, wave: Wave) -> Result<LandedWave>;
     fn consumed(&mut self, wave: Wave) -> Result<()>;
 }

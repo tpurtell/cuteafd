@@ -11,6 +11,7 @@ pub(crate) mod experts;
 pub(crate) mod forward;
 pub(crate) mod lane;
 pub(crate) mod peer;
+pub(crate) mod prefill;
 pub(crate) mod programs;
 pub(crate) mod serve;
 pub(crate) mod spark;
