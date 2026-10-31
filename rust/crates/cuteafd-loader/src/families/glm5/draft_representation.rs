@@ -140,8 +140,8 @@ impl GlmDraftRuntimeLayout {
             || g.hidden % g.conv_group != 0 || tap_rows == 0 {
             return Err(GlmDraftStorageError::Unsupported("invalid drafter geometry"));
         }
-        if g.head_dim != 128 || g.selector_rank != 256 {
-            return Err(GlmDraftStorageError::Unsupported("kernels require head_dim 128 and selector rank 256"));
+        if !matches!(g.head_dim, 128 | 64) || g.selector_rank != 256 {
+            return Err(GlmDraftStorageError::Unsupported("kernels require head_dim 128 or 64 and selector rank 256"));
         }
         let h = g.hidden;
         let attention = mul(g.heads, g.head_dim)?;
@@ -236,7 +236,7 @@ pub fn draft_workspace_bytes(g: GlmDraftGeometry, capacity: GlmDraftCapacity, bl
             draft_fp8_scratch_bytes(2048.max(rows), s.k, s.n, sms, mode)).max().unwrap_or(256)
     } else { 0 };
     let attention_scratch = crate::serving_capacity::draft_attention_workspace_bytes(sequences,
-        g.kv_heads, 2, 2048 + block, 128, sms).map_err(|_| GlmDraftStorageError::Overflow)?;
+        g.kv_heads, 2, 2048 + block, g.head_dim, sms).map_err(|_| GlmDraftStorageError::Overflow)?;
     // Both SM-sized arenas follow the selected GPU, even for BF16 projections.
     Ok((add(owned, workspace)?, add(scratch, allocation(attention_scratch))?))
 }

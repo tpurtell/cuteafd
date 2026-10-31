@@ -231,10 +231,10 @@ impl DflashConfig {
         let raw: RawConfig = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)
             .context("parsing the DFlash2 config.json")?;
         let d = &raw.dflash_config;
-        ensure!(raw.head_dim == 128 && raw.num_key_value_heads > 0
+        ensure!(matches!(raw.head_dim, 128 | 64) && raw.num_key_value_heads > 0
             && raw.num_attention_heads % raw.num_key_value_heads == 0
             && raw.num_attention_heads / raw.num_key_value_heads * d.block_size <= 64,
-            "DFlash2 kernels take 128-wide heads and at most 64 queries per kv head and block \
+            "DFlash2 kernels take 128- or 64-wide heads and at most 64 queries per kv head and block \
              (got {} heads, {} kv, block {})", raw.num_attention_heads, raw.num_key_value_heads, d.block_size);
         ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
             "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
@@ -1481,10 +1481,11 @@ impl<'a> DflashDrafter<'a> {
                 let q_rows = self.cfg.heads * self.cfg.head_dim;
                 self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
                     context.kv.buffer.ptr, n, h, 2 * kv)?;
-                self.library.glm_dflash_qk_rope(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
+                self.library.glm_dflash_qk_rope_width(context.kv.buffer.ptr, layer.q_norm.buffer.ptr,
                     layer.k_norm.buffer.ptr, self.context_positions.buffer.ptr, context.slots.buffer.ptr,
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
-                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                    self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
+                    self.cfg.head_dim, s)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -1886,7 +1887,7 @@ impl<'a> DflashDrafter<'a> {
         let head_workspace = alloc(VOCABULARY_HEAD_WORKSPACE)?;
         let attention_workspace = {
             let _scope = cuteafd_ffi::memory_ledger::scope("workspace/draft-attention");
-            alloc(self.library.glm_dflash_attention_workspace(sequences, c.kv_heads, RING + c.block)?)?
+            alloc(self.library.glm_dflash_attention_workspace_width(sequences, c.kv_heads, RING + c.block, c.head_dim)?)?
         };
         Ok(Workspace {
             sequences,
@@ -2093,14 +2094,14 @@ impl<'a> DflashDrafter<'a> {
                 match (&layer.attention, &w.attention, &self.context) {
                     (DraftAttention::Gqa(a), AttentionWorkspace::Gqa(attention), DraftContext::Gqa(_)) => {
                         self.linear(w.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
-                        l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
+                        l.glm_dflash_qk_rope_width(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
-                            rows, c.heads, c.kv_heads, c.theta, eps, false, s)?;
-                        l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
+                            rows, c.heads, c.kv_heads, c.theta, eps, false, c.head_dim, s)?;
+                        l.glm_dflash_attention_width(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
                             attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
-                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, s)?;
+                            max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, c.head_dim, s)?;
                         self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, attention_width, h)?;
                     }
                     (DraftAttention::Mla(a), AttentionWorkspace::Mla(attention), DraftContext::Mla(context)) => {

@@ -79,8 +79,28 @@ impl NativeLibrary {
     pub unsafe fn glm_dflash_qk_rope(&self, qkv: P, q_norm: P, k_norm: P, positions: P, slots: P, q_out: M,
         k_out: M, v_out: M, rows: usize, heads: usize, kv_heads: usize, theta: f32, eps: f32, fp8_kv: bool, stream: M)
         -> Result<()> {
+        // SAFETY: forwarded; the 128-wide entry points.
+        unsafe { self.glm_dflash_qk_rope_width(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out, rows, heads,
+            kv_heads, theta, eps, fp8_kv, 128, stream) }
+    }
+
+    /// [`Self::glm_dflash_qk_rope`] at `head_dim` 128 or 64 (the `_d64`
+    /// entry points: same operands, 64-wide heads and norm weights).
+    ///
+    /// # Safety
+    /// As [`Self::glm_dflash_qk_rope`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn glm_dflash_qk_rope_width(&self, qkv: P, q_norm: P, k_norm: P, positions: P, slots: P, q_out: M,
+        k_out: M, v_out: M, rows: usize, heads: usize, kv_heads: usize, theta: f32, eps: f32, fp8_kv: bool,
+        head_dim: usize, stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, M, M, M, i32, i32, i32, f32, f32, M) -> i32;
-        let symbol: &[u8] = if fp8_kv { b"cuteafd_glm_dflash_qk_rope_fp8" } else { b"cuteafd_glm_dflash_qk_rope" };
+        let symbol: &[u8] = match (head_dim, fp8_kv) {
+            (128, true) => b"cuteafd_glm_dflash_qk_rope_fp8",
+            (128, false) => b"cuteafd_glm_dflash_qk_rope",
+            (64, true) => b"cuteafd_glm_dflash_qk_rope_d64_fp8",
+            (64, false) => b"cuteafd_glm_dflash_qk_rope_d64",
+            _ => anyhow::bail!("DFlash2 qk rope takes 128- or 64-wide heads, not {head_dim}"),
+        };
         // SAFETY: both format-specific symbols have the native signature above.
         let f = *unsafe { self.lib.get::<F>(symbol) }?;
         check(unsafe {
@@ -91,8 +111,19 @@ impl NativeLibrary {
 
     /// Workspace bytes of [`Self::glm_dflash_attention`].
     pub fn glm_dflash_attention_workspace(&self, sequences: usize, kv_heads: usize, max_keys: usize) -> Result<usize> {
+        self.glm_dflash_attention_workspace_width(sequences, kv_heads, max_keys, 128)
+    }
+
+    /// [`Self::glm_dflash_attention_workspace`] at `head_dim` 128 or 64.
+    pub fn glm_dflash_attention_workspace_width(&self, sequences: usize, kv_heads: usize, max_keys: usize,
+        head_dim: usize) -> Result<usize> {
         type F = unsafe extern "C" fn(i32, i32, i32) -> u64;
-        let f = *unsafe { self.lib.get::<F>(b"cuteafd_glm_dflash_attention_workspace") }?;
+        let symbol: &[u8] = match head_dim {
+            128 => b"cuteafd_glm_dflash_attention_workspace",
+            64 => b"cuteafd_glm_dflash_attention_workspace_d64",
+            _ => anyhow::bail!("DFlash2 attention takes 128- or 64-wide heads, not {head_dim}"),
+        };
+        let f = *unsafe { self.lib.get::<F>(symbol) }?;
         Ok(usize::try_from(unsafe { f(i(sequences)?, i(kv_heads)?, i(max_keys)?) })?)
     }
 
@@ -105,8 +136,29 @@ impl NativeLibrary {
     pub unsafe fn glm_dflash_attention(&self, q: P, k_block: P, v_block: P, k_ring: P, v_ring: P, seq_slots: P,
         ctx_lengths: P, ctx_ends: P, out: M, workspace: M, sequences: usize, block_rows: usize, heads: usize,
         kv_heads: usize, ring: usize, max_keys: usize, window: usize, scale: f32, fp8_kv: bool, stream: M) -> Result<()> {
+        // SAFETY: forwarded; the 128-wide entry points.
+        unsafe { self.glm_dflash_attention_width(q, k_block, v_block, k_ring, v_ring, seq_slots, ctx_lengths, ctx_ends,
+            out, workspace, sequences, block_rows, heads, kv_heads, ring, max_keys, window, scale, fp8_kv, 128, stream) }
+    }
+
+    /// [`Self::glm_dflash_attention`] at `head_dim` 128 or 64 (the `_d64`
+    /// entry points: identical operands, 64-wide heads).
+    ///
+    /// # Safety
+    /// As [`Self::glm_dflash_attention`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn glm_dflash_attention_width(&self, q: P, k_block: P, v_block: P, k_ring: P, v_ring: P, seq_slots: P,
+        ctx_lengths: P, ctx_ends: P, out: M, workspace: M, sequences: usize, block_rows: usize, heads: usize,
+        kv_heads: usize, ring: usize, max_keys: usize, window: usize, scale: f32, fp8_kv: bool, head_dim: usize,
+        stream: M) -> Result<()> {
         type F = unsafe extern "C" fn(P, P, P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, i32, i32, f32, M) -> i32;
-        let symbol: &[u8] = if fp8_kv { b"cuteafd_glm_dflash_attention_fp8" } else { b"cuteafd_glm_dflash_attention" };
+        let symbol: &[u8] = match (head_dim, fp8_kv) {
+            (128, true) => b"cuteafd_glm_dflash_attention_fp8",
+            (128, false) => b"cuteafd_glm_dflash_attention",
+            (64, true) => b"cuteafd_glm_dflash_attention_d64_fp8",
+            (64, false) => b"cuteafd_glm_dflash_attention_d64",
+            _ => anyhow::bail!("DFlash2 attention takes 128- or 64-wide heads, not {head_dim}"),
+        };
         // SAFETY: both format-specific symbols have the native signature above.
         let f = *unsafe { self.lib.get::<F>(symbol) }?;
         check(unsafe {
