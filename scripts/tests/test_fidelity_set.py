@@ -459,3 +459,25 @@ def test_v2_scored_span_ends_at_the_best_turn_and_history_continues():
     a01 = [r for r in probe.requests if "Fidelity fixture a01" in r["messages"][0]["content"]]
     assert sum(m["role"] == "tool" for m in a01[0]["messages"]) >= sum(m["role"] == "tool" for m in a00[-1]["messages"])
     assert manifest["recipe"]["version"]["scored_end"].startswith("assistant-turn end")
+
+
+def test_topup_appends_next_b_windows_and_records_halves():
+    probe = FakeAPI(generated=3000, calls=0)
+    manifest = make_api_topup(probe, 3)
+    ids = [w["id"] for w in manifest["windows"]]
+    assert len(ids) == 67 and ids[ids.index("b11") + 1:ids.index("b11") + 4] == ["b12", "b13", "b14"]
+    top = manifest["topup"]
+    assert top["windows"] == ["b12", "b13", "b14"]
+    assert top["halves"] == {"b12": "decode", "b13": "prefill", "b14": "decode"}
+    assert top["strata"]["topup"] == {"8-16K": 3} and top["original_allocation"]["windows"] == 64
+    with pytest.raises(ValueError, match="recipe v2"):
+        make_api_topup(FakeAPI(), 1, recipe="v1")
+
+
+def make_api_topup(probe, n, recipe="v2"):
+    return builder.build_set(family="muse_spark", model="test-model", checkpoint="test-model",
+        version="t", arm={"checkpoint": "test-model", "snapshot_revision": "r", "config_sha256": "c",
+                          "tokenizer_sha256": "t"},
+        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe, topup_b=n,
+        legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))},
+        legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})

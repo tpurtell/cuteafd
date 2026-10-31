@@ -156,10 +156,33 @@ def recipe_identity(recipe):
     return {**rules, "sha256": hashlib.sha256(canonical(rules)).hexdigest()}
 
 
+TOPUP_RULE = ("8-16K top-up (TJ 2026-10-31): the recipe's B loop continued past b11 with the same "
+              "prompt and target rule; top-up k goes to decode when k is even, prefill when odd")
+
+
+def topup_halves(ids):
+    return {wid: ("decode" if k % 2 == 0 else "prefill") for k, wid in enumerate(ids)}
+
+
+def topup_record(windows, ids):
+    by_id = {w["id"]: w for w in windows}
+    if any(by_id[wid]["block"] != "B" for wid in ids):
+        raise ValueError("top-up windows must be B windows")
+    strata = {}
+    for w in windows:
+        key = "topup" if w["id"] in ids else "original"
+        strata.setdefault(key, {}).setdefault(w["bucket"], 0)
+        strata[key][w["bucket"]] += 1
+    return {"windows": ids, "halves": topup_halves(ids), "rule": TOPUP_RULE,
+            "reason": "new-set floor of 10,000 scored generated rows per standard half (target 10,200)",
+            "original_allocation": {"windows": 64, "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10}},
+            "strata": strata}
+
+
 def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: dict,
               tokenizer, probe, root: pathlib.Path = ROOT, recordings: list[dict] | None = None,
               files: list[str] | None = None, legacy_reference: dict | None = None,
-              legacy_provenance: dict | None = None, recipe: str = "v1") -> dict:
+              legacy_provenance: dict | None = None, recipe: str = "v1", topup_b: int = 0) -> dict:
     if recipe not in RECIPES:
         raise ValueError("unknown fidelity text recipe")
     if recipe == "v2" and (getattr(probe, "identity", {}).get("text_source") not in ("api", "hf") or recordings):
@@ -432,7 +455,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             windows[-1]["provenance"]["malformed_tool_calls"] = malformed
             windows[-1]["provenance"]["tool_error_retries"] = recovery
         windows[-1]["provenance"].setdefault("ended_at_context_cap", False)
-    for i in range(12):
+    if topup_b and recipe != "v2":
+        raise ValueError("top-up windows are defined for recipe v2 sets only")
+    for i in range(12 + topup_b):
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
     for i in range(10):
         ids = token_ids(tokenizer, (root / files[i % len(files)]).read_text())
@@ -465,6 +490,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+    if topup_b:
+        ids = [f"b{12 + k:02d}" for k in range(topup_b)]
+        manifest["topup"] = topup_record(windows, ids)
     if recipe == "v2":
         manifest["recipe"].update(version=recipe_identity(recipe),
             prompt_roles="conditioning history and tool results ctx; this window's assistant turns gen")
@@ -781,6 +809,8 @@ def main(argv=None):
     p.add_argument("--timeout", type=float, default=1800)
     p.add_argument("--template-date", help="YYYY-MM-DD (UTC) for templates that render the current date; "
                    "every cached response must carry that request date")
+    p.add_argument("--topup-b", type=int, default=0,
+                   help="append this many 8-16K B windows (b12, ...) to reach the new-set row floor")
     p.add_argument("--recipe", choices=RECIPES, default="v1",
                    help="own-text recipe; v2 continues tool turns in-window and wraps trailing context")
     p.add_argument("--out", type=pathlib.Path)
@@ -880,7 +910,7 @@ def main(argv=None):
             recordings=[json.loads(path.read_text()) for path in a.recording],
             files=json.loads(a.file_list.read_text()) if a.file_list else None,
             legacy_reference=json.loads(a.legacy_reference.read_bytes()),
-            recipe=a.recipe, legacy_provenance={"path": a.legacy_reference.name,
+            recipe=a.recipe, topup_b=a.topup_b, legacy_provenance={"path": a.legacy_reference.name,
                 "sha256": hashlib.sha256(a.legacy_reference.read_bytes()).hexdigest()})
     manifest["tokenizer_sha256"] = tokenizer_identity(a.tokenizer.parent)["tokenizer_sha256"]
     manifest["set_sha256"] = set_hash(manifest)
