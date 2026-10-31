@@ -56,10 +56,8 @@ impl Channel {
 /// unit's attention swap a GPU sends its expert-input half one-way and runs on
 /// to the next unit's attention push before the peer read the first, so the
 /// two swapped cores need two slots; the one-way halves and the partials need one.
-/// Decode never interleaves a prefill call (`prefill_share` runs each call to a
-/// drained completion, so every exchanged event has been read at its
-/// boundary), and a decode step is one layer-major pass (this module's model:
-/// one slot per channel), so these bounds cover every shared driver.
+/// The model also inserts a decode pass at every step boundary of the call
+/// (decode lanes that may run inside a prefill call, #717); the bounds hold.
 pub fn receive_slots(channel: Channel) -> usize {
     match channel {
         Channel::Attention | Channel::Moe => 2,

@@ -143,11 +143,12 @@ mod tests {
     /// The shared prefill scheduler's real step order (`prefill_schedule`: units
     /// interleave per layer, waves land later) drives the exchange model: every
     /// interleaving of the two GPU streams, per channel the most received but
-    /// unread events. `receive_slots` must cover it. Prefill calls of 1..6 units
-    /// at 1..3 waves in flight, every onboarding pattern of 3 layers.
+    /// unread events. `receive_slots` must equal it. Prefill calls of 1..6 units
+    /// at 1..3 waves in flight, every onboarding pattern of 3 layers, and a
+    /// decode pass inserted at every step boundary (decode lanes inside a call).
     #[test]
     fn receive_slots_cover_the_shared_prefill_schedule() -> Result<()> {
-        use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute};
+        use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
         use std::collections::{BTreeMap, HashSet, VecDeque};
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         enum Op { Push(u32), Wait(u32), Read(u32) }
@@ -159,9 +160,20 @@ mod tests {
                         else { FfnRoute::Spark }).collect();
                     let call = sequence_units(units * 1024, 1024, waves, 3)?;
                     let steps = prefill_schedule(&routes, &call, waves)?;
+                    // A decode step (one layer-major pass of every layer, on the same
+                    // streams) at each step boundary in turn, and none: covers decode
+                    // lanes that may run inside a prefill call (#717 direction).
+                    let decode: Vec<Step> = (0..3).flat_map(|layer| [Step::Attention { layer, unit: usize::MAX },
+                        if routes[layer] == FfnRoute::Spark { Step::Send { layer, unit: usize::MAX } }
+                        else { Step::Local { layer, unit: usize::MAX } }]
+                        .into_iter().chain((routes[layer] == FfnRoute::Spark)
+                            .then_some(Step::Land { layer, unit: usize::MAX }))).collect();
+                    for insert in std::iter::once(None).chain((0..=steps.len()).map(Some)) {
+                    let mut walk = steps.clone();
+                    if let Some(at) = insert { walk.splice(at..at, decode.iter().copied()); }
                     let mut channel_of = Vec::new();
                     let mut programs = [Vec::new(), Vec::new()];
-                    for step in steps {
+                    for step in walk {
                         for (channel, send, receive) in hook_exchanges(step) {
                             let e = channel_of.len() as u32;
                             channel_of.push(channel);
@@ -171,28 +183,42 @@ mod tests {
                             }
                         }
                     }
-                    let at = |g: usize, op: Op| programs[g].iter().position(|o| *o == op);
+                    // Positions of every push and read per GPU (u32::MAX: absent), precomputed.
+                    let events = channel_of.len();
+                    let mut push = [vec![usize::MAX; events], vec![usize::MAX; events]];
+                    let mut read = [vec![usize::MAX; events], vec![usize::MAX; events]];
+                    for g in 0..2 {
+                        for (pc, op) in programs[g].iter().enumerate() {
+                            match op { Op::Push(e) => push[g][*e as usize] = pc, Op::Read(e) => read[g][*e as usize] = pc,
+                                Op::Wait(_) => {} }
+                        }
+                    }
                     let mut seen = HashSet::new();
                     let mut queue = VecDeque::from([[0usize, 0usize]]);
                     while let Some(pcs) = queue.pop_front() {
                         if !seen.insert(pcs) { continue; }
                         for g in 0..2 {
-                            for channel in Channel::ALL {
-                                let unread = (0..channel_of.len() as u32).filter(|&e| channel_of[e as usize] == channel)
-                                    .filter(|&e| at(1 - g, Op::Push(e)).is_some_and(|push| pcs[1 - g] > push)
-                                        && at(g, Op::Read(e)).is_some_and(|read| pcs[g] <= read)).count();
-                                let entry = worst.entry(channel).or_insert(0);
-                                *entry = (*entry).max(unread);
+                            let mut unread = [0usize; 5];
+                            for e in 0..events {
+                                if push[1 - g][e] != usize::MAX && pcs[1 - g] > push[1 - g][e]
+                                    && read[g][e] != usize::MAX && pcs[g] <= read[g][e] {
+                                    unread[Channel::ALL.iter().position(|c| *c == channel_of[e]).unwrap()] += 1;
+                                }
+                            }
+                            for (i, channel) in Channel::ALL.iter().enumerate() {
+                                let entry = worst.entry(*channel).or_insert(0);
+                                *entry = (*entry).max(unread[i]);
                             }
                         }
                         for g in 0..2 {
                             let Some(&op) = programs[g].get(pcs[g]) else { continue };
                             let runnable = match op {
-                                Op::Wait(e) => at(1 - g, Op::Push(e)).is_some_and(|push| pcs[1 - g] > push),
+                                Op::Wait(e) => push[1 - g][e as usize] != usize::MAX && pcs[1 - g] > push[1 - g][e as usize],
                                 _ => true,
                             };
                             if runnable { let mut next = pcs; next[g] += 1; queue.push_back(next); }
                         }
+                    }
                     }
                 }
             }
