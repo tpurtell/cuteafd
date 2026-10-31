@@ -661,6 +661,14 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
                 ranks,
                 LayerExecutionPlan::new(&placement, inputs.hops())?,
             )?;
+            let onboarded = placement.layers.iter().enumerate()
+                .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. }))
+                .map(|(layer, l)| {
+                    ensure!(l.experts == ExpertHome::RtxWhole { gpu: inputs.hops().entry_gpu },
+                        "Step-5 onboarded layer {layer} is not on the routed entry GPU");
+                    Ok(layer)
+                }).collect::<Result<Vec<_>>>()?;
+            let checked_ownership = checked_ownership.with_onboarded(onboarded)?;
             let next_context = context.min(placement.pool_tokens);
             let pages = placement.pool_tokens / 64;
             ensure!(

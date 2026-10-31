@@ -531,6 +531,31 @@ impl<'a> RoutedFfn<'a> {
         self.finish_on(rows, stream)
     }
 
+    /// An onboarded layer: this layer's EXL3 experts run whole on this (entry)
+    /// GPU from the same FP8 K32 wire and routes the Spark wave would carry; the
+    /// F32 routed sum is rounded once to BF16 into the routed reply plane.
+    pub(super) fn onboard_on(&self, experts: &std::cell::RefCell<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>,
+        rows: usize, stream: &Stream<'a>) -> Result<()> {
+        use crate::shared::experts::rtx::{ExpertInput, Routes, RtxExpertLayer};
+        self.check_stream(rows, stream)?;
+        ensure!(!self.immutable.bf16_input, "Step-5 onboarded EXL3 experts read the FP8 K32 wire");
+        let mut experts = experts.borrow_mut();
+        ensure!(experts.device() == stream.device.id, "Step-5 onboarded experts are not on the routed GPU");
+        let layer = self.immutable.layer;
+        // SAFETY: WIRE/IDS/ROUTES hold `rows` complete rows written on this stream by
+        // the front end and stay unchanged until it drains; the executor's output's
+        // previous use completed in stream order.
+        unsafe {
+            experts.enqueue(layer, rows, ExpertInput::Fp8K32(self.plane(WIRE).ptr),
+                Routes { ids: self.plane(IDS).ptr, weights: self.plane(ROUTES).ptr }, stream.raw, &mut || ())?;
+        }
+        let output = CuteafdDeviceBuffer { ptr: experts.output(), bytes: rows * H * 4, device_id: stream.device.id, flags: 0 };
+        stream.device.run(|| {
+            // SAFETY: the executor's F32 output and the disjoint routed plane survive the stream drain.
+            unsafe { stream.device.library.cuda_f32_to_bf16_async(output, self.plane(ROUTED), rows * H, stream.raw) }
+        })
+    }
+
     pub fn wire_dtype(&self) -> cuteafd_transport::ExpertV2Dtype {
         if self.immutable.bf16_input { cuteafd_transport::ExpertV2Dtype::Bf16 }
         else { cuteafd_transport::ExpertV2Dtype::Fp8E4m3Ue8m0K32 }

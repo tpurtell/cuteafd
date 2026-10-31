@@ -266,7 +266,8 @@ fn with_backend<T>(args: &ServeArgs,
     // coordinator's own allocations are admitted; the coordinator then loads
     // its weights while the Sparks load theirs (and, pushing, in one group).
     let spark_admission = SparkAdmission::plan(&args.snapshot, ExpertGeometry::STEP5, Some(&catalog), &SparkWorkingSet {
-        rtx_layers: vec![], spark_layers: (3..91).collect(), spark_ranks: args.peers.len(),
+        rtx_layers: admission.ownership.onboarded_layers().to_vec(),
+        spark_layers: (3..91).filter(|layer| !admission.ownership.onboarded(*layer)).collect(), spark_ranks: args.peers.len(),
         prefill_lanes: 1 }, args.peers.len(), None,
         spark_model(&exports, endpoint, u64::from(args.prefill_waves), clients, config.max_frame_bytes)?)?;
     let available = inputs.inventory.gpus.iter().map(GpuBudget::available).collect::<Vec<_>>();
@@ -284,6 +285,9 @@ fn with_backend<T>(args: &ServeArgs,
         total.checked_sub(native).context("Step-5 native allocation missing from solved ledger")
     }).collect::<Result<Vec<_>>>()?;
     let head_rank = usize::from(admission.ownership.execution().spec().head_gpu);
+    let onboarded_budget = admission.placement.expert_ranges.get(usize::from(
+        admission.ownership.execution().spec().entry_gpu)).filter(|range| range.layers > 0)
+        .map(|range| usize::try_from(range.peak_bytes)).transpose()?;
     let predictor_budget = if args.mtp > 0 {
         let own = cuteafd_loader::plan::families::step5::coordinator::RankWeightLayout::for_mtp(
             &checkpoint, usize::from(args.mtp))?.resident_bytes;
@@ -360,12 +364,19 @@ fn with_backend<T>(args: &ServeArgs,
                 tracing::info!(pushed = pushed.is_some(), operands = records.operands.len(), steps = records.steps.len(),
                     "Step-5 coordinator dense operands landed");
             }
-            match native {
-                Some(native) => Ok(native),
+            let native = match native {
+                Some(native) => native,
                 None => Execution::load_native(&programs, &checkpoint, &ownership, &caches_ref, &stages_ref,
                     inputs.unit_rows(), inputs.rows, inputs.logit_rows(),
-                    &available, &reserves, 92),
-            }
+                    &available, &reserves, 92)?,
+            };
+            // Onboarded EXL3 routed layers, whole on the entry GPU inside its solved expert arena.
+            let entry = usize::from(ownership.execution().spec().entry_gpu);
+            let onboarded = ownership.onboarded_layers();
+            if onboarded.is_empty() { return Ok(native); }
+            let peak = onboarded_budget.context("Step-5 onboarded layers without a solved expert arena")?;
+            let package = format.package_manifest(&args.native_lib)?.parent().context("EXL3 package")?.join("rtx-tp1");
+            native.with_onboarded(devices[entry], &catalog, &package, onboarded, inputs.unit_rows(), peak)
         })
     })?;
     cuteafd_transport::worker_selection::require_peer_clients(&args.peers, endpoint, clients)?;

@@ -73,6 +73,8 @@ struct NativeOwners<'a> {
     head: Option<super::head::TargetHeadOwner<'a>>,
     arenas: Vec<Arena<'a>>,
     rope: Vec<Rc<TargetTables<'a>>>,
+    /// Onboarded routed layers' EXL3 experts, whole on the entry GPU.
+    onboarded: Option<RefCell<crate::shared::experts::rtx::exl3::Exl3Tp2<'a>>>,
 }
 impl<'a> NativeOwners<'a> {
     fn load(programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
@@ -148,7 +150,7 @@ impl<'a> NativeOwners<'a> {
             }
             let head = head_plan.map(|plan| super::head::TargetHeadOwner::load_in(devices[head_rank],
                 programs, checkpoint, plan, available[head_rank], &[], Some((&arenas[head_rank], 0)))).transpose()?;
-            Ok(Self { ranks, head, arenas, rope: tables })
+            Ok(Self { ranks, head, arenas, rope: tables, onboarded: None })
         })
     }
 }
@@ -412,6 +414,21 @@ impl<'e, 'a> Execution<'e, 'a> {
 
 /// Native owners loaded ahead of their execution binding.
 pub(super) struct LoadedNative<'a>(NativeOwners<'a>);
+
+impl<'a> LoadedNative<'a> {
+    /// Loads the solver's onboarded routed layers whole on `device` (the entry
+    /// GPU) from the installed `rtx-tp1` package, inside `budget` bytes.
+    pub(super) fn with_onboarded(mut self, device: Device<'a>, catalog: &cuteafd_loader::OfficialV41Catalog,
+        package: &std::path::Path, layers: &[usize], rows: usize, budget: usize) -> Result<Self> {
+        if layers.is_empty() { return Ok(self); }
+        use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
+        let weights = Exl3Tp2::load_whole_weights(device, catalog, package, layers.to_vec(), rows, budget,
+            RtxSelectionPolicy::CanonicalDecode)?;
+        self.0.onboarded = Some(RefCell::new(weights.execution()?));
+        tracing::info!(layers = layers.len(), "Step-5 EXL3 routed layers onboarded on the entry RTX");
+        Ok(self)
+    }
+}
 
 impl<'e, 'a> MainExecution<'e, 'a> {
     #[allow(clippy::too_many_arguments)]
@@ -1075,7 +1092,14 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
                         if dispatch { ffn.frontend_on(meta.rows, meta.stream) }
                         else { ffn.normalize_on(meta.rows, meta.stream) }
                     })?;
-                    if dispatch {
+                    if dispatch && execution.ownership.onboarded(layer) {
+                        // Onboarded: the entry GPU's EXL3 experts replace the Spark wave.
+                        ensure!(wave.is_none(), "Step-5 duplicate routed dispatch");
+                        let experts = execution.native.onboarded.as_ref().context("Step-5 onboarded experts not loaded")?;
+                        self.step.compose(rank, ffn, |ffn, meta| ffn.shared_on(meta.rows, meta.stream))?;
+                        self.step.compose(rank, ffn, |ffn, meta| ffn.onboard_on(experts, meta.rows, meta.stream))?;
+                        wave = Some(rank);
+                    } else if dispatch {
                         ensure!(wave.is_none(), "Step-5 duplicate routed Spark wave");
                         let layout = RouteStaging::new(self.rows(), 8, ffn.wire_row_bytes())?;
                         let dtype = ffn.wire_dtype();
@@ -1122,19 +1146,24 @@ impl<E: CopyEngine> PipelineKernels for Bindings<'_, '_, '_, '_, '_, E> {
         let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 routed completion owner"); };
         let split = execution.ownership.execution().mode(layer)? == LayerMode::HeadSplit;
         let output = if rank == entry { ffn.routed_output() } else { self.routed_reply()? };
-        // Waves land in dispatch order: the executor lands the oldest first.
-        let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
-        let mut transport = execution.transport.borrow_mut();
-        let link = transport.as_mut().context("Step-5 main transport missing")?;
-        let exchange = link.get_mut().exchange()?;
-        self.step.compose(entry, &execution.routed_reply, |_, meta| meta.stream.device.run(|| {
-            let slot = wave.slot();
-            exchange.land(wave, meta.stream.raw)?;
-            // SAFETY: the slot's planes and the admitted BF16 reply owner are
-            // disjoint; `land` ordered the planes on this lane stream.
-            unsafe { exchange.reduce(slot, std::ptr::null(), output.ptr.cast(), meta.rows, meta.stream.raw) }
-        }))?;
-        drop(transport);
+        if execution.ownership.onboarded(layer) {
+            // The onboarded experts already wrote the BF16 reply on the entry GPU's stream.
+            ensure!(rank == entry, "Step-5 onboarded routed layer off the entry GPU");
+        } else {
+            // Waves land in dispatch order: the executor lands the oldest first.
+            let wave = execution.pending_wave.borrow_mut().pop_front().context("Step-5 main wave absent")?;
+            let mut transport = execution.transport.borrow_mut();
+            let link = transport.as_mut().context("Step-5 main transport missing")?;
+            let exchange = link.get_mut().exchange()?;
+            self.step.compose(entry, &execution.routed_reply, |_, meta| meta.stream.device.run(|| {
+                let slot = wave.slot();
+                exchange.land(wave, meta.stream.raw)?;
+                // SAFETY: the slot's planes and the admitted BF16 reply owner are
+                // disjoint; `land` ordered the planes on this lane stream.
+                unsafe { exchange.reduce(slot, std::ptr::null(), output.ptr.cast(), meta.rows, meta.stream.raw) }
+            }))?;
+            drop(transport);
+        }
         if split || rank != entry {
             let destination_rank = 1 - entry;
             let Ffn::Routed(destination) = &execution.layer(destination_rank, layer)?.ffn else { anyhow::bail!("Step-5 routed receive owner"); };
