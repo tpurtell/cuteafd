@@ -327,7 +327,10 @@ impl<'a> ContextExchange<'a> {
     /// of its own assembled buffer (the producer wrote it there), only the
     /// peer copy runs.
     pub fn push_query(&self, rank: usize, slot: usize, source: *const c_void, pitch: usize, rows: usize) -> Result<()> {
-        self.push_query_width(rank, slot, source, pitch, rows, self.layout.query_bytes as usize)
+        self.check_rows(rows)?;
+        let (own, peer) = (self.buffers(rank, slot)?.query, self.buffers(1 - rank, slot)?.query);
+        let planes = query_planes(rank, own, peer, source, pitch, rows, self.layout.query_bytes as usize);
+        self.push(rank, slot, Exchange::Query, &planes)
     }
 
     /// [`Self::push_query`] of a layer whose half is `half` bytes per row (at most the
@@ -337,15 +340,8 @@ impl<'a> ContextExchange<'a> {
         self.check_rows(rows)?;
         ensure!(half > 0 && half <= self.layout.query_bytes as usize && half % 16 == 0 && pitch >= half,
             "query half of {half} B outside the exchange's {} B", self.layout.query_bytes);
-        let row = 2 * half;
-        let column = rank * half;
-        let own = self.buffers(rank, slot)?.query;
-        let peer = self.buffers(1 - rank, slot)?.query;
-        let in_place = std::ptr::eq(source, own.cast::<u8>().wrapping_add(column).cast()) && pitch == row;
-        let mut planes = vec![Self::plane(peer, column, row, source, pitch, rows, half)];
-        if !in_place {
-            planes.push(Self::plane(own, column, row, source, pitch, rows, half));
-        }
+        let (own, peer) = (self.buffers(rank, slot)?.query, self.buffers(1 - rank, slot)?.query);
+        let planes = query_planes(rank, own, peer, source, pitch, rows, half);
         self.push(rank, slot, Exchange::Query, &planes)
     }
 
@@ -407,9 +403,73 @@ impl<'a> ContextExchange<'a> {
     }
 }
 
+/// The copies assembling `rank`'s query half (`half` bytes per row of `source`, rows `pitch`
+/// apart) into both GPUs' `[rows, 2 * half]` assembled queries `own` and `peer`; the own copy
+/// is skipped when the producer already wrote it in place.
+fn query_planes(rank: usize, own: *mut c_void, peer: *mut c_void, source: *const c_void, pitch: usize,
+    rows: usize, half: usize) -> Vec<PeerPlane> {
+    let row = 2 * half;
+    let column = rank * half;
+    let in_place = std::ptr::eq(source, own.cast::<u8>().wrapping_add(column).cast()) && pitch == row;
+    let mut planes = vec![ContextExchange::plane(peer, column, row, source, pitch, rows, half)];
+    if !in_place {
+        planes.push(ContextExchange::plane(own, column, row, source, pitch, rows, half));
+    }
+    planes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The query copies before per-layer widths existed (dev 3aa884aae, verbatim): the
+    /// reference every existing family's exchange must still produce.
+    fn legacy_query_planes(rank: usize, own: *mut c_void, peer: *mut c_void, source: *const c_void,
+        pitch: usize, rows: usize, query_bytes: usize) -> Vec<PeerPlane> {
+        let half = query_bytes;
+        let row = 2 * half;
+        let column = rank * half;
+        let in_place = std::ptr::eq(source, own.cast::<u8>().wrapping_add(column).cast()) && pitch == row;
+        let mut planes = vec![ContextExchange::plane(peer, column, row, source, pitch, rows, half)];
+        if !in_place {
+            planes.push(ContextExchange::plane(own, column, row, source, pitch, rows, half));
+        }
+        planes
+    }
+
+    fn fields(planes: &[PeerPlane]) -> Vec<[u64; 6]> {
+        planes.iter().map(|p| [p.destination as u64, p.source as u64, p.rows, p.row_bytes,
+            p.destination_pitch, p.source_pitch]).collect()
+    }
+
+    /// GLM 5.3, GLM 5.3 Flash and DeepSeek V4 (the families passing no width) get byte-for-byte
+    /// the copies they had before the per-layer width: same destinations, sources, rows, widths
+    /// and pitches, in place or not, on both ranks. Mistral Large 4's NoPE width assembles its
+    /// own contiguous [rows, 64, 512] query inside the same buffer.
+    #[test]
+    fn default_query_width_is_the_previous_exchange_for_every_family() {
+        // Per-rank query half bytes: GLM 32 x 576, GLM Flash 32 x 512, V4 Flash 32 x 512, V4 Pro 64 x 512.
+        for half in [32 * 576 * 2, 32 * 512 * 2, 64 * 512 * 2] {
+            let (own, peer) = (0x10_0000_0000usize as *mut c_void, 0x20_0000_0000usize as *mut c_void);
+            for rank in 0..2 {
+                for rows in [1, 7, 64] {
+                    for (source, pitch) in [(0x30_0000_0000usize as *const c_void, half),
+                        (own.cast::<u8>().wrapping_add(rank * half).cast_const().cast(), 2 * half)] {
+                        assert_eq!(fields(&query_planes(rank, own, peer, source, pitch, rows, half)),
+                            fields(&legacy_query_planes(rank, own, peer, source, pitch, rows, half)),
+                            "half {half} rank {rank} rows {rows} pitch {pitch}");
+                    }
+                }
+            }
+        }
+        // A narrower layer (ML4 NoPE) writes its own row layout, inside the widest buffer.
+        let (wide, narrow) = (32 * 576 * 2, 32 * 512 * 2);
+        let planes = query_planes(1, 0x1000usize as *mut c_void, 0x9000_0000usize as *mut c_void,
+            0x5000_0000usize as *const c_void, narrow, 64, narrow);
+        assert!(fields(&planes).iter().all(|p| p[3] == narrow as u64 && p[4] == 2 * narrow as u64));
+        assert_eq!(planes[0].destination as usize, 0x9000_0000 + narrow);
+        assert!(64 * 2 * narrow <= 64 * 2 * wide);
+    }
 
     #[test]
     fn compact_pool_commit_planes_cover_each_owned_row_once() {
