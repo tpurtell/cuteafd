@@ -462,6 +462,10 @@ pub(crate) struct GlmEngine<'a> {
     /// Host time per phase since the last reset: GPU wait before the expert
     /// request, the Spark exchange, the logits download.
     pub profile: RefCell<[f64; 3]>,
+    /// The media rows of the prefill call in flight (absolute start, rows):
+    /// each prefill embed overwrites its rows' image features (see
+    /// [`Self::prefill_media_device`]). Empty for text and decode.
+    pending_media: RefCell<Option<(usize, cuteafd_engine::media::MediaChunk)>>,
     /// Host seconds inside the exchanges: building and posting requests,
     /// copying received partials into the pinned staging.
     pub exchange_host: RefCell<[f64; 4]>,
@@ -616,6 +620,7 @@ impl<'a> GlmEngine<'a> {
             staging_owner: RefCell::new([None; 2]), context_reuse: Cell::new(false), context_unit: Cell::new(0), prefill_link: RefCell::new(None), prefill_runtime: None,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, full_prefill_logits: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
+            pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), draft_probe: RefCell::new(None), width_taps: RefCell::new(None),
             graphs: RefCell::new(std::collections::HashMap::new()), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_misses: Cell::new(0), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, prefill_w8a8: true })
     }
@@ -1090,6 +1095,52 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
+    /// [`Self::prefill_device`] with the request's image features: rows inside a
+    /// media span take the encoder's rows instead of their placeholder
+    /// embeddings (Mistral spans also carry their marker rows). Text is
+    /// unchanged: no spans in range means no injection.
+    pub fn prefill_media_device(&self, placement: &mut GlmPlacement, tokens: &[u32],
+        experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, logit_rows: usize,
+        media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
+        let start = placement.len;
+        let chunk = match media.filter(|m| !m.spans().is_empty()) {
+            Some(media) => {
+                let mut chunk = cuteafd_engine::media::MediaChunk::default();
+                media.write_chunk(start, start + tokens.len(), &mut chunk)?;
+                (!chunk.indices.is_empty()).then_some(chunk)
+            }
+            None => None,
+        };
+        *self.pending_media.borrow_mut() = chunk.map(|chunk| (start, chunk));
+        let result = self.prefill_device(placement, tokens, experts, logit_rows);
+        *self.pending_media.borrow_mut() = None;
+        result
+    }
+
+    /// Overwrites this embed's rows (absolute positions of `tables`) that the
+    /// pending media chunk covers. `delta` (rows x hidden BF16) and `indices`
+    /// are not read before layer 0 writes them, so they stage the rows; all on
+    /// this stream, after the embed and before the first norm.
+    fn inject_media(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
+        let pending = self.pending_media.borrow();
+        let Some((call, chunk)) = pending.as_ref() else { return Ok(()); };
+        let (Some(&first), t) = (tables.positions.first(), tables.positions.len()) else { return Ok(()); };
+        let (begin, row) = (usize::try_from(first)?.checked_sub(*call).context("media rows before the call")?,
+            self.cfg.hidden * 2);
+        let (mut indices, mut features) = (Vec::new(), Vec::new());
+        for (i, &index) in chunk.indices.iter().enumerate() {
+            let index = index as usize;
+            if (begin..begin + t).contains(&index) {
+                indices.push((index - begin) as u32);
+                features.extend_from_slice(&chunk.features[i * row..(i + 1) * row]);
+            }
+        }
+        if indices.is_empty() { return Ok(()); }
+        self.library.embedding_injection()?.inject_host(&features, &indices, w.delta.buffer, w.indices.buffer,
+            w.h.buffer, t, self.cfg.hidden, 1, self.stream)?;
+        Ok(())
+    }
+
     /// Downloads a step's logits (counted in the logits phase).
     fn host_logits(&self, logits: Option<StepLogits>) -> Result<Option<Vec<f32>>> {
         let timer = std::time::Instant::now();
@@ -1348,6 +1399,7 @@ impl<'a> GlmEngine<'a> {
         }
         if self.layer_execution.is_some() {
             self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            self.inject_media(w, tables)?;
             return self.layer_step(scope, w, w1.context("owned attention peer")?, &ranked[0],
                 t, logit_rows, &mut experts, on_layer);
         }
@@ -1370,6 +1422,7 @@ impl<'a> GlmEngine<'a> {
             return Ok(Some(self.device_logits(w, logit_rows, head)));
         }
         self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
+        self.inject_media(w, tables)?;
         let bytes = t * h * 2;
         if let Some(w1) = w1 {
             self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
@@ -2254,6 +2307,7 @@ impl<'a> GlmEngine<'a> {
                 self.put_tables(w, &ranked[unit][0])?;
                 if let Some(peers) = &peer_workspaces { self.on(1, || self.put_tables(peers.get(unit)?, &ranked[unit][1]))?; }
                 self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
+                self.inject_media(w, &lanes[unit])?;
             }
             return self.layer_prefill(scope, &workspaces[..lanes.len()],
                 peer_workspaces.as_ref().context("owned attention lanes")?, &ranked, logit_rows, link, runtime);
@@ -2296,6 +2350,7 @@ impl<'a> GlmEngine<'a> {
                 }
             }
             self.embedding.embed(chunks[unit], w.ids.buffer, 1, w.h.buffer, self.stream)?;
+            self.inject_media(w, &lanes[unit])?;
             // The rank-1 entry copy is published in this unit's first attention,
             // next to its DIRECT wait: Begin admits several slots before any attention.
             Ok(())

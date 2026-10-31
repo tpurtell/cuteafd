@@ -452,3 +452,12 @@ fn official_literal_prompt_ids_are_plain_bpe_and_not_control_ids() {
         println!("literal {} -> {ids:?}", token.content);
     }
 }
+
+#[test]
+fn mistral_media_markers_are_media_literals() {
+    let tokens = LiteralTokens::new(["[IMG]", "[IMG_BREAK]", "[IMG_END]", "[AUDIO]", "[BEGIN_AUDIO]",
+        "[INST]", "[THINK]"].map(str::to_owned));
+    let text = "a [IMG] b [IMG_BREAK] c [IMG_END] d [AUDIO] [INST] [THINK]";
+    let media: Vec<_> = tokens.spans(text, true).into_iter().map(|span| &text[span]).collect();
+    assert_eq!(media, ["[IMG]", "[IMG_BREAK]", "[IMG_END]", "[AUDIO]"]);
+}

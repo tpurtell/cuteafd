@@ -68,8 +68,11 @@ impl LiteralTokens {
                 .match_kind(daachorse::MatchKind::LeftmostLongest).build(tokens)
                 .expect("nonempty distinct literal token spellings"))
         };
+        // Media markers in either spelling: `<|image|>`-style and Mistral's `[IMG]`,
+        // `[IMG_BREAK]`, `[IMG_END]`, `[AUDIO]`, `[BEGIN_AUDIO]`.
         let media = tokens.iter().filter(|token| ["image", "audio", "video", "vision"]
-            .iter().any(|word| token.contains(word))).cloned().collect();
+            .iter().any(|word| token.to_ascii_lowercase().contains(word))
+            || token.starts_with("[IMG")).cloned().collect();
         Self { all: matcher(tokens), media: matcher(media) }
     }
 
