@@ -121,6 +121,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 glm5_drafter_snapshot: args.drafter_snapshot.clone(),
                 glm5_draft_bf16: args.glm5_draft_bf16,
                 kimi_drafter_snapshot: None,
+                muse_drafter_snapshot: None,
                 dense_qwen_drafter_snapshot: args.drafter_snapshot.clone().filter(|_| args.speculator != "off"),
                 kimi_draft_fp8: args.draft_fp8,
                 glm5_attention_plan_rows: args.attention_plan_rows,
@@ -269,6 +270,11 @@ pub(crate) fn run_plan(mut args: PlanArgs) -> Result<()> {
             let resolved = file_args(args.clone(), &snapshot)?;
             layout.dense_qwen_drafter_snapshot = Some(resolved.drafter_snapshot
                 .context("dense dSpark planning requires its checkpoint")?);
+        }
+        if family == "muse_spark" && args.speculator != "off" {
+            anyhow::ensure!(args.speculator == "dflash2" && args.drafter_snapshot.is_some(),
+                "Muse Spark speculation requires --speculator dflash2 --drafter-snapshot SNAPSHOT");
+            layout.muse_drafter_snapshot = args.drafter_snapshot.clone();
         }
         if family == "kimi_k3" && args.speculator != "off" {
             anyhow::ensure!(args.speculator == "dflash2" && args.drafter_snapshot.is_some(),

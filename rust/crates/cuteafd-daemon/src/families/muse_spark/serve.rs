@@ -16,8 +16,10 @@ pub(crate) struct ServeArgs {
     #[arg(long)] pub snapshot: PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")] pub native_lib: PathBuf,
     #[arg(long, default_value = "/opt/cuteafd/share/PROGRAMS.json")] pub manifest: PathBuf,
-    /// Coordinator GPUs: one RTX, or a head-split pair (attention heads halve).
-    #[arg(long, value_delimiter = ',', default_values_t = [0, 1])] pub devices: Vec<i32>,
+    /// The entry coordinator GPU; `--split-device` adds the second of a head-split
+    /// pair (attention heads halve), as every family's launcher passes them.
+    #[arg(long, default_value_t = 0)] pub device: i32,
+    #[arg(long)] pub split_device: Option<i32>,
     /// Spark expert ranks: every expert's intermediate is sliced across them (TP),
     /// each replying per-expert partials the coordinator combines.
     #[arg(long, value_delimiter = ',')] pub peers: Vec<SocketAddr>,
@@ -63,6 +65,9 @@ pub(crate) struct ServeArgs {
 }
 
 impl ServeArgs {
+    /// The coordinator GPUs in rank order.
+    pub(super) fn devices(&self) -> Vec<i32> { std::iter::once(self.device).chain(self.split_device).collect() }
+
     pub(super) fn prefill(&self) -> Result<cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan> {
         use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides};
         Ok(prefill_shape(self.peers.len(), cuteafd_loader::plan::Family::prefill_limits(
@@ -78,9 +83,10 @@ impl ServeArgs {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        cuteafd_loader::placement::families::muse_spark::executor(self.devices.len())?;
-        ensure!(self.devices.iter().all(|&device| device >= 0)
-            && self.devices.iter().collect::<std::collections::HashSet<_>>().len() == self.devices.len(),
+        let devices = self.devices();
+        cuteafd_loader::placement::families::muse_spark::executor(devices.len())?;
+        ensure!(devices.iter().all(|&device| device >= 0)
+            && devices.iter().collect::<std::collections::HashSet<_>>().len() == devices.len(),
             "Muse Spark coordinator devices must be distinct");
         let distinct = self.peers.iter().collect::<std::collections::HashSet<_>>().len();
         // Every Spark world the shared package range data gives the checkpoint's width.
@@ -113,12 +119,13 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
     cfg.release_geometry()?;
     let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
-    let gpus = args.devices.len();
+    let device_ids = args.devices();
+    let gpus = device_ids.len();
     let manifest = startup::preflight(&args.manifest, gpus)?;
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     // SAFETY: every native owner drops on this worker before the library.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
-    let inventory = RuntimeInventory::measure(&library, &args.devices, InventoryPhase::PreWeight, |_| Ok(()))?;
+    let inventory = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| Ok(()))?;
     let (built, placement) = startup::admit(startup::Options { cfg: &cfg, core: &core, catalog: &catalog,
         manifest: &manifest,
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
@@ -140,7 +147,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
             let head = core.get_weight(cuteafd_loader::families::muse_spark::core::HEAD)
                 .map(|head| head.stored_outputs).context("Muse drafter needs the K6 target head")?;
             let head_device = crate::shared::memory::device::Device { library: &library,
-                id: *args.devices.last().context("Muse devices")? };
+                id: *device_ids.last().context("Muse devices")? };
             let sms = head_device.run(|| library.sm_count())?;
             cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
                 usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
@@ -157,7 +164,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let admission = crate::shared::placement::SparkAdmission::plan(&args.snapshot,
         cuteafd_core::ExpertGeometry::MUSE_SPARK, Some(&catalog), &spark.working, args.peers.len(), None,
         spark.model.clone())?.start(&args.peers)?;
-    let devices = args.devices.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
+    let devices = device_ids.iter().map(|&id| crate::shared::memory::device::Device { library: &library, id })
         .collect::<Vec<_>>();
     let programs = devices.iter().map(|device| device.run(|| library.programs()?.with_manifest(&args.manifest)))
         .collect::<Result<Vec<_>>>()?;
@@ -308,10 +315,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_a_head_split_pair_with_automatic_context_and_onboarding() -> Result<()> {
+    fn defaults_are_one_entry_gpu_with_automatic_context_and_onboarding() -> Result<()> {
         let defaults = args(&["--peers", PEERS])?;
         defaults.validate()?;
-        assert_eq!(defaults.devices, [0, 1]);
+        assert_eq!(defaults.devices(), [0]);
+        assert_eq!(args(&["--peers", PEERS, "--split-device", "1"])?.devices(), [0, 1]);
         assert_eq!(defaults.max_context, None);
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
@@ -322,9 +330,9 @@ mod tests {
         assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "fp8"]).is_ok());
         assert!(args(&["--peers", PEERS, "--expert-partial-wide-format", "bf16"]).is_err());
         args(&["--peers", PEERS, "--expert-partial-bf16-max-rows", "4096"])?.validate()?;
-        let single = args(&["--peers", PEERS, "--devices", "1"])?;
+        let single = args(&["--peers", PEERS, "--device", "1"])?;
         single.validate()?;
-        assert_eq!(single.devices, [1]);
+        assert_eq!(single.devices(), [1]);
         for peers in ["127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4", PEERS] {
             args(&["--peers", peers])?.validate()?;
         }
@@ -372,7 +380,7 @@ mod tests {
             args(&["--peers", peers.as_str()])?.validate()?;
         }
         for extra in [vec!["--peers", nine.as_str()], vec!["--peers", "127.0.0.1:1,127.0.0.1:1"],
-            vec!["--peers", PEERS, "--devices", "0,1,2"], vec!["--peers", PEERS, "--devices", "0,0"],
+            vec!["--peers", PEERS, "--device", "1", "--split-device", "1"], vec!["--peers", PEERS, "--split-device", "0"],
             vec!["--peers", PEERS, "--max-context", "1048577"], vec!["--peers", PEERS, "--max-context", "0"],
             vec!["--peers", PEERS, "--spark-budget-gib", "0"], vec!["--peers", PEERS, "--spark-budget-gib", "NaN"],
             vec!["--peers", PEERS, "--prefill-rows", "4097"], vec!["--peers", PEERS, "--prefix-partial", "on"],

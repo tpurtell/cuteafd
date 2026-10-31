@@ -189,9 +189,10 @@ EOF
     _spark_slot_keys HOST LANE_A
     return
   fi
-  # Kimi K3 and Step-5 (WIP slots only): the shared serve contract and Spark
-  # workers, no media or family modes yet; Step-5 takes an opt-in MTP depth.
-  if [[ "$1" == kimi_k3 || "$1" == step5 ]]; then
+  # Kimi K3, Step-5 and Muse Spark (WIP slots only): the shared serve contract
+  # and Spark workers, no media or family modes yet; Step-5 takes an opt-in
+  # MTP depth, Muse a DFlash2 drafter and its partial-reply format.
+  if [[ "$1" == kimi_k3 || "$1" == step5 || "$1" == muse_spark ]]; then
     cat <<'EOF'
 ATTENTION_PLACEMENT
 SPARK_EXPERT_DOCKER_INFERENCE
@@ -229,6 +230,7 @@ PROFILE_SPARK_NSYS_GPU_METRICS
 EOF
     [[ "$1" != kimi_k3 ]] || printf '%s\n' KV_CACHE RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING
     [[ "$1" != step5 ]] || printf '%s\n' SPECULATOR_DEPTH KV_CACHE PREFILL_BATCH_TOKENS PREFILL_WAVES FULL_PREFILL_LOGITS PREFILL_PACKING
+    [[ "$1" != muse_spark ]] || printf '%s\n' RTX_EXPERT_LAYERS SPECULATOR_MODEL_ID SPECULATOR_MODEL_REVISION SPECULATOR_DRAFTS DRAFT_KV_CACHE PREFILL_ROWS PREFILL_WAVES PREFILL_PACKING EXPERT_PARTIAL_BF16_MAX_ROWS EXPERT_PARTIAL_WIDE_FORMAT
     _spark_slot_keys HOST LANE_A
     return
   fi
@@ -403,7 +405,7 @@ EOF
 # Each shared-executor port opts in here after its serve CLI accepts the shape.
 family_prefill_mode() {
   case "$1" in
-    step5|kimi_k3|qwen4|deepseek_v4|deepseek_v41) echo units ;;
+    step5|kimi_k3|muse_spark|qwen4|deepseek_v4|deepseek_v41) echo units ;;
     glm5|glm5_flash|mimo_v2) echo units-span ;;
     *) echo legacy ;;
   esac
@@ -1635,8 +1637,8 @@ attention_placement="$(get ATTENTION_PLACEMENT auto)"
 # executor exists.
 case "$attention_placement:$family" in
   # Kimi K3 and Step-5 run only their recorded automatic placement.
-  auto:kimi_k3|auto:step5) ;;
-  *:kimi_k3|*:step5) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
+  auto:kimi_k3|auto:step5|auto:muse_spark) ;;
+  *:kimi_k3|*:step5|*:muse_spark) release_die "$family supports only ATTENTION_PLACEMENT=auto" ;;
   auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|layers:qwen4) ;;
   # K4/P7 qualified explicit layers; context remains the recorded auto default.
   # The planner still requires the selected image's executor and native programs.
@@ -1654,14 +1656,15 @@ case "$family" in
   qwen3_5) serve=serve-qwen35 ;;
   kimi_k3) serve=serve-kimi ;;
   step5) serve=serve-step5 ;;
-  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3 and Step-5 checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
+  muse_spark) serve=serve-muse ;;
+  *) echo "run-family.sh serves DeepSeek V4, GLM 5.x, GLM 5.3 Flash, MiMo V2, Qwen 3.8, Kimi K3, Step-5 and Muse Spark checkpoints, not $family (./run.sh serves DeepSeek V4.1)" >&2; exit 2 ;;
 esac
 # Kimi K3 and Step-5 serve through their own commands: automatic attention
 # placement, text only (their bundled vision towers are not in scope) and GPU
 # token embeddings. Kimi ships no MTP head; Step-5 defaults to native MTP
 # depth 3 (SPECULATOR=off disables it).
 text_family=0
-[[ "$family" != kimi_k3 && "$family" != step5 ]] || text_family=1
+[[ "$family" != kimi_k3 && "$family" != step5 && "$family" != muse_spark ]] || text_family=1
 if ((text_family)); then
   case "$vision:$audio" in
     auto:auto|auto:off|off:auto|off:off) vision=off; audio=off ;;
@@ -1897,7 +1900,7 @@ if [[ -z "$speculator" ]]; then
 fi
 case "$family:$speculator" in
   qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
-  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
+  *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|muse_spark:dflash2|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
 draft_args=()
@@ -2002,6 +2005,11 @@ case "$speculator" in
         { [[ -z "$default_drafter" ]] || echo "download it (hf download $drafter) or set SPECULATOR=off" >&2; exit 1; }
       draft_args=(--draft "$draft_snapshot")
       [[ "$family" != kimi_k3 ]] || draft_args+=(--draft-fp8 true)
+      if [[ "$family" == muse_spark ]]; then
+        muse_draft_kv="$(get DRAFT_KV_CACHE fp8)"
+        case "$muse_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
+        draft_args+=(--draft-kv-cache "$muse_draft_kv")
+      fi
     elif [[ $family == mimo_v2 ]]; then
       draft_args=(--draft "$snapshot")
     else
@@ -2026,7 +2034,7 @@ fi
 # retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
 case $family in
-  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
+  mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5|muse_spark)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
@@ -2083,6 +2091,9 @@ if [[ "$family" == qwen3_5 ]]; then
   family_args+=(--prefix-point-boundaries "$(get PREFIX_POINT_BOUNDARIES 1)")
 fi
 prefill_packing="$(get PREFILL_PACKING)"
+if [[ -n "$prefill_packing" && "$family" == muse_spark ]]; then
+  release_die "Muse Spark has no packed prefill yet (#923); unset PREFILL_PACKING"
+fi
 if [[ -n "$prefill_packing" ]]; then
   [[ "$family" == mimo_v2 || "$family" == glm5_flash || "$family" == step5 || "$family" == qwen4 || "$family" == qwen3_5 || "$family" == kimi_k3 || "$family" == deepseek_v4 || "$family" == glm5 || "$family" == deepseek_v41 ]] || { echo "PREFILL_PACKING is unsupported for $family" >&2; exit 2; }
   case "$prefill_packing" in
@@ -2137,6 +2148,20 @@ fi
 if ((text_family)); then
   pool="$(get POOL_TOKENS auto)"
   [[ "$pool" == auto ]] || family_args+=(--pool-tokens "$pool")
+fi
+# Muse Spark: RTX expert onboarding (auto or a fixed count; an image without its
+# coordinator EXL3 package refuses rather than serving them from the Sparks),
+# the partial-reply cutoff and wide format (the prefill unit shape comes from the
+# deployment plan, as for every units family).
+if [[ $family == muse_spark ]]; then
+  local_layers="$(get RTX_EXPERT_LAYERS auto)"
+  [[ "$local_layers" == auto || "$local_layers" =~ ^[0-9]+$ ]] ||
+    release_die "Muse Spark RTX_EXPERT_LAYERS is auto or a fixed routed-layer count, not $local_layers"
+  family_args+=(--rtx-expert-layers "$local_layers")
+  [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
+  [[ -z "$(get EXPERT_PARTIAL_WIDE_FORMAT)" ]] || family_args+=(--expert-partial-wide-format "$(get EXPERT_PARTIAL_WIDE_FORMAT)")
+  [[ -z "$(get SPARK_DEVICE_BUDGET_BYTES)" ]] ||
+    family_args+=(--spark-budget-gib "$(python3 -c 'import sys; print(int(sys.argv[1]) / (1 << 30))' "$(get SPARK_DEVICE_BUDGET_BYTES)")")
 fi
 if [[ $family == kimi_k3 ]]; then
   kv_cache="$(get KV_CACHE fp8)"
@@ -2267,7 +2292,7 @@ fi
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
-  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*) ;;
+  deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*) ;;
   qwen4:*)
     if [[ "$ranks" == 0 ]]; then
       : # Qualified Spark-free pairs default to native TP2 and whole-layer ownership.
@@ -2590,7 +2615,7 @@ case "$family" in
       off) lane_env_args+=(-e CUTEAFD_GLMF_REMOTE_DFLASH=0) ;;
       "") [[ -z "${CUTEAFD_GLMF_REMOTE_DFLASH:-}" ]] || lane_env_args+=(-e "CUTEAFD_GLMF_REMOTE_DFLASH=$CUTEAFD_GLMF_REMOTE_DFLASH") ;;
     esac ;;
-  qwen4|qwen3_5|kimi_k3|step5|mimo_v2) ;;
+  qwen4|qwen3_5|kimi_k3|step5|muse_spark|mimo_v2) ;;
   *) echo "missing worker endpoint geometry for $family" >&2; exit 2 ;;
 esac
 if [[ -n "$expert_input" && "$expert_input" != fp8 && "$ranks" == 0 ]]; then
@@ -2633,6 +2658,9 @@ audio_encoder_hash=""
   fi
   if [[ "$family:$speculator" == kimi_k3:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot" --draft-fp8 true)
+  fi
+  if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
+    plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   # Read the effective serve argv, including family modes that enable auto.
   plan_host_cache=0
@@ -2699,6 +2727,10 @@ audio_encoder_hash=""
   fi
   if [[ "$family" == kimi_k3 ]]; then
     plan_draft_args+=(--kv-cache "$kv_cache")
+    [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
+    [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
+  fi
+  if [[ "$family" == muse_spark ]]; then
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
   fi

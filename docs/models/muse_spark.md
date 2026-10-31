@@ -8,9 +8,10 @@ checkpoint's precision. The BF16 release fuses each layer's 256 experts into
 one tensor and has no expert package; `cuteafd plan` names the publication to
 serve instead.
 
-Status: planned. The plan, Spark expert residency, expert-parallel EXL3
-exports and the CPU reference are in place; the coordinator engine is in
-progress. Example configs land with the first served build.
+Status: under qualification. The plan, the coordinator engine on one RTX or a
+head-split pair, the Spark expert path, RTX onboarding, the prefix cache, the
+chat encoding with constrained tool calls and both DFlash2 drafters are in
+place; serving is text only until the bundled towers are bound (#936).
 
 ## Architecture
 
@@ -30,61 +31,102 @@ no shared expert.
   renormalized). The experts run at a 4096-wide stream: `pre_expert_proj`
   (8192 to 4096) and a norm, the experts, then `post_expert_proj` back.
   **Each expert's output is RMS-normalized before its routing weight.**
-- **Head:** untied, `20 * tanh(logits * 0.1768 / 20)`, vocabulary 202,048.
+- **Head:** untied, `20 * tanh(logits * 0.1768 / 20)`, vocabulary 202,048
+  (the K6 head is stored at 202,112 rows and trimmed before the softcap).
 - **Context:** 1M (`max_position_embeddings`).
 
 Every `(1 + w)` in the centered and input-scaled norms is a BF16 add, as the
 reference module computes it on the BF16 parameter.
 
-## Experts are whole on each rank
+## Experts: tensor-parallel partials, combined on the coordinator
 
-Because each expert's output is normalized over its whole width before the
-routing weight, the routed experts are never sliced by intermediate. Spark
-ranks hold whole experts, partitioned by a shared owner table (expert
-`e` of layer `l` on rank `(e + l) % N`). Every rank receives every row and
-the global routes, runs only the routes it owns (the others map to -1 in its
-expert map and are skipped), applies each route's norm and weight, and returns
-one partial sum; the coordinator adds the ranks as it does for tensor
-parallel. The exchange and the reply size are those of TP.
+Spark ranks hold every expert's slice of the intermediate (TP over the
+shared EXL3 Spark worker, worlds 2..8 from the package range data). Because
+each expert's output is normalized over its whole width before its routing
+weight, the ranks cannot sum: each replies its **per-expert partials** for
+every routed (row, slot), and the coordinator's combine
+(`muse_tp_combine_*`) sums the ranks per route, applies the layer's
+`post_expert_norm` and the routing weight, and reduces the eight routes.
+The combine reads every rank's reply in place through an `i64` table of
+region addresses (`rank_regions`).
 
-The residency follows the checkpoint: a routed layer that stores
-`mlp.experts.post_expert_norm.weight` is served as whole experts, with the
-norm weight resident beside its experts; other checkpoints keep the balanced
-intermediate split. RTX-onboarded layers are whole on one GPU, alternating
-between the two GPUs.
+Replies are BF16 for a step's narrow segments (up to
+`--expert-partial-bf16-max-rows`, 64 by default: decode and verify stay
+lossless) and NVFP4 (or FP8, `--expert-partial-wide-format`) for wider
+prefill segments. Each endpoint's frame is sized from the admitted worst
+reply (NVFP4 91.5 MiB, FP8 117.8 MiB per frame).
 
-At decode a token's eight routes land unevenly on the ranks (two of eight on
-the busiest of six at best). Popularity-balanced ownership and replication of
-hot experts in Spark headroom are the levers; they are measured on real
-routes from the fidelity golden before either is committed.
+**RTX onboarding** is on by default: an onboarded layer runs its experts on
+the coordinator from the image's EXL3 package (`exl3-muse-k<tiers>/rtx-tp2`
+on a pair, `rtx-tp1` on one GPU). On a pair each GPU holds half of every
+onboarded expert's intermediate; both swap the expert-input halves, run the
+shared EXL3 core with the partial-reply epilogue (all rows BF16), swap the
+partials, and combine with ranks 2 (ranks 1 on one GPU). Automatic placement
+onboards whatever memory allows after the KV pool target; an image without
+the package refuses with a named reason rather than serving the layers from
+the Sparks.
+
+## Coordinator
+
+A head-split RTX pair halves the attention heads (and the K/V records) per
+GPU, splits `pre_expert_proj` over its outputs and `post_expert_proj` over
+its inputs (single residency), and exchanges over peer access. One RTX runs
+the whole layer. The embedding stays on the entry GPU (rank 1 gathers over
+peer access); the head runs on the last rank.
+
+The prefix cache restores exact frontiers (full-layer KV records and the
+sliding rings), with the shared host tier; prefill runs as row units on the
+shared prefill pipeline. Packed prefill is not supported yet (#923).
+
+## Chat encoding
+
+The checkpoint's own template renders the prompt (byte-identical to
+transformers on the goldens). The model replies in recipient-addressed
+messages: `to=self` is private reasoning, `to=commentary` and `to=user` are
+visible content, any other recipient is a tool call in an
+`<atem:function_calls>` block. `reasoning_effort` maps onto the template's
+`low`/`medium`/`high`/`xhigh` (`minimal` to low, `max` to xhigh); turning
+thinking off is refused, as the template always reasons. Strict or required
+tool calls, tool-decoding assistance and structured `response_format` run
+under a native grammar (`muse_tool_schema`): reasoning first, then the calls
+or a `to=user` answer in the requested format.
 
 ## Layouts
 
-`cuteafd plan --layout` (header-only EXL3 K4 + Core-K6 fixture, 100 GiB Spark
-budget, RTX PRO 6000):
+`cuteafd plan --layout` on the header-only EXL3 K4 + Core-K6 fixture
+(RTX PRO 6000, default Spark budget, no host prefix tier):
 
-| Layout | Experts per Spark | KV pool | RTX expert layers |
-|---|---|---|---|
-| 2 RTX + 6 Sparks | 61.3 GiB | 2.10M | automatic |
-| 2 RTX + 5 Sparks | ~73 GiB | 2.10M | automatic |
-| 2 RTX + 4 Sparks | 92.0 GiB | 2.10M | automatic |
-| 1 RTX + 4..6 Sparks | | ~835K | automatic |
+| Layout | KV pool | RTX expert layers |
+|---|---|---|
+| 2 RTX + 4..8 Sparks | 2.10M (the 2M target) | automatic (1 here; 3 with the host tier) |
+| 2 RTX + 3 Sparks | refused | |
+| 1 RTX + 4 Sparks | 814K | automatic (0) |
+| 1 RTX + 6 Sparks | 805K | automatic (0) |
+| 1 RTX + 8 Sparks | 796K | automatic (0) |
+| any + 2 Sparks | refused | |
 
-KV is 4 KiB per token per full layer (BF16), 64 KiB per token over the 16 full
-layers; sliding layers keep a per-sequence ring of the window plus one prefill
-unit.
+One RTX admits the pool below the 1M compiled context, so an automatic
+context is clamped to it. KV is 4 KiB per token per full layer (BF16),
+64 KiB per token over the 16 full layers; sliding layers keep a
+per-sequence ring of the window plus one rollback step.
 
 ## Speculation
 
-Two DFlash2 drafters exist; the default is the one that delivers the most
-tokens per second.
+Two DFlash2 drafters; the default is the one that delivers the most tokens
+per second (to be measured on the first hardware window).
 
-| Drafter | Geometry | Shared DFlash2 kernels |
+| Drafter | Geometry | Drafter attention |
 |---|---|---|
-| `RadixArk/Muse-Spark-Open-DFlash2` (46c90f41) | 5 layers, 64 query / 8 KV heads of 128, taps 1, 16, 30, 44, 59 | fits |
-| `nvidia/Muse-Spark-Open-816B-A42B-DFlash2` (22e2669e) | 5 layers, 128 query / 16 KV heads of 64, taps 3, 19, 31, 47, 59 | needs a head_dim-64 drafter attention |
+| `RadixArk/Muse-Spark-Open-DFlash2` (46c90f41) | 5 layers, 64 query / 8 KV heads of 128, taps 1, 16, 30, 44, 59 | shared d128 |
+| `nvidia/Muse-Spark-Open-816B-A42B-DFlash2` (22e2669e) | 5 layers, 128 query / 16 KV heads of 64, taps 3, 19, 31, 47, 59 | native `_d64` |
 
-Both borrow the target's softcapped head for their candidate logits.
+`--draft SNAPSHOT` opts in. The drafter runs on the last coordinator GPU,
+beside the target head. Neither carries a head: both read the target's exact
+head path (K6 head, trim, softcap with the target's output multiplier) on
+their own charged scratch, and a drafter trained against another softcap or
+multiplier is refused. Taps are the target's hidden rows after the tapped
+layers; a prefill call commits its last 2048 rows (the drafter's window) as
+context.
 
 ## Numerics references
 

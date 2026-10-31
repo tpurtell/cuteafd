@@ -63,6 +63,11 @@ pub fn describe(config: &Value) -> Result<LaunchDescription> {
             let (first, last) = kimi_routed(text_config(config))?;
             ("kimi_k3", first, Some(last))
         }
+        // Every Muse decoder layer is a MoE (`mlp_layer_types` all sparse).
+        "muse_spark" => {
+            let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(config)?;
+            ("muse_spark", 0, Some(cfg.layers - 1))
+        }
         other => bail!("unsupported model_type {other:?}"),
     };
     Ok(LaunchDescription { family, model_type, first_expert_layer: first, last_expert_layer: last })
