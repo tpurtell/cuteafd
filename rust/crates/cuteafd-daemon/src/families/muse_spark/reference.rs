@@ -48,12 +48,32 @@ pub(crate) struct Reference {
     /// sum over key tiles of `tile` rows, one BF16 rounding of the output;
     /// `None` is the eager module's normalized-BF16-probability path.
     pub(crate) online_tile: Option<usize>,
+    /// Exchange with a native attention kernel on the same inputs: `dump`
+    /// writes each layer's normed/rotated q, k, v and this oracle's attention
+    /// output (`layer{L}.{q,k,v,out}.bin`, BF16 bits, [rows, heads, 64]);
+    /// `inject` reads `layer{L}.out.bin` (the kernel's output) in place of
+    /// computing attention. One prefill call over the whole prompt.
+    pub(crate) attention_dump: Option<std::path::PathBuf>,
+    pub(crate) attention_inject: Option<std::path::PathBuf>,
+}
+
+fn write_bf16(path: &std::path::Path, rows: &[Vec<f32>]) -> Result<()> {
+    let bytes: Vec<u8> = rows.iter().flatten().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+    Ok(std::fs::write(path, bytes)?)
+}
+
+fn read_bf16(path: &std::path::Path, rows: usize, width: usize) -> Result<Vec<Vec<f32>>> {
+    let bytes = std::fs::read(path).with_context(|| format!("injected attention {}", path.display()))?;
+    ensure!(bytes.len() == rows * width * 2, "{}: {} bytes, expected [{rows}, {width}] BF16", path.display(), bytes.len());
+    Ok(bytes.chunks_exact(width * 2).map(|row| row.chunks_exact(2)
+        .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)).collect()).collect())
 }
 
 impl Reference {
     pub(crate) fn new(cfg: MuseSparkConfig, embedding: Matrix, layers: Vec<Layer>, norm: Vec<f32>, head: Matrix) -> Self {
         let cache = vec![Vec::new(); cfg.layers];
-        Self { cfg, embedding, layers, norm, head, cache, position: 0, online_tile: None }
+        Self { cfg, embedding, layers, norm, head, cache, position: 0, online_tile: None,
+            attention_dump: None, attention_inject: None }
     }
 
     fn layer(&self, layer: usize) -> Result<&Layer> { self.layers.get(layer).context("layer outside the reference weights") }
@@ -104,6 +124,9 @@ impl Ops for Reference {
         let eps = cfg.rms_norm_eps;
         let start = self.cache[layer].len();
         let mut out = Vec::with_capacity(x.len());
+        let (mut dump_q, mut dump_k, mut dump_v, mut dump_out) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let injected = self.attention_inject.as_ref().map(|dir|
+            read_bf16(&dir.join(format!("layer{layer}.out.bin")), x.len(), heads * dim)).transpose()?;
         for (offset, row) in x.iter().enumerate() {
             let position = start + offset;
             let (q, k, v) = (l.q.apply(row), l.k.apply(row), l.v.apply(row));
@@ -125,6 +148,9 @@ impl Ops for Reference {
                 kh = kh.iter().map(|h| rotate(h, &table)).collect();
             }
             let vh: Vec<Vec<f32>> = (0..kv_heads).map(|h| v[h * dim..(h + 1) * dim].to_vec()).collect();
+            dump_q.push(qh.concat());
+            dump_k.push(kh.concat());
+            dump_v.push(vh.concat());
             self.cache[layer].push((kh.concat(), vh.concat()));
             let history = &self.cache[layer];
             let first = if sliding { (position + 1).saturating_sub(cfg.window) } else { 0 };
@@ -168,12 +194,21 @@ impl Ops for Reference {
                     }
                     head_out.iter().map(|v| contract::bf16(*v as f32)).collect()
                 };
-                attended.extend(contract::rms(&head_out, eps));
+                attended.extend(head_out);
             }
+            if let Some(injected) = &injected { attended = injected[offset].clone(); }
+            dump_out.push(attended.clone());
+            let attended: Vec<f32> = attended.chunks_exact(dim).flat_map(|head| contract::rms(head, eps)).collect();
             let gate = l.g.apply(row);
             let gated: Vec<f32> = attended.iter().zip(&gate)
                 .map(|(a, g)| contract::bf16(a * contract::bf16(1.0 / (1.0 + (-g).exp())))).collect();
             out.push(l.o.apply(&gated));
+        }
+        if let Some(dir) = &self.attention_dump {
+            std::fs::create_dir_all(dir)?;
+            for (name, rows) in [("q", &dump_q), ("k", &dump_k), ("v", &dump_v), ("out", &dump_out)] {
+                write_bf16(&dir.join(format!("layer{layer}.{name}.bin")), rows)?;
+            }
         }
         self.position = start + x.len();
         Ok(out)

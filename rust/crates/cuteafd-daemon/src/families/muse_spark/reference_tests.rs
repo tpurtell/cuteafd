@@ -120,3 +120,69 @@ fn online_softmax_attention_stays_within_the_stated_tolerance() -> Result<()> {
     }
     Ok(())
 }
+
+fn fixture_logits(ops: &mut Reference, cfg: &MuseSparkConfig) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<u32>)> {
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures().join("official.json"))?)?;
+    let tokens: Vec<u32> = serde_json::from_value(record["tokens"].clone())?;
+    let official: Vec<Vec<f32>> = serde_json::from_value(record["logits"].clone())?;
+    Ok((forward(cfg, ops, &tokens, cfg.layers)?, official, tokens))
+}
+
+fn compare(ours: &[Vec<f32>], official: &[Vec<f32>]) -> (f32, usize) {
+    let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+    let top1 = ours.iter().zip(official).filter(|(a, b)| argmax(a) == argmax(b)).count();
+    let worst = ours.iter().zip(official).flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+        .fold(0f32, f32::max);
+    (worst, top1)
+}
+
+/// The exchange is lossless: injecting the oracle's own dumped attention
+/// reproduces its logits bit for bit.
+#[test]
+fn attention_dump_then_inject_reproduces_the_oracle() -> Result<()> {
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures().join("official.json"))?)?;
+    let cfg = MuseSparkConfig::from_hf(&record["config"])?;
+    let dir = tempfile::tempdir()?;
+    let mut dumped = reference(&cfg)?;
+    dumped.attention_dump = Some(dir.path().to_path_buf());
+    let (first, ..) = fixture_logits(&mut dumped, &cfg)?;
+    for layer in 0..cfg.layers {
+        for name in ["q", "k", "v", "out"] {
+            assert!(dir.path().join(format!("layer{layer}.{name}.bin")).is_file());
+        }
+    }
+    let mut injected = reference(&cfg)?;
+    injected.attention_inject = Some(dir.path().to_path_buf());
+    let (second, ..) = fixture_logits(&mut injected, &cfg)?;
+    assert_eq!(first, second);
+    Ok(())
+}
+
+/// Engine-level gate for a native attention kernel (Sol kernel agent):
+/// 1. `CUTEAFD_MUSE_ATTENTION_DUMP=DIR cargo test ... muse_spark_attention_exchange`
+///    writes each layer's kernel inputs (`layer{L}.{q,k,v}.bin`, BF16 [9, heads, 64],
+///    q/k after norm + RoPE, rows at positions 0..9 of one sequence) and the
+///    oracle's own output (`layer{L}.out.bin`);
+/// 2. run the kernel on those inputs (layer 0 sliding window 5, layer 1 full NoPE,
+///    8 query / 2 KV heads, scale 0.125) and write its outputs to
+///    `DIR/kernel/layer{L}.out.bin` (BF16 [9, 8*64], before the per-head o_norm);
+/// 3. `CUTEAFD_MUSE_ATTENTION_INJECT=DIR/kernel cargo test ...` reports and gates
+///    max |logit diff| <= 0.05 and top-1 9/9 against the official model.
+#[test]
+fn muse_spark_attention_exchange() -> Result<()> {
+    let (dump, inject) = (std::env::var_os("CUTEAFD_MUSE_ATTENTION_DUMP"), std::env::var_os("CUTEAFD_MUSE_ATTENTION_INJECT"));
+    if dump.is_none() && inject.is_none() { return Ok(()); }
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures().join("official.json"))?)?;
+    let cfg = MuseSparkConfig::from_hf(&record["config"])?;
+    let mut ops = reference(&cfg)?;
+    ops.attention_dump = dump.map(std::path::PathBuf::from);
+    ops.attention_inject = inject.clone().map(std::path::PathBuf::from);
+    let (ours, official, tokens) = fixture_logits(&mut ops, &cfg)?;
+    let (worst, top1) = compare(&ours, &official);
+    eprintln!("muse attention exchange: max |logit diff| {worst:.4}, top-1 {top1}/{}", tokens.len());
+    if inject.is_some() {
+        assert!(worst <= 0.05, "max logit difference {worst}");
+        assert_eq!(top1, tokens.len());
+    }
+    Ok(())
+}
