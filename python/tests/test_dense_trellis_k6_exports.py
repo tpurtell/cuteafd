@@ -241,3 +241,34 @@ def test_glm_static_table_matches_installed_published_checkpoint_headers(monkeyp
             side = 2 if split == "input" and world == 2 else 1
             assert (local_k, local_n, side) in geometries, (stem, local_k, local_n, side)
     assert len(expected) == 547
+
+
+def test_muse_geometries_dtypes_and_existing_family_order(monkeypatch):
+    module = load_exporter(monkeypatch)
+    for name, methods in (
+        ("b12x.integration.cuteafd.trellis_linear", ("compile_trellis_linear_aot",)),
+        ("b12x.integration.cuteafd.trellis_transform", ("compile_trellis_input_aot", "compile_trellis_output_aot")),
+    ):
+        fake = ModuleType(name)
+        for method in methods:
+            setattr(fake, method, lambda **params: params)
+        monkeypatch.setitem(sys.modules, name, fake)
+    geometries = {shape[1:] for shape in module["shapes_for"](("muse",))}
+    assert geometries == {(8192, 4096, 1), (8192, 8192, 1), (8192, 512, 1),
+                          (8192, 1024, 1), (4096, 8192, 2), (4096, 8192, 1),
+                          (8192, 202112, 1)}
+    programs = module["programs"](families=("muse",), input_dtype="bf16")
+    names = {item[0] for item in programs}
+    assert {"trellis_output_n8192_bf16", "trellis_output_n8192_f32",
+            "trellis_output_n202112_f32"} <= names
+    policies = module["row_policies"](("muse",))
+    assert len(policies) == 14
+    for policy in policies:
+        assert all(policy[field] in names for field in ("native_input", "native_program", "output_program"))
+        expected = "f32" if policy["shape"] in ("muse_o_tp2", "muse_lm_head") else "bf16"
+        assert policy["output_program"].endswith("_" + expected)
+    for family in ("kimik3", "glm", "glmf"):
+        baseline = module["programs"](families=(family,), input_dtype="bf16")
+        combined = module["programs"](families=(family, "muse"), input_dtype="bf16")
+        assert [item[:3] for item in combined[:len(baseline)]] == [item[:3] for item in baseline]
+        assert len({item[0] for item in combined}) == len(combined)

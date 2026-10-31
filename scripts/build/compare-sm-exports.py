@@ -132,6 +132,12 @@ def jobs(scope):
         ("step5-metadata", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "metadata"]),
         ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
+    for heads, suffix in ((128, ""), (64, "-tp2")):
+        for group in ("pointwise", "projections", "attention"):
+            result.append((f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
+                           ["--heads", str(heads), "--group", group]))
+    result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
         result.append((f"v41-slices-{role}", "export_b12x_slices_aot.py", args))
