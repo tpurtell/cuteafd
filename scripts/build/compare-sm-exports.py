@@ -136,6 +136,8 @@ def jobs(scope):
         for group in ("pointwise", "projections", "attention"):
             result.append((f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
                            ["--heads", str(heads), "--group", group]))
+    result.append(("muse-tp-combine", "export_b12x_muse_aot.py", ["--group", "tp-combine"]))
+    result.append(("expert-partial", "export_b12x_expert_partial_aot.py", []))
     result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
                    ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
@@ -173,7 +175,7 @@ def jobs(scope):
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
-    # Muse Spark: whole-expert (expert-parallel) K4/K5 exports with the per-route norm sum.
+    # Muse Spark: TP-resident K4/K5 experts; the generic partial epilogue is separate.
     result.append(("exl3-muse-k45", "package_exl3_aot.py",
                    ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
@@ -390,8 +392,6 @@ def _export_exl3(extra, output):
                 options["route_block"] = block
             if (limit := package.swiglu_limit(geometry)) != 10.0:
                 options["swiglu_limit"] = limit
-            if geometry in getattr(package, "ROUTE_NORM_EPS", {}):
-                options["route_norm_eps"] = package.ROUTE_NORM_EPS[geometry]
             if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
                 options["decode_schedule"] = schedule
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)

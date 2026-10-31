@@ -53,6 +53,10 @@ def builders(heads=128, group="pointwise", max_rows=4096):
                       attention_output=partial(m.compile_attention_output_aot, heads=heads),
                       expert_input_quant=compile_expert_input_quant_aot)
         return result
+    if group == "tp-combine":
+        from b12x.integration.cuteafd.muse_tp import compile_tp_combine_aot
+        return {f"tp_combine_{format}": partial(compile_tp_combine_aot, format=format)
+                for format in ("bf16", "nvfp4", "fp8")}
     if group == "projections":
         from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
         return {"router": m.compile_router_aot,
@@ -72,7 +76,7 @@ def builders(heads=128, group="pointwise", max_rows=4096):
 
 def programs(heads=128, max_rows=4096):
     return [(name, name, {"max_rows": max_rows}, build)
-            for group in ("pointwise", "projections", "attention")
+            for group in ("pointwise", "projections", "attention", "tp-combine")
             for name, build in builders(heads, group, max_rows).items()]
 
 
@@ -80,7 +84,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--heads", type=int, choices=(64, 128), default=128)
-    parser.add_argument("--group", choices=("pointwise", "projections", "attention"), default="pointwise")
+    parser.add_argument("--group", choices=("pointwise", "projections", "attention", "tp-combine"), default="pointwise")
     args = parser.parse_args()
     from export_b12x_dsv4_aot import main as export
     names = ",".join(builders(args.heads, args.group))
