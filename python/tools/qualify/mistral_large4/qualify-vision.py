@@ -135,6 +135,15 @@ def pack_spec(config, tensors, snapshot, merged=55 * 55):
     return spec, b"".join(chunks), rows
 
 
+def planner_scratch_bytes(merged=55 * 55):
+    """cuteafd-loader `plan::layout::mistral_scratch_bytes`: the planner's tower charge."""
+    n, span, mib = merged * 4, merged + 55, 1 << 20
+    parts = [n*2048*4, n*2048*4, n*2048*2, n*588*2, n*2048*2, n*2048*2, n*2048*2, n*2048*2, span*6144*2,
+             4096*6144*4, 4096*2048*4, 4096*12288*4, 4096*6144*2, 4096*6144*4, 4096*6144*2, 4096*6144*4,
+             n*588, 3*256*4, n*2*4, 16384*16*4, 2*4, 4*mib]
+    return sum(-(-b // 256) * 256 for b in parts)
+
+
 def normalization_lut(snapshot):
     processor = json.loads((snapshot / "processor_config.json").read_text())["image_processor"]
     if processor["patch_size"] != 14 or processor["image_processor_type"] != "PixtralImageProcessor":
@@ -209,6 +218,9 @@ def run(args):
     lut = normalization_lut(args.snapshot)
     owner, required = C.c_void_p(), Ledger()
     check(library.cuteafd_vision_required(C.byref(spec), C.byref(required)))
+    # The planner charges exactly what the native owner allocates.
+    if required.scratch + required.blas_workspace != planner_scratch_bytes() or required.weights != spec.weight_bytes:
+        raise RuntimeError(f"native ledger {required.as_dict()} differs from the planner charge {planner_scratch_bytes()}")
     check(library.cuteafd_vision_create(C.byref(spec), 0, required.weights + required.scratch + required.blas_workspace, C.byref(owner)))
     original = F.scaled_dot_product_attention
     # Split independent query rows to bound the reference's math scratch at 12K patches.
@@ -220,6 +232,7 @@ def run(args):
     F.scaled_dot_product_attention = bounded
     result = dict(checkpoint=str(args.snapshot), device=torch.cuda.get_device_name(0),
         sm=torch.cuda.get_device_capability(0), numerics=2, reserved=4, ledger=required.as_dict(),
+        planner_scratch_bytes=planner_scratch_bytes(),
         calibration_policy="mistral-bf16-official-floor/1",
         library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
         processor_sha256=hashlib.sha256((args.snapshot / "processor_config.json").read_bytes()).hexdigest(),

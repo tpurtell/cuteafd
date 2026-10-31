@@ -1342,6 +1342,13 @@ pub fn mistral_scratch_bytes(merged: u64) -> u64 {
         .into_iter().map(|b| b.div_ceil(256)*256).sum()
 }
 
+#[test]
+fn mistral_scratch_is_the_qualifier_figure() {
+    // python/tools/qualify/mistral_large4/qualify-vision.py planner_scratch_bytes(), which
+    // the hardware screen also asserts against cuteafd_vision_required.
+    assert_eq!(mistral_scratch_bytes(55 * 55), 1_148_123_648);
+}
+
 /// Mistral Large 4's bundled Pixtral tower at its 55 x 55 merged capacity.
 pub fn mistral_large4_towers(report: &PlanReport, checkpoint: &super::Checkpoint) -> Towers {
     let vision = if vision_source_bytes(report) > 0 {

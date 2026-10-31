@@ -105,3 +105,9 @@ def test_mistral_fixture_grids_fit_the_tower_and_are_even():
         assert gh % 2 == 0 and gw % 2 == 0 and gh // 2 <= 55 and gw // 2 <= 55, name
         _, _, rgb = gate.fixture(name)
         assert rgb.shape == (gh * 14, gw * 14, 3)
+
+
+def test_mistral_planner_scratch_matches_the_rust_formula():
+    gate = load_gate()
+    # cargo test -p cuteafd-loader mistral_scratch: the Rust formula at 55 x 55.
+    assert gate.planner_scratch_bytes() == 1_148_123_648
