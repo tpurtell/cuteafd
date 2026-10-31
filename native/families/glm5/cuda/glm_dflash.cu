@@ -97,11 +97,11 @@ __global__ void conv_residual_norm_kernel(const bf16* source, const bf16* dynami
 
 // One warp per (row, head) of [q heads | k heads]: per-head RMSNorm, then
 // rotate_half RoPE at the row's position; k and v rows go to `slots[row]`
-// (skipped when negative) of the [slot, kv_heads, 128] caches.
+// (skipped when negative) of the [slot, kv_heads, head_dim] caches.
 constexpr int kHeadDim = 128;
 
-template <bool fp8>
-__global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
+template <int dim, bool fp8>
+__device__ __forceinline__ void qk_rope_body(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
                                const int32_t* slots, bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads,
                                int kv_heads, float theta, float eps) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) / 32, lane = threadIdx.x % 32;
@@ -111,54 +111,70 @@ __global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* 
   const bool is_q = head < heads;
   const int slot = slots != nullptr ? slots[row] : row;
   if (!is_q && slot < 0) return;
-  const uint64_t width = uint64_t(heads + 2 * kv_heads) * kHeadDim;
-  const bf16* in = qkv + row * width + uint64_t(head) * kHeadDim;
+  const uint64_t width = uint64_t(heads + 2 * kv_heads) * dim;
+  const bf16* in = qkv + row * width + uint64_t(head) * dim;
   const bf16* norm = is_q ? q_norm : k_norm;
-  // Lane holds elements lane + 32 * j; element e pairs with e +- 64 (j +- 2).
-  float x[4], sum = 0;
+  // Each lane holds dim / 32 elements; RoPE pairs the two head halves.
+  float x[dim / 32], sum = 0;
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
+  for (int j = 0; j < dim / 32; ++j) {
     x[j] = f(in[lane + 32 * j]);
     sum += x[j] * x[j];
   }
   for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-  const float inv = rsqrtf(sum / kHeadDim + eps);
+  const float inv = rsqrtf(sum / dim + eps);
 #pragma unroll
-  for (int j = 0; j < 4; ++j) x[j] = r(r(x[j] * inv) * f(norm[lane + 32 * j]));
+  for (int j = 0; j < dim / 32; ++j) x[j] = r(r(x[j] * inv) * f(norm[lane + 32 * j]));
   const float position = float(positions[row]);
-  float y[4];
+  float y[dim / 32];
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
-    const int e = lane + 32 * j, i = e % (kHeadDim / 2);
-    const float inv_freq = 1.0f / powf(theta, float(2 * i) / kHeadDim);
+  for (int j = 0; j < dim / 32; ++j) {
+    const int e = lane + 32 * j, i = e % (dim / 2);
+    const float inv_freq = 1.0f / powf(theta, float(2 * i) / dim);
     const float angle = position * inv_freq;
     const float c = r(cosf(angle)), s = r(sinf(angle));
-    const float pair = x[(j + 2) % 4];
-    y[j] = j < 2 ? r(r(x[j] * c) - r(pair * s)) : r(r(x[j] * c) + r(pair * s));
+    const float pair = x[(j + dim / 64) % (dim / 32)];
+    y[j] = j < dim / 64 ? r(r(x[j] * c) - r(pair * s)) : r(r(x[j] * c) + r(pair * s));
   }
   if (is_q) {
-    bf16* out = q_out + (uint64_t(row) * heads + head) * kHeadDim;
+    bf16* out = q_out + (uint64_t(row) * heads + head) * dim;
 #pragma unroll
-    for (int j = 0; j < 4; ++j) out[lane + 32 * j] = __float2bfloat16(y[j]);
+    for (int j = 0; j < dim / 32; ++j) out[lane + 32 * j] = __float2bfloat16(y[j]);
     return;
   }
   const int kv = head - heads;
-  bf16* k = k_out + (uint64_t(slot) * kv_heads + kv) * kHeadDim;
-  bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * kHeadDim;
-  const bf16* v_in = qkv + row * width + uint64_t(heads + kv_heads + kv) * kHeadDim;
+  bf16* k = k_out + (uint64_t(slot) * kv_heads + kv) * dim;
+  bf16* v = v_out + (uint64_t(slot) * kv_heads + kv) * dim;
+  const bf16* v_in = qkv + row * width + uint64_t(heads + kv_heads + kv) * dim;
   if constexpr (fp8) {
-    float values[4];
+    float values[dim / 32];
 #pragma unroll
-    for (int j = 0; j < 4; ++j) values[j] = f(v_in[lane + 32 * j]);
-    cuteafd::draft_kv::store<128>(k_out, slot, kv, kv_heads, y);
-    cuteafd::draft_kv::store<128>(v_out, slot, kv, kv_heads, values);
+    for (int j = 0; j < dim / 32; ++j) values[j] = f(v_in[lane + 32 * j]);
+    cuteafd::draft_kv::store<dim>(k_out, slot, kv, kv_heads, y);
+    cuteafd::draft_kv::store<dim>(v_out, slot, kv, kv_heads, values);
   } else {
 #pragma unroll
-  for (int j = 0; j < 4; ++j) {
+  for (int j = 0; j < dim / 32; ++j) {
     k[lane + 32 * j] = __float2bfloat16(y[j]);
     v[lane + 32 * j] = v_in[lane + 32 * j];
   }
   }
+}
+
+template <bool fp8>
+__global__ void qk_rope_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
+                               const int32_t* slots, bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads,
+                               int kv_heads, float theta, float eps) {
+  qk_rope_body<128, fp8>(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
+                           rows, heads, kv_heads, theta, eps);
+}
+
+template <bool fp8>
+__global__ void qk_rope_d64_kernel(const bf16* qkv, const bf16* q_norm, const bf16* k_norm, const int64_t* positions,
+                               const int32_t* slots, bf16* q_out, bf16* k_out, bf16* v_out, int rows, int heads,
+                               int kv_heads, float theta, float eps) {
+  qk_rope_body<64, fp8>(qkv, q_norm, k_norm, positions, slots, q_out, k_out, v_out,
+                           rows, heads, kv_heads, theta, eps);
 }
 
 __global__ void silu_mul_kernel(const bf16* gate_up, bf16* out, uint64_t rows, int inter) {
@@ -506,4 +522,59 @@ extern "C" int32_t cuteafd_glm_dflash_attention_fp8(const void* q, const void* k
   return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
       ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
       ring, max_keys, window, false, kHeadDim, 2, true, scale, static_cast<cudaStream_t>(stream));
+}
+
+// ABI-isomorphic d64 variants: norm weights have 64 elements, RoPE pairs the
+// two 32-element halves, and the attention arena admits 64 queries per KV head.
+extern "C" int32_t cuteafd_glm_dflash_qk_rope_d64(const void* qkv, const void* q_norm, const void* k_norm,
+                                              const void* positions, const void* slots, void* q_out, void* k_out,
+                                              void* v_out, int32_t rows, int32_t heads, int32_t kv_heads,
+                                              float theta, float eps, void* stream) {
+  if (rows < 1 || kv_heads < 1 || heads < 0) return cudaErrorInvalidValue;
+  const int warps = rows * (heads + kv_heads);
+  qk_rope_d64_kernel<false><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
+      static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, theta, eps);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_glm_dflash_qk_rope_d64_fp8(const void* qkv, const void* q_norm, const void* k_norm,
+                                              const void* positions, const void* slots, void* q_out, void* k_out,
+                                              void* v_out, int32_t rows, int32_t heads, int32_t kv_heads,
+                                              float theta, float eps, void* stream) {
+  if (rows < 1 || kv_heads < 1 || heads < 0) return cudaErrorInvalidValue;
+  const int warps = rows * (heads + kv_heads);
+  qk_rope_d64_kernel<true><<<(warps * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const bf16*>(qkv), static_cast<const bf16*>(q_norm), static_cast<const bf16*>(k_norm),
+      static_cast<const int64_t*>(positions), static_cast<const int32_t*>(slots), static_cast<bf16*>(q_out),
+      static_cast<bf16*>(k_out), static_cast<bf16*>(v_out), rows, heads, kv_heads, theta, eps);
+  return cudaGetLastError();
+}
+
+extern "C" int32_t cuteafd_glm_dflash_attention_d64(const void* q, const void* k_block, const void* v_block,
+                                                const void* k_ring, const void* v_ring, const void* seq_slots,
+                                                const void* ctx_lengths, const void* ctx_ends, void* out,
+                                                void* workspace, int32_t sequences, int32_t block_rows,
+                                                int32_t heads, int32_t kv_heads, int32_t ring, int32_t max_keys,
+                                                int32_t window, float scale, void* stream) {
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, window, false, 64, 2, false, scale, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" int32_t cuteafd_glm_dflash_attention_d64_fp8(const void* q, const void* k_block, const void* v_block,
+                                                const void* k_ring, const void* v_ring, const void* seq_slots,
+                                                const void* ctx_lengths, const void* ctx_ends, void* out,
+                                                void* workspace, int32_t sequences, int32_t block_rows,
+                                                int32_t heads, int32_t kv_heads, int32_t ring, int32_t max_keys,
+                                                int32_t window, float scale, void* stream) {
+  return cuteafd::draft_attention::launch(q, k_block, v_block, k_ring, v_ring, seq_slots,
+      ctx_lengths, ctx_ends, nullptr, out, workspace, sequences, block_rows, heads, kv_heads,
+      ring, max_keys, window, false, 64, 2, true, scale, static_cast<cudaStream_t>(stream));
+}
+
+extern "C" uint64_t cuteafd_glm_dflash_attention_workspace_d64(int32_t sequences, int32_t kv_heads, int32_t max_keys) {
+  // This ABI admits up to 64 queries per KV head, including smaller launches.
+  return cuteafd::draft_attention::workspace(sequences, kv_heads, 2, max_keys, 64);
 }
