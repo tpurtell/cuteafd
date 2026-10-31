@@ -117,16 +117,6 @@ impl Model {
     }
 
     pub(super) fn cfg(&self) -> &MuseSparkConfig { &self.cfg }
-
-    /// Coordinator bytes of `stem` as resident (K6 payload + vectors, or its header bytes).
-    fn resident(&self, stem: &str, ranks: usize) -> u64 {
-        if let Some(projection) = self.core.projections.get(stem) {
-            return projection.resident_bytes(ranks).unwrap_or(projection.source_bytes);
-        }
-        self.tensors.get(&format!("{stem}.weight")).or_else(|| self.tensors.get(stem))
-            .map_or(0, |t| t.shape.iter().product::<usize>() as u64 * if t.dtype == DType::F32 { 4 } else { 2 })
-            / ranks as u64
-    }
 }
 
 fn spec(cfg: &MuseSparkConfig, checkpoint: &Checkpoint) -> ModelSpec {

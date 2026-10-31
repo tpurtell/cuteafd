@@ -67,29 +67,23 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         refusal(report, "Muse Spark runs on one RTX or a head-split RTX pair".into(), "Use --rtx 1 or 2.");
         return memory;
     }
-    // Coordinator text weights by residency: head-split attention halves, the
-    // rest whole on each GPU (MoE projections, router, norms, gates).
-    let mut split = 0u64;
-    let mut replicated = 0u64;
-    for layer in 0..cfg.layers {
-        let b = format!("{}layers.{layer}", super::TEXT);
-        for leaf in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "self_attn.gate_proj"] {
-            let whole = model.resident(&format!("{b}.{leaf}"), 1);
-            let half = model.resident(&format!("{b}.{leaf}"), 2);
-            split += whole;
-            replicated += half.saturating_mul(2).saturating_sub(whole);
-        }
-        for leaf in ["mlp.pre_expert_proj", "mlp.post_expert_proj", "mlp.gate.weight", "mlp.gate.e_score_correction_bias",
-            "mlp.pre_expert_norm.weight", "mlp.experts.post_expert_norm.weight", "input_layernorm.weight",
-            "pre_feedforward_layernorm.weight", "post_feedforward_layernorm.weight",
-            "post_attention_residual_gate.gate", "post_feedforward_residual_gate.gate"] {
-            replicated += model.resident(&format!("{b}.{leaf}"), 1);
-        }
-    }
-    let embedding = *model.bytes.get(&Component::Embedding).unwrap_or(&0);
-    let head = model.resident("lm_head", 1);
+    // Coordinator text weights from the shared per-rank layout the runtime packs
+    // (head-split attention halves, the rest whole on each GPU).
+    let layouts = match (0..cfg.layers).map(|layer| crate::families::muse_spark::weight_layout::LayerLayout::ranks(
+        cfg, layer, gpus, &model.core)).collect::<anyhow::Result<Vec<_>>>() {
+        Ok(layouts) => layouts,
+        Err(error) => { refusal(report, format!("Muse Spark weight layout refused: {error:#}"), "Check the checkpoint's core headers."); return memory; }
+    };
+    let global = match crate::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &model.core) {
+        Ok(global) => global,
+        Err(error) => { refusal(report, format!("Muse Spark head layout refused: {error:#}"), "Check the head's headers."); return memory; }
+    };
+    let per_gpu: Vec<u64> = (0..gpus).map(|gpu| layouts.iter().map(|ranks| ranks[gpu].bytes().unwrap_or(0) as u64).sum()).collect();
+    let embedding = global.embedding as u64;
+    let head = global.head_bytes() as u64;
     let experts = *model.bytes.get(&Component::RoutedExpert).unwrap_or(&0);
-    report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + split + replicated);
+    report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head
+        + global.final_norm as u64 * gpus as u64 + per_gpu.iter().sum::<u64>());
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
     memory.notes.push(format!("Muse K6 core: {} header-native projections ({}); payload + H128 vectors charged",
         model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
@@ -105,10 +99,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let split_gpus = gpus as u64;
     let mut fixed = Vec::new();
     for gpu in 0..gpus as u8 {
-        fixed.push(Demand::new(gpu, Category::Weights, "text weights, head-split attention",
-            split / split_gpus, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Weights,
-            "text weights replicated (MoE projections, router, norms, residual gates, H128 vectors)", replicated, Basis::Exact));
+            "layer weights (head-split attention; MoE projections, router, norms, residual gates whole)",
+            per_gpu[usize::from(gpu)], Basis::Exact));
+        fixed.push(Demand::new(gpu, Category::Weights, "final norm", global.final_norm as u64, Basis::Exact));
         fixed.push(Demand::new(gpu, Category::Kv, format!("sliding rings, {slots} sequences x {} layers",
             cfg.sliding_layers()), rings * slots / split_gpus, Basis::Formula));
         // One exact retained sliding window per slot (prompt end + turn end marks).
