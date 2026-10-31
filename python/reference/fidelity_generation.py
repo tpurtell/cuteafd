@@ -58,8 +58,13 @@ class ChatRenderer:
         if self.native:
             return {"thinking_effort": effort} if effort is not None else {}
         template = self.tokenizer.get_chat_template()
-        return {key: effort for key in ("thinking_effort", "reasoning_effort")
-                if effort is not None and re.search(r"\b" + key + r"\b", template)}
+        options = {key: effort for key in ("thinking_effort", "reasoning_effort")
+                   if effort is not None and re.search(r"\b" + key + r"\b", template)}
+        if body.get("response_format") is not None and re.search(r"\bresponse_format\b", template):
+            # Templates that render the response format (Mistral [MODEL_SETTINGS]) must
+            # see it, as the provider's own renderer does.
+            options["response_format"] = body["response_format"]
+        return options
 
     def render(self, body, assistant=None):
         messages = normalized_messages(body["messages"])
@@ -76,6 +81,20 @@ class ChatRenderer:
         return self.tokenizer.apply_chat_template(
             messages, tools=body.get("tools"), tokenize=False,
             add_generation_prompt=assistant is None, **self.template_options(body))
+
+    def conversation_ids(self, body, messages):
+        """Render a full conversation (no generation prompt) to checkpoint token ids."""
+        rendered = copy.deepcopy(body)
+        rendered["messages"] = messages
+        if self.encoder or self.native:
+            raise ValueError("recipe v2 trailing context needs a Jinja chat template")
+        text = self.tokenizer.apply_chat_template(
+            normalized_messages(messages), tools=body.get("tools"), tokenize=False,
+            add_generation_prompt=False, **self.template_options(rendered))
+        ids = token_ids(self.tokenizer, text)
+        if self.tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False) != text:
+            raise ValueError("conversation does not re-tokenize losslessly")
+        return ids
 
     def prompt(self, body):
         if self.native:
