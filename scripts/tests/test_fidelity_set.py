@@ -500,3 +500,25 @@ def test_v2_trailing_context_falls_back_to_raw_text_when_the_renderer_rewrites_h
     native = make_api(FakeAPI(generated=30, calls=0), "v2")
     assert native["recipe"]["trailing_context_windows"]["native user turn"] > 0
     assert native["recipe"]["version"]["sha256"] == manifest["recipe"]["version"]["sha256"]
+
+
+class JsonModeAPI(FakeAPI):
+    """Provider JSON mode injects 22 tokens our render does not have."""
+
+    def __call__(self, body):
+        chat = super().__call__(body)
+        extra = 22 if body.get("response_format") else 0
+        chat["generation_provenance"] = {"usage": {"prompt_tokens": len(chat["probe"]["prompt_ids"]) + extra}}
+        return chat
+
+
+def test_v2_drops_provider_json_mode_when_it_breaks_prompt_exactness():
+    probe = JsonModeAPI(generated=3000, calls=0)
+    manifest = make_api(probe, "v2")
+    assert manifest["recipe"]["json_mode_dropped_windows"] == ["d00", "d01", "d02"]
+    d00 = next(w for w in manifest["windows"] if w["id"] == "d00")
+    assert d00["provenance"]["json_mode"]["provider_prompt_offset"] == 22
+    final = [r for r in probe.requests if "Fidelity fixture d00" in r["messages"][0]["content"]][-1]
+    assert "response_format" not in final and "Reply in JSON." in final["messages"][-1]["content"]
+    exact = make_api(FakeAPI(generated=3000, calls=0), "v2")
+    assert exact["recipe"]["json_mode_dropped_windows"] == []

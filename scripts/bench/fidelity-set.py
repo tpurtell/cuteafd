@@ -153,7 +153,9 @@ def recipe_identity(recipe):
              "tool_clause": "only when tools are declared", "tool_unavailable_result": V2_TOOL_UNAVAILABLE,
              "trailing_context": "checkpoint-native user turn after the final assistant turn when the renderer keeps "
                                  "the scored turn as an exact token prefix; otherwise v1 raw repository text",
-             "earlier_turn_roles": "gen only where the earlier prompt+generation is an exact token prefix"}
+             "earlier_turn_roles": "gen only where the earlier prompt+generation is an exact token prefix",
+             "json_mode": "response_format dropped when the provider's JSON mode changes prompt_tokens; "
+                          "the window prompt's own JSON instruction remains"}
     return {**rules, "sha256": hashlib.sha256(canonical(rules)).hexdigest()}
 
 
@@ -246,6 +248,16 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             raise ContextCap(f"{name}: rendered prompt plus generation exceeds 16K cap")
         body["max_tokens"] = 1024
         chat = probe(body)
+        json_mode = None
+        if recipe == "v2" and body.get("response_format") and provider_prompt_offset(chat):
+            # The provider's JSON mode injects text our checkpoint render lacks; the window's
+            # own prompt already asks for JSON, so ask again without the provider switch.
+            json_mode = {"dropped_response_format": body.pop("response_format"),
+                         "provider_prompt_offset": provider_prompt_offset(chat)}
+            sample = probe.prompt({**body, "max_tokens": 1})
+            if len(sample["probe"]["prompt_ids"]) + 1024 > MAX_TOKENS:
+                raise ContextCap(f"{name}: rendered prompt plus generation exceeds 16K cap")
+            chat = probe(body)
         server = chat.get("server", {})
         if server.get("model", checkpoint) != checkpoint or server.get("family", family) != family:
             raise ValueError("probe server checkpoint/family differs from generation manifest")
@@ -307,11 +319,18 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                                              **continuation)
             if trailing is not None:
                 windows[-1]["provenance"]["trailing_context"] = trailing
+            if json_mode is not None:
+                windows[-1]["provenance"]["json_mode"] = json_mode
         if "generation_provenance" in chat:
             windows[-1]["provenance"]["generation"] = chat["generation_provenance"]
         print(f"{name}: prompt={len(prompt)} generated={len(generated)}", file=sys.stderr, flush=True)
         # v2: the conversation (and the next fixture window) continues from the last turn.
         return final_chat if recipe == "v2" else chat
+
+    def provider_prompt_offset(chat):
+        usage = (chat.get("generation_provenance") or {}).get("usage") or {}
+        reported = usage.get("prompt_tokens")
+        return 0 if reported is None else reported - len(chat["probe"]["prompt_ids"])
 
     def continue_window(name, body, chat, tokens, roles, turns, executor, history, limit):
         """v2: answer tool calls in-window and ask again until 512 generated rows."""
@@ -505,6 +524,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     from fidelity_split import standard_layout
     standard_layout(windows)
     if recipe == "v2":
+        manifest["recipe"]["json_mode_dropped_windows"] = sorted(
+            w["id"] for w in windows if "json_mode" in w.get("provenance", {}))
         manifest["recipe"]["trailing_context_windows"] = {
             kind: sum(w.get("provenance", {}).get("trailing_context") == kind for w in windows)
             for kind in ("native user turn", "raw repository text (renderer rewrites the scored turn)")}
