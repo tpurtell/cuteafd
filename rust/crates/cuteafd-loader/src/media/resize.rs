@@ -55,14 +55,45 @@ struct Coeffs {
     k: Vec<i32>,                 // out_size * ksize
 }
 
+#[cfg(test)]
 fn precompute(in_size: usize, out_size: usize) -> Coeffs {
-    const SUPPORT: f64 = 2.0;
+    precompute_filter(in_size, out_size, Resample::Bicubic)
+}
+
+/// Pillow resampler codes; omitted in legacy processor identities for bicubic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Resample {
+    #[default]
+    Bicubic,
+    Lanczos,
+}
+impl Resample {
+    pub fn is_bicubic(&self) -> bool { *self == Self::Bicubic }
+    fn support(self) -> f64 { match self { Self::Bicubic => 2.0, Self::Lanczos => 3.0 } }
+    fn filter(self, x: f64) -> f64 {
+        match self {
+            Self::Bicubic => bicubic(x),
+            Self::Lanczos => {
+                if !(-3.0..3.0).contains(&x) { return 0.0; }
+                fn sinc(x: f64) -> f64 {
+                    if x == 0.0 { 1.0 } else {
+                        let x = x * std::f64::consts::PI;
+                        x.sin() / x
+                    }
+                }
+                sinc(x) * sinc(x / 3.0)
+            }
+        }
+    }
+}
+
+fn precompute_filter(in_size: usize, out_size: usize, filter: Resample) -> Coeffs {
     // box = (0, 0, in_w, in_h) as C floats; (in1 - in0) promoted to double.
     let in0 = 0f32;
     let in1 = in_size as f32;
     let scale = (in1 - in0) as f64 / out_size as f64;
     let filterscale = if scale < 1.0 { 1.0 } else { scale };
-    let support = SUPPORT * filterscale;
+    let support = filter.support() * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
     let mut bounds = Vec::with_capacity(out_size);
     let mut k = vec![0i32; out_size * ksize];
@@ -77,7 +108,7 @@ fn precompute(in_size: usize, out_size: usize) -> Coeffs {
         let count = count.min(ksize);
         let mut ww = 0.0f64;
         for (x, wx) in w.iter_mut().enumerate().take(count) {
-            let v = bicubic(((x as i64 + xmin) as f64 - center + 0.5) * ss);
+            let v = filter.filter(((x as i64 + xmin) as f64 - center + 0.5) * ss);
             *wx = v;
             ww += v;
         }
@@ -103,7 +134,12 @@ fn clip8(v: i32) -> u8 {
     (v >> PRECISION_BITS).clamp(0, 255) as u8
 }
 
+#[cfg(test)]
 pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImage {
+    resize(img, width, height, Resample::Bicubic)
+}
+
+pub(crate) fn resize(img: &RgbImage, width: u32, height: u32, filter: Resample) -> RgbImage {
     let (iw, ih) = (img.width as usize, img.height as usize);
     let (ow, oh) = (width as usize, height as usize);
     if ow == 0 || oh == 0 {
@@ -140,14 +176,14 @@ pub(crate) fn resize_bicubic(img: &RgbImage, width: u32, height: u32) -> RgbImag
     }
     let need_h = ow != iw;
     let need_v = oh != ih;
-    let cv = precompute(ih, oh);
+    let cv = precompute_filter(ih, oh, filter);
     let ybox_first = cv.bounds[0].0;
     let (lx, lc) = cv.bounds[oh - 1];
     let ybox_last = lx + lc;
 
     // Horizontal pass over input rows [ybox_first, ybox_last).
     let (tmp, tmp_w, row_off) = if need_h {
-        let ch = precompute(iw, ow);
+        let ch = precompute_filter(iw, ow, filter);
         let rows = ybox_last - ybox_first;
         let mut t = vec![0u8; ow * rows * 3];
         for y in 0..rows {
@@ -246,6 +282,31 @@ mod tests {
                     (s - (1 << PRECISION_BITS)).abs() <= cnt as i64,
                     "{i}->{o} px {xx}: {s}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod pillow_goldens {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    #[test]
+    fn bicubic_and_lanczos_match_pillow_rgb_bytes() {
+        for (iw, ih, ow, oh, cubic, lanczos) in [
+            (7,5,3,2,"cb6bb928b9fc6143445cb25d5f73fecacf9fbf6ffa4baa53276eb1fbb3c75687","b9832dd430b1ebe0f0653145c93b7c42b98a8161dde4b502e7ff100195c7bf7d"),
+            (3,2,9,7,"80f6e34bd112601320875286a6dc2c92c9c200cd0c48f7390fc48af3a5567b89","183db5ec25454f5f9d7338f48bf4767053fd23830669524b393ec54063698c3a"),
+            (7,5,7,2,"3a0d27959a90b54e511d3c23e6d6a25b7cd2f2aa33da95b49543420478d87428","840a3ab70ff726fcb04f451655a9e297e7504d3d86c2d1cfd8806b0ecf8944e2"),
+            (7,5,3,5,"fa3c8422b2b476788d0d85a7e8fc51c23bf01dce9e5d96ca3d5a264b28ac22d1","4fcfdc7e6f8104ae6df3df40b8a54a8cfe7f397c00db94788ea188dbe3027f62"),
+            (1,1,5,3,"9eccf9c4e0d192734b1adeb951c51a507cde238fd64d381acc53c66b56cc1298","9eccf9c4e0d192734b1adeb951c51a507cde238fd64d381acc53c66b56cc1298"),
+            (7,5,7,5,"cd8326c5993f35c8520797b786576ca1ec3b781b9d0b5793d0dbb5b10f9af8c3","cd8326c5993f35c8520797b786576ca1ec3b781b9d0b5793d0dbb5b10f9af8c3"),
+            (83,61,17,23,"70b5da7439b68480893797cdf3713f206efbc9cb59a709dac6a33695f3cb6ffe","bd499e0f86bcca8d29c889a42146d47ca51e649a541d6722f0d5bba5331ed26a"),
+        ] {
+            let input = RgbImage { width: iw, height: ih,
+                data: (0..iw as usize*ih as usize*3).map(|i| ((i*73+i/7*19)%256) as u8).collect() };
+            for (filter, expected) in [(Resample::Bicubic,cubic), (Resample::Lanczos,lanczos)] {
+                assert_eq!(format!("{:x}", Sha256::digest(&resize(&input,ow,oh,filter).data)), expected,
+                    "{iw}x{ih}->{ow}x{oh} {filter:?}");
             }
         }
     }

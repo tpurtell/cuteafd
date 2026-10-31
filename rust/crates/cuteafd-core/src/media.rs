@@ -66,6 +66,31 @@ impl<'de> Deserialize<'de> for MediaKey {
     }
 }
 
+/// The encoder's PCM-to-feature geometry, independent of request batching.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum AudioTokenGeometry {
+    #[default]
+    MimoRvq,
+    /// Causal patch stages produce one feature per product of patch strides.
+    PcmPatches { samples_per_token: usize },
+}
+impl AudioTokenGeometry {
+    pub fn is_mimo(&self) -> bool { *self == Self::MimoRvq }
+    pub fn tokens(self, samples: usize) -> Option<usize> {
+        if samples == 0 || samples > 7_200_000 { return None; }
+        match self {
+            Self::MimoRvq => {
+                if samples <= 480 { return None; }
+                let frames = samples / 240 + 1;
+                let codes = (frames / 6000) * 1500 + (frames % 6000).div_ceil(2).div_ceil(2);
+                Some(codes.div_ceil(4))
+            }
+            Self::PcmPatches { samples_per_token: 0 } => None,
+            Self::PcmPatches { samples_per_token } => Some(samples.div_ceil(samples_per_token)),
+        }
+    }
+}
+
 /// A contiguous span of media feature rows in the expanded native prompt.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MediaSpan {
@@ -83,6 +108,18 @@ impl MediaSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_patch_geometry_matches_all_stage_stride_boundaries() {
+        let patch = AudioTokenGeometry::PcmPatches { samples_per_token: 16 * 6 * 5 * 4 };
+        for samples in [1, 16, 96, 480, 481, 1919, 1920, 1921, 24000, 7_200_000] {
+            assert_eq!(patch.tokens(samples), Some(samples.div_ceil(1920)));
+        }
+        for invalid in [0, 7_200_001, usize::MAX] { assert_eq!(patch.tokens(invalid), None); }
+        assert_eq!(AudioTokenGeometry::PcmPatches { samples_per_token: 0 }.tokens(1), None);
+        assert_eq!(AudioTokenGeometry::MimoRvq.tokens(480), None);
+        assert_eq!(AudioTokenGeometry::MimoRvq.tokens(24000), Some(7));
+    }
 
     #[test]
     fn full_key_and_span_round_trip() {

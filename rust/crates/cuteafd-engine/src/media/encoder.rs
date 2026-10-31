@@ -1,11 +1,12 @@
 use super::{AudioKey, ImageKey, MediaError, MediaKey};
+use cuteafd_core::media::AudioTokenGeometry;
 use std::{collections::HashMap, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum EncodeInput {
     Image { grid: [u32; 3], rgb8: Arc<[u8]> },
     /// One complete clip of canonical finite mono FP32 PCM at 24 kHz.
-    Audio { pcm: Arc<[f32]> },
+    Audio { pcm: Arc<[f32]>, geometry: AudioTokenGeometry },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct EncodeJob {
@@ -25,7 +26,10 @@ impl EncodeJob {
         Self { key: key.into(), input: EncodeInput::Image { grid, rgb8 }, tokens, hidden_width }
     }
     pub fn audio(key: AudioKey, pcm: Arc<[f32]>, tokens: usize, hidden_width: usize) -> Self {
-        Self { key: key.into(), input: EncodeInput::Audio { pcm }, tokens, hidden_width }
+        Self::audio_with_geometry(key, pcm, tokens, hidden_width, AudioTokenGeometry::MimoRvq)
+    }
+    pub fn audio_with_geometry(key: AudioKey, pcm: Arc<[f32]>, tokens: usize, hidden_width: usize, geometry: AudioTokenGeometry) -> Self {
+        Self { key: key.into(), input: EncodeInput::Audio { pcm, geometry }, tokens, hidden_width }
     }
     pub fn feature_bytes(&self) -> Result<usize, MediaError> {
         self.tokens.checked_mul(self.hidden_width).and_then(|n| n.checked_mul(2))
@@ -35,13 +39,10 @@ impl EncodeJob {
         self.feature_bytes()?;
         match (&self.key, &self.input) {
             (MediaKey::Image(_), EncodeInput::Image { grid, rgb8 }) if !grid.contains(&0) && !rgb8.is_empty() => Ok(()),
-            (MediaKey::Audio(_), EncodeInput::Audio { pcm }) => {
-                if !(481..=7_200_000).contains(&pcm.len()) || pcm.iter().any(|x| !x.is_finite()) {
+            (MediaKey::Audio(_), EncodeInput::Audio { pcm, geometry }) => {
+                if geometry.tokens(pcm.len()) != Some(self.tokens) || pcm.iter().any(|x| !x.is_finite()) {
                     return Err(MediaError::Features);
                 }
-                let frames = pcm.len() / 240 + 1;
-                let codes = (frames / 6000) * 1500 + (frames % 6000).div_ceil(2).div_ceil(2);
-                if self.tokens != codes.div_ceil(4) { return Err(MediaError::Features); }
                 Ok(())
             }
             _ => Err(MediaError::Features),
@@ -120,5 +121,23 @@ impl EncoderClient for FakeEncoder {
     }
     fn cancel(&mut self, ticket: EncoderTicket) {
         if self.jobs.remove(&ticket).is_some() { self.cancelled += 1; }
+    }
+}
+
+#[cfg(test)]
+mod audio_geometry_tests {
+    use super::*;
+    #[test]
+    fn audio_admission_uses_declared_geometry_not_mimo_counts() {
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        for samples in [1usize, 480, 481, 1920, 1921, 24000] {
+            let mut job = EncodeJob::audio_with_geometry(AudioKey([0;32]), vec![0.25; samples].into(),
+                samples.div_ceil(1920), 8192, policy);
+            assert!(job.validate().is_ok());
+            job.tokens += 1;
+            assert!(job.validate().is_err());
+        }
+        assert!(EncodeJob::audio(AudioKey([0;32]), vec![0.25;24000].into(), 7, 4096).validate().is_ok());
+        assert!(EncodeJob::audio(AudioKey([0;32]), vec![0.25;24000].into(), 13, 4096).validate().is_err());
     }
 }
