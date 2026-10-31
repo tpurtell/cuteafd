@@ -20,6 +20,7 @@ import ctypes as C
 import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 import time
 
@@ -160,9 +161,48 @@ def normalization_lut(snapshot):
 
 
 GRIDS = {"square": (16, 16), "wide": (24, 80), "tall": (110, 30), "max": (110, 110)}
+# Real images (--images MANIFEST): name -> (RGB8 [h, w, 3] at its ViT grid).
+REAL = {}
+
+
+def hf_grid(height, width, longest=1540, cell=28):
+    """HF PixtralImageProcessor resize: floor on downscale, whole 28-pixel cells (ViT grid)."""
+    ratio = max(height / longest, width / longest)
+    if ratio > 1:
+        height, width = math.floor(height / ratio), math.floor(width / ratio)
+    return 2 * ((max(height, 1) - 1) // cell + 1), 2 * ((max(width, 1) - 1) // cell + 1)
+
+
+def load_images(manifest_path, overrides=()):
+    """Sha-pinned public images, RGB via PIL convert('RGB'), Pillow bicubic to the HF grid.
+
+    Both halves feed these exact RGB8 pixels to their tower, so the comparison
+    tests the tower, not decoding. `overrides` adds `file@GHxGW` resizes."""
+    from PIL import Image
+    manifest = json.loads(manifest_path.read_text())
+    root = manifest_path.parent
+    for image in manifest["images"]:
+        data = (root / image["file"]).read_bytes()
+        if hashlib.sha256(data).hexdigest() != image["sha256"]:
+            raise ValueError(f"{image['file']}: sha256 differs from the manifest")
+    images = {i["file"]: Image.open(root / i["file"]).convert("RGB") for i in manifest["images"]}
+    requests = [(f"{i['kind']}:{i['file']}", i["file"], None) for i in manifest["images"]]
+    for item in overrides:
+        file, grid = item.split("@")
+        gh, gw = (int(v) for v in grid.split("x"))
+        requests.append((f"{file}@{gh}x{gw}", file, (gh, gw)))
+    for name, file, grid in requests:
+        image = images[file]
+        gh, gw = grid or hf_grid(image.height, image.width)
+        resized = image.resize((gw * 14, gh * 14), Image.Resampling.BICUBIC)
+        REAL[name] = np.ascontiguousarray(np.asarray(resized, np.uint8))
+    return list(REAL)
 
 
 def fixture(name):
+    if name in REAL:
+        rgb = REAL[name]
+        return rgb.shape[0] // 14, rgb.shape[1] // 14, rgb
     gh, gw = GRIDS[name]
     yy, xx = np.indices((gh * 14, gw * 14), dtype=np.uint32)
     rgb = np.stack([(xx * 7 + yy * 3) % 256, (xx // 8 + yy * 11) % 256,
@@ -199,6 +239,10 @@ def reference(config, tensors, dtype, device="cuda"):
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     return tower.to(device, dtype).eval(), projector.to(device, dtype).eval(), [Path(ml4.__file__)]
+
+
+def safe(name):
+    return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 
 
 def official(models, name, dtype, lut, device):
@@ -267,7 +311,7 @@ def compare(args):
     result = dict(saved, reference_device=device, g2={}, bf16_floor={},
         modeling_sha256={p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in models[torch.float32][2]})
     for name in args.grids:
-        native = np.load(args.compare_native / f"{name}.npy")
+        native = np.load(args.compare_native / f"{safe(name)}.npy")
         result["bf16_floor"][name], result["g2"][name] = score(native, models, name, lut, device)
         print(json.dumps(dict(event="G2", grid=name, stages=result["g2"][name])), flush=True)
     result["stages"] = {}
@@ -275,7 +319,7 @@ def compare(args):
         refs = {d: stage_states(models, name, d, lut, device) for d in (torch.bfloat16, torch.float32)}
         rows = {}
         for stage in sorted(refs[torch.float32]):
-            path = args.compare_native / f"{name}.stage{stage}.npy"
+            path = args.compare_native / f"{safe(name)}.stage{stage}.npy"
             if path.exists():
                 value = np.load(path)
                 rows[stage] = dict(native_vs_fp32=common.metrics(value, refs[torch.float32][stage]),
@@ -378,12 +422,12 @@ def run(args):
                 result["bf16_floor"][name], result["g2"][name] = score(native, models, name, lut, "cuda")
             if args.save_native:
                 args.save_native.mkdir(parents=True, exist_ok=True)
-                np.save(args.save_native / f"{name}.npy", native)
+                np.save(args.save_native / f"{safe(name)}.npy", native)
                 if name in args.stages:
                     stages = {}
                     encode(name, stages)
                     for stage, value in stages.items():
-                        np.save(args.save_native / f"{name}.stage{stage}.npy", value)
+                        np.save(args.save_native / f"{safe(name)}.stage{stage}.npy", value)
             print(json.dumps(dict(event="G2", grid=name, markers=result["markers_exact"][name],
                 stages=result["g2"].get(name))), flush=True)
         initial, final = Ledger(), Ledger()
@@ -422,10 +466,19 @@ if __name__ == "__main__":
     parser.add_argument("--snapshot", type=Path, required=True)
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--grids", nargs="+", default=list(GRIDS), choices=list(GRIDS))
+    parser.add_argument("--grids", nargs="+", default=None,
+        help=f"synthetic {list(GRIDS)} and/or real-image names (default: all synthetic, or all real with --images)")
+    parser.add_argument("--images", type=Path, help="sha-pinned real image manifest (JSON beside the images)")
+    parser.add_argument("--resize", nargs="*", default=[], help="extra real-image grids, FILE@GHxGW")
     parser.add_argument("--native-only", action="store_true")
     parser.add_argument("--save-native", type=Path, help="device half: keep each encoded span here")
     parser.add_argument("--compare-native", type=Path, help="reference half: score spans saved by --save-native")
-    parser.add_argument("--stages", nargs="*", default=[], choices=list(GRIDS),
+    parser.add_argument("--stages", nargs="*", default=[],
         help="also keep (device) / score (reference) the tower's hidden states of these grids")
-    raise SystemExit(run(parser.parse_args()))
+    arguments = parser.parse_args()
+    real = load_images(arguments.images, arguments.resize) if arguments.images else []
+    arguments.grids = arguments.grids or real or list(GRIDS)
+    unknown = [g for g in arguments.grids + arguments.stages if g not in GRIDS and g not in REAL]
+    if unknown:
+        parser.error(f"unknown grids {unknown}")
+    raise SystemExit(run(arguments))
