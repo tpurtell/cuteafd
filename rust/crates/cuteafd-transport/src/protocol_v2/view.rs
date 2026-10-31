@@ -144,7 +144,41 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
             },
         };
         view.validate()?;
+        // Partial-reply data: the flag, the header's wide format and every row's
+        // region bit agree, or the frame is refused (the worker never guesses).
+        let wide = read_u16(bytes, 46, "partial_wide")?;
+        if view.partial_replies() {
+            super::PartialWire::from_u16(wide)?;
+            for row in 0..rows_len {
+                let region = view.row_region(row)?;
+                if region > 1 {
+                    bail!("ExpertProtocolV2 partial region bit {region} is neither 0 nor 1");
+                }
+            }
+        } else if wide != 0 || (0..rows_len).any(|row| view.row_region(row).map_or(true, |r| r != 0)) {
+            bail!("ExpertProtocolV2 request without partial replies carries partial region data");
+        }
         Ok(view)
+    }
+
+    pub fn partial_replies(&self) -> bool {
+        self.header.flags & super::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0
+    }
+
+    /// Row `index`'s partial-reply region (0 BF16, 1 wide; 0 without the flag).
+    pub fn row_region(&self, index: usize) -> Result<u16> {
+        let offset = index.checked_mul(super::EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN)
+            .context("row region offset overflow")?;
+        read_u16(self.row_descriptor_bytes, offset + 10, "row_region")
+    }
+
+    /// The request's partial-reply plan (validated at parse), when flagged.
+    pub fn partial_plan(&self) -> Result<Option<super::PartialReplyPlan>> {
+        if !self.partial_replies() { return Ok(None); }
+        let wide = super::PartialWire::from_u16(read_u16(self.frame_bytes, 46, "partial_wide")?)?;
+        let regions = (0..self.header.row_count as usize).map(|row| Ok(self.row_region(row)? as u8))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some(super::PartialReplyPlan { wide, regions }))
     }
 
     pub fn header_len(&self) -> usize {
@@ -171,6 +205,7 @@ impl<'a> ExpertProtocolV2RequestView<'a> {
         if self.stream_plan_enabled()
             || self.stream_data_enabled()
             || self.precompile_warmup_enabled()
+            || self.partial_replies()
         {
             bail!("only regular ExpertProtocolV2 requests can be forwarded");
         }

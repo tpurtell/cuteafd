@@ -9,6 +9,7 @@ use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Residency};
 const JOBS_PER_EXPERT: usize = 9;
 const BANKS: usize = 2;
 pub(crate) mod execution;
+pub(crate) mod partial;
 pub(crate) mod worker;
 
 /// Family-qualified package name for one decoder-tier pair.

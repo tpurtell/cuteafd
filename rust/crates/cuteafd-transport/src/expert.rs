@@ -341,9 +341,18 @@ impl<'a> BackboneRequest<'a> {
         .context("native output row bytes overflow")
     }
     pub fn plane_bytes(&self) -> Result<usize> {
+        if let Some(plan) = self.view.partial_plan()? {
+            let geometry = cuteafd_core::expert_geometry();
+            return Ok(plan.payload(geometry.topk as usize, geometry.hidden as usize)?.3);
+        }
         (self.rows() as usize)
             .checked_mul(self.output_row_bytes()? as usize)
             .context("route plane byte overflow")
+    }
+    /// The request's partial-reply regions (the worker writes each row's partials
+    /// into the region its descriptor names), when the request asks for them.
+    pub fn partial_plan(&self) -> Result<Option<crate::PartialReplyPlan>> {
+        self.view.partial_plan()
     }
     /// Fill caller-owned GPU-upload arrays without reordering or rounding routes.
     pub fn copy_routes_into(&self, ids: &mut [i32], weights: &mut [f32]) -> Result<()> {
@@ -416,7 +425,8 @@ impl<'a> BackboneRequest<'a> {
             row_count: self.rows(),
             output_dim: cuteafd_core::expert_geometry().hidden,
             output_dtype: self.output_dtype(),
-            output_row_stride_bytes: self.output_row_bytes()?,
+            // Partial replies carry two regions, not rows: stride 0.
+            output_row_stride_bytes: if self.view.partial_replies() { 0 } else { self.output_row_bytes()? },
             output_payload_bytes: self.plane_bytes()? as u64,
             status: ExpertProtocolV2Status::Ok,
             // Request-only admission flags never appear in a response.

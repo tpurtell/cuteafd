@@ -350,8 +350,11 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     // Existing media owners belong to the baseline, not expert residency/workspace.
     let baseline = cuteafd_ffi::memory_ledger::snapshot();
     census.sample("before_expert_modules", Some(&library))?;
+    // Experts with a per-expert output norm reply per-expert partials through the
+    // shared epilogue programs, which the image's PROGRAMS.json carries.
+    let partial_replies = catalog.exl3().is_some() && catalog.per_expert_output_norm();
     let programs = (|| -> Result<_> {
-        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 {
+        if catalog.format() == cuteafd_loader::plan::checkpoint::CheckpointFormat::Exlr8 || partial_replies {
             let path = config.library.parent().context("native library directory")?
                 .join("../share/PROGRAMS.json");
             Ok(Some(library.programs()?.with_manifest(&path)?))
@@ -418,6 +421,14 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
                 weights.execution(&library, &owner_config, extent.compiled, extent, budget, &mut modules)?
             };
             execution.defer(usize::from(extent.buffered_units), extent.staging_rows as usize, extent.owner)?;
+            if partial_replies {
+                let programs = programs.as_ref().context("partial replies need the image's PROGRAMS.json")?;
+                let super::backend::Execution::Exl3(worker) = &mut execution else {
+                    anyhow::bail!("partial replies are served by the EXL3 worker only");
+                };
+                worker.install_partial_epilogue(crate::shared::experts::exl3::partial::PartialEpilogue::load(
+                    &library, programs, extent.capacity as usize)?);
+            }
             let used = cuteafd_ffi::memory_ledger::snapshot().total(cuteafd_ffi::memory_ledger::Space::Device, device)
                 .saturating_sub(before);
             budget = budget.checked_sub(used).context("Spark execution owners exceed admitted workspace")?;

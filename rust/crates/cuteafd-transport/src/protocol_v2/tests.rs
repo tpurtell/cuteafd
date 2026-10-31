@@ -1889,3 +1889,31 @@ fn partial_reply_payload_is_two_aligned_regions_with_stride_zero() -> Result<()>
     assert!(strided.validate().is_err());
     Ok(())
 }
+
+#[test]
+fn request_view_reads_and_validates_partial_regions() -> Result<()> {
+    let plain = request(5, ExpertV2SourceKind::Prefill)?;
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1, 0, 1, 1, 0] })?;
+    let mut bytes = Vec::new();
+    partial.encode_into(&mut bytes)?;
+    let view = ExpertProtocolV2RequestView::parse(&bytes)?;
+    assert!(view.partial_replies());
+    assert_eq!(view.partial_plan()?, partial.partial);
+    assert_eq!((0..5).map(|r| view.row_region(r).unwrap()).collect::<Vec<_>>(), [1, 0, 1, 1, 0]);
+    // The zero-copy view refuses what the owned decode refuses.
+    let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
+    let mut corrupt = bytes.clone();
+    corrupt[header_len + EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 10] = 7;
+    assert!(ExpertProtocolV2RequestView::parse(&corrupt).is_err());
+    let mut plain_bytes = Vec::new();
+    plain.encode_into(&mut plain_bytes)?;
+    let view = ExpertProtocolV2RequestView::parse(&plain_bytes)?;
+    assert!(!view.partial_replies() && view.partial_plan()?.is_none());
+    let mut stray = plain_bytes.clone();
+    stray[header_len + 10] = 1;
+    assert!(ExpertProtocolV2RequestView::parse(&stray).is_err());
+    // A partial request is never forwarded as a regular one.
+    let mut out = Vec::new();
+    assert!(ExpertProtocolV2RequestView::parse(&bytes)?.encode_regular_forwarded_into(ExpertV2Dtype::Bf16, &mut out).is_err());
+    Ok(())
+}
