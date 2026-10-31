@@ -550,10 +550,16 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     from b12x.integration.cuteafd import mistral_large4 as ml4
     from b12x.integration.cuteafd.native_dense import compile_swiglu_split_aot
 
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+
     rope_g = ml4.rope_attention(g)
     index_pages = -(-max_context // PAGE_ROWS)
+    kw = g.index_head_dim + g.index_heads
     out = [
         ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(rope_g)),
+        # The indexer's [wk | weights_proj] over h, BF16 as shipped (modules_to_not_convert).
+        ("index_kw", "bf16_projection", {"width": g.hidden, "outputs": kw},
+         lambda: compile_bf16_projection_aot(width=g.hidden, outputs=kw)),
         ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(rope_g)),
         ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(rope_g)),
     ]

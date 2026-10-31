@@ -821,11 +821,6 @@ impl<'a> GlmLoader<'a> {
             }
             Ok(())
         };
-        let raw = |name: &str| -> Result<Vec<u8>> {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            ensure!(!(shape.len() == 2 && dtype == DType::F8E4M3), "{name}: replicated operands are not FP8");
-            Ok(bytes)
-        };
         let qkv_a = [format!("{p}.self_attn.q_a_proj.weight"), format!("{p}.self_attn.kv_a_proj_with_mqa.weight")];
         let attention = [&qkv_a[..], &[format!("{p}.self_attn.q_b_proj.weight"),
             format!("{p}.self_attn.kv_b_proj.weight"), format!("{p}.self_attn.o_proj.weight")]].concat();
@@ -896,7 +891,13 @@ impl<'a> GlmLoader<'a> {
         }
         if full_indexer {
             let wq_b = [cfg.weight(layer, Op::IndexQ).context("indexer wq_b")?];
-            if core || self.bf16_native(&wq_b)? {
+            if cfg.variant.ml4().is_some() {
+                // The direct-query indexer's wq_b runs only in the K6 core (loaded with the
+                // core layouts); a shipped FP8 block-128 wq_b has no native projection yet.
+                ensure!(self.catalog.tensor(&wq_b[0]).is_err(), "{}: Mistral Large 4 runs the indexer wq_b \
+                    only from the K6 core; the FP8 block-128 form needs the native ml4 index-query projection",
+                    wq_b[0]);
+            } else if core || self.bf16_native(&wq_b)? {
                 put(&mut ops, "w_iq", self.upload_all(ranks, &self.bf16_rows(&wq_b)?.0)?);
             } else {
                 let (w8_name, scale_name, _) = fp8_operand_names("w_iq");
@@ -967,11 +968,6 @@ impl<'a> GlmLoader<'a> {
                 map.insert(scale_name, scale);
             }
             Ok(())
-        };
-        let raw = |name: &str| -> Result<Vec<u8>> {
-            let (bytes, dtype, shape) = self.raw(name)?;
-            ensure!(!(shape.len() == 2 && dtype == DType::F8E4M3), "{name}: replicated operands are not FP8");
-            Ok(bytes)
         };
         put(&mut ops, "input_norm", self.replicated_tensor(ranks, &cfg.weight(layer, Op::InputNorm).context("input norm")?)?);
         put(&mut ops, "post_norm", self.replicated_tensor(ranks, &cfg.weight(layer, Op::PostAttentionNorm).context("post norm")?)?);

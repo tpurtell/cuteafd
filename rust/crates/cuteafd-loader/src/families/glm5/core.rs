@@ -12,10 +12,16 @@ use super::names::Operand as Op;
 /// q-LoRA / latent down projections whole, the query up (or direct query)
 /// projection by output heads, the output projection by input heads, the FFN
 /// gate/up by output and down by input.
-fn core_operands(cfg: &GlmDsaConfig, layer: usize) -> [(&'static str, Op, CoreSplit); 7] {
-    [("q_a", Op::QA, CoreSplit::Whole), ("kv_a", Op::KvA, CoreSplit::Whole), ("q_b", Op::QB, CoreSplit::Output),
-     ("o", Op::O, CoreSplit::Input), ("gate", Op::Gate, CoreSplit::Output), ("up", Op::Up, CoreSplit::Output),
-     ("down", Op::Down, CoreSplit::Input)].map(|entry| { let _ = (cfg, layer); entry })
+fn core_operands(cfg: &GlmDsaConfig, layer: usize) -> Vec<(&'static str, Op, CoreSplit)> {
+    let mut operands = vec![("q_a", Op::QA, CoreSplit::Whole), ("kv_a", Op::KvA, CoreSplit::Whole),
+        ("q_b", Op::QB, CoreSplit::Output), ("o", Op::O, CoreSplit::Input), ("gate", Op::Gate, CoreSplit::Output),
+        ("up", Op::Up, CoreSplit::Output), ("down", Op::Down, CoreSplit::Input)];
+    // A direct-query variant's indexer query projection may ship in the K6 core
+    // (replicated on every attention rank, like the GLM indexer's operands).
+    if cfg.variant.ml4().is_some() && cfg.indexers[layer] == super::GlmIndexer::Full {
+        operands.push(("index_q", Op::IndexQ, CoreSplit::Whole));
+    }
+    operands
 }
 
 pub fn split(cfg: &GlmDsaConfig, stem: &str) -> Option<CoreSplit> {
@@ -41,6 +47,11 @@ pub fn expected(cfg: &GlmDsaConfig) -> BTreeMap<String, Vec<usize>> {
             (Op::Gate, inter, cfg.hidden), (Op::Up, inter, cfg.hidden), (Op::Down, cfg.hidden, inter),
         ] {
             if let Some(name) = cfg.weight(layer, op) { shapes.insert(name, vec![n, k]); }
+        }
+        if cfg.variant.ml4().is_some() && cfg.indexers[layer] == super::GlmIndexer::Full {
+            if let Some(name) = cfg.weight(layer, Op::IndexQ) {
+                shapes.insert(name, vec![cfg.index_heads * cfg.index_head_dim, cfg.hidden]);
+            }
         }
     }
     shapes
@@ -110,7 +121,7 @@ impl CoreInventory {
         let mut layouts = (0..ranks).map(|_| BTreeMap::new()).collect::<Vec<_>>();
         for (key, op, _) in core_operands(cfg, layer) {
             let Some(projection) = cfg.stem(layer, op).and_then(|stem| self.get_weight(&stem)) else { continue; };
-            let attention = matches!(op, Op::QA | Op::KvA | Op::QB | Op::O);
+            let attention = matches!(op, Op::QA | Op::KvA | Op::QB | Op::O | Op::IndexQ);
             let world = if projection.split == CoreSplit::Whole || attention && owner.is_some() { 1 } else { ranks };
             let side = if projection.split == CoreSplit::Input && world > 1 { TrellisSide::Input }
                 else { TrellisSide::Output };
@@ -212,6 +223,9 @@ impl CoreCharges {
                     programs.insert(name);
                 }
             }
+            ensure!(entries.iter().filter(|p| p["name"] == "ml4_index_kw").count() == 1,
+                "Mistral Large 4 K6 requires ml4_index_kw");
+            programs.insert("ml4_index_kw".to_string());
             for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
                 let name = format!("ml4_swiglu_i{inter}");
                 ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");

@@ -88,6 +88,7 @@ GLMF_SHAPES = (
 # 64 heads x 128 (v 128), dense layer 0 (I 24576), one shared expert (I 6144).
 ML4_SHAPES = (
     ("ml4_q", 6144, 8192, 1),
+    # Also the indexer's wq_b [4096, 6144] when the recipe moves it into the core.
     ("ml4_q_tp2", 6144, 4096, 1),
     ("ml4_kv_a_padded", 6144, 640, 1),
     ("ml4_kv_a_nope", 6144, 512, 1),

@@ -504,23 +504,19 @@ impl<'a> GlmEngine<'a> {
         self.run_on(rank, &format!("ml4_index_layer_norm_{cap}"), &[("x", w.x.buffer.ptr),
             ("weight", layer.ptr("index_q_norm_w")?), ("bias", layer.ptr("index_q_norm_b")?),
             ("out", normed.ptr)], &[row])?;
-        let n = match self.native_linear(rank, w, layer, "index_q", normed, rows, s.iq.buffer, false)? {
-            NativeOut::F32 { n } => { self.native_narrow(rank, w, rows, n, s.iq.buffer)?; n }
-            NativeOut::Bf16 { n } => n,
-        };
-        ensure!(n == self.cfg.index_heads * self.cfg.index_head_dim, "Mistral Large 4 index query width");
+        // wq_b in the checkpoint's own form: the K6 core (the shared trellis path).
+        // A checkpoint keeping the official FP8 block-128 wq_b needs its native
+        // FP8 projection at K = hidden; refuse rather than re-quantize.
+        ensure!(layer.core.contains_key("index_q"), "Mistral Large 4 indexer wq_b: only the K6 core form \
+            runs; an FP8 block-128 wq_b needs the native ml4 index-query projection");
+        self.core_linear(rank, w, layer, "index_q", normed, s.iq.buffer, rows, None)?;
         self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", s.iq.buffer.ptr),
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
             ("s", layer.ptr("index_scale_s")?), ("b", layer.ptr("index_scale_b")?),
             ("query", s.iq.buffer.ptr)], &[row])?;
-        let x = head(w.x.buffer, rows * self.cfg.hidden * 2)?;
-        let programs = self.native_programs(rank)?;
-        let stream = self.stream_of(rank);
-        // [wk | weights_proj](x), BF16 [rows, 128 + I].
-        // SAFETY: x holds rows x hidden BF16; w_ik the concatenated BF16 rows; kw rows x (128 + I).
-        self.on(rank, || unsafe { programs.companion("exlr8_dense_bf16_index_weights")?
-            .launch(&[x.ptr, layer.ptr("w_ik")?, s.kw.buffer.ptr], rows as u32, 0, stream)
-            .map_err(anyhow::Error::from) })?;
+        // [wk | weights_proj](x), BF16 [rows, 128 + I], both BF16 as shipped.
+        self.run_on(rank, "ml4_index_kw", &[("x", w.x.buffer.ptr), ("w", layer.ptr("w_ik")?),
+            ("out", s.kw.buffer.ptr)], &[row])?;
         self.run_on(rank, &format!("ml4_index_post{}_{cap}", if rope { "" } else { "_nope" }), &[
             ("iq", s.iq.buffer.ptr), ("kw", s.kw.buffer.ptr), ("positions", w.positions.buffer.ptr),
             ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("k_weight", layer.ptr("k_norm_w")?),
