@@ -435,3 +435,27 @@ def test_v2_short_answers_get_native_user_turn_context():
     head = renderer.ids(renderer.message({"role": "user", "content": "File: " + "x" * 64}))[:2]
     assert e00["tokens"][-padding:][:2] == head
     assert set(e00["roles"][-e00["provenance"]["trailing_ctx"]:]) == {"ctx"}
+
+
+class ShortFinalAPI(FakeAPI):
+    """Tool turn, long tool turn, then a short final answer (the Muse pattern)."""
+
+    def __call__(self, body):
+        own = sum(1 for m in body["messages"] if m["role"] == "tool")
+        self.generated = 400 if own == 0 else 1600 if own == 1 else 40
+        self.calls = 2
+        return super().__call__(body)
+
+
+def test_v2_scored_span_ends_at_the_best_turn_and_history_continues():
+    probe = ShortFinalAPI()
+    manifest = make_api(probe, "v2")
+    e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
+    p = e00["provenance"]
+    assert p["turns_generated"] == 3 and p["scored_end_turn"] == 2 and len(p["turns"]) == 2
+    assert e00["roles"][e00["score_from"]:].count("gen") > 400 > p["turns"][0]["generated_tokens"] - 400
+    # The fixture conversation for the next A window continues from the final turn.
+    a00 = [r for r in probe.requests if "Fidelity fixture a00" in r["messages"][0]["content"]]
+    a01 = [r for r in probe.requests if "Fidelity fixture a01" in r["messages"][0]["content"]]
+    assert sum(m["role"] == "tool" for m in a01[0]["messages"]) >= sum(m["role"] == "tool" for m in a00[-1]["messages"])
+    assert manifest["recipe"]["version"]["scored_end"].startswith("assistant-turn end")

@@ -148,7 +148,8 @@ V2_TOOL_UNAVAILABLE = "Tool unavailable in this session; answer directly from th
 def recipe_identity(recipe):
     if recipe == "v1":
         return None
-    rules = {"id": "own-text-v2", "continue_until_scored_generated": 512, "max_turns_per_window": V2_MAX_TURNS,
+    rules = {"id": "own-text-v2", "continue_until_scored_generated": 512,
+             "scored_end": "assistant-turn end maximizing scored generated rows, earliest on ties", "max_turns_per_window": V2_MAX_TURNS,
              "tool_clause": "only when tools are declared", "tool_unavailable_result": V2_TOOL_UNAVAILABLE,
              "trailing_context": "checkpoint-native user turn after the final assistant turn",
              "earlier_turn_roles": "gen only where the earlier prompt+generation is an exact token prefix"}
@@ -242,11 +243,11 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         tokens = prompt + generated
         roles = ["ctx"] * len(prompt) + ["gen"] * len(generated)
         turns = [{"generated_tokens": len(generated), "prompt_tokens": len(prompt)}]
-        continuation = {}
+        continuation, final_chat = {}, None
         if recipe == "v2":
             limit = {"A": 2048 if target < 2048 else 8192 if target < 8192 else MAX_TOKENS - 1,
                      "B": MAX_TOKENS - 1}.get(block, MAX_TOKENS - 1)
-            tokens, roles, chat, body, turns, continuation = continue_window(
+            tokens, roles, chat, body, turns, continuation, final_chat = continue_window(
                 name, body, chat, tokens, roles, turns, executor, history, limit)
             prompt, generated = chat["probe"]["prompt_ids"], chat["probe"]["generated"]
         if recipe == "v2":
@@ -278,11 +279,14 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         if "generation_provenance" in chat:
             windows[-1]["provenance"]["generation"] = chat["generation_provenance"]
         print(f"{name}: prompt={len(prompt)} generated={len(generated)}", file=sys.stderr, flush=True)
-        return chat
+        # v2: the conversation (and the next fixture window) continues from the last turn.
+        return final_chat if recipe == "v2" else chat
 
     def continue_window(name, body, chat, tokens, roles, turns, executor, history, limit):
         """v2: answer tool calls in-window and ask again until 512 generated rows."""
         info = {"ended_with_tool_calls": False, "earlier_turns_ctx": 0, "tool_errors": 0}
+        opening = turns[0]["prompt_tokens"]
+        snapshots = [(tokens, roles, chat, body, len(turns))]
         # Scored rows are the window's last 512 positions; tool results there are ctx.
         while roles[-512:].count("gen") < 512 and chat.get("tool_calls") and len(turns) < V2_MAX_TURNS:
             calls = chat["tool_calls"]
@@ -326,8 +330,16 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                 history += [assistant, *results]
             body, chat = following, next_chat
             turns.append({"generated_tokens": len(generated), "prompt_tokens": len(prompt)})
+            snapshots.append((tokens, roles, chat, body, len(turns)))
         info["ended_with_tool_calls"] = bool(chat.get("tool_calls"))
-        return tokens, roles, chat, body, turns, info
+        # The window ends at the assistant-turn end whose last 512 positions hold the
+        # most generated rows (earliest on ties); later turns stay out of this window,
+        # never relabelled, and the conversation still continues for the next window.
+        scored = [r[max(opening, len(r) - 512):].count("gen") for _, r, *_ in snapshots]
+        best = scored.index(max(scored))
+        tokens, roles, window_chat, body, kept = snapshots[best]
+        info.update(scored_end_turn=kept, turns_generated=len(turns))
+        return tokens, roles, window_chat, body, turns[:kept], info, chat
 
     def native_trailing_context(body, chat, tokens, roles, padding):
         """#431: trailing repository text as a checkpoint-native user turn (all ctx)."""
