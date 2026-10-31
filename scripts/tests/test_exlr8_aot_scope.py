@@ -372,3 +372,26 @@ def test_spark_builds_without_a_spark_need_have_no_program_table(tmp_path):
     assert _spark_table(tmp_path, [], True) == (True, False, True)
     assert _spark_table(tmp_path, ['muse:exl3-k45'], False) == (True, True, True)
     assert _spark_table(tmp_path, ['glm:exl3-k45', 'muse:exl3-k45'], True) == (True, True, True)
+
+
+@pytest.mark.skipif(shutil.which('cmake') is None, reason='needs cmake')
+@pytest.mark.parametrize('geometry,count', [('glm', 6), ('glmf', 4), ('qwen4', 2), ('dsv4p', 6), ('kimik3', 6),
+                                            ('muse', 6), ('muse', 4), ('muse', 3), ('muse', 2)])
+def test_generic_spark_count_profiles_exist_in_the_package(tmp_path, geometry, count):
+    """exl3.cmake's per-count width profiles must be ones package_exl3_aot builds for the
+    geometry (a hardcoded block count once requested GLM widths for Muse)."""
+    cmake = (ROOT / 'native/cmake/shared/exl3.cmake').read_text()
+    start = cmake.index('  set(CUTEAFD_EXL3_PROFILE_ARGS)')
+    end = cmake.index('  list(JOIN CUTEAFD_EXL3_GEOMETRY_LAYOUTS', start)
+    script = tmp_path / 'profiles.cmake'
+    script.write_text(f'set(CUTEAFD_EXL3_ROLE spark)\nset(CUTEAFD_EXL3_GEOMETRY {geometry})\n'
+                      f'set(CUTEAFD_GENERIC_SPARK_COUNTS "{geometry}={count}")\nset(CUTEAFD_EXL3_GEOMETRY_LAYOUTS)\n'
+                      + cmake[start:end] + 'message(STATUS "PROFILES=${CUTEAFD_EXL3_PROFILE_ARGS}")\n')
+    result = subprocess.run(['cmake', '-P', str(script)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    line = next(l for l in (result.stdout + result.stderr).splitlines() if 'PROFILES=' in l)
+    requested = {p for p in line.split('PROFILES=', 1)[1].split(';') if p and p != '--profile'}
+    sys.path.insert(0, str(ROOT / 'python/tools/aot'))
+    import package_exl3_aot
+    known = {entry[0] for entry in package_exl3_aot.build_profiles('spark', geometry, all_spark_counts=True)}
+    assert requested and requested <= known, (geometry, count, sorted(requested - known))
