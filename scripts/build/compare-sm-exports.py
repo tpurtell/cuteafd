@@ -167,6 +167,9 @@ def jobs(scope):
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
+    # Muse Spark: whole-expert (expert-parallel) K4/K5 exports with the per-route norm sum.
+    result.append(("exl3-muse-k45", "package_exl3_aot.py",
+                   ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
@@ -381,6 +384,8 @@ def _export_exl3(extra, output):
                 options["route_block"] = block
             if (limit := package.swiglu_limit(geometry)) != 10.0:
                 options["swiglu_limit"] = limit
+            if geometry in getattr(package, "ROUTE_NORM_EPS", {}):
+                options["route_norm_eps"] = package.ROUTE_NORM_EPS[geometry]
             if (schedule := package.default_decode_schedule(geometry, role, profile, rows, list(bits))) is not None:
                 options["decode_schedule"] = schedule
             export(output / profile / f"m{rows}", width, experts, rows, bits, "auto", topk, dtype, **options)

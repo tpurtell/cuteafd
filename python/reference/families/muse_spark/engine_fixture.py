@@ -30,8 +30,10 @@ def main(out: Path) -> None:
     torch.manual_seed(7)
     torch.set_num_threads(1)
     layers = 2
-    text = dict(vocab_size=97, hidden_size=64, intermediate_size=64, moe_hidden_size=32, moe_intermediate_size=48,
-                num_hidden_layers=layers, num_attention_heads=8, num_key_value_heads=2, head_dim=8,
+    # Release head geometry (head_dim 64, 4 query heads per KV head) at a small
+    # width, so native attention kernels run on the fixture unchanged.
+    text = dict(vocab_size=97, hidden_size=512, intermediate_size=64, moe_hidden_size=128, moe_intermediate_size=128,
+                num_hidden_layers=layers, num_attention_heads=8, num_key_value_heads=2, head_dim=64,
                 num_local_experts=6, num_experts_per_tok=2, sliding_window=5,
                 layer_types=["sliding_attention", "full_attention"], mlp_layer_types=["sparse"] * layers,
                 layer_rope_theta=[500000.0, 0], rope_parameters={"rope_theta": 500000.0, "rope_type": "default"},
@@ -43,8 +45,10 @@ def main(out: Path) -> None:
     with torch.no_grad():
         for name, value in list(model.named_parameters()) + list(model.named_buffers()):
             if value.dtype.is_floating_point and "inv_freq" not in name:
-                value.copy_(torch.randn_like(value) * (0.3 if value.ndim > 1 else 0.5))
-    head = torch.randn(config.vocab_size, config.hidden_size) * 0.3
+                # Scale matrices by fan-in so activations stay O(1) at width 512.
+                fan_in = value.shape[-1] if value.ndim > 1 else 1
+                value.copy_(torch.randn_like(value) * ((2.0 / fan_in) ** 0.5 if value.ndim > 1 else 0.5))
+    head = torch.randn(config.vocab_size, config.hidden_size) * 1.5
     tensors = {muse.PREFIX + k: v.detach().clone() for k, v in model.state_dict().items() if "rotary" not in k}
     tensors[muse.HEAD] = head
     for key, value in tensors.items():
