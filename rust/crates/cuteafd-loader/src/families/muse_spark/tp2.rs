@@ -22,9 +22,9 @@
 //! full rows over E, so the expert input is assembled before the norm and an
 //! onboarded layer's combine runs on full partials.
 //!
-//! Each channel has its own receive slot(s) on each receiving GPU, sized by its
-//! own widest payload; a push may overwrite a slot only once the receiver has
-//! read the event that slot held last. [`receive_slots`] is what the
+//! Each channel has its own round-robin receive slots on each receiving GPU,
+//! sized by its own widest payload; a push may overwrite a slot only once the
+//! receiver has read the event that slot held last. [`receive_slots`] is what the
 //! exhaustive interleaving model in this module's tests proves sufficient for
 //! every schedule the shared prefill scheduler issues (1..3 units in flight,
 //! decode steps anywhere, any onboarding).
@@ -48,12 +48,23 @@ impl Channel {
     }
 }
 
-/// Receive slots per GPU of `channel`, proven sufficient by the interleaving
-/// model: one. Between two events of a channel every stream passes a two-way
-/// wait that follows the receiver's read of the first (the `Moe` swap after
-/// `Attention`, the `Attention` swap after `Moe`, the Spark round trip between
-/// `ExpertInput` and `Combined`), so a channel never holds two unread events.
-pub fn receive_slots(_channel: Channel) -> usize { 1 }
+/// Receive slots per GPU of `channel`, round-robin in receive order: the bound
+/// the exhaustive interleaving model reaches under the shared prefill
+/// scheduler's real step order (the daemon's
+/// `peer::tests::receive_slots_cover_the_shared_prefill_schedule`, which
+/// asserts these are exact). Units interleave per layer there: after one
+/// unit's attention swap a GPU sends its expert-input half one-way and runs on
+/// to the next unit's attention push before the peer read the first, so the
+/// two swapped cores need two slots; the one-way halves and the partials need one.
+pub fn receive_slots(channel: Channel) -> usize {
+    match channel {
+        Channel::Attention | Channel::Moe => 2,
+        Channel::ExpertInput | Channel::Partials | Channel::Combined => 1,
+    }
+}
+
+/// Receive slot of a channel's `ordinal`-th received event.
+pub fn receive_slot(channel: Channel, ordinal: u64) -> usize { (ordinal % receive_slots(channel) as u64) as usize }
 
 /// Bytes of each receive slot of `channel` at `rows` rows; `Partials` exists
 /// only when a layer onboards.
@@ -156,9 +167,10 @@ mod tests {
     }
 
     /// Every channel's slot count covers the most received-but-unread events of
-    /// that channel in every interleaving: 1..3 prefill units, 3 layers with
-    /// every onboarding pattern, decode steps before any pass. The bounds are
-    /// reached (tight).
+    /// that channel in every interleaving of layer-major passes (1..3 units,
+    /// 3 layers, every onboarding pattern, decode steps before any pass). The
+    /// real scheduler interleaves units within a layer and needs more; the
+    /// daemon's schedule-driven model sets the counts exactly.
     #[test]
     fn receive_slots_cover_every_interleaving() {
         let mut worst = std::collections::BTreeMap::<Channel, usize>::new();
@@ -174,7 +186,7 @@ mod tests {
                 }
             }
         }
-        for channel in Channel::ALL { assert_eq!(worst[&channel], receive_slots(channel), "{channel:?} bound not tight"); }
+        assert!(worst.values().all(|&n| n == 1), "layer-major passes need one slot per channel: {worst:?}");
     }
 
     /// The model is not vacuous: one-way exchanges alone let the receiver's
