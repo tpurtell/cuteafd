@@ -336,6 +336,86 @@ mod tests {
         }
     }
 
+    /// Mistral: optional token-delimited `[THINK]` block, then an answer or back-to-back
+    /// `[TOOL_CALLS]NAME[ARGS]{json}` calls closed by the JSON object, compiled natively.
+    #[tokio::test]
+    async fn mistral_constraints_compile_and_enforce_calls_natively() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let temp = tempfile::tempdir().unwrap();
+        // Byte vocabulary (ids 0..95 for ASCII 32..126) plus the Mistral control tokens.
+        let specials = [(95, "</s>"), (96, "[THINK]"), (97, "[/THINK]"), (98, "[TOOL_CALLS]"), (99, "[ARGS]"),
+            (100, "[INST]"), (101, "[/INST]"), (102, "[AVAILABLE_TOOLS]"), (103, "[/AVAILABLE_TOOLS]"),
+            (104, "[TOOL_RESULTS]"), (105, "[/TOOL_RESULTS]"), (106, "[SYSTEM_PROMPT]"), (107, "[/SYSTEM_PROMPT]"),
+            (108, "[MODEL_SETTINGS]"), (109, "[/MODEL_SETTINGS]"), (110, "<s>")];
+        let mut vocab = serde_json::Map::new();
+        for ch in 32u8..127 { vocab.insert((ch as char).to_string(), json!(ch - 32)); }
+        let added: Vec<_> = specials.iter().map(|(id, content)| json!({"id": id, "content": content, "special": true,
+            "single_word": false, "lstrip": false, "rstrip": false, "normalized": false})).collect();
+        let tokenizer = temp.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, json!({"version":"1.0", "added_tokens": added,
+            "model":{"type":"WordLevel", "vocab":vocab, "unk_token":"?"}}).to_string()).unwrap();
+        std::fs::write(temp.path().join("tokenizer_config.json"), json!({"bos_token":"<s>","eos_token":"</s>"}).to_string()).unwrap();
+        std::fs::write(temp.path().join("generation_config.json"), json!({"eos_token_id":95}).to_string()).unwrap();
+        std::fs::write(temp.path().join("chat_template.jinja"), cuteafd_api::openai::chat::mistral::TEMPLATE_FOR_TESTS).unwrap();
+        let encoding = Arc::new(openai::chat::mistral::MistralEncoding::from_snapshot(temp.path()).unwrap());
+        let token = |text: &str| -> Vec<u32> {
+            let mut out = Vec::new();
+            let mut rest = text;
+            while !rest.is_empty() {
+                if let Some((id, content)) = specials.iter().find(|(_, content)| rest.starts_with(content)) {
+                    out.push(*id); rest = &rest[content.len()..];
+                } else {
+                    out.push(u32::from(rest.as_bytes()[0] - 32)); rest = &rest[1..];
+                }
+            }
+            out
+        };
+        for required in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("mistral-fixture", ModelEncoding::Mistral(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(25), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let body = json!({"model":"mistral-fixture", "messages":[{"role":"user","content":"Look it up"}],
+                "tool_choice": if required {"required"} else {"auto"},
+                "tools":[{"type":"function","function":{"name":"lookup","strict":true,
+                    "parameters":{"type":"object","properties":{"x":{"const":"a"}},"required":["x"],"additionalProperties":false}}}]});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            assert!(request.prompt.ends_with("[/INST]"), "{}", request.prompt);
+            assert!(request.stop_token_ids.contains(&95) && !request.stop_token_ids.contains(&98));
+            let mut compiler = Compiler::with_vocab(&library, tokenizer.clone(), 111, vec![95]);
+            let spec = request.constraint.as_ref().expect("strict tools are constrained");
+            for wire in ["[THINK]plan[/THINK][TOOL_CALLS]lookup[ARGS]{\"x\":\"a\"}[TOOL_CALLS]lookup[ARGS]{\"x\":\"a\"}",
+                "[TOOL_CALLS]lookup[ARGS]{\"x\":\"a\"}"] {
+                let mut state = compiler.matcher(spec).unwrap();
+                for (at, id) in token(wire).into_iter().enumerate() {
+                    state.accept(id).unwrap_or_else(|e| panic!("required={required} {wire} token {at}: {e:#}"));
+                }
+                state.accept(95).unwrap();
+                assert!(state.terminated());
+            }
+            // Arguments stay schema-checked; plain answers only pass when calls are optional.
+            let mut invalid = compiler.matcher(spec).unwrap();
+            assert!(token("[TOOL_CALLS]lookup[ARGS]{\"x\":\"b\"}").into_iter().any(|id| invalid.accept(id).is_err()));
+            let mut plain = compiler.matcher(spec).unwrap();
+            let plain_ok = token("[THINK]p[/THINK]Done.").into_iter().all(|id| plain.accept(id).is_ok())
+                && plain.accept(95).is_ok();
+            assert_eq!(plain_ok, !required);
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// The XGrammar matcher's mask buffer is reused across rows and
     /// `fill_bitmask` returns whether that row needs a mask at all. A row whose
     /// grammar allows every token must be recorded as `None`; recording the
