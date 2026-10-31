@@ -6,6 +6,7 @@ pub(crate) mod block;
 pub(crate) mod programs;
 pub(crate) mod serve;
 pub(crate) mod startup;
+pub(crate) mod step;
 pub(crate) mod weights;
 #[cfg(test)]
 pub(crate) mod reference;

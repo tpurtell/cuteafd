@@ -21,6 +21,8 @@ pub(crate) const POINTWISE: &[(&str, &[&str])] = &[
     ("route_select", &["logits", "bias", "ids", "weights"]),
     ("softcap", &["logits", "out"]),
     ("router", &["x", "weight", "out"]),
+    // Expert-width rows -> the shared FP8 K32 Spark wire (E 4096).
+    ("expert_input_quant", &["source_ptr", "values_ptr", "scale_rows_ptr", "scale_mma_ptr"]),
 ];
 
 pub(crate) const PER_HEADS: &[(&str, &[&str])] = &[

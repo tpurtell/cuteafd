@@ -11,6 +11,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib"))
 import _pinned_sparkinfer
 
 
+EXPERT_WIDTH = 4096
+
+
+def compile_expert_input_quant_aot():
+    """Expert-width BF16 rows -> the shared FP8 K32 Spark wire (E 4096, row 4224 bytes)."""
+    from b12x.integration.cuteafd._common import AotProgram, Operand, Scalar
+    from b12x._lib.quant.mxfp8_rows import compile_mxfp8_rows_quant_aot
+    import torch
+
+    h = EXPERT_WIDTH
+    compiled = compile_mxfp8_rows_quant_aot(size_k=h, expected_m=80, amax_floor=1e-4, wire_rows=True)
+    return AotProgram(
+        name="muse_expert_input_quant", compiled=compiled,
+        operands=(Operand("source_ptr", torch.bfloat16, f"[rows,{h}]"),
+                  Operand("values_ptr", torch.uint32, f"[rows,{(h + h // 32) // 4}] (u8 [rows,{h + h // 32}])", "out"),
+                  Operand("scale_rows_ptr", torch.uint8, "values_ptr + H", "out"),
+                  Operand("scale_mma_ptr", torch.uint8, "unused", "in")),
+        scalars=(Scalar("m"), Scalar("grid_x")),
+        geometry={"hidden": h, "row_bytes": h + h // 32, "expected_m": 80, "amax_floor": 1e-4,
+                  "exact_row_cap": 2**31 - 1},
+        doc=compile_expert_input_quant_aot.__doc__,
+    )
+
+
 def builders(heads=128, group="pointwise", max_rows=4096):
     if heads not in (64, 128) or not 1 <= max_rows <= 4096:
         raise ValueError("Muse requires heads64/128 and max_rows in 1..4096")
@@ -22,7 +46,8 @@ def builders(heads=128, group="pointwise", max_rows=4096):
                       softcap=m.compile_softcap_aot,
                       qk_norm_rope_swa=partial(m.compile_qk_norm_rope_aot, heads=heads, kind="swa"),
                       qk_norm_nope_full=partial(m.compile_qk_norm_rope_aot, heads=heads, kind="full"),
-                      attention_output=partial(m.compile_attention_output_aot, heads=heads))
+                      attention_output=partial(m.compile_attention_output_aot, heads=heads),
+                      expert_input_quant=compile_expert_input_quant_aot)
         return result
     if group == "projections":
         from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
