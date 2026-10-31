@@ -57,7 +57,7 @@ impl CoreProjection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreWeightLayout {
     pub stem: String, pub side: crate::formats::dense_trellis::TrellisSide, pub rank: usize, pub ranks: usize,
-    pub shape: [usize;2], pub bytes: usize,
+    pub shape: [usize;2], pub bytes: usize, pub bits: usize,
     pub codebook: crate::formats::exl3_storage::Exl3Codebook,
 }
 impl CoreWeightLayout {
@@ -74,13 +74,14 @@ impl CoreWeightLayout {
             crate::formats::dense_trellis::TrellisSide::Output=>(n/ranks,k),
             crate::formats::dense_trellis::TrellisSide::Input=>(n,k/ranks),
         };
-        ensure!(projection.bits==6 && n>0 && k>0 && n%128==0 && k%128==0,"dense trellis K6 local H128 geometry");
-        let payload=n.checked_mul(k).and_then(|v|v.checked_mul(6))
+        ensure!(matches!(projection.bits,2..=6) && n>0 && k>0 && n%128==0 && k%128==0,
+            "dense trellis K2-K6 local H128 geometry");
+        let payload=n.checked_mul(k).and_then(|v|v.checked_mul(projection.bits))
             .context("dense trellis payload extent overflow")?/8;
         let vectors=n.checked_add(k).and_then(|v|v.checked_mul(2))
             .context("dense trellis vector extent overflow")?;
         let bytes=payload.checked_add(vectors).context("dense trellis resident extent overflow")?;
-        Ok(Self{stem:projection.stem.clone(),side,rank,ranks,shape:[n,k],bytes,codebook:projection.codebook})
+        Ok(Self{stem:projection.stem.clone(),side,rank,ranks,shape:[n,k],bytes,bits:projection.bits,codebook:projection.codebook})
     }
 }
 

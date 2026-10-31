@@ -122,8 +122,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False, activation: str = "silu",
            compact_weights: bool = False) -> dict:
-    if len(bits) != 2 or len(set(bits)) != len(bits) or any(b not in range(2, 6) for b in bits):
-        raise ValueError("export requires two distinct K2..K5 decoder tiers")
+    if len(bits) != 2 or len(set(bits)) != len(bits) or any(b not in range(2, 7) for b in bits):
+        raise ValueError("export requires two distinct K2..K6 decoder tiers")
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
     # geometry vocabulary: _projection_mixed_tile_config()/the compile path reject a
     # thread-count mismatch or a tile that does not fit the problem, so the pinned
@@ -133,10 +133,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
     # decode over more rows once many rows share an expert (large prefill).
     if compact_weights and len(bits) != 2:
         raise ValueError("compact weights require a disjoint two-tier export")
-    if activation not in ("silu", "situ"):
-        raise ValueError("EXL3 activation must be silu or situ")
+    if activation not in ("silu", "situ", "silu_post_clamp"):
+        raise ValueError("EXL3 activation must be silu, situ or silu_post_clamp")
     if activation == "situ" and swiglu_limit is not None:
         raise ValueError("Situ does not use a SwiGLU clamp")
+    if activation == "silu_post_clamp" and swiglu_limit is None:
+        raise ValueError("silu_post_clamp bounds SiLU at a positive SwiGLU limit")
     if route_block not in (8, 16, 32, 64):
         raise ValueError("EXL3 route block must be 8, 16, 32 or 64 rows")
     # Token-major input rotation reads each token's input block once for all of
@@ -335,7 +337,7 @@ def main() -> None:
     parser.add_argument("--topk", type=int, choices=range(1, 17), metavar="1..16", default=6)
     parser.add_argument("--swiglu-limit", default="10",
                         help="SwiGLU clamp limit, or none for an unclamped SwiGLU (GLM)")
-    parser.add_argument("--activation", choices=("silu", "situ"), default="silu")
+    parser.add_argument("--activation", choices=("silu", "situ", "silu_post_clamp"), default="silu")
     parser.add_argument("--output-dtype", choices=("bf16", "fp32"), default="bf16")
     parser.add_argument("--blocks-per-sm", type=int, choices=(1, 2), help="Offline residency override; default uses B12x policy")
     parser.add_argument("--route-block", type=int, choices=(8, 16, 32, 64), default=8,

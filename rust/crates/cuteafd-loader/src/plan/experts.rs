@@ -212,9 +212,9 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
     let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
-        && bits.bytes().all(|bit| (b'2'..=b'5').contains(&bit))
+        && bits.bytes().all(|bit| (b'2'..=b'6').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
-        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
+        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5");
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
         || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
@@ -236,7 +236,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if native && mxfp4 && (intermediate % world != 0 || intermediate / world % 32 != 0) {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block: 32 });
     }
-    let packaged = if family == "step5" { matches!(world, 4 | 6) }
+    let packaged = if family == "step5" && !exl3 { matches!(world, 4 | 6) }
         else if native { matches!(world, 2 | 3 | 4 | 6) }
         else if exl3 { matches!(world, 2 | 3 | 4 | 6) || (family == "qwen4" && world == 1) }
         else if nvfp4 { matches!(world, 2 | 3 | 4 | 6) || (family == "glmf" && world == 5) }
@@ -420,10 +420,19 @@ mod tests {
                 assert_eq!(nvfp4.slicing, Slicing::Blocks(16));
                 assert!(nvfp4.same_ownership(&spark_recipe("step5:fp8", 1536, world).unwrap()));
             } else { assert!(spark_recipe("step5:nvfp4", 1536, world).is_err()); }
-            for format in ["nvfp4a4", "mxfp4", "exl3-k34"] {
+            for format in ["nvfp4a4", "mxfp4"] {
                 assert!(spark_recipe(&format!("step5:{format}"), 1536, world).is_err());
             }
+            // EXL3 K4/K6: exact H128 slices at every packaged two-tier world.
+            let exl3 = spark_recipe("step5:exl3-k46", 1536, world);
+            if matches!(world, 2 | 3 | 4 | 6) {
+                let recipe = exl3.unwrap();
+                assert_eq!(recipe.widths, vec![1536 / world; world]);
+                assert_eq!(recipe.slicing, Slicing::Blocks(128));
+            } else { assert!(exl3.is_err()); }
+            assert!(spark_recipe("step5:exl3-k47", 1536, world).is_err());
         }
+        assert_eq!(spark_worlds("step5:exl3-k46", 1536), [2, 3, 4, 6]);
         for package in ["mimo:fp8", "glm:nvfp4", "glmf:exl3-k34", "qwen4:nvfp4"] {
             assert!(spark_recipe(package, 2048, 6).is_ok());
         }

@@ -83,8 +83,45 @@ GLMF_SHAPES = (
     ("glmf_shared_down_tp2", 1024, 4096, 2),
     ("glmf_lm_head", 4096, 154880, 1),
 )
-FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES}
-F32_OUTPUTS = (163840, 154880)
+# Step-5 (head_dim 192, 64 Q / 4 KV heads): K6 target core with the current
+# two-GPU head split (q/k/v rows, o_proj columns) and whole FFNs and heads; its
+# three MTP stages are K4 throughout, each with its own vocabulary head. A fifth
+# element names a width other than K6 and suffixes its program names with _k<bits>.
+STEP5_SHAPES = (
+    ("step5_q", 4096, 12288, 1),
+    ("step5_q_tp2", 4096, 6144, 1),
+    ("step5_kv", 4096, 768, 1),
+    ("step5_kv_tp2", 4096, 384, 1),
+    ("step5_o", 12288, 4096, 1),
+    ("step5_o_tp2", 6144, 4096, 2),
+    ("step5_shared_gate_up", 4096, 1536, 1),
+    ("step5_shared_down", 1536, 4096, 1),
+    ("step5_dense_gate_up", 4096, 13824, 1),
+    ("step5_dense_down", 13824, 4096, 1),
+    ("step5_lm_head", 4096, 128896, 1),
+    ("step5_mtp_q", 4096, 12288, 1, 4),
+    ("step5_mtp_kv", 4096, 768, 1, 4),
+    ("step5_mtp_o", 12288, 4096, 1, 4),
+    ("step5_mtp_gate_up", 4096, 13824, 1, 4),
+    ("step5_mtp_down", 13824, 4096, 1, 4),
+    ("step5_mtp_eh", 8192, 4096, 1, 4),
+    ("step5_mtp_head", 4096, 128896, 1, 4),
+)
+FAMILY_SHAPES = {"kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES}
+F32_OUTPUTS = (163840, 154880, 128896)
+
+
+def _bits(item):
+    return item[4] if len(item) > 4 else 6
+
+
+def _suffix(item):
+    return "" if _bits(item) == 6 else f"_k{_bits(item)}"
+
+
+def _key(item):
+    """Runtime lookup key: (K, N, side, bits); K6 keeps its historical 3-tuple."""
+    return item[1:4] + (() if _bits(item) == 6 else (_bits(item),))
 
 
 def shapes_for(families):
@@ -92,9 +129,9 @@ def shapes_for(families):
     result, seen = [], set()
     for family in families:
         for item in FAMILY_SHAPES[family]:
-            if item[1:] not in seen:
+            if _key(item) not in seen:
                 result.append(item)
-                seen.add(item[1:])
+                seen.add(_key(item))
     return tuple(result)
 
 
@@ -105,10 +142,12 @@ GROUPED_MAX_ROWS = 4096
 
 def row_policies(families=("kimik3",)):
     result = []
-    for name, k, n, side in shapes_for(families):
+    for item in shapes_for(families):
+        name, k, n, side = item[:4]
         for book in ("mcg", "mul1"):
             result.append(dict(shape=name, input_features=k, output_features=n,
                 sharded_side=side, codebook=book,
+                **({} if _bits(item) == 6 else {"bits": _bits(item)}),
                 native_program=f"trellis_{name}_{book}",
                 native_input=f"trellis_input_k{k}_bf16",
                 output_program=f"trellis_output_n{n}_{'f32' if n in F32_OUTPUTS else 'bf16'}",
@@ -129,8 +168,8 @@ def programs(*, families=("kimik3",), input_dtype="f16"):
     # only new geometry/transform entries, including in a multi-family build.
     result, seen_names, seen_shapes = [], set(), set()
     for family in families:
-        shapes = tuple(shape for shape in shapes_for((family,)) if shape[1:] not in seen_shapes)
-        seen_shapes.update(shape[1:] for shape in shapes)
+        shapes = tuple(shape for shape in shapes_for((family,)) if _key(shape) not in seen_shapes)
+        seen_shapes.update(_key(shape) for shape in shapes)
         for item in programs_for_shapes(shapes, input_dtype=input_dtype):
             if item[0] not in seen_names:
                 result.append(item)
@@ -149,23 +188,25 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
     core_dtype = {"input_dtype": "bf16"} if input_dtype == "bf16" else {}
     ingress_dtype = {"output_dtype": "bf16"} if input_dtype == "bf16" else {}
     result = []
-    for name, k, n, side in shapes:
+    for item in shapes:
+        name, k, n, side = item[:4]
         for codebook in ("mcg", "mul1"):
-            params = dict(input_features=k, output_features=n, bits=6,
+            params = dict(input_features=k, output_features=n, bits=_bits(item),
                           codebook=codebook, sharded_side=side,
                           rotation_count=1, max_rows=max_rows, **core_dtype)
             result.append((f"trellis_{name}_{codebook}", "trellis_linear", params,
                            partial(compile_trellis_linear_aot, **params)))
-    for k in sorted({k for _, k, _, _ in shapes}):
+    for k in sorted({item[1] for item in shapes}):
         params = dict(features=k, input_dtype="bf16", max_rows=max_rows, **ingress_dtype)
         result.append((f"trellis_input_k{k}_bf16", "trellis_input", params,
                        partial(compile_trellis_input_aot, **params)))
-    for n in sorted({n for _, _, n, _ in shapes}):
+    for n in sorted({item[2] for item in shapes}):
         dtype = "f32" if n in f32_outputs else "bf16"
         params = dict(features=n, output_dtype=dtype, max_rows=max_rows)
         result.append((f"trellis_output_n{n}_{dtype}", "trellis_output", params,
                        partial(compile_trellis_output_aot, **params)))
-    for name, k, n, side in shapes:
+    for item in shapes:
+        name, k, n, side = item[:4]
         groups = GROUPED_SHAPES.get(name)
         if not groups:
             continue
