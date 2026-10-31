@@ -92,6 +92,8 @@ pub(crate) struct MuseBackend<'r, 'a> {
     draft: Option<super::draft::MuseDraft<'a>>,
     /// The draft policy's expert pricing (`policy_geometry`), present with a drafter.
     pricing: Option<DraftPricing>,
+    /// The verify rounds' routes and layer clock on the head rank (with a drafter).
+    probe: RefCell<Option<crate::shared::memory::device::DeviceOwner<'a, crate::shared::draft::probe::RoundProbe<'a>>>>,
 }
 
 impl<'r, 'a> MuseBackend<'r, 'a> {
@@ -102,6 +104,10 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
         pricing: Option<DraftPricing>) -> Result<Self> {
         ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
+        // Every Muse layer is MoE; the probe rings the head rank's route ids per layer.
+        let head = ranks.last().context("Muse backend without ranks")?.device;
+        let probe = draft.as_ref().map(|_| head.own(|| crate::shared::draft::probe::RoundProbe::new(head.library,
+            vec![false; cfg.layers], cfg.topk, HEAD_ROWS))).transpose()?;
         ensure!(draft.as_ref().is_none_or(|draft| streams.last() == Some(&draft.stream)),
             "Muse drafter must run on the head rank's stream");
         ensure!(!ranks.is_empty() && streams.len() == ranks.len() && (ranks.len() == 1) == peer.is_none()
@@ -110,7 +116,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
             profile: RefCell::new([0.0; 2]), unit_rows, waves, slots, context, pages, ring_rows,
-            local: RefCell::new(local), draft, pricing })
+            local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
     }
 
     fn head_rank(&self) -> usize { self.ranks.len() - 1 }
@@ -152,8 +158,10 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
         let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
         let mut experts = self.experts.borrow_mut();
+        let mut probe = self.probe.borrow_mut();
         let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &meta, false, wave,
-            &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(), 0..rows)?;
+            &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
+            probe.as_mut().map(|owner| owner.get_mut()), 0..rows)?;
         Ok(self.logits(logits, rows))
     }
 }
@@ -256,9 +264,9 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         ensure!(width > 0 && width < draft.block, "Muse draft width {width} beyond the drafter's block {}", draft.block);
         self.policy_geometry(width)
     }
-    /// No route probe yet: the shared policy keeps its seeded prior (`probe_finish` is None).
     fn arm_draft_probe(&self) -> Result<()> {
-        self.draft.as_ref().map(|_| ()).context("Muse drafter was not admitted")
+        ensure!(self.probe.borrow().is_some(), "Muse draft policy probe was not admitted");
+        Ok(())
     }
     /// The chunk's tail was tapped during its prefill call: commit it as context.
     fn prefill_draft(&self, placement: &Placement, start: usize, chunk: &[u32], next: Option<u32>,
@@ -319,9 +327,19 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         }
         Ok(())
     }
-    fn probe_begin(&self, _rows: usize) {}
-    fn probe_end(&self) {}
-    fn probe_finish<T>(&self, _observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> { None }
+    fn probe_begin(&self, rows: usize) {
+        if let Some(probe) = self.probe.borrow_mut().as_mut() { probe.get_mut().begin(rows); }
+    }
+    fn probe_end(&self) {
+        if let Some(probe) = self.probe.borrow_mut().as_mut() { probe.get_mut().end(); }
+    }
+    fn probe_finish<T>(&self, observe: impl FnOnce(&RoundRoutes, &[Option<f64>]) -> T) -> Option<T> {
+        let mut probe = self.probe.borrow_mut();
+        let owner = probe.as_mut()?;
+        let _scope = owner.device.enter().ok()?;
+        let (routes, times) = owner.get_mut().finish()?;
+        Some(observe(routes, &times))
+    }
 }
 
 #[cfg(test)]

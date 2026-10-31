@@ -69,7 +69,8 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
     wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
     local: &mut [super::onboard::OnboardedExperts<'_>], draft: Option<&super::draft::MuseDraft<'_>>,
-    head_rows: std::ops::Range<usize>) -> Result<Buffer> {
+    mut probe: Option<&mut crate::shared::draft::probe::RoundProbe<'_>>, head_rows: std::ops::Range<usize>)
+    -> Result<Buffer> {
     ensure!(ranks.len() == streams.len() && (ranks.len() == 1 || peers.len() == 2) && tokens.len() == meta.positions.len()
         && (local.is_empty() || local.len() == ranks.len()), "Muse step geometry");
     let planes: Vec<StepPlanes> = ranks.iter().zip(streams).map(|(rank, &stream)| {
@@ -89,9 +90,19 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
             rank.device.run(|| rank.device(cfg, stream).layer(layer, &planes[index], path, peer))?;
         }
         // The drafter taps the head rank's hidden rows after the layer, on that rank's stream.
+        let last = ranks.len() - 1;
         if let Some(draft) = draft {
-            let last = ranks.len() - 1;
             draft.tap(layer, ranks[last].lane.views.plane("hidden")?, 0, tokens.len(), 0)?;
+        }
+        // The draft policy's round: this layer's route ids and its end mark, on the head rank's stream.
+        if let Some(probe) = probe.as_deref_mut() {
+            let ids = ranks[last].lane.views.rows("route_ids", tokens.len())?;
+            ranks[last].device.run(|| {
+                // SAFETY: the router wrote these ids on this stream; the ring is read after the step's sync.
+                if probe.wants_ring(false) { unsafe { probe.ring(ranks[last].device.library, layer, ids, tokens.len(), streams[last])?; } }
+                // SAFETY: the probe's events belong to the head rank's device and stream.
+                unsafe { probe.mark(layer, streams[last]) }
+            })?;
         }
     }
     let last = ranks.len() - 1;
@@ -116,6 +127,20 @@ mod tests {
         let order = ["\"final_norm\"", "rank.core.local(", "copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4",
             "\"softcap\""];
         let at: Vec<usize> = order.iter().map(|needle| head.find(needle).unwrap()).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
+    }
+
+    /// With a drafter, every layer taps the head rank's hidden rows and the
+    /// draft policy's probe rings that rank's route ids then marks the layer,
+    /// after every rank ran it (onboarded layers too), on the head stream.
+    #[test]
+    fn step_taps_and_probes_after_every_layer() {
+        let source = include_str!("forward.rs").split("#[cfg(test)]").next().unwrap();
+        let step = source.split("pub(crate) fn step(").nth(1).unwrap();
+        let layer_loop = step.split("for layer in 0..cfg.layers").nth(1).unwrap();
+        let order = ["for (index, (rank, &stream))", "draft.tap(layer, ranks[last].lane.views.plane(\"hidden\")?",
+            "probe.ring(ranks[last].device.library, layer, ids", "probe.mark(layer, streams[last])"];
+        let at: Vec<usize> = order.iter().map(|needle| layer_loop.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
     }
 
