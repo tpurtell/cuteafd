@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 pub(crate) mod block;
 pub(crate) mod programs;
+pub(crate) mod weights;
 #[cfg(test)]
 pub(crate) mod reference;
 #[cfg(test)]
