@@ -138,14 +138,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         let spark = SparkBudgetInventory::exl3_with(catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                 slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget, reserve, Some(&owners))?;
-        // An onboarded layer is whole on one GPU, or TP2 halves of the pair.
+        // An onboarded layer is whole on one GPU: the per-expert norm needs each
+        // expert's complete output, so TP2 halves would be inexact.
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Muse Spark requires EXL3 expert headers"))?;
         let mut costs = Vec::with_capacity(cfg.layers);
         for layer in 0..cfg.layers {
-            let whole = manifest.residency(crate::V41Exl3Layer::Backbone(layer), 1, 0)?.device_arena_layout()?.1 as u64;
-            let half = (0..2).map(|rank| manifest.residency(crate::V41Exl3Layer::Backbone(layer), 2, rank)
-                .and_then(|plan| Ok(plan.device_arena_layout()?.1 as u64))).collect::<anyhow::Result<Vec<_>>>()?;
-            costs.push((whole, [half[0], half[1]]));
+            costs.push(manifest.residency(crate::V41Exl3Layer::Backbone(layer), 1, 0)?.device_arena_layout()?.1 as u64);
         }
         Ok((spark, costs))
     })();
@@ -159,7 +157,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let modes = if gpus == 2 { MODES } else { SINGLE };
     let layers = (0..cfg.layers).map(|layer| {
         let full = cfg.attention[layer] == crate::families::muse_spark::MuseAttention::Full;
-        let (whole, half) = costs[layer];
+        let whole = costs[layer];
         LayerDemand {
             kind: if full { AttentionClass::Gqa } else { AttentionClass::Swa },
             weights: ModeBytes::default(),
@@ -168,8 +166,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             } else { KvDemand::default() },
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 },
-                half: [Bytes2 { resident: half[0], staging: 0 }, Bytes2 { resident: half[1], staging: 0 }],
-                tp2: gpus == 2, spark_ok: true }),
+                half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
             modes: modes.to_vec(),
         }
     }).collect::<Vec<_>>();
@@ -186,8 +183,10 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         layers_first_gpu: 0, pool, layers, pool_overhead: vec![0; gpus], pool_bounded: Vec::new(), fixed,
         startup: Vec::new(), movables: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2],
         onboard: opts.onboard.unwrap_or(Onboard::Auto), expert_gpus: gpus, minimum_expert_layers: 0,
+        // Whole onboarded layers alternate between the GPUs.
         policy: LayerPolicy { default: modes.to_vec(), ownership: LayerOwnership::Ranges,
-            expert_ownership: ExpertOwnership::Contiguous, ..Default::default() },
+            expert_ownership: if gpus == 2 { ExpertOwnership::AlternatingWhole } else { ExpertOwnership::Contiguous },
+            ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
             entry_gpu: 0, head_gpu: (gpus - 1) as u8, terminal: if gpus == 2 { TerminalHome::Replicated }
                 else { TerminalHome::AttentionOwner } },
