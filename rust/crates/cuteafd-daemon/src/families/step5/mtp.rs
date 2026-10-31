@@ -316,7 +316,7 @@ impl<'a> StageOwner<'a> {
         let sliding = state.sliding.iter().find(|s| s.mtp && s.layer == 92 + self.stage)
             .context("Step-5 predictor cache layer missing")?;
         ensure!(cache.layout().kv_format == self.kv_format && sliding.query_heads == 64
-            && sliding.key.bytes == cache.layout().ring.rows * self.kv_format.plane_record_bytes(4, 192) as u64
+            && sliding.key.bytes == cache.layout().mtp_ring.rows * self.kv_format.plane_record_bytes(4, 192) as u64
             && sliding.value.bytes == sliding.key.bytes,
             "Step-5 predictor cache KV geometry");
         let length = *state.mtp_lengths.get(self.stage).context("Step-5 predictor length missing")?;
@@ -337,7 +337,7 @@ impl<'a> StageOwner<'a> {
             "Step-5 predictor lane row capacity/cache binding");
         cache.validate_reset(sequence)?;
         let coordinates = Coordinates::new(self.stage, base, rows,
-            cache.layout().context, cache.layout().ring)?;
+            cache.layout().context, cache.layout().mtp_ring)?;
         let components = self.cache_components(cache, sequence)?;
         cache.drain()?;
         let mut encoded = [0; 8];
@@ -364,7 +364,7 @@ impl<'a> StageOwner<'a> {
         ensure!(cache.predictor_frontier(sequence, self.stage)? == base,
             "Step-5 live predictor submission evidence differs from its frontier");
         let coordinates = Coordinates::new(self.stage, base, rows,
-            cache.layout().context, cache.layout().ring)?;
+            cache.layout().context, cache.layout().mtp_ring)?;
         let components = self.cache_components(cache, sequence)?;
         let inputs = [self.input.planes[4].buffer, self.input.planes[5].buffer];
         cache.busy[sequence as usize].set(true);
@@ -385,7 +385,7 @@ impl<'a> StageOwner<'a> {
         let element = if self.stage == 0 { 2 } else { 4 };
         let target = self.input.planes[5].buffer;
         let ring = cuteafd_core::prefix::AppendRing { window: cache.layout().mtp_hidden_rows
-            - cache.layout().ring.step, step: cache.layout().ring.step, rows: cache.layout().mtp_hidden_rows };
+            - cache.layout().step_rows, step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows };
         self.stream.device.run(|| {
             for run in ring.runs(base, rows as u64).context("Step-5 predictor source history extent")? {
                 let input = slice(source, run.slot as usize * H * element, run.rows as usize * H * element)?;
@@ -510,7 +510,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
             compact.enqueue(stream, projected, rows, 64)?
         } else { projected };
         let row_bytes = owner.kv_format.plane_record_bytes(4, 192);
-        for run in self.cache.layout().ring.proposal(self.coordinates.base, rows as u64)
+        for run in self.cache.layout().mtp_ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor proposal ring")? {
             for (target, source) in self.components[..2].iter().copied().zip(projected) {
                 let source = slice(source, run.offset as usize * row_bytes, run.rows as usize * row_bytes)?;
@@ -528,11 +528,11 @@ impl<'e, 'a> StageStep<'e, 'a> {
                 extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64, kv_format: owner.kv_format },
             start: 0, key: self.components[0], value: self.components[1], summaries: None,
             table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
-            pages: self.cache.layout().ring.rows as usize / 64,
+            pages: self.cache.layout().mtp_ring.rows as usize / 64,
         })?;
         let history_ring = cuteafd_core::prefix::AppendRing {
-            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().ring.step,
-            step: self.cache.layout().ring.step, rows: self.cache.layout().mtp_hidden_rows };
+            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().step_rows,
+            step: self.cache.layout().step_rows, rows: self.cache.layout().mtp_hidden_rows };
         for run in history_ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor own history ring")? {
             let source = slice(owner.attention.output(), run.offset as usize * H * 4, run.rows as usize * H * 4)?;
@@ -852,7 +852,7 @@ mod tests {
         let cfg = Config::parse(&checkpoint)?;
         let kv_format: Qwen4KvCache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
-        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format)?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, 64, kv_format)?;
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
@@ -953,7 +953,7 @@ mod tests {
         let cfg = Config::parse(&checkpoint)?;
         let kv_format: Qwen4KvCache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
-        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format)?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, 64, kv_format)?;
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);

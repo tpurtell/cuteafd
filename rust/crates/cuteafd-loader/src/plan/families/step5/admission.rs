@@ -115,7 +115,7 @@ pub fn staging_bytes(layout: &Step5CacheLayout, rank: usize, sequences: usize) -
         .context("Step-5 staging rank")?
         .regions
         .len();
-    let step = usize::try_from(layout.ring.step)?;
+    let step = usize::try_from(layout.step_rows)?;
     let rows = retained_wave_rows(step, sequences)?;
     let regions = (step + 7) / 8;
     let metadata = regions
@@ -201,8 +201,8 @@ impl OnboardInputs {
     pub fn exl3(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, unit_rows: usize,
         mode: Onboard) -> Result<Option<Self>> {
         if catalog.exl3().is_none() || mode == Onboard::Layers(0) { return Ok(None); }
-        Ok(Some(Self { costs: crate::placement::exl3_onboard::expert_costs(catalog, false)?,
-            workspace: crate::placement::exl3_onboard::rtx_workspace(catalog, manifest, unit_rows as u64, 1)?,
+        Ok(Some(Self { costs: crate::placement::rtx_onboard::expert_costs(catalog, false)?,
+            workspace: crate::placement::rtx_onboard::expert_workspace(catalog, manifest, unit_rows as u64, 1, "step5")?,
             mode }))
     }
 }
@@ -454,7 +454,8 @@ fn admit_frozen(cfg: &Config, inputs: &RuntimeInputs, depth: usize,
         (initial, inputs.context.min(initial)),
         |tokens, &context| {
             let cache =
-                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.rows as u64, inputs.kv_format)?;
+                Step5CacheLayout::for_execution(cfg, &ownership, context, depth, inputs.unit_rows() as u64,
+                    inputs.rows as u64, inputs.kv_format)?;
             let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
             let marks = inputs.marks.slots(mark_bytes);
             let mut fixed = Vec::new();
@@ -889,7 +890,7 @@ mod tests {
             assert_eq!(candidate.cache.ranks[0].mtp_lengths.len(), 3);
             assert!(candidate.cache.ranks[1].mtp_lengths.is_empty());
             let expected = Step5CacheLayout::for_execution(&cfg, &candidate.ownership,
-                candidate.cache.context, 3, inputs.rows as u64, format)?;
+                candidate.cache.context, 3, inputs.unit_rows() as u64, inputs.rows as u64, format)?;
             assert_eq!(candidate.cache, expected);
             for rank in 0..2 {
                 let reservation = Reservation::new(&expected, rank, inputs.sequences as u64,
@@ -1064,7 +1065,7 @@ mod tests {
         assert_eq!(admission.cache.context, admission.placement.pool_tokens);
         assert_eq!(config().max_context, EXTENT);
         let initial =
-            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
+            Step5CacheLayout::for_execution(&config(), &admission.ownership, EXTENT, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16)?;
         assert!(initial.ranks[0].bytes > admission.cache.ranks[0].bytes);
         Ok(())
     }

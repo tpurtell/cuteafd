@@ -282,7 +282,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
         let dir = snapshot(quant);
         let cp = Checkpoint::open(dir.path()).unwrap();
         let cfg = Config::parse(&cp).unwrap();
-        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
+        let diagnostic = Step5CacheLayout::new(&cfg, 1, 1024, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
         // Exercise unequal owner counts, a rank with no CSA, and owned SWA.
         for (ranks, policy) in [(1, 0), (2, 0), (2, 1), (2, 2)] {
             let modes: Vec<_> = (0..cfg.layers).map(|l| {
@@ -300,7 +300,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             let head = if ranks == 1 { 0 } else { 1 };
             let owners = ExecutionOwnership::new(&cfg, ranks, ownership::plan(&modes, 0, head)).unwrap();
             assert_eq!(owners.routed_endpoints().unwrap(), 1);
-            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
+            let layout = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             assert_eq!(layout.geometry.placement, if ranks == 1 { KvPlacement::SingleDevice }
                 else { KvPlacement::PartitionedLayers });
             assert_eq!(layout.geometry.ranks.iter().map(|r| r.persistent_unit_bytes).sum::<u64>(),
@@ -390,7 +390,7 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
                     assert_eq!(layout.csa_tail_bytes(rank, frontier % 64).unwrap(), cost.persistent_unit_bytes / 64 * (frontier % 64));
                 }
             }
-            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
+            let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
             for (rank, state) in mtp.ranks.iter().enumerate() {
                 assert_eq!(state.mtp_hidden.is_some(), rank == head as usize);
                 assert_eq!(state.mtp_stage_hidden.len(), if rank == head as usize { 3 } else { 0 });
@@ -425,7 +425,7 @@ fn execution_ownership_refuses_unbound_modes_and_checkpoint_changes() {
     let mut changed = cfg.clone();
     changed.full[3] = false;
     assert!(owners.validate_config(&changed).is_err());
-    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
+    assert!(crate::serving_capacity::step5::Step5CacheLayout::for_execution(&changed, &owners, 1024, 0, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).is_err());
 }
 
 #[test]
@@ -491,7 +491,7 @@ fn predictor_histories_are_private_charged_and_snapshotted_without_append_slack(
     let cfg = Config::parse(&cp).unwrap();
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
     for depth in 0..=3 {
-        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256, kv_format).unwrap();
+        let layout = Step5CacheLayout::new(&cfg, 2, 1 << 20, depth, 256, 256, kv_format).unwrap();
         let state = &layout.ranks[0];
         assert_eq!(state.mtp_stage_hidden.len(), depth);
         assert!(layout.ranks[1].mtp_stage_hidden.is_empty());
@@ -542,7 +542,7 @@ fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
     let cp = Checkpoint::open(dir.path()).unwrap();
     let cfg = Config::parse(&cp).unwrap();
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
-    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format).unwrap();
+    let layout = Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, 64, kv_format).unwrap();
     let state = &layout.ranks[0];
     for stages in [[600, 0, 0], [600, 598, 0], [600, 598, 597]] {
         let copies = layout.snapshot_copies(0, 603, &stages, 1, 0, 1, 0).unwrap();
@@ -586,7 +586,7 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
     let cfg = Model::open(&cp).unwrap().cfg;
     for kv_format in [crate::families::qwen4::Qwen4KvCache::Bf16, crate::families::qwen4::Qwen4KvCache::Fp8] {
     for ranks in [1, 2] {
-        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64, kv_format).unwrap();
+        let layout = Step5CacheLayout::new(&cfg, ranks, 1 << 20, 3, 64, 64, kv_format).unwrap();
         assert_eq!(layout.mtp_hidden_rows, 640);
         assert_eq!(layout.ranks[0].mtp_stage_hidden.len(), 3);
         assert!(layout.ranks[0].mtp_stage_hidden.iter().all(|span| span.bytes == 640 * 4096 * 4));
@@ -676,9 +676,9 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         assert!(layout.snapshot_copies(0, 0, &[0; 3], 3, 0, 4, 4).is_err());
         assert!(layout.snapshot_copies(0, 0, &[0; 3], u64::MAX, 0, 4, 0).is_err());
     }
-    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64, kv_format).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64, kv_format).is_err());
-    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 3, 1024, 0, 64, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 0, 0, 64, 64, kv_format).is_err());
+    assert!(Step5CacheLayout::new(&cfg, 1, 1024, 4, 64, 64, kv_format).is_err());
     }
 }
 
@@ -1609,4 +1609,91 @@ fn exl3_card_columns_fit_from_headers() {
             report.wip_launchable(), report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
     }
     assert!(fit(2, 6).wip_launchable());
+}
+
+
+/// Host model of Step's target SWA order on one lane: each unit's K/V are
+/// staged into the ring (`AppendRing::proposal`), then every row at position p
+/// reads tokens p-511..=p through the ring page table (slot = token % rows),
+/// then the next unit stages. A ring of window + one unit returns exactly the
+/// staged keys for every read, at every unit size and split, across wraps, and
+/// a restore of the visible window into a fresh ring reads identically.
+#[test]
+fn swa_ring_of_one_unit_reads_every_window_exactly_and_restores_byte_identically() {
+    use crate::serving_capacity::step5::swa_ring;
+    let key = |token: u64| token.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    for unit in [1u64, 63, 64, 65, 511, 512, 513, 2048, 2752, 4096] {
+        let ring = swa_ring(512, unit).unwrap();
+        assert_eq!(ring.rows, (512 + unit).next_multiple_of(64));
+        for total in [unit, 2 * unit + 17, 3 * unit, 5 * unit + 1] {
+            let mut slots = vec![0u64; ring.rows as usize];
+            let mut restored: Option<(u64, Vec<u64>)> = None;
+            let mut base = 0;
+            while base < total {
+                let rows = unit.min(total - base);
+                for run in ring.proposal(base, rows).unwrap() {
+                    for i in 0..run.rows { slots[(run.slot + i) as usize] = key(base + run.offset + i); }
+                }
+                for p in base..base + rows {
+                    for token in p.saturating_sub(511)..=p {
+                        assert_eq!(slots[(token % ring.rows) as usize], key(token),
+                            "unit {unit} total {total} row {p} token {token}");
+                    }
+                }
+                base += rows;
+                // A mark at this unit boundary: copy the visible window only.
+                if restored.is_none() && base < total {
+                    let mut fresh = vec![0u64; ring.rows as usize];
+                    for run in ring.visible(base) {
+                        for i in 0..run.rows { fresh[(run.slot + i) as usize] = slots[(run.slot + i) as usize]; }
+                    }
+                    restored = Some((base, fresh));
+                }
+            }
+            // Replay the rest from the restored mark: every read is identical.
+            if let Some((mark, mut fresh)) = restored {
+                let mut base = mark;
+                while base < total {
+                    let rows = unit.min(total - base);
+                    for run in ring.proposal(base, rows).unwrap() {
+                        for i in 0..run.rows { fresh[(run.slot + i) as usize] = key(base + run.offset + i); }
+                    }
+                    for p in base..base + rows {
+                        for token in p.saturating_sub(511)..=p {
+                            assert_eq!(fresh[(token % ring.rows) as usize], key(token));
+                        }
+                    }
+                    base += rows;
+                }
+                // Everything a later read can reach (the visible window) is
+                // identical; slots outside it are never read and may differ.
+                for run in ring.visible(total) {
+                    let range = run.slot as usize..(run.slot + run.rows) as usize;
+                    assert_eq!(fresh[range.clone()], slots[range], "restored replay differs at unit {unit} total {total}");
+                }
+            }
+        }
+        // One row more than a unit has no proposal: the ring fails closed.
+        assert!(ring.proposal(0, unit + 1).is_none());
+    }
+}
+
+/// The target SWA ring is one unit, whatever the prefill reserve; predictor
+/// rings, the hidden history and staging follow the step rows.
+#[test]
+fn target_ring_is_one_unit_and_the_reserve_only_sizes_step_storage() {
+    use crate::serving_capacity::step5::{swa_ring, Step5CacheLayout};
+    let fixture = exl3_snapshot();
+    let cfg = Config::parse(&Checkpoint::open(fixture.path()).unwrap()).unwrap();
+    let fp8 = crate::families::qwen4::Qwen4KvCache::Fp8;
+    let one = Step5CacheLayout::new(&cfg, 1, 1 << 20, 3, 2752, 2752, fp8).unwrap();
+    let reserve = Step5CacheLayout::new(&cfg, 1, 1 << 20, 3, 2752, 3 * 2752, fp8).unwrap();
+    assert_eq!(one.ring, swa_ring(512, 2752).unwrap());
+    assert_eq!(reserve.ring, one.ring);
+    assert_eq!((reserve.step_rows, reserve.mtp_ring.step), (3 * 2752, 3 * 2752));
+    assert!(reserve.mtp_hidden_rows > one.mtp_hidden_rows);
+    let target = |layout: &Step5CacheLayout| layout.ranks[0].sliding.iter().filter(|r| !r.mtp)
+        .map(|r| r.key.bytes + r.value.bytes).sum::<u64>();
+    assert_eq!(target(&reserve), target(&one));
+    assert!(Step5CacheLayout::new(&cfg, 1, 1 << 20, 0, 4096, 2048, fp8).is_err());
 }

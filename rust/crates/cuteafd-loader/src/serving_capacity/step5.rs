@@ -69,8 +69,24 @@ pub struct Step5CacheLayout {
     pub context: u64,
     pub kv_format: Qwen4KvCache,
     pub mtp_hidden_rows: u64,
+    /// Target SWA rings: [`swa_ring`] of one prefill unit.
     pub ring: cuteafd_core::prefix::AppendRing,
+    /// Predictor SWA rings: a predictor appends a whole step in one call.
+    pub mtp_ring: cuteafd_core::prefix::AppendRing,
+    /// Rows one step may carry (the prefill reserve): staging and step admission.
+    pub step_rows: u64,
     window: u64,
+}
+
+/// The target SWA ring: `window + unit_rows`, page aligned. A unit's K/V are
+/// staged into the ring before its attention reads them (`Step::stage`, then
+/// `Step::attend`, in order on one lane stream), so the ring holds the window
+/// plus the rows of one unit. Units of a sequence stage, attend and commit in
+/// order on that stream, so a whole multi-unit step never occupies the ring at
+/// once: sizing by the prefill reserve only wastes memory. The cache layout,
+/// staging, step metadata (ring page tables) and the planner all read this.
+pub fn swa_ring(window: u64, unit_rows: u64) -> Option<cuteafd_core::prefix::AppendRing> {
+    cuteafd_core::prefix::AppendRing::new(window, unit_rows, PAGE_ROWS)
 }
 
 fn invalid(what: &'static str) -> CacheGeometryError {
@@ -101,21 +117,27 @@ impl RankState {
 
 impl Step5CacheLayout {
     /// Selected K/V, BF16 pending K/Z, E4M3 dense summaries; recurrence stays F32.
-    pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64,
+    /// `unit_rows` sizes the target SWA rings ([`swa_ring`]); `step_rows` (at
+    /// least one unit) sizes staging, predictor rings and the hidden history.
+    pub fn new(cfg: &Config, ranks: usize, context: u64, mtp: usize, unit_rows: u64, step_rows: u64,
         kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
-        Self::build(cfg, ranks, context, mtp, max_step, kv_format, None)
+        Self::build(cfg, ranks, context, mtp, unit_rows, step_rows, kv_format, None)
     }
 
     /// The serving candidate uses the same validated ownership as its weights.
     /// This storage contract alone does not admit execution or serving.
     pub fn for_execution(cfg: &Config, ownership: &crate::plan::families::step5::ownership::ExecutionOwnership,
-        context: u64, mtp: usize, max_step: u64, kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
+        context: u64, mtp: usize, unit_rows: u64, step_rows: u64, kv_format: Qwen4KvCache) -> Result<Self, CacheGeometryError> {
         ownership.validate_config(cfg).map_err(|_| invalid("ownership/checkpoint geometry"))?;
-        Self::build(cfg, ownership.ranks(), context, mtp, max_step, kv_format, Some(ownership))
+        Self::build(cfg, ownership.ranks(), context, mtp, unit_rows, step_rows, kv_format, Some(ownership))
     }
 
-    fn build(cfg: &Config, ranks: usize, context: u64, mtp: usize, max_step: u64,
+    #[allow(clippy::too_many_arguments)]
+    fn build(cfg: &Config, ranks: usize, context: u64, mtp: usize, unit_rows: u64, step_rows: u64,
         kv_format: Qwen4KvCache, ownership: Option<&crate::plan::families::step5::ownership::ExecutionOwnership>) -> Result<Self, CacheGeometryError> {
+        if unit_rows == 0 || unit_rows > step_rows {
+            return Err(invalid("prefill unit outside the step rows"));
+        }
         if ![1, 2].contains(&ranks) || cfg.groups % ranks != 0 || cfg.heads % ranks != 0
             || (cfg.window, cfg.groups, cfg.dim, cfg.hidden) != (512, 4, 192, 4096)
             || cfg.full.len() != cfg.layers + cfg.mtp || cfg.layers != 92
@@ -129,14 +151,15 @@ impl Step5CacheLayout {
         let capacity = context.div_ceil(REGION_ROWS);
         let mtp_owner = ownership.map_or(0, |o| usize::from(o.execution().spec().head_gpu));
         let window = cfg.window as u64;
-        let ring = cuteafd_core::prefix::AppendRing::new(window, max_step, PAGE_ROWS)
-            .ok_or_else(|| invalid("append-only ring step or extent"))?;
+        let ring = swa_ring(window, unit_rows).ok_or_else(|| invalid("append-only ring step or extent"))?;
+        let mtp_ring = cuteafd_core::prefix::AppendRing::new(window, step_rows, PAGE_ROWS)
+            .ok_or_else(|| invalid("predictor ring step or extent"))?;
         // Preserve the old frontier while appending a complete uncommitted wave,
         // including the teacher shift through all predictor stages.
         let mtp_hidden_rows = if mtp == 0 { 0 } else {
             let history_window = window.checked_add(mtp as u64 + 1)
                 .ok_or(CacheGeometryError::Overflow("Step-5 MTP history window"))?;
-            cuteafd_core::prefix::AppendRing::new(history_window, max_step, PAGE_ROWS)
+            cuteafd_core::prefix::AppendRing::new(history_window, step_rows, PAGE_ROWS)
                 .ok_or_else(|| invalid("MTP append-only history extent"))?.rows
         };
         let mut states = Vec::with_capacity(ranks);
@@ -179,7 +202,7 @@ impl Step5CacheLayout {
             if rank == mtp_owner && mtp > 0 {
                 for stage in 0..mtp {
                     state.ring(cfg.layers + stage, true, cfg.heads,
-                        mul(&[ring.rows, kv_format.plane_record_bytes(cfg.groups, cfg.dim) as u64])?)?;
+                        mul(&[mtp_ring.rows, kv_format.plane_record_bytes(cfg.groups, cfg.dim) as u64])?)?;
                     let length = state.reserve(8)?;
                     state.mtp_lengths.push(length);
                     let hidden = state.reserve(mul(&[mtp_hidden_rows, cfg.hidden as u64, 4])?)?;
@@ -205,7 +228,7 @@ impl Step5CacheLayout {
                     else { KvPlacement::PartitionedHeads },
                 ranks: costs,
             },
-            context, kv_format, mtp_hidden_rows, ring, window,
+            context, kv_format, mtp_hidden_rows, ring, mtp_ring, step_rows, window,
         })
     }
 
@@ -250,9 +273,10 @@ impl Step5CacheLayout {
         for ring in &state.sliding {
             let end = if ring.mtp { *stages.get(ring.layer - 92)
                 .ok_or_else(|| invalid("snapshot predictor stage"))? } else { frontier };
+            let layout = if ring.mtp { self.mtp_ring } else { self.ring };
             for component in [ring.key, ring.value] {
-                let row = component.bytes / self.ring.rows;
-                for run in self.ring.visible(end) {
+                let row = component.bytes / layout.rows;
+                for run in layout.visible(end) {
                     parts.push((component, run.slot * row, run.offset * row, run.rows * row));
                 }
             }
@@ -272,7 +296,7 @@ impl Step5CacheLayout {
         if let Some(target) = state.mtp_hidden {
             let history = cuteafd_core::prefix::AppendRing {
                 window: self.window + stages.len() as u64 + 1,
-                step: self.ring.step, rows: self.mtp_hidden_rows,
+                step: self.step_rows, rows: self.mtp_hidden_rows,
             };
             for (component, end) in std::iter::once((target, frontier))
                 .chain(state.mtp_stage_hidden.iter().copied().zip(stages.iter().copied())) {

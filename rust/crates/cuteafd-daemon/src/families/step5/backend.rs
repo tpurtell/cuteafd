@@ -332,8 +332,8 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             let cache = self.ranks[head_rank].borrow();
             if let Some(history) = cache.layout().ranks[head_rank].mtp_hidden {
                 let ring = cuteafd_core::prefix::AppendRing {
-                    window: cache.layout().mtp_hidden_rows - cache.layout().ring.step,
-                    step: cache.layout().ring.step, rows: cache.layout().mtp_hidden_rows,
+                    window: cache.layout().mtp_hidden_rows - cache.layout().step_rows,
+                    step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows,
                 };
                 for sequence in &descriptors {
                     let target = cache.request_component(history, sequence.sequence)?;

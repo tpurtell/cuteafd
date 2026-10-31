@@ -33,7 +33,8 @@ EXL3_CAPACITIES = "1,16,80,256,1024,2048,2752,4096"
 EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
-                     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
+                     "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4",
+                     "step5", "step5_nvfp4", "step5_bf16")
 EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3")
 
 
