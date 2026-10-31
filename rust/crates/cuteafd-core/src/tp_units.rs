@@ -26,6 +26,18 @@ pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
         "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
 }
 
+/// A frozen (deprecated) format's admitted Spark worlds: the cards it shipped
+/// or was admitted on before it froze. Its packaged worlds may be wider (a
+/// historical role or a tail sibling's layout), but a frozen format never
+/// admits a new world. `None` for formats that are not frozen.
+pub fn frozen_admitted_worlds(family: &str, format: &str) -> Option<Vec<usize>> {
+    let format = if format.starts_with("exl3") { "exl3" } else { format.strip_suffix("a4").unwrap_or(format) };
+    let entry = spark_package_entry(&format!("{family}:{format}"));
+    (entry["deprecated"].as_bool() == Some(true)).then(|| entry["admitted_worlds"].as_array()
+        .expect("a frozen package range names its admitted worlds").iter()
+        .filter_map(|world| world.as_u64().map(|world| world as usize)).collect())
+}
+
 /// Descriptor ABI and stored columns determine code, not rank identity.
 pub fn package_width_keys(intermediate: usize, unit: usize, world: usize,
     exl3: bool, native: bool, nvfp4: bool) -> Vec<(bool, usize)> {
