@@ -66,7 +66,8 @@ fn exl3_publication_form_passes_the_contract() {
     assert_eq!(component(&report, Component::RoutedExpert).formats.get("exl3-k4"), Some(&(71 * 128 * 3)));
     let experts = report.experts.as_ref().expect("an expert package contract");
     assert_eq!(experts.package, PACKAGE);
-    assert_eq!(experts.spark_worlds, [2, 3, 4, 6]);
+    // The width-class package range (spark-package-ranges.json `ml4:exl3`).
+    assert_eq!(experts.spark_worlds, [5, 6, 7, 8]);
 }
 
 #[test]
