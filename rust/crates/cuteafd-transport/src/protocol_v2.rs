@@ -47,6 +47,11 @@ pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR: u32 = 1 << 17;
 // the debug checksum, which occupies those bytes.
 pub const EXPERT_PROTOCOL_V2_FLAG_RESPONSE_UNIT_PACE: u32 = 1 << 19;
 pub const EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION: u32 = 1 << 11;
+/// Per-expert partial replies (models whose experts carry a per-expert output
+/// norm): the worker returns each routed (row, slot)'s unweighted partial in the
+/// region each row's descriptor names (BF16, or the request's wide format), and
+/// the coordinator combines them. A per-request capability; echoed in responses.
+pub const EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES: u32 = 1 << 20;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT: u32 = 12;
 const EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK: u32 =
     0x0f << EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_SHIFT;
@@ -356,6 +361,96 @@ pub struct ExpertProtocolV2Request {
     pub rows: Vec<ExpertProtocolV2RowDescriptor>,
     pub routes: Vec<ExpertProtocolV2RouteEntry>,
     pub hidden_payload: Bytes,
+    /// Per-expert partial replies: set exactly when the flag is.
+    pub partial: Option<PartialReplyPlan>,
+}
+
+/// The wide partial format (rows outside the BF16 region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartialWire {
+    /// E2M1 values with an E4M3 scale per 16 (record `E/2 + E/16` bytes).
+    Nvfp4 = 1,
+    /// E4M3 values with a UE8M0 scale per 32 (record `E + E/32` bytes).
+    Fp8 = 2,
+}
+
+impl PartialWire {
+    pub fn from_u16(value: u16) -> Result<Self> {
+        match value { 1 => Ok(Self::Nvfp4), 2 => Ok(Self::Fp8),
+            other => bail!("ExpertProtocolV2 partial wide format {other} is neither nvfp4 (1) nor fp8 (2)") }
+    }
+    pub fn record_bytes(self, width: usize) -> usize {
+        match self { Self::Nvfp4 => width / 2 + width / 16, Self::Fp8 => width + width / 32 }
+    }
+}
+
+/// Region of every request row (0: BF16, 1: wide), computed by the coordinator
+/// and carried in each row descriptor; the worker never derives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialReplyPlan {
+    pub wide: PartialWire,
+    pub regions: Vec<u8>,
+}
+
+/// The response payload extent a header implies: `rows x stride` for ordinary
+/// responses; for partial replies the stride is 0 and the payload is the
+/// requester's region layout (`PartialReplyPlan::payload`), which only the
+/// requester can size exactly, so it is checked there.
+pub(crate) fn response_payload_bytes(header: &ExpertProtocolV2ResponseHeader) -> Result<Option<usize>> {
+    if header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 {
+        if header.output_row_stride_bytes != 0 {
+            bail!("ExpertProtocolV2 partial reply must have row stride 0");
+        }
+        if header.flags & (EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_MORE_CHUNKS) != 0 {
+            bail!("ExpertProtocolV2 partial reply is never row-indexed or chunked");
+        }
+        return Ok(None);
+    }
+    if header.output_dim == 0 {
+        bail!("ExpertProtocolV2 response output_dim must be non-zero");
+    }
+    let logical_row_bytes = header.output_dtype.row_bytes(header.output_dim as usize)
+        .context("ExpertProtocolV2 response output row byte count")?;
+    let stride = header.output_row_stride_bytes as usize;
+    if stride < logical_row_bytes {
+        bail!("ExpertProtocolV2 response output row stride bytes {stride} smaller than logical row bytes {logical_row_bytes}");
+    }
+    Ok(Some((header.row_count as usize).checked_mul(stride)
+        .context("ExpertProtocolV2 response output payload byte count overflow")?))
+}
+
+/// Payload alignment of each partial region.
+pub const EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN: usize = 256;
+
+impl PartialReplyPlan {
+    pub fn validate(&self, rows: usize) -> Result<()> {
+        if self.regions.len() != rows {
+            bail!("ExpertProtocolV2 partial plan has {} region bits for {rows} rows", self.regions.len());
+        }
+        if let Some(bad) = self.regions.iter().find(|&&r| r > 1) {
+            bail!("ExpertProtocolV2 partial region bit {bad} is neither 0 (BF16) nor 1 (wide)");
+        }
+        Ok(())
+    }
+
+    /// (BF16 rows, wide rows).
+    pub fn counts(&self) -> (usize, usize) {
+        let wide = self.regions.iter().filter(|&&r| r == 1).count();
+        (self.regions.len() - wide, wide)
+    }
+
+    /// Reply payload: the BF16 region then the wide region, each 256-byte aligned.
+    /// `(bf16 bytes, wide offset, wide bytes, total)`.
+    pub fn payload(&self, topk: usize, width: usize) -> Result<(usize, usize, usize, usize)> {
+        let (bf16_rows, wide_rows) = self.counts();
+        let bf16 = bf16_rows.checked_mul(topk).and_then(|n| n.checked_mul(width * 2))
+            .context("partial BF16 region overflow")?;
+        let wide_at = bf16.next_multiple_of(EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN);
+        let wide = wide_rows.checked_mul(topk).and_then(|n| n.checked_mul(self.wide.record_bytes(width)))
+            .context("partial wide region overflow")?;
+        let total = if wide == 0 { bf16 } else { wide_at.checked_add(wide).context("partial payload overflow")? };
+        Ok((bf16, wide_at, wide, total))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -530,9 +625,11 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
                 | EXPERT_PROTOCOL_V2_FLAG_SPARK_REDUCTION
                 | EXPERT_PROTOCOL_V2_FLAG_SPARK_ROW_SHARDED_REDUCTION
                 | EXPERT_PROTOCOL_V2_SPARK_COLLECTIVE_PART_COUNT_MASK
+                | EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
         }
         "response" => {
-            EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
+            EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES
+                | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_CAPACITY_ERROR
                 | EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM
                 | EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16
                 | EXPERT_PROTOCOL_V2_FLAG_RESPONSE_ROW_INDICES
@@ -584,6 +681,11 @@ fn validate_flags(flags: u32, label: &str) -> Result<()> {
         {
             bail!("ExpertProtocolV2 precompile warmup cannot use streamed ingress frames");
         }
+        if flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 && (stream_plan_enabled(flags)
+            || stream_data_enabled(flags) || spark_reduction_enabled(flags)
+            || response_fp8_e4m3_row_scaled_enabled(flags) || response_nvfp4_e2m1_fp8_e4m3_enabled(flags)) {
+            bail!("ExpertProtocolV2 partial replies are whole-row requests with their own reply formats");
+        }
     }
     Ok(())
 }
@@ -632,15 +734,21 @@ fn validate_common_header(bytes: &[u8], expected_kind: u16) -> Result<usize> {
     Ok(read_u32(bytes, 12, "header_len")? as usize)
 }
 
-fn encode_row_descriptor(out: &mut Vec<u8>, row: &ExpertProtocolV2RowDescriptor) {
+fn encode_row_descriptor(out: &mut Vec<u8>, row: &ExpertProtocolV2RowDescriptor, region: u8) {
     push_u64(out, row.row_id);
     push_u16(out, row.source_kind as u16);
-    push_u16(out, 0);
+    // Partial-reply region of this row (0 without the flag).
+    push_u16(out, u16::from(region));
     push_u64(out, row.source_request_id);
     push_u64(out, row.token_position);
     push_u32(out, row.route_offset);
     push_u32(out, row.route_count);
     push_u32(out, 0);
+}
+
+/// The partial-reply region a row descriptor carries (byte +10).
+fn decode_row_region(bytes: &[u8], offset: usize) -> Result<u16> {
+    read_u16(bytes, offset + 10, "row_region")
 }
 
 fn decode_row_descriptor(bytes: &[u8], offset: usize) -> Result<ExpertProtocolV2RowDescriptor> {
@@ -683,7 +791,7 @@ fn payload_checksum(
     let mut scratch = Vec::with_capacity(EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN);
     for row in rows {
         scratch.clear();
-        encode_row_descriptor(&mut scratch, row);
+        encode_row_descriptor(&mut scratch, row, 0);
         hasher.update(&scratch);
     }
     scratch.reserve(EXPERT_PROTOCOL_V2_ROUTE_ENTRY_LEN);

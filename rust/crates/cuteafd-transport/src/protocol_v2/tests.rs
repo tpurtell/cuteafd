@@ -1789,3 +1789,103 @@ fn mapped_request_padding_aligns_odd_rows_and_sparse_routes() -> Result<()> {
     assert!(expert_request_payload_offset(usize::MAX, 40, 12).is_none());
     Ok(())
 }
+
+#[test]
+fn partial_reply_regions_ride_in_reserved_fields_and_round_trip() -> Result<()> {
+    let regions = vec![0, 0, 1, 1, 1, 0];
+    let plain = request(6, ExpertV2SourceKind::Prefill)?;
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: regions.clone() })?;
+    assert_ne!(partial.header.flags & EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES, 0);
+    let mut bytes = Vec::new();
+    partial.encode_into(&mut bytes)?;
+    let decoded = ExpertProtocolV2Request::decode(&bytes)?;
+    assert_eq!(decoded.partial, Some(PartialReplyPlan { wide: PartialWire::Nvfp4, regions }));
+    assert_eq!(decoded, partial);
+    // The wide format sits in the header's reserved u16; row regions in each descriptor's.
+    assert_eq!(u16::from_le_bytes([bytes[46], bytes[47]]), 1);
+    let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
+    assert_eq!(u16::from_le_bytes([bytes[header_len + 2 * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 10],
+        bytes[header_len + 2 * EXPERT_PROTOCOL_V2_ROW_DESCRIPTOR_LEN + 11]]), 1);
+    // Without the flag the reserved fields stay zero and decode unchanged (other families byte-identical).
+    let mut plain_bytes = Vec::new();
+    plain.encode_into(&mut plain_bytes)?;
+    assert_eq!(ExpertProtocolV2Request::decode(&plain_bytes)?.partial, None);
+    let fp8 = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1; 6] })?;
+    let mut fp8_bytes = Vec::new();
+    fp8.encode_into(&mut fp8_bytes)?;
+    assert_eq!(ExpertProtocolV2Request::decode(&fp8_bytes)?.partial.unwrap().wide, PartialWire::Fp8);
+    Ok(())
+}
+
+#[test]
+fn malformed_partial_region_data_is_refused() -> Result<()> {
+    let plain = request(4, ExpertV2SourceKind::Decode)?;
+    // Wrong bit count, a bit that is neither 0 nor 1, an unknown wide format.
+    assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 3] }).is_err());
+    assert!(plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 2, 0, 0] }).is_err());
+    let partial = plain.clone().with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] })?;
+    let mut bytes = Vec::new();
+    partial.encode_into(&mut bytes)?;
+    let header_len = EXPERT_PROTOCOL_V2_REQUEST_HEADER_LEN;
+    let mut corrupt = bytes.clone();
+    corrupt[header_len + 10] = 2;
+    assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "region bit 2");
+    let mut corrupt = bytes.clone();
+    corrupt[46] = 3;
+    assert!(ExpertProtocolV2Request::decode(&corrupt).is_err(), "wide format 3");
+    // A request without the flag carrying region data or a wide format is refused.
+    let mut plain_bytes = Vec::new();
+    plain.encode_into(&mut plain_bytes)?;
+    let mut stray = plain_bytes.clone();
+    stray[header_len + 10] = 1;
+    assert!(ExpertProtocolV2Request::decode(&stray).is_err(), "stray region bit");
+    let mut stray = plain_bytes.clone();
+    stray[46] = 1;
+    assert!(ExpertProtocolV2Request::decode(&stray).is_err(), "stray wide format");
+    // The flag and the plan must agree.
+    let mut flagged = plain.clone();
+    flagged.header.flags |= EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+    assert!(flagged.validate().is_err());
+    let mut planned = plain.clone();
+    planned.partial = Some(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] });
+    assert!(planned.validate().is_err());
+    // Partial replies are whole-row requests: no Spark reduction or low-precision combined reply.
+    assert!(plain.clone().with_spark_reduction()
+        .with_partial_replies(PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0; 4] }).is_err());
+    Ok(())
+}
+
+#[test]
+fn partial_reply_payload_is_two_aligned_regions_with_stride_zero() -> Result<()> {
+    let plan = PartialReplyPlan { wide: PartialWire::Nvfp4, regions: vec![0, 1, 1] };
+    let (bf16, wide_at, wide, total) = plan.payload(8, 4096)?;
+    assert_eq!((bf16, wide), (8 * 8192, 2 * 8 * 2304));
+    assert_eq!(wide_at % EXPERT_PROTOCOL_V2_PARTIAL_REGION_ALIGN, 0);
+    assert_eq!(total, wide_at + wide);
+    let bf16_only = PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![0; 2] };
+    assert_eq!(bf16_only.payload(8, 4096)?.3, 2 * 8 * 8192);
+    assert_eq!(PartialReplyPlan { wide: PartialWire::Fp8, regions: vec![1] }.payload(8, 4096)?.2, 8 * 4224);
+    // A partial response has stride 0 and is never read per row.
+    let mut response = ExpertProtocolV2Response::new_with_output_stride(42, 7, 13, 3, 4096, ExpertV2Dtype::Bf16,
+        8192, ExpertProtocolV2Status::Ok, vec![0; 3 * 8192])?;
+    response.header.flags |= EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+    response.header.output_row_stride_bytes = 0;
+    response.header.output_payload_bytes = total as u64;
+    response.partial_output_payload = vec![0; total].into();
+    response.validate()?;
+    let mut bytes = Vec::new();
+    response.encode_into(&mut bytes)?;
+    let decoded = ExpertProtocolV2Response::decode(&bytes)?;
+    assert_eq!(decoded.partial_output_payload.len(), total);
+    let view = ExpertProtocolV2ResponseView::parse(&bytes)?;
+    assert!(view.partial_output_row_payload(0).is_err());
+    // An ordinary response with stride 0 is still refused.
+    let mut ordinary = response.clone();
+    ordinary.header.flags &= !EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES;
+    assert!(ordinary.validate().is_err());
+    // A partial reply with a nonzero stride is refused.
+    let mut strided = response.clone();
+    strided.header.output_row_stride_bytes = 8192;
+    assert!(strided.validate().is_err());
+    Ok(())
+}

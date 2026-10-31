@@ -550,17 +550,7 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 pace,
         };
         header.validate_row_capacity_error()?;
-        if header.output_dim == 0 {
-            bail!("ExpertProtocolV2 response output_dim must be non-zero");
-        }
-        let logical_row_bytes = header
-            .output_dtype
-            .row_bytes(header.output_dim as usize)
-            .context("ExpertProtocolV2 response output row byte count")?;
-        if (header.output_row_stride_bytes as usize) < logical_row_bytes {
-            bail!("ExpertProtocolV2 response output row stride is smaller than a row");
-        }
-        let expected = u64::from(row_count) * u64::from(header.output_row_stride_bytes);
+        let expected = super::response_payload_bytes(&header)?.map_or(output_payload_bytes, |bytes| bytes as u64);
         if expected != output_payload_bytes
             || wire_bytes != header_len as u64 + output_payload_bytes
         {
@@ -611,6 +601,9 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 "ExpertProtocolV2 response row index {index} exceeds row count {}",
                 self.header.row_count
             );
+        }
+        if self.header.flags & super::EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES != 0 {
+            bail!("ExpertProtocolV2 partial reply has no per-row output; read its regions");
         }
         let stride = self.header.output_row_stride_bytes as usize;
         let start = index
@@ -677,25 +670,8 @@ impl<'a> ExpertProtocolV2ResponseView<'a> {
                 bail!("ExpertProtocolV2 response row indices must be unique within a chunk");
             }
         }
-        if self.header.output_dim == 0 {
-            bail!("ExpertProtocolV2 response output_dim must be non-zero");
-        }
-        let logical_row_bytes = self
-            .header
-            .output_dtype
-            .row_bytes(self.header.output_dim as usize)
-            .context("ExpertProtocolV2 response output row byte count")?;
-        let output_row_stride_bytes = self.header.output_row_stride_bytes as usize;
-        if output_row_stride_bytes < logical_row_bytes {
-            bail!(
-                "ExpertProtocolV2 response output row stride bytes {} smaller than logical row bytes {}",
-                self.header.output_row_stride_bytes,
-                logical_row_bytes
-            );
-        }
-        let expected_payload = (self.header.row_count as usize)
-            .checked_mul(output_row_stride_bytes)
-            .context("ExpertProtocolV2 response output payload byte count overflow")?;
+        let expected_payload = super::response_payload_bytes(&self.header)?
+            .unwrap_or(self.partial_output_payload.len());
         if expected_payload != self.partial_output_payload.len() {
             bail!(
                 "ExpertProtocolV2 response output payload bytes mismatch: expected={} actual={}",
