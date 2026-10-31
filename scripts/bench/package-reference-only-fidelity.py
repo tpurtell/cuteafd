@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
 from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
+from fidelity_split import standard_layout
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
 POLICY_EXPECT = dict(top1_min=.90, kl_max=.06,
@@ -97,12 +98,11 @@ def require_new_set_generated_rows(rows):
 
 def standard_generated_rows(panel):
     """Report natural row counts using the consumer's fixed split, never resample."""
-    source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
+    from fidelity_split import standard_ids
     windows = {window['id']: window for window in panel['windows']}
     counts = {}
     for name in ('decode', 'prefill'):
-        match = re.search(r'pub const STANDARD_' + name.upper() + r':[^=]+=\s*\[(.*?)\];', source, re.S)
-        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
+        ids = standard_ids(panel['windows'], name)
         counts[name] = sum(window['roles'][window['score_from']:].count('gen')
                            for window in (windows[wid] for wid in ids))
     small, large = min(counts.values()), max(counts.values())
@@ -272,9 +272,9 @@ def package(source, out, config, tokenizer_path, license_path):
             and validation['set_sha256'] == seal['set_sha256'] == full_seal['set_sha256'] == meta['set_sha256'] == rows['set_sha256'] == set_id
             and validation['golden_seal_sha256'] == digest(source / 'golden-seal.json')
             and validation['full_seal_sha256'] == seal['full_seal_sha256'] == digest(source / 'full.sha256.json')
-            and validation['scored_tokens'] == meta['scored_tokens'] == 32768
+            and validation['scored_tokens'] == meta['scored_tokens'] == 512 * len(panel['windows'])
             and np.isfinite(meta['nll']) and abs(validation['nll'] - meta['nll']) <= 1e-8
-            and len(panel['windows']) == 64
+            and standard_layout(panel['windows'])
             and meta['mtp'] is False and meta['use_cache'] is False and meta['attention'] == 'eager'):
         raise ValueError('unsealed or mismatched oracle evidence')
     inventory = {e['path']: e for e in seal['files']}
@@ -312,7 +312,7 @@ def package(source, out, config, tokenizer_path, license_path):
     shutil.copyfile(license_path, destination / 'LICENSE')
     entries = {e['id']: e for e in rows['windows']}
     sealed_rows = {e['path']: e for e in full_seal['files']}
-    if len(entries) != 64 or set(entries) != {w['id'] for w in panel['windows']}:
+    if set(entries) != {w['id'] for w in panel['windows']} or len(entries) != len(panel['windows']):
         raise ValueError('oracle coverage differs')
     files = []
     for window in panel['windows']:

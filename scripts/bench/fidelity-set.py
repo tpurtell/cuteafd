@@ -156,27 +156,23 @@ def recipe_identity(recipe):
     return {**rules, "sha256": hashlib.sha256(canonical(rules)).hexdigest()}
 
 
-TOPUP_RULE = ("8-16K top-up (TJ 2026-10-31): the recipe's B loop continued past b11 with the same "
-              "prompt and target rule; top-up k goes to decode when k is even, prefill when odd")
+ORIGINAL_BLOCKS = {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10}
 
 
-def topup_halves(ids):
-    return {wid: ("decode" if k % 2 == 0 else "prefill") for k, wid in enumerate(ids)}
-
-
-def topup_record(windows, ids):
-    by_id = {w["id"]: w for w in windows}
-    if any(by_id[wid]["block"] != "B" for wid in ids):
-        raise ValueError("top-up windows must be B windows")
-    strata = {}
-    for w in windows:
-        key = "topup" if w["id"] in ids else "original"
-        strata.setdefault(key, {}).setdefault(w["bucket"], 0)
-        strata[key][w["bucket"]] += 1
-    return {"windows": ids, "halves": topup_halves(ids), "rule": TOPUP_RULE,
-            "reason": "new-set floor of 10,000 scored generated rows per standard half (target 10,200)",
-            "original_allocation": {"windows": 64, "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10}},
-            "strata": strata}
+def allocation_note(windows, ids):
+    """Plain metadata: why a set has more windows than the original allocation."""
+    from fidelity_split import standard_half
+    def strata(selected):
+        counts = {}
+        for w in selected:
+            counts[w["bucket"]] = counts.get(w["bucket"], 0) + 1
+        return dict(sorted(counts.items()))
+    added = [w for w in windows if w["id"] in ids]
+    return {"reason": "8-16K B windows added (TJ 2026-10-31) so each standard half reaches the new-set floor of "
+                      "10,000 scored generated rows (target 10,200); same B prompt/target rule continued past b11",
+            "added_windows": {wid: standard_half(wid) for wid in ids},
+            "original_blocks": ORIGINAL_BLOCKS, "original_strata": strata([w for w in windows if w["id"] not in ids]),
+            "added_strata": strata(added), "resulting_strata": strata(windows)}
 
 
 def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: dict,
@@ -490,9 +486,12 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
+    manifest["recipe"]["blocks"] = {block: sum(w["block"] == block for w in windows) for block in "ABCDE"}
+    manifest["recipe"]["windows"] = len(windows)
     if topup_b:
-        ids = [f"b{12 + k:02d}" for k in range(topup_b)]
-        manifest["topup"] = topup_record(windows, ids)
+        manifest["allocation_note"] = allocation_note(windows, [f"b{12 + k:02d}" for k in range(topup_b)])
+    from fidelity_split import standard_layout
+    standard_layout(windows)
     if recipe == "v2":
         manifest["recipe"].update(version=recipe_identity(recipe),
             prompt_roles="conditioning history and tool results ctx; this window's assistant turns gen")

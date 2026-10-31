@@ -461,15 +461,15 @@ def test_v2_scored_span_ends_at_the_best_turn_and_history_continues():
     assert manifest["recipe"]["version"]["scored_end"].startswith("assistant-turn end")
 
 
-def test_topup_appends_next_b_windows_and_records_halves():
+def test_topup_appends_next_b_windows_and_notes_allocation():
     probe = FakeAPI(generated=3000, calls=0)
     manifest = make_api_topup(probe, 3)
     ids = [w["id"] for w in manifest["windows"]]
     assert len(ids) == 67 and ids[ids.index("b11") + 1:ids.index("b11") + 4] == ["b12", "b13", "b14"]
-    top = manifest["topup"]
-    assert top["windows"] == ["b12", "b13", "b14"]
-    assert top["halves"] == {"b12": "decode", "b13": "prefill", "b14": "decode"}
-    assert top["strata"]["topup"] == {"8-16K": 3} and top["original_allocation"]["windows"] == 64
+    note = manifest["allocation_note"]
+    assert note["added_windows"] == {"b12": "decode", "b13": "prefill", "b14": "decode"}
+    assert note["added_strata"] == {"8-16K": 3} and note["original_blocks"]["B"] == 12
+    assert manifest["recipe"]["blocks"]["B"] == 15 and manifest["recipe"]["windows"] == 67
     with pytest.raises(ValueError, match="recipe v2"):
         make_api_topup(FakeAPI(), 1, recipe="v1")
 

@@ -39,7 +39,7 @@ pub fn builtin() -> Vec<Profile> {
             &["decode_content", "concurrency", "agentic", "tool_eval", "prefix_cache", "structured"]),
         p("quality", "Quality", "Tool eval, structured output, IFEval, code pass@1, math, long-context needle.",
             &QUALITY),
-        p("fidelity", "Fidelity", "Standard-v2: balanced 32 decode / 32 prefill windows; all 64 decode when prefill is not admitted.", &["fidelity"]),
+        p("fidelity", "Fidelity", "Standard-v2: sealed decode / prefill halves (32 / 32 for 64-window sets); all windows decode when prefill is not admitted.", &["fidelity"]),
         p("quant", "Quant check", "Quality panels that move with quantization: tool eval, IFEval, math, code.",
             &["tool_eval", "ifeval", "math", "code"]),
         p("long", "Long context", "Prefill to the model maximum, decode vs retained context, needle heatmap, \
