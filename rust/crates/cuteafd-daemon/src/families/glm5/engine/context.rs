@@ -35,7 +35,8 @@
 use super::*;
 use crate::shared::peer_split::context::{local_pages, page_owner, shard_rows, ContextExchange};
 use cuteafd_ffi::CuteafdDeviceBuffer;
-use cuteafd_loader::placement::families::glm5::{context_buffers, context_commit_pages, context_workspace, GlmContext};
+use cuteafd_loader::placement::families::glm5::{context_buffers, context_commit_pages, context_gather,
+    context_workspace, record_page_bytes, GlmContext};
 
 /// Bytes of an index page (64 x 128 E4M3 keys, then 64 FP32 scales).
 const INDEX_KEYS: usize = PAGE_ROWS * 128;
@@ -54,7 +55,8 @@ pub(super) struct ContextRank<'a> {
     gather: Dev<'a>,
     /// Per prefill lane: records, index keys and index scales, each as `[src | dst | bytes]` u64.
     commit: Vec<Dev<'a>>,
-    /// Two layer-parity views: `[pages, 64 x 656]` records, then `[pages, 8448]` index pages.
+    /// Two layer-parity views: `[pages, 64 x record]` records (the widest record over the
+    /// layers; each layer views its own pitch), then `[pages, 8448]` index pages.
     staging: [Dev<'a>; 2],
 }
 
@@ -65,8 +67,9 @@ pub(super) struct GlmContextSplit<'a> {
     pub exchange: ContextExchange<'a>,
     /// Logical pages one staging view holds: the compiled extent's.
     staging_pages: usize,
-    /// Per GPU, one immutable partial recipe for each head range.
-    partial: [[String; 2]; 2],
+    /// Per record contract (`cfg.attention_kinds()` order), per GPU, one immutable partial
+    /// recipe for each head range.
+    partial: Vec<[[String; 2]; 2]>,
     /// `lse_combine2`'s sink operand (unused without a sink; GLM 5.3 has none).
     sink: [Dev<'a>; 2],
 }
@@ -91,13 +94,16 @@ impl<'a> GlmContextSplit<'a> {
         ensure!(exchange.heads() == cfg.heads / 2 && exchange.topk() == cfg.index_topk, "context exchange geometry");
         let staging_pages = extent.div_ceil(PAGE_ROWS);
         let list = context_workspace(cfg, extent as u64, rows, lanes, context);
-        let mut partial: [[String; 2]; 2] = Default::default();
-        let rank = |rank: usize, partial: &mut [String; 2]| -> Result<(ContextRank<'a>, Dev<'a>)> {
+        let kinds = cfg.attention_kinds();
+        let mut partial: Vec<[[String; 2]; 2]> = vec![Default::default(); kinds.len()];
+        let rank = |rank: usize, partial: &mut Vec<[[String; 2]; 2]>| -> Result<(ContextRank<'a>, Dev<'a>)> {
             engine.on(rank, || {
                 let sms = engine.library.sm_count()?;
-                for (slot, begin) in partial.iter_mut().zip([0, cfg.heads / 2]) {
-                    *slot = cuteafd_core::coordinator_programs::attention_partial_program(
-                        manifest, "glm", begin, DECODE_ROWS, sms, &engine.attention_plan)?;
+                for (kind, slots) in kinds.iter().zip(partial.iter_mut()) {
+                    for (slot, begin) in slots[rank].iter_mut().zip([0, cfg.heads / 2]) {
+                        *slot = cuteafd_core::coordinator_programs::attention_partial_program_of(
+                            manifest, cfg.program_family(), kind, begin, DECODE_ROWS, sms, &engine.attention_plan)?;
+                    }
                 }
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-workspace");
                 let mut allocations = list.iter().map(|&(_, bytes)| engine.alloc(bytes as usize))
@@ -118,17 +124,15 @@ impl<'a> GlmContextSplit<'a> {
                 }
                 engine.library.cuda_zero_bytes(topk_scratch.buffer, topk_scratch.buffer.bytes)?;
                 let _scope = cuteafd_ffi::memory_ledger::scope("context-staging");
-                let view = staging_pages * (RECORD_PAGE_BYTES + INDEX_PAGE_BYTES);
+                let view = staging_pages * (record_page_bytes(cfg) as usize + INDEX_PAGE_BYTES);
                 let staging = [engine.alloc(view)?, engine.alloc(view)?];
                 // The sink operand is never read (no sink): a 256-byte floor allocation, uncharged.
                 let sink = engine.alloc(0)?;
                 Ok((ContextRank { candidates, own, peer, topk_scratch, partial_scratch, gather, commit, staging }, sink))
             })
         };
-        let [mut first, mut second] = partial.clone();
-        let (r0, s0) = rank(0, &mut first)?;
-        let (r1, s1) = rank(1, &mut second)?;
-        partial = [first, second];
+        let (r0, s0) = rank(0, &mut partial)?;
+        let (r1, s1) = rank(1, &mut partial)?;
         Ok(Self { ranks: [r0, r1], exchange, staging_pages, partial, sink: [s0, s1] })
     }
 
@@ -150,6 +154,14 @@ pub(super) struct ContextUnit {
 }
 
 impl<'a> GlmEngine<'a> {
+    /// Record row bytes of each record contract (`cfg.attention_kinds()` order).
+    fn record_contracts(&self) -> Vec<usize> {
+        let mut out: Vec<usize> = (0..self.cfg.layers).map(|l| self.cfg.record_bytes(l)).collect();
+        out.sort_unstable_by(|a, b| b.cmp(a));
+        out.dedup();
+        out
+    }
+
     /// Local pool pages per GPU (the scratch page follows them): half the logical ids under
     /// context, all of them otherwise.
     pub(super) fn local_pages(&self) -> usize {
@@ -192,7 +204,7 @@ impl<'a> GlmEngine<'a> {
             }
         }
         let limit = context_commit_pages(self.prefill_rows as u64) as usize;
-        let (table, commits) = commit_blocks(rank, start, rows, pages, limit)?;
+        let (table, commits) = commit_blocks(&self.record_contracts(), rank, start, rows, pages, limit)?;
         let commit = own.commit.get(lane).context("commit lane")?;
         upload(commit.buffer, bytes_of(&table))?;
         Ok(ContextUnit { history, shards, commits })
@@ -212,20 +224,26 @@ impl<'a> GlmEngine<'a> {
             fn produce(&mut self) -> Result<Query> {
                 let e = self.engine;
                 let (kv, _, _) = e.rank_caches(self.rank, self.index);
-                e.producer(self.rank, self.w, self.layer, self.rows, "m64", kv.buffer, self.w.query.buffer.ptr)?;
-                Ok(Query { values: self.w.query.buffer.ptr, row_pitch: e.cfg.heads / 2 * 576 * 2 })
+                if e.cfg.variant.ml4().is_some() {
+                    // A latent-sharing layer holds no `kv_a`: it writes no record.
+                    e.ml4_core_producer(self.rank, self.w, self.index, self.layer, scalar_rows(self.rows)?, "m64",
+                        kv.buffer, self.w.query.buffer.ptr, false)?;
+                } else {
+                    e.producer(self.rank, self.w, self.layer, self.rows, "m64", kv.buffer, self.w.query.buffer.ptr)?;
+                }
+                Ok(Query { values: self.w.query.buffer.ptr, row_pitch: e.cfg.heads / 2 * e.cfg.latent_dim(self.index) * 2 })
             }
             fn score(&mut self) -> Result<Option<Candidates>> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);
                 let (_, cache, _) = e.rank_caches(rank, self.index);
                 let Some(cache) = cache else { return Ok(None) };
                 let own = &e.context.as_ref().context("context split")?.ranks[rank];
-                e.index_producer(rank, w, self.layer, self.rows, "m64", cache.buffer)?;
+                e.index_producer(rank, w, self.index, self.layer, self.rows, "m64", cache.buffer)?;
                 let k = e.cfg.index_topk;
                 let candidates = Candidates { scores: own.candidates.buffer.ptr,
                     indices: view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr };
                 let width = Scalar::I32(self.tables.table_stride as i32);
-                e.run_on(rank, "glm_scored_index_topk_decode_m64", &[("q", w.q_fp8.buffer.ptr),
+                e.run_on(rank, &e.family_program("scored_index_topk_decode_m64"), &[("q", w.q_fp8.buffer.ptr),
                     ("weights", w.head_weights.buffer.ptr), ("cache", cache.buffer.ptr),
                     ("table", w.page_table.buffer.ptr), ("lengths", w.cache_lengths.buffer.ptr),
                     ("indices", candidates.indices.cast_mut()), ("scores", candidates.scores.cast_mut()),
@@ -237,7 +255,7 @@ impl<'a> GlmEngine<'a> {
                 let (e, w, rank) = (self.engine, self.w, self.rank);
                 let own = &e.context.as_ref().context("context split")?.ranks[rank];
                 let k = e.cfg.index_topk;
-                e.run_on(rank, "glm_dsa_candidate_merge", &[("scores", scores), ("indices", indices),
+                e.run_on(rank, &e.family_program("dsa_candidate_merge"), &[("scores", scores), ("indices", indices),
                     ("out_scores", own.candidates.buffer.ptr),
                     ("out_indices", view(&own.candidates, DECODE_ROWS * k * 4, self.t * k * 4)?.ptr),
                     ("table", w.page_table.buffer.ptr), ("local_slots", w.indices.buffer.ptr),
@@ -252,7 +270,9 @@ impl<'a> GlmEngine<'a> {
                 let heads = e.cfg.heads / 2;
                 let lse = view(out, DECODE_ROWS * heads * 512 * 2, self.t * heads * 4)?.ptr;
                 let (kv, _, _) = e.rank_caches(rank, self.index);
-                e.run_on(rank, &split.partial[rank][heads_rank], &[("q", query), ("cache", kv.buffer.ptr),
+                let kind = e.cfg.attention_kinds().iter().position(|k| *k == e.cfg.attention_kind(self.index))
+                    .context("layer record contract")?;
+                e.run_on(rank, &split.partial[kind][rank][heads_rank], &[("q", query), ("cache", kv.buffer.ptr),
                     ("indices", w.indices.buffer.ptr), ("lengths", w.lengths.buffer.ptr),
                     ("extra_cache", kv.buffer.ptr), ("extra_indices", w.indices.buffer.ptr),
                     ("extra_lengths", w.lengths.buffer.ptr), ("out", out.buffer.ptr), ("lse", lse),
@@ -262,7 +282,7 @@ impl<'a> GlmEngine<'a> {
             fn combine(&mut self, [first, second]: [Partial; 2]) -> Result<()> {
                 let e = self.engine;
                 let split = e.context.as_ref().context("context split")?;
-                e.run_on(self.rank, "glm_lse_combine2", &[("o0", first.values), ("l0", first.lse),
+                e.run_on(self.rank, &e.family_program("lse_combine2"), &[("o0", first.values), ("l0", first.lse),
                     ("o1", second.values), ("l1", second.lse), ("sink", split.sink[self.rank].buffer.ptr),
                     ("out", self.w.attn.buffer.ptr)], &[self.rows])
             }
@@ -283,8 +303,14 @@ impl<'a> GlmEngine<'a> {
         let split = self.context.as_ref().context("context split")?;
         let own = &split.ranks[rank];
         let staging = &own.staging[index % 2];
-        let records = view(staging, 0, split.staging_pages * RECORD_PAGE_BYTES)?;
-        let keys = view(staging, records.bytes, split.staging_pages * INDEX_PAGE_BYTES)?;
+        // This layer's records at its own pitch (656 B, Mistral Large 4's NoPE 528 B) inside a
+        // view sized for the widest; the index pages follow that widest extent.
+        let record_bytes = self.cfg.record_bytes(index);
+        let widest = record_page_bytes(&self.cfg) as usize;
+        let records = view(staging, 0, split.staging_pages * PAGE_ROWS * record_bytes)?;
+        let keys = view(staging, split.staging_pages * widest, split.staging_pages * INDEX_PAGE_BYTES)?;
+        let kv_gather = context_gather(&self.cfg, self.cfg.attention_kind(index));
+        let index_gather = self.family_program("paged_staging_gather_index");
         let (kv, index_cache, _) = self.rank_caches(rank, index);
         let half = split.staging_pages.div_ceil(2);
         for (owner, &shard) in unit.shards.iter().enumerate().filter(|(_, &n)| n > 0) {
@@ -293,9 +319,9 @@ impl<'a> GlmEngine<'a> {
             let gather = |name: &str, pool: *mut c_void, staging: *mut c_void| self.run_on(rank, name,
                 &[("pool", pool), ("table", table), ("staging", staging)],
                 &[Scalar::I32((shard * PAGE_ROWS) as i32), Scalar::I32(2), Scalar::I32(owner as i32)]);
-            gather("glm_paged_staging_gather_kv", pool.buffer.ptr, records.ptr)?;
+            gather(&kv_gather, pool.buffer.ptr, records.ptr)?;
             if let (Some(pool_keys), true) = (pool_keys, index_cache.is_some()) {
-                gather("glm_paged_staging_gather_index", pool_keys.buffer.ptr, keys.ptr)?;
+                gather(&index_gather, pool_keys.buffer.ptr, keys.ptr)?;
             }
         }
         self.attention_over(rank, w, index, layer, rows, cap, tables, records,
@@ -315,10 +341,14 @@ impl<'a> GlmEngine<'a> {
             self.on(rank, || unsafe { self.library.cuda_kv_cache_write_blocks_async(source.ptr, pool.buffer.ptr,
                 list(kind, 0)?, list(kind, 1)?, list(kind, 2)?, unit.commits, self.stream_of(rank)) })
         };
-        copy(0, records, kv)?;
+        // One record plane per record contract, then the index keys and scales. A
+        // latent-sharing layer's records are its source's (already committed by that layer).
+        let contracts = self.record_contracts();
+        let plane = contracts.iter().position(|&bytes| bytes == record_bytes).context("layer record contract")?;
+        if self.cfg.owns_kv(index) { copy(plane, records, kv)?; }
         if let Some(index_cache) = index_cache {
-            copy(1, keys, index_cache)?;
-            copy(2, keys, index_cache)?;
+            copy(contracts.len(), keys, index_cache)?;
+            copy(contracts.len() + 1, keys, index_cache)?;
         }
         Ok(())
     }
@@ -367,15 +397,18 @@ fn rank_tables(tables: &StepTables, rank: usize, pages: usize) -> Result<StepTab
     Ok(out)
 }
 
-/// The commit blocks of rows `[start, start + rows)` on `rank`'s pages, staging -> pool:
-/// records, index keys, index scales, each as `[src | dst | bytes]` lists of `limit` u64
-/// (zero padded); and the block count per kind.
-fn commit_blocks(rank: usize, start: usize, rows: usize, pages: &[u32], limit: usize) -> Result<(Vec<u64>, usize)> {
+/// The commit blocks of rows `[start, start + rows)` on `rank`'s pages, staging -> pool: the
+/// records of each record contract in `records` (row bytes; GLM's 656, Mistral Large 4's 656
+/// and 528), then index keys and index scales, each as `[src | dst | bytes]` lists of `limit`
+/// u64 (zero padded); and the block count per kind.
+fn commit_blocks(records: &[usize], rank: usize, start: usize, rows: usize, pages: &[u32], limit: usize)
+    -> Result<(Vec<u64>, usize)> {
     use crate::shared::peer_split::context::{commit_blocks, CommitPlane};
-    let planes = [(RECORD_BYTES, 0, RECORD_PAGE_BYTES), (128, 0, INDEX_PAGE_BYTES),
-        (4, INDEX_KEYS, INDEX_PAGE_BYTES)].map(|(row_bytes, base, unit_bytes)| CommitPlane {
+    let planes: Vec<_> = records.iter().map(|&bytes| (bytes, 0, PAGE_ROWS * bytes))
+        .chain([(128, 0, INDEX_PAGE_BYTES), (4, INDEX_KEYS, INDEX_PAGE_BYTES)])
+        .map(|(row_bytes, base, unit_bytes)| CommitPlane {
             first: start, rows, rows_per_unit: PAGE_ROWS, row_bytes, base, unit_bytes,
-        });
+        }).collect();
     let blocks = commit_blocks(rank, pages, &planes, limit)?;
     Ok((blocks.table, blocks.counts[0]))
 }
@@ -480,7 +513,7 @@ mod tests {
         let limit = context_commit_pages(512) as usize;
         let mut covered = vec![0u8; 550];
         for rank in 0..2 {
-            let (table, commits) = commit_blocks(rank, 100, 450, &seq, limit).unwrap();
+            let (table, commits) = commit_blocks(&[RECORD_BYTES], rank, 100, 450, &seq, limit).unwrap();
             assert_eq!(table.len(), 9 * limit);
             for i in 0..commits {
                 let (src, dst, bytes) = (table[i] as usize, table[limit + i] as usize, table[2 * limit + i] as usize);
@@ -499,6 +532,31 @@ mod tests {
         }
         assert!(covered[..100].iter().all(|&c| c == 0) && covered[100..].iter().all(|&c| c == 1));
         // A 4,096-row lane at an odd page offset needs the full limit on one GPU.
-        assert_eq!(commit_blocks(0, 32, 4096, &ids(66, 0), context_commit_pages(4096) as usize).unwrap().1, 33);
+        assert_eq!(commit_blocks(&[RECORD_BYTES], 0, 32, 4096, &ids(66, 0), context_commit_pages(4096) as usize).unwrap().1, 33);
+    }
+
+    /// Mistral Large 4: one record plane per record contract (656-byte RoPE, 528-byte NoPE pages),
+    /// each at its own page pitch, then the shared index keys and scales of the same rows.
+    #[test]
+    fn two_record_contracts_commit_their_own_page_pitch() {
+        let seq = ids(9, 1);
+        let limit = context_commit_pages(512) as usize;
+        let records = [656, 528];
+        for rank in 0..2 {
+            let (table, commits) = commit_blocks(&records, rank, 100, 450, &seq, limit).unwrap();
+            assert_eq!(table.len(), 4 * 3 * limit);
+            let (glm, _) = commit_blocks(&[656], rank, 100, 450, &seq, limit).unwrap();
+            // The 656-byte plane and the index planes are exactly GLM's.
+            assert_eq!(table[..3 * limit], glm[..3 * limit]);
+            assert_eq!(table[2 * 3 * limit..], glm[3 * limit..]);
+            for i in 0..commits {
+                let (src, dst, bytes) = (table[3 * limit + i] as usize, table[4 * limit + i] as usize,
+                    table[5 * limit + i] as usize);
+                let (rope_src, rope_bytes) = (table[i] as usize, table[2 * limit + i] as usize);
+                let (page, first) = (rope_src / (64 * 656), rope_src % (64 * 656) / 656);
+                assert_eq!((src, bytes), (page * 64 * 528 + first * 528, rope_bytes / 656 * 528));
+                assert_eq!(dst, (seq[page] >> 1) as usize * 64 * 528 + first * 528);
+            }
+        }
     }
 }

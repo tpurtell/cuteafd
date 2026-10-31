@@ -383,7 +383,8 @@ fn prefix_cache<'e, 'a>(engine: &'e GlmEngine<'a>, args: &PrefixArgs, concurrenc
         engine.prefill_rows, engine.cfg.vocab_size)?;
     let entries = args.prefix_cache_entries;
     let family = GlmPrefix::new(engine, args.prefix_partial == Toggle::On)?;
-    let template = engine.paged_buffers().first().map(|b| b.0).context("GLM has no layers")?;
+    let template = engine.paged_buffers().iter().find_map(|(records, _)| records.map(|(buffer, _)| buffer))
+        .context("GLM has no latent-owning layers")?;
     // The pinned host tier: one GPU's pages, or under context each page from its owner
     // (both GPUs' pools registered, so every copy runs on its owner's copy streams). A heads
     // split keeps replicated pages on both GPUs and stays device-resident.

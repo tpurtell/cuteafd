@@ -312,8 +312,15 @@ impl std::error::Error for MissingCoordinatorProgram {}
 /// the one variant. These caps describe numerical plan alternatives, not live row limits.
 pub fn attention_partial_programs(manifest: &serde_json::Value, family: &str, begin: usize, rows: usize, sms: usize)
     -> Result<Vec<(usize, String)>, AttentionPartialError> {
+    attention_partial_programs_of(manifest, family, "sparse_mla", begin, rows, sms)
+}
+
+/// [`attention_partial_programs`] of one record contract `kind` (`sparse_mla`, or a variant's
+/// `sparse_mla_nope` for its NoPE layers): `{family}_{kind}_partial_h{begin}_s{N}_m{rows}`.
+pub fn attention_partial_programs_of(manifest: &serde_json::Value, family: &str, kind: &str, begin: usize,
+    rows: usize, sms: usize) -> Result<Vec<(usize, String)>, AttentionPartialError> {
     let programs = manifest["programs"].as_array().ok_or(AttentionPartialError::InvalidManifest("program manifest"))?;
-    let prefix = format!("{family}_sparse_mla_partial_h{begin}_s");
+    let prefix = format!("{family}_{kind}_partial_h{begin}_s");
     let suffix = format!("_m{rows}");
     let variants: Vec<&serde_json::Value> = programs.iter()
         .filter(|p| p["name"].as_str().is_some_and(|n| n.starts_with(&prefix) && n.ends_with(&suffix))).collect();
@@ -344,8 +351,15 @@ pub fn attention_partial_programs(manifest: &serde_json::Value, family: &str, be
 pub fn attention_partial_program(manifest: &serde_json::Value, family: &str, begin: usize,
     execution_capacity_rows: usize, sms: usize,
     plan: &AttentionReductionPlan) -> Result<String, AttentionPartialError> {
+    attention_partial_program_of(manifest, family, "sparse_mla", begin, execution_capacity_rows, sms, plan)
+}
+
+/// [`attention_partial_program`] of record contract `kind` ([`attention_partial_programs_of`]).
+pub fn attention_partial_program_of(manifest: &serde_json::Value, family: &str, kind: &str, begin: usize,
+    execution_capacity_rows: usize, sms: usize,
+    plan: &AttentionReductionPlan) -> Result<String, AttentionPartialError> {
     if plan.capacity_rows() > execution_capacity_rows { return Err(AttentionPartialError::NumericalDomain); }
-    let partials = attention_partial_programs(manifest, family, begin, execution_capacity_rows, sms)?;
+    let partials = attention_partial_programs_of(manifest, family, kind, begin, execution_capacity_rows, sms)?;
     partials.into_iter().find(|(cap, _)| *cap >= plan.rows()).map(|(_, name)| name)
         .ok_or(AttentionPartialError::NoRecipe)
 }

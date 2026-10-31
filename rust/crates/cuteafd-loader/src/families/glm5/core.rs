@@ -249,6 +249,28 @@ impl CoreCharges {
                 ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");
                 programs.insert(name);
             }
+            // A head split (heads or context placement) runs each GPU's 32-head share
+            // (`ml42_*`); context also writes the share into the combined query (`_context`).
+            if ranks == 2 && owners.is_none() {
+                let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
+                let context = crate::placement::families::glm5::context_programs(cfg,
+                    entries.iter().filter_map(|p| p["name"].as_str()),
+                    |name| entries.iter().any(|p| p["name"] == name).then_some(0)).is_some();
+                for cap in ["m64", "m4096"] {
+                    let mut names = vec![format!("{split}_values_{cap}")];
+                    for tag in ["", "_nope"] {
+                        names.push(format!("{split}_query_scale{tag}_{cap}"));
+                        names.push(format!("{split}_absorb{tag}_{cap}"));
+                        if context { names.push(format!("{split}_absorb{tag}_context_{cap}")); }
+                    }
+                    if context { names.push(format!("{split}_query_scale_context_{cap}")); }
+                    for name in names {
+                        ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1,
+                            "Mistral Large 4 head split requires {name}");
+                        programs.insert(name);
+                    }
+                }
+            }
         } else if bodies.iter().any(|body| !body.is_empty()) {
             let entries = manifest["programs"].as_array().context("GLM K6 stage program inventory")?;
             for prefix in if owners.is_some() { vec!["glm", "glm2"] }
@@ -260,7 +282,7 @@ impl CoreCharges {
                     ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "GLM K6 requires {name}");
                 }
                 let context = prefix == "glm2" && owners.is_none()
-                    && crate::placement::families::glm5::context_programs(
+                    && crate::placement::families::glm5::context_programs(cfg,
                         entries.iter().filter_map(|p| p["name"].as_str()),
                         |name| entries.iter().any(|p| p["name"] == name).then_some(0)).is_some();
                 for cap in ["m64", "m4096"] {

@@ -768,7 +768,7 @@ impl Opened {
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
         let split_device = match args.split_device {
-            // Whole-attention variants pair GPUs as whole-layer owners, not a head split.
+            // Mistral Large 4 pairs GPUs as whole-layer owners without its share programs.
             Some(device) if !self.cfg.variant.is_glm() => Some(device),
             Some(device) if programs.spec("glm2_o_m64").is_ok() => Some(device),
             Some(device) => {
@@ -883,15 +883,16 @@ impl Opened {
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
-        let mut context = (devices.len() == 2 && self.cfg.variant.is_glm()).then(|| glm::context_programs(names.iter().copied(),
+        let mut context = (devices.len() == 2).then(|| glm::context_programs(&self.cfg, names.iter().copied(),
             |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
         if let Some(context) = &mut context {
             let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
                 self.library.cuda_set_device(device)?;
                 let sms = self.library.sm_count()?;
-                [0, self.cfg.heads / 2].into_iter().map(|begin| {
-                    let name = cuteafd_core::coordinator_programs::attention_partial_program(
-                        &manifest, "glm", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
+                self.cfg.attention_kinds().iter().flat_map(|kind| [0, self.cfg.heads / 2].map(|begin| (*kind, begin)))
+                    .map(|(kind, begin)| {
+                    let name = cuteafd_core::coordinator_programs::attention_partial_program_of(
+                        &manifest, self.cfg.program_family(), kind, begin, engine::DECODE_ROWS, sms, &attention_plan)?;
                     Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
                 }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))
             }).collect::<Result<Vec<_>>>();

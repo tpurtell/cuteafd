@@ -428,7 +428,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
         onboard, full_prefill_logits: options.full_prefill_logits,
-        context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(m,
+        context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(&cfg, m,
             options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                 "sm_120", options.rtx_bytes[0]).sms) as usize, &attention_plan)) };
     // Auto resolves in the solver (context where the build carries its programs), as at runtime.
@@ -464,7 +464,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
     let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
-    let context_programs = if split { Some(glm::manifest_context(&manifest,
+    let context_programs = if split { Some(glm::manifest_context(&cfg, &manifest,
         options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
             "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
         .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
@@ -761,7 +761,8 @@ mod tests {
             if gpus == 1 {
                 manifest["programs"].as_array_mut().unwrap().retain(|p|
                     !p["name"].as_str().unwrap().starts_with("glm2_")
-                    && !glm::CONTEXT_PROGRAMS.contains(&p["name"].as_str().unwrap()));
+                    && !glm::CONTEXT_PROGRAMS.iter().any(|n| p["name"].as_str().unwrap() == format!("glm_{n}"))
+                    && p["name"] != "glm_paged_staging_gather_kv");
             }
             for context in [1 << 20, default + 128] {
                 for pool_tokens in [None, Some(0)] {

@@ -32,7 +32,9 @@ use cuteafd_hostcache::copy::DeviceRange;
 const INDEX_KEY_BYTES: usize = 128;
 const INDEX_SCALES: usize = PAGE_ROWS * INDEX_KEY_BYTES;
 
-type PagedBuffers = (usize, CuteafdDeviceBuffer, Option<CuteafdDeviceBuffer>);
+/// Per rank and attention layer: its latent records at their row bytes (none on a layer reading
+/// another's latent) and, on full-indexer layers, its index pages.
+type PagedBuffers = (usize, Option<(CuteafdDeviceBuffer, usize)>, Option<CuteafdDeviceBuffer>);
 
 fn locate_page(parity: bool, page: u32) -> (usize, usize) {
     if parity { ((page & 1) as usize, (page >> 1) as usize) } else { (0, page as usize) }
@@ -40,10 +42,12 @@ fn locate_page(parity: bool, page: u32) -> (usize, usize) {
 
 fn page_segments(paged: &[PagedBuffers], parity: bool, layers: bool, page: u32) -> Vec<DeviceRange> {
     let (owner, page) = locate_page(parity, page);
-    let record_page = PAGE_ROWS * RECORD_BYTES;
     let mut out = Vec::new();
     for &(_, records, index) in paged.iter().filter(|(rank, _, _)| layers || *rank == owner) {
-        out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
+        if let Some((records, row_bytes)) = records {
+            let record_page = PAGE_ROWS * row_bytes;
+            out.push(DeviceRange { addr: records.ptr as u64 + (page * record_page) as u64, bytes: record_page });
+        }
         if let Some(index) = index {
             out.push(DeviceRange { addr: index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64, bytes: INDEX_PAGE_BYTES });
         }
@@ -58,10 +62,12 @@ fn copy_rows(paged: &[PagedBuffers], parity: bool, copy: TailCopy,
     anyhow::ensure!(rows <= PAGE_ROWS && from_rank == to_rank
         && owner.is_none_or(|o| o == from_rank) && owner.is_some() == parity,
         "tail copy {copy:?} crosses GPUs or exceeds a page");
-    let record_page = PAGE_ROWS * RECORD_BYTES;
     for &(rank, records, index) in paged.iter().filter(|(rank, _, _)| owner.is_none_or(|o| o == *rank)) {
-        submit(rank, view(records, to * record_page, rows * RECORD_BYTES)?,
-            view(records, from * record_page, rows * RECORD_BYTES)?)?;
+        if let Some((records, row_bytes)) = records {
+            let record_page = PAGE_ROWS * row_bytes;
+            submit(rank, view(records, to * record_page, rows * row_bytes)?,
+                view(records, from * record_page, rows * row_bytes)?)?;
+        }
         if let Some(index) = index {
             let (from, to) = (from * INDEX_PAGE_BYTES, to * INDEX_PAGE_BYTES);
             submit(rank, view(index, to, rows * INDEX_KEY_BYTES)?, view(index, from, rows * INDEX_KEY_BYTES)?)?;
@@ -98,7 +104,8 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
     /// parity-owned under context, or split into disjoint owner-local layer segments.
     pub fn page_bytes(&self) -> usize {
         self.paged.iter().filter(|(rank, _, _)| self.engine.layers_kv() || *rank == 0)
-            .map(|(_, _, index)| PAGE_ROWS * RECORD_BYTES + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
+            .map(|(_, records, index)| records.map_or(0, |(_, row_bytes)| PAGE_ROWS * row_bytes)
+                + index.map_or(0, |_| INDEX_PAGE_BYTES)).sum()
     }
 
     /// Whether pages are partitioned by parity (context attention).
@@ -109,7 +116,7 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
     /// Every allocation the host tier copies (both GPUs' pools and the stand-in tail), for the
     /// copy engine's routing by owning device.
     pub fn buffers(&self) -> Vec<CuteafdDeviceBuffer> {
-        self.paged.iter().flat_map(|&(_, records, index)| std::iter::once(records).chain(index))
+        self.paged.iter().flat_map(|&(_, records, index)| records.map(|(records, _)| records).into_iter().chain(index))
             .chain(std::iter::once(self.scratch.buffer)).collect()
     }
 
@@ -237,13 +244,14 @@ fn download(engine: &GlmEngine<'_>, addr: u64, bytes: usize, template: CuteafdDe
 /// full-indexer layers), layer by layer, in position order.
 fn paged_rows(family: &GlmPrefix<'_, '_>, placement: &GlmPlacement, len: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let record_page = PAGE_ROWS * RECORD_BYTES;
     for (p, &page) in placement.pages.iter().enumerate().take(len.div_ceil(PAGE_ROWS)) {
         let rows = (len - p * PAGE_ROWS).min(PAGE_ROWS);
         let (owner, page) = locate_page(family.parity(), page);
         for &(_, records, index) in family.paged.iter().filter(|(rank, _, _)| !family.parity() || *rank == owner) {
-            out.extend_from_slice(&download(family.engine, records.ptr as u64 + (page * record_page) as u64,
-                rows * RECORD_BYTES, records)?);
+            if let Some((records, row_bytes)) = records {
+                out.extend_from_slice(&download(family.engine, records.ptr as u64 + (page * PAGE_ROWS * row_bytes) as u64,
+                    rows * row_bytes, records)?);
+            }
             if let Some(index) = index {
                 let bytes = download(family.engine, index.ptr as u64 + (page * INDEX_PAGE_BYTES) as u64,
                     INDEX_PAGE_BYTES, index)?;
@@ -362,9 +370,9 @@ mod ownership_tests {
     fn layers_page_segments_and_copy_rows_cover_each_owner_once() {
         let record_page = PAGE_ROWS * RECORD_BYTES;
         let paged = vec![
-            (0, buffer(0x100000, 4 * record_page, 0), Some(buffer(0x200000, 4 * INDEX_PAGE_BYTES, 0))),
-            (1, buffer(0x300000, 4 * record_page, 1), None),
-            (1, buffer(0x400000, 4 * record_page, 1), Some(buffer(0x500000, 4 * INDEX_PAGE_BYTES, 1))),
+            (0, Some((buffer(0x100000, 4 * record_page, 0), RECORD_BYTES)), Some(buffer(0x200000, 4 * INDEX_PAGE_BYTES, 0))),
+            (1, Some((buffer(0x300000, 4 * record_page, 1), RECORD_BYTES)), None),
+            (1, Some((buffer(0x400000, 4 * record_page, 1), RECORD_BYTES)), Some(buffer(0x500000, 4 * INDEX_PAGE_BYTES, 1))),
         ];
         let segments = page_segments(&paged, false, true, 2);
         assert_eq!(segments.iter().map(|s| (s.addr, s.bytes)).collect::<Vec<_>>(), vec![
@@ -383,6 +391,7 @@ mod ownership_tests {
             }).unwrap();
             let mut expected = Vec::new();
             for &(rank, records, index) in &paged {
+                let (records, _) = records.unwrap();
                 expected.push((rank, records.ptr as usize + 2 * record_page,
                     records.ptr as usize + record_page, rows * RECORD_BYTES));
                 if let Some(index) = index {
@@ -396,6 +405,29 @@ mod ownership_tests {
         }
         assert!(copy_rows(&paged, false, TailCopy { from: 1, to: 2, rows: 1, owner: Some(0) },
             |_, _, _| panic!("invalid owner must not submit")).is_err());
+    }
+
+    /// Mistral Large 4: each layer's records at its own pitch (656 B RoPE, 528 B NoPE); a layer
+    /// reading another's latent snapshots only its index pages (its source holds the records).
+    #[test]
+    fn mixed_record_contracts_and_latent_readers_snapshot_their_own_bytes() {
+        let (rope, nope) = (PAGE_ROWS * 656, PAGE_ROWS * 528);
+        let paged = vec![
+            (0, Some((buffer(0x100000, 4 * rope, 0), 656)), Some(buffer(0x200000, 4 * INDEX_PAGE_BYTES, 0))),
+            (0, Some((buffer(0x300000, 4 * nope, 0), 528)), None),
+            (0, None, Some(buffer(0x400000, 4 * INDEX_PAGE_BYTES, 0))),
+        ];
+        let segments = page_segments(&paged, false, true, 1);
+        assert_eq!(segments.iter().map(|s| (s.addr, s.bytes)).collect::<Vec<_>>(), vec![
+            (0x100000 + rope as u64, rope), (0x200000 + INDEX_PAGE_BYTES as u64, INDEX_PAGE_BYTES),
+            (0x300000 + nope as u64, nope), (0x400000 + INDEX_PAGE_BYTES as u64, INDEX_PAGE_BYTES)]);
+        let mut copies = Vec::new();
+        copy_rows(&paged, false, TailCopy { from: 0, to: 3, rows: 5, owner: None }, |_, dst, src| {
+            copies.push((dst.ptr as usize, src.ptr as usize, src.bytes)); Ok(())
+        }).unwrap();
+        assert_eq!(copies[0], (0x100000 + 3 * rope, 0x100000, 5 * 656));
+        assert_eq!(copies[3], (0x300000 + 3 * nope, 0x300000, 5 * 528));
+        assert_eq!(copies.len(), 1 + 2 + 1 + 2, "no record copy for the latent reader");
     }
 
     #[test]

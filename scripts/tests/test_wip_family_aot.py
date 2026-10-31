@@ -438,30 +438,42 @@ def test_ml4_exports_its_programs_and_k6_shapes_beside_other_families(tmp_path, 
 
 
 def test_ml4_engine_program_names_are_exported_stems():
-    """Every ml4_* program name the GLM engine builds for Mistral Large 4 is a stem the
-    exporter's ml4_programs emits (RoPE stems carry no tag; NoPE ones ``_nope``)."""
+    """Every ml4_* / ml42_* program name the GLM engine builds for Mistral Large 4 is a stem the
+    exporter emits (ml4_programs for the whole model, ml4_head_split_programs for a head split's
+    share; RoPE stems carry no tag, NoPE ones ``_nope``)."""
     import re
     exporter = (ROOT / 'python/tools/aot/export_b12x_dsv4_aot.py').read_text()
-    body = exporter.split('def ml4_programs(')[1].split('\ndef ')[0]
     exported = set()
-    for stem in re.findall(r'\(f?"([a-z0-9_{}]+)", "', body):
-        names = {stem}
-        for field, values in (('{tag}', ('', '_nope')), ('{mode}', ('decode', 'prefill')),
-                              ('{rows}', ('64', '4096')), ('{inter}', ('6144', '12288', '3072'))):
-            names = {n.replace(field, v) for n in names for v in values} if field in stem else names
-        exported |= {f'ml4_{n}' for n in names}
+    for function, family in (('ml4_programs', 'ml4'), ('ml4_head_split_programs', 'ml42')):
+        body = exporter.split(f'def {function}(')[1].split('\ndef ')[0]
+        for stem in re.findall(r'\(f?"([a-z0-9_{}]+)", "', body):
+            names = {stem}
+            for field, values in (('{tag}', ('', '_nope')), ('{mode}', ('decode', 'prefill')),
+                                  ('{rows}', ('64', '4096')), ('{inter}', ('6144', '12288', '3072'))):
+                names = {n.replace(field, v) for n in names for v in values} if field in stem else names
+            exported |= {f'{family}_{n}' for n in names}
     engine = ''.join((ROOT / p).read_text() for p in (
         'rust/crates/cuteafd-daemon/src/families/glm5/engine.rs',
         'rust/crates/cuteafd-daemon/src/families/glm5/engine/native_dense.rs'))
-    used = re.findall(r'"(ml4_[a-z0-9_{}]+)"', engine)
-    assert used, 'no ml4 program names found'
+    used = re.findall(r'"((?:ml4|\{family\})_[a-z0-9_{}]+)"', engine)
+    assert any(u.startswith('{family}') for u in used) and any(u.startswith('ml4_') for u in used)
     for pattern in used:
-        names = {pattern}
-        for field, values in (('{tag}', ('', '_nope')), ('{mode}', ('decode', 'prefill')),
-                              ('{cap}', ('m64', 'm4096')), ('{intermediate}', ('6144', '12288', '3072'))):
-            names = {n.replace(field, v) for n in names for v in values}
-        # Positional `{}` hides which tag a call passes (it once asked for `_rope`); name it `{tag}`.
-        assert all('{' not in n for n in names), f'{pattern}: use the named {{tag}}/{{mode}}/{{cap}} fields'
         assert '_rope' not in pattern, pattern
-        missing = sorted(n for n in names if n not in exported and not n.startswith('ml4_draft'))
+        # Positional `{}` hides which tag a call passes (it once asked for `_rope`); name it.
+        assert '{}' not in pattern, f'{pattern}: use named fields'
+        names = {pattern}
+        for field, values in (('{family}', ('ml4', 'ml42')), ('{tag}', ('', '_nope')),
+                              ('{mode}', ('decode', 'prefill')), ('{cap}', ('m64', 'm4096')),
+                              ('{intermediate}', ('6144', '12288', '3072')),
+                              ('{placed}', ('', '_context')), ('{scale_placed}', ('', '_context'))):
+            names = {n.replace(field, v) for n in names for v in values}
+        assert all('{' not in n for n in names), pattern
+        missing = sorted(n for n in names if n not in exported and not n.startswith('ml4_draft')
+                         # Whole-model programs have no _context form; the engine only places a
+                         # head split's share (ml42) into the combined query.
+                         and not (n.startswith('ml4_') and '_context' in n)
+                         # NoPE query scales write no tail: they have no _context form.
+                         and not ('query_scale_nope_context' in n))
+        if pattern.startswith('{family}'):
+            missing = [n for n in missing if not (n.startswith('ml4_') and '_context' in n)]
         assert not missing, f'{pattern}: not exported: {missing}'

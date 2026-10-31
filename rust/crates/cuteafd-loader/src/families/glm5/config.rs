@@ -234,12 +234,31 @@ impl GlmDsaConfig {
         if self.variant.is_glm() { "glm" } else { "ml4" }
     }
 
-    /// The namespace of a head split's share programs (`glm2_*`); a variant
-    /// without them runs whole attention on each GPU (heads on one GPU,
-    /// whole-layer owners on two).
+    /// The namespace of a head split's share programs (`glm2_*`, Mistral Large 4's `ml42_*`):
+    /// each GPU's half of the heads, under heads and context placement.
     pub fn split_program_family(&self) -> Option<&'static str> {
-        self.variant.is_glm().then_some("glm2")
+        Some(if self.variant.is_glm() { "glm2" } else { "ml42" })
     }
+
+    /// Record contracts of this variant's attention layers (`sparse_mla`, and
+    /// Mistral Large 4's NoPE `sparse_mla_nope`): one program kind each.
+    pub fn attention_kinds(&self) -> &'static [&'static str] {
+        if self.variant.is_glm() { &["sparse_mla"] } else { &["sparse_mla", "sparse_mla_nope"] }
+    }
+
+    /// The program kind of layer `layer`'s record contract ([`Self::attention_kinds`]).
+    pub fn attention_kind(&self, layer: usize) -> &'static str {
+        if self.rope(layer) { "sparse_mla" } else { "sparse_mla_nope" }
+    }
+
+    /// Absorbed query / latent width of layer `layer` (576 with RoPE, 512 without).
+    pub fn latent_dim(&self, layer: usize) -> usize {
+        self.kv_lora_rank + if self.rope(layer) { self.qk_rope_head_dim } else { 0 }
+    }
+
+    /// The widest record and absorbed query over every layer (buffers reused across layers).
+    pub fn max_record_bytes(&self) -> usize { (0..self.layers).map(|l| self.record_bytes(l)).max().unwrap_or(0) }
+    pub fn max_latent_dim(&self) -> usize { (0..self.layers).map(|l| self.latent_dim(l)).max().unwrap_or(0) }
 
     pub fn logit_softcap(&self) -> Option<f64> {
         self.variant.ml4().map(|cfg| cfg.logit_softcap)

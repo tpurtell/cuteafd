@@ -656,22 +656,31 @@ impl<'a> GlmEngine<'a> {
         Some(observe(routes, &times))
     }
 
-    /// Every layer's latent record pool (656 B per row, 64-row pages) and, on full-indexer
-    /// layers, its index-key pool (8448 B per page: 64 x 128 E4M3 keys, then 64 FP32 scales).
-    pub(crate) fn paged_buffers(&self) -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
+    /// Every layer's latent record pool at its row bytes (64-row pages; none on a layer
+    /// reading another's latent) and, on full-indexer layers, its index-key pool (8448 B per
+    /// page: 64 x 128 E4M3 keys, then 64 FP32 scales).
+    pub(crate) fn paged_buffers(&self)
+        -> Vec<(Option<(cuteafd_ffi::CuteafdDeviceBuffer, usize)>, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
         self.paged_buffers_on(0)
     }
 
     /// [`Self::paged_buffers`] of rank `rank` (1: the head split's copy on its second GPU).
+    /// Rank `rank`'s paged state per attention layer it holds: the latent records at their row
+    /// bytes (656 B; Mistral Large 4's NoPE 528 B; none on a layer reading another's latent,
+    /// whose pages its source carries) and full-indexer layers' index pages.
     pub(crate) fn paged_buffers_on(&self, rank: usize)
-        -> Vec<(cuteafd_ffi::CuteafdDeviceBuffer, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
+        -> Vec<(Option<(cuteafd_ffi::CuteafdDeviceBuffer, usize)>, Option<cuteafd_ffi::CuteafdDeviceBuffer>)> {
         let (kv, index) = match (rank, &self.peer) {
             (1, Some(peer)) => (&peer.kv, &peer.index),
             _ => (&self.kv, &self.index),
         };
         let layers = if rank == 1 { &self.peer.as_ref().unwrap().layers } else { &self.weights.layers };
-        kv.iter().zip(index).zip(layers).filter(|(_, layer)| layer.range("q_a_norm").is_some())
-            .map(|((kv, index), _)| (kv.buffer, index.as_ref().map(|i| i.buffer))).collect()
+        // The rank holds the layer's attention: GLM's q-LoRA norm, or the per-head W_UK
+        // (Mistral Large 4 has no q-LoRA), exactly as the cache allocation decides.
+        kv.iter().zip(index).zip(layers).enumerate()
+            .filter(|(_, (_, layer))| layer.range("q_a_norm").is_some() || layer.range("w_uk").is_some())
+            .map(|(layer, ((kv, index), _))| (self.cfg.owns_kv(layer).then(|| (kv.buffer, self.cfg.record_bytes(layer))),
+                index.as_ref().map(|i| i.buffer))).collect()
     }
 
     /// GPUs this engine runs on: 2 under a head split.
@@ -717,9 +726,8 @@ impl<'a> GlmEngine<'a> {
     /// Allocates the token-split buffers and exchange once the peer is attached; `extent`:
     /// the admitted compiled context (the staging the solver charged).
     pub fn attach_context(&mut self, extent: usize, manifest: &serde_json::Value) -> Result<()> {
-        // The context split's staging and commit planes are the 656-byte GLM 5.x
-        // record; Mistral Large 4's per-layer records run heads or layers placement.
-        ensure!(self.cfg.variant.is_glm(), "context attention placement supports GLM 5.x records only");
+        // Staging views each layer's own record pitch inside the widest; commits carry one
+        // record plane per contract (GLM 5.x 656 B; Mistral Large 4 656 and 528 B).
         let context = self.context_mode.context("this engine was built without context attention")?;
         let exchange = self.exchange()?;
         let abort = match (exchange.abort_word(0)?, exchange.abort_word(1)?) {
@@ -769,6 +777,13 @@ impl<'a> GlmEngine<'a> {
     /// `stem` in this variant's program namespace (`glm_norm`, `ml4_norm`).
     fn family_program(&self, stem: &str) -> String {
         format!("{}_{stem}", self.cfg.program_family())
+    }
+
+    /// The namespace of `layer`'s attention-head programs: the variant's, or a head
+    /// split's share (`ml42_*`) when its heads are split over the two GPUs.
+    fn ml4_attention_family(&self, layer: &GlmLayer<'_>) -> &'static str {
+        if layer.attention_split { self.cfg.split_program_family().unwrap_or(self.cfg.program_family()) }
+        else { self.cfg.program_family() }
     }
 
     /// Launches `name` on rank `rank`'s stream.
@@ -2546,7 +2561,7 @@ impl<'a> GlmEngine<'a> {
         }
         self.producer(rank, w, layer, rows, cap, kv, w.query.buffer.ptr)?;
         if let Some(index_cache) = index_cache {
-            self.index_producer(rank, w, layer, rows, cap, index_cache)?;
+            self.index_producer(rank, w, index, layer, rows, cap, index_cache)?;
             self.run_on(rank, &format!("glm_index_topk_{mode}_{cap}"), &[
                 ("q_fp8", w.q_fp8.buffer.ptr), ("weights", w.head_weights.buffer.ptr),
                 ("index_k_cache", index_cache.ptr), ("page_table", w.page_table.buffer.ptr),
@@ -2597,7 +2612,7 @@ impl<'a> GlmEngine<'a> {
         index_cache: Option<cuteafd_ffi::CuteafdDeviceBuffer>) -> Result<()> {
         let mode = if tables.decode { "decode" } else { "prefill" };
         let rope = self.cfg.rope(index);
-        self.ml4_core_producer(rank, w, index, layer, scalar_rows(rows)?, cap, kv)?;
+        self.ml4_core_producer(rank, w, index, layer, scalar_rows(rows)?, cap, kv, w.query.buffer.ptr, false)?;
         if let Some(index_cache) = index_cache {
             self.ml4_core_index_producer(rank, w, index, layer, scalar_rows(rows)?, cap, index_cache)?;
             self.run_on(rank, &format!("ml4_index_topk_{mode}_{cap}"), &[
@@ -2611,7 +2626,8 @@ impl<'a> GlmEngine<'a> {
         let prefill_scalars = [rows];
         let scalars = if tables.decode { &decode_scalars[..] } else { &prefill_scalars[..] };
         let tag = if rope { "" } else { "_nope" };
-        self.run_on(rank, &format!("ml4_sparse_mla{tag}_{mode}_{cap}"), &[
+        let family = self.ml4_attention_family(layer);
+        self.run_on(rank, &format!("{family}_sparse_mla{tag}_{mode}_{cap}"), &[
             ("q", w.query.buffer.ptr), ("kv_cache", kv.ptr), ("indices", w.indices.buffer.ptr),
             ("lengths", w.lengths.buffer.ptr), ("out", w.attn.buffer.ptr), ("scratch", w.scratch.buffer.ptr)],
             scalars)?;
@@ -2666,8 +2682,11 @@ impl<'a> GlmEngine<'a> {
 
     /// The DSA index producer on `rank`: index keys at the rows' slots in `index_cache`,
     /// the FP8 index query and head weights into the workspace.
-    fn index_producer(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: Scalar, cap: &str,
-        index_cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+    fn index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, rows: Scalar,
+        cap: &str, index_cache: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_core_index_producer(rank, w, index, layer, scalar_rows(rows)?, cap, index_cache);
+        }
         if layer.is_native() {
             return self.native_index_producer(rank, w, layer, scalar_rows(rows)?, cap, index_cache);
         }
@@ -2688,6 +2707,9 @@ impl<'a> GlmEngine<'a> {
 
     /// W_UV + o_proj of this rank's heads over `attn` into `delta` (a partial sum under a split).
     fn o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, cap: &str, rows: Scalar) -> Result<()> {
+        if self.cfg.variant.ml4().is_some() {
+            return self.ml4_core_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
+        }
         if layer.core.contains_key("o") {
             return self.core_o_proj(rank, w, layer, scalar_rows(rows)?, cap);
         }

@@ -30,10 +30,15 @@ names.
   reference.
 - **Router and head:** a softmax top-4 of 128 experts, renormalized. The head
   is soft-capped with `tanh(x / 30) * 30`.
-- **Placement:** there are no head-split programs, so attention runs whole: on
-  one GPU, or on two GPUs as whole-layer owners (`ATTENTION_PLACEMENT=auto` or
-  `layers`). A layer stays on the GPU of the layer whose latent and top-k it
-  reads.
+- **Placement:** on two GPUs, `auto` resolves to whole-layer owners (`layers`).
+  A layer stays on the GPU of the layer whose latent and top-k it reads.
+  `heads` and `context` run GLM 5.3's head split with Mistral Large 4's
+  `ml42_*` share programs: each GPU projects its 32 heads and runs its half of
+  `o`, followed by an all-reduce. Under `context`, each 64-row latent page
+  lives once. GPUs exchange queries and run 64-head partials over their own
+  pages at 128^-0.5, then LSE-combine. Staging and commits use each layer's own
+  record (656 B, or 528 B on NoPE layers). A layer reading layer 35's latent
+  commits no records. Which mode `auto` picks is settled by measurement.
 - **Chat:** the server reads the chat contract from the checkpoint itself,
   from its tokenizer's control tokens and its `chat_template.jinja`, not from
   the engine variant. Prompts match `mistral_common`'s v15 instruct rendering
@@ -50,7 +55,9 @@ names.
   36, 54 and 71, and uses an RNN Markov head. It stays opt-in
   (`SPECULATOR=off` is the default) until the lossless and delivered-tok/s
   gates pass on hardware.
-- **Not yet:** the vision encoder and context attention placement.
+- **Prefix cache:** snapshots carry each layer's records at their own size,
+  and none for latent readers, whose pages belong to their source layer.
+- **Not yet:** the vision encoder.
 
 ## References
 

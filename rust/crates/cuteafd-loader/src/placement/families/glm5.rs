@@ -35,36 +35,55 @@ pub struct GlmContext {
     pub partial_scratch: u64,
 }
 
-/// Programs `context` needs, beside the split partials (any `_s<N>` variant).
-pub const CONTEXT_PROGRAMS: [&str; 5] = ["glm_scored_index_topk_decode_m64", "glm_dsa_candidate_merge",
-    "glm_lse_combine2", "glm_paged_staging_gather_kv", "glm_paged_staging_gather_index"];
+/// Programs `context` needs in the variant's namespace (`glm_*`, `ml4_*`), beside the split
+/// partials (any `_s<N>` variant) and one staging gather per record contract.
+pub const CONTEXT_PROGRAMS: [&str; 4] = ["scored_index_topk_decode_m64", "dsa_candidate_merge",
+    "lse_combine2", "paged_staging_gather_index"];
 
-/// The `context` programs beside the split partials, for the fail-closed
-/// reason when a build's manifest lacks them (issue #202).
-pub fn context_program_list() -> String {
-    let mut names: Vec<String> = CONTEXT_PROGRAMS.iter().map(|n| (*n).to_string()).collect();
-    names.push("glm_sparse_mla_partial_h0_s*_m64".into());
-    names.push("glm_sparse_mla_partial_h32_s*_m64".into());
+/// `cfg`'s staging gather of record contract `kind` (`kv`, NoPE `kv_nope`).
+pub fn context_gather(cfg: &GlmDsaConfig, kind: &str) -> String {
+    format!("{}_paged_staging_gather_{}", cfg.program_family(),
+        if kind == "sparse_mla_nope" { "kv_nope" } else { "kv" })
+}
+
+/// The `context` programs of `cfg`, for the fail-closed reason when a build's
+/// manifest lacks them (issue #202).
+pub fn context_program_list(cfg: &GlmDsaConfig) -> String {
+    let family = cfg.program_family();
+    let mut names: Vec<String> = CONTEXT_PROGRAMS.iter().map(|n| format!("{family}_{n}")).collect();
+    for kind in cfg.attention_kinds() {
+        names.push(context_gather(cfg, kind));
+        names.push(format!("{family}_{kind}_partial_h0_s*_m64"));
+        names.push(format!("{family}_{kind}_partial_h{}_s*_m64", cfg.heads / 2));
+    }
     names.join(", ")
 }
 
-/// The `context` programs and scratch `lookup` (name -> scratch bytes) finds,
+/// `cfg`'s `context` programs and scratch `lookup` (name -> scratch bytes) finds,
 /// or None when this build lacks any of them (a `context` request then fails
 /// closed; `heads` is the build's only attention executor).
-pub fn context_programs<'n>(names: impl IntoIterator<Item = &'n str> + Clone,
+pub fn context_programs<'n>(cfg: &GlmDsaConfig, names: impl IntoIterator<Item = &'n str> + Clone,
     lookup: impl Fn(&str) -> Option<u64>) -> Option<GlmContext> {
-    let partial = |begin: u64| names.clone().into_iter()
-        .filter(|n| n.starts_with(&format!("glm_sparse_mla_partial_h{begin}_s")) && n.ends_with("_m64"))
+    let family = cfg.program_family();
+    let partial = |kind: &str, begin: usize| names.clone().into_iter()
+        .filter(|n| n.starts_with(&format!("{family}_{kind}_partial_h{begin}_s")) && n.ends_with("_m64"))
         .filter_map(&lookup).max();
-    CONTEXT_PROGRAMS.iter().all(|n| lookup(n).is_some()).then_some(())?;
-    Some(GlmContext { topk_scratch: lookup(CONTEXT_PROGRAMS[0])?,
-        partial_scratch: partial(0)?.max(partial(32)?) })
+    CONTEXT_PROGRAMS.iter().all(|n| lookup(&format!("{family}_{n}")).is_some()).then_some(())?;
+    let mut partial_scratch = 0;
+    for kind in cfg.attention_kinds() {
+        lookup(&context_gather(cfg, kind))?;
+        partial_scratch = partial_scratch.max(partial(kind, 0)?).max(partial(kind, cfg.heads / 2)?);
+    }
+    Some(GlmContext { topk_scratch: lookup(&format!("{family}_{}", CONTEXT_PROGRAMS[0]))?, partial_scratch })
 }
 
 /// Index records per page (64 keys) and their bytes (64 x 128 E4M3, 64 FP32 scales).
 pub const INDEX_PAGE_BYTES: u64 = PAGE_ROWS * 132;
-/// Latent record pages (64 x 656 B).
+/// Latent record pages of GLM 5.x (64 x 656 B); [`record_page_bytes`] per variant.
 pub const RECORD_PAGE_BYTES: u64 = PAGE_ROWS * 656;
+
+/// The widest latent record page over `cfg`'s layers (staging reused across layers).
+pub fn record_page_bytes(cfg: &GlmDsaConfig) -> u64 { PAGE_ROWS * cfg.max_record_bytes() as u64 }
 
 /// Most pages one GPU commits per prefill lane of `rows` rows (a range of
 /// rows spans one more page than it fills; every second page is this GPU's).
@@ -85,8 +104,9 @@ pub fn context_workspace(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lan
     // History pages of either parity, as compact local-page lists.
     let half = extent.div_ceil(PAGE_ROWS).div_ceil(2);
     // Per lane: source offsets, destination offsets and sizes of each owned
-    // page's records, index keys and index scales.
-    let commit = 3 * 3 * context_commit_pages(prefill_rows) * 8;
+    // page's records (one plane per record contract), index keys and index scales.
+    let contracts = cfg.attention_kinds().len() as u64;
+    let commit = 3 * (contracts + 2) * context_commit_pages(prefill_rows) * 8;
     let mut out = vec![("candidates", rows * k * 8), ("own-head partial", partial), ("peer-head partial", partial),
         ("scored top-k scratch", context.topk_scratch), ("partial scratch", context.partial_scratch),
         ("gather tables", 2 * half * 4)];
@@ -99,27 +119,30 @@ pub fn context_workspace(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lan
 /// engine's allocation (`ContextExchange` and staging) both come from this.
 pub fn context_buffers(cfg: &GlmDsaConfig, extent: u64, prefill_rows: u64, lanes: u64, context: GlmContext)
     -> ContextBuffers {
-    ContextBuffers { staging_unit_bytes: RECORD_PAGE_BYTES + INDEX_PAGE_BYTES, staging_unit_rows: PAGE_ROWS,
-        // Own heads' absorbed 576-wide BF16 query; a partial of 32 heads and its LSE.
-        query_row_bytes: cfg.heads as u64 / 2 * 576 * 2, partial_row_bytes: cfg.heads as u64 / 2 * (512 * 2 + 4),
+    ContextBuffers { staging_unit_bytes: record_page_bytes(cfg) + INDEX_PAGE_BYTES, staging_unit_rows: PAGE_ROWS,
+        // Own heads' absorbed BF16 query at the widest latent (576 with RoPE); a partial of
+        // 32 heads and its LSE.
+        query_row_bytes: cfg.heads as u64 / 2 * cfg.max_latent_dim() as u64 * 2,
+        partial_row_bytes: cfg.heads as u64 / 2 * (512 * 2 + 4),
         candidate_row_bytes: cfg.index_topk as u64 * 8, compiled_extent: extent, decode_rows: DECODE_ROWS,
         // The gather-route prefill never exchanges; decode runs one lane.
         lanes: 1, workspace_bytes: context_workspace_bytes(cfg, extent, prefill_rows, lanes, context) }
 }
 
 /// The `context` programs a manifest carries (PROGRAMS.json), as [`context_programs`].
-pub fn manifest_context(manifest: &serde_json::Value, sms: usize,
+pub fn manifest_context(cfg: &GlmDsaConfig, manifest: &serde_json::Value, sms: usize,
     plan: &cuteafd_core::coordinator_programs::AttentionReductionPlan) -> Option<GlmContext> {
     let programs = manifest["programs"].as_array()?;
     let lookup = |name: &str| programs.iter().find(|p| p["name"].as_str() == Some(name))
         .map(|p| p["scratch_bytes_at_capacity"]["scratch"].as_u64().unwrap_or(0));
     let names = programs.iter().filter_map(|p| p["name"].as_str());
-    let mut context = context_programs(names, lookup)?;
-    context.partial_scratch = [0, 32].into_iter().map(|begin| {
-        let name = cuteafd_core::coordinator_programs::attention_partial_program(
-            manifest, "glm", begin, DECODE_ROWS as usize, sms, plan).ok()?;
-        lookup(&name)
-    }).collect::<Option<Vec<_>>>()?.into_iter().max()?;
+    let mut context = context_programs(cfg, names, lookup)?;
+    context.partial_scratch = cfg.attention_kinds().iter().flat_map(|kind| [0, cfg.heads / 2].map(|begin| (*kind, begin)))
+        .map(|(kind, begin)| {
+            let name = cuteafd_core::coordinator_programs::attention_partial_program_of(
+                manifest, cfg.program_family(), kind, begin, DECODE_ROWS as usize, sms, plan).ok()?;
+            lookup(&name)
+        }).collect::<Option<Vec<_>>>()?.into_iter().max()?;
     Some(context)
 }
 
@@ -135,12 +158,13 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
     lookup: impl Fn(&str) -> Option<u64>) -> anyhow::Result<GlmScratch> {
     let (cap, mode) = if decode { ("m64", "decode") } else { ("m4096", "prefill") };
     if !cfg.variant.is_glm() {
-        // Whole attention through the variant's stage programs (K6 core only):
-        // the sparse MLA of both record kinds is the only scratch owner.
+        // Attention through the variant's stage programs (K6 core only): the sparse
+        // MLA of both record kinds is the only scratch owner, whole or a head split's share.
         let family = cfg.program_family();
+        let attention = if split { cfg.split_program_family().unwrap_or(family) } else { family };
         let mut programs = 0;
         for tag in ["", "_nope"] {
-            let name = format!("{family}_sparse_mla{tag}_{mode}_{cap}");
+            let name = format!("{attention}_sparse_mla{tag}_{mode}_{cap}");
             programs = programs.max(lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))?);
         }
         // The FP8 indexer query (a checkpoint keeping wq_b as shipped) shares the arena.
@@ -542,12 +566,13 @@ pub struct GlmWorkingSet {
 }
 
 /// The attention placement a request resolves to before admission: the
-/// request, except that auto on two GPUs for a variant without head-split
-/// programs (Mistral Large 4) means whole-layer owners. GLM is unchanged
-/// (auto stays auto; the solver picks context on two GPUs).
+/// request, except that auto on two GPUs for Mistral Large 4 means whole-layer
+/// owners until context measures faster (heads and context are explicit
+/// requests there). GLM is unchanged (auto stays auto; the solver picks
+/// context on two GPUs).
 pub fn resolve_attention(cfg: &GlmDsaConfig, requested: Option<AttentionPlacement>, gpus: usize)
     -> Option<AttentionPlacement> {
-    if requested.is_none() && gpus == 2 && cfg.split_program_family().is_none() {
+    if requested.is_none() && gpus == 2 && !cfg.variant.is_glm() {
         Some(AttentionPlacement::Layers)
     } else { requested }
 }
@@ -570,7 +595,8 @@ pub fn solve_working_set(inputs: &GlmInputs<'_>, serial_tp2_workspace: [u64; 2],
             (attention placement layers or auto)"));
     }
     if context_chosen && inputs.context.is_none() {
-        return Err(PlacementError::MissingContextPrograms { family: "glm5", programs: context_program_list() });
+        return Err(PlacementError::MissingContextPrograms { family: inputs.cfg.family_id(),
+            programs: context_program_list(inputs.cfg) });
     }
     let routed = if inputs.skip_routed_experts { 0 }
         else { inputs.layers.saturating_sub(inputs.cfg.first_moe_layer) };
@@ -2217,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn mistral_large4_charges_per_layer_records_and_runs_whole_attention() {
+    fn mistral_large4_charges_per_layer_records_and_offers_its_head_split() {
         let cfg = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
         let mut i = inputs(&cfg, &[96 * GIB; 2]);
         i.spark_ranks = 6;
@@ -2226,11 +2252,21 @@ mod tests {
         let units: u64 = req.layers.iter().map(|l| l.kv_unit.unit_bytes_whole).sum();
         let geometry = crate::serving_capacity::mistral_large4_cache_geometry(cfg.variant.ml4().unwrap(), 1).unwrap();
         assert_eq!(units, geometry.ranks[0].persistent_unit_bytes);
-        assert!(req.layers.iter().all(|l| l.modes.is_empty()), "no head split on two GPUs");
+        // Its ml42 share programs give two GPUs the head split (context too, with its programs);
+        // auto stays whole-layer owners until context measures faster.
+        assert!(req.layers.iter().all(|l| l.modes == [LayerMode::HeadSplit]), "head split on two GPUs");
         assert_eq!(resolve_attention(&cfg, None, 2), Some(AttentionPlacement::Layers));
         assert_eq!(resolve_attention(&cfg, None, 1), None);
         assert_eq!(resolve_attention(&config(), None, 2), None);
-        assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_err());
+        assert!(solve_working_set(&i, [0; 2], Some(AttentionPlacement::Heads)).is_ok());
+        // Context without its programs fails closed and names ML4's own programs.
+        let missing = solve_working_set(&i, [0; 2], Some(AttentionPlacement::Context)).unwrap_err().to_string();
+        assert!(missing.contains("ml4_sparse_mla_nope_partial_h32") && missing.contains("ml4_paged_staging_gather_kv_nope"),
+            "{missing}");
+        let mut ctx = i.clone();
+        ctx.context = Some(GlmContext { topk_scratch: 1 << 20, partial_scratch: 1 << 20 });
+        let (placed, _) = solve_working_set(&ctx, [0; 2], Some(AttentionPlacement::Context)).unwrap();
+        assert!(placed.layers.iter().all(|l| l.mode == LayerMode::ContextSplit));
         let (placed, _) = solve_working_set(&i, [0; 2], resolve_attention(&cfg, None, 2)).unwrap();
         let owners = attention_owners(&cfg, cfg.layers).unwrap();
         for (layer, assignment) in placed.layers.iter().enumerate() {
@@ -2467,17 +2503,19 @@ mod tests {
             "glm_sparse_mla_partial_h32_s2_m64", "glm_sparse_mla_partial_h32_s4_m64"];
         let scratch = |name: &str| names.contains(&name).then(|| if name.ends_with("s4_m64") { 900 }
             else if name.contains("topk") { 70 } else { 100 });
-        assert_eq!(context_programs(names, scratch), Some(GlmContext { topk_scratch: 70, partial_scratch: 900 }));
+        let cfg = config();
+        assert_eq!(context_programs(&cfg, names, scratch), Some(GlmContext { topk_scratch: 70, partial_scratch: 900 }));
         for missing in names[..5].iter().chain(&names[5..6]) {
             let kept: Vec<_> = names.iter().copied().filter(|n| n != missing).collect();
-            assert_eq!(context_programs(kept.iter().copied(), |n| kept.contains(&n).then_some(1)), None, "{missing}");
+            assert_eq!(context_programs(&cfg, kept.iter().copied(), |n| kept.contains(&n).then_some(1)), None, "{missing}");
         }
     }
 
     #[test]
     fn context_manifest_scratch_matches_runtime_partial_recipe_for_every_plan() {
         use cuteafd_core::coordinator_programs::{attention_partial_program, AttentionReductionPlan};
-        let mut programs: Vec<_> = CONTEXT_PROGRAMS.iter().map(|name|
+        let mut programs: Vec<_> = CONTEXT_PROGRAMS.iter().map(|name| format!("glm_{name}"))
+            .chain(["glm_paged_staging_gather_kv".to_string()]).map(|name|
             serde_json::json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 70}})).collect();
         for begin in [0, 32] {
             for (splits, caps170, caps188, bytes) in [(2, vec![64], vec![64], 100),
@@ -2493,7 +2531,7 @@ mod tests {
         for sms in [170, 188] {
             for rows in 1..=64 {
                 let plan = AttentionReductionPlan::new(64, None, Some(rows)).unwrap();
-                let selected = manifest_context(&manifest, sms, &plan).unwrap();
+                let selected = manifest_context(&config(), &manifest, sms, &plan).unwrap();
                 let runtime_scratch = [0, 32].into_iter().map(|begin| {
                     let name = attention_partial_program(&manifest, "glm", begin, 64, sms, &plan).unwrap();
                     manifest["programs"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap()

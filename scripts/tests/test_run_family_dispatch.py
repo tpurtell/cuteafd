@@ -1589,8 +1589,16 @@ def test_mistral_large4_serves_on_the_glm_engine_with_an_opt_in_bundled_drafter(
     assert plan[plan.index("--speculator") + 1] == "dspark"
     refused = _family_launch_result(tmp_path / "spec", config, "test/ml4", "SPECULATOR=dflash2\nVISION=off\nAUDIO=off\n")
     assert refused.returncode != 0 and "bundled mtp_dspark" in refused.stderr
-    refused = _family_launch_result(tmp_path / "ctx", config, "test/ml4", "ATTENTION_PLACEMENT=context\nVISION=off\nAUDIO=off\n")
-    assert refused.returncode != 0 and "whole attention" in refused.stderr
+    # Its ml42 head split runs heads and context on two GPUs as explicit requests.
+    for mode in ("context", "heads"):
+        placed = _family_launch_result(tmp_path / mode, config, "test/ml4",
+                                       f"RTX_GPUS=2\nATTENTION_PLACEMENT={mode}\nVISION=off\nAUDIO=off\n")
+        assert placed.returncode == 0, placed.stderr
+        plan = next(shlex.split(line) for line in placed.stderr.splitlines()
+                    if "cuteafd plan" in line and "--deployment" in line)
+        assert plan[plan.index("--attention-placement") + 1] == mode
+    refused = _family_launch_result(tmp_path / "bad", config, "test/ml4", "ATTENTION_PLACEMENT=ring\nVISION=off\nAUDIO=off\n")
+    assert refused.returncode != 0 and "auto, layers, heads or context" in refused.stderr
 
 
 def test_glm53_all_local_two_rtx_launch_has_no_spark_peers(tmp_path):

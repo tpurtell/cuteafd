@@ -1633,9 +1633,9 @@ read -r detected model_type first_layer last_layer <<<"$described"
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
 # The checkpoint's own family names its deployment plan; Mistral Large 4 runs
-# the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant,
-# with whole attention on each GPU (two GPUs: layer owners, resolved by plan and
-# server from auto). SPECULATOR=dspark serves its bundled mtp_dspark drafter; it
+# the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant. Two GPUs:
+# auto resolves to whole-layer owners (plan and server) until context measures faster; heads
+# and context (its ml42 head split) are explicit requests. SPECULATOR=dspark serves its bundled mtp_dspark drafter; it
 # stays opt-in (default off) until its lossless gate passes on hardware.
 checkpoint_family="$family"
 if [[ "$family" == mistral_large4 ]]; then
@@ -1646,8 +1646,8 @@ if [[ "$family" == mistral_large4 ]]; then
     *) release_die "Mistral Large 4 drafts only with its bundled mtp_dspark (SPECULATOR=dspark or off)" ;;
   esac
   case "$(get ATTENTION_PLACEMENT auto)" in
-    auto|layers|heads) ;;
-    *) release_die "Mistral Large 4 runs whole attention: ATTENTION_PLACEMENT auto, layers (two GPUs) or heads (one GPU)" ;;
+    auto|layers|heads|context) ;;
+    *) release_die "Mistral Large 4 attention placement is auto, layers, heads or context" ;;
   esac
 fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then

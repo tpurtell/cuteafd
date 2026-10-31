@@ -455,8 +455,11 @@ impl<'a> GlmEngine<'a> {
     /// its nope part absorbed through W_UK; on latent owners `wkv_a(x)` cropped
     /// from its padded store and packed into the layer's FP8 record.
     #[allow(clippy::too_many_arguments)]
+    /// `query` receives the rows' absorbed query of this rank's heads: `w.query` itself, or
+    /// (`context`) its share of the combined two-GPU query, token rows 2 x heads apart.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn ml4_core_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>,
-        rows: usize, cap: &str, kv: Buffer) -> Result<()> {
+        rows: usize, cap: &str, kv: Buffer, query: *mut c_void, context: bool) -> Result<()> {
         let scratch = self.core_scratch(w)?;
         let programs = self.core_programs(rank)?;
         let (q, qkv) = (scratch.stage("q")?, scratch.stage("qkv")?);
@@ -465,12 +468,17 @@ impl<'a> GlmEngine<'a> {
         let tag = if rope { "" } else { "_nope" };
         let row = Scalar::I32(rows as i32);
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
-        let query = w.query.buffer.ptr;
+        // A head split's share runs its 32-head programs (`ml42_*`); `_context` places it in
+        // the combined query (NoPE query scale writes no tail, so it never needs one).
+        let family = self.ml4_attention_family(layer);
+        ensure!(!context || layer.attention_split, "a context query share needs a head-split layer");
+        let placed = if context { "_context" } else { "" };
+        let scale_placed = if context && rope { "_context" } else { "" };
         self.core_linear(rank, w, layer, "q_b", w.x.buffer, q, rows, None)?;
-        self.run_on(rank, &format!("ml4_query_scale{tag}_{cap}"), &[("q", q.ptr),
+        self.run_on(rank, &format!("{family}_query_scale{tag}{scale_placed}_{cap}"), &[("q", q.ptr),
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
             ("s", layer.ptr("query_scale_s")?), ("b", layer.ptr("query_scale_b")?), ("query", query)], &[row])?;
-        self.run_on(rank, &format!("ml4_absorb{tag}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
+        self.run_on(rank, &format!("{family}_absorb{tag}{placed}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
             ("out", query)], &[row])?;
         if layer.core.contains_key("kv_a") {
             let width = self.cfg.kv_lora_rank + if rope { self.cfg.qk_rope_head_dim } else { 0 };
@@ -531,7 +539,7 @@ impl<'a> GlmEngine<'a> {
     pub(super) fn ml4_core_o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
         cap: &str) -> Result<()> {
         let values = self.core_scratch(w)?.stage("values")?;
-        self.run_on(rank, &format!("ml4_values_{cap}"), &[("a", w.attn.buffer.ptr),
+        self.run_on(rank, &format!("{}_values_{cap}", self.ml4_attention_family(layer)), &[("a", w.attn.buffer.ptr),
             ("w", layer.ptr("w_uv")?), ("out", values.ptr)], &[Scalar::I32(rows as i32)])?;
         self.core_linear(rank, w, layer, "o", values, w.delta.buffer, rows,
             w.core_rows.as_ref().map(|rows| rows[0].buffer))

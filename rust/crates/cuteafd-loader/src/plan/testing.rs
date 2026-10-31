@@ -383,7 +383,8 @@ pub fn glm5_tensors(expert: impl Fn(&str, usize, usize) -> Vec<Tensor>) -> Vec<T
 /// programs and the decode/prefill producers, attention, o_proj and dense/MoE FFNs of both shares.
 pub fn glm5_native_programs() -> Value {
     use crate::placement::families::glm5 as glm;
-    let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| format!("glm_{name}"))
+        .chain(["glm_paged_staging_gather_kv".to_string()]).collect::<Vec<_>>();
     for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
         names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
         for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {

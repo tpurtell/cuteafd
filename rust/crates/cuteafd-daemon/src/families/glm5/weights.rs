@@ -755,6 +755,17 @@ impl<'a> GlmLoader<'a> {
         self.landed_all(ranks, &[land], bytes)
     }
 
+    /// A per-head BF16 vector `[heads]`, each rank its contiguous `heads / ranks` (the query
+    /// heads a head split gives it); one rank keeps the whole vector.
+    fn head_vector(&self, ranks: usize, name: &str) -> Result<Vec<DeviceAllocation<'a>>> {
+        let _memory_format = cuteafd_ffi::memory_ledger::format("bf16");
+        let (bytes, dtype, shape) = self.raw(name)?;
+        ensure!(dtype == DType::Bf16 && shape.len() == 1 && shape[0] % ranks == 0,
+            "{name}: expected a BF16 [heads] vector over {ranks} GPUs, found {dtype:?} {shape:?}");
+        let part = bytes.len() / ranks;
+        (0..ranks).map(|rank| self.on_rank(rank, |_| self.upload(&bytes[rank * part..][..part]))).collect()
+    }
+
     fn replicated(&self, ranks: usize, read: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<DeviceAllocation<'a>>> {
         self.upload_all(ranks, &read()?)
     }
@@ -827,9 +838,12 @@ impl<'a> GlmLoader<'a> {
         if core {
             // Variant operands by name: GLM's q-LoRA norm, the latent norm on
             // latent owners, per-head query-scale vectors where the variant has them.
-            for (key, op) in [("q_a_norm", Op::QANorm), ("kv_a_norm", Op::KvANorm),
-                ("query_scale_s", Op::QueryScaleS), ("query_scale_b", Op::QueryScaleB)] {
+            for (key, op) in [("q_a_norm", Op::QANorm), ("kv_a_norm", Op::KvANorm)] {
                 if let Some(name) = cfg.weight(layer, op) { put(&mut ops, key, self.replicated_tensor(ranks, &name)?); }
+            }
+            // Per-head query-scale vectors follow the heads: each rank of a head split its own.
+            for (key, op) in [("query_scale_s", Op::QueryScaleS), ("query_scale_b", Op::QueryScaleB)] {
+                if let Some(name) = cfg.weight(layer, op) { put(&mut ops, key, self.head_vector(ranks, &name)?); }
             }
             for (rank, (uk, uv)) in self.kv_b_bf16(cfg, layer, ranks)?.into_iter().enumerate() {
                 ops[rank].insert("w_uk", uk);
