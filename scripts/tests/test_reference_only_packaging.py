@@ -257,3 +257,16 @@ def test_reference_role_metrics_without_generated_rows():
     metrics = packager.reference_role_metrics(dict(nll=.5, scored_tokens=10,
         nll_gen=None, nll_ctx=.5, gen_top1=None, scored_tokens_gen=0, scored_tokens_ctx=10))
     assert 'n/a (no rows)' in packager.reference_role_note(metrics)
+
+
+@pytest.mark.parametrize('family,fragment', [('muse_spark', 'BF16'), ('mistral_large4', 'FP8')])
+def test_family_golden_roots_map_to_their_precision(family, fragment):
+    root = packager.golden_root(family)
+    assert fragment in packager.reference_precision(dict(root_arithmetic=root), dict())
+
+
+def test_v41_root_arithmetic_maps_to_official_fp8_mxfp4():
+    precision = packager.reference_precision(dict(root_arithmetic=dict(packager.V41_ROOT)), dict())
+    assert precision.startswith('official FP8 block dense + MXFP4 experts')
+    with pytest.raises(ValueError, match='unrecognized'):
+        packager.reference_precision(dict(root_arithmetic=dict(arithmetic='x', source='y')), dict())

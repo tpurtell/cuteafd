@@ -196,12 +196,36 @@ KIMI_F32_ROOT = {
 KIMI_F32_PRECISION = 'native MXFP4 experts and shipped BF16/F32 dense tensors, computed in F32'
 
 
+# Exact sealed root arithmetic written by a family golden -> the root precision it computes.
+V41_ROOT = {
+    'arithmetic': 'Official inference/model.py block by block with a torch emulation of kernel.py (FP8 block dense, '
+                  'MXFP4 experts, FP4 compressed KV); Engram tables row-gathered from the checkpoint shards; MTP and caches off.',
+    'source': 'official inference/model.py and kernel emulation',
+}
+V41_PRECISION = 'official FP8 block dense + MXFP4 experts (no vendor BF16 master)'
+
+
+def golden_root(family):
+    import importlib
+    module = importlib.import_module(f'families.{family}.golden')
+    return module.Family.golden_meta(None)['root_arithmetic']
+
+
+ROOT_PRECISIONS = [
+    (lambda: KIMI_F32_ROOT, KIMI_F32_PRECISION),
+    (lambda: V41_ROOT, V41_PRECISION),
+    (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
+    (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
+]
+
+
 def reference_precision(meta, panel):
     precision = panel.get('reference_snapshot', {}).get('precision')
     if isinstance(precision, str) and precision.strip():
         return precision
-    if meta.get('root_arithmetic') == KIMI_F32_ROOT:
-        return KIMI_F32_PRECISION
+    for root, label in ROOT_PRECISIONS:
+        if meta.get('root_arithmetic') == root():
+            return label
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
 
 
