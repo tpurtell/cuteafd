@@ -1031,7 +1031,7 @@ mod tests {
             index_heads: 32, index_head_dim: 128, index_topk: 2048, indexers, first_moe_layer: 3,
             dense_intermediate: 12288, experts: 256, topk: 8, moe_intermediate: 2048,
             shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
-            mtp_layers: 1, eos_tokens: vec![154820] }
+            mtp_layers: 1, eos_tokens: vec![154820], variant: crate::families::glm5::GlmVariant::Glm }
     }
 
     fn inputs<'a>(cfg: &'a GlmDsaConfig, cards: &[u64]) -> GlmInputs<'a> {

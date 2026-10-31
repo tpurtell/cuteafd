@@ -497,7 +497,7 @@ mod charge_tests {
             index_heads: 32, index_head_dim: 128, index_topk: 2048, indexers: vec![GlmIndexer::Full; 78],
             first_moe_layer: 3, dense_intermediate: 12288, experts: 256, topk: 8, moe_intermediate: 2048,
             shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
-            mtp_layers: 1, eos_tokens: vec![154820] };
+            mtp_layers: 1, eos_tokens: vec![154820], variant: cuteafd_loader::families::glm5::GlmVariant::Glm };
         let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
         let scratch_bytes = cuteafd_loader::plan::exlr8::dense::scratch_bytes;
         let decode = scratch_bytes(&cfg, heads, inter, NATIVE_DECODE_ROWS);
