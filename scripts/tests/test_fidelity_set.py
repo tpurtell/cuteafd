@@ -481,3 +481,22 @@ def make_api_topup(probe, n, recipe="v2"):
         tokenizer=FakeTokenizer(), probe=probe, recipe=recipe, topup_b=n,
         legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))},
         legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
+
+
+class HistoryRewritingAPI(FakeAPI):
+    """A renderer that drops a turn's reasoning once a user turn follows (DeepSeek drop_thinking)."""
+
+    def conversation(self, body, messages):
+        rewritten = [dict(m, reasoning_content="") if m["role"] == "assistant" else m for m in messages]
+        return self.renderer.conversation_ids(body, rewritten)
+
+
+def test_v2_trailing_context_falls_back_to_raw_text_when_the_renderer_rewrites_history():
+    manifest = make_api(HistoryRewritingAPI(generated=30, calls=0), "v2")
+    e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
+    assert e00["provenance"]["trailing_context"].startswith("raw repository text")
+    counts = manifest["recipe"]["trailing_context_windows"]
+    assert counts["raw repository text (renderer rewrites the scored turn)"] > 0 and counts["native user turn"] == 0
+    native = make_api(FakeAPI(generated=30, calls=0), "v2")
+    assert native["recipe"]["trailing_context_windows"]["native user turn"] > 0
+    assert native["recipe"]["version"]["sha256"] == manifest["recipe"]["version"]["sha256"]

@@ -151,7 +151,8 @@ def recipe_identity(recipe):
     rules = {"id": "own-text-v2", "continue_until_scored_generated": 512,
              "scored_end": "assistant-turn end maximizing scored generated rows, earliest on ties", "max_turns_per_window": V2_MAX_TURNS,
              "tool_clause": "only when tools are declared", "tool_unavailable_result": V2_TOOL_UNAVAILABLE,
-             "trailing_context": "checkpoint-native user turn after the final assistant turn",
+             "trailing_context": "checkpoint-native user turn after the final assistant turn when the renderer keeps "
+                                 "the scored turn as an exact token prefix; otherwise v1 raw repository text",
              "earlier_turn_roles": "gen only where the earlier prompt+generation is an exact token prefix"}
     return {**rules, "sha256": hashlib.sha256(canonical(rules)).hexdigest()}
 
@@ -278,9 +279,18 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         # Short turns remain short: trailing human code supplies ctx rows, not
         # fabricated assistant output. These rows never carry the gen bar.
         padding = max(0, start + 512 - len(tokens))
+        trailing = None
         if recipe == "v2" and padding:
-            tokens, roles = native_trailing_context(body, chat, tokens, roles, padding)
-        else:
+            native = native_trailing_context(body, chat, tokens, roles, padding)
+            if native is not None:
+                tokens, roles = native
+                trailing = "native user turn"
+            else:
+                # The checkpoint renderer rewrites the scored turn (e.g. drops its reasoning)
+                # once a user turn follows; keep exact ids with the v1 raw text instead.
+                tokens, roles = tokens + corpus_ids[:padding], roles + ["ctx"] * padding
+                trailing = "raw repository text (renderer rewrites the scored turn)"
+        elif padding:
             tokens += corpus_ids[:padding]
             roles += ["ctx"] * padding
         expected_bucket = "0-2K" if target < 2048 else "2-8K" if target < 8192 else "8-16K"
@@ -295,6 +305,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         if recipe == "v2":
             windows[-1]["provenance"].update(turns=turns, scored_generated=roles[start:].count("gen"),
                                              **continuation)
+            if trailing is not None:
+                windows[-1]["provenance"]["trailing_context"] = trailing
         if "generation_provenance" in chat:
             windows[-1]["provenance"]["generation"] = chat["generation_provenance"]
         print(f"{name}: prompt={len(prompt)} generated={len(generated)}", file=sys.stderr, flush=True)
@@ -371,7 +383,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         text = corpus[:max(4096, padding * 8)]
         rendered = probe.conversation(body, body["messages"] + [assistant, {"role": "user", "content": text}])
         if rendered[:len(tokens)] != tokens:
-            raise ValueError("native trailing context does not extend the generated window")
+            return None
         suffix = rendered[len(tokens):len(tokens) + padding]
         if len(suffix) != padding:
             raise ValueError("native trailing context is shorter than the required padding")
@@ -493,6 +505,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     from fidelity_split import standard_layout
     standard_layout(windows)
     if recipe == "v2":
+        manifest["recipe"]["trailing_context_windows"] = {
+            kind: sum(w.get("provenance", {}).get("trailing_context") == kind for w in windows)
+            for kind in ("native user turn", "raw repository text (renderer rewrites the scored turn)")}
         manifest["recipe"].update(version=recipe_identity(recipe),
             prompt_roles="conditioning history and tool results ctx; this window's assistant turns gen")
     if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
