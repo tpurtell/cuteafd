@@ -135,9 +135,11 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             ingress: cuteafd_core::SparkIngress::Fp8K32 }];
         let budget = opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES);
         let reserve = spark_reserve_bytes(prefill.waves, prefill.unit_rows)?;
-        let spark = SparkBudgetInventory::exl3_with(catalog, &working, &endpoints,
+        // The checkpoint's per-expert output norm makes the residency whole experts.
+        anyhow::ensure!(catalog.whole_expert_outputs(), "Muse Spark experts must carry their post-expert norm");
+        let spark = SparkBudgetInventory::exl3(catalog, &working, &endpoints,
             cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
-                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget, reserve, Some(&owners))?;
+                slot_bytes: rings.slot_bytes, alignment: rings.alignment }, budget, reserve)?;
         // An onboarded layer is whole on one GPU: the per-expert norm needs each
         // expert's complete output, so TP2 halves would be inexact.
         let manifest = catalog.exl3().ok_or_else(|| anyhow::anyhow!("Muse Spark requires EXL3 expert headers"))?;

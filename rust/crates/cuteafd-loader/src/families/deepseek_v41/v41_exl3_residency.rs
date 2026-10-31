@@ -162,6 +162,52 @@ impl V41Exl3Residency {
     }
 }
 
+impl OfficialV41Catalog {
+    /// Whether the routed experts carry a per-expert output norm (applied to
+    /// each expert's whole output before its routing weight): such experts are
+    /// never sliced by intermediate; Spark ranks hold them whole (expert parallel).
+    pub fn whole_expert_outputs(&self) -> bool {
+        self.tensors().iter().any(|tensor| tensor.metadata.name.ends_with(".experts.post_expert_norm.weight"))
+    }
+
+    /// The checkpoint's Spark residency for `rank` of `world`: whole experts
+    /// partitioned by the shared staggered owner table when the experts carry
+    /// a per-expert output norm, otherwise the balanced intermediate split.
+    pub fn exl3_spark_residency(&self, layer: V41Exl3Layer, world: usize, rank: usize) -> Result<V41Exl3Residency> {
+        if self.whole_expert_outputs() {
+            let shape = self.routed_experts();
+            let owners = cuteafd_core::ExpertOwners::staggered(shape.layers, shape.experts, world)?;
+            return self.exl3_partitioned_residency(layer, &owners, rank);
+        }
+        self.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?.balanced_residency(layer, world, rank)
+    }
+
+    /// Whole-expert residency with the checkpoint's per-expert output norm:
+    /// when the layer stores `mlp.experts.post_expert_norm.weight` (BF16, the
+    /// expert width), its words ride as the `post_expert_norm` buffer's initial
+    /// payload, and the route-norm sum applies it. Absent, the sum is plain.
+    pub fn exl3_partitioned_residency(&self, layer: V41Exl3Layer, owners: &cuteafd_core::ExpertOwners,
+        rank: usize) -> Result<V41Exl3Residency> {
+        let manifest = self.exl3().context("whole-expert EXL3 residency needs trellis headers")?;
+        let mut plan = manifest.partitioned_residency(layer, owners, rank)?;
+        let V41Exl3Layer::Backbone(index) = layer else { unreachable!("partitioned residency is backbone-only") };
+        let name = manifest.naming.projection(false, index, 0, V41Exl3ProjectionKind::Down);
+        let norm = name.split_once(".experts.").map(|(prefix, _)| format!("{prefix}.experts.post_expert_norm.weight"));
+        if let Some(norm) = norm.filter(|norm| self.tensor(norm).is_ok()) {
+            let tensor = self.tensor(&norm)?;
+            ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16
+                && tensor.metadata.shape == [manifest.experts.hidden],
+                "{norm}: post-expert norm must be BF16 [{}]", manifest.experts.hidden);
+            let mut bytes = vec![0u8; manifest.experts.hidden * 2];
+            let file = self.shard_file(&tensor.shard)?;
+            super::v41_catalog::projection_read(&file, &mut bytes, tensor.metadata.byte_offset)?;
+            let words = bytes.chunks_exact(4).map(|w| i32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect::<Vec<_>>();
+            plan.buffers.push(V41Exl3ResidentBuffer { name: "post_expert_norm".into(), bytes: bytes.len(), initial_words: words });
+        }
+        Ok(plan)
+    }
+}
+
 impl V41Exl3Manifest {
     /// Plan whole-unit balanced owned-byte storage.
     /// Divisible geometry returns the legacy plan verbatim, including descriptors.

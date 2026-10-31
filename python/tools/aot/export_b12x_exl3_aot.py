@@ -121,7 +121,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False, activation: str = "silu",
-           compact_weights: bool = False) -> dict:
+           compact_weights: bool = False, route_norm_eps: float | None = None) -> dict:
     if len(bits) != 2 or len(set(bits)) != len(bits) or any(b not in range(2, 6) for b in bits):
         raise ValueError("export requires two distinct K2..K5 decoder tiers")
     # The (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) tuple is b12x's own
@@ -166,6 +166,11 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         raise ValueError("dynamic tile claims apply to the warp-specialized kernel only")
     if output_dtype not in ("bf16", "fp32"):
         raise ValueError("EXL3 output must be bf16 or fp32")
+    # Per-route post-expert RMSNorm (Muse Spark): the sum normalizes each whole
+    # expert's output before its routing weight; the experts are whole on the
+    # rank (expert parallel), so the export never sees an intermediate slice.
+    if route_norm_eps is not None and not (route_norm_eps > 0 and hidden == 4096):
+        raise ValueError("route-norm EXL3 sums need a positive epsilon and hidden 4096")
     # Decode schedule (b12x parse_decode_schedule: a preset such as gb10, or
     # l2/pf1/pf2/pdl options): when and with which L2 policy the cooperative
     # kernel fetches weight words. Bit-identical to the default schedule; the
@@ -234,7 +239,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                                   force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
     output.mkdir(parents=True, exist_ok=True)
     objects = []
-    for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", launch.topk_sum.compiled)]:
+    sum_compiled = launch.topk_sum.compiled
+    if route_norm_eps is not None:
+        from b12x.moe._shared.kernels.w4a16.route_norm_sum import compile_route_norm_topk_sum
+        sum_compiled = compile_route_norm_topk_sum(topk=topk, hidden_size=hidden, eps=route_norm_eps,
+            output_dtype=output_dtype, route_ids_dtype=torch.int32).compiled
+    for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", sum_compiled)]:
         compiled.export_to_c(str(output), label, "cuteafd_" + label)
         header = (output / (label + ".h")).read_text()
         wrapper = re.search(r"static inline int32_t (cute_dsl_\w+_wrapper)\((.*?)\) \{", header, re.S)
@@ -290,6 +300,9 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         manifest.update(descriptor_rows=7, native_info_version=3)
     if activation != "silu":
         manifest["activation"] = activation
+    if route_norm_eps is not None:
+        # Recorded only when set, so other manifests stay byte-identical.
+        manifest["route_norm_eps"] = route_norm_eps
     if experts > 512:
         manifest["descriptor_bits"] = 10
     if block_m != 8:
@@ -355,6 +368,8 @@ def main() -> None:
     parser.add_argument("--decode-schedule",
                         help="Cooperative-kernel decode schedule: a b12x preset (gb10) or "
                              "l2=,pf1=,pf2=,pdl= options; bit-identical to the default")
+    parser.add_argument("--route-norm-eps", type=float,
+                        help="Per-route post-expert RMSNorm epsilon (Muse Spark whole experts)")
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
                                        "(for example 64,256,64,256 or 128,128,128,128); default is the "
                                        "B12x per-capacity policy")
@@ -366,7 +381,8 @@ def main() -> None:
            ws_input_stages=args.ws_input_stages, ws_dynamic_tiles=args.ws_dynamic_tiles,
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
            activation=args.activation,
-           decode_schedule=args.decode_schedule, compact_weights=args.compact_weights)
+           decode_schedule=args.decode_schedule, compact_weights=args.compact_weights,
+           route_norm_eps=args.route_norm_eps)
 
 
 if __name__ == "__main__":

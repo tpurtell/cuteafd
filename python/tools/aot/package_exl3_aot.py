@@ -268,10 +268,16 @@ GEOMETRIES = {
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
     'kimik3': (3584, 3072, 896, 16),
+    # Muse Spark: whole experts at the 4096-wide pre_expert_proj stream, each
+    # expert's output RMS-normalized before its routing weight (expert parallel).
+    'muse': (4096, 4096, 256, 8),
 }
+# Per-route post-expert RMSNorm epsilon (config post_norm_eps): the sum applies
+# the checkpoint's norm to each whole expert's output before its routing weight.
+ROUTE_NORM_EPS = {'muse': 1e-8}
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'muse': None}
 
 
 def activation(geometry: str) -> str:
@@ -753,12 +759,26 @@ def profiles_for_role(role: str, geometry: str = 'dsv4p') -> list[tuple]:
     if geometry == 'kimik3':
         return [profile for profile in shard_profiles(geometry, role)
                 if role != 'spark' or profile[0] == 'tp6-width512']
+    if geometry in ROUTE_NORM_EPS:
+        return route_norm_profiles(geometry, role)
     return shard_profiles(geometry, role)
+
+
+def route_norm_profiles(geometry: str, role: str) -> list[tuple]:
+    """Whole-expert geometries: the per-route norm needs each expert's full
+    output, so no intermediate slicing. Sparks run one expert-parallel export
+    (full width, the global route namespace; a rank's owned count is a launch
+    scalar) shared by every world; onboarded RTX layers are whole on one GPU."""
+    _hidden, intermediate, experts, topk = GEOMETRIES[geometry]
+    if role != 'spark':
+        return [('rtx-tp1', intermediate, experts, topk, 'fp32', ['rtx-tp1'])]
+    return [('ep-width%d' % intermediate, intermediate, experts, topk, 'bf16',
+             [f'ep{world}' for world in range(1, 9)])]
 
 
 def build_profiles(role: str, geometry: str, *, all_spark_counts: bool = False) -> list[tuple]:
     profiles = profiles_for_role(role, geometry)
-    if all_spark_counts or role != 'spark':
+    if all_spark_counts or role != 'spark' or geometry in ROUTE_NORM_EPS:
         return profiles
     worlds = {2, 3, 4, 6} if GEOMETRIES[geometry][1] // 128 >= 6 else {2, 3, 4}
     if geometry == 'qwen4':
@@ -1077,6 +1097,8 @@ def build(args: argparse.Namespace) -> None:
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
                     options['swiglu_limit'] = limit
+                if geometry in ROUTE_NORM_EPS:
+                    options['route_norm_eps'] = ROUTE_NORM_EPS[geometry]
                 default_options = options
                 if (schedule_hint := default_decode_schedule(
                         geometry, args.role, profile, capacity, args.bits)) is not None:
@@ -1108,7 +1130,7 @@ def build(args: argparse.Namespace) -> None:
                     shutil.copy2(raw / name, target)
                 variant = {'directory': directory, **{key: meta[key] for key in
                     ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
-                for key in ('descriptor_rows', 'native_info_version'):
+                for key in ('descriptor_rows', 'native_info_version', 'route_norm_eps'):
                     if key in meta:
                         variant[key] = meta[key]
                 if 'tile' in meta:

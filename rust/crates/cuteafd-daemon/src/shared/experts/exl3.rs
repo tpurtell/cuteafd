@@ -80,8 +80,12 @@ pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer
     let spark = matches!(layer, ExpertLayer::BackboneExl3Tp { .. });
     let (layer, world, rank) = residency_selection(layer)?;
     let manifest = catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
-    if spark { manifest.balanced_residency(layer, world, rank) }
-        else { manifest.residency(layer, world, rank) }
+    if spark { catalog.exl3_spark_residency(layer, world, rank) }
+        else {
+            anyhow::ensure!(world == 1 || !catalog.whole_expert_outputs(),
+                "experts with a per-expert output norm are whole on one GPU, never TP{world} halves");
+            manifest.residency(layer, world, rank)
+        }
 }
 
 fn budget(catalog: &OfficialV41Catalog, plan: &V41Exl3Residency) -> Result<ExpertLoadBudget> {
