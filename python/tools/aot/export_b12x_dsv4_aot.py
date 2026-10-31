@@ -588,6 +588,9 @@ def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
             (f"index_query_scale_m{rows}", "query_scale", {"rope": False, "heads": g.index_heads, "max_rows": rows},
              lambda r=rows: ml4.compile_query_scale_aot(g, rope=False, max_rows=r, heads=g.index_heads,
                                                         head_dim=g.index_head_dim)),
+            # The indexer query over a checkpoint keeping its FP8 block-128 wq_b as shipped.
+            (f"index_q_m{rows}", "index_q", {"mode": mode, "max_rows": rows, "fp8_weights": "only"},
+             lambda mode=mode, r=rows: ml4.compile_index_q_fp8_aot(g, mode=mode, max_rows=r)),
             (f"index_layer_norm_m{rows}", "layer_norm", {"width": g.hidden, "max_rows": rows},
              lambda r=rows: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=r, eps=g.index_norm_eps)),
             (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": index_pages},

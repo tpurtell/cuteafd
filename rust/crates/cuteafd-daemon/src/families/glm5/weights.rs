@@ -320,7 +320,7 @@ impl<'a> GlmLoader<'a> {
             match dtype {
                 DType::Bf16 => crate::shared::memory::load_timing::upload(bytes.len(), || self.library.copy_h2d(dest, bytes))?,
                 DType::F8E4M3 => {
-                    let (scale, scale_dtype, _) = self.raw(&format!("{}_scale_inv", name))?;
+                    let (scale, scale_dtype, _) = self.raw(&landing::block_grid(self.catalog, name))?;
                     ensure!(scale_dtype == DType::F32, "{name}: block scales must be FP32");
                     ensure!(scale.len() == shape[0].div_ceil(128) * k_blocks * 4, "{name}: unexpected scale grid");
                     let (w, s) = (self.upload(bytes)?, self.upload(&scale)?);
@@ -384,8 +384,8 @@ impl<'a> GlmLoader<'a> {
                         crate::families::glm5_flash::fp8::Layout::Block, crate::shared::fp8_linear::Fp8Scales::Pow2);
                     values[at..at + n * k].copy_from_slice(&q[..n * k]);
                     grid.extend(scales);
-                } else if self.catalog.tensor(&format!("{name}_scale_inv")).is_ok() {
-                    let (scale, scale_dtype, scale_shape) = self.raw(&format!("{name}_scale_inv"))?;
+                } else if self.catalog.tensor(&landing::block_grid(self.catalog, name)).is_ok() {
+                    let (scale, scale_dtype, scale_shape) = self.raw(&landing::block_grid(self.catalog, name))?;
                     ensure!(scale_dtype == DType::F32 && scale_shape == [block_rows, k.div_ceil(128)],
                         "{name}: expected FP32 128x128 block scales, found {scale_dtype:?} {scale_shape:?}");
                     grid.extend(scale.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())));
@@ -459,7 +459,7 @@ impl<'a> GlmLoader<'a> {
             ensure!(i + 1 == names.len() || self.catalog.tensor(name)?.metadata.shape[0] % 128 == 0,
                 "{names:?}: only the last concatenated weight may end inside a 128-row block");
         }
-        let grids = names.iter().map(|n| format!("{n}_scale_inv")).collect::<Vec<_>>();
+        let grids = names.iter().map(|n| landing::block_grid(self.catalog, n)).collect::<Vec<_>>();
         Ok(Some((landing::concat(self.catalog, names)?, landing::concat(self.catalog, &grids)?)))
     }
 
@@ -655,7 +655,7 @@ impl<'a> GlmLoader<'a> {
         }
         ensure!(axis == Axis::Rows, "{names:?}: concatenated weights split by rows");
         if self.native_fp8(names)? {
-            let grids = names.iter().map(|n| format!("{n}_scale_inv")).collect::<Vec<_>>();
+            let grids = names.iter().map(|n| landing::block_grid(self.catalog, n)).collect::<Vec<_>>();
             return (0..ranks).map(|rank| {
                 let (values, values_bytes) = landing::row_shares(self.catalog, names, ranks, rank, 128)?;
                 let (grid, grid_bytes) = landing::row_shares(self.catalog, &grids, ranks, rank, 1)?;
@@ -710,7 +710,7 @@ impl<'a> GlmLoader<'a> {
                 "{name}: {shape:?} does not split into whole 128-K blocks over {ranks} GPUs");
             return (0..ranks).map(|rank| {
                 let (values, values_bytes) = landing::col_share(self.catalog, name, ranks, rank)?;
-                let (grid, grid_bytes) = landing::col_share(self.catalog, &format!("{name}_scale_inv"), ranks, rank)?;
+                let (grid, grid_bytes) = landing::col_share(self.catalog, &landing::block_grid(self.catalog, name), ranks, rank)?;
                 self.on_rank(rank, |_| Ok((self.landed(&[values], values_bytes)?, self.landed(&[grid], grid_bytes)?)))
             }).collect();
         }
@@ -892,11 +892,18 @@ impl<'a> GlmLoader<'a> {
         if full_indexer {
             let wq_b = [cfg.weight(layer, Op::IndexQ).context("indexer wq_b")?];
             if cfg.variant.ml4().is_some() {
-                // The direct-query indexer's wq_b runs only in the K6 core (loaded with the
-                // core layouts); a shipped FP8 block-128 wq_b has no native projection yet.
-                ensure!(self.catalog.tensor(&wq_b[0]).is_err(), "{}: Mistral Large 4 runs the indexer wq_b \
-                    only from the K6 core; the FP8 block-128 form needs the native ml4 index-query projection",
-                    wq_b[0]);
+                // The direct-query indexer's wq_b in the checkpoint's own form: the K6 core
+                // (loaded with the core layouts), or its shipped FP8 block-128 E4M3 + grid,
+                // replicated (ml4_index_q). Anything else is refused, never re-quantized.
+                if self.catalog.tensor(&wq_b[0]).is_ok() {
+                    ensure!(self.native_fp8(&wq_b)?, "{}: Mistral Large 4 serves the indexer wq_b from the \
+                        K6 core or its shipped FP8 block-128 form only", wq_b[0]);
+                    let (w8_name, scale_name, _) = fp8_operand_names("w_iq");
+                    let ((values, values_bytes), (grid, grid_bytes)) = self.fp8_lands(&wq_b)?
+                        .context("Mistral Large 4 FP8 wq_b landing")?;
+                    put(&mut ops, w8_name, self.landed_all(ranks, &values, values_bytes)?);
+                    put(&mut ops, scale_name, self.landed_all(ranks, &grid, grid_bytes)?);
+                }
             } else if core || self.bf16_native(&wq_b)? {
                 put(&mut ops, "w_iq", self.upload_all(ranks, &self.bf16_rows(&wq_b)?.0)?);
             } else {

@@ -143,6 +143,8 @@ pub fn step_scratch(cfg: &GlmDsaConfig, split: bool, decode: bool,
             let name = format!("{family}_sparse_mla{tag}_{mode}_{cap}");
             programs = programs.max(lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))?);
         }
+        // The FP8 indexer query (a checkpoint keeping wq_b as shipped) shares the arena.
+        programs = programs.max(lookup(&format!("{family}_index_q_{cap}")).unwrap_or(0));
         let name = format!("{family}_index_topk_{mode}_{cap}");
         return Ok(GlmScratch { programs,
             topk: lookup(&name).ok_or_else(|| anyhow::anyhow!("{family} step needs program {name}"))? });

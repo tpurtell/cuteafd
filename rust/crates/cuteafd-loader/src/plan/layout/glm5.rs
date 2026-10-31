@@ -243,10 +243,15 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
                 }
                 if cfg.indexers[layer] == GlmIndexer::Full {
                     let name = w(layer, Op::IndexQ).unwrap();
+                    // A direct-query variant may carry wq_b in the K6 core (whole, per attention rank).
+                    if let Some(core_q) = cfg.stem(layer, Op::IndexQ).and_then(|stem| core.get_weight(&stem)) {
+                        put(rank, "indexer", "exl3-k6", core_q.resident_bytes(1)?);
+                    } else {
                     let index_bf16 = (native || trellis) && tensor(&name)?.dtype == DType::Bf16;
                     let (values, scales) = projection(&name)?;
                     put(rank, "indexer", if index_bf16 { "bf16" } else { "fp8" }, values * if index_bf16 { 2 } else { 1 });
                     if !index_bf16 { put(rank, "indexer", "fp8-scale", scales); }
+                    }
                     let ik = [Op::IndexK, Op::IndexWeights].into_iter().map(|op| tensor(&w(layer, op).unwrap())
                         .map(|t| t.shape.iter().product::<usize>() as u64 * 2)).sum::<anyhow::Result<u64>>()?;
                     put(rank, "indexer", "bf16", ik);

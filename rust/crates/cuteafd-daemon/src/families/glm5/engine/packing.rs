@@ -203,7 +203,7 @@ fn variant_inventory<'n>(family: &str, names: impl IntoIterator<Item = &'n str>)
         let suffix = &name[family.len() + 1..];
         let stem = suffix.strip_suffix("_m4096").unwrap_or(suffix);
         let role = match stem {
-            "norm" | "router_scores" | "expert_input_quant" | "index_kw" | "index_layer_norm"
+            "norm" | "router_scores" | "expert_input_quant" | "index_kw" | "index_q" | "index_layer_norm"
                 | "index_query_scale" | "query_scale" | "query_scale_nope" => PackedRows,
             "rank_pack" | "rank_pack_nope" | "absorb" | "absorb_nope" | "values" | "index_post"
                 | "index_post_nope" | "index_topk_prefill" | "sparse_mla_prefill" | "sparse_mla_nope_prefill"
@@ -261,11 +261,11 @@ mod tests {
         use prefill_packing::ProgramRows::{PackedRows, SequenceLocal};
         let cfg = GlmDsaConfig::from_hf(&serde_json::from_str(include_str!(
             "../../../../../cuteafd-loader/src/families/mistral_large4/official-config.json"))?)?;
-        let names = ["ml4_norm", "ml4_index_kw", "ml4_query_scale_nope_m4096", "ml4_swiglu_i3072",
+        let names = ["ml4_norm", "ml4_index_kw", "ml4_index_q_m4096", "ml4_query_scale_nope_m4096", "ml4_swiglu_i3072",
             "ml4_absorb_m4096", "ml4_sparse_mla_nope_prefill_m4096", "ml4_index_topk_prefill_m4096",
             "ml4_sparse_mla_decode_m64", "glm_norm"];
         let inventory = coordinator_inventory(&cfg, names, false)?;
-        for name in ["ml4_norm", "ml4_index_kw", "ml4_query_scale_nope_m4096", "ml4_swiglu_i3072"] {
+        for name in ["ml4_norm", "ml4_index_kw", "ml4_index_q_m4096", "ml4_query_scale_nope_m4096", "ml4_swiglu_i3072"] {
             assert!(inventory.contains(&(name.to_owned(), PackedRows)), "{name}");
         }
         for name in ["ml4_absorb_m4096", "ml4_sparse_mla_nope_prefill_m4096", "ml4_index_topk_prefill_m4096"] {

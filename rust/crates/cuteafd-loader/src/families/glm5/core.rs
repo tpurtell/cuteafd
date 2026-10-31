@@ -232,6 +232,18 @@ impl CoreCharges {
             ensure!(entries.iter().filter(|p| p["name"] == "ml4_index_kw").count() == 1,
                 "Mistral Large 4 K6 requires ml4_index_kw");
             programs.insert("ml4_index_kw".to_string());
+            // An indexer wq_b kept in its shipped FP8 block-128 form runs the
+            // native FP8 projection (the checkpoint's tensor_storage decides).
+            let fp8_index_q = (0..layers).any(|layer| cfg.indexers[layer] == super::GlmIndexer::Full
+                && cfg.stem(layer, Op::IndexQ).is_some_and(|stem| core.get_weight(&stem).is_none()));
+            if fp8_index_q {
+                for cap in ["m64", "m4096"] {
+                    let name = format!("ml4_index_q_{cap}");
+                    ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1,
+                        "Mistral Large 4 with an FP8 indexer wq_b requires {name}");
+                    programs.insert(name);
+                }
+            }
             for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
                 let name = format!("ml4_swiglu_i{inter}");
                 ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");

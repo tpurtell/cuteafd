@@ -2706,7 +2706,7 @@ impl<'a> GlmEngine<'a> {
 
     /// Scalars of the programs over FP8 weights: `rows`, plus the prefill
     /// programs' `fp8_rows` (1: W8A8, 0: W8A16).
-    fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
+    pub(super) fn projection_scalars(&self, rows: Scalar, cap: &str) -> Vec<Scalar> {
         if cap == "m64" {
             vec![rows]
         } else {

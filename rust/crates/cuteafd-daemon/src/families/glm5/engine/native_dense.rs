@@ -504,12 +504,15 @@ impl<'a> GlmEngine<'a> {
         self.run_on(rank, &format!("ml4_index_layer_norm_{cap}"), &[("x", w.x.buffer.ptr),
             ("weight", layer.ptr("index_q_norm_w")?), ("bias", layer.ptr("index_q_norm_b")?),
             ("out", normed.ptr)], &[row])?;
-        // wq_b in the checkpoint's own form: the K6 core (the shared trellis path).
-        // A checkpoint keeping the official FP8 block-128 wq_b needs its native
-        // FP8 projection at K = hidden; refuse rather than re-quantize.
-        ensure!(layer.core.contains_key("index_q"), "Mistral Large 4 indexer wq_b: only the K6 core form \
-            runs; an FP8 block-128 wq_b needs the native ml4 index-query projection");
-        self.core_linear(rank, w, layer, "index_q", normed, s.iq.buffer, rows, None)?;
+        // wq_b in the checkpoint's own form: the K6 core (the shared trellis path), or
+        // the shipped FP8 block-128 weight through its native projection (never re-quantized).
+        if layer.core.contains_key("index_q") {
+            self.core_linear(rank, w, layer, "index_q", normed, s.iq.buffer, rows, None)?;
+        } else {
+            let fp8 = [("x", normed.ptr), ("w_iq_fp8", layer.ptr("w_iq_fp8")?),
+                ("w_iq_scale", layer.ptr("w_iq_scale")?), ("out", s.iq.buffer.ptr), ("scratch", w.scratch.buffer.ptr)];
+            self.run_on(rank, &format!("ml4_index_q_{cap}"), &fp8, &self.projection_scalars(row, cap))?;
+        }
         self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", s.iq.buffer.ptr),
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
             ("s", layer.ptr("index_scale_s")?), ("b", layer.ptr("index_scale_b")?),
