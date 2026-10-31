@@ -131,6 +131,15 @@ pub fn max_rank_bytes(cutoff: Cutoff, unit_rows: usize, sequences: usize, topk: 
     }).max().unwrap_or(0)
 }
 
+/// The shared Spark intake's per-row plane width for partial replies: the
+/// intake allocates `rows x row_bytes` per rank and slot and lands each frame
+/// at offset 0 with its own length (`cuteafd_pull_frames` bounds by capacity),
+/// so a row width of `ceil(max_rank_bytes / unit_rows)` (16-byte aligned)
+/// covers every region mix the admission allows. Planner and runtime use this.
+pub fn intake_row_bytes(cutoff: Cutoff, unit_rows: usize, sequences: usize, topk: usize, width: usize) -> usize {
+    max_rank_bytes(cutoff, unit_rows, sequences, topk, width).div_ceil(unit_rows.max(1)).next_multiple_of(16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +200,17 @@ mod tests {
             8 * (960 * 8192 + 1792 * 4224));
         assert_eq!("fp8".parse::<WideFormat>()?, WideFormat::Fp8);
         assert!("bf16".parse::<WideFormat>().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn intake_rows_cover_the_worst_reply_without_all_bf16() -> Result<()> {
+        let cutoff = Cutoff::new(64, 8)?;
+        let row = intake_row_bytes(cutoff, 2752, 16, 8, 4096);
+        assert!(row * 2752 >= max_rank_bytes(cutoff, 2752, 16, 8, 4096) && row % 16 == 0);
+        assert!(row < 8 * 8192, "{row} would be the all-BF16 charge");
+        // A one-row decode lane holds its single BF16 row exactly.
+        assert_eq!(intake_row_bytes(cutoff, 1, 1, 8, 4096), 8 * 8192);
         Ok(())
     }
 }

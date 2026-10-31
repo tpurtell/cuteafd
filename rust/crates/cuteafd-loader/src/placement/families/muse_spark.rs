@@ -175,10 +175,13 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     // Spark partial replies land on the coordinator: per wave slot, every rank's
     // worst-case mix of BF16 (decode/verify segments) and NVFP4 (prefill) partials.
     let cutoff = crate::families::muse_spark::replies::Cutoff::with_wide(partial_bf16_max_rows, 1, partial_wide_format)?;
-    let rank_reply = crate::families::muse_spark::replies::max_rank_bytes(cutoff,
+    // The shared intake allocates rows x row_bytes per rank and slot; the row width
+    // is the worst partial-reply mix spread over the unit (replies::intake_row_bytes).
+    let intake_row = crate::families::muse_spark::replies::intake_row_bytes(cutoff,
         usize::try_from(prefill.unit_rows)?, usize::try_from(slots)?, cfg.topk, cfg.expert_hidden) as u64;
     fixed.push(Demand::new(0, Category::Transport, "Muse Spark partial reply planes",
-        rank_reply * spark_ranks as u64 * prefill.waves, Basis::Exact));
+        crate::serving_capacity::prefill_return_bytes(prefill.waves, prefill.unit_rows, spark_ranks as u64,
+            intake_row / 2), Basis::Exact));
     fixed.extend(runtime_fixed);
 
     // Spark: whole experts partitioned by the shared owner table.
