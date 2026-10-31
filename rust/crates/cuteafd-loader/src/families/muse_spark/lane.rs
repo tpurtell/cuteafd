@@ -13,6 +13,32 @@ use super::MuseSparkConfig;
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
+/// The step metadata planes the attention programs read beyond the lane's
+/// per-row planes: each row's full-layer record slot (`page_slots`) and
+/// sliding record slot (`step_slots`), i64, and the page table: one shared
+/// row for a prefill unit, a row per decode/verify row otherwise, each
+/// `ceil(context / 64)` i32 pages wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StepTables {
+    pub rows: usize,
+    pub decode_rows: usize,
+    pub stride: usize,
+}
+
+impl StepTables {
+    pub fn new(rows: usize, decode_rows: usize, context: u64) -> Result<Self> {
+        ensure!((1..=rows).contains(&decode_rows) && context > 0, "Muse step table geometry");
+        let stride = usize::try_from(context.div_ceil(super::cache::PAGE_ROWS))?;
+        Ok(Self { rows, decode_rows, stride })
+    }
+    pub fn slots_bytes(&self) -> usize { self.rows * 8 }
+    pub fn table_bytes(&self) -> usize { self.decode_rows.max(1) * self.stride * 4 }
+    /// page_slots + step_slots + the page table, each `ALIGN`-aligned.
+    pub fn bytes(&self) -> usize {
+        2 * self.slots_bytes().next_multiple_of(ALIGN) + self.table_bytes().next_multiple_of(ALIGN)
+    }
+}
+
 /// Plane name -> bytes, in a fixed order (BTreeMap) so the device's offsets
 /// are deterministic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +122,16 @@ impl LanePlanes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_tables_hold_a_decode_batch_of_full_page_rows() -> Result<()> {
+        let tables = StepTables::new(2752, 16, 1 << 20)?;
+        assert_eq!(tables.stride, 16384);
+        assert_eq!(tables.table_bytes(), 16 * 16384 * 4);
+        assert_eq!(tables.bytes(), 2 * 2752 * 8 + 16 * 16384 * 4);
+        assert!(StepTables::new(64, 65, 1 << 20).is_err() && StepTables::new(64, 1, 0).is_err());
+        Ok(())
+    }
 
     #[test]
     fn release_lane_planes() -> Result<()> {

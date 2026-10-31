@@ -71,6 +71,11 @@ mod tests {
             .find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).context("spark")?;
         let rings = spark.items.iter().find(|item| item.group == "rdma rings").context("rings")?.bytes;
         assert_eq!(rings, plan.model.ring_bytes(ExpertGeometry::MUSE_SPARK)? as u64);
+        // Step metadata: the runtime's StepStorage extent is the charged item.
+        let charged = placement.items[0].iter().find(|item| item.group == "Muse step metadata").context("charge")?.bytes;
+        let tables = shared::step_tables(2752, 16, cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(
+            &testing::muse_spark_config())?.max_position as u64)?;
+        assert_eq!(charged, tables.bytes() as u64);
         Ok(())
     }
 }

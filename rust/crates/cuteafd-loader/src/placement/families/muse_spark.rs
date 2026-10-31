@@ -154,6 +154,13 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse lane planes", lane.bytes()? as u64,
             Basis::Exact));
     }
+    // Step metadata: per-row record slots and the page table for the widest
+    // decode/verify batch (every slot at the 64-row rollback step) at the context.
+    let tables = step_tables(usize::try_from(prefill.unit_rows)?, usize::try_from(slots)?, context)?;
+    for gpu in 0..ranks {
+        fixed.push(Demand::new(u8::try_from(gpu)?, Category::Workspace, "Muse step metadata", tables.bytes() as u64,
+            Basis::Exact));
+    }
     // One lane-private K6 scratch set per rank (serial projections; the head's on the head rank).
     let projections = crate::families::muse_spark::weight_layout::projections(cfg, core, ranks,
         usize::try_from(prefill.unit_rows)?)?;
@@ -248,6 +255,14 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     };
     spark_budget.constrain(&mut request)?;
     Ok(MuseRequest { request, spark_budget, layouts, global, projections })
+}
+
+/// The step metadata a rank allocates: the unit's per-row slots and a page
+/// table for `slots` sequences each stepping up to the 64-row rollback step
+/// (decode and verify), capped at the unit's rows.
+pub fn step_tables(unit_rows: usize, slots: usize, context: u64) -> Result<crate::families::muse_spark::lane::StepTables> {
+    let decode = (slots * crate::families::muse_spark::cache::SWA_RING_STEP as usize).min(unit_rows);
+    crate::families::muse_spark::lane::StepTables::new(unit_rows, decode, context)
 }
 
 /// The sliding layers' rotary tables: the module's default RoPE over the head
