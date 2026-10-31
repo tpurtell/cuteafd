@@ -7,6 +7,7 @@ pub(crate) mod core;
 pub(crate) mod device;
 pub(crate) mod experts;
 pub(crate) mod lane;
+pub(crate) mod peer;
 pub(crate) mod programs;
 pub(crate) mod serve;
 pub(crate) mod spark;

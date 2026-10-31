@@ -59,8 +59,13 @@ impl LanePlanes {
             ("positions", rows * 8), ("ring_slots", rows * 8), ("seq_first", rows * 4),
         ]);
         if ranks == 2 {
-            // The TP2 o_proj F32 partial lands from the peer.
-            planes.insert("o_peer", f32(h));
+            // TP2 o_proj (the shared K-split rule): this GPU's core narrowed to BF16
+            // (pushed to the peer) and the rank-ordered F32 sum before the one egress.
+            // The peer's core lands in the exchange's receive slot.
+            planes.insert("o_core", bf16(h));
+            planes.insert("o_reduced", f32(h));
+            // This rank's half of the expert width (pre_expert output split, post_expert K-split input).
+            planes.insert("expert_half", bf16(e / 2));
         }
         for name in Self::SPAN {
             let unit = planes[name];
@@ -101,7 +106,8 @@ mod tests {
         assert_eq!(pair.planes["q"] * 2, whole.planes["q"]);
         assert_eq!(pair.planes["kv_step"], 2752 * 8 * 64 * 2 * 2);
         assert_eq!(whole.planes["expert_wire"], 2752 * 4224);
-        assert!(!whole.planes.contains_key("o_peer") && pair.planes.contains_key("o_peer"));
+        assert!(!whole.planes.contains_key("o_core") && !whole.planes.contains_key("o_reduced"));
+        assert_eq!((pair.planes["o_core"], pair.planes["o_reduced"]), (2752 * 8192 * 2, 2752 * 8192 * 4));
         let offsets = pair.offsets()?;
         assert!(offsets.values().all(|(at, _)| at % ALIGN == 0));
         let end = offsets.values().map(|(at, n)| at + n).max().unwrap();

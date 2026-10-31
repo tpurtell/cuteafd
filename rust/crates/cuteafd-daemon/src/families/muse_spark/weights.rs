@@ -50,9 +50,10 @@ impl PackedLayer {
             ensure!(loaded.info.dtype == dtype, "{name}: {:?}, expected {dtype:?}", loaded.info.dtype);
             Ok(loaded.bytes)
         };
+        let half = cfg.expert_hidden / ranks;
         for (name, stem, outputs, split_rows) in [("attn.q", "self_attn.q_proj", q, true), ("attn.k", "self_attn.k_proj", kv, true),
             ("attn.v", "self_attn.v_proj", kv, true), ("attn.gate", "self_attn.gate_proj", q, true),
-            ("moe.pre_expert", "mlp.pre_expert_proj", cfg.expert_hidden, false),
+            ("moe.pre_expert", "mlp.pre_expert_proj", half, true),
             ("moe.post_expert", "mlp.post_expert_proj", h, false), ("attn.o", "self_attn.o_proj", h, false)] {
             if let Some(core_layout) = core_layouts.get(name) {
                 core.insert(name, core_layout.read(&mut |member: &str| read(member))?);
@@ -62,6 +63,9 @@ impl PackedLayer {
             let packed = if name == "attn.o" {
                 // o_proj [h, heads*d]: this rank's heads are its input columns.
                 columns(&whole, h, cfg.heads * d, rank * q, q)
+            } else if name == "moe.post_expert" {
+                // post_expert_proj [h, E]: this rank's half of the expert width (K-split).
+                columns(&whole, h, cfg.expert_hidden, rank * half, half)
             } else if split_rows {
                 rows(&whole, h, rank * outputs, outputs)
             } else { whole };

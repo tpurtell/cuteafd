@@ -163,6 +163,17 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
                 scratch.bytes()? as u64, Basis::Exact));
         }
     }
+    // TP2: the exchange's per-channel receive slots on each GPU (one each, proven by
+    // the interleaving model in `families::muse_spark::tp2`). `Partials` (onboarded
+    // layers' peer partials) belongs to `tp2_workspace`, opened only on onboarding.
+    if pair {
+        let unit = usize::try_from(prefill.unit_rows)?;
+        let exchange = tp2_exchange_bytes(cfg, unit)?;
+        for gpu in 0..ranks {
+            fixed.push(Demand::new(u8::try_from(gpu)?, Category::Transport, "Muse TP2 exchange slots",
+                exchange as u64, Basis::Exact));
+        }
+    }
     // Sliding layers' RoPE tables (shared rope_tables_bf16, half width) over the context, on every GPU.
     let rope = rope_tables(cfg, context)?;
     for gpu in 0..ranks {
@@ -246,8 +257,18 @@ pub fn rope_tables(cfg: &MuseSparkConfig, context: u64) -> Result<crate::plan::r
         [crate::plan::rope::Recipe::new(cfg.head_dim, cfg.rope_theta, None)?])
 }
 
-/// Per GPU under TP2 onboarding: its own and its peer's BF16 partials for one
-/// unit (`rows x topk x E`), the combine's two ranks.
+/// Per GPU of a TP2 pair: the receive slots of every channel but `Partials`
+/// (attention and post-expert cores, the expert-input and combined halves).
+pub fn tp2_exchange_bytes(cfg: &MuseSparkConfig, unit_rows: usize) -> Result<usize> {
+    use crate::families::muse_spark::tp2::{receive_slots, slot_bytes, Channel};
+    Channel::ALL.iter().filter(|&&c| c != Channel::Partials).try_fold(0usize, |sum, &channel| {
+        let bytes = slot_bytes(channel, cfg.hidden, cfg.expert_hidden, cfg.topk, unit_rows)? * receive_slots(channel);
+        sum.checked_add(bytes).context("Muse TP2 exchange overflow")
+    })
+}
+
+/// Per GPU under TP2 onboarding: its own BF16 partials and the `Partials`
+/// receive slot holding its peer's for one unit (`rows x topk x E` each).
 pub fn tp2_partial_bytes(cfg: &MuseSparkConfig, unit_rows: usize) -> usize {
     2 * unit_rows * cfg.topk * crate::families::muse_spark::replies::PartialFormat::Bf16.row_bytes(cfg.expert_hidden)
 }

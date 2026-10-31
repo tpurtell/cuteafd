@@ -61,9 +61,11 @@ impl LayerLayout {
             matrix("attn.v", "self_attn.v_proj", kv, h, Some(CoreSplit::Output))?;
             matrix("attn.o", "self_attn.o_proj", h, q, Some(CoreSplit::Input))?;
             matrix("attn.gate", "self_attn.gate_proj", q, h, Some(CoreSplit::Output))?;
-            // Whole on every rank: the MoE frontend/backend, router and vectors.
-            matrix("moe.pre_expert", "mlp.pre_expert_proj", e, h, None)?;
-            matrix("moe.post_expert", "mlp.post_expert_proj", h, e, None)?;
+            // MoE frontend/backend split too (single residency): pre_expert by
+            // output columns over E, post_expert by input columns over E (K-split,
+            // rank-ordered F32 reduction). Router and vectors stay whole.
+            matrix("moe.pre_expert", "mlp.pre_expert_proj", e / ranks, h, Some(CoreSplit::Output))?;
+            matrix("moe.post_expert", "mlp.post_expert_proj", h, e / ranks, Some(CoreSplit::Input))?;
             operands.insert("moe.router", cfg.experts * h * 4);
             operands.insert("moe.bias", cfg.experts * 4);
             operands.insert("moe.pre_expert_norm", e * 2);
@@ -174,8 +176,14 @@ mod tests {
         for rank in &pair {
             assert_eq!(rank.core["attn.q"].shape, [4096, 8192]);
             assert_eq!(rank.core["attn.o"].shape, [8192, 4096]);
-            assert_eq!(rank.core["moe.pre_expert"], whole.core["moe.pre_expert"]);
+            assert_eq!(rank.core["moe.pre_expert"].shape, [2048, 8192]);
+            assert_eq!(rank.core["moe.post_expert"].shape, [8192, 2048]);
             assert_eq!(rank.operands["moe.router"], 256 * 8192 * 4);
+        }
+        // No projection is held twice: the MoE halves sum to the whole (plus one vector set).
+        for name in ["moe.pre_expert", "moe.post_expert"] {
+            let halves = pair[0].core[name].bytes + pair[1].core[name].bytes;
+            assert!(halves >= whole.core[name].bytes && halves - whole.core[name].bytes < 1 << 20, "{name}");
         }
         let pair_total = pair[0].attention_bytes().unwrap() + pair[1].attention_bytes().unwrap();
         // Split halves sum to the whole payload plus one replicated input/output vector set.

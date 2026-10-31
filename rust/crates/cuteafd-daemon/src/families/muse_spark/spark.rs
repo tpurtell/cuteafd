@@ -257,10 +257,18 @@ mod tests {
         assert!(source.contains("reserve_h2d_ordered"), "upload staging reserved before readiness");
         assert!(!source.contains("block_on") && !source.contains("cuda_stream_synchronize"));
         let device = include_str!("device.rs");
-        let layer = device.split("pub(crate) fn layer(").nth(1).unwrap();
+        let round_trip = device.split("fn spark_experts(").nth(1).unwrap().split("pub(crate) fn layer(").next().unwrap();
         let order = ["self.expert_wire(rows)", "experts.send(layer, rows)", "experts.land(wave)",
-            "self.combine(layer", "experts.consumed(wave)", "self.moe_backend(layer, rows)"];
-        let at: Vec<usize> = order.iter().map(|needle| layer.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "layer order {order:?}");
+            "self.combine(layer", "experts.consumed(wave)"];
+        let at: Vec<usize> = order.iter().map(|needle| round_trip.find(needle).unwrap()).collect();
+        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "Spark round trip order {order:?}");
+        // Both layouts run the round trip between the frontend and the backend.
+        let layer = device.split("pub(crate) fn layer(").nth(1).unwrap();
+        for (front, back) in [("self.moe_frontend(layer, rows)", "self.moe_backend(layer, rows)"),
+            ("self.moe_frontend_split(layer, rows", "self.moe_backend_split(layer, rows")] {
+            let (f, b) = (layer.find(front).unwrap(), layer.find(back).unwrap());
+            let trip = f + layer[f..].find("self.spark_experts(layer, rows, experts)").unwrap();
+            assert!(f < trip && trip < b, "{front} -> round trip -> {back}");
+        }
     }
 }

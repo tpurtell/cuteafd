@@ -68,5 +68,13 @@ impl<'a> CorePrograms<'a> {
         self.projection(weights, ProjectionOutput::F32)?.core(rows, input, weights, self.scratch()?, stream)
     }
 
+    /// The K-split egress (shared rule): `rank0 + rank1` BF16 cores widened and
+    /// added in rank order in F32 (`reduced`), then the one H128/svh egress.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reduced(&self, add: &cuteafd_ffi::Bf16F32Add<'_>, rows: usize, rank0: Buffer, rank1: Buffer,
+        reduced: Buffer, weights: &CoreWeights<'_>, output: Buffer, stream: *mut c_void) -> Result<()> {
+        self.projection(weights, ProjectionOutput::F32)?.reduced(add, rows, rank0, rank1, reduced, weights, output, stream)
+    }
+
     pub(crate) fn program_count(&self) -> usize { self.projections.len() }
 }
