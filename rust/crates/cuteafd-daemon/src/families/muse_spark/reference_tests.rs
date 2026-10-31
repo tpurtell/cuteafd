@@ -234,3 +234,24 @@ fn online_softmax_against_the_eager_oracle() -> Result<()> {
     }
     Ok(())
 }
+
+/// Semantic check independent of rounding: the oracle with every BF16 rounding
+/// disabled against the official model run in FP32 (`fixture_precision.py`
+/// writes `official_f32.json`). BF16 noise vanishes from both sides, so any
+/// remaining gap is a semantic difference or FP32-vs-oracle reduction order.
+#[test]
+fn oracle_without_bf16_rounding_matches_the_official_fp32_model() -> Result<()> {
+    let path = fixtures().join("official_f32.json");
+    if !path.is_file() { return Ok(()); }
+    let record: serde_json::Value = serde_json::from_slice(&std::fs::read(fixtures().join("official.json"))?)?;
+    let cfg = MuseSparkConfig::from_hf(&record["config"])?;
+    let tokens: Vec<u32> = serde_json::from_value(record["tokens"].clone())?;
+    let exact: Vec<Vec<f32>> = serde_json::from_value(serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path)?)?["logits"].clone())?;
+    let mut ops = reference(&cfg)?;
+    let logits = cuteafd_loader::families::muse_spark::reference::without_bf16_rounding(||
+        forward(&cfg, &mut ops, &tokens, cfg.layers))?;
+    let (worst, top1) = compare(&logits, &exact);
+    eprintln!("muse oracle (no BF16 rounding) vs official FP32: max |logit diff| {worst:.6}, top-1 {top1}/{}", tokens.len());
+    assert!(worst <= 1e-4, "semantic gap {worst}");
+    Ok(())
+}

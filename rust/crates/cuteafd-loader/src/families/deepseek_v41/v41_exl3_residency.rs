@@ -167,7 +167,17 @@ impl OfficialV41Catalog {
     /// each expert's whole output before its routing weight): such experts are
     /// never sliced by intermediate; Spark ranks hold them whole (expert parallel).
     pub fn whole_expert_outputs(&self) -> bool {
-        self.tensors().iter().any(|tensor| tensor.metadata.name.ends_with(".experts.post_expert_norm.weight"))
+        // One binary search on the first routed layer's norm name (the catalog is
+        // sorted); planners call this per layer and rank, so never scan.
+        self.post_expert_norm_name(self.routed_experts().first_layer)
+            .is_some_and(|name| self.tensor(&name).is_ok())
+    }
+
+    /// `...layers.L.mlp.experts.post_expert_norm.weight` in the checkpoint's EXL3 naming.
+    fn post_expert_norm_name(&self, layer: usize) -> Option<String> {
+        let manifest = self.exl3()?;
+        let down = manifest.naming.projection(false, layer, 0, V41Exl3ProjectionKind::Down);
+        down.split_once(".experts.").map(|(prefix, _)| format!("{prefix}.experts.post_expert_norm.weight"))
     }
 
     /// The checkpoint's Spark residency for `rank` of `world`: whole experts
@@ -191,9 +201,7 @@ impl OfficialV41Catalog {
         let manifest = self.exl3().context("whole-expert EXL3 residency needs trellis headers")?;
         let mut plan = manifest.partitioned_residency(layer, owners, rank)?;
         let V41Exl3Layer::Backbone(index) = layer else { unreachable!("partitioned residency is backbone-only") };
-        let name = manifest.naming.projection(false, index, 0, V41Exl3ProjectionKind::Down);
-        let norm = name.split_once(".experts.").map(|(prefix, _)| format!("{prefix}.experts.post_expert_norm.weight"));
-        if let Some(norm) = norm.filter(|norm| self.tensor(norm).is_ok()) {
+        if let Some(norm) = self.post_expert_norm_name(index).filter(|norm| self.tensor(norm).is_ok()) {
             let tensor = self.tensor(&norm)?;
             ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16
                 && tensor.metadata.shape == [manifest.experts.hidden],

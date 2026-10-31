@@ -55,9 +55,23 @@ impl Tolerance {
     }
 }
 
+thread_local! {
+    /// Test-only: run the contracts without BF16 rounding (the semantic check
+    /// against the official model in FP32/FP64). Never set outside tests.
+    static EXACT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with every BF16 rounding of these contracts disabled (test-only).
+pub fn without_bf16_rounding<T>(f: impl FnOnce() -> T) -> T {
+    EXACT.with(|exact| exact.set(true));
+    let result = f();
+    EXACT.with(|exact| exact.set(false));
+    result
+}
+
 /// Round to BF16 (nearest even), as `tensor.to(torch.bfloat16)`.
 pub fn bf16(value: f32) -> f32 {
-    if value.is_nan() { return value; }
+    if value.is_nan() || EXACT.with(|exact| exact.get()) { return value; }
     let bits = value.to_bits();
     f32::from_bits((bits.wrapping_add(0x7fff + ((bits >> 16) & 1))) & 0xffff_0000)
 }
