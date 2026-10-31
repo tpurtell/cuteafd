@@ -4,6 +4,11 @@ Usage: python native/tests/glm_draft_kernels_selftest.py /path/to/libcuteafd_nat
            [--head SHARD.safetensors] [--head-shape VOCAB WIDTH] [--head-only]
            [--head-rows 8,64] [--profile-head] [--quick]
            [--mimo-forward SNAPSHOT/dflash --fp8-rows 8,64 --profile-mimo --fp8-baseline LIB]
+           [--attention-only --attention-partition-arm LABEL=LIB ...]
+
+The opt-in partition profile expects d128 and d64 DFlash2 attention/workspace
+symbols in every library. It reports launch-inclusive eager CUDA-event medians
+for a bounded geometry/concurrency/context matrix; it does not change policy.
 
 Run with Python containing CUDA PyTorch, on one GPU.
 
@@ -840,6 +845,69 @@ def attention_check(lib, args):
                   f"median_ms={median:.6f} baseline_ms={old_median} arena_bytes={arena}")
 
 
+def partition_profile(args):
+    """Opt-in bounded CUDA-event timing; production partition policy is not modified."""
+    from draft_kv_selftest import pack
+    arms = [("baseline", args.library)] + [item.split("=", 1) for item in args.attention_partition_arm]
+    libraries = []
+    for label, path in arms:
+        lib = C.CDLL(path)
+        for dim in (64, 128):
+            suffix = "_d64" if dim == 64 else ""
+            fn = getattr(lib, "cuteafd_glm_dflash_attention" + suffix + "_fp8")
+            fn.argtypes, fn.restype = [P] * 10 + [C.c_int32] * 7 + [C.c_float, P], C.c_int32
+            ws = getattr(lib, "cuteafd_glm_dflash_attention_workspace" + suffix)
+            ws.argtypes, ws.restype = [C.c_int32] * 3, C.c_uint64
+        libraries.append((label, lib))
+    torch.manual_seed(945)
+    print("dim,heads,kv_heads,sequences,context,window,arm,median_us,cost_pct", flush=True)
+    for dim, heads, kvh in ((128, 64, 8), (64, 128, 16)):
+        suffix = "_d64" if dim == 64 else ""
+        for sequences in (1, 4, 16):
+            for context in (0, 32, 128, 512, 1024, 2048):
+                block, ring = 8, max(64, context + 17)
+                q = torch.randn(sequences, block, heads, dim, device="cuda").bfloat16()
+                k = torch.randn(sequences, block, kvh, dim, device="cuda").bfloat16()
+                v = torch.randn_like(k)
+                kr = pack(torch.randn(sequences * ring, kvh, dim, device="cuda").bfloat16())
+                vr = pack(torch.randn(sequences * ring, kvh, dim, device="cuda").bfloat16())
+                slots = torch.arange(sequences, device="cuda", dtype=torch.int32)
+                lengths = torch.full_like(slots, context)
+                ends = torch.full_like(slots, 2 * ring + context + 13)
+                launches, storage = [], []
+                native_stream = torch.cuda.current_stream().cuda_stream
+                for label, lib in libraries:
+                    fn = getattr(lib, "cuteafd_glm_dflash_attention" + suffix + "_fp8")
+                    size = getattr(lib, "cuteafd_glm_dflash_attention_workspace" + suffix)(sequences, kvh, context + block)
+                    scratch = torch.empty(size, device="cuda", dtype=torch.uint8)
+                    out = torch.empty_like(q)
+                    def launch(fn=fn, out=out, scratch=scratch, label=label):
+                        status = fn(q.data_ptr(), k.data_ptr(), v.data_ptr(), kr.data_ptr(), vr.data_ptr(),
+                            slots.data_ptr(), lengths.data_ptr(), ends.data_ptr(), out.data_ptr(), scratch.data_ptr(),
+                            sequences, block, heads, kvh, ring, context + block, 2048, dim ** -.5,
+                            native_stream)
+                        assert status == 0, (label, status)
+                    launch()
+                    torch.cuda.synchronize()
+                    launches.append((label, launch))
+                    storage.append((scratch, out))
+                # Interleave event-timed native launches within one session.
+                samples = {label: [] for label, _ in launches}
+                for repeat in range(7):
+                    for label, launch in (launches if repeat % 2 == 0 else launches[::-1]):
+                        a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        a.record()
+                        for _ in range(32):
+                            launch()
+                        b.record()
+                        b.synchronize()
+                        samples[label].append(a.elapsed_time(b) * 1000 / 32)
+                baseline = sorted(samples["baseline"])[3]
+                for label, _ in launches:
+                    median = sorted(samples[label])[3]
+                    print(f"{dim},{heads},{kvh},{sequences},{context},2048,{label},{median:.6f},{100*(median/baseline-1):.3f}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("library")
@@ -865,7 +933,18 @@ def main():
     group.add_argument("--skip-head", action="store_true")
     group.add_argument("--head-only", action="store_true", help="skip unrelated FP8 checks")
     group.add_argument("--attention-only", action="store_true", help="shared attention FP64 masks/tails and capacity gate")
+    parser.add_argument("--attention-partition-arm", action="append", default=[], metavar="LABEL=LIB",
+                        help="opt-in bounded partition timing; repeat for at most three candidate libraries")
     args = parser.parse_args()
+    if args.attention_partition_arm:
+        if not args.attention_only or len(args.attention_partition_arm) > 3 or any(
+                "=" not in item or not all(item.split("=", 1)) for item in args.attention_partition_arm):
+            parser.error("partition timing requires --attention-only and one to three LABEL=LIB arms")
+        labels = [item.split("=", 1)[0] for item in args.attention_partition_arm]
+        if "baseline" in labels or len(set(labels)) != len(labels):
+            parser.error("partition arm labels must be distinct and not baseline")
+        partition_profile(args)
+        return
     try:
         args.head_rows = [int(value) for value in args.head_rows.split(",")]
     except ValueError:
