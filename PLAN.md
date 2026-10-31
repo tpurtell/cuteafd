@@ -6302,3 +6302,13 @@ scalar evidence, model card, receipts, corpus, logs and the managed revision.
 A completed-archive retry verifies the managed snapshot without replaying the
 publisher against its retired standalone paths. Storage/finalizer/lifecycle
 checks add17+3+43 CPU cases, with no actual import or transfer yet.
+
+The short GPU pilot passed in563.50 seconds (2026-10-31T16:57:47UTC), exit0:
+all72 frozen-source layers,24 native byte-exact block proofs,7 separate
+2,205-token sparse/KV proofs and16 serialized candidates. Worst tested K6
+heldout NMSE is3.15245e-4 (<1e-3); routed K4 witness is3.15434e-4 (<0.05).
+No OOM or numerical crash occurred. Keep the proposed K6/core, K4/routed and
+native exclusions. Full production started2026-10-31T17:02:39UTC under unit
+`mistral-core-k6-1793466152658395709`, with authorized CPU upload and
+zero-copy distributed import enabled. Producer files/fork/calibration are
+frozen; recover this run explicitly with its existing launcher and --resume.
