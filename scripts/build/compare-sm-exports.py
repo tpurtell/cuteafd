@@ -178,6 +178,8 @@ def jobs(scope):
         ("ml4-k6-dense", "export_b12x_dsv4_aot.py",
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "ml4"]),
         ("ml4", "export_b12x_dsv4_aot.py", ["--geometry", "ml4"]),
+        # With its head split (ml42) and the token-split extras, as context-enabled images build.
+        ("ml4-context", "export_b12x_dsv4_aot.py", ["--geometry", "ml4", "--context-split", "on"]),
         ("glm-k6-dense", "export_b12x_dsv4_aot.py",
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glm"]),
         ("glmf-k6-dense", "export_b12x_dsv4_aot.py",

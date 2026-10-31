@@ -299,7 +299,7 @@ cmake \
   -DCUTEAFD_DSV4_MAX_CONTEXT="${CUTEAFD_WIP_DSV4_MAX_CONTEXT:-1048576}" \
   -DCUTEAFD_ENABLE_DSV4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_DSV4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_GLM_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLM_AOT:-OFF}" || echo OFF)" \
-  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && ( "${CUTEAFD_WIP_GLM_AOT:-OFF}" == ON || "${CUTEAFD_WIP_GLMF_AOT:-OFF}" == ON || "${CUTEAFD_WIP_DSV4_AOT:-OFF}" == ON ) ]] && echo "${CUTEAFD_WIP_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
+  -DCUTEAFD_CONTEXT_SPLIT_AOT="$( [[ "$role" == coordinator && ( "${CUTEAFD_WIP_GLM_AOT:-OFF}" == ON || "${CUTEAFD_WIP_GLMF_AOT:-OFF}" == ON || "${CUTEAFD_WIP_DSV4_AOT:-OFF}" == ON || "${CUTEAFD_WIP_ML4_AOT:-OFF}" == ON ) ]] && echo "${CUTEAFD_WIP_CONTEXT_SPLIT_AOT:-ON}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MIMO_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MIMO_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_MIMO_GEOMETRIES="$(g="${CUTEAFD_WIP_MIMO_GEOMETRIES:-mimo}"; echo "${g//,/;}")" \
   -DCUTEAFD_ENABLE_GLMF_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_GLMF_AOT:-OFF}" || echo OFF)" \
