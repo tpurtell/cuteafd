@@ -139,3 +139,39 @@ fn declared_index_file_is_the_inventory() {
         assert!(crate::plan::checkpoint::index_name(dir.path()).is_err(), "{bad}");
     }
 }
+
+fn layout_options(ranks: usize, gpus: usize) -> PlanOptions {
+    PlanOptions {
+        placement: ExpertPlacement::from_spark_ranks(ranks),
+        mapped_scale_host_budget_bytes: Some(64 << 30),
+        layout: Some(plan::layout::LayoutOptions {
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; gpus],
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0), prefix_slots: Some(0),
+            glm5_drafter_disabled: true, ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn exl3_publication_lays_out_on_the_glm_engine() {
+    let dir = snapshot(true, None);
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    for (ranks, gpus) in [(6, 1), (6, 2), (4, 2)] {
+        let report = input.plan(&layout_options(ranks, gpus)).unwrap();
+        let memory = report.memory_layout.as_ref().expect("a memory layout");
+        assert!(!memory.devices.is_empty(), "{ranks}+{gpus}: {:?}", report.hints);
+        assert_eq!(report.prefill_waves, Some(3), "{ranks}+{gpus}");
+        let rtx = memory.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).count();
+        assert_eq!(rtx, gpus);
+        let groups: std::collections::BTreeSet<_> = memory.devices[0].items.iter().map(|item| item.group.clone()).collect();
+        for group in ["attention", "indexer", "embedding", "lm_head"] {
+            assert!(groups.iter().any(|g| g.contains(group)), "{ranks}+{gpus}: no {group} in {groups:?}");
+        }
+        println!("ml4 {ranks} Sparks + {gpus} RTX: pool {} tokens, onboard {:?}, fits {}",
+            memory.pool_tokens, report.onboard_layers, report.fits);
+        // Before the build: the K6 core charges need the built PROGRAMS.json and
+        // the Spark scratch its package census; the planner names both.
+        assert!(memory.notes.iter().any(|n| n.contains("no calibrated Spark EXL3 scratch for mistral_large4")));
+    }
+}

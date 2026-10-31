@@ -92,7 +92,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
     let mut sparks = spark_devices(report, model, input, options, SPARK, &working,
-        spark_endpoints("glm5", lanes), &mut waste, &mut notes);
+        spark_endpoints(model.spec().family, lanes), &mut waste, &mut notes);
     let mut pool_tokens = 0;
     let mut local_layers = 0;
     match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(),
@@ -143,7 +143,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
     report.prefill_transports = Some(u64::from(!working.spark_layers.is_empty()));
     // Reapply after admission has selected its executable suffix and lane count.
-    charge_spark_devices(report, model, input, options, SPARK, &working, spark_endpoints("glm5", working.prefill_lanes),
+    charge_spark_devices(report, model, input, options, SPARK, &working, spark_endpoints(model.spec().family, working.prefill_lanes),
         &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));
     if report.encoder.is_none() {
         resolve_encoder(report, &Towers::checkpoint(report), &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);

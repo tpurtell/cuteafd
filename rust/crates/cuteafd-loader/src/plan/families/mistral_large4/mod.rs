@@ -272,6 +272,14 @@ impl FamilyModel for Model {
         if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
     }
 
+    /// Mistral Large 4 runs the GLM 5.3 engine: its adapter over the shared
+    /// solver, with the operands the checkpoint's variant names.
+    fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
+        options: &mut crate::plan::layout::LayoutOptions, _requested: crate::plan::ExpertPlacement)
+        -> Option<anyhow::Result<cuteafd_core::memory_layout::MemoryLayout>> {
+        Some(Ok(crate::plan::layout::glm5::layout(report, self, input, options)))
+    }
+
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         crate::serving_capacity::mistral_large4_cache_geometry(&self.cfg, options.coordinator_ranks).map(Some)
