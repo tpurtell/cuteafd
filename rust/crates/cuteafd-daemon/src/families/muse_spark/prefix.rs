@@ -35,6 +35,20 @@ pub(crate) struct Placement {
     pub len: usize,
 }
 
+impl crate::shared::qwen::scheduler::Placement for Placement {
+    fn len(&self) -> usize { self.len }
+    fn set_len(&mut self, len: usize) { self.len = len; }
+    fn units(&self) -> &[u32] { &self.pages }
+    fn slot(&self) -> i32 { self.slot as i32 }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+}
+
+/// Bytes of one mark summed over the coordinator ranks (each keeps its KV heads).
+pub(crate) fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> Result<usize> {
+    let cache = MuseCacheLayout::new(cfg, ranks)?;
+    Ok(usize::try_from(MuseStateLayout::new(cfg, &cache, 1)?.mark_bytes())? * ranks)
+}
+
 pub(crate) struct MusePrefix<'r, 'a> {
     library: &'a cuteafd_ffi::NativeLibrary,
     ranks: &'r [RankResources<'a>],
@@ -107,7 +121,9 @@ impl<'r, 'a> MusePrefix<'r, 'a> {
 
     /// Stable allocations the host snapshot tier may copy: every rank's record
     /// pool and mark arena.
-    pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> { self.arenas.clone() }
+    pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
+        self.ranks.iter().map(|rank| Rc::clone(&rank.kv.pool)).chain(self.arenas.iter().cloned()).collect()
+    }
 }
 
 impl PrefixFamily for MusePrefix<'_, '_> {
@@ -185,6 +201,8 @@ mod tests {
             let state = MuseStateLayout::new(&cfg, &MuseCacheLayout::new(&cfg, ranks)?, 16)?;
             let charged = cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) / ranks as u64;
             assert_eq!(state.mark_bytes(), charged, "ranks {ranks}");
+            // The backend sizes the mark rule with the same bytes admission used (one-rank total).
+            assert_eq!(super::mark_bytes(&cfg, ranks)? as u64, cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1));
         }
         Ok(())
     }

@@ -37,7 +37,8 @@ impl KvExtents {
 
 /// One rank's KV storage and its per-layer views.
 pub(crate) struct RankKv<'a> {
-    pub pool: Allocation<'a>,
+    /// The full layers' record pool (shared with the prefix host tier's registration).
+    pub pool: std::rc::Rc<Allocation<'a>>,
     /// Every sliding layer's rings for every slot (`MuseStateLayout::ring_offset`).
     pub rings: Allocation<'a>,
     pub layers: Vec<LayerKv>,
@@ -57,7 +58,7 @@ impl<'a> RankKv<'a> {
             extents.ring_bytes());
         let pool = {
             let _scope = cuteafd_ffi::memory_ledger::scope("kv/muse records");
-            Allocation::new(device, extents.pool_bytes().max(256))?
+            std::rc::Rc::new(Allocation::new(device, extents.pool_bytes().max(256))?)
         };
         let rings = {
             let _scope = cuteafd_ffi::memory_ledger::scope("kv/muse sliding rings");
