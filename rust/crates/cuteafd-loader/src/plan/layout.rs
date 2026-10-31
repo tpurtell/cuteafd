@@ -387,9 +387,10 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
-        // Mistral Large 4 K4.5 TP6 (its smallest fitting world; wider worlds' slices are
-        // narrower): eight retained capacity manifests plus 4096-row K32 wire/routes,
-        // 533,876,812 bytes (see census test).
+        // PROVISIONAL: derived from package manifests, not measured. Mistral Large 4 K4.5 TP6
+        // (its smallest fitting world; wider worlds' slices are narrower): eight retained
+        // capacity manifests plus 4096-row K32 wire/routes, 533,876,812 bytes (see census
+        // test). The first Spark hardware census replaces it; a difference is a finding.
         "mistral_large4" => 510 * MIB,
         _ => 0,
     };
