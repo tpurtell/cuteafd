@@ -248,6 +248,9 @@ def run(a, family, *, extras_root=None):
                 if checking and wid in ("official_short", "adapted_short"):
                     short[wid] = hidden.float().cpu()
                 del hidden, carry, values
+                if DEVICE == "cuda":
+                    # GB10 shares memory with the host: return cached blocks between windows.
+                    torch.cuda.empty_cache()
             if short:
                 difference = short["official_short"] - short["adapted_short"]
                 pending["checks"].append({"layer": index, "max_abs_hidden_difference": difference.abs().max().item(),
