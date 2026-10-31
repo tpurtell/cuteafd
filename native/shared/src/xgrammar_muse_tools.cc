@@ -10,10 +10,22 @@ const std::string kNameEnd = "\">";
 const std::string kEnd = "</atem:parameter>";
 const std::string kRaw = "muse_raw_string";
 const std::string kKey = "muse_parameter_key";
+// The template's `esc` breaks every special token ("<|...|>") apart, so no
+// rendered value contains "<|": a raw value must not either (the parser would
+// read <|eom|>, <|start|>, <|eot|> as message structure).
+const std::string kSpecial = "<|";
 std::string Literal(const std::string& text) { return EBNFScriptCreator::Str(text); }
-// The template's esc_attr: names are XML-escaped (and newlines folded), so a
-// declared name renders as this attribute text.
-std::string Attribute(const std::string& name) {
+std::string Replace(std::string text, const std::string& from, const std::string& to) {
+  size_t at = 0;
+  while ((at = text.find(from, at)) != std::string::npos) { text.replace(at, from.size(), to); at += to.size(); }
+  return text;
+}
+// The template's esc_attr: `esc` (special tokens and media placeholders broken
+// apart), newlines folded (esc_header), then XML escapes, so a declared name
+// renders as this attribute text.
+std::string Attribute(const std::string& raw) {
+  std::string name = Replace(Replace(Replace(Replace(raw, "<|", "< |"), "<image>", "< image>"),
+      "<video>", "< video>"), "<audio>", "< audio>");
   std::string out;
   for (char c : name) {
     switch (c) {
@@ -28,6 +40,18 @@ std::string Attribute(const std::string& name) {
   }
   return out;
 }
+// A literal for a regex: the regex metacharacters escaped.
+std::string RegexEscape(const std::string& text) {
+  std::string out;
+  for (char c : text) {
+    if (std::string("\\^$.|?*+()[]{}/").find(c) != std::string::npos) out += '\\';
+    out += c;
+  }
+  return out;
+}
+// A JSON string literal with every '<' escaped (\u003c): the same value, never
+// the closing tag or a special token in the value's text.
+std::string SafeJSON(const picojson::value& value) { return Replace(value.serialize(false), "<", "\\u003c"); }
 picojson::value Parse(const std::string& text) {
   picojson::value value;
   auto error = picojson::parse(value, text);
@@ -56,23 +80,43 @@ void MuseToolCallingConverter::AddBasicRules() {
   level_ = 2;
   JSONSchemaConverter::AddBasicRules();
   level_ = previous;
-  // Raw text up to the closing tag (the template does not escape values).
+  // Raw text up to the closing tag, never containing it or a special token.
   ebnf_script_creator_.AddRule(kRaw,
-      "TagDispatch(loop_after_dispatch=false,excludes=(" + Literal(kEnd) + "))");
+      "TagDispatch(loop_after_dispatch=false,excludes=(" + Literal(kEnd) + ", " + Literal(kSpecial) + "))");
   // An undeclared name: attribute text without quotes, markup or newlines.
   ebnf_script_creator_.AddRule(kKey, R"ebnf([^"<>\r\n]+)ebnf");
 }
-std::string MuseToolCallingConverter::GenerateString(const StringSpec& spec, const std::string& name) {
-  if (level_ != 1) return JSONSchemaConverter::GenerateString(spec, name);
+// The content language of a constrained string (format, pattern or length),
+// minus every text that contains a forbidden substring: at level 1 (raw) the
+// closing tag and special tokens, inside JSON a raw '<' (the encoded form
+// \u003c stays available through the basic string rule's escapes).
+std::string MuseToolCallingConverter::Constrained(const StringSpec& spec, bool raw) {
+  std::string body;
   if (spec.format) {
-    if (auto pattern = JSONFormatToRegexPattern(*spec.format)) return RegexToEBNF(*pattern, false);
+    if (auto pattern = JSONFormatToRegexPattern(*spec.format)) body = RegexToEBNF(*pattern, false);
   }
-  if (spec.pattern) return RegexToEBNF(*spec.pattern, false);
-  if (spec.min_length != 0 || spec.max_length != -1) {
-    return "[^]{" + std::to_string(spec.min_length) + "," +
+  if (body.empty() && spec.pattern) body = RegexToEBNF(*spec.pattern, false);
+  if (body.empty()) {
+    body = "[^]{" + std::to_string(spec.min_length) + "," +
         (spec.max_length == -1 ? "" : std::to_string(spec.max_length)) + "}";
   }
-  return kRaw;
+  auto allowed = V41RegularFSM(Grammar::FromEBNF("root ::= " + body));
+  auto forbidden = raw
+      ? V41RegularFSM(Grammar::FromRegex("[^]*(" + RegexEscape(kEnd) + "|" + RegexEscape(kSpecial) + ")[^]*"))
+      : V41RegularFSM(Grammar::FromRegex("[^]*[<\"\\\\\\x00-\\x1f][^]*"));
+  auto safe = V41Subtract(allowed, forbidden);
+  if (V41Empty(safe)) throw std::invalid_argument("string schema admits only values the tool syntax cannot carry");
+  return V41EmitFSM(safe, ebnf_script_creator_);
+}
+std::string MuseToolCallingConverter::GenerateString(const StringSpec& spec, const std::string& name) {
+  const bool constrained = spec.format || spec.pattern || spec.min_length != 0 || spec.max_length != -1;
+  if (level_ != 1) {
+    if (!constrained) return JSONSchemaConverter::GenerateString(spec, name);
+    // Inside JSON: the constrained characters without a raw '<', quote, backslash or
+    // control character (a safe subset; upstream likewise emits no escapes here).
+    return Literal("\"") + " " + Constrained(spec, false) + " " + Literal("\"");
+  }
+  return constrained ? Constrained(spec, true) : kRaw;
 }
 std::string MuseToolCallingConverter::GenerateArray(const ArraySpec& spec, const std::string& name) {
   ++level_;
@@ -101,19 +145,16 @@ std::string MuseToolCallingConverter::GenerateAny(const AnySpec& spec, const std
   return JSONSchemaConverter::GenerateAny(spec, name);
 }
 std::string MuseToolCallingConverter::GenerateConst(const ConstSpec& spec, const std::string& name) {
-  if (level_ != 1) return JSONSchemaConverter::GenerateConst(spec, name);
   auto value = Parse(spec.json_value);
-  // A string constant renders raw; anything else as its JSON text.
-  if (value.is<std::string>()) {
-    const auto& text = value.get<std::string>();
-    if (text.find(kEnd) != std::string::npos)
-      throw std::invalid_argument("string constant contains the closing parameter tag");
-    return Literal(text);
-  }
-  return Literal(value.serialize(false));
+  // Inside JSON (and for non-strings at level 1): the JSON text with '<' encoded.
+  if (level_ != 1 || !value.is<std::string>()) return Literal(SafeJSON(value));
+  // A string constant renders raw; one the tool syntax cannot carry raw is refused.
+  const auto& text = value.get<std::string>();
+  if (text.find(kEnd) != std::string::npos || text.find(kSpecial) != std::string::npos)
+    throw std::invalid_argument("string constant contains the closing parameter tag or a special token");
+  return Literal(text);
 }
 std::string MuseToolCallingConverter::GenerateEnum(const EnumSpec& spec, const std::string& name) {
-  if (level_ != 1) return JSONSchemaConverter::GenerateEnum(spec, name);
   std::vector<std::string> alternatives;
   for (const auto& value : spec.json_values) alternatives.push_back(GenerateConst({value}, name));
   return EBNFScriptCreator::Or(alternatives);
@@ -147,7 +188,16 @@ std::string MuseToolCallingConverter::NextSeparator(bool end) {
   return level_ == 1 ? GetWhitespacePattern() : JSONSchemaConverter::NextSeparator(end);
 }
 std::string MuseToolSchemaToEBNF(const picojson::value& schema, bool strict) {
-  return JSONSchemaToEBNF(schema, true, std::nullopt, std::nullopt, strict, 16,
+  auto ebnf = JSONSchemaToEBNF(schema, true, std::nullopt, std::nullopt, strict, 16,
       static_cast<JSONFormat>(6), false);
+  // Every unconstrained JSON string (values, keys, any, and the excluded-key
+  // tries) ends its negated character class with the same JSON specials: add a
+  // raw '<' there too (the \u003c escape remains).
+  const std::string tail = "\\0-\\x1f\\\"\\\\\\r\\n]";
+  const std::string safe = "\\0-\\x1f\\\"\\\\\\r\\n<]";
+  size_t at = 0, replaced = 0;
+  while ((at = ebnf.find(tail, at)) != std::string::npos) { ebnf.replace(at, tail.size(), safe); at += safe.size(); ++replaced; }
+  if (replaced == 0) throw std::logic_error("pinned XGrammar JSON string class no longer matches the Muse rewrite");
+  return ebnf;
 }
 }  // namespace xgrammar

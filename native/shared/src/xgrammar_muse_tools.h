@@ -33,6 +33,7 @@ class MuseToolCallingConverter : public JSONSchemaConverter {
   int level_ = 0;
   std::unordered_map<std::string, std::string> cache_;
   std::string ContextKey(const std::string&) const;
+  std::string Constrained(const StringSpec&, bool raw);
 };
 std::string MuseToolSchemaToEBNF(const picojson::value& schema, bool strict);
 }  // namespace xgrammar

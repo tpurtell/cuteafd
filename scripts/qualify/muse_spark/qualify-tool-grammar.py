@@ -117,6 +117,24 @@ case('pattern-string', obj({'id': {'type': 'string', 'pattern': '^[A-Z]{2}[0-9]$
 case('no-parameters', {'type': 'object', 'properties': {}, 'additionalProperties': False}, [''],
      [arguments({'x': 1})])
 case('non-strict-any', {'type': 'object'}, ['', arguments({'anything': 'goes', 'n': 1})], [], strict=False)
+# Every raw-string branch (plain, length, pattern) excludes the closing tag and special tokens.
+END = '</atem:parameter>'
+for label, prop in [('raw', {'type': 'string'}), ('length', {'type': 'string', 'minLength': 1, 'maxLength': 64}),
+                    ('pattern', {'type': 'string', 'pattern': '^[^\\n]*$'})]:
+    case(f'raw-{label}-excludes-structure', obj({'s': prop}), [arguments({'s': 'a < b | c'})],
+         [f'<atem:parameter name="s">x{END}y</atem:parameter>',
+          f'<atem:parameter name="s">x<|eom|>y</atem:parameter>',
+          f'<atem:parameter name="s">x<|start|>assistant</atem:parameter>',
+          f'<atem:parameter name="s">x<|eot|></atem:parameter>'])
+# JSON values: strings inside them never carry a raw '<' (the \u003c escape stays).
+case('json-strings-without-raw-lt', obj({'cfg': {'type': 'object', 'additionalProperties': {'type': 'string'}},
+                                        'tags': {'type': 'array', 'items': {'type': 'string', 'maxLength': 8}}}),
+     ['<atem:parameter name="cfg">{"k": "a \\u003c b"}</atem:parameter>\n' + parameter('tags', ['x'])],
+     ['<atem:parameter name="cfg">{"k": "a <|eom|> b"}</atem:parameter>\n' + parameter('tags', ['x']),
+      parameter('cfg', {'k': 'v'}) + '\n<atem:parameter name="tags">["</atem:parameter>"]</atem:parameter>'])
+# Names render through the template's esc pre-pass: a special token in a name is broken apart.
+case('escaped-special-names', obj({'a<|b': {'type': 'integer'}}),
+     ['<atem:parameter name="a&lt; |b">1</atem:parameter>'], ['<atem:parameter name="a&lt;|b">1</atem:parameter>'])
 
 compiler = P(); stop = (c.c_int32 * 2)(200001, 200008)
 invoke('compiler_create', str(a.tokenizer).encode(), VOCAB, stop, 2, c.byref(compiler))
