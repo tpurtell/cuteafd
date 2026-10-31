@@ -6461,3 +6461,16 @@ Layers 0–33 and all valid partial work were preserved. Numerical code and
 recipe are unchanged. The second user-pause receipt is archived under
 production/pauses/; resume-after-network-maintenance.json records the
 transition. Continue 30-minute monitoring with --publish/handoff enabled.
+
+RECOVERED AFTER ANOTHER RAPTOR REBOOT (2026-10-31 06:35 UTC). Current
+enabled unit: step5-core-k6-1793428481217978246. SSH dropped at 06:27 UTC;
+raptor's uptime confirms a 06:29 reboot. Its static LAN address and source
+access recovered without another storage/config change. Layers 0–38 and
+valid partial layer-39 state were preserved; new expert-2 through expert-16
+projections confirm forward progress. Launcher restart spacing is now
+120 seconds instead of 30 so a brief reboot can recover before exhausting
+the bounded start limit. 16 targeted recovery CPU cases pass, and the
+live unit reports RestartUSec=2min. This launcher-only change is outside
+the sealed numerical producer identity; quantization code/settings are
+unchanged. Monitor records the outage and excludes partial-resume layer
+timings. Keep publication/handoff enabled and continue 30-minute checks.
