@@ -467,7 +467,7 @@ impl<'a> GlmEngine<'a> {
         let (_, _, cos_sin) = self.rank_caches(rank, 0);
         let query = w.query.buffer.ptr;
         self.core_linear(rank, w, layer, "q_b", w.x.buffer, q, rows, None)?;
-        self.run_on(rank, &format!("ml4_query_scale{}_{cap}", if rope { "_rope" } else { "" }), &[("q", q.ptr),
+        self.run_on(rank, &format!("ml4_query_scale{tag}_{cap}"), &[("q", q.ptr),
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
             ("s", layer.ptr("query_scale_s")?), ("b", layer.ptr("query_scale_b")?), ("query", query)], &[row])?;
         self.run_on(rank, &format!("ml4_absorb{tag}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
@@ -520,7 +520,8 @@ impl<'a> GlmEngine<'a> {
         // [wk | weights_proj](x), BF16 [rows, 128 + I], both BF16 as shipped.
         self.run_on(rank, "ml4_index_kw", &[("x", w.x.buffer.ptr), ("w", layer.ptr("w_ik")?),
             ("out", s.kw.buffer.ptr)], &[row])?;
-        self.run_on(rank, &format!("ml4_index_post{}_{cap}", if rope { "" } else { "_nope" }), &[
+        let tag = if rope { "" } else { "_nope" };
+        self.run_on(rank, &format!("ml4_index_post{tag}_{cap}"), &[
             ("iq", s.iq.buffer.ptr), ("kw", s.kw.buffer.ptr), ("positions", w.positions.buffer.ptr),
             ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("k_weight", layer.ptr("k_norm_w")?),
             ("k_bias", layer.ptr("k_norm_b")?), ("q_fp8", w.q_fp8.buffer.ptr),

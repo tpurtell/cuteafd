@@ -435,3 +435,33 @@ def test_ml4_exports_its_programs_and_k6_shapes_beside_other_families(tmp_path, 
     families = args[args.index('--dense-trellis-families') + 1].split(',')
     assert families[-1] == 'ml4' and ('glm' in families) == glm and ('kimik3' in families) == kimi
     assert ('glm_stage' in geometries) == glm
+
+
+def test_ml4_engine_program_names_are_exported_stems():
+    """Every ml4_* program name the GLM engine builds for Mistral Large 4 is a stem the
+    exporter's ml4_programs emits (RoPE stems carry no tag; NoPE ones ``_nope``)."""
+    import re
+    exporter = (ROOT / 'python/tools/aot/export_b12x_dsv4_aot.py').read_text()
+    body = exporter.split('def ml4_programs(')[1].split('\ndef ')[0]
+    exported = set()
+    for stem in re.findall(r'\(f?"([a-z0-9_{}]+)", "', body):
+        names = {stem}
+        for field, values in (('{tag}', ('', '_nope')), ('{mode}', ('decode', 'prefill')),
+                              ('{rows}', ('64', '4096')), ('{inter}', ('6144', '12288', '3072'))):
+            names = {n.replace(field, v) for n in names for v in values} if field in stem else names
+        exported |= {f'ml4_{n}' for n in names}
+    engine = ''.join((ROOT / p).read_text() for p in (
+        'rust/crates/cuteafd-daemon/src/families/glm5/engine.rs',
+        'rust/crates/cuteafd-daemon/src/families/glm5/engine/native_dense.rs'))
+    used = re.findall(r'"(ml4_[a-z0-9_{}]+)"', engine)
+    assert used, 'no ml4 program names found'
+    for pattern in used:
+        names = {pattern}
+        for field, values in (('{tag}', ('', '_nope')), ('{mode}', ('decode', 'prefill')),
+                              ('{cap}', ('m64', 'm4096')), ('{intermediate}', ('6144', '12288', '3072'))):
+            names = {n.replace(field, v) for n in names for v in values}
+        # Positional `{}` hides which tag a call passes (it once asked for `_rope`); name it `{tag}`.
+        assert all('{' not in n for n in names), f'{pattern}: use the named {{tag}}/{{mode}}/{{cap}} fields'
+        assert '_rope' not in pattern, pattern
+        missing = sorted(n for n in names if n not in exported and not n.startswith('ml4_draft'))
+        assert not missing, f'{pattern}: not exported: {missing}'
