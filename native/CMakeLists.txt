@@ -341,6 +341,7 @@ if(CUTEAFD_ENABLE_CUDA)
     families/deepseek_v4/cuda/dsv4_dspark.cu
     families/glm5/cuda/glm_dflash.cu
     families/glm5_flash/cuda/glmf_dspark.cu
+    families/mistral_large4/cuda/ml4_dspark.cu
     families/glm5/cuda/glm_mla_prefill.cu
     shared/cuda/vocab_head_rows.cu
     families/mimo_v2/cuda/mimo_dflash.cu
