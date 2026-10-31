@@ -207,7 +207,7 @@ def load_layer(checkpoint, config, index, *, device="cuda", dtype=None):
     return layer.eval()
 
 
-def load_outer(checkpoint, config, *, device="cuda", dtype=None):
+def load_outer(checkpoint, config, *, device="cuda", dtype=None, head=True):
     """Embedding (with its weightless norm), final norm and untied head."""
     import torch
     reference, _ = _module()
@@ -219,16 +219,16 @@ def load_outer(checkpoint, config, *, device="cuda", dtype=None):
         rotary = reference.MuseSparkTextRotaryEmbedding(config)
     modules = {}
     for module, name, key in ((embed, "weight", PREFIX + "embed_tokens.weight"),
-                              (norm, "weight", PREFIX + "norm.weight")):
+                              *(((norm, "weight", PREFIX + "norm.weight"),) if head else ())):
         value = checkpoint.get(key, device)
         if dtype is not None:
             value = value.to(dtype)
         module._parameters[name] = torch.nn.Parameter(value, requires_grad=False)
-    head = checkpoint.get(HEAD, device)
-    if dtype is not None:
-        head = head.to(dtype)
+    modules.update(embed=embed.eval(), rotary=rotary.eval())
+    if head:
+        weight = checkpoint.get(HEAD, device)
+        modules.update(norm=norm.eval(), head=weight.to(dtype) if dtype is not None else weight)
     checkpoint.close()
-    modules.update(embed=embed.eval(), norm=norm.eval(), rotary=rotary.eval(), head=head)
     return modules
 
 

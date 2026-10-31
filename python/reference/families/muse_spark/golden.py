@@ -73,10 +73,14 @@ class Family:
     def state_bytes(self, tokens):
         return tokens * self.config.hidden_size * 4
 
+    def outer_tensors(self, stage):
+        embed = [model.PREFIX + "embed_tokens.weight"]
+        return embed if stage == "embed" else embed + [model.PREFIX + "norm.weight", model.HEAD]
+
     def embed(self, tokens):
         import torch
         if self.outer is None:
-            self.outer = model.load_outer(self.checkpoint, self.config, device=layer_major.DEVICE, dtype=self.dtype)
+            self.outer = model.load_outer(self.checkpoint, self.config, device=layer_major.DEVICE, dtype=self.dtype, head=False)
         ids = torch.tensor([tokens], device=layer_major.DEVICE, dtype=torch.long)
         return self.outer["embed"](ids)
 
@@ -131,8 +135,7 @@ class Family:
             "weights": "renormalized sigmoid scores (eps 1e-15) x routed_scaling_factor", "files": entries})
 
     def load_final(self):
-        if self.outer is None:
-            self.outer = model.load_outer(self.checkpoint, self.config, device=layer_major.DEVICE, dtype=self.dtype)
+        self.outer = model.load_outer(self.checkpoint, self.config, device=layer_major.DEVICE, dtype=self.dtype)
 
     def final(self, hidden):
         import shape_invariant

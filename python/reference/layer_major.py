@@ -165,9 +165,12 @@ def run(a, family, *, extras_root=None):
     if manifest["family"] != family.name or any(w.get("media") for w in manifest["windows"]):
         raise ValueError(f"{family.name} golden supports only its own text panel")
     snapshot = verify_snapshot(manifest, a.snapshot)
-    for index in range(family.layers):
+    # Header-only preflight for every layer already downloaded; the rest are
+    # checked right after their shards complete, before any of their bytes load.
+    present = [i for i in range(family.layers) if not pending_shards(family, i)]
+    for index in present:
         family.check_layer(index)
-    print(f"native shape preflight passed for {family.layers} layers", flush=True)
+    print(f"native shape preflight passed for {len(present)}/{family.layers} downloaded layers", flush=True)
     pins = family.provenance()
     marker = a.out / "qualified-gate.json"
     if not checking and marker.exists():
@@ -211,6 +214,7 @@ def run(a, family, *, extras_root=None):
     state = LayerState(state_root, binding)
     with torch.inference_mode():
         if state.latest is None:
+            wait_for_tensors(family, family.outer_tensors("embed"), getattr(a, "wait_shards", 0))
             pending = state.begin(-1)
             for window in windows:
                 state.save(pending, window["id"], {"hidden": family.embed(window["tokens"])})
@@ -221,6 +225,7 @@ def run(a, family, *, extras_root=None):
             tick = time.monotonic()
             read_before, read_seconds_before = family.checkpoint.read_bytes, family.checkpoint.read_seconds
             wait_for_shards(family, index, getattr(a, "wait_shards", 0))
+            family.check_layer(index)
             if DEVICE == "cuda":
                 admit_reference_memory(torch.cuda, family.layer_bytes(index) + family.work_bytes(
                     max(window_tokens(w) for w in windows)))
@@ -263,6 +268,7 @@ def run(a, family, *, extras_root=None):
                 log_reference_cuda_memory(torch.cuda, f"after layer {index}")
             print(f"layer {index + 1}/{family.layers} committed; {seconds:.1f}s (load {load_seconds:.1f}s); "
                   f"read {(family.checkpoint.read_bytes - read_before) / 1e9:.2f} GB", flush=True)
+        wait_for_tensors(family, family.outer_tensors("final"), getattr(a, "wait_shards", 0))
         family.load_final()
         entries, short_logits = [], {}
         total_nll, total_rows = 0.0, 0
@@ -319,13 +325,29 @@ def shard_complete(path):
     return size == 8 + count + end
 
 
+def pending_shards(family, index):
+    return missing_shards(family, family.tensors(index))
+
+
+def missing_shards(family, names):
+    shards = sorted({family.checkpoint.index[n] for n in names})
+    return [s for s in shards if not shard_complete(family.checkpoint.snapshot / s)]
+
+
+def wait_for_tensors(family, names, timeout):
+    deadline = time.monotonic() + timeout
+    while missing_shards(family, names):
+        if time.monotonic() >= deadline:
+            raise ValueError(f"outer tensors not downloaded: {missing_shards(family, names)[:4]}")
+        time.sleep(120)
+
+
 def wait_for_shards(family, index, timeout):
     """Block (sleeping, not spinning) until every shard the layer reads is complete."""
     deadline = time.monotonic() + timeout
     announced = False
     while True:
-        shards = sorted({family.checkpoint.index[n] for n in family.tensors(index)})
-        pending = [s for s in shards if not shard_complete(family.checkpoint.snapshot / s)]
+        pending = pending_shards(family, index)
         if not pending:
             return
         if time.monotonic() >= deadline:

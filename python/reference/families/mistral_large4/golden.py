@@ -74,9 +74,14 @@ class Family:
     def state_bytes(self, tokens):
         return tokens * (self.config.hidden_size * 4 + self.config.index_topk * 4 + self.config.kv_lora_rank * 4)
 
-    def ensure_outer(self):
-        if self.outer is None:
-            self.outer = model.load_outer(self.checkpoint, self.config, device=layer_major.DEVICE, dtype=self.dtype)
+    def outer_tensors(self, stage):
+        return ([model.OUTER["embed_tokens.weight"], model.OUTER["rotary_emb.alpha"]] if stage == "embed"
+                else list(model.OUTER.values()))
+
+    def ensure_outer(self, head=False):
+        if self.outer is None or (head and "head" not in self.outer):
+            self.outer = model.load_outer(self.checkpoint, self.config, device=layer_major.DEVICE,
+                                          dtype=self.dtype, head=head)
             self.rotary = self.outer["rotary"]
 
     def embed(self, tokens):
@@ -139,7 +144,7 @@ class Family:
         return hidden, out, tuple(reuse)
 
     def load_final(self):
-        self.ensure_outer()
+        self.ensure_outer(head=True)
 
     def final(self, hidden):
         import shape_invariant

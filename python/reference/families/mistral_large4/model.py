@@ -290,7 +290,7 @@ def load_layer(checkpoint, config, index, *, device="cuda", dtype=None):
     return layer.eval()
 
 
-def load_outer(checkpoint, config, *, device="cuda", dtype=None):
+def load_outer(checkpoint, config, *, device="cuda", dtype=None, head=True):
     import torch
     from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
     dtype = dtype or torch.bfloat16
@@ -303,11 +303,13 @@ def load_outer(checkpoint, config, *, device="cuda", dtype=None):
     rotary.alpha = alpha
     with torch.device("meta"):
         norm = reference.MistralLarge4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    norm._parameters["weight"] = torch.nn.Parameter(checkpoint.get(OUTER["norm.weight"], device, dtype), requires_grad=False)
     embed = checkpoint.get(OUTER["embed_tokens.weight"], device, dtype)
-    head = checkpoint.get(OUTER["lm_head.weight"], device, dtype)
+    outer = {"embed": embed, "rotary": rotary.eval()}
+    if head:
+        norm._parameters["weight"] = torch.nn.Parameter(checkpoint.get(OUTER["norm.weight"], device, dtype), requires_grad=False)
+        outer.update(norm=norm.eval(), head=checkpoint.get(OUTER["lm_head.weight"], device, dtype))
     checkpoint.close()
-    return {"embed": embed, "norm": norm.eval(), "rotary": rotary.eval(), "head": head}
+    return outer
 
 
 def logits(hidden, head, config, linear=None):
