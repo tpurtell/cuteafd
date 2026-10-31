@@ -1,6 +1,7 @@
 //! Muse Spark (`muse_spark` wrapping `text_config.model_type=muse_spark_text`) checkpoint readers.
 pub mod config;
 pub mod core;
+pub mod reference;
 
 pub use config::{MuseAttention, MuseSparkConfig};
 
