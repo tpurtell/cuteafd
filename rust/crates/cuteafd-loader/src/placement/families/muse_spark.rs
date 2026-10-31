@@ -20,11 +20,9 @@ pub const PAGE_ROWS: u64 = 64;
 pub const LANES: u64 = 1;
 const HEAD_SPLIT: &[LayerMode] = &[LayerMode::HeadSplit];
 const WHOLE: &[LayerMode] = &[LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }];
-/// A head-split RTX pair: every layer's attention heads halve across the GPUs.
-pub const PAIR: ExecutorModes = ExecutorModes { family: "muse_spark", modes: HEAD_SPLIT, hops: false,
-    attention: AttentionPlacement::Heads };
-/// One RTX: every layer whole.
-pub const SINGLE: ExecutorModes = ExecutorModes { family: "muse_spark", modes: WHOLE, hops: false,
+/// Every layer head-split on an RTX pair, or whole on one RTX.
+pub const MUSE_SPARK: ExecutorModes = ExecutorModes { family: "muse_spark",
+    modes: &[LayerMode::HeadSplit, LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner }], hops: false,
     attention: AttentionPlacement::Heads };
 
 /// Program namespaces a coordinator layout binds (`muse_` geometry-free and
@@ -40,10 +38,11 @@ pub fn code_demand(rank: usize, pending: u64) -> Result<Demand> {
     Ok(Demand::new(u8::try_from(rank)?, Category::Workspace, "Muse future loaded code", pending, Basis::Formula))
 }
 
-pub fn executor(gpus: usize) -> Result<ExecutorModes> {
+/// The executor and the layer modes one coordinator count runs.
+pub fn executor(gpus: usize) -> Result<(ExecutorModes, &'static [LayerMode])> {
     match gpus {
-        1 => Ok(SINGLE),
-        2 => Ok(PAIR),
+        1 => Ok((MUSE_SPARK, WHOLE)),
+        2 => Ok((MUSE_SPARK, HEAD_SPLIT)),
         other => anyhow::bail!("Muse Spark runs on one RTX or a head-split RTX pair, not {other}"),
     }
 }
@@ -100,7 +99,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, context, automatic_context,
         requested_pool, onboard, spark_budget_bytes, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
-    let executor = executor(ranks)?;
+    let (executor, modes) = executor(ranks)?;
     ensure!(spark_ranks > 0, "Muse Spark routed experts need Spark ranks");
     ensure!(slots > 0 && context > 0 && context <= cfg.max_position as u64,
         "Muse slots {slots} / context {context} outside 1..={}", cfg.max_position);
@@ -165,7 +164,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
             fixed_bytes: ModeBytes::default(), extra: Vec::new(), context_indexer: false, colocate: None,
             experts: Some(ExpertCost { whole: Bytes2 { resident: whole, staging: 0 },
                 half: [Bytes2::default(); 2], tp2: false, spark_ok: true }),
-            modes: executor.modes.to_vec(),
+            modes: modes.to_vec(),
         })
     }).collect::<Result<Vec<_>>>()?;
     let capacities = gpus.iter().map(|gpu| gpu.capacity_bytes).collect::<Vec<_>>();
@@ -179,7 +178,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         startup, movables: Vec::new(), expert_workspace: 0, tp2_workspace: [0; 2],
         onboard, expert_gpus: ranks, minimum_expert_layers: 0,
         // Whole onboarded layers alternate between the GPUs.
-        policy: LayerPolicy { default: executor.modes.to_vec(), ownership: LayerOwnership::Ranges,
+        policy: LayerPolicy { default: modes.to_vec(), ownership: LayerOwnership::Ranges,
             expert_ownership: if pair { ExpertOwnership::AlternatingWhole } else { ExpertOwnership::Contiguous },
             ..Default::default() },
         hops: HopSpec { storage: HopStorage::ReceiveSlots, row_bytes: cfg.hidden as u64 * 2, rows: 0, lanes: 0,
