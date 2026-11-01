@@ -94,7 +94,7 @@ impl<'a> KimiPrefix<'a> {
         let inner = Rc::get_mut(&mut self.0).context("Kimi prefix drafter must bind before publication")?;
         if let Some(draft) = &draft {
             ensure!(draft.cache_format() == inner.mla[0].format(), "Kimi target/draft cache records differ");
-            let bytes = draft.mark_segments(0)?.iter().map(|buffer| buffer.bytes).sum::<usize>();
+            let bytes = draft.mark_bytes();
             inner.layout.mark_bytes = inner.layout.mark_bytes.checked_add(bytes).context("Kimi complete mark overflow")?;
         }
         inner.draft = draft;
@@ -108,8 +108,8 @@ impl<'a> KimiPrefix<'a> {
 
     pub(crate) fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
         self.0.mla.iter().flat_map(|bank| bank.owners())
-            .chain(self.0.kda.iter().map(|bank| bank.mark_owner()))
-            .chain(self.0.draft.iter().map(|draft| draft.mark_owner())).collect()
+            .chain(self.0.kda.iter().filter_map(|bank| bank.mark_owner()))
+            .chain(self.0.draft.iter().filter_map(|draft| draft.mark_owner())).collect()
     }
 
     fn validate(&self, placement: &Placement, len: usize) -> Result<()> {

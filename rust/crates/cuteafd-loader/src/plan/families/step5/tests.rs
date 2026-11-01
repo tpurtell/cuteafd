@@ -646,8 +646,8 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             }
         }
         let (slots, arena) = layout.prefix_arena_bytes(16, 20, 2 << 30).unwrap();
-        assert_eq!(slots, 34);
-        assert!(arena.iter().sum::<u64>() > 2 << 30);
+        assert_eq!(slots, (2 << 30) / layout.ranks.iter().map(|r| r.bytes).sum::<u64>());
+        assert!(arena.iter().sum::<u64>() <= 2 << 30);
         assert_eq!(arena[0], slots * layout.ranks[0].bytes);
         assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
         assert!(layout.snapshot_spans(ranks, 0, &[]).is_err());

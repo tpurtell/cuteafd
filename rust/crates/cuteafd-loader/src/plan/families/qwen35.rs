@@ -165,7 +165,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(scratch > 0, "dense native prefill requires nonzero scratch");
     let slots = usize::try_from(options.resolved_state_slots("qwen3_5"))?;
     let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
-    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
+    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(options.resolved_concurrency("qwen3_5"),
         options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
     let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;

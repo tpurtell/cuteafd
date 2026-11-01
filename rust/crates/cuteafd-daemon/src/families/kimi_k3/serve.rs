@@ -327,7 +327,8 @@ mod tests {
         for budget in ["0", "auto", "1", "32GiB"] {
             args(&["--peers", peers, "--host-cache-bytes", budget])?.validate()?;
         }
-        assert!(args(&["--max-sequences", "65"]).is_err());
+        assert!(args(&["--max-sequences", "129"]).is_err());
+        assert!(cuteafd_core::concurrency::validate("kimi_k3", 65).is_err());
         assert!(args(&["--speculator", "mtp"]).is_err());
         Ok(())
     }

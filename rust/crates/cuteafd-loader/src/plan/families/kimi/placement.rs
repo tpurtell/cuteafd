@@ -94,7 +94,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
     let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
     let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-        slots, opts.prefix_entries("kimi_k3"), 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
+        opts.resolved_concurrency("kimi_k3"), opts.prefix_entries("kimi_k3"), 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
         opts.host_cache_bytes != Some(0)));
     let mut mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();

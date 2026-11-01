@@ -121,7 +121,8 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     if case.dspark { argv.push("--dspark".into()); }
     if host { argv.extend(["--host-cache-bytes".into(), "auto".into()]); }
     if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
-    let cli = Cli::try_parse_from(argv)?;
+    let mut cli = Cli::try_parse_from(argv)?;
+    cli.prefix.resolve_entries(cli.engine.max_sequences);
     // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
@@ -811,7 +812,8 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers, "--dspark".into()];
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
-    let cli = Cli::try_parse_from(argv)?;
+    let mut cli = Cli::try_parse_from(argv)?;
+    cli.prefix.resolve_entries(cli.engine.max_sequences);
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(

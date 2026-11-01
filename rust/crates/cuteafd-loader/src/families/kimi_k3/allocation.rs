@@ -304,7 +304,7 @@ pub fn kda_demands(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize,
 
 pub fn kda_demands_for_layers(layers: usize, slots: usize, marks: usize, lanes: usize,
     rank: u8) -> Result<[Demand; 4]> {
-    ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && marks > 0 && (1..=2).contains(&lanes)
+    ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && (1..=2).contains(&lanes)
         && rank < 2, "Kimi KDA state geometry");
     let state = 48 * 128 * 128 * 4 + 3 * 3 * 6144 * 2;
     let replay = 64 * 48 * (3 * 128 * 4 + 4 + 3 * 128 * 2);

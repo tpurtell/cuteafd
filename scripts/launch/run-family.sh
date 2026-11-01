@@ -1013,7 +1013,7 @@ profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || r
 profile="$(release_coordinator_profile "$profile_bytes" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 ((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY="$default_concurrency"
-[[ "$PREFIX_CACHE_ENTRIES" != auto ]] || PREFIX_CACHE_ENTRIES=$(((5 * CONCURRENCY + 3) / 4))
+[[ "$PREFIX_CACHE_ENTRIES" != auto ]] || PREFIX_CACHE_ENTRIES=$((CONCURRENCY <= 16 ? 20 : (5 * CONCURRENCY + 3) / 4))
 if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
   if [[ -z "${cfg_overrides[EMBEDDING]:-}" ]] && ! grep -Eq '^[[:space:]]*EMBEDDING[[:space:]]*=[[:space:]]*[^#[:space:]]' "$config"; then
     EMBEDDING=host
@@ -1956,6 +1956,9 @@ profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" 
 read -r profile_gib default_concurrency <<<"$profile"
 [[ "$family" != qwen3_5 ]] || default_concurrency=4
 effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
+[[ "$effective_concurrency" =~ ^[0-9]+$ ]] && ((effective_concurrency >= 1 && effective_concurrency <= 128)) || release_die "CONCURRENCY must be an integer in 1..=128"
+effective_prefix_entries="$(get PREFIX_CACHE_ENTRIES auto)"
+[[ "$effective_prefix_entries" != auto ]] || effective_prefix_entries=$((effective_concurrency <= 16 ? 20 : (5 * effective_concurrency + 3) / 4))
 if [[ "$family" == mimo_v2 ]]; then
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
     [[ -n "${cfg[EMBEDDING]:-}" ]] || embedding=host
@@ -2071,7 +2074,7 @@ kv_reserve_args=()
   kv_reserve_args+=(--kv-early-termination-min-output-tokens "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)")
 case $family in
   mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
-    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
@@ -2687,12 +2690,13 @@ audio_encoder_hash=""
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
   if [[ "$family" == qwen3_5 ]]; then
-    plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096)
+    plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096
+      --prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--mimo-swa-kv-cache "$mimo_swa_kv")
-    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     plan_draft_args+=(--context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
       --expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
@@ -2707,7 +2711,7 @@ audio_encoder_hash=""
   fi
   # Rust resolves recurrent storage and prefix defaults from the same concurrency.
   if [[ "$family" == glm5_flash ]]; then
-    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     # The plan resolves VISION=auto as serve-glmf would serve it: with the template source serving
     # gets, vision stays on; without one, a checkpoint template that cannot mark images plans text.

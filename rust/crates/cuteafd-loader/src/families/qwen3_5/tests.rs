@@ -206,7 +206,7 @@ fn dense_default_prefix_geometry_releases_retention_with_host() {
         assert_eq!(mark, expected_mark);
         let old = mark_slots_for(16, 20, mark, 2 << 30);
         let staged = mark_slots_with_host(16, 20, mark, 2 << 30, true);
-        assert_eq!((old, staged), (if layers == 32 { 41 } else { 34 }, 2));
+        assert_eq!((old, staged), (if layers == 32 { 41 } else { 13 }, 2));
         println!("{name}: C16 entries=20 mark_bytes={mark} slots={old}->{staged} arena_GiB={:.6}->{:.6} freed_GiB={:.6}",
             old as f64 * mark as f64 / (1u64 << 30) as f64,
             staged as f64 * mark as f64 / (1u64 << 30) as f64,

@@ -3061,7 +3061,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * 8 + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 16 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -3428,6 +3428,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     // The fixture now declares its real context ceiling for host admission.
     for report in expected.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
+        report["cache_requirements"]["concurrency"] = json!(4);
+        report["cache_requirements"]["state_slots"] = json!(4);
     }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
@@ -4581,7 +4583,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
 }
 
 /// GLM 5.3 Flash's layout reserves the mark arena its server allocates at the default knobs
-/// (`MarkArena::slots_for`: 2C + 2 for its 147.6 MB FP32 marks, where it reserved a flat 18),
+/// (`MarkArena::slots_for`: 14 complete 147.6 MB FP32 marks in the 2 GiB budget),
 /// and its state carries the speculative replay records.
 #[test]
 fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
@@ -4590,7 +4592,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
         .get(&Category::Prefix).copied().unwrap_or(0);
     let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
         rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) };
-    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
+    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: 14 fit independently of C.
     let mut config = glm5_flash_config(45);
     config["text_config"]["layer_types"] = json!((0..45)
         .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
@@ -4599,12 +4601,12 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!((rank.retained_mark_bytes, rank.speculative_replay_bytes), (147_619_840, 321_421_312));
     let tensors = glm5_flash_tensors(&config);
     let dir = snapshot(config, &tensors);
-    for (concurrency, slots) in [(1, 14), (8, 18), (16, 34)] {
+    for (concurrency, slots) in [(1, 14), (8, 14), (16, 14)] {
         let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
         assert_eq!(cuteafd_core::prefix::mark_slots_for(concurrency, 20, rank.retained_mark_bytes, 2 << 30), slots);
         assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
         let state: u64 = memory.devices[0].items.iter().filter(|i| ["KDA state and replay", "DSA index tails and replay", "commit tables"].contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency.max(8)
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency
             + rank.speculative_replay_bytes);
     }
     // At the default 2M pool cap the released arena becomes reported free headroom.
@@ -4613,11 +4615,11 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let legacy = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
     capped.layout.as_mut().unwrap().host_cache_bytes = None;
     let staged = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
-    let released = (34 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
+    let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
     assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(), released as i64);
-    assert_eq!(released, 4_723_834_880);
+    assert_eq!(released, 1_771_438_080);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);
@@ -4675,14 +4677,14 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let fewer = (none.pool_tokens - pool.pool_tokens) as i64 * unit as i64 / 256;
     assert_eq!(none.devices[0].free_bytes() - pool.devices[0].free_bytes(),
         (GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - fewer);
-    // Against the arena the server would allocate at 16 sequences (34 marks of 147.6 MB), pool marks
+    // Against the budgeted arena (14 marks of 147.6 MB), pool marks
     // free the arena's bytes less the reserved unit, for the pool (up to its target) or as free memory.
     let arena = layout(false, None);
-    assert_eq!(item(&arena, "marks"), 34 * rank.retained_mark_bytes);
+    assert_eq!(item(&arena, "marks"), 14 * rank.retained_mark_bytes);
     assert!(pool.pool_tokens >= arena.pool_tokens, "{} {}", pool.pool_tokens, arena.pool_tokens);
     let more = (pool.pool_tokens - arena.pool_tokens) as i64 * unit as i64 / 256;
     assert_eq!(pool.devices[0].free_bytes() - arena.devices[0].free_bytes(),
-        (34 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
+        (14 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
 }
 
 

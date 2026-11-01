@@ -615,7 +615,7 @@ mod tests {
         let gpu = &result.devices[0];
         assert_eq!(gpu.engine_budget_bytes, 96 * GIB * 97 / 100 - 10 * GIB);
         assert_eq!(result.allocated_gpu_kv_tokens, 63 * 64);
-        assert_eq!((result.concurrency, result.state_slots), (16, 20));
+        assert_eq!((result.concurrency, result.state_slots), (16, 16));
         assert!(gpu.non_engine_bytes + gpu.reserved_bytes + gpu.pool_bytes <= 96 * GIB * 97 / 100);
         assert!(gpu.unused_budget_bytes < GIB);
     }

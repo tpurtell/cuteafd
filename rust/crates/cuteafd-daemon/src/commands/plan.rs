@@ -923,7 +923,7 @@ mod tests {
             prefix_cache_entries: None,
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
-            mimo_rings: 16,
+            mimo_rings: 0,
             mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Int8,
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: None,
@@ -1199,11 +1199,11 @@ mod tests {
                         crate::cli::Commands::ServeMimo(args) => {
                             assert_eq!(resolved, args.max_sequences);
                             let batch = layout.mimo_draft_sequences().max(resolved as u64);
-                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings.max(resolved as u64),
+                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings(),
                                 layout.draft_context_slots);
                             let startup_batch = args.engine.draft_sequences.max(args.max_sequences);
                             let startup_slots = mimo::mimo_draft_context_slots(startup_batch as u64,
-                                args.engine.rings.max(args.max_sequences) as u64,
+                                cuteafd_core::concurrency::request_slots(args.max_sequences as u64, args.engine.rings as u64),
                                 args.engine.draft_context_slots.map(|n| n as u64));
                             let planned = mimo::MimoDraftCapacity::new(slots as usize, batch as usize, 8).unwrap();
                             let started = mimo::MimoDraftCapacity::new(startup_slots as usize, startup_batch, 8).unwrap();

@@ -41,7 +41,7 @@ pub(crate) struct ServeArgs {
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    /// Sequences decoding at once (each holds two state slots).
+    /// Active sequences decoding at once; retained snapshots use the prefix budget.
     #[arg(long, default_value_t = 4)]
     pub max_sequences: usize,
     /// Public model id; defaults to the snapshot's Hugging Face id.

@@ -454,7 +454,7 @@ pub(crate) struct PlanArgs {
     #[arg(long)]
     pub(crate) mimo_prefix_draft: bool,
     /// MiMo target ring count for --layout (at least concurrency).
-    #[arg(long = "rings", default_value_t = 16)]
+    #[arg(long = "rings", default_value_t = 0)]
     pub(crate) mimo_rings: u64,
     /// MiMo sliding and native-MTP ring format for --layout (matches serving).
     #[arg(long, value_enum, default_value = "int8")]
@@ -920,11 +920,11 @@ mod tests {
         for entries in ["0", "2", "24", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", entries])).is_ok());
         }
-        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "129"])).is_err());
-        for concurrency in ["1", "2", "16"] {
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "160"])).is_ok());
+        for concurrency in ["1", "2", "16", "17", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--memory-reservation", "87.5%"])).is_ok());
         }
-        for concurrency in ["0", "17"] {
+        for concurrency in ["0", "129"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
         for (context, output, valid) in [("256", "128", true), ("0", "128", false),
