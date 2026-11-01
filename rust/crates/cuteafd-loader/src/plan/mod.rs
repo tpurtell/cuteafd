@@ -608,6 +608,7 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
     let towers = match report.family.as_deref() {
         Some("glm5_flash") => Some(layout::glm_flash_towers(report, input.checkpoint())),
+        Some("mimo_v2") => Some(layout::mimo_towers(report, input.checkpoint(), model.spec().hidden as u64)),
         _ => None,
     };
     let admission = if let Some(towers) = towers {

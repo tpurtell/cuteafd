@@ -1223,6 +1223,18 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
         if mode == MediaMode::Off { return Ok((0, 0)); }
         inventory.clone().map_err(anyhow::Error::msg)
     };
+    if (report.vision != MediaMode::Off && towers.vision.is_err())
+        || (report.audio != MediaMode::Off && towers.audio.is_err()) {
+        let mut rtx = options.rtx_bytes.iter().enumerate().map(|(index, &capacity_bytes)| DeviceLayout {
+            kind: DeviceKind::Rtx, index: index as u32, capacity_bytes, items: Vec::new(), kv_tokens: 0,
+        }).collect::<Vec<_>>();
+        let mut notes = Vec::new();
+        resolve_encoder(report, towers, &mut rtx, &mut [], &[], options, &mut notes);
+        let mut memory = model.placement(input, report, options, requested)
+            .ok_or_else(|| anyhow::anyhow!("family has no placement adapter"))??;
+        memory.notes.extend(notes);
+        return Ok(memory);
+    }
     let vision = bytes(report.vision, &towers.vision)?;
     let audio = bytes(report.audio, &towers.audio)?;
     let requests = [EncoderRequest { mode: report.vision, weights: vision.0, scratch: vision.1, copies: options.vision_replicas },

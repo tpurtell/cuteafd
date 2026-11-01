@@ -4368,7 +4368,16 @@ fn glm_flash_auto_sparks_reserves_tower_before_optional_experts() {
     let mut tensors = glm5_flash_tensors(&cfg);
     tensors.extend(super::families::glm::glm_flash_vision_tensors().into_iter()
         .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)));
+    let expert_zero: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".mlp.experts.0.")).cloned().collect();
+    for expert in 1..8 {
+        tensors.extend(expert_zero.iter().map(|(name, dtype, shape)|
+            (name.replace(".mlp.experts.0.", &format!(".mlp.experts.{expert}.")), *dtype, shape.clone())));
+    }
     let dir = snapshot(cfg, &tensors);
+    let package = dir.path().join("lib/fp8/fp8-glmf");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp2":{
+        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
     let share = dir.path().join("share");
     std::fs::create_dir_all(&share).unwrap();
     let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
@@ -4385,7 +4394,10 @@ fn glm_flash_auto_sparks_reserves_tower_before_optional_experts() {
         attention_placement: Some(AttentionPlacement::Heads),
         layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30; 2], spark_bytes: 1 << 30,
             context_tokens: 262144, pool_tokens: Some(262144),
-            glmf_drafter_disabled: true, graph_budget_bytes: Some(64 << 20),
+            glmf_drafter_disabled: true, glmf_prefill_expanded: false,
+            prefill_rows: 4096, state_slots: Some(8), prefix_slots: Some(8),
+            glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+                kda_fp8: false, fp8_head: false, output_shard: false }, graph_budget_bytes: Some(64 << 20),
             workspace_manifest: Some(manifest), host_memory: Some((128 << 30, 128 << 30)),
             ..Default::default() }), ..sparks(4) };
     let auto = plan(dir.path(), &options).unwrap();
