@@ -212,11 +212,19 @@ mod tests {
     /// reader fence), not the engine, lane or bank streams themselves.
     #[test]
     fn no_family_drain_synchronizes_a_compute_stream() {
-        // (family, PrefixFamily source, what its drain must call)
+        // GLM's generic family delegates to a device backend. Check both links,
+        // excluding the trait declaration and mock backend from body selection.
+        let glm5 = include_str!("../../families/glm5/prefix.rs");
+        let generic = &glm5[glm5.find("impl<D: PrefixDevice> PrefixFamily for Prefix<D>")
+            .expect("GLM generic prefix implementation")..];
+        assert_eq!(drain_body(generic).trim(), "drain(&self) -> Result<(), BoxError>{ self.device.drain() }");
+        let native = &glm5[glm5.find("impl PrefixDevice for NativePrefix<'_, '_>")
+            .expect("GLM native prefix implementation")..];
+        // (family, native prefix source, what its drain must call)
         let families = [
             ("deepseek_v4", include_str!("../../families/deepseek_v4/prefix.rs"), "copies.drain()"),
             ("deepseek_v41", include_str!("../../families/deepseek_v41/v41_native_serve/prefix.rs"), "prefix_drain()"),
-            ("glm5", include_str!("../../families/glm5/prefix.rs"), "copies.drain()"),
+            ("glm5", native, "copies.drain()"),
             ("glm5_flash", include_str!("../../families/glm5_flash/prefix.rs"), "copies.drain()"),
             ("mimo_v2", include_str!("../../families/mimo_v2/prefix.rs"), "copies.drain()"),
             ("qwen3_5", include_str!("../../families/qwen3_5/prefix.rs"), "copies.drain()"),
