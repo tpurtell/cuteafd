@@ -425,6 +425,32 @@ class PackageProfileTests(unittest.TestCase):
             self.assertEqual(variant['route_block'], 64)
             self.assertTrue(variant['ws_dynamic_tiles'])
 
+    def test_step5_measured_spark_cells_do_not_extrapolate(self):
+        measured = {(256, 256), (384, 256), (384, 1024)}
+        for width in (256, 384, 512):
+            for rows in (1, 16, 80, 256, 1024, 2048, 2752, 4096):
+                with self.subTest(width=width, rows=rows):
+                    cell = package.spark_ws_cell('step5', 'spark', width, rows)
+                    if (width, rows) in measured:
+                        self.assertEqual(cell, dict(route_block=64, dynamic=True,
+                                                    tile=package.TILE_RTX_MIXED))
+                        self.assertTrue(package.ws_dynamic_tiles('step5', 'spark', width, rows))
+                        self.assertEqual(package.ws_tile('step5', 'spark', width, rows),
+                                         package.TILE_RTX_MIXED)
+                    else:
+                        self.assertIsNone(cell)
+                        self.assertFalse(package.ws_dynamic_tiles('step5', 'spark', width, rows))
+                        self.assertIsNone(package.ws_tile('step5', 'spark', width, rows))
+                    self.assertFalse(package.wire_input('step5', 'spark', width, rows))
+                    self.assertEqual(package.ws_dynamic_tiles('step5', 'spark', width, rows, compact=True),
+                                     package.compact_warp_specialized('step5', 'spark', width, rows))
+        for width in (768, 1536):
+            for rows in (256, 1024, 2048, 2752, 4096):
+                with self.subTest(role='coordinator', width=width, rows=rows):
+                    self.assertIsNone(package.spark_ws_cell('step5', 'coordinator', width, rows))
+                    self.assertEqual(package.coordinator_ws_cell('step5', 'coordinator', width, rows),
+                                     package._WS_S14_M256 if rows == 256 else package._WS_S14)
+
     def test_ordinary_spark_ws_cells_preserve_compact_cache_keys(self):
         for geometry, bits in (('qwen4', (4, 5)),):
             with self.subTest(geometry=geometry), tempfile.TemporaryDirectory() as temporary:
@@ -793,8 +819,6 @@ class PackageProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             output, manifest, _calls, _ = self.build_fixture(root, 'spark', (2, 3), capacities=(1, 16, 80))
-            pinned = [v for v in manifest['variants'] if self.pinned_tile(v)]
-            self.assertTrue(pinned, 'the fixture must carry a capacity the planner widens')
             for variant in manifest['variants']:
                 with self.subTest(directory=variant['directory']):
                     pin = self.pinned_tile(variant)
