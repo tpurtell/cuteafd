@@ -417,12 +417,9 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
             if queued {
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
                     "independent snapshot queued");
-                loop {
-                    let ready = prefixes.borrow_mut().poll_retain(lane, &mut requests.borrow_mut(),
-                        draft.borrow_mut().as_deref_mut())?;
-                    if ready { break; }
-                    tokio::task::yield_now().await;
-                }
+                let ready = lanes::wait_ready(|| prefixes.borrow_mut().poll_retain(lane,
+                    &mut requests.borrow_mut(), draft.borrow_mut().as_deref_mut()), lanes::RETAIN_DEADLINE).await?;
+                ensure!(ready, "prefix retain did not publish within {:?}", lanes::RETAIN_DEADLINE);
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
                     "independent snapshot published");
             }
