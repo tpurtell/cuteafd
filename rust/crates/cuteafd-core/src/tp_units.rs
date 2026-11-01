@@ -463,7 +463,7 @@ mod tests {
                         let shard = LayerShard::new(intermediate, 32, layer, world, rank).unwrap();
                         let canonical = if unequal { (rank + world - layer) % world } else { rank };
                         assert_eq!(shard.width, widths[canonical]);
-                        assert_eq!(shard.first, widths[..canonical].iter().sum());
+                        assert_eq!(shard.first, widths[..canonical].iter().sum::<usize>());
                         assert_eq!(shard.first % 32, 0);
                         assert_eq!(shard.width % 32, 0);
                         let map = RankUnits::new(layer_rule(intermediate / 32, world), 3,
