@@ -518,6 +518,10 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         resource::publish(&shared.policy, 0, 0, None);
         Some(shared)
     } else { None };
+    // Expert usage needs route capture even without a draft policy.
+    if shared.is_none() && crate::shared::expert_usage::enabled() {
+        engine.arm_draft_probe()?;
+    }
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let (family, cache, selector) = owners.parts();
@@ -1294,8 +1298,12 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
                 features: drafter.and_then(|_| drafted[i].as_ref().map(|d| &d.features[..neural])), censor }
         }).collect();
         let times = round_clock.observe();
-        match engine.probe_finish(|routes, layer_us| resource::observe_drafted(&mut shared.policy,
-            &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
+        match engine.probe_finish(|routes, layer_us| {
+            if crate::shared::expert_usage::enabled() {
+                crate::shared::expert_usage::record(routes);
+            }
+            resource::observe_drafted(&mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))
+        }) {
             Some(Ok(())) => lane.observed_rounds += 1,
             Some(Err(error)) => {
                 lane.skipped_rounds += 1;
@@ -1307,6 +1315,9 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
             }
         }
         resource::publish(&shared.policy, lane.observed_rounds, lane.skipped_rounds, None);
+    } else if crate::shared::expert_usage::enabled() {
+        // No draft policy: still count this successful round's routes.
+        let _ = engine.probe_finish(|routes, _| crate::shared::expert_usage::record(routes));
     }
     if let Some(trace) = trace.as_mut() {
         let line = serde_json::json!({"rows": sequences.iter().map(Vec::len).sum::<usize>(),
@@ -1348,6 +1359,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "expert_usage": crate::shared::expert_usage::snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
 }

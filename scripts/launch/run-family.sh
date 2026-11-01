@@ -468,6 +468,7 @@ ENABLE_BENCH
 ENGRAM_WARM
 EXPERT_FORMAT
 EXPERT_PORT
+EXPERT_USAGE
 FP8_EXPERT_PREFILL
 GATEWAY
 HOST_CACHE_BYTES
@@ -969,6 +970,11 @@ v41_l2_prefetch="$(get L2_PREFETCH)"
 # a smaller cap that holds the scales (about 6 GiB) preloads those alone.
 v41_engram_warm="$(get ENGRAM_WARM off)"
 case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or off" ;; esac
+# EXPERT_USAGE (on|off; default off): count per-layer x per-expert route hits
+# (serve-native --expert-usage). Enabling it turns on route capture, so it is off
+# until the C1/C16 cost measurement proves it perf-neutral.
+v41_expert_usage="$(get EXPERT_USAGE off)"
+case "$v41_expert_usage" in on|off) ;; *) release_die "EXPERT_USAGE must be on or off" ;; esac
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
@@ -1481,6 +1487,7 @@ fi
 [[ "$TP2_DSPARK_EXPERTS" != on ]] || args+=(--tp2-dspark-experts)
 [[ -z "$v41_l2_prefetch" ]] || args+=(--l2-prefetch "$v41_l2_prefetch")
 [[ "$v41_engram_warm" != on ]] || args+=(--engram-warm)
+[[ "$v41_expert_usage" != on ]] || args+=(--expert-usage)
 # Explicit replicated topology is described to the coordinator once, and each
 # worker derives group=rank/TP and tp_rank=rank%TP from the same two flags.
 if ((topology_explicit)); then

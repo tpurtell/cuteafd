@@ -180,7 +180,8 @@ fn serve_loop(
     let mut ready = Some(ready);
     // The mark arena is allocated before local experts fill the device.
     let arena = |engine: &super::engine::Engine<'_>| -> Result<usize> {
-        if args.dspark && !engine.skip_routed && engine.weights.dspark.is_some() { engine.arm_draft_probe()?; }
+        if (args.dspark && !engine.skip_routed && engine.weights.dspark.is_some())
+            || crate::shared::expert_usage::enabled() { engine.arm_draft_probe()?; }
         let mark = Dsv4Prefix::mark_bytes_of(engine)?;
         Ok(mark_slots(engine, &prefix, mark) * mark)
     };
@@ -528,10 +529,15 @@ fn speculative_step(
             source: if copied { DraftSource::Copy } else if drafts[i].is_empty() { DraftSource::Undrafted } else { DraftSource::Neural },
             evidence: (!drafts[i].is_empty()).then_some(Evidence::History(&priors[i][..neural.min(priors[i].len())])), censor }
     }).collect();
-    let result = engine.probe_finish(|routes, layer_us| binding::observe(&mut shared.policy, &RoundRecord {
-        shared: false, requests: &round, routes, layer_us, times,
-        draft: (width > 0).then_some(DraftPass { width, requests: Some(draft_indices.len()) }), predicted,
-    }));
+    let result = engine.probe_finish(|routes, layer_us| {
+        if crate::shared::expert_usage::enabled() {
+            crate::shared::expert_usage::record(routes);
+        }
+        binding::observe(&mut shared.policy, &RoundRecord {
+            shared: false, requests: &round, routes, layer_us, times,
+            draft: (width > 0).then_some(DraftPass { width, requests: Some(draft_indices.len()) }), predicted,
+        })
+    });
     match result {
         Some(Ok(())) => *observed += 1,
         Some(Err(error)) => { *skipped += 1; tracing::debug!(%error, "V4 draft policy round not observed"); }
@@ -1069,9 +1075,12 @@ async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, 
     } else {
         let sequences: Vec<Vec<u32>> = active.iter().map(|a| vec![a.next]).collect();
         let starts: Vec<usize> = active.iter().map(|a| a.placement.len).collect();
+        let usage = crate::shared::expert_usage::enabled();
+        let probe_rows = active.len();
         let mut rows: Vec<(&mut Placement, u32)> = active.iter_mut().map(|a| (&mut a.placement, a.next)).collect();
         let timer = Instant::now();
-        engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
+        engine.probe_begin(probe_rows);
+        let step = engine.decode_device(&mut rows, transports.first_mut(), runtime).and_then(|logits| {
             let (selected, mut poisoned) = select_rows(selector, &logits, active, &sequences, &starts)?;
             crate::shared::spark_waves::healthy()?;
             shape.verify_us = console::us(timer);
@@ -1082,7 +1091,13 @@ async fn decode_round(lease: LaneLease<'_>, engine: &super::engine::Engine<'_>, 
                 };
                 finish_row(request, token, eos, &logits, row, caching, engine.library)
             }).collect::<Vec<bool>>())
-        })
+        });
+        engine.probe_end(step.is_ok());
+        // Only a successful round's routes describe anything.
+        if usage && step.is_ok() {
+            let _ = engine.probe_finish(|routes, _| crate::shared::expert_usage::record(routes));
+        }
+        step
     };
     let finished = match step {
         Ok(finished) => finished,

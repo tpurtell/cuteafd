@@ -174,7 +174,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 bound_inputs(&mut inputs);
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
-                (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default(),
+                // Without a draft runtime, capture routes for expert usage (as the serial lane does).
+                let capture = draft.as_deref().map(DraftRuntime::capture)
+                    .unwrap_or(Capture { routes: crate::shared::expert_usage::enabled(), timing: false });
+                (inputs, Some(batch), capture,
                     draft.as_deref().is_some_and(DraftRuntime::has_policy))
             };
             let prepared_us = started.elapsed().as_micros() as u64;
@@ -301,6 +304,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     }
                 }
                 let layer_us = pass.captured_layer_us();
+                // Only a successful round's routes describe anything.
+                if crate::shared::expert_usage::enabled() {
+                    crate::shared::expert_usage::record_capture(pass.captured_routes());
+                }
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), lane, shared,
                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
                     &accepted_inputs, &copied, &clock);

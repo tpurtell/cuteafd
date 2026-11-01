@@ -31,20 +31,29 @@ pub(crate) struct RoundRoutes {
     rows: usize,
     ids: Vec<u16>,
     filled: Vec<bool>,
+    /// Layers with no routed experts this round (their ids stay zero).
+    dense: Vec<bool>,
 }
 
 impl RoundRoutes {
     pub fn new(layers: usize, topk: usize) -> Self {
-        Self { layers, topk, rows: 0, ids: Vec::new(), filled: vec![false; layers] }
+        Self { layers, topk, rows: 0, ids: Vec::new(), filled: vec![false; layers],
+            dense: vec![false; layers] }
     }
     pub fn layers(&self) -> usize { self.layers }
+    pub fn topk(&self) -> usize { self.topk }
     pub fn rows(&self) -> usize { self.rows }
+    /// Whether `layer` is dense (unrouted) this round.
+    pub fn is_dense(&self, layer: usize) -> bool { self.dense.get(layer).copied().unwrap_or(false) }
+    /// Whether `layer` was filled this round.
+    pub fn is_filled(&self, layer: usize) -> bool { self.filled.get(layer).copied().unwrap_or(false) }
     /// Start a round of `rows` verifier rows; every layer is unfilled.
     pub fn begin(&mut self, rows: usize) {
         self.rows = rows;
         self.ids.clear();
         self.ids.resize(self.layers * rows * self.topk, 0);
         self.filled.fill(false);
+        self.dense.fill(false);
     }
     /// One layer's ids, `rows * topk` in row order, masked by `mask` (the
     /// family's expert-index bits; router flag bits above them are dropped).
@@ -89,6 +98,7 @@ impl RoundRoutes {
     pub fn dense(&mut self, layer: usize) -> Result<(), RouteError> {
         if layer >= self.layers { return Err(RouteError::Layer(layer)); }
         self.filled[layer] = true;
+        self.dense[layer] = true;
         Ok(())
     }
     /// Replace the round with a whole `[layer][row][slot]` capture of `rows`
@@ -98,6 +108,19 @@ impl RoundRoutes {
         if capture.len() != self.layers { return Err(RouteError::Missing(capture.len().min(self.layers))); }
         self.begin(rows);
         for (layer, routes) in capture.iter().enumerate() { self.push_rows(layer, routes, mask)?; }
+        Ok(())
+    }
+    /// As [`fill`](Self::fill), but a layer whose capture is empty was not
+    /// captured this round and stays unfilled (V4.1 prefill and partial
+    /// captures). Filled layers must still have exactly `rows` rows.
+    pub fn fill_partial<const K: usize>(&mut self, capture: &[Vec<[u32; K]>], rows: usize, mask: u32)
+        -> Result<(), RouteError> {
+        if capture.len() != self.layers { return Err(RouteError::Missing(capture.len().min(self.layers))); }
+        self.begin(rows);
+        for (layer, routes) in capture.iter().enumerate() {
+            if routes.is_empty() { continue; }
+            self.push_rows(layer, routes, mask)?;
+        }
         Ok(())
     }
     fn slot(&mut self, layer: usize, len: usize) -> Result<&mut [u16], RouteError> {
@@ -164,6 +187,32 @@ mod tests {
         // A new round clears every layer.
         routes.begin(1);
         assert_eq!((routes.complete(), routes.flat().len()), (Err(RouteError::Missing(0)), 6));
+    }
+
+    #[test]
+    fn partial_capture_leaves_empty_layers_unfilled() {
+        let mut routes = RoundRoutes::new(3, 6);
+        routes.fill_partial(&[vec![], vec![[1u32; 6], [2; 6]], vec![]], 2, u32::MAX).unwrap();
+        assert_eq!(routes.rows(), 2);
+        assert!(!routes.is_filled(0) && routes.is_filled(1) && !routes.is_filled(2));
+        assert_eq!(&routes.flat()[12..24], &[1; 6].iter().chain(&[2; 6]).copied().collect::<Vec<_>>()[..]);
+        // A filled layer with the wrong row count is still rejected.
+        assert!(routes.fill_partial(&[vec![], vec![[1u32; 6]], vec![]], 2, u32::MAX).is_err());
+    }
+
+    #[test]
+    fn geometry_and_dense_layers_are_readable() {
+        let mut routes = RoundRoutes::new(3, 8);
+        assert_eq!((routes.layers(), routes.topk(), routes.rows()), (3, 8, 0));
+        routes.begin(2);
+        routes.dense(0).unwrap();
+        routes.push(1, &[0; 16], 511).unwrap();
+        assert!(routes.is_dense(0) && routes.is_filled(0));
+        assert!(!routes.is_dense(1) && routes.is_filled(1));
+        assert!(!routes.is_dense(2) && !routes.is_filled(2));
+        // A new round clears the dense marks too.
+        routes.begin(1);
+        assert!(!routes.is_dense(0) && !routes.is_filled(0));
     }
 
     #[test]

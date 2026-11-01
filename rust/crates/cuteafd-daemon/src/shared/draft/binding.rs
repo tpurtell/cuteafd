@@ -159,6 +159,13 @@ pub(crate) fn needs_routes(policy: &DraftPolicy) -> bool {
 /// Probes are allocated before some families bind their policy.
 pub(crate) fn configured_needs_routes() -> bool {
     super::draft_mode() == cuteafd_core::DraftMode::Shared || replay_trace().is_some()
+        || crate::shared::expert_usage::enabled()
+}
+
+/// Whether the draft policy needs per-layer timing (routes for pricing or the
+/// replay trace). Expert usage captures routes without timing.
+pub(crate) fn configured_needs_timing() -> bool {
+    super::draft_mode() == cuteafd_core::DraftMode::Shared || replay_trace().is_some()
 }
 
 /// The simple rule's round: the cutoff with its row price and token cost,

@@ -492,7 +492,8 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "prefix_cache": cache.stats(),
-            "draft_policy": crate::shared::draft::resource::snapshot()});
+            "draft_policy": crate::shared::draft::resource::snapshot(),
+            "expert_usage": crate::shared::expert_usage::snapshot()});
     }
 }
 
@@ -550,6 +551,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         engine.arm_draft_probe()?;
         SharedPolicy::with_geometry(geometry, resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
     }).transpose()?;
+    // Expert usage needs route capture even without a draft policy.
+    if shared.is_none() && crate::shared::expert_usage::enabled() {
+        engine.arm_draft_probe()?;
+    }
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
     let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
@@ -1135,13 +1140,20 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                 censor }
         }).collect();
         let times = round_clock.observe();
-        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| resource::observe_drafted(
-            &mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))) {
+        if let Some(Err(error)) = engine.probe_finish(|routes, layer_us| {
+            if crate::shared::expert_usage::enabled() {
+                crate::shared::expert_usage::record(routes);
+            }
+            resource::observe_drafted(&mut shared.policy, &requests, routes, layer_us, times, drafted_width, predicted, Some(drafted_requests))
+        }) {
             tracing::debug!(%error, "GLM draft round not observed");
         }
         if shared.policy.stats().rounds % 32 == 1 {
             resource::publish(&shared.policy, shared.policy.stats().rounds, 0, None);
         }
+    } else if crate::shared::expert_usage::enabled() {
+        // No draft policy: still count this successful round's routes.
+        let _ = engine.probe_finish(|routes, _| crate::shared::expert_usage::record(routes));
     }
     for (i, request) in active.iter().enumerate() {
         let proposal = &sequences[i][1..];

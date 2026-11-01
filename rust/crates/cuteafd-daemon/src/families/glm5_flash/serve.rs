@@ -422,8 +422,12 @@ impl SharedPolicy {
             })
         } else { None };
         let policy = &mut self.policy;
-        let outcome = engine.probe_finish(|routes, layer_us|
-            super::draft_binding::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests)));
+        let outcome = engine.probe_finish(|routes, layer_us| {
+            if crate::shared::expert_usage::enabled() {
+                crate::shared::expert_usage::record(routes);
+            }
+            super::draft_binding::observe_drafted(policy, requests, routes, layer_us, times, width, predicted, Some(drafted_requests))
+        });
         match outcome {
             Some(Ok(())) => self.observed += 1,
             Some(Err(error)) => {
@@ -835,6 +839,7 @@ fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, acti
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
             "verify": verify.snapshot(), "draft_policy": super::draft_binding::snapshot(),
+            "expert_usage": crate::shared::expert_usage::snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         crate::shared::probe::graph_capture_stats(&mut stats);
         // Idle checkpoints only: never sample the process ledger on the decode hot path.
@@ -892,6 +897,10 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             Some(SharedPolicy::new(engine, opened, drafter, ranks)?),
         _ => None,
     };
+    // Expert usage needs route capture even without a draft policy.
+    if shared.is_none() && crate::shared::expert_usage::enabled() {
+        engine.arm_draft_probe(engine.decode_rows)?;
+    }
     let mut active: Vec<Active<'_>> = Vec::new();
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
@@ -1554,6 +1563,9 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         }).collect();
         let times = round_clock.observe();
         shared.observe(engine, &requests, times, drafted_width, drafted_requests, predicted);
+    } else if crate::shared::expert_usage::enabled() {
+        // No draft policy: still count this successful round's routes.
+        let _ = engine.probe_finish(|routes, _| crate::shared::expert_usage::record(routes));
     }
     if let Some(trace) = trace.as_mut() {
         lane.trace_round += 1;

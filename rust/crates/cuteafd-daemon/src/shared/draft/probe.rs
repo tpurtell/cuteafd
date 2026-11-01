@@ -35,6 +35,9 @@ pub(crate) struct RingCheck {
 
 pub(crate) struct RoundProbe<'a> {
     collect_routes: bool,
+    /// Per-layer CUDA-event timing (the priced policy or the replay trace).
+    /// Expert usage captures routes without it.
+    timing: bool,
     clock: LayerClock<'a>,
     routes: RoundRoutes,
     /// Pinned `[layer][row][slot]` u32 ids, packed to this round's row stride.
@@ -71,6 +74,7 @@ impl<'a> RoundProbe<'a> {
         library.copy_h2d(device_ring.buffer, ring.bytes())?;
         let last_owned = dense.iter().rposition(|&dense| !dense);
         Ok(Self { collect_routes: super::binding::configured_needs_routes(),
+            timing: super::binding::configured_needs_timing(),
             clock: LayerClock::new(library, layers)?, routes: RoundRoutes::new(layers, topk), ring,
             device_ring, last_owned, downloaded: false, capacity,
             topk, ringed: vec![false; layers], staged: vec![false; layers], dense,
@@ -112,7 +116,7 @@ impl<'a> RoundProbe<'a> {
     pub unsafe fn mark(&mut self, layer: usize, stream: *mut c_void) -> Result<()> {
         if self.active {
             // SAFETY: forwarded from the caller; no read of this round's marks is in flight.
-            unsafe { self.clock.mark(layer, stream, false) };
+            if self.timing { unsafe { self.clock.mark(layer, stream, false) }; }
             if Some(layer) == self.last_owned && self.ringed.iter().any(|&queued| queued) {
                 // SAFETY: all owner-local D2D writes precede this download on the same stream;
                 // the pinned ring remains owned until the existing verifier sync and finish.
@@ -130,7 +134,7 @@ impl<'a> RoundProbe<'a> {
     /// # Safety
     /// `stream` is live on this probe's device and ordered after the input transfer.
     pub unsafe fn mark_entry(&mut self, layer: usize, stream: *mut c_void) {
-        if self.active {
+        if self.active && self.timing {
             // SAFETY: the caller guarantees the event and stream ownership/order.
             unsafe { self.clock.mark_entry(layer, stream, false); }
         }
@@ -192,7 +196,8 @@ impl<'a> RoundProbe<'a> {
             tracing::debug!(%error, "draft policy round routes not observed");
             return None;
         }
-        Some((&self.routes, self.clock.read()))
+        let times = if self.timing { self.clock.read() } else { Vec::new() };
+        Some((&self.routes, times))
     }
 }
 

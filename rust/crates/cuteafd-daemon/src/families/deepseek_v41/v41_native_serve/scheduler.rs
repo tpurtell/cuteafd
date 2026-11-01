@@ -242,6 +242,8 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "admission": kv_waiter.stats(),
         "media": media.stats(),
         "totals": console::totals::snapshot(),
+        // Per-layer x per-expert route hits (small `{enabled:false}` when off).
+        "expert_usage": crate::shared::expert_usage::snapshot(),
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
     stats
@@ -490,6 +492,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
+    // Opt-in per-layer x per-expert route counters.
+    if args.expert_usage {
+        crate::shared::expert_usage::enable(cuteafd_core::expert_geometry().experts);
+    }
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
@@ -1692,7 +1698,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let started = Instant::now();
     ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
     let speculative = draft.is_some();
-    let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
+    let usage = crate::shared::expert_usage::enabled();
+    let capture = draft.as_deref().map(DraftRuntime::capture)
+        .unwrap_or(Capture { routes: usage, timing: false });
     // Speculative rows vary every round: keep each decode shape's graphs,
     // whether or not this policy captures routes.
     if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
@@ -1767,6 +1775,8 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
                 return Err(error);
             }
         };
+        // Only a successful round's routes describe anything.
+        if usage { crate::shared::expert_usage::record_capture(pass.captured_routes()); }
         let verified_us = started.elapsed().as_micros() as u64 - prepared_us;
         let (accepted, emitted, emissions, accepted_inputs) = commit_lane(lib, lane, pass, requests,
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(), 0,
@@ -1806,6 +1816,8 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let executed_us = started.elapsed().as_micros() as u64;
     let result = (|| -> Result<()> {
         let next = next?;
+        // Only a successful round's routes describe anything.
+        if usage { crate::shared::expert_usage::record_capture(pass.captured_routes()); }
         tracing::debug!(target: "cuteafd::cost_model", batch=batch_id, lane,
             requests=members.len(), rows=inputs.iter().map(Vec::len).sum::<usize>(),
             prepared_us, verify_us=executed_us-prepared_us, "verification round cost");

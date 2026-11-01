@@ -369,6 +369,18 @@ impl<'a> Engine<'a> {
 
     pub(crate) fn arm_draft_probe(&self) -> Result<()> {
         self.require_live()?;
+        // Expert usage captures routes without a drafter; admission charged the arena.
+        if self.draft_probe.borrow().is_none() && crate::shared::expert_usage::enabled() {
+            let (dense, topk) = {
+                let lanes = self.lanes.borrow();
+                let config = lanes.local[0][0].config();
+                (config.dense.clone(), config.topk)
+            };
+            let device = self.exchange_streams[0].device;
+            let probe = device.own(|| crate::shared::draft::probe::RoundProbe::new(
+                device.library, dense, topk, 64))?;
+            *self.draft_probe.borrow_mut() = Some(probe);
+        }
         ensure!(self.draft_probe.borrow().is_some(), "Kimi draft policy probe was not admitted");
         Ok(())
     }

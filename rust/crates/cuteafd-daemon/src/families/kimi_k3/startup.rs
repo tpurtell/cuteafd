@@ -133,6 +133,9 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
             fixed.extend(cuteafd_loader::families::kimi_k3::core::draft_head_demand(&core,
                 layout.capacity().block_rows, programs.family_metadata("dense_trellis_k6")?)?);
         }
+    } else if crate::shared::expert_usage::enabled() {
+        // Expert usage captures routes without a drafter: charge its arena too.
+        fixed.push(cuteafd_loader::families::kimi_k3::draft_probe_demand(cfg.layers, cfg.topk, rows.min(64))?);
     }
     let selected = cuteafd_loader::placement::ProgramSet::from_names(
         if core.projections.is_empty() { &["kimik3"][..] } else { &["kimik3", "kimi"][..] }, programs.names());

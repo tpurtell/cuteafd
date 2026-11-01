@@ -1265,13 +1265,14 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
         self.capture_timing = false;
         self.router.set_ring_capture(false);
     }
-    /// Before a pass: route ids only for the priced policy or the replay
-    /// trace; timing also while a console viewer is connected (its layer and
-    /// expert-stage panels). Always clears the previous pass's marks, so an
-    /// untimed pass reports no layer times rather than stale ones.
+    /// Before a pass: route ids only for the priced policy, the replay trace or
+    /// expert usage; timing also while a console viewer is connected (its layer
+    /// and expert-stage panels). Route capture and layer timing are independent:
+    /// usage-only capture records routes without per-layer CUDA events, elapsed
+    /// queries or retained small graph shapes. Always clears the previous pass's
+    /// marks, so an untimed pass reports no layer times rather than stale ones.
     pub fn set_capture(&mut self, capture: Capture) {
         let Capture { routes, timing } = capture;
-        let timing = timing || routes;
         self.capture_routes = routes;
         self.capture_timing = timing;
         self.router.set_ring_capture(routes);

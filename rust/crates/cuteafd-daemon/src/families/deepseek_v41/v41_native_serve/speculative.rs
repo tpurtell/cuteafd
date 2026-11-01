@@ -180,7 +180,8 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn has_policy(&self) -> bool { self.policy.is_some() }
     /// What a verification round records: see [`round_capture`].
     pub fn capture(&self) -> Capture {
-        round_capture(self.policy.as_ref(), super::console::live().is_some())
+        round_capture(self.policy.as_ref(), super::console::live().is_some(),
+            crate::shared::expert_usage::enabled())
     }
     fn wants_confidence(&self) -> bool {
         self.policy.is_some() || tracing::enabled!(target: "cuteafd::draft_policy", tracing::Level::DEBUG)
@@ -687,15 +688,17 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
 }
 
 /// A policy-bound verification round captures route ids only for resource
-/// pricing or the replay trace, whatever the draft mode; simple and fixed modes
-/// skip them. Per-layer CUDA-event times and the FFN stage split come with the
-/// routes and also whenever a console viewer is connected (its layer profile
-/// and expert-stage panels), so a default launch keeps them while watched and
-/// skips them while nobody is.
-pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, console_live: bool) -> Capture {
-    let Some(policy) = policy else { return Capture::default() };
-    let routes = crate::shared::draft::binding::needs_routes(policy);
-    Capture { routes, timing: routes || console_live }
+/// pricing, the replay trace or expert usage, whatever the draft mode; simple
+/// and fixed modes skip them. Per-layer CUDA-event times and the FFN stage split
+/// come with the priced policy and also whenever a console viewer is connected
+/// (its layer profile and expert-stage panels), so a default launch keeps them
+/// while watched and skips them while nobody is. Expert usage captures routes
+/// without timing: it must not force per-layer CUDA events or retained shapes.
+pub(crate) fn round_capture(policy: Option<&cuteafd_core::DraftPolicy>, console_live: bool,
+    usage: bool) -> Capture {
+    let Some(policy) = policy else { return Capture { routes: usage, timing: false } };
+    let priced = crate::shared::draft::binding::needs_routes(policy);
+    Capture { routes: priced || usage, timing: priced || console_live }
 }
 
 #[cfg(test)]
@@ -709,7 +712,9 @@ mod restored_prefix_tests {
     #[test]
     fn console_keeps_layer_times_in_every_draft_mode() {
         use cuteafd_core::{DraftMode, DraftPolicy, PolicySeed};
-        assert_eq!(round_capture(None, true), Capture::default());
+        assert_eq!(round_capture(None, true, false), Capture::default());
+        // Expert usage captures routes without layer timing.
+        assert_eq!(round_capture(None, false, true), Capture { routes: true, timing: false });
         let geometry = super::policy::remote_geometry(7);
         for (mode, fixed, priced) in [(DraftMode::Simple, false, false), (DraftMode::SimpleRc, false, false),
             (DraftMode::SimpleDerived, false, false), (DraftMode::Shared, true, false), (DraftMode::Shared, false, true)] {
@@ -718,10 +723,13 @@ mod restored_prefix_tests {
             // The replay trace (SPECULATION_TRACE) forces routes; this test runs without it.
             let traced = crate::shared::draft::binding::needs_routes(&policy) && !priced;
             assert!(!traced, "{mode:?} fixed={fixed}: unexpected route need");
-            let watched = round_capture(Some(&policy), true);
-            let unwatched = round_capture(Some(&policy), false);
+            let watched = round_capture(Some(&policy), true, false);
+            let unwatched = round_capture(Some(&policy), false, false);
             assert_eq!(watched, Capture { routes: priced, timing: true }, "{mode:?} fixed={fixed} watched");
             assert_eq!(unwatched, Capture { routes: priced, timing: priced }, "{mode:?} fixed={fixed} unwatched");
+            // Usage forces routes but not timing on an unpriced policy.
+            assert_eq!(round_capture(Some(&policy), false, true),
+                Capture { routes: true, timing: priced }, "{mode:?} fixed={fixed} usage");
         }
     }
     #[test]
