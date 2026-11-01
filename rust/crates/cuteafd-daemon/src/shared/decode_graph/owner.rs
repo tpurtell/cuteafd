@@ -8,6 +8,9 @@ use super::fatal_drain;
 
 pub(crate) struct GraphOwner<'a, P> {
     pub raw: *mut c_void,
+    /// Retained source graph for pointer/argument updates. The normal capture
+    /// path destroys it; only families that update captured arguments keep it.
+    pub graph: Option<*mut c_void>,
     device: Device<'a>,
     pub pins: P,
 }
@@ -19,7 +22,19 @@ impl<'a, P> GraphOwner<'a, P> {
     /// wave must drain launches before dropping this owner or its external pins.
     pub unsafe fn new(library: &'a NativeLibrary, device: i32, raw: *mut c_void, pins: P) -> Result<Self> {
         ensure!(!raw.is_null(), "null graph executable");
-        Ok(Self { raw, device: Device { library, id: device }, pins })
+        Ok(Self { raw, graph: None, device: Device { library, id: device }, pins })
+    }
+
+    /// Retain the source graph alongside its executable so captured kernel
+    /// arguments can be updated without recapturing.
+    /// # Safety
+    /// raw and graph are exclusively owned, instantiated on device, and every
+    /// captured allocation is kept alive by pins or the containing wave.
+    pub unsafe fn new_retained(library: &'a NativeLibrary, device: i32, raw: *mut c_void,
+        graph: *mut c_void, pins: P) -> Result<Self> {
+        ensure!(!raw.is_null(), "null graph executable");
+        ensure!(!graph.is_null(), "null retained graph");
+        Ok(Self { raw, graph: Some(graph), device: Device { library, id: device }, pins })
     }
     pub fn device(&self) -> i32 { self.device.id }
 }
@@ -63,6 +78,11 @@ impl<P> Drop for GraphOwner<'_, P> {
         // drain; live entries are dropped by their drained containing wave.
         if let Err(error) = self.device.run(|| unsafe { self.device.library.cuda_graph_exec_destroy(self.raw) }) {
             tracing::error!(%error, device = self.device.id, "destroying graph executable");
+        }
+        if let Some(graph) = self.graph.take() {
+            if let Err(error) = self.device.run(|| unsafe { self.device.library.cuda_graph_destroy(graph) }) {
+                tracing::error!(%error, device = self.device.id, "destroying retained graph");
+            }
         }
     }
 }

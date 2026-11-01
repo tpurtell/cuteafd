@@ -1191,6 +1191,21 @@ type CudaGraphEndCaptureFn = unsafe extern "C" fn(
 type CudaGraphLaunchFn =
     unsafe extern "C" fn(cuda_graph_exec: *mut c_void, cuda_stream: *mut c_void) -> CuteafdStatus;
 type CudaGraphExecDestroyFn = unsafe extern "C" fn(cuda_graph_exec: *mut c_void) -> CuteafdStatus;
+type CudaGraphEndCaptureRetainedFn = unsafe extern "C" fn(
+    cuda_stream: *mut c_void,
+    out: *mut CuteafdCudaGraphCaptureInfo,
+) -> CuteafdStatus;
+type CudaGraphDestroyFn = unsafe extern "C" fn(cuda_graph: *mut c_void) -> CuteafdStatus;
+type CudaGraphExecUpdatePointersFn = unsafe extern "C" fn(
+    cuda_graph_exec: *mut c_void,
+    cuda_graph: *mut c_void,
+    old_values: *const u64,
+    new_values: *const u64,
+    widths: *const u8,
+    kinds: *const u8,
+    found: *mut u8,
+    count: usize,
+) -> CuteafdStatus;
 type CopyH2DFn =
     unsafe extern "C" fn(dst: CuteafdDeviceBuffer, src: *const c_void, bytes: usize) -> CuteafdStatus;
 type CopyD2HFn =
@@ -1702,6 +1717,9 @@ native_symbols! {
     cuteafd_cuda_graph_end_capture: CudaGraphEndCaptureFn,
     cuteafd_cuda_graph_launch: CudaGraphLaunchFn,
     cuteafd_cuda_graph_exec_destroy: CudaGraphExecDestroyFn,
+    cuteafd_cuda_graph_end_capture_retained: CudaGraphEndCaptureRetainedFn,
+    cuteafd_cuda_graph_destroy: CudaGraphDestroyFn,
+    cuteafd_cuda_graph_exec_update_pointers: CudaGraphExecUpdatePointersFn,
     cuteafd_copy_h2d: CopyH2DFn,
     cuteafd_copy_h2d_async: CopyH2DAsyncFn,
     cuteafd_copy_h2d_batch_async: CopyH2DBatchAsyncFn,
@@ -2820,6 +2838,79 @@ impl NativeLibrary {
         let destroy_fn: CudaGraphExecDestroyFn = self.cuteafd_cuda_graph_exec_destroy()?;
         let status = unsafe { destroy_fn(cuda_graph_exec) };
         self.status_to_result("cuteafd_cuda_graph_exec_destroy", status)
+    }
+
+    /// Ends a capture and keeps BOTH the source graph and its executable, so
+    /// captured kernel arguments can be updated in place without recapturing.
+    /// The caller owns both handles and must destroy them (the graph via
+    /// `cuda_graph_destroy`, the exec via `cuda_graph_exec_destroy`).
+    /// # Safety
+    /// The stream is live on the current device and is not capturing.
+    pub unsafe fn cuda_graph_end_capture_retained(
+        &self,
+        cuda_stream: *mut c_void,
+    ) -> Result<CuteafdCudaGraphCaptureInfo> {
+        let end_capture_fn: CudaGraphEndCaptureRetainedFn =
+            self.cuteafd_cuda_graph_end_capture_retained()?;
+        let mut info = CuteafdCudaGraphCaptureInfo::default();
+        let status = unsafe { end_capture_fn(cuda_stream, &mut info) };
+        self.status_to_result("cuteafd_cuda_graph_end_capture_retained", status)?;
+        Ok(info)
+    }
+
+    /// # Safety
+    /// The graph was captured on the current device and no launch using it is
+    /// still in flight.
+    pub unsafe fn cuda_graph_destroy(&self, cuda_graph: *mut c_void) -> Result<()> {
+        let destroy_fn: CudaGraphDestroyFn = self.cuteafd_cuda_graph_destroy()?;
+        let status = unsafe { destroy_fn(cuda_graph) };
+        self.status_to_result("cuteafd_cuda_graph_destroy", status)
+    }
+
+    /// Updates a retained graph and its executable in place by substituting
+    /// kernel-argument values. `kinds[i]` is 0 for a scalar argument and 1 for a
+    /// device-pointer argument; the native update validates that every pointer
+    /// value resolves to a CUDA allocation and every scalar value does not, and
+    /// matches arguments on width, kind and value, so a scalar can never be
+    /// rewritten with a pointer value (or the reverse). `found[i]` reports
+    /// whether `old_values[i]` matched a kernel argument; the caller must treat
+    /// a non-identity value that was not found as a failed update.
+    /// # Safety
+    /// The executable and retained graph belong to the current device, every
+    /// launch using them has drained, and the value arrays describe kernel
+    /// arguments captured in the graph.
+    pub unsafe fn cuda_graph_exec_update_pointers(
+        &self,
+        cuda_graph_exec: *mut c_void,
+        cuda_graph: *mut c_void,
+        old_values: &[u64],
+        new_values: &[u64],
+        widths: &[u8],
+        kinds: &[u8],
+        found: &mut [u8],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            old_values.len() == new_values.len()
+                && old_values.len() == widths.len()
+                && old_values.len() == kinds.len()
+                && old_values.len() == found.len(),
+            "graph update value count differs"
+        );
+        let update_fn: CudaGraphExecUpdatePointersFn =
+            self.cuteafd_cuda_graph_exec_update_pointers()?;
+        let status = unsafe {
+            update_fn(
+                cuda_graph_exec,
+                cuda_graph,
+                old_values.as_ptr(),
+                new_values.as_ptr(),
+                widths.as_ptr(),
+                kinds.as_ptr(),
+                found.as_mut_ptr(),
+                old_values.len(),
+            )
+        };
+        self.status_to_result("cuteafd_cuda_graph_exec_update_pointers", status)
     }
 
 

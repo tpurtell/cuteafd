@@ -352,6 +352,58 @@ cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out);
 cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_exec_update(void* cuda_graph_exec, void* cuda_graph);
+// Updates a retained graph (cuteafd_cuda_graph_end_capture_retained) and its
+// executable in place by substituting kernel-argument values.
+//
+// widths[i] is the argument width in bytes (4 or 8). kinds[i] is 0 for a scalar
+// argument and 1 for a device-pointer argument. A kernel-node argument is
+// replaced only when its size equals widths[i], its kind (pointer vs scalar,
+// resolved with cuPointerGetAttributes) equals kinds[i], and its value equals
+// old_values[i]. Matching on kind as well as width/value means a scalar update
+// can never rewrite a pointer argument (or the reverse), even when the numeric
+// values collide. Only kernel nodes are updated; a memcpy/memset node that
+// references an old value makes the whole update fail (the caller recaptures)
+// rather than silently leaving that node on a stale pointer. Nodes are read
+// through the driver API, so kernels from driver-loaded modules (CuTe-DSL AOT
+// cudaLibrary kernels, no runtime host stub) are updated like runtime kernels;
+// argument sizes come from cuFuncGetParamInfo.
+//
+// Launch geometry (grid/block dimensions) is copied wholesale from the captured
+// node and is NOT updated. The caller must keep launch extents stable across an
+// update (the index-selection bank keys on geometry for exactly this reason) and
+// must not pass a launch-extent scalar as a changing value.
+//
+// Pointer/scalar validation (before any node is touched): a kind==1 value must
+// be 8 bytes and, unless old == new, both old and new must resolve to a CUDA
+// allocation (device, managed or registered host); an 8-byte kind==0 value must
+// not resolve to one. A scalar that shares a pointer's numeric value can
+// therefore never be rewritten as a pointer, nor a pointer as a scalar.
+//
+// Returns INVALID_ARGUMENT for a failed validation, an unsupported parameter
+// layout, an ambiguous substitution (one old value of one width mapped to two
+// new values), or a non-kernel node that references an old value; INTERNAL_ERROR
+// for a failed CUDA call (message carries the driver error name/string). On ANY
+// failure the graph/exec may be partially updated and must be retired by the
+// caller (recapture), and the per-thread CUDA last-error is cleared before
+// returning, so a recovered failure cannot leak into the next kernel's
+// launch-status check.
+//
+// found[i] is set to 1 when old_values[i] matched at least one kernel-node
+// argument of the same width and kind, else 0. Duplicate entries that match the
+// same argument are all reported found. The caller must treat any non-identity
+// value (old != new) that was not found as a failed update: a missed
+// substitution would leave the graph pointing at stale arguments.
+cuteafd_status_t cuteafd_cuda_graph_exec_update_pointers(
+    void* cuda_graph_exec, void* cuda_graph, const uint64_t* old_values,
+    const uint64_t* new_values, const uint8_t* widths, const uint8_t* kinds,
+    uint8_t* found, size_t count);
+#if defined(CUTEAFD_NATIVE_TEST_HOOKS)
+// TEST ONLY (native selftest): make the next update_pointers call on this
+// thread fail at `stage` (1 = cuGraphKernelNodeGetParams, 2 =
+// cuGraphKernelNodeSetParams, 3 = cuGraphExecKernelNodeSetParams); one-shot,
+// 0 disarms. Not built into the production library.
+void cuteafd_cuda_graph_update_pointers_inject_fault(int stage);
+#endif
 cuteafd_status_t cuteafd_cuda_graph_destroy(void* cuda_graph);
 cuteafd_status_t cuteafd_cuda_graph_exec_destroy(void* cuda_graph_exec);
 cuteafd_status_t cuteafd_cuda_graph_update_rmsnorm_bf16_node(

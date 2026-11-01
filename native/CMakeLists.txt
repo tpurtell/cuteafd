@@ -8,6 +8,7 @@ if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 option(CUTEAFD_ENABLE_CUDA "Build CUDA kernels and CUDA-backed ABI functions" OFF)
+option(CUTEAFD_NATIVE_TEST_HOOKS "Build test-only native hooks (graph-update fault injection)" OFF)
 option(CUTEAFD_ENABLE_VISION_ATTENTION_AOT "Build shared Qwen/GLM BF16 vision attention" OFF)
 option(CUTEAFD_ENABLE_AUDIO_AOT "Build qualification-only FP32 MiMo audio tower" OFF)
 option(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT "Build full RTX backbone expert kernels alongside dSpark" OFF)
@@ -450,6 +451,9 @@ if(CUTEAFD_ENABLE_CUDA)
   target_include_directories(cuteafd_native PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_options(cuteafd_native PRIVATE "-Wl,--wrap=__cudaRegisterFunction")
 endif()
+if(CUTEAFD_NATIVE_TEST_HOOKS)
+  target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_NATIVE_TEST_HOOKS)
+endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT)
   target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_AUDIO_AOT_SM=${CUTEAFD_AUDIO_CAPABILITY})
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_AUDIO_DIR}")
@@ -678,6 +682,20 @@ if(CUTEAFD_ENABLE_CUDA)
   add_executable(cuteafd_cuda_selftest tests/cuda_selftest.cc)
   target_link_libraries(cuteafd_cuda_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_selftest COMMAND cuteafd_cuda_selftest)
+  # Driver-API graph argument update (runtime + driver-library nodes). The
+  # selftest needs the test-only fault-injection hook, so it is built only when
+  # CUTEAFD_NATIVE_TEST_HOOKS is enabled; the production library never exports
+  # the hook.
+  if(CUTEAFD_NATIVE_TEST_HOOKS)
+    add_executable(cuteafd_cuda_graph_update_selftest tests/cuda_graph_update_selftest.cu)
+    set_target_properties(cuteafd_cuda_graph_update_selftest PROPERTIES
+      CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+    target_compile_definitions(cuteafd_cuda_graph_update_selftest PRIVATE CUTEAFD_NATIVE_TEST_HOOKS)
+    target_include_directories(cuteafd_cuda_graph_update_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+    target_link_libraries(cuteafd_cuda_graph_update_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cuda_driver)
+    add_test(NAME cuteafd_cuda_graph_update_selftest COMMAND cuteafd_cuda_graph_update_selftest)
+    set_tests_properties(cuteafd_cuda_graph_update_selftest PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+  endif()
   add_executable(cuteafd_vision_pointwise_selftest tests/vision_pointwise_test.cu)
   set_target_properties(cuteafd_vision_pointwise_selftest PROPERTIES
     CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")

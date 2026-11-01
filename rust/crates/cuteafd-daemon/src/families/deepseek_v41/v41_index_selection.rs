@@ -55,6 +55,49 @@ fn tile_width(max_length: usize, bucket: usize) -> usize {
     max_length.max(1).div_ceil(bucket).saturating_mul(bucket).min(WIDTH)
 }
 
+/// Graph-update argument kinds. The native update validates that a pointer
+/// value resolves to a CUDA allocation and a scalar value does not, and matches
+/// arguments on width, kind and value, so a scalar argument can never be
+/// rewritten with a pointer value (or the reverse).
+const KIND_SCALAR: u8 = 0;
+const KIND_POINTER: u8 = 1;
+
+/// Stable launch geometry for the index-selection graph bank. Volatile device
+/// pointers and per-request capacities are deliberately excluded; they are
+/// updated in the captured graph instead. Pure so the key can be unit-tested.
+fn selection_fingerprint(
+    layer: usize,
+    rows: usize,
+    request_lengths: &[usize],
+    max_length: u64,
+) -> Vec<usize> {
+    let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
+    let use_candidates = layer > 20 && max_length > WIDTH as u64;
+    let tiles = (max_length as usize).div_ceil(width).max(1);
+    let mut fingerprint = Vec::with_capacity(4 + request_lengths.len());
+    fingerprint.push(layer);
+    fingerprint.push(rows);
+    fingerprint.extend(request_lengths.iter().copied());
+    fingerprint.extend([width, usize::from(use_candidates), tiles, request_lengths.len()]);
+    fingerprint
+}
+
+/// Reject a graph update that did not substitute every non-identity value.
+/// Identity values (old == new) are collision probes and need not be found.
+fn verify_substitutions(old_values: &[u64], new_values: &[u64], found: &[u8]) -> Result<()> {
+    ensure!(
+        old_values.len() == new_values.len() && old_values.len() == found.len(),
+        "graph update value count differs"
+    );
+    for (i, ((old, new), found)) in old_values.iter().zip(new_values).zip(found).enumerate() {
+        ensure!(
+            old == new || *found != 0,
+            "graph update value {i} was not found in any kernel node"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct ScoreGroup {
     request: usize,
@@ -174,11 +217,14 @@ pub(crate) struct IndexSelectionWave<'a> {
     /// Per-layer pinned metadata and lengths (see `LayerStaging`).
     staging: LayerStaging<'a>,
     capacity: usize,
-    graph: Option<(*mut c_void, Vec<usize>)>,
-    graphs: crate::shared::decode_graph::GraphBank<Vec<usize>, crate::shared::decode_graph::GraphOwner<'a, ()>>,
+    graph: Option<Vec<usize>>,
+    graphs: crate::shared::decode_graph::GraphBank<Vec<usize>, crate::shared::decode_graph::GraphOwner<'a, (Vec<u64>, Vec<u8>, Vec<u8>)>>,
     retain_decode_graphs: bool,
     fixed_captures: BTreeSet<Vec<usize>>,
     fixed_recaptures: usize,
+    /// Graph updates refused because a value was ambiguous, not found, or not a
+    /// validated pointer/scalar. Each one falls back to a recapture.
+    graph_update_fallbacks: usize,
     ready: Option<Ready>,
     pending: Option<Ready>,
     in_flight: bool,
@@ -244,6 +290,7 @@ impl<'a> IndexSelectionWave<'a> {
             staging: LayerStaging::new(library, capacity * 56, 40)?, capacity,
             graph: None, graphs: crate::shared::decode_graph::GraphBank::new(None),
             retain_decode_graphs: false, fixed_captures: BTreeSet::new(), fixed_recaptures: 0,
+            graph_update_fallbacks: 0,
             ready: None, pending: None, in_flight: false,
             audit: std::env::var_os("CUTEAFD_V41_INDEX_AUDIT").is_some_and(|v| v == "1"),
             async_audit: AsyncAudit::new(library, capacity)?,
@@ -329,22 +376,34 @@ impl<'a> IndexSelectionWave<'a> {
         self.ready = None;
         Ok(())
     }
-    fn select_graph(&mut self, fingerprint: &[usize]) -> Result<bool> {
+    fn select_graph(&mut self, fingerprint: &[usize], values: &[u64], widths: &[u8],
+        kinds: &[u8]) -> Result<bool> {
         // Eight indexed layers share this owner; source identities remain exact.
         let policy = super::graph_policy::fixed_binding_limit().map(|limit| (
             super::graph_policy::captures_shape(fingerprint[1] as u32), limit * 8));
-        self.select_graph_with_policy(fingerprint, policy)
+        self.select_graph_with_policy(fingerprint, values, widths, kinds, policy)
     }
-    fn select_graph_with_policy(&mut self, fingerprint: &[usize], policy: Option<(bool, usize)>) -> Result<bool> {
-        if self.graph.as_ref().is_some_and(|(_, key)| key == fingerprint) { return Ok(true); }
-        let fixed_limit = policy.map(|(_, limit)| limit);
+    fn select_graph_with_policy(&mut self, fingerprint: &[usize], values: &[u64], widths: &[u8],
+        kinds: &[u8], policy: Option<(bool, usize)>) -> Result<bool> {
         let key = fingerprint.to_vec();
-        let cached = self.graphs.get(&key).map(|owner| owner.raw);
+        if self.graph.as_ref().is_some_and(|active| active.as_slice() == fingerprint) {
+            if let Err(error) = self.update_graph_values(&key, values, widths, kinds) {
+                self.record_update_fallback(&error, &key);
+                self.storage.stream.require_complete()?;
+                self.graphs.retire(&key);
+                drop(self.graphs.drain_retired(|| Ok(()))?);
+                self.graph = None;
+            } else {
+                return Ok(true);
+            }
+        }
+        let fixed_limit = policy.map(|(_, limit)| limit);
+        let cached = self.graphs.get(&key).is_some();
         if let Some(limit) = fixed_limit {
             ensure!(!self.in_flight, "index selection pending");
             self.storage.stream.require_complete()?;
             self.ready = None;
-            if !fixed_binding_admitted(cached.is_some(), policy.unwrap().0, self.graphs.len(), limit) {
+            if !fixed_binding_admitted(cached, policy.unwrap().0, self.graphs.len(), limit) {
                 tracing::debug!(target: "cuteafd::target_step", rows=fingerprint[1],
                     retained=self.graphs.len(), "V4.1 index selection eager binding");
                 return Ok(false);
@@ -353,33 +412,75 @@ impl<'a> IndexSelectionWave<'a> {
             self.clear_graph()?;
             return Ok(true);
         } else { self.restart()?; }
-        if let Some((_, old)) = self.graph.take() {
+        if let Some(old) = self.graph.take() {
             if fixed_limit.is_none() && old[1] > cuteafd_core::V41_VERIFY_ROWS {
                 self.graphs.retire(&old);
             }
         }
-        if cached.is_some() {
+        if cached {
             self.graphs.launch(&key);
+            if let Err(error) = self.update_graph_values(&key, values, widths, kinds) {
+                self.record_update_fallback(&error, &key);
+                self.storage.stream.require_complete()?;
+                self.graphs.retire(&key);
+                drop(self.graphs.drain_retired(|| Ok(()))?);
+                self.graph = None;
+            } else {
+                self.graph = Some(key);
+                return Ok(true);
+            }
         } else if fixed_limit.is_none() && self.graphs.len() > MAX_RETAINED_DECODE_GRAPHS {
             self.graphs.retire_oldest(|_| true);
         }
         drop(self.graphs.drain_retired(|| Ok(()))?);
-        self.graph = cached.map(|raw| (raw, key));
-        if self.graph.is_none() {
-            tracing::debug!(target: "cuteafd::graph_capture", site="index_selection",
-                retained=self.graphs.len(), retain=self.retain_decode_graphs,
-                key=?fingerprint, "graph cache miss");
-        }
+        self.graph = None;
+        tracing::debug!(target: "cuteafd::graph_capture", site="index_selection",
+            retained=self.graphs.len(), retain=self.retain_decode_graphs,
+            key=?fingerprint, "graph cache miss");
         Ok(true)
     }
-    fn insert_graph(&mut self, graph: *mut c_void, fingerprint: Vec<usize>) -> Result<()> {
+    fn record_update_fallback(&mut self, error: &anyhow::Error, key: &[usize]) {
+        self.graph_update_fallbacks += 1;
+        tracing::warn!(target: "cuteafd::graph_capture", site="index_selection",
+            %error, fallbacks=self.graph_update_fallbacks, key=?key,
+            "index selection graph update refused; recapturing");
+    }
+    fn update_graph_values(&mut self, key: &Vec<usize>, values: &[u64], widths: &[u8],
+        kinds: &[u8]) -> Result<()> {
+        let library = self.storage.stream.library;
+        let owner = self.graphs.get_mut(key).context("index selection graph owner missing")?;
+        let graph = owner.graph.context("index selection retained graph missing")?;
+        if owner.pins.0.as_slice() == values && owner.pins.1.as_slice() == widths
+            && owner.pins.2.as_slice() == kinds { return Ok(()); }
+        let mut found = vec![0u8; values.len()];
+        unsafe {
+            library.cuda_graph_exec_update_pointers(
+                owner.raw, graph, &owner.pins.0, values, widths, kinds, &mut found)?;
+        }
+        // A missed substitution would leave the graph on stale arguments while
+        // the pins below record the new set, so refuse before updating them.
+        verify_substitutions(&owner.pins.0, values, &found)?;
+        owner.pins.0.clear();
+        owner.pins.0.extend_from_slice(values);
+        owner.pins.1.clear();
+        owner.pins.1.extend_from_slice(widths);
+        owner.pins.2.clear();
+        owner.pins.2.extend_from_slice(kinds);
+        Ok(())
+    }
+    fn active_exec(&self) -> Option<*mut c_void> {
+        self.graph.as_ref().and_then(|key| self.graphs.get(key)).map(|owner| owner.raw)
+    }
+    fn insert_graph(&mut self, exec: *mut c_void, graph: *mut c_void,
+        fingerprint: Vec<usize>, values: Vec<u64>, widths: Vec<u8>, kinds: Vec<u8>) -> Result<()> {
         let device = self.storage.stream.library.cuda_get_device()?;
         // SAFETY: request/cache proposals and wave storage remain pinned by the lane.
-        let owner = unsafe { crate::shared::decode_graph::GraphOwner::new(self.storage.stream.library, device, graph, ())? };
+        let owner = unsafe { crate::shared::decode_graph::GraphOwner::new_retained(
+            self.storage.stream.library, device, exec, graph, (values, widths, kinds))? };
         tracing::debug!(target: "cuteafd::graph_capture", site="index_selection", device,
             bank=self as *const Self as usize, key=?fingerprint, "native binding graph captured");
         self.graphs.insert(fingerprint.clone(), owner, None);
-        self.graph = Some((graph, fingerprint));
+        self.graph = Some(fingerprint);
         Ok(())
     }
     fn record_fixed_capture(&mut self, fingerprint: &[usize]) {
@@ -589,13 +690,9 @@ impl<'a> IndexSelectionWave<'a> {
         let expected_source = if query.layer >= 20 { 20 } else { query.layer };
         let mut bindings = Vec::with_capacity(rows);
         let mut max_length = 0u64;
-        let mut fingerprint = vec![
-            query.layer,
-            rows,
-            query.packed.ptr as usize,
-            query.scales.ptr as usize,
-            query.head_weights.ptr as usize,
-        ];
+        // Stable launch geometry only. Volatile device pointers and per-request
+        // capacities are updated in the captured graph instead of keying on them.
+        let mut request_lengths = Vec::with_capacity(requests.len());
         let mut metadata = Vec::with_capacity(rows);
         let mut groups = Vec::new();
         for (i, r) in requests.iter().enumerate() {
@@ -621,6 +718,7 @@ impl<'a> IndexSelectionWave<'a> {
                 "selection state owner differs"
             );
             let p = r.proposal;
+            request_lengths.push(r.positions.len());
             ensure!(p.cache.pool_rows.bytes > 0 && p.cache.slot < p.cache.pool_rows.bytes / 8
                 && p.cache.pool_pages.bytes == (p.cache.pool_rows.bytes / 8) * p.cache.device_pages.bytes,
                 "index pool table geometry differs");
@@ -644,12 +742,6 @@ impl<'a> IndexSelectionWave<'a> {
                 bindings.push((p.binding(), position));
             }
         }
-        // Request partitions and slots live in per-row metadata, not executable
-        // geometry. Only distinct proposal/table owners require another launch.
-        for group in &groups {
-            fingerprint.push(group.rows);
-            fingerprint.extend(group.binding);
-        }
         if query.origin().is_some() {
             ensure!(
                 bindings
@@ -659,13 +751,14 @@ impl<'a> IndexSelectionWave<'a> {
                 "selection token order differs from query producer"
             );
         }
+        let mut source_blocks = None;
         if query.layer > 20 {
             let s = shared.context("later index layer requires source candidates")?;
             ensure!(
                 s.layer == 20 && s.rows == rows && s.bindings == bindings && s.blocks.is_some(),
                 "candidate source snapshot or row order differs"
             );
-            fingerprint.push(s.blocks.unwrap().ptr as usize);
+            source_blocks = s.blocks;
         } else {
             ensure!(
                 shared.is_none(),
@@ -677,8 +770,66 @@ impl<'a> IndexSelectionWave<'a> {
         let width = tile_width(max_length as usize, DECODE_WIDTH_BUCKET);
         let use_candidates = query.layer > 20 && max_length > WIDTH as u64;
         let tiles = (max_length as usize).div_ceil(width).max(1);
-        fingerprint.extend([width, usize::from(use_candidates)]);
-        fingerprint.push(if query.layer > 20 { 1 } else { tiles });
+        let fingerprint = selection_fingerprint(query.layer, rows, &request_lengths, max_length);
+        // Kernel arguments that change between rounds with the same geometry:
+        // the query/cache/proposal device pointers and the capacity/stride
+        // scalars. Stable workspace pointers and launch extents are left as
+        // captured (the fingerprint keys on geometry, so they cannot change).
+        let mut values: Vec<u64> = Vec::new();
+        let mut widths: Vec<u8> = Vec::new();
+        let mut kinds: Vec<u8> = Vec::new();
+        for group in &groups {
+            let p = requests[group.request].proposal;
+            let offset = group.offset;
+            let slots = p.cache.pool_rows.bytes / 8;
+            let stride = p.cache.pool_pages.bytes / (slots * 4);
+            values.extend([
+                (query.packed.ptr as usize + offset * 2048) as u64,
+                (query.scales.ptr as usize + offset * 128) as u64,
+                (query.head_weights.ptr as usize + offset * 64) as u64,
+                p.cache.packed.ptr as u64,
+                p.cache.scales.ptr as u64,
+                p.cache.pool_pages.ptr as u64,
+                p.cache.pool_rows.ptr as u64,
+                p.packed.ptr as u64,
+                p.scales.ptr as u64,
+                p.capacity as u64,
+                (p.cache.packed.bytes / 64) as u64,
+                slots as u64,
+                stride as u64,
+            ]);
+            widths.extend([8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4]);
+            kinds.extend([KIND_POINTER, KIND_POINTER, KIND_POINTER, KIND_POINTER,
+                KIND_POINTER, KIND_POINTER, KIND_POINTER, KIND_POINTER, KIND_POINTER,
+                KIND_SCALAR, KIND_SCALAR, KIND_SCALAR, KIND_SCALAR]);
+        }
+        // The candidate source is a kernel argument only when the follower path
+        // runs; otherwise it must not be in the update set or the not-found
+        // check would force a recapture every round.
+        if use_candidates {
+            values.push(source_blocks.context("candidate blocks missing")?.ptr as u64);
+            widths.push(8);
+            kinds.push(KIND_POINTER);
+        }
+        // Stable scalar arguments are included as identity mappings. If a
+        // changing scalar happens to equal one of them, the native update sees
+        // an ambiguous substitution and refuses, so the caller recaptures
+        // instead of silently corrupting the launch geometry.
+        for group in &groups {
+            values.push(group.rows as u64);
+            widths.push(4);
+            kinds.push(KIND_SCALAR);
+        }
+        values.extend([rows as u64, width as u64, (width / 8) as u64, 1]);
+        widths.extend([4, 4, 4, 4]);
+        kinds.extend([KIND_SCALAR; 4]);
+        if !use_candidates {
+            for tile in 0..tiles {
+                values.push((tile * width) as u64);
+                widths.push(8);
+                kinds.push(KIND_SCALAR);
+            }
+        }
         let (host, staging) = self.staging.region(query.layer);
         for (i, m) in metadata.iter().enumerate() {
             for (j, value) in m.iter().enumerate() {
@@ -689,7 +840,7 @@ impl<'a> IndexSelectionWave<'a> {
         // Prefill tails (and any other uncached large shape) bind eagerly.
         let forced_eager = self.window.is_windowed() || crate::shared::decode_graph::census::eager("index")
             || !super::graph_policy::captures_shape(rows as u32);
-        let capture = if forced_eager { false } else { self.select_graph(&fingerprint)? };
+        let capture = if forced_eager { false } else { self.select_graph(&fingerprint, &values, &widths, &kinds)? };
         if defer {
             self.in_flight = true;
             if let Some(busy) = &self.shared_scratch_busy { busy.set(true); }
@@ -716,17 +867,20 @@ impl<'a> IndexSelectionWave<'a> {
             let launched = unsafe {
                 self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates)
             };
-            let captured = unsafe { self.storage.stream.library.cuda_graph_end_capture(self.storage.stream.raw) };
+            let captured = unsafe {
+                self.storage.stream.library.cuda_graph_end_capture_retained(self.storage.stream.raw)
+            };
             match (launched, captured) {
-                (Ok(()), Ok(g)) => {
+                (Ok(()), Ok(info)) => {
                     if super::graph_policy::fixed_binding_limit().is_some() {
                         self.record_fixed_capture(&fingerprint);
                     }
-                    self.insert_graph(g, fingerprint)?;
+                    self.insert_graph(info.graph_exec, info.graph, fingerprint, values, widths, kinds)?;
                 },
-                (Err(e), Ok(g)) => {
+                (Err(e), Ok(info)) => {
                     unsafe {
-                        self.storage.stream.library.cuda_graph_exec_destroy(g)?;
+                        self.storage.stream.library.cuda_graph_exec_destroy(info.graph_exec)?;
+                        self.storage.stream.library.cuda_graph_destroy(info.graph)?;
                     }
                     return Err(e);
                 }
@@ -735,8 +889,8 @@ impl<'a> IndexSelectionWave<'a> {
         }
         let dispatch = || unsafe {
             if capture {
-                let g = self.graph.as_ref().context("selection graph missing")?.0;
-                self.storage.stream.library.cuda_graph_launch(g, self.storage.stream.raw)
+                let exec = self.active_exec().context("selection graph missing")?;
+                self.storage.stream.library.cuda_graph_launch(exec, self.storage.stream.raw)
             } else { self.enqueue(query, requests, &groups, shared, rows, tiles, width, use_candidates) }
         };
         let launched = if crate::shared::decode_graph::census::enabled() {
@@ -1078,16 +1232,16 @@ mod graph_tests {
             .into_iter().enumerate() {
             wave.restart()?;
             let fingerprint = vec![layer, rows, input.ptr as usize, output.ptr as usize];
-            assert!(wave.select_graph_with_policy(&fingerprint, None)?);
+            assert!(wave.select_graph_with_policy(&fingerprint, &[], &[], &[], None)?);
             if wave.graph.is_none() {
                 unsafe {
                     library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
                     library.copy_d2d_async(output, input, rows * 4, wave.storage.stream.raw)?;
-                    let graph = library.cuda_graph_end_capture(wave.storage.stream.raw)?;
-                    wave.insert_graph(graph, fingerprint)?;
+                    let info = library.cuda_graph_end_capture_retained(wave.storage.stream.raw)?;
+                    wave.insert_graph(info.graph_exec, info.graph, fingerprint, Vec::new(), Vec::new(), Vec::new())?;
                 }
             }
-            let graph = wave.graph.as_ref().unwrap().0;
+            let graph = wave.active_exec().unwrap();
             if rows <= 64 {
                 assert_eq!(*handles.entry((layer, rows)).or_insert(graph), graph,
                     "restart or large-prefill transition discarded a decode graph");
@@ -1110,19 +1264,19 @@ mod graph_tests {
         for key in 0..MAX_RETAINED_DECODE_GRAPHS + 3 {
             wave.restart()?;
             let fingerprint = vec![2, 4, input.ptr as usize, output.ptr as usize, key];
-            assert!(wave.select_graph_with_policy(&fingerprint, None)?);
+            assert!(wave.select_graph_with_policy(&fingerprint, &[], &[], &[], None)?);
             assert!(wave.graph.is_none());
             unsafe {
                 library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
                 library.copy_d2d_async(output, input, 16, wave.storage.stream.raw)?;
-                let graph = library.cuda_graph_end_capture(wave.storage.stream.raw)?;
-                wave.insert_graph(graph, fingerprint)?;
+                let info = library.cuda_graph_end_capture_retained(wave.storage.stream.raw)?;
+                wave.insert_graph(info.graph_exec, info.graph, fingerprint, Vec::new(), Vec::new(), Vec::new())?;
             }
             assert!(wave.graphs.len() <= MAX_RETAINED_DECODE_GRAPHS + 1);
             let value = (key % 251 + 1) as u8;
             library.copy_h2d(input, &vec![value; 320])?;
             library.copy_h2d(output, &[0; 320])?;
-            unsafe { library.cuda_graph_launch(wave.graph.as_ref().unwrap().0, wave.storage.stream.raw)?; }
+            unsafe { library.cuda_graph_launch(wave.active_exec().unwrap(), wave.storage.stream.raw)?; }
             wave.synchronize()?;
             let mut actual = vec![0; 320];
             library.copy_d2h(&mut actual, output)?;
@@ -1141,16 +1295,16 @@ mod graph_tests {
                 .into_iter().enumerate() {
             wave.restart()?;
             let fingerprint = vec![2, rows, input.ptr as usize, output.ptr as usize, key];
-            let capture = wave.select_graph_with_policy(&fingerprint, Some((allowed, 2)))?;
+            let capture = wave.select_graph_with_policy(&fingerprint, &[], &[], &[], Some((allowed, 2)))?;
             assert_eq!(capture, key < 2);
             if capture && wave.graph.is_none() {
                 // SAFETY: both allocations outlive the bank and the stream is drained.
-                let graph = unsafe {
+                let info = unsafe {
                     library.cuda_graph_begin_capture(wave.storage.stream.raw)?;
                     library.copy_d2d_async(output, input, rows * 4, wave.storage.stream.raw)?;
-                    library.cuda_graph_end_capture(wave.storage.stream.raw)?
+                    library.cuda_graph_end_capture_retained(wave.storage.stream.raw)?
                 };
-                wave.insert_graph(graph, fingerprint.clone())?;
+                wave.insert_graph(info.graph_exec, info.graph, fingerprint.clone(), Vec::new(), Vec::new(), Vec::new())?;
                 wave.record_fixed_capture(&fingerprint);
             }
             let value = iteration as u8 + 1;
@@ -1159,7 +1313,7 @@ mod graph_tests {
             // SAFETY: inputs/outputs are live, shape-exact, and exclusive until synchronize.
             unsafe {
                 if capture {
-                    let graph = wave.graph.as_ref().unwrap().0;
+                    let graph = wave.active_exec().unwrap();
                     assert_eq!(*fixed_handles.entry(key).or_insert(graph), graph);
                     library.cuda_graph_launch(graph, wave.storage.stream.raw)?;
                 } else {
