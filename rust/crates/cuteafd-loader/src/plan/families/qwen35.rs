@@ -163,8 +163,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         }
     }
     ensure!(scratch > 0, "dense native prefill requires nonzero scratch");
-    let slots = usize::try_from(if options.concurrency == 0 { 4 } else { options.concurrency })?;
-    ensure!(options.state_slots.is_none_or(|n| n == slots as u64), "dense state slots must equal concurrency");
+    let slots = usize::try_from(options.resolved_state_slots("qwen3_5"))?;
     let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
         options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));

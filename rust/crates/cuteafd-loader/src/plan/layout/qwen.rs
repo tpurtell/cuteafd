@@ -221,7 +221,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let loaded_bytes = device.used_bytes();
     let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
-            prefill_rows: span, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
+            prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
@@ -364,7 +364,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
-            manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
+            manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },
             ple, future_expert_bytes: 0, headroom },

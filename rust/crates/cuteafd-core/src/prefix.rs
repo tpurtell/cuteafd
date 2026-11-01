@@ -893,6 +893,17 @@ mod tests {
 mod staging_tests {
     use super::*;
     #[test]
+    fn device_mark_budget_overrides_lane_floor() {
+        for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+            let entries = crate::concurrency::prefix_entries(c);
+            for budget in [0, 1, 1023, 1024, 2048, 8192] {
+                let slots = mark_slots_for(c, entries, 1024, budget);
+                assert!(slots * 1024 <= budget, "C{c}: {slots} marks exceed {budget}");
+            }
+            assert_eq!(mark_slots_for(c, 0, 1024, u64::MAX), 0);
+        }
+    }
+    #[test]
     fn host_working_set_is_constant_and_host_off_is_legacy() {
         for lanes in [1, 2, 8, 16, 128] {
             for entries in [0, 1, 20, 128] {

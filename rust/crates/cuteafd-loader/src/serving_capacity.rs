@@ -177,8 +177,8 @@ pub fn cache_requirements(
             "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4"
         ),
         requested_kv_floor_tokens: requested_floor,
-        concurrency: u64::from(cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency),
-        state_slots: u64::from(cuteafd_core::serving_capacity::CapacityPolicy::default().state_slots()?),
+        concurrency: cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency,
+        state_slots: cuteafd_core::concurrency::state_slots(u64::from(cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency)) as u32,
         target_only_layouts: layouts,
         unavailable_layouts: failures,
     }))

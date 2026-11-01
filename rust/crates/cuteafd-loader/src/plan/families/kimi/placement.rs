@@ -75,7 +75,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
-    let slots = opts.state_slots.unwrap_or_else(|| if opts.concurrency > 0 { opts.concurrency } else { 16 });
+    let slots = opts.resolved_state_slots("kimi_k3");
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     // Header-only diagnostics remain available without installed artifacts. An

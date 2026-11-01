@@ -560,7 +560,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let profile = ModelProfile::new(model, ModelEncoding::Qwen(encoding));
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
         "dense target currently admits GPU token embeddings only");
-    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(16);
+    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
@@ -575,6 +575,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             library.cuda_set_device(engine_args.device)?;
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
             let lanes = usize::from(engine_args.max_sequences);
+            let slots = cuteafd_core::concurrency::state_slots(lanes as u64) as usize;
             let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
             let mtp_admission = (engine_args.mtp > 0).then(|| super::engine::mtp::Admission::new(
                 &reader, &header.config, &programs)).transpose()?;
@@ -586,7 +587,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
             ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
-                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), lanes,
+                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;

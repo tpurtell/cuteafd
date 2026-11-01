@@ -646,8 +646,8 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
         options.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
     }
     if let Some(cache) = report.cache_requirements.as_mut() {
-        cache.concurrency = concurrency;
-        cache.state_slots = options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency));
+        cache.concurrency = u32::try_from(concurrency)?;
+        cache.state_slots = u32::try_from(options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
     }
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {

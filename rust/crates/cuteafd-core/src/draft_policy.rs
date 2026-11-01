@@ -76,7 +76,7 @@ pub const MAX_RESOURCE_CLASSES: usize = 4;
 const ERROR_RATE: f64 = 0.1;
 /// Independent evidence regimes for resource costs and confidence calibration.
 pub const CONCURRENCY_BUCKETS: usize = 6;
-/// C1, C2-4, C5-8 and C9+.
+/// C1, C2-4, C5-8, C9-16, C17-32 and C33+.
 pub fn draft_concurrency_bucket(requests: usize) -> usize {
     match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, 9..=16 => 3, 17..=32 => 4, _ => 5 }
 }

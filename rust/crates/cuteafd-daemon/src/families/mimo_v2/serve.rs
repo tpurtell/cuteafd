@@ -53,7 +53,7 @@ pub(crate) struct ServeArgs {
     /// Sequences decoding at once (each holds an SWA ring).
     #[arg(long, default_value_t = cuteafd_loader::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
-    /// Bounded pending API requests (default 16).
+    /// Bounded pending API requests (defaults to concurrency).
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH")]
     pub http_queue_depth: Option<usize>,
     /// Time a caller waits for a pending-queue permit.

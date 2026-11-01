@@ -195,6 +195,10 @@ impl LayoutOptions {
         }
     }
 
+    pub fn resolved_state_slots(&self, family: &str) -> u64 {
+        self.state_slots.unwrap_or_else(|| cuteafd_core::concurrency::state_slots(self.resolved_concurrency(family)))
+    }
+
     pub fn prefix_entries(&self, family: &str) -> u64 {
         if self.mimo_prefix_entries == u64::MAX {
             cuteafd_core::concurrency::prefix_entries(self.resolved_concurrency(family))

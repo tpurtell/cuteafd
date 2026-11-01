@@ -99,7 +99,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         Some(format!("{organization}/{model}"))
     })).context("Kimi serving requires --model-id for a snapshot without HF identity")?;
     let profile = ModelProfile::new(model, ModelEncoding::Kimi(encoding));
-    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(16);
+    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
@@ -112,11 +112,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(&worker_args.snapshot, false, false)?;
             let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
             cfg.release_geometry()?;
-            let slots = usize::from(worker_args.max_sequences);
+            let concurrency = usize::from(worker_args.max_sequences);
+            let slots = cuteafd_core::concurrency::state_slots(concurrency as u64) as usize;
             let prefill = worker_args.prefill()?;
             let mark_bytes = super::state::KdaLayout::new(&cfg, slots, 1, 1)?.mark_bytes()
                 .checked_mul(2).context("Kimi TP2 prefix mark extent overflow")?;
-            let marks = worker_args.prefix.mark_rule(slots).slots(mark_bytes);
+            let marks = worker_args.prefix.mark_rule(concurrency).slots(mark_bytes);
             startup::preflight(&worker_args.manifest, &worker_args.native_lib)?;
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
@@ -141,7 +142,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             // The shared selector allocates on the calling thread's device and
             // consumes logits on the terminal rank's exact producing stream.
             library.cuda_set_device(worker_args.split_device)?;
-            scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, slots,
+            scheduler::schedule(&backend, &worker_args.snapshot, &mut receive, &worker_stats, concurrency,
                 match loaded.engine.native_draft() {
                     Some(draft) => scheduler::Drafts::Neural {
                         depth: worker_args.draft_fixed.map_or(draft.drafts(), usize::from),
