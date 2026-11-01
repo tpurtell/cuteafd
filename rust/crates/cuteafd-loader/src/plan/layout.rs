@@ -1001,19 +1001,10 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
     devices: &mut [DeviceLayout], notes: &mut Vec<String>, what: impl Fn(&DeviceLayout) -> String) {
     let checkpoint = input.checkpoint();
     for device in devices {
-        let resident = input.expert_catalog().and_then(|catalog| {
-            if !matches!(super::spark_executions::SparkBackend::for_catalog(catalog)?,
-                super::spark_executions::SparkBackend::Native) || catalog.nvfp4().is_some() {
-                return Ok(None);
-            }
-            let rank = device.index as usize;
-            crate::placement::SparkAssignment::resident_from_catalog(catalog, working, rank,
-                crate::placement::SparkResidentLayout::Native { world: working.spark_ranks, rank }).map(Some)
-        });
-        match resident {
-            Ok(Some(assignment)) => {
+        match input.native_spark_resident(working, device.index as usize) {
+            Ok(Some(bytes)) => {
                 if let Some(item) = device.items.iter_mut().find(|item| item.group == "routed_expert") {
-                    item.bytes = assignment.resident_bytes;
+                    item.bytes = bytes;
                     item.basis = Basis::Formula;
                 }
             }

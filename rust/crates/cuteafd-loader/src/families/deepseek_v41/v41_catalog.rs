@@ -1419,6 +1419,52 @@ mod tests {
     }
 
     #[test]
+    fn native_layer_census_checks_every_expert_and_source_header() {
+        let config = official_config();
+        let mut shape = RoutedExpertShape::of_v41(&config);
+        shape.layers = 1;
+        shape.experts = 2;
+        let mut tensors = Vec::new();
+        for expert in 0..shape.experts {
+            for (slot, suffix) in ["w1.weight", "w3.weight", "w2.weight", "w1.scale", "w3.scale", "w2.scale"]
+                .into_iter().enumerate() {
+                let divisor = if slot < 3 { 2 } else { 32 };
+                let name = format!("layers.0.ffn.experts.{expert}.{suffix}");
+                tensors.push(V41Tensor { shard: "unused".into(), placement: placement(&name),
+                    metadata: SafetensorsTensorMetadata { name,
+                        dtype: if slot < 3 { DType::I8 } else { DType::F8E8M0 },
+                        shape: if slot % 3 == 2 { vec![shape.hidden, shape.intermediate / divisor] }
+                            else { vec![shape.intermediate, shape.hidden / divisor] },
+                        byte_offset: 0, byte_length: (shape.hidden * shape.intermediate / divisor) as u64 } });
+            }
+        }
+        tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        let mut catalog = OfficialV41Catalog { reader: Default::default(),
+            format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+            config: Some(config), experts: shape, snapshot: PathBuf::new(), tensors,
+            exl3: None, nvfp4: None, fp8: None };
+        catalog.validate_native_spark_layer(0).unwrap();
+        for index in 0..catalog.tensors.len() {
+            let valid = catalog.tensors[index].clone();
+            catalog.tensors[index].metadata.dtype = DType::Bf16;
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid.clone();
+            catalog.tensors[index].metadata.shape.swap(0, 1);
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid.clone();
+            catalog.tensors[index].metadata.byte_length -= 1;
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid.clone();
+            catalog.tensors[index].placement = V41TensorPlacement::CoordinatorRtx;
+            assert!(catalog.validate_native_spark_layer(0).is_err());
+            catalog.tensors[index] = valid;
+        }
+        catalog.tensors.pop();
+        assert!(catalog.validate_native_spark_layer(0).is_err());
+        assert!(catalog.validate_native_spark_layer(1).is_err());
+    }
+
+    #[test]
     fn exact_k32_mount_and_push_reconstruct_every_source_plane() -> Result<()> {
         use std::os::unix::fs::FileExt;
         use crate::push_load::builder::{Builder, Destination};

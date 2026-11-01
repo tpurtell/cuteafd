@@ -49,6 +49,38 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn native_spark_resident_reuses_headers_without_reusing_placement_totals() {
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    for v41 in [true, false] {
+        let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
+        let input = PlanInput::open(dir.path()).unwrap();
+        let catalog = input.expert_catalog().unwrap();
+        assert!(input.native_spark_headers.get().is_none());
+        let initialized = || input.native_spark_headers.get().unwrap().iter()
+            .filter(|entry| entry.get().is_some()).count();
+        for world in 2..=cuteafd_core::MAX_SPARK_WORLD {
+            for layers in [vec![0], vec![1], vec![0, 1], vec![]] {
+                let working = SparkWorkingSet { spark_layers: layers, spark_ranks: world,
+                    prefill_lanes: 1, ..Default::default() };
+                for rank in 0..world {
+                    let expected = SparkAssignment::resident_from_catalog(catalog, &working, rank,
+                        SparkResidentLayout::Native { world, rank }).unwrap().resident_bytes;
+                    assert_eq!(input.native_spark_resident(&working, rank).unwrap(), Some(expected),
+                        "v41={v41} world={world} rank={rank} layers={:?}", working.spark_layers);
+                }
+            }
+            assert_eq!(initialized(), 2, "world/rotation/onboarding changes reuse only the checked headers");
+        }
+        let invalid = SparkWorkingSet { spark_layers: vec![0, 0], spark_ranks: 4,
+            prefill_lanes: 1, ..Default::default() };
+        assert!(input.native_spark_resident(&invalid, 0).unwrap_err().to_string().contains("sorted and unique"));
+        let invalid = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().layers], ..invalid };
+        assert!(input.native_spark_resident(&invalid, 0).unwrap_err().to_string().contains("outside routed"));
+        assert_eq!(initialized(), 2);
+    }
+}
+
+#[test]
 fn spark_count_resolution_reuses_the_preflight_checkpoint() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();

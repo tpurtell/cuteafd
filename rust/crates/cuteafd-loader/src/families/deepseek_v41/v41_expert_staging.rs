@@ -196,6 +196,38 @@ pub struct V41ExpertStaging<'a> {
 }
 
 impl OfficialV41Catalog {
+    fn validate_native_source(&self, name: &str, slot: usize) -> Result<()> {
+        let config = self.routed_experts();
+        let tensor = self.tensor(name)?;
+        ensure!(matches!(tensor.placement, V41TensorPlacement::BackboneExpertTp4 { .. }),
+            "generic TP staging requires a routed backbone expert tensor {name}");
+        let dtype = if slot < 3 { DType::I8 } else { DType::F8E8M0 };
+        ensure!(tensor.metadata.dtype == dtype,
+            "generic TP staging requires native FP4/E8M0 storage for {name}");
+        let divisor = if slot < 3 { 2 } else { 32 };
+        let shape = if slot == 2 || slot == 5 {
+            [config.hidden, config.intermediate / divisor]
+        } else { [config.intermediate, config.hidden / divisor] };
+        ensure!(tensor.metadata.shape == shape
+            && tensor.metadata.byte_length == u64::try_from(config.intermediate
+                .checked_mul(config.hidden).context("native source extent overflow")? / divisor)?,
+            "unexpected native source geometry for {name}");
+        Ok(())
+    }
+
+    pub(crate) fn validate_native_spark_layer(&self, layer: usize) -> Result<()> {
+        let config = self.routed_experts();
+        ensure!(layer >= config.first_layer && layer < config.layers,
+            "Spark layer {layer} is outside routed checkpoint headers");
+        for expert in 0..config.experts {
+            for (slot, suffix) in ["w1.weight", "w3.weight", "w2.weight", "w1.scale", "w3.scale", "w2.scale"]
+                .into_iter().enumerate() {
+                self.validate_native_source(&format!("layers.{layer}.ffn.experts.{expert}.{suffix}"), slot)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn expert_staging(&self, selection: V41ExpertSelection) -> Result<V41ExpertStaging<'_>> {
 
         let config = self.routed_experts();
@@ -311,25 +343,8 @@ impl OfficialV41Catalog {
             let size = if let Some(geometry) = geometry {
                 // The generic selection never trusts the TP4-hardcoded catalog
                 // helpers: every extent is re-derived from validated metadata.
-                let tensor = self.tensor(name)?;
-                ensure!(
-                    matches!(tensor.placement, V41TensorPlacement::BackboneExpertTp4 { .. }),
-                    "generic TP staging requires a routed backbone expert tensor {name}"
-                );
-                let expected_dtype = if slot < 3 { DType::I8 } else { DType::F8E8M0 };
-                ensure!(
-                    tensor.metadata.dtype == expected_dtype,
-                    "generic TP staging requires native FP4/E8M0 storage for {name}"
-                );
-                let length = usize::try_from(tensor.metadata.byte_length)?;
-                let divisor = if slot < 3 { 2 } else { 32 };
-                let expected_shape = if slot == 2 || slot == 5 {
-                    [config.hidden, config.intermediate / divisor]
-                } else { [config.intermediate, config.hidden / divisor] };
-                ensure!(tensor.metadata.shape == expected_shape
-                    && length == config.intermediate * config.hidden / divisor,
-                    "unexpected native source geometry for {name}");
-                geometry.intermediate_size() * config.hidden / divisor
+                self.validate_native_source(name, slot)?;
+                geometry.intermediate_size() * config.hidden / if slot < 3 { 2 } else { 32 }
             } else if matches!(selection, V41ExpertSelection::BackboneFull { .. }) {
                 usize::try_from(self.tensor(name)?.metadata.byte_length)?
             } else if matches!(selection, V41ExpertSelection::BackboneTp2 { .. } | V41ExpertSelection::DsparkTp2 { .. }) {
