@@ -62,3 +62,29 @@ def test_reference_import_does_not_require_cuda_or_torch():
     tree = ast.parse((ROOT / "python/reference/families/muse_spark/audio.py").read_text())
     imports = [node for node in tree.body if isinstance(node, (ast.Import, ast.ImportFrom))]
     assert all("torch" not in ast.unparse(node) for node in imports)
+
+
+def test_audio_build_switch_includes_pcm_exports():
+    for name in ("build-release-artifacts.sh", "build-wip-artifacts.sh"):
+        source = (ROOT / "scripts/build" / name).read_text()
+        assert '-DCUTEAFD_ENABLE_AUDIO_AOT="$audio_aot"' in source
+    cmake = (ROOT / "native/CMakeLists.txt").read_text()
+    assert 'CUTEAFD_ENABLE_PCM_AUDIO_AOT' not in cmake
+    assert 'if(CUTEAFD_ENABLE_AUDIO_AOT)\n  include(cmake/shared/pcm_audio.cmake)' in cmake
+
+
+def test_pcm_dispatcher_shares_modules_across_devices_without_encode_mutex(tmp_path):
+    import json
+    exporter = load("muse_pcm_exporter", "python/tools/aot/export_b12x_audio_aot.py")
+    (tmp_path / "audio_pcm.json").write_text(json.dumps({"programs": [{
+        "name": "audio_pcm_projection_k16_n256", "geometry": {"width": 16, "outputs": 256},
+        "abi": {"pointers": ["x", "weight", "bias", "out"], "scalars": [["rows", "int32"]]},
+    }]}))
+    exporter.write_pcm_dispatcher(tmp_path)
+    source = (tmp_path / "audio_pcm_support.cc").read_text()
+    assert "bool loaded[MAX_DEVICES]" in source
+    assert "++entry.references" in source
+    assert "--owner->entry->references" in source
+    launch = source.split('extern "C" int cuteafd_pcm_support_launch', 1)[1]
+    assert "mutex" not in launch
+    assert "program.launch(a,rows,stream)" in launch

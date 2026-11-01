@@ -106,6 +106,7 @@ struct MemoEntry {
 #[derive(Debug)]
 pub struct AudioPreparer {
     encoder: EncoderId,
+    geometry: cuteafd_core::media::AudioTokenGeometry,
     pub limits: AudioDecodeLimits,
     memo: Mutex<VecDeque<MemoEntry>>,
     memo_bytes: usize,
@@ -121,8 +122,12 @@ pub struct PreparedAudioMedia {
 }
 impl AudioPreparer {
     pub fn new(encoder: EncoderId, slots: Arc<tokio::sync::Semaphore>) -> Self {
+        Self::with_geometry(encoder, slots, cuteafd_core::media::AudioTokenGeometry::MimoRvq)
+    }
+    pub fn with_geometry(encoder: EncoderId, slots: Arc<tokio::sync::Semaphore>, geometry: cuteafd_core::media::AudioTokenGeometry) -> Self {
         Self {
             encoder,
+            geometry,
             slots,
             limits: AudioDecodeLimits::default(),
             memo: Mutex::new(VecDeque::new()),
@@ -180,11 +185,12 @@ impl AudioPreparer {
                 result.memo_hits += 1;
                 cached
             } else {
-                Arc::new(audio::prepare(
+                Arc::new(audio::prepare_with_geometry(
                     &encoded,
                     source.format,
                     self.encoder,
                     self.limits,
+                    self.geometry,
                 )?)
             };
             result.samples = result
@@ -249,6 +255,25 @@ mod tests {
         bytes.extend((samples * 2).to_le_bytes());
         bytes.resize(bytes.len() + samples as usize * 2, 0);
         STANDARD.encode(bytes)
+    }
+    #[test]
+    fn pcm_patch_preparation_uses_unpadded_samples_and_shared_memo() {
+        use cuteafd_core::media::AudioTokenGeometry;
+        let policy = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let preparer = AudioPreparer::with_geometry(
+            EncoderId([2; 32]), Arc::new(tokio::sync::Semaphore::new(1)), policy);
+        for samples in [1u32, 1919, 1920, 1921, 30721] {
+            let data = wav_source(samples);
+            let sources = [AudioSource { data: &data, format: AudioFormat::Wav }];
+            let first = preparer.prepare(&sources).unwrap();
+            assert_eq!(first.audio_tokens, (samples as usize).div_ceil(1920));
+            assert_eq!(first.samples, samples as usize);
+            assert_eq!(first.clips[0].geometry.policy, policy);
+            assert_eq!(first.memo_hits, 0);
+            let repeated = preparer.prepare(&sources).unwrap();
+            assert_eq!(repeated.memo_hits, 1);
+            assert_eq!(first.clips[0].key, repeated.clips[0].key);
+        }
     }
     #[test]
     fn official_mimo_template_matches_transformers_processor_audio_span() {

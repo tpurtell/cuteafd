@@ -58,6 +58,9 @@ impl PcmTowerSpec {
     pub fn native_spec(&self) -> &PcmSpec {
         &self.native
     }
+    pub fn encoder_id(&self, revision: &str, sm: u32) -> cuteafd_loader::media::EncoderId {
+        self.plan.encoder_id(revision, sm)
+    }
     /// Load on the shared media owner's CUDA thread after planner admission.
     pub fn load(&self, library: &Path, device: i32, admitted: u64) -> Result<PcmTower> {
         let required = self.required_bytes()?;

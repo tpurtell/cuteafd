@@ -70,8 +70,8 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         Ok(NativeVision::required(&library, &spec.native)?.total_bytes())
     }).transpose()?.unwrap_or(0);
     let audio_bytes = audio.map(|_| -> Result<_> {
-        let spec = super::audio::AudioTowerSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
-        let bytes = cuteafd_ffi::audio::NativeAudio::required(&library, spec.native())?.total_bytes()?;
+        let spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
+        let bytes = spec.required_bytes(&library)?;
         audio_reservation(bytes, budget)
     }).transpose()?.unwrap_or(0);
     let reserved = vision_bytes.checked_add(audio_bytes).context("media reservation overflow")?;
@@ -86,7 +86,6 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
     if let (Some(image_config), Some(audio_config)) = (vision, audio) {
         let sm = architecture(&library)?;
         ensure!(sm == 121, "Spark audio worker requires SM121, got SM{sm}");
-        let backend = cuteafd_ffi::audio::NativeAudio::backend(&library)?;
         let image_spec = TowerSpec::from_snapshot(snapshot, image_config.max_tokens)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, image_spec.image_family())?;
         let image_handshake = EncoderHandshake {
@@ -95,14 +94,11 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
             output_width: image_spec.native.output_width, patch_size: processor.patch,
             merge_size: processor.merge, plan_hash: image_config.plan_hash,
         };
-        let audio_spec = super::audio::AudioTowerSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
-        let audio_handshake = super::remote::AudioHandshake {
-            encoder_id: audio_spec.plan().encoder_id(&audio_config.revision, sm, &backend),
-            plan_hash: audio_config.plan_hash, max_samples: audio_spec.native().max_samples,
-            output_width: audio_spec.native().output_width,
-        };
+        let audio_spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
+        let backend = audio_spec.backend(&library)?;
+        let audio_handshake = audio_spec.handshake(&audio_config.revision, sm, &backend, audio_config.plan_hash);
         let service = std::sync::Arc::new(EncoderService::start_with_audio(image_spec, library, 0, vision_bytes,
-            Some(super::audio::AudioOwnerConfig { spec: audio_spec, admitted_bytes: audio_bytes - AUDIO_GUARD_BYTES }))?);
+            Some(audio_spec.owner(audio_bytes - AUDIO_GUARD_BYTES)))?);
         let image = EncoderServer::start_shared(image_config.listen.parse().context("encoder listen address")?,
             image_handshake, service.clone(), normalization_lut(&processor), Duration::from_secs(60))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -144,18 +140,14 @@ fn audio_reservation(admitted: u64, budget: u64) -> Result<u64> {
 
 /// Returns weights/scratch plus the Spark guard to charge before experts load.
 pub fn start_audio(config: &AudioWorkerConfig, snapshot: &Path, library: PathBuf, budget: u64) -> Result<(EncoderServer, u64)> {
-    let spec = super::audio::AudioTowerSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
+    let spec = super::audio::BundledAudioSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
     let sm = architecture(&library)?;
     ensure!(sm == 121, "Spark audio worker requires SM121, got SM{sm}");
-    let backend = cuteafd_ffi::audio::NativeAudio::backend(&library)?;
-    let admitted = cuteafd_ffi::audio::NativeAudio::required(&library, spec.native())?.total_bytes()?;
+    let admitted = spec.required_bytes(&library)?;
     let reserved = audio_reservation(admitted, budget)?;
-    let handshake = super::remote::AudioHandshake {
-        encoder_id: spec.plan().encoder_id(&config.revision, sm, &backend),
-        plan_hash: config.plan_hash, max_samples: spec.native().max_samples,
-        output_width: spec.native().output_width,
-    };
-    let service = EncoderService::start_audio(library, 0, super::audio::AudioOwnerConfig { spec, admitted_bytes: admitted })?;
+    let backend = spec.backend(&library)?;
+    let handshake = spec.handshake(&config.revision, sm, &backend, config.plan_hash);
+    let service = EncoderService::start_audio(library, 0, spec.owner(admitted))?;
     let server = EncoderServer::start_audio(config.listen.parse().context("audio encoder listen address")?,
         handshake, service, Duration::from_secs(60)).map_err(|e| anyhow::anyhow!("{e}"))?;
     tracing::info!(address = %server.address, sm, admitted_bytes = admitted, reserved_bytes = reserved,

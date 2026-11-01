@@ -178,7 +178,12 @@ pub fn prepare(
     encoder: EncoderId,
     limits: AudioDecodeLimits,
 ) -> Result<PreparedAudio> {
-    prepare_pcm(decode(encoded, format, limits)?, encoder)
+    prepare_with_geometry(encoded, format, encoder, limits, AudioTokenGeometry::MimoRvq)
+}
+
+pub fn prepare_with_geometry(encoded: &[u8], format: AudioFormat, encoder: EncoderId,
+    limits: AudioDecodeLimits, policy: AudioTokenGeometry) -> Result<PreparedAudio> {
+    prepare_pcm_with_geometry(decode_with_geometry(encoded, format, limits, policy)?, encoder, policy)
 }
 
 #[derive(Debug)]

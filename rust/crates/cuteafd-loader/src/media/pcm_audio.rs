@@ -55,6 +55,14 @@ impl PcmAudioPlan {
     pub fn reads(&self) -> &BTreeMap<String, AudioTensorRead> {
         &self.reads
     }
+    pub fn encoder_id(&self, revision: &str, sm: u32) -> super::EncoderId {
+        let headers = self.reads.iter().map(|(name, read)| {
+            let m = &read.metadata;
+            (name.clone(), serde_json::json!({"dtype":"BF16", "shape":m.shape,
+                "offset":m.byte_offset, "length":m.byte_length}))
+        }).collect();
+        super::EncoderId::derive("muse_spark_pcm_bf16", revision, &headers, 1, sm)
+    }
     pub fn required_bytes(&self, samples: usize) -> Result<u64> {
         self.weight_bytes
             .checked_add(scratch_bytes(samples)?)
@@ -295,7 +303,22 @@ mod tests {
         assert_eq!(plan.weight_bytes(), 235_680_768);
         assert_eq!(scratch_bytes(7_200_000).unwrap(), 10_905_600);
         assert_eq!(plan.required_bytes(7_200_000).unwrap(), 246_586_368);
+        assert_eq!(crate::plan::resolve_audio(crate::plan::MediaMode::Auto, root).unwrap(),
+            crate::plan::MediaMode::Auto);
+        let identity = plan.encoder_id("snapshot-revision", 121);
+        assert_eq!(identity, plan.encoder_id("snapshot-revision", 121));
+        assert_ne!(identity, plan.encoder_id("different-revision", 121));
+        assert_ne!(identity, plan.encoder_id("snapshot-revision", 120));
         assert!(matches!(plan.read_weights(plan.weight_bytes()-1), Err(AudioTowerError::Admission { .. })));
+        let mut unsupported_config = config;
+        unsupported_config["audio_config"]["conv_kernel_size"] = serde_json::json!(9);
+        std::fs::write(root.join("config.json"), unsupported_config.to_string()).unwrap();
+        assert!(crate::plan::resolve_audio(crate::plan::MediaMode::Auto, root).is_err());
+        assert!(crate::plan::resolve_audio(crate::plan::MediaMode::Rtx(None), root).is_err());
+        std::fs::write(root.join("config.json"), "{invalid").unwrap();
+        assert!(crate::plan::resolve_audio(crate::plan::MediaMode::Auto, root).is_err());
+        std::fs::remove_file(root.join("config.json")).unwrap();
+        assert!(crate::plan::resolve_audio(crate::plan::MediaMode::Auto, root).is_err());
     }
     #[test]
     fn reject_dtype_and_truncated_payload() {

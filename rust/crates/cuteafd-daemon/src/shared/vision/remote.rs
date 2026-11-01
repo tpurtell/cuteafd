@@ -108,6 +108,7 @@ pub struct AudioHandshake {
     pub plan_hash: [u8; 32],
     pub max_samples: u32,
     pub output_width: u32,
+    pub geometry: cuteafd_core::media::AudioTokenGeometry,
 }
 #[derive(Clone)]
 enum Handshake {
@@ -129,11 +130,16 @@ impl Handshake {
         match self {
             Self::Image(value) => value.validate(),
             Self::Audio(value) => {
-                cuteafd_loader::media::audio::AudioGeometry::for_samples(
-                    value.max_samples as usize,
+                cuteafd_loader::media::audio::AudioGeometry::for_policy(
+                    value.max_samples as usize, value.geometry,
                 )
                 .map_err(error)?;
-                if ![4096, 6144].contains(&value.output_width) {
+                let valid_width = match value.geometry {
+                    cuteafd_core::media::AudioTokenGeometry::MimoRvq => [4096, 6144].contains(&value.output_width),
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: 1920 } => value.output_width == 8192,
+                    _ => false,
+                };
+                if !valid_width {
                     return Err(error("invalid audio output width"));
                 }
                 Ok(())
@@ -149,6 +155,7 @@ impl Handshake {
                 if actual.encoder_id == expected.encoder_id
                     && actual.plan_hash == expected.plan_hash
                     && actual.output_width == expected.output_width
+                    && actual.geometry == expected.geometry
                     && actual.max_samples >= expected.max_samples =>
             {
                 Ok(())
@@ -165,7 +172,11 @@ impl Handshake {
                 stream.write_all(b"CAFDAU01").map_err(error)?;
                 stream.write_all(&value.encoder_id.0).map_err(error)?;
                 stream.write_all(&value.plan_hash).map_err(error)?;
-                for n in [value.max_samples, value.output_width, 24000, 4] {
+                let policy = match value.geometry {
+                    cuteafd_core::media::AudioTokenGeometry::MimoRvq => 4,
+                    cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token } => samples_per_token as u32,
+                };
+                for n in [value.max_samples, value.output_width, 24000, policy] {
                     put_u32(stream, n)?;
                 }
                 Ok(())
@@ -194,12 +205,14 @@ impl Handshake {
                 patch_size: patch,
                 merge_size: merge,
             })
-        } else if &magic == b"CAFDAU01" && patch == 24000 && merge == 4 {
+        } else if &magic == b"CAFDAU01" && patch == 24000 && [4, 1920].contains(&merge) {
             Self::Audio(AudioHandshake {
                 encoder_id,
                 plan_hash,
                 max_samples: capacity,
                 output_width,
+                geometry: if merge == 4 { cuteafd_core::media::AudioTokenGeometry::MimoRvq }
+                    else { cuteafd_core::media::AudioTokenGeometry::PcmPatches { samples_per_token: merge as usize } },
             })
         } else {
             return Err(error("unsupported encoder wire version/geometry"));
@@ -214,9 +227,9 @@ impl Handshake {
                 let cuteafd_engine::media::EncodeInput::Audio { pcm, .. } = &job.input else {
                     return Err(error("audio peer refuses image"));
                 };
-                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(pcm.len())
+                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(pcm.len(), value.geometry)
                     .map_err(error)?;
-                if !matches!(&job.input, cuteafd_engine::media::EncodeInput::Audio { geometry, .. } if geometry.is_mimo())
+                if !matches!(&job.input, cuteafd_engine::media::EncodeInput::Audio { geometry, .. } if *geometry == value.geometry)
                     || !job.key.is_audio()
                     || pcm.len() > value.max_samples as usize
                     || pcm.iter().any(|v| !v.is_finite())
@@ -643,7 +656,7 @@ impl EncoderServer {
                     .submit_audio(super::audio::AudioEncodeJob {
                         pcm: pcm.clone(),
                         output: vec![0; rows],
-                        fp32_scratch: vec![0.0; rows],
+                        fp32_scratch: if service.audio_geometry().is_some_and(|g| g.is_mimo()) { vec![0.0; rows] } else { Vec::new() },
                     })
                     .map_err(error)?;
                 let output = loop {
@@ -812,7 +825,7 @@ where
                 let samples = get_u32(s)? as usize;
                 let tokens = get_u64(s)?;
                 let len = get_u64(s)?;
-                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_samples(samples)
+                let geometry = cuteafd_loader::media::audio::AudioGeometry::for_policy(samples, handshake.geometry)
                     .map_err(error)?;
                 if samples > handshake.max_samples as usize
                     || tokens != geometry.tokens as u64
@@ -826,11 +839,12 @@ where
                     .chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
                     .collect::<Vec<_>>();
-                EncodeJob::audio(
+                EncodeJob::audio_with_geometry(
                     key,
                     pcm.into(),
                     tokens as usize,
                     handshake.output_width as usize,
+                    handshake.geometry,
                 )
             }
             _ => return Err(error("encoder peer refuses job modality")),
@@ -1006,6 +1020,7 @@ mod tests {
     }
     fn audio_handshake() -> AudioHandshake {
         AudioHandshake {
+            geometry: cuteafd_core::media::AudioTokenGeometry::MimoRvq,
             encoder_id: EncoderId([3; 32]),
             plan_hash: [9; 32],
             max_samples: 7200000,
@@ -1014,6 +1029,25 @@ mod tests {
     }
     fn audio_job() -> EncodeJob {
         EncodeJob::audio(AudioKey([4; 32]), vec![0.25; 24000].into(), 7, 4096)
+    }
+    #[test]
+    fn pcm_audio_loopback_preserves_policy_and_exact_rows() {
+        use cuteafd_core::media::AudioTokenGeometry;
+        let geometry = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let handshake = AudioHandshake { geometry, output_width: 8192, ..audio_handshake() };
+        let server = EncoderServer::start_backend("127.0.0.1:0".parse().unwrap(), handshake.clone().into(),
+            Duration::from_secs(2), || true, |job| Ok(EncodeOutput {
+                key: job.key, features: FakeEncoder::features(job)?, elapsed_ms: 1.0,
+            })).unwrap();
+        let mut client = RemoteEncoder::connect_audio(vec![server.address], handshake, Duration::from_secs(2)).unwrap();
+        assert!(client.submit(audio_job()).is_err());
+        for samples in [1usize, 1919, 1920, 1921, 30721] {
+            let job = EncodeJob::audio_with_geometry(AudioKey([samples as u8; 32]), vec![0.25; samples].into(),
+                samples.div_ceil(1920), 8192, geometry);
+            let expected = FakeEncoder::features(&job).unwrap();
+            let id = client.submit(job).unwrap();
+            assert_eq!(wait(&mut client, id).unwrap().features, expected);
+        }
     }
     #[test]
     fn audio_loopback_is_byte_exact_bounded_and_modality_checked() {
