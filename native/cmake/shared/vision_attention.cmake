@@ -94,10 +94,10 @@ endfunction()
 foreach(dim 64 72)
   cuteafd_vision_owner_entry(d${dim} HEAD_DIM ${dim} DIRECTORY "${CUTEAFD_VISION_ATTENTION_DIR}"
     PROGRAMS vision_attention_d${dim})
-  list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d${dim}.json")
+  foreach(ext h o json)
+    list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS "${CUTEAFD_VISION_ATTENTION_DIR}/vision_attention_d${dim}.${ext}")
+  endforeach()
 endforeach()
-get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
-list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
 add_custom_command(
   OUTPUT ${CUTEAFD_VISION_ATTENTION_OUTPUTS}
   COMMAND ${CUTEAFD_SPARKINFER_VERIFY_COMMAND}
@@ -108,6 +108,9 @@ add_custom_command(
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting full-image head64/head72 BF16 vision attention offline"
   VERBATIM)
+get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
+list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
+list(REMOVE_DUPLICATES CUTEAFD_VISION_ATTENTION_OUTPUTS)
 get_property(owner_entries GLOBAL PROPERTY CUTEAFD_VISION_OWNER_ENTRIES)
 list(JOIN owner_entries ",\n" owner_entries)
 file(GENERATE OUTPUT "${CUTEAFD_VISION_ATTENTION_DIR}/entries.json" CONTENT "[${owner_entries}]\n")

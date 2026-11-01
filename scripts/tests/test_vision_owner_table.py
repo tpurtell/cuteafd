@@ -76,6 +76,40 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     exports = [line for line in command.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
     assert len(exports) == 1
     assert exports[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
+    # New registrations must never become outputs of the legacy command.
+    contents = (ROOT / "native/cmake/shared/vision_attention.cmake").read_text()
+    registration = '''
+foreach(mode full windows)
+  set(windowed)
+  if(mode STREQUAL "windows")
+    set(windowed WINDOWED)
+  endif()
+  cuteafd_vision_owner_entry(d96_${mode} HEAD_DIM 96 ${windowed}
+    PROGRAMS vision_attention_d96_${mode}
+    ARGS --group attention --head-dim 96
+    POINTWISE_GROUP muse POINTWISE_PROGRAMS vision_axial_rotary_d96_f32 vision_position_gather_h1536
+    POINTWISE_ARGS --group pointwise --head-dim 96 --hidden 1536 --learned-position)
+endforeach()
+'''
+    contents = contents.replace("get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)",
+        registration + "get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)")
+    injected = tmp_path / "with-modern.cmake"
+    injected.write_text(contents)
+    cmakelists = source / "CMakeLists.txt"
+    cmakelists.write_text(cmakelists.read_text().replace(
+        str(ROOT / "native/cmake/shared/vision_attention.cmake"), str(injected)))
+    build = tmp_path / "modern-build"
+    result = subprocess.run([cmake, "-S", str(source), "-B", str(build)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    entries = json.loads((build / "vision_attention/entries.json").read_text())
+    assert [(e["head_dim"], e["windowed"]) for e in entries] == [(64, False), (72, False), (96, False), (96, True)]
+    rules = (build / "CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
+    exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
+    assert len(exports) == 4, exports  # legacy + two attention + one shared pointwise
+    legacy_rule = rules.split("vision_attention/vision_attention_d64.h:", 1)[1].split("vision_attention/vision_attention_d64.o:", 1)[0]
+    assert "--group attention" not in legacy_rule
+    assert "--group pointwise" not in legacy_rule
 
 
 def test_native_table_lifetimes_failures_and_dispatch_without_cuda(tmp_path):
