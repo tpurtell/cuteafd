@@ -420,13 +420,19 @@ SPARK_WS_CELLS = {
     ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
     ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    # Step-5 K4/K6, GB10 2026-11-01: random and synthetic Gini .4/.7/.8,
+    # exact against each tier's control; K6 ties within measured noise pass.
+    # Real-route confirmation is pending; other capacities keep their controls.
+    ('step5', 256, 256): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
+    ('step5', 384, 256): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
+    ('step5', 384, 1024): dict(route_block=64, dynamic=True, tile=TILE_RTX_MIXED),
 }
 
 
 def spark_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
     if role != 'spark' or capacity <= 80:
         return None
-    return SPARK_WS_CELLS.get((geometry, width))
+    return SPARK_WS_CELLS.get((geometry, width, capacity), SPARK_WS_CELLS.get((geometry, width)))
 
 
 def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
