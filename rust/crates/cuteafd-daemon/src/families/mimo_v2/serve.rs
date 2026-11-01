@@ -1031,7 +1031,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
     let (draft0, emit0) = (lane.draft_s, lane.emit_s);
     let engine_before = tally.live().then(|| *engine.profile.borrow());
     // Rows each sequence may add after its next token.
-    let room = cuteafd_core::concurrency::draft_budget(active.len() as u64, DECODE_ROWS as u64) as usize;
+    let room = DECODE_ROWS.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
         .min(a.capacity - a.placement.len - 1).min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS)) }).collect();
     let ready: Vec<_> = active.iter().map(|a| match drafter {
@@ -1166,7 +1166,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         predicted = selection.predicted;
         selection.lengths
     } else { vec![0; active.len()] };
-    if resource::trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
+    if resource::trim_budget_with_priors(&mut planned, DECODE_ROWS, &priors, |i| active[i].ticket.id()) { predicted = None; }
     if fixed.is_some() {
         if let Some(shared) = shared.as_ref() {
             let candidates: Vec<_> = active.iter().zip(&priors).map(|(a, prior)|

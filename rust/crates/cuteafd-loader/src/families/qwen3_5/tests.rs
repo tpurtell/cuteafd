@@ -122,7 +122,6 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         "enable_confidence_head":true,"confidence_head_with_markov":true,
         "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
     std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-    let mut previous = usize::MAX;
     for c in [17, 32, 33, 64] {
         let layout = options.layout.as_mut().unwrap();
         layout.concurrency = c;
@@ -134,9 +133,6 @@ fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
         assert_eq!(report.cache_requirements.as_ref().unwrap().concurrency as u64, c);
         let memory = report.memory_layout.unwrap();
         let supported = crate::formats::block_dspark::supports_sequences(c as usize);
-        let budget = if supported { cuteafd_core::concurrency::draft_budget(c, 64) as usize } else { 0 };
-        assert!(budget <= previous);
-        previous = budget;
         assert_eq!(memory.notes.iter().any(|note| note.contains("anchor-only")), !supported);
         if !supported {
             options.layout.as_mut().unwrap().dense_qwen_drafter_snapshot = None;

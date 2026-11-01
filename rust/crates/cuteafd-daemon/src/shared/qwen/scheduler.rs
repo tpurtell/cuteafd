@@ -1284,7 +1284,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     let mut predicted = None;
     let (steps_before, draft_s_before) = (lane.timing.steps, lane.timing.seconds);
     // Each sequence verifies its next token plus its drafts within the decode programs' rows.
-    let room = cuteafd_core::concurrency::draft_budget(active.len() as u64, geometry.decode_rows as u64) as usize;
+    let room = geometry.decode_rows.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len() - 1)
             .min(reserved_drafts(a.placement.len(), a.placement.units().len(), cache.pool().page_rows())) }).collect();
@@ -1311,7 +1311,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                 }
             }
             let pending: usize = active.iter().map(|a| a.draft.pending_rows()).sum();
-            if resource::trim_budget(&mut depths, geometry.decode_rows) { predicted = None; }
+            if resource::trim_budget_with_priors(&mut depths, geometry.decode_rows, &neural_confidence, |i| active[i].ticket.id()) { predicted = None; }
             let rows: usize = depths.iter().map(|d| d + 1).sum();
             if depths.iter().any(|&d| d > 0) || pending + rows > geometry.decode_rows / 2 {
                 let mut seqs: Vec<DraftSeq<'_, _, _>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {

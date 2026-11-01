@@ -434,7 +434,7 @@ fn speculative_step(
 ) -> Result<Vec<bool>> {
     let mut clock = RoundClock::at(cycle);
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
-        (cuteafd_core::concurrency::draft_budget(active.len() as u64, engine.decode_rows as u64) as usize)
+        engine.decode_rows.saturating_sub(active.len())
             .min(a.job.max_tokens.saturating_sub(a.generated + 1))
             .min(a.capacity.saturating_sub(a.placement.len + 2))
             .min(reserved_drafts(a.placement.len, a.placement.units.len(), SOURCE_PAGE_TOKENS))

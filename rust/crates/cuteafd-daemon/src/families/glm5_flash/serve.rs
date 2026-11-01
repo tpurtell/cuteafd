@@ -108,9 +108,9 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-/// Even per-sequence room when a fixed count bypasses the shared draft policy.
+/// Per-request upper bound; the policy or final global cap shares the rows.
 fn verify_room(verify_rows: usize, sequences: usize) -> usize {
-    cuteafd_core::concurrency::draft_budget(sequences as u64, verify_rows as u64) as usize
+    verify_rows.saturating_sub(sequences)
 }
 
 /// Fixed neural count and packed admission prefill.
@@ -1374,20 +1374,10 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     let mut tally = console::Step::begin(lease.index());
     let (draft0, verify0, emit0) = (lane.draft_s, lane.verify_s, lane.emit_s);
     let engine_before = tally.live().then(|| *engine.profile.borrow());
-    // Rows each sequence may add after its next token: an even share of the verify budget.
-    // Both fixed widths and the shared policy respect this per-request cap.
+    // Each request may use leftover rows; selection spends one global budget.
     let room = verify_room(verify_rows, active.len());
     let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
-    // With the wide programs the rows the even share leaves over go to the first sequences that can
-    // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
-    if shared.is_none() && engine.decode_rows > DECODE_ROWS && active.len() <= 16 {
-        super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
-            let a = &active[i];
-            !probe::no_speculation(&a.job.probe)
-                && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
-        });
-    }
     // Verify writes stay inside each request's reserved units.
     for (limit, a) in limits.iter_mut().zip(active.iter()) {
         *limit = (*limit).min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS));
@@ -1454,7 +1444,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             _ => None,
         }).collect();
     let mut predicted = None;
-    let planned = match (fixed, shared.as_mut()) {
+    let mut planned = match (fixed, shared.as_mut()) {
         // No draft pass ran: every sequence verifies its next token alone.
         (None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
         (None, Some(shared)) => {
@@ -1476,6 +1466,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         // No neural drafter means no speculative proposal.
         (None, None) => vec![0; active.len()],
     };
+    if super::draft_binding::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
+        |i| active[i].ticket.id()) { predicted = None; }
     // A history continuation never competes with or replaces the confident prefix.
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
         let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
@@ -2157,7 +2149,8 @@ mod verify_rows_tests {
             }
             let proposals: Vec<(Vec<u32>, Vec<f32>)> = history.iter().map(|h| drafts(h)).collect();
             let room = verify_room(64, streams);
-            let ks = vec![room.min(7); streams];
+            let mut ks = vec![room.min(7); streams];
+            crate::shared::draft::resource::trim_budget(&mut ks, 64);
             for (i, ((tokens_i, _), &k)) in proposals.iter().zip(&ks).enumerate() {
                 let rows: Vec<u32> = std::iter::once(next[i]).chain(tokens_i[..k].iter().copied()).collect();
                 verified += rows.len();
@@ -2176,7 +2169,7 @@ mod verify_rows_tests {
     }
 
     #[test]
-    fn even_room_verification_emits_target_greedy_tokens() {
+    fn global_budget_verification_emits_target_greedy_tokens() {
         let (emissions, _) = decode(16, 48);
         for (s, emitted) in emissions.iter().enumerate() {
             let mut context = vec![s as u32, s as u32 * 7 % VOCAB];
@@ -2188,9 +2181,9 @@ mod verify_rows_tests {
     }
 
     #[test]
-    fn room_is_the_even_share_of_the_verify_budget() {
-        assert_eq!([1, 2, 9, 16, 64, 65].map(|s| verify_room(64, s)), [63, 31, 6, 3, 0, 0]);
-        assert_eq!([1, 16, 17].map(|s| verify_room(127, s)), [126, 6, 6]);
+    fn room_leaves_all_remaining_rows_available_to_each_request() {
+        assert_eq!([1, 2, 9, 16, 64, 65].map(|s| verify_room(64, s)), [63, 62, 55, 48, 0, 0]);
+        assert_eq!([1, 16, 17].map(|s| verify_room(127, s)), [126, 111, 110]);
     }
 
     #[test]

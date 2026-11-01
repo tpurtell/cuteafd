@@ -254,18 +254,6 @@ struct Active<'a> {
     ticket: console::Ticket,
 }
 
-/// Fixed diagnostic counts still share one verifier budget, anchors included.
-fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
-    let mut rows = lengths.len() + lengths.iter().sum::<usize>();
-    let trimmed = rows > budget;
-    while rows > budget {
-        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
-        lengths[index] -= 1;
-        rows -= 1;
-    }
-    trimmed
-}
-
 /// Stops censor an unjudged continuation, never a disagreeing draft token.
 fn finish_censor(finished: bool, committed: usize, rows: &[u32], last: Option<u32>, stops: &[u32]) -> Option<Censor> {
     if !finished { return None; }
@@ -987,7 +975,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     let mut tally = console::Step::begin(lease.index());
     let (phases_before, engine_before) = (*phases, tally.live().then(|| *engine.profile.borrow()));
     // Rows each sequence may add after its next token.
-    let room = cuteafd_core::concurrency::draft_budget(active.len() as u64, DECODE_ROWS as u64) as usize;
+    let room = DECODE_ROWS.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
             .min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS)) }).collect();
@@ -1056,7 +1044,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
         }
         _ => vec![0; active.len()],
     };
-    if trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
+    if resource::trim_budget_with_priors(&mut planned, DECODE_ROWS, &priors, |i| active[i].ticket.id()) { predicted = None; }
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
         let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
             .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
@@ -1343,11 +1331,12 @@ mod draft_tests {
     #[test]
     fn fixed_counts_keep_every_anchor_inside_the_global_budget() {
         let mut lengths = [7; 16];
-        assert!(trim_budget(&mut lengths, 64));
+        assert!(crate::shared::draft::resource::trim_budget(&mut lengths, 64));
         assert_eq!(lengths.len() + lengths.iter().sum::<usize>(), 64);
-        assert!(lengths.iter().all(|&length| length == 3));
+        assert_eq!(&lengths[..6], &[7; 6]);
+        assert_eq!(&lengths[7..], &[0; 9]);
         let mut lengths = [32, 0, 0, 0];
-        assert!(!trim_budget(&mut lengths, 64));
+        assert!(!crate::shared::draft::resource::trim_budget(&mut lengths, 64));
         assert_eq!(lengths, [32, 0, 0, 0]);
     }
 }
