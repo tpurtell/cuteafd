@@ -6474,3 +6474,19 @@ live unit reports RestartUSec=2min. This launcher-only change is outside
 the sealed numerical producer identity; quantization code/settings are
 unchanged. Monitor records the outage and excludes partial-resume layer
 timings. Keep publication/handoff enabled and continue 30-minute checks.
+
+QUANTIZATION COMPLETE (2026-11-01 06:30 UTC): all 93,600 matrices and all
+three MTP stages are committed. Final export validation passes: 96 shards,
+375,913 tensors, 315,357,147,520 payload bytes, including 1,513 native
+tensors / 6,199,381,760 bytes retained. The independent assembled-export
+audit also passes all layouts/MCG/scales, fixed producer origins, exact
+index coverage, native source bytes (all 667 vision tensors), diagnostics,
+licenses and tokenizer assets. Audit and original receipt metadata:
+~/.cache/cuteafd/builds/step5-quant-export/assembled-fixed-release-audit.json.
+GPU container is stopped and canonical maxq lease released. Current service
+step5-core-k6-1793428481217978246 is running CPU-only publication; upload
+requests are succeeding. No publication-complete/import/handoff marker yet.
+Continue watching this service; it will upload, verify public bytes, adopt
+through the no-copy bridge, spread onto the six Sparks, then retire owned
+standalone payloads. Final managed-snapshot independent checker is prepared
+under ~/.cache/cuteafd/builds/step5-quant-export/. Do not re-quantize.
