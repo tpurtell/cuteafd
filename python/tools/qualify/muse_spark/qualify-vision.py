@@ -237,6 +237,55 @@ def reference_stages(modules, rgb):
     return {name: value.detach().float().cpu().numpy() for name, value in result.items()}
 
 
+def reference_tail_replay(modules, stages, refs, grid_hw):
+    """Replay each tail op from identical native inputs, then the whole tail."""
+    import torch
+    tower, adapter, projection = modules
+    parameter = next(tower.parameters())
+    device, dtype = parameter.device, parameter.dtype
+    grid = torch.tensor([[1, *grid_hw]], device=device, dtype=torch.long)
+    inverse = torch.argsort(torch.from_numpy(refs["permutation"]).to(device, dtype=torch.long))
+
+    def native(stage):
+        return torch.from_numpy(stages[str(stage)]).to(device, dtype=dtype)
+
+    with torch.no_grad():
+        isolated = {"52": native(50)[inverse], "53": tower.ln_post(native(52)),
+                    "54": tower.pixel_shuffle(native(53), grid),
+                    "55": adapter(native(54)), "56": projection(native(55))}
+        x = native(50)[inverse]
+        chained = {"52": x}
+        for stage, operation in [("53", tower.ln_post),
+                                  ("54", lambda value: tower.pixel_shuffle(value, grid)),
+                                  ("55", adapter), ("56", projection)]:
+            x = operation(x)
+            chained[stage] = x
+        # Distinguish single-store LayerNorm from a BF16 normalized intermediate.
+        x = native(52).float()
+        variance, mean = torch.var_mean(x, dim=-1, unbiased=False, keepdim=True)
+        normalized = (x - mean) * torch.rsqrt(variance + tower.ln_post.eps)
+        weight, bias = tower.ln_post.weight.float(), tower.ln_post.bias.float()
+        rounding = {"single_store": (normalized * weight + bias).to(dtype),
+                    "bf16_before_affine": (normalized.to(torch.bfloat16).float() * weight + bias).to(dtype)}
+    arrays = lambda values: {key: value.detach().float().cpu().numpy() for key, value in values.items()}
+    return dict(isolated=arrays(isolated), chained=arrays(chained), norm_rounding=arrays(rounding))
+
+
+def tail_replay_metrics(stages, bf16, fp32):
+    """Keep local diagnostics separate from the cumulative qualification gate."""
+    result = {}
+    for mode in ("isolated", "chained"):
+        result[mode] = {key: dict(strict_bf16=common.metrics(stages[key], expected),
+                                 fp32_yardstick=stage_metrics(stages[key], expected, fp32[mode][key]))
+                        for key, expected in bf16[mode].items()}
+    result["inverse_byte_exact"] = bool(np.array_equal(stages["52"], bf16["isolated"]["52"]))
+    result["shuffle_byte_exact"] = bool(np.array_equal(stages["54"], bf16["isolated"]["54"]))
+    result["official_bf16_norm_rounding"] = {
+        key: common.metrics(value, bf16["isolated"]["53"])
+        for key, value in bf16["norm_rounding"].items()}
+    return result
+
+
 def run(args):
     import torch
     from PIL import Image
@@ -268,7 +317,11 @@ def run(args):
         precision=dict(fp32_weights="checkpoint BF16 upcast", tf32=False,
             official_bf16_rope=bf16_rope_dtypes, official_fp32_rope=None,
             allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction),
-        library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest())
+        library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
+        reference_runtime=dict(torch_version=torch.__version__, cuda_version=torch.version.cuda,
+            post_ln_type=f"{type(modules[0].ln_post).__module__}.{type(modules[0].ln_post).__qualname__}",
+            post_ln_eps=modules[0].ln_post.eps, post_ln_parameter_dtype=str(modules[0].ln_post.weight.dtype),
+            cudnn_enabled=torch.backends.cudnn.enabled))
     try:
         check(lib.cuteafd_vision_upload(owner, 0, blob, len(blob)))
         del blob
@@ -336,20 +389,24 @@ def run(args):
             saved = output.copy()
             encode(OBSERVER())
             repeat = bool(np.array_equal(saved, output))
-            fp32_refs, yardstick = {}, {}
+            fp32_refs, yardstick, tail_replay = {}, {}, {}
+            bf16_tail = reference_tail_replay(modules, stages, refs, (gh, gw)) if args.replay_tail else None
             if args.fp32_yardstick:
                 reference_precision(modules, torch.float32, official_rope)
                 result["precision"]["official_fp32_rope"] = rope_dtypes(modules)
                 fp32_refs = reference_stages(modules, rgb)
                 yardstick = {key: stage_metrics(stages[key], refs[key], fp32_refs[key])
                     for key in comparisons}
+                if args.replay_tail:
+                    fp32_tail = reference_tail_replay(modules, stages, refs, (gh, gw))
+                    tail_replay = tail_replay_metrics(stages, bf16_tail, fp32_tail)
                 reference_precision(modules, torch.bfloat16, official_rope)
                 if any(getattr(modules[0].rotary_emb, name) is not original
                     for name, original in zip(("inv_freq", "original_inv_freq"), official_rope)):
                     raise AssertionError("official BF16 RoPE buffers were not restored unchanged")
             result["images"][str(path)] = dict(grid=[gh, gw], tokens=tokens, encode_ms=elapsed,
                 stages=comparisons, metadata_exact=metadata, block_replay=replay,
-                fp32_yardstick=yardstick,
+                fp32_yardstick=yardstick, tail_replay=tail_replay,
                 byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
             if args.dump_stages:
                 args.dump_stages.mkdir(parents=True, exist_ok=True)
@@ -381,4 +438,9 @@ if __name__ == "__main__":
     parser.add_argument("--replay-blocks", action="store_true")
     parser.add_argument("--fp32-yardstick", action="store_true",
         help="gate by native/official BF16 error vs official FP32; retain unchanged strict BF16 verdict")
-    raise SystemExit(run(parser.parse_args()))
+    parser.add_argument("--replay-tail", action="store_true",
+        help="diagnose each tail op from identical native inputs; requires --fp32-yardstick")
+    args = parser.parse_args()
+    if args.replay_tail and not args.fp32_yardstick:
+        parser.error("--replay-tail requires --fp32-yardstick")
+    raise SystemExit(run(args))
