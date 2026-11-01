@@ -276,6 +276,9 @@ if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
     "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
 fi
 IFS=';' read -ra release_family_list <<<"$expert_families"
+# Like fp8/, the exl3/ directory always exists so the release image can COPY it
+# when the scope ships no EXL3 family (a deepseek_v41-scoped build has none).
+install -d "$output_dir/exl3"
 for release_family in "${release_family_list[@]}"; do
   [[ "$release_family" == *:exl3-k* ]] || continue
   release_package="exl3-${release_family%%:*}-${release_family#*:exl3-}"

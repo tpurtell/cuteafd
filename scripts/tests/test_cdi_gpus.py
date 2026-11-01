@@ -85,7 +85,7 @@ def test_v41_launch_uses_cdi_for_coordinator_and_exports_helpers_to_workers():
     helper = text.split('release_coordinator_device_args() {', 1)[1].split('\n}', 1)[0]
     assert 'cuteafd_cdi_gpu_args "$csv" || exit 2' in helper
     assert '--name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}"' in v41
-    assert 'export -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args;' in v41
+    assert 'export -f release_die release_hub_mounts release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args;' in v41
 
 
 def test_no_legacy_gpus_flag_in_launchers():

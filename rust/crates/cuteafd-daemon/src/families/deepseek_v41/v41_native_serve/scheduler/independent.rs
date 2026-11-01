@@ -179,6 +179,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             };
             let prepared_us = started.elapsed().as_micros() as u64;
             round_id += 1;
+            super::stall::tick();
             tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id, requests=members.len(),
                 "independent verifier issued");
             let operation: Result<()> = async {
