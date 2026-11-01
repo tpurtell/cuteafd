@@ -113,7 +113,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 return memory;
             }
         }, startup: Vec::new() };
-    let built = match crate::placement::families::muse_spark::request(inputs) {
+    let mut built = match crate::placement::families::muse_spark::request(inputs) {
         Ok(built) => built,
         Err(error) => {
             refusal(report, format!("Muse Spark joint admission refused: {error:#}"),
@@ -121,6 +121,18 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
+    let media = crate::placement::families::muse_spark::MediaOptions::from_checkpoint(input.checkpoint(),
+        report.vision, report.audio, opts.vision_replicas).and_then(|options| built.admit_media(&options));
+    if let Err(error) = media {
+        refusal(report, format!("Muse bundled media admission refused: {error:#}"),
+            "Use the bundled BF16 towers, a fitting encoder placement, or explicitly disable media.");
+        return memory;
+    }
+    if let Some(media) = &built.media {
+        report.encoder = Some(media.vision.clone());
+        report.audio_encoder = Some(media.audio.clone());
+        if media.audio.kind == crate::plan::encoder::EncoderKind::Off { report.audio = crate::plan::MediaMode::Off; }
+    }
     let embedding = built.global.embedding as u64;
     let head = built.global.head_bytes() as u64;
     let experts = *model.bytes.get(&Component::RoutedExpert).unwrap_or(&0);
@@ -140,11 +152,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return memory;
         }
     };
-    if let Err(error) = built.local.check(&placed) {
+    if let Err(error) = built.local.check(&placed).and_then(|_| built.check_media_workers(&placed)) {
         refusal(report, format!("Muse Spark coordinator admission refused: {error:#}"),
             "Rebuild the image with the Muse coordinator scope (its EXL3 rtx-tp1/rtx-tp2 package).");
         return memory;
     }
+    let media = built.media;
     let spark_budget = built.spark_budget;
     memory.pool_tokens = placed.pool_tokens;
     memory.notes.push(format!("Muse selected RTX expert layers: {}; pool {} tokens; full-layer KV {} B/token over {} \
@@ -185,6 +198,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         if let Err(error) = muse_owners(&mut device, &working, prefill.unit_rows, prefill.waves) {
             refusal(report, format!("Muse Spark execution owners: {error:#}"), "Use a supported wave count.");
         }
+        if let Some(media) = &media { device.items.extend(media.spark_items[rank].iter().cloned()); }
         memory.devices.push(device);
     }
     report.spark_rank_share = if experts == 0 { 0.0 } else { widest as f64 / experts as f64 };

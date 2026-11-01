@@ -239,9 +239,6 @@ impl Family for MuseSpark {
 impl FamilyModel for Model {
     fn spec(&self) -> &ModelSpec { &self.spec }
     fn native_serving_admission(&self) -> bool { true }
-    fn vision_mode(&self, mode: crate::plan::MediaMode) -> crate::plan::MediaMode {
-        if mode == crate::plan::MediaMode::Auto { crate::plan::MediaMode::Off } else { mode }
-    }
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         crate::families::muse_spark::cache::MuseCacheLayout::new(&self.cfg, options.coordinator_ranks)

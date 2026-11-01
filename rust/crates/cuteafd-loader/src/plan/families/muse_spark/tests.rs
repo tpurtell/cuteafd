@@ -70,8 +70,8 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
     for component in report.components.iter().filter(|c| c.status != Status::Disabled) {
         assert_eq!(component.rejected, 0, "{:?}: {:?}", component.component, component.rejections);
     }
-    assert!(report.components.iter().filter(|c| matches!(c.component, Component::Vision | Component::Audio))
-        .all(|c| c.status == Status::Disabled), "media stay off");
+    assert_eq!(report.vision, MediaMode::Auto, "vision auto is not family-disabled");
+    assert_eq!(report.audio, MediaMode::Off, "text fixture declares no audio tower");
     assert!(!report.hints.iter().any(|h| h.what.contains("EXL3 publication")), "{:?}", report.hints);
     let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
     // 62 x 256 x 3 projections of 4096 x 4096 at 4 bits, plus vectors, norms and markers.

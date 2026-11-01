@@ -54,6 +54,7 @@ pub(crate) struct Options<'a> {
     pub local: shared::LocalPackage,
     /// The DFlash2 drafter's charge (`shared::drafter_inventory`), when one serves.
     pub drafter: Option<shared::MuseDrafter>,
+    pub media: Option<shared::MediaOptions>,
 }
 
 /// Measured admission: the shared request with live baselines and the code the
@@ -73,13 +74,19 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
             baseline: Baseline::Measured { free_bytes: sample.free_bytes } })
     }).collect::<Result<Vec<_>>>()?;
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
-    shared::placement(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
+    let mut built = shared::request(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
         gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill, slots: options.slots,
         mark_slots: options.mark_slots, context,
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
-        local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })
+        local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })?;
+    if let Some(media) = &options.media { built.admit_media(media)?; }
+    let placed = cuteafd_loader::placement::solve(&built.request)?;
+    built.local.check(&placed)?;
+    built.request.executor.check(&placed)?;
+    built.check_media_workers(&placed)?;
+    Ok((built, placed))
 }
 
 #[cfg(test)]
@@ -176,7 +183,7 @@ mod tests {
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cutoff_rows, partial_wide_format: wide,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
-                drafter: served_drafter })?;
+                drafter: served_drafter, media: None })?;
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {
                 assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");
@@ -209,7 +216,7 @@ mod tests {
     #[test]
     fn planner_equals_measured_startup_before_allocation() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+        testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
         let input = testing::BudgetedPlanInput::open(dir.path())?;
         let checkpoint = input.checkpoint();
         let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
@@ -248,8 +255,16 @@ mod tests {
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_wide_format: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
-                drafter: None })?;
+                drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
+                    cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?) })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
+            let encoder = report.encoder.as_ref().context("vision placement")?;
+            assert_eq!(encoder.admitted_bytes(), 4_864_551_264, "native vision ledger");
+            let layout = report.memory_layout.as_ref().context("vision layout")?;
+            let native: u64 = layout.devices.iter().flat_map(|device| &device.items)
+                .filter(|item| item.group == "vision tower" || item.group == "vision scratch")
+                .map(|item| item.bytes).sum();
+            assert_eq!(native, encoder.admitted_bytes());
             assert!(live.pool_tokens > 0);
             // The same image without its package: startup refuses whenever the placement
             // onboards, never serving the layers from the Sparks instead.
@@ -267,7 +282,7 @@ mod tests {
                     max_context: None, pool_tokens: None, onboard: Onboard::Auto,
                     spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                    partial_wide_format: Default::default(), local, drafter: None }).err().expect("missing package refuses").to_string();
+                    partial_wide_format: Default::default(), local, drafter: None, media: None }).err().expect("missing package refuses").to_string();
                 assert!(error.contains("rebuild with the Muse coordinator scope"), "{error}");
                 refused += 1;
             }
