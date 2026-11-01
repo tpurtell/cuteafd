@@ -247,6 +247,17 @@ impl std::fmt::Display for NativeFailure {
     }
 }
 impl std::error::Error for NativeFailure {}
+impl NativeFailure {
+    /// Preserve request faults while leaving tokenizer loading and internal span bugs as 500s.
+    pub fn from_admission_error(error: anyhow::Error) -> Self {
+        if let Some(failure) = error.downcast_ref::<Self>() { return failure.clone(); }
+        if error.downcast_ref::<cuteafd_loader::PromptEncodingError>().is_some() {
+            Self::BadRequest(format!("{error:#}"))
+        } else {
+            Self::Worker(format!("{error:#}"))
+        }
+    }
+}
 impl From<String> for NativeFailure {
     fn from(message: String) -> Self { Self::Worker(message) }
 }
@@ -405,11 +416,20 @@ pub(crate) fn model_record(state: &NativeState) -> Value {
     }
     model
 }
+// The daemon's background reporter publishes here; HTTP never probes or locks
+// the allocator, and no family scheduler needs to carry these process stats.
+static HOST_HEAP: std::sync::RwLock<Value> = std::sync::RwLock::new(Value::Null);
+
+pub fn publish_host_heap(value: Value) {
+    *HOST_HEAP.write().unwrap_or_else(|e| e.into_inner()) = value;
+}
+
 async fn stats_route(State(state): State<NativeState>) -> Json<Value> {
     let mut value = state.stats.lock().map(|stats| stats.clone()).unwrap_or(Value::Null);
     if !value.is_object() { value = json!({}); }
     refresh_mapped_tables(&mut value, &state.tables);
     let object = value.as_object_mut().unwrap();
+    object.insert("host_heap".into(), HOST_HEAP.read().unwrap_or_else(|e| e.into_inner()).clone());
     object.extend(state.admission.metrics().as_object().unwrap().clone());
     object.insert("http_queue_len".into(), json!(state.queue.max_capacity() - state.queue.capacity()));
     let thermal = cuteafd_core::thermal::current();
@@ -1475,6 +1495,7 @@ mod tests {
                 assert!(matches!(entry["backend"].as_str(), Some("mincore-routed" | "mmap-fallback")));
                 assert_eq!(entry["cumulative"]["gathers"], expected);
                 assert_eq!(value["http_queue_len"], 0);
+                assert!(value.get("host_heap").is_some());
                 if cached.lock().unwrap().is_null() {
                     assert_eq!(entry["cumulative"]["rows"], expected * 2);
                 } else {
@@ -1493,6 +1514,8 @@ mod tests {
 
     #[tokio::test]
     async fn stats_without_tables_preserve_published_family_fields() {
+        let heap = json!({"allocator":"glibc", "scope":"all_arenas", "live_bytes":1234});
+        publish_host_heap(heap.clone());
         let published = json!({"family":"qwen4", "active":0, "nested":{"tokens":12}});
         let (queue, _receive) = mpsc::channel(4);
         let state = NativeState { queue, limits: NativeLimits::default(),
@@ -1504,6 +1527,7 @@ mod tests {
         for (key, expected) in published.as_object().unwrap() { assert_eq!(&value[key], expected); }
         assert_eq!(value["http_queue_len"], 0);
         assert!(value.get("mapped_tables").is_none());
+        assert_eq!(value["host_heap"], heap);
     }
 
     #[tokio::test]

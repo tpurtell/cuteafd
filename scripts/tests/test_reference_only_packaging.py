@@ -1,5 +1,6 @@
 """Reference-only publication storage and privacy contracts, without hardware."""
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
@@ -175,15 +176,13 @@ def test_sparse_launch_disclosure_preserves_tiles_and_rejects_missing_parameters
 
 @pytest.mark.parametrize('decode_gen,prefill_gen', [(8306, 7065), (16000, 1000)])
 def test_standard_generated_rows_are_informational_for_every_panel(decode_gen, prefill_gen):
-    import re
-    source = (ROOT / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
+    from fidelity_split import split
     windows = []
-    for half, total in [('DECODE', decode_gen), ('PREFILL', prefill_gen)]:
-        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', re.search(
-            r'pub const STANDARD_' + half + r':[^=]+=\s*\[(.*?)\];', source, re.S).group(1))
-        for index, wid in enumerate(ids):
+    for half, total in [('decode', decode_gen), ('prefill', prefill_gen)]:
+        for index, wid in enumerate(split()['sealed'][half]):
             count = min(512, max(0, total - index * 512))
-            windows.append(dict(id=wid, roles=['gen'] + ['ctx'] * (512 - count) + ['gen'] * count,
+            block = 'E' if wid == 'legacy' else wid[0].upper()
+            windows.append(dict(id=wid, block=block, roles=['gen'] + ['ctx'] * (512 - count) + ['gen'] * count,
                                 score_from=1))
     result = packager.standard_generated_rows(dict(windows=windows))
     assert result == dict(tier='standard-v2', decode_generated_positions=decode_gen,
@@ -259,3 +258,31 @@ def test_reference_role_metrics_without_generated_rows():
     metrics = packager.reference_role_metrics(dict(nll=.5, scored_tokens=10,
         nll_gen=None, nll_ctx=.5, gen_top1=None, scored_tokens_gen=0, scored_tokens_ctx=10))
     assert 'n/a (no rows)' in packager.reference_role_note(metrics)
+
+
+@pytest.mark.parametrize('family,fragment', [('muse_spark', 'BF16'), ('mistral_large4', 'FP8')])
+def test_family_golden_roots_map_to_their_precision(family, fragment):
+    root = packager.golden_root(family)
+    assert fragment in packager.reference_precision(dict(root_arithmetic=root), dict())
+
+
+def test_v41_root_arithmetic_maps_to_official_fp8_mxfp4():
+    precision = packager.reference_precision(dict(root_arithmetic=dict(packager.V41_ROOT)), dict())
+    assert precision.startswith('official FP8 block dense + MXFP4 experts')
+    with pytest.raises(ValueError, match='unrecognized'):
+        packager.reference_precision(dict(root_arithmetic=dict(arithmetic='x', source='y')), dict())
+
+
+def test_identity_note_binds_the_computed_set_and_requires_all_windows_equal(tmp_path):
+    proof = dict(old_set='a' * 64, new_set='b' * 64, old_rules='c' * 64, new_rules='d' * 64, all_equal=True,
+                 windows=[dict(id='a00', equal=True), dict(id='a01', equal=True)])
+    path = tmp_path / 'proof.json'
+    path.write_text(json.dumps(proof))
+    note = packager.identity_note(path, 'a' * 64)
+    assert note['equivalent_set_sha256'] == 'b' * 64 and note['windows'] == 2
+    with pytest.raises(ValueError, match='does not cover'):
+        packager.identity_note(path, 'e' * 64)
+    proof['windows'][1]['equal'] = False
+    path.write_text(json.dumps(proof))
+    with pytest.raises(ValueError, match='differing window'):
+        packager.identity_note(path, 'a' * 64)

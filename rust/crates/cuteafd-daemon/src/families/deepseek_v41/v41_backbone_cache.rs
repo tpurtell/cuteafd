@@ -33,6 +33,11 @@ pub(crate) struct CacheLease {
     slot: usize,
     generation: u64,
 }
+#[cfg(test)]
+impl CacheLease {
+    /// An unbound identity for CPU-only scheduler lifecycle tests; never used with a cache.
+    pub(crate) fn unbound_for_test(slot: usize) -> Self { Self { owner: 0, slot, generation: 0 } }
+}
 struct Request {
     id: u64,
     version: u64,

@@ -261,12 +261,15 @@ pub fn run_with(args: &RunArgs, model: &str, model_record: &Value,
         crate::fidelity_dataset::quick_windows(&reference)?
     } else { reference.selected_windows(args.tier != "quick")? };
     if standard {
+        let (decode_ids, prefill_ids) = (crate::fidelity_dataset::standard_ids(&reference, "decode")?,
+                                         crate::fidelity_dataset::standard_ids(&reference, "prefill")?);
+        let split_mode = format!("{} decode / {} prefill", decode_ids.len(), prefill_ids.len());
         dataset_identity.as_mut().unwrap()["standard_subset"] = json!({
             "version": crate::fidelity_dataset::STANDARD_TIER,
             "sha256": crate::fidelity_dataset::STANDARD_SPLIT_SHA256,
-            "mode": if admitted { "32 decode / 32 prefill" } else { crate::fidelity_dataset::STANDARD_FALLBACK },
-            "decode": crate::fidelity_dataset::STANDARD_DECODE,
-            "prefill": crate::fidelity_dataset::STANDARD_PREFILL,
+            "mode": if admitted { split_mode.as_str() } else { crate::fidelity_dataset::STANDARD_FALLBACK },
+            "decode": decode_ids,
+            "prefill": prefill_ids,
         });
     }
     let standard_balance = standard.then(|| crate::fidelity_dataset::standard_balance(&reference));

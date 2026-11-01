@@ -1275,6 +1275,10 @@ pub(crate) struct NativeServeArgs {
     pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
+    /// `--decode-share`: running requests keep this share of the time while
+    /// prompts prefill a call at a time (0: whole prompts before the next step).
+    #[command(flatten)]
+    pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
 
     #[arg(long)] pub snapshot: PathBuf,
     /// Public model id; defaults to the snapshot's Hugging Face id.

@@ -60,6 +60,23 @@ impl<'a, P: VerificationTarget<'a>, C: DraftChain<'a>> LaneCommit for Commit<'_,
     }
 }
 
+async fn retire_completed<M: round_failure::RoundMember, F: std::future::Future<Output = Result<()>>>(
+    active: &RefCell<&mut [Option<M>]>, slots: impl IntoIterator<Item = usize>, lane: usize, round_id: u64,
+    mut release: impl FnMut(M) -> F,
+) {
+    for slot in slots {
+        let request = active.borrow_mut()[slot].take().unwrap();
+        let request_id = request.id();
+        if let Err(error) = release(request).await {
+            tracing::error!(lane, request_id, %error,
+                "independent lane request release failed; the serve loop continues");
+        } else {
+            tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id, round_id,
+                "independent lane request retired");
+        }
+    }
+}
+
 async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease<'_>, pass: &mut P,
     transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
     active: &RefCell<&mut [Option<Active<'a>>]>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>,
@@ -75,17 +92,12 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let retired: Vec<_> = active.borrow().iter().enumerate().filter_map(|(slot, entry)|
                 entry.as_ref().filter(|r| r.lane() == lane && (r.finished || r.job.events.is_closed()))
                     .map(|_| slot)).collect();
-            for slot in retired {
-                let request = active.borrow_mut()[slot].take().unwrap();
-                let request_id = request.id();
-                retire(lane, request, requests, prefixes, draft).await?;
-                tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id, round_id,
-                    "independent lane request retired");
-            }
-            // Admission/prefill still uses both execution lanes.
+            retire_completed(active, retired, lane, round_id,
+                |request| retire(lane, request, requests, prefixes, draft)).await;
+            // Admission and prefill rounds run between lane sets: both lanes stop.
             let members: Vec<_> = {
                 let active = active.borrow();
-                if wake.poll_media(round_id)
+                if wake.poll_media(round_id) || wake.prefill_due(round_id)
                     || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty(),
                         requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
@@ -167,6 +179,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             };
             let prepared_us = started.elapsed().as_micros() as u64;
             round_id += 1;
+            super::stall::tick();
             tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id, requests=members.len(),
                 "independent verifier issued");
             let operation: Result<()> = async {
@@ -371,4 +384,30 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
         probe.finish_state();
     }
     target.and(speculative.map(|_| ())).and(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retirement_error_does_not_fail_either_lane_or_skip_next_retirement() {
+        let (first, mut first_output, _) = round_failure::tests::active_fixture(1, 0);
+        let (second, mut second_output, _) = round_failure::tests::active_fixture(2, 0);
+        let (peer, mut peer_output, _) = round_failure::tests::active_fixture(3, 1);
+        let mut active = [Some(first), Some(second), Some(peer)];
+        let mut released = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        runtime.block_on(retire_completed(&RefCell::new(active.as_mut_slice()), [0, 1], 0, 1, |request| {
+            let id = request.id();
+            released.push(id);
+            std::future::ready(if id == 1 { Err(anyhow::anyhow!("injected release failure")) } else { Ok(()) })
+        }));
+        assert_eq!(released, [1, 2], "cleanup continues after a per-request error");
+        assert!(active[0].is_none() && active[1].is_none());
+        assert!(!active[2].as_ref().unwrap().failed, "peer lane survives");
+        assert!(first_output.try_recv().is_err());
+        assert!(second_output.try_recv().is_err());
+        assert!(peer_output.try_recv().is_err());
+    }
 }
