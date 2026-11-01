@@ -4514,6 +4514,10 @@ fn explicit_encoder_failure_and_small_pool_admission() {
         let invalid = plan(dir.path(), &PlanOptions { vision, ..options.clone() }).unwrap();
         assert!(!invalid.placement_supported);
         assert!(!invalid.executable());
+        assert!(!invalid.memory_layout.as_ref().unwrap().devices.is_empty());
+        let encoder = invalid.encoder.as_ref().expect("named media refusal");
+        assert_eq!(encoder.kind, EncoderKind::Off);
+        assert!(encoder.reason.contains("absent") || encoder.reason.contains("unavailable"), "{}", encoder.reason);
         assert_ne!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Disabled);
     }
 }
