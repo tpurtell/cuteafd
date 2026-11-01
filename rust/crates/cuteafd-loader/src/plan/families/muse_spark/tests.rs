@@ -61,7 +61,8 @@ fn detects_the_checkpoint_and_classifies_every_text_tensor() {
 
 #[test]
 fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
-    let dir = snapshot(&all_layers());
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(6), ..Default::default() }).unwrap();
     assert_eq!(report.family.as_deref(), Some("muse_spark"));
@@ -71,7 +72,7 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
         assert_eq!(component.rejected, 0, "{:?}: {:?}", component.component, component.rejections);
     }
     assert_eq!(report.vision, MediaMode::Auto, "vision auto is not family-disabled");
-    assert_eq!(report.audio, MediaMode::Off, "text fixture declares no audio tower");
+    assert_eq!(report.audio, MediaMode::Auto, "bundled PCM audio is not family-disabled");
     assert!(!report.hints.iter().any(|h| h.what.contains("EXL3 publication")), "{:?}", report.hints);
     let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
     // 62 x 256 x 3 projections of 4096 x 4096 at 4 bits, plus vectors, norms and markers.
@@ -89,6 +90,37 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
     let o = model.get_weight("model.language_model.layers.0.self_attn.o_proj").unwrap();
     assert_eq!(o.split, crate::families::muse_spark::core::CoreSplit::Input, "o_proj splits its input on TP2");
     assert!(experts.spark_worlds.contains(&4) && experts.spark_worlds.contains(&6));
+}
+
+#[test]
+fn bundled_media_inventory_is_header_exact_and_never_hides_declared_errors() {
+    use crate::placement::families::muse_spark::MediaOptions;
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &[0]);
+    let open = || Checkpoint::coordinator(dir.path(), false, false).unwrap();
+    let inventory = MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 2).unwrap();
+    assert_eq!(inventory.vision_bytes.0 + inventory.vision_bytes.1, 4_864_551_264);
+    assert_eq!(inventory.audio_bytes, (235_680_768, 10_905_600));
+    assert_eq!(inventory.replicas, 2);
+    let path = dir.path().join("config.json");
+    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (tower, field, invalid) in [("vision_config", "patch_size", serde_json::json!(16)),
+        ("audio_config", "conv_kernel_size", serde_json::json!(9))] {
+        let mut config = original.clone();
+        config[tower][field] = invalid;
+        std::fs::write(&path, config.to_string()).unwrap();
+        assert!(MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 1).is_err(), "{tower}");
+        let disabled = MediaOptions::from_checkpoint(&open(), MediaMode::Off, MediaMode::Off, 1).unwrap();
+        assert_eq!((disabled.vision_bytes, disabled.audio_bytes), ((0, 0), (0, 0)));
+    }
+    let mut config = original;
+    config.as_object_mut().unwrap().remove("vision_config");
+    config.as_object_mut().unwrap().remove("audio_config");
+    std::fs::write(&path, config.to_string()).unwrap();
+    let missing = MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 1).unwrap();
+    assert_eq!((missing.vision_bytes, missing.audio_bytes), ((0, 0), (0, 0)));
+    assert!(MediaOptions::from_checkpoint(&open(), MediaMode::Rtx(None), MediaMode::Off, 1).is_err());
+    assert!(MediaOptions::from_checkpoint(&open(), MediaMode::Off, MediaMode::Spark(None), 1).is_err());
 }
 
 #[test]

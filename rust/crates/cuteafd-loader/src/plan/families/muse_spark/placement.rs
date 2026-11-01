@@ -80,7 +80,8 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 loaded_bytes: 0 } }).collect(),
         spark_ranks: ranks, prefill, slots, context, automatic_context: opts.context_tokens == 0,
         requested_pool: opts.pool_tokens.filter(|n| *n > 0), onboard: opts.onboard.unwrap_or(Onboard::Auto),
-        spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES),
+        spark_budget_bytes: opts.spark_allocation_budget_bytes.unwrap_or(crate::plan::DEFAULT_SPARK_BUDGET_BYTES)
+            .min(opts.spark_bytes),
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows,
         partial_wide_format: opts.muse_partial_wide_format,
         local: match crate::placement::families::muse_spark::local_workspace(catalog,

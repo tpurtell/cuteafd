@@ -1117,18 +1117,28 @@ pub fn muse_spark_tensors(expert_layers: &[usize]) -> (Vec<Tensor>, Vec<(String,
 /// Routed experts are written for `expert_layers` only; the index still names
 /// every layer's experts so the inventory is complete.
 pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
-    write_muse_snapshot(dir, expert_layers, false);
+    write_muse_snapshot(dir, expert_layers, false, false);
 }
 
 pub fn write_muse_vision_snapshot(dir: &Path, expert_layers: &[usize]) {
-    write_muse_snapshot(dir, expert_layers, true);
+    write_muse_snapshot(dir, expert_layers, true, false);
 }
 
-fn write_muse_snapshot(dir: &Path, expert_layers: &[usize], vision: bool) {
+pub fn write_muse_media_snapshot(dir: &Path, expert_layers: &[usize]) {
+    write_muse_snapshot(dir, expert_layers, true, true);
+}
+
+fn write_muse_snapshot(dir: &Path, expert_layers: &[usize], vision: bool, audio: bool) {
     let (mut tensors, mut projections) = muse_spark_tensors(expert_layers);
+    tensors.retain(|tensor| !crate::media::muse_vision::is_tensor(&tensor.0)
+        && !tensor.0.starts_with("model.audio_tower."));
     if vision {
-        tensors.retain(|tensor| !crate::media::muse_vision::is_tensor(&tensor.0));
         tensors.extend(crate::media::muse_vision::tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape)));
+    }
+    if audio {
+        tensors.retain(|tensor| !tensor.0.starts_with("model.audio_tower."));
+        tensors.extend(crate::media::pcm_audio::tensor_shapes().into_iter()
+            .map(|(name, shape)| t(format!("model.audio_tower.{name}"), "BF16", &shape)));
     }
     let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
     for tensor in tensors {
@@ -1155,7 +1165,15 @@ fn write_muse_snapshot(dir: &Path, expert_layers: &[usize], vision: bool) {
     }
     // Text/admission fixtures carry classification sentinels, not bundled towers.
     let mut config = muse_spark_config();
-    config.as_object_mut().unwrap().remove("audio_config");
+    if audio {
+        config["audio_config"] = json!({"model_type":"muse_spark_audio",
+            "hidden_sizes":crate::media::pcm_audio::WIDTHS, "patch_sizes":crate::media::pcm_audio::PATCHES,
+            "depths":[2,2,2,2], "num_hidden_layers":4, "conv_kernel_size":7,
+            "mlp_ratio":4, "rms_norm_eps":1e-6, "hidden_act":"gelu", "out_hidden_size":8192});
+        config["audio_token_id"] = json!(200038);
+        fs::write(dir.join("processor_config.json"), json!({"feature_extractor":{"sampling_rate":24000,
+            "samples_per_token":1920, "feature_size":1, "padding_value":0, "padding_side":"right"}}).to_string()).unwrap();
+    } else { config.as_object_mut().unwrap().remove("audio_config"); }
     if vision {
         config["out_hidden_size"] = json!(6144);
         config["projector_hidden_size"] = json!(4096);

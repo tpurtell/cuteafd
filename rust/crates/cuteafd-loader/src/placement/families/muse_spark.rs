@@ -140,8 +140,8 @@ pub struct MediaAdmission {
 }
 
 impl MuseRequest {
-    /// Resolve towers against mandatory text/pool demands, then charge them before
-    /// the final pool/onboarding solve. Planned and measured callers use this verbatim.
+    /// Resolve towers against the shared pool-first placement, then charge them
+    /// before the final solve. Planned and measured callers use this verbatim.
     pub fn admit_media(&mut self, options: &MediaOptions) -> Result<()> {
         use crate::plan::{encoder::*, MediaMode};
         use cuteafd_core::memory_layout::Item;
@@ -156,9 +156,6 @@ impl MuseRequest {
             return Ok(());
         }
         let mut probe = self.request.clone();
-        if probe.onboard == Onboard::Auto {
-            probe.onboard = Onboard::Layers(probe.minimum_expert_layers);
-        }
         if probe.pool.requested.is_none() { probe.pool.ceiling = probe.pool.target; }
         let placed = solve(&probe).context("Muse mandatory target before media admission")?;
         let mut hardware = EncoderHardware { v41: false,

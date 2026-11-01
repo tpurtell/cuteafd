@@ -1668,7 +1668,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     push(Category::Tables, "mapped-tables/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
         && report.vision != super::MediaMode::Off)
-        || (family == "mimo_v2" && report.audio != super::MediaMode::Off);
+        || (family == "mimo_v2" && report.audio != super::MediaMode::Off)
+        || (family == "muse_spark" && [&report.encoder, &report.audio_encoder].into_iter()
+            .any(|encoder| encoder.as_ref().is_some_and(|encoder| encoder.admitted_bytes() > 0)));
     if media_cache_loaded {
         let media = options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20));
         push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);

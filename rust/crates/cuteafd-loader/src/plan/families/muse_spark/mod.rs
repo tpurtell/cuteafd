@@ -210,15 +210,7 @@ impl Family for MuseSpark {
             else { return None; };
         Some(TensorRole::layer(component, layer))
     }
-    fn component_hint(&self, component: Component) -> Option<Hint> {
-        match component {
-            Component::Vision => Some(Hint {
-                what: "Muse Spark bundled vision/audio execution is not implemented".into(),
-                how: "Serve text with media off; add the bundled MuseSparkVision/Audio towers and vision_adapter/projection later".into(),
-            }),
-            _ => None,
-        }
-    }
+    fn component_hint(&self, _component: Component) -> Option<Hint> { None }
     fn component_hint_for(&self, _spec: &ModelSpec, component: Component, formats: &[String]) -> Option<Hint> {
         // An EXL3 publication's routed component also carries the BF16 post-expert norm.
         if component == Component::RoutedExpert && !formats.iter().any(|f| f.starts_with("exl3")) {
@@ -248,6 +240,17 @@ impl FamilyModel for Model {
         (layer < self.cfg.layers).then_some(FfnActivation::SiluBf16Product { limit: None })
     }
     fn accepts(&self, role: &TensorRole, stem: &str, operand: &mut QuantOperand) -> Result<(), String> {
+        if matches!(role.component, Component::Vision | Component::Audio) {
+            let shapes = if role.component == Component::Vision {
+                crate::media::muse_vision::tensor_shapes()
+            } else { crate::media::pcm_audio::tensor_shapes().into_iter()
+                .map(|(name, shape)| (format!("model.audio_tower.{name}"), shape)).collect() };
+            let shape = shapes.iter().find(|(name, _)| name.strip_suffix(".weight").unwrap_or(name) == stem)
+                .map(|(_, shape)| shape).ok_or_else(|| format!("{stem}: outside bundled Muse tower contract"))?;
+            return super::require(operand.is_plain(&[format::Encoding::Bf16]) && operand.logical == *shape
+                && operand.input_scale.is_none() && operand.companions.iter().all(|name| name == "bias"), ||
+                format!("{stem}: bundled Muse tower needs plain BF16 {shape:?}, found {}", super::describe(operand)));
+        }
         if let Some(projection) = self.core.projections.get(stem) {
             super::require(matches!(operand.encoding, format::Encoding::Exl3 { bits: 6 })
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
