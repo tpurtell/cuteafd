@@ -59,7 +59,7 @@ impl TowerSpec {
                 gate_up:field("mlp.fc1.weight", &[8960,1536])?, gate_up_bias:field("mlp.fc1.bias", &[8960])?,
                 down:field("mlp.fc2.weight", &[1536,8960])?, down_bias:field("mlp.fc2.bias", &[1536])?,
                 norm1:field("norm1.weight", &[1536])?, norm2:field("norm2.weight", &[1536])?,
-                key0_bias:NO_VISION_OFFSET, window:*kind, column_order:0 };
+                key0_bias:NO_VISION_OFFSET, window:*kind as i32, column_order:0 };
             native.norm1_bias[i] = field("norm1.bias", &[1536])?;
             native.norm2_bias[i] = field("norm2.bias", &[1536])?;
             native.q_norm[i] = NO_VISION_OFFSET;
