@@ -247,6 +247,17 @@ impl std::fmt::Display for NativeFailure {
     }
 }
 impl std::error::Error for NativeFailure {}
+impl NativeFailure {
+    /// Preserve request faults while leaving tokenizer loading and internal span bugs as 500s.
+    pub fn from_admission_error(error: anyhow::Error) -> Self {
+        if let Some(failure) = error.downcast_ref::<Self>() { return failure.clone(); }
+        if error.downcast_ref::<cuteafd_loader::PromptEncodingError>().is_some() {
+            Self::BadRequest(format!("{error:#}"))
+        } else {
+            Self::Worker(format!("{error:#}"))
+        }
+    }
+}
 impl From<String> for NativeFailure {
     fn from(message: String) -> Self { Self::Worker(message) }
 }
