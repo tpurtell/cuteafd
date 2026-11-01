@@ -18,7 +18,13 @@ from .recipe import TARGET_REPO
 HOSTS=('ostrich','dodo','emu','kiwi','rhea','moa')
 
 def nest(*args,timeout=3600):
-    return json.loads(subprocess.check_output(['nest',*map(str,args),'--json'],text=True,timeout=timeout))
+    output=subprocess.check_output(['nest',*map(str,args),'--json'],text=True,timeout=timeout)
+    # The importer emits this status notice on stdout even in JSON mode.
+    # Accept only its known notice; malformed or extra JSON still fails.
+    lines=output.splitlines()
+    if args[:2]==('hf','import') and lines and lines[0].strip()==f'{TARGET_REPO}: mirrored':
+        output='\n'.join(lines[1:])
+    return json.loads(output)
 
 def successful(result):
     job=result.get('job')
@@ -26,6 +32,17 @@ def successful(result):
         raise ValueError('Sparknest job did not finish successfully')
     if any(not h.get('finished') or h.get('failed') or h.get('cancelled') or h.get('done_files')!=h.get('total_files') or (h.get('total_bytes',0)>0 and h.get('done_bytes')!=h['total_bytes']) for h in job.get('hosts',{}).values()):
         raise ValueError('Sparknest host job failed')
+
+def verified_import(result,expected_files):
+    successful(result)
+    stat=result.get('import')
+    if (not isinstance(stat,dict) or not stat.get('finished') or stat.get('errors')
+            or stat.get('cancelled') or stat.get('copied_bytes')!=0):
+        raise ValueError('Sparknest zero-copy import not verified')
+    counts=(stat.get('files'),stat.get('skipped',0))
+    if any(type(n) is not int or n<0 for n in counts) or sum(counts)!=expected_files:
+        raise ValueError('Sparknest import file count differs')
+    return stat
 
 def safe_remove(path,parent):
     path,parent=Path(path),Path(parent)
@@ -83,10 +100,7 @@ def main():
             else:subprocess.run(['cp','--reflink=always','--preserve=timestamps','--',str(local/name),str(target)],check=True,timeout=120)
         refs=stage/'refs';refs.mkdir(exist_ok=True);(refs/'main').write_text(revision)
         result=nest('hf','import',stage,'--offline','--no-copy','--wait',timeout=3600)
-        successful(result)
-        stat=result.get('import')
-        if not stat or not stat.get('finished') or stat.get('errors') or stat.get('copied_bytes')!=0 or stat.get('files')!=len(files):
-            raise ValueError('Sparknest zero-copy import not verified')
+        verified_import(result,len(files))
         verify_files(managed,files)
         atomic_json(imported,dict(status='passed',revision=revision,files=files,copied_bytes=0,result=result))
     # Copy onto the fabric before retiring any off-grid managed copies.

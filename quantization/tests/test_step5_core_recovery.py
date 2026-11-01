@@ -101,6 +101,35 @@ def test_completed_no_copy_import_can_have_unknown_initial_byte_total():
             'finished':True,'done_files':2,'total_files':2,'done_bytes':90,'total_bytes':100}}}})
 
 
+def test_import_json_allows_only_the_exact_mirror_notice(monkeypatch):
+    result={'import':{'finished':True,'files':0,'skipped':205,'copied_bytes':0}}
+    output='  '+handoff.TARGET_REPO+': mirrored\n'+json.dumps(result)
+    monkeypatch.setattr(handoff.subprocess,'check_output',lambda *a,**k:output)
+    assert handoff.nest('hf','import','/owned/stage')==result
+    with pytest.raises(json.JSONDecodeError):handoff.nest('plan','--place','hf:other/model')
+    output='  other/model: mirrored\n'+json.dumps(result)
+    with pytest.raises(json.JSONDecodeError):handoff.nest('hf','import','/owned/stage')
+    output='  '+handoff.TARGET_REPO+': mirrored\n'+json.dumps(result)+'\n{}'
+    with pytest.raises(json.JSONDecodeError):handoff.nest('hf','import','/owned/stage')
+
+
+@pytest.mark.parametrize('files,skipped',[(205,0),(0,205),(100,105)])
+def test_zero_copy_import_accepts_new_or_idempotently_skipped_files(files,skipped):
+    result={'job':{'finished':True,'pending':0,'hosts':{'maxq':{
+        'finished':True,'done_files':205,'total_files':205,'done_bytes':315800970142,'total_bytes':0}}},
+        'import':{'finished':True,'files':files,'skipped':skipped,'copied_bytes':0,'errors':[]}}
+    assert handoff.verified_import(result,205)==result['import']
+
+
+@pytest.mark.parametrize('damage',[{'files':0,'skipped':204},{'files':205,'skipped':1},
+    {'copied_bytes':1},{'cancelled':True},{'errors':['failed']},{'files':-1,'skipped':206},
+    {'files':True,'skipped':204}])
+def test_zero_copy_import_rejects_incomplete_copied_or_failed_replays(damage):
+    result={'job':{'finished':True},'import':dict(finished=True,files=0,skipped=205,copied_bytes=0,errors=[])}
+    result['import'].update(damage)
+    with pytest.raises(ValueError):handoff.verified_import(result,205)
+
+
 def test_mtp_recovers_verified_seed_and_latest_stage_after_two_crash_barriers(monkeypatch,tmp_path):
     """Real safetensors receipts/frontiers survive both MTP retirement barriers."""
     class H:
