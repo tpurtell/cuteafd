@@ -1442,6 +1442,7 @@ pub(crate) fn v41_set_effort_budget(prompt: String, budget: u8) -> String {
     format!("{}{budget}{}", &prompt[..start], &prompt[start + digits..])
 }
 
+#[cfg(test)] mod cancel_storm_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
