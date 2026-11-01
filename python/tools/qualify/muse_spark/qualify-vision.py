@@ -151,15 +151,25 @@ def official_modules(snapshot, tensors, device):
     return tower, adapter, projection
 
 
-def reference_precision(modules, dtype):
-    """Reuse checkpoint weights; keep the official RoPE frequency buffer FP32."""
+def reference_precision(modules, dtype, official_rope):
+    """Upcast the FP32 arm, but restore untouched official BF16 RoPE buffers."""
+    import torch
     for module in modules:
         module.to(dtype=dtype)
     tower = modules[0]
-    inv, _ = tower.rotary_emb.compute_axial_rope_parameters(
-        tower.config, device=next(tower.parameters()).device)
-    tower.rotary_emb.inv_freq = inv
-    tower.rotary_emb.original_inv_freq = inv.clone()
+    if dtype == torch.float32:
+        inv, _ = tower.rotary_emb.compute_axial_rope_parameters(
+            tower.config, device=next(tower.parameters()).device)
+        tower.rotary_emb.inv_freq = inv
+        tower.rotary_emb.original_inv_freq = inv.clone()
+    else:
+        tower.rotary_emb.inv_freq, tower.rotary_emb.original_inv_freq = official_rope
+
+
+def rope_dtypes(modules):
+    rotary = modules[0].rotary_emb
+    return {name: str(getattr(rotary, name).dtype)
+        for name in ("inv_freq", "original_inv_freq")}
 
 
 def stage_metrics(actual, bf16, fp32):
@@ -236,6 +246,8 @@ def run(args):
     tensors = read_visual(args.snapshot)
     spec, blob = pack_spec(cfg, tensors)
     modules = official_modules(args.snapshot, tensors, "cuda")
+    official_rope = (modules[0].rotary_emb.inv_freq, modules[0].rotary_emb.original_inv_freq)
+    bf16_rope_dtypes = rope_dtypes(modules)
     del tensors
     lib = C.CDLL(str(args.library))
     lib.cuteafd_vision_required.argtypes = [C.POINTER(Spec), C.POINTER(Ledger)]
@@ -254,6 +266,7 @@ def run(args):
     check(lib.cuteafd_vision_create(C.byref(spec), 0, required.weights + required.scratch + required.blas_workspace, C.byref(owner)))
     result = dict(device=torch.cuda.get_device_name(0), ledger=required.as_dict(), images={},
         precision=dict(fp32_weights="checkpoint BF16 upcast", tf32=False,
+            official_bf16_rope=bf16_rope_dtypes, official_fp32_rope=None,
             allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction),
         library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest())
     try:
@@ -325,11 +338,15 @@ def run(args):
             repeat = bool(np.array_equal(saved, output))
             fp32_refs, yardstick = {}, {}
             if args.fp32_yardstick:
-                reference_precision(modules, torch.float32)
+                reference_precision(modules, torch.float32, official_rope)
+                result["precision"]["official_fp32_rope"] = rope_dtypes(modules)
                 fp32_refs = reference_stages(modules, rgb)
                 yardstick = {key: stage_metrics(stages[key], refs[key], fp32_refs[key])
                     for key in comparisons}
-                reference_precision(modules, torch.bfloat16)
+                reference_precision(modules, torch.bfloat16, official_rope)
+                if any(getattr(modules[0].rotary_emb, name) is not original
+                    for name, original in zip(("inv_freq", "original_inv_freq"), official_rope)):
+                    raise AssertionError("official BF16 RoPE buffers were not restored unchanged")
             result["images"][str(path)] = dict(grid=[gh, gw], tokens=tokens, encode_ms=elapsed,
                 stages=comparisons, metadata_exact=metadata, block_replay=replay,
                 fp32_yardstick=yardstick,
