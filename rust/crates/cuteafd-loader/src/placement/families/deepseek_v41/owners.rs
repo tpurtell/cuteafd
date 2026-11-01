@@ -246,7 +246,7 @@ impl<'a> NativePrograms<'a> {
     pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
         head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256 && matches!(ranks, 1 | 2)
-            && (1..=4).contains(&slots) && (1..=16).contains(&concurrency) && (!window_batch || ranks == 1),
+            && (1..=4).contains(&slots) && (1..=32).contains(&concurrency) && (!window_batch || ranks == 1),
             "invalid V4.1 prefill slot geometry");
         let (r, u) = (reserve, unit);
         let mut out = Vec::new();
@@ -599,6 +599,10 @@ mod tests {
             let one = programs.prefill_slots(256, 64, ranks, 2, 1, Fp8Head::Off, ranks == 1)?;
             assert_eq!(owner(&one, 0, "prefill slots encoder suffix"), (64 + 128) * (40960 + 16));
             assert!(programs.prefill_slots(256, 64, ranks, 2, 0, Fp8Head::Off, ranks == 1).is_err());
+            assert!(programs.prefill_slots(256, 64, ranks, 2, 32, Fp8Head::Off, ranks == 1).is_ok(),
+                "32 concurrent prefill slots are a supported ceiling (e7f681401 capped it at 16)");
+            assert!(programs.prefill_slots(256, 64, ranks, 2, 33, Fp8Head::Off, ranks == 1).is_err(),
+                "33 slots must remain refused (hardware/wave bound)");
             assert!(target.iter().all(|d| d.category == Category::Workspace));
             assert!(!target.iter().any(|d| d.group.starts_with("lane 2")), "decode lanes only");
             // Engram planes live with the gates (layers 1 and 14, GPU0 on two RTX).
