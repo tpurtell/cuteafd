@@ -149,24 +149,26 @@ fn single_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
         wave_bytes: crate::placement::families::qwen4::SPARK_WORKSPACE_BYTES, basis };
     let endpoints = spark_endpoints("qwen4", 1);
     let mut sparks = spark_devices(report, model, input, options, charges, &working, endpoints, &mut waste, &mut notes);
-    if report.encoder.is_none() {
-        let target = options.pool_tokens.filter(|&tokens| tokens != 0)
-            .unwrap_or(options.target_pool_tokens.max(shape.context_tokens));
-        let per_token = Qwen4Config::from_hf(&checkpoint.config).ok()
-            .and_then(|cfg| crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv).ok())
-            .map_or(0, |g| (g.ranks[0].persistent_unit_bytes + g.ranks[0].pool_metadata_unit_bytes)
-                .div_ceil(g.logical_unit_rows.max(1)));
-        resolve_encoder(report, &qwen_towers(report), &mut devices, &mut sparks, &[per_token * target], options, &mut notes);
-    }
-    let mut pool_tokens = 0;
-    match placement(input, report, options, &mut devices[0], shape.manifest.as_ref(),
-        PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency, context_tokens: shape.context_tokens, mtp }) {
-        Ok(tokens) => pool_tokens = tokens,
+    let target = options.pool_tokens.filter(|&tokens| tokens != 0)
+        .unwrap_or(options.target_pool_tokens.max(shape.context_tokens));
+    let per_token = Qwen4Config::from_hf(&checkpoint.config).ok()
+        .and_then(|cfg| crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv).ok())
+        .map_or(0, |g| (g.ranks[0].persistent_unit_bytes + g.ranks[0].pool_metadata_unit_bytes)
+            .div_ceil(g.logical_unit_rows.max(1)));
+    let towers = qwen_towers(report);
+    let result = admit_device_encoders(report, &towers, &mut devices, &mut sparks,
+        &[per_token * target], None, options, &mut notes, |trial, devices| {
+            placement(input, trial, options, &mut devices[0], shape.manifest.as_ref(),
+                PlanShape { prefill_rows: shape.prefill_rows, concurrency: shape.concurrency,
+                    context_tokens: shape.context_tokens, mtp })
+        });
+    let pool_tokens = match result {
+        Ok(tokens) => tokens,
         Err(error) => {
             report.placement_supported = false;
-            notes.push(format!("Qwen admission: {error}"));
+            notes.push(format!("Qwen admission: {error}")); 0
         }
-    }
+    };
     if pool_tokens < shape.context_tokens {
         notes.push(format!("full-context admission shortfall: context {} tokens, pool {pool_tokens} tokens, shortfall {} tokens",
             shape.context_tokens, shape.context_tokens - pool_tokens));
@@ -298,23 +300,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
         return MemoryLayout { devices, pool_tokens: 0, waste: Vec::new(), notes };
     }
     report.attention_placement = crate::placement::AttentionPlacement::Layers;
-    if report.encoder.is_none() {
-        let mut media = devices.clone();
-        let mut reserved = options.clone();
-        reserved.pool_tokens = Some(options.pool_tokens.filter(|&n| n > 0).unwrap_or_else(||
-            crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, 256, true).target));
-        match apply(input, &reserved, &mut media, rows, concurrency, context, mtp, manifest) {
-            Ok(_) => {
-                resolve_encoder(report, &qwen_towers(report), &mut media, &mut [], &[0; 2], options, &mut notes);
-                for (device, admitted) in devices.iter_mut().zip(media) {
-                    device.items.extend(admitted.items.into_iter().filter(|item|
-                        item.group.starts_with("vision") || item.group.starts_with("audio")));
-                }
-            }
-            Err(error) => { report.placement_supported = false; notes.push(format!("Qwen media admission: {error:#}")); }
-        }
-    }
-    let pool_tokens = match apply(input, options, &mut devices, rows, concurrency, context, mtp, manifest) {
+    let pool_tokens = match apply(input, report, options, &mut devices, &mut notes, rows, concurrency, context, mtp, manifest) {
         Ok(placement) => { report.solver_placement = Some(placement.clone()); notes.push(format!("placement: {}", placement.summary())); placement.pool_tokens },
         Err(error) => {
             report.placement_supported = false;
@@ -327,7 +313,7 @@ fn dual_layout(report: &mut PlanReport, _model: &dyn super::super::FamilyModel,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut [DeviceLayout],
+fn apply(input: &super::super::PlanInput, report: &mut PlanReport, options: &LayoutOptions, devices: &mut Vec<DeviceLayout>, notes: &mut Vec<String>,
     rows: u64, concurrency: u64, context: u64, mtp: bool, manifest: Option<&serde_json::Value>) -> Result<Placement> {
     let checkpoint = input.checkpoint();
     let cfg = Qwen4Config::from_hf(&checkpoint.config)?;
@@ -361,7 +347,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
-    let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
+    let mut inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
             manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
@@ -375,10 +361,26 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
         requested_pool: options.pool_tokens.filter(|&n| n > 0), spark_ranks: 0,
         onboard: options.onboard.unwrap_or(Onboard::Auto), startup_graph_modes: Some((concurrency.min(16) as usize, true)),
     };
-    let placement = qwen4::dual_placement(&inputs).context("solving Qwen owner ranges")?;
-    for (rank, device) in devices.iter_mut().enumerate() {
-        device.items.extend(placement.items[rank].iter().cloned());
-        device.kv_tokens = placement.pool_tokens;
-    }
-    Ok(placement)
+    let towers = qwen_towers(report);
+    let target = options.pool_tokens.filter(|&tokens| tokens > 0).unwrap_or_else(||
+        crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, 256, true).target);
+    let auto = report.vision == super::super::MediaMode::Auto;
+    let admitted = admit_device_encoders(report, &towers, devices, &mut Vec::new(), &[0; 2],
+        None, options, notes, |_trial, devices| {
+            for (rank, device) in devices.iter().enumerate() {
+                inputs.gpus[rank].baseline = Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() };
+            }
+            let placement = qwen4::dual_placement(&inputs).context("solving Qwen owner ranges")?;
+            if auto && devices.iter().any(|device|
+                device.items.iter().any(|item| item.group == "vision tower" && item.bytes > 0)) {
+                anyhow::ensure!(placement.pool_tokens >= target,
+                    "auto native tower would reduce the requested KV target {target} to {}", placement.pool_tokens);
+            }
+            for (rank, device) in devices.iter_mut().enumerate() {
+                device.items.extend(placement.items[rank].iter().cloned());
+                device.kv_tokens = placement.pool_tokens;
+            }
+            Ok(placement)
+        })?;
+    Ok(admitted)
 }

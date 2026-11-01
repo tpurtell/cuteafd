@@ -4395,7 +4395,7 @@ fn glm_flash_auto_sparks_reserves_tower_before_optional_experts() {
         layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30; 2], spark_bytes: 1 << 30,
             context_tokens: 262144, pool_tokens: Some(262144),
             glmf_drafter_disabled: true, glmf_prefill_expanded: false,
-            prefill_rows: 4096, state_slots: Some(8), prefix_slots: Some(8),
+            prefill_rows: 4096, prefill_waves: 2, state_slots: Some(8), prefix_slots: Some(8),
             glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
                 kda_fp8: false, fp8_head: false, output_shard: false }, graph_budget_bytes: Some(64 << 20),
             workspace_manifest: Some(manifest), host_memory: Some((128 << 30, 128 << 30)),

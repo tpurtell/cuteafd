@@ -209,9 +209,7 @@ pub fn admit_encoders<T>(requests: &[EncoderRequest], hardware: &EncoderHardware
         if request.mode == MediaMode::Auto {
             selected.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
                 replicas: Vec::new(), reason, shortfall: diagnostic.shortfall });
-            let result = visit(requests, hardware_base, index + 1, selected, solve);
-            if result.is_err() { selected.truncate(index); }
-            result
+            visit(requests, hardware_base, index + 1, selected, solve)
         } else { anyhow::bail!("{reason}") }
     }
     let mut selected = Vec::new();
