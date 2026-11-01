@@ -540,6 +540,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     pub token_io: crate::shared::token_io::TokenIoArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
@@ -612,7 +614,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             } else { scheduler::Drafts::None };
             scheduler::schedule(&backend, &engine_args.snapshot, &mut receive, &worker_stats, lanes,
                 drafts, eos, engine_args.decode_share, &engine_args.prefix,
-                engine_args.token_io.token_select, &mut text_media(), None, || {
+                engine_args.loop_abort.config(), engine_args.token_io.token_select, &mut text_media(), None, || {
                     if let Some(ready) = ready.take() {
                         let _ = ready.send(Ok(backend.geometry().max_context));
                     }

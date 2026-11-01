@@ -198,6 +198,7 @@ use cuteafd_api::openai::{
     PromptUsage,
 };
 use crate::shared::console;
+use crate::shared::loop_abort::{LoopAbort, LoopAbortConfig};
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -231,6 +232,10 @@ struct Active<'a, P: Placement, D> {
     /// Admission order, for traces.
     id: u64,
     ticket: console::Ticket,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: LoopAbort,
+    /// The last emitted token tripped the loop guard (suppresses turn retention).
+    looped: bool,
 }
 
 /// Commits a selected token to the request's grammar.
@@ -270,6 +275,7 @@ impl<P: Placement, D> Active<'_, P, D> {
         self.history.push(token);
         self.keyed_history.push(token);
         self.generated += 1;
+        self.looped = self.loop_abort.push(token);
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
         let stop = self.job.stop_token_ids.contains(&token)
@@ -282,7 +288,7 @@ impl<P: Placement, D> Active<'_, P, D> {
         }
         let finish = if stop {
             Some(InferenceFinishReason::Stop)
-        } else if self.generated >= self.job.max_tokens || self.placement.len() + 1 >= self.capacity {
+        } else if self.looped || self.generated >= self.job.max_tokens || self.placement.len() + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
@@ -726,7 +732,8 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs, select: SelectPlacement,
+    drafts: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: &PrefixArgs,
+    loop_abort: LoopAbortConfig, select: SelectPlacement,
     media: &mut MediaAdmission<Prompt, B::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>,
     initialized: impl FnOnce() -> Result<()>)
@@ -1096,6 +1103,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 };
                 let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_, B::Placement, B::Draft>> {
+                    let loop_abort = loop_abort.guard(p.job.finish_detail.clone(), p.id);
                     let mut request = Active {
                         keyed_history: p.keys.tokens().to_vec(),
                         history: p.tokens,
@@ -1104,6 +1112,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         outcomes: DraftHistory::default(), proposed: 0, accepted: 0, cycles: 0, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                         ticket: p.ticket,
+                        loop_abort,
+                        looped: false,
                     };
                     request.next = first;
                     if effective_neural(neural, &request.job.probe) {
@@ -1393,9 +1403,10 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                 Ok((token, done)) => {
                     last = Some((j + 1, token));
                     finished = done;
-                    if done && caching && !probe::cold(&request.job.probe) {
+                    if done && caching && !request.looped && !probe::cold(&request.job.probe) {
                         // A normal finish (the client took the last chunk): the row that
-                        // produced the last token follows the turn snapshot.
+                        // produced the last token follows the turn snapshot. A loop abort
+                        // must not retain the looping turn.
                         request.turn = logits.row_host(engine.library(), offset + j).ok();
                     }
                     if done || rows.get(j + 1) != Some(&token) {
@@ -1779,6 +1790,133 @@ mod request_neural_tests {
             drop(wave);
             assert_eq!(placements, [257; 3]);
             assert_eq!(states, if configured { [2, 0, 2] } else { [0; 3] });
+        }
+    }
+}
+
+#[cfg(test)]
+mod loop_abort_tests {
+    use super::*;
+
+    /// A reversible byte tokenizer (ids 0..=255), so `emit` can detokenise
+    /// synthetic id streams without a model snapshot.
+    fn byte_tokenizer() -> tempfile::TempDir {
+        let mut extra = 256u32;
+        let mut vocab = serde_json::Map::new();
+        for byte in 0..=255u32 {
+            let character = if (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174 {
+                char::from_u32(byte).unwrap()
+            } else {
+                let character = char::from_u32(extra).unwrap();
+                extra += 1;
+                character
+            };
+            vocab.insert(character.to_string(), serde_json::json!(byte));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let value = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+            "model":{"type":"WordLevel","vocab":vocab,"unk_token":"?"}});
+        std::fs::write(dir.path().join("tokenizer.json"), value.to_string()).unwrap();
+        dir
+    }
+
+    #[derive(Clone, Default)]
+    struct TestPlacement { len: usize }
+    impl Placement for TestPlacement {
+        fn len(&self) -> usize { self.len }
+        fn set_len(&mut self, len: usize) { self.len = len; }
+        fn units(&self) -> &[u32] { &[] }
+        fn slot(&self) -> i32 { 0 }
+        fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    }
+
+    #[derive(Default)]
+    struct TestDraft;
+    impl DraftState for TestDraft {
+        fn pending_rows(&self) -> usize { 0 }
+        fn close(&mut self, _token: u32) {}
+    }
+
+    fn active(dir: &tempfile::TempDir, max_tokens: usize, config: crate::shared::loop_abort::LoopAbortConfig)
+        -> (Active<'static, TestPlacement, TestDraft>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
+        let (events, receive) = mpsc::unbounded_channel();
+        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
+            media: Vec::new(), audio: Vec::new(), max_tokens, sampling: Default::default(),
+            stop_token_ids: Vec::new(), events, usage: None, probe: None };
+        let loop_abort = config.guard(job.finish_detail.clone(), 1);
+        let request = Active {
+            job,
+            history: Vec::new(), keyed_history: Vec::new(), constraint: None,
+            placement: TestPlacement::default(), draft: TestDraft, outcomes: DraftHistory::default(),
+            proposed: 0, accepted: 0, cycles: 0, turn: None, capacity: usize::MAX, next: 0,
+            decoder: cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap(),
+            generated: 0, buffered: 0, started: Instant::now(), id: 1,
+            ticket: console::Ticket::new(1, 0, None), loop_abort, looped: false,
+        };
+        (request, receive)
+    }
+
+    fn block() -> Vec<u32> { (2..202).collect() }
+
+    fn feed(request: &mut Active<'_, TestPlacement, TestDraft>,
+        receive: &mut mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>,
+        tokens: &[u32]) -> (Vec<InferenceChunk>, bool) {
+        let mut finished = false;
+        for &token in tokens {
+            finished = request.emit(token).unwrap();
+            if finished { break; }
+        }
+        let mut chunks = Vec::new();
+        while let Ok(Ok(chunk)) = receive.try_recv() { chunks.push(chunk); }
+        (chunks, finished)
+    }
+
+    fn shipped() -> crate::shared::loop_abort::LoopAbortConfig {
+        crate::shared::loop_abort::LoopAbortConfig::default()
+    }
+
+    fn disabled() -> crate::shared::loop_abort::LoopAbortConfig {
+        crate::shared::loop_abort::LoopAbortConfig { run: 0, copies: 8, fast_span: 0, fast_copies: 8 }
+    }
+
+    #[test]
+    fn loop_abort_finishes_with_length_and_sets_detail() {
+        let dir = byte_tokenizer();
+        let (mut request, mut receive) = active(&dir, 100_000, shipped());
+        let block = block();
+        let mut stream = Vec::new();
+        for _ in 0..9 { stream.extend_from_slice(&block); }
+        let (chunks, finished) = feed(&mut request, &mut receive, &stream);
+        assert!(finished, "the guard must finish the reply");
+        assert!(request.generated < block.len() * 9, "aborted before the ninth copy");
+        assert_eq!(request.job.finish_detail.name(), Some("repetition"));
+        assert!(request.looped, "the retention gate must see the loop");
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Length),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_abort_off_runs_to_max_tokens() {
+        let dir = byte_tokenizer();
+        let (mut request, mut receive) = active(&dir, 500, disabled());
+        let block = block();
+        let mut stream = Vec::new();
+        for _ in 0..9 { stream.extend_from_slice(&block); }
+        let (chunks, finished) = feed(&mut request, &mut receive, &stream);
+        assert!(finished);
+        assert_eq!(request.generated, 500, "a disabled guard runs to max_tokens");
+        assert_eq!(request.job.finish_detail.name(), None);
+        assert!(!request.looped);
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Length),
+            other => panic!("last chunk is not Finish: {other:?}"),
         }
     }
 }

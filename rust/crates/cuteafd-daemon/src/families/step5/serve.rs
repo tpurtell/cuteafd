@@ -62,6 +62,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)]
+    loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     token_io: TokenIoArgs,
     #[command(flatten)]
     api: crate::shared::api::ApiArgs,
@@ -404,7 +406,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
         let drafts = if args.mtp == 0 { scheduler::Drafts::None }
             else { scheduler::Drafts::Neural { depth: usize::from(args.mtp), fixed: false } };
         scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts,
-            eos, args.decode_share, &args.prefix, args.token_io.token_select, &mut text_media(), None,
+            eos, args.decode_share, &args.prefix, args.loop_abort.config(), args.token_io.token_select,
+            &mut text_media(), None,
             || initialized(backend.geometry().max_context))
     })
 }

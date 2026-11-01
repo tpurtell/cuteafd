@@ -15,6 +15,7 @@ use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
 use super::console;
 use crate::shared::draft::clock::RoundClock;
+use crate::shared::loop_abort::LoopAbort;
 
 #[cfg(test)]
 pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
@@ -31,10 +32,11 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
-        tokens: tokens.to_vec(), image_keys, next_after_commit: None };
+        tokens: tokens.to_vec(), image_keys, next_after_commit: None,
+        loop_abort: crate::shared::loop_abort::LoopAbortConfig::default().guard(Default::default(), id) };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
     let mut active = [Some(request), None];
@@ -80,6 +82,8 @@ pub(super) struct Active<'a> {
     tokens: Vec<u32>,
     image_keys: ImageKeys,
     next_after_commit: Option<RetainedScores>,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: LoopAbort,
 }
 impl Active<'_> {
     fn id(&self) -> u64 { self.ticket.id() }
@@ -96,6 +100,7 @@ impl Active<'_> {
         self.anchor = token;
         self.tokens.push(token);
         self.generated += 1;
+        let looped = self.loop_abort.push(token);
         self.buffered += 1;
         let mut chunks = [None, None, None];
         let mut count = 0;
@@ -106,7 +111,7 @@ impl Active<'_> {
                 self.buffered = 0;
             }
         }
-        if token == 1 || self.generated == self.job.max_tokens {
+        if token == 1 || self.generated == self.job.max_tokens || looped {
             if let Some(content) = self.decoder.finish()? {
                 push(InferenceChunk::Text { content, content_tokens: self.buffered });
                 self.buffered = 0;
@@ -119,8 +124,9 @@ impl Active<'_> {
                 else { InferenceFinishReason::Length } });
             self.finished = true;
             self.ticket.finishing();
-            // A cold benchmark probe leaves nothing behind.
-            self.cacheable = !crate::shared::probe::cold(&self.job.probe);
+            // A cold benchmark probe leaves nothing behind, and a loop abort must
+            // not retain the looping turn.
+            self.cacheable = !looped && !crate::shared::probe::cold(&self.job.probe);
         }
         Ok(chunks)
     }
@@ -421,7 +427,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
         let (events, receive) = mpsc::unbounded_channel();
         receivers.push(receive);
-        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
             prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
@@ -785,9 +791,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let mask = constraint.as_mut().map(|state| state.mask()).transpose()?.flatten();
                 // The first generated token is emitted-token index 0.
                 let anchor = scores.sample(mask, job.sampling, 0)?;
+                let loop_abort = args.loop_abort.config().guard(job.finish_detail.clone(), id);
                 Ok(Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
                     lease, job, decoder, anchor, generated: 0, buffered: 0,
                     finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
+                    loop_abort,
                     })
             })();
             member += 1;
@@ -1772,16 +1780,24 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(), 0,
             Some(&round), retain_enabled)?;
         let live = console::live();
-        let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
-        tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
-        for (&slot, tokens) in members.iter().zip(emissions) {
+        // A loop abort can cut a round's emission short: count only what was
+        // actually emitted, not the accepted-but-unemitted tail.
+        let before: Vec<usize> = members.iter()
+            .map(|&slot| active[slot].as_ref().map_or(0, |r| r.generated)).collect();
+        for (&slot, tokens) in members.iter().zip(&emissions) {
             let request = active[slot].as_mut().unwrap();
-            if let Err(error) = request.emit(&tokens) {
+            if let Err(error) = request.emit(tokens) {
                 request.failed = !request.job.events.is_closed();
                 let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;
             }
         }
+        let mut emissions = emissions;
+        for (tokens, (&slot, &before)) in emissions.iter_mut().zip(members.iter().zip(&before)) {
+            tokens.truncate(active[slot].as_ref().map_or(0, |r| r.generated).saturating_sub(before));
+        }
+        let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+        tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
         observe_lane_round(draft.as_deref_mut(), lane, false, pass.captured_routes(),
             &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
@@ -1813,16 +1829,24 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
             active, members, &inputs, &mut batch, &next, draft.as_deref_mut(),
             executed_us-prepared_us, None, retain_enabled)?;
         let live = console::live();
-        let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
-        tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
-        for (&slot, tokens) in members.iter().zip(emissions) {
+        // A loop abort can cut a round's emission short: count only what was
+        // actually emitted, not the accepted-but-unemitted tail.
+        let before: Vec<usize> = members.iter()
+            .map(|&slot| active[slot].as_ref().map_or(0, |r| r.generated)).collect();
+        for (&slot, tokens) in members.iter().zip(&emissions) {
             let request = active[slot].as_mut().unwrap();
-            if let Err(error) = request.emit(&tokens) {
+            if let Err(error) = request.emit(tokens) {
                 request.failed = !request.job.events.is_closed();
                 let _ = request.job.events.send(Err(format!("{error:#}").into()));
                 request.finished = true;
             }
         }
+        let mut emissions = emissions;
+        for (tokens, (&slot, &before)) in emissions.iter_mut().zip(members.iter().zip(&before)) {
+            tokens.truncate(active[slot].as_ref().map_or(0, |r| r.generated).saturating_sub(before));
+        }
+        let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+        tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref())));
         let layer_us = pass.captured_layer_us();
         observe_lane_round(draft.as_deref_mut(), lane, false, pass.captured_routes(),
             &layer_us, active, members, &inputs, &accepted_inputs, &copied, &clock);
@@ -3131,5 +3155,128 @@ mod sampling_tests {
         assert_eq!(row.output_row, 3);
         // The device never calls logf, so this must be the host f32::ln bits.
         assert_eq!(row.ln_min_p.to_bits(), 0.05f32.ln().to_bits());
+    }
+}
+
+#[cfg(test)]
+mod loop_abort_tests {
+    use super::*;
+
+    /// A reversible byte tokenizer (ids 0..=255), so `emit_one` can detokenise
+    /// synthetic id streams without a model snapshot.
+    fn byte_tokenizer() -> tempfile::TempDir {
+        let mut extra = 256u32;
+        let mut vocab = serde_json::Map::new();
+        for byte in 0..=255u32 {
+            let character = if (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174 {
+                char::from_u32(byte).unwrap()
+            } else {
+                let character = char::from_u32(extra).unwrap();
+                extra += 1;
+                character
+            };
+            vocab.insert(character.to_string(), serde_json::json!(byte));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let value = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+            "model":{"type":"WordLevel","vocab":vocab,"unk_token":"?"}});
+        std::fs::write(dir.path().join("tokenizer.json"), value.to_string()).unwrap();
+        dir
+    }
+
+    fn active(dir: &tempfile::TempDir, max_tokens: usize, config: crate::shared::loop_abort::LoopAbortConfig)
+        -> (Active<'static>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
+        let (events, receive) = mpsc::unbounded_channel();
+        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+            literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
+            media: Vec::new(), audio: Vec::new(), max_tokens, sampling: Default::default(),
+            stop_token_ids: Vec::new(), events, usage: None, probe: None };
+        let loop_abort = config.guard(job.finish_detail.clone(), 1);
+        let request = Active {
+            constraint: None,
+            ticket: console::Ticket::new(1, 0, None),
+            lease: CacheLease::unbound_for_test(0),
+            job,
+            decoder: cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap(),
+            anchor: 0, generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
+            tokens: Vec::new(), image_keys: super::super::prefix::media_keys(&[], &[]).unwrap(),
+            next_after_commit: None, loop_abort,
+        };
+        (request, receive)
+    }
+
+    /// A 200-id block with no internal repetition (ids 2..=201; 1 is EOS).
+    fn block() -> Vec<u32> { (2..202).collect() }
+
+    fn feed(request: &mut Active<'_>, tokens: &[u32]) -> Vec<InferenceChunk> {
+        let mut chunks = Vec::new();
+        for &token in tokens {
+            for chunk in request.emit_one(token).unwrap().into_iter().flatten() { chunks.push(chunk); }
+            if request.finished { break; }
+        }
+        chunks
+    }
+
+    fn shipped() -> crate::shared::loop_abort::LoopAbortConfig {
+        crate::shared::loop_abort::LoopAbortConfig::default()
+    }
+
+    fn disabled() -> crate::shared::loop_abort::LoopAbortConfig {
+        crate::shared::loop_abort::LoopAbortConfig { run: 0, copies: 8, fast_span: 0, fast_copies: 8 }
+    }
+
+    #[test]
+    fn loop_abort_finishes_with_length_and_sets_detail() {
+        let dir = byte_tokenizer();
+        let (mut request, _receive) = active(&dir, 100_000, shipped());
+        let block = block();
+        let mut stream = Vec::new();
+        for _ in 0..9 { stream.extend_from_slice(&block); }
+        let chunks = feed(&mut request, &stream);
+        assert!(request.finished, "the guard must finish the reply");
+        assert!(request.generated < block.len() * 9, "aborted before the ninth copy");
+        assert_eq!(request.job.finish_detail.name(), Some("repetition"));
+        assert!(!request.cacheable, "a loop abort must not retain the turn");
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Length),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_abort_off_runs_to_max_tokens() {
+        let dir = byte_tokenizer();
+        let (mut request, _receive) = active(&dir, 500, disabled());
+        let block = block();
+        let mut stream = Vec::new();
+        for _ in 0..9 { stream.extend_from_slice(&block); }
+        let chunks = feed(&mut request, &stream);
+        assert!(request.finished);
+        assert_eq!(request.generated, 500, "a disabled guard runs to max_tokens");
+        assert_eq!(request.job.finish_detail.name(), None);
+        assert!(request.cacheable, "a normal finish retains the turn");
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Length),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eos_before_abort_is_a_plain_stop() {
+        let dir = byte_tokenizer();
+        let (mut request, _receive) = active(&dir, 100_000, shipped());
+        let chunks = feed(&mut request, &[1]);
+        assert!(request.finished);
+        assert_eq!(request.generated, 1);
+        assert_eq!(request.job.finish_detail.name(), None);
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Stop),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
     }
 }

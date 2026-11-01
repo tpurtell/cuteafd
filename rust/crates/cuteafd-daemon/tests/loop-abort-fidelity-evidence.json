@@ -1,0 +1,101 @@
+{
+  "schema": "cuteafd.loop_abort.fidelity_evidence/1",
+  "generated": "2026-11-01",
+  "detector": {
+    "module": "rust/crates/cuteafd-daemon/src/shared/repeat_guard.rs",
+    "rule_r": {
+      "window": 32,
+      "run": 512,
+      "copies": 8,
+      "seen": 7
+    },
+    "rule_f": {
+      "window": 256,
+      "span": 384,
+      "copies": 8
+    },
+    "max_entries": 65536
+  },
+  "harness": {
+    "path": "rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py",
+    "sha256": "d1a3ef231560e3830b24b97402fd7cd64ccd320958f1dccc29a0a3eccb499449",
+    "note": "Faithful Python port of rules R and F; validated against the crate fixture by --fixture."
+  },
+  "fidelity": {
+    "repository": "wrldsuksgo2mars/cuteafd-fidelity",
+    "config": "deepseek_v41-v2_20261005",
+    "revision": "01a0948a62a478a0a9355dd5b57fe4a49bc6cca0",
+    "windows_sha256": "5580f716306b78201c3a5b029a5a7971bbb0ae9cbbbc8161653f040bbcdaf80b",
+    "published_configs": 1,
+    "note": "Only one config is published; 'all families' = every published config. Windows are capped at 1,024 generated tokens, so rule R can only fire on periods <= ~170 there and rule F (>= 385 identical tokens) cannot fire; the long-generation control below reaches both rules.",
+    "gen_rows": {
+      "transcripts": 53,
+      "tokens": 28820,
+      "fires": 0,
+      "rule_r_eligible": 27,
+      "rule_r_eligible_fires": 0,
+      "max_consecutive_seen": 0,
+      "max_shingle_copies": 2
+    },
+    "all_roles": {
+      "windows": 64,
+      "tokens": 344101,
+      "fires": 0,
+      "rule_r_eligible": 64,
+      "rule_r_eligible_fires": 0,
+      "max_consecutive_seen": 0,
+      "max_shingle_copies": 6
+    }
+  },
+  "long_generation_control": {
+    "corpus": "replica-d opencode assistant steps since 2026-10-22 22:00Z (providerID=llmgw, modelID in thinker,dsv41)",
+    "measured": "2026-11-01",
+    "messages": 38465,
+    "steps": 38350,
+    "reasons": {
+      "tool-calls": 36920,
+      "stop": 1380,
+      "length": 50
+    },
+    "capped_steps": 48,
+    "control_steps_ge_1800_chars": 11365,
+    "rule_r": {
+      "capped_fires": "47/48",
+      "control_fires": 0,
+      "fire_token_p50": 8928,
+      "fire_token_p90": 19861,
+      "fire_token_max": 30111,
+      "mean_saved_pct_of_32000": 68
+    },
+    "rule_r_plus_f": {
+      "capped_fires": "47/48",
+      "control_fires": 0,
+      "control_sample": 500,
+      "control_sample_note": "the 500 longest control steps (rule F is O(256)/token in the Python port)",
+      "fire_token_p50": 8928,
+      "fire_token_p90": 19861,
+      "fire_token_max": 30111,
+      "mean_saved_pct_of_32000": 69
+    },
+    "note": "The control corpus is long-generation real output: rule R fires on 47 of 48 capped loops and never on 11,365 good-output steps; the combined R+F detector also never fires on the 500 longest control steps. Rule F is exercised by the committed fixture (fast_loop) and the crate unit tests."
+  },
+  "fixture": {
+    "path": "rust/crates/cuteafd-daemon/src/shared/repeat_guard_fixture.json",
+    "streams": {
+      "looped": 12360,
+      "draft_then_write": 5000,
+      "fast_loop": 2220
+    },
+    "expected": {
+      "looped": "Repeat in (3127, 32000)",
+      "draft_then_write": "never fires",
+      "fast_loop": "Fast in (294, 32000)"
+    }
+  },
+  "reproduce": [
+    "python3 rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py --fixture rust/crates/cuteafd-daemon/src/shared/repeat_guard_fixture.json",
+    "python3 rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py --fidelity <dataset-dir>",
+    "python3 rust/crates/cuteafd-daemon/tests/loop-abort-fidelity-harness.py --fidelity <dataset-dir> --all-roles",
+    "python3 rust/crates/cuteafd-daemon/tests/loop-abort-corpus-replay.py"
+  ]
+}

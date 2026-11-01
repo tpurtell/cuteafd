@@ -280,6 +280,26 @@ impl PrefixCacheSource {
     }
 }
 
+/// Request-local finish detail, published with the terminal usage.
+///
+/// The engine sets `repetition` when the loop guard aborts a reply. The detail
+/// is additive: when unset, `usage.finish_detail` is absent, so every existing
+/// response stays byte-identical.
+#[derive(Clone, Debug, Default)]
+pub struct FinishDetail {
+    detail: Arc<std::sync::atomic::AtomicU8>,
+}
+impl FinishDetail {
+    /// Mark the reply as ended by the repetition guard.
+    pub fn set_repetition(&self) {
+        self.detail.store(1, std::sync::atomic::Ordering::Release);
+    }
+    /// The detail name, or `None` when no detail was set.
+    pub fn name(&self) -> Option<&'static str> {
+        match self.detail.load(std::sync::atomic::Ordering::Acquire) { 1 => Some("repetition"), _ => None }
+    }
+}
+
 pub struct NativeRequest {
     pub prompt: String,
     pub literal_spans: cuteafd_loader::LiteralSpans,
@@ -302,6 +322,8 @@ pub struct NativeRequest {
     pub probe: Option<Arc<probe::Probe>>,
     pub usage: Option<crate::usage::UsageHandle>,
     pub prefix_cache_source: PrefixCacheSource,
+    /// Set by the engine when the loop guard aborts the reply.
+    pub finish_detail: FinishDetail,
 }
 impl NativeRequest {
     /// The single encoding boundary for every family's rendered chat requests.
@@ -682,6 +704,8 @@ pub(crate) struct Built {
     /// Client stop strings (the parser ends on them; the gateway reports which).
     pub(crate) stop_sequences: Vec<String>,
     tap: Arc<Mutex<Tap>>,
+    /// The request-local finish detail, shared with the engine.
+    finish_detail: FinishDetail,
 }
 
 impl Built {
@@ -883,6 +907,8 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let stop_sequences = converted.parsing_options.stop_sequences.clone();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let tap = Arc::new(Mutex::new(Tap::default()));
+    // Created here so the engine and the response renderer share one handle.
+    let finish_detail = FinishDetail::default();
     let generator = Tapped { inner: ChatCompletionRequest::chunk_generator(&converted, id.clone(), model.clone())
         .with_include_usage(!streaming || include_usage), tap: tap.clone() };
     let expanded_media_probe = probe.as_ref().is_some_and(|p| !p.spec.media.is_empty() || !p.spec.audio.is_empty());
@@ -990,7 +1016,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let (prompt, literal_spans) = shield.finish(prompt, matches!(profile.encoding, ModelEncoding::DeepseekV41));
     Ok(Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, validator,
         work: MediaWork { images: image_sources, media: media_sources, audio: audio_sources },
-        probe, streaming, include_usage, id, model, stop_sequences, tap })
+        probe, streaming, include_usage, id, model, stop_sequences, tap, finish_detail })
 }
 
 /// Prepared media for one request (decoded on blocking threads).
@@ -1073,6 +1099,7 @@ pub(crate) struct Running {
     pub(crate) image_tokens: usize,
     pub(crate) audio_tokens: usize,
     prefix_cache_source: PrefixCacheSource,
+    finish_detail: FinishDetail,
     /// The prompt usage and matched client stop string, observed as the
     /// generator sees them.
     pub(crate) tap: Arc<Mutex<Tap>>,
@@ -1115,7 +1142,7 @@ impl Submitter {
     pub(crate) async fn submit(&self, profile: &ModelProfile, built: Built, usage: Option<crate::usage::UsageHandle>,
         chat_accounting: bool) -> Result<Running, Rejection> {
         let Built { prompt, literal_spans, constraint, max_tokens, sampling, stop_token_ids, processor, mut validator, work, probe,
-            streaming, include_usage, id, model, tap, .. } = built;
+            streaming, include_usage, id, model, tap, finish_detail, .. } = built;
         let queue_started = std::time::Instant::now();
         let permit = match self.admission.reserve(self.queue.clone()).await {
             Ok(permit) => permit,
@@ -1133,6 +1160,7 @@ impl Submitter {
         let prefix_cache_source = PrefixCacheSource::default();
         let job = NativeRequest {
             prefix_cache_source: prefix_cache_source.clone(),
+            finish_detail: finish_detail.clone(),
             audio: prepared.audio,
             media: prepared.media,
             prompt,
@@ -1203,7 +1231,7 @@ impl Submitter {
                 }
             }
         };
-        Ok(Running { prefix_cache_source, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
+        Ok(Running { prefix_cache_source, finish_detail, chunks: Box::pin(chunks), failure, image_tokens, audio_tokens, tap, streaming, include_usage, id, model })
     }
 }
 
@@ -1266,7 +1294,7 @@ async fn chat(State(state): State<NativeState>, headers: axum::http::HeaderMap,
 
 /// Render an accepted request as Chat Completions SSE or JSON.
 async fn respond(running: Running) -> Response {
-    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, streaming, include_usage, id, model, .. } = running;
+    let Running { chunks, failure, image_tokens, audio_tokens, prefix_cache_source, finish_detail, streaming, include_usage, id, model, .. } = running;
     if streaming {
         let stream = async_stream::stream! {
             let mut chunks = chunks;
@@ -1289,6 +1317,7 @@ async fn respond(running: Running) -> Response {
                         let mut value = serde_json::to_value(&chunk).unwrap();
                         add_media_usage(&mut value, image_tokens, audio_tokens);
                         add_prefix_source(&mut value, &prefix_cache_source);
+                        add_finish_detail(&mut value, &finish_detail);
                         if include_usage {
                             let taken = value.get_mut("usage").map(Value::take);
                             if let Some(usage) = taken.filter(Value::is_object) {
@@ -1308,7 +1337,8 @@ async fn respond(running: Running) -> Response {
             }
             let failed = failure.lock().unwrap().clone();
             if let Some(message) = failed { yield Ok(sse_error(message)); return; }
-            if let Some(usage) = usage_chunk {
+            if let Some(mut usage) = usage_chunk {
+                add_finish_detail(&mut usage, &finish_detail);
                 yield Ok(format!("data: {}\n\n", serde_json::to_string(&usage).unwrap()));
             }
             yield Ok("data: [DONE]\n\n".to_owned());
@@ -1344,6 +1374,7 @@ async fn respond(running: Running) -> Response {
     let mut value = serde_json::to_value(response).expect("chat response serializes");
     add_media_usage(&mut value, image_tokens, audio_tokens);
     add_prefix_source(&mut value, &prefix_cache_source);
+    add_finish_detail(&mut value, &finish_detail);
     Json(value).into_response()
 }
 
@@ -1395,6 +1426,38 @@ fn prefix_source_is_request_local_and_additive_in_usage() {
         add_prefix_source(&mut delta, &source);
         assert!(delta.get("usage").is_none(), "stream deltas must not gain usage");
     }
+}
+
+/// Add `usage.finish_detail` only when the engine set one, so a normal finish
+/// keeps every existing golden byte-identical.
+fn add_finish_detail(response: &mut Value, detail: &FinishDetail) {
+    let Some(name) = detail.name() else { return };
+    if let Some(usage) = response.get_mut("usage").and_then(Value::as_object_mut) {
+        usage.insert("finish_detail".into(), json!(name));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn finish_detail_is_additive_in_usage_and_absent_by_default() {
+    let detail = FinishDetail::default();
+    let other = FinishDetail::default();
+    // Unset: no key at all, so every existing golden stays byte-identical.
+    let mut value = json!({"usage": {"prompt_tokens": 12}, "choices": []});
+    add_finish_detail(&mut value, &detail);
+    assert!(value["usage"].get("finish_detail").is_none());
+    assert_eq!(value["usage"]["prompt_tokens"], 12);
+    // Set: additive, and request-local.
+    detail.set_repetition();
+    add_finish_detail(&mut value, &detail);
+    assert_eq!(value["usage"]["finish_detail"], "repetition");
+    assert_eq!(value["usage"]["prompt_tokens"], 12);
+    assert_eq!(detail.name(), Some("repetition"));
+    assert_eq!(other.name(), None);
+    // A stream delta without usage never gains one.
+    let mut delta = json!({"choices": []});
+    add_finish_detail(&mut delta, &detail);
+    assert!(delta.get("usage").is_none(), "stream deltas must not gain usage");
 }
 
 fn add_media_usage(response: &mut Value, image_tokens: usize, audio_tokens: usize) {

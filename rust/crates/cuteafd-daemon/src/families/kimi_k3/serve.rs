@@ -46,6 +46,7 @@ pub(crate) struct ServeArgs {
     pub prefill_packing: crate::shared::prefill_packing::PackingMode,
     #[command(flatten)] pub prefix: PrefixArgs,
     #[command(flatten)] pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
+    #[command(flatten)] pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)] pub token_io: crate::shared::token_io::TokenIoArgs,
     #[command(flatten)] pub api: crate::shared::api::ApiArgs,
 }
@@ -147,7 +148,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
                         fixed: worker_args.draft_fixed.is_some() },
                     None => scheduler::Drafts::None,
                 }, eos, worker_args.decode_share, &worker_args.prefix,
-                worker_args.token_io.token_select, &mut super::super::qwen3_5::serve::text_media(), None, || {
+                worker_args.loop_abort.config(), worker_args.token_io.token_select,
+                &mut super::super::qwen3_5::serve::text_media(), None, || {
                     loaded.engine.require_live()?;
                     crate::shared::inventory::RuntimeInventory::measure(&library,
                         &[worker_args.device, worker_args.split_device],

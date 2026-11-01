@@ -56,6 +56,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
@@ -96,7 +98,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let packing = args.prefill_packing.unwrap_or_default();
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, decode_share, prefix, packing));
+        serve_loop(engine_args, args.loop_abort.config(), receive, ready_tx, worker_stats, max_context,
+            decode_share, prefix, packing));
     let max_context = ready_rx.await.context("engine failed before it was ready")??;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
@@ -160,6 +163,7 @@ struct StepShape {
 #[allow(clippy::too_many_arguments)]
 fn serve_loop(
     args: EngineArgs,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig,
     mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<usize>>,
     stats: Arc<Mutex<serde_json::Value>>,
@@ -199,7 +203,7 @@ fn serve_loop(
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,
             engine.decode_rows)?;
         schedule(engine, &loaded, &tokenizer, eos, &mut receive, transports, runtime, &stats,
-            decode_share, &prefix, host_config, &mut selector, shared, || {
+            decode_share, &prefix, loop_abort, host_config, &mut selector, shared, || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(engine.max_context));
                 }
@@ -261,6 +265,10 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: crate::shared::loop_abort::LoopAbort,
+    /// The last emitted token tripped the loop guard (suppresses turn retention).
+    looped: bool,
 }
 
 impl Active<'_> {
@@ -273,6 +281,7 @@ impl Active<'_> {
         probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
+        self.looped = self.loop_abort.push(token);
         self.buffered += 1;
         // A grammar that accepted its stop token has ended the request.
         let stop = token == eos || self.constraint.as_ref().is_some_and(|state| state.terminated());
@@ -284,7 +293,7 @@ impl Active<'_> {
         }
         let finish = if stop {
             Some(InferenceFinishReason::Stop)
-        } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
+        } else if self.looped || self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
@@ -343,7 +352,7 @@ fn finish_row_status(request: &mut Active<'_>, token: Result<u32>, eos: u32, log
     match token.and_then(|token| request.emit(token, eos)) {
         Ok(false) => (false, false),
         Ok(true) => {
-            if caching && !probe::cold(&request.job.probe) {
+            if caching && !request.looped && !probe::cold(&request.job.probe) {
                 request.turn = logits.row_host(library, row).ok();
             }
             (true, false)
@@ -694,6 +703,7 @@ fn schedule(
     stats: &Mutex<serde_json::Value>,
     decode_share: DecodeShareArgs,
     prefix: &PrefixArgs,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig,
     host_config: Option<cuteafd_hostcache::config::Config>,
     selector: &mut TokenSelector<'_>,
     mut shared: Option<SharedPolicy>,
@@ -966,10 +976,13 @@ fn schedule(
                         continue;
                     }
                 };
+                let loop_abort = loop_abort.guard(p.job.finish_detail.clone(), p.ticket.id());
                 let mut request = Active {
                     decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
                     next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
                     ticket: p.ticket, drafts: DraftHistory::default(),
+                    loop_abort,
+                    looped: false,
                 };
                 let emitted = request.emit(first, eos);
                 request.ticket.first(first);
@@ -1008,7 +1021,7 @@ fn schedule(
             tracing::info!(tokens = request.generated, seconds, tok_s = request.generated as f64 / seconds,
                 draft_calls = request.draft_calls,
                 active = active.len(), "request complete");
-            if let Some(row) = &request.turn {
+            if let Some(row) = request.turn.as_ref().filter(|_| !request.looped) {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.history[..request.placement.len];
                 cache.capture_session(request.ticket.session());

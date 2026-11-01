@@ -58,6 +58,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
@@ -110,7 +112,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let remote = super::media::RemoteVision::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix, vision, media_cache_bytes, remote));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix,
+            vision, media_cache_bytes, remote, args.loop_abort.config()));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     if let Some((preparer, health)) = media {
@@ -166,7 +169,8 @@ type VisionReady = Option<(Arc<cuteafd_api::openai::media::MediaPreparer>, Optio
 fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     draft: Drafts, eos: Vec<u32>, decode_share: DecodeShareArgs, prefix: PrefixArgs,
-    vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
+    vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     args.planner_graph_modes = Some((max_sequences.min(DECODE_ROWS), !matches!(draft, Drafts::None)));
     let opened = match open(&args) {
         Ok(opened) => opened,
@@ -215,7 +219,7 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
             probe::graph_capture_stats(&mut stats);
         }
         scheduler::schedule(&Qwen4Backend { engine, opened: &opened }, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, eos,
-            decode_share, &prefix, args.token_io.token_select, &mut media, preparer.as_deref(), || {
+            decode_share, &prefix, loop_abort, args.token_io.token_select, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, preparer.clone().map(|p| (p, health.clone())))));
                 }

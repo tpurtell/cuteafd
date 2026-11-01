@@ -271,15 +271,16 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 let (accepted, emitted, emissions, accepted_inputs) = publish_commit_lane(&mut active.borrow_mut(),
                     &members, &mut batch, decision)?;
                 let live = console::live();
-                let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
-                { let active = active.borrow();
-                    tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref()))); }
+                // A loop abort can cut a round's emission short: count only what
+                // was actually emitted, not the accepted-but-unemitted tail.
+                let before: Vec<usize> = { let active = active.borrow();
+                    members.iter().map(|&slot| active[slot].as_ref().map_or(0, |r| r.generated)).collect() };
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id,
                     "independent verifier committed");
-                for (&slot, tokens) in members.iter().zip(emissions) {
+                for (&slot, tokens) in members.iter().zip(&emissions) {
                     let sender = active.borrow()[slot].as_ref().unwrap().job.events.clone();
                     let delivered: Result<()> = async {
-                        for token in tokens {
+                        for &token in tokens {
                             let (chunks, finished) = {
                                 let mut active = active.borrow_mut();
                                 let request = active[slot].as_mut().unwrap();
@@ -300,6 +301,15 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                         let _ = sender.send(Err(format!("{error:#}").into()));
                     }
                 }
+                let mut emissions = emissions;
+                { let active = active.borrow();
+                    for (tokens, (&slot, &before)) in emissions.iter_mut().zip(members.iter().zip(&before)) {
+                        tokens.truncate(active[slot].as_ref().map_or(0, |r| r.generated).saturating_sub(before));
+                    }
+                }
+                let tally = console::Tally::new(proposal, &inputs, &accepted_inputs, &emissions, live);
+                { let active = active.borrow();
+                    tally.usage(members.iter().map(|&slot| active[slot].as_ref().and_then(|r| r.job.usage.as_ref()))); }
                 let layer_us = pass.captured_layer_us();
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), lane, shared,
                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,

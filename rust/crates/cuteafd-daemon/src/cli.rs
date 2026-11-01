@@ -729,6 +729,37 @@ mod tests {
         assert_eq!(args.mapped_scale_preload_gib, 0.0);
     }
 
+    /// LD-01: the loop-abort run defaults to 512 (ON by default on Jonathan's
+    /// direction; the upstream-sync divergence is recorded in the slice RESULT).
+    #[test]
+    fn loop_abort_run_defaults_to_512() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.loop_abort.loop_abort_run, 512);
+        assert_eq!(args.loop_abort.loop_abort_copies, 8);
+        assert_eq!(args.loop_abort.loop_fast_span, 384);
+        assert_eq!(args.loop_abort.loop_fast_copies, 8);
+    }
+
+    /// LD-01: `--loop-abort-run 0` is the kill switch; the range is 0..=65536.
+    #[test]
+    fn loop_abort_run_zero_is_the_kill_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0"].iter())).unwrap().command else {
+            panic!("expected native serving") };
+        assert_eq!(args.loop_abort.loop_abort_run, 0);
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "65537"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-copies", "1"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-fast-copies", "65"].iter())).is_err());
+    }
+
     #[test]
     fn engram_warm_is_an_opt_in_native_serve_switch() {
         use clap::Parser;
@@ -1173,6 +1204,9 @@ pub(crate) struct NativeServeArgs {
     /// Default and maximum generated tokens, further bounded by remaining context.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_OUTPUT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=393216))]
     pub max_output_tokens: u32,
+
+    #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]

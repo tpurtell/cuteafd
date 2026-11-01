@@ -81,6 +81,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
@@ -175,7 +177,8 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let remote_audio = super::media::RemoteAudio::from_args(&args)?;
     let media_cache_bytes = args.media_cache_bytes;
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio, media_cache_bytes, remote, remote_audio));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio,
+            media_cache_bytes, remote, remote_audio, args.loop_abort.config()));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     if let Some((preparer, audio_preparer, health, audio_health)) = media {
@@ -244,7 +247,8 @@ type VisionReady = Option<(Option<Arc<cuteafd_api::openai::media::MediaPreparer>
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>) -> Result<()> {
+    draft: Policy, prefix: PrefixArgs, vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>, remote_audio: Option<super::media::RemoteAudio>,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -283,7 +287,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
         schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
-            args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
+            loop_abort, args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
                 }
@@ -356,6 +360,10 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: crate::shared::loop_abort::LoopAbort,
+    /// The last emitted token tripped the loop guard (suppresses turn retention).
+    looped: bool,
 }
 
 /// Commits a selected token to the request's grammar.
@@ -395,6 +403,7 @@ impl Active<'_> {
         self.history.push(token);
         self.keyed_history.push(token);
         self.generated += 1;
+        self.looped = self.loop_abort.push(token);
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
         let stop = self.job.stop_token_ids.contains(&token)
@@ -407,7 +416,7 @@ impl Active<'_> {
         }
         let finish = if stop {
             Some(InferenceFinishReason::Stop)
-        } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
+        } else if self.looped || self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
@@ -482,7 +491,8 @@ fn release(family: &MimoPrefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, select: SelectPlacement,
+    policy: Policy, prefix: &PrefixArgs,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig, select: SelectPlacement,
     host_config: Option<cuteafd_hostcache::config::Config>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
@@ -490,13 +500,15 @@ fn schedule(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let (family, cache) = prefix_cache_with(engine, prefix, max_sequences, |_| Ok(host_config))?;
     owners.prefix(family, cache);
     owners.selector(TokenSelector::new(engine.library, select, engine.cfg.vocab_size, DECODE_ROWS)?);
-    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, &mut owners, media, preparer, ready)
+    schedule_inner(engine, opened, snapshot, receive, stats, max_sequences, policy, prefix, loop_abort,
+        &mut owners, media, preparer, ready)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path::Path,
     receive: &mut mpsc::Receiver<NativeRequest>, stats: &Mutex<serde_json::Value>, max_sequences: usize,
-    policy: Policy, prefix: &PrefixArgs, owners: &mut super::serving_owners::ServingOwners<'_, '_>,
+    policy: Policy, prefix: &PrefixArgs, loop_abort: crate::shared::loop_abort::LoopAbortConfig,
+    owners: &mut super::serving_owners::ServingOwners<'_, '_>,
     media: &mut MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, ready: impl FnOnce()) -> Result<()> {
     let drafter = engine.drafter.as_ref();
@@ -844,6 +856,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 let job_events = p.job.events.clone();
                 let draft_from = if prefix.mimo_prefix_draft && engine.drafter.is_some() { family.draft_from(p.placement.ring) } else { resume };
                 let admitted = (|| -> Result<Active<'_>> {
+                    let loop_abort = loop_abort.guard(p.job.finish_detail.clone(), p.ticket.id());
                     let mut request = Active {
                         slot,
                         drafts: DraftHistory::default(),
@@ -855,6 +868,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
+                        loop_abort,
+                        looped: false,
                     };
                     request.next = match p.first {
                         Some(token) => token,
@@ -947,7 +962,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 experts_s = phases[1], cycles, dflash, dflash_ok, copy, copy_ok, draft_calls, late_graphs = engine.late_captures(),
                 "request complete");
             (lane.steps, lane.verify_s, lane.draft_s, lane.emit_s) = (0, 0.0, 0.0, 0.0);
-            if let Some(row) = request.turn.as_ref().filter(|_| !probe::cold(&request.job.probe)) {
+            if let Some(row) = request.turn.as_ref().filter(|_| !request.looped && !probe::cold(&request.job.probe)) {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.keyed_history[..request.placement.len];
                 cache.capture_session(request.ticket.session());
@@ -1239,7 +1254,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
                 Ok((token, done)) => {
                     last = Some(token);
                     finished = done;
-                    if done && cache.enabled() && !probe::cold(&request.job.probe) {
+                    if done && cache.enabled() && !request.looped && !probe::cold(&request.job.probe) {
                         // A normal finish (the client took the last chunk): the row that
                         // produced the last token follows the turn snapshot.
                         request.turn = logits.row_host(engine.library, offset + j).ok();

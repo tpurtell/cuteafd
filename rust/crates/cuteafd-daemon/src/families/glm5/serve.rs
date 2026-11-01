@@ -69,6 +69,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
+    pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
+    #[command(flatten)]
     pub console: console::ConsoleArgs,
     #[command(flatten)]
     pub api: crate::shared::api::ApiArgs,
@@ -108,7 +110,8 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let prefix = args.prefix.clone();
     let hub = console::hub(args.console.console_text, || Ok(console_layout(&args, &profile.id)));
     let worker = tokio::task::spawn_blocking(move ||
-        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
+        serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix,
+            args.loop_abort.config()));
     let max_context = ready_rx.await.context("engine failed before it was ready")??;
     let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
     cuteafd_bench::context::phase("engine loaded");
@@ -163,7 +166,7 @@ struct Policy {
 
 fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest>,
     ready: tokio::sync::oneshot::Sender<Result<usize>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
-    policy: Policy, prefix: PrefixArgs) -> Result<()> {
+    policy: Policy, prefix: PrefixArgs, loop_abort: crate::shared::loop_abort::LoopAbortConfig) -> Result<()> {
     let opened = match open(&args) {
         Ok(opened) => opened,
         Err(error) => {
@@ -178,7 +181,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
         schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
-            ranks, &prefix, args.token_io.token_select, || {
+            ranks, &prefix, loop_abort, args.token_io.token_select, || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(engine.max_context));
                 }
@@ -248,6 +251,10 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
+    /// Loop abort: the per-request guard, built at admission from the live knobs.
+    loop_abort: crate::shared::loop_abort::LoopAbort,
+    /// The last emitted token tripped the loop guard (suppresses turn retention).
+    looped: bool,
 }
 
 /// Fixed diagnostic counts still share one verifier budget, anchors included.
@@ -306,6 +313,7 @@ impl Active<'_> {
         crate::shared::probe::token(&self.job.probe, token);
         self.history.push(token);
         self.generated += 1;
+        self.looped = self.loop_abort.push(token);
         self.buffered += 1;
         // A grammar that accepted one of its stop tokens has ended the request.
         let stop = self.job.stop_token_ids.contains(&token)
@@ -318,7 +326,7 @@ impl Active<'_> {
         }
         let finish = if stop {
             Some(InferenceFinishReason::Stop)
-        } else if self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
+        } else if self.looped || self.generated >= self.job.max_tokens || self.placement.len + 1 >= self.capacity {
             Some(InferenceFinishReason::Length)
         } else {
             None
@@ -523,7 +531,8 @@ fn draft_homes(layers: impl IntoIterator<Item = (bool, bool, usize)>,
 #[allow(clippy::too_many_arguments)]
 fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receiver<NativeRequest>,
     mut transport: Option<&mut SparkLink<'_>>, runtime: &tokio::runtime::Runtime, stats: &Mutex<serde_json::Value>,
-    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs, select: SelectPlacement,
+    max_sequences: usize, policy: Policy, ranks: usize, prefix: &PrefixArgs,
+    loop_abort: crate::shared::loop_abort::LoopAbortConfig, select: SelectPlacement,
     ready: impl FnOnce()) -> Result<()> {
     let (family, mut cache) = prefix_cache(engine, prefix, max_sequences)?;
     let markers = crate::shared::prefix::marker_ids(&opened.snapshot,
@@ -796,6 +805,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 };
                 let job_events = p.job.events.clone();
                 let admitted = (|| -> Result<Active<'_>> {
+                    let loop_abort = loop_abort.guard(p.job.finish_detail.clone(), p.id);
                     let mut request = Active {
                         id: p.id,
                         prompt_tokens: p.tokens.len(),
@@ -807,6 +817,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
                         capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
+                        loop_abort,
+                        looped: false,
                     };
                     request.next = match (p.first, &logits) {
                         (Some(first), _) => first,
@@ -879,7 +891,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 plan_ms = per_step(host[1]), embed_ms = per_step(host[2]), verify_ms = per_step(host[3]),
                 select_ms = per_step(host[4]), update_ms = per_step(host[5]),
                 "host step phases since the last completed request (ms per step)");
-            if let Some(row) = &request.turn {
+            if let Some(row) = request.turn.as_ref().filter(|_| !request.looped) {
                 // The conversation so far: every committed row (the last token is not in it).
                 let rows = &request.history[..request.placement.len];
                 cache.capture_session(request.ticket.session());
@@ -1076,7 +1088,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
                     if done {
                         // A normal finish (the client took the last chunk): the row that
                         // produced the last token follows the turn snapshot.
-                        if retain_turn && !probe::cold(&request.job.probe) {
+                        if retain_turn && !request.looped && !probe::cold(&request.job.probe) {
                             request.turn = logits.row_host(&opened.library, offset + j)
                                 .inspect_err(|error| tracing::warn!("turn logits: {error:#}")).ok();
                         }
