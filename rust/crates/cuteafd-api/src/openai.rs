@@ -1120,8 +1120,10 @@ impl Submitter {
         let permit = match self.admission.reserve(self.queue.clone()).await {
             Ok(permit) => permit,
             Err(admission::Rejected::Closed) => return Err(Rejection::new(StatusCode::SERVICE_UNAVAILABLE, "worker queue is closed")),
-            Err(admission::Rejected::Overloaded) =>
-                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue is full or its wait budget expired").retry()),
+            Err(admission::Rejected::Full) =>
+                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue is full").retry()),
+            Err(admission::Rejected::Timeout) =>
+                return Err(Rejection::new(StatusCode::TOO_MANY_REQUESTS, "request queue wait budget expired").retry()),
         };
         if let Some(scope) = &usage { scope.queued(queue_started.elapsed().as_secs_f64() * 1000.); }
         let prepared = prepare_media(profile, &self.images, work, probe.as_ref()).await?;
@@ -1462,6 +1464,8 @@ pub(crate) fn v41_set_effort_budget(prompt: String, budget: u8) -> String {
     format!("{}{budget}{}", &prompt[..start], &prompt[start + digits..])
 }
 
+#[cfg(test)]
+mod cancel_storm_tests;
 #[cfg(test)]
 mod tests {
     use super::*;

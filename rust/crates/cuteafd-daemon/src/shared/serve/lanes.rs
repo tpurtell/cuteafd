@@ -13,6 +13,35 @@
 use anyhow::Result;
 use std::cell::Cell;
 use std::future::Future;
+use std::time::{Duration, Instant};
+
+/// How long a lane commit may wait for its device copies before the round fails.
+pub(crate) const COMMIT_DEADLINE: Duration = Duration::from_secs(120);
+/// How long a lane may wait for a queued prefix retain before giving up.
+pub(crate) const RETAIN_DEADLINE: Duration = Duration::from_secs(30);
+/// Polls before a bounded wait starts sleeping instead of yielding.
+const WAIT_SPINS: u32 = 64;
+/// One sleep of a bounded wait past [`WAIT_SPINS`].
+const WAIT_SLEEP: Duration = Duration::from_micros(200);
+
+/// Poll `ready` until it reports true, bounded by `deadline`. A device copy or
+/// commit that never completes must not spin the lane at 100% CPU forever
+/// (W64 F3 cancel storm): after a short spin, sleep; after `deadline`, give up
+/// so the caller can abort the copy and release its owners.
+pub(crate) async fn wait_ready(mut ready: impl FnMut() -> Result<bool>, deadline: Duration) -> Result<bool> {
+    let started = Instant::now();
+    let mut spins = 0u32;
+    loop {
+        if ready()? { return Ok(true); }
+        if started.elapsed() >= deadline { return Ok(false); }
+        if spins < WAIT_SPINS {
+            spins += 1;
+            tokio::task::yield_now().await;
+        } else {
+            tokio::time::sleep(WAIT_SLEEP).await;
+        }
+    }
+}
 
 /// The stop flag the lanes of one [`LaneSet::join`] share.
 #[derive(Default)]
@@ -138,7 +167,8 @@ pub(crate) trait LaneCommit {
 pub(crate) async fn commit(commit: &mut impl LaneCommit) -> Result<()> {
     let result = async {
         commit.begin()?;
-        while !commit.ready()? { tokio::task::yield_now().await; }
+        anyhow::ensure!(wait_ready(|| commit.ready(), COMMIT_DEADLINE).await?,
+            "lane commit did not drain within {COMMIT_DEADLINE:?}");
         commit.publish()
     }.await;
     if let Err(error) = result {
@@ -156,7 +186,7 @@ mod tests {
     use std::cell::RefCell;
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(future)
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(future)
     }
 
     async fn peer(lease: LaneLease<'_>, rounds: &Cell<usize>, finished: &Cell<bool>) -> Result<()> {
@@ -300,5 +330,38 @@ mod tests {
         let mut late = Fake { fail_publish: true, ..Fake::default() };
         assert_eq!(block_on(commit(&mut late)).unwrap_err().to_string(), "publish failed");
         assert_eq!(late.log, ["begin", "publish", "abort"]);
+    }
+
+    /// W64 F3: a device copy that never completes must not spin the lane at
+    /// 100% CPU forever. The bounded wait gives up after its deadline.
+    #[test]
+    fn a_wait_that_never_becomes_ready_gives_up_instead_of_spinning() {
+        let started = Instant::now();
+        let ready = block_on(wait_ready(|| Ok(false), Duration::from_millis(20))).unwrap();
+        assert!(!ready);
+        assert!(started.elapsed() < Duration::from_secs(2), "the wait must not spin past its deadline");
+    }
+    #[test]
+    fn a_wait_that_becomes_ready_returns_true() {
+        let mut polls = 0;
+        let ready = block_on(wait_ready(|| { polls += 1; Ok(polls >= 3) }, Duration::from_secs(1))).unwrap();
+        assert!(ready && polls == 3);
+    }
+    #[test]
+    fn a_wait_propagates_a_poll_error() {
+        let error = block_on(wait_ready(|| -> Result<bool> { anyhow::bail!("poll failed") },
+            Duration::from_secs(1))).unwrap_err();
+        assert_eq!(error.to_string(), "poll failed");
+    }
+    /// The commit and the cancel/retire path both use the bounded wait, so a
+    /// stuck device copy cannot hold a lane forever.
+    #[test]
+    fn lane_waits_are_bounded() {
+        let source = include_str!("lanes.rs");
+        assert!(source.contains("wait_ready(|| commit.ready(), COMMIT_DEADLINE)"));
+        let independent = include_str!("../../families/deepseek_v41/v41_native_serve/scheduler/independent.rs");
+        assert!(independent.contains("lanes::wait_ready("));
+        assert!(independent.contains("lanes::RETAIN_DEADLINE"));
+        assert!(!independent.contains("loop {\n                    let ready = prefixes.borrow_mut().poll_retain"));
     }
 }

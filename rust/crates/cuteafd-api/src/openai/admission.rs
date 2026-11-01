@@ -15,7 +15,14 @@ pub(super) struct Admission {
     waiters_peak: Arc<AtomicU64>,
 }
 #[derive(Debug, PartialEq)]
-pub(super) enum Rejected { Overloaded, Closed }
+pub(super) enum Rejected {
+    /// The bounded waiter set is full: no slot to wait in.
+    Full,
+    /// A waiter slot was held but the queue did not drain within the budget.
+    Timeout,
+    /// The worker queue is closed (the engine stopped).
+    Closed,
+}
 impl Admission {
     pub fn new(depth: usize, wait: Duration) -> Self {
         Self { waiters: Arc::new(Semaphore::new(depth)), depth, wait,
@@ -40,7 +47,7 @@ impl Admission {
         let _waiter = self.waiters.try_acquire().map_err(|_| {
             self.rejects.fetch_add(1, Ordering::Relaxed);
             self.rejects_full.fetch_add(1, Ordering::Relaxed);
-            Rejected::Overloaded
+            Rejected::Full
         })?;
         let held = self.depth.saturating_sub(self.waiters.available_permits());
         self.waiters_peak.fetch_max(held as u64, Ordering::Relaxed);
@@ -54,7 +61,7 @@ impl Admission {
             Err(_) => {
                 self.rejects.fetch_add(1, Ordering::Relaxed);
                 self.rejects_timeout.fetch_add(1, Ordering::Relaxed);
-                Err(Rejected::Overloaded)
+                Err(Rejected::Timeout)
             }
         }
     }
@@ -67,7 +74,7 @@ mod tests {
     async fn full_queue_waits_for_worker_and_timeout_rejects() {
         let (tx, mut rx) = mpsc::channel(1); tx.send(1).await.unwrap();
         let admission = Admission::new(1, Duration::from_millis(20));
-        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Overloaded)));
+        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Timeout)));
         let pending = tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}});
         tokio::task::yield_now().await;
         assert!(!pending.is_finished());
@@ -81,7 +88,7 @@ mod tests {
         let admission = Admission::new(1, Duration::from_secs(60));
         let pending = tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}});
         tokio::task::yield_now().await;
-        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Overloaded)));
+        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Full)));
         pending.abort(); let _ = pending.await;
         assert_eq!(admission.waiters.available_permits(), 1);
     }
@@ -99,7 +106,7 @@ mod tests {
         let admission = Admission::new(1, Duration::from_secs(60));
         let pending = tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}});
         tokio::task::yield_now().await;
-        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Overloaded)));
+        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Full)));
         let m = admission.metrics();
         assert_eq!(m["http_queue_rejects_full"], 1);
         assert_eq!(m["http_queue_rejects_timeout"], 0);
@@ -110,7 +117,7 @@ mod tests {
     async fn expired_wait_counts_as_timeout() {
         let (tx, _rx) = mpsc::channel(1); tx.send(1).await.unwrap();
         let admission = Admission::new(1, Duration::from_millis(20));
-        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Overloaded)));
+        assert!(matches!(admission.reserve(tx.clone()).await, Err(Rejected::Timeout)));
         let m = admission.metrics();
         assert_eq!(m["http_queue_rejects_timeout"], 1);
         assert_eq!(m["http_queue_rejects_full"], 0);
