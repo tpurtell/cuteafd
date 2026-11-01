@@ -1287,7 +1287,16 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
                     .ok_or_else(|| anyhow::anyhow!("media Spark reservation overflow"))?;
                 anyhow::ensure!(spark_encoder_headroom(device, opts.spark_allocation_budget_bytes) >= required,
                     "Spark {rank} native {name} tower + scratch + 1 GiB exceeds physical/allocation budget");
-                device.items.extend(encoder_items(name, encoder));
+                let items = encoder_items(name, encoder);
+                // Preserve the public MiMo ledger's historical display order;
+                // admission above always uses the complete solved inventory.
+                if trial.family.as_deref() == Some("mimo_v2") {
+                    let index = device.items.iter().position(|item| item.group == "Spark runtime residual")
+                        .unwrap_or(device.items.len());
+                    device.items.splice(index..index, items);
+                } else {
+                    device.items.extend(items);
+                }
             }
         }
         Ok((trial, opts, memory))
@@ -1321,6 +1330,7 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
             return Err(error);
         }
     };
+    let mut media_notes = Vec::new();
     for (name, encoder) in ["vision", "audio"].into_iter().zip(&selected) {
         if name == "audio" && original.audio == MediaMode::Off { continue; }
         if encoder.kind == EncoderKind::Off {
@@ -1333,9 +1343,13 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
             }
             if name == "audio" { accepted.audio = MediaMode::Off; }
         }
-        memory.notes.push(format!("{name} {:?}: {}; {} bytes admitted; shortfall {} bytes",
+        media_notes.push(format!("{name} {:?}: {}; {} bytes admitted; shortfall {} bytes",
             encoder.kind, encoder.reason, encoder.admitted_bytes(), encoder.shortfall));
     }
+    let note_index = if accepted.family.as_deref() == Some("mimo_v2") {
+        memory.notes.iter().position(|note| note.starts_with("placement:")).unwrap_or(memory.notes.len())
+    } else { memory.notes.len() };
+    memory.notes.splice(note_index..note_index, media_notes);
     accepted.native_serving_admitted = model.native_serving_admission();
     *report = accepted;
     *options = resolved;
@@ -1357,6 +1371,19 @@ pub(crate) fn admit_device_encoders<T>(report: &mut PlanReport, towers: &Towers,
             host: format!("spark{}", device.index), idle: false,
             expert_bytes: device.items.iter().filter(|item| item.category == Category::Experts).map(|item| item.bytes).sum(),
             free_bytes: spark_encoder_headroom(device, options.spark_allocation_budget_bytes) }).collect() };
+    let resolve_refusal = |report: &mut PlanReport, rtx: &mut Vec<DeviceLayout>,
+        sparks: &mut Vec<DeviceLayout>, notes: &mut Vec<String>| {
+        if let Some(budget) = budget_rtx {
+            let mut inventory = budget.to_vec();
+            resolve_encoder(report, towers, &mut inventory, sparks, kv, options, notes);
+            for (device, admitted) in rtx.iter_mut().zip(inventory) {
+                device.items.extend(admitted.items.into_iter().filter(|item|
+                    item.group.starts_with("vision") || item.group.starts_with("audio")));
+            }
+        } else {
+            resolve_encoder(report, towers, rtx, sparks, kv, options, notes);
+        }
+    };
     let mut requests = Vec::new();
     for (mode, inventory, copies) in [(report.vision, &towers.vision, options.vision_replicas),
         (report.audio, &towers.audio, 1)] {
@@ -1364,14 +1391,14 @@ pub(crate) fn admit_device_encoders<T>(report: &mut PlanReport, towers: &Towers,
             _ if mode == MediaMode::Off => (0, 0),
             Ok(bytes) => *bytes,
             Err(_) => {
-                resolve_encoder(report, towers, rtx, sparks, kv, options, notes);
+                resolve_refusal(report, rtx, sparks, notes);
                 return solve(report, rtx);
             }
         };
         // Retain the shipped explicit refusal (including its exact shortfall).
         if matches!(mode, MediaMode::Rtx(_) | MediaMode::Spark(_))
             && encoder_placement(mode, &hardware, weights, scratch, copies).kind == EncoderKind::Off {
-            resolve_encoder(report, towers, rtx, sparks, kv, options, notes);
+            resolve_refusal(report, rtx, sparks, notes);
             return solve(report, rtx);
         }
         requests.push(EncoderRequest { mode, weights, scratch, copies });

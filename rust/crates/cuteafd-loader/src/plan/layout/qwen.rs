@@ -365,8 +365,31 @@ fn apply(input: &super::super::PlanInput, report: &mut PlanReport, options: &Lay
     let target = options.pool_tokens.filter(|&tokens| tokens > 0).unwrap_or_else(||
         crate::placement::PoolPolicy::resolve(&options.rtx_bytes, context, None, 256, true).target);
     let auto = report.vision == super::super::MediaMode::Auto;
+    // Dual's mandatory owner partition and startup graphs are themselves a
+    // fixed point. Retain its shipped strict-target inventory preview, not an
+    // approximation from the as-yet unpartitioned runtime-only devices.
+    let budget = if report.encoder.is_none() {
+        let requested = inputs.requested_pool;
+        inputs.requested_pool = Some(target);
+        let preview = qwen4::dual_placement(&inputs);
+        inputs.requested_pool = requested;
+        match preview {
+            Ok(placement) => {
+                let mut budget = devices.clone();
+                for (device, items) in budget.iter_mut().zip(placement.items) {
+                    device.items.extend(items);
+                }
+                Some(budget)
+            }
+            Err(error) => {
+                report.placement_supported = false;
+                notes.push(format!("Qwen media admission: {error:#}"));
+                None
+            }
+        }
+    } else { None };
     let admitted = admit_device_encoders(report, &towers, devices, &mut Vec::new(), &[0; 2],
-        None, options, notes, |_trial, devices| {
+        budget.as_deref(), options, notes, |_trial, devices| {
             for (rank, device) in devices.iter().enumerate() {
                 inputs.gpus[rank].baseline = Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() };
             }
