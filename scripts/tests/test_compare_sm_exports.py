@@ -110,6 +110,42 @@ def test_native_artifact_gate_uses_the_serving_tile_and_output_recipe(family):
             family == "dsv4p" and not role.startswith("spark_w"))
 
 
+@pytest.mark.parametrize("family,hidden", [("v41", 5120), ("dsv4f", 4096), ("dsv4p", 7168)])
+def test_native_compare_jobs_resolve_the_exporters_shared_tile_and_split(family, hidden):
+    packages = compare_sm.load_file("compare_recipe_packages", ROOT / "python/tools/lib/spark_packages.py")
+    policy = compare_sm.load_file("compare_recipe_policy", ROOT / "python/tools/lib/mxfp4_layouts.py")
+    path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
+    tree = ast.parse(path.read_text())
+    export = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "export")
+    width_assignment, = [node for node in ast.walk(export) if isinstance(node, ast.Assign)
+                         and isinstance(node.value, ast.Call) and isinstance(node.value.func, ast.Name)
+                         and node.value.func.id == "native_slice_width"]
+    pipeline, = [node for node in ast.walk(export) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "V41SlicePipeline"]
+    split = next(keyword.value for keyword in pipeline.keywords if keyword.arg == "fc1_k_splits")
+    jobs = {name: args for name, _, args in compare_sm.jobs("all")}
+    artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
+                 for artifact in values}
+    for role, artifact in artifacts.items():
+        args = jobs[f"{family}-{role}"]
+        fallback = dict(tuple(map(int, pair.split(":")))
+                        for pair in args[args.index("--width") + 1].split(","))
+        for capacity, width in fallback.items():
+            namespace = dict(hidden=hidden, intermediate=artifact.logical, capacity=capacity,
+                             selected_width=width, role=role, props=SimpleNamespace(major=12, minor=1),
+                             native_slice_width=policy.native_slice_width,
+                             native_fc1_k_splits=policy.native_fc1_k_splits)
+            exec(compile(ast.fix_missing_locations(ast.Module(body=[width_assignment], type_ignores=[])),
+                         str(path), "exec"), namespace)
+            selected_split = eval(compile(ast.Expression(split), str(path), "eval"), namespace)
+            assert namespace["selected_width"] == policy.native_slice_width(
+                hidden, artifact.logical, 121, capacity, width)
+            assert selected_split == policy.native_fc1_k_splits(hidden, artifact.logical, 121, capacity)
+            if family == "v41" and artifact.logical == 384:
+                assert (namespace["selected_width"], selected_split) == (
+                    (128, 2) if capacity <= 80 else (192, 1))
+
+
 @pytest.mark.parametrize("group,names", [
     ("residual", ["attn_res_c1_keep_append", "attn_res_c2_add_append",
                   "attn_res_c4_add", "attn_res_c5_add",
