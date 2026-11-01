@@ -1681,7 +1681,7 @@ fn exl3_card_columns_fit_from_headers() {
             assert!(real.wip_launchable(), "{:#?}", real.hints);
             assert_eq!(real.onboard_layers, expected.onboard_layers);
             assert_eq!(actual.pool_tokens, fixture.pool_tokens);
-            let spark_bytes = |layout: &layout::MemoryLayout| layout.devices.iter()
+            let spark_bytes = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices.iter()
                 .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
                 .map(|d| d.used_bytes()).collect::<Vec<_>>();
             assert_eq!(spark_bytes(actual), spark_bytes(fixture));
