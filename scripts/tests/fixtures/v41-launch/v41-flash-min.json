@@ -113,7 +113,7 @@
     "--max-context-tokens",
     "1048576",
     "--max-output-tokens",
-    "393216",
+    "131072",
     "--usage",
     "on",
     "--console-secret-file",

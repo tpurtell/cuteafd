@@ -232,6 +232,23 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
         let _ = (placement, capacity);
         Ok(())
     }
+    /// The drafter's live page reservation for `placement` (`DraftPagePool::reservation`), when
+    /// the family reserves full-context draft pages with its target pages.
+    fn draft_demand(&self, placement: &Self::Placement) -> Option<crate::reserve::DraftDemand> {
+        let _ = placement;
+        None
+    }
+    /// Draft pages live reservations can still claim (`DraftPagePool::reservable`); `None`
+    /// without a full-context drafter.
+    fn draft_reservable(&self) -> Option<usize> { None }
+    /// Rows one request's reservation can ever reach in the draft pool
+    /// ([`crate::reserve::draft_lifetime_rows`]); `None` without a full-context drafter.
+    fn draft_lifetime_rows(&self) -> Option<usize> { None }
+    /// The draft page reservation a fresh admission at `origin` starts from.
+    fn draft_admission(&self, origin: usize) -> Option<crate::reserve::DraftDemand> {
+        let _ = origin;
+        None
+    }
     /// A retired retained attachment may be reclaimed by the drafter's live admission.
     fn draft_pages_valid(&self, attachment: &super::DraftPageAttachment) -> bool {
         let _ = attachment;
@@ -360,6 +377,14 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     }
     /// The placement's pages, in row order.
     fn pages<'p>(&self, placement: &'p Self::Placement) -> &'p [u32];
+    /// Append freshly allocated pages to a live placement (a decode reservation top-up,
+    /// [`PrefixCache::extend`]) and install them wherever the family keeps the placement's page
+    /// list (derived page tables, a bound slot). Runs between rounds only: no queued work reads
+    /// the old list. Nothing has written the new pages. On error the cache releases them.
+    fn extend_pages(&self, placement: &mut Self::Placement, pages: &[u32]) -> Result<(), BoxError> {
+        let _ = (placement, pages);
+        Err("family cannot grow a live placement".into())
+    }
     /// Committed rows: the length a snapshot of this placement may capture (a speculative
     /// family reports the rows its state is consistent at, not rows still being verified).
     fn commit_point(&self, placement: &Self::Placement) -> usize;

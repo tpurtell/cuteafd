@@ -10,7 +10,8 @@ pub(super) mod stall;
 pub(crate) mod layout;
 use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
-use crate::families::deepseek_v41::v41_backbone_cache::CacheLease;
+use crate::families::deepseek_v41::v41_backbone_cache::{CacheLease, UNIT_TOKENS};
+use cuteafd_engine::reserve::{Demand, KvReserve, Ledger, Lease, Room};
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
@@ -35,7 +36,9 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
         job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
-        tokens: tokens.to_vec(), image_keys, next_after_commit: None };
+        tokens: tokens.to_vec(), image_keys, next_after_commit: None,
+        reserve: KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 4).unwrap(), UNIT_TOKENS)
+            .lease(tokens.len(), 4, 1, usize::MAX).unwrap(), stalled: false };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
     let mut active = [Some(request), None];
@@ -81,6 +84,10 @@ pub(super) struct Active<'a> {
     tokens: Vec<u32>,
     image_keys: ImageKeys,
     next_after_commit: Option<RetainedScores>,
+    /// Its KV reservation's bounds (issue #951).
+    reserve: Lease,
+    /// Waiting for a reservation top-up: kept out of rounds, holding its slot and units.
+    stalled: bool,
 }
 impl Active<'_> {
     fn id(&self) -> u64 { self.ticket.id() }
@@ -124,6 +131,24 @@ impl Active<'_> {
             self.cacheable = !crate::shared::probe::cold(&self.job.probe);
         }
         Ok(chunks)
+    }
+    /// End now with `finish` (early termination under KV pressure): flush, finish, retire.
+    fn end(&mut self, finish: InferenceFinishReason) -> Result<()> {
+        if !self.job.events.is_closed() {
+            if let Some(content) = self.decoder.finish()? {
+                let _ = self.job.events.send(Ok(InferenceChunk::Text { content, content_tokens: self.buffered }));
+                self.buffered = 0;
+            }
+            if self.buffered > 0 {
+                let _ = self.job.events.send(Ok(InferenceChunk::Text { content: String::new(), content_tokens: self.buffered }));
+                self.buffered = 0;
+            }
+            let _ = self.job.events.send(Ok(InferenceChunk::Finish { finish_reason: finish }));
+        }
+        self.finished = true;
+        self.ticket.finishing();
+        self.cacheable = !crate::shared::probe::cold(&self.job.probe);
+        Ok(())
     }
     fn emit(&mut self, tokens: &[u32]) -> Result<()> {
         for &token in tokens {
@@ -227,7 +252,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
 /// the previous key shape when one is bound.
 fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache<'_>,
     kv_waiter: &cuteafd_engine::prefix::DeferredAdmission<admission::Prepared>,
-    media: &admission::Media<C>, prefilling: usize) -> serde_json::Value {
+    media: &admission::Media<C>, prefilling: usize, reserve: &KvReserve, stalled: usize) -> serde_json::Value {
     // Deliberately exports the cache's whole effective `Config` under
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
@@ -241,6 +266,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "target_sampling": sampling_stats::snapshot(),
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
+        "kv_reserve": {"stats": reserve.stats(), "stalled": stalled, "config": reserve.config()},
         "media": media.stats(),
         "totals": console::totals::snapshot(),
         // The decode share: prompts waiting to prefill, and encoder prefetch waves a
@@ -250,6 +276,113 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
     stats
+}
+
+/// The drain rule's view of every leased request: decoding ones (stalled or not) from their
+/// slots, then `holders` (waiting on encodes or packed into the admission wave) at their
+/// prompt. Also the slots of the decoding ones, in the same order.
+fn reserve_demands<'r>(reserve: &KvReserve, requests: &'r Requests<'_>, active: &[Option<Active<'_>>],
+    holders: &[(CacheLease, &admission::Prepared)], verify_rows: usize, limit: usize)
+    -> Result<(Vec<Demand<'r>>, Vec<usize>)> {
+    let mut demands = Vec::new();
+    let mut slots = Vec::new();
+    for (slot, request) in active.iter().enumerate() {
+        let Some(request) = request.as_ref().filter(|r| !r.finished) else { continue };
+        let pages = requests.units(request.lease)?;
+        demands.push(Demand { lease: request.reserve, held: pages.len(), pages,
+            committed: requests.cache().committed_end(request.lease)? as usize, produced: request.generated,
+            decoding: true, draft: None });
+        slots.push(slot);
+    }
+    for &(lease, prepared) in holders {
+        let pages = requests.units(lease)?;
+        let Ok(reserved) = reserve.lease(prepared.prompt.len(), prepared.job.max_tokens, verify_rows, limit) else { continue };
+        demands.push(Demand { lease: reserved, held: pages.len(), pages, committed: prepared.prompt.len(), produced: 0,
+            decoding: false, draft: None });
+    }
+    Ok((demands, slots))
+}
+
+/// V4.1's round over the shared policy: units live in `Requests`, decoding requests in their
+/// slots. An ended request finishes with `length` and is retired at once (its units return
+/// before anything is granted); no lane round is in flight.
+struct V41Ledger<'s, 'a, 'd, 'w, 'p, C: DraftChain<'a>> {
+    /// Lease arithmetic for the holders (no counters: the driving policy keeps those).
+    reserve: KvReserve,
+    requests: &'s mut Requests<'a>,
+    active: &'s mut [Option<Active<'a>>],
+    holders: &'s [(CacheLease, &'p admission::Prepared)],
+    prefixes: &'s mut PrefixCache<'a>,
+    draft: Option<&'d mut DraftRuntime<'w, 'a, C>>,
+    verify_rows: usize,
+    limit: usize,
+    error: Option<anyhow::Error>,
+}
+
+impl<'a, C: DraftChain<'a>> V41Ledger<'_, 'a, '_, '_, '_, C> {
+    fn slots(&self) -> Vec<usize> {
+        (0..self.active.len()).filter(|&slot| self.active[slot].as_ref().is_some_and(|r| !r.finished)).collect()
+    }
+    fn fail(&mut self, error: anyhow::Error) { self.error.get_or_insert(error); }
+}
+
+impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
+    fn room(&self) -> Room { self.prefixes.room() }
+    fn settled(&self) -> bool { self.prefixes.settled() }
+    fn demands(&self) -> (Vec<Demand<'_>>, Vec<bool>) {
+        match reserve_demands(&self.reserve, self.requests, self.active, self.holders, self.verify_rows, self.limit) {
+            Ok((demands, slots)) => {
+                let stalled = slots.iter().map(|&slot| self.active[slot].as_ref().unwrap().stalled).collect();
+                (demands, stalled)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        }
+    }
+    fn end(&mut self, index: usize) {
+        let slot = self.slots()[index];
+        let mut request = self.active[slot].take().unwrap();
+        request.stalled = false;
+        let ended = request.end(InferenceFinishReason::Length)
+            .and_then(|()| retire_request(request, self.requests, self.prefixes, self.draft.as_deref_mut()));
+        if let Err(error) = ended { self.fail(error); }
+        // Return the units to the pool now (the cache releases a retired request's units).
+        if let Err(error) = self.prefixes.tick(self.requests, self.draft.as_deref_mut()) { self.fail(error); }
+    }
+    fn grow(&mut self, index: usize, pages: usize) -> bool {
+        let slot = self.slots()[index];
+        let lease = self.active[slot].as_ref().unwrap().lease;
+        match self.prefixes.extend(self.requests, self.draft.as_deref_mut(), lease, pages * UNIT_TOKENS) {
+            Ok(grown) => grown,
+            Err(error) => { self.fail(error); false }
+        }
+    }
+    fn set_stalled(&mut self, index: usize, stalled: bool) {
+        let slot = self.slots()[index];
+        self.active[slot].as_mut().unwrap().stalled = stalled;
+    }
+}
+
+/// Plan this boundary's reservation top-ups: grow granted requests' units, stall refused ones
+/// (they keep their slot and units and skip rounds), end the ones past the early-termination
+/// threshold with `length`. Runs only at a drained boundary: no lane round is in flight.
+#[allow(clippy::too_many_arguments)]
+fn reserve_round<'a, C: DraftChain<'a>>(reserve: &mut KvReserve, requests: &mut Requests<'a>,
+    active: &mut [Option<Active<'a>>], holders: &[(CacheLease, &admission::Prepared)], prefixes: &mut PrefixCache<'a>,
+    mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, verify_rows: usize, limit: usize) -> Result<()> {
+    // A stalled request whose client left retires now (its units and draft slot return).
+    for entry in active.iter_mut() {
+        if entry.as_ref().is_some_and(|r| r.stalled && r.job.events.is_closed()) {
+            let mut request = entry.take().unwrap();
+            request.stalled = false;
+            retire_request(request, requests, prefixes, draft.as_deref_mut())?;
+        }
+    }
+    // Every retirement so far (this boundary's and the ones above) is free before planning.
+    prefixes.reclaim(requests, draft.as_deref_mut())?;
+    let mut ledger = V41Ledger { reserve: KvReserve::new(reserve.config(), UNIT_TOKENS), requests, active, holders,
+        prefixes, draft, verify_rows, limit, error: None };
+    reserve.round(&mut ledger);
+    ledger.error.map_or(Ok(()), Err)
 }
 
 type PackedAdmission = (admission::Prepared, u64, CacheLease, usize, ImageKeys,
@@ -500,6 +633,8 @@ pub(super) struct Waiting<'a> {
     decoder: cuteafd_loader::StreamingTokenDecoder,
     /// Scores of a packed group this prompt joined (it then needs no call).
     packed: Option<Result<RetainedScores>>,
+    /// Its KV reservation's bounds; it joins the running requests with them.
+    reserve: Lease,
 }
 type QueuedPrompt<'a, S> = queue::Queued<Waiting<'a>, super::prefill_target::V41Prefill<S>>;
 
@@ -571,7 +706,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
     }
 
     fn admit(&mut self, slot: usize, waiting: Waiting<'a>, scores: RetainedScores) -> Result<()> {
-        let Waiting { prepared, id, lease, image_keys, cached, images, mut ticket, mut constraint, decoder, .. } = waiting;
+        let Waiting { prepared, id, lease, image_keys, cached, images, mut ticket, mut constraint, decoder, reserve, .. } = waiting;
         let admission::Prepared { job, prompt, .. } = prepared;
         let events = job.events.clone();
         let result = (|| -> Result<(u32, Option<RetainedScores>)> {
@@ -596,12 +731,13 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             Ok(value) => value,
             Err(error) => return queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
                 Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
-                    cached, hit_scores: None, images, ticket, constraint, decoder, packed: None }, error),
+                    cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
         };
         // The lane it was announced on at admission (queued prompts count in `loads`).
         let lane = ticket.lane();
         let mut request = Active { constraint, ticket, lease, job, decoder, anchor, generated: 0, buffered: 0,
-            finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit };
+            finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit,
+            reserve, stalled: false };
         request.ticket.first(request.anchor);
         if let Err(error) = request.emit(&[request.anchor]) {
             request.failed = !request.job.events.is_closed();
@@ -702,7 +838,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     // still needs wait here for their encodes; decode keeps running.
     let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
     let mut stats_published = Instant::now();
-    let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
+    let limits = args.reserve.limits(args.max_context_tokens as usize)?;
+    // KV reservation by decode chunks (issue #951): admission, top-ups and stalls.
+    let mut reserve = KvReserve::new(args.reserve.config(args.max_context_tokens as usize)?, UNIT_TOKENS);
+    let verify_rows = draft.as_ref().map_or(1, |d| d.max_verify_rows());
+    let limit = (args.max_context_tokens as usize).min(prefixes.engine().pool().capacity() * UNIT_TOKENS);
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
         if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact { 0 }
         else { args.prefill_batch_tokens as usize });
@@ -724,7 +864,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
-                *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len());
+                *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(), &reserve,
+                    active.iter().flatten().filter(|r| r.stalled).count());
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
@@ -747,6 +888,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     "retired requests with release errors; the serve loop continues");
             }
         }
+        // Their units are free for admission and the reservation round only once reclaimed.
+        prefixes.reclaim(requests, draft.as_deref_mut())?;
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
@@ -831,6 +974,40 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
                 continue;
             }
+            // The drain rule over every leased request (decoding, waiting on encodes, packed
+            // into this wave) decides whether a new reservation is safe now.
+            let Ok(new_lease) = reserve.lease(prepared.prompt.len(), prepared.job.max_tokens, verify_rows, limit) else {
+                let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
+                    "prompt leaves no room for output in the GPU KV pool; shorten the prompt or increase the pool".into())));
+                continue;
+            };
+            // Units of requests released inside this admission wave count as free too.
+            prefixes.reclaim(requests, draft.as_deref_mut())?;
+            let rows = {
+                // Prompts queued for prefill hold their leases too.
+                let holders: Vec<_> = media.leased().map(|l| (l.lease, &l.prepared))
+                    .chain(admitted.iter().map(|(prepared, _, lease, ..)| (*lease, prepared)))
+                    .chain(prefills.iter().filter_map(|queued| queued.request()).map(|w| (w.lease, &w.prepared)))
+                    .collect();
+                let (demands, _) = reserve_demands(&reserve, requests, &active, &holders, verify_rows, limit)?;
+                let any_stalled = active.iter().flatten().any(|r| r.stalled);
+                match reserve.admit(prefixes.room(), &demands, &new_lease, None, any_stalled) {
+                    Some(pages) => reserve.admission_rows(&new_lease).min(pages * UNIT_TOKENS),
+                    None if busy_slots > 0 || !admitted.is_empty() => {
+                        tracing::debug!(busy_slots, "waiting for the KV drain rule");
+                        if let Err(prepared) = kv_waiter.defer_until_release(prepared, true, requests.release_epoch()) {
+                            let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
+                                "KV admission queue full".into())));
+                        }
+                        break;
+                    }
+                    None => {
+                        let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::BadRequest(
+                            "prompt leaves no room for output in the GPU KV pool; shorten the prompt or increase the pool".into())));
+                        continue;
+                    }
+                }
+            };
             let lease = match (|| -> Result<_> {
                 id = id.checked_add(1).context("request ID exhausted")?;
                 requests.admit(slot, id)
@@ -850,34 +1027,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     requests.attach_images(lease, crate::families::deepseek_v41::v41_requests::RequestImages::new(images)?)?;
                 }
                 let restore_started = Instant::now();
-                // Units for the request's whole declared lifetime are allocated here and the
-                // best snapshot restored into them; every running request already owns its
-                // own lifetime units, so this is the whole capacity check.
+                // Units for the prompt and one decode chunk (the shared reservation rule) are
+                // allocated here and the best snapshot restored into them.
                 let cold = crate::shared::probe::cold(&job.probe);
                 let draft_id = draft_id(&draft, id);
-                let lifetime = |output: usize| prompt.len().saturating_add(output);
-                let restored = match prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
-                    prompt, image_keys.spans(), lifetime(job.max_tokens), cold) {
-                    Err(error) if busy_slots == 0 && super::prefix::exhausted(&error) => {
-                        // Idle and short: grant the longest output that fits the pool (every
-                        // snapshot-only unit counted as free), then admit at that lifetime.
-                        let requested = job.max_tokens;
-                        let units = |output: usize| lifetime(output)
-                            .div_ceil(crate::families::deepseek_v41::v41_backbone_cache::UNIT_TOKENS);
-                        let granted = kv_waiter.shrink_output(&mut prefixes, requested,
-                            |prefixes, output| Ok::<_, anyhow::Error>(prefixes.could_fit(units(output))), |_, _| Ok(()))?
-                            .ok_or(error)?;
-                        let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
-                            prompt, image_keys.spans(), lifetime(granted), cold)?;
-                        if granted < requested {
-                            tracing::warn!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=restored.cached,
-                                requested, granted, "max_tokens shrunk to fit the GPU KV pool");
-                        }
-                        job.max_tokens = granted;
-                        restored
-                    }
-                    other => other?,
-                };
+                let restored = prefixes.admit(requests, draft.as_deref_mut(), lease, draft_id, image_keys.tokens(),
+                    prompt, image_keys.spans(), rows, cold)?;
                 job.prefix_cache_source.set(restored.cached, restored.source.as_ref().is_some_and(|source| source.host));
                 if let Some(probe) = job.probe.as_ref().filter(|probe| probe.spec.record_state) {
                     if let Some(source) = &restored.source {
@@ -967,14 +1122,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
                 ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count, restore);
-                Ok((constraint, decoder))
+                let reserve = reserve.lease(prompt.len(), job.max_tokens, verify_rows, limit)?;
+                Ok((constraint, decoder, reserve))
             })();
             match ready {
-                Ok((constraint, decoder)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
+                Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
                     cursor: super::prefill_target::V41Prefill::new(),
                     request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
                         image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
-                        packed: None }) }) }
+                        packed: None, reserve }) }) }
                 Err(error) => {
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                         .cloned().unwrap_or_else(|| format!("{error:#}").into());
@@ -1013,15 +1169,28 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
+        // Reservation top-ups at this drained boundary; stalled requests sit this round out.
+        {
+            // Prompts waiting on encodes or queued for prefill hold their leases.
+            let holders: Vec<_> = media.leased().map(|l| (l.lease, &l.prepared))
+                .chain(prefills.iter().filter_map(|queued| queued.request()).map(|w| (w.lease, &w.prepared)))
+                .collect();
+            reserve_round(&mut reserve, requests, &mut active, &holders, &mut prefixes, draft.as_deref_mut(),
+                verify_rows, limit)?;
+        }
         let members: [Vec<usize>; 2] = std::array::from_fn(|lane| active.iter().enumerate()
-            .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane() == lane && !r.finished
+            .filter_map(|(slot, request)| request.as_ref().filter(|r| r.lane() == lane && !r.finished && !r.stalled
                 && !r.job.events.is_closed()).map(|_| slot)).collect());
-        if members.iter().all(Vec::is_empty) { continue; }
+        if members.iter().all(Vec::is_empty) {
+            // Every decoding request waits for units: a retirement or snapshot capture frees them.
+            if active.iter().flatten().any(|r| r.stalled) { std::thread::sleep(Duration::from_millis(1)); }
+            continue;
+        }
         let capacity: Vec<_> = members.iter().flatten().map(|&slot| {
             let r = active[slot].as_ref().unwrap();
-            (r.lease, (r.job.max_tokens - r.generated).min(draft.as_ref().map_or(1, |d| d.max_verify_rows())) as u32)
+            (r.lease, (r.job.max_tokens - r.generated).min(verify_rows) as u32)
         }).collect();
-        // Every request's units cover its declared lifetime: this only validates the bindings.
+        // The plan above reserved every member's next round: this only validates the bindings.
         let room = requests.cache().check_append_capacity(&capacity);
         if let Err(error) = &room {
             if let Some(pressure) = error.downcast_ref::<crate::families::deepseek_v41::v41_compressor::SourcePoolExhausted>() {
@@ -2613,7 +2782,7 @@ mod sampling_tests {
         assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
         // Queued prompts decode on the lane they were announced on (review A4).
         assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
-        assert!(serve.contains("Ok((constraint, decoder)) => { loads[lane] += 1; prefills.push("));
+        assert!(serve.contains("Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push("));
         assert!(serve[round..decode].contains("prefills.settle("));
         let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
         let admit = &admit[..admit.find("\n    }\n").unwrap()];
@@ -2641,14 +2810,16 @@ mod sampling_tests {
         assert!(serve.contains("&& prefills.is_empty() { break; }"));
     }
 
-    /// The lanes stop at their first completed boundary past the debt, and an
-    /// independent lane checks it beside the media wake.
+    /// The lanes stop at their first completed boundary past the debt: an independent
+    /// lane's single boundary decision (`LaneControl::decide`) takes the prefill deadline.
     #[test]
     fn independent_lanes_stop_at_the_prefill_deadline() {
         let lanes = include_str!("scheduler/independent.rs");
-        assert!(lanes.contains("if wake.poll_media(round_id) || wake.prefill_due(round_id)"));
-        let stop = lanes.find("wake.prefill_due(round_id)").unwrap();
-        assert!(lanes[stop..stop + 400].contains("lease.stop(); return Ok(());"));
+        let decide = lanes.find("match control.decide(wake.prefill_due(round_id),").unwrap();
+        assert!(lanes[decide..decide + 400].contains("Boundary::Stop => { lease.stop(); return Ok(()); }"));
+        // A past deadline after one round stops the lane; `prefill_due` itself needs a round.
+        let past = admission::Wake { prefill_due: Some(Instant::now()), ..Default::default() };
+        assert!(!past.prefill_due(0) && past.prefill_due(1));
     }
 
     #[test]
@@ -3090,10 +3261,13 @@ mod sampling_tests {
         let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
         let mut encoder = cuteafd_engine::media::FakeEncoder::default();
         let media = admission::Media::new(&mut encoder, 4).unwrap();
-        let snapshot = serving_stats(&disabled, &waiter, &media, 2);
-        for key in ["output_shrinks", "output_tokens_withheld", "deferred"] {
-            assert!(snapshot["admission"][key].is_u64(), "missing admission {key} in {snapshot}");
+        let reserve = KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
+        let snapshot = serving_stats(&disabled, &waiter, &media, 2, &reserve, 2);
+        assert!(snapshot["admission"]["deferred"].is_u64(), "missing admission deferred in {snapshot}");
+        for key in ["top_ups", "stalls", "early_terminations", "deadlock_breaks", "admission_waits"] {
+            assert!(snapshot["kv_reserve"]["stats"][key].is_u64(), "missing kv_reserve {key} in {snapshot}");
         }
+        assert_eq!(snapshot["kv_reserve"]["stalled"], 2);
         for key in ["encodes", "submit_waits", "submit_timeouts", "encode_timeouts"] {
             assert!(snapshot["media"][key].is_u64(), "missing media {key} in {snapshot}");
         }
@@ -3106,7 +3280,7 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0);
+        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0);
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");

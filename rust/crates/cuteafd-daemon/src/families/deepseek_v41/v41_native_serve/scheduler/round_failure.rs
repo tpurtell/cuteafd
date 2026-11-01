@@ -233,7 +233,9 @@ pub(super) mod tests {
         (Active { constraint: None, ticket, lease: CacheLease::unbound_for_test(id as usize), job,
             decoder, anchor: 0, generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
             tokens: vec![0], image_keys: super::super::super::prefix::media_keys(&[0], &[]).unwrap(),
-            next_after_commit: None }, output, log)
+            next_after_commit: None,
+            reserve: cuteafd_engine::reserve::KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 1)
+                .unwrap(), super::super::UNIT_TOKENS).lease(1, 1, 1, usize::MAX).unwrap(), stalled: false }, output, log)
     }
 
     #[derive(Default)]

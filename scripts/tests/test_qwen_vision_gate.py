@@ -294,7 +294,7 @@ def test_qwen_verify_histogram_uses_existing_timer_and_physical_rows():
     timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
     assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("resource::observe_drafted(")
     assert '"verify": verify.snapshot()' in serve
-    assert serve.count("&cache, media, preparer, &lane.stats);") == 2
+    assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
     assert "self.startup_graphs && self.use_graphs && !diagnostic" in engine
     assert "decode_bucket(rows, spec) } else { rows }" in engine
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve

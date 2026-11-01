@@ -1,9 +1,10 @@
 //! Paired index/FP4 KV pages of one compressed source. The prefix engine owns the pages
 //! (`cuteafd_engine::prefix::RefPagePool`, one 512-token unit = one page of each ratio-two source
-//! and two of the ratio-one source); a request slot's page table is bound once, at admission, to
-//! the units of its whole lifetime (`bind`), so appends only publish rows inside bound pages:
-//! no allocation, copy-on-write or reservation happens on the decode path. Rows past a slot's
-//! committed length are its own; shared pages hold only rows below every sharer's length.
+//! and two of the ratio-one source); a request slot's page table is bound at admission to the
+//! units of its reservation and extended at drained boundaries when decode tops it up (`bind`),
+//! so appends only publish rows inside bound pages: no allocation, copy-on-write or reservation
+//! happens inside a decode round. Rows past a slot's committed length are its own; shared pages
+//! hold only rows below every sharer's length.
 use crate::shared::memory::{DeviceAllocation, HostAllocation};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41Kv};
@@ -197,15 +198,6 @@ impl<'a> SourceCache<'a> {
         }
         self.pages[slot] = pages.to_vec();
         self.rows[slot] = rows;
-        Ok(())
-    }
-    /// Drop the unwritten tail of a slot's binding: `pages` is a prefix of its pages that still
-    /// holds its committed `rows`. Device page-table entries past it are never read again.
-    pub fn shrink(&mut self, slot: usize, pages: &[u32], rows: usize) -> Result<()> {
-        self.ensure_idle(slot)?;
-        ensure!(self.pages[slot].starts_with(pages) && rows == self.rows[slot] && rows <= pages.len() * PAGE_ROWS,
-            "shrunk source binding must keep the slot's committed rows");
-        self.pages[slot].truncate(pages.len());
         Ok(())
     }
     /// Pages bound to `slot` and its initialized rows.

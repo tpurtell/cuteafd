@@ -1,12 +1,10 @@
-//! A bounded FIFO waiter for page pressure or lifetime admission.
+//! A bounded FIFO waiter for page pressure or reservation admission.
 //! Waiting owns no KV or state slot.
 use super::PrefixError;
 
 /// Per-waiter lifetime counters; `deferred` counts accepted jobs, including retries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AdmissionStats {
-    pub output_shrinks: u64,
-    pub output_tokens_withheld: u64,
     pub deferred: u64,
 }
 
@@ -94,26 +92,6 @@ impl<T> DeferredAdmission<T> {
         }
     }
 
-    /// An idle request whose prompt plus `requested` output tokens does not fit the KV pool gets
-    /// the longest output allowance that `fits` the `room`, and `take` reserves it there. The
-    /// caller first frees what only a cached prompt costs (`PrefixCache::release_copies`), so a
-    /// cached prompt gets what the same request gets cold. Every shrink is counted for `stats`.
-    /// `fits` must be monotone. `None`, with nothing taken, when not even one output token fits.
-    pub fn shrink_output<R, E>(&mut self, room: &mut R, requested: usize,
-        mut fits: impl FnMut(&R, usize) -> Result<bool, E>,
-        take: impl FnOnce(&mut R, usize) -> Result<(), E>) -> Result<Option<usize>, E> {
-        let Some(granted) = fit_output(requested, |output| fits(room, output))? else {
-            return Ok(None);
-        };
-        take(room, granted)?;
-        if granted < requested {
-            self.stats.output_shrinks = self.stats.output_shrinks.saturating_add(1);
-            self.stats.output_tokens_withheld = self.stats.output_tokens_withheld
-                .saturating_add((requested - granted) as u64);
-        }
-        Ok(Some(granted))
-    }
-
     pub fn pending(&self) -> Option<&T> {
         self.pending.as_ref().map(|pending| &pending.job)
     }
@@ -129,21 +107,6 @@ impl<T> DeferredAdmission<T> {
     pub fn is_empty(&self) -> bool {
         self.pending.is_none()
     }
-}
-
-/// Largest output allowance up to `maximum` that `fits`; `None` when not even one token does.
-/// A request with active peers waits instead; call only for an otherwise idle pool.
-/// `fits` must be monotone: once an allowance fails, every larger allowance fails.
-pub fn fit_output<E>(maximum: usize,
-    mut fits: impl FnMut(usize) -> Result<bool, E>) -> Result<Option<usize>, E> {
-    if maximum == 0 || !fits(1)? { return Ok(None); }
-    let (mut low, mut high) = (1, maximum);
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        if fits(mid)? { low = mid; } else { high = mid - 1; }
-    }
-    debug_assert!(fits(low)?, "returned output allowance must fit");
-    Ok(Some(low))
 }
 
 #[cfg(test)]
@@ -190,7 +153,7 @@ mod tests {
         waiter.defer(4, &error, true, 0).unwrap();
         assert_eq!(waiter.defer_until_release(5, true, 0), Err(5));
         assert!(matches!(waiter.poll(1, 0, true, |_| true), AdmissionPoll::Empty));
-        assert_eq!(waiter.stats(), AdmissionStats { deferred: 2, ..Default::default() });
+        assert_eq!(waiter.stats(), AdmissionStats { deferred: 2 });
         assert_eq!(DeferredAdmission::<()>::default().stats(), AdmissionStats::default());
         assert_eq!(serde_json::to_value(waiter.stats()).unwrap()["deferred"], 2);
     }
@@ -232,79 +195,6 @@ mod tests {
         waiter.defer_until_release(8, true, 0).unwrap();
         assert!(matches!(waiter.poll(0, 0, true, |_| true), AdmissionPoll::Empty));
         assert_eq!(waiter.pending(), None);
-    }
-
-    #[test]
-    fn non_monotone_fit_returns_a_fitting_allowance_but_need_not_be_maximal() {
-        let fits = |output| Ok::<_, &'static str>(output == 1 || output == 10);
-        assert_eq!(fit_output(10, fits), Ok(Some(1)));
-        assert_eq!(fits(1), Ok(true));
-        assert_eq!(fits(10), Ok(true), "a gap violates the binary search contract");
-    }
-
-    #[test]
-    fn output_reservation_is_the_longest_that_fits() -> Result<(), &'static str> {
-        for maximum in [0, 1, 2, 1000, usize::MAX] {
-            for available in [0, 1, 2, 17, 1000, usize::MAX] {
-                assert_eq!(fit_output(maximum, |output| Ok(output <= available))?,
-                    (maximum > 0 && available > 0).then_some(maximum.min(available)));
-            }
-        }
-        Ok(())
-    }
-
-    /// A retained source sharing its tail costs `copy` more output tokens until released.
-    struct Room {
-        free: usize,
-        copy: usize,
-        taken: Option<usize>,
-    }
-    impl Room {
-        fn release_copies(&mut self) { self.copy = 0; }
-        fn fits(&self, output: usize) -> Result<bool, &'static str> {
-            Ok(output + self.copy <= self.free)
-        }
-        fn take(&mut self, output: usize) -> Result<(), &'static str> {
-            if !self.fits(output)? { return Err("output does not fit"); }
-            self.taken = Some(output);
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn shrink_grants_a_cached_prompt_what_the_same_request_gets_cold_and_counts_it() -> Result<(), &'static str> {
-        let mut waiter = DeferredAdmission::<()>::default();
-        let mut cold = Room { free: 700, copy: 0, taken: None };
-        let mut cached = Room { free: 700, copy: 512, taken: None };
-        assert_eq!(fit_output(1000, |output| cached.fits(output))?, Some(188));
-        cached.release_copies();
-        for room in [&mut cold, &mut cached] {
-            let granted = waiter.shrink_output(room, 1000, Room::fits, Room::take)?;
-            assert_eq!((granted, room.taken), (Some(700), Some(700)));
-        }
-        let mut whole = Room { free: 700, copy: 0, taken: None };
-        assert_eq!(waiter.shrink_output(&mut whole, 600, Room::fits, Room::take)?, Some(600));
-        let mut full = Room { free: 0, copy: 0, taken: None };
-        assert_eq!(waiter.shrink_output(&mut full, 1000, Room::fits, Room::take)?, None);
-        assert_eq!(full.taken, None);
-        assert_eq!(waiter.shrink_output(&mut whole, 0,
-            |_, _| -> Result<bool, &'static str> { unreachable!() }, |_, _| unreachable!())?, None);
-        let mut failing = Room { free: 50, copy: 0, taken: None };
-        assert_eq!(waiter.shrink_output(&mut failing, 1000, Room::fits, |_, _| Err("take failed")), Err("take failed"));
-        assert_eq!(failing.taken, None);
-        assert_eq!(waiter.stats(), AdmissionStats { output_shrinks: 2, output_tokens_withheld: 600, deferred: 0 });
-        Ok(())
-    }
-
-    #[test]
-    fn shrink_propagates_fit_errors_without_taking_or_counting() {
-        let mut waiter = DeferredAdmission::<()>::default();
-        for fail_at in [1, 6] {
-            assert_eq!(waiter.shrink_output(&mut (), 10,
-                |_, output| if output == fail_at { Err("fit failed") } else { Ok(true) },
-                |_, _| panic!("failed fit must not take")), Err("fit failed"));
-        }
-        assert_eq!(waiter.stats(), AdmissionStats::default());
     }
 
     #[test]
