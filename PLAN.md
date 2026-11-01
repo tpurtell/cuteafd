@@ -6226,280 +6226,62 @@ Do not replay publication against the deliberately retired standalone paths.
 Full-model generation/serving qualification and K6 engine shape support remain
 separate work; this task branch is pushed for review, not merged.
 
-## Step-5 Preview BF16 to mixed EXL3 K4 / Core K6 (MaxQ, 2026-10-30)
+## Step-5 Preview EXL3 K4 / Core K6 release (2026-11-01)
 
-TJ authorized a shortened format pilot, autonomous recipe decisions, full
-quantization and publication as `wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6`,
-then a zero-copy Sparknest import, one file copy spread across the six RDMA
-Sparks, and removal of standalone/intermediate payloads after verification.
-This supersedes the Step brief's recipe/upload approval stops. Work stays on
-`quant/step5-k4-core-k6`; implementation checkout is
-`~/Developer/cute-worktrees/step5-quant-integration`. No engine changes or
-maxq serving/performance work are included.
+Completed and published:
+https://huggingface.co/wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6
+Revision `83d47a384eabc07ea6fcfaac4779b0e5f013ce89`. Source: Step-5-Preview-BF16 at
+`7734b7ffac118d70d8398bfa3eb0fab007eb45b1`.
 
-Pinned source `stepfun-ai/Step-5-Preview-BF16` at
-`7734b7ffac118d70d8398bfa3eb0fab007eb45b1` is local in Sparknest on maxq.
-All 48 release files passed actual Hub LFS/Git checksum verification,
-including nested inference sources. The authoritative index covers 2,449
-tensors / 1,205,950,680,832 bytes. Explicit reviewed redundant header aliases
-and unindexed release copies are counted only at their indexed locations.
-The fail-closed recipe produces 375,913 tensors / 315,357,147,520 bytes
-(293.699 GiB), 96 shards and 93,600 quantized matrices: target core/head K6,
-routed experts K4 on layers 3–87 and K6 on 88–90, and all three MTP cores
-including their actual independent output heads at K4. Preserve all 1,513
-native tensors byte-for-byte, including 667 vision tensors, gates, indexers,
-routers and norms. Both source StepFun license files are copied verbatim.
+The release has 96 shards, 375,913 tensors and 315,357,147,520 indexed
+payload bytes (293.699 GiB). All 93,600 transformed matrices were rebuilt
+from layer 0 with the corrected K128 FP32 XTX accumulator; no predecessor
+lineage or earlier-accumulator matrices remain. GPTQModel main/pin is
+`25dd11c391ce6bf3ceadf8722e8274c3cde7079a`. Sigma=.025, seed=787,
+native FP32 residual/BF16 boundaries and serialized reconstruction are
+unchanged. Calibration is the pinned public panel: 1,426 prompts,
+1,105,269 native tokens, with exact native tokenizer backend preservation.
 
-GPTQModel main is pushed at `2f126a60c296fe0e62d3e843af9090046355d947`.
-The adapter uses the existing verified Step-5 native reference, windowed
-attention and sparse kernels, observes packed QKV without extra products,
-and preserves FP32 residual/native BF16 GEMM and SwiGLU boundaries. Each
-fused expert is loaded by slice; only one layer is resident. MTP starts from
-the final target's raw residual, with three successive teacher-forced token
-and absolute-position shifts, stage-local heads and rolling recovery.
+Target core and main head are K6 (645 matrices); routed experts are K4
+on layers 3–87 (89,760) and K6 on layers 88–90 (3,168). All three MTP
+cores and stage-local heads are K4 (27). The 1,513 native tensors,
+including all 667 vision tensors, both licenses and tokenizer assets are
+preserved byte-for-byte. MTP consumes the raw final target residual with
+successive token/absolute-position shifts, independently checked against
+pinned vLLM source and the bounded native/serialized pilot.
 
-The source's historical Llama tokenizer label causes AutoTokenizer to
-replace its ByteLevel backend. Preparation now uses the existing fidelity
-loader and attests the exact serialized backend plus ten raw/plain-chat
-encoding comparisons. No regex heuristic changes are applied. The corrected
-full native calibration panel has 1,426 prompts and 1,105,269 tokens, longest
-1,041 tokens. A task-owned uv environment uses the pinned Transformers
-source and compatible Hub/tokenizers packages, borrowing existing Torch
-read-only; the main checkout's .venv remains untouched. The 106 integrated
-CPU cases passed in the matching SM120 image, including publication,
-recovery, source mutation and tokenizer/backend regressions.
+Baseline 217 CPU checks passed in the matching SM120 image. Subsequent
+launcher/handoff fixes pass 27 targeted recovery cases. The 324.35-second
+GPU pilot passed 105 format rows and all six native checks, including an
+actual seven-projection production-layer transaction and byte-exact replay
+from its assembled shard. Independent final managed audit passes all
+headers, layouts/scales, fixed origins, native source bytes, metadata,
+index, diagnostics and publication/import manifests. Its 96 imported
+weight hashes match archived assembly receipts; producer/publisher/import
+checks cover full trellis hashes. No full-model serving/quality claim.
+Engine integration/qualification remains separate (#792, #911).
 
-The bounded pilot compares 21 representative matrices across five formats,
-with a short eight-layer BF16 prefix, real prompt boundaries, >512-token
-window witness, measured native sparse metadata, serialized replay and
-independent three-stage MTP wiring. Late-layer expert comparison explicitly
-uses a layer-7 input witness and makes no actual layer-88 calibration claim.
-Production uses its real causal stream. This short panel does not exercise
-long-context top-k pruning; full-model quality/serving qualification remains
-separate. Expected pilot work is bounded to one inventory, no repeated arms.
+SparkNest adopted 205 release files with --no-copy (0 copied bytes), then
+placed exactly one managed copy of every file on the six RDMA Sparks:
+ostrich 19 weight shards; dodo, emu and kiwi 15 each; rhea and moa 16 each.
+Weights total about 48.3–49.6 GiB per host. Managed snapshot:
+`/mnt/sparknest/hf-home/hub/models--wrldsuksgo2mars--Step-5-Preview-EXL3-K4-Core-K6/snapshots/83d47a384eabc07ea6fcfaac4779b0e5f013ce89`.
+HF refs/main matches this revision. No off-grid target copy remains.
 
-The enabled user service wraps the existing fair maxq lease on raptor,
-bounded preflight/run, rolling front-edge retirement and crash recovery.
-After GPU teardown/lease release it uploads and audits remote bytes, adopts
-through a mandatory Btrfs reflink bridge plus Sparknest --no-copy import,
-verifies managed bytes, places one copy on the six fabric hosts, and removes
-standalone export/cache/staging before retiring redundant off-grid copies
-through Sparknest. Sources, logs, metrics and audit receipts remain.
-Run root: `~/.cache/cuteafd/quantization/step5-k4-core-k6/`.
-Evidence: `~/.cache/cuteafd/builds/step5-core-k6/`.
-Recipe/prior-art and engine follow-up report: `~/step5-core-quant.md`.
+Standalone export, alternate HF cache leaf, reflink import staging,
+rolling activations and packed recovery weights are removed. Obsolete
+pilot tensor payloads are retired; calibration tokens, code, logs, scalar
+metrics and audit receipts remain. Original source and shared caches were
+untouched. All task services are stopped/disabled and GPU leases released.
+The final CPU-only unit was step5-core-k6-1793519523192738670 (exit 0).
+Do not restart the completed or superseded producers.
 
-The first GPU pilot stopped during layer-7 capture because the native sparse
-indexer computes W with a functional linear call, bypassing its module hook.
-GPTQModel main `ed84937b20ab3ccbfc7d06c3b001fc24e545b37a` adds an observation-only
-wrapper with no extra GEMM or arithmetic changes; 22 helper CPU cases pass.
-The pilot now labels W's original FP32 storage and its actual BF16 effective
-operand separately, and recovers partial captures without replacing committed
-predecessor evidence. The failed attempt is archived as
-`pilot-failed-capture-1793349721997881557`; its user unit is disabled.
-Pilot units do not restart automatically; production still resumes on failure.
-Receipt-backed CPU fault injection now covers a crash after MTP EH seed commit
-and after a completed MTP successor, including envelope/older-frontier retirement.
-
-The corrected short GPU pilot passed in 247.47 seconds: 105 metric rows,
-all native sliding/sparse, serialized-projection and three-stage MTP checks.
-Worst K6 weighted NMSE is 3.6057144e-4, below the declared 1e-3 bound.
-CPU finalization audited 87 candidate payloads and 42 Hessians before retiring
-pilot activation and candidate weight banks. The integrated gate passes
-116 cases. Independent pinned vLLM target/runner/MTP source inspection confirms
-the initial target tap and interstage chain are raw residuals before head norm.
-Actual tables and source call sites are appended to `~/step5-core-quant.md`.
-
-Full production launched under enabled user unit
-`step5-core-k6-1793350843718029823`, with automatic upload, zero-copy import,
-six-Spark placement and cleanup enabled. Numerical source identities and the
-reviewed GPTQModel pin are frozen. The HF account is authenticated as
-`wrldsuksgo2mars`. Source/pilot/production markers live under the run root;
-recover the existing run rather than starting another producer. Report layer
-progress and ETA every 30 minutes after it is stable. Public target remains
-`wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6`.
-
-The first full producer stopped before exporting layer 0 because the native
-RowParallelLinear wrapper has no nn.Linear.in_features attribute. Both widths
-now come from the reviewed weight shapes. That stopped attempt is archived
-as `production-failed-native-api-1793350843718029823`; its obsolete activations
-are retired while three projection results and original evidence remain.
-No producer identity or receipt was rewritten to reuse incompatible state.
-
-The strengthened short pilot passed in 268.75 seconds with the same 105
-format rows plus a real seven-projection dense-layer production transaction.
-It verified assembly, rolling retirement and byte-exact native replay from
-that assembled shard for all three calibration prompts. All six native
-checks and the independent receipt audit passed; probe weight/activation
-payloads are retired. The integrated CPU gate passes 129 cases.
-
-Current full production unit: `step5-core-k6-1793352607963307063` (launched
-2026-10-30 09:30 UTC). Its automatic publication/import/six-Spark placement
-and cleanup are enabled. Earlier pilot/producer units are disabled. The
-current numerical source/pin is frozen; only publication metadata was
-extended to explain native tokenizer loading while preserving source assets.
-Continue this run and recover its latest durable frontier if needed.
-
-The producer above is stopped and its unit disabled after layer 3 expert 217
-exposed unsafe long-K sequential FP32 XTX accumulation. This is an accumulation
-bug, not source corruption or a need to increase damping. Controlled GPU arms
-show the legacy result fails SPD after unchanged sigma=.025; bounded K=128
-FP32 accumulation passes the existing regularization/congruence/block-LDL
-path on both the rare expert (1,955 rows, relative Frobenius error 7.00e-8)
-and the busiest expert (253,367 rows, 6.58e-7). GPTQModel main is pushed at
-25dd11c391ce6bf3ceadf8722e8274c3cde7079a; shared GLM helpers and generic EXL3
-quantization are unchanged. GPU comparison receipts are under
-~/.cache/cuteafd/builds/step5-core-k6/expert217-busy/.
-
-Recovery is being qualified with explicit producer lineage: preserve the
-original 679 projection evidence records, 658 remaining packed candidates,
-three exported layers and layer-2 frontier byte-for-byte. Audit all retained
-payload checksums and the restricted source delta before activating a v2
-plan. Keep original producer identities on historical receipts; record the
-bounded-XTX producer for subsequent matrices and carry both origins into
-publication metadata. Re-run the short native/serialized production pilot
-before resuming this production root; do not start an independent full run.
-
-The audited K128 resume is now active. All 4,913 historical objects passed
-full checksum, exact module/scope, source-semantic and route-count checks;
-no historical object was rewritten. The original v1 plan remains archived
-byte-for-byte under production/epochs/000-plan.json. Sealed integration
-f43eec613 passed 217 CPU cases in the matching SM120 image.
-
-The fresh K128 short GPU pilot passed in 324.35 seconds with all six native
-and serialized checks, including the actual seven-matrix production-layer
-transaction and byte-exact replay from its assembled shard. The prior
-qualified pilot is retained at pilot-qualified-before-k128; its unit and
-the failed old producer unit are disabled.
-
-Current enabled production unit: step5-core-k6-1793358846411772718, resumed
-2026-10-30 11:14 UTC at layer 3 expert 217, preserving 679 completed
-projections and the layer-2 frontier. It uses GPTQModel main 25dd11c39 and
-the v2 plan with explicit historical per-module origins. Upload, no-copy
-Sparknest import, six-Spark placement and cleanup remain enabled. Wait for
-layer 3 to complete, then report progress and ETA every 30 minutes.
-
-The mixed-accumulator producer above is SUPERSEDED. TJ correctly challenged
-retaining early matrices merely because factorization passed: that does not
-establish accurate Hessians, and later layers depend on the early quantized
-stream. The old unit step5-core-k6-1793358846411772718 is stopped/disabled.
-All its 72.63 GiB of weight/activation payloads were retired, while JSON
-receipts, metrics, plans and logs remain in
-production-superseded-mixed-accumulation-1793358846411772718. Neither source
-checkpoint nor Sparknest-managed data was changed.
-
-CURRENT RUN: enabled step5-core-k6-1793362893146861204, launched 2026-10-30
-12:21 UTC from layer 0. The fresh production root and fresh export contain
-no predecessor lineage and reuse no old quantized matrix or activation.
-All Hessians and the causal quantized stream are rebuilt using K128 FP32
-accumulation. The same sealed GPTQModel 25dd11c39, 217 CPU checks and passed
-324.35-second GPU pilot qualify this unchanged numerical producer; another
-pilot is unnecessary. Publication, no-copy Sparknest import, six-Spark
-placement and cleanup stay enabled. Estimate approximately 42 hours of
-quantization, refined by completed full MoE layers. Continue 30-minute
-status checks once the clean run is stable.
-
-USER-REQUESTED PAUSE (2026-10-31 01:25 UTC): stop quantization for a
-SparkNest upgrade. Unit step5-core-k6-1793362893146861204 is stopped and
-disabled; its Docker container is stopped/removed. Do not restart or resume
-monitoring until TJ says the upgrade is complete and requests continuation.
-Layers 0–30 are complete; layer 31 has committed partial expert work. All
-checkpoint/recovery payloads remain intact in production, including its
-plan and latest frontier. Local pause receipt: production/paused-by-user.json.
-No publication/import has begun. After TJ resumes, preserve this clean
-run and use the existing launcher --resume --publish after admission checks;
-never restart the superseded mixed-accumulator units.
-
-RESUMED at TJ's request after the SparkNest upgrade (2026-10-31 01:27 UTC).
-Current enabled unit: step5-core-k6-1793410012476226221. Admission confirmed
-the source is local/accessible, the pinned numerical code and qualification
-remain unchanged, and the existing layer-30 frontier/partial layer-31
-receipts verify. New expert-76/77 projections in layer 31 confirm progress
-beyond the pause point. Original clean numerical identity is unchanged;
-no matrices or activations were discarded. The pause receipt is archived
-under production/pauses/, with resume-after-sparknest.json recording the
-transition. Publication, no-copy import, six-Spark placement and cleanup
-remain enabled. Continue the 30-minute progress/ETA monitoring.
-
-CONNECTIVITY INTERRUPTION (2026-10-31 02:31 UTC): raptor disconnected and
-its fleet DNS name stopped resolving. Known fabric/Tailscale addresses
-also timed out; SparkNest reports raptor offline. The launcher stopped its
-maxq container and exhausted bounded SSH retries (exit 255), with no
-quantizer/numerical error. Layers 0–32 and 315 complete experts in layer 33
-remain committed. Preserve this clean run. User's resume authorization is
-still active: wait for raptor to return, then resume under the canonical
-maxq lease with --resume --publish. Do not bypass or relocate the hardware
-lock. Connectivity receipt: production/connectivity-interruption.json.
-
-CONNECTIVITY RECOVERED (2026-10-31 03:53 UTC): current enabled unit
-step5-core-k6-1793418663022857522 verified checkpoints and committed new
-layer-33 expert-318 through expert-328 projections beyond the interruption.
-Raptor returned on LAN IP 172.22.220.3; maxq SparkNest still targeted its
-old 172.22.2.12 address, causing source metadata EIO. Corrected only this
-address in the user-owned /srv/sparknest/node.toml, then restarted maxq's
-daemon with approved agent-sudo. Source config/index hashes match the
-original audit. No numerical code, quantized tensor, activation or recipe
-changed. Older failed units are disabled. Resume-after-connectivity.json
-records downtime; monitor excludes partial-resume layer timings from its
-ETA baseline. Continue the clean run with publication and handoff enabled.
-
-USER-REQUESTED PAUSE AGAIN (2026-10-31 04:21 UTC): stop for IP/network
-maintenance. Unit step5-core-k6-1793418663022857522 is stopped and disabled;
-its GPU container is stopped/removed. Layers 0–33 are complete, with
-committed partial expert work in layer 34. All checkpoints, activations and
-partial projections remain intact. production/paused-by-user.json records
-this pause. Do not auto-resume until TJ requests it after addressing is
-settled. The existing clean producer is resumable; no completed layers
-need rebuilding due to an IP change. Publication/handoff remain pending.
-
-RESUMED AGAIN at TJ's request (2026-10-31 04:28 UTC). Current enabled unit:
-step5-core-k6-1793420882847858742. Raptor DNS and maxq SparkNest config now
-agree on 172.22.2.12; source is local and both metadata hashes match the
-original audit. Checkpoint admission passed and new layer-34 expert-308
-through expert-315 projections confirm progress beyond the pause point.
-Layers 0–33 and all valid partial work were preserved. Numerical code and
-recipe are unchanged. The second user-pause receipt is archived under
-production/pauses/; resume-after-network-maintenance.json records the
-transition. Continue 30-minute monitoring with --publish/handoff enabled.
-
-RECOVERED AFTER ANOTHER RAPTOR REBOOT (2026-10-31 06:35 UTC). Current
-enabled unit: step5-core-k6-1793428481217978246. SSH dropped at 06:27 UTC;
-raptor's uptime confirms a 06:29 reboot. Its static LAN address and source
-access recovered without another storage/config change. Layers 0–38 and
-valid partial layer-39 state were preserved; new expert-2 through expert-16
-projections confirm forward progress. Launcher restart spacing is now
-120 seconds instead of 30 so a brief reboot can recover before exhausting
-the bounded start limit. 16 targeted recovery CPU cases pass, and the
-live unit reports RestartUSec=2min. This launcher-only change is outside
-the sealed numerical producer identity; quantization code/settings are
-unchanged. Monitor records the outage and excludes partial-resume layer
-timings. Keep publication/handoff enabled and continue 30-minute checks.
-
-QUANTIZATION COMPLETE (2026-11-01 06:30 UTC): all 93,600 matrices and all
-three MTP stages are committed. Final export validation passes: 96 shards,
-375,913 tensors, 315,357,147,520 payload bytes, including 1,513 native
-tensors / 6,199,381,760 bytes retained. The independent assembled-export
-audit also passes all layouts/MCG/scales, fixed producer origins, exact
-index coverage, native source bytes (all 667 vision tensors), diagnostics,
-licenses and tokenizer assets. Audit and original receipt metadata:
-~/.cache/cuteafd/builds/step5-quant-export/assembled-fixed-release-audit.json.
-GPU container is stopped and canonical maxq lease released. Current service
-step5-core-k6-1793428481217978246 is running CPU-only publication; upload
-requests are succeeding. No publication-complete/import/handoff marker yet.
-Continue watching this service; it will upload, verify public bytes, adopt
-through the no-copy bridge, spread onto the six Sparks, then retire owned
-standalone payloads. Final managed-snapshot independent checker is prepared
-under ~/.cache/cuteafd/builds/step5-quant-export/. Do not re-quantize.
-
-PUBLICATION VERIFIED (2026-11-01 07:42 UTC): public HF revision
-83d47a384eabc07ea6fcfaac4779b0e5f013ce89 contains all 96 shards and 205 release
-files; remote SHA checks and anonymous access pass. SparkNest has already
-adopted the snapshot on maxq with zero copied bytes. Its updated CLI emits
-a mirrored-status line before JSON and reports replayed files as skipped;
-the Step-5 handoff now handles that exact notice and counts new+skipped
-files while preserving all success/zero-copy/complete-managed-SHA guards.
-27 targeted recovery CPU cases pass. Current CPU-only publication/handoff
-unit: step5-core-k6-1793519523192738670. It reuses the verified publication and is
-verifying the managed snapshot before six-Spark placement and cleanup.
-No quantization or numerical source changed. Full final managed audit
-remains pending until import/placement complete.
+Run receipts: `~/.cache/cuteafd/quantization/step5-k4-core-k6/production/`.
+Independent audit: `~/.cache/cuteafd/builds/step5-quant-export/final-managed-audit.json`.
+Placement/cleanup audits: `~/.cache/cuteafd/builds/step5-core-k6/final-*-audit.json`
+and `final-obsolete-payload-retirement.json`. Recipe/final tensor size table:
+`~/step5-core-quant.md`. Implementation: `quantization/step5/core_k6/`.
+The replay-safe handoff tolerates the exact SparkNest mirror notice and
+new+skipped import counts, retaining strict success, zero-copy, complete
+inventory and managed checksum checks. Launcher retries are two minutes
+apart for brief coordinator outages; numerical producer source is sealed.
