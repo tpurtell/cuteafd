@@ -2,6 +2,7 @@
 """Qwen G2/G3: pinned official FP32 tower, BF16 yardstick and native byte identity."""
 import argparse
 import ctypes as C
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -193,6 +194,7 @@ def run(args):
         for tokens in args.tokens:
             encode(tokens)
             native, stages, _ = encode(tokens, model is not None); saved[tokens] = native
+            result.setdefault("output_sha256", {})[str(tokens)] = hashlib.sha256(native.tobytes()).hexdigest()
             if model is None: continue
             gh, gw, rgb = fixture(tokens)
             grid = torch.tensor([[1,gh,gw]], device="cuda")

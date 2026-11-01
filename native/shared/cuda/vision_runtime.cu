@@ -219,7 +219,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s->abi_version==2) {
-    e=cuteafd_vision_attention_create(s->head_dim,&o->attention);if(e)return fail(e);
+    e=cuteafd_vision_attention_create_entry(s->head_dim,0,"",&o->attention);if(e)return fail(e);
   }
 #endif
   e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
