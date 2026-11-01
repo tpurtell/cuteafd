@@ -564,7 +564,8 @@ mod readiness_tests {
         let source = source.split_once("\nfn media_failure").unwrap().0;
         let releases = source.lines().filter(|line| line.contains("release(&family,")
             || line.contains("release_failed(&family,")).collect::<Vec<_>>();
-        assert_eq!(releases.len(), 8);
+        // Admission, scoring, binding and reconcile failures, early ends and finishes.
+        assert_eq!(releases.len(), 9);
         let round = include_str!("scheduler.rs").split_once("\nasync fn decode_round").unwrap().1;
         let failed = round.lines().filter(|line| line.contains("release_failed(family,")).collect::<Vec<_>>();
         assert_eq!(failed.len(), 1);

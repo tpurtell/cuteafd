@@ -928,7 +928,8 @@ mod tests {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
         for (context, output, valid) in [("256", "128", true), ("0", "128", false),
-            ("1048577", "128", false), ("256", "0", false), ("256", "393217", false)] {
+            ("1048577", "128", false), ("256", "0", true), ("256", "-1", true), ("256", "393217", true),
+            ("256", "12k", false)] {
             let command = base.into_iter().chain(["--max-context-tokens", context, "--max-output-tokens", output]);
             assert_eq!(super::Cli::try_parse_from(command).is_ok(), valid);
         }
