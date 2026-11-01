@@ -260,8 +260,8 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
     let audio_preparer = vision.as_ref().and_then(|vision| vision.audio_preparer.clone());
     let (encoder, bytes) = vision.map_or((super::media::Encoder::Off, 0), |vision|
         (vision.encoder, vision.cache_bytes));
-    let health = encoder.health_handle(false);
-    let audio_health = encoder.health_handle(true);
+    let health = encoder.health_handle_for(false);
+    let audio_health = encoder.health_handle_for(true);
     let mut media = MediaAdmission::new(EmbeddingCache::new(bytes), encoder, 16);
     let mut ready = Some(ready);
     let result = opened.with_engine_reserved(&args, Some((&prefix, max_sequences)),

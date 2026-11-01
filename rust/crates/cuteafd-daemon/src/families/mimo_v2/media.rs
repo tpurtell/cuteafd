@@ -191,78 +191,7 @@ impl ReadyVision {
     }
 }
 
-pub(super) enum Encoder {
-    Local(crate::shared::vision::local::LocalEncoder),
-    Remote(crate::shared::vision::remote::RemoteEncoder),
-    Split { image: Box<Encoder>, audio: Box<Encoder> },
-    #[cfg(test)]
-    Fixture(cuteafd_engine::media::FakeEncoder, Arc<std::sync::atomic::AtomicBool>),
-    Off,
-}
-impl Encoder {
-    fn split(image: Self, audio: Self) -> Self {
-        Self::Split { image: Box::new(image), audio: Box::new(audio) }
-    }
-    pub fn health_handle(&self, audio_job: bool) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        match self {
-            Self::Remote(client) => Some(client.health_handle()), Self::Local(client) => Some(client.health_handle()),
-            Self::Split { image, audio } => if audio_job { audio } else { image }.health_handle(audio_job),
-            #[cfg(test)]
-            Self::Fixture(_, health) => Some(health.clone()),
-            Self::Off => None,
-        }
-    }
-    pub fn available_for(&self, audio_job: bool) -> bool {
-        match self {
-            Self::Remote(client) => client.healthy(), Self::Local(client) => client.healthy(),
-            Self::Split { image, audio } => if audio_job { audio } else { image }.available_for(audio_job),
-            #[cfg(test)]
-            Self::Fixture(_, health) => health.load(std::sync::atomic::Ordering::Acquire),
-            Self::Off => false,
-        }
-    }
-}
-impl cuteafd_engine::media::EncoderClient for Encoder {
-    fn submit(&mut self, job: EncodeJob) -> std::result::Result<cuteafd_engine::media::EncoderTicket, cuteafd_engine::media::MediaError> {
-        use cuteafd_engine::media::MediaError;
-        match self {
-            Self::Local(client) => client.submit(job), Self::Remote(client) => client.submit(job),
-            Self::Split { image, audio } => {
-                let is_audio = job.key.is_audio();
-                let owner = if is_audio { audio } else { image };
-                let ticket = owner.submit(job)?;
-                // Each owner starts at ticket zero. Reserve the low bit for modality.
-                match ticket.0.checked_mul(2).and_then(|id| id.checked_add(u64::from(is_audio))) {
-                    Some(id) => Ok(cuteafd_engine::media::EncoderTicket(id)),
-                    None => { owner.cancel(ticket); Err(MediaError::QueueFull) },
-                }
-            },
-            #[cfg(test)]
-            Self::Fixture(client, _) => client.submit(job),
-            Self::Off => Err(MediaError::Encoder("encoder not loaded".into())),
-        }
-    }
-    fn poll(&mut self, ticket: cuteafd_engine::media::EncoderTicket) -> Option<std::result::Result<cuteafd_engine::media::EncodeOutput, cuteafd_engine::media::MediaError>> {
-        match self {
-            Self::Local(client) => client.poll(ticket), Self::Remote(client) => client.poll(ticket),
-            Self::Split { image, audio } => if ticket.0 & 1 == 1 { audio } else { image }
-                .poll(cuteafd_engine::media::EncoderTicket(ticket.0 / 2)),
-            #[cfg(test)]
-            Self::Fixture(client, _) => client.poll(ticket),
-            Self::Off => None,
-        }
-    }
-    fn cancel(&mut self, ticket: cuteafd_engine::media::EncoderTicket) {
-        match self {
-            Self::Local(client) => client.cancel(ticket), Self::Remote(client) => client.cancel(ticket),
-            Self::Split { image, audio } => if ticket.0 & 1 == 1 { audio } else { image }
-                .cancel(cuteafd_engine::media::EncoderTicket(ticket.0 / 2)),
-            #[cfg(test)]
-            Self::Fixture(client, _) => client.cancel(ticket),
-            Self::Off => (),
-        }
-    }
-}
+pub(super) use crate::shared::qwen::Encoder;
 pub(super) fn failure(error: cuteafd_engine::media::MediaError) -> cuteafd_api::openai::NativeFailure {
     match error {
         cuteafd_engine::media::MediaError::CacheFull { .. } | cuteafd_engine::media::MediaError::QueueFull =>
@@ -574,8 +503,8 @@ mod tests {
         assert!(encoder.poll(i).unwrap().is_ok());
         audio_health.store(false, Ordering::Release);
         assert!(encoder.available_for(false)); assert!(!encoder.available_for(true));
-        assert!(Arc::ptr_eq(&encoder.health_handle(false).unwrap(), &image_health));
-        assert!(Arc::ptr_eq(&encoder.health_handle(true).unwrap(), &audio_health));
+        assert!(Arc::ptr_eq(&encoder.health_handle_for(false).unwrap(), &image_health));
+        assert!(Arc::ptr_eq(&encoder.health_handle_for(true).unwrap(), &audio_health));
     }
     #[test]
     fn remote_audio_requires_complete_sm121_identity_and_enabled_placement() {
