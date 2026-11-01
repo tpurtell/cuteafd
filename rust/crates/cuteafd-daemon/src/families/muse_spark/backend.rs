@@ -21,7 +21,7 @@ use crate::shared::{draft::routes::RoundRoutes, prefix::{CudaCopyEngine, PrefixA
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenEmbedding}};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::NativeRequest;
-use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, MediaKeys, RequestMedia},
+use cuteafd_engine::{media::{EncodeJob, EmbeddingCache, RequestMedia},
     prefix::{PrefixCache, PrefixConfig, PrefixFamily, RefPagePool}};
 use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::muse_spark::{lane::HEAD_ROWS, MuseSparkConfig};
@@ -107,6 +107,7 @@ pub(crate) struct MuseBackend<'r, 'a> {
     peer: Option<&'r super::peer::MusePeer<'a>>,
     library: &'a NativeLibrary,
     profile: RefCell<[f64; 2]>,
+    media_binding: super::media::Binding,
     /// Prefill units: rows and waves in flight; the sequence slots, context, pool pages.
     unit_rows: usize,
     waves: usize,
@@ -130,7 +131,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         table: &'r TokenEmbedding<'a>, experts: &'r mut dyn SparkExperts, peer: Option<&'r super::peer::MusePeer<'a>>,
         unit_rows: usize, waves: usize, slots: usize, context: usize, pages: usize,
         local: Vec<super::onboard::OnboardedExperts<'a>>, draft: Option<super::draft::MuseDraft<'a>>,
-        pricing: Option<DraftPricing>) -> Result<Self> {
+        pricing: Option<DraftPricing>, media_binding: super::media::Binding) -> Result<Self> {
         ensure!(draft.is_some() == pricing.is_some(), "Muse drafter and its policy pricing come together");
         // Every Muse layer is MoE; the probe rings the head rank's route ids per layer.
         let head = ranks.last().context("Muse backend without ranks")?.device;
@@ -143,7 +144,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             "Muse backend geometry differs from its ranks, embedding or layers");
         let ring_rows = usize::try_from(cuteafd_loader::placement::families::muse_spark::ring_rows(cfg)?)?;
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), unit_rows, waves, slots, context, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), media_binding, unit_rows, waves, slots, context, pages, ring_rows,
             local: RefCell::new(local), draft, pricing, probe: RefCell::new(probe) })
     }
 
@@ -237,23 +238,25 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         Ok((family, cache))
     }
     fn prepare(&self, job: NativeRequest, tokens: Vec<u32>) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.media.is_empty(), "Muse Spark media towers are not bound yet (text only)");
-        let keys = MediaKeys::new(&tokens, u32::try_from(self.cfg.vocab_size)?, &[])?;
-        let media = RequestMedia::new(Vec::new(), self.cfg.hidden, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, Vec::new()))
+        self.media_binding.prepare(job, tokens, self.cfg.vocab_size, self.cfg.hidden, self.context)
     }
     fn probe_features(&self, prompt: &scheduler::Prompt, media: &mut RequestMedia, _cache: &mut EmbeddingCache,
         _snapshot: &Path) -> Result<()> {
-        ensure!(prompt.job.media.is_empty() && media.spans().is_empty(), "Muse Spark serves text only");
+        self.media_binding.coordinates(&prompt.tokens, media)
+    }
+    fn coordinates(&self, tokens: &[u32], _job: &NativeRequest, media: &RequestMedia) -> Result<()> {
+        self.media_binding.coordinates(tokens, media)
+    }
+    fn placement(&self, pages: Vec<u32>, slot: i32) -> Placement {
+        Placement { slot: slot as usize, pages, len: 0, media: None }
+    }
+    fn bind_request(&self, placement: &mut Placement, _coordinates: (), media: RequestMedia, tokens: &[u32],
+        resume: usize) -> Result<()> {
+        self.media_binding.coordinates(tokens, &media)?;
+        ensure!(resume <= tokens.len() && placement.len == resume, "Muse media bind frontier differs");
+        placement.media = Some(media);
         Ok(())
     }
-    fn coordinates(&self, _tokens: &[u32], job: &NativeRequest, media: &RequestMedia) -> Result<()> {
-        ensure!(job.media.is_empty() && media.spans().is_empty(), "Muse Spark serves text only");
-        Ok(())
-    }
-    fn placement(&self, pages: Vec<u32>, slot: i32) -> Placement { Placement { slot: slot as usize, pages, len: 0 } }
-    fn bind_request(&self, _placement: &mut Placement, _coordinates: (), _media: RequestMedia, _tokens: &[u32],
-        _resume: usize) -> Result<()> { Ok(()) }
     fn history(&self, _placement: &Placement) {}
     fn require_live(&self) -> Result<()> { Ok(()) }
     fn log_table_stats(&self, _phase: &str) {}
@@ -270,7 +273,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         let mut experts = self.experts.borrow_mut();
         let mut local = self.local.borrow_mut();
         let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
-            pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots };
+            pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, media: placement.media.as_ref() };
         let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
             call, &mut local, self.draft.as_ref(), units.len())?;
         crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
