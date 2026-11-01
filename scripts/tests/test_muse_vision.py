@@ -52,3 +52,23 @@ fn main() {{
             pixel = mismatch // 2
             raise AssertionError(f"official resize differs at h={pixel // 1792 + 1}, w={pixel % 1792 + 1}: byte {mismatch}")
         raise AssertionError(f"official extreme resize differs at byte {mismatch}")
+
+
+def test_fp32_yardstick_preserves_audio_error_ratio_and_floor():
+    import numpy as np
+    import pytest
+    spec = importlib.util.spec_from_file_location("muse_vision_qualifier",
+        ROOT / "python/tools/qualify/muse_spark/qualify-vision.py")
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    fp32 = np.ones((2, 3), dtype=np.float64)
+    bf16 = fp32 + 1
+    accepted = qualifier.stage_metrics(fp32 + 1.09, bf16, fp32)
+    rejected = qualifier.stage_metrics(fp32 + 1.11, bf16, fp32)
+    assert accepted["passed"] and accepted["error_ratio"] == pytest.approx(1.09)
+    assert not rejected["passed"] and rejected["error_ratio"] == pytest.approx(1.11)
+    assert qualifier.stage_metrics(fp32 + 1e-8, fp32, fp32)["passed"]
+    assert not qualifier.stage_metrics(fp32 + 2e-7, fp32, fp32)["passed"]
+    assert not qualifier.stage_metrics(fp32 * np.nan, bf16, fp32)["passed"]
+    with pytest.raises(ValueError, match="shapes differ"):
+        qualifier.stage_metrics(fp32[:1], bf16, fp32)

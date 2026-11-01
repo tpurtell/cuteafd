@@ -151,15 +151,46 @@ def official_modules(snapshot, tensors, device):
     return tower, adapter, projection
 
 
+def reference_precision(modules, dtype):
+    """Reuse checkpoint weights; keep the official RoPE frequency buffer FP32."""
+    for module in modules:
+        module.to(dtype=dtype)
+    tower = modules[0]
+    inv, _ = tower.rotary_emb.compute_axial_rope_parameters(
+        tower.config, device=next(tower.parameters()).device)
+    tower.rotary_emb.inv_freq = inv
+    tower.rotary_emb.original_inv_freq = inv.clone()
+
+
+def stage_metrics(actual, bf16, fp32):
+    """Use the audio tower's unchanged 1.1x official-BF16 error yardstick."""
+    if actual.shape != bf16.shape or actual.shape != fp32.shape:
+        raise ValueError("FP32 yardstick stage shapes differ")
+    rms = lambda value: float(np.sqrt(np.mean(np.square(value, dtype=np.float64))))
+    floor = 1e-7
+    signal = rms(fp32)
+    native_error, official_error = rms(actual - fp32), rms(bf16 - fp32)
+    finite = all(np.isfinite(value).all() for value in (actual, bf16, fp32))
+    return dict(signal_rms=signal, absolute_floor=floor,
+        native_absolute_rms=native_error, official_bf16_absolute_rms=official_error,
+        native_relative_rms=native_error / max(signal, floor),
+        official_bf16_relative_rms=official_error / max(signal, floor),
+        error_ratio=native_error / max(official_error, floor),
+        native_vs_bf16_relative_rms=rms(actual - bf16) / max(rms(bf16), floor),
+        max_abs=float(np.max(np.abs(actual - fp32))),
+        passed=bool(finite and native_error <= 1.1 * max(official_error, floor)))
+
+
 def reference_stages(modules, rgb):
     """Official implementation with separately captured layout-sensitive stages."""
     import torch
     from transformers.models.muse_spark import modeling_muse_spark as official
     tower, adapter, projection = modules
-    device = next(tower.parameters()).device
+    parameter = next(tower.parameters())
+    device, dtype = parameter.device, parameter.dtype
     gh, gw = rgb.shape[0] // 14, rgb.shape[1] // 14
     grid = torch.tensor([[1, gh, gw]], dtype=torch.long, device=device)
-    x = torch.from_numpy(patches(rgb)).to(device, dtype=torch.bfloat16)
+    x = torch.from_numpy(patches(rgb)).to(device, dtype=dtype)
     result = {"patch_input": x}
     with torch.no_grad():
         cu = official.get_vision_cu_seqlens(grid)
@@ -190,7 +221,7 @@ def reference_stages(modules, rgb):
         result["55"] = x
         result["56"] = projection(x)
         # Confirm explicit stages still equal the official public tower path.
-        public = projection(adapter(tower(torch.from_numpy(patches(rgb)).to(device, dtype=torch.bfloat16), grid).last_hidden_state))
+        public = projection(adapter(tower(torch.from_numpy(patches(rgb)).to(device, dtype=dtype), grid).last_hidden_state))
         if not torch.equal(public, result["56"]):
             raise AssertionError("explicit official layout stages differ from public forward")
     return {name: value.detach().float().cpu().numpy() for name, value in result.items()}
@@ -199,6 +230,8 @@ def reference_stages(modules, rgb):
 def run(args):
     import torch
     from PIL import Image
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     cfg = json.loads((args.snapshot / "config.json").read_text())
     tensors = read_visual(args.snapshot)
     spec, blob = pack_spec(cfg, tensors)
@@ -219,7 +252,10 @@ def run(args):
     required, owner = Ledger(), C.c_void_p()
     check(lib.cuteafd_vision_required(C.byref(spec), C.byref(required)))
     check(lib.cuteafd_vision_create(C.byref(spec), 0, required.weights + required.scratch + required.blas_workspace, C.byref(owner)))
-    result = dict(device=torch.cuda.get_device_name(0), ledger=required.as_dict(), images={})
+    result = dict(device=torch.cuda.get_device_name(0), ledger=required.as_dict(), images={},
+        precision=dict(fp32_weights="checkpoint BF16 upcast", tf32=False,
+            allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction),
+        library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest())
     try:
         check(lib.cuteafd_vision_upload(owner, 0, blob, len(blob)))
         del blob
@@ -287,18 +323,34 @@ def run(args):
             saved = output.copy()
             encode(OBSERVER())
             repeat = bool(np.array_equal(saved, output))
+            fp32_refs, yardstick = {}, {}
+            if args.fp32_yardstick:
+                reference_precision(modules, torch.float32)
+                fp32_refs = reference_stages(modules, rgb)
+                yardstick = {key: stage_metrics(stages[key], refs[key], fp32_refs[key])
+                    for key in comparisons}
+                reference_precision(modules, torch.bfloat16)
             result["images"][str(path)] = dict(grid=[gh, gw], tokens=tokens, encode_ms=elapsed,
                 stages=comparisons, metadata_exact=metadata, block_replay=replay,
+                fp32_yardstick=yardstick,
                 byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
             if args.dump_stages:
                 args.dump_stages.mkdir(parents=True, exist_ok=True)
-                np.savez(args.dump_stages / (path.stem + ".npz"), **{"native_"+k:v for k,v in stages.items()}, **{"ref_"+k:v for k,v in refs.items()})
+                np.savez(args.dump_stages / (path.stem + ".npz"), **{"native_"+k:v for k,v in stages.items()},
+                    **{"ref_"+k:v for k,v in refs.items()}, **{"fp32_"+k:v for k,v in fp32_refs.items()})
         final = Ledger()
         check(lib.cuteafd_vision_get_ledger(owner, C.byref(final)))
         result["final_ledger"] = final.as_dict()
-        result["pass"] = final.device_allocations == 2 and all(row["byte_repeatable"] and all(row["metadata_exact"].values()) and all(stage["pass"] for stage in row["stages"].values()) for row in result["images"].values())
+        integrity = final.device_allocations == 2 and all(row["byte_repeatable"]
+            and all(row["metadata_exact"].values()) for row in result["images"].values())
+        result["pass"] = integrity and all(all(stage["pass"] for stage in row["stages"].values())
+            for row in result["images"].values())
+        result["fp32_yardstick_pass"] = integrity and all(all(stage["passed"]
+            for stage in row["fp32_yardstick"].values()) for row in result["images"].values()) if args.fp32_yardstick else None
+        result["gate_basis"] = "fp32_yardstick" if args.fp32_yardstick else "strict_bf16"
+        result["gate_pass"] = result["fp32_yardstick_pass"] if args.fp32_yardstick else result["pass"]
         args.output.write_text(json.dumps(result, indent=2) + "\n")
-        return 0 if result["pass"] else 1
+        return 0 if result["gate_pass"] else 1
     finally:
         check(lib.cuteafd_vision_destroy(owner))
 
@@ -310,4 +362,6 @@ if __name__ == "__main__":
     parser.add_argument("--images", type=Path, nargs="+", required=True)
     parser.add_argument("--dump-stages", type=Path)
     parser.add_argument("--replay-blocks", action="store_true")
+    parser.add_argument("--fp32-yardstick", action="store_true",
+        help="gate by native/official BF16 error vs official FP32; retain unchanged strict BF16 verdict")
     raise SystemExit(run(parser.parse_args()))
