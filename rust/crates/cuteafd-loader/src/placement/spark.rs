@@ -138,7 +138,8 @@ pub struct SparkAssignment {
 pub enum SparkResidentLayout {
     Exl3 { world: usize, rank: usize },
     Fp8 { world: usize, rank: usize, slicing: crate::formats::fp8_experts::Slicing },
-    Native { world: usize, rank: usize, stored_width: usize },
+    Native { world: usize, rank: usize },
+    Nvfp4 { world: usize, rank: usize, stored_width: usize },
 }
 
 impl SparkAssignment {
@@ -191,7 +192,8 @@ impl SparkAssignment {
                     (tensors.weight_read_bytes_with(world, rank, slicing)? as u64)
                         .checked_mul(tensors.shape().experts as u64).context("Spark FP8 resident overflow")?
                 }
-                SparkResidentLayout::Native { world, rank, stored_width } => {
+                SparkResidentLayout::Native { world, rank }
+                | SparkResidentLayout::Nvfp4 { world, rank, .. } => {
                     use crate::V41ExpertSelection;
                     ensure!(catalog.exl3().is_none() && catalog.fp8().is_none(),
                         "Spark native layout cannot convert compressed checkpoint headers");
@@ -204,6 +206,17 @@ impl SparkAssignment {
                             geometry.hidden as usize, layer, world, rank)?
                     };
                     let width = shard.intermediate_size();
+                    let stored_width = match layout {
+                        SparkResidentLayout::Nvfp4 { stored_width, .. } => {
+                            ensure!(catalog.nvfp4().is_some(), "NVFP4 layout requires NVFP4 headers");
+                            stored_width
+                        }
+                        _ => {
+                            ensure!(catalog.nvfp4().is_none(), "native MXFP4 layout cannot store NVFP4");
+                            cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden as usize, width)
+                                .context("invalid native MXFP4 resident geometry")?
+                        }
+                    };
                     ensure!(stored_width >= width && stored_width % 32 == 0,
                         "Spark native installed width {stored_width} cannot store logical width {width}");
                     // Check every retained expert's tensor headers, not just config geometry.
@@ -379,9 +392,11 @@ mod tests {
                 prefill_lanes: 1, ..Default::default() };
             let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-            for stored_width in [576, 640] {
+            for stored_width in if nvfp4 { vec![576, 640] } else { vec![640] } {
+                let layout = if nvfp4 { SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width } }
+                    else { SparkResidentLayout::Native { world: 4, rank: 3 } };
                 let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
-                    SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).unwrap();
+                    layout, &endpoints, rings).unwrap();
                 assert_eq!((assignment.slices[0].first, assignment.slices[0].width, assignment.slices[0].stored_width),
                     (1728, 576, stored_width as u32));
                 let expected = if nvfp4 {
@@ -399,7 +414,7 @@ mod tests {
             }
             for stored_width in [544, 577] {
                 assert!(SparkAssignment::from_catalog(&catalog, &working, 3,
-                    SparkResidentLayout::Native { world: 4, rank: 3, stored_width }, &endpoints, rings).is_err());
+                    SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width }, &endpoints, rings).is_err());
             }
             // Config geometry alone must not admit an expert with a missing projection.
             let index_path = dir.path().join("model.safetensors.index.json");
@@ -409,7 +424,8 @@ mod tests {
             weights.remove(&name);
             std::fs::write(&index_path, serde_json::to_vec(&index).unwrap()).unwrap();
             let result = crate::read_expert_catalog(dir.path()).and_then(|catalog| SparkAssignment::from_catalog(
-                &catalog, &working, 3, SparkResidentLayout::Native { world: 4, rank: 3, stored_width: 640 }, &endpoints, rings));
+                &catalog, &working, 3, if nvfp4 { SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width: 640 } }
+                    else { SparkResidentLayout::Native { world: 4, rank: 3 } }, &endpoints, rings));
             assert!(result.is_err());
         }
     }

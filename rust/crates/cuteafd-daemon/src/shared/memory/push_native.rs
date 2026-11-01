@@ -37,6 +37,9 @@ impl ScalePlan {
         let mut plan = Self::default();
         for (layer, planes, base) in layers {
             if !planes.scale_codes { continue; }
+            let geometry = catalog.routed_experts();
+            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, 32, layer, world, rank)?;
+            ensure!(shard.width == planes.intermediate, "native scale shard differs from resident planes");
             for expert in 0..planes.experts {
                 let (names, _) = names(catalog, layer, expert, world, rank)?;
                 // A step must complete within one source tensor: projections
@@ -46,8 +49,8 @@ impl ScalePlan {
                     let tensor = catalog.tensor(&names[slot])?;
                     let row_bytes = tensor.metadata.shape[1];
                     let rows = if down { 0..planes.hidden }
-                        else { rank * planes.intermediate..(rank + 1) * planes.intermediate };
-                    let cols = if down { rank * planes.intermediate / 32..(rank + 1) * planes.intermediate / 32 }
+                        else { shard.source_range() };
+                    let cols = if down { shard.first / 32..(shard.first + shard.width) / 32 }
                         else { 0..row_bytes };
                     let rect = Rect { name: names[slot].clone(), path: catalog.snapshot().join(&tensor.shard),
                         base: tensor.metadata.byte_offset, row_bytes, rows, cols };

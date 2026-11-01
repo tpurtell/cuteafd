@@ -19,13 +19,18 @@ endif()
 
 set(CUTEAFD_V41_SPARK_TP_SELECTED)
 foreach(tp IN LISTS CUTEAFD_SPARK_TP_ROLES)
-  if(tp STREQUAL "tp2" OR tp STREQUAL "tp3" OR tp STREQUAL "tp6" OR tp STREQUAL "tp8")
+  if(tp MATCHES "^tp[2-8]$")
+    string(REGEX REPLACE "^tp" "" world "${tp}")
+    math(EXPR unequal "72 % ${world}")
+    if(world EQUAL 4 OR NOT unequal EQUAL 0)
+      continue() # Adjacent-width objects are built by shared/mxfp4_widths.cmake.
+    endif()
     if(tp IN_LIST CUTEAFD_V41_SPARK_TP_SELECTED)
       message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES lists ${tp} more than once")
     endif()
     list(APPEND CUTEAFD_V41_SPARK_TP_SELECTED "${tp}")
   else()
-    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts only tp2, tp3, tp6 and tp8, got ${tp}")
+    message(FATAL_ERROR "CUTEAFD_SPARK_TP_ROLES accepts tp2 through tp8, got ${tp}")
   endif()
 endforeach()
 
@@ -113,6 +118,8 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       "${CMAKE_CURRENT_SOURCE_DIR}/${wrapper_src}"
       "${width_stamp}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${role} replicated-group Spark expert kernels"
     VERBATIM

@@ -99,9 +99,17 @@ def test_measured_storage_holds_and_generated_native_header_agree(native_map):
             LAYOUTS.stored_width(hidden, width)
 
 
+def test_native_plan_rejects_mixed_decode_tilings():
+    data = LAYOUTS.layouts()
+    data["native_slices"][0]["slices"][1] = 64
+    with pytest.raises(ValueError, match="decode capacities must share"):
+        LAYOUTS.validate(data)
+
+
 def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.native_slice_width(5120, 288, 121, 1, 192) == 128
-    assert LAYOUTS.native_slice_width(5120, 288, 121, 16, 192) == 64
+    assert LAYOUTS.native_slice_width(5120, 288, 121, 16, 192) == 128
+    assert LAYOUTS.native_slice_width(5120, 288, 121, 256, 192) == 64
     assert LAYOUTS.native_slice_width(5120, 288, 120, 1, 192) == 192
     assert LAYOUTS.native_slice_width(4096, 352, 121, 16, 128) == 128
     assert LAYOUTS.native_slice_width(5120, 576, 121, 80, 192) == 192

@@ -16,7 +16,7 @@
     {
       "hidden": 5120, "width": 288, "sm": 121,
       "capacities": [1, 16, 80, 256, 1024, 4096],
-      "slices": [128, 64, 128, 64, 64, 64],
+      "slices": [128, 128, 128, 64, 64, 64],
       "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; strict F32 and invariants"
     },
     {

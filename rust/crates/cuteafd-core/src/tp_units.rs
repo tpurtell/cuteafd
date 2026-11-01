@@ -26,6 +26,19 @@ pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
         "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
 }
 
+/// Additive width-keyed native ABI roles never encode Spark count or rank.
+pub const NATIVE_WIDTH_ROLE_BASE: u32 = 65536;
+
+pub fn native_width_role(width: usize) -> Option<u32> {
+    (width > 0 && width % 32 == 0 && width <= 8192)
+        .then(|| NATIVE_WIDTH_ROLE_BASE + width as u32)
+}
+
+pub fn native_role_width(role: u32) -> Option<usize> {
+    let width = role.checked_sub(NATIVE_WIDTH_ROLE_BASE)? as usize;
+    (native_width_role(width) == Some(role)).then_some(width)
+}
+
 /// A frozen (deprecated) format's admitted Spark worlds: the cards it shipped
 /// or was admitted on before it froze. Its packaged worlds may be wider (a
 /// historical role or a tail sibling's layout), but a frozen format never

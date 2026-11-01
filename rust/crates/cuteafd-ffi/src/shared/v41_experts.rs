@@ -138,8 +138,10 @@ impl V41ExpertReduction {
             "unsupported native expert reduction attestation");
         ensure!(self.fc2_k_steps == self.slice_width / self.mma_k
             && self.plane_count == info.logical_intermediate.div_ceil(self.slice_width)
+            && info.kernel_intermediate >= info.logical_intermediate
             && self.plane_count.checked_mul(self.slice_width)
-                .is_some_and(|extent| extent <= info.kernel_intermediate),
+                .and_then(|extent| extent.checked_sub(info.logical_intermediate))
+                .is_some_and(|tail| tail < self.slice_width),
             "native expert slice/fold geometry differs from compiled expert info");
         ensure!(matches!(self.plane_fold, 1 | 2 | 3) && matches!(self.implementation, 1 | 2),
             "unknown native expert plane fold or implementation");
@@ -259,6 +261,17 @@ fn expected_expert_geometry(
     role: u32,
     kernel_intermediate: u32,
 ) -> Option<(u32, u32, u32, u32)> {
+    if !nvfp4 {
+        if let Some(width) = cuteafd_core::tp_units::native_role_width(role) {
+            let intermediate = geometry.intermediate as usize;
+            let units = intermediate / 32;
+            let admitted = (2..=cuteafd_core::MAX_SPARK_WORLD).any(|world| units % world != 0
+                && [units / world * 32, units.div_ceil(world) * 32].contains(&width));
+            if !admitted { return None; }
+            let stored = cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden as usize, width)?;
+            return Some((geometry.experts, width as u32, stored as u32, geometry.topk));
+        }
+    }
     let draft = |intermediate: u32| Some((128, intermediate, intermediate, 3));
     let tp = match (nvfp4, role) {
         (false, 0) => return draft(2304),
@@ -273,7 +286,11 @@ fn expected_expert_geometry(
     };
     let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
     let padded = logical.div_ceil(128) * 128;
-    let kernel = if nvfp4 && kernel_intermediate == logical { logical } else { padded };
+    let kernel = if nvfp4 {
+        if kernel_intermediate == logical { logical } else { padded }
+    } else {
+        cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden as usize, logical as usize)? as u32
+    };
     Some((geometry.experts, logical, kernel, geometry.topk))
 }
 
@@ -767,7 +784,10 @@ impl NativeLibrary {
     /// Query immutable native MXFP4 numerical metadata before allocation/readiness.
     pub fn native_expert_reduction(&self, info: &V41ExpertInfo) -> Result<V41ExpertReduction> {
         type Query = unsafe extern "C" fn(i32, *mut V41ExpertReduction) -> i32;
+        let width_name = cuteafd_core::tp_units::native_role_width(info.role)
+            .map(|width| format!("cuteafd_v41_spark_w{width}_expert_info_reduction"));
         let name: &[u8] = match info.role {
+            _ if width_name.is_some() => width_name.as_ref().unwrap().as_bytes(),
             1 => b"cuteafd_v41_expert_info_reduction",
             2 => b"cuteafd_v41_local_expert_info_reduction",
             3 => b"cuteafd_v41_tp2_expert_info_reduction",
@@ -787,6 +807,34 @@ impl NativeLibrary {
         ensure!(status == 0, "native expert reduction query failed with CUDA status {status}");
         result.validate(info)?;
         Ok(result)
+    }
+
+    /// An adjacent K32 shard selected from absolute layer/rank ownership.
+    pub fn native_width_expert_info(&self, capacity: u32, width: usize) -> Result<V41ExpertInfo> {
+        let role = cuteafd_core::tp_units::native_width_role(width)
+            .context("invalid native K32 artifact width")?;
+        let name = family_symbol(format!("cuteafd_v41_spark_w{width}_expert_info").as_bytes())?;
+        // SAFETY: the width export uses the same immutable repr(C) metadata ABI.
+        let function = unsafe { self.lib.get::<InfoFn>(&name) }
+            .with_context(|| format!("missing adjacent native artifact {}", String::from_utf8_lossy(&name)))?;
+        let mut info = V41ExpertInfo::default();
+        // SAFETY: info is writable; the capacity conversion is checked.
+        let status = unsafe { function(i32::try_from(capacity)?, &mut info) };
+        let geometry = cuteafd_core::expert_geometry();
+        let expected = expected_expert_geometry(geometry, false, role, info.kernel_intermediate)
+            .context("native width is not an adjacent shard of the checkpoint")?;
+        ensure!(status == 0 && info.role == role && info.abi_version == 2
+            && info.input_dtype == 7 && info.hidden_size == geometry.hidden
+            && info.capacity_rows == capacity && info.scratch_bytes > 0
+            && (info.experts, info.logical_intermediate, info.kernel_intermediate, info.topk) == expected,
+            "adjacent native expert metadata differs from the checkpoint: {info:?}, expected {expected:?}");
+        Ok(info)
+    }
+
+    pub fn native_width_expert_kernel(&self, capacity: u32, width: usize) -> Result<V41ExpertKernel<'_>> {
+        let info = self.native_width_expert_info(capacity, width)?;
+        let prefix = family_symbol(format!("cuteafd_v41_spark_w{width}").as_bytes())?;
+        self.expert_kernel_named(capacity, info, String::from_utf8(prefix)?, false)
     }
 
     fn expert_info_for(&self, capacity: u32, interface: u8) -> Result<V41ExpertInfo> {
@@ -992,6 +1040,11 @@ impl NativeLibrary {
             _ => "cuteafd_v41",
         };
         let prefix = String::from_utf8(family_symbol(prefix.as_bytes())?)?;
+        self.expert_kernel_named(capacity, info, prefix, matches!(interface, 5 | 6 | 7 | 12 | 13))
+    }
+
+    fn expert_kernel_named(&self, capacity: u32, info: V41ExpertInfo, prefix: String,
+        nvfp4: bool) -> Result<V41ExpertKernel<'_>> {
         let symbol = |operation: &str| format!("{prefix}_expert_{operation}").into_bytes();
         // SAFETY: this additive entry point writes one u32 and loads no CUDA state.
         let query_group_rows = unsafe { *self.lib.get::<GroupRowsFn>(&symbol("group_rows"))? };
@@ -1011,7 +1064,6 @@ impl NativeLibrary {
             status == 0,
             "V4.1 expert initialization failed with CUDA status {status}"
         );
-        let nvfp4 = matches!(interface, 5 | 6 | 7 | 12 | 13);
         let output_kind = if info.abi_version == 3 || nvfp4 {
             type OutputKindFn = unsafe extern "C" fn(i32, *mut u32) -> i32;
             let query = unsafe { self.lib.get::<OutputKindFn>(&symbol("output_kind"))? };
@@ -1208,9 +1260,9 @@ mod tests {
     }
 
     #[test]
-    fn native_tp8_geometry_preserves_logical_k32_and_stored_h128_widths() {
+    fn native_tp8_geometry_uses_the_measured_storage_policy() {
         for (geometry, experts, logical, stored) in [
-            (V41, 384, 288, 384),
+            (V41, 384, 288, 288),
             (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH, 256, 256, 256),
             (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO, 384, 384, 384),
         ] {
@@ -1218,6 +1270,39 @@ mod tests {
                 Some((experts, logical, stored, 6)));
             assert_eq!(expected_expert_geometry(geometry, true, 8, stored), None);
         }
+    }
+
+    #[test]
+    fn native_width_metadata_uses_checkpoint_adjacent_geometry() {
+        for geometry in [V41, cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH,
+            cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO] {
+            let units = geometry.intermediate as usize / 32;
+            for width in (32..=8192).step_by(32) {
+                let role = cuteafd_core::tp_units::native_width_role(width).unwrap();
+                let adjacent = (2..=8).any(|world| units % world != 0
+                    && [units / world * 32, units.div_ceil(world) * 32].contains(&width));
+                let result = expected_expert_geometry(geometry, false, role, 0);
+                assert_eq!(result.is_some(), adjacent);
+                if let Some((experts, logical, stored, topk)) = result {
+                    assert_eq!((experts, logical, topk), (geometry.experts, width as u32, geometry.topk));
+                    assert_eq!(stored as usize, cuteafd_core::mxfp4_layouts::stored_width(
+                        geometry.hidden as usize, width).unwrap());
+                }
+                assert!(expected_expert_geometry(geometry, true, role, 0).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn compute_tail_is_not_resident_weight_padding() {
+        let info = V41ExpertInfo { abi_version: 2, logical_intermediate: 288,
+            kernel_intermediate: 288, ..Default::default() };
+        let recipe = V41ExpertReduction { version: 1, slice_width: 128, fc2_k_steps: 4,
+            plane_count: 3, plane_fold: 1, implementation: 1, mma_k: 32,
+            block_threads: 128, fc1_k_stage: 128 };
+        recipe.validate(&info).unwrap();
+        assert!(recipe.plane_count * recipe.slice_width > info.kernel_intermediate);
+        assert!(recipe.validate(&V41ExpertInfo { kernel_intermediate: 256, ..info }).is_err());
     }
 
     #[test]

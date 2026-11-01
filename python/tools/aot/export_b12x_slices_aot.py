@@ -18,6 +18,8 @@ from pathlib import Path
 
 from v41_spark_tp3_launch_geometry import launch_geometry
 from expert_grouping import native_group_macros, slice_group_rows
+from mxfp4_layouts import stored_width, native_slice_width
+from spark_packages import native_width_inventory, native_width_role
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
 os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
@@ -36,7 +38,7 @@ ROLE_GEOMETRY = {
     "spark_tp2": (384, 1152, 1152, 6),
     "spark_tp3": (384, 768, 768, 6),
     "spark_tp6": (384, 384, 384, 6),
-    "spark_tp8": (384, 288, 384, 6),
+    "spark_tp8": (384, 288, stored_width(5120, 288), 6),
     "rtx_backbone": (384, 2304, 2304, 6),
     "spark": (384, 576, 640, 6),
 }
@@ -80,6 +82,12 @@ ROLE_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6, "s
 
 def role_geometry(family, role):
     """(experts, intermediate, kernel_intermediate, topk) for one family role."""
+    shape = FAMILY_GEOMETRY[family]
+    if role.startswith("spark_w"):
+        width = int(role.removeprefix("spark_w"))
+        if width not in native_width_inventory(shape["intermediate"], list(range(2, 9))):
+            raise ValueError(f"{family} has no native shard width {width}")
+        return shape["experts"], width, stored_width(shape["hidden"], width), shape["topk"]
     if family == "v41":
         return ROLE_GEOMETRY[role]
     shape = FAMILY_GEOMETRY[family]
@@ -87,7 +95,7 @@ def role_geometry(family, role):
     if tp is None or shape["intermediate"] % tp or (shape["intermediate"] // tp) % 32:
         raise ValueError(f"{family} has no {role} expert slice")
     intermediate = shape["intermediate"] // tp
-    return shape["experts"], intermediate, (intermediate + 127) // 128 * 128, shape["topk"]
+    return shape["experts"], intermediate, stored_width(shape["hidden"], intermediate), shape["topk"]
 
 
 def expert_plane_bytes(family: str, hidden: int, intermediate: int, stored: int) -> tuple[int, ...]:
@@ -134,12 +142,13 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError("native Blackwell device required")
-    if role not in ROLE_GEOMETRY:
+    width_role = role.startswith("spark_w")
+    if role not in ROLE_GEOMETRY and not width_role:
         raise ValueError(f"unsupported expert placement role {role!r}")
     coordinator = role == "coordinator"
     tp2 = role == "rtx_tp2"
     draft_tp2 = role == "dspark_tp2"
-    expected_sm = ROLE_SM[role]
+    expected_sm = (12, 1) if width_role else ROLE_SM[role]
     if (props.major, props.minor) != expected_sm:
         raise ValueError(
             f"{role} expert slices require SM{expected_sm[0]}{expected_sm[1]}, "
@@ -194,6 +203,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
         atomic = not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
         selected_width = width[capacity] if isinstance(width, dict) else width
+        if role.startswith("spark"):
+            selected_width = native_slice_width(hidden, intermediate, props.major * 10 + props.minor,
+                                                capacity, selected_width)
         routes = capacity * topk
         planes = (intermediate + selected_width - 1) // selected_width
         # The native Spark TP3 launch geometry is recorded from the reviewed
@@ -246,6 +258,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
                                                experts=experts, topk=topk, intermediate=intermediate,
                                                hidden=hidden, scale_codes=family == "v41",
+                                               exact_storage=kernel_intermediate == intermediate and intermediate % 128 != 0,
                                                fc2_n_splits=fc2_n_splits(role, capacity, selected_width, hidden)))
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
@@ -361,7 +374,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         )
         info = [
             3 if atomic else 2,
-            ROLE_NATIVE_ID[role],
+            native_width_role(intermediate) if width_role else ROLE_NATIVE_ID[role],
             experts,
             hidden,
             intermediate,
@@ -447,7 +460,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--role", choices=("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8", "coordinator", "rtx_backbone", "rtx_tp2", "dspark_tp2"), default="spark")
+    parser.add_argument("--role", default="spark", help="placement role or geometry-derived spark_wWIDTH")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", choices=sorted(FAMILY_GEOMETRY), default="v41",
                         help="routed-expert family; names the exported symbols")

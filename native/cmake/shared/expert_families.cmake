@@ -42,11 +42,23 @@ set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:128,16:128,80:128,256:128,1024:128,4096:128")
 set(expert_ops info initialize output_kind group_rows bind_scratch initialize_scratch_async launch)
 
 foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
-  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|spark_tp3|spark_tp6|spark_tp8|rtx_backbone|rtx_tp2)$")
-    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2|spark_tp3|spark_tp6|spark_tp8|rtx_backbone|rtx_tp2)")
+  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp[2-8]|rtx_backbone|rtx_tp2)$")
+    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp[2-8]|rtx_backbone|rtx_tp2)")
   endif()
   set(family "${CMAKE_MATCH_1}")
   set(role "${CMAKE_MATCH_2}")
+  if(role MATCHES "^spark_tp([2-8])$")
+    set(world "${CMAKE_MATCH_1}")
+    if(family STREQUAL "dsv4f")
+      set(units 64)
+    else()
+      set(units 96)
+    endif()
+    math(EXPR unequal "${units} % ${world}")
+    if(NOT unequal EQUAL 0)
+      continue() # Shared geometry-derived width objects replace a false equal role.
+    endif()
+  endif()
   set(device_handles "")
   if(role MATCHES "^rtx_")
     set(wanted coordinator)
@@ -106,6 +118,8 @@ ${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41
       "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
       "${stamp}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${family} ${role} routed-expert kernels"
     VERBATIM

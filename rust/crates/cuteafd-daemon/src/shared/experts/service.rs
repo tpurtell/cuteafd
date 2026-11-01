@@ -178,8 +178,8 @@ fn load_weights<'a>(
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
     let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, _| {
-        let budget = ExpertWeights::plan_execution(config.selection(0)?, library,
-            compiled, live, nvfp4)?;
+        let selections = layers.iter().map(|&layer| config.selection(layer)).collect::<Result<Vec<_>>>()?;
+        let budget = ExpertWeights::plan_execution_layers(selections, library, compiled, live, nvfp4)?;
         let device = budget.total()?;
         let scratch = budget.scratch_bytes.checked_add(budget.decode_scratch_bytes)
             .and_then(|bytes| bytes.checked_add(budget.small_scratch_bytes))

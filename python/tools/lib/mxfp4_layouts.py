@@ -12,7 +12,17 @@ def layouts() -> dict:
     data = json.loads(LAYOUTS_PATH.read_text())
     if data["schema"] != 1:
         raise ValueError("unsupported MXFP4 layout schema")
+    validate(data)
     return data
+
+
+def validate(data: dict) -> None:
+    for row in data["native_slices"]:
+        recipes = dict(zip(row["capacities"], row["slices"], strict=True))
+        if len({width for capacity, width in recipes.items() if capacity <= 80}) != 1:
+            raise ValueError("native MXFP4 decode capacities must share one slice recipe")
+        if any(width not in (64, 128, 192) for width in recipes.values()):
+            raise ValueError("invalid native MXFP4 slice width")
 
 
 def stored_width(hidden: int, width: int) -> int:

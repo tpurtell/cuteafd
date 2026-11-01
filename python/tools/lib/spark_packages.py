@@ -54,8 +54,28 @@ def ownership_topology(tp: int, ep: int) -> bool:
                            for family in ('v41', 'dsv4f', 'dsv4p'))) or (tp, ep) in ((2, 2), (3, 2), (2, 3))
 
 
-# Stable public native ABI role ids, not a list of packaged worlds.
+# Stable legacy ABI ids. Unequal source ownership selects width-keyed artifacts.
 NATIVE_SPARK_ROLE_IDS = {2: 5, 3: 6, 4: 1, 6: 7, 8: 8}
+NATIVE_WIDTH_ROLE_BASE = 65536
+
+
+def native_widths(intermediate: int, world: int) -> list[int]:
+    if not 1 <= world <= 8 or intermediate <= 0 or intermediate % 32 or intermediate // 32 < world:
+        raise ValueError("invalid native K32 shard geometry")
+    units = intermediate // 32
+    return sorted({32 * (units // world), 32 * -(-units // world)}, reverse=True)
+
+
+def native_width_role(width: int) -> int:
+    if width <= 0 or width % 32 or width > 8192:
+        raise ValueError("invalid native artifact width")
+    return NATIVE_WIDTH_ROLE_BASE + width
+
+
+def native_width_inventory(intermediate: int, worlds: list[int]) -> list[int]:
+    """Only unequal worlds need additive width-keyed native entry points."""
+    return sorted({width for world in worlds if (intermediate // 32) % world
+                   for width in native_widths(intermediate, world)}, reverse=True)
 
 
 def native_spark_geometry(family: str = 'v41') -> dict[int, tuple[int, int, int]]:
