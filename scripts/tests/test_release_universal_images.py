@@ -157,7 +157,7 @@ spark_tp_roles="$2"
 echo ACCEPTED
 """
     for advertised, requested in [
-        (UNIVERSAL, UNIVERSAL), ("tp8;tp3;tp6;tp2", UNIVERSAL),
+        (UNIVERSAL, UNIVERSAL), ("tp8;tp7;tp6;tp5;tp3;tp2", UNIVERSAL),
         ("tp2;tp6", "tp2;tp6"), ("tp6", "tp6"), ("", ""),
     ]:
         result = _bash(harness, positional=[advertised, requested])
@@ -169,7 +169,7 @@ echo ACCEPTED
         ("tp2;tp3;tp5;tp6;tp7;tp8;tp4", UNIVERSAL),    # foreign token in the label
         ("tp2;tp3;tp5;tp6;tp7;tp8", "tp2;tp3"),        # label overstates the request
         (UNIVERSAL, ""),                   # a legacy build that baked roles
-        ("tp5", UNIVERSAL),                # a label nothing can honor
+        ("tp5", UNIVERSAL),                # one role cannot substantiate a full claim
     ]:
         result = _bash(harness, positional=[advertised, requested])
         assert result.returncode == 2, (advertised, requested, result.stdout)
@@ -351,7 +351,7 @@ def _jq(role: str, claimed: str, document: str, library_sha: str) -> bool:
 def test_bake_check_accepts_the_real_coordinator_and_expert_shapes():
     assert _jq("coordinator", "", _manifest("coordinator", [], "coord-sha"), "coord-sha")
     assert _jq("expert", UNIVERSAL,
-               _manifest("expert", ["tp2", "tp3", "tp6", "tp8"], "spark-sha"), "spark-sha")
+               _manifest("expert", ["tp2", "tp3", "tp5", "tp6", "tp7", "tp8"], "spark-sha"), "spark-sha")
     assert _jq("expert", "tp6;tp2;tp3",
                _manifest("expert", ["tp2", "tp3", "tp6"], "spark-sha"), "spark-sha")
     assert _jq("expert", "tp6", _manifest("expert", ["tp6"], "spark-sha"), "spark-sha")

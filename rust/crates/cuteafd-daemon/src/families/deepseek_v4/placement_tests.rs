@@ -257,11 +257,11 @@ fn planner_equals_runtime_topology_selected_live_units() {
     let manifest = synthetic_context(dir.path());
     let shared = Shared::open(dir.path()).unwrap();
     for rtx in [1, 2] {
-        for sparks in [1, 2, 4, 5, 6, 8] {
+        for sparks in 1..=cuteafd_core::MAX_SPARK_WORLD {
             let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks,
                 context: 1_048_576, budget: 24 << 30, onboard: Some(Onboard::Layers(2)),
                 dspark: false, exchange_f32: false, peer_budget: None, attention: None };
-            if matches!(sparks, 2 | 4) {
+            if cuteafd_core::tp_units::native_spark_artifacts(4096, 2048, sparks).is_ok() {
                 assert_equal(&shared, &case, &format!("topology {rtx} RTX + {sparks} Sparks"));
             } else {
                 let (_, supported, hints) = planned(&shared, &case);

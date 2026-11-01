@@ -1048,7 +1048,7 @@ fn deepseek_v41_components_formats_and_placement() {
     assert_eq!(component(&report, Component::MappedTable).owner, Owner::HostMapped);
     assert!(component(&report, Component::MappedTable).formats.contains_key("fp8-block1x32/ue8m0"));
     assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
-    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6, 8]);
+    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, (2..=8).collect::<Vec<_>>());
     assert!(!report.executable());
     assert!(report.hints.iter().any(|h| h.what.contains("native placement refused")));
 }
@@ -1117,7 +1117,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     for nvfp4 in [false, true] {
         let dir = strict_v41_snapshot(nvfp4);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        for (ranks, gpus) in [(3, 1), (6, 2)] {
+        for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
                 workspace_manifest: v41_workspace(dir.path()),
@@ -1127,7 +1127,8 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
             assert!(report.placement_supported, "{}", render(&report));
             let memory = report.memory_layout.as_ref().unwrap();
             let experts = report.experts.as_ref().unwrap();
-            assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
+            assert_eq!(experts.package, if nvfp4 { "v41:nvfp4 (expertd-native)" }
+                else { "v41:mxfp4 (expertd-native)" });
             let packed = |tp: u64| {
                 let (hidden, logical, experts) = (5120u64, 2304 / tp, 384u64);
                 let stored = logical.div_ceil(128) * 128;
@@ -1909,8 +1910,9 @@ fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
         ("mimop:fp8 (MXFP4)", 32, &[2, 6, 7, 8][..]));
-    // TP6 of 2048 in 32-row blocks: 352 rows, stored 384 wide.
-    assert!((report.spark_rank_share - 384.0 / 2048.0).abs() < 1e-12);
+    // The generic recipe advertises logical K32 ownership, not its H128
+    // package's physical extent: ceil(64 / 6) blocks = 352 columns.
+    assert!((report.spark_rank_share - 352.0 / 2048.0).abs() < 1e-12);
 }
 
 #[test]
@@ -2206,6 +2208,41 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind};
+    for v41 in [true, false] {
+        let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            rtx_bytes: vec![96 << 30], local_expert_layers: Some(1),
+            workspace_manifest: v41.then(|| dir.path().join("share/PROGRAMS.json")),
+            pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default()
+        }), ..sparks(4) }).unwrap();
+        assert!(report.placement_supported, "{}", render(&report));
+        assert_eq!(report.experts.as_ref().unwrap().package,
+            if v41 { "v41:mxfp4 (expertd-native)" } else { "dsv4f:mxfp4 (expertd-native)" });
+        // Independent resident-plane arithmetic, after the single local layer.
+        let (hidden, logical, stored, experts, remote) = if v41 {
+            (5120u64, 576u64, 640u64, 384u64, 39u64)
+        } else { (4096, 512, 512, 256, 3) };
+        let payload = hidden * stored * 3 / 2;
+        let scales = if v41 {
+            2 * stored * (1 + 2 * (hidden / 128))
+                + hidden * (1 + 2 * (logical / 32).div_ceil(4))
+        } else { hidden * stored * 3 / 32 };
+        let expected = remote * experts * (payload + scales);
+        let memory = report.memory_layout.as_ref().unwrap();
+        assert_eq!(memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark).count(), 4);
+        for device in memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark) {
+            let resident = device.items.iter().find(|item| item.group == "routed_expert").unwrap();
+            assert_eq!(resident.basis, Basis::Formula);
+            assert_eq!(resident.bytes, expected, "{}", render(&report));
+            assert_eq!(device.by_category()[&Category::Experts], expected);
+        }
+    }
+}
+
+#[test]
 fn v4_plan_shared_span_matches_unit_rows_and_waves() {
     let dir = v4_snapshot();
     for (unit, waves) in [(2048, 1), (2048, 2), (2048, 3), (4096, 1), (4096, 2), (2752, 3)] {
@@ -2427,7 +2464,7 @@ fn spark_rank_options_follow_transport_and_packages() {
             workspace_manifest: v41_workspace(dsv41.path()), ..Default::default()
         }), ..options.clone() };
         let v41 = plan(dsv41.path(), &v41_options).unwrap();
-        assert_eq!(v41.placement_supported, matches!(ranks, 2 | 3 | 4 | 6 | 8), "v41 {ranks}: {}", render(&v41));
+        assert_eq!(v41.placement_supported, matches!(ranks, 2..=8), "v41 {ranks}: {}", render(&v41));
     }
 }
 
@@ -3778,7 +3815,7 @@ fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
 #[test]
 fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     let dir = strict_v41_snapshot(false);
-    for ranks in [2, 3, 4, 6] {
+    for ranks in 2..=6 {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
             ..Default::default()
@@ -3788,7 +3825,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
         if ranks == 2 {
             assert!(!report.executable(), "two native shards exceed Spark memory");
             assert!(report.hints.last().unwrap().what.contains("spark0 full memory layout"));
-            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 6]"));
+            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 5, 6]"));
         } else {
             assert!(report.executable(), "{}", render(&report));
             assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 262_144);

@@ -1001,25 +1001,26 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
     devices: &mut [DeviceLayout], notes: &mut Vec<String>, what: impl Fn(&DeviceLayout) -> String) {
     let checkpoint = input.checkpoint();
     for device in devices {
-        let package = report.experts.as_ref().map_or("", |experts| experts.package.as_str());
-        if package.split(" + ").all(|package| matches!(package,
-            "v41:mxfp4" | "dsv4f:mxfp4" | "dsv4p:mxfp4")) {
-            let resident = input.expert_catalog().and_then(|catalog| {
-                let rank = device.index as usize;
-                crate::placement::SparkAssignment::resident_from_catalog(catalog, working, rank,
-                    crate::placement::SparkResidentLayout::Native { world: working.spark_ranks, rank })
-            });
-            match resident {
-                Ok(assignment) => {
-                    if let Some(item) = device.items.iter_mut().find(|item| item.group == "routed_expert") {
-                        item.bytes = assignment.resident_bytes;
-                        item.basis = Basis::Formula;
-                    }
+        let resident = input.expert_catalog().and_then(|catalog| {
+            if !matches!(super::spark_executions::SparkBackend::for_catalog(catalog)?,
+                super::spark_executions::SparkBackend::Native) || catalog.nvfp4().is_some() {
+                return Ok(None);
+            }
+            let rank = device.index as usize;
+            crate::placement::SparkAssignment::resident_from_catalog(catalog, working, rank,
+                crate::placement::SparkResidentLayout::Native { world: working.spark_ranks, rank }).map(Some)
+        });
+        match resident {
+            Ok(Some(assignment)) => {
+                if let Some(item) = device.items.iter_mut().find(|item| item.group == "routed_expert") {
+                    item.bytes = assignment.resident_bytes;
+                    item.basis = Basis::Formula;
                 }
-                Err(error) => {
-                    report.placement_supported = false;
-                    notes.push(format!("{} native resident admission: {error:#}", what(device)));
-                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                report.placement_supported = false;
+                notes.push(format!("{} native resident admission: {error:#}", what(device)));
             }
         }
         let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))

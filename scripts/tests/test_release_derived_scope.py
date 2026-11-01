@@ -52,7 +52,7 @@ def test_union_equals_per_entry_derivation(fixture_repo):
             if key == P + 'GENERIC_SPARK_COUNTS':
                 assert expected <= SCOPE.tokens(value)
             elif key == P + 'SPARK_TP_ROLES':
-                assert SCOPE.tokens(value) == expected | {'tp8'}
+                assert SCOPE.tokens(value) == expected | {'tp5', 'tp7', 'tp8'}
             else:
                 assert SCOPE.tokens(value) == expected
     assert SCOPE.PREVIOUS_RELEASE_FLOOR['GENERIC_SPARK_COUNTS'] <= SCOPE.tokens(union[P + 'GENERIC_SPARK_COUNTS'])
@@ -82,9 +82,10 @@ def test_full_release_expands_native_roles_without_widening_explicit_scope(fixtu
     selected = 'dsv4f:spark;dsv4p:spark'
     full, _ = SCOPE.derive(repo, path, 'all', {P + 'EXPERT_FAMILIES': selected})
     experts = SCOPE.tokens(full[P + 'EXPERT_FAMILIES'])
-    assert {'dsv4f:spark_tp8', 'dsv4p:spark_tp8', 'dsv4p:spark_tp3'} <= experts
-    assert not {'dsv4f:spark_tp3', 'dsv4f:spark_tp6', 'dsv4p:spark_tp5',
-                'dsv4p:spark_tp7'} & experts
+    # Equal worlds keep their role names; unequal worlds resolve each request
+    # to both adjacent width artifacts. Only the all-scope expands coverage.
+    assert {f'{family}:spark_tp{world}' for family in ('dsv4f', 'dsv4p')
+            for world in (2, 3, 5, 6, 7, 8)} <= experts
     explicit, _ = SCOPE.derive(repo, path, 'explicit', {P + 'EXPERT_FAMILIES': selected})
     assert explicit[P + 'EXPERT_FAMILIES'] == selected
 

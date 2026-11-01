@@ -800,7 +800,7 @@ class V10BuildTargetTest(unittest.TestCase):
         self.assertIn(f"coordinator image: {coordinator}", default)
         self.assertIn(f"spark image: {spark}", default)
         # The promoted default carries the universal role set.
-        self.assertIn("tp2;tp3;tp6", default)
+        self.assertIn("tp2;tp3;tp5;tp6;tp7;tp8", default)
 
 
     def test_all_examples_use_the_promoted_pair(self) -> None:
@@ -849,7 +849,7 @@ class V11ReleaseBuildTargetTest(unittest.TestCase):
         self.assertIn("release tag: v11", v11)
         self.assertIn("coordinator image: ghcr.io/tpurtell/cuteafd-coordinator:v11", v11)
         self.assertIn("spark image: ghcr.io/tpurtell/cuteafd-spark-expert:v11", v11)
-        self.assertIn("tp2;tp3;tp6", v11)
+        self.assertIn("tp2;tp3;tp5;tp6;tp7;tp8", v11)
 
 
 if __name__ == "__main__":

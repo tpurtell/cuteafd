@@ -925,7 +925,12 @@ mod tests {
                     let expected = if world == 4 { ExpertLayer::Backbone { layer: 7, rank } }
                         else { ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world } };
                     assert_eq!(layer, expected, "{family} TP{world} rank {rank}");
-                    assert!(layer.role() <= 8);
+                    let geometry = cuteafd_core::expert_geometry();
+                    let shard = layer.native_shard().unwrap();
+                    let artifacts = cuteafd_core::tp_units::native_spark_artifacts(
+                        geometry.hidden as usize, geometry.intermediate as usize, world).unwrap();
+                    let artifact = artifacts.iter().find(|artifact| artifact.logical == shard.width).unwrap();
+                    assert_eq!(layer.role(), artifact.role);
                     assert!(native.declared_world.ownership_topology().is_none());
                     assert_eq!(native.native_group().unwrap(), None);
                 }

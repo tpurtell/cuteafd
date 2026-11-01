@@ -1,6 +1,7 @@
 """ctypes bindings for official TP4 and local dSpark expert qualification."""
 
 import ctypes as C
+import _pinned_sparkinfer
 from spark_packages import native_spark_artifacts
 from mxfp4_layouts import stored_width
 

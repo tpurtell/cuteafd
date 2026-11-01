@@ -428,14 +428,16 @@ mod tests {
     #[test]
     fn padded_native_source_units_are_not_kernel_alignment() {
         use cuteafd_core::tp_units::RankUnits;
-        for (package, intermediate, world, stored) in [
-            ("v41:mxfp4 (expertd-native)", 2304, 8, 384),
+        for (package, intermediate, world, logical) in [
+            ("v41:mxfp4 (expertd-native)", 2304, 8, 288),
             ("dsv4p:mxfp4 (expertd-native)", 3072, 3, 1024),
         ] {
             let recipe = super::super::experts::spark_recipe(package, intermediate, world).unwrap();
             let block = source_block_columns(package, true, 128, 128);
             assert_eq!(block, 32);
-            assert_eq!(recipe.widths, vec![stored; world]);
+            assert_eq!(recipe.widths, vec![logical; world]);
+            assert_eq!(recipe.native_artifacts[0].logical, logical);
+            assert_eq!(recipe.native_artifacts[0].stored, logical);
             for rank in 0..world {
                 let map = RankUnits::new(recipe.rule, 1, intermediate, block, 0, world, rank).unwrap();
                 assert_eq!(map.resident_units() * block, intermediate / world);
@@ -473,8 +475,10 @@ mod tests {
             ..Default::default()
         };
         let input = PlanInput::open(dir.path()).unwrap();
+        // Deliberately substitute the display contract's H128 block for the
+        // native source unit; a range annotation must not alter direct admission.
         let old_ranges = input.spark_ranges_with_source_units(&options,
-            |_, padded, count_unit, contract_block| if padded { contract_block } else { count_unit }).unwrap();
+            |_, _, _, contract_block| contract_block).unwrap();
         let direct = input.plan(&options).unwrap();
         let package = &direct.experts.as_ref().unwrap().package;
         assert!(package.starts_with(match case {
@@ -493,7 +497,7 @@ mod tests {
                 .zip(after["counts"].as_array().unwrap()) {
                 if before["source_block_columns"] != after["source_block_columns"] {
                     assert!(case <= 1);
-                    assert_eq!(before["padded"], true);
+                    assert_eq!(after["padded"], false);
                     assert_eq!(before["source_block_columns"], 128);
                     assert_eq!(after["source_block_columns"], 32);
                     before["source_block_columns"] = after["source_block_columns"].clone();
