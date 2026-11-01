@@ -352,6 +352,47 @@ cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out);
 cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, void* cuda_stream);
 cuteafd_status_t cuteafd_cuda_graph_exec_update(void* cuda_graph_exec, void* cuda_graph);
+// Updates a retained graph (cuteafd_cuda_graph_end_capture_retained) and its
+// executable in place by substituting kernel-argument values. The "_v2" name
+// is the ABI bump over the p4/p9 7-arg cuteafd_cuda_graph_exec_update_pointers
+// (no `kinds`): a mismatched library fails symbol lookup instead of misreading
+// arguments.
+//
+// widths[i] is the argument width in bytes (4 or 8). kinds[i] is 0 for a scalar
+// argument and 1 for a device-pointer argument. A kernel-node argument is
+// replaced only when its size equals widths[i] and its value equals
+// old_values[i]. Only kernel nodes are updated (memcpy/memset nodes are left
+// unchanged). Nodes are read through the driver API, so kernels from
+// driver-loaded modules (CuTe-DSL AOT cudaLibrary kernels, no runtime host stub)
+// are updated like runtime kernels; argument sizes come from cuFuncGetParamInfo.
+//
+// Pointer/scalar validation (before any node is touched): a kind==1 value must
+// be 8 bytes and, unless old == new, both old and new must resolve to a CUDA
+// allocation (device, managed or registered host); an 8-byte kind==0 value must
+// not resolve to one. A scalar that shares a pointer's numeric value can
+// therefore never be rewritten as a pointer, nor a pointer as a scalar.
+//
+// Returns INVALID_ARGUMENT for a failed validation, an unsupported parameter
+// layout, or an ambiguous substitution (one old value of one width mapped to two
+// new values); INTERNAL_ERROR for a failed CUDA call (message carries the
+// driver error name/string). On ANY failure the graph/exec may be partially
+// updated and must be retired by the caller (recapture), and the per-thread
+// CUDA last-error is cleared before returning, so a recovered failure cannot
+// leak into the next kernel's launch-status check.
+//
+// found[i] is set to 1 when old_values[i] matched at least one kernel-node
+// argument of the same width, else 0. The caller must treat any non-identity
+// value (old != new) that was not found as a failed update: a missed
+// substitution would leave the graph pointing at stale arguments.
+cuteafd_status_t cuteafd_cuda_graph_exec_update_pointers_v2(
+    void* cuda_graph_exec, void* cuda_graph, const uint64_t* old_values,
+    const uint64_t* new_values, const uint8_t* widths, const uint8_t* kinds,
+    uint8_t* found, size_t count);
+// TEST ONLY (native selftest): make the next update_pointers_v2 call on this
+// thread fail at `stage` (1 = cuGraphKernelNodeGetParams, 2 =
+// cuGraphKernelNodeSetParams, 3 = cuGraphExecKernelNodeSetParams); one-shot,
+// 0 disarms. Not bound by the Rust FFI.
+void cuteafd_cuda_graph_update_pointers_inject_fault(int stage);
 cuteafd_status_t cuteafd_cuda_graph_destroy(void* cuda_graph);
 cuteafd_status_t cuteafd_cuda_graph_exec_destroy(void* cuda_graph_exec);
 cuteafd_status_t cuteafd_cuda_graph_update_rmsnorm_bf16_node(

@@ -678,6 +678,14 @@ if(CUTEAFD_ENABLE_CUDA)
   add_executable(cuteafd_cuda_selftest tests/cuda_selftest.cc)
   target_link_libraries(cuteafd_cuda_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cublas CUDA::cuda_driver)
   add_test(NAME cuteafd_cuda_selftest COMMAND cuteafd_cuda_selftest)
+  # p10 WP1: driver-API graph argument update (runtime + driver-library nodes).
+  add_executable(cuteafd_cuda_graph_update_selftest tests/cuda_graph_update_selftest.cu)
+  set_target_properties(cuteafd_cuda_graph_update_selftest PROPERTIES
+    CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
+  target_include_directories(cuteafd_cuda_graph_update_selftest PRIVATE ${CUTEAFD_NATIVE_INCLUDE_DIRS})
+  target_link_libraries(cuteafd_cuda_graph_update_selftest PRIVATE cuteafd_native CUDA::cudart CUDA::cuda_driver)
+  add_test(NAME cuteafd_cuda_graph_update_selftest COMMAND cuteafd_cuda_graph_update_selftest)
+  set_tests_properties(cuteafd_cuda_graph_update_selftest PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   add_executable(cuteafd_vision_pointwise_selftest tests/vision_pointwise_test.cu)
   set_target_properties(cuteafd_vision_pointwise_selftest PROPERTIES
     CUDA_ARCHITECTURES "${CUTEAFD_CUDA_ARCHITECTURES}")
