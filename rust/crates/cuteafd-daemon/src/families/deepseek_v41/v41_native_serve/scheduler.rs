@@ -582,15 +582,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 };
                 if job.events.is_closed() { continue; }
                 let events = job.events.clone();
-                match admission::Prepared::new(job, &args.snapshot, limits) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
-                            .cloned().unwrap_or_else(|| format!("{error:#}").into());
-                        let _ = events.send(Err(failure));
-                        continue;
-                    }
-                }
+                let Some(prepared) = crate::shared::api::admission_result(&events,
+                    admission::Prepared::new(job, &args.snapshot, limits)) else { continue; };
+                prepared
                 }
             };
             if prepared.job.events.is_closed() { continue; }
@@ -731,7 +725,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let admission::Prepared { job, prompt, images } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
             let result = (|| -> Result<Active<'a>> {
-                let mut constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()?;
+                let mut constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
+                    .map_err(cuteafd_api::openai::NativeFailure::from_admission_error)?;
                 ensure!(!job.events.is_closed(), "client disconnected");
                 let decoder = cuteafd_loader::streaming_token_decoder(&args.snapshot, false)?;
                 let cached = hit.as_ref().map_or(0, |(end, _)| *end);

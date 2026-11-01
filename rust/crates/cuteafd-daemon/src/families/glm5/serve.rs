@@ -600,14 +600,10 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 reject(&job, format!("scoring: {error:#}"));
                 continue;
             }
-            let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
-                Ok(constraint) => constraint,
-                Err(error) => {
-                    reject(&job, format!("{error:#}"));
-                    continue;
-                }
-            };
-            let tokens = probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))?;
+            let Some(constraint) = crate::shared::api::admission_result(&job.events,
+                job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose()) else { continue; };
+            let Some(tokens) = crate::shared::api::admission_result(&job.events,
+                probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))) else { continue; };
             let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
