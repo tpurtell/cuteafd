@@ -1665,6 +1665,30 @@ fn exl3_card_columns_fit_from_headers() {
             report.wip_launchable(), report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
     }
     assert!(fit(2, 6).wip_launchable());
+    if let Some(snapshot) = std::env::var_os("CUTEAFD_STEP5_EXL3_SNAPSHOT") {
+        for (gpus, sparks) in [(1, 3), (2, 6)] {
+            let real = plan::plan(std::path::Path::new(&snapshot), &PlanOptions {
+                placement: ExpertPlacement::from_spark_ranks(sparks),
+                draft_ownership: Some(spec::DraftOwnership::None),
+                layout: Some(layout::LayoutOptions {
+                    host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: vec![96 << 30; gpus],
+                    workspace_manifest: Some(manifest.clone()), ..Default::default()
+                }), ..Default::default()
+            }).unwrap();
+            let expected = fit(gpus, sparks);
+            let actual = real.memory_layout.as_ref().unwrap();
+            let fixture = expected.memory_layout.as_ref().unwrap();
+            assert!(real.wip_launchable(), "{:#?}", real.hints);
+            assert_eq!(real.onboard_layers, expected.onboard_layers);
+            assert_eq!(actual.pool_tokens, fixture.pool_tokens);
+            let spark_bytes = |layout: &layout::MemoryLayout| layout.devices.iter()
+                .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+                .map(|d| d.used_bytes()).collect::<Vec<_>>();
+            assert_eq!(spark_bytes(actual), spark_bytes(fixture));
+            eprintln!("Step-5 EXL3 real {gpus}+{sparks}: pool {}, onboard {:?}, Spark bytes {:?}; fixture identical",
+                actual.pool_tokens, real.onboard_layers, spark_bytes(actual));
+        }
+    }
 }
 
 
