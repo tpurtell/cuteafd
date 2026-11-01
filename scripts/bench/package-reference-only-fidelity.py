@@ -270,6 +270,9 @@ def public_panel(panel):
     # Keep immutable generation identity, not deployment arguments or local paths.
     server = public.get('generation_server', {})
     public['generation_server'] = {k: server[k] for k in ('build', 'family', 'model') if k in server}
+    # Superseded internal allocation record of early top-up sets (the window ids and per-block
+    # counts carry the allocation); never consumed.
+    public.pop('topup', None)
     public['publication_provenance'] = {
         **public.get('publication_provenance', {}),
         'source_set_sha256': panel['set_sha256'],
@@ -326,7 +329,12 @@ def package(source, out, config, tokenizer_path, license_path, identity=None):
             or proof.get('fixed_rows') != 128 or proof.get('set_sha256') != set_id
             or proof.get('snapshot_identity') != meta['snapshot_identity']):
         raise ValueError('invalid reference prefix qualification')
-    for value in meta['source_pin'].values():
+    for key, value in meta['source_pin'].items():
+        # Identity strings beside the hashes: the pinned library version and the root's HF id.
+        if key == 'transformers' and isinstance(value, str) and re.fullmatch(r'\d+\.\d+\.\d+', value):
+            continue
+        if key == 'checkpoint' and value == meta['checkpoint']:
+            continue
         if not isinstance(value, str) or len(value) not in (40, 64) or any(c not in '0123456789abcdef' for c in value):
             raise ValueError('invalid source pin')
     if rows['dtype'] != '<f2' or rows['kind'] != 'log_softmax':
@@ -371,7 +379,16 @@ def package(source, out, config, tokenizer_path, license_path, identity=None):
                           sha256=digest(target), shape=[512, 1024], source_full_sha256=entry['sha256']))
         print(f'packaged {config}/{wid}', flush=True)
     provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
-                                      'transformers', 'attention', 'mtp', 'use_cache', 'gates', 'native_fp32_parameters')}
+                                      'transformers', 'attention', 'mtp', 'use_cache')}
+    # Layer-major goldens record their checks as arithmetic/expert storage/official forward.
+    provenance['gates'] = meta['gates'] if 'gates' in meta else {
+        k: meta[k] for k in ('arithmetic', 'expert_storage', 'official_forward', 'fixed_rows') if k in meta}
+    if not provenance['gates']:
+        raise ValueError('golden records no reference gates')
+    provenance['native_fp32_parameters'] = meta.get(
+        'native_fp32_parameters', 'checkpoint F32 tensors kept F32; all computation in F32')
+    if meta.get('harness_commit'):
+        provenance['harness_commit'] = meta['harness_commit']
     if meta.get('root_arithmetic') is not None:
         provenance['root_arithmetic'] = meta['root_arithmetic']
         provenance['reference_precision'] = reference_precision(meta, panel)

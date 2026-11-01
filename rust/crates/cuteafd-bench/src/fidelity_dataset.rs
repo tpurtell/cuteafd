@@ -514,6 +514,16 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                     "transformers_source_sha256", "compressed_tensors_source_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
                 && padding_valid
+        } else if manifest["family"] == "muse_spark" || manifest["family"] == "mistral_large4" {
+            // Official transformers 5.22.1 modeling (pinned file hashes), our adapter and runner.
+            let family = manifest["family"].as_str().unwrap_or_default();
+            let modeling = format!("modeling_{family}_sha256");
+            let configuration = format!("configuration_{family}_sha256");
+            source["revision"] == manifest["root_checkpoint"]["revision"]
+                && source["checkpoint"] == manifest["root_checkpoint"]["id"]
+                && source["transformers"] == "5.22.1"
+                && [modeling.as_str(), configuration.as_str(), "masking_utils_sha256", "reference_adapter_sha256",
+                    "layer_major_sha256", "golden_sha256"].iter().all(|key| hash(&source[*key], 64))
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -531,7 +541,9 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             && hash(&qualification["reference_validation"]["full_seal_sha256"], 64)
             && proof["lengths"] == json!([576, 640]) && proof["score_from"] == 64
             && proof["logits_sha256"].as_array().is_some_and(|a| a.len() == 2 && a.iter().all(|h| hash(h, 64)))
-            && qualification["scored_tokens"] == 32768
+            // Every window scores 512 rows; the set's own window count fixes the total.
+            && manifest["files"].as_array().is_some_and(|files| files.len() >= 64
+                && qualification["scored_tokens"] == json!(512 * files.len()))
             && qualification["reference_validation"]["scored_tokens"] == qualification["scored_tokens"]
             && qualification["reference_validation"]["nll"].as_f64().zip(qualification["nll"].as_f64())
                 .is_some_and(|(a, b)| a.is_finite() && (a - b).abs() <= 1e-8)
@@ -610,7 +622,7 @@ mod tests {
             "stored_shape":[128], "loaded_shape":[96], "tail_shape":[32], "tail_dtype":"F32",
             "tail_bitwise_zero":true, "tail_sha256":digest(&[0u8;128])})).collect();
         let manifest = json!({"family":"kimi_k3", "set_sha256":"sealed", "vocab":163840,
-            "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}});
+            "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}, "files":vec![json!({}); 64]});
         let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
             "set_sha256":"sealed", "qualifies":true, "engine_parity":false, "nll":0.7, "scored_tokens":32768,
             "reference_validation":{"passed":true,"engine_parity":false,"set_sha256":"sealed",
@@ -1132,11 +1144,15 @@ mod tests {
             let manifest_bytes = std::fs::read(root.join("manifest.json")).unwrap();
             let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
             let reference = load(&root, &manifest).unwrap();
-            assert_eq!(reference.windows.len(), 64);
+            assert!(reference.windows.len() >= 64);
             assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+            let mut total = 0;
             for shape in ["decode", "prefill"] {
-                assert_eq!(standard_windows(&reference, shape, true).unwrap().len(), 32);
+                let n = standard_windows(&reference, shape, true).unwrap().len();
+                assert_eq!(n, standard_ids(&reference, shape).unwrap().len());
+                total += n;
             }
+            assert_eq!(total, reference.windows.len());
             let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
             let expected = if qualification["kind"] == "reference_only" { "reference-only qualified" } else { "reference" };
             assert_eq!(qualification_label(&qualification, &manifest).unwrap(), expected);
@@ -1208,7 +1224,8 @@ mod tests {
     fn reference_requires_complete_non_engine_evidence() {
         let identity = json!({"checkpoint":"Qwen/Qwen3.5-9B", "snapshot_revision":"a".repeat(40),
             "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
-        let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)}});
+        let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)},
+            "files":vec![json!({}); 64]});
         let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference", "qualifies":true, "engine_parity":false,
             "set_sha256":"set", "nll":1.2, "scored_tokens":32768,
             "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",

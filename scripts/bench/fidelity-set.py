@@ -171,7 +171,7 @@ def allocation_note(windows, ids):
             counts[w["bucket"]] = counts.get(w["bucket"], 0) + 1
         return dict(sorted(counts.items()))
     added = [w for w in windows if w["id"] in ids]
-    return {"reason": "8-16K B windows added (TJ 2026-10-31) so each standard half reaches the new-set floor of "
+    return {"reason": "8-16K B windows added (2026-10-31) so each standard half reaches the new-set floor of "
                       "10,000 scored generated rows (target 10,200); same B prompt/target rule continued past b11",
             "added_windows": {wid: standard_half(wid) for wid in ids},
             "original_blocks": ORIGINAL_BLOCKS, "original_strata": strata([w for w in windows if w["id"] not in ids]),
