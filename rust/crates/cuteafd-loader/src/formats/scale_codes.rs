@@ -61,10 +61,10 @@ pub fn plane_bytes(rows: usize, columns: usize) -> Option<usize> {
 }
 
 /// Fixed resident layout of an MXFP4 package using coded UE8M0 scales.
-/// Payloads retain the native N256/K128 order; FC2 scales use logical K.
+/// Aligned payloads retain N256/K128; exact tails use N128. FC2 scales use logical K.
 pub fn expert_planes(hidden: usize, intermediate: usize, stored: usize) -> Option<[usize; 4]> {
     if hidden == 0 || hidden % 256 != 0 || intermediate == 0 || intermediate % 32 != 0
-        || stored != intermediate.checked_add(127)? / 128 * 128 {
+        || Some(stored) != cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate) {
         return None;
     }
     let values = hidden.checked_mul(stored)?;
@@ -74,7 +74,7 @@ pub fn expert_planes(hidden: usize, intermediate: usize, stored: usize) -> Optio
 
 pub fn expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> Option<u64> {
     let (hidden, intermediate) = (usize::try_from(hidden).ok()?, usize::try_from(intermediate).ok()?);
-    let stored = intermediate.checked_add(127)? / 128 * 128;
+    let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate)?;
     let bytes = expert_planes(hidden, intermediate, stored)?.into_iter()
         .try_fold(0usize, |sum, n| sum.checked_add(n))?;
     u64::try_from(bytes).ok()?.checked_mul(experts)

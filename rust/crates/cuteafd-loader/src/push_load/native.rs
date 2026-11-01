@@ -35,8 +35,9 @@ impl NativePlanes {
                 && intermediate > 0
                 && intermediate % 32 == 0
                 && kernel_intermediate >= intermediate
-                && kernel_intermediate % (if nvfp4 { 64 } else { 128 }) == 0
-                && (nvfp4 || kernel_intermediate == intermediate.div_ceil(128) * 128)
+                && kernel_intermediate % (if nvfp4 { 64 } else { 32 }) == 0
+                && (nvfp4 || Some(kernel_intermediate)
+                    == cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate))
                 && kernel_intermediate <= 8192
                 && experts > 0,
             "invalid native push geometry"

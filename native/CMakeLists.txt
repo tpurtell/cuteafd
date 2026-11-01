@@ -318,6 +318,14 @@ endif()
 if(CUTEAFD_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py")
+  execute_process(COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+    --header "${CMAKE_CURRENT_BINARY_DIR}/cuteafd_mxfp4_layouts.h"
+    COMMAND_ERROR_IS_FATAL ANY)
   # Extract the real undocumented registration ABI; upgrades must match our
   # forwarding static_assert rather than silently corrupting registrations.
   file(READ "${CUDAToolkit_INCLUDE_DIRS}/crt/host_runtime.h" CUTEAFD_CUDA_HOST_RUNTIME)
