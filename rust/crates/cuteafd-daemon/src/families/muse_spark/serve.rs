@@ -36,6 +36,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
+    #[arg(long, default_value = "auto")] pub vision: cuteafd_loader::plan::MediaMode,
+    #[arg(long, default_value = "auto")] pub audio: cuteafd_loader::plan::MediaMode,
+    #[arg(long, value_delimiter = ',')] pub vision_peers: Vec<SocketAddr>,
+    #[arg(long, requires = "vision_peers")] pub encoder_plan_hash: Option<String>,
+    #[arg(long, requires = "vision_peers")] pub encoder_revision: Option<String>,
+    #[arg(long, value_delimiter = ',')] pub audio_peers: Vec<SocketAddr>,
+    #[arg(long, requires = "audio_peers")] pub audio_encoder_plan_hash: Option<String>,
+    #[arg(long, requires = "audio_peers")] pub audio_encoder_revision: Option<String>,
+    #[arg(long)] pub media_cache_bytes: Option<u64>,
     /// Opt in to a DFlash2 drafter snapshot (RadixArk/Muse-Spark-Open-DFlash2); it runs
     /// beside the target head and reads the target's exact head (softcap and multiplier).
     #[arg(long)] pub draft: Option<PathBuf>,
@@ -99,6 +108,25 @@ impl ServeArgs {
             && gib < u64::MAX as f64 / (1u64 << 30) as f64),
             "Muse Spark requires a finite positive --spark-budget-gib");
         self.prefill()?;
+        for (name, mode, peers, hash, revision) in [
+            ("vision", self.vision, &self.vision_peers, &self.encoder_plan_hash, &self.encoder_revision),
+            ("audio", self.audio, &self.audio_peers, &self.audio_encoder_plan_hash, &self.audio_encoder_revision),
+        ] {
+            use cuteafd_loader::plan::MediaMode;
+            let remote = !peers.is_empty();
+            ensure!(!remote || matches!(mode, MediaMode::Auto | MediaMode::Spark(_)),
+                "Muse {name} encoder peers require auto or Spark placement");
+            ensure!(!matches!(mode, MediaMode::Spark(_)) || remote,
+                "Muse Spark {name} requires planner-resolved encoder peers");
+            ensure!(remote == hash.is_some() && remote == revision.is_some(),
+                "Muse {name} encoder peers, plan hash and revision must be supplied together");
+            ensure!(peers.len() <= 8 && peers.iter().collect::<std::collections::HashSet<_>>().len() == peers.len(),
+                "Muse {name} encoder peers must be distinct and at most eight");
+            if let Some(hash) = hash { crate::shared::vision::worker::parse_plan_hash(hash)?; }
+            ensure!(revision.as_ref().is_none_or(|revision| !revision.trim().is_empty()),
+                "Muse {name} encoder revision cannot be empty");
+        }
+        ensure!(self.audio_peers.len() <= 1, "Muse audio admits one encoder owner");
         // A request's widest step is a verify (anchor plus drafts, at most the 64-row
         // rollback step); the cutoff must keep it BF16, so decode and verify stay lossless.
         cuteafd_loader::families::muse_spark::replies::Cutoff::new(self.expert_partial_bf16_max_rows,
@@ -110,7 +138,7 @@ impl ServeArgs {
 }
 
 /// Bring the engine up and hand `run` the backend and its admitted sequences.
-fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize) -> Result<T>)
+fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBackend<'_, '_>, usize, super::media::Ready) -> Result<T>)
     -> Result<T> {
     ensure!(args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu,
         "Muse Spark keeps its embedding on the entry GPU");
@@ -153,10 +181,12 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
             cuteafd_loader::placement::families::muse_spark::drafter_inventory(&cfg, &config,
                 usize::from(args.max_sequences), usize::from(args.max_sequences), head, sms as u64,
                 args.draft_kv_cache)
-        }).transpose()?, media: None })?;
+        }).transpose()?, media: Some(super::media::inventory(&args.snapshot,
+            args.vision, args.audio, args.vision_peers.len().max(1))?) })?;
     tracing::info!(placement = %placement.summary(), rtx_expert_layers = placement.onboard_layers,
         pool_tokens = placement.pool_tokens, k6_programs = built.projections.iter().map(|r| r.programs.len()).sum::<usize>(),
         "Muse Spark admitted TP experts with coordinator-combined partials");
+    let media = super::media::Ready::load(args, &library, built.media.as_ref().context("Muse media admission missing")?)?;
     let prefill = args.prefill()?;
     let cutoff = cuteafd_loader::families::muse_spark::replies::Cutoff::with_wide(args.expert_partial_bf16_max_rows,
         cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS, args.expert_partial_wide_format)?;
@@ -231,16 +261,19 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
         served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?)?;
-    run(&backend, sequences)
+    run(&backend, sequences, media)
 }
 
 fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_api::openai::NativeRequest>,
-    stats: &Arc<std::sync::Mutex<serde_json::Value>>, eos: Vec<u32>, initialized: impl FnOnce(usize) -> Result<()>)
-    -> Result<()> {
+    stats: &Arc<std::sync::Mutex<serde_json::Value>>, eos: Vec<u32>,
+    initialized: impl FnOnce(super::media::ApiReady) -> Result<()>) -> Result<()> {
     use crate::shared::qwen::scheduler::{self, Backend as _};
-    with_backend(args, |backend, sequences| {
-        let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(0),
-            crate::shared::qwen::Encoder::Off, 16);
+    with_backend(args, |backend, sequences, ready| {
+        let super::media::Ready { encoder, image, audio, cache_bytes, prefix } = ready;
+        let api = super::media::ApiReady { context: backend.geometry().max_context, image, audio,
+            image_health: encoder.health_handle_for(false), audio_health: encoder.health_handle_for(true) };
+        let mut media = cuteafd_engine::media::MediaAdmission::new(cuteafd_engine::media::EmbeddingCache::new(cache_bytes),
+            encoder, 16);
         let drafts = match (&args.draft, args.draft_fixed) {
             (None, _) => scheduler::Drafts::None,
             (Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true },
@@ -248,8 +281,8 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
                 depth: crate::shared::speculation::dflash::DflashConfig::read(snapshot)?.drafts(), fixed: false },
         };
         scheduler::schedule(backend, &args.snapshot, receive, stats, sequences, drafts, eos,
-            args.decode_share, &args.prefix, args.token_io.token_select, &mut media, None,
-            || initialized(backend.geometry().max_context))
+            args.decode_share, &prefix, args.token_io.token_select, &mut media, None,
+            || initialized(api))
     })
 }
 
@@ -270,7 +303,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     let stats = Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let engine_args = args.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<super::media::ApiReady>>();
     let handle = tokio::task::spawn_blocking(move || {
         let mut ready = Some(ready_tx);
         let result = worker(&engine_args, &mut receive, &worker_stats, eos, |context| {
@@ -283,8 +316,9 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         }
         result
     });
-    let context = ready_rx.await.context("Muse Spark worker exited before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output)?;
+    let ready = ready_rx.await.context("Muse Spark worker exited before readiness")??;
+    let limits = NativeLimits::new(u32::try_from(ready.context)?, args.max_output)?;
+    let profile = ready.install(profile)?;
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
         "muse_spark", profile.id.clone(), snapshot.clone())));
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
@@ -325,6 +359,9 @@ mod tests {
         assert_eq!(defaults.pool_tokens, None);
         assert_eq!(defaults.rtx_expert_layers, cuteafd_loader::placement::Onboard::Auto);
         assert_eq!(defaults.max_sequences, 16);
+        assert_eq!(defaults.vision, cuteafd_loader::plan::MediaMode::Auto);
+        assert_eq!(defaults.audio, cuteafd_loader::plan::MediaMode::Auto);
+        assert!(defaults.vision_peers.is_empty() && defaults.audio_peers.is_empty());
         assert_eq!(defaults.spark_budget_bytes(), cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES);
         assert_eq!(defaults.expert_partial_bf16_max_rows, 64);
         assert_eq!(defaults.expert_partial_wide_format, cuteafd_loader::families::muse_spark::replies::WideFormat::Nvfp4);
@@ -343,18 +380,20 @@ mod tests {
     /// Bring-up order: admission seals the Spark endpoint before the coordinator
     /// loads (onboarded experts inside the same window), the link connects
     /// after the load, and the backend serves the shared scheduler with no
-    /// drafter, text-only media, and the readiness callback last.
+    /// drafter, admitted media owners, and the readiness callback last.
     #[test]
     fn serve_brings_up_then_schedules_the_backend() {
         let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
         let body = source.split("fn with_backend<T>").nth(1).unwrap().split("\nfn worker(").next().unwrap();
-        let order = ["startup::admit(", "SparkAdmission::plan(", "load_while_admitting(Some(admission)",
-            "super::onboard::load(", "MuseEngine::connect(", "MuseBackend::new(", "run(&backend, sequences)"];
+        let order = ["startup::admit(", "super::media::Ready::load(", "SparkAdmission::plan(", "load_while_admitting(Some(admission)",
+            "super::onboard::load(", "MuseEngine::connect(", "MuseBackend::new(", "run(&backend, sequences, media)"];
         let at: Vec<usize> = order.iter().map(|needle| body.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
         assert!(!body.contains("bail!(\"Muse Spark step executor"), "serving no longer stops after bring-up");
         let worker = source.split("\nfn worker(").nth(1).unwrap().split("\npub(crate) async fn run(").next().unwrap();
-        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("Encoder::Off"));
+        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("EmbeddingCache::new(cache_bytes)"));
+        assert!(worker.contains("encoder.health_handle_for(false)") && worker.contains("encoder.health_handle_for(true)"));
+        assert!(worker.contains("args.decode_share, &prefix"));
         // `--draft` drives neural drafts (the policy's depth, or the fixed one); without it, none.
         assert!(worker.contains("(Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true }"));
         assert!(worker.contains("DflashConfig::read(snapshot)?.drafts(), fixed: false"));
@@ -363,6 +402,31 @@ mod tests {
         let run = source.split("\npub(crate) async fn run(").nth(1).unwrap();
         assert!(run.contains("MuseEncoding::from_snapshot(") && run.contains("ModelEncoding::Muse("));
         assert!(run.find("ready_rx.await").unwrap() < run.find("TcpListener::bind").unwrap());
+    }
+
+    #[test]
+    fn media_peer_identity_is_validated_before_device_access() -> Result<()> {
+        let hash = "ab".repeat(32);
+        for tower in ["vision", "audio"] {
+            let peers = if tower == "vision" { "--vision-peers" } else { "--audio-peers" };
+            let hash_arg = if tower == "vision" { "--encoder-plan-hash" } else { "--audio-encoder-plan-hash" };
+            let revision = if tower == "vision" { "--encoder-revision" } else { "--audio-encoder-revision" };
+            let mode = if tower == "vision" { "--vision" } else { "--audio" };
+            let base = ["--peers", PEERS, peers, "127.0.0.1:19442"];
+            let complete = [base.as_slice(), &[hash_arg, hash.as_str(), revision, "checkpoint-revision"]].concat();
+            args(&complete)?.validate()?;
+            args(&[complete.as_slice(), &[mode, "spark:0"]].concat())?.validate()?;
+            for invalid in [base.to_vec(),
+                [base.as_slice(), &[hash_arg, hash.as_str()]].concat(),
+                [base.as_slice(), &[hash_arg, "bad-hash", revision, "revision"]].concat(),
+                [base.as_slice(), &[hash_arg, hash.as_str(), revision, ""]].concat(),
+                [complete.as_slice(), &[mode, "off"]].concat(),
+                [complete.as_slice(), &[mode, "rtx:0"]].concat(),
+                vec!["--peers", PEERS, mode, "spark:0"]] {
+                assert!(args(&invalid)?.validate().is_err(), "{tower}: {invalid:?}");
+            }
+        }
+        Ok(())
     }
 
     #[test]
