@@ -157,8 +157,11 @@ def make_plan(inputs):
 
 
 class APIError(RuntimeError):
-    def __init__(self, status):
+    def __init__(self, status, api_error=None):
         self.status = status
+        # Keep the exception's public message status-only: API bodies may
+        # contain operational data and must not leak through traceback logs.
+        self._api_error = api_error if isinstance(api_error, str) and len(api_error) <= 4096 else None
         super().__init__(f'SparkNest API returned HTTP {status}')
 
 
@@ -206,7 +209,14 @@ class NativeTransport:
         if len(content) > 1024 * 1024:
             raise ValueError('oversized SparkNest control response')
         if not 200 <= response.status < 300:
-            raise APIError(response.status)
+            api_error = None
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    api_error = parsed.get('error')
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass
+            raise APIError(response.status, api_error)
         return json.loads(content)
 
     def authenticate(self):
@@ -251,7 +261,11 @@ class NativeTransport:
             try:
                 value = self._local('GET', '/v1/ls?' + urlencode({'path': namespace}))
             except APIError as error:
-                if error.status == 404:
+                # SparkNest 0.7.2's selector resolves a missing namespace
+                # as Invalid, not NotFound. Match only its exact path-bound
+                # error; NotDir, malformed queries and other 400s still fail.
+                if (error.status == 404 or (error.status == 400
+                        and error._api_error == f'invalid argument: {namespace} not found')):
                     return None
                 raise
             entries = value.get('entries', [])

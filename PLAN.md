@@ -6329,3 +6329,19 @@ match the producer and the durable supervisor exits zero. Failure updates keep
 the original OOM-resume versus numerical-diagnosis recovery instructions.
 At setup, six layers and 5,201/47,989 projections are committed with no new
 crash; remaining layer time is about 23.6 hours (mean 25.61 minutes/layer).
+
+Quantization completed 2026-11-01 20:58:59 UTC (26h22m21s including final
+export/audit) with all 47,989 projections, 63 shards and exact expected payload.
+Independent reload audit passes all 1,503 retained tensors / 16,250,077,184
+bytes and all numerical records. Public upload finished 22:05:40 UTC:
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6` revision
+`89998fb177acd9a862ac8bd4fb79bfd50e940c97`, 142 verified public files.
+
+The CPU continuation stopped before managed writes: SparkNest 0.7.2 returns
+400 with an exact path-specific `invalid argument: PATH not found` for absent
+namespace paths, while the adapter expected 404. Recognize only that exact
+400 body as absence; all other errors still fail. Status-only exception output
+keeps response details private. The adapter fix passes 55 ingest/finish cases
+and a read-only actual missing-ref check. Resume CPU publication/placement
+only; source numerical identity, quantized weights and public revision remain
+unchanged, and no quantization or upload reset is needed.

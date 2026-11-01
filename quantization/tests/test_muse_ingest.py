@@ -386,3 +386,76 @@ def test_task_staging_symlink_is_not_followed_for_removal(case,monkeypatch):
 def test_ref_staging_does_not_trigger_hf_incomplete_rename_sealing(case):
     assert case.plan['ref']['temporary'].endswith('.pending')
     assert all(item['temporary'].endswith('.incomplete') for item in case.plan['files'])
+
+
+def api_transport(status, body):
+    """Exercise the real bounded response parser and local API adapter."""
+    payload=json.dumps(body).encode() if not isinstance(body,bytes) else body
+    class Connection:
+        def __init__(self,path,*,timeout):self.closed=False
+        def request(self,method,endpoint,**kwargs):
+            assert method=='GET' and endpoint.startswith('/v1/ls?path=')
+        def getresponse(self):return SimpleNamespace(status=status,read=lambda limit:payload[:limit])
+        def close(self):self.closed=True
+    return ingest.NativeTransport(unix_factory=Connection)
+
+
+@pytest.mark.parametrize('namespace',[
+    '/hf-home/hub/models--new-repo/refs/main',
+    '/hf-home/hub/models--existing-repo/snapshots/revision/missing.safetensors',
+])
+def test_exact_sparknest_missing_path_400_is_absent(namespace):
+    transport=api_transport(400,dict(error=f'invalid argument: {namespace} not found'))
+    assert transport.metadata(namespace) is None
+    assert transport.read_ref(namespace) is None
+
+
+@pytest.mark.parametrize('status,body',[
+    (400,dict(error='not a directory')),
+    (400,dict(error='invalid argument: too many symlinks')),
+    (400,dict(error='invalid argument: invalid query parameter')),
+    (400,dict(error='invalid argument: /hf-home/hub/another-path not found')),
+    (400,dict(error='/hf-home/hub/models--new-repo/refs/main not found')),
+    (400,dict(error=['invalid argument: /hf-home/hub/models--new-repo/refs/main not found'])),
+    (400,b'non-JSON proxy error'),
+    (400,b'{"error":'),
+    (401,dict(error='invalid argument: /hf-home/hub/models--new-repo/refs/main not found')),
+    (403,dict(error='invalid argument: /hf-home/hub/models--new-repo/refs/main not found')),
+    (409,dict(error='invalid argument: /hf-home/hub/models--new-repo/refs/main not found')),
+    (500,dict(error='invalid argument: /hf-home/hub/models--new-repo/refs/main not found')),
+])
+def test_other_sparknest_errors_are_never_absent(status,body):
+    transport=api_transport(status,body)
+    with pytest.raises(ingest.APIError) as caught:
+        transport.metadata('/hf-home/hub/models--new-repo/refs/main')
+    assert str(caught.value)==f'SparkNest API returned HTTP {status}'
+
+
+def test_api_error_details_are_bounded_and_not_in_exception_output():
+    namespace='/hf-home/hub/models--new-repo/refs/main'
+    detail='PRIVATE-OPERATIONAL-DETAIL'
+    with pytest.raises(ingest.APIError) as caught:
+        api_transport(400,dict(error=detail)).metadata(namespace)
+    assert caught.value._api_error==detail
+    assert detail not in str(caught.value) and detail not in repr(caught.value)
+    with pytest.raises(ingest.APIError) as caught:
+        api_transport(400,dict(error='x'*4097)).metadata(namespace)
+    assert caught.value._api_error is None
+
+
+def test_missing_symlink_target_uses_its_exact_resolved_path(monkeypatch):
+    transport=ingest.NativeTransport()
+    namespace='/hf-home/hub/models--existing-repo/refs/main'
+    target='/hf-home/hub/blobs/aa/absent'
+    calls=[]
+    def local(method,endpoint):
+        path=parse_qs(urlsplit(endpoint).query)['path'][0];calls.append(path)
+        if path==namespace:return dict(entries=[dict(kind='symlink',name='main',target=target)])
+        raise ingest.APIError(400,f'invalid argument: {path} not found')
+    monkeypatch.setattr(transport,'_local',local)
+    assert transport.metadata(namespace) is None
+    assert calls==[namespace,target]
+
+
+def test_existing_404_absence_contract_is_preserved():
+    assert api_transport(404,dict(error='not found')).metadata('/hf-home/hub/models--new-repo/refs/main') is None
