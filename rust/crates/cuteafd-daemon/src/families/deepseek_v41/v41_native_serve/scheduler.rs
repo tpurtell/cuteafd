@@ -513,7 +513,6 @@ struct Round<'r, 'w, 'a, P: ServingTarget<'w, 'a>> {
     prefixes: &'r mut PrefixCache<'a>,
     times: &'r mut super::prefill_target::V41PrefillTimes,
     active: &'r mut [Option<Active<'a>>],
-    loads: &'r mut [usize; 2],
     /// `--decode-share 0`: whole prompts (`run_to_end`), never interleaved.
     whole: bool,
 }
@@ -594,8 +593,8 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
                 Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
                     cached, hit_scores: None, images, ticket, constraint, decoder, packed: None }, error),
         };
-        let lane = cuteafd_loader::plan::decode_lanes::assign(*self.loads);
-        ticket.set_lane(lane);
+        // The lane it was announced on at admission (queued prompts count in `loads`).
+        let lane = ticket.lane();
         let mut request = Active { constraint, ticket, lease, job, decoder, anchor, generated: 0, buffered: 0,
             finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit };
         request.ticket.first(request.anchor);
@@ -605,7 +604,6 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
             request.finished = true;
         }
         self.active[slot] = Some(request);
-        self.loads[lane] += 1;
         Ok(())
     }
 
@@ -732,6 +730,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
+        // Queued prompts keep the lane they were announced on and decode there.
+        for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }
         // Admit available work at a completed boundary (both lanes drained):
         // admitted prompts join the decode-share queue holding their slots.
         let mut media_ready = media_ready.into_iter();
@@ -945,11 +945,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 Ok((constraint, decoder))
             })();
             match ready {
-                Ok((constraint, decoder)) => prefills.push(queue::Queued { slot,
+                Ok((constraint, decoder)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
                     cursor: super::prefill_target::V41Prefill::new(),
                     request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
                         image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
-                        packed: None }) }),
+                        packed: None }) }) }
                 Err(error) => {
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                         .cloned().unwrap_or_else(|| format!("{error:#}").into());
@@ -966,13 +966,14 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // A prefill round at a completed boundary (both decode lanes drained):
         // one call of each waiting prompt, or every prompt whole with share 0.
         if prefills.due(active.iter().any(Option::is_some)) {
-            pack_waiting::<P>(lib, runtime, requests, prefill_slots, &mut prefills, args, draft.as_deref_mut(),
-                &mut prefixes, whole)?;
             let mut round = Round { lib, args, runtime, first: &mut *first, first_transport: &mut *first_transport,
                 second_transport: &mut *second_transport, requests: &mut *requests, prefill: &mut *prefill_slots,
-                draft: draft.as_deref_mut(), prefixes: &mut prefixes, times: &mut times, active: &mut active,
-                loads: &mut loads, whole };
-            let finished = prefills.round(|entry| queue::chunk(&mut round, entry));
+                draft: draft.as_deref_mut(), prefixes: &mut prefixes, times: &mut times, active: &mut active, whole };
+            // The packed pass runs inside the round's timed window: its time is owed too.
+            let finished = prefills.round_with(&mut round,
+                |round, waiting| pack_waiting::<P>(round.lib, round.runtime, round.requests, round.prefill, waiting,
+                    round.args, round.draft.as_deref_mut(), round.prefixes, round.whole),
+                |round, entry| queue::chunk(round, entry))?;
             for (_, result) in finished { result?; }
             prefills.settle(active.iter().any(Option::is_some));
         }
@@ -1023,7 +1024,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len() + prefills.len(),
-                host_pending: !media.full() && !media.backlog.is_empty(),
+                host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
                 prefill_due: cycle.map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
         if let Some(started) = cycle { prefills.stepped(started.elapsed().as_secs_f64()); }
@@ -2565,8 +2566,20 @@ mod sampling_tests {
         let decode = serve.find("P::decode_round(").unwrap();
         assert!(round < decode, "a round runs at the boundary before the decode round");
         assert_eq!(serve.matches("P::decode_round(").count(), 1);
-        assert_eq!(serve.matches("prefills.round(").count(), 1);
+        assert_eq!(serve.matches("prefills.round_with(").count(), 1);
+        // The packed pass is inside the round's timed window.
+        let timed = &serve[serve.find("prefills.round_with(").unwrap()..];
+        assert!(timed[..timed.find("queue::chunk(round, entry)").unwrap()].contains("pack_waiting::<P>("));
+        assert_eq!(serve.matches("pack_waiting::<P>(").count(), 1);
+        // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
+        assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
+        // Queued prompts decode on the lane they were announced on (review A4).
+        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
+        assert!(serve.contains("Ok((constraint, decoder)) => { loads[lane] += 1; prefills.push("));
         assert!(serve[round..decode].contains("prefills.settle("));
+        let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
+        let admit = &admit[..admit.find("\n    }\n").unwrap()];
+        assert!(admit.contains("let lane = ticket.lane();") && !admit.contains("assign("), "{admit}");
         // Share 0: no clock, no debt, no deadline.
         assert!(serve.contains("let whole = args.decode_share.decode_share == 0.0;"));
         assert!(serve.contains("let cycle = (!whole && !prefills.is_empty()).then(Instant::now);"));

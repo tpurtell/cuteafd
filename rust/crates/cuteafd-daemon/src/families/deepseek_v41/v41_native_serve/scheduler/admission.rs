@@ -229,7 +229,8 @@ pub(super) fn media_failure(error: MediaError) -> anyhow::Error {
 pub(super) struct Wake<'p> {
     pub media_pending: bool,
     pub media_slots: usize,
-    /// Image requests wait host-side for an encoder waiter slot.
+    /// Admissible work waits host-side: image requests for an encoder waiter
+    /// slot, or prompts deferred behind another's pending prompt snapshot.
     pub host_pending: bool,
     /// The deferred request and the release epoch it waits past.
     pub retry: Option<(&'p NativeRequest, u64)>,
@@ -302,6 +303,16 @@ mod tests {
         let future = Wake { prefill_due: Some(Instant::now() + Duration::from_secs(60)), ..Default::default() };
         assert!(!future.prefill_due(5));
         assert!(!Wake::default().prefill_due(u64::MAX), "share 0 never stops for prefill");
+    }
+    /// A prompt deferred behind another's pending prompt snapshot (a prefix
+    /// waiter) wakes the lanes like a host-side image backlog: with nothing
+    /// else to do it would wait a whole active generation (#976 review A2).
+    #[test]
+    fn a_prefix_waiter_wakes_the_lanes_at_a_free_slot() {
+        let waiter = Wake { host_pending: true, ..Default::default() };
+        assert!(waiter.ready(1, 16, false, 0), "an empty HTTP queue still admits the waiter");
+        assert!(!waiter.ready(16, 16, false, 0), "no slot: keep decoding");
+        assert!(!Wake::default().ready(1, 16, false, 0));
     }
     #[test]
     fn parked_image_limit_preserves_a_text_slot() -> Result<()> {
