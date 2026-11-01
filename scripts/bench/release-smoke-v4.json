@@ -1031,7 +1031,9 @@
         "SPARK_1_LANE_A": "192.0.2.2",
         "SPARK_2_HOST": "REPLACE-ME-spark-2",
         "SPARK_2_LANE_A": "192.0.2.3",
-        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89"
       }
     },
     {
@@ -1074,7 +1076,9 @@
         "SPARK_5_HOST": "REPLACE-ME-spark-5",
         "SPARK_5_LANE_A": "192.0.2.6",
         "SPARK_5_LANE_B": "198.51.100.6",
-        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc"
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v4-rc",
+        "MODEL_ID": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+        "MODEL_REVISION": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89"
       }
     },
     {
