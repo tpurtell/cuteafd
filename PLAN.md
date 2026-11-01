@@ -6345,3 +6345,13 @@ keeps response details private. The adapter fix passes 55 ingest/finish cases
 and a read-only actual missing-ref check. Resume CPU publication/placement
 only; source numerical identity, quantized weights and public revision remain
 unchanged, and no quantization or upload reset is needed.
+
+TJ clarified that managed admission must use hardlink staging and a no-copy
+SparkNest import. Stop the direct upload-API placement continuation while
+resolving that route; do not resume it from scheduled failure prompts.
+The CPU unit was stopped 2026-11-01 22:46:14 UTC. All 63 local final shards
+remain; cleanup has not started. 26 weight shards (175,808,982,704 bytes)
+already have verified Spark copies; retain them for reuse. The managed ref
+was never published, and no managed-complete marker exists. Source quantization
+was a clean layer-0 restart (`resume:false`); the original invalid quantized
+weights and causal activation caches never seeded the repaired producer.
