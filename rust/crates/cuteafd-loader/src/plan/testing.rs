@@ -1141,7 +1141,10 @@ pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
             }
         }
     }
-    fs::write(dir.join("config.json"), muse_spark_config().to_string()).unwrap();
+    // This text/admission fixture carries classification sentinels, not a complete audio tower.
+    let mut config = muse_spark_config();
+    config.as_object_mut().unwrap().remove("audio_config");
+    fs::write(dir.join("config.json"), config.to_string()).unwrap();
     fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
     let mut compact = exl3_compact(4);
     for key in ["core_bits", "head_bits"] { compact[key] = json!(6.0); }

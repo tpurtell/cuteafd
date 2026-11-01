@@ -212,7 +212,7 @@ impl Family for MuseSpark {
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
         match component {
-            Component::Vision | Component::Audio => Some(Hint {
+            Component::Vision => Some(Hint {
                 what: "Muse Spark bundled vision/audio execution is not implemented".into(),
                 how: "Serve text with media off; add the bundled MuseSparkVision/Audio towers and vision_adapter/projection later".into(),
             }),

@@ -183,6 +183,7 @@ fn fused_bf16_experts_name_the_publication_to_serve() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = testing::muse_spark_config();
     config.as_object_mut().unwrap().remove("quantization_config");
+    config.as_object_mut().unwrap().remove("audio_config");
     let (mut tensors, _) = testing::muse_spark_tensors(&[]);
     tensors.retain(|t| !t.0.ends_with(".trellis") && !t.0.ends_with(".suh") && !t.0.ends_with(".svh") && !t.0.ends_with(".mcg"));
     for layer in 0..62 {
