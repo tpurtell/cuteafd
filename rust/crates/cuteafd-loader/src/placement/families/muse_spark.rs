@@ -226,11 +226,11 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     fixed.push(Demand::new(0, Category::Transport, "Muse Spark partial reply planes", planes, Basis::Exact));
     fixed.extend(runtime_fixed);
 
-    // Spark: whole experts partitioned by the shared owner table.
+    // Spark: intermediate slices of every expert across the shared TP world.
     let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (0..cfg.layers).collect(),
         spark_ranks, prefill_lanes: LANES };
     let (endpoint, spark_rings) = spark_endpoint(prefill, cutoff, usize::try_from(slots)?)?;
-    let reserve = spark_reserve_bytes(prefill.waves, prefill.unit_rows)?;
+    let reserve = spark_reserve_bytes(spark_ranks, prefill.waves, prefill.unit_rows)?;
     let spark_budget = SparkBudgetInventory::exl3(catalog, &working, &[endpoint], spark_rings,
         spark_budget_bytes, reserve)?;
     // Onboarded layers: TP2 halves on a pair (partials combined like the Sparks'), whole on one RTX.
@@ -555,12 +555,12 @@ pub fn spark_executions(waves: u64, unit_rows: u64) -> Result<cuteafd_core::Spar
 }
 
 /// The pre-placement Spark reserve: the runtime residual plus the typed owners.
-pub fn spark_reserve_bytes(waves: u64, unit_rows: u64) -> Result<u64> {
-    let owners = spark_executions(waves, unit_rows)?.workspace_bytes(owner_bytes)?
+pub fn spark_reserve_bytes(world: usize, waves: u64, unit_rows: u64) -> Result<u64> {
+    let owners = spark_executions(waves, unit_rows)?.workspace_bytes(|extent| owner_bytes(world, extent))?
         .and_then(|bytes| bytes.total()).context("Muse Spark owner reserve overflow")?;
     Ok(cuteafd_core::memory_layout::SPARK_RUNTIME_RESIDUAL_BYTES + owners)
 }
 
-pub fn owner_bytes(extent: cuteafd_core::OwnerExtent) -> Result<cuteafd_core::OwnerBytes> {
-    crate::plan::layout::spark_slots::exl3_owner_bytes("muse_spark", cuteafd_core::ExpertGeometry::MUSE_SPARK, extent)
+pub fn owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent) -> Result<cuteafd_core::OwnerBytes> {
+    crate::plan::layout::spark_slots::muse_owner_bytes(world, extent)
 }

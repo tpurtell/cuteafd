@@ -396,10 +396,6 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
-        // Muse Spark whole experts (H4096, full I4096 per rank, E256, top-8):
-        // the FC1/FC2 activation arenas are twice GLM Flash's TP1 (I2048) at
-        // the same hidden and top-k. Estimated until the first EP census.
-        "muse_spark" => 2 * 569 * MIB,
         _ => 0,
     };
     at_4096.saturating_mul(unit_rows.max(4096)).div_ceil(4096)

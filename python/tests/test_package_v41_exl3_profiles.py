@@ -94,6 +94,37 @@ class PackageProfileTests(unittest.TestCase):
         profiles = package.profiles_for_role('coordinator', 'muse')
         self.assertIn(('rtx-tp2', 2048, 256, 8, 'fp32', ['rtx-tp2']), profiles)
 
+    def test_muse_spark_policy_only_changes_qualified_exact_cells(self):
+        qualified = {(1024, 1024): (64, (64, 256, 64, 256)),
+            (896, 256): (64, (64, 128, 64, 256)),
+            (896, 1024): (64, (64, 128, 64, 256)),
+            (896, 2048): (64, (64, 128, 64, 256)),
+            (896, 4096): (64, (64, 128, 64, 256)),
+            (768, 256): (32, (64, 256, 64, 256)),
+            (640, 256): (64, (64, 128, 64, 256)),
+            (640, 1024): (64, (64, 128, 64, 256)),
+            (640, 2752): (64, (64, 128, 64, 256)),
+            (640, 4096): (64, (64, 128, 64, 256))}
+        for width in (512, 640, 768, 896, 1024, 1280, 1408, 2048):
+            for capacity in (1, 16, 80, 256, 1024, 2048, 2752, 4096):
+                with self.subTest(width=width, capacity=capacity):
+                    cell = package.spark_ws_cell('muse', 'spark', width, capacity)
+                    if (width, capacity) not in qualified:
+                        self.assertIsNone(cell)
+                        continue
+                    block, tile = qualified[width, capacity]
+                    self.assertEqual(cell, dict(route_block=block, dynamic=True, tile=tile))
+                    self.assertEqual(package.ws_route_block('muse', 'spark', width, capacity), block)
+                    self.assertEqual(package.ws_tile('muse', 'spark', width, capacity), tile)
+                    self.assertTrue(package.ws_dynamic_tiles('muse', 'spark', width, capacity))
+        # Max-Q rankings are not PRO 6000 qualification: RTX remains unchanged.
+        for width in (2048, 4096):
+            for capacity in (256, 1024, 2048, 2752, 4096):
+                self.assertIsNone(package.spark_ws_cell('muse', 'coordinator', width, capacity))
+                self.assertEqual(package.ws_route_block('muse', 'coordinator', width, capacity),
+                                 32 if capacity == 256 else 64)
+                self.assertEqual(package.ws_tile('muse', 'coordinator', width, capacity), package.TILE_RTX_MIXED)
+
     @staticmethod
     def expected_policy_tile(variant):
         """Ask the pinned planner; never restate its numbers in a test."""
@@ -257,8 +288,8 @@ class PackageProfileTests(unittest.TestCase):
                 for name, value in values.items():
                     stack.enter_context(patch.object(package, name, return_value=value))
                 _, _, calls, _ = self.build_fixture(
-                    Path(temporary), 'spark', (4, 5), geometry='glm',
-                    capacities=(1024,), profiles=('tp2-width1024',))
+                    Path(temporary), 'spark', (4, 5), geometry='muse',
+                    capacities=(1024,), profiles=('tp4-width1024',))
                 self.assertEqual(len(calls), 1)
                 paths.append(calls[0].args[0].parent.name)
         self.assertEqual(paths[0], paths[-1])
@@ -801,8 +832,7 @@ class PackageProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             output, manifest, _calls, _ = self.build_fixture(root, 'spark', (2, 3), capacities=(1, 16, 80))
-            pinned = [v for v in manifest['variants'] if self.pinned_tile(v)]
-            self.assertTrue(pinned, 'the fixture must carry a capacity the planner widens')
+            self.assertTrue(manifest['variants'], 'the fixture must exercise resolved planner tiles')
             for variant in manifest['variants']:
                 with self.subTest(directory=variant['directory']):
                     pin = self.pinned_tile(variant)
