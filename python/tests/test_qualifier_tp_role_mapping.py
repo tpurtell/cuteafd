@@ -44,13 +44,10 @@ def _load_qualifier():
 
 def test_role_table_is_the_authority_for_every_degree() -> None:
     module = _load_qualifier()
-    assert module.SPARK_TP_ROLE == {2: 5, 3: 6, 6: 7, 8: 8}
-    assert module.SPARK_TP_INTERMEDIATE == {2: 1152, 3: 768, 6: 384, 8: 288}
-    assert module.SPARK_TP_KERNEL_INTERMEDIATE == {2: 1152, 3: 768, 6: 384, 8: 384}
-    # The legacy arithmetic must NOT reproduce the TP6 entry; if it did, this
-    # test could not distinguish table-driven selection from 3 + degree.
-    assert module.SPARK_TP_ROLE[6] != 3 + 6
-    assert module.SPARK_TP_ROLE[2] == 3 + 2 and module.SPARK_TP_ROLE[3] == 3 + 3
+    artifacts = module.native_spark_artifacts()
+    assert artifacts[6][0].role == 7
+    assert artifacts[2][0].role == 5 and artifacts[3][0].role == 6
+    assert len(artifacts[5]) == len(artifacts[7]) == 2
 
 
 def test_no_legacy_role_arithmetic_survives_in_the_source() -> None:
@@ -58,10 +55,9 @@ def test_no_legacy_role_arithmetic_survives_in_the_source() -> None:
     # Any `3 + options.spark_tp` (in either path) is the bug this prevents.
     assert not re.search(r"3\s*\+\s*options\.spark_tp", source), (
         "legacy 3 + spark_tp role arithmetic is back; TP6 would map to role 9")
-    # Both role determinations must read the table.
-    assert source.count("SPARK_TP_ROLE[options.spark_tp]") >= 2, (
-        "expected the checkpoint and timing paths to both use SPARK_TP_ROLE")
-    assert "LEGACY_TP4_ROLE" in source
+    assert "native_shard(options.spark_tp, options.tp_rank, options.layer)" in source
+    assert "role, intermediate = artifact.role, artifact.logical" in source
+    assert "tp4_legacy" not in source
 
 
 def test_both_role_paths_are_covered_by_executable_checks() -> None:
@@ -111,6 +107,6 @@ def test_role_gate_rejects_the_legacy_tp6_mapping() -> None:
 
     # role 9 is what the legacy formula would have expected: must be rejected.
     with pytest.raises(AssertionError):
-        module.assert_native_role_geometry(make(9), 16, tp_degree=6)
+        module.assert_native_role_geometry(make(9), 16, artifact=module.native_spark_artifacts()[6][0])
     # role 7 is the registered TP6 family: accepted.
-    assert module.assert_native_role_geometry(make(7), 16, tp_degree=6).role == 7
+    assert module.assert_native_role_geometry(make(7), 16, artifact=module.native_spark_artifacts()[6][0]).role == 7

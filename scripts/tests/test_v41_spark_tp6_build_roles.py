@@ -12,7 +12,7 @@ release time.
 The two producers resolve roles differently on purpose, and both halves are
 asserted:
 
-* `build.sh` resolves the universal release set (`tp2;tp3;tp6;tp8`) regardless of the
+* `build.sh` resolves the universal release set (`tp2;tp3;tp5;tp6;tp7;tp8`) regardless of the
   configured topology, so one published image pair serves every approved native
   topology. Detailed malformed-input coverage lives in
   `test_release_universal_images.py`.
@@ -40,7 +40,7 @@ WIP = REPO / "wip.sh"
 RELEASE_COMMON = REPO / "scripts" / "lib" / "release-common.sh"
 MANIFEST = REPO / "scripts" / "build" / "write-v41-expert-tp-manifest.py"
 
-UNIVERSAL = "tp2;tp3;tp6;tp8"
+UNIVERSAL = "tp2;tp3;tp5;tp6;tp7;tp8"
 
 # Each script keeps its role plan in one contiguous, marker-delimited block before
 # its dry-run exit. wip.sh names the WIP role variable in its usage text earlier in
@@ -114,8 +114,8 @@ def test_build_release_default_is_universal(spark_tp) -> None:
 @pytest.mark.parametrize(
     "override,expected",
     [
-        ("tp2;tp3;tp6;tp8", UNIVERSAL),
-        ("tp8;tp6;tp2;tp3", UNIVERSAL),
+        ("tp2;tp3;tp5;tp6;tp7;tp8", UNIVERSAL),
+        ("tp8;tp7;tp6;tp5;tp2;tp3", UNIVERSAL),
         ("tp6", "tp6"),
         ("tp2;tp6", "tp2;tp6"),
         ("", ""),
@@ -126,10 +126,10 @@ def test_build_release_subset_escape_hatch(override, expected) -> None:
 
 
 def test_build_rejects_an_unknown_role_with_a_clear_error() -> None:
-    result = _run_roles("", "tp5")
+    result = _run_roles("", "tp9")
     assert result.returncode == 2, result.stdout
-    assert "accepts only tp2, tp3, tp6 and tp8" in result.stderr
-    assert "tp5" in result.stderr
+    assert "accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in result.stderr
+    assert "tp9" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -154,9 +154,9 @@ def test_wip_role_selection_matrix(spark_tp, override, expected) -> None:
 
 
 def test_wip_rejects_an_unknown_role_and_names_the_wip_variable() -> None:
-    result = _run_wip_roles("", "tp5")
+    result = _run_wip_roles("", "tp9")
     assert result.returncode == 2, result.stdout
-    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp6 and tp8" in result.stderr
+    assert "CUTEAFD_WIP_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in result.stderr
 
 
 def test_wip_subset_is_always_contained_in_the_release_default() -> None:
@@ -188,8 +188,8 @@ def test_release_and_wip_artifact_scripts_share_the_allowlist() -> None:
         (REPO / "scripts" / "build" / "build-wip-artifacts.sh", "CUTEAFD_WIP_SPARK_TP_ROLES"),
     ):
         text = path.read_text(encoding="utf-8")
-        assert "tp2|tp3|tp6|tp8)" in text, path
-        assert f"{variable} accepts only tp2, tp3, tp6 and tp8" in text, path
+        assert "tp2|tp3|tp5|tp6|tp7|tp8)" in text, path
+        assert f"{variable} accepts only tp2, tp3, tp5, tp6, tp7 and tp8" in text, path
 
 
 def _role_geometry(role: str) -> tuple:

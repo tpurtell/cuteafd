@@ -419,7 +419,11 @@ def layout_geometry(base, layout: str):
             widths += exact_widths(base.intermediate, tp, 32)
         if int(width) not in widths:
             raise SystemExit(f"{layout}: no rank of TP{tp} owns {width} rows of {base.intermediate} exactly")
-        g = with_width(g, int(width))
+        stored = int(width)
+        if base.weights == "mxfp4":
+            from mxfp4_layouts import generic_stored_width
+            stored = generic_stored_width(base.hidden, stored)
+        g = with_width(g, stored)
     return tp, g
 
 

@@ -2,7 +2,7 @@
 //!
 //! These tests cover `V41ExpertSelection::BackboneTp { layer, expert, rank,
 //! world }`, which stages an explicitly sized shard of one official native
-//! FP4/E8M0 backbone routed expert for a TP world of 2, 3 or 4.
+//! FP4/E8M0 backbone routed expert for a TP world of 1 through 8.
 //!
 //! Two independent layers of evidence:
 //!
@@ -61,7 +61,7 @@ fn explicit_world_2_3_4_shards_partition_the_official_expert_exactly() {
         let mut expected_scale_column = 0usize;
         for rank in 0..world {
             let geometry =
-                V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, world, rank).unwrap();
+                V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, 0, world, rank).unwrap();
             assert_eq!(geometry.world(), world);
             assert_eq!(geometry.rank(), rank);
             assert_eq!(geometry.full_intermediate_size(), INTERMEDIATE);
@@ -123,7 +123,7 @@ fn explicit_world_2_3_4_shards_partition_the_official_expert_exactly() {
 /// A TP3 shard of a 768-wide expert (`I768`) must satisfy the same contract.
 #[test]
 fn tp3_covers_i768_shards() {
-    let geometry = V41ExpertStaging::backbone_tp_geometry(768, HIDDEN, 3, 1).unwrap();
+    let geometry = V41ExpertStaging::backbone_tp_geometry(768, HIDDEN, 0, 3, 1).unwrap();
     assert_eq!(geometry.intermediate_size(), 256);
     assert_eq!(geometry.w2_weight_shard_bytes(), HIDDEN * 128);
     assert_eq!(geometry.w2_scale_shard_bytes(), HIDDEN * 8);
@@ -136,31 +136,31 @@ fn tp3_covers_i768_shards() {
 /// represented are rejected before any read.
 #[test]
 fn explicit_tp_geometry_rejects_invalid_world_rank_and_shapes() {
-    for world in [1, 8] {
-        assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, world, 0).is_ok());
+    for world in 1..=8 {
+        assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, 0, world, 0).is_ok());
     }
-    for world in [0usize, 5, 7, 9, usize::MAX] {
+    for world in [0usize, 9, usize::MAX] {
         assert!(
-            V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, world, 0).is_err(),
+            V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, 0, world, 0).is_err(),
             "world {world} must be rejected"
         );
     }
     for (world, rank) in [(2usize, 2usize), (3, 3), (4, 4), (7, 8), (0, 0)] {
         assert!(
-            V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, world, rank).is_err(),
+            V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, 0, world, rank).is_err(),
             "rank {rank} for world {world} must be rejected"
         );
     }
     // 2300 / 2 = 1150 intermediate values, which is not a multiple of 32.
-    assert!(V41ExpertStaging::backbone_tp_geometry(2300, HIDDEN, 2, 0).is_err());
-    // 2304 is not divisible by 5 (and five ranks are outside the contract).
-    assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, HIDDEN, 5, 0).is_err());
+    assert!(V41ExpertStaging::backbone_tp_geometry(2300, HIDDEN, 0, 2, 0).is_err());
+    // A nonempty rank needs at least one whole K32 unit.
+    assert!(V41ExpertStaging::backbone_tp_geometry(32, HIDDEN, 0, 2, 0).is_err());
     // Hidden size must tile the group-32 scale plane.
-    assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, 5119, 2, 0).is_err());
-    assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, 0, 2, 0).is_err());
-    assert!(V41ExpertStaging::backbone_tp_geometry(0, HIDDEN, 2, 0).is_err());
+    assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, 5119, 0, 2, 0).is_err());
+    assert!(V41ExpertStaging::backbone_tp_geometry(INTERMEDIATE, 0, 0, 2, 0).is_err());
+    assert!(V41ExpertStaging::backbone_tp_geometry(0, HIDDEN, 0, 2, 0).is_err());
     // Extent product overflow: 32 * (usize::MAX - 31) does not fit.
-    assert!(V41ExpertStaging::backbone_tp_geometry(64, usize::MAX - 31, 2, 0).is_err());
+    assert!(V41ExpertStaging::backbone_tp_geometry(64, usize::MAX - 31, 0, 2, 0).is_err());
 }
 
 fn official_snapshot() -> Option<PathBuf> {
@@ -450,8 +450,7 @@ fn generic_world_shards_match_raw_official_source_bytes() {
     // selector bounds unchanged.
     for selection in [
         V41ExpertSelection::BackboneTp { layer, expert, rank: 0, world: 0 },
-        V41ExpertSelection::BackboneTp { layer, expert, rank: 0, world: 1 },
-        V41ExpertSelection::BackboneTp { layer, expert, rank: 0, world: 5 },
+        V41ExpertSelection::BackboneTp { layer, expert, rank: 0, world: 9 },
         V41ExpertSelection::BackboneTp { layer, expert, rank: 2, world: 2 },
         V41ExpertSelection::BackboneTp { layer, expert, rank: 3, world: 3 },
         V41ExpertSelection::BackboneTp { layer, expert, rank: 4, world: 4 },

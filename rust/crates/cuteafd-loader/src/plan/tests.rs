@@ -49,6 +49,38 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn native_spark_resident_reuses_headers_without_reusing_placement_totals() {
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    for v41 in [true, false] {
+        let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
+        let input = PlanInput::open(dir.path()).unwrap();
+        let catalog = input.expert_catalog().unwrap();
+        assert!(input.native_spark_headers.get().is_none());
+        let initialized = || input.native_spark_headers.get().unwrap().iter()
+            .filter(|entry| entry.get().is_some()).count();
+        for world in 2..=cuteafd_core::MAX_SPARK_WORLD {
+            for layers in [vec![0], vec![1], vec![0, 1], vec![]] {
+                let working = SparkWorkingSet { spark_layers: layers, spark_ranks: world,
+                    prefill_lanes: 1, ..Default::default() };
+                for rank in 0..world {
+                    let expected = SparkAssignment::resident_from_catalog(catalog, &working, rank,
+                        SparkResidentLayout::Native { world, rank }).unwrap().resident_bytes;
+                    assert_eq!(input.native_spark_resident(&working, rank).unwrap(), Some(expected),
+                        "v41={v41} world={world} rank={rank} layers={:?}", working.spark_layers);
+                }
+            }
+            assert_eq!(initialized(), 2, "world/rotation/onboarding changes reuse only the checked headers");
+        }
+        let invalid = SparkWorkingSet { spark_layers: vec![0, 0], spark_ranks: 4,
+            prefill_lanes: 1, ..Default::default() };
+        assert!(input.native_spark_resident(&invalid, 0).unwrap_err().to_string().contains("sorted and unique"));
+        let invalid = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().layers], ..invalid };
+        assert!(input.native_spark_resident(&invalid, 0).unwrap_err().to_string().contains("outside routed"));
+        assert_eq!(initialized(), 2);
+    }
+}
+
+#[test]
 fn spark_count_resolution_reuses_the_preflight_checkpoint() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
@@ -1048,7 +1080,7 @@ fn deepseek_v41_components_formats_and_placement() {
     assert_eq!(component(&report, Component::MappedTable).owner, Owner::HostMapped);
     assert!(component(&report, Component::MappedTable).formats.contains_key("fp8-block1x32/ue8m0"));
     assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
-    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6, 8]);
+    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, (2..=8).collect::<Vec<_>>());
     assert!(!report.executable());
     assert!(report.hints.iter().any(|h| h.what.contains("native placement refused")));
 }
@@ -1117,7 +1149,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     for nvfp4 in [false, true] {
         let dir = strict_v41_snapshot(nvfp4);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        for (ranks, gpus) in [(3, 1), (6, 2)] {
+        for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
                 workspace_manifest: v41_workspace(dir.path()),
@@ -1127,10 +1159,13 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
             assert!(report.placement_supported, "{}", render(&report));
             let memory = report.memory_layout.as_ref().unwrap();
             let experts = report.experts.as_ref().unwrap();
-            assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
+            assert_eq!(experts.package, if nvfp4 { "v41:nvfp4 (expertd-native)" }
+                else { "v41:mxfp4 (expertd-native)" });
             let packed = |tp: u64| {
                 let (hidden, logical, experts) = (5120u64, 2304 / tp, 384u64);
-                let stored = logical.div_ceil(128) * 128;
+                let stored = if nvfp4 { logical.div_ceil(128) * 128 } else {
+                    cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64
+                };
                 if nvfp4 { experts * (3 * hidden * stored * 9 / 16 + 16) }
                 else {
                     let payloads = hidden * stored + hidden * stored / 2;
@@ -1909,8 +1944,11 @@ fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
         ("mimop:fp8 (MXFP4)", 32, &[2, 6, 7, 8][..]));
-    // TP6 of 2048 in 32-row blocks: 352 rows, stored 384 wide.
-    assert!((report.spark_rank_share - 384.0 / 2048.0).abs() < 1e-12);
+    // Admission charges the widest physical package, independently of ownership.
+    let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
+    let widest = recipe.widths.iter().map(|&logical|
+        cuteafd_core::mxfp4_layouts::generic_stored_width(6144, logical)).max().unwrap();
+    assert!((report.spark_rank_share - widest as f64 / 2048.0).abs() < 1e-12);
 }
 
 #[test]
@@ -2206,6 +2244,42 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind};
+    for v41 in [true, false] {
+        let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            rtx_bytes: vec![96 << 30], local_expert_layers: Some(1),
+            workspace_manifest: v41.then(|| dir.path().join("share/PROGRAMS.json")),
+            pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default()
+        }), ..sparks(4) }).unwrap();
+        assert!(report.placement_supported, "{}", render(&report));
+        assert_eq!(report.experts.as_ref().unwrap().package,
+            if v41 { "v41:mxfp4 (expertd-native)" } else { "dsv4f:mxfp4 (expertd-native)" });
+        // Independent resident-plane arithmetic, after the single local layer.
+        let (hidden, logical, experts, remote) = if v41 {
+            (5120u64, 576u64, 384u64, 39u64)
+        } else { (4096, 512, 256, 3) };
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;
+        let payload = hidden * stored * 3 / 2;
+        let scales = if v41 {
+            2 * stored * (1 + 2 * (hidden / 128))
+                + hidden * (1 + 2 * (logical / 32).div_ceil(4))
+        } else { hidden * stored * 3 / 32 };
+        let expected = remote * experts * (payload + scales);
+        let memory = report.memory_layout.as_ref().unwrap();
+        assert_eq!(memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark).count(), 4);
+        for device in memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark) {
+            let resident = device.items.iter().find(|item| item.group == "routed_expert").unwrap();
+            assert_eq!(resident.basis, Basis::Formula);
+            assert_eq!(resident.bytes, expected, "{}", render(&report));
+            assert_eq!(device.by_category()[&Category::Experts], expected);
+        }
+    }
+}
+
+#[test]
 fn v4_plan_shared_span_matches_unit_rows_and_waves() {
     let dir = v4_snapshot();
     for (unit, waves) in [(2048, 1), (2048, 2), (2048, 3), (4096, 1), (4096, 2), (2752, 3)] {
@@ -2427,7 +2501,7 @@ fn spark_rank_options_follow_transport_and_packages() {
             workspace_manifest: v41_workspace(dsv41.path()), ..Default::default()
         }), ..options.clone() };
         let v41 = plan(dsv41.path(), &v41_options).unwrap();
-        assert_eq!(v41.placement_supported, matches!(ranks, 2 | 3 | 4 | 6 | 8), "v41 {ranks}: {}", render(&v41));
+        assert_eq!(v41.placement_supported, matches!(ranks, 2..=8), "v41 {ranks}: {}", render(&v41));
     }
 }
 
@@ -3430,12 +3504,22 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // Layer 1 rotates native K32 ownership: rank 0 has 320 columns, rank 4 has 352.
+    // Logical K32 ranges rotate; Pro's 352-column owner retains 384 physical columns.
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = families::mimo::MIMO_V2.open(&checkpoint).unwrap();
+    assert_eq!(report.spark_rank_share, 384. / 2048.);
+    let (projected, _) = layout::spark_slices(&report, model.as_ref(), 6, 2048 * 1024);
+    assert_eq!(projected, [384, 384, 384, 384, 320, 320].map(|width| width * 1024));
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
-    // Both widths store 12 down-scale bytes per hidden row, rather than 10/11.
-    let down_scale_padding = |groups: u64| 384 * 6144 * (12 - groups);
-    assert_eq!((experts(0) - down_scale_padding(10)) * 11,
-        (experts(4) - down_scale_padding(11)) * 10);
+    let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
+    for rank in 0..6 {
+        let stored = recipe.stored_width_for_layer(rank, 1).unwrap() as u64;
+        let hidden = 6144;
+        let expected = 384 * (3 * hidden * stored / 2 + 2 * stored * hidden / 32
+            + hidden * stored.div_ceil(128) * 4);
+        assert_eq!(experts(rank), expected, "rank {rank}");
+    }
+    assert!(experts(4) > experts(0));
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
 
@@ -3778,7 +3862,7 @@ fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
 #[test]
 fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     let dir = strict_v41_snapshot(false);
-    for ranks in [2, 3, 4, 6] {
+    for ranks in 2..=6 {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
             ..Default::default()
@@ -3788,7 +3872,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
         if ranks == 2 {
             assert!(!report.executable(), "two native shards exceed Spark memory");
             assert!(report.hints.last().unwrap().what.contains("spark0 full memory layout"));
-            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 6]"));
+            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 5, 6]"));
         } else {
             assert!(report.executable(), "{}", render(&report));
             assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 262_144);

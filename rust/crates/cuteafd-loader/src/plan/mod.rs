@@ -501,6 +501,8 @@ pub struct PlanInput {
     phases: PhaseCounters,
     /// The routed-expert catalog, read on first use.
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
+    /// Source headers do not change when placement searches worlds or prefill shapes.
+    native_spark_headers: OnceLock<Vec<OnceLock<Result<(), String>>>>,
 }
 
 impl PlanInput {
@@ -508,13 +510,15 @@ impl PlanInput {
         let start = Instant::now();
         let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
         Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(),
-            open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default() })
+            open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
+            native_spark_headers: OnceLock::new() })
     }
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
         Self { checkpoint, header_validation: None, catalog: OnceLock::new(),
-            open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default() }
+            open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
+            native_spark_headers: OnceLock::new() }
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {
@@ -536,6 +540,42 @@ impl PlanInput {
             Ok(catalog) => Ok(catalog),
             Err(error) => Err(anyhow::anyhow!("{error:#}")),
         }
+    }
+
+    fn native_spark_resident(&self, working: &crate::placement::SparkWorkingSet, rank: usize)
+        -> anyhow::Result<Option<u64>> {
+        use anyhow::Context;
+        let catalog = self.expert_catalog()?;
+        if spark_executions::SparkBackend::for_catalog(catalog)? != spark_executions::SparkBackend::Native
+            || catalog.nvfp4().is_some() { return Ok(None); }
+        if !working.selected_ranks().contains(&rank) { return Ok(Some(0)); }
+        anyhow::ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),
+            "Spark layers must be sorted and unique");
+        let shape = catalog.routed_experts();
+        let headers = self.native_spark_headers.get_or_init(||
+            (0..shape.layers).map(|_| OnceLock::new()).collect());
+        let mut total = 0u64;
+        for &layer in &working.spark_layers {
+            let checked = headers.get(layer).context("Spark layer is outside routed checkpoint headers")?;
+            if let Err(error) = checked.get_or_init(||
+                catalog.validate_native_spark_layer(layer).map_err(|error| format!("{error:#}"))) {
+                anyhow::bail!("{error}");
+            }
+            let shard = crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry::new(
+                shape.intermediate, shape.hidden, layer, working.spark_ranks, rank)?;
+            let logical = shard.intermediate_size();
+            let stored = cuteafd_core::mxfp4_layouts::stored_width(shape.hidden, logical)
+                .context("invalid native MXFP4 resident geometry")?;
+            let bytes = if catalog.mxfp4_scale_codes() {
+                crate::formats::scale_codes::expert_bytes(shape.experts as u64,
+                    shape.hidden as u64, logical as u64).context("coded Spark residency overflow")?
+            } else {
+                crate::placement::families::deepseek_v41::resident_bytes(shape.hidden as u64,
+                    stored as u64, shape.experts as u64, false)?
+            };
+            total = total.checked_add(bytes).context("Spark resident sum overflow")?;
+        }
+        Ok(Some(total))
     }
 
     /// The plan for `options` over this checkpoint.
@@ -1143,7 +1183,26 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
-            experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
+            let recipe = match experts::spark_recipe(&contract.package, i, ranks) {
+                Ok(recipe) => recipe,
+                Err(_) => return experts::stored_slice(i, contract.block, ranks)
+                    .map(|slice| slice as f64 / i as f64),
+            };
+            if !recipe.native_artifacts.is_empty() {
+                let hidden = spec.hidden as u64;
+                let source = hidden * i as u64 * 51 / 32;
+                let widest = recipe.native_artifacts.iter().filter_map(|artifact| {
+                    if contract.package.starts_with("v41:") {
+                        crate::formats::scale_codes::expert_bytes(1, hidden, artifact.logical as u64)
+                    } else {
+                        crate::placement::families::deepseek_v41::resident_bytes(hidden,
+                            artifact.stored as u64, 1, false).ok()
+                    }
+                }).max()?;
+                Some(widest as f64 / source as f64)
+            } else {
+                recipe.stored_widths.iter().max().map(|&slice| slice as f64 / i as f64)
+            }
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));

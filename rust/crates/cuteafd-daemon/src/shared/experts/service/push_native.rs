@@ -22,8 +22,7 @@ pub(super) fn load<'a>(library: &'a NativeLibrary, catalog: &OfficialV41Catalog,
             let info = selection.select_info(library, config.compiled_capacity()?, catalog.nvfp4().is_some())?;
             let budget = ExpertWeights::plan(library, catalog, selection)?;
             slices.push(cuteafd_core::SparkSlice { unit_map: None, layer: selection.layer() as u32,
-                first: u32::try_from(config.rank.checked_mul(info.logical_intermediate as usize)
-                    .context("native push slice overflow")?)?, width: info.logical_intermediate,
+                first: u32::try_from(selection.native_shard()?.first)?, width: info.logical_intermediate,
                 stored_width: info.kernel_intermediate, tiers: vec![], projection_counts: vec![] });
             budgets.push(budget);
         }

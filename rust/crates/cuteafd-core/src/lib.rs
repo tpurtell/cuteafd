@@ -4,6 +4,7 @@ pub const MAX_SPARK_WORLD: usize = 8;
 const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
 
 pub mod tp_units;
+pub mod mxfp4_layouts;
 pub mod dense_attention;
 pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;

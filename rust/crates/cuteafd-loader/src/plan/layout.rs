@@ -933,21 +933,19 @@ pub struct SparkCharges {
     pub basis: Basis,
 }
 
-/// Each Spark rank's routed slice bytes from the checkpoint (`routed` source
-/// bytes): exact 128-row block packages store their own widths, other
-/// packages pad every rank to the widest slice (reported as waste).
+/// Initial source-byte projection. Header-derived native resident bytes replace
+/// this projection when selected layers and rank ownership are known.
 pub(crate) fn spark_slices(report: &PlanReport, model: &dyn super::FamilyModel, ranks: usize, routed: u64)
     -> (Vec<u64>, Option<Waste>) {
     let stored = (routed as f64 * report.spark_rank_share) as u64;
     let even = routed / ranks.max(1) as u64;
     let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
     let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
-    let recipe = (!package.starts_with("v41")).then(||
-        super::experts::spark_recipe(package, intermediate, ranks).ok()).flatten();
+    let recipe = super::experts::spark_recipe(package, intermediate, ranks).ok();
     let exact = recipe.as_ref().filter(|recipe|
         matches!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(_)));
     let bytes = (0..ranks).map(|rank| exact.map_or(stored, |recipe|
-        (routed as f64 * recipe.widths[rank] as f64 / intermediate as f64) as u64)).collect();
+        (routed as f64 * recipe.stored_widths[rank] as f64 / intermediate as f64) as u64)).collect();
     let waste = (exact.is_none() && report.spark_rank_share * ranks as f64 > 1.001).then(|| Waste {
         device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
             128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),
@@ -1003,6 +1001,19 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
     devices: &mut [DeviceLayout], notes: &mut Vec<String>, what: impl Fn(&DeviceLayout) -> String) {
     let checkpoint = input.checkpoint();
     for device in devices {
+        match input.native_spark_resident(working, device.index as usize) {
+            Ok(Some(bytes)) => {
+                if let Some(item) = device.items.iter_mut().find(|item| item.group == "routed_expert") {
+                    item.bytes = bytes;
+                    item.basis = Basis::Formula;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                report.placement_supported = false;
+                notes.push(format!("{} native resident admission: {error:#}", what(device)));
+            }
+        }
         let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
             .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
                 .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))

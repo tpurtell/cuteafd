@@ -1,0 +1,258 @@
+{
+  "schema": 1,
+  "storage_holds": [],
+  "native_slices": [
+    {
+      "hidden": 5120,
+      "width": 288,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80,
+        256,
+        1024,
+        4096
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        64,
+        64,
+        64
+      ],
+      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; strict F32 and invariants"
+    },
+    {
+      "hidden": 5120,
+      "width": 352,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80,
+        256,
+        1024,
+        4096
+      ],
+      "slices": [
+        128,
+        128,
+        128,
+        128,
+        128,
+        128
+      ],
+      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; padded-matching recipe"
+    },
+    {
+      "hidden": 5120,
+      "width": 320,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 5120,
+      "width": 448,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 5120,
+      "width": 576,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 288,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 320,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 352,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        32,
+        32,
+        32
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 416,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 672,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 704,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 7168,
+      "width": 416,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 7168,
+      "width": 448,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 7168,
+      "width": 608,
+      "sm": 121,
+      "capacities": [
+        1,
+        16,
+        80
+      ],
+      "slices": [
+        128,
+        128,
+        128
+      ],
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    }
+  ],
+  "ownership": [
+    {
+      "intermediate": 2304,
+      "world": 5,
+      "unit": 64,
+      "source": "#928 GB10 composed barrier blend: 1.013/0.999/1.000 at C1/16/80; K32 C80 loses"
+    }
+  ],
+  "generic_storage_holds": [
+    {
+      "hidden": 6144,
+      "width": 352,
+      "stored": 384,
+      "reason": "#928 MiMo Pro C80 matching loss exceeds control spread"
+    }
+  ]
+}

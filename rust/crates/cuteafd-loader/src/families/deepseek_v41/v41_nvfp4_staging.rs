@@ -69,7 +69,7 @@ impl OfficialV41Catalog {
             V41ExpertSelection::BackboneTp { layer, expert, rank, world } => {
                 ensure!(layer < config.num_hidden_layers, "backbone layer out of range");
                 ensure!(expert < config.n_routed_experts, "backbone expert out of range");
-                let geometry = V41BackboneTpGeometry::new(
+                let geometry = V41BackboneTpGeometry::equal(
                     config.moe_intermediate_size, config.hidden_size, world, rank,
                 )?;
                 (
@@ -265,7 +265,7 @@ impl V41Nvfp4Staging<'_> {
                     .with_context(|| format!("staging NVFP4 tensor {name}"))?;
             } else if let V41ExpertSelection::BackboneTp { world, rank, .. } = self.selection {
                 let config = self.catalog.config().text();
-                let geometry = V41BackboneTpGeometry::new(
+                let geometry = V41BackboneTpGeometry::equal(
                     config.moe_intermediate_size, config.hidden_size, world, rank,
                 )?;
                 self.catalog

@@ -266,21 +266,21 @@ def artifact_slug(tp: int, ep: int) -> str:
     return f"tp{tp}ep{ep}"
 
 
-def _topology_config(export: dict) -> tuple[int | None, int]:
-    """Map the exported topology to (`_v41_expert_native.library` spark_tp, I)."""
+def _topology_config(export: dict):
+    """Resolve every executable artifact required by the exported topology."""
     tp, ep = int(export["tp"]), int(export["ep"])
-    from spark_packages import native_spark_geometry, ownership_topology
-    geometry = native_spark_geometry()
-    if not ownership_topology(tp, ep) or tp not in geometry:
+    from spark_packages import native_spark_artifacts, ownership_topology
+    artifacts = native_spark_artifacts()
+    if not ownership_topology(tp, ep) or tp not in artifacts:
         raise ValueError(f"unsupported exported topology tp={tp} ep={ep}")
-    return (None if tp == 4 else tp), geometry[tp][1]
+    return artifacts[tp]
 
 
 # --------------------------------------------------------------------------- #
 # Native stage (GPU lease required; implemented, not executed on CPU)
 # --------------------------------------------------------------------------- #
 
-def _build_rank_arena(snapshot, layer, intermediate, tp_rank, gids, lib, torch):
+def _build_rank_arena(snapshot, layer, first, artifact, gids, lib, torch):
     """Slice the official checkpoint at one TP rank and pack with the native packer.
 
     Each resident expert is packed into arena slot `expert_id` (identity, no
@@ -294,7 +294,8 @@ def _build_rank_arena(snapshot, layer, intermediate, tp_rank, gids, lib, torch):
     from _v41_expert_native import L, P, check
 
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
-    lo, hi = tp_rank * intermediate, (tp_rank + 1) * intermediate
+    intermediate = artifact.logical
+    lo, hi = first, first + intermediate
     files: dict = {}
 
     def tensor(key: str):
@@ -337,6 +338,15 @@ def _build_rank_arena(snapshot, layer, intermediate, tp_rank, gids, lib, torch):
         dst = (P * 4)(*[arena[i].data_ptr() + slot * per_bytes[i] for i in range(4)])
         check(lib.cuteafd_pack_expert_async(src, dst, intermediate, stream))
     torch.cuda.synchronize()
+    from _v41_expert_native import pack_reference
+    packed = pack_reference({name: pair[0] for name, pair in sliced.items()},
+                            {name: pair[1] for name, pair in sliced.items()}, stored=artifact.stored)
+    for i in (1, 3):
+        per_coded = packed[i].numel() // len(gids)
+        arena[i] = torch.zeros(384 * per_coded, dtype=torch.uint32, device="cuda")
+        for k, gid in enumerate(gids):
+            slot = arena_slot(gid)
+            arena[i][slot * per_coded:(slot + 1) * per_coded].copy_(packed[i][k * per_coded:(k + 1) * per_coded])
     digest = hashlib.sha256(b"".join(digests)).hexdigest()
     return arena, digest
 
@@ -375,7 +385,7 @@ def quantize_wire(x, capacity: int, torch_module):
     return wire
 
 
-def _run_rank_plane(lib, spark_tp, arena, case, rank, tp, ep, x, torch) -> tuple[np.ndarray, dict]:
+def _run_rank_plane(lib, artifact, arena, case, rank, tp, ep, x, torch) -> tuple[np.ndarray, dict]:
     """Run the native ABI for one rank and return (BF16 [1,5120] plane, ABI info)."""
     from _v41_expert_native import Native, check
 
@@ -383,7 +393,7 @@ def _run_rank_plane(lib, spark_tp, arena, case, rank, tp, ep, x, torch) -> tuple
     wire = quantize_wire(x, 1, torch)
     native_ids = torch.tensor([ids], dtype=torch.int32, device="cuda")
     native_weights = torch.tensor([weights], dtype=torch.float32, device="cuda")
-    native = Native(lib, 1, arena, wire, native_ids, native_weights, spark_tp=spark_tp)
+    native = Native(lib, 1, arena, wire, native_ids, native_weights, artifact=artifact)
     kind, symbol, shape = abi_layout(
         bool(native.token_accumulation), int(native.info.abi_version))
     rows = TOPK if kind == "fp32_routes" else 1
@@ -435,13 +445,13 @@ def run_native(args, export: dict) -> dict:
     if args.native_lib is None:
         raise SystemExit("--native requires --native-lib")
 
-    spark_tp, intermediate = _topology_config(export)
+    artifacts = _topology_config(export)
+    from spark_packages import native_shard
     tp, ep = int(export["tp"]), int(export["ep"])
     world = tp * ep
     if int(args.layer) != int(export["layer"]):
         raise SystemExit(
             f"--layer {args.layer} must equal the exported layer {export['layer']}")
-    lib = library(str(args.native_lib), spark_tp=spark_tp)
     snapshot = Path(args.snapshot).expanduser()
     index_path = snapshot / "model.safetensors.index.json"
     if not index_path.is_file():
@@ -456,14 +466,16 @@ def run_native(args, export: dict) -> dict:
         abi: dict[int, dict] = {}
         hashes: list[str] = []
         for tp_rank in range(tp):
+            first, artifact = native_shard(tp, tp_rank, args.layer)
+            lib = library(str(args.native_lib), artifact=artifact)
             arena, digest = _build_rank_arena(
-                snapshot, args.layer, intermediate, tp_rank, gids, lib, torch)
+                snapshot, args.layer, first, artifact, gids, lib, torch)
             hashes.append(digest)
             for group in range(ep):
                 rank = group * tp + tp_rank
                 for _ in range(trials):
                     plane, info = _run_rank_plane(
-                        lib, spark_tp, arena, case, rank, tp, ep, x, torch)
+                        lib, artifact, arena, case, rank, tp, ep, x, torch)
                     per_rank[rank].append(plane)
                     abi[rank] = info
             del arena
@@ -525,8 +537,8 @@ def run_native(args, export: dict) -> dict:
         artifacts["cross_final"] = write(f"{slug}_cross_final.u16", cross["final_bits"][0])
     report = {
         "topology": export["topology"],
-        "spark_tp": spark_tp,
-        "intermediate": intermediate,
+        "spark_tp": tp,
+        "artifacts": [artifact._asdict() for artifact in artifacts],
         "snapshot_revision": snapshot.name,
         "snapshot_index_sha256": index_sha,
         "layer": int(args.layer),

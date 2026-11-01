@@ -192,7 +192,8 @@ pub enum Slicing {
     /// the widest rank's width, zero-padded to 128 (one program per world).
     Padded,
     /// Ranks own whole `g`-row blocks (H128, or native MXFP4 K32) and store
-    /// exactly their own rows (a program per distinct width): no weight padding.
+    /// their own rows, except measured geometry-specific storage holds. Layout
+    /// names identify logical ownership; program metadata attests stored width.
     Blocks(usize),
 }
 
@@ -217,8 +218,8 @@ fn exact_layout_directory_with(directory: &Path, tensors: &Fp8ExpertTensors, tp:
     let (Some(package), Some(layout)) = (directory.parent(), directory.file_name().and_then(|name| name.to_str()))
         else { return padded; };
     let exact = tensors.exact_slicing(tp);
-    let paths = (0..tp).map(|rank| tensors.rank_width(tp, rank, exact).ok()
-        .map(|width| package.join(format!("{layout}-w{width}")))).collect::<Option<Vec<_>>>();
+    let paths = (0..tp).map(|rank| tensors.rank_range_with(tp, rank, exact).ok()
+        .map(|(_, logical)| package.join(format!("{layout}-w{logical}")))).collect::<Option<Vec<_>>>();
     match paths {
         Some(paths) if paths.iter().all(|path| path.is_dir()) => (paths[rank].clone(), exact),
         _ => padded,
@@ -584,7 +585,12 @@ impl Fp8ExpertTensors {
     pub fn rank_width(&self, tp: usize, rank: usize, slicing: Slicing) -> Result<usize> {
         match slicing {
             Slicing::Padded => self.slice(tp),
-            Slicing::Blocks(_) => Ok(self.rank_range_with(tp, rank, slicing)?.1),
+            Slicing::Blocks(_) => {
+                let logical = self.rank_range_with(tp, rank, slicing)?.1;
+                Ok(if !self.coordinator && self.format == ExpertFormat::Mxfp4 {
+                    cuteafd_core::mxfp4_layouts::generic_stored_width(self.shape.hidden, logical)
+                } else { logical })
+            },
         }
     }
 
@@ -1688,6 +1694,20 @@ mod tests {
     }
 
     #[test]
+    fn mxfp4_held_storage_preserves_logical_ownership_and_projection_pitch() -> Result<()> {
+        let tensors = catalog(ExpertFormat::Mxfp4, 2048);
+        let slicing = Slicing::Blocks(32);
+        assert_eq!(tensors.rank_range_with(6, 0, slicing)?, (0, 352));
+        assert_eq!(tensors.rank_width(6, 0, slicing)?, 384);
+        let [weight, scale] = tensors.projection_slices(Fp8Projection::Down, 6, 0, slicing)?;
+        assert_eq!((weight.width, weight.destination_pitch), (176, 192));
+        assert_eq!((scale.width, scale.destination_pitch), (11, 12));
+        let coordinator = tensors.for_coordinator();
+        assert_eq!(coordinator.rank_width(6, 0, slicing)?, 352);
+        Ok(())
+    }
+
+    #[test]
     fn mxfp4_slices_keep_their_32_blocks() {
         let mxfp4 = catalog(ExpertFormat::Mxfp4, 2048);
         assert_eq!(mxfp4.slice(6).unwrap(), 384);
@@ -1711,6 +1731,7 @@ mod tests {
         ] {
             for intermediate in [640, 1536, 2048, 2304, 3072] {
                 let mut tensors = catalog(format, intermediate);
+                if package == "mimof:fp8" { tensors.shape.hidden = 4096; }
                 for world in 1..=8 {
                     let Ok(recipe) = spark_recipe(package, intermediate, world) else { continue };
                     let root = tempfile::tempdir()?;
@@ -1733,7 +1754,7 @@ mod tests {
                             let worker = tensors.unit_map(world, rank, worker_slicing)?;
                             assert_eq!(coordinator.fingerprint(), worker.fingerprint(), "{context}");
                             assert_eq!(tensors.rank_width(world, rank, worker_slicing)?,
-                                recipe.widths[recipe.rank_for_layer(rank, layer)], "{context}");
+                                recipe.stored_width_for_layer(rank, layer).unwrap(), "{context}");
                         }
                     }
                 }
@@ -1781,14 +1802,14 @@ mod tests {
                     (padded.clone(), Slicing::Padded));
             }
             let exact = tensors.exact_slicing(6);
-            let widest = tensors.rank_width(6, 0, exact).unwrap();
-            let narrowest = tensors.rank_width(6, 5, exact).unwrap();
+            let widest = tensors.rank_range_with(6, 0, exact).unwrap().1;
+            let narrowest = tensors.rank_range_with(6, 5, exact).unwrap().1;
             std::fs::create_dir(dir.path().join(format!("tp6-w{widest}"))).unwrap();
             assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, 0, true),
                 (padded.clone(), Slicing::Padded));
             std::fs::create_dir(dir.path().join(format!("tp6-w{narrowest}"))).unwrap();
             for rank in 0..6 {
-                let width = tensors.rank_width(6, rank, exact).unwrap();
+                let width = tensors.rank_range_with(6, rank, exact).unwrap().1;
                 assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, true),
                     (dir.path().join(format!("tp6-w{width}")), exact));
                 assert_eq!(exact_layout_directory_with(&padded, &tensors, 6, rank, false),

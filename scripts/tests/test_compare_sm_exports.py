@@ -64,13 +64,13 @@ def test_two_target_counts():
 def test_pro_native_tp3_has_equal_k32_geometry_without_v41_identity():
     path = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
     tree = ast.parse(path.read_text())
-    tables = {node.targets[0].id: ast.literal_eval(node.value)
-              for node in tree.body if isinstance(node, ast.Assign)
-              and isinstance(node.targets[0], ast.Name)
-              and node.targets[0].id in ("ROLE_GEOMETRY", "FAMILY_GEOMETRY", "ROLE_TP_DEGREE")}
-    function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "role_geometry")
-    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), tables)
-    assert tables["role_geometry"]("dsv4p", "spark_tp3") == (384, 1024, 1024, 6)
+    packages = compare_sm.load_file("compare_native_packages", ROOT / "python/tools/lib/spark_packages.py")
+    policy = compare_sm.load_file("compare_native_policy", ROOT / "python/tools/lib/mxfp4_layouts.py")
+    artifact, = packages.native_spark_artifacts("dsv4p")[3]
+    assert (artifact.role, artifact.logical, artifact.stored) == (6, 1024, 1024)
+    assert artifact.stored == policy.stored_width(7168, artifact.logical)
+    tp8, = packages.native_spark_artifacts("v41")[8]
+    assert tp8.stored == policy.stored_width(5120, tp8.logical) == 288
     function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "export")
     for node in ast.walk(function):
         test = ast.unparse(node.test).replace("'", '"') if isinstance(node, (ast.If, ast.IfExp)) else ''
@@ -92,6 +92,22 @@ def test_v41_slice_gate_matches_ordered_serving_recipe(role, cmake):
     assert f"--role {role}" in recipe
     assert "--rows 1,16,80,256,1024,4096 --width 192 --standard-names" in recipe
     assert "--atomic-min-capacity" not in recipe
+
+
+@pytest.mark.parametrize("family", ("v41", "dsv4f", "dsv4p"))
+def test_native_artifact_gate_uses_the_serving_tile_and_output_recipe(family):
+    packages = compare_sm.load_file("compare_artifact_recipes", ROOT / "python/tools/lib/spark_packages.py")
+    artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
+                 for artifact in values}
+    jobs = {name: args for name, _, args in compare_sm.jobs("all")}
+    for role, artifact in artifacts.items():
+        args = jobs[f"{family}-{role}"]
+        width = 192 if family == "v41" and (
+            not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
+        assert args[args.index("--width") + 1] == ",".join(
+            f"{capacity}:{width}" for capacity in compare_sm.CAPACITIES.split(","))
+        assert ("--atomic-min-capacity" in args) == (
+            family != "v41" and not role.startswith("spark_w"))
 
 
 @pytest.mark.parametrize("group,names", [
