@@ -442,7 +442,8 @@ class PackageProfileTests(unittest.TestCase):
                         self.assertFalse(package.ws_dynamic_tiles('step5', 'spark', width, rows))
                         self.assertIsNone(package.ws_tile('step5', 'spark', width, rows))
                     self.assertFalse(package.wire_input('step5', 'spark', width, rows))
-                    self.assertFalse(package.ws_dynamic_tiles('step5', 'spark', width, rows, compact=True))
+                    self.assertEqual(package.ws_dynamic_tiles('step5', 'spark', width, rows, compact=True),
+                                     package.compact_warp_specialized('step5', 'spark', width, rows))
         for width in (768, 1536):
             for rows in (256, 1024, 2048, 2752, 4096):
                 with self.subTest(role='coordinator', width=width, rows=rows):
