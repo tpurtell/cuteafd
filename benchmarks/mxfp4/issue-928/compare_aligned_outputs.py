@@ -27,11 +27,11 @@ def dump(args):
     torch.backends.cuda.matmul.allow_tf32 = False
     widths = [int(value) for value in args.widths.split(",")]
     result = dict(fork=args.fork, tree_sha256=args.tree_sha256, source=str(expected_source),
-                  seed=args.seed, cells={})
+                  seed=args.seed, topk=args.topk, cells={})
     for width in widths:
         assert width > 0 and width % 32 == 0
         generator = torch.Generator().manual_seed(args.seed + width)
-        experts, hidden, topk = 16, 5120, 6
+        experts, hidden, topk = 16, 5120, args.topk
         weights, scales = {}, {}
         for name, shape in (("w1", (experts, width, hidden // 2)),
                             ("w3", (experts, width, hidden // 2)),
@@ -42,7 +42,7 @@ def dump(args):
         weight_hashes = {name: digest(value) for name, value in
                          [(f"weight.{k}", v) for k, v in weights.items()] +
                          [(f"scale.{k}", v) for k, v in scales.items()]}
-        for capacity in (1, 16, 80):
+        for capacity in map(int, args.rows.split(",")):
             torch.manual_seed(args.seed + capacity)
             x = (torch.randn(capacity, hidden, device="cuda") * .5).bfloat16()
             ids = torch.rand(capacity, experts, device="cuda").topk(topk, -1).indices.int()
@@ -73,7 +73,8 @@ def compare(args):
 
     old = torch.load(args.old, weights_only=True, map_location="cpu")
     new = torch.load(args.new, weights_only=True, map_location="cpu")
-    assert old["seed"] == new["seed"] and old["cells"].keys() == new["cells"].keys()
+    assert old["seed"] == new["seed"] and old["topk"] == new["topk"]
+    assert old["cells"].keys() == new["cells"].keys()
     cells = {}
     for key, a in old["cells"].items():
         b = new["cells"][key]
@@ -90,22 +91,54 @@ def compare(args):
     print(json.dumps(report, indent=2))
 
 
+def timing(args):
+    import b12x
+    import torch
+    from types import SimpleNamespace
+    import benchmarks.bench_cuteafd_fp8_moe as bench
+
+    assert Path(b12x.__file__).resolve().parent.parent == Path(args.source).resolve()
+    torch.backends.cuda.matmul.allow_tf32 = False
+    parsed = bench.parse_args(["--geometry", "v41", "--native-slices", "--mxfp4-pair",
+        "--mxfp4-tilings", "--widths", args.widths, "--rows", args.rows,
+        "--iters", "20", "--seed", str(args.seed), "--control-repeats", "3",
+        "--graph", "--output", str(args.output)])
+    original = bench.tiling_specs
+
+    def identical_controls(options, width, baseline_tile, tiles):
+        specs, controls = original(options, width, baseline_tile, tiles)
+        return specs[:len(controls)], controls
+
+    # Both seals run only the existing padded API; no exact-tail options are used.
+    bench.tiling_specs = identical_controls
+    geometry = SimpleNamespace(name="v41", hidden=5120, intermediate=2304,
+                               experts=384, top_k=args.topk)
+    bench.mxfp4_tiling_screen(geometry, parsed, None)
+    data = json.loads(args.output.read_text())
+    data["seal"] = dict(fork=args.fork, tree_sha256=args.tree_sha256,
+                        source=str(Path(args.source).resolve()), seed=args.seed)
+    args.output.write_text(json.dumps(data, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    emit = sub.add_parser("dump")
-    emit.add_argument("--source", required=True)
-    emit.add_argument("--fork", required=True)
-    emit.add_argument("--tree-sha256", required=True)
-    emit.add_argument("--widths", default="384,576,768,1152,2304")
-    emit.add_argument("--seed", type=int, default=92811)
-    emit.add_argument("--output", type=Path, required=True)
+    for command in ("dump", "timing"):
+        emit = sub.add_parser(command)
+        emit.add_argument("--source", required=True)
+        emit.add_argument("--fork", required=True)
+        emit.add_argument("--tree-sha256", required=True)
+        emit.add_argument("--widths", default="384,576,768,1152,2304")
+        emit.add_argument("--rows", default="1,16,80")
+        emit.add_argument("--topk", type=int, choices=(3, 6), default=6)
+        emit.add_argument("--seed", type=int, default=92811)
+        emit.add_argument("--output", type=Path, required=True)
     check = sub.add_parser("compare")
     check.add_argument("--old", type=Path, required=True)
     check.add_argument("--new", type=Path, required=True)
     check.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    dump(args) if args.command == "dump" else compare(args)
+    {"dump": dump, "compare": compare, "timing": timing}[args.command](args)
 
 
 if __name__ == "__main__":
