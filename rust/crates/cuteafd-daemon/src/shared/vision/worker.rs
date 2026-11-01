@@ -155,9 +155,28 @@ pub fn start_audio(config: &AudioWorkerConfig, snapshot: &Path, library: PathBuf
     Ok((server, reserved))
 }
 
+// Baseline replay seam: the existing startup formula includes a guard only
+// when audio is present. No admission behavior is changed by this extraction.
+fn media_reservation(vision: u64, audio: u64, budget: u64) -> Result<u64> {
+    let audio = if audio > 0 { audio_reservation(audio, budget)? } else { 0 };
+    let reserved = vision.checked_add(audio).context("media reservation overflow")?;
+    ensure!(reserved <= budget, "media towers exceed budget");
+    Ok(reserved)
+}
+const MEDIA_GUARD_BYTES: u64 = AUDIO_GUARD_BYTES;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn media_reservation_keeps_one_guard_outside_expert_budget() {
+        assert_eq!(media_reservation(7, 0, MEDIA_GUARD_BYTES + 7).unwrap(), MEDIA_GUARD_BYTES + 7);
+        assert_eq!(media_reservation(3, 4, MEDIA_GUARD_BYTES + 7).unwrap(), MEDIA_GUARD_BYTES + 7);
+        assert_eq!(media_reservation(0, 0, 0).unwrap(), 0);
+        assert_eq!(media_reservation(0, 7, MEDIA_GUARD_BYTES + 7).unwrap(), MEDIA_GUARD_BYTES + 7);
+        assert!(media_reservation(0, 7, MEDIA_GUARD_BYTES + 6).is_err());
+        assert!(media_reservation(0, u64::MAX, u64::MAX).is_err());
+    }
     #[test]
     fn audio_reservation_keeps_guard_outside_expert_budget() {
         assert_eq!(audio_reservation(7, AUDIO_GUARD_BYTES + 7).unwrap(), AUDIO_GUARD_BYTES + 7);
