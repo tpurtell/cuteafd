@@ -240,6 +240,8 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "admission": kv_waiter.stats(),
         "media": media.stats(),
         "totals": console::totals::snapshot(),
+        // Per-layer x per-expert route hits (small `{enabled:false}` when off).
+        "expert_usage": crate::shared::expert_usage::snapshot(),
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
     stats
@@ -484,6 +486,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             "native coordinator exact cap differs from validated inventory");
     }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
+    // Opt-in per-layer x per-expert route counters.
+    if args.expert_usage {
+        crate::shared::expert_usage::enable(cuteafd_core::expert_geometry().experts);
+    }
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
@@ -1653,7 +1659,9 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     let started = Instant::now();
     ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
     let speculative = draft.is_some();
-    let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
+    let usage = crate::shared::expert_usage::enabled();
+    let capture = draft.as_deref().map(DraftRuntime::capture)
+        .unwrap_or(Capture { routes: usage, timing: false });
     // Speculative rows vary every round: keep each decode shape's graphs,
     // whether or not this policy captures routes.
     if draft.as_deref().is_some_and(DraftRuntime::has_policy) { pass.retain_small_graph_shapes(); }
@@ -1719,6 +1727,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
         pass.set_capture(capture);
         let next = runtime.block_on(execute_sampled_rows(pass, requests,
             batch.as_mut().unwrap(), transport, &round));
+        if usage { crate::shared::expert_usage::record(pass.captured_routes()); }
         pass.set_route_capture(false);
         // Reuse the shared tail below by re-entering the same control flow.
         let next = match next {
@@ -1764,6 +1773,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // make the export claim device work that never happened.
     sampling_stats::record_round(false, 0, 0);
     let next = runtime.block_on(execute_logits(lib, pass, requests, &mut batch, transport, capture, compact));
+    if usage { crate::shared::expert_usage::record(pass.captured_routes()); }
     let executed_us = started.elapsed().as_micros() as u64;
     let result = (|| -> Result<()> {
         let next = next?;

@@ -1,7 +1,16 @@
 //! Lane-local rounds; shared owners are borrowed only during synchronous work.
 use super::*;
+use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
 use std::cell::RefCell;
+
+/// The capture a lane round records. A draft runtime supplies its own capture;
+/// without one, routes are captured when expert usage is on (the same rule the
+/// serial lane uses). The call site binds `usage` to
+/// `crate::shared::expert_usage::enabled()`.
+fn lane_capture(draft: Option<Capture>, usage: bool) -> Capture {
+    draft.unwrap_or(Capture { routes: usage, timing: false })
+}
 
 pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &tokio::runtime::Runtime,
     first: &mut P, second: &mut P, requests: &mut Requests<'a>,
@@ -162,7 +171,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 }
                 bound_inputs(&mut inputs);
                 let batch = prepare_decode_lane(&mut requests, &active, &members, &inputs, draft.is_some())?;
-                (inputs, Some(batch), draft.as_deref().map(DraftRuntime::capture).unwrap_or_default(),
+                // Without a draft runtime, capture routes for expert usage (as the serial lane does).
+                (inputs, Some(batch),
+                    lane_capture(draft.as_deref().map(DraftRuntime::capture),
+                        crate::shared::expert_usage::enabled()),
                     draft.as_deref().is_some_and(DraftRuntime::has_policy))
             };
             let prepared_us = started.elapsed().as_micros() as u64;
@@ -288,6 +300,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     }
                 }
                 let layer_us = pass.captured_layer_us();
+                if crate::shared::expert_usage::enabled() {
+                    crate::shared::expert_usage::record(pass.captured_routes());
+                }
                 observe_lane_round(draft.borrow_mut().as_deref_mut(), lane, shared,
                     pass.captured_routes(), &layer_us, &active.borrow(), &members, &inputs,
                     &accepted_inputs, &copied, &clock);
