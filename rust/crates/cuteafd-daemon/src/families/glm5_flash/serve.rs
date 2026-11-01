@@ -147,6 +147,9 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(args.max_sequences as u32)?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
         GlmEncoding::from_snapshot(&snapshot)?

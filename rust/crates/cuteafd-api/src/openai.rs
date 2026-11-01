@@ -218,6 +218,7 @@ impl Default for ModelProfile {
 }
 pub mod auth;
 pub mod health;
+pub mod admin;
 mod limits;
 mod admission;
 mod constraints;
@@ -386,7 +387,8 @@ pub fn router_for_model(queue: mpsc::Sender<NativeRequest>, limits: NativeLimits
             let _ = tokio::task::spawn_blocking(move || cuteafd_transport::traffic::publish_phase(phase)).await;
             StatusCode::NO_CONTENT
         }).layer(axum::extract::DefaultBodyLimit::max(64 * 1024)))
-        .route("/v1/chat/completions", post(chat));
+        .route("/v1/chat/completions", post(chat))
+        .route("/v1/admin/limits", get(admin::get_limits).post(admin::post_limits));
     // With the gateway mounted, its listing (OpenAI and Anthropic fields,
     // official aliases) owns /v1/models; the served model's entry keeps the
     // chat route's fields, so existing readers see the same record first.

@@ -1301,7 +1301,8 @@ mod tests {
         crate::families::deepseek_v41::v41_native_serve::admission::spark_admission(std::path::Path::new(&snapshot),
             &catalog, 20, peers.len(), unit_rows.max(cuteafd_core::V41_VERIFY_ROWS as u32), 2,
             // The workers run TP4 x EP1 (golden-run --spark-tp 4 --spark-ep 1), as serve's admission names it.
-            Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1))?.start(&peers)?.wait()?;
+            Some(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1),
+            crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS)?.start(&peers)?.wait()?;
         let roce = SparkExperts::new_world(cuteafd_transport::expert::SparkWorld::owned(cuteafd_transport::expert::SparkTopology::NATIVE_TP4_EP1)?, &peers, 16, crate::families::deepseek_v41::v41_native_serve::transport_config(crate::families::deepseek_v41::v41_native_serve::protocol_v2_timing()), 0)?;
         let mut transport =
             devices[1].own(|| NativeTp4Wave::new(&lib, roce, NativeTp4Wave::device_bytes(16)?))?;

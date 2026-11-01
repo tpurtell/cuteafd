@@ -18,6 +18,7 @@ pub(crate) mod host_heap;
 pub(crate) mod inventory;
 pub(crate) mod l2_prefetch;
 pub(crate) mod launch_grid;
+pub(crate) mod limits;
 pub(crate) mod mapped_table;
 pub(crate) mod token_table;
 pub(crate) mod memory;

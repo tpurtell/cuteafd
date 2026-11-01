@@ -137,9 +137,9 @@ pub(crate) struct CacheAttention<'a> {
     positions: Vec<Vec<u64>>,
 }
 impl CacheAttention<'_> {
-    pub fn attention_requests_fixed(&self)->Result<([AttentionRequest<'_>;16],usize)> {
+    pub fn attention_requests_fixed(&self)->Result<([AttentionRequest<'_>;128],usize)> {
         let count=self.windows.len();
-        ensure!((1..=16).contains(&count) && self.positions.len()==count,
+        ensure!((1..=128).contains(&count) && self.positions.len()==count,
             "invalid fixed attention request count");
         Ok((std::array::from_fn(|i| {
             let i=if i<count {i} else {0};
@@ -518,7 +518,7 @@ impl<'a> BackboneCache<'a> {
     fn plan_stage(&self, work: &[CacheWork], replay: bool, reserve: bool) -> Result<CacheBatch> {
         self.healthy()?;
         ensure!(
-            !work.is_empty() && work.len() <= 16,
+            !work.is_empty() && work.len() <= 128,
             "invalid cache batch request count"
         );
         let mut stage = None;

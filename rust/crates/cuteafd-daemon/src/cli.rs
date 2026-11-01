@@ -426,6 +426,10 @@ pub(crate) struct PlanArgs {
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
     #[arg(long, default_value_t = 0)]
     pub(crate) concurrency: u64,
+    /// Allocated concurrency ceiling for --layout (defaults to --concurrency). Every
+    /// start-time structure is sized from it, as `serve-native --concurrency-max` sizes them.
+    #[arg(long, env = "CUTEAFD_CONCURRENCY_MAX", value_parser = clap::value_parser!(u64).range(1..=128))]
+    pub(crate) concurrency_max: Option<u64>,
     /// The engine's recurrent-state slots for --layout, when they differ from the family's rule
     /// over --concurrency (GLM 5.3 Flash serves max(--slots, --max-sequences)).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -496,6 +500,13 @@ pub(crate) struct PlanArgs {
     /// Matching image PROGRAMS.json for exact V4 Flash/Pro workspaces.
     #[arg(long)]
     pub(crate) workspace_manifest: Option<PathBuf>,
+}
+impl PlanArgs {
+    /// The allocated concurrency ceiling: `--concurrency-max`, or the live
+    /// limit when the ceiling was not given.
+    pub(crate) fn concurrency_max(&self) -> u64 {
+        self.concurrency_max.unwrap_or(self.concurrency)
+    }
 }
 
 #[derive(Debug, Args)]
@@ -921,10 +932,10 @@ mod tests {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", entries])).is_ok());
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "129"])).is_err());
-        for concurrency in ["1", "2", "16"] {
+        for concurrency in ["1", "2", "16", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--memory-reservation", "87.5%"])).is_ok());
         }
-        for concurrency in ["0", "17"] {
+        for concurrency in ["0", "129"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
         for (context, output, valid) in [("256", "128", true), ("0", "128", false),
@@ -932,6 +943,52 @@ mod tests {
             let command = base.into_iter().chain(["--max-context-tokens", context, "--max-output-tokens", output]);
             assert_eq!(super::Cli::try_parse_from(command).is_ok(), valid);
         }
+    }
+
+    #[test]
+    fn native_concurrency_max_defaults_to_the_live_limit() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.concurrency_max(), args.concurrency);
+        assert!(args.validate_concurrency().is_ok());
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--concurrency", "8"])).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.concurrency_max(), 8);
+        assert!(args.validate_concurrency().is_ok());
+        // The ceiling can raise to the engine's widest slot count (128).
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--concurrency", "16", "--concurrency-max", "128"])).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.concurrency_max(), 128);
+        assert!(args.validate_concurrency().is_ok());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", "129"])).is_err());
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency-max", "129"])).is_err());
+    }
+
+    #[test]
+    fn native_concurrency_max_bounds_the_live_limit() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--concurrency", "16", "--concurrency-max", "8"])).unwrap().command
+            else { panic!("expected native serving"); };
+        assert!(args.validate_concurrency().is_err());
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--concurrency", "8", "--concurrency-max", "16"])).unwrap().command
+            else { panic!("expected native serving"); };
+        assert!(args.validate_concurrency().is_ok());
+        assert_eq!(args.concurrency_max(), 16);
+        // A test-only narrower engine bound refuses a wider ceiling, naming it.
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--concurrency", "8", "--concurrency-max", "16"])).unwrap().command
+            else { panic!("expected native serving"); };
+        let error = args.validate_concurrency_with_bound(8).unwrap_err().to_string();
+        assert!(error.contains("concurrency-max must be in 1..=8"), "{error}");
     }
 
     #[test]
@@ -1192,9 +1249,16 @@ pub(crate) struct NativeServeArgs {
     pub rtx_expert_layers: crate::shared::memory::budget::LocalLayers,
 
 
-    /// Maximum active requests, shared by both execution lanes.
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]
+    /// Maximum active requests, shared by both execution lanes. This is the
+    /// live limit: it may be lowered or raised at runtime up to
+    /// `--concurrency-max`.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=128))]
     pub concurrency: u32,
+
+    /// Allocated concurrency ceiling (start-time): sizes slots, the drafter,
+    /// the HTTP queue and the KV plan. Defaults to `--concurrency`.
+    #[arg(long, env = "CUTEAFD_CONCURRENCY_MAX", value_parser = clap::value_parser!(u32).range(1..=128))]
+    pub concurrency_max: Option<u32>,
 
     /// Buffered HTTP jobs; defaults to concurrency. At most this many additional callers wait.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4096))]
@@ -1319,6 +1383,31 @@ fn plan_decode_rows(value: &str) -> Result<u64, String> {
 impl NativeServeArgs {
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && !self.dspark_fixed
+    }
+
+    /// The allocated concurrency ceiling: `--concurrency-max`, or the live
+    /// limit when the ceiling was not given.
+    pub fn concurrency_max(&self) -> u32 {
+        self.concurrency_max.unwrap_or(self.concurrency)
+    }
+
+    /// The live limit may not exceed the allocated ceiling, and both stay in
+    /// the engine's slot range (`1..=V41_SLOTS_MAX`).
+    pub fn validate_concurrency(&self) -> anyhow::Result<()> {
+        self.validate_concurrency_with_bound(crate::shared::limits::V41_SLOTS_MAX)
+    }
+
+    /// The ceiling is bounded by the engine's request-slot bound. The bound is
+    /// a parameter so a test can exercise a wider engine without a GPU.
+    fn validate_concurrency_with_bound(&self, slots: u32) -> anyhow::Result<()> {
+        let max = self.concurrency_max();
+        anyhow::ensure!((1..=slots).contains(&self.concurrency),
+            "concurrency must be in 1..={slots}, got {}", self.concurrency);
+        anyhow::ensure!((1..=slots).contains(&max),
+            "concurrency-max must be in 1..={slots}, got {max}");
+        anyhow::ensure!(self.concurrency <= max,
+            "concurrency {} exceeds concurrency-max {max}", self.concurrency);
+        Ok(())
     }
 }
 

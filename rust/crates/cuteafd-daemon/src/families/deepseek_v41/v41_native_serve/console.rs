@@ -108,7 +108,7 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     layout.hardware = crate::shared::console::hardware(args.rtx_gpus as usize, args.peers.len(), false);
     layout.split = (args.rtx_gpus > 1).then(|| "layer range · 2 lanes".to_string());
     layout.lanes = 2;
-    layout.concurrency = args.concurrency as usize;
+    layout.concurrency = args.concurrency_max() as usize;
     layout.eos = vec![1];
     layout.speculator = args.dspark.then(|| Speculator {
         name: "dSpark".into(),

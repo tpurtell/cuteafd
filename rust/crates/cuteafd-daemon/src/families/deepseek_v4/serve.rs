@@ -81,6 +81,9 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(args.engine.max_sequences as u32)?;
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
         ModelEncoding::DeepseekV4,

@@ -98,7 +98,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let members: Vec<_> = {
                 let active = active.borrow();
                 if wake.poll_media(round_id) || wake.prefill_due(round_id)
-                    || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty(),
+                    || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(),
+                        crate::shared::limits::live().concurrency(), !receive.is_empty(),
                         requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
                 }
@@ -106,7 +107,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     r.as_ref().filter(|r| r.lane() == lane).map(|_| slot)).collect()
             };
             if members.is_empty() { return Ok(()); }
-            ensure!(members.len() <= 8, "independent lane exceeds eight requests");
+            // Each lane owns at most half the allocated slots; the decode
+            // width (`decode_lane_rows`) covers that many verify rows.
+            ensure!(members.len() <= active.borrow().len().div_ceil(2),
+                "independent lane exceeds its request bound");
             let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
             let started = Instant::now();
             // Reserve target capacity and snapshot this lane's seeds, then release

@@ -140,6 +140,15 @@ impl ApiPolicy {
     pub fn app(self, router: axum::Router, hub: Arc<cuteafd_api::openai::ConsoleHub>) -> axum::Router {
         // Token text reaches only viewers holding the console cookie.
         hub.set_gate(self.gate.clone());
+        // Expose the live concurrency limit over HTTP. The API crate cannot
+        // depend on the daemon, so the daemon installs the bridge here.
+        let limits = crate::shared::limits::live();
+        cuteafd_api::openai::admin::install(cuteafd_api::openai::admin::AdminLimits {
+            allocated: limits.allocated(),
+            gate: self.gate.clone(),
+            live: Arc::new(move || limits.concurrency()),
+            set_concurrency: Arc::new(move |n| limits.set_concurrency(n)),
+        });
         let snapshot_hub = hub.clone();
         let mut this = self;
         this.live = Some(Arc::new(move || {

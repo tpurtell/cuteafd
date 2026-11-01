@@ -176,10 +176,10 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
     if args.host_cache_evict_tokens > 0 { config.eviction_headroom[3] = super::scores::VOCAB as u64 * 4; }
     if matches!(args.host_cache_bytes, crate::shared::prefix::HostBudget::Auto) {
         let required = crate::shared::prefix::budget::retained_bytes(layout,
-            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes)?;
+            args.concurrency_max() as usize, args.max_context_tokens as usize, config.chunk_bytes)?;
         let memory = crate::shared::prefix::budget::host_memory()?;
         config.bytes = crate::shared::prefix::budget::resolve_bytes(layout, None,
-            args.concurrency as usize, args.max_context_tokens as usize, config.chunk_bytes, memory)?;
+            args.concurrency_max() as usize, args.max_context_tokens as usize, config.chunk_bytes, memory)?;
         anyhow::ensure!(config.bytes > 0,
             "automatic host prefix quota resolves to zero; provide a positive quota or disable host retention explicitly");
         config.validate()?;
@@ -193,8 +193,8 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
     let conversations_50k = geometry.conversations(config.bytes, 50_000, config.chunk_bytes);
     tracing::info!(mark_bytes = layout.mark_bytes, host_bytes = config.bytes,
         conversations_max_context = max_conversations, conversations_50k, "host prefix capacity");
-    if config.enabled() && conversations_50k < args.concurrency as u64 + 4 {
-        tracing::warn!(conversations_50k, desired = args.concurrency + 4,
+    if config.enabled() && conversations_50k < args.concurrency_max() as u64 + 4 {
+        tracing::warn!(conversations_50k, desired = args.concurrency_max() + 4,
             "host prefix quota holds fewer 50K conversations than concurrency plus four");
     }
     let host = if config.enabled() && args.prefix_cache_entries > 0 {
@@ -227,7 +227,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
 /// the previous key shape when one is bound.
 fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache<'_>,
     kv_waiter: &cuteafd_engine::prefix::DeferredAdmission<admission::Prepared>,
-    media: &admission::Media<C>, prefilling: usize) -> serde_json::Value {
+    media: &admission::Media<C>, prefilling: usize, active: usize) -> serde_json::Value {
     // Deliberately exports the cache's whole effective `Config` under
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
@@ -247,9 +247,18 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // prompt's call cancelled because another prompt's call came next.
         "prefill_queue": {"prefilling": prefilling, "prefetch_waves_cancelled":
             super::prefill_target::PREFETCH_WAVES_CANCELLED.load(std::sync::atomic::Ordering::Relaxed)},
+        // Allocated ceiling, live limit and the admission bound.
+        "limits": crate::shared::limits::live().snapshot(),
+        "active": active,
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
     stats
+}
+
+/// The live gate: true when the admitted occupancy (decoding members and
+/// media-held slots) already fills the live limit.
+fn live_gate_full(active: usize, media: usize, live: u32) -> bool {
+    active + media >= live as usize
 }
 
 type PackedAdmission = (admission::Prepared, u64, CacheLease, usize, ImageKeys,
@@ -690,7 +699,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
     let _stall_watch = stall::spawn();
-    let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
+    let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency_max()).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
     let mut closed = false;
@@ -700,7 +709,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<admission::Prepared>::default();
     // Admitted (leased, restored) requests whose images the restored frontier
     // still needs wait here for their encodes; decode keeps running.
-    let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
+    let mut media = admission::Media::new(&mut *vision, args.concurrency_max() as usize)?;
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
@@ -724,7 +733,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
-                *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len());
+                *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(),
+                    active.iter().flatten().count());
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
@@ -768,6 +778,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     "native asynchronous vision preparation");
                 leased.into_admitted()
             } else {
+            // Admit only while the live limit leaves room. Lowering never kills
+            // a stream: excess requests drain by retirement. Prompts admitted
+            // earlier in THIS pass sit in `held_slots` until they are leased.
+            if live_gate_full(active.iter().flatten().count() + held_slots.len(), media.len(),
+                crate::shared::limits::live().concurrency()) { break; }
             let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)
                 && !held_slots.contains(&slot) && !prefills.iter().any(|queued| queued.slot == slot)) else { break };
             let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
@@ -823,7 +838,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
             if !prepared.images.is_empty() && media.full() {
                 // Encoder waiters are full: wait host-side, holding no lease.
-                if media.backlog.len() < (args.concurrency as usize).max(8) {
+                if media.backlog.len() < (args.concurrency_max() as usize).max(8) {
                     media.backlog.push_back(prepared);
                 } else {
                     let _ = prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
@@ -1887,7 +1902,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 ) -> Result<()> {
     let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
-    ensure!(!members.is_empty() && members.len() <= 8, "invalid single decode lane");
+    ensure!(!members.is_empty() && members.len() <= active.len(), "invalid single decode lane");
     let speculative = draft.is_some();
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
@@ -3090,7 +3105,7 @@ mod sampling_tests {
         let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
         let mut encoder = cuteafd_engine::media::FakeEncoder::default();
         let media = admission::Media::new(&mut encoder, 4).unwrap();
-        let snapshot = serving_stats(&disabled, &waiter, &media, 2);
+        let snapshot = serving_stats(&disabled, &waiter, &media, 2, 0);
         for key in ["output_shrinks", "output_tokens_withheld", "deferred"] {
             assert!(snapshot["admission"][key].is_u64(), "missing admission {key} in {snapshot}");
         }
@@ -3106,7 +3121,7 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0);
+        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, 0);
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");
@@ -3114,6 +3129,21 @@ mod sampling_tests {
             assert!(configured["target_sampling"][key].is_u64(),
                 "missing {key} in {configured}");
         }
+    }
+
+    /// The live gate is the sum of every admitted occupancy term: a request is
+    /// admitted only while `active + media < live`.
+    #[test]
+    fn live_gate_counts_active_and_media() {
+        assert!(!live_gate_full(0, 0, 1));
+        assert!(live_gate_full(1, 0, 1));
+        assert!(live_gate_full(0, 1, 1));
+        assert!(!live_gate_full(1, 0, 2));
+        assert!(live_gate_full(1, 1, 2));
+        assert!(live_gate_full(2, 0, 2));
+        // The serve loop reads the live limit at every admission.
+        let source = include_str!("scheduler.rs");
+        assert!(source.contains("crate::shared::limits::live().concurrency()"));
     }
 
     /// A packed frontier is retained under the same Checked/RecordedSample rule

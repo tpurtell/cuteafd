@@ -60,7 +60,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     ensure!(prefill_shape.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         prefill_shape.unit_cap);
     let slots = prefill_shape.waves;
-    let decode_rows = super::DECODE_LANE_ROWS;
+    let decode_rows = super::decode_lane_rows(args.concurrency_max());
     memory_checkpoint("before native preload")?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib,&[0,1], crate::shared::inventory::InventoryPhase::PreWeight, |gpu| {
         admission::preload(&lib,capacity,2,catalog.nvfp4().is_some())?;
@@ -339,7 +339,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
-            &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
+            &lib, &catalog, capacity, args.concurrency_max(), draft_width, args.tp2_dspark_experts,
             64640, super::prefix::Arenas::draft_mark_bytes(snapshot_slots)))?)
     } else { None };
     // Vision and target snapshot copies use GPU0. These allocations precede KV sizing.
@@ -359,7 +359,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     } };
     let ffn_arenas = ffn_bytes(prefill_reserve as u32, capacity)? + 2 * ffn_bytes(decode_rows, decode_rows)?;
     admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 2, capacity,
-        slots, prefill_reserve, ffn_arenas as u64)?;
+        slots, prefill_reserve, ffn_arenas as u64, decode_rows)?;
     // Both Spark transport lanes live on GPU1 and reserve one wave each; a
     // six-rank replicated layout needs its own larger per-wave buffer count.
     let spark_ranks = args.peers.len();
@@ -384,17 +384,17 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let draft_weights = if args.dspark {
         Some(if args.tp2_dspark_experts {
             devices[1].own(||crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_tp2(&lib,&catalog,
-                capacity,args.concurrency,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
+                capacity,args.concurrency_max(),[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
         } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
-            capacity, args.concurrency, draft_budgets(1), 16 << 20, draft_width))?})
+            capacity, args.concurrency_max(), draft_budgets(1), 16 << 20, draft_width))?})
     } else { None };
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
     if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
         // The loaded weights size their lane chains through the same shape the
         // pre-load inventory used; any divergence is an accounting defect.
-        let lane_requests = args.concurrency.div_ceil(if args.concurrency == 1 { 1 } else { 2 });
-        let lanes = if args.concurrency == 1 { 1 } else { 2 };
+        let lane_requests = args.concurrency_max().div_ceil(if args.concurrency_max() == 1 { 1 } else { 2 });
+        let lanes = if args.concurrency_max() == 1 { 1 } else { 2 };
         let loaded = devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DistributedDsparkChain::device_bytes(
             weights, lane_requests, 64640))?;
         for (gpu, bytes) in loaded.iter().enumerate() {
@@ -404,7 +404,7 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         }
     }
     let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
-        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency)).transpose()?;
+        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, args.concurrency_max())).transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_draft_limit(args.dspark_draft_limit)?;
         draft.set_fixed(args.dspark_fixed);
@@ -517,8 +517,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     let cache_bytes: [usize;2]=pool.cache_bytes.clone().try_into().map_err(|_|anyhow::anyhow!("dual cache budgets"))?;
     let pipeline = super::engram_pipeline(&lib, &catalog, &args, capacity as usize, slots)?;
     let mut requests = if args.tp2_attention {
-        Requests::new_replicated(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)?
-    } else { Requests::new_distributed(&lib,pipeline,args.concurrency as usize,pool.pages,map,cache_bytes)? };
+        Requests::new_replicated(&lib,pipeline,args.concurrency_max() as usize,pool.pages,map,cache_bytes)?
+    } else { Requests::new_distributed(&lib,pipeline,args.concurrency_max() as usize,pool.pages,map,cache_bytes)? };
     pass.configure_cache_replicas(requests.cache())?;
     second.configure_cache_replicas(requests.cache())?;
     for (slot, _) in &mut prefill_slots.slots { slot.configure_cache_replicas(requests.cache())?; }

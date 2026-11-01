@@ -75,11 +75,13 @@ pub struct Auth {
 }
 /// `/v1` routes the API key never guards: the live console's reads (open to
 /// anyone on the port, as before keys existed; token text inside them still
-/// needs the console cookie) and the benchmark controls, which the console
-/// cookie guards instead (`cuteafd_bench::http`).
+/// needs the console cookie), the benchmark controls, which the console
+/// cookie guards instead (`cuteafd_bench::http`), and `POST /v1/admin/limits`,
+/// which the console secret always guards instead (`openai::admin`).
 pub fn key_exempt(method: &axum::http::Method, path: &str) -> bool {
     (method == axum::http::Method::GET
         && matches!(path, "/v1/console" | "/v1/console/events" | "/v1/console/snapshot" | "/v1/fabric" | "/v1/stats" | "/v1/thermal"))
+        || (method == axum::http::Method::POST && path == "/v1/admin/limits")
         || path.starts_with("/v1/bench/")
 }
 pub async fn require_key(axum::extract::State(auth): axum::extract::State<Auth>,
@@ -106,6 +108,14 @@ mod tests {
     use super::*;
     use axum::{body::Body, routing::{get, post}, Router};
     use tower::ServiceExt;
+    #[test]
+    fn admin_limits_is_not_on_the_open_list() {
+        // GET follows the API key; POST is never open: the console secret
+        // (`openai::admin`) authorizes it instead of the API key.
+        assert!(!key_exempt(&axum::http::Method::GET, "/v1/admin/limits"));
+        assert!(key_exempt(&axum::http::Method::POST, "/v1/admin/limits"));
+        assert!(!key_exempt(&axum::http::Method::PUT, "/v1/admin/limits"));
+    }
     #[test]
     fn whole_key_and_redacted_debug() {
         let key = ApiKey::new("test-key").unwrap();

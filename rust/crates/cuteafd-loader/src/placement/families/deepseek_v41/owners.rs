@@ -47,6 +47,15 @@ pub fn encoder_suffix_bytes(unit: u64, concurrency: u64) -> u64 {
 pub const DECODE_LANE_ROWS: u64 = 80;
 const _: () = assert!(cuteafd_core::V41_VERIFY_ROWS as u64 <= DECODE_LANE_ROWS);
 
+/// The decode lane width for a ceiling: the compiled cover (80 rows) at the
+/// default ceiling, wider when the ceiling admits more requests per lane. The
+/// native library must be built for the same width; the startup admission
+/// check refuses a manifest that does not cover it.
+pub fn decode_lane_rows(concurrency: u64) -> u64 {
+    const ROWS_PER_REQUEST: u64 = 10;
+    DECODE_LANE_ROWS.max(concurrency.div_ceil(2) * ROWS_PER_REQUEST)
+}
+
 /// The attention GPU of `layer` on two RTX (the encoder/decoder map: layers
 /// 0..20 on GPU0, 20..40 on GPU1).
 fn v41_attention_gpu(layer: usize) -> usize { usize::from(layer >= 20) }
@@ -393,7 +402,7 @@ impl<'a> NativePrograms<'a> {
     /// `experts` is the published coordinator (not RTX backbone) manifest.
     pub fn dspark(&self, experts: &Value, rows: u64, requests: u64, width: u64,
         ranks: usize, head_mode: Fp8Head) -> Result<Vec<Demand>> {
-        ensure!((1..=4096).contains(&rows) && (1..=16).contains(&requests)
+        ensure!((1..=4096).contains(&rows) && (1..=128).contains(&requests)
             && matches!(width, 5 | 7) && matches!(ranks, 1 | 2), "invalid V4.1 draft owners");
         ensure!(experts["role"].as_str() == Some("coordinator"), "dSpark expert manifest role mismatch");
         ensure!(experts["input_format"].as_str() == Some("bf16"),

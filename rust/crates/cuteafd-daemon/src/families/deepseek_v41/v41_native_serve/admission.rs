@@ -3,9 +3,8 @@ pub(crate) use crate::shared::memory::budget::LocalLayers;
 use anyhow::{Context, Result, ensure};
 use cuteafd_loader::placement::*;
 
-fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, waves: u8, bf16: bool)
-    -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
-    let decode = super::DECODE_LANE_ROWS;
+fn spark_model(catalog: &cuteafd_loader::OfficialV41Catalog, capacity: u32, waves: u8, bf16: bool,
+    decode: u32) -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     use cuteafd_core::{SparkEndpoint, SparkIngress};
     use cuteafd_loader::plan::spark_executions::{admit_family, SparkBackend};
     let ingress = if bf16 { SparkIngress::Bf16 } else { SparkIngress::Fp8K32 };
@@ -45,7 +44,8 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
         return Ok(None);
     }
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
-    spark_admission(&args.snapshot, catalog, local_layers, args.peers.len(), capacity, slots, topology).map(Some)
+    spark_admission(&args.snapshot, catalog, local_layers, args.peers.len(), capacity, slots, topology,
+        super::decode_lane_rows(args.concurrency_max())).map(Some)
 }
 
 /// The Spark admission for `ranks` workers serving layers `local_layers..`,
@@ -54,12 +54,13 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
 /// before any transport connects.
 pub(crate) fn spark_admission(snapshot: &std::path::Path, catalog: &cuteafd_loader::OfficialV41Catalog,
     local_layers: usize, ranks: usize, capacity: u32, slots: usize,
-    topology: Option<cuteafd_transport::expert::SparkTopology>) -> Result<crate::shared::placement::SparkAdmission> {
+    topology: Option<cuteafd_transport::expert::SparkTopology>, decode: u32)
+    -> Result<crate::shared::placement::SparkAdmission> {
     let geometry = catalog.routed_experts().geometry()?;
     let working = SparkWorkingSet { spark_layers: (local_layers..geometry.layers as usize).collect(),
         rtx_layers: (0..local_layers).collect(), spark_ranks: ranks, prefill_lanes: slots as u64 };
     crate::shared::placement::SparkAdmission::plan(snapshot, geometry, Some(catalog), &working, ranks, topology,
-        spark_model(catalog, capacity, u8::try_from(slots)?, catalog.nvfp4().is_some())?)
+        spark_model(catalog, capacity, u8::try_from(slots)?, catalog.nvfp4().is_some(), decode)?)
 }
 
 #[cfg(test)]
@@ -91,7 +92,7 @@ mod spark_tests {
                 // The planner's resolved unit and waves, as serve admits them.
                 let options = cuteafd_loader::plan::layout::LayoutOptions { prefill_unit_rows: Some(u64::from(live)),
                     prefill_waves: u64::from(waves), ..Default::default() };
-                assert_eq!(spark_model(&catalog, live, waves, false)?.executions,
+                assert_eq!(spark_model(&catalog, live, waves, false, crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS)?.executions,
                     cuteafd_loader::plan::layout::planned_spark_executions("deepseek_v41", backend, None, &options)?);
             }
         }
@@ -105,9 +106,9 @@ mod spark_tests {
         let root = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_v41_snapshot(root.path());
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-        let model = spark_model(&catalog, cuteafd_core::V41_VERIFY_ROWS as u32, 2, false)?;
+        let model = spark_model(&catalog, cuteafd_core::V41_VERIFY_ROWS as u32, 2, false, crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS)?;
         model.validate(cuteafd_core::ExpertGeometry::DEEPSEEK_V41)?;
-        assert!(spark_model(&catalog, 16, 2, false).is_err(),
+        assert!(spark_model(&catalog, 16, 2, false, crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS).is_err(),
             "16-row endpoints cannot admit the 64-row decode owners");
         Ok(())
     }
@@ -119,7 +120,7 @@ mod spark_tests {
         let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
         for (live, compiled) in [(256, 256), (2048, 4096), (4096, 4096)] {
             for bf16 in [false, true] {
-                let model = spark_model(&catalog, live, 2, bf16)?;
+                let model = spark_model(&catalog, live, 2, bf16, crate::families::deepseek_v41::v41_native_serve::DECODE_LANE_ROWS)?;
                 assert_eq!((model.capacity(), model.compiled_capacity()), (live, compiled));
                 // Two decode lanes, one prefill owner holding the two units in flight.
                 assert_eq!(model.executions.decode, [cuteafd_core::DecodeExecution {
@@ -248,13 +249,13 @@ pub(super) fn verify_target_charges(lib: &cuteafd_ffi::NativeLibrary, native_lib
 /// width) equals what serve admits and allocates (`exact`, from the native
 /// library's own plans and the TP2 owner policy).
 pub(super) fn verify_expert_charges(catalog: &cuteafd_loader::OfficialV41Catalog, native_lib: &std::path::Path,
-    sms: u32, ranks: usize, unit: u32, slots: usize, reserve: u64, exact: u64) -> Result<()> {
+    sms: u32, ranks: usize, unit: u32, slots: usize, reserve: u64, exact: u64, decode: u32) -> Result<()> {
     let directory = native_lib.parent().context("native library has no directory")?;
     let programs = [directory.join("PROGRAMS.json"), directory.join("../share/PROGRAMS.json"),
         directory.join("../../share/PROGRAMS.json")].into_iter().find(|path| path.is_file())
         .context("missing PROGRAMS.json beside the native library or in its share directory")?;
     let (_, planned) = families::deepseek_v41::expert_inventory(catalog, &programs, u64::from(unit), ranks, sms,
-        slots, reserve, u64::from(super::DECODE_LANE_ROWS))?;
+        slots, reserve, u64::from(decode))?;
     tracing::info!(planned, exact, ranks, unit, slots, reserve, "V4.1 expert workspaces: plan == runtime");
     ensure!(planned == exact, "V4.1 expert workspaces: planned {planned} B per GPU, serve admits {exact} B ({:+} B)",
         exact as i64 - planned as i64);
@@ -289,11 +290,12 @@ pub(super) fn admit_startup(
     // Every owner serve allocates: two decode lanes, the prefill slots' storage.
     let shape = super::AdmittedPrefill::resolve(args)?;
     let passes = shape.waves;
-    let mut target = programs.target(u64::from(super::DECODE_LANE_ROWS), shape.reserve_rows() as u64,
-        u64::from(capacity), 1, passes, u64::from(args.concurrency),
+    let decode = super::decode_lane_rows(args.concurrency_max());
+    let mut target = programs.target(u64::from(decode), shape.reserve_rows() as u64,
+        u64::from(capacity), 1, passes, u64::from(args.concurrency_max()),
         crate::families::deepseek_v41::v41_tensors::fp8_head(),
         BackboneExecution::window_batch_enabled())?;
-    validate_engram_rows(&target, shape.reserve_rows(), super::DECODE_LANE_ROWS as usize)?;
+    validate_engram_rows(&target, shape.reserve_rows(), decode as usize)?;
     // Test builds retain the materialized query reference buffer; production
     // intentionally has no such owner.
     #[cfg(test)]
@@ -306,11 +308,11 @@ pub(super) fn admit_startup(
     ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
     let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
-        owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes)?, slots)?;
+        owners::transports_bytes(u64::from(decode), u64::from(capacity), args.peers.len(), passes)?, slots)?;
     let draft = if args.dspark {
         let mut draft =
             crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::single_inventory(
-                lib, catalog, capacity, args.concurrency,
+                lib, catalog, capacity, args.concurrency_max(),
                 if args.dspark_draft_limit > 5 { 7 } else { 5 })?;
         startup.extend(target_owners.draft_load_phases(&draft)?);
         draft.marks = resident::prefix_arena_bytes(slots, true, 1)[0]
@@ -477,7 +479,7 @@ pub(super) fn local_workspace(
     // at decode width.
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
     Ok((lane(rows)?.checked_mul(slots).context("local serving lanes overflow")?
-        + 2 * lane(super::DECODE_LANE_ROWS)?) as u64)
+        + 2 * lane(super::decode_lane_rows(args.concurrency_max()))?) as u64)
 }
 
 /// With `draft`, the sample must precede all draft weights, runtime buffers and
@@ -560,7 +562,7 @@ pub(super) fn resolve_with_owners(
         })
         .collect::<Result<Vec<_>>>()?;
     let cards = memory.iter().map(|m| m.1 as u64).collect::<Vec<_>>();
-    let tails = args.concurrency as u64 + 2 * args.prefix_cache_entries as u64;
+    let tails = args.concurrency_max() as u64 + 2 * args.prefix_cache_entries as u64;
     let mut pool = PoolPolicy::resolve(
         &cards,
         args.max_context_tokens as u64,
@@ -579,7 +581,7 @@ pub(super) fn resolve_with_owners(
     }
     if pool.requested.is_none() {
         pool.floor = pool.floor.max(
-            (args.max_context_tokens as u64).div_ceil(512) * 512 + args.concurrency as u64 * 512,
+            (args.max_context_tokens as u64).div_ceil(512) * 512 + args.concurrency_max() as u64 * 512,
         );
         pool.target = pool.target.max(pool.floor);
     }
@@ -622,7 +624,7 @@ pub(super) fn resolve_with_owners(
     families::deepseek_v41::cache_demands(
         &mut req,
         &config,
-        args.concurrency as u64,
+        args.concurrency_max() as u64,
         args.prefix_cache_entries as u64,
         args.tp2_attention,
     )?;
@@ -636,7 +638,7 @@ pub(super) fn resolve_with_owners(
     let exact = cuteafd_loader::serving_capacity::deepseek_v41_cache_bytes(
         &config,
         ranks,
-        args.concurrency as u64,
+        args.concurrency_max() as u64,
         groups as u64,
         args.tp2_attention,
     )?;
@@ -1045,7 +1047,7 @@ mod admission_tests {
         let mut args = args(dir.path());
         args.max_context_tokens = 131_072;
         args.rtx_expert_layers = LocalLayers::Count(0);
-        let tails = args.concurrency as usize + 2 * args.prefix_cache_entries as usize;
+        let tails = args.concurrency_max() as usize + 2 * args.prefix_cache_entries as usize;
         let memory = [(80usize << 30, 96usize << 30)];
         for tokens in [32_768, 131_072] {
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(
@@ -1204,7 +1206,7 @@ mod admission_tests {
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }
         args.max_context_tokens = 262_144;
-        for concurrency in [0, 17, u32::MAX] {
+        for concurrency in [0, 129, u32::MAX] {
             args.concurrency = concurrency;
             assert!(resolve(&args, &memory, vec![], 0, &[0], 0, None).is_err());
         }

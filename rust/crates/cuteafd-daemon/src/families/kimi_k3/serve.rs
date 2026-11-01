@@ -90,6 +90,9 @@ impl ServeArgs {
 pub(crate) async fn run(args: ServeArgs) -> Result<()> {
     args.validate()?;
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(u32::from(args.max_sequences))?;
     let encoding = Arc::new(KimiEncoding::from_snapshot(&args.snapshot)?);
     let eos = encoding.eos_token_ids();
     let model = args.model_id.clone().or_else(|| args.snapshot.ancestors().find_map(|path| {

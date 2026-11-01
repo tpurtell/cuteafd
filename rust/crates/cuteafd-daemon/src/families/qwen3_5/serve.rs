@@ -549,6 +549,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeLimits};
     use std::sync::{Arc, Mutex};
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(u32::from(args.max_sequences))?;
     let snapshot = args.snapshot.clone();
     let encoding = Arc::new(QwenEncoding::from_snapshot(&snapshot)?);
     let eos = encoding.tokens().eos.clone();

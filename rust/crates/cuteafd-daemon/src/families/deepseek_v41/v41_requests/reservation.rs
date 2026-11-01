@@ -66,7 +66,7 @@ impl Requests<'_> {
     }
 
     pub fn reserve_encoder(&mut self, requests: &[RequestTokens<'_>]) -> Result<RequestBatch> {
-        ensure!(!requests.is_empty() && requests.len() <= 16, "invalid encoder request count");
+        ensure!(!requests.is_empty() && requests.len() <= 128, "invalid encoder request count");
         let masks = self.resolved_masks(requests, true)?;
         let mut prepared = Vec::with_capacity(requests.len());
         let mut work = Vec::with_capacity(requests.len());

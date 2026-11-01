@@ -137,6 +137,15 @@ impl ConsoleGate {
     pub fn unlocked(&self, headers: &HeaderMap) -> bool {
         self.issued(headers).is_some()
     }
+    /// Authorized for admin actions: the console cookie, or the console secret
+    /// itself as `Authorization: Bearer <secret>` (so a script can POST without
+    /// a browser). A locked gate authorizes nothing.
+    pub fn authorized(&self, headers: &HeaderMap) -> bool {
+        self.unlocked(headers)
+            || crate::openai::auth::bearer(headers).is_some_and(|token| {
+                self.with_secret(|s, valid| valid && constant_time_eq(s, token.as_bytes()))
+            })
+    }
     fn set_cookie(&self, headers: &HeaderMap) -> HeaderValue {
         let secure = self.secure
             || headers

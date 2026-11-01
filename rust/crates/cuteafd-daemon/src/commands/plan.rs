@@ -24,6 +24,13 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
     if !args.layout && args.vision_replicas != 1 {
         return Err(PlanError::InvalidOption { option: "--vision-replicas", reason: "requires --layout to describe replica inventory".into() });
     }
+    if args.concurrency_max.is_some() && !args.layout {
+        return Err(PlanError::InvalidOption { option: "--concurrency-max", reason: "requires --layout to size the ceiling".into() });
+    }
+    if args.concurrency > args.concurrency_max() {
+        return Err(PlanError::InvalidOption { option: "--concurrency-max",
+            reason: format!("concurrency {} exceeds concurrency-max {}", args.concurrency, args.concurrency_max()) });
+    }
     let mut options = PlanOptions {
         decode_lanes: args.decode_lanes,
         mapped_scale_preload_bytes: cuteafd_loader::plan::mapped_scale_preload_bytes(args.mapped_scale_preload_gib)?,
@@ -95,7 +102,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 graph_budget_bytes: args.graph_budget_mib.map(|mib| mib << 20),
                 glmf_pool_marks: args.prefix_marks == crate::families::glm5_flash::prefix::PrefixMarks::Pool,
                 glmf_shared_replay: args.replay_records == crate::families::glm5_flash::engine::ReplayRecords::Shared,
-                concurrency: args.concurrency,
+                concurrency: args.concurrency_max(),
                 state_slots: args.state_slots,
                 glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
@@ -745,6 +752,28 @@ mod tests {
         assert_eq!((default.prefill_lanes, default.prefill_waves, default.prefill_span_rows), (0, 1, None));
     }
 
+    /// `cuteafd plan` sizes the layout from the ceiling, not the live start
+    /// value, and refuses a live value above the ceiling.
+    #[test]
+    fn plan_sizes_the_layout_from_the_concurrency_ceiling() {
+        use clap::Parser;
+        let parse = |argv: &[&str]| match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Commands::Plan(args) => options(&args).unwrap().layout.unwrap(),
+            _ => panic!("expected plan command"),
+        };
+        let layout = parse(&["cuteafd", "plan", "model", "--layout",
+            "--concurrency", "8", "--concurrency-max", "128"]);
+        assert_eq!(layout.concurrency, 128, "the ceiling sizes the layout");
+        let layout = parse(&["cuteafd", "plan", "model", "--layout", "--concurrency", "8"]);
+        assert_eq!(layout.concurrency, 8, "without a ceiling the live value sizes it");
+        let args = match crate::cli::Cli::try_parse_from(["cuteafd", "plan", "model", "--layout",
+            "--concurrency", "16", "--concurrency-max", "8"]).unwrap().command {
+            crate::cli::Commands::Plan(args) => args,
+            _ => panic!("expected plan command"),
+        };
+        assert!(options(&args).is_err(), "a live value above the ceiling is refused");
+    }
+
     #[test]
     fn exlr8_native_cli_resolves_default_config_and_opt_out_before_admission() {
         let dir = tempfile::tempdir().unwrap();
@@ -915,6 +944,7 @@ mod tests {
             graph_budget_mib: None,
             replay_records: crate::families::glm5_flash::engine::ReplayRecords::Own,
             concurrency: 8,
+            concurrency_max: None,
             state_slots: None,
             mark_lanes: None,
             prefix_slots: None,

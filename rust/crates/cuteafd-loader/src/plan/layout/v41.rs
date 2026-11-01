@@ -29,7 +29,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     report.prefill_span_rows = Some(prefill.span_rows);
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
-    ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
+    ensure!((1..=128).contains(&shape.concurrency), "V4.1 concurrency must be 1..128");
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
@@ -53,7 +53,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // at decode width.
     let slots = usize::try_from(prefill.waves)?;
     let span = slots as u64 * rows;
-    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots,
+    let decode_rows = v41::owners::decode_lane_rows(shape.concurrency);
+    let target = programs.target(decode_rows, span, rows, ranks, slots,
         shape.concurrency, mode, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
@@ -81,7 +82,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     }
     let spark_ranks = report.placement.spark_ranks();
     // The two decode lanes' links, further slots' reduce outputs and the one prefill link.
-    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(v41::owners::DECODE_LANE_ROWS, rows, spark_ranks, slots)? } else { 0 };
+    let transport = if spark_ranks > 0 { v41::owners::transports_bytes(decode_rows, rows, spark_ranks, slots)? } else { 0 };
     let mut fixed = fixed;
     if options.drafter_bytes > 0 {
         fixed.push(Demand::new(0, Category::Drafter, "external drafter weights",
@@ -91,7 +92,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut fixed = owners.fixed.clone();
     let catalog = input.expert_catalog()?;
     let (experts, workspace) = v41::expert_inventory(catalog, manifest, rows, ranks, sms, slots, span,
-        v41::owners::DECODE_LANE_ROWS)?;
+        decode_rows)?;
     let draft = if dspark {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("V41_EXPERT_AOT.json"))
             .context("missing V4.1 dSpark coordinator allocation manifest")?)?;

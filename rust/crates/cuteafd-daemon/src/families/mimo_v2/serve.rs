@@ -146,6 +146,9 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         tracing::warn!(requested = args.max_sequences, effective = effective_sequences, "clamping MiMo decoding sequences");
         args.max_sequences = effective_sequences;
     }
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(args.max_sequences as u32)?;
     // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
     // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
     let encoding = QwenEncoding::from_snapshot(&snapshot)?;

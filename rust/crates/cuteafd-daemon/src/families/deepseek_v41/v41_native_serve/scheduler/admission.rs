@@ -250,12 +250,16 @@ impl Wake<'_> {
         completed_rounds > 0 && self.prefill_due.is_some_and(|due| Instant::now() >= due)
     }
     /// `epoch` is the current release epoch: a deferred request retries once
-    /// it moved (a request retired) or its client left.
-    pub fn ready(self, active: usize, slots: usize, queued: bool, epoch: u64) -> bool {
+    /// it moved (a request retired) or its client left. `live` is the live
+    /// concurrency limit: a lane yields for admission only while the live
+    /// limit leaves room, so lowering the limit never stops every lane before
+    /// it decodes (DW-5).
+    pub fn ready(self, active: usize, slots: usize, live: u32, queued: bool, epoch: u64) -> bool {
+        let room = slots.min(live as usize);
         match self.retry {
             Some((job, _)) if job.events.is_closed() => true,
-            Some((_, blocked)) => active + self.media_slots < slots && epoch != blocked,
-            None => active + self.media_slots < slots && (queued || self.host_pending),
+            Some((_, blocked)) => active + self.media_slots < room && epoch != blocked,
+            None => active + self.media_slots < room && (queued || self.host_pending),
         }
     }
 }
@@ -359,12 +363,12 @@ mod tests {
         assert!(!media.poll_media(0));
         assert!(media.poll_media(1));
         let full = Wake { media_pending:true, media_slots:2, ..Default::default() };
-        assert!(!full.ready(14, 16, true, 0));
-        assert!(full.ready(13, 16, true, 0));
-        assert!(!Wake::default().ready(16, 16, true, 0));
+        assert!(!full.ready(14, 16, 16, true, 0));
+        assert!(full.ready(13, 16, 16, true, 0));
+        assert!(!Wake::default().ready(16, 16, 16, true, 0));
         let backlog = Wake { host_pending:true, ..Default::default() };
-        assert!(backlog.ready(1, 16, false, 0));
-        assert!(!backlog.ready(16, 16, false, 0));
+        assert!(backlog.ready(1, 16, 16, false, 0));
+        assert!(!backlog.ready(16, 16, 16, false, 0));
         assert!(!Wake::default().poll_media(1));
         assert!(!Wake::default().poll_media(u64::MAX));
     }
@@ -385,9 +389,9 @@ mod tests {
     #[test]
     fn a_prefix_waiter_wakes_the_lanes_at_a_free_slot() {
         let waiter = Wake { host_pending: true, ..Default::default() };
-        assert!(waiter.ready(1, 16, false, 0), "an empty HTTP queue still admits the waiter");
-        assert!(!waiter.ready(16, 16, false, 0), "no slot: keep decoding");
-        assert!(!Wake::default().ready(1, 16, false, 0));
+        assert!(waiter.ready(1, 16, 16, false, 0), "an empty HTTP queue still admits the waiter");
+        assert!(!waiter.ready(16, 16, 16, false, 0), "no slot: keep decoding");
+        assert!(!Wake::default().ready(1, 16, 16, false, 0));
     }
     #[test]
     fn parked_image_limit_preserves_a_text_slot() -> Result<()> {
@@ -409,21 +413,53 @@ mod tests {
         let (job, _output) = request();
         let blocked = Wake { retry: Some((&job, 7)), ..Wake::default() };
         // No retirement since the request was deferred: lanes keep decoding.
-        assert!(!blocked.ready(2, 16, true, 7));
-        assert!(!blocked.ready(2, 16, false, 7));
+        assert!(!blocked.ready(2, 16, 16, true, 7));
+        assert!(!blocked.ready(2, 16, 16, false, 7));
         // A request retired: stop for admission even with an empty channel.
-        assert!(blocked.ready(1, 16, false, 8));
-        assert!(!Wake::default().ready(16, 16, true, 0));
-        assert!(!Wake::default().ready(2, 16, false, 0));
-        assert!(Wake::default().ready(2, 16, true, 0));
+        assert!(blocked.ready(1, 16, 16, false, 8));
+        assert!(!Wake::default().ready(16, 16, 16, true, 0));
+        assert!(!Wake::default().ready(2, 16, 16, false, 0));
+        assert!(Wake::default().ready(2, 16, 16, true, 0));
     }
+    /// DW-5: lowering the live limit below the active count must not stop
+    /// every lane before it decodes. The old `ready` compared against the
+    /// allocated ceiling, so a queued request kept `queued=true` and every
+    /// lane yielded forever (100% CPU, zero tokens).
+    #[test]
+    fn lowering_the_live_limit_never_stops_every_lane() {
+        let wake = Wake::default();
+        // active == live: no room, so lanes decode even with a queued request.
+        assert!(!wake.ready(4, 16, 4, true, 0), "a full live limit must not yield");
+        // Lowering below the active count keeps the same answer.
+        assert!(!wake.ready(4, 16, 2, true, 0), "a lowered limit must not yield");
+        // Raising above the active count lets admission run again.
+        assert!(wake.ready(4, 16, 8, true, 0), "a raised limit admits");
+        // A deferred request retries only when the live limit leaves room.
+        let (job, _output) = request();
+        let blocked = Wake { retry: Some((&job, 7)), ..Wake::default() };
+        assert!(!blocked.ready(4, 16, 4, true, 8), "no room under the live limit");
+        assert!(blocked.ready(3, 16, 4, true, 8), "a retirement made room");
+    }
+
+    /// Raising the live limit takes effect at the next admission: the same
+    /// active count that yielded at the old limit admits at the new one.
+    #[test]
+    fn raising_the_live_limit_admits_at_the_next_round() {
+        let wake = Wake::default();
+        assert!(!wake.ready(8, 16, 8, true, 0));
+        assert!(wake.ready(8, 16, 12, true, 0));
+        // The allocated ceiling still bounds the live limit.
+        assert!(!wake.ready(16, 16, 128, true, 0));
+        assert!(wake.ready(15, 16, 128, true, 0));
+    }
+
     #[test]
     fn cancelled_pending_request_wakes_admission_without_waiting_for_retirement() {
         let (job, output) = request();
         let wake = Wake { retry: Some((&job, 3)), ..Wake::default() };
-        assert!(!wake.ready(2, 16, true, 3));
+        assert!(!wake.ready(2, 16, 16, true, 3));
         drop(output);
-        assert!(wake.ready(2, 16, true, 3));
+        assert!(wake.ready(2, 16, 16, true, 3));
     }
     #[test]
     fn budget_includes_uncommitted_anchor_and_entire_output_allowance() -> Result<()> {

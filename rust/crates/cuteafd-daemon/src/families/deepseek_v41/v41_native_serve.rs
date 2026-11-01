@@ -126,10 +126,32 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
     Ok((send, WorkerHandle { worker_thread }))
 }
 
+/// The pre-spawn step that installs the process-wide limits. Kept as a named
+/// function so a test can prove the values it installs without a CUDA worker.
+fn install_limits(args: &crate::cli::NativeServeArgs)
+    -> Result<&'static crate::shared::limits::LiveLimits, crate::shared::limits::LimitError> {
+    install_limits_with(args, crate::shared::limits::install)
+}
+
+/// The seam's body, generic over the installer so a test can capture the
+/// values without touching the process-wide `OnceLock` (which other tests in
+/// this binary may already have initialized).
+fn install_limits_with<'a>(args: &crate::cli::NativeServeArgs,
+    install: impl FnOnce(u32, u32) -> Result<&'a crate::shared::limits::LiveLimits,
+        crate::shared::limits::LimitError>,
+) -> Result<&'a crate::shared::limits::LiveLimits, crate::shared::limits::LimitError> {
+    install(args.concurrency_max(), args.concurrency)
+}
+
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
-    cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    args.validate_concurrency()?;
+    // Install the ceiling before any thread exists, so `run()`'s API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) can never win the `OnceLock` with
+    // the 1/1 fallback.
+    install_limits(&args)?;
+    cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency_max()))?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
         Err(error) => tracing::warn!(target: "cuteafd::fabric", "fabric discovery failed: {error:#}"),
@@ -151,7 +173,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     let listen = args.listen.clone();
     let snapshot = args.snapshot.clone();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
-    let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
+    let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency_max()) as usize);
     let http_queue_wait = Duration::from_millis(args.http_queue_wait_ms);
     let (ready, readiness) = oneshot::channel();
     let stats = std::sync::Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
@@ -218,6 +240,58 @@ mod served_profile_tests {
         std::fs::write(quant.join("README.md"), "---\nbase_model: deepseek-ai/DeepSeek-V4.1-Flash-1017\nbase_model_relation: quantized\n---\n").unwrap();
         let profile = served_profile(Some("served".into()), &quant).unwrap();
         assert_eq!((profile.id.as_str(), profile.v41_turns), ("served", V41Turns::DropCompleted));
+    }
+}
+
+#[cfg(test)]
+mod limits_order_tests {
+    use super::{install_limits, install_limits_with};
+
+    /// The API bridge (`ApiPolicy::app` -> `limits::live()`) is built by
+    /// `run()` after `start()` returns, so the configured ceiling must be
+    /// installed inside `start()` before the worker thread exists. Installed
+    /// later (after readiness), `live()` can win the `OnceLock` with its 1/1
+    /// fallback and the engine admits one request.
+    #[test]
+    fn limits_install_precedes_worker_spawn_and_readiness() {
+        let source = include_str!("v41_native_serve.rs");
+        let needle = concat!("install_limits(", "&args)?;");
+        assert_eq!(source.matches(needle).count(), 1, "exactly one install site");
+        let install = source.find(needle).unwrap();
+        let start = source.find("fn start(mut args: crate::cli::NativeServeArgs").unwrap();
+        let spawn = start + source[start..].find("std::thread::Builder::new()").unwrap();
+        let returned = start + source[start..].find("Ok(Started {").unwrap();
+        assert!(start < install && install < spawn && install < returned,
+            "install must run in start() before the worker spawns");
+    }
+
+    /// The pre-spawn step installs the allocated ceiling and the live start
+    /// value, and hands back the process-wide handle the API bridge reads.
+    #[test]
+    fn install_limits_installs_the_allocated_ceiling() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441"];
+        let crate::cli::Commands::ServeNative(args) = crate::cli::Cli::try_parse_from(
+            base.into_iter().chain(["--concurrency", "8", "--concurrency-max", "16"])).unwrap().command
+            else { panic!("expected native serving"); };
+        let seen = std::cell::Cell::new((0u32, 0u32));
+        let handle: &'static crate::shared::limits::LiveLimits =
+            Box::leak(Box::new(crate::shared::limits::LiveLimits::new(16, 8)));
+        let installed = install_limits_with(&args, |allocated, live| {
+            seen.set((allocated, live));
+            Ok(handle)
+        }).unwrap();
+        assert_eq!(seen.get(), (16, 8), "install gets (concurrency_max, concurrency)");
+        assert_eq!(installed.allocated(), 16);
+        assert_eq!(installed.concurrency(), 8);
+        // The real seam returns the process-wide handle the API bridge reads.
+        // Another test in this binary may already have won the `OnceLock`.
+        match install_limits(&args) {
+            Ok(installed) => assert!(std::ptr::eq(installed, crate::shared::limits::live())),
+            Err(crate::shared::limits::LimitError::AlreadyInstalled { .. }) => {}
+            Err(error) => panic!("unexpected install error: {error}"),
+        }
     }
 }
 
@@ -370,7 +444,7 @@ fn worker(
     ensure!(admitted.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         admitted.unit_cap);
     let slots = admitted.waves;
-    let decode_rows = DECODE_LANE_ROWS;
+    let decode_rows = decode_lane_rows(args.concurrency_max());
     admission::startup_phase(&lib, "v41/before native preload", device_total)?;
     let inventory = crate::shared::inventory::RuntimeInventory::measure(&lib, &[lib.cuda_get_device()?], crate::shared::inventory::InventoryPhase::PreWeight, |_| {
         admission::preload(&lib, capacity, 1, catalog.nvfp4().is_some())?;
@@ -538,7 +612,7 @@ fn worker(
             &lib,
             &catalog,
             capacity,
-            args.concurrency,
+            args.concurrency_max(),
             32 * 1024 * 1024 * 1024,
             16 * 1024 * 1024,
             if args.dspark_draft_limit > 5 { 7 } else { 5 },
@@ -548,7 +622,7 @@ fn worker(
     };
     let mut draft = draft_weights
         .as_ref()
-        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency))
+        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, args.concurrency_max()))
         .transpose()?;
     if let Some(draft) = &mut draft {
         draft.set_draft_limit(args.dspark_draft_limit)?;
@@ -582,7 +656,7 @@ fn worker(
     let local_workspace = admission::local_workspace(&lib, &catalog, &args, aot_capacity)?;
     if local_workspace > 0 {
         admission::verify_expert_charges(&catalog, &args.native_lib, u32::try_from(lib.sm_count()?)?, 1, capacity,
-            slots, reserve as u64, local_workspace)?;
+            slots, reserve as u64, local_workspace, decode_rows)?;
     }
     let memory = admission::admission_memory(&lib, &inventory)?;
     let (free, _) = memory[0];
@@ -598,7 +672,7 @@ fn worker(
     cuteafd_bench::context::set_rtx_expert_layers(pool.placement.onboard_layers);
     let spark_admission = admission::start_sparks(&args, &catalog, local_layers, capacity,
         topology)?;
-    let mut requests = Requests::new(&lib, pipeline, args.concurrency as usize, pool.pages, pool.cache_bytes[0])?;
+    let mut requests = Requests::new(&lib, pipeline, args.concurrency_max() as usize, pool.pages, pool.cache_bytes[0])?;
     cuteafd_ffi::memory_ledger::relabel_other("v41/kv");
     admission::startup_phase(&lib, "v41/kv", device_total)?;
     requests.use_engine_pages()?;
@@ -748,6 +822,13 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
 /// decode/verify step (`V41_VERIFY_ROWS`, which every verify selection and
 /// draft trim already bounds).
 pub(crate) const DECODE_LANE_ROWS: u32 = cuteafd_loader::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS as u32;
+
+/// The decode lane width for the configured ceiling: the compiled cover (80
+/// rows) at the default ceiling, wider when the ceiling admits more requests
+/// per lane. The native library must be built for the same width.
+pub(crate) fn decode_lane_rows(concurrency: u32) -> u32 {
+    cuteafd_loader::placement::families::deepseek_v41::owners::decode_lane_rows(u64::from(concurrency)) as u32
+}
 
 /// Ledger scopes of the target owners the planner charges (WP6 plan == runtime).
 pub(crate) const DECODE_LANES_SCOPE: &str = "v41/workspace:decode-lanes";

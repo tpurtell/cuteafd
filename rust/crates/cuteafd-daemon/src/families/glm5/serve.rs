@@ -88,6 +88,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         super::native_activation(&args.engine, cfg.first_moe_layer, cfg.layers, true)?;
     }
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(args.max_sequences as u32)?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = GlmEncoding::from_snapshot(&snapshot)?.with_thinking_off(args.thinking_off);
     let profile = ModelProfile::new(

@@ -413,6 +413,9 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile, NativeLimits};
     args.validate()?;
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(u32::from(args.max_sequences))?;
     let snapshot = args.snapshot.clone();
     let encoding = Arc::new(Step5Encoding::from_snapshot(&snapshot)?);
     let eos = encoding.tokens().eos.clone();

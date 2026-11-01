@@ -88,6 +88,9 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let api = args.api.load()?;
+    // Install the live limits before the worker spawns, so the API bridge
+    // (`ApiPolicy::app` -> `limits::live()`) reads the family's real ceiling.
+    crate::shared::limits::install_family(args.max_sequences as u32)?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = Arc::new(QwenEncoding::from_snapshot(&snapshot)?);
     let eos = encoding.tokens().eos.clone();
