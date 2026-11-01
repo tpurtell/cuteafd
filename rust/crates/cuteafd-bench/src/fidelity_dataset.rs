@@ -48,6 +48,9 @@ pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e39
 pub const MUSE_SPARK_REVISION: &str = "d18a3b292cc0a279998123f2ddd16999869bb658";
 pub const MUSE_SPARK_CONFIG: &str = "muse-spark-v1_20261031_own-text-bf16";
 pub const MUSE_SPARK_MANIFEST_SHA256: &str = "b9ec12b2e008a87d20f88edfe731252b5298d8f4da31cb34a96e5451a92bc717";
+pub const MISTRAL_LARGE4_REVISION: &str = "71eb39bd490cfa1af7a32edc94476a35eb475c01";
+pub const MISTRAL_LARGE4_CONFIG: &str = "mistral-large4-v1_20261031_own-text-fp8";
+pub const MISTRAL_LARGE4_MANIFEST_SHA256: &str = "2b5e0490bf433bf62adeaade9c1d4c782bf39704ba2dd94c9b201cec4c5d38ff";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -347,6 +350,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG) => Some(MUSE_SPARK_MANIFEST_SHA256),
+            (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -964,7 +968,7 @@ mod tests {
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
             (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
-            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG)] {
+            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -1026,6 +1030,16 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 10629);
             assert_eq!(balance["prefill"]["generated_positions"], 10475);
+        }
+        if commit == MISTRAL_LARGE4_REVISION && config == MISTRAL_LARGE4_CONFIG {
+            assert_eq!(reference.checkpoint, "mistralai/Mistral-Large-4-1T-A52B");
+            assert_eq!(reference.windows.len(), 64);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "mistralai/Mistral-Large-4-1T-A52B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 11435);
+            assert_eq!(balance["prefill"]["generated_positions"], 10678);
         }
         if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
             assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
