@@ -565,12 +565,12 @@ fn worker(
     drop(slot_storage);
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
         slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
-    let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
+    let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency_max())
         .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
     // planner's charges, nothing retained beyond them.
     admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots,
-        args.concurrency)?;
+        args.concurrency_max())?;
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the

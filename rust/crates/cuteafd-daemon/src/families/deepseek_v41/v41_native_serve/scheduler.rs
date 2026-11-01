@@ -255,10 +255,11 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
     stats
 }
 
-/// The live gate: true when the admitted occupancy (decoding members and
-/// media-held slots) already fills the live limit.
-fn live_gate_full(active: usize, media: usize, live: u32) -> bool {
-    active + media >= live as usize
+/// The live gate: true when the admitted occupancy already fills the live
+/// limit. `busy` counts every admitted term (decoding members, media-held
+/// slots, prompts queued for prefill and prompts admitted in this pass).
+fn live_gate_full(busy: usize, live: u32) -> bool {
+    busy >= live as usize
 }
 
 type PackedAdmission = (admission::Prepared, u64, CacheLease, usize, ImageKeys,
@@ -779,10 +780,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 leased.into_admitted()
             } else {
             // Admit only while the live limit leaves room. Lowering never kills
-            // a stream: excess requests drain by retirement. Prompts admitted
-            // earlier in THIS pass sit in `held_slots` until they are leased.
-            if live_gate_full(active.iter().flatten().count() + held_slots.len(), media.len(),
-                crate::shared::limits::live().concurrency()) { break; }
+            // a stream: excess requests drain by retirement. `busy_slots` counts
+            // every admitted occupancy term (decoding members, media-held slots,
+            // prompts queued for prefill and prompts admitted earlier in THIS pass).
+            if live_gate_full(busy_slots, crate::shared::limits::live().concurrency()) { break; }
             let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)
                 && !held_slots.contains(&slot) && !prefills.iter().any(|queued| queued.slot == slot)) else { break };
             let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
@@ -3135,12 +3136,11 @@ mod sampling_tests {
     /// admitted only while `active + media < live`.
     #[test]
     fn live_gate_counts_active_and_media() {
-        assert!(!live_gate_full(0, 0, 1));
-        assert!(live_gate_full(1, 0, 1));
-        assert!(live_gate_full(0, 1, 1));
-        assert!(!live_gate_full(1, 0, 2));
-        assert!(live_gate_full(1, 1, 2));
-        assert!(live_gate_full(2, 0, 2));
+        assert!(!live_gate_full(0, 1));
+        assert!(live_gate_full(1, 1));
+        assert!(!live_gate_full(1, 2));
+        assert!(live_gate_full(2, 2));
+        assert!(live_gate_full(3, 2));
         // The serve loop reads the live limit at every admission.
         let source = include_str!("scheduler.rs");
         assert!(source.contains("crate::shared::limits::live().concurrency()"));
