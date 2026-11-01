@@ -392,7 +392,8 @@ fn media_auto_off_disables_component_bytes() {
     let used = text.memory_layout.as_ref().unwrap().devices[0].used_bytes();
     options.vision = MediaMode::Auto;
     options.audio = MediaMode::Auto;
-    options.layout.as_mut().unwrap().rtx_bytes = vec![used + 1024];
+    let context = crate::placement::ArchContext::for_device("sm_120", used).context_bytes;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![used + context + 1024];
     options.layout.as_mut().unwrap().vision_replicas = 9;
     // Audio has one copy, so remove its Spark candidate by retaining only the
     // text's exact Spark allocation budget.
@@ -401,6 +402,9 @@ fn media_auto_off_disables_component_bytes() {
         .map(|d| d.used_bytes()).max().unwrap();
     options.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(spark_used);
     let off = input.plan(&options).unwrap();
+    assert!(off.fits, "{:?}", off.hints);
+    assert_eq!(off.encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
+    assert_eq!(off.audio_encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
     assert!(off.disabled_media_bytes > 0, "{:?}", off.hints);
     for component in [Component::Vision, Component::Audio] {
         let component = off.components.iter().find(|c| c.component == component).unwrap();
