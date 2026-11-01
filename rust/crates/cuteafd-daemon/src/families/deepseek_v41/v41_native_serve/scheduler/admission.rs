@@ -295,7 +295,7 @@ mod tests {
     }
     fn request() -> (NativeRequest, mpsc::UnboundedReceiver<std::result::Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
         let (events, output) = mpsc::unbounded_channel();
-        (NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(),
+        (NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(),
             audio: Vec::new(), max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events,
             usage: None, probe: None }, output)
     }
