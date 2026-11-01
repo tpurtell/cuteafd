@@ -140,6 +140,31 @@ pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeome
         pinned_staging: u64::from(extent.staging_rows) * topk * 8 })
 }
 
+/// Retained allocation witnesses of the widest installed ML4 slice in this
+/// world. Capacity-private state and low-row alias owners match the worker.
+pub(crate) fn ml4_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    use std::sync::OnceLock;
+    static CENSUS: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
+    let census = CENSUS.get_or_init(|| serde_json::from_str(include_str!("spark_slot_census.json"))
+        .expect("bundled Spark slot census is valid JSON"));
+    let row = census.iter().find(|row| row["family"] == "mistral_large4" && row["format"] == "exl3"
+        && row["world"].as_u64() == Some(world as u64))
+        .with_context(|| format!("no Mistral Large 4 TP{world} EXL3 allocation census"))?;
+    let geometry = cuteafd_core::ExpertGeometry::MISTRAL_LARGE4;
+    let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(extent.capacity as usize)?;
+    anyhow::ensure!(capacities.last() == Some(&extent.compiled), "ML4 owner export and retained capacities disagree");
+    let installed = row["manifests"].as_array().context("ML4 census has no capacity witnesses")?;
+    let manifests = capacities.into_iter().map(|capacity| installed.iter()
+        .find(|manifest| manifest["capacity"].as_u64() == Some(u64::from(capacity)))
+        .cloned().with_context(|| format!("Mistral Large 4 TP{world} census has no m{capacity}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?;
+    let wire_routes = u64::from(geometry.hidden) * 33 / 32 + u64::from(geometry.topk) * 8;
+    Ok(cuteafd_core::OwnerBytes { scratch: retained, io: u64::from(extent.capacity) * wire_routes,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
+}
+
 /// Legacy calibrated slot bound (stream, scratch, inputs and staging at
 /// the compiled 4096-row export) for backends without a census.
 fn legacy_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry,
@@ -157,9 +182,11 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
     let geometry = catalog.routed_experts().geometry()?;
     let backend = SparkBackend::for_catalog(catalog)?;
     let groups = native_groups(input, family, working, rank)?;
+    let world = working.spark_ranks;
     let family = family.to_owned();
     Ok(move |extent| match (&groups, backend) {
         (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
+        (_, SparkBackend::Exl3(_)) if family == "mistral_large4" => ml4_owner_bytes(world, extent),
         (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
         (_, SparkBackend::Native | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
             Ok(legacy_owner_bytes(&family, geometry, extent)),
@@ -211,7 +238,7 @@ mod tests {
     #[test]
     fn planner_charges_every_shipped_native_package_census_at_its_export() {
         let census: serde_json::Value = serde_json::from_str(include_str!("spark_slot_census.json")).unwrap();
-        for row in census.as_array().unwrap() {
+        for row in census.as_array().unwrap().iter().filter(|row| row["format"] != "exl3") {
             let package = row["package"].as_str().unwrap();
             let family = row["family"].as_str().unwrap();
             let format = match row["format"].as_str().unwrap() {
@@ -231,6 +258,95 @@ mod tests {
                 assert_eq!(owner.pinned_staging, rows * topk * 8, "each unit retains packed route planes");
             }
         }
+    }
+
+    #[test]
+    fn ml4_census_charges_each_worlds_retained_capacity_set() -> anyhow::Result<()> {
+        let census: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+        let rows: Vec<_> = census.iter().filter(|row| row["family"] == "mistral_large4"
+            && row["format"] == "exl3").collect();
+        assert_eq!(rows.iter().map(|row| row["world"].as_u64().unwrap()).collect::<Vec<_>>(), [5, 6, 7, 8]);
+        for (row, (decode, prefill, maximum)) in rows.into_iter().zip([
+            (18_810_348, 358_759_748, 559_042_636),
+            (18_318_828, 341_851_460, 533_876_812),
+            (18_073_068, 333_397_316, 521_293_900),
+            (17_827_308, 324_943_172, 508_710_988),
+        ]) {
+            let world = row["world"].as_u64().unwrap() as usize;
+            let width = (48usize.div_ceil(world) * 128) as u64;
+            assert_eq!(ml4_owner_bytes(world, extent(64, 80))?.scratch, decode);
+            assert_eq!(ml4_owner_bytes(world, extent(2752, 2752))?.scratch, prefill);
+            let largest = ml4_owner_bytes(world, extent(4096, 4096))?;
+            assert_eq!(largest.scratch + largest.io, maximum, "TP{world} full retained bound");
+            let manifests = row["manifests"].as_array().unwrap();
+            assert_eq!(manifests.len(), CENSUS_CAPACITIES.len());
+            for (index, capacity) in CENSUS_CAPACITIES.into_iter().enumerate() {
+                assert_eq!(manifests[index]["capacity"], capacity);
+                assert_eq!(manifests[index]["intermediate"], width);
+                let retained_set = cuteafd_core::Exl3RowPolicy::Nearest.capacities(capacity as usize)?;
+                let compiled = *retained_set.last().unwrap();
+                let selected = manifests.iter().filter(|manifest| retained_set.contains(
+                    &(manifest["capacity"].as_u64().unwrap() as u32))).cloned().collect::<Vec<_>>();
+                let retained = crate::serving_capacity::exl3_workspace_bytes(&selected, true)?;
+                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&selected, false)?;
+                assert_eq!(retained - without_wire,
+                    retained_set.iter().map(|&rows| u64::from(rows)).sum::<u64>() * 6144 * 2);
+                let owner = ml4_owner_bytes(world, extent(capacity, compiled))?;
+                assert_eq!(owner.scratch, retained, "TP{world} m{compiled}");
+                assert_eq!(owner.io, u64::from(capacity) * (6144 + 192 + 32));
+                assert_eq!(owner.pinned_staging, u64::from(capacity) * 32);
+                assert_eq!(owner, ml4_owner_bytes(world, cuteafd_core::OwnerExtent {
+                    buffered_units: 3, ..extent(capacity, compiled) })?, "retained arenas are not per wave");
+            }
+            let decode = ml4_owner_bytes(world, extent(64, 80))?;
+            for capacity in [2, 16, 32, 64, 80] {
+                let owner = ml4_owner_bytes(world, extent(capacity, 80))?;
+                assert_eq!(owner.scratch, decode.scratch, "canonical m80 floor at TP{world}/{capacity}");
+                assert_eq!(owner.io, u64::from(capacity) * (6144 + 192 + 32));
+            }
+            assert!(decode.scratch < ml4_owner_bytes(world, extent(2752, 2752))?.scratch);
+        }
+        assert!(ml4_owner_bytes(4, extent(64, 80)).is_err());
+        assert!(ml4_owner_bytes(9, extent(64, 80)).is_err());
+        assert!(ml4_owner_bytes(5, extent(64, 256)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ml4_catalog_uses_world_census_for_every_selected_rank() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        crate::plan::testing::write_mistral_large4_snapshot(root.path(), None, true);
+        let input = crate::plan::PlanInput::open(root.path())?;
+        for world in 5..=8 {
+            let working = SparkWorkingSet { spark_layers: vec![1], spark_ranks: world,
+                prefill_lanes: 1, ..Default::default() };
+            for rank in 0..world {
+                for (capacity, compiled) in [(64, 80), (2752, 2752)] {
+                    let expected = ml4_owner_bytes(world, extent(capacity, compiled))?;
+                    assert_eq!(owner_bytes(&input, &working, "mistral_large4", rank)?(
+                        extent(capacity, compiled))?, expected, "TP{world} rank{rank}");
+                }
+                let executions = crate::plan::spark_executions::admit_family("mistral_large4",
+                    &cuteafd_core::EXL3_CAPACITIES, None, 2752, 3)?;
+                let total = executions.workspace_bytes(|extent| ml4_owner_bytes(world, extent))?.unwrap();
+                let prefill = ml4_owner_bytes(world, executions.owners().last().unwrap())?;
+                for residual in [0, prefill.scratch + prefill.io + 1] {
+                    let mut device = DeviceLayout { kind: DeviceKind::Spark, index: rank as u32,
+                        capacity_bytes: 121 * GIB, kv_tokens: 0,
+                        items: vec![Item::new(Category::Workspace, "expert waves", "", residual, Basis::Calibrated)] };
+                    // Recharging replaces the owner entries, never doubles them.
+                    for _ in 0..2 {
+                        charge_executions(&mut device, &input, &working, "mistral_large4", &executions)?;
+                        assert_eq!(device.items.iter().filter(|item| item.group == "execution owners")
+                            .map(|item| item.bytes).collect::<Vec<_>>(),
+                            [total.device_bytes - residual.min(prefill.scratch + prefill.io)]);
+                        assert_eq!(device.items.iter().filter(|item| item.group == "execution staging")
+                            .map(|item| item.bytes).collect::<Vec<_>>(), [total.pinned_bytes]);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
