@@ -54,7 +54,7 @@ PREFILL_BATCH_TOKENS=2048
 CONCURRENCY=16
 PREFIX_CACHE_ENTRIES=20
 MAX_CONTEXT_TOKENS=1048576
-MAX_OUTPUT_TOKENS=393216
+MAX_OUTPUT_TOKENS=131072
 HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
@@ -84,6 +84,7 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+site_hub=0
 namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image

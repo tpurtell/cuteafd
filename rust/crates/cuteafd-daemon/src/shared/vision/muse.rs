@@ -4,27 +4,15 @@ use super::*;
 impl TowerSpec {
     pub fn muse(snapshot: &Path, max_tokens: usize) -> Result<Self> {
         let cfg: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
-        let v = &cfg["vision_config"];
-        for (field, expected) in [("hidden_size",1536), ("intermediate_size",8960),
-            ("num_attention_heads",16), ("num_hidden_layers",50), ("patch_size",14),
-            ("patch_temporal",2), ("merge_size",2), ("pos_emb_height",32), ("pos_emb_width",32)] {
-            if v[field].as_u64() != Some(expected) {
-                return Err(VisionError::Unsupported(format!("vision_config.{field}={}; need {expected}; add a Muse exporter/kernel", v[field])));
-            }
-        }
-        let layers = v["layer_types"].as_array().filter(|a| a.len()==50)
-            .ok_or_else(|| VisionError::Unsupported("Muse needs 50 attention layer types".into()))?;
-        if !(1..=4096).contains(&max_tokens) || cfg["text_config"]["hidden_size"] != 8192
-            || cfg["out_hidden_size"] != 6144 || cfg["projector_hidden_size"] != 4096
-            || cfg["projector_hidden_act"] != "gelu" || v["hidden_act"] != "gelu"
-            || v["layer_norm_eps"].as_f64() != Some(1e-5)
-            || v["rope_parameters"]["rope_type"] != "axial"
-            || v["rope_parameters"]["rope_theta"].as_f64() != Some(10000.0) {
-            return Err(VisionError::Unsupported("unsupported Muse vision numerics/adapter/capacity".into()));
-        }
+        let layers = cuteafd_loader::media::muse_vision::validate_config(&cfg)
+            .map_err(VisionError::Unsupported)?;
+        cuteafd_loader::media::muse_vision::scratch_bytes(max_tokens as u64)
+            .map_err(VisionError::Unsupported)?;
         let mut tensors = tower_catalog(snapshot, "model.vision_tower.")?;
         tensors.extend(tower_catalog(snapshot, "model.vision_adapter.")?);
         tensors.extend(tower_catalog(snapshot, "model.vision_projection.")?);
+        let admitted_weights = cuteafd_loader::media::muse_vision::resident_weights(&cfg,
+            tensors.values().map(|(_, metadata)| metadata)).map_err(VisionError::Unsupported)?;
         let mut reads = Vec::new();
         let mut cursor = 0usize;
         let mut put = |name: &str, shape: &[usize]| -> Result<u64> {
@@ -71,10 +59,7 @@ impl TowerSpec {
                 gate_up:field("mlp.fc1.weight", &[8960,1536])?, gate_up_bias:field("mlp.fc1.bias", &[8960])?,
                 down:field("mlp.fc2.weight", &[1536,8960])?, down_bias:field("mlp.fc2.bias", &[1536])?,
                 norm1:field("norm1.weight", &[1536])?, norm2:field("norm2.weight", &[1536])?,
-                key0_bias:NO_VISION_OFFSET, window:match kind.as_str() {
-                    Some("window_attention")=>32, Some("full_attention")=>0,
-                    _=>return Err(VisionError::Unsupported(format!("Muse layer {i} attention {kind}"))),
-                }, column_order:0 };
+                key0_bias:NO_VISION_OFFSET, window:*kind as i32, column_order:0 };
             native.norm1_bias[i] = field("norm1.bias", &[1536])?;
             native.norm2_bias[i] = field("norm2.bias", &[1536])?;
             native.q_norm[i] = NO_VISION_OFFSET;
@@ -94,6 +79,9 @@ impl TowerSpec {
         cursor = (cursor+255)&!255;
         native.inv_freq = cursor as u64;
         native.weight_bytes = (cursor+24*4) as u64;
+        if native.weight_bytes != admitted_weights {
+            return Err(VisionError::Unsupported("Muse packed weights differ from planner contract".into()));
+        }
         Ok(Self { native, reads })
     }
 }

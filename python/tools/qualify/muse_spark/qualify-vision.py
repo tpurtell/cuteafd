@@ -151,15 +151,56 @@ def official_modules(snapshot, tensors, device):
     return tower, adapter, projection
 
 
+def reference_precision(modules, dtype, official_rope):
+    """Upcast the FP32 arm, but restore untouched official BF16 RoPE buffers."""
+    import torch
+    for module in modules:
+        module.to(dtype=dtype)
+    tower = modules[0]
+    if dtype == torch.float32:
+        inv, _ = tower.rotary_emb.compute_axial_rope_parameters(
+            tower.config, device=next(tower.parameters()).device)
+        tower.rotary_emb.inv_freq = inv
+        tower.rotary_emb.original_inv_freq = inv.clone()
+    else:
+        tower.rotary_emb.inv_freq, tower.rotary_emb.original_inv_freq = official_rope
+
+
+def rope_dtypes(modules):
+    rotary = modules[0].rotary_emb
+    return {name: str(getattr(rotary, name).dtype)
+        for name in ("inv_freq", "original_inv_freq")}
+
+
+def stage_metrics(actual, bf16, fp32):
+    """Use the audio tower's unchanged 1.1x official-BF16 error yardstick."""
+    if actual.shape != bf16.shape or actual.shape != fp32.shape:
+        raise ValueError("FP32 yardstick stage shapes differ")
+    rms = lambda value: float(np.sqrt(np.mean(np.square(value, dtype=np.float64))))
+    floor = 1e-7
+    signal = rms(fp32)
+    native_error, official_error = rms(actual - fp32), rms(bf16 - fp32)
+    finite = all(np.isfinite(value).all() for value in (actual, bf16, fp32))
+    return dict(signal_rms=signal, absolute_floor=floor,
+        native_absolute_rms=native_error, official_bf16_absolute_rms=official_error,
+        native_relative_rms=native_error / max(signal, floor),
+        official_bf16_relative_rms=official_error / max(signal, floor),
+        error_ratio=native_error / max(official_error, floor),
+        native_vs_bf16_relative_rms=rms(actual - bf16) / max(rms(bf16), floor),
+        max_abs=float(np.max(np.abs(actual - fp32))),
+        passed=bool(finite and native_error <= 1.1 * max(official_error, floor)))
+
+
 def reference_stages(modules, rgb):
     """Official implementation with separately captured layout-sensitive stages."""
     import torch
     from transformers.models.muse_spark import modeling_muse_spark as official
     tower, adapter, projection = modules
-    device = next(tower.parameters()).device
+    parameter = next(tower.parameters())
+    device, dtype = parameter.device, parameter.dtype
     gh, gw = rgb.shape[0] // 14, rgb.shape[1] // 14
     grid = torch.tensor([[1, gh, gw]], dtype=torch.long, device=device)
-    x = torch.from_numpy(patches(rgb)).to(device, dtype=torch.bfloat16)
+    x = torch.from_numpy(patches(rgb)).to(device, dtype=dtype)
     result = {"patch_input": x}
     with torch.no_grad():
         cu = official.get_vision_cu_seqlens(grid)
@@ -179,8 +220,7 @@ def reference_stages(modules, rgb):
             kind = tower.config.layer_types[i]
             x = block(x, cu_seqlens=windows if kind == "window_attention" else cu,
                       position_embeddings=rotary)
-            if (i + 1) % 4 == 0 or i == 49:
-                result[str(i + 1)] = x
+            result[str(i + 1)] = x
         x = x[torch.argsort(permutation)]
         result["52"] = x
         x = tower.ln_post(x)
@@ -191,19 +231,72 @@ def reference_stages(modules, rgb):
         result["55"] = x
         result["56"] = projection(x)
         # Confirm explicit stages still equal the official public tower path.
-        public = projection(adapter(tower(torch.from_numpy(patches(rgb)).to(device, dtype=torch.bfloat16), grid).last_hidden_state))
+        public = projection(adapter(tower(torch.from_numpy(patches(rgb)).to(device, dtype=dtype), grid).last_hidden_state))
         if not torch.equal(public, result["56"]):
             raise AssertionError("explicit official layout stages differ from public forward")
     return {name: value.detach().float().cpu().numpy() for name, value in result.items()}
 
 
+def reference_tail_replay(modules, stages, refs, grid_hw):
+    """Replay each tail op from identical native inputs, then the whole tail."""
+    import torch
+    tower, adapter, projection = modules
+    parameter = next(tower.parameters())
+    device, dtype = parameter.device, parameter.dtype
+    grid = torch.tensor([[1, *grid_hw]], device=device, dtype=torch.long)
+    inverse = torch.argsort(torch.from_numpy(refs["permutation"]).to(device, dtype=torch.long))
+
+    def native(stage):
+        return torch.from_numpy(stages[str(stage)]).to(device, dtype=dtype)
+
+    with torch.no_grad():
+        isolated = {"52": native(50)[inverse], "53": tower.ln_post(native(52)),
+                    "54": tower.pixel_shuffle(native(53), grid),
+                    "55": adapter(native(54)), "56": projection(native(55))}
+        x = native(50)[inverse]
+        chained = {"52": x}
+        for stage, operation in [("53", tower.ln_post),
+                                  ("54", lambda value: tower.pixel_shuffle(value, grid)),
+                                  ("55", adapter), ("56", projection)]:
+            x = operation(x)
+            chained[stage] = x
+        # Distinguish single-store LayerNorm from a BF16 normalized intermediate.
+        x = native(52).float()
+        variance, mean = torch.var_mean(x, dim=-1, unbiased=False, keepdim=True)
+        normalized = (x - mean) * torch.rsqrt(variance + tower.ln_post.eps)
+        weight, bias = tower.ln_post.weight.float(), tower.ln_post.bias.float()
+        rounding = {"single_store": (normalized * weight + bias).to(dtype),
+                    "bf16_before_affine": (normalized.to(torch.bfloat16).float() * weight + bias).to(dtype)}
+    arrays = lambda values: {key: value.detach().float().cpu().numpy() for key, value in values.items()}
+    return dict(isolated=arrays(isolated), chained=arrays(chained), norm_rounding=arrays(rounding))
+
+
+def tail_replay_metrics(stages, bf16, fp32):
+    """Keep local diagnostics separate from the cumulative qualification gate."""
+    result = {}
+    for mode in ("isolated", "chained"):
+        result[mode] = {key: dict(strict_bf16=common.metrics(stages[key], expected),
+                                 fp32_yardstick=stage_metrics(stages[key], expected, fp32[mode][key]))
+                        for key, expected in bf16[mode].items()}
+    result["inverse_byte_exact"] = bool(np.array_equal(stages["52"], bf16["isolated"]["52"]))
+    result["shuffle_byte_exact"] = bool(np.array_equal(stages["54"], bf16["isolated"]["54"]))
+    result["official_bf16_norm_rounding"] = {
+        key: common.metrics(value, bf16["isolated"]["53"])
+        for key, value in bf16["norm_rounding"].items()}
+    return result
+
+
 def run(args):
     import torch
     from PIL import Image
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
     cfg = json.loads((args.snapshot / "config.json").read_text())
     tensors = read_visual(args.snapshot)
     spec, blob = pack_spec(cfg, tensors)
     modules = official_modules(args.snapshot, tensors, "cuda")
+    official_rope = (modules[0].rotary_emb.inv_freq, modules[0].rotary_emb.original_inv_freq)
+    bf16_rope_dtypes = rope_dtypes(modules)
     del tensors
     lib = C.CDLL(str(args.library))
     lib.cuteafd_vision_required.argtypes = [C.POINTER(Spec), C.POINTER(Ledger)]
@@ -220,7 +313,15 @@ def run(args):
     required, owner = Ledger(), C.c_void_p()
     check(lib.cuteafd_vision_required(C.byref(spec), C.byref(required)))
     check(lib.cuteafd_vision_create(C.byref(spec), 0, required.weights + required.scratch + required.blas_workspace, C.byref(owner)))
-    result = dict(device=torch.cuda.get_device_name(0), ledger=required.as_dict(), images={})
+    result = dict(device=torch.cuda.get_device_name(0), ledger=required.as_dict(), images={},
+        precision=dict(fp32_weights="checkpoint BF16 upcast", tf32=False,
+            official_bf16_rope=bf16_rope_dtypes, official_fp32_rope=None,
+            allow_bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction),
+        library_sha256=hashlib.sha256(args.library.read_bytes()).hexdigest(),
+        reference_runtime=dict(torch_version=torch.__version__, cuda_version=torch.version.cuda,
+            post_ln_type=f"{type(modules[0].ln_post).__module__}.{type(modules[0].ln_post).__qualname__}",
+            post_ln_eps=modules[0].ln_post.eps, post_ln_parameter_dtype=str(modules[0].ln_post.weight.dtype),
+            cudnn_enabled=torch.backends.cudnn.enabled))
     try:
         check(lib.cuteafd_vision_upload(owner, 0, blob, len(blob)))
         del blob
@@ -235,7 +336,6 @@ def run(args):
             refs = reference_stages(modules, rgb)
             gh, gw = rh // 14, rw // 14
             tokens = gh * gw // 4
-            lut = common.normalization_lut()  # replaced with Muse's checkpoint normalization
             lut = ((np.arange(256, dtype=np.float64) / 255.0).astype(np.float32) - np.float32(.5)) / np.float32(.5)
             lut = np.tile(lut, (3, 1)).copy()
             stages, errors = {}, []
@@ -260,23 +360,71 @@ def run(args):
             if errors:
                 raise RuntimeError(errors)
             stages["56"] = (output.astype(np.uint32) << 16).view(np.float32)
-            comparisons = {key: common.metrics(value, refs[key]) for key, value in stages.items()}
+            metadata = {native: bool(np.array_equal(stages[native], refs[official]))
+                        for native, official in [("-1", "patch_input"), ("-2", "cos"), ("-3", "sin")]}
+            comparisons = {key: common.metrics(value, refs[key]) for key, value in stages.items() if int(key) >= 0}
+            replay = {}
+            if args.replay_blocks:
+                tower = modules[0]
+                device = next(tower.parameters()).device
+                rotary = tuple(torch.from_numpy(refs[name]).to(device, dtype=torch.bfloat16) for name in ("cos", "sin"))
+                cu = torch.tensor([0, gh * gw], device=device, dtype=torch.int32)
+                windows = torch.from_numpy(refs["window_lengths"]).to(device, dtype=torch.int32)
+                with torch.no_grad():
+                    for i, block in enumerate(tower.layers):
+                        previous = stages["51" if i == 0 else str(i)]
+                        actual = torch.from_numpy(previous).to(device, dtype=torch.bfloat16)
+                        expected = block(actual, position_embeddings=rotary,
+                            cu_seqlens=windows if tower.config.layer_types[i] == "window_attention" else cu)
+                        expected = expected.float().cpu().numpy()
+                        row = common.metrics(stages[str(i+1)], expected)
+                        per_row = np.linalg.norm(stages[str(i+1)]-expected, axis=1) / np.maximum(np.linalg.norm(expected, axis=1), 1e-20)
+                        worst = int(np.argmax(per_row))
+                        raster = int(refs["permutation"][worst])
+                        row.update(worst_relative_row=float(per_row[worst]), window_row=worst,
+                            raster_hw=[raster // gw, raster % gw], kind=tower.config.layer_types[i])
+                        replay[str(i+1)] = row
             if not all(str(i) in stages for i in [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 50, 51, 52, 53, 54, 55, 56]):
                 raise AssertionError("missing native stage observations")
             saved = output.copy()
             encode(OBSERVER())
             repeat = bool(np.array_equal(saved, output))
+            fp32_refs, yardstick, tail_replay = {}, {}, {}
+            bf16_tail = reference_tail_replay(modules, stages, refs, (gh, gw)) if args.replay_tail else None
+            if args.fp32_yardstick:
+                reference_precision(modules, torch.float32, official_rope)
+                result["precision"]["official_fp32_rope"] = rope_dtypes(modules)
+                fp32_refs = reference_stages(modules, rgb)
+                yardstick = {key: stage_metrics(stages[key], refs[key], fp32_refs[key])
+                    for key in comparisons}
+                if args.replay_tail:
+                    fp32_tail = reference_tail_replay(modules, stages, refs, (gh, gw))
+                    tail_replay = tail_replay_metrics(stages, bf16_tail, fp32_tail)
+                reference_precision(modules, torch.bfloat16, official_rope)
+                if any(getattr(modules[0].rotary_emb, name) is not original
+                    for name, original in zip(("inv_freq", "original_inv_freq"), official_rope)):
+                    raise AssertionError("official BF16 RoPE buffers were not restored unchanged")
             result["images"][str(path)] = dict(grid=[gh, gw], tokens=tokens, encode_ms=elapsed,
-                stages=comparisons, byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
+                stages=comparisons, metadata_exact=metadata, block_replay=replay,
+                fp32_yardstick=yardstick, tail_replay=tail_replay,
+                byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
             if args.dump_stages:
                 args.dump_stages.mkdir(parents=True, exist_ok=True)
-                np.savez(args.dump_stages / (path.stem + ".npz"), **{"native_"+k:v for k,v in stages.items()}, **{"ref_"+k:v for k,v in refs.items()})
+                np.savez(args.dump_stages / (path.stem + ".npz"), **{"native_"+k:v for k,v in stages.items()},
+                    **{"ref_"+k:v for k,v in refs.items()}, **{"fp32_"+k:v for k,v in fp32_refs.items()})
         final = Ledger()
         check(lib.cuteafd_vision_get_ledger(owner, C.byref(final)))
         result["final_ledger"] = final.as_dict()
-        result["pass"] = final.device_allocations == 2 and all(row["byte_repeatable"] and all(stage["pass"] for stage in row["stages"].values()) for row in result["images"].values())
+        integrity = final.device_allocations == 2 and all(row["byte_repeatable"]
+            and all(row["metadata_exact"].values()) for row in result["images"].values())
+        result["pass"] = integrity and all(all(stage["pass"] for stage in row["stages"].values())
+            for row in result["images"].values())
+        result["fp32_yardstick_pass"] = integrity and all(all(stage["passed"]
+            for stage in row["fp32_yardstick"].values()) for row in result["images"].values()) if args.fp32_yardstick else None
+        result["gate_basis"] = "fp32_yardstick" if args.fp32_yardstick else "strict_bf16"
+        result["gate_pass"] = result["fp32_yardstick_pass"] if args.fp32_yardstick else result["pass"]
         args.output.write_text(json.dumps(result, indent=2) + "\n")
-        return 0 if result["pass"] else 1
+        return 0 if result["gate_pass"] else 1
     finally:
         check(lib.cuteafd_vision_destroy(owner))
 
@@ -287,4 +435,12 @@ if __name__ == "__main__":
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--images", type=Path, nargs="+", required=True)
     parser.add_argument("--dump-stages", type=Path)
-    raise SystemExit(run(parser.parse_args()))
+    parser.add_argument("--replay-blocks", action="store_true")
+    parser.add_argument("--fp32-yardstick", action="store_true",
+        help="gate by native/official BF16 error vs official FP32; retain unchanged strict BF16 verdict")
+    parser.add_argument("--replay-tail", action="store_true",
+        help="diagnose each tail op from identical native inputs; requires --fp32-yardstick")
+    args = parser.parse_args()
+    if args.replay_tail and not args.fp32_yardstick:
+        parser.error("--replay-tail requires --fp32-yardstick")
+    raise SystemExit(run(args))

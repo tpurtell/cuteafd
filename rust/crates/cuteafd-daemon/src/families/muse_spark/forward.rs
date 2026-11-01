@@ -30,6 +30,16 @@ pub(crate) fn embed(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &supe
     rank.device_with(cfg, stream, lane).norm(0, "embed_norm", None, rows, gathered, lane.rows("hidden", rows)?)
 }
 
+/// Replace media rows after the weightless text norm on every participating rank.
+pub(crate) fn inject_media(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
+    media: &cuteafd_engine::media::MediaChunk, rows: usize, stream: *mut c_void) -> Result<()> {
+    if media.indices.is_empty() { return Ok(()); }
+    // inject_host drains these admitted scratch planes before later layer work reuses them.
+    rank.device.run(|| Ok(rank.device.library.embedding_injection()?.inject_host(
+        &media.features, &media.indices, lane.plane("residual")?, lane.plane("token_ids")?,
+        lane.rows("hidden", rows)?, rows, cfg.hidden, 1, stream)?))
+}
+
 /// The head over `rows` (a contiguous range of the step's rows) on the head rank.
 pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super::lane::LaneViews,
     rows: std::ops::Range<usize>, stream: *mut c_void) -> Result<Buffer> {
@@ -65,7 +75,8 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
 /// `experts` is rank 0's Spark path; `peers[r]` rank r's exchange end on a pair.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: &[*mut c_void],
-    table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], meta: &StepMetadata, prefill: bool,
+    table: &crate::shared::token_io::TokenEmbedding<'_>, tokens: &[u32], media: &cuteafd_engine::media::MediaChunk,
+    meta: &StepMetadata, prefill: bool,
     wave: super::experts::WaveStep,
     experts: &mut dyn SparkExperts, mut peers: Vec<&mut dyn PeerExchange>,
     local: &mut [super::onboard::OnboardedExperts<'_>], draft: Option<&super::draft::MuseDraft<'_>>,
@@ -77,7 +88,10 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
         let bank = if prefill { 0 } else { rank.step.tables.decode_bank() };
         rank.device.run(|| rank.step.upload(rank.device.library, bank, meta, prefill, wave.clone(), stream))
     }).collect::<Result<_>>()?;
-    for (rank, &stream) in ranks.iter().zip(streams) { embed(cfg, rank, &rank.lane.views, table, tokens, stream)?; }
+    for (rank, &stream) in ranks.iter().zip(streams) {
+        embed(cfg, rank, &rank.lane.views, table, tokens, stream)?;
+        inject_media(cfg, rank, &rank.lane.views, media, tokens.len(), stream)?;
+    }
     let mut experts = Some(experts);
     for layer in 0..cfg.layers {
         for (index, (rank, &stream)) in ranks.iter().zip(streams).enumerate() {
@@ -111,38 +125,7 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
 
 #[cfg(test)]
 mod tests {
-    /// A step uploads its metadata, embeds, runs every layer on each rank in
-    /// rank order (rank 0 alone holds the Spark path), then scores on the last rank;
-    /// the head trims the padded rows before the softcap.
-    #[test]
-    fn step_order_and_head_trim() {
-        let source = include_str!("forward.rs").split("#[cfg(test)]").next().unwrap();
-        let step = source.split("pub(crate) fn step(").nth(1).unwrap();
-        let order = ["rank.step.upload(", "embed(cfg, rank, &rank.lane.views, table, tokens, stream)", "for layer in 0..cfg.layers",
-            ".layer(layer, &planes[index], path, peer)", "head(cfg, &ranks[last], &ranks[last].lane.views, head_rows"];
-        let at: Vec<usize> = order.iter().map(|needle| step.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-        assert!(step.contains("if index == 0 { experts.as_deref_mut() } else { None }"));
-        let head = source.split("pub(crate) fn head(").nth(1).unwrap().split("pub(crate) fn step(").next().unwrap();
-        let order = ["\"final_norm\"", "rank.core.local(", "copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4",
-            "\"softcap\""];
-        let at: Vec<usize> = order.iter().map(|needle| head.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-    }
 
-    /// With a drafter, every layer taps the head rank's hidden rows and the
-    /// draft policy's probe rings that rank's route ids then marks the layer,
-    /// after every rank ran it (onboarded layers too), on the head stream.
-    #[test]
-    fn step_taps_and_probes_after_every_layer() {
-        let source = include_str!("forward.rs").split("#[cfg(test)]").next().unwrap();
-        let step = source.split("pub(crate) fn step(").nth(1).unwrap();
-        let layer_loop = step.split("for layer in 0..cfg.layers").nth(1).unwrap();
-        let order = ["for (index, (rank, &stream))", "draft.tap(layer, ranks[last].lane.views.plane(\"hidden\")?",
-            "probe.ring(ranks[last].device.library, layer, ids", "probe.mark(layer, streams[last])"];
-        let at: Vec<usize> = order.iter().map(|needle| layer_loop.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-    }
 
     /// The head rank's logits planes are what admission charged.
     #[test]

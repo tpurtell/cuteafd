@@ -67,6 +67,12 @@ impl Placement {
         Self { state, units, pages, len: 0 }
     }
 
+    /// Appends freshly reserved units (a decode top-up).
+    pub fn extend(&mut self, units: &[u32]) {
+        self.pages.extend(units.iter().map(|&u| u as i32));
+        self.units.extend_from_slice(units);
+    }
+
     /// Physical window slot of `position` (ring of this sequence's pages).
     pub fn window_slot(&self, shape: &PoolShape, position: usize) -> i64 {
         let page = self.state * shape.ring_pages + (position / SOURCE_PAGE_TOKENS) % shape.ring_pages;
@@ -137,6 +143,15 @@ impl PoolAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_decode_top_up_extends_units_and_their_program_page_ids_together() {
+        let mut placement = Placement::new(3, vec![7, 2]);
+        placement.len = 300;
+        placement.extend(&[9, 4]);
+        assert_eq!((placement.units.as_slice(), placement.pages.as_slice(), placement.len, placement.state),
+            (&[7, 2, 9, 4][..], &[7, 2, 9, 4][..], 300, 3));
+    }
 
     #[test]
     fn context_forks_preserve_compression_unit_owner() -> Result<()> {

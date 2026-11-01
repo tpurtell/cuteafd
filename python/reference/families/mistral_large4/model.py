@@ -290,7 +290,7 @@ def load_layer(checkpoint, config, index, *, device="cuda", dtype=None):
     return layer.eval()
 
 
-def load_outer(checkpoint, config, *, device="cuda", dtype=None):
+def load_outer(checkpoint, config, *, device="cuda", dtype=None, head=True):
     import torch
     from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
     dtype = dtype or torch.bfloat16
@@ -303,11 +303,13 @@ def load_outer(checkpoint, config, *, device="cuda", dtype=None):
     rotary.alpha = alpha
     with torch.device("meta"):
         norm = reference.MistralLarge4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-    norm._parameters["weight"] = torch.nn.Parameter(checkpoint.get(OUTER["norm.weight"], device, dtype), requires_grad=False)
     embed = checkpoint.get(OUTER["embed_tokens.weight"], device, dtype)
-    head = checkpoint.get(OUTER["lm_head.weight"], device, dtype)
+    outer = {"embed": embed, "rotary": rotary.eval()}
+    if head:
+        norm._parameters["weight"] = torch.nn.Parameter(checkpoint.get(OUTER["norm.weight"], device, dtype), requires_grad=False)
+        outer.update(norm=norm.eval(), head=checkpoint.get(OUTER["lm_head.weight"], device, dtype))
     checkpoint.close()
-    return {"embed": embed, "norm": norm.eval(), "rotary": rotary.eval(), "head": head}
+    return outer
 
 
 def logits(hidden, head, config, linear=None):
@@ -443,19 +445,105 @@ def causal_tiles(official):
 
 
 @contextmanager
+def stable_ties(reference):
+    """Untiled official indexer and attention; only top-k tie order is fixed.
+
+    Used for the independent official-geometry arm so it differs from the tiled
+    arm in geometry alone (relu scores tie at exactly 0.0, and official ``topk``
+    leaves tie order to the kernel and tensor width).
+    """
+    import torch
+    original, previous = reference.MistralLarge4TextIndexer.forward, torch.Tensor.topk
+
+    def topk(self, k, dim=-1, largest=True, sorted=True):
+        if dim in (-1, self.ndim - 1) and largest and self.dtype == torch.float32:
+            return fixed_index_topk(self, k)
+        return previous(self, k, dim=dim, largest=largest, sorted=sorted)
+
+    def forward(self, *args, **kwargs):
+        torch.Tensor.topk = topk
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            torch.Tensor.topk = previous
+    reference.MistralLarge4TextIndexer.forward = forward
+    try:
+        yield
+    finally:
+        reference.MistralLarge4TextIndexer.forward = original
+
+
+def ordered_experts(experts, hidden_states, top_k_index, top_k_weights):
+    """MistralLarge4TextExperts.forward with a fixed accumulation order.
+
+    Per expert the arithmetic is the official one line for line; only ``index_add_``
+    (atomic on CUDA) becomes a sequential per-token sum in ascending expert order,
+    the official loop's and CPU ``index_add_``'s order.
+    """
+    import torch
+    import torch.nn as nn
+    tokens, slots = top_k_index.shape
+    contributions = hidden_states.new_zeros((tokens, slots, hidden_states.shape[-1]))
+    expert_mask = torch.nn.functional.one_hot(top_k_index, num_classes=experts.num_experts + 1).permute(2, 1, 0)
+    expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+    for expert_idx in expert_hit:
+        expert_idx = expert_idx[0]
+        if expert_idx == experts.num_experts:
+            continue
+        top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        gate, up = nn.functional.linear(current_state, experts.gate_up_proj[expert_idx]).chunk(2, dim=-1)
+        current_hidden_states = experts.act_fn(gate) * up
+        current_hidden_states = nn.functional.linear(current_hidden_states, experts.down_proj[expert_idx])
+        current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
+        contributions[token_idx, top_k_pos] = current_hidden_states.to(contributions.dtype)
+    order = top_k_index.argsort(dim=-1, stable=True)
+    contributions = contributions.gather(1, order[..., None].expand_as(contributions))
+    final_hidden_states = torch.zeros_like(hidden_states)
+    for slot in range(slots):
+        final_hidden_states = final_hidden_states + contributions[:, slot]
+    return final_hidden_states
+
+
+def fixed_rows(forward):
+    """Row-local modules on 128-row tiles: CUDA reduction launch shapes never depend
+    on how many rows (tokens per expert, window length) they see."""
+    def tiled(self, x):
+        import torch
+        flat = x.reshape(-1, x.shape[-1])
+        outputs = []
+        for start in range(0, flat.shape[0], ROWS):
+            chunk = flat[start:start + ROWS]
+            count = chunk.shape[0]
+            if count != ROWS:
+                padded = chunk.new_zeros((ROWS, chunk.shape[-1]))
+                padded[:count].copy_(chunk)
+                chunk = padded
+            outputs.append(forward(self, chunk)[:count])
+        out = torch.cat(outputs) if outputs else forward(self, x)
+        return out.reshape(*x.shape[:-1], out.shape[-1])
+    return tiled
+
+
+@contextmanager
 def geometry(reference):
-    """Fixed-M128 linears, tiled attention and tiled indexer around the official module."""
+    """Fixed-M128 linears and norms, tiled attention and indexer, ordered expert sums."""
     import torch
     import torch.nn.functional as F
     import shape_invariant
     previous = (F.linear, torch.einsum, reference.eager_attention_forward,
-                reference.MistralLarge4TextIndexer.forward)
+                reference.MistralLarge4TextIndexer.forward, reference.MistralLarge4TextExperts.forward,
+                reference.MistralLarge4RMSNorm.forward, torch.nn.LayerNorm.forward)
     F.linear = shape_invariant.linear
     torch.einsum = shape_invariant.einsum
     reference.eager_attention_forward = causal_tiles(previous[2])
     reference.MistralLarge4TextIndexer.forward = tiled_indexer(previous[3])
+    reference.MistralLarge4TextExperts.forward = ordered_experts
+    reference.MistralLarge4RMSNorm.forward = fixed_rows(previous[5])
+    torch.nn.LayerNorm.forward = fixed_rows(previous[6])
     try:
         yield
     finally:
         (F.linear, torch.einsum, reference.eager_attention_forward,
-         reference.MistralLarge4TextIndexer.forward) = previous
+         reference.MistralLarge4TextIndexer.forward, reference.MistralLarge4TextExperts.forward,
+         reference.MistralLarge4RMSNorm.forward, torch.nn.LayerNorm.forward) = previous

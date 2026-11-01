@@ -61,7 +61,8 @@ fn detects_the_checkpoint_and_classifies_every_text_tensor() {
 
 #[test]
 fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
-    let dir = snapshot(&all_layers());
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(6), ..Default::default() }).unwrap();
     assert_eq!(report.family.as_deref(), Some("muse_spark"));
@@ -70,8 +71,8 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
     for component in report.components.iter().filter(|c| c.status != Status::Disabled) {
         assert_eq!(component.rejected, 0, "{:?}: {:?}", component.component, component.rejections);
     }
-    assert!(report.components.iter().filter(|c| matches!(c.component, Component::Vision | Component::Audio))
-        .all(|c| c.status == Status::Disabled), "media stay off");
+    assert_eq!(report.vision, MediaMode::Auto, "vision auto is not family-disabled");
+    assert_eq!(report.audio, MediaMode::Auto, "bundled PCM audio is not family-disabled");
     assert!(!report.hints.iter().any(|h| h.what.contains("EXL3 publication")), "{:?}", report.hints);
     let routed = report.components.iter().find(|c| c.component == Component::RoutedExpert).unwrap();
     // 62 x 256 x 3 projections of 4096 x 4096 at 4 bits, plus vectors, norms and markers.
@@ -92,7 +93,38 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
 }
 
 #[test]
-fn whole_expert_ranks_split_the_routed_bytes_evenly() {
+fn bundled_media_inventory_is_header_exact_and_never_hides_declared_errors() {
+    use crate::placement::families::muse_spark::MediaOptions;
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &[0]);
+    let open = || Checkpoint::open(dir.path()).unwrap();
+    let inventory = MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 2).unwrap();
+    assert_eq!(inventory.vision_bytes.0 + inventory.vision_bytes.1, 4_864_551_264);
+    assert_eq!(inventory.audio_bytes, (235_680_768, 10_905_600));
+    assert_eq!(inventory.replicas, 2);
+    let path = dir.path().join("config.json");
+    let original: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (tower, field, invalid) in [("vision_config", "patch_size", serde_json::json!(16)),
+        ("audio_config", "conv_kernel_size", serde_json::json!(9))] {
+        let mut config = original.clone();
+        config[tower][field] = invalid;
+        std::fs::write(&path, config.to_string()).unwrap();
+        assert!(MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 1).is_err(), "{tower}");
+        let disabled = MediaOptions::from_checkpoint(&open(), MediaMode::Off, MediaMode::Off, 1).unwrap();
+        assert_eq!((disabled.vision_bytes, disabled.audio_bytes), ((0, 0), (0, 0)));
+    }
+    let mut config = original;
+    config.as_object_mut().unwrap().remove("vision_config");
+    config.as_object_mut().unwrap().remove("audio_config");
+    std::fs::write(&path, config.to_string()).unwrap();
+    let missing = MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 1).unwrap();
+    assert_eq!((missing.vision_bytes, missing.audio_bytes), ((0, 0), (0, 0)));
+    assert!(MediaOptions::from_checkpoint(&open(), MediaMode::Rtx(None), MediaMode::Off, 1).is_err());
+    assert!(MediaOptions::from_checkpoint(&open(), MediaMode::Off, MediaMode::Spark(None), 1).is_err());
+}
+
+#[test]
+fn rotated_tp_ranks_balance_the_routed_bytes() {
     let dir = snapshot(&all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for ranks in [4, 6] {
@@ -105,7 +137,7 @@ fn whole_expert_ranks_split_the_routed_bytes_evenly() {
         let (max, min) = (*spark.iter().max().unwrap(), *spark.iter().min().unwrap());
         // Staggered ownership: ranks differ by at most the rotated remainder.
         assert!(max - min < max / 20, "TP{ranks} expert bytes {spark:?}");
-        eprintln!("muse EP{ranks} expert GiB/rank {:?}; onboard {:?}; pool {}", spark.iter()
+        eprintln!("muse TP{ranks} expert GiB/rank {:?}; onboard {:?}; pool {}", spark.iter()
             .map(|b| format!("{:.1}", *b as f64 / GIB as f64)).collect::<Vec<_>>(), report.onboard_layers, memory.pool_tokens);
     }
 }
@@ -133,6 +165,18 @@ fn plan_matrix(column: usize) {
         assert!(!report.hints.iter().any(|h| h.what.contains("no muse:exl3-k45 layout")), "{rtx} RTX + {ranks}: {:?}",
             report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
         if ranks >= 4 { assert!(report.fits, "{rtx} RTX + {ranks} must fit (minimum 4): {:?}", report.hints); }
+        if matches!((rtx, ranks), (1, 4) | (2, 6)) {
+            let memory = report.memory_layout.as_ref().unwrap();
+            let spark = memory.devices.iter().find(|device|
+                device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).unwrap();
+            let owners: u64 = spark.items.iter().filter(|item|
+                matches!(item.group.as_str(), "execution owners" | "execution staging"))
+                .map(|item| item.bytes).sum();
+            eprintln!("muse census {rtx}+{ranks}: owners={owners} free={} pool={} onboard={:?}",
+                spark.free_bytes(), memory.pool_tokens, report.onboard_layers);
+            assert_eq!(memory.pool_tokens, if rtx == 1 { 814016 } else { 2097152 },
+                "Spark census must preserve this coordinator-bound pool");
+        }
         if (rtx, ranks) == (2, 6) {
             assert!(report.fits && report.placement_supported, "{:?}", report.hints);
             let memory = report.memory_layout.as_ref().unwrap();
@@ -183,6 +227,7 @@ fn fused_bf16_experts_name_the_publication_to_serve() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = testing::muse_spark_config();
     config.as_object_mut().unwrap().remove("quantization_config");
+    config.as_object_mut().unwrap().remove("audio_config");
     let (mut tensors, _) = testing::muse_spark_tensors(&[]);
     tensors.retain(|t| !t.0.ends_with(".trellis") && !t.0.ends_with(".suh") && !t.0.ends_with(".svh") && !t.0.ends_with(".mcg"));
     for layer in 0..62 {
@@ -306,4 +351,115 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     std::fs::write(drafter.path().join("config.json"), other.to_string()).unwrap();
     let refused = input.plan(&with_draft).unwrap();
     assert!(refused.hints.iter().any(|h| h.what.contains("softcap/output_multiplier differ")), "{:?}", refused.hints);
+}
+
+#[test]
+fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
+    use crate::plan::encoder::EncoderKind;
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = with_layout(1, 6);
+    // Text fits at a fixed small pool, but neither tower can occupy the absent
+    // second RTX or the deliberately tiny Spark allocation budget.
+    let layout = options.layout.as_mut().unwrap();
+    layout.context_tokens = 4096;
+    layout.pool_tokens = Some(4096);
+    layout.spark_bytes = 1;
+    layout.spark_allocation_budget_bytes = Some(1);
+    let auto = input.plan(&options).unwrap();
+    for (component, encoder) in [(Component::Vision, auto.encoder.as_ref()),
+        (Component::Audio, auto.audio_encoder.as_ref())] {
+        // If even the text pool is refused, both explicit ownership diagnostics
+        // must still survive. Auto fallback itself is covered below.
+        assert!(encoder.is_some(), "{component:?}: {:?}", auto.hints);
+    }
+    options.vision = MediaMode::Rtx(Some(8));
+    options.audio = MediaMode::Spark(Some(8));
+    let refused = input.plan(&options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    for encoder in [refused.encoder.as_ref(), refused.audio_encoder.as_ref()] {
+        let encoder = encoder.expect("media refusal has an ownership diagnostic");
+        assert_eq!(encoder.kind, EncoderKind::Off);
+        assert!(encoder.reason.contains("refused"));
+    }
+}
+
+#[test]
+fn media_auto_off_disables_component_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    // Force Auto through Off without changing the text inventory: impossible
+    // replica count eliminates Sparks; a capacity just above the text-only
+    // layout leaves no room for either tower.
+    let mut options = with_layout(1, 6);
+    options.vision = MediaMode::Off;
+    options.audio = MediaMode::Off;
+    let opts = options.layout.as_mut().unwrap();
+    opts.context_tokens = 4096;
+    opts.pool_tokens = Some(4096);
+    opts.onboard = Some(crate::placement::Onboard::Layers(0));
+    let text = input.plan(&options).unwrap();
+    let used = text.memory_layout.as_ref().unwrap().devices[0].used_bytes();
+    options.vision = MediaMode::Auto;
+    options.audio = MediaMode::Auto;
+    // The ledger excludes the baseline CUDA context deducted by GpuBudget.
+    let context = crate::placement::ArchContext::for_device("sm_120", used).context_bytes;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![used + context + 1024];
+    options.layout.as_mut().unwrap().vision_replicas = 9;
+    // Audio has one copy, so remove its Spark candidate by retaining only the
+    // text's exact Spark allocation budget.
+    let spark_used = text.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+        .map(|d| d.used_bytes()).max().unwrap();
+    options.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(spark_used);
+    let off = input.plan(&options).unwrap();
+    assert!(off.fits, "{:?}", off.hints);
+    assert_eq!(off.encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
+    assert_eq!(off.audio_encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
+    assert!(off.disabled_media_bytes > 0, "{:?}", off.hints);
+    for component in [Component::Vision, Component::Audio] {
+        let component = off.components.iter().find(|c| c.component == component).unwrap();
+        assert_eq!(component.status, Status::Disabled);
+        assert_eq!(component.bytes, 0);
+    }
+}
+
+#[test]
+fn coordinator_media_hash_includes_vision_and_pcm_tensor_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &[0]);
+    let hash = || {
+        let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
+        assert!(checkpoint.tensors.iter().all(|t| !t.meta.name.starts_with("model.audio_tower.")
+            && !crate::media::muse_vision::is_tensor(&t.meta.name)));
+        PlanInput::from_checkpoint(checkpoint).plan(&PlanOptions {
+            vision: MediaMode::Off, audio: MediaMode::Off,
+            placement: ExpertPlacement::from_spark_ranks(6), ..Default::default()
+        }).unwrap().encoder_plan_hash
+    };
+    let mut previous = hash();
+    let path = dir.path().join("model-00000.safetensors");
+    // Change only a tower header, not config or text tensors. F16 has the same
+    // storage extent as BF16; disabled towers do not require runnable numerics.
+    for prefix in ["model.vision", "model.audio_tower."] {
+        use std::io::{Read, Seek, Write};
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut length = [0; 8];
+        file.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0; u64::from_le_bytes(length) as usize];
+        file.read_exact(&mut bytes).unwrap();
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let name = header.as_object().unwrap().keys().find(|name| name.starts_with(prefix)).unwrap().clone();
+        header[&name]["dtype"] = serde_json::json!("F16");
+        let mut updated = serde_json::to_vec(&header).unwrap();
+        assert!(updated.len() <= bytes.len());
+        updated.resize(bytes.len(), b' ');
+        file.seek(std::io::SeekFrom::Start(8)).unwrap();
+        file.write_all(&updated).unwrap();
+        let next = hash();
+        assert_ne!(previous, next, "{prefix}");
+        previous = next;
+    }
 }

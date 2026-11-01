@@ -1117,7 +1117,29 @@ pub fn muse_spark_tensors(expert_layers: &[usize]) -> (Vec<Tensor>, Vec<(String,
 /// Routed experts are written for `expert_layers` only; the index still names
 /// every layer's experts so the inventory is complete.
 pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
-    let (tensors, mut projections) = muse_spark_tensors(expert_layers);
+    write_muse_snapshot(dir, expert_layers, false, false);
+}
+
+pub fn write_muse_vision_snapshot(dir: &Path, expert_layers: &[usize]) {
+    write_muse_snapshot(dir, expert_layers, true, false);
+}
+
+pub fn write_muse_media_snapshot(dir: &Path, expert_layers: &[usize]) {
+    write_muse_snapshot(dir, expert_layers, true, true);
+}
+
+fn write_muse_snapshot(dir: &Path, expert_layers: &[usize], vision: bool, audio: bool) {
+    let (mut tensors, mut projections) = muse_spark_tensors(expert_layers);
+    tensors.retain(|tensor| !crate::media::muse_vision::is_tensor(&tensor.0)
+        && !tensor.0.starts_with("model.audio_tower."));
+    if vision {
+        tensors.extend(crate::media::muse_vision::tensor_shapes().into_iter().map(|(name, shape)| t(name, "BF16", &shape)));
+    }
+    if audio {
+        tensors.retain(|tensor| !tensor.0.starts_with("model.audio_tower."));
+        tensors.extend(crate::media::pcm_audio::tensor_shapes().into_iter()
+            .map(|(name, shape)| t(format!("model.audio_tower.{name}"), "BF16", &shape)));
+    }
     let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
     for tensor in tensors {
         let shard = tensor.0.split(".layers.").nth(1).and_then(|tail| tail.split('.').next())
@@ -1141,7 +1163,28 @@ pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
             }
         }
     }
-    fs::write(dir.join("config.json"), muse_spark_config().to_string()).unwrap();
+    // Text/admission fixtures carry classification sentinels, not bundled towers.
+    let mut config = muse_spark_config();
+    if audio {
+        config["audio_config"] = json!({"model_type":"muse_spark_audio",
+            "hidden_sizes":crate::media::pcm_audio::WIDTHS, "patch_sizes":crate::media::pcm_audio::PATCHES,
+            "depths":[2,2,2,2], "num_hidden_layers":4, "conv_kernel_size":7,
+            "mlp_ratio":4, "rms_norm_eps":1e-6, "hidden_act":"gelu", "out_hidden_size":8192});
+        config["audio_token_id"] = json!(200038);
+        fs::write(dir.join("processor_config.json"), json!({"feature_extractor":{"sampling_rate":24000,
+            "samples_per_token":1920, "feature_size":1, "padding_value":0, "padding_side":"right"}}).to_string()).unwrap();
+    } else { config.as_object_mut().unwrap().remove("audio_config"); }
+    if vision {
+        config["out_hidden_size"] = json!(6144);
+        config["projector_hidden_size"] = json!(4096);
+        config["projector_hidden_act"] = json!("gelu");
+        config["vision_config"] = json!({"hidden_size":1536, "intermediate_size":8960,
+            "num_attention_heads":16, "num_hidden_layers":50, "patch_size":14, "patch_temporal":2,
+            "merge_size":2, "pos_emb_height":32, "pos_emb_width":32, "hidden_act":"gelu",
+            "layer_norm_eps":1e-5, "rope_parameters":{"rope_type":"axial", "rope_theta":10000.0},
+            "layer_types":vec!["window_attention";50]});
+    } else { config.as_object_mut().unwrap().remove("vision_config"); }
+    fs::write(dir.join("config.json"), config.to_string()).unwrap();
     fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
     let mut compact = exl3_compact(4);
     for key in ["core_bits", "head_bits"] { compact[key] = json!(6.0); }

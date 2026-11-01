@@ -212,9 +212,16 @@ echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
 # CUTEAFD_RELEASE_RUST_LTO / _CODEGEN_UNITS opt in (e.g. thin / 1).
 [[ -z "${CUTEAFD_RELEASE_RUST_LTO:-}" ]] || export CARGO_PROFILE_RELEASE_LTO="$CUTEAFD_RELEASE_RUST_LTO"
 [[ -z "${CUTEAFD_RELEASE_RUST_CODEGEN_UNITS:-}" ]] || export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CUTEAFD_RELEASE_RUST_CODEGEN_UNITS"
+# Coordinator-only Cargo features. Keep tuned glibc by default; explicitly set
+# CUTEAFD_RELEASE_COORDINATOR_FEATURES=jemalloc for allocator comparisons.
+cargo_feature_args=()
+if [[ "$role" == coordinator ]]; then
+  coordinator_features="${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}"
+  [[ -z "$coordinator_features" ]] || cargo_feature_args=(--features "$coordinator_features")
+fi
 host_isa_jobs=()
 for host_isa in "${host_isas[@]}"; do
-  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" &
+  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" ${cargo_feature_args[@]+"${cargo_feature_args[@]}"} &
   host_isa_jobs+=("$!")
 done
 for host_isa_job in "${host_isa_jobs[@]}"; do wait "$host_isa_job"; done
@@ -277,6 +284,9 @@ if [[ -n "${CUTEAFD_KACHE:-}${CUTEAFD_KACHE_REQUESTED:-}" ]]; then
     "$source_dir" "$output_dir/cuteafd" "$output_dir/COMPILER_PROVENANCE.json"
 fi
 IFS=';' read -ra release_family_list <<<"$expert_families"
+# Like fp8/, the exl3/ directory always exists so the release image can COPY it
+# when the scope ships no EXL3 family (a deepseek_v41-scoped build has none).
+install -d "$output_dir/exl3"
 for release_family in "${release_family_list[@]}"; do
   [[ "$release_family" == *:exl3-k* ]] || continue
   release_package="exl3-${release_family%%:*}-${release_family#*:exl3-}"

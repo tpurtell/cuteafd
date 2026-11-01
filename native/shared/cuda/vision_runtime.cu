@@ -6,6 +6,8 @@
 #include <type_traits>
 #include <vector>
 #include <new>
+#include <initializer_list>
+#include <algorithm>
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
 #include "cuteafd_vision_attention_internal.h"
 #endif
@@ -38,7 +40,11 @@ struct Owner {
   int32_t *hw_row = nullptr, *hw_col = nullptr, *col = nullptr, *inverse = nullptr;
   int32_t *pos_indices = nullptr, *cu_seqlens = nullptr;
   float *pos_weights = nullptr, *lse = nullptr;
-  void *attention = nullptr, *workspace = nullptr;
+  void *attention = nullptr, *workspace = nullptr, *window_attention = nullptr;
+  uint16_t *muse_x = nullptr, *muse_xt = nullptr, *muse_qkv = nullptr;
+  uint16_t *muse_proj = nullptr, *muse_cos = nullptr, *muse_sin = nullptr;
+  uint16_t *muse_adapter = nullptr;
+  std::vector<int32_t> muse_permutation, muse_inverse, muse_windows;
   bool uploaded = false;
 };
 bool copy_spec(Owner& o, const cuteafd_vision_spec& s) {
@@ -156,12 +162,14 @@ int mha_attention(Owner* o,int n) {
 #include "vision_glm.cuh"
 #define CUTEAFD_HAVE_GLM_VISION 1
 #endif
+#include "vision_muse.cuh"
 bool valid_tower(const cuteafd_vision_spec& s) {
   if(s.storage_abi!=3 || !s.depth || !s.blocks || !s.norm1_bias ||
      !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
   if(s.abi_version==1)return valid_spec(s);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s.reserved==2)return valid_qwen(s);
+  if(s.reserved==5)return valid_muse(s);
 #ifdef CUTEAFD_HAVE_GLM_VISION
   if(s.reserved==3)return valid_glm(s);
 #endif
@@ -171,6 +179,7 @@ bool valid_tower(const cuteafd_vision_spec& s) {
 size_t scratch_tower(Owner* o) {
   const auto& s=o->spec;
   if(s.abi_version==2 && s.reserved==2)return scratch_qwen(o,s.max_tokens,s.output_width);
+  if(s.abi_version==2 && s.reserved==5)return scratch_muse(o,s.max_tokens,s.output_width);
 #ifdef CUTEAFD_HAVE_GLM_VISION
   if(s.abi_version==2 && s.reserved==3)return scratch_glm(o,s.max_tokens,s.output_width);
 #endif
@@ -192,6 +201,7 @@ extern "C" int32_t cuteafd_vision_destroy(void* owner) {
   int previous=-1; cudaGetDevice(&previous); cudaSetDevice(o->device);
   int first=o->stream ? drain(o,0) : 0;
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(o->window_attention) { int rc=cuteafd_vision_attention_destroy(o->window_attention);if(!first)first=rc; }
   if(o->attention) { int rc=cuteafd_vision_attention_destroy(o->attention);if(!first)first=rc; }
 #endif
   if(o->blas)cublasDestroy(o->blas);
@@ -219,7 +229,16 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s->abi_version==2) {
-    e=cuteafd_vision_attention_create_entry(s->head_dim,0,"",&o->attention);if(e)return fail(e);
+    const char* group=s->reserved==5 ? "muse" : "";
+    e=cuteafd_vision_attention_create_entry(s->head_dim,0,group,&o->attention);if(e)return fail(e);
+    if(s->reserved==5) {
+      e=cuteafd_vision_attention_create_entry(s->head_dim,1,group,&o->window_attention);if(e)return fail(e);
+      try {
+        o->muse_permutation.resize(size_t(s->max_tokens)*4);
+        o->muse_inverse.resize(size_t(s->max_tokens)*4);
+        o->muse_windows.resize(513);
+      } catch(const std::bad_alloc&) { return fail(cudaErrorMemoryAllocation); }
+    }
   }
 #endif
   e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
@@ -248,6 +267,7 @@ extern "C" int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64
   if(!owner || !rgb || !lut || !output)return cudaErrorInvalidValue;
   auto* o=static_cast<Owner*>(owner); const auto& s=o->spec;
   if(s.abi_version==2 && s.reserved==2)return encode_qwen(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
+  if(s.abi_version==2 && s.reserved==5)return encode_muse(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
 #ifdef CUTEAFD_HAVE_GLM_VISION
   if(s.abi_version==2 && s.reserved==3)return encode_glm(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
 #endif

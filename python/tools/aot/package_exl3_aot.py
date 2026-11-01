@@ -418,21 +418,35 @@ SPARK_WS_CELLS = {
     ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
     ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    # Muse K4, 2026-11-01 GB10: all low/median/high-Gini route fixtures
+    # and random routes improve with exact expert-partial replies (#923).
+    # Only measured capacities qualify; unresolved cells retain their controls.
+    ('muse', 1024, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 896, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 768, 256): dict(route_block=32, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 2752): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
 }
 
 
 def spark_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
     if role != 'spark' or capacity <= 80:
         return None
-    return SPARK_WS_CELLS.get((geometry, width))
+    return SPARK_WS_CELLS.get((geometry, width, capacity), SPARK_WS_CELLS.get((geometry, width)))
 
 
 def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
     """Packed-route M block of a warp-specialized prefill export (see
     `warp_specialized`); every cell whose measured arm split the block by
     capacity carries its own row count here."""
-    cell = coordinator_ws_cell(geometry, role, width, capacity)
-    return cell['route_block'] if cell else 64
+    cell = (coordinator_ws_cell(geometry, role, width, capacity)
+            or spark_ws_cell(geometry, role, width, capacity))
+    return cell.get('route_block', 64) if cell else 64
 
 
 def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
@@ -1009,23 +1023,10 @@ def build(args: argparse.Namespace) -> None:
             for capacity in capacities:
                 requested = tiles.get(profile, {}).get(capacity)
                 tile = (64, 128, 64, 128) if compact else requested
-                # Content-keyed: an override changes the compiled geometry, so it
-                # must never land in (or be read from) the policy-keyed export, and
-                # neither may a pinned capacity: a build tree that predates the pin
-                # holds the widened export under the policy key. Without either the
-                # path is what every existing build used.
-                profile_dir = (args.build_dir / profile if tile is None else
-                               args.build_dir / f"{profile}+tile{'-'.join(map(str, tile))}")
                 compact_ws = compact and len(args.bits) == 2 and compact_ws_export(
                     geometry, args.role, width, capacity, args.bits)
                 compact_block = (compact_ws_route_block(geometry, args.role, width, capacity)
                                  if compact_ws else None)
-                if compact_block is not None:
-                    # N128 alone also names the cooperative export; separate its cache.
-                    dynamic = ws_dynamic_tiles(geometry, args.role, width, capacity, compact=True)
-                    profile_dir = profile_dir.with_name(
-                        f'{profile_dir.name}+ws-m{compact_block}-{"dynamic" if dynamic else "static"}')
-                raw = profile_dir / f'm{capacity}'  # one capacity, one directory
                 options = {'compact_weights': True} if compact else {}
                 if activation(geometry) != 'silu':
                     options['activation'] = activation(geometry)
@@ -1041,19 +1042,6 @@ def build(args: argparse.Namespace) -> None:
                 if ws:
                     block = (compact_block if compact_block is not None
                              else ws_route_block(geometry, args.role, width, capacity))
-                    if not compact:
-                        # Existing policy-keyed directories contain cooperative exports.
-                        # The input format and claim mode are part of the compiled
-                        # program, so they name its cache directory.
-                        if wire_input(geometry, args.role, width, capacity):
-                            suffix = '-wire-s3-dynamic'
-                        elif args.role == 'coordinator':
-                            dynamic = ws_dynamic_tiles(geometry, args.role, width, capacity)
-                            suffix = '-bf16-dynamic' if dynamic else '-bf16-static'
-                        else:
-                            suffix = ''
-                        profile_dir = profile_dir.with_name(f'{profile_dir.name}+ws-m{block}{suffix}')
-                        raw = profile_dir / f'm{capacity}'
                 if block != 8:
                     options['route_block'] = block
                 if ws:
@@ -1068,9 +1056,6 @@ def build(args: argparse.Namespace) -> None:
                     if (policy_tile := ws_tile(geometry, args.role, width, capacity,
                                               compact=compact_ws)) is not None and requested is None:
                         options['tile'] = policy_tile
-                        if compact_ws and policy_tile[1] == 192:
-                            profile_dir = profile_dir.with_name(f'{profile_dir.name}-n192')
-                            raw = profile_dir / f'm{capacity}'
                 elif len(args.bits) == 2 and token_major_rotation(geometry, capacity, args.role):
                     options['token_major_rotation'] = True
                 if (limit := swiglu_limit(geometry)) != 10.0:
@@ -1078,16 +1063,13 @@ def build(args: argparse.Namespace) -> None:
                 default_options = options
                 if (schedule_hint := default_decode_schedule(
                         geometry, args.role, profile, capacity, args.bits)) is not None:
-                    raw = profile_dir.with_name(f'{profile_dir.name}+{schedule_hint}') / raw.name
                     default_options = {**options, 'decode_schedule': schedule_hint}
-                # Explicit schedule siblings keep their original options and suffix.
-                exports = [(None, raw, default_options)]
+                exports = [(None, default_options)]
                 for schedule, schedule_options in ([] if compact else decode_schedule_variants(
                         geometry, args.role, profile, capacity)):
-                    exports.append((schedule, profile_dir.with_name(f'{profile_dir.name}+{schedule}')
-                                    / raw.name, {**options, **schedule_options}))
-                for schedule, raw, run_options in exports:
-                    pending.append((raw, width, experts, capacity, topk, dtype, run_options,
+                    exports.append((schedule, {**options, **schedule_options}))
+                for schedule, run_options in exports:
+                    pending.append((width, experts, capacity, topk, dtype, run_options,
                                     destinations, schedule, requested))
         from _export_jobs import export_jobs, gpu_workers, park_context_lease
         jobs = min(gpu_workers(export_jobs()), len(pending))
@@ -1099,21 +1081,21 @@ def build(args: argparse.Namespace) -> None:
         unique = {}
         keys = []
         for item in pending:
-            key = (*item[1:6], json.dumps(item[6], sort_keys=True))
+            key = (*item[:5], json.dumps(item[5], sort_keys=True))
             keys.append(key)
             unique.setdefault(key, item)
         # Stable width/options cache identity, independent of the first world
         # that happened to request this variant. ABI and schedule are in options.
         for key, item in list(unique.items()):
             identity = json.dumps([geometry, args.role, args.bits, expected_compute, key], sort_keys=True)
-            raw = args.build_dir / f'width{item[1]}-{hashlib.sha256(identity.encode()).hexdigest()[:20]}' / f'm{item[3]}'
-            unique[key] = (raw, *item[1:])
+            raw = args.build_dir / f'width{item[0]}-{hashlib.sha256(identity.encode()).hexdigest()[:20]}' / f'm{item[2]}'
+            unique[key] = (raw, *item)
         payloads = [(args, expected_compute, *item[:7]) for item in unique.values()]
         compiled = dict(zip(unique, compile_variants(payloads, jobs)))
         for item, key in zip(pending, keys):
             meta, runtime_files = compiled[key]
             source = unique[key][0]
-            raw, width, experts, capacity, topk, dtype, run_options, destinations, schedule, requested = item
+            width, experts, capacity, topk, dtype, run_options, destinations, schedule, requested = item
             for destination in destinations:
                 directory = f'{destination}/m{capacity}' + ('' if schedule is None else f'-{schedule}')
                 for name in runtime_files:

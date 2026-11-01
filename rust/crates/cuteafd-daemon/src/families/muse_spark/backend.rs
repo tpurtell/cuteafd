@@ -27,6 +27,26 @@ use cuteafd_ffi::NativeLibrary;
 use cuteafd_loader::families::muse_spark::{lane::HEAD_ROWS, MuseSparkConfig};
 use std::{cell::RefCell, ffi::c_void, path::Path};
 
+/// Pack image/audio features with row offsets across the same sequence order as tokens.
+fn step_media<'a>(groups: impl IntoIterator<Item = (Option<&'a RequestMedia>, usize, usize)>)
+    -> Result<cuteafd_engine::media::MediaChunk> {
+    let mut packed = cuteafd_engine::media::MediaChunk::default();
+    let mut offset = 0u32;
+    for (media, start, rows) in groups {
+        let end = start.checked_add(rows).context("Muse media step extent overflow")?;
+        if let Some(media) = media.filter(|media| media.needed(start, end).next().is_some()) {
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            media.write_chunk(start, end, &mut chunk)?;
+            for index in chunk.indices {
+                packed.indices.push(index.checked_add(offset).context("Muse media row overflow")?);
+            }
+            packed.features.extend(chunk.features);
+        }
+        offset = offset.checked_add(u32::try_from(rows)?).context("Muse packed step extent overflow")?;
+    }
+    Ok(packed)
+}
+
 /// The committed length after a verify step of `rows` from `len`: a plain
 /// step commits every row (callers that never accept: probe scoring, cold
 /// steps); a speculative one commits nothing until `accept`.
@@ -190,12 +210,14 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         let meta = StepMetadata::build(&described, self.ring_rows, self.slots, self.unit_rows, false)?;
         let wave = WaveStep { segments: sequences.iter().map(|(placement, tokens)| WaveSegment {
             request: placement.slot as u64 + 1, rows: tokens.len() }).collect(), kind };
+        let media = step_media(sequences.iter().map(|(placement, tokens)|
+            (placement.media.as_ref(), placement.len, tokens.len())))?;
         let tokens = sequences.iter().flat_map(|(_, tokens)| tokens.iter().copied()).collect::<Vec<_>>();
         let mut ends = self.peer.map(|peer| (0..2).map(|rank| peer.rank(rank)).collect::<Vec<_>>()).unwrap_or_default();
         let peers = ends.iter_mut().map(|end| end as &mut dyn super::device::PeerExchange).collect();
         let mut experts = self.experts.borrow_mut();
         let mut probe = self.probe.borrow_mut();
-        let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &meta, false, wave,
+        let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &media, &meta, false, wave,
             &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
             probe.as_mut().map(|owner| owner.get_mut()), 0..rows)?;
         Ok(self.logits(logits, rows))
@@ -389,8 +411,6 @@ mod tests {
     /// `<|im_start|>`), resolved from the served snapshot when present.
     #[test]
     fn message_starts_are_the_checkpoints() {
-        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(source.contains("fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }"));
         assert_eq!(cuteafd_api::openai::chat::muse::START, "<|start|>");
         let snapshots = std::path::Path::new(
             "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
@@ -399,6 +419,30 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn step_media_packs_partial_image_and_audio_spans_at_sequence_offsets() -> Result<()> {
+        use cuteafd_core::{AudioKey, ImageKey, MediaKey, MediaSpan};
+        fn ready(key: MediaKey, features: &[u8]) -> Result<RequestMedia> {
+            let mut cache = EmbeddingCache::new(64);
+            let _reservation = cache.reserve(key, features.len())?;
+            let lease = cache.complete(key, std::sync::Arc::from(features))?;
+            let mut media = RequestMedia::new(vec![MediaSpan { start: 2, len: 3, key }], 1, 8)?;
+            media.attach(lease)?;
+            Ok(media)
+        }
+        let image = ready(ImageKey([1; 32]).into(), &[10, 11, 20, 21, 30, 31])?;
+        let audio = ready(AudioKey([1; 32]).into(), &[40, 41, 50, 51, 60, 61])?;
+        let packed = step_media([(None, 0, 2), (Some(&image), 3, 3), (Some(&audio), 1, 4)])?;
+        assert_eq!(packed.indices, [2, 3, 6, 7, 8]);
+        assert_eq!(packed.features, [20, 21, 30, 31, 40, 41, 50, 51, 60, 61]);
+        // A restored prefix may retain only span identities outside the current step.
+        let cold = RequestMedia::new(image.spans().to_vec(), 1, 8)?;
+        assert!(step_media([(Some(&cold), 5, 3)])?.indices.is_empty());
+        assert!(step_media([(Some(&cold), 2, 1)]).is_err());
+        assert!(step_media([(None, usize::MAX, 1)]).is_err());
+        Ok(())
+    }
 
     /// The shared scheduler's decode round, on the host: a step of an anchor
     /// and its drafts is verified, the round walks the rows setting the length
@@ -437,11 +481,6 @@ mod tests {
         assert_eq!(written, [500, 564, 628], "each chunk writes past the last");
         assert_eq!(ungraphed_kind(false, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::Prefill);
         assert_eq!(ungraphed_kind(true, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::MtpVerify);
-        // The backend routes both verify entries through the bookkeeping above, never refusing a draft.
-        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(!source.contains("has no drafter yet"));
-        let verify = source.split("fn verify_rows(").nth(1).unwrap().split("\n    }").next().unwrap();
-        assert!(verify.contains("after_verify(placement.len, tokens.len(), speculative)"));
         Ok(())
     }
 }

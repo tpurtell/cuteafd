@@ -6,8 +6,6 @@ use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
-    let auto_vision_retry = (report.spark_ranks == 0 && report.vision == super::super::MediaMode::Auto)
-        .then(|| (report.clone(), options.clone()));
     let prefill = match resolve_prefill(report, options, report.spark_ranks,
         crate::serving_capacity::prefill_waves::PrefillLimits {
             max_waves: if report.spark_ranks == 0 { 1 }
@@ -27,12 +25,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     let mut devices: Vec<_> = options.rtx_bytes.iter().take(ranks).enumerate().map(|(rank, &bytes)| DeviceLayout {
         kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: bytes.saturating_sub(options.headroom_bytes),
         items: vec![], kv_tokens: 0 }).collect();
-    // Serving loads RTX media before sampling admission memory. Reserve the
-    // same tower first so embedding-home selection sees that occupied memory.
-    let early_encoder = report.spark_ranks == 0 || matches!(report.vision, super::super::MediaMode::Rtx(_));
-    if early_encoder {
-        resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut [],
-            &vec![0; ranks], options, &mut notes);
+    for (device, items) in devices.iter_mut().zip(&options.encoder_items) {
+        device.items.extend(items.iter().cloned());
     }
     let mut pool = 0;
     let mut waste = Vec::new();
@@ -208,7 +202,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             } else {
                 devices[rank].items.push(runtime);
             }
-            let loaded_bytes = devices[rank].items.iter().filter(|item| item.group.starts_with("vision "))
+            let loaded_bytes = devices[rank].items.iter().filter(|item| item.group.starts_with("vision ") || item.group.starts_with("audio "))
                 .map(|item| item.bytes).sum();
             baselines.push((total, Baseline::Planned { context_bytes: code, loaded_bytes }));
         }
@@ -273,24 +267,6 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             working.spark_ranks, working.prefill_lanes, working.spark_layers));
         Ok((placed, working))
     })();
-    if matches!(admitted.as_ref().err().and_then(|error| error.downcast_ref::<placement::PlacementError>()),
-        Some(placement::PlacementError::BelowFloor { .. }))
-        && report.encoder.as_ref().is_some_and(|encoder| matches!(encoder.kind,
-            crate::plan::encoder::EncoderKind::Rtx { .. })) {
-        if let Some((original, original_options)) = auto_vision_retry {
-            // Auto media is optional: preserve the text-serving floor when the
-            // precharged tower prevents admission. Explicit RTX requests stay strict.
-            *report = original;
-            *options = original_options;
-            report.vision = super::super::MediaMode::Off;
-            let mut result = layout(report, model, input, options);
-            report.vision = super::super::MediaMode::Auto;
-            let reason = "auto vision disabled to preserve the GLM Flash KV pool floor";
-            if let Some(encoder) = &mut report.encoder { encoder.reason = reason.into(); }
-            result.notes.push(reason.into());
-            return result;
-        }
-    }
     let mut selected = None;
     match admitted {
         Ok((placed, working)) => {
@@ -355,11 +331,5 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             devices.push(device);
         }
     }
-    // Media placement is still the shared planner path, outside the coordinator solver port.
-    let mut sparks = devices.split_off(ranks);
-    if !early_encoder {
-        resolve_encoder(report, &glm_flash_towers(report, checkpoint), &mut devices, &mut sparks, &vec![0; ranks], options, &mut notes);
-    }
-    devices.extend(sparks);
     MemoryLayout { devices, pool_tokens: pool, waste, notes }
 }

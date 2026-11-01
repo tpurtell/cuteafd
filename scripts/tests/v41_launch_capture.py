@@ -316,11 +316,11 @@ def release_checkpoint(family: str, model: str) -> dict:
 
 
 def normalize(value: str, root: Path) -> str:
-    return value.replace(str(root), "<root>")
+    return value.replace(str(root / "namespace"), "/mnt/sparknest").replace(str(root), "<root>")
 
 
 def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None,
-            launcher_source: Path | None = None, dry_run: bool = False) -> dict:
+            launcher_source: Path | None = None, dry_run: bool = False, site_hub: bool = False) -> dict:
     """Run LAUNCHER_ROOT/run.sh for one case; return the recorded serving containers.
 
     A non-zero exit (unknown key, unused key, bad value) raises RuntimeError
@@ -336,6 +336,10 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         coordinator_host = "coordinator" if release_entry else "raptor"
         home = root / "hosts" / coordinator_host
         home.mkdir(parents=True)
+        namespace = root / "namespace"
+        namespace.mkdir()
+        if not site_hub:
+            (namespace / "hf-home").symlink_to(root / "hf")
         hub = root / "hf" / "hub"
         checkpoints, revisions = dict(CHECKPOINTS), dict(REVISIONS)
         release_values = {}
@@ -406,7 +410,7 @@ def capture(launcher_root: Path, case: str, *, release_entry: dict | None = None
         spec.write_text("devices:\n" + "".join(f"  - name: {name}\n" for name in (*GPU_UUIDS, "0", "1", "all")))
         log = root / "log.jsonl"
         env = {"PATH": f"{root / 'bin'}:/usr/bin:/bin", "HOME": str(home), "HF_HOME": str(root / "hf"),
-               "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
+               "CUTEAFD_NAMESPACE_ROOT": str(namespace), "CAPTURE_LOG": str(log), "CAPTURE_ROOT": str(root), "CAPTURE_HOST": coordinator_host,
                "CAPTURE_SPARKS": str(sparks), "CAPTURE_SPARKINFER": lock["revision"],
                "CAPTURE_FAMILY": release_entry["family"] if release_entry else "deepseek_v41",
                "CAPTURE_EXL3": "1" if release_values.get("EXPERT_FORMAT") == "exl3"

@@ -42,55 +42,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         index: rank as u32, capacity_bytes: options.spark_bytes, kv_tokens: 0,
         items: vec![cuteafd_core::memory_layout::spark_runtime_residual(),
             Item::new(Category::Runtime, "context+modules", "", 512 * MIB, Basis::Calibrated)] }).collect::<Vec<_>>();
-    // Media sees fixed target/pool demands and mandatory experts, not the
-    // optional Auto prefix. Spark-free admission must reserve every expert.
-    if report.encoder.is_none() {
-        let towers = mimo_towers(report, checkpoint, model.spec().hidden as u64);
-        let mut media_options = options.clone();
-        if spark_ranks > 0 && options.onboard.unwrap_or_else(|| options.local_expert_layers
-            .map(crate::placement::Onboard::Layers).unwrap_or(crate::placement::Onboard::Auto))
-            == crate::placement::Onboard::Auto {
-            media_options.onboard = Some(crate::placement::Onboard::Layers(0));
-        }
-        // Fixed zero onboarding must not grow an automatic pool to all free
-        // memory: cap it at the target, but let it shrink to fit like the main
-        // solve. An explicit POOL_TOKENS stays strict.
-        media_options.pool_ceiling_at_target = true;
-        let mut admission = devices.clone();
-        match apply_resolved(input, &mut media_options, &mut admission, spark_ranks, concurrency, context, manifest) {
-            Ok((placement, working)) => {
-                if let Err(error) = spark_experts(input, options, &mut sparks, placement.onboard_layers) {
-                    report.placement_supported = false; notes.push(format!("MiMo Spark slices: {error:#}"));
-                }
-                // The tower's Spark headroom is what the worker has left after its
-                // rank I/O; the final solve re-charges it for its own working set.
-                spark_io(report, model, options, &working, &mut sparks, &mut notes);
-                resolve_encoder(report, &towers, &mut admission, &mut sparks,
-                    &vec![0; ranks], options, &mut notes);
-                for (device, admitted) in devices.iter_mut().zip(admission) {
-                    device.items.extend(admitted.items.into_iter().filter(|item|
-                        item.group.starts_with("vision") || item.group.starts_with("audio")));
-                }
-                for spark in &mut sparks { spark.items.retain(|item| item.group != "routed_expert"); }
-            }
-            Err(error) => {
-                report.placement_supported = false;
-                notes.push(format!("MiMo media admission: {error:#}"));
-                // The refusal text is built from hints, so carry the actual note.
-                report.hints.push(super::super::Hint { what: format!("MiMo media admission: {error:#}"),
-                    how: "Select a fitting Spark layout or a smaller explicit pool.".into() });
-                // A mandatory target failure must not leave media unresolved or
-                // advertise its unallocated RTX headroom as available.
-                for device in &mut admission {
-                    device.items.push(Item::new(Category::Reserved, "unavailable target admission", "",
-                        device.capacity_bytes, Basis::Formula));
-                }
-                let _ = spark_experts(input, options, &mut sparks, 0);
-                resolve_encoder(report, &towers, &mut admission, &mut sparks,
-                    &vec![0; ranks], options, &mut notes);
-                for spark in &mut sparks { spark.items.retain(|item| item.group != "routed_expert"); }
-            }
-        }
+    for (device, items) in devices.iter_mut().zip(&options.encoder_items) {
+        device.items.extend(items.iter().cloned());
     }
     let mut pool_tokens = 0;
     let mut waste = Vec::new();

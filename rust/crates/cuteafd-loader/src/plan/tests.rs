@@ -588,6 +588,40 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
 }
 
 #[test]
+fn native_admission_uses_mandatory_budget_without_copying_it_into_the_final_solve() {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let original = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let gib = 1u64 << 30;
+    let raw = DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: 10 * gib,
+        items: vec![Item::new(Category::Runtime, "context", "", gib, Basis::Exact)], kv_tokens: 0 };
+    let mut inventory = raw.clone();
+    inventory.items.push(Item::new(Category::Weights, "mandatory owners and target pool", "", 8 * gib, Basis::Exact));
+    let towers = layout::Towers { name: "test", vision: Ok((2 * gib, 0)), audio: Ok((0, 0)), v41: false };
+    for mode in [MediaMode::Auto, MediaMode::Rtx(None), MediaMode::Off] {
+        let mut report = original.clone();
+        report.vision = mode;
+        report.audio = MediaMode::Off;
+        report.encoder = None;
+        report.audio_encoder = None;
+        let mut devices = vec![raw.clone()];
+        let mut calls = 0;
+        let result = layout::admit_device_encoders(&mut report, &towers, &mut devices, &mut Vec::new(), &[0],
+            Some(std::slice::from_ref(&inventory)), &layout::LayoutOptions::default(), &mut Vec::new(),
+            |_report, devices| {
+                calls += 1;
+                assert_eq!(devices[0].items, raw.items, "mandatory preview must not be charged twice");
+                Ok(37)
+            }).unwrap();
+        assert_eq!((calls, result), (1, 37));
+        let encoder = report.encoder.unwrap();
+        assert_eq!(encoder.kind, encoder::EncoderKind::Off);
+        assert_eq!(encoder.shortfall, if mode == MediaMode::Off { 0 } else { gib });
+        if mode == MediaMode::Rtx(None) { assert!(!report.placement_supported); }
+    }
+}
+
+#[test]
 fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
@@ -1961,6 +1995,29 @@ fn audio_defaults_off_without_qualified_bundle_and_explicit_placement_refuses() 
     assert!(auto.audio_encoder.is_none());
     assert_eq!(off.encoder_plan_hash, auto.encoder_plan_hash);
     assert_eq!(off.hints.iter().map(|h| &h.what).collect::<Vec<_>>(), auto.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
+}
+
+#[test]
+fn declared_audio_kind_is_checkpoint_native_and_invalid_towers_never_disable_auto() {
+    use crate::media::AudioTowerKind;
+    let cases = [
+        (json!({"model_type":"muse_spark", "audio_config":{"model_type":"muse_spark_audio"}}),
+            Some(AudioTowerKind::MusePcm), "MusePcm"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"audio_channels":20}}),
+            Some(AudioTowerKind::MimoRvq), "MimoRvq"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"model_type":"unknown_audio"}}),
+            None, "unknown_audio"),
+        (json!({"model_type":"qwen4_exp", "audio_config":{}}), None, "qwen4_exp"),
+    ];
+    for (config, kind, named) in cases {
+        let declared = AudioTowerKind::from_config(&config);
+        if let Some(kind) = kind { assert_eq!(declared.unwrap(), Some(kind)); }
+        else { assert!(declared.unwrap_err().contains(named)); }
+        let dir = snapshot(config, &[]);
+        let error = resolve_audio(MediaMode::Auto, dir.path()).unwrap_err().to_string();
+        assert!(error.contains(named), "{error}");
+        assert_eq!(resolve_audio(MediaMode::Off, dir.path()).unwrap(), MediaMode::Off);
+    }
 }
 
 #[test]
@@ -4334,6 +4391,59 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
 }
 
 #[test]
+fn glm_flash_auto_sparks_reserves_tower_before_optional_experts() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(16);
+    cfg["text_config"]["n_routed_experts"] = json!(8);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let mut tensors = glm5_flash_tensors(&cfg);
+    tensors.extend(super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)));
+    let expert_zero: Vec<_> = tensors.iter().filter(|(name, ..)| name.contains(".mlp.experts.0.")).cloned().collect();
+    for expert in 1..8 {
+        tensors.extend(expert_zero.iter().map(|(name, dtype, shape)|
+            (name.replace(".mlp.experts.0.", &format!(".mlp.experts.{expert}.")), *dtype, shape.clone())));
+    }
+    let dir = snapshot(cfg, &tensors);
+    let package = dir.path().join("lib/fp8/fp8-glmf");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(package.join("manifest.json"), json!({"layouts":{"tp2":{
+        "capacities":[{"capacity":4096,"scratch_bytes":12345}]}}}).to_string()).unwrap();
+    let share = dir.path().join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let manifest = share.join("PROGRAMS.json");
+    std::fs::write(&manifest, json!({"capacities":{"max_context":262144},"programs":programs}).to_string()).unwrap();
+    // The Spark physical ceiling leaves no native tower room, forcing Auto to
+    // test an RTX reservation through the unchanged pool-first solver.
+    let options = PlanOptions { vision: MediaMode::Auto,
+        attention_placement: Some(AttentionPlacement::Heads),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30; 2], spark_bytes: 1 << 30,
+            context_tokens: 262144, pool_tokens: Some(262144),
+            glmf_drafter_disabled: true, glmf_prefill_expanded: false,
+            prefill_rows: 4096, prefill_waves: 2, state_slots: Some(8), prefix_slots: Some(8),
+            glmf_representation: crate::families::glm5_flash::resident::GlmfRepresentation {
+                kda_fp8: false, fp8_head: false, output_shard: false }, graph_budget_bytes: Some(64 << 20),
+            workspace_manifest: Some(manifest), host_memory: Some((128 << 30, 128 << 30)),
+            ..Default::default() }), ..sparks(4) };
+    let auto = plan(dir.path(), &options).unwrap();
+    assert!(auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 }, "{}", render(&auto));
+    let repeated = plan(dir.path(), &options).unwrap();
+    assert_eq!(serde_json::to_value(&auto).unwrap(), serde_json::to_value(&repeated).unwrap());
+    let explicit = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(1)), ..options }).unwrap();
+    assert_eq!(auto.solver_placement, explicit.solver_placement);
+}
+
+#[test]
 fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
     use super::encoder::EncoderKind;
     let mut cfg = glm5_flash_config(2);
@@ -4404,6 +4514,10 @@ fn explicit_encoder_failure_and_small_pool_admission() {
         let invalid = plan(dir.path(), &PlanOptions { vision, ..options.clone() }).unwrap();
         assert!(!invalid.placement_supported);
         assert!(!invalid.executable());
+        assert!(!invalid.memory_layout.as_ref().unwrap().devices.is_empty());
+        let encoder = invalid.encoder.as_ref().expect("named media refusal");
+        assert_eq!(encoder.kind, EncoderKind::Off);
+        assert!(encoder.reason.contains("absent") || encoder.reason.contains("unavailable"), "{}", encoder.reason);
         assert_ne!(invalid.components.iter().find(|c| c.component == Component::Vision).unwrap().status, Status::Disabled);
     }
 }

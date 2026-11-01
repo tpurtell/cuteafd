@@ -17,6 +17,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'python/reference'))
 from fidelity_windows import canonical, validate_public_metadata, validate_public_text, validate_text_source
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
+from fidelity_split import standard_layout
 
 QUICK = ['legacy', 'a00', 'a04', 'a08', 'a20', 'c00', 'd00', 'e00']
 POLICY_EXPECT = dict(top1_min=.90, kl_max=.06,
@@ -97,12 +98,11 @@ def require_new_set_generated_rows(rows):
 
 def standard_generated_rows(panel):
     """Report natural row counts using the consumer's fixed split, never resample."""
-    source = (REPO / 'rust/crates/cuteafd-bench/src/fidelity_dataset.rs').read_text()
+    from fidelity_split import standard_ids
     windows = {window['id']: window for window in panel['windows']}
     counts = {}
     for name in ('decode', 'prefill'):
-        match = re.search(r'pub const STANDARD_' + name.upper() + r':[^=]+=\s*\[(.*?)\];', source, re.S)
-        ids = re.findall(r'"([a-e][0-9]{2}|legacy)"', match.group(1))
+        ids = standard_ids(panel['windows'], name)
         counts[name] = sum(window['roles'][window['score_from']:].count('gen')
                            for window in (windows[wid] for wid in ids))
     small, large = min(counts.values()), max(counts.values())
@@ -196,12 +196,36 @@ KIMI_F32_ROOT = {
 KIMI_F32_PRECISION = 'native MXFP4 experts and shipped BF16/F32 dense tensors, computed in F32'
 
 
+# Exact sealed root arithmetic written by a family golden -> the root precision it computes.
+V41_ROOT = {
+    'arithmetic': 'Official inference/model.py block by block with a torch emulation of kernel.py (FP8 block dense, '
+                  'MXFP4 experts, FP4 compressed KV); Engram tables row-gathered from the checkpoint shards; MTP and caches off.',
+    'source': 'official inference/model.py and kernel emulation',
+}
+V41_PRECISION = 'official FP8 block dense + MXFP4 experts (no vendor BF16 master)'
+
+
+def golden_root(family):
+    import importlib
+    module = importlib.import_module(f'families.{family}.golden')
+    return module.Family.golden_meta(None)['root_arithmetic']
+
+
+ROOT_PRECISIONS = [
+    (lambda: KIMI_F32_ROOT, KIMI_F32_PRECISION),
+    (lambda: V41_ROOT, V41_PRECISION),
+    (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
+    (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
+]
+
+
 def reference_precision(meta, panel):
     precision = panel.get('reference_snapshot', {}).get('precision')
     if isinstance(precision, str) and precision.strip():
         return precision
-    if meta.get('root_arithmetic') == KIMI_F32_ROOT:
-        return KIMI_F32_PRECISION
+    for root, label in ROOT_PRECISIONS:
+        if meta.get('root_arithmetic') == root():
+            return label
     raise ValueError('missing reference precision: unrecognized sealed root arithmetic')
 
 
@@ -246,6 +270,9 @@ def public_panel(panel):
     # Keep immutable generation identity, not deployment arguments or local paths.
     server = public.get('generation_server', {})
     public['generation_server'] = {k: server[k] for k in ('build', 'family', 'model') if k in server}
+    # Superseded internal allocation record of early top-up sets (the window ids and per-block
+    # counts carry the allocation); never consumed.
+    public.pop('topup', None)
     public['publication_provenance'] = {
         **public.get('publication_provenance', {}),
         'source_set_sha256': panel['set_sha256'],
@@ -255,7 +282,21 @@ def public_panel(panel):
     return public
 
 
-def package(source, out, config, tokenizer_path, license_path):
+def identity_note(path, set_id):
+    """An audited equivalence between the computed set and a later manifest of the same tokens."""
+    proof = json.loads(Path(path).read_text())
+    if proof.get('old_set') != set_id or proof.get('all_equal') is not True or not proof.get('windows'):
+        raise ValueError('identity proof does not cover this set with all windows equal')
+    if any(not w.get('equal') for w in proof['windows']):
+        raise ValueError('identity proof has a differing window')
+    return dict(equivalent_set_sha256=proof['new_set'], computed_rules_sha256=proof['old_rules'],
+                equivalent_rules_sha256=proof['new_rules'], windows=len(proof['windows']),
+                proof_sha256=digest(Path(path)),
+                statement='Logits were computed on this set; the equivalent set has byte-identical window tokens, '
+                          'roles and score geometry and differs only in recipe metadata.')
+
+
+def package(source, out, config, tokenizer_path, license_path, identity=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -272,9 +313,9 @@ def package(source, out, config, tokenizer_path, license_path):
             and validation['set_sha256'] == seal['set_sha256'] == full_seal['set_sha256'] == meta['set_sha256'] == rows['set_sha256'] == set_id
             and validation['golden_seal_sha256'] == digest(source / 'golden-seal.json')
             and validation['full_seal_sha256'] == seal['full_seal_sha256'] == digest(source / 'full.sha256.json')
-            and validation['scored_tokens'] == meta['scored_tokens'] == 32768
+            and validation['scored_tokens'] == meta['scored_tokens'] == 512 * len(panel['windows'])
             and np.isfinite(meta['nll']) and abs(validation['nll'] - meta['nll']) <= 1e-8
-            and len(panel['windows']) == 64
+            and standard_layout(panel['windows'])
             and meta['mtp'] is False and meta['use_cache'] is False and meta['attention'] == 'eager'):
         raise ValueError('unsealed or mismatched oracle evidence')
     inventory = {e['path']: e for e in seal['files']}
@@ -288,7 +329,12 @@ def package(source, out, config, tokenizer_path, license_path):
             or proof.get('fixed_rows') != 128 or proof.get('set_sha256') != set_id
             or proof.get('snapshot_identity') != meta['snapshot_identity']):
         raise ValueError('invalid reference prefix qualification')
-    for value in meta['source_pin'].values():
+    for key, value in meta['source_pin'].items():
+        # Identity strings beside the hashes: the pinned library version and the root's HF id.
+        if key == 'transformers' and isinstance(value, str) and re.fullmatch(r'\d+\.\d+\.\d+', value):
+            continue
+        if key == 'checkpoint' and value == meta['checkpoint']:
+            continue
         if not isinstance(value, str) or len(value) not in (40, 64) or any(c not in '0123456789abcdef' for c in value):
             raise ValueError('invalid source pin')
     if rows['dtype'] != '<f2' or rows['kind'] != 'log_softmax':
@@ -312,7 +358,7 @@ def package(source, out, config, tokenizer_path, license_path):
     shutil.copyfile(license_path, destination / 'LICENSE')
     entries = {e['id']: e for e in rows['windows']}
     sealed_rows = {e['path']: e for e in full_seal['files']}
-    if len(entries) != 64 or set(entries) != {w['id'] for w in panel['windows']}:
+    if set(entries) != {w['id'] for w in panel['windows']} or len(entries) != len(panel['windows']):
         raise ValueError('oracle coverage differs')
     files = []
     for window in panel['windows']:
@@ -333,7 +379,16 @@ def package(source, out, config, tokenizer_path, license_path):
                           sha256=digest(target), shape=[512, 1024], source_full_sha256=entry['sha256']))
         print(f'packaged {config}/{wid}', flush=True)
     provenance = {k: meta[k] for k in ('snapshot_identity', 'source_pin', 'platform', 'tokenizers', 'torch',
-                                      'transformers', 'attention', 'mtp', 'use_cache', 'gates', 'native_fp32_parameters')}
+                                      'transformers', 'attention', 'mtp', 'use_cache')}
+    # Layer-major goldens record their checks as arithmetic/expert storage/official forward.
+    provenance['gates'] = meta['gates'] if 'gates' in meta else {
+        k: meta[k] for k in ('arithmetic', 'expert_storage', 'official_forward', 'fixed_rows') if k in meta}
+    if not provenance['gates']:
+        raise ValueError('golden records no reference gates')
+    provenance['native_fp32_parameters'] = meta.get(
+        'native_fp32_parameters', 'checkpoint F32 tensors kept F32; all computation in F32')
+    if meta.get('harness_commit'):
+        provenance['harness_commit'] = meta['harness_commit']
     if meta.get('root_arithmetic') is not None:
         provenance['root_arithmetic'] = meta['root_arithmetic']
         provenance['reference_precision'] = reference_precision(meta, panel)
@@ -343,6 +398,9 @@ def package(source, out, config, tokenizer_path, license_path):
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
+    equivalence = identity_note(identity, set_id) if identity else None
+    if equivalence:
+        provenance['equivalent_set'] = equivalence
     generated_rows = standard_generated_rows(panel)
     require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
@@ -385,7 +443,7 @@ def package(source, out, config, tokenizer_path, license_path):
             f'{panel_description}'
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
-            f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
+            f'{meta["scored_tokens"]:,} scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
             f'{reference_role_note(role_metrics)}'
             f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
@@ -401,6 +459,9 @@ def package(source, out, config, tokenizer_path, license_path):
             + (f'## Panel Caveat\n\n{caveat}\n\n' if caveat else '') +
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
+            + (f'Equivalent set: `{equivalence["equivalent_set_sha256"]}` (recipe rules `{equivalence["equivalent_rules_sha256"][:12]}`; '
+               f'computed under `{equivalence["computed_rules_sha256"][:12]}`) has byte-identical tokens, roles and score geometry '
+               f'in all {equivalence["windows"]} windows; audit proof sha256 `{equivalence["proof_sha256"]}`.\n' if equivalence else '') +
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'
             'Reference data is MIT licensed; the official checkpoint remains subject to its own upstream license.\n')
     validate_public_text(card, scored_text=True)
@@ -416,8 +477,10 @@ def main():
     for name in ('source', 'out', 'tokenizer', 'license'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--config', required=True)
+    parser.add_argument('--identity-proof', type=Path, help='audited token-identity proof to a later manifest')
     args = parser.parse_args()
-    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license), indent=2))
+    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license,
+                             args.identity_proof), indent=2))
     print('Staged only; no upload or engine qualification performed.')
 
 

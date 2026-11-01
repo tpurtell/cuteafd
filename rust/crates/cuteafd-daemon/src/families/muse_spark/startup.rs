@@ -54,6 +54,7 @@ pub(crate) struct Options<'a> {
     pub local: shared::LocalPackage,
     /// The DFlash2 drafter's charge (`shared::drafter_inventory`), when one serves.
     pub drafter: Option<shared::MuseDrafter>,
+    pub media: Option<shared::MediaOptions>,
 }
 
 /// Measured admission: the shared request with live baselines and the code the
@@ -73,13 +74,19 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
             baseline: Baseline::Measured { free_bytes: sample.free_bytes } })
     }).collect::<Result<Vec<_>>>()?;
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
-    shared::placement(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
+    let mut built = shared::request(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
         gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill, slots: options.slots,
         mark_slots: options.mark_slots, context,
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
-        local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })
+        local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })?;
+    if let Some(media) = &options.media { built.admit_media(media)?; }
+    let placed = built.admitted_placement()?;
+    built.local.check(&placed)?;
+    built.request.executor.check(&placed)?;
+    built.check_media_workers(&placed)?;
+    Ok((built, placed))
 }
 
 #[cfg(test)]
@@ -176,7 +183,7 @@ mod tests {
                 spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                 partial_bf16_max_rows: cutoff_rows, partial_wide_format: wide,
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
-                drafter: served_drafter })?;
+                drafter: served_drafter, media: None })?;
             // Coordinator ledgers, item by item (then the whole placement).
             for gpu in 0..gpus {
                 assert_eq!(live.items[gpu], planned.items[gpu], "{label}: GPU {gpu} ledger");
@@ -209,7 +216,7 @@ mod tests {
     #[test]
     fn planner_equals_measured_startup_before_allocation() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        testing::write_muse_spark_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+        testing::write_muse_vision_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
         let input = testing::BudgetedPlanInput::open(dir.path())?;
         let checkpoint = input.checkpoint();
         let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
@@ -248,8 +255,16 @@ mod tests {
                 partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_wide_format: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
-                drafter: None })?;
+                drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint,
+                    cuteafd_loader::plan::MediaMode::Auto, cuteafd_loader::plan::MediaMode::Off, 1)?) })?;
             assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
+            let encoder = report.encoder.as_ref().context("vision placement")?;
+            assert_eq!(encoder.admitted_bytes(), 4_864_551_264, "native vision ledger");
+            let layout = report.memory_layout.as_ref().context("vision layout")?;
+            let native: u64 = layout.devices.iter().flat_map(|device| &device.items)
+                .filter(|item| item.group == "vision tower" || item.group == "vision scratch")
+                .map(|item| item.bytes).sum();
+            assert_eq!(native, encoder.admitted_bytes());
             assert!(live.pool_tokens > 0);
             // The same image without its package: startup refuses whenever the placement
             // onboards, never serving the layers from the Sparks instead.
@@ -267,12 +282,103 @@ mod tests {
                     max_context: None, pool_tokens: None, onboard: Onboard::Auto,
                     spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
                     partial_bf16_max_rows: cuteafd_loader::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
-                    partial_wide_format: Default::default(), local, drafter: None }).err().expect("missing package refuses").to_string();
+                    partial_wide_format: Default::default(), local, drafter: None, media: None }).err().expect("missing package refuses").to_string();
                 assert!(error.contains("rebuild with the Muse coordinator scope"), "{error}");
                 refused += 1;
             }
         }
         assert!(refused > 0, "no layout onboarded, so the missing-package refusal went unexercised");
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_rtx_media_ledgers_equal_measured_startup() -> Result<()> {
+        use cuteafd_loader::plan::MediaMode;
+        media_ledger_case(MediaMode::Rtx(Some(0)), MediaMode::Rtx(Some(1)), 1)
+    }
+
+    #[test]
+    fn replicated_spark_media_ledgers_equal_measured_startup() -> Result<()> {
+        use cuteafd_loader::plan::MediaMode;
+        media_ledger_case(MediaMode::Spark(Some(0)), MediaMode::Spark(Some(1)), 2)
+    }
+
+    #[test]
+    fn audio_only_ledger_equals_measured_startup() -> Result<()> {
+        use cuteafd_loader::plan::MediaMode;
+        media_ledger_case(MediaMode::Off, MediaMode::Rtx(Some(0)), 1)
+    }
+
+    #[test]
+    fn disabled_media_has_no_native_or_host_reservation() -> Result<()> {
+        use cuteafd_loader::plan::MediaMode;
+        media_ledger_case(MediaMode::Off, MediaMode::Off, 1)
+    }
+
+    fn media_ledger_case(vision: cuteafd_loader::plan::MediaMode, audio: cuteafd_loader::plan::MediaMode,
+        replicas: usize) -> Result<()> {
+        use cuteafd_core::memory_layout::DeviceKind;
+        use cuteafd_loader::plan::{encoder::EncoderKind, MediaMode};
+        let dir = tempfile::tempdir()?;
+        testing::write_muse_media_snapshot(dir.path(), &(0..62).collect::<Vec<_>>());
+        let input = testing::BudgetedPlanInput::open(dir.path())?;
+        let checkpoint = input.checkpoint();
+        let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
+        let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
+        let (gpus, sparks) = (2, 6);
+        let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
+        let path = testing::write_muse_exl3_capacities(&dir.path().join("image"));
+        std::fs::write(&path, serde_json::to_vec(&manifest(gpus))?)?;
+        let opts = LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
+            head_split: true, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
+            vision_replicas: replicas, media_cache_bytes: Some(123_456_789), ..Default::default() };
+        let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks), vision, audio,
+            layout: Some(opts.clone()), ..Default::default() })?;
+        assert!(report.fits, "{:?}", report.hints);
+        let planned = report.solver_placement.as_ref().context("media solver placement")?;
+        let prefill = cuteafd_loader::serving_capacity::prefill_waves::prefill_shape(sparks,
+            cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK),
+            Default::default())?;
+        let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
+        let (built, live) = admit(Options { cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
+            manifest: &preflight(&path, gpus)?,
+            measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
+                untracked_bytes: arch.context_bytes }; gpus],
+            headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
+            mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
+                shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
+            max_context: None, pool_tokens: None, onboard: Onboard::Auto,
+            spark_budget_bytes: cuteafd_loader::plan::DEFAULT_SPARK_BUDGET_BYTES,
+            partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_wide_format: opts.muse_partial_wide_format,
+            local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
+            drafter: None, media: Some(shared::MediaOptions::from_checkpoint(checkpoint, vision, audio, replicas)?) })?;
+        assert_eq!(&live, planned);
+        let admitted = built.media.context("runtime media")?;
+        assert_eq!(Some(&admitted.vision), report.encoder.as_ref());
+        assert_eq!(Some(&admitted.audio), report.audio_encoder.as_ref());
+        let layout = report.memory_layout.as_ref().context("media memory layout")?;
+        for (name, mode, encoder, bytes, copies) in [
+            ("vision", vision, &admitted.vision, 4_864_551_264, replicas),
+            ("audio", audio, &admitted.audio, 246_586_368, 1),
+        ] {
+            let native = layout.devices.iter().flat_map(|device| &device.items)
+                .filter(|item| item.group == format!("{name} tower") || item.group == format!("{name} scratch"))
+                .map(|item| item.bytes).sum::<u64>();
+            if mode == MediaMode::Off { assert_eq!(native, 0); continue; }
+            assert_eq!(encoder.admitted_bytes(), bytes);
+            let expected_copies = if matches!(encoder.kind, EncoderKind::Spark { .. }) { copies } else { 1 };
+            assert_eq!(native, bytes * expected_copies as u64);
+        }
+        for device in layout.devices.iter().filter(|device| device.kind == DeviceKind::Spark) {
+            let expected = &admitted.spark_items[device.index as usize];
+            for item in expected { assert!(device.items.contains(item)); }
+            let guards = device.items.iter().filter(|item| item.group == "media admission guard").count();
+            assert_eq!(guards, usize::from(!expected.is_empty()));
+        }
+        let host = report.host_ledger.as_ref().context("media host ledger")?;
+        let cache = if vision == MediaMode::Off && audio == MediaMode::Off { 0 } else { 123_456_789 };
+        assert_eq!(host.items.iter().filter(|item| item.group == "media/embedding-cache")
+            .map(|item| item.bytes).sum::<u64>(), cache);
         Ok(())
     }
 

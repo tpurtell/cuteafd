@@ -60,6 +60,9 @@ pub(crate) struct PrefixArgs {
     /// state). Off: exact snapshot frontiers only. GLM 5.3 Flash has none (recurrent state).
     #[arg(long, env = "CUTEAFD_PREFIX_PARTIAL", value_enum, default_value_t = Toggle::Off)]
     pub prefix_partial: Toggle,
+    /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
+    #[command(flatten)]
+    pub reserve: crate::shared::kv_reserve::ReserveArgs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]

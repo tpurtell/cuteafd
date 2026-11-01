@@ -25,7 +25,6 @@ pub(crate) struct ServeArgs {
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
-    #[arg(long, default_value_t = 32768)] pub max_output: u32,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
@@ -54,7 +53,7 @@ impl ServeArgs {
     /// `admitted` is the engine's resolved context extent (the explicit
     /// --max-context, else the checkpoint core's default).
     fn api_limits(&self, admitted: usize) -> Result<NativeLimits> {
-        NativeLimits::new(u32::try_from(self.max_context.unwrap_or(admitted).min(admitted))?, self.max_output)
+        self.prefix.reserve.limits(self.max_context.unwrap_or(admitted).min(admitted))
     }
 
     fn max_context(&self, core: &cuteafd_loader::families::kimi_k3::core::CoreInventory) -> usize {

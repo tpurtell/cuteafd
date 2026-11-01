@@ -52,3 +52,46 @@ fn main() {{
             pixel = mismatch // 2
             raise AssertionError(f"official resize differs at h={pixel // 1792 + 1}, w={pixel % 1792 + 1}: byte {mismatch}")
         raise AssertionError(f"official extreme resize differs at byte {mismatch}")
+
+
+def test_fp32_yardstick_preserves_audio_error_ratio_and_floor():
+    import numpy as np
+    import pytest
+    spec = importlib.util.spec_from_file_location("muse_vision_qualifier",
+        ROOT / "python/tools/qualify/muse_spark/qualify-vision.py")
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    fp32 = np.ones((2, 3), dtype=np.float64)
+    bf16 = fp32 + 1
+    accepted = qualifier.stage_metrics(fp32 + 1.09, bf16, fp32)
+    rejected = qualifier.stage_metrics(fp32 + 1.11, bf16, fp32)
+    assert accepted["passed"] and accepted["error_ratio"] == pytest.approx(1.09)
+    assert not rejected["passed"] and rejected["error_ratio"] == pytest.approx(1.11)
+    assert qualifier.stage_metrics(fp32 + 1e-8, fp32, fp32)["passed"]
+    assert not qualifier.stage_metrics(fp32 + 2e-7, fp32, fp32)["passed"]
+    assert not qualifier.stage_metrics(fp32 * np.nan, bf16, fp32)["passed"]
+    with pytest.raises(ValueError, match="shapes differ"):
+        qualifier.stage_metrics(fp32[:1], bf16, fp32)
+
+
+def test_tail_replay_keeps_local_and_cumulative_errors_separate():
+    import numpy as np
+    spec = importlib.util.spec_from_file_location("muse_vision_tail_qualifier",
+        ROOT / "python/tools/qualify/muse_spark/qualify-vision.py")
+    qualifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(qualifier)
+    stages = {key: np.ones((2, 3), dtype=np.float32) for key in ("52", "53", "54", "55", "56")}
+    bf16 = {mode: {key: value.copy() for key, value in stages.items()}
+            for mode in ("isolated", "chained")}
+    bf16["norm_rounding"] = {"single_store": stages["53"].copy()}
+    fp32 = {mode: {key: value - .001 for key, value in stages.items()}
+            for mode in ("isolated", "chained")}
+    bf16["chained"]["55"] += .5
+    result = qualifier.tail_replay_metrics(stages, bf16, fp32)
+    assert result["inverse_byte_exact"] and result["shuffle_byte_exact"]
+    assert result["isolated"]["55"]["strict_bf16"]["pass"]
+    assert not result["chained"]["55"]["strict_bf16"]["pass"]
+    assert result["isolated"]["53"]["fp32_yardstick"]["passed"]
+    assert result["official_bf16_norm_rounding"]["single_store"]["pass"]
+    bf16["isolated"]["54"][0, 0] += .125
+    assert not qualifier.tail_replay_metrics(stages, bf16, fp32)["shuffle_byte_exact"]

@@ -188,6 +188,8 @@ pub struct LayoutOptions {
     pub workspace_manifest: Option<std::path::PathBuf>,
     /// Per-GPU budget for resident weights (`--coordinator-weight-budget-gib`).
     pub weight_budget_bytes: u64,
+    /// Native media demands installed before the family's pool-first solve.
+    pub encoder_items: Vec<Vec<Item>>,
 }
 
 impl LayoutOptions {
@@ -292,6 +294,7 @@ impl Default for LayoutOptions {
             glmf_kda_fp32_partials: false,
             workspace_manifest: None,
             weight_budget_bytes: u64::MAX,
+            encoder_items: Vec::new(),
         }
     }
 }
@@ -396,10 +399,6 @@ pub fn spark_slot_bytes(family: &str, unit_rows: u64) -> u64 {
         // Qwen K4.5 TP1: eight retained capacity manifests plus wire/routes,
         // 674,287,636 bytes; every TP2/3/4 rank is smaller (see census test).
         "qwen4" => 644 * MIB,
-        // Muse Spark whole experts (H4096, full I4096 per rank, E256, top-8):
-        // the FC1/FC2 activation arenas are twice GLM Flash's TP1 (I2048) at
-        // the same hidden and top-k. Estimated until the first EP census.
-        "muse_spark" => 2 * 569 * MIB,
         _ => 0,
     };
     at_4096.saturating_mul(unit_rows.max(4096)).div_ceil(4096)
@@ -1160,6 +1159,14 @@ pub fn fp32_audio_tower(checkpoint: &super::Checkpoint) -> Result<(u64, u64), St
         .map(|scratch| (plan.weight_bytes(), scratch)).map_err(|e| e.to_string())
 }
 
+/// Bundled causal BF16 PCM weights and fixed sixteen-token streaming scratch.
+pub fn pcm_audio_tower(checkpoint: &super::Checkpoint) -> Result<(u64, u64), String> {
+    let plan = crate::media::pcm_audio::PcmAudioPlan::from_snapshot(&checkpoint.snapshot)
+        .map_err(|e| e.to_string())?;
+    crate::media::pcm_audio::scratch_bytes(crate::media::audio::MAX_CLIP_SAMPLES)
+        .map(|scratch| (plan.weight_bytes(), scratch)).map_err(|e| e.to_string())
+}
+
 /// MiMo's bundled towers: FP32 vectors in the measured 4096-token native
 /// ledger (fixed 4096-row GEMM staging and the 4 MiB BLAS workspace), and its
 /// FP32 audio tower.
@@ -1195,11 +1202,258 @@ pub fn v41_towers(report: &PlanReport) -> Towers {
         v41: true, audio: no_audio() }
 }
 
+pub(crate) fn encoder_items(name: &str, placement: &super::encoder::EncoderPlacement) -> Vec<Item> {
+    vec![Item::new(Category::Weights, format!("{name} tower"),
+        if name == "vision" { "BF16 + FP32 vectors" } else { "FP32 native" }, placement.weights, Basis::Formula),
+        Item::new(Category::Workspace, format!("{name} scratch"),
+            if name == "audio" { "resident BLAS/FFT included" } else { "resident" }, placement.scratch, Basis::Formula)]
+}
+
+/// Family callbacks return the actual admitted layout. Media is installed in
+/// their baselines before solving, so optional expert onboarding cannot win a
+/// race for native tower storage.
+pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &super::PlanInput,
+    report: &mut PlanReport, options: &mut LayoutOptions, requested: ExpertPlacement,
+    towers: &Towers) -> anyhow::Result<MemoryLayout> {
+    use super::{encoder::*, MediaMode};
+    let bytes = |mode, inventory: &Result<(u64, u64), String>| -> anyhow::Result<(u64, u64)> {
+        if mode == MediaMode::Off { return Ok((0, 0)); }
+        inventory.clone().map_err(anyhow::Error::msg)
+    };
+    if (report.vision != MediaMode::Off && towers.vision.is_err())
+        || (report.audio != MediaMode::Off && towers.audio.is_err()) {
+        let mut rtx = options.rtx_bytes.iter().enumerate().map(|(index, &capacity_bytes)| DeviceLayout {
+            kind: DeviceKind::Rtx, index: index as u32, capacity_bytes, items: Vec::new(), kv_tokens: 0,
+        }).collect::<Vec<_>>();
+        let mut notes = Vec::new();
+        resolve_encoder(report, towers, &mut rtx, &mut [], &[], options, &mut notes);
+        let mut memory = model.placement(input, report, options, requested)
+            .ok_or_else(|| anyhow::anyhow!("family has no placement adapter"))??;
+        memory.notes.extend(notes);
+        return Ok(memory);
+    }
+    let vision = bytes(report.vision, &towers.vision)?;
+    let audio = bytes(report.audio, &towers.audio)?;
+    let requests = [EncoderRequest { mode: report.vision, weights: vision.0, scratch: vision.1, copies: options.vision_replicas },
+        EncoderRequest { mode: report.audio, weights: audio.0, scratch: audio.1, copies: 1 }];
+    let hardware = EncoderHardware { v41: towers.v41,
+        gpus: options.rtx_bytes.iter().map(|&free_bytes| EncoderGpuBudget { free_bytes, kv_target_bytes: 0 }).collect(),
+        sparks: (0..requested.spark_ranks()).map(|rank| EncoderSparkBudget { rank, host: format!("spark{rank}"),
+            idle: false, expert_bytes: 0, free_bytes: options.spark_bytes }).collect() };
+    let original = report.clone();
+    let original_options = options.clone();
+    let mut failed = None;
+    let outcome = admit_encoders(&requests, &hardware, |selected| {
+        let mut trial = original.clone();
+        let mut opts = original_options.clone();
+        trial.encoder = Some(selected[0].clone());
+        trial.audio_encoder = (trial.audio != MediaMode::Off).then(|| selected[1].clone());
+        opts.encoder_items = vec![Vec::new(); opts.rtx_bytes.len()];
+        for (name, encoder) in ["vision", "audio"].into_iter().zip(selected) {
+            if let EncoderKind::Rtx { gpu } = encoder.kind {
+                opts.encoder_items[gpu].extend(encoder_items(name, encoder));
+            }
+        }
+        let mut memory = model.placement(input, &mut trial, &mut opts, requested)
+            .ok_or_else(|| anyhow::anyhow!("family has no placement adapter"))??;
+        failed = Some((trial.clone(), opts.clone(), memory.clone()));
+        if !trial.placement_supported || !trial.fits || memory.pool_tokens == 0 {
+            anyhow::bail!("{}", memory.notes.join("; "));
+        }
+        let auto_rtx = requests.iter().zip(selected).any(|(request, selected)|
+            request.mode == MediaMode::Auto && matches!(selected.kind, EncoderKind::Rtx { .. }));
+        if auto_rtx && opts.pool_tokens.filter(|&tokens| tokens > 0).is_none() {
+            let context = if opts.context_tokens > 0 { opts.context_tokens }
+                else { Shape::resolve(&mut trial.clone(), model, &mut opts.clone(),
+                    ShapePolicy::manifest_bounded()).context_tokens };
+            let target = crate::placement::PoolPolicy::resolve(&opts.rtx_bytes, context, None, 256,
+                requested.spark_ranks() == 0).target;
+            anyhow::ensure!(memory.pool_tokens >= target,
+                "auto native tower would reduce the requested KV target {target} to {}", memory.pool_tokens);
+        }
+        // Spark layouts include the selected suffix's resident weights, I/O and
+        // execution owners. Never create a vision-only worker or charge a host
+        // that the successful solve did not retain.
+        for (name, encoder) in ["vision", "audio"].into_iter().zip(selected) {
+            for rank in encoder.spark_ranks() {
+                let device = memory.devices.iter_mut().find(|device| device.kind == DeviceKind::Spark
+                    && device.index as usize == rank).ok_or_else(|| anyhow::anyhow!(
+                        "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS"))?;
+                let required = encoder.admitted_bytes().checked_add(GIB)
+                    .ok_or_else(|| anyhow::anyhow!("media Spark reservation overflow"))?;
+                anyhow::ensure!(spark_encoder_headroom(device, opts.spark_allocation_budget_bytes) >= required,
+                    "Spark {rank} native {name} tower + scratch + 1 GiB exceeds physical/allocation budget");
+                let items = encoder_items(name, encoder);
+                // Preserve the public MiMo ledger's historical display order;
+                // admission above always uses the complete solved inventory.
+                if trial.family.as_deref() == Some("mimo_v2") {
+                    let index = device.items.iter().position(|item| item.group == "Spark runtime residual")
+                        .unwrap_or(device.items.len());
+                    device.items.splice(index..index, items);
+                } else {
+                    device.items.extend(items);
+                }
+            }
+        }
+        Ok((trial, opts, memory))
+    });
+    let (selected, (mut accepted, resolved, mut memory)) = match outcome {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            if failed.is_none() {
+                // No candidate reached the solver (absent device/replica). Keep
+                // the text layout and resolve the explicit refusal on its devices.
+                let mut trial = original.clone();
+                let mut opts = original_options.clone();
+                trial.vision = MediaMode::Off;
+                trial.audio = MediaMode::Off;
+                opts.encoder_items = vec![Vec::new(); opts.rtx_bytes.len()];
+                let memory = model.placement(input, &mut trial, &mut opts, requested)
+                    .ok_or_else(|| anyhow::anyhow!("family has no placement adapter"))??;
+                failed = Some((trial, opts, memory));
+            }
+            if let Some((mut trial, opts, mut memory)) = failed {
+                // Unsupported text geometry still reports media ownership from
+                // the failing solve's actual devices, not an absent encoder.
+                for device in &mut memory.devices {
+                    device.items.retain(|item| !item.group.starts_with("vision ") && !item.group.starts_with("audio "));
+                }
+                trial.vision = original.vision;
+                trial.audio = original.audio;
+                let mut sparks = memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark).cloned().collect::<Vec<_>>();
+                let mut rtx = memory.devices.iter().filter(|device| device.kind == DeviceKind::Rtx).cloned().collect::<Vec<_>>();
+                let kv = vec![0; rtx.len()];
+                resolve_encoder(&mut trial, towers, &mut rtx, &mut sparks, &kv, &opts, &mut memory.notes);
+                memory.devices = rtx;
+                memory.devices.extend(sparks);
+                trial.placement_supported = false;
+                trial.fits = false;
+                trial.hints.push(super::Hint { what: format!("native media admission: {error:#}"),
+                    how: "Select a fitting native encoder placement, pool or Spark layout.".into() });
+                memory.notes.push(format!("native media admission: {error:#}"));
+                *report = trial;
+                *options = opts;
+                return Ok(memory);
+            }
+            return Err(error);
+        }
+    };
+    let mut media_notes = Vec::new();
+    for (name, encoder) in ["vision", "audio"].into_iter().zip(&selected) {
+        if name == "audio" && original.audio == MediaMode::Off { continue; }
+        if encoder.kind == EncoderKind::Off {
+            let component = if name == "vision" { Component::Vision } else { Component::Audio };
+            disable_media_component(&mut accepted, component);
+            if name == "audio" { accepted.audio = MediaMode::Off; }
+        }
+        media_notes.push(format!("{name} {:?}: {}; {} bytes admitted; shortfall {} bytes",
+            encoder.kind, encoder.reason, encoder.admitted_bytes(), encoder.shortfall));
+    }
+    let note_index = if accepted.family.as_deref() == Some("mimo_v2") {
+        memory.notes.iter().position(|note| note.starts_with("placement:")).unwrap_or(memory.notes.len())
+    } else { memory.notes.len() };
+    memory.notes.splice(note_index..note_index, media_notes);
+    accepted.native_serving_admitted = model.native_serving_admission();
+    *report = accepted;
+    *options = resolved;
+    Ok(memory)
+}
+
+pub(crate) fn disable_media_component(report: &mut PlanReport, component: Component) {
+    if let Some(c) = report.components.iter_mut().find(|c| c.component == component)
+        .filter(|c| c.status != Status::Unused && c.status != Status::Disabled) {
+        report.disabled_media_bytes += c.bytes;
+        c.bytes = 0;
+        c.status = Status::Disabled;
+    }
+}
+
+/// Admit at a family's materialized mandatory-inventory boundary. The callback
+/// owns the unchanged full solve; the returned devices and result are reused.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn admit_device_encoders<T>(report: &mut PlanReport, towers: &Towers,
+    rtx: &mut Vec<DeviceLayout>, sparks: &mut Vec<DeviceLayout>, kv: &[u64],
+    budget_rtx: Option<&[DeviceLayout]>, options: &LayoutOptions, notes: &mut Vec<String>,
+    mut solve: impl FnMut(&mut PlanReport, &mut [DeviceLayout]) -> anyhow::Result<T>) -> anyhow::Result<T> {
+    use super::{encoder::*, MediaMode};
+    let hardware = EncoderHardware { v41: towers.v41,
+        gpus: budget_rtx.unwrap_or(rtx).iter().enumerate().map(|(rank, device)| EncoderGpuBudget {
+            free_bytes: device.free_bytes().max(0) as u64, kv_target_bytes: kv.get(rank).copied().unwrap_or(0) }).collect(),
+        sparks: sparks.iter().map(|device| EncoderSparkBudget { rank: device.index as usize,
+            host: format!("spark{}", device.index), idle: false,
+            expert_bytes: device.items.iter().filter(|item| item.category == Category::Experts).map(|item| item.bytes).sum(),
+            free_bytes: spark_encoder_headroom(device, options.spark_allocation_budget_bytes) }).collect() };
+    let resolve_refusal = |report: &mut PlanReport, rtx: &mut Vec<DeviceLayout>,
+        sparks: &mut Vec<DeviceLayout>, notes: &mut Vec<String>| {
+        if let Some(budget) = budget_rtx {
+            let mut inventory = budget.to_vec();
+            resolve_encoder(report, towers, &mut inventory, sparks, kv, options, notes);
+            for (device, admitted) in rtx.iter_mut().zip(inventory) {
+                device.items.extend(admitted.items.into_iter().filter(|item|
+                    item.group.starts_with("vision") || item.group.starts_with("audio")));
+            }
+        } else {
+            resolve_encoder(report, towers, rtx, sparks, kv, options, notes);
+        }
+    };
+    let mut requests = Vec::new();
+    for (mode, inventory, copies) in [(report.vision, &towers.vision, options.vision_replicas),
+        (report.audio, &towers.audio, 1)] {
+        let (weights, scratch) = match inventory {
+            _ if mode == MediaMode::Off => (0, 0),
+            Ok(bytes) => *bytes,
+            Err(_) => {
+                resolve_refusal(report, rtx, sparks, notes);
+                return solve(report, rtx);
+            }
+        };
+        // Retain the shipped explicit refusal (including its exact shortfall).
+        if matches!(mode, MediaMode::Rtx(_) | MediaMode::Spark(_))
+            && encoder_placement(mode, &hardware, weights, scratch, copies).kind == EncoderKind::Off {
+            resolve_refusal(report, rtx, sparks, notes);
+            return solve(report, rtx);
+        }
+        requests.push(EncoderRequest { mode, weights, scratch, copies });
+    }
+    let original = report.clone();
+    let mut failed = None;
+    let result = admit_encoders(&requests, &hardware, |selected| {
+        let mut trial = original.clone();
+        let mut devices = rtx.clone();
+        let mut peers = sparks.clone();
+        let mut trial_notes = Vec::new();
+        install_encoders(&mut trial, towers, &mut devices, &mut peers, kv, options, &mut trial_notes, Some(selected));
+        let result = solve(&mut trial, &mut devices);
+        match result {
+            Ok(result) => Ok((trial, devices, peers, trial_notes, result)),
+            Err(error) => { failed = Some((trial, devices, peers, trial_notes)); Err(error) }
+        }
+    });
+    match result {
+        Ok((_, (trial, devices, peers, trial_notes, result))) => {
+            *report = trial; *rtx = devices; *sparks = peers; notes.extend(trial_notes); Ok(result)
+        }
+        Err(error) => {
+            if let Some((trial, devices, peers, trial_notes)) = failed {
+                *report = trial; *rtx = devices; *sparks = peers; notes.extend(trial_notes);
+            }
+            Err(error)
+        }
+    }
+}
+
 /// Places the media towers beside a layout's devices: `kv` is each GPU's KV
 /// target the tower must leave room for.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_encoder(report: &mut PlanReport, towers: &Towers, rtx: &mut [DeviceLayout],
     sparks: &mut [DeviceLayout], kv: &[u64], options: &LayoutOptions, notes: &mut Vec<String>) {
+    install_encoders(report, towers, rtx, sparks, kv, options, notes, None);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_encoders(report: &mut PlanReport, towers: &Towers, rtx: &mut [DeviceLayout],
+    sparks: &mut [DeviceLayout], kv: &[u64], options: &LayoutOptions, notes: &mut Vec<String>,
+    selected: Option<&[super::encoder::EncoderPlacement]>) {
     use super::encoder::*;
     let (weights, scratch) = match &towers.vision {
         Ok(bytes) => *bytes,
@@ -1221,7 +1475,8 @@ pub fn resolve_encoder(report: &mut PlanReport, towers: &Towers, rtx: &mut [Devi
         gpus: rtx.iter().enumerate().map(|(i,d)| EncoderGpuBudget { free_bytes: d.free_bytes().max(0) as u64, kv_target_bytes: kv.get(i).copied().unwrap_or(0) }).collect(),
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}",d.index), idle: false,
             expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(), free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
-    let mut placement = encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas);
+    let mut placement = selected.map(|selected| selected[0].clone())
+        .unwrap_or_else(|| encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas));
     // Launch starts a Spark worker only for an expert rank and attaches the
     // encoder to that worker. No expert package means no worker to host it.
     let vision_only_spark = matches!(&placement.kind, EncoderKind::Off)
@@ -1288,7 +1543,8 @@ pub fn resolve_encoder(report: &mut PlanReport, towers: &Towers, rtx: &mut [Devi
         sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
             idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
             free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
-    let placement = encoder_placement(report.audio, &hardware, weights, scratch, 1);
+    let placement = selected.map(|selected| selected[1].clone())
+        .unwrap_or_else(|| encoder_placement(report.audio, &hardware, weights, scratch, 1));
     let add = |d: &mut DeviceLayout| {
         d.items.push(Item::new(Category::Weights, "audio tower", "FP32 native", placement.weights, Basis::Formula));
         d.items.push(Item::new(Category::Workspace, "audio scratch", "resident BLAS/FFT included", placement.scratch, Basis::Formula));
@@ -1660,7 +1916,9 @@ pub(crate) fn charge_host(report: &mut PlanReport, options: &LayoutOptions, chec
     push(Category::Tables, "mapped-tables/preloaded", "checkpoint", report.mapped_placement.preloaded_bytes, Basis::Exact);
     let media_cache_loaded = (matches!(family, "mimo_v2" | "qwen4" | "glm5_flash")
         && report.vision != super::MediaMode::Off)
-        || (family == "mimo_v2" && report.audio != super::MediaMode::Off);
+        || (family == "mimo_v2" && report.audio != super::MediaMode::Off)
+        || (family == "muse_spark" && [&report.encoder, &report.audio_encoder].into_iter()
+            .any(|encoder| encoder.as_ref().is_some_and(|encoder| encoder.admitted_bytes() > 0)));
     if media_cache_loaded {
         let media = options.media_cache_bytes.unwrap_or((8u64 << 30).min(total / 20));
         push(Category::Embedding, "media/embedding-cache", "host quota", media, Basis::Formula);

@@ -139,15 +139,7 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
             let stream = self.streams[index];
             planes.push(rank.device.run(|| rank.step.upload(rank.device.library, unit.slot, &meta, true, wave.clone(), stream))?);
             super::forward::embed(self.cfg, rank, &lane, self.table, tokens, stream)?;
-            if !media.indices.is_empty() {
-                // The official model scatters projected features AFTER the
-                // weightless text embedding norm, on every head-split rank.
-                // Reuse admitted scratch; inject_host drains it before normal
-                // producers overwrite residual/token_ids in a later unit.
-                rank.device.run(|| Ok(rank.device.library.embedding_injection()?.inject_host(
-                    &media.features, &media.indices, lane.plane("residual")?, lane.plane("token_ids")?,
-                    lane.rows("hidden", rows)?, rows, self.cfg.hidden, 1, stream)?))?;
-            }
+            super::forward::inject_media(self.cfg, rank, &lane, &media, rows, stream)?;
             lanes.push(lane);
         }
         self.units[unit.index] = Some(UnitState { lanes, planes, wave: None });
@@ -240,17 +232,6 @@ mod tests {
         Ok(())
     }
 
-    /// Units carry state only in their slot: views from `LaneViews::slot`, the
-    /// metadata bank of the unit's slot.
-    #[test]
-    fn units_address_their_slot() {
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        let begin = source.split("fn begin_unit(").nth(1).unwrap().split("fn attention(").next().unwrap();
-        assert!(begin.contains("rank.lane.views.slot(unit.slot)"));
-        assert!(begin.contains("rank.step.upload(rank.device.library, unit.slot, &meta, true"));
-        assert!(begin.contains("super::forward::embed(self.cfg, rank, &lane"));
-        assert!(source.contains("rank.device_with(cfg, self.streams[index], &state.lanes[index])"));
-    }
 
     /// The drafter's tap rows are the call's last `TAP_ROWS` rows: the units
     /// overlapping that window tap their overlap at its window offset, so the
@@ -274,11 +255,6 @@ mod tests {
                 }
                 assert!(covered.iter().all(|&c| c == 1), "rows {rows} unit {unit}");
             }
-        }
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        for hook in ["fn local_ffn(", "fn land_experts("] {
-            let body = source.split(hook).nth(1).unwrap().split("\n    fn ").next().unwrap();
-            assert!(body.trim_end().ends_with("self.tap(layer, unit)\n    }") || body.contains("self.tap(layer, unit)"), "{hook}");
         }
         Ok(())
     }

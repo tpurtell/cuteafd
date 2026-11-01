@@ -417,6 +417,14 @@ impl MtpCache<'_> {
 
     pub(crate) fn reset_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().reset_slot(slot) }
     pub(crate) fn discard_context(&self, slot: usize) -> Result<()> { self.0.borrow_mut().discard_slot(slot) }
+    /// The slot's live draft page reservation.
+    pub(crate) fn reservation(&self, slot: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        let mtp = self.0.borrow();
+        let binding = mtp.bindings.get(slot).copied().flatten()?;
+        mtp.pool.reservation(binding, 2).ok()
+    }
+    pub(crate) fn reservable(&self) -> usize { self.0.borrow().pool.reservable() }
+    pub(crate) fn lifetime_rows(&self) -> usize { self.0.borrow().pool.lifetime_rows(2) }
     pub(crate) fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {
         let mut mtp = self.0.borrow_mut();
         mtp.select_slot(slot)?;

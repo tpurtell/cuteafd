@@ -51,16 +51,29 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
-/// Auto enables only the complete, qualified MiMo V2.6 Flash/Pro tower.
+/// Resolve only complete bundled MiMo RVQ or Muse BF16 PCM checkpoint geometry.
 /// Explicit placement still reports missing or unsupported checkpoint tensors.
 pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
-    match crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
-        crate::media::audio_tower::AudioStorage::Fp32) {
-        Ok(_) => Ok(mode),
-        Err(_) if mode == MediaMode::Auto => Ok(MediaMode::Off),
-        Err(error) => Err(PlanError::InvalidOption { option: "audio placement", reason: error.to_string() }),
-    }
+    let config: serde_json::Value = crate::read_json_file(&snapshot.join("config.json"))
+        .map_err(|error| PlanError::InvalidOption { option: "audio placement", reason: error.to_string() })?;
+    resolve_audio_config(mode, snapshot, &config)
+}
+
+fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value) -> Result<MediaMode, PlanError> {
+    if mode == MediaMode::Off { return Ok(mode); }
+    use crate::media::AudioTowerKind;
+    let invalid = |reason| PlanError::InvalidOption { option: "audio placement", reason };
+    let Some(kind) = AudioTowerKind::from_config(config).map_err(invalid)? else {
+        return if mode == MediaMode::Auto { Ok(MediaMode::Off) }
+            else { Err(invalid("checkpoint has no bundled audio tower".into())) };
+    };
+    match kind {
+        AudioTowerKind::MusePcm => crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ()),
+        AudioTowerKind::MimoRvq => crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+            crate::media::audio_tower::AudioStorage::Fp32).map(|_| ()),
+    }.map_err(|error| invalid(format!("declared {kind:?} audio tower: {error}")))?;
+    Ok(mode)
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -593,7 +606,15 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
-    match model.placement(input, report, options, requested) {
+    let towers = match report.family.as_deref() {
+        Some("glm5_flash") => Some(layout::glm_flash_towers(report, input.checkpoint())),
+        Some("mimo_v2") => Some(layout::mimo_towers(report, input.checkpoint(), model.spec().hidden as u64)),
+        _ => None,
+    };
+    let admission = if let Some(towers) = towers {
+        Some(layout::admit_layout_encoders(model, input, report, options, requested, &towers))
+    } else { model.placement(input, report, options, requested) };
+    match admission {
         Some(Ok(memory)) => {
             report.native_serving_admitted = model.native_serving_admission();
             Ok(memory)
@@ -651,7 +672,7 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
         vision: options.vision,
-        audio: resolve_audio(options.audio, &checkpoint.snapshot)?,
+        audio: resolve_audio_config(options.audio, &checkpoint.snapshot, &checkpoint.config)?,
         disabled_media_bytes: 0,
         encoder: None,
         audio_encoder: None,
@@ -1038,7 +1059,11 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
+        // This call derives executable geometry, not the tensor-only fit verdict.
+        // Runtime admission may refuse while the checkpoint weights still fit.
+        let weights_fit = report.fits;
         let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        report.fits = weights_fit;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
     }
@@ -1061,10 +1086,26 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
     }
     use sha2::{Digest, Sha256};
-    let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
-        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision
-            || (report.audio != MediaMode::Off && r.component == Component::Audio)))
-        .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
+    let is_tower = |name: &str| family.classify(spec, name)
+        .is_some_and(|role| matches!(role.component, Component::Vision | Component::Audio));
+    let mut tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
+        .filter(|t| is_tower(&t.meta.name))
+        .map(|t| (t.meta.name.clone(), format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
+    // Role-filtered coordinator checkpoints omit cold towers. Reopen only the
+    // missing tower shards, once each, without pulling their payloads into RAM.
+    let missing_tower_shards: BTreeSet<_> = checkpoint.weight_map.iter()
+        .filter(|(name, _)| is_tower(name) && !tower_headers.contains_key(*name))
+        .map(|(_, shard)| shard).collect();
+    for shard in missing_tower_shards {
+        let path = checkpoint.snapshot.join(shard);
+        if !path.is_file() { continue; } // Missing-role diagnostics are already populated.
+        for meta in crate::read_safetensors_metadata(&path)? {
+            if is_tower(&meta.name) {
+                tower_headers.insert(meta.name.clone(), format!("{:?}:{:?}:{}:{}",
+                    meta.dtype, meta.shape, meta.byte_offset, meta.byte_length));
+            }
+        }
+    }
     // Preserve the vision-only peer contract exactly while audio is disabled.
     let contract = if report.audio == MediaMode::Off {
         serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement,
