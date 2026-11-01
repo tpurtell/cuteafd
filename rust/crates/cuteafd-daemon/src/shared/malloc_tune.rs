@@ -19,6 +19,8 @@ use std::fmt;
 
 /// glibc caps `M_MMAP_THRESHOLD` at `HEAP_MAX_SIZE / 2` = 32 MiB on 64-bit; larger is refused.
 pub const MAX_MMAP_THRESHOLD: usize = 32 << 20;
+/// Reject tiny thresholds that would turn ordinary allocations into mappings.
+pub const MIN_MMAP_THRESHOLD: usize = 128 << 10;
 /// Default pinned mmap threshold: a 512-token page of ids is 2 KiB, a V4.1 logits row 517 KB,
 /// a long prompt's body megabytes — the per-request transients that matter sit above 256 KiB.
 pub const DEFAULT_MMAP_THRESHOLD: usize = 256 << 10;
@@ -40,7 +42,7 @@ impl Policy {
 
     /// Parse `CUTEAFD_MALLOC_TUNE`: `None`/empty/`on`/`default` = the default pin, `off` = off,
     /// a byte count (optionally `k`/`m` suffixed) = pin at that size, clamped to glibc's maximum.
-    /// Anything else is an error naming the value.
+    /// Counts below 128 KiB and invalid values are errors naming the value.
     pub fn parse(value: Option<&str>) -> Result<Self, String> {
         let value = value.map(str::trim).unwrap_or("");
         match value.to_ascii_lowercase().as_str() {
@@ -56,6 +58,9 @@ impl Policy {
                     .filter(|&bytes| bytes > 0)
                     .ok_or_else(|| format!("CUTEAFD_MALLOC_TUNE={value:?}: expected on, off or a byte count"))?;
                 let mmap = bytes.min(MAX_MMAP_THRESHOLD);
+                if mmap < MIN_MMAP_THRESHOLD {
+                    return Err(format!("CUTEAFD_MALLOC_TUNE={value:?}: minimum mmap threshold is {MIN_MMAP_THRESHOLD} bytes (128k)"));
+                }
                 Ok(Policy::Pin { mmap, trim: mmap.saturating_mul(4) })
             }
         }
@@ -87,8 +92,8 @@ pub fn apply(policy: Policy) -> Applied {
         Policy::Off => Vec::new(),
         Policy::Pin { mmap, trim } => {
             let clamp = |bytes: usize| i32::try_from(bytes.min(i32::MAX as usize)).unwrap_or(i32::MAX);
-            // SAFETY: mallopt only sets allocator parameters; it is documented safe to call at
-            // any time and the daemon calls it before spawning its worker threads.
+            // SAFETY: mallopt only sets allocator parameters. The daemon calls it before
+            // spawning worker threads; tests exercise it in an isolated child process.
             unsafe {
                 vec![
                     libc::mallopt(libc::M_MMAP_THRESHOLD, clamp(mmap)),
@@ -124,7 +129,10 @@ mod tests {
         assert_eq!(Policy::parse(Some("0")), Ok(Policy::Off));
         assert_eq!(Policy::parse(Some("1m")), Ok(Policy::Pin { mmap: 1 << 20, trim: 4 << 20 }));
         assert_eq!(Policy::parse(Some("512k")), Ok(Policy::Pin { mmap: 512 << 10, trim: 2 << 20 }));
-        assert_eq!(Policy::parse(Some("65536")), Ok(Policy::Pin { mmap: 65536, trim: 4 * 65536 }));
+        assert_eq!(Policy::parse(Some("128k")), Ok(Policy::Pin { mmap: MIN_MMAP_THRESHOLD, trim: 4 * MIN_MMAP_THRESHOLD }));
+        for value in ["256", "65536", "127k"] {
+            assert!(Policy::parse(Some(value)).unwrap_err().contains("minimum mmap threshold"));
+        }
         // Above glibc's ceiling clamps rather than fails.
         assert_eq!(Policy::parse(Some("1024m")), Ok(Policy::Pin { mmap: MAX_MMAP_THRESHOLD, trim: 4 * MAX_MMAP_THRESHOLD }));
         assert!(Policy::parse(Some("lots")).is_err());
@@ -142,12 +150,18 @@ mod tests {
     /// nothing. Deleting the pin would fail this: the results would be empty.
     #[test]
     fn apply_pins_glibc_thresholds() {
+        const CHILD: &str = "CUTEAFD_MALLOC_TUNE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "shared::malloc_tune::tests::apply_pins_glibc_thresholds", "--test-threads=1"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success());
+            return;
+        }
         let applied = apply(Policy::default_pin());
         assert_eq!(applied.results, vec![1, 1], "{applied}");
         assert_eq!(apply(Policy::Off).results, Vec::<i32>::new());
         assert!(applied.to_string().contains("pinned at 262144 bytes"));
-        // Restore glibc's dynamic behaviour for the rest of the test binary: mallopt with
-        // M_MMAP_THRESHOLD disables it, so re-pin at the default start value.
-        let _ = apply(Policy::Pin { mmap: 128 << 10, trim: 128 << 10 });
+        // Pinning permanently disables glibc's dynamic threshold in this child only.
     }
 }

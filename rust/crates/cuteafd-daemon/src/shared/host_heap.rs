@@ -8,18 +8,13 @@
 //! Two allocator backends, with DIFFERENT scopes — never compare their numbers
 //! across builds:
 //!
-//! - default build (glibc): `mallinfo2()`.  **Calling thread's arena only.**
-//!   glibc keeps a separate arena per thread (up to `M_ARENA_MAX`), and
-//!   `mallinfo2` reports the arena of the thread that calls it — not the main
-//!   arena and not the process.  The reporter thread may therefore see its own
-//!   (near-empty) arena rather than the serving threads' heaps.  `live` =
-//!   `uordblks + hblkhd` (in-use bytes in that arena plus mmapped chunks),
-//!   `active` = `arena` (non-mmapped arena bytes), `mapped` = `arena + hblkhd`,
-//!   `fragmentation` = `arena - uordblks`, and `hblkhd` is reported separately.
-//!   `resident`, `retained` and `metadata` are 0.  A mutex serializes the
-//!   `mallinfo2` calls (it is MT-Unsafe); that does NOT make it safe against
-//!   concurrent `malloc`/`free` in other threads, so the numbers are a
-//!   best-effort sample.
+//! - default build (glibc): `mallinfo2()` sums every arena, locking each arena
+//!   while walking its free lists, plus process-global mmapped chunks. `live` =
+//!   `uordblks + hblkhd`, `active` = `arena` (non-mmapped arena bytes),
+//!   `mapped` = `arena + hblkhd`, `fragmentation` = `arena - uordblks`.
+//!   `resident`, `retained` and `metadata` are 0. Calls are serialized here;
+//!   allocations continue between arena visits, so this is not an atomic
+//!   process-wide snapshot. The lock walk can briefly delay malloc/free.
 //! - `--features jemalloc`: jemalloc is the global allocator; all arenas are
 //!   covered.  `live` = `stats.allocated`, `active` = `stats.active`,
 //!   `mapped` = `stats.mapped` (**active extents only**), `retained` =
@@ -35,23 +30,23 @@
 //! native library and change its allocator behaviour.
 //!
 //! Always available: `rss` from `/proc/self/statm`, and a `host_heap` object in
-//! `/v1/stats` (see `serving_stats`).  The snapshot is refreshed by a background
-//! reporter (at most once per `CUTEAFD_HOST_HEAP_SECS`, or every 60 s when that
-//! is 0); the serving path only reads the cached copy, so it may be up to one
+//! `/v1/stats` for every family. The snapshot is refreshed by a background
+//! reporter (every `CUTEAFD_HOST_HEAP_SECS`, with a minimum/default of 60 s).
+//! The serving path only reads the cached copy, so it may be up to one
 //! reporter interval stale.  Logging is opt-in:
 //!
 //! - `CUTEAFD_HOST_HEAP_EVERY=N` — one `cuteafd::hostheap` line every N retired
 //!   requests (0/unset = off).
-//! - `CUTEAFD_HOST_HEAP_SECS=N` — one line every N seconds (0/unset = off; the
-//!   cache is still refreshed every 60 s for `/v1/stats`).
+//! - `CUTEAFD_HOST_HEAP_SECS=N` - log every max(N, 60) seconds (0/unset = off;
+//!   the cache is still refreshed every 60 s for `/v1/stats`).
 //! - `CUTEAFD_JEMALLOC_STATS_SECS=N` (jemalloc build) — newline-delimited
 //!   jemalloc stats every N seconds (0/unset = OFF; the default).
 //! - `CUTEAFD_JEMALLOC_STATS_FILE=path` — append those dumps to `path` instead
 //!   of stderr (the coordinator log).  A file needs a writable mount; the
 //!   coordinator container has none by default.
 //!
-//! The probe never allocates on the serving path beyond the log line itself and
-//! never blocks; `mallinfo2`/jemalloc reads are a handful of microseconds.
+//! The serving path reads only the cached snapshot. Allocator sampling and its
+//! arena-lock walk happen in the reporter, no more than once a minute.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
@@ -59,7 +54,7 @@ use std::sync::{OnceLock, RwLock};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// Refresh cadence for the cached snapshot when `CUTEAFD_HOST_HEAP_SECS` is 0.
+/// Minimum/default refresh cadence: probing glibc walks and locks every arena.
 const DEFAULT_REFRESH_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -85,8 +80,6 @@ pub(crate) struct HeapSnapshot {
     pub hblkhd: u64,
     /// Arena limit (jemalloc only; 0 for glibc).
     pub arenas: u64,
-    /// True for the glibc backend, which sees only the calling thread's arena.
-    pub calling_thread_arena: bool,
 }
 
 fn page_size() -> u64 {
@@ -106,29 +99,26 @@ fn rss_bytes() -> u64 {
 
 #[cfg(not(feature = "jemalloc"))]
 pub(crate) fn snapshot() -> HeapSnapshot {
-    // mallinfo2 is MT-Unsafe: serialize the calls.  This does not make it safe
-    // against concurrent malloc/free in other threads; it only prevents two
-    // mallinfo2 calls from racing each other.
+    // Serialize probes. glibc locks each arena while summing its free lists;
+    // this is not an atomic snapshot across arenas or concurrent mmap activity.
     static LOCK: Mutex<()> = Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: mallinfo2 only reads this process's allocator state.
     let mi = unsafe { libc::mallinfo2() };
-    let arena = mi.arena as u64;
-    let hblkhd = mi.hblkhd as u64;
-    let uordblks = mi.uordblks as u64;
+    glibc_snapshot(mi.arena as u64, mi.uordblks as u64, mi.hblkhd as u64, rss_bytes())
+}
+
+#[cfg(not(feature = "jemalloc"))]
+fn glibc_snapshot(arena: u64, uordblks: u64, hblkhd: u64, rss: u64) -> HeapSnapshot {
     HeapSnapshot {
-        rss: rss_bytes(),
+        rss,
         // uordblks excludes mmapped chunks; hblkhd is where they live.
         live: uordblks.saturating_add(hblkhd),
         active: arena,
         mapped: arena.saturating_add(hblkhd),
-        resident: 0,
-        retained: 0,
-        metadata: 0,
         fragmentation: arena.saturating_sub(uordblks),
         hblkhd,
-        arenas: 0,
-        calling_thread_arena: true,
+        ..HeapSnapshot::default()
     }
 }
 
@@ -156,12 +146,16 @@ pub(crate) fn snapshot() -> HeapSnapshot {
         fragmentation: active.saturating_sub(live),
         hblkhd: 0,
         arenas: arenas::narenas::read().unwrap_or(0) as u64,
-        calling_thread_arena: false,
     }
 }
 
 pub(crate) fn allocator_name() -> &'static str {
     if cfg!(feature = "jemalloc") { "jemalloc" } else { "glibc" }
+}
+
+fn allocator_scope() -> &'static str {
+    // Prefixed jemalloc does not see the native library's glibc allocations.
+    if cfg!(feature = "jemalloc") { "rust_all_arenas" } else { "all_arenas" }
 }
 
 /// Cached snapshot, refreshed by the background reporter.  The serving path
@@ -172,16 +166,14 @@ fn refresh_cache() -> HeapSnapshot {
     let s = snapshot();
     let mut w = CACHE.write().unwrap_or_else(|e| e.into_inner());
     *w = Some(s);
+    drop(w);
+    cuteafd_api::openai::publish_host_heap(snapshot_json());
     s
 }
 
 fn cached() -> HeapSnapshot {
     let guard = CACHE.read().unwrap_or_else(|e| e.into_inner());
-    (*guard).unwrap_or_else(|| HeapSnapshot {
-        // A missing cache must not claim all-arena coverage on the glibc build.
-        calling_thread_arena: !cfg!(feature = "jemalloc"),
-        ..HeapSnapshot::default()
-    })
+    (*guard).unwrap_or_default()
 }
 
 /// The `/v1/stats` object.  Reads the cached snapshot only (never advances the
@@ -190,7 +182,7 @@ pub(crate) fn snapshot_json() -> serde_json::Value {
     let s = cached();
     serde_json::json!({
         "allocator": allocator_name(),
-        "scope": if s.calling_thread_arena { "calling_thread_arena" } else { "all_arenas" },
+        "scope": allocator_scope(),
         "rss_bytes": s.rss,
         "live_bytes": s.live,
         "active_bytes": s.active,
@@ -208,7 +200,7 @@ fn log_snapshot(requests: u64, s: &HeapSnapshot) {
     tracing::info!(target: "cuteafd::hostheap",
         requests,
         allocator = allocator_name(),
-        scope = if s.calling_thread_arena { "calling_thread_arena" } else { "all_arenas" },
+        scope = allocator_scope(),
         live_bytes = s.live,
         active_bytes = s.active,
         mapped_bytes = s.mapped,
@@ -240,6 +232,10 @@ fn env_u64(name: &str) -> u64 {
     }
 }
 
+fn refresh_secs(requested: u64) -> u64 {
+    requested.max(DEFAULT_REFRESH_SECS)
+}
+
 static RETIRED: AtomicU64 = AtomicU64::new(0);
 static EVERY: OnceLock<u64> = OnceLock::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -268,7 +264,7 @@ pub(crate) fn start() {
     let _ = EVERY.set(every);
     // Prime the cache so /v1/stats is meaningful before the first tick.
     refresh_cache();
-    let refresh = if secs > 0 { secs } else { DEFAULT_REFRESH_SECS };
+    let refresh = refresh_secs(secs);
     let spawned = std::thread::Builder::new().name("host-heap".into()).spawn(move || loop {
         std::thread::sleep(Duration::from_secs(refresh));
         let s = refresh_cache();
@@ -340,12 +336,14 @@ mod tests {
         let s = snapshot();
         assert!(s.rss > 0, "rss must be readable: {s:?}");
         assert!(s.live > 0, "live bytes must be nonzero: {s:?}");
-        assert!(s.mapped >= s.active, "mapped {} < active {}: {s:?}", s.mapped, s.active);
         std::hint::black_box(&held);
     }
 
     #[test]
     fn env_zero_means_off() {
+        assert_eq!(refresh_secs(0), 60);
+        assert_eq!(refresh_secs(1), 60);
+        assert_eq!(refresh_secs(120), 120);
         assert_eq!(env_u64("CUTEAFD_HOST_HEAP_EVERY_UNSET_FOR_TEST"), 0);
     }
 
@@ -355,33 +353,21 @@ mod tests {
         let value = snapshot_json();
         assert_eq!(value["allocator"], allocator_name());
         assert!(value["live_bytes"].as_u64().unwrap_or(0) > 0);
-        let expected = if cfg!(feature = "jemalloc") { "all_arenas" } else { "calling_thread_arena" };
+        let expected = if cfg!(feature = "jemalloc") { "rust_all_arenas" } else { "all_arenas" };
         assert_eq!(value["scope"], expected);
     }
 
-    // The old glibc path reported live = uordblks, which excludes mmapped
-    // chunks; a > M_MMAP_THRESHOLD allocation then left `live` flat.  glibc's
-    // dynamic threshold can rise to 32 MiB, so allocate 64 MiB to guarantee an
-    // mmapped chunk.  Run with --test-threads=1 if this flakes: concurrent
-    // frees can only shrink the delta, and the 64 MiB allocation leaves a
-    // 32 MiB margin.
     #[cfg(not(feature = "jemalloc"))]
     #[test]
     fn glibc_live_includes_mmapped_chunks() {
-        let before = snapshot();
-        let held = vec![0u8; 64 << 20];
-        std::hint::black_box(&held);
-        let after = snapshot();
-        let hblkhd_grew = after.hblkhd.saturating_sub(before.hblkhd);
-        assert!(
-            hblkhd_grew >= 32 << 20,
-            "hblkhd grew only {hblkhd_grew} bytes for a 64 MiB mmapped allocation: before={before:?} after={after:?}"
-        );
-        let live_grew = after.live.saturating_sub(before.live);
-        assert!(
-            live_grew >= 32 << 20,
-            "live grew only {live_grew} bytes for a 64 MiB mmapped allocation: before={before:?} after={after:?}"
-        );
+        // Test the accounting directly: process-wide deltas race concurrent frees.
+        let s = glibc_snapshot(1024, 768, 4096, 8192);
+        assert_eq!(s.live, 4864);
+        assert_eq!(s.active, 1024);
+        assert_eq!(s.mapped, 5120);
+        assert_eq!(s.fragmentation, 256);
+        assert_eq!(s.hblkhd, 4096);
+        assert_eq!(s.rss, 8192);
     }
 
     #[cfg(feature = "jemalloc")]
@@ -390,7 +376,6 @@ mod tests {
         refresh_cache();
         let s = snapshot();
         assert!(s.metadata > 0, "jemalloc metadata must be nonzero: {s:?}");
-        assert!(s.mapped >= s.active, "mapped {} < active {}: {s:?}", s.mapped, s.active);
         let v = snapshot_json();
         for key in [
             "allocator",
@@ -408,7 +393,7 @@ mod tests {
             assert!(v.get(key).is_some(), "missing {key}: {v}");
         }
         assert_eq!(v["allocator"], "jemalloc");
-        assert_eq!(v["scope"], "all_arenas");
+        assert_eq!(v["scope"], "rust_all_arenas");
         // mapped is active extents only; retained is reported separately.
         assert!(v["mapped_bytes"].as_u64().unwrap_or(0) >= v["active_bytes"].as_u64().unwrap_or(0));
     }

@@ -114,7 +114,6 @@ fn main() -> Result<()> {
         .init();
     tracing::info!("{host_isa}");
     tracing::info!("{malloc}");
-    shared::host_heap::start();
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
 }
 
@@ -212,6 +211,7 @@ async fn run() -> Result<()> {
         }
         Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeStep5(_) | Commands::ServeGlmf(_)
         | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
+            shared::host_heap::start();
             tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
             shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10));
             shared::thermal::monitor("coordinator");
