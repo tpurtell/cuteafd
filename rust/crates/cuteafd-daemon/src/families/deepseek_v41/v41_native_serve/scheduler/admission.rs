@@ -28,7 +28,10 @@ impl Prepared {
             )?;
             (expanded.tokens, expanded.images)
         };
-        job.max_tokens = limits.output_for_prompt(prompt.len(), job.max_tokens)?;
+        // An oversized prompt is the client's fault, not the replica's: report it
+        // as a bad request so the gateway does not mark this replica down.
+        job.max_tokens = limits.output_for_prompt(prompt.len(), job.max_tokens)
+            .map_err(|error| cuteafd_api::openai::NativeFailure::BadRequest(format!("{error:#}")))?;
         Ok(Self {
             job,
             prompt,
@@ -268,6 +271,15 @@ pub(super) fn remaining_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_prompt_is_reported_as_a_bad_request() {
+        // An oversized prompt is the client's fault: it must map to 400 so the
+        // gateway does not mark the replica down (the 2026-11-01 flapping bug).
+        let source = include_str!("admission.rs");
+        let needle = concat!("NativeFailure::", "BadRequest");
+        assert!(source.contains(needle), "oversized prompts must map to 400, not 500");
+    }
 
     #[test]
     fn media_wake_waits_for_committed_round_and_text_fast_loop_is_unchanged() {
