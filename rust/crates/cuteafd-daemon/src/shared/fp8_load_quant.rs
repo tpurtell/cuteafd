@@ -202,7 +202,7 @@ impl<'a> LoadKernels<'a> {
         for (index, target) in targets.iter().enumerate() {
             let source = target.source;
             ensure!(source.rows > 0 && source.columns > 0 && source.pitch >= source.columns
-                && target.stored_rows % 256 == 0
+                && target.stored_rows % 32 == 0
                 && target.start_row.checked_add(source.rows).is_some_and(|n| n <= target.stored_rows)
                 && (source.rows - 1).checked_mul(source.pitch).and_then(|n| n.checked_add(source.columns))
                     .is_some_and(|n| n <= source.bytes.len())

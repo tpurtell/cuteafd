@@ -61,7 +61,9 @@ __global__ void pack_scale_codes(const cuteafd_scale_code_job_t* jobs,
         const uint64_t col = tile * 4 + byte;
         if (col < job.columns) code |= uint16_t(source[col] - low) << (byte * 4);
       }
-      const uint64_t index = (resident / 256 * tiles + tile) * 256 + resident % 256;
+      const uint64_t tile_start = resident / 256 * 256;
+      const uint64_t tile_rows = min(uint64_t(256), uint64_t(job.stored_rows) - tile_start);
+      const uint64_t index = tile_start * tiles + tile * tile_rows + resident % 256;
       reinterpret_cast<uint16_t*>(job.destination)[index] = code;
     }
   }
@@ -84,7 +86,7 @@ extern "C" int32_t cuteafd_v41_pack_scale_codes_async(
     const uint64_t tiles = (uint64_t(job.columns) + 3) / 4;
     const uint64_t bytes = uint64_t(job.stored_rows) * (tiles * 2 + 1);
     if (!job.source || !job.destination || !job.rows || !job.columns ||
-        job.stored_rows % 256 || job.start_row > job.stored_rows ||
+        job.stored_rows % 32 || job.start_row > job.stored_rows ||
         job.rows > job.stored_rows - job.start_row || job.pitch < job.columns ||
         job.columns > job.source_bytes ||
         uint64_t(job.rows - 1) > (job.source_bytes - job.columns) / job.pitch ||

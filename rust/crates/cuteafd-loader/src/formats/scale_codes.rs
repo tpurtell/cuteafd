@@ -1,4 +1,4 @@
-//! Lossless V4.1 expert scales: N256/K128 uint16 offsets, then one base per row.
+//! Lossless V4.1 expert scales: N256/K128 words with a compact final row tile.
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -26,7 +26,7 @@ impl Rows<'_> {
     pub fn pack(self, output: &mut [u8], stored_rows: usize, start_row: usize) -> Result<(), ScaleCodeError> {
         let tiles = self.columns.div_ceil(4);
         let code_bytes = stored_rows.checked_mul(tiles).and_then(|n| n.checked_mul(2));
-        if self.columns == 0 || self.rows == 0 || self.pitch < self.columns || stored_rows % 256 != 0
+        if self.columns == 0 || self.rows == 0 || self.pitch < self.columns || stored_rows % 32 != 0
             || start_row.checked_add(self.rows).is_none_or(|n| n > stored_rows)
             || self.rows.checked_sub(1).and_then(|n| n.checked_mul(self.pitch))
                 .and_then(|n| n.checked_add(self.columns)).is_none_or(|n| n > self.bytes.len())
@@ -46,7 +46,9 @@ impl Rows<'_> {
             for (tile, block) in source.chunks(4).enumerate() {
                 let mut code = 0u16;
                 for (byte, &value) in block.iter().enumerate() { code |= u16::from(value - low) << (byte * 4); }
-                let index = ((resident / 256 * tiles + tile) * 256 + resident % 256) * 2;
+                let tile_start = resident / 256 * 256;
+                let tile_rows = (stored_rows - tile_start).min(256);
+                let index = (tile_start * tiles + tile * tile_rows + resident % 256) * 2;
                 output[index..index + 2].copy_from_slice(&code.to_le_bytes());
             }
         }
@@ -99,6 +101,65 @@ mod tests {
             rows: 1, pitch: 4, columns: 4, first_row: 384 }.pack(&mut output, 256, 0).unwrap_err();
         assert_eq!(error.to_string(), "mtp.1.ffn.experts.7.w1.scale: row 384 UE8M0 span 16 exceeds 15; unsupported V4.1 scale codes");
     }
+    #[test]
+    fn compact_n_tail_reconstructs_every_scale_and_never_overlaps_bases() {
+        for rows in [32usize, 64, 96, 288, 576, 640, 672, 704, 832, 1152, 1344] {
+            for columns in [1usize, 3, 4, 5, 9, 18, 160, 224] {
+                let source: Vec<u8> = (0..rows).flat_map(|row| (0..columns)
+                    .map(move |col| 110 + (row % 8) as u8 + ((row + col) % 16) as u8)).collect();
+                let mut output = vec![0; plane_bytes(rows, columns).unwrap()];
+                Rows { tensor: "w.scale", bytes: &source, rows, pitch: columns,
+                    columns, first_row: 0 }.pack(&mut output, rows, 0).unwrap();
+                let tiles = columns.div_ceil(4);
+                let code_bytes = rows * tiles * 2;
+                let mut word = 0;
+                // Independent tile-order decoder rather than the packer's row index.
+                for start in (0..rows).step_by(256) {
+                    for tile in 0..tiles {
+                        for row in start..(start + 256).min(rows) {
+                            let code = u16::from_le_bytes(output[word * 2..word * 2 + 2].try_into().unwrap());
+                            for nibble in 0..4 {
+                                let col = tile * 4 + nibble;
+                                let delta = ((code >> (nibble * 4)) & 15) as u8;
+                                if col < columns {
+                                    assert_eq!(delta + output[code_bytes + row], source[row * columns + col]);
+                                } else {
+                                    assert_eq!(delta, 0);
+                                }
+                            }
+                            word += 1;
+                        }
+                    }
+                }
+                assert_eq!(word * 2, code_bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn exact_gate_up_halves_share_a_compact_final_tile() {
+        let width = 288;
+        let rows = 2 * width;
+        let mut output = vec![0; plane_bytes(rows, 5).unwrap()];
+        for (start_row, base) in [(0, 111), (width, 117)] {
+            Rows { tensor: "w13.scale", bytes: &vec![base; width * 5], rows: width,
+                pitch: 5, columns: 5, first_row: 0 }.pack(&mut output, rows, start_row).unwrap();
+        }
+        assert!(output[..rows * 4].iter().all(|&byte| byte == 0));
+        assert!(output[rows * 4..rows * 4 + width].iter().all(|&byte| byte == 111));
+        assert!(output[rows * 4 + width..].iter().all(|&byte| byte == 117));
+    }
+
+    #[test]
+    fn invalid_compact_geometry_is_refused_before_writing() {
+        for stored in [0usize, 31, 33, 511] {
+            let mut output = vec![0xa5; plane_bytes(stored, 4).unwrap()];
+            assert!(Rows { tensor: "w.scale", bytes: &[111; 4], rows: 1,
+                pitch: 4, columns: 4, first_row: 0 }.pack(&mut output, stored, 0).is_err());
+            assert!(output.iter().all(|&byte| byte == 0xa5));
+        }
+    }
+
     #[test]
     fn independent_gate_up_padding() {
         let mut output = vec![0; plane_bytes(1280, 4).unwrap()];
