@@ -10,6 +10,23 @@ import sys
 
 CAPACITY = 16384
 HEADS = 16
+MUSE_GEOMETRY = dict(hidden=1536, intermediate=8960, patch_width=1176,
+                     merge=2, adapter_width=4096, output_width=8192)
+
+
+def muse_transformer_names():
+    """CMake and the exporter share one geometry/program inventory."""
+    g = MUSE_GEOMETRY
+    h, i, a = g["hidden"], g["intermediate"], g["adapter_width"]
+    names = [f"layer_norm_h{h}", f"residual_h{h}", f"row_gather_h{h}",
+             f"spatial_merge_h{h}_r{g['merge']}"]
+    names += [f"biased_projection_h{w}_o{o}" for w, o in
+              ((h, 3 * h), (h, h), (h, i), (i, h))]
+    names += [f"projection_h{w}_o{o}" for w, o in
+              ((g["patch_width"], h), (h * g["merge"] ** 2, a),
+               (a, a), (a, g["output_width"]))]
+    names += [f"gelu_h{w}" for w in dict.fromkeys((i, a))]
+    return [f"vision_{name}" for name in names]
 
 
 def tile_for_head_dim(head_dim):
@@ -20,16 +37,23 @@ def tile_for_head_dim(head_dim):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--capability", type=int, choices=(120, 121), required=True)
-    parser.add_argument("--group", choices=("legacy", "pointwise", "attention"), default="legacy")
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--capability", type=int, choices=(120, 121))
+    parser.add_argument("--group", choices=("legacy", "pointwise", "attention", "transformer"), default="legacy")
+    parser.add_argument("--list-transformer-programs", action="store_true")
     parser.add_argument("--head-dim", type=int, default=96)
     parser.add_argument("--hidden", type=int, default=1536)
     parser.add_argument("--bf16-products", action="store_true")
     parser.add_argument("--learned-position", action="store_true")
+    parser.add_argument("--with-transformer", action="store_true")
     parser.add_argument("--bf16-before-gamma", action="store_true")
     parser.add_argument("--windowed", action="store_true")
     args = parser.parse_args()
+    if args.list_transformer_programs:
+        print(";".join(muse_transformer_names()))
+        return
+    if args.output_dir is None or args.capability is None:
+        parser.error("--output-dir and --capability are required for export")
     # No driver/runtime access or initialized device context is permitted here.
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
     os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
@@ -78,6 +102,10 @@ def main():
         declarations = builders(args.group, head_dim=args.head_dim, hidden=args.hidden,
             bf16_products=args.bf16_products, learned_position=args.learned_position,
             bf16_before_gamma=args.bf16_before_gamma, windowed=args.windowed)
+        if args.with_transformer:
+            if args.group != "pointwise":
+                parser.error("--with-transformer requires --group pointwise")
+            declarations.update(builders("transformer"))
         export_programs(destination, "vision", declarations)
         if torch.cuda.is_initialized():
             raise RuntimeError("offline vision export initialized CUDA")
@@ -126,6 +154,11 @@ def builders(group, *, head_dim=96, hidden=1536, bf16_products=False,
              learned_position=False, bf16_before_gamma=False, windowed=False):
     """Static tower geometry only; image dimensions and rows remain launch data."""
     from b12x.integration.cuteafd import media
+    if group == "transformer":
+        result = media.vision_transformer_programs(**MUSE_GEOMETRY)
+        if [f"vision_{name}" for name in result] != muse_transformer_names():
+            raise ValueError("Muse transformer declaration inventory differs from CMake")
+        return result
     if group == "attention":
         return {f"attention_d{head_dim}_{'windows' if windowed else 'full'}":
                 lambda: media.compile_vision_attention_aot(dim=head_dim, windowed=windowed)}
