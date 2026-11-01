@@ -371,6 +371,13 @@ fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
         assert_eq!(encoder.kind, EncoderKind::Off);
         assert!(encoder.reason.contains("refused"));
     }
+}
+
+#[test]
+fn media_auto_off_disables_component_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     // Force Auto through Off without changing the text inventory: impossible
     // replica count eliminates Sparks; a capacity just above the text-only
     // layout leaves no room for either tower.
