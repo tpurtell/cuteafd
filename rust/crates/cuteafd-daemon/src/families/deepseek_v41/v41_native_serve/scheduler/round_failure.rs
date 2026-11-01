@@ -54,7 +54,7 @@ pub(super) struct RetireReport {
 pub(super) fn fail_round<M: RoundMember>(active: &mut [Option<M>], error: &anyhow::Error) {
     let message = format!("{error:#}");
     for member in active.iter_mut().flatten() {
-        member.fail(&message);
+        if !member.is_done() { member.fail(&message); }
     }
 }
 
@@ -103,6 +103,18 @@ pub(super) fn release_both(kv: impl FnOnce() -> anyhow::Result<()>,
     first.and(second)
 }
 
+/// Drain admissions that never reached `active`, including ready media waiters.
+/// Pop one at a time so a fatal error during admission leaves all other owners here.
+pub(super) fn drain_admissions(
+    admitted: &mut std::collections::VecDeque<super::PackedAdmission>, message: &str,
+    mut release: impl FnMut(CacheLease, u64),
+) {
+    while let Some((prepared, id, lease, ..)) = admitted.pop_front() {
+        let _ = prepared.job.events.send(Err(message.to_owned().into()));
+        release(lease, id);
+    }
+}
+
 /// RV3-5: the scheduler's admission release: [`release_both`] over the KV lease
 /// and the draft slot, logging (never returning) an error.
 pub(super) fn release_admission<'w, 'a, C: DraftChain<'a>>(requests: &mut Requests<'a>,
@@ -141,7 +153,7 @@ impl<'a, C: DraftChain<'a>> Releaser<Active<'a>> for RetireAdapter<'_, '_, '_, '
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
@@ -197,6 +209,114 @@ mod tests {
     fn leases(count: u64) -> HashSet<u64> { (0..count).collect() }
 
     fn fault(message: &str) -> anyhow::Error { anyhow::anyhow!("{message}") }
+
+    pub(in super::super) fn active_fixture(id: u64, lane: u8) -> (Active<'static>,
+        tokio::sync::mpsc::UnboundedReceiver<std::result::Result<super::super::InferenceChunk,
+            cuteafd_api::openai::NativeFailure>>, std::sync::Arc<UsageLog>) {
+        use super::super::*;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), serde_json::json!({
+            "version":"1.0", "model":{"type":"WordLevel", "vocab":{"?":0,"end":1}, "unk_token":"?"}
+        }).to_string()).unwrap();
+        let decoder = cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap();
+        let log = Arc::new(UsageLog::default());
+        let usage = cuteafd_api::usage::UsageHandle::new(Default::default(), log.clone());
+        usage.finished(200);
+        let mut ticket = console::Ticket::new(id, lane, Some(usage));
+        let now = Instant::now();
+        ticket.announce(1, 0, 1, false, 0, (now, now));
+        let (events, output) = mpsc::unbounded_channel();
+        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+            prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
+            max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events,
+            usage: None, probe: None };
+        (Active { constraint: None, ticket, lease: CacheLease::unbound_for_test(id as usize), job,
+            decoder, anchor: 0, generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
+            tokens: vec![0], image_keys: super::super::super::prefix::media_keys(&[0], &[]).unwrap(),
+            next_after_commit: None }, output, log)
+    }
+
+    #[derive(Default)]
+    pub(in super::super) struct UsageLog {
+        pub records: Mutex<Vec<cuteafd_api::usage::Record>>,
+        counters: cuteafd_api::usage::Counters,
+    }
+    impl cuteafd_api::usage::UsageSink for UsageLog {
+        fn record(&self, record: cuteafd_api::usage::Record) { self.records.lock().unwrap().push(record); }
+        fn counters(&self) -> &cuteafd_api::usage::Counters { &self.counters }
+    }
+
+    #[test]
+    fn same_round_lane_finish_survives_peer_failure() {
+        use super::super::InferenceChunk;
+        let (mut finished, mut finished_output, finished_log) = active_fixture(1, 0);
+        let (running, mut running_output, running_log) = active_fixture(2, 1);
+        finished.emit(&[1]).unwrap();
+        let mut active = [Some(finished), Some(running)];
+        fail_round(&mut active, &fault("lane 1 verification failed"));
+        fail_round(&mut active, &fault("repeated failure"));
+        assert!(active[0].as_ref().unwrap().cacheable, "finished turn retains its prefix");
+        assert!(!active[0].as_ref().unwrap().failed);
+        let mut finishes = 0;
+        while let Ok(event) = finished_output.try_recv() {
+            match event.unwrap() { InferenceChunk::Finish { .. } => finishes += 1, _ => () }
+        }
+        assert_eq!(finishes, 1);
+        assert!(matches!(running_output.try_recv(), Ok(Err(_))));
+        assert!(running_output.try_recv().is_err(), "peer gets exactly one terminal error");
+        for mut member in active.into_iter().flatten() { member.console_retire(); }
+        let finished = finished_log.records.lock().unwrap();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].outcome, "ok");
+        assert!(finished[0].error_class.is_none(), "console ticket retires done, not failed");
+        assert_eq!(running_log.records.lock().unwrap()[0].error_class.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn fatal_admission_exit_answers_and_releases_all_pending_owners() {
+        // Check the actual serve ownership boundary as well as its drain behavior:
+        // a perfect drain helper is useless if the fallible loop has already dropped the queue.
+        let source = include_str!("../scheduler.rs");
+        let boundary = source.find("let result = (|| -> Result<()> {\n    loop {").unwrap();
+        assert!(source[..boundary].contains("VecDeque::<PackedAdmission>"));
+        let exit = &source[source.find("// A fatal target/transport error").unwrap()..];
+        assert!(exit.contains("admitted.extend(media_ready.drain(..)"));
+        assert!(exit.contains("round_failure::drain_admissions("));
+        let media = include_str!("admission.rs");
+        assert!(!media.contains("-> Result<Vec<Leased>>"), "media cleanup cannot abort serve");
+        assert!(!source.contains("leased.fail(error, requests, draft.as_deref_mut())?"));
+
+        let mut pending = std::collections::VecDeque::new();
+        let mut outputs = Vec::new();
+        let mut slots = HashSet::new();
+        let mut kv = HashSet::new();
+        let mut draft = HashSet::new();
+        for id in 0..3 {
+            let (request, output, _) = active_fixture(id, 0);
+            slots.insert(id as usize); kv.insert(id); draft.insert(id);
+            let now = std::time::Instant::now();
+            pending.push_back((super::super::admission::Prepared { job: request.job, prompt: vec![0], images: vec![] },
+                id, request.lease, id as usize, request.image_keys, None, (now, now)));
+            outputs.push(output);
+        }
+        // The first packed member has already transferred ownership to active;
+        // the two remaining owners include a ready media waiter.
+        let first = pending.pop_front().unwrap();
+        drain_admissions(&mut pending, "prefill/reset failed", |lease, id| {
+            assert_eq!(lease, CacheLease::unbound_for_test(id as usize));
+            kv.remove(&id); draft.remove(&id); slots.remove(&(id as usize));
+        });
+        assert!(pending.is_empty());
+        assert_eq!(kv, HashSet::from([0]));
+        assert_eq!(draft, HashSet::from([0]));
+        assert_eq!(slots, HashSet::from([0]));
+        for output in &mut outputs[1..] {
+            assert!(matches!(output.try_recv(), Ok(Err(_))));
+            assert!(output.try_recv().is_err());
+        }
+        assert!(outputs[0].try_recv().is_err(), "active owner is untouched by admission drain");
+        drop(first);
+    }
 
     /// 48 members, one failed round: every member gets exactly one error event.
     #[test]

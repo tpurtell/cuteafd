@@ -58,14 +58,12 @@ impl Leased {
     }
     /// Release the lease and draft slot without answering the client.
     pub fn release<'a, C: DraftChain<'a>>(&self, requests: &mut Requests<'a>,
-        draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
-        let target = requests.release_if_present(self.lease);
-        let speculative = draft.map(|draft| draft.release(self.id)).transpose();
-        target.and(speculative.map(|_| ()))
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>) {
+        round_failure::release_admission(requests, draft, self.lease, self.id);
     }
     /// Answer the client with `error` (unavailable unless typed) and release.
     pub fn fail<'a, C: DraftChain<'a>>(self, error: anyhow::Error, requests: &mut Requests<'a>,
-        draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>) {
         let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>().cloned()
             .unwrap_or_else(|| cuteafd_api::openai::NativeFailure::Unavailable(format!("{error:#}")));
         let _ = self.prepared.job.events.send(Err(failure));
@@ -132,10 +130,10 @@ impl<C: EncoderClient> Media<C> {
     /// Retire waiters whose client left, then collect the requests whose
     /// features are all installed. A failed encode answers its client.
     pub fn poll<'a, D: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
-        mut draft: Option<&mut DraftRuntime<'_, 'a, D>>) -> Result<Vec<Leased>> {
+        mut draft: Option<&mut DraftRuntime<'_, 'a, D>>) -> Vec<Leased> {
         for slot in 0..self.leased.len() {
             if self.leased[slot].as_ref().is_some_and(|leased| leased.prepared.job.events.is_closed()) {
-                self.leased[slot].take().unwrap().release(requests, draft.as_deref_mut())?;
+                self.leased[slot].take().unwrap().release(requests, draft.as_deref_mut());
             }
         }
         let mut ready = Vec::new();
@@ -146,30 +144,31 @@ impl<C: EncoderClient> Media<C> {
                     // V4.1 restores before it encodes, so the waiter's resume is exact.
                     debug_assert!(waiter.retries() == 0 && !waiter.cold(), "V4.1 media waiter reconciled");
                     let (slot, media) = waiter.into_parts();
-                    let request = self.leased[slot].take().context("media waiter without a request")?;
+                    let Some(request) = self.leased[slot].take() else {
+                        tracing::error!(slot, "media waiter without a request");
+                        continue;
+                    };
                     match install(requests, &request, &media) {
                         Ok(()) => ready.push(request),
-                        Err(error) => request.fail(error, requests, draft.as_deref_mut())?,
+                        Err(error) => request.fail(error, requests, draft.as_deref_mut()),
                     }
                 }
                 MediaPoll::Failed(slot, error) => {
                     if let Some(request) = self.leased[slot].take() {
-                        request.fail(media_failure(error), requests, draft.as_deref_mut())?;
+                        request.fail(media_failure(error), requests, draft.as_deref_mut());
                     }
                 }
                 MediaPoll::Pending | MediaPoll::Empty => break,
             }
         }
-        Ok(ready)
+        ready
     }
     /// Answer every waiter and release its owners (the scheduler stopped).
     pub fn stop<'a, D: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
         mut draft: Option<&mut DraftRuntime<'_, 'a, D>>) {
         let unavailable = || cuteafd_api::openai::NativeFailure::Unavailable("vision admission stopped".into());
         for request in self.leased.iter_mut().filter_map(Option::take) {
-            if let Err(error) = request.fail(anyhow::anyhow!(unavailable()), requests, draft.as_deref_mut()) {
-                tracing::warn!(%error, "releasing stopped image owners");
-            }
+            request.fail(anyhow::anyhow!(unavailable()), requests, draft.as_deref_mut());
         }
         for prepared in self.backlog.drain(..) { let _ = prepared.job.events.send(Err(unavailable())); }
         let _ = self.admission.poll(|_| true);

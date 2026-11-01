@@ -501,13 +501,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
         if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact { 0 }
         else { args.prefill_batch_tokens as usize });
+    // Keep pending owners outside the fallible loop so every fatal exit can drain them.
+    let mut admitted = std::collections::VecDeque::<PackedAdmission>::new();
+    let mut media_ready = std::collections::VecDeque::new();
     let result = (|| -> Result<()> {
     loop {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         prefixes.tick(requests, draft.as_deref_mut())?;
-        let media_ready = media.poll(requests, draft.as_deref_mut())?;
+        media_ready.extend(media.poll(requests, draft.as_deref_mut()));
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
@@ -538,15 +541,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
         // Admit available work at a completed boundary. Prefill currently owns
         // both lanes; mixed prefill/decode interleaving is a subsequent policy.
-        let mut media_ready = media_ready.into_iter();
         let mut intake = receive.len().max(1);
-        let mut admitted: Vec<PackedAdmission> = Vec::new();
         let mut next_wave = std::collections::VecDeque::new();
         let mut held_slots = std::collections::BTreeSet::new();
         loop {
             let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len();
             let backlog = !media.full() && !media.backlog.is_empty();
-            let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.next() {
+            let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.pop_front() {
                 tracing::info!(request_id=leased.id, encoder_ms=leased.started.elapsed().as_secs_f64()*1000.0,
                     "native asynchronous vision preparation");
                 leased.into_admitted()
@@ -614,8 +615,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
                 continue;
             }
-            id = id.checked_add(1).context("request ID exhausted")?;
-            let lease = requests.admit(slot, id)?;
+            let lease = match (|| -> Result<_> {
+                id = id.checked_add(1).context("request ID exhausted")?;
+                requests.admit(slot, id)
+            })() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    let _ = prepared.job.events.send(Err(format!("{error:#}").into()));
+                    return Err(error);
+                }
+            };
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
                 let admission::Prepared { job, prompt, images } = &mut prepared;
@@ -708,7 +717,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let leased = admission::Leased { prepared, id, lease, slot, image_keys, hit, restore, resume,
                     started: Instant::now() };
                 if let Err((leased, error)) = media.enqueue(leased) {
-                    leased.fail(error, requests, draft.as_deref_mut())?;
+                    leased.fail(error, requests, draft.as_deref_mut());
                 }
                 continue;
             }
@@ -718,12 +727,13 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             // Its rows depend only on its tokens and restored frontier, both known
             // now: fetch them while it waits behind earlier members, packed or not.
             start_admission_lookahead(requests, lease, &prepared.prompt, args);
-            admitted.push((prepared, id, lease, slot, image_keys, hit, restore));
+            admitted.push_back((prepared, id, lease, slot, image_keys, hit, restore));
         }
         prefix_waiters.extend(next_wave);
         let mut packed_scores = prefill_packed_admissions::<P>(lib, runtime, requests, prefill_slots,
-            &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
-        for (member, (prepared, id, lease, slot, image_keys, hit, restore)) in admitted.into_iter().enumerate() {
+            admitted.make_contiguous(), args, draft.as_deref_mut(), &mut prefixes)?;
+        let mut member = 0;
+        while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
@@ -774,6 +784,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
                     })
             })();
+            member += 1;
             match result {
                 Ok(mut request) => {
                     request.ticket.first(request.anchor);
@@ -870,6 +881,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             tracing::warn!(retired = report.retired, errors = report.errors, "serve loop stopped; drained active members");
         }
     }
+    admitted.extend(media_ready.drain(..).map(admission::Leased::into_admitted));
+    let message = match &result { Ok(()) => "serve loop stopped".to_owned(),
+        Err(error) => format!("serve loop stopped: {error:#}") };
+    round_failure::drain_admissions(&mut admitted, &message, |lease, id| {
+        round_failure::release_admission(requests, draft.as_deref_mut(), lease, id);
+    });
     media.stop(requests, draft.as_deref_mut());
     result
 }
