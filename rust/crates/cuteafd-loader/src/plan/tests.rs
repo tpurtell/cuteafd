@@ -304,6 +304,52 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
     }
 }
 
+#[test]
+fn boot_concurrency_full_plan_matrix() {
+    let mut fixtures = shared_wave_snapshots();
+    fixtures.push(("deepseek_v41", strict_v41_snapshot(false)));
+    fixtures.push(("mimo_v2", snapshot(mimo_flash_config(), &mimo_flash_tensors())));
+    let kimi = tempfile::tempdir().unwrap();
+    write_kimi_snapshot(kimi.path(), false);
+    fixtures.push(("kimi_k3", kimi));
+    fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
+    let (dense, dense_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+    fixtures.push(("qwen3_5", dense));
+    for (family, dir) in fixtures {
+        let input = PlanInput::open(dir.path()).unwrap();
+        for gpus in [1, 2] {
+            for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+                let mut options = if family == "qwen3_5" { dense_options.clone() }
+                    else { wave_plan_options(dir.path(), 4) };
+                let layout = options.layout.as_mut().unwrap();
+                layout.state_slots = None;
+                layout.rtx_bytes = vec![96 << 30; gpus];
+                layout.concurrency = c;
+                let (report, phases) = input.plan_with_timings(&options);
+                assert!(phases.total() < std::time::Duration::from_secs(10),
+                    "{family} C{c} GPUs={gpus}: {phases:?}");
+                let report = report.unwrap();
+                assert_eq!(report.family.as_deref(), Some(family));
+                if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
+                    assert!(!report.fits && !report.placement_supported);
+                    assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
+                        "{family} C{c}: {}", render(&report));
+                } else {
+                    let cache = report.cache_requirements.as_ref().unwrap();
+                    assert_eq!(u64::from(cache.concurrency), c);
+                    assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+                    if !report.fits || !report.placement_supported {
+                        let memory = report.memory_layout.as_ref().unwrap();
+                        assert!(!report.hints.is_empty() || !memory.notes.is_empty()
+                            || memory.devices.iter().any(|device| device.used_bytes() > device.capacity_bytes),
+                            "{family} C{c}: refusal must name its cause");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn shared_wave_snapshots() -> Vec<(&'static str, tempfile::TempDir)> {
     let flash = glm5_flash_config(2);
     let qwen = qwen4_config(4);

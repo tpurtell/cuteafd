@@ -3288,7 +3288,7 @@ mod tests {
 
     #[test]
     fn concurrency_boundaries_and_bucket_exploration_are_independent() {
-        assert_eq!([0, 1, 2, 4, 5, 8, 9, 16, 128].map(draft_concurrency_bucket), [0, 0, 1, 1, 2, 2, 3, 3, 3]);
+        assert_eq!([0, 1, 2, 4, 5, 8, 9, 16, 17, 32, 33, 128].map(draft_concurrency_bucket), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
         let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         policy.engaged[0] = true;
         policy.engaged[3] = true;

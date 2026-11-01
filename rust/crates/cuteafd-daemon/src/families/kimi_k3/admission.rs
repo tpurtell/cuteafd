@@ -659,7 +659,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     ensure!(i.devices.iter().all(|device| *device >= 0) && i.devices[0] != i.devices[1],
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.attention != Some(AttentionPlacement::Context), "Kimi context attention has no query/LSE exchange ABI");
-    ensure!((1..=64).contains(&i.state_slots) && i.prefix_marks > 0
+    ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&i.state_slots) && i.prefix_marks > 0
         && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&i.rows)
         && (1..=2).contains(&i.lanes), "Kimi native admission slot/prefix/row/lane geometry");
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(i.rows, i.waves, i.unit_rows)?

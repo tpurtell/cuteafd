@@ -172,4 +172,4 @@ fn block(out: &mut BTreeMap<String, TensorContract>, prefix: &str, cfg: &Qwen35C
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
