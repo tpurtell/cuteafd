@@ -297,6 +297,12 @@ impl PrefixFamily for Dsv4Prefix<'_, '_> {
         &placement.units
     }
 
+    /// The step tables are built from the placement's page ids every step.
+    fn extend_pages(&self, placement: &mut Placement, units: &[u32]) -> Result<(), BoxError> {
+        placement.extend(units);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &Placement) -> usize {
         placement.len
     }

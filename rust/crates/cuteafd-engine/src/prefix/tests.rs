@@ -313,6 +313,10 @@ impl PrefixFamily for Fake {
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] {
         &placement.pages
     }
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize {
         placement.len
     }
@@ -394,6 +398,26 @@ fn config(entries: usize, slots: usize) -> PrefixConfig {
 fn cache(fake: &Fake, entries: usize, host_bytes: u64) -> PrefixCache<Shared> {
     let host = HostConfig { bytes: host_bytes, chunk_bytes: 1 << 16, min_tokens: 1, ..HostConfig::default() };
     PrefixCache::new(fake.layout(), config(entries, fake.slots), Some((host, Shared(fake.mem.clone())))).unwrap()
+}
+
+#[test]
+fn extending_a_live_placement_waits_instead_of_failing_and_counts_snapshot_pages() {
+    let fake = Fake::new(8, 2, 4);
+    let mut cache = cache(&fake, 0, 0);
+    let placement = |pages| Placement { pages, ring: 0, len: 0, ring_from: 0 };
+    let mut a = cache.admit_cold(&fake, 1, 1, placement).unwrap().placement;
+    let b = cache.admit_cold(&fake, 1, 1, placement).unwrap().placement;
+    let rows = cache.pool().page_rows();
+    assert_eq!((cache.room(&fake).total(), cache.settled()), (6, true));
+    assert!(cache.extend(&fake, &mut a, 7 * rows).unwrap());
+    assert_eq!((a.pages.len(), cache.room(&fake).total()), (7, 0));
+    assert!(!cache.extend(&fake, &mut a, 8 * rows).unwrap(), "no page: the request waits");
+    assert_eq!(a.pages.len(), 7);
+    assert!(cache.extend(&fake, &mut a, 3 * rows).unwrap(), "already reserved");
+    cache.release(&fake, &b.pages).unwrap();
+    assert!(cache.extend(&fake, &mut a, 8 * rows).unwrap());
+    cache.release(&fake, &a.pages).unwrap();
+    assert_eq!(cache.pool().free(), 8);
 }
 
 #[test]

@@ -366,6 +366,13 @@ impl Qwen4Placement {
         Self { units, pages, pool_pages, slot, len: 0, state_len: 0, mtp_frontier: Default::default(), mtp_snapshot_pending: Default::default(), history, rope: Default::default(), media: None }
     }
 
+    /// Appends freshly reserved units (a decode top-up) with their record and pool pages.
+    pub fn extend(&mut self, units: &[u32]) {
+        self.pages.extend(units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i)));
+        self.pool_pages.extend(units.iter().map(|&u| u as i32));
+        self.units.extend_from_slice(units);
+    }
+
     pub fn record(&self, position: usize) -> Result<i64> {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
@@ -419,6 +426,15 @@ fn ngram_history(eos: u32, ngram_size: usize, tokens: &[u32]) -> NgramHistory {
 #[cfg(test)]
 mod tests {
     use cuteafd_loader::families::qwen4::NgramHasher;
+
+    #[test]
+    fn a_decode_top_up_matches_a_placement_built_over_all_its_units() {
+        let history = || NgramHasher::from_config(1000, 20_000_000, 3, 2, 0, 1234, 7).start();
+        let mut grown = super::Qwen4Placement::new(vec![4, 0], 1, history());
+        grown.extend(&[6, 2]);
+        let whole = super::Qwen4Placement::new(vec![4, 0, 6, 2], 1, history());
+        assert_eq!((&grown.units, &grown.pages, &grown.pool_pages), (&whole.units, &whole.pages, &whole.pool_pages));
+    }
 
     #[test]
     fn mtp_source_charge_uses_scheduler_verify_budget() -> anyhow::Result<()> {

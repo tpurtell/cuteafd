@@ -529,8 +529,6 @@ pub(crate) struct ServeArgs {
     pub mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 32768)]
-    pub max_output: u32,
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)]
@@ -546,7 +544,7 @@ pub(crate) struct ServeArgs {
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
-    use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeLimits};
+    use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
     use std::sync::{Arc, Mutex};
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -625,7 +623,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         result
     });
     let max_context = ready_rx.await.context("dense engine failed before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     let hub = crate::shared::console::hub(false, || console_layout(&args, &profile.id));
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
         hub.clone(), api.serve(profile, &snapshot)?);

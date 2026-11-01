@@ -57,8 +57,6 @@ pub(crate) struct ServeArgs {
     mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
-    #[arg(long, default_value_t = 32768)]
-    max_output: u32,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     max_sequences: u8,
     #[arg(long)]
@@ -450,7 +448,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
-    use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile, NativeLimits};
+    use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -480,7 +478,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         result
     });
     let context = ready_rx.await.context("Step-5 worker exited before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(context)?;
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
         "step5", profile.id.clone(), snapshot.clone())));
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),
@@ -506,6 +504,24 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn output_limits_use_shared_signed_reservation_options() -> Result<()> {
+        let mut args = args();
+        for maximum in [-1, 0, 32768, 131072] {
+            args.prefix.reserve.max_output_tokens = maximum;
+            let expected = cuteafd_api::openai::NativeLimits::new(262_144, maximum)?;
+            assert_eq!(args.prefix.reserve.limits(262_144)?.output(), expected.output());
+            args.prefix.reserve.config(262_144)?;
+        }
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-step5", "--snapshot", "/m",
+            "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2",
+            "--max-output-tokens", "-1", "--kv-decode-reserve-chunk", "640"])?;
+        let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
+        assert_eq!(args.prefix.reserve.max_output_tokens, -1);
+        assert_eq!(args.prefix.reserve.kv_decode_reserve_chunk, 640);
+        Ok(())
     }
 
     #[test]

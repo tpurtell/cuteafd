@@ -145,6 +145,12 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
         }
     }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.pages }
+    /// Each wave uploads the placement's pages; growth happens between rounds only.
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        self.validate(placement, placement.committed)?;
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize { placement.committed }
 
     fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {
@@ -248,6 +254,72 @@ mod tests {
     use crate::shared::memory::device::cache_test_device;
     use cuteafd_engine::prefix::{After, PrefixCache, PrefixConfig, SnapshotKind};
     use cuteafd_hostcache::copy::StubCopyEngine;
+
+    #[test]
+    fn reservation_top_up_past_16k_stalls_and_resumes_with_live_page_tables() -> Result<()> {
+        use crate::shared::kv_reserve::{Reserve, Reserving};
+        use cuteafd_engine::reserve::{Lease, ReserveConfig};
+        struct Request { placement: Placement, lease: Lease, produced: usize, initial_rows: usize }
+        impl Reserving for Request {
+            type Placement = Placement;
+            fn lease(&self) -> &Lease { &self.lease }
+            fn committed(&self) -> usize { self.placement.committed }
+            fn produced(&self) -> usize { self.produced }
+            fn placement(&self) -> &Placement { &self.placement }
+            fn placement_mut(&mut self) -> &mut Placement { &mut self.placement }
+            fn closed(&self) -> bool { false }
+        }
+        // No CUDA owners are needed to exercise the production placement hook.
+        // A nonzero committed prompt avoids resetting a device sequence at bind.
+        let family = Step5Prefix { ranks: Vec::new(), sequences: 3, context: 1 << 20,
+            kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16,
+            layout: FamilyLayout { page_rows: 64, pages: 849, page_bytes: 64,
+                mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::EXACT,
+                mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform },
+            pending: Pending::<()>::default() };
+        let mut cache = PrefixCache::<StubCopyEngine, Frontier>::new(family.layout(), PrefixConfig {
+            entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 64 }, None)?;
+        let mut reserve = Reserve::new(ReserveConfig::new(640, 0, -1, 1 << 20)?, 64);
+        let (mut active, mut stalled) = (Vec::<Request>::new(), Vec::<Request>::new());
+        for sequence in 0..3 {
+            let lease = reserve.lease(16_320, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
+            let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
+            let placement = cache.admit_cold(&family, 16_320, rows,
+                |pages| Placement { pages, sequence, committed: 16_320 })?.placement;
+            let initial_rows = placement.pages.len() * 64;
+            active.push(Request { placement, lease, produced: 1, initial_rows });
+        }
+        let mut waited = std::collections::BTreeSet::new();
+        let (mut saw_resume, mut wrote_past_initial) = (false, false);
+        for _ in 0..4000 {
+            reserve.round(&mut cache, &family, &mut active, &mut stalled, &[], |_, _| panic!("no early end"))?;
+            for request in &stalled { waited.insert(request.placement.sequence); }
+            let descriptors = active.iter().enumerate().map(|(index, request)| {
+                let p = &request.placement;
+                saw_resume |= waited.contains(&p.sequence);
+                wrote_past_initial |= p.committed + 4 > request.initial_rows;
+                super::super::transaction::SequenceRows { sequence: p.sequence, start: index * 4,
+                    rows: 4, base: p.committed, pages: &p.pages }
+            }).collect::<Vec<_>>();
+            if !descriptors.is_empty() {
+                super::super::transaction::validate_wave(&descriptors, cache.pool(), 3, 12, 1 << 20, 849)?;
+            }
+            for request in &mut active {
+                request.placement.committed += 4;
+                request.produced += 4;
+            }
+            let (done, running): (Vec<_>, Vec<_>) = active.drain(..)
+                .partition(|request| request.placement.committed >= request.lease.end());
+            active = running;
+            for request in done { cache.release(&family, &request.placement.pages)?; }
+            if active.is_empty() && stalled.is_empty() { break; }
+        }
+        assert!(active.is_empty() && stalled.is_empty());
+        assert!(saw_resume && wrote_past_initial && !waited.is_empty());
+        assert!(reserve.stats().top_ups > 0 && reserve.stats().stalls > 0);
+        assert_eq!(cache.pool().free(), 849);
+        Ok(())
+    }
 
     #[test]
     fn drafting_restore_requires_every_canonical_predictor_frontier() {
