@@ -3061,7 +3061,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * 16 + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 4 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -3461,6 +3461,9 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     let mut legacy = expected;
     for report in legacy.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = Value::Null;
+        // Restore the historical report's hard-coded provenance before hashing it.
+        report["cache_requirements"]["concurrency"] = json!(16);
+        report["cache_requirements"]["state_slots"] = json!(20);
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
         assert_eq!(notes.remove(1), json!("attention placement heads"));

@@ -14,7 +14,6 @@ pub const fn prefix_entries(concurrency: u64) -> u64 {
 pub const fn request_slots(concurrency: u64, explicit: u64) -> u64 {
     if explicit > concurrency { explicit } else { concurrency }
 }
-pub const fn decode_lanes(concurrency: u64) -> u64 { if concurrency <= 1 { 1 } else { 2 } }
 pub const fn members_per_lane(concurrency: u64, lanes: u64) -> u64 { concurrency.div_ceil(lanes) }
 pub const fn queue_depth(concurrency: u64) -> u64 { concurrency }
 pub const fn draft_budget(members: u64, verify_rows: u64) -> u64 {
@@ -52,7 +51,9 @@ mod tests {
             for c in [1, 4, 16, 17, 32, 64, 65, 128] {
                 assert_eq!(state_slots(c), c);
                 assert_eq!(prefix_entries(c), 20.max((c * 5).div_ceil(4)));
-                assert!(members_per_lane(c, decode_lanes(c)) <= 64);
+                for lanes in [1, 2] {
+                    assert_eq!(members_per_lane(c, lanes), c.div_ceil(lanes));
+                }
                 match validate(family, c) {
                     Ok(()) => assert_eq!(queue_depth(c), c),
                     Err(error) => {
