@@ -360,6 +360,14 @@ pub trait PrefixFamily<M: Clone + Default = ()> {
     }
     /// The placement's pages, in row order.
     fn pages<'p>(&self, placement: &'p Self::Placement) -> &'p [u32];
+    /// Append freshly allocated pages to a live placement (a decode reservation top-up,
+    /// [`PrefixCache::extend`]) and install them wherever the family keeps the placement's page
+    /// list (derived page tables, a bound slot). Runs between rounds only: no queued work reads
+    /// the old list. Nothing has written the new pages. On error the cache releases them.
+    fn extend_pages(&self, placement: &mut Self::Placement, pages: &[u32]) -> Result<(), BoxError> {
+        let _ = (placement, pages);
+        Err("family cannot grow a live placement".into())
+    }
     /// Committed rows: the length a snapshot of this placement may capture (a speculative
     /// family reports the rows its state is consistent at, not rows still being verified).
     fn commit_point(&self, placement: &Self::Placement) -> usize;

@@ -1045,6 +1045,48 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         Ok(())
     }
 
+    /// Grow a live placement's reservation to `rows` rows (and its drafter's credit with it),
+    /// evicting only inactive snapshots. `Ok(false)`, with the target pages unchanged, when the
+    /// pools cannot supply them now: the request waits (stalls) and retries.
+    pub fn extend<F: PrefixFamily<M>>(&mut self, family: &F, placement: &mut F::Placement, rows: usize)
+        -> Result<bool, PrefixError> {
+        // Draft credit first: a raised credit with no target growth is only an early reservation.
+        match self.admit_draft(family, placement, rows) {
+            Ok(()) => {}
+            Err(PrefixError::DraftPages(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        let have = family.pages(placement).len();
+        let total = self.pool.pages_for(rows);
+        if total <= have { return Ok(true); }
+        let need = self.pool.need_for(have..total);
+        if !self.make_room_for(family, need, None)? { return Ok(false); }
+        let fresh = self.pool.alloc_for(have..total)?;
+        if let Err(source) = family.extend_pages(placement, &fresh) {
+            self.pool.release(&fresh);
+            return Err(PrefixError::Family { what: "extend pages", source });
+        }
+        Ok(true)
+    }
+
+    /// Pages a reservation may still take: free pages plus pages only retained snapshots hold
+    /// (what [`PrefixCache::extend`] and admission can evict). A parity pool counts twice its
+    /// scarcer half, since a sequence takes its pages from both halves in turn.
+    pub fn reservable(&self) -> usize {
+        if !self.pool.is_parity() {
+            return self.pool.free() + self.snapshot_only_pages().count();
+        }
+        let mut halves = self.pool.free_halves();
+        for page in self.snapshot_only_pages() { halves[(page & 1) as usize] += 1; }
+        2 * halves[0].min(halves[1])
+    }
+
+    /// Whether every retained page is visible to [`PrefixCache::reservable`]: no capture is
+    /// still queued (its pages come back as an evictable snapshot when it lands).
+    pub fn settled(&self) -> bool {
+        self.pending.is_empty()
+    }
+
     /// Private append lease: share complete pages and COW the partial tail.
     /// The caller either replaces its placement and releases the old lease, or
     /// releases this lease on abort. No committed placement changes here.

@@ -199,6 +199,10 @@ impl PrefixFamily for Split {
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] {
         &placement.pages
     }
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize {
         placement.len
     }
@@ -371,7 +375,7 @@ fn admission_and_growth_stop_at_either_half_and_waiters_see_it() {
     let mut cache = cache(&fake, 0, 0);
     let placement = |pages| Placement { pages, ring: 0, len: 0 };
     // 7 pages: GPU0's half full, GPU1 one free.
-    let mut a = cache.admit_cold(&fake, 1, 7 * ROWS, placement).unwrap().placement.pages;
+    let a = cache.admit_cold(&fake, 1, 7 * ROWS, placement).unwrap().placement.pages;
     assert_eq!(cache.pool().free_halves(), [0, 1]);
     let error = match cache.admit(&fake, &seq(5, 2), 2, false, placement) {
         Err(error) => error,
@@ -383,11 +387,13 @@ fn admission_and_growth_stop_at_either_half_and_waiters_see_it() {
     assert!(matches!(waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), true, |_| false),
         AdmissionPoll::Blocked));
     // Growing to 8 pages needs GPU1's last page.
-    cache.grow(&fake, &mut a, 8 * ROWS).unwrap();
+    assert_eq!(cache.reservable(), 0, "twice the scarcer half");
+    let mut grown = placement(a);
+    assert!(cache.extend(&fake, &mut grown, 8 * ROWS).unwrap());
     assert_eq!(cache.pool().free_halves(), [0, 0]);
-    assert!(cache.grow(&fake, &mut a, 9 * ROWS).is_err(), "position 8 needs GPU0");
-    assert_eq!(a.len(), 8);
-    cache.release(&fake, &a).unwrap();
+    assert!(!cache.extend(&fake, &mut grown, 9 * ROWS).unwrap(), "position 8 needs GPU0");
+    assert_eq!(grown.pages.len(), 8);
+    cache.release(&fake, &grown.pages).unwrap();
     assert!(matches!(waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), true, |_| false),
         AdmissionPoll::Ready(1)));
     // GPU1's limit: a 3-page sequence takes two GPU0 and one GPU1 pages; four of them exhaust
