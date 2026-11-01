@@ -240,6 +240,8 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "admission": kv_waiter.stats(),
         "media": media.stats(),
         "totals": console::totals::snapshot(),
+        // Host-heap live/active/mapped bytes (2026-10-26 residual-growth probe).
+        "host_heap": crate::shared::host_heap::snapshot_json(),
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
     stats

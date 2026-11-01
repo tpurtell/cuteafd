@@ -212,9 +212,19 @@ echo "Host ISA targets: ${host_isas[*]} (base ${host_isas[0]})"
 # CUTEAFD_RELEASE_RUST_LTO / _CODEGEN_UNITS opt in (e.g. thin / 1).
 [[ -z "${CUTEAFD_RELEASE_RUST_LTO:-}" ]] || export CARGO_PROFILE_RELEASE_LTO="$CUTEAFD_RELEASE_RUST_LTO"
 [[ -z "${CUTEAFD_RELEASE_RUST_CODEGEN_UNITS:-}" ]] || export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="$CUTEAFD_RELEASE_RUST_CODEGEN_UNITS"
+# Coordinator-only Cargo features. The coordinator ships jemalloc as its global
+# allocator by default (the host-heap leak fix, §13); experts keep glibc. The
+# off switch is an empty value (CUTEAFD_RELEASE_COORDINATOR_FEATURES=) or a
+# manual --no-default-features build. The feature is off in the Cargo default
+# set, so a plain `cargo build` is unaffected.
+cargo_feature_args=()
+if [[ "$role" == coordinator ]]; then
+  coordinator_features="${CUTEAFD_RELEASE_COORDINATOR_FEATURES-jemalloc}"
+  [[ -z "$coordinator_features" ]] || cargo_feature_args=(--features "$coordinator_features")
+fi
 host_isa_jobs=()
 for host_isa in "${host_isas[@]}"; do
-  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" &
+  cuteafd_host_isa_cargo_build "$cargo_target_dir" "$host_isa" "$build_root/source/rust/Cargo.toml" ${cargo_feature_args[@]+"${cargo_feature_args[@]}"} &
   host_isa_jobs+=("$!")
 done
 for host_isa_job in "${host_isa_jobs[@]}"; do wait "$host_isa_job"; done
