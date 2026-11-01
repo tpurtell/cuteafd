@@ -372,6 +372,33 @@ def test_v41_engram_warm_key_reaches_only_the_coordinator_command(tmp_root, monk
         assert not any("engram-warm" in arg or "ENGRAM_WARM" in arg for arg in worker["argv"])
 
 
+@pytest.mark.parametrize("value", [None, "0", "0.2"])
+def test_v41_decode_share_key_reaches_only_the_coordinator_command(tmp_root, monkeypatch, value) -> None:
+    """DECODE_SHARE reaches serve-native --decode-share as for every family (#953);
+    unset passes nothing (the engine default, 0.2). Planners and workers never see it."""
+    import v41_launch_capture as capture_module
+
+    original = capture_module.example_config
+
+    def with_key(name, directory):
+        config = original(name, directory)
+        if value is not None:
+            config.write_text(config.read_text() + f"DECODE_SHARE={value}\n")
+        return config
+
+    monkeypatch.setattr(capture_module, "example_config", with_key)
+    result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    if value is None:
+        assert "--decode-share" not in command
+    else:
+        assert command[command.index("--decode-share") + 1] == value
+        assert command.count("--decode-share") == 1
+    assert not any("decode-share" in arg for plan in result["plans"] for arg in plan)
+    for worker in result["containers"][1:]:
+        assert not any("decode-share" in arg or "DECODE_SHARE" in arg for arg in worker["argv"])
+
+
 def test_v41_rejects_kv_cache_as_an_unused_key(tmp_root, monkeypatch) -> None:
     """V4.1 has no KV-precision flag. KV_CACHE is a hard error before any container."""
     import v41_launch_capture as capture_module
@@ -450,3 +477,15 @@ def test_profile_spark_wraps_the_selected_v41_worker_and_ncu_skip_reaches_the_co
             assert not any("graceful-stop" in option for option in run["options"])
             assert run["command"][:2] == ["cuteafd", "expertd-native"]
     assert sorted(ranks) == list(range(len(workers)))
+
+
+def test_v41_site_hub_reaches_coordinator_and_each_remote_worker(tmp_root):
+    current = capture(ROOT, CASES[0], site_hub=True)
+    assert len(current["containers"]) > 1
+    for container in current["containers"]:
+        run = parse_run(container["argv"])
+        assert run["env"]["HF_HOME"] == "<root>/hf"
+        assert "<root>/hf/hub:<root>/hf/hub:ro" in run["mounts"]
+        assert not any("/mnt/sparknest:" in mount for mount in run["mounts"])
+        command = run["command"]
+        assert command[command.index("--snapshot") + 1].startswith("<root>/hf/hub/")

@@ -254,6 +254,7 @@ def run(args):
             encode(tokens)
             native, stages, _ = encode(tokens, model is not None)
             saved[tokens] = native
+            result.setdefault("output_sha256", {})[str(tokens)] = hashlib.sha256(native.tobytes()).hexdigest()
             if model is not None:
                 gh, gw, rgb = fixture(tokens)
                 grid = torch.tensor([[1, gh, gw]], device="cuda")

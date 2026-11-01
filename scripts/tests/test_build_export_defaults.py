@@ -104,3 +104,67 @@ def test_spark_exec_forwards_context_admission_inputs():
     cards = (ROOT / 'scripts/bench/wip-cards.py').read_text()
     scopes = cards.split('def build_scopes(cards):', 1)[1].split('def package_dir', 1)[0]
     assert 'CMAKE_BUILD_PARALLEL_LEVEL' not in scopes
+
+
+@pytest.mark.parametrize('mode', ['release', 'wip'])
+@pytest.mark.parametrize('features', [None, '', 'jemalloc'])
+def test_coordinator_allocator_features_reach_cargo(mode, features):
+    """Execute launcher argv and the artifact script's feature selection, not grep.
+
+    Docker is replaced by a shell function that imports its actual -e arguments
+    into a clean container environment before running the real selection block.
+    No hardware, Docker daemon or compiler is contacted.
+    """
+    launcher = (ROOT / ('build.sh' if mode == 'release' else 'wip.sh')).read_text()
+    artifact = (ROOT / f'scripts/build/build-{mode}-artifacts.sh').read_text()
+    if mode == 'release':
+        start = launcher.index('timeout --foreground "$export_timeout" docker run')
+        end = launcher.index(' ||\n  coordinator_export_status=$?', start)
+        launch = launcher[start:end]
+        start = artifact.index('cargo_feature_args=()')
+        selection = artifact[start:artifact.index('\nhost_isa_jobs=()', start)]
+        setup = 'export_timeout=30\ntimeout() { shift 2; "$@"; }\n'
+        variable = 'CUTEAFD_RELEASE_COORDINATOR_FEATURES'
+    else:
+        start = launcher.index('wip_cargo_features="')
+        validation = launcher[start:launcher.index('\nwip_build_key=', start)]
+        start = launcher.index('  local -a coordinator_build=(docker exec')
+        end = launcher.index('\n  # Cargo first', start)
+        launch = launcher[start:end].replace('local -a', 'declare -a')
+        launch += '\n"${coordinator_build[@]}" rust\n'
+        start = artifact.index('cargo_features="')
+        selection = artifact[start:artifact.index('\nwip_rust_fingerprint=', start)]
+        setup = validation + '\n'
+        variable = 'CUTEAFD_WIP_CARGO_FEATURES'
+    script = '''set -eo pipefail
+release_die() { echo "$*" >&2; exit 2; }
+docker() (
+    # No host environment inheritance: the feature must cross the -e boundary.
+    unset CUTEAFD_RELEASE_COORDINATOR_FEATURES CUTEAFD_WIP_CARGO_FEATURES
+    while (($#)); do
+        if [[ "$1" == -e ]]; then export "$2"; shift 2; else shift; fi
+    done
+    role=coordinator
+''' + selection + '''
+    printf '<%s>\\n' "${cargo_feature_args[@]}"
+)
+''' + setup + launch
+    env = {k: v for k, v in os.environ.items()
+           if k not in ('CUTEAFD_RELEASE_COORDINATOR_FEATURES', 'CUTEAFD_WIP_CARGO_FEATURES')}
+    if features is not None:
+        env[variable] = features
+    result = subprocess.run(['bash', '-c', script], env=env, capture_output=True,
+                            text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == (['<--features>', '<jemalloc>'] if features else ['<>'])
+
+
+@pytest.mark.parametrize('features,expected', [('jemalloc,dev-probe', 0), ('unknown', 2)])
+def test_wip_allocator_features_keep_the_validation_allowlist(features, expected):
+    text = (ROOT / 'wip.sh').read_text()
+    start = text.index('wip_cargo_features="')
+    block = text[start:text.index('\nwip_build_key=', start)]
+    result = subprocess.run(['bash', '-c', 'release_die() { echo "$*"; exit 2; }\n' + block],
+                            env={**os.environ, 'CUTEAFD_WIP_CARGO_FEATURES': features},
+                            text=True, capture_output=True, timeout=15)
+    assert result.returncode == expected, result.stdout + result.stderr

@@ -159,7 +159,7 @@ wip_tree_fingerprint() {
   find "$@" -type f \( -name '*.rs' -o -name '*.toml' -o -name '*.lock' -o -name '*.cu' -o -name '*.cc' -o -name '*.h' -o -name '*.cmake' -o -name 'CMakeLists.txt' -o -name '*.py' \) \
     -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
 }
-# Dev-only Cargo features (wip.sh validates dev-* names; the coordinator leg only).
+# Coordinator Cargo features (wip.sh validates jemalloc and dev-* names).
 cargo_features="${CUTEAFD_WIP_CARGO_FEATURES:-}"
 cargo_feature_args=()
 [[ -z "$cargo_features" ]] || cargo_feature_args=(--features "$cargo_features")

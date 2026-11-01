@@ -48,8 +48,6 @@ pub(crate) struct ServeArgs {
     mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
-    #[arg(long, default_value_t = 32768)]
-    max_output: u32,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     max_sequences: u8,
     #[arg(long)]
@@ -410,7 +408,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
-    use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile, NativeLimits};
+    use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -440,7 +438,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         result
     });
     let context = ready_rx.await.context("Step-5 worker exited before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(context)?;
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
         "step5", profile.id.clone(), snapshot.clone())));
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, std::time::Duration::from_secs(25),

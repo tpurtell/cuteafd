@@ -82,12 +82,13 @@ def main():
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--config', required=True)
     parser.add_argument('--seal', action='store_true')
+    parser.add_argument('--identity-proof', type=Path, help='audited token-identity proof to a later manifest')
     args = parser.parse_args()
     validator = load_tool('validate-fidelity-dataset')
     result = validator.validate_reference_only(args.source, seal=args.seal)
     (args.source / 'reference-validation.json').write_text(json.dumps(result, indent=2) + '\n')
     packager = load_tool('package-reference-only-fidelity')
-    index = packager.package(args.source, args.out, args.config, args.tokenizer, args.license)
+    index = packager.package(args.source, args.out, args.config, args.tokenizer, args.license, args.identity_proof)
     config = args.out / args.config
     manifest = json.loads((config / 'manifest.json').read_text())
     for path in config.rglob('*'):

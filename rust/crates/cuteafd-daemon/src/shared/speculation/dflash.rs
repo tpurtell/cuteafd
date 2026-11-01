@@ -1807,6 +1807,26 @@ impl<'a> DflashDrafter<'a> {
         Ok(state.pool.retain_snapshot(attachment.snapshot)?)
     }
 
+    /// The slot's live draft page reservation (`None` for windowed drafters).
+    pub(crate) fn mla_reservation(&self, slot: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        let DraftContext::Mla(context) = &self.context else { return None };
+        let state = context.state.borrow();
+        let binding = state.bindings.get(slot).copied().flatten()?;
+        state.pool.reservation(binding, self.cfg.block).ok()
+    }
+    pub(crate) fn mla_lifetime_rows(&self) -> Option<usize> {
+        let DraftContext::Mla(context) = &self.context else { return None };
+        Some(context.state.borrow().pool.lifetime_rows(self.cfg.block))
+    }
+    pub(crate) fn mla_reservable(&self) -> Option<usize> {
+        let DraftContext::Mla(context) = &self.context else { return None };
+        Some(context.state.borrow().pool.reservable())
+    }
+    pub(crate) fn mla_admission(&self, origin: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        matches!(self.context, DraftContext::Mla(_)).then(|| cuteafd_engine::reserve::DraftDemand {
+            origin, headroom: self.cfg.block.div_ceil(cuteafd_engine::prefix::DRAFT_PAGE_ROWS) + 1, held: 0 })
+    }
+
     pub(crate) fn admit_mla_pages(&self, slot: usize, capacity: usize) -> std::result::Result<(), cuteafd_engine::prefix::BoxError> {
         (|| -> Result<()> {
             let DraftContext::Mla(context) = &self.context else { return Ok(()) };

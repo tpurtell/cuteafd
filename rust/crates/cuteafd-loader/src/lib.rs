@@ -92,7 +92,7 @@ pub use tensors::{
 };
 pub use tokenizer::{
     cached_tokenizer, decode_tokenizer_ids, encode_tokenizer_text, encode_tokenizer_prompt, streaming_token_decoder, LoadedTokenizer,
-    LiteralSpans, LiteralTokens,
+    LiteralSpans, LiteralTokens, PromptEncodingError,
     StreamingTokenDecoder, TokenizerDecodeSummary, TokenizerEncodingSummary,
 };
 

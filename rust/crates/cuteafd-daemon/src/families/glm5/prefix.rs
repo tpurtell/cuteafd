@@ -77,7 +77,7 @@ fn copy_rows(paged: &[PagedBuffers], parity: bool, copy: TailCopy,
     Ok(())
 }
 
-pub(crate) struct GlmPrefix<'e, 'a> {
+pub(crate) struct NativePrefix<'e, 'a> {
     engine: &'e GlmEngine<'a>,
     /// Per rank and layer: latent records and, on full-indexer layers, index keys.
     paged: Vec<PagedBuffers>,
@@ -118,7 +118,7 @@ pub(crate) fn draft_mark_bytes(windows_only: bool, window_bytes: usize) -> usize
     if windows_only && window_bytes > 0 { DRAFT_MARK_HEADER + window_bytes } else { 0 }
 }
 
-impl<'e, 'a> GlmPrefix<'e, 'a> {
+impl<'e, 'a> NativePrefix<'e, 'a> {
     /// `mark_slots`: the prefix arena's slots, each holding a window-ring drafter's windows.
     pub fn new(engine: &'e GlmEngine<'a>, partial: bool, mark_slots: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("prefix");
@@ -204,8 +204,86 @@ impl<'e, 'a> GlmPrefix<'e, 'a> {
 
 }
 
-impl PrefixFamily for GlmPrefix<'_, '_> {
+/// Device-independent prefix state; the native backend retains the engine calls unchanged.
+pub(crate) struct Prefix<D> { device: D }
+pub(crate) type GlmPrefix<'e, 'a> = Prefix<NativePrefix<'e, 'a>>;
+impl<D> std::ops::Deref for Prefix<D> {
+    type Target = D;
+    fn deref(&self) -> &D { &self.device }
+}
+impl<'e, 'a> Prefix<NativePrefix<'e, 'a>> {
+    pub fn new(engine: &'e GlmEngine<'a>, partial: bool, mark_slots: usize) -> Result<Self> {
+        Ok(Self { device: NativePrefix::new(engine, partial, mark_slots)? })
+    }
+}
+
+pub(crate) trait PrefixDevice {
+    fn layout(&self) -> FamilyLayout;
+    fn capture(&self, slot: MarkSlot, placement: &GlmPlacement, len: usize) -> Result<(), BoxError>;
+    fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>;
+    fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
+    fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>;
+    fn draft_page_bytes(&self) -> usize;
+    fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>;
+    fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool;
+    fn draft_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool;
+    fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError>;
+    fn capture_draft_pages(&self, placement: &GlmPlacement, len: usize)
+        -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError>;
+    fn release_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError>;
+    fn promote_draft_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError>;
+    fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange>;
+    fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
+        placement: &mut GlmPlacement, frontier: usize) -> Result<(), BoxError>;
+    fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError>;
+    fn drain(&self) -> Result<(), BoxError>;
+    fn page_device(&self, page: u32) -> Option<u8>;
+    fn page_segments(&self, page: u32) -> Vec<DeviceRange>;
+    fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange>;
+    fn host_tail(&self) -> Vec<DeviceRange>;
+}
+
+impl<D: PrefixDevice> PrefixFamily for Prefix<D> {
     type Placement = GlmPlacement;
+    fn layout(&self) -> FamilyLayout{ self.device.layout() }
+    fn pages<'p>(&self, placement: &'p GlmPlacement) -> &'p [u32] {
+        &placement.pages
+    }
+    /// Verify rebuilds its target table each step; fixed drafter rings keep their slot/frontier.
+    fn extend_pages(&self, placement: &mut GlmPlacement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        Ok(())
+    }
+    fn commit_point(&self, placement: &GlmPlacement) -> usize {
+        placement.len
+    }
+    fn capture(&self, slot: MarkSlot, placement: &GlmPlacement, len: usize) -> Result<(), BoxError>{ self.device.capture(slot, placement, len) }
+    fn restore(&self, mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError>{ self.device.restore(mark, placement, len) }
+    fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.bind(placement) }
+    fn discard(&self, placement: &mut GlmPlacement) -> Result<(), BoxError>{ self.device.discard(placement) }
+    fn draft_page_bytes(&self) -> usize{ self.device.draft_page_bytes() }
+    fn admit_draft_pages(&self, placement: &mut GlmPlacement, capacity: usize) -> Result<(), BoxError>{ self.device.admit_draft_pages(placement, capacity) }
+    fn draft_pages_valid(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool{ self.device.draft_pages_valid(attachment) }
+    fn draft_pages_revocable(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool{ self.device.draft_pages_revocable(attachment) }
+    fn retain_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError>{ self.device.retain_draft_pages(attachment) }
+    fn capture_draft_pages(&self, placement: &GlmPlacement, len: usize)
+        -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError>{ self.device.capture_draft_pages(placement, len) }
+    fn release_draft_pages(&self, attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError>{ self.device.release_draft_pages(attachment) }
+    fn promote_draft_pages(&self, saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError>{ self.device.promote_draft_pages(saved) }
+    fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange>{ self.device.draft_page_segments(page) }
+    fn restore_draft_pages(&self, attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
+        placement: &mut GlmPlacement, frontier: usize) -> Result<(), BoxError>{ self.device.restore_draft_pages(attachment, placement, frontier) }
+    fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError>{ self.device.copy_rows(copy) }
+    fn drain(&self) -> Result<(), BoxError>{ self.device.drain() }
+    fn page_device(&self, page: u32) -> Option<u8>{ self.device.page_device(page) }
+    fn page_segments(&self, page: u32) -> Vec<DeviceRange>{ self.device.page_segments(page) }
+    fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange>{ self.device.mark_segments(slot) }
+    fn host_tail(&self) -> Vec<DeviceRange>{ self.device.host_tail() }
+}
+
+impl PrefixDevice for NativePrefix<'_, '_> {
 
     fn layout(&self) -> FamilyLayout {
         FamilyLayout {
@@ -218,14 +296,6 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
             mark_store: MarkStore::Arena,
             page_owners: if self.parity() { PageOwners::Parity } else { PageOwners::Uniform },
         }
-    }
-
-    fn pages<'p>(&self, placement: &'p GlmPlacement) -> &'p [u32] {
-        &placement.pages
-    }
-
-    fn commit_point(&self, placement: &GlmPlacement) -> usize {
-        placement.len
     }
 
     /// A mark exists only for a window-ring drafter: its windows and, when its history was the
@@ -533,6 +603,119 @@ pub(crate) fn resume_check(engine: &GlmEngine<'_>, tokens: &[u32],
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    struct MockDevice {
+        layout: FamilyLayout,
+        frontiers: std::cell::RefCell<[usize; 3]>,
+    }
+    impl PrefixDevice for MockDevice {
+        fn layout(&self) -> FamilyLayout { self.layout }
+        fn capture(&self, _slot: MarkSlot, _placement: &GlmPlacement, _len: usize) -> Result<(), BoxError> { Ok(()) }
+        fn restore(&self, _mark: Option<MarkSlot>, placement: &mut GlmPlacement, len: usize) -> Result<(), BoxError> { placement.len = len; if let Some(slot) = placement.draft_slot { self.frontiers.borrow_mut()[slot] = len; } Ok(()) }
+        fn bind(&self, placement: &mut GlmPlacement) -> Result<(), BoxError> { if let Some(slot) = placement.draft_slot { self.frontiers.borrow_mut()[slot] = 0; } Ok(()) }
+        fn discard(&self, _placement: &mut GlmPlacement) -> Result<(), BoxError> { Ok(()) }
+        fn draft_page_bytes(&self) -> usize { 0 }
+        fn admit_draft_pages(&self, _placement: &mut GlmPlacement, _capacity: usize) -> Result<(), BoxError> { Ok(()) }
+        fn draft_pages_valid(&self, _attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool { false }
+        fn draft_pages_revocable(&self, _attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> bool { false }
+        fn retain_draft_pages(&self, _attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> { Ok(()) }
+        fn capture_draft_pages(&self, _placement: &GlmPlacement, _len: usize)
+        -> Result<Option<cuteafd_engine::prefix::DraftPageAttachment>, BoxError> { Ok(None) }
+        fn release_draft_pages(&self, _attachment: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), BoxError> { Ok(()) }
+        fn promote_draft_pages(&self, _saved: &cuteafd_engine::prefix::DraftPageAttachment)
+        -> Result<cuteafd_engine::prefix::DraftPageAttachment, BoxError> { Err("no pooled draft pages".into()) }
+        fn draft_page_segments(&self, _page: cuteafd_engine::prefix::DraftPageId) -> Vec<DeviceRange> { Vec::new() }
+        fn restore_draft_pages(&self, _attachment: Option<&cuteafd_engine::prefix::DraftPageAttachment>,
+        _placement: &mut GlmPlacement, _frontier: usize) -> Result<(), BoxError> { Ok(()) }
+        fn copy_rows(&self, _copy: TailCopy) -> Result<(), BoxError> { Ok(()) }
+        fn drain(&self) -> Result<(), BoxError> { Ok(()) }
+        fn page_device(&self, page: u32) -> Option<u8> { (self.layout.page_owners == PageOwners::Parity).then_some((page & 1) as u8) }
+        fn page_segments(&self, _page: u32) -> Vec<DeviceRange> { Vec::new() }
+        fn mark_segments(&self, _slot: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
+        fn host_tail(&self) -> Vec<DeviceRange> { Vec::new() }
+    }
+
+    #[test]
+    fn ml4_reservation_top_up_past_16k_preserves_media_and_draft_frontiers() -> Result<()> {
+        use crate::shared::kv_reserve::{Reserve, Reserving};
+        use cuteafd_engine::prefix::{PrefixCache, PrefixConfig};
+        use cuteafd_engine::reserve::{Lease, ReserveConfig};
+        use cuteafd_hostcache::copy::StubCopyEngine;
+        struct Request { placement: GlmPlacement, lease: Lease, produced: usize,
+            initial_rows: usize, media: Vec<u8> }
+        impl Reserving for Request {
+            type Placement = GlmPlacement;
+            fn lease(&self) -> &Lease { &self.lease }
+            fn committed(&self) -> usize { self.placement.len }
+            fn produced(&self) -> usize { self.produced }
+            fn placement(&self) -> &GlmPlacement { &self.placement }
+            fn placement_mut(&mut self) -> &mut GlmPlacement { &mut self.placement }
+            fn closed(&self) -> bool { false }
+        }
+        for parity in [false, true] {
+            let pages = if parity { 850 } else { 849 };
+            let family = Prefix { device: MockDevice {
+                layout: FamilyLayout { page_rows: PAGE_ROWS, pages, page_bytes: 64,
+                    mark_bytes: 0, draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena,
+                    page_owners: if parity { PageOwners::Parity } else { PageOwners::Uniform } },
+                frontiers: std::cell::RefCell::new([0; 3]) } };
+            let mut cache = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
+                entries: 0, mark_slots: 0, keep_logits: false, min_tokens: PAGE_ROWS }, None)?;
+            let mut reserve = Reserve::new(ReserveConfig::new(640, 0, -1, 1 << 20)?, PAGE_ROWS);
+            let (mut active, mut stalled) = (Vec::<Request>::new(), Vec::<Request>::new());
+            for slot in 0..3 {
+                let lease = reserve.lease(16_320, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
+                let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
+                let placement = cache.admit_cold(&family, 16_320, rows,
+                    |pages| GlmPlacement { pages, len: 16_320, draft_slot: Some(slot) })?.placement;
+                family.frontiers.borrow_mut()[slot] = 16_320;
+                let initial_rows = placement.pages.len() * PAGE_ROWS;
+                active.push(Request { placement, lease, produced: 1, initial_rows, media: vec![slot as u8; 128] });
+            }
+            let mut waited = std::collections::BTreeSet::new();
+            let (mut resumed, mut beyond_initial) = (false, false);
+            for _ in 0..4000 {
+                let before = *family.frontiers.borrow();
+                reserve.round(&mut cache, &family, &mut active, &mut stalled, &[], |_, _| panic!("no early end"))?;
+                assert_eq!(*family.frontiers.borrow(), before, "top-up/stall cannot reset a drafter ring");
+                for request in &stalled { waited.insert(request.placement.draft_slot.unwrap()); }
+                for request in active.iter().chain(&stalled) {
+                    let slot = request.placement.draft_slot.unwrap();
+                    assert_eq!(request.media, vec![slot as u8; 128]);
+                    assert_eq!(family.frontiers.borrow()[slot], request.placement.len);
+                }
+                for request in &mut active {
+                    let p = &mut request.placement;
+                    let slot = p.draft_slot.unwrap();
+                    resumed |= waited.contains(&slot);
+                    beyond_initial |= p.len + 4 > request.initial_rows;
+                    for pos in p.len..p.len + 4 {
+                        let physical = p.slot(pos)? as usize;
+                        let page = physical / PAGE_ROWS;
+                        assert!(page < pages && cache.pool().refs(page as u32) > 0);
+                        if parity {
+                            let (owner, local) = locate_page(true, page as u32);
+                            assert_eq!(family.page_device(page as u32), Some(owner as u8));
+                            assert!(local < pages.div_ceil(2));
+                        }
+                    }
+                    p.len += 4;
+                    family.frontiers.borrow_mut()[slot] = p.len;
+                    request.produced += 4;
+                }
+                let (done, running): (Vec<_>, Vec<_>) = active.drain(..).partition(|r| r.placement.len >= r.lease.end());
+                active = running;
+                for request in done { cache.release(&family, &request.placement.pages)?; }
+                if active.is_empty() && stalled.is_empty() { break; }
+            }
+            assert!(active.is_empty() && stalled.is_empty());
+            assert!(resumed && beyond_initial && !waited.is_empty());
+            assert!(reserve.stats().top_ups > 0 && reserve.stats().stalls > 0);
+            assert_eq!(cache.pool().free(), pages);
+        }
+        Ok(())
+    }
+
 
     fn buffer(addr: usize, bytes: usize, rank: usize) -> CuteafdDeviceBuffer {
         CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, device_id: rank as i32, flags: 0 }

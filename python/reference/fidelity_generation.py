@@ -29,15 +29,34 @@ def normalized_messages(messages):
         for call in message.get("tool_calls", []):
             function = call.get("function", call)
             if isinstance(function.get("arguments"), str):
-                function["arguments"] = json.loads(function["arguments"])
+                try:
+                    function["arguments"] = json.loads(function["arguments"])
+                except json.JSONDecodeError:
+                    pass  # A length-cut call keeps the provider's exact partial text.
     return messages
 
 
+def valid_arguments(call):
+    arguments = (call.get("function") or {}).get("arguments")
+    if not isinstance(arguments, str):
+        return True
+    try:
+        json.loads(arguments)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+
 class ChatRenderer:
-    def __init__(self, tokenizer):
+    def __init__(self, tokenizer, template_date=None):
         self.tokenizer = tokenizer
+        # Templates that print a "current date" (Muse Spark: strftime_now) render the
+        # provider's request date; pin it so local re-renders are date-independent.
+        self.template_date = template_date
         self.native = getattr(tokenizer, "_fidelity_identity", None)
         self.encoder = getattr(tokenizer, "_fidelity_encode_messages", None)
+        if template_date is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", template_date):
+            raise ValueError("template date must be YYYY-MM-DD")
         if self.encoder:
             self.identity = tokenizer._fidelity_chat_identity
         elif self.native:
@@ -48,6 +67,8 @@ class ChatRenderer:
             if not template:
                 raise ValueError("generation requires the checkpoint's own chat template")
             self.identity = {"chat_template_sha256": hashlib.sha256(template.encode()).hexdigest()}
+            if template_date is not None and re.search(r"\bcurrent_date\b", template):
+                self.identity["template_current_date"] = template_date
 
     def template_options(self, body):
         effort = body.get("reasoning_effort")
@@ -57,9 +78,19 @@ class ChatRenderer:
         effort = nested if nested is not None else effort
         if self.native:
             return {"thinking_effort": effort} if effort is not None else {}
+        if self.encoder:
+            # Checkpoint encoders take effort/thinking directly in render(); no Jinja options.
+            return {}
         template = self.tokenizer.get_chat_template()
-        return {key: effort for key in ("thinking_effort", "reasoning_effort")
-                if effort is not None and re.search(r"\b" + key + r"\b", template)}
+        options = {key: effort for key in ("thinking_effort", "reasoning_effort")
+                   if effort is not None and re.search(r"\b" + key + r"\b", template)}
+        if self.template_date is not None and re.search(r"\bcurrent_date\b", template):
+            options["current_date"] = self.template_date
+        if body.get("response_format") is not None and re.search(r"\bresponse_format\b", template):
+            # Templates that render the response format (Mistral [MODEL_SETTINGS]) must
+            # see it, as the provider's own renderer does.
+            options["response_format"] = body["response_format"]
+        return options
 
     def render(self, body, assistant=None):
         messages = normalized_messages(body["messages"])
@@ -76,6 +107,26 @@ class ChatRenderer:
         return self.tokenizer.apply_chat_template(
             messages, tools=body.get("tools"), tokenize=False,
             add_generation_prompt=assistant is None, **self.template_options(body))
+
+    def conversation_ids(self, body, messages):
+        """Render a full conversation (no generation prompt) to checkpoint token ids."""
+        rendered = copy.deepcopy(body)
+        rendered["messages"] = messages
+        if self.native:
+            raise ValueError("recipe v2 trailing context needs a Jinja template or checkpoint encoder")
+        if self.encoder:
+            text = self.render(rendered)
+            ids = token_ids(self.tokenizer, text)
+            if self.tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False) != text:
+                raise ValueError("conversation does not re-tokenize losslessly")
+            return ids
+        text = self.tokenizer.apply_chat_template(
+            normalized_messages(messages), tools=body.get("tools"), tokenize=False,
+            add_generation_prompt=False, **self.template_options(rendered))
+        ids = token_ids(self.tokenizer, text)
+        if self.tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False) != text:
+            raise ValueError("conversation does not re-tokenize losslessly")
+        return ids
 
     def prompt(self, body):
         if self.native:
@@ -120,8 +171,12 @@ class ResponseCache:
         if backend.get("text_source") == "api":
             # Hosted responses depend on wire inputs, not local rendering code.
             request = binding["request"]
-            return {"endpoint": backend["endpoint"], "model": request["model"],
-                    "provider": request.get("provider"), "request": request}
+            key = {"endpoint": backend["endpoint"], "model": request["model"],
+                   "provider": request.get("provider"), "request": request}
+            if backend.get("wire_order", "sorted") != "sorted":
+                # Key order on the wire is a provider input (tojson templates render it).
+                key["wire_order"] = backend["wire_order"]
+            return key
         return binding
 
     def find(self, body):
@@ -170,6 +225,10 @@ class TextGenerator:
     def prompt(self, body):
         return {"probe": {"prompt_ids": self.renderer.prompt(body)}}
 
+    def conversation(self, body, messages):
+        """Full conversation ids rendered exactly as this backend renders its prompts."""
+        return self.renderer.conversation_ids(body, messages)
+
     def result(self, body, generated, message, provenance):
         if not generated:
             raise ValueError("backend returned no generated tokens")
@@ -183,7 +242,10 @@ class TextGenerator:
 
 class APIClient(TextGenerator):
     def __init__(self, renderer, cache, *, checkpoint, family, base, model, key_file,
-                 timeout=1800, retries=4, extra_body=None, identity=None):
+                 timeout=1800, retries=4, extra_body=None, identity=None, wire_order="request"):
+        if wire_order not in ("request", "sorted"):
+            raise ValueError("wire order must be request or sorted")
+        self.wire_order = wire_order
         parts = urllib.parse.urlsplit(base)
         if parts.username or parts.password or parts.query or parts.fragment:
             raise ValueError("API base must not contain credentials, query or fragment")
@@ -195,7 +257,8 @@ class APIClient(TextGenerator):
         if set(self.extra_body) & {"model", "messages", "temperature", "max_tokens", "stream", "tools"}:
             raise ValueError("API options may not override the fixed generation recipe")
         super().__init__(renderer, cache, checkpoint=checkpoint, family=family,
-                         identity={**(identity or {}), "text_source": "api", "endpoint": self.endpoint, "model_id": model})
+                         identity={**(identity or {}), "text_source": "api", "endpoint": self.endpoint, "model_id": model,
+                                   **({"wire_order": wire_order} if wire_order != "sorted" else {})})
 
     def request(self, body):
         if stat.S_IMODE(self.key_file.stat().st_mode) != 0o600:
@@ -203,7 +266,10 @@ class APIClient(TextGenerator):
         key = self.key_file.read_text().strip()
         if not key:
             raise ValueError("empty API key file")
-        request = urllib.request.Request(self.endpoint, canonical(body),
+        # Providers render tools/messages in the order received; send what we render.
+        payload = (canonical(body) if self.wire_order == "sorted"
+                   else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode())
+        request = urllib.request.Request(self.endpoint, payload,
             {"Content-Type": "application/json", "Authorization": "Bearer " + key})
         for attempt in range(self.retries + 1):
             try:
@@ -232,6 +298,44 @@ class APIClient(TextGenerator):
             record = self.cache.find(request)
         return request, record
 
+    def cut_completion(self, body, message):
+        """Reconstructible prefix of a turn cut inside a tool call's arguments.
+
+        The partial arguments cannot be rendered exactly, so keep the calls before
+        the cut and stop where a render with the cut call omitted and a render with
+        a complete placeholder call first diverge: everything before that point is
+        identical model text in both, nothing after it is claimed.
+        """
+        calls = message["tool_calls"]
+        first = next(i for i, call in enumerate(calls) if not valid_arguments(call))
+        kept = {**message, "tool_calls": calls[:first]}
+        if not kept["tool_calls"]:
+            kept.pop("tool_calls")
+        placeholder = copy.deepcopy(calls[first])
+        placeholder["function"]["arguments"] = "{}"
+        probe = {**message, "tool_calls": calls[:first] + [placeholder]}
+        if not kept.get("content") and not kept.get("reasoning_content") and "tool_calls" not in kept:
+            kept["content"] = ""
+        prompt = self.renderer.prompt(body)
+        renders = []
+        for candidate in (kept, probe):
+            try:
+                renders.append(self.renderer.completion(body, candidate))
+            except ValueError:
+                renders.append(None)
+        if renders[1] is None:
+            raise ValueError("cut tool call cannot be bounded by a placeholder render")
+        if renders[0] is None:
+            renders[0] = []
+        common = 0
+        for left, right in zip(renders[0], renders[1]):
+            if left != right:
+                break
+            common += 1
+        if not common or not prompt:
+            raise ValueError("cut tool-call turn has no reconstructible prefix")
+        return renders[1][:common]
+
     def rendering_body(self, request):
         rendered = copy.deepcopy(request)
         if self.family == "kimi_k3" and not (request.get("reasoning_effort")
@@ -239,6 +343,12 @@ class APIClient(TextGenerator):
             # Official K3 API docs and native template both default to max.
             rendered["reasoning_effort"] = "max"
         return rendered
+
+    def conversation(self, body, messages):
+        lookup = copy.deepcopy(body)
+        lookup["max_tokens"] = 1024
+        request, _ = self.resolved_request(lookup)
+        return self.renderer.conversation_ids(self.rendering_body(request), messages)
 
     def prompt(self, body):
         lookup = copy.deepcopy(body)
@@ -252,8 +362,17 @@ class APIClient(TextGenerator):
         request, record = self.resolved_request(body)
         if record is None:
             record = self.cache.get(request, lambda: self.request(request))
-        rendered_body = self.rendering_body(record["binding"]["request"])
+        cached = record["binding"]["request"]
+        # Cached records are canonical (sorted-key) JSON; templates that serialize
+        # tools or messages with tojson must see the caller's original key order.
+        ordered = {**cached, **{key: copy.deepcopy(request[key]) for key in ("messages", "tools")
+                                if key in request and request[key] == cached.get(key)}}
+        rendered_body = self.rendering_body(ordered)
         raw = record["response"]
+        pinned = self.renderer.identity.get("template_current_date")
+        if pinned is not None and record["date"][:10] != pinned:
+            # The provider rendered its own date; a different day is a different prompt.
+            raise ValueError(f"cached response date {record['date'][:10]} differs from template date {pinned}")
         if raw.get("error") or not raw.get("choices"):
             raise ValueError("API returned an error or no choices (raw response cached)")
         choice = raw["choices"][0]
@@ -263,10 +382,15 @@ class APIClient(TextGenerator):
         message["reasoning_content"] = reasoning
         if not message.get("content") and not reasoning and not message.get("tool_calls"):
             raise ValueError("API returned no accessible text or tool calls")
-        generated_full = self.renderer.completion(rendered_body, message)
+        cut = [call for call in message.get("tool_calls") or [] if not valid_arguments(call)]
+        if cut:
+            generated_full = self.cut_completion(rendered_body, message)
+        else:
+            generated_full = self.renderer.completion(rendered_body, message)
         generated = generated_full[:body["max_tokens"]]
         visible_message = message
-        if len(generated) < len(generated_full):
+        if len(generated) < len(generated_full) or not all(
+                valid_arguments(call) for call in message.get("tool_calls") or []):
             # A cut response is unfinished; never execute calls from its discarded suffix.
             visible_message = {**message, "tool_calls": []}
         return self.result(rendered_body, generated, visible_message, {
@@ -285,6 +409,92 @@ class APIClient(TextGenerator):
             "raw_response_sha256": hashlib.sha256(canonical(raw)).hexdigest(),
             "generated_ids_full": len(generated_full), "generated_ids_kept": len(generated),
             "reconstructed_tokens": len(generated), "retokenization": "lossless full completion; checkpoint chat template; recipe ID prefix"})
+
+
+class EngineClient(TextGenerator):
+    """Greedy text from our engine serving the official checkpoint (bench probe).
+
+    The prompt is rendered locally exactly as for the API backend and sent as
+    ``prompt_ids``; the engine returns the generated ids, which are kept verbatim.
+    The assistant message for tool execution and history comes from the
+    checkpoint's own completion parser; it must re-render to exactly those ids,
+    else the turn is treated as unfinished (no calls executed).
+    """
+
+    def __init__(self, renderer, cache, *, checkpoint, family, base, token, identity, timeout=1800):
+        parts = urllib.parse.urlsplit(base)
+        if parts.username or parts.password or parts.query or parts.fragment:
+            raise ValueError("engine base must not contain credentials, query or fragment")
+        self.url, self.token, self.timeout = base.rstrip("/") + "/v1/bench/probe", token, timeout
+        self.parse = getattr(renderer.tokenizer, "_fidelity_parse_completion", None)
+        if self.parse is None:
+            raise ValueError("engine generation needs the checkpoint's own completion parser")
+        super().__init__(renderer, cache, checkpoint=checkpoint, family=family,
+                         identity={**identity, "text_source": "engine", "do_sample": False})
+
+    def generate(self, body, prompt_ids):
+        spec = {"cold": True, "no_speculation": True, "prompt_ids": prompt_ids,
+                "output_dependent": True, "record_rows": 0, "top_k": 1}
+        headers = {"Content-Type": "application/json"}
+        if self.token:
+            headers["x-cuteafd-bench"] = self.token
+            headers["Authorization"] = "Bearer " + self.token
+        # The engine samples nothing and applies no provider JSON mode; the window prompt
+        # itself asks for JSON (as in the staged API set, where response_format was dropped).
+        wire = {k: v for k, v in body.items() if k not in ("seed", "response_format")}
+        wire["temperature"] = 0
+        request = urllib.request.Request(self.url, canonical({"body": wire, "spec": spec}), headers)
+        with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            chat = json.load(response)
+        record = chat.get("probe") or {}
+        if record.get("error") or not record.get("generated") or record.get("prompt_ids") != prompt_ids:
+            raise ValueError("engine did not run the given prompt ids or returned no tokens")
+        if not record.get("cold") or not record.get("no_speculation") or record.get("cached_tokens", 0):
+            raise ValueError("engine generation must be cold and speculation-free")
+        server = chat.get("server", {})
+        for setting in server.get("settings", []) if isinstance(server.get("settings"), list) else []:
+            if (setting.get("name") in ("CUTEAFD_V41_FP8_HEAD", "fp8-head")
+                    and str(setting.get("value")).lower() not in ("off", "false", "0", "none", "bf16")):
+                raise ValueError("engine reports an enabled FP8 head, not the checkpoint-precision arm")
+        return {"generated": record["generated"], "engine": record.get("engine"), "server": server}
+
+    def __call__(self, body):
+        rendered = self.rendering_body(body) if hasattr(self, "rendering_body") else body
+        prompt_ids = self.renderer.prompt(rendered)
+        record = self.cache.get({**body, "prompt_ids_sha256": hashlib.sha256(canonical(prompt_ids)).hexdigest()},
+                                lambda: self.generate(body, prompt_ids))
+        generated = list(record["response"]["generated"])[:body["max_tokens"]]
+        text = self.renderer.tokenizer.decode(generated, skip_special_tokens=False)
+        mode = "chat" if body.get("thinking", {}).get("type") == "disabled" else "thinking"
+        message, finished = {"role": "assistant", "content": "", "reasoning_content": "", "tool_calls": []}, False
+        try:
+            message = self.parse(text, mode)
+            for k, call in enumerate(message.get("tool_calls") or []):
+                # The checkpoint format has no call ids; tool results pair by position.
+                call.setdefault("id", f"call_{len(body['messages'])}_{k}")
+                call.setdefault("type", "function")
+            finished = self.renderer.completion(rendered, message) == generated
+        except (AssertionError, ValueError, KeyError):
+            pass
+        if not finished:
+            # A length cut or an unparsed turn: keep the exact ids, never execute calls.
+            prefix = text.split("</think>", 1)
+            message = {"role": "assistant", "content": "", "tool_calls": [],
+                       "reasoning_content": prefix[0] if len(prefix) == 1 else prefix[0]}
+        return self.result(rendered, generated, message, {
+            **self.identity, "date": record["date"], "engine": record["response"].get("engine"),
+            "engine_server": record["response"].get("server", {}),
+            "finished_turn": finished, "generated_ids": len(generated),
+            "reasoning_content": message.get("reasoning_content", ""), "content": message.get("content", ""),
+            "tool_calls": message.get("tool_calls") or [],
+            "raw_response_sha256": hashlib.sha256(canonical(record["response"])).hexdigest(),
+            "retokenization": "none: engine ids kept verbatim; checkpoint parser re-render checked"})
+
+    def rendering_body(self, body):
+        return copy.deepcopy(body)
+
+    def conversation(self, body, messages):
+        return self.renderer.conversation_ids(self.rendering_body(body), messages)
 
 
 def parse_qwen_response(text, tools, *, thinking_prefix=False):

@@ -319,3 +319,206 @@ def test_recording_history_above_16k_is_not_truncated(fake_server):
         {"messages": [{"role": "user", "content": "x" * 60000}], "turns": [{"messages": 1}]}]}
     with pytest.raises(ValueError, match="16K"):
         make(fake_server, recordings=[recording])
+
+
+# ---- recipe v2: in-window tool continuation and native trailing context (#431) ----
+
+class TemplateRenderer:
+    """A checkpoint-like template: each message is a tagged span; ids are characters."""
+
+    @staticmethod
+    def message(m):
+        text = m.get("reasoning_content", "") + "|" + (m.get("content") or "")
+        for call in m.get("tool_calls") or []:
+            text += "{" + call["function"]["name"] + ":" + call["function"]["arguments"] + "}"
+        return f"<{m['role']}>" + text + f"</{m['role']}>"
+
+    @staticmethod
+    def ids(text):
+        # About four characters per id, as for a real BPE vocabulary.
+        return [sum(map(ord, text[i:i + 4])) % 50000 + 100 for i in range(0, len(text), 4)]
+
+    def render(self, messages, generation=False):
+        # Role headers and message bodies are token boundaries, as with special-token templates.
+        out = []
+        for m in messages:
+            head = f"<{m['role']}>"
+            out += [7] + self.ids(self.message(m)[len(head):]) if m["role"] == "assistant" else self.ids(self.message(m))
+        return out + ([7] if generation else [])
+
+    def conversation_ids(self, body, messages):
+        return self.render(messages)
+
+
+class FakeAPI:
+    """Own-text API probe: replies with tool calls for the first ``calls`` turns of a window."""
+
+    def __init__(self, generated=40, calls=2, tool_windows=("a", "b", "d", "e")):
+        self.renderer, self.generated, self.calls = TemplateRenderer(), generated, calls
+        self.tool_windows, self.identity, self.requests = tool_windows, {"text_source": "api"}, []
+
+    def prompt(self, body):
+        return {"probe": {"prompt_ids": self.renderer.render(body["messages"], True)}}
+
+    def conversation(self, body, messages):
+        return self.renderer.conversation_ids(body, messages)
+
+    def __call__(self, body):
+        self.requests.append(body)
+        name = body["messages"][0]["content"].split("Fidelity fixture ")[-1][:3]
+        own = sum(1 for m in body["messages"] if m["role"] == "tool" and m.get("tool_call_id", "").startswith("c"))
+        message = {"role": "assistant", "reasoning_content": "r" * 8, "content": "x" * self.generated}
+        if name[0] in self.tool_windows and own < self.calls:
+            tool = "list_dir" if body.get("tools") else "bash"
+            message["tool_calls"] = [{"id": f"c{own}", "type": "function",
+                                      "function": {"name": tool, "arguments": "{\"path\":\".\"}"}}]
+        prompt = self.renderer.render(body["messages"], True)
+        generated = self.renderer.render(body["messages"] + [message])[len(prompt):]
+        return {"probe": {"prompt_ids": prompt, "generated": generated,
+                          "engine": "api"},
+                "content": message["content"], "reasoning": message["reasoning_content"],
+                "tool_calls": message.get("tool_calls", []), "server": {}}
+
+
+def make_api(probe, recipe):
+    return builder.build_set(family="mistral_large4", model="test-model", checkpoint="test-model",
+        version="t", arm={"checkpoint": "test-model", "snapshot_revision": "r", "config_sha256": "c",
+                          "tokenizer_sha256": "t"},
+        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe,
+        legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))},
+        legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
+
+
+def test_v1_remains_default_and_unversioned(fake_server):
+    manifest = make(fake_server)
+    assert "version" not in manifest["recipe"]
+    assert all("turns" not in w["provenance"] for w in manifest["windows"])
+
+
+def test_v2_continues_tool_turns_in_window_and_versions_the_recipe():
+    probe = FakeAPI(generated=200, calls=3)
+    manifest = make_api(probe, "v2")
+    version = manifest["recipe"]["version"]
+    assert version["id"] == "own-text-v2" and len(version["sha256"]) == 64
+    for window in manifest["windows"]:
+        if window["id"][0] in "ab" or window["id"] in ("d03", "d04", "d05") or window["id"][0] == "e":
+            p = window["provenance"]
+            assert len(p["turns"]) > 1 or p.get("ended_at_stratum") or p.get("ended_at_context_cap")
+            scored = window["roles"][window["score_from"]:]
+            assert len(scored) == 512 and scored.count("gen") == p["scored_generated"]
+    # Tool-less windows drop the tools clause and get the unavailable-tool result.
+    b00 = [r for r in probe.requests if "Fidelity fixture b00" in r["messages"][0]["content"]]
+    assert all("repository tools" not in r["messages"][0]["content"] for r in b00)
+    assert any(m.get("content") == builder.V2_TOOL_UNAVAILABLE for m in b00[-1]["messages"])
+    a00 = [r for r in probe.requests if "Fidelity fixture a00" in r["messages"][0]["content"]]
+    assert "repository tools" in a00[0]["messages"][0]["content"]
+    assert any(m["role"] == "tool" and m["content"] != builder.V2_TOOL_UNAVAILABLE for m in a00[-1]["messages"])
+
+
+def test_v2_earlier_turns_stay_generated_only_on_exact_prefix():
+    probe = FakeAPI(generated=800, calls=2)
+    manifest = make_api(probe, "v2")
+    e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
+    assert e00["provenance"]["earlier_turns_ctx"] == 0
+    # Tool results stay ctx: the gen ids are exactly the generated assistant spans.
+    assert e00["roles"].count("gen") == sum(t["generated_tokens"] for t in e00["provenance"]["turns"])
+    assert e00["roles"][e00["score_from"]:].count("gen") >= 400
+
+
+def test_v2_short_answers_get_native_user_turn_context():
+    probe = FakeAPI(generated=30, calls=0)
+    manifest = make_api(probe, "v2")
+    e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
+    padding = e00["provenance"]["trailing_ctx"]
+    assert padding > 0
+    renderer = TemplateRenderer()
+    head = renderer.ids(renderer.message({"role": "user", "content": "File: " + "x" * 64}))[:2]
+    assert e00["tokens"][-padding:][:2] == head
+    assert set(e00["roles"][-e00["provenance"]["trailing_ctx"]:]) == {"ctx"}
+
+
+class ShortFinalAPI(FakeAPI):
+    """Tool turn, long tool turn, then a short final answer (the Muse pattern)."""
+
+    def __call__(self, body):
+        own = sum(1 for m in body["messages"] if m["role"] == "tool")
+        self.generated = 400 if own == 0 else 1600 if own == 1 else 40
+        self.calls = 2
+        return super().__call__(body)
+
+
+def test_v2_scored_span_ends_at_the_best_turn_and_history_continues():
+    probe = ShortFinalAPI()
+    manifest = make_api(probe, "v2")
+    e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
+    p = e00["provenance"]
+    assert p["turns_generated"] == 3 and p["scored_end_turn"] == 2 and len(p["turns"]) == 2
+    assert e00["roles"][e00["score_from"]:].count("gen") > 400 > p["turns"][0]["generated_tokens"] - 400
+    # The fixture conversation for the next A window continues from the final turn.
+    a00 = [r for r in probe.requests if "Fidelity fixture a00" in r["messages"][0]["content"]]
+    a01 = [r for r in probe.requests if "Fidelity fixture a01" in r["messages"][0]["content"]]
+    assert sum(m["role"] == "tool" for m in a01[0]["messages"]) >= sum(m["role"] == "tool" for m in a00[-1]["messages"])
+    assert manifest["recipe"]["version"]["scored_end"].startswith("assistant-turn end")
+
+
+def test_topup_appends_next_b_windows_and_notes_allocation():
+    probe = FakeAPI(generated=3000, calls=0)
+    manifest = make_api_topup(probe, 3)
+    ids = [w["id"] for w in manifest["windows"]]
+    assert len(ids) == 67 and ids[ids.index("b11") + 1:ids.index("b11") + 4] == ["b12", "b13", "b14"]
+    note = manifest["allocation_note"]
+    assert note["added_windows"] == {"b12": "decode", "b13": "prefill", "b14": "decode"}
+    assert note["added_strata"] == {"8-16K": 3} and note["original_blocks"]["B"] == 12
+    assert manifest["recipe"]["blocks"]["B"] == 15 and manifest["recipe"]["windows"] == 67
+    with pytest.raises(ValueError, match="recipe v2"):
+        make_api_topup(FakeAPI(), 1, recipe="v1")
+
+
+def make_api_topup(probe, n, recipe="v2"):
+    return builder.build_set(family="muse_spark", model="test-model", checkpoint="test-model",
+        version="t", arm={"checkpoint": "test-model", "snapshot_revision": "r", "config_sha256": "c",
+                          "tokenizer_sha256": "t"},
+        tokenizer=FakeTokenizer(), probe=probe, recipe=recipe, topup_b=n,
+        legacy_reference={"schema": "cuteafd.bench.reference/1", "score_from": 64, "tokens": list(range(576))},
+        legacy_provenance={"path": "synthetic-test-anchor", "sha256": "b" * 64})
+
+
+class HistoryRewritingAPI(FakeAPI):
+    """A renderer that drops a turn's reasoning once a user turn follows (DeepSeek drop_thinking)."""
+
+    def conversation(self, body, messages):
+        rewritten = [dict(m, reasoning_content="") if m["role"] == "assistant" else m for m in messages]
+        return self.renderer.conversation_ids(body, rewritten)
+
+
+def test_v2_trailing_context_falls_back_to_raw_text_when_the_renderer_rewrites_history():
+    manifest = make_api(HistoryRewritingAPI(generated=30, calls=0), "v2")
+    e00 = next(w for w in manifest["windows"] if w["id"] == "e00")
+    assert e00["provenance"]["trailing_context"].startswith("raw repository text")
+    counts = manifest["recipe"]["trailing_context_windows"]
+    assert counts["raw repository text (renderer rewrites the scored turn)"] > 0 and counts["native user turn"] == 0
+    native = make_api(FakeAPI(generated=30, calls=0), "v2")
+    assert native["recipe"]["trailing_context_windows"]["native user turn"] > 0
+    assert native["recipe"]["version"]["sha256"] == manifest["recipe"]["version"]["sha256"]
+
+
+class JsonModeAPI(FakeAPI):
+    """Provider JSON mode injects 22 tokens our render does not have."""
+
+    def __call__(self, body):
+        chat = super().__call__(body)
+        extra = 22 if body.get("response_format") else 0
+        chat["generation_provenance"] = {"usage": {"prompt_tokens": len(chat["probe"]["prompt_ids"]) + extra}}
+        return chat
+
+
+def test_v2_drops_provider_json_mode_when_it_breaks_prompt_exactness():
+    probe = JsonModeAPI(generated=3000, calls=0)
+    manifest = make_api(probe, "v2")
+    assert manifest["recipe"]["json_mode_dropped_windows"] == ["d00", "d01", "d02"]
+    d00 = next(w for w in manifest["windows"] if w["id"] == "d00")
+    assert d00["provenance"]["json_mode"]["provider_prompt_offset"] == 22
+    final = [r for r in probe.requests if "Fidelity fixture d00" in r["messages"][0]["content"]][-1]
+    assert "response_format" not in final and "Reply in JSON." in final["messages"][-1]["content"]
+    exact = make_api(FakeAPI(generated=3000, calls=0), "v2")
+    assert exact["recipe"]["json_mode_dropped_windows"] == []

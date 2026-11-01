@@ -27,6 +27,21 @@ pub fn native_manifest(library: &std::path::Path, name: &str) -> Result<Value> {
 
 const COMPRESSOR_WORKSPACE: u64 = 4 << 20;
 
+/// One retained encoder-suffix row: the layer-19 residual (40960 B) and its
+/// pre-norm scales (16 B). The runtime's `EncoderSuffix` sizes rows with it.
+pub const ENCODER_SUFFIX_ROW_BYTES: u64 = 40960 + 16;
+/// Rows of one prompt's retained suffix: the decoder replay's final window.
+pub const ENCODER_SUFFIX_ROWS: u64 = 128;
+/// The packed arena's rows for units of `unit` rows (up to 16 members' tails).
+pub fn packed_suffix_rows(unit: u64) -> u64 { unit.min(16 * ENCODER_SUFFIX_ROWS) }
+/// The prefill slots' encoder suffix storage: the packed arena plus one
+/// prompt suffix per request slot (`concurrency`), every one allocated at
+/// startup. Prompts mid-encoder (several interleave under the decode share)
+/// each hold one; a request slot holds at most one prompt.
+pub fn encoder_suffix_bytes(unit: u64, concurrency: u64) -> u64 {
+    (packed_suffix_rows(unit) + concurrency * ENCODER_SUFFIX_ROWS) * ENCODER_SUFFIX_ROW_BYTES
+}
+
 /// Rows of a decode lane's private owners: the compiled cover of the widest
 /// decode/verify step (`V41_VERIFY_ROWS`).
 pub const DECODE_LANE_ROWS: u64 = 80;
@@ -228,10 +243,11 @@ impl<'a> NativePrograms<'a> {
     /// by the daemon's plan == runtime test), plus each of the `slots` slot
     /// passes' private device owners (its verify-width target head and window
     /// batch table). Excludes local expert / TP2 FFN arenas.
-    pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, head_mode: Fp8Head,
-        window_batch: bool) -> Result<Vec<Demand>> {
+    pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
+        head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256 && matches!(ranks, 1 | 2)
-            && (1..=4).contains(&slots) && (!window_batch || ranks == 1), "invalid V4.1 prefill slot geometry");
+            && (1..=4).contains(&slots) && (1..=16).contains(&concurrency) && (!window_batch || ranks == 1),
+            "invalid V4.1 prefill slot geometry");
         let (r, u) = (reserve, unit);
         let mut out = Vec::new();
         for rank in 0..ranks {
@@ -270,7 +286,7 @@ impl<'a> NativePrograms<'a> {
                 add(&mut out, "index", index_query + selection + follower);
             }
             if !placed || rank == 0 {
-                add(&mut out, "encoder suffix", unit.min(16 * 128) * (40960 + 16));
+                add(&mut out, "encoder suffix", encoder_suffix_bytes(unit, concurrency));
                 add(&mut out, "embedding", u * (4 + 40960 + 16 + 10240 + 4));
             }
             // Engram: reserve row planes on each gate GPU (layers 1, 14), gates' scratch at the unit.
@@ -308,10 +324,10 @@ impl<'a> NativePrograms<'a> {
     /// weights, cache/prefix banks, vision and Spark transports: the two
     /// decode lanes, private at `decode_rows` (`DECODE_LANE_ROWS`), and the
     /// prefill slots' storage ([`Self::prefill_slots`]).
-    pub fn target(&self, decode_rows: u64, reserve: u64, unit: u64, ranks: usize, slots: usize, head_mode: Fp8Head,
-        window_batch: bool) -> Result<Vec<Demand>> {
+    pub fn target(&self, decode_rows: u64, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
+        head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
         let mut out = self.decode_lanes(decode_rows, ranks, head_mode, window_batch)?;
-        out.extend(self.prefill_slots(reserve, unit, ranks, slots, head_mode, window_batch)?);
+        out.extend(self.prefill_slots(reserve, unit, ranks, slots, concurrency, head_mode, window_batch)?);
         Ok(out)
     }
 
@@ -563,7 +579,7 @@ mod tests {
         let manifest = manifest();
         let programs = NativePrograms::new(&manifest, 188)?;
         for ranks in [1, 2] {
-            let target = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::Off, ranks == 1)?;
+            let target = programs.target(80, 8256, 4096, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 // Decode lanes are identical, private, at decode width.
                 for group in ["backbone", "index", "target head"] {
@@ -575,23 +591,27 @@ mod tests {
                     4 * owner(&target, rank, "lane 0 target head"));
                 assert!(owner(&target, rank, "prefill slots lane") > owner(&target, rank, "lane 0 backbone"));
             }
-            assert_eq!(owner(&target, 0, "prefill slots encoder suffix"), 2048 * (40960 + 16));
+            // The packed arena plus one prompt suffix per request slot.
+            assert_eq!(owner(&target, 0, "prefill slots encoder suffix"), (2048 + 16 * 128) * (40960 + 16));
             assert!(!target.iter().any(|d| d.gpu != 0 && d.group.ends_with("encoder suffix")));
-            let small = programs.prefill_slots(256, 64, ranks, 2, Fp8Head::Off, ranks == 1)?;
-            assert_eq!(owner(&small, 0, "prefill slots encoder suffix"), 64 * (40960 + 16));
+            let small = programs.prefill_slots(256, 64, ranks, 2, 16, Fp8Head::Off, ranks == 1)?;
+            assert_eq!(owner(&small, 0, "prefill slots encoder suffix"), (64 + 16 * 128) * (40960 + 16));
+            let one = programs.prefill_slots(256, 64, ranks, 2, 1, Fp8Head::Off, ranks == 1)?;
+            assert_eq!(owner(&one, 0, "prefill slots encoder suffix"), (64 + 128) * (40960 + 16));
+            assert!(programs.prefill_slots(256, 64, ranks, 2, 0, Fp8Head::Off, ranks == 1).is_err());
             assert!(target.iter().all(|d| d.category == Category::Workspace));
             assert!(!target.iter().any(|d| d.group.starts_with("lane 2")), "decode lanes only");
             // Engram planes live with the gates (layers 1 and 14, GPU0 on two RTX).
             assert!(!target.iter().any(|d| d.gpu != 0 && d.group.contains("engram")));
             // The slot set's rows scale with the reserve, its scratch with the unit.
-            let narrow = programs.prefill_slots(8256, 2048, ranks, 4, Fp8Head::Off, ranks == 1)?;
-            let short = programs.prefill_slots(4224, 2048, ranks, 4, Fp8Head::Off, ranks == 1)?;
+            let narrow = programs.prefill_slots(8256, 2048, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
+            let short = programs.prefill_slots(4224, 2048, ranks, 4, 16, Fp8Head::Off, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 assert!(owner(&narrow, rank, "prefill slots lane") > owner(&short, rank, "prefill slots lane"));
             }
-            let fp8 = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::All, ranks == 1)?;
-            let packed = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::Packed, ranks == 1)?;
-            let draft = programs.target(80, 8256, 4096, ranks, 4, Fp8Head::Draft, ranks == 1)?;
+            let fp8 = programs.target(80, 8256, 4096, ranks, 4, 16, Fp8Head::All, ranks == 1)?;
+            let packed = programs.target(80, 8256, 4096, ranks, 4, 16, Fp8Head::Packed, ranks == 1)?;
+            let draft = programs.target(80, 8256, 4096, ranks, 4, 16, Fp8Head::Draft, ranks == 1)?;
             for rank in 0..ranks as u8 {
                 for group in ["lane 0 target head", "lane 1 target head"] {
                     assert_eq!(owner(&fp8, rank, group) - owner(&target, rank, group), 660992);
@@ -604,13 +624,13 @@ mod tests {
                     - owner(&target, rank, "prefill slots target heads"), 4 * 655360);
             }
         }
-        assert!(programs.target(0, 8256, 4096, 1, 2, Fp8Head::All, false).is_err());
-        assert!(programs.target(80, 8256, 4097, 2, 2, Fp8Head::All, false).is_err());
-        assert!(programs.target(80, 8256, 4096, 3, 2, Fp8Head::All, false).is_err());
-        assert!(programs.target(80, 8256, 4096, 2, 2, Fp8Head::All, true).is_err());
-        assert!(programs.prefill_slots(2048, 4096, 1, 2, Fp8Head::Off, false).is_err(), "unit wider than the reserve");
-        let off = programs.target(80, 8256, 4096, 1, 4, Fp8Head::Off, false)?;
-        let on = programs.target(80, 8256, 4096, 1, 4, Fp8Head::Off, true)?;
+        assert!(programs.target(0, 8256, 4096, 1, 2, 16, Fp8Head::All, false).is_err());
+        assert!(programs.target(80, 8256, 4097, 2, 2, 16, Fp8Head::All, false).is_err());
+        assert!(programs.target(80, 8256, 4096, 3, 2, 16, Fp8Head::All, false).is_err());
+        assert!(programs.target(80, 8256, 4096, 2, 2, 16, Fp8Head::All, true).is_err());
+        assert!(programs.prefill_slots(2048, 4096, 1, 2, 16, Fp8Head::Off, false).is_err(), "unit wider than the reserve");
+        let off = programs.target(80, 8256, 4096, 1, 4, 16, Fp8Head::Off, false)?;
+        let on = programs.target(80, 8256, 4096, 1, 4, 16, Fp8Head::Off, true)?;
         assert_eq!(on.iter().map(|d| d.bytes).sum::<u64>() - off.iter().map(|d| d.bytes).sum::<u64>(),
             2 * window_batch_bytes(80)? + 4 * window_batch_bytes(4096)?);
         for rows in [1, 80, 256, 1024, 4096] {

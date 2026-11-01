@@ -199,11 +199,6 @@ impl<'a> CompressorState<'a> {
         let slot = self.validate(lease)?;
         self.index.bind(slot, pages, rows)
     }
-    /// Shrink a lease's binding to `pages`, a prefix of its pages holding its `rows`.
-    pub fn rebind(&mut self, lease: CompressorLease, pages: &[u32], rows: usize) -> Result<()> {
-        let slot = self.validate(lease)?;
-        self.index.shrink(slot, pages, rows)
-    }
     /// Pages bound to a lease and its initialized source rows.
     pub fn binding(&self, lease: CompressorLease) -> Result<(&[u32], usize)> {
         Ok(self.index.binding(self.validate_identity(lease)?))

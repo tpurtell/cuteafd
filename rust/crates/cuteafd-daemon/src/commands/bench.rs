@@ -391,7 +391,7 @@ mod tests {
         assert_eq!((sequences.value.as_deref(), sequences.default.as_deref(), sequences.source.as_str()),
             (Some("2"), Some("4"), "cli"));
         assert!(sequences.differs());
-        let output = find("max-output");
+        let output = find("max-output-tokens");
         assert_eq!(output.source, "default");
         assert!(!output.differs());
         assert!(!context.settings.iter().any(|s| s.name == "no-copy-drafts"));

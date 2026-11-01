@@ -3,3 +3,4 @@
 //! cache in `cuteafd-daemon::v41_native_serve::prefix`.
 pub mod prefix;
 pub mod media;
+pub mod reserve;

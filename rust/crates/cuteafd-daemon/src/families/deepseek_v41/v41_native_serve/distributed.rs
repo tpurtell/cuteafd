@@ -314,10 +314,13 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
         query_storage, output_storage, dual_storage));
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
         slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
+    let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
+        .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6), unless the experimental TP2 attention/projections
     // replace or add owners the planner does not model.
     if !(args.tp2_attention || args.tp2_query_projection || args.tp2_output_projection) {
-        admission::verify_target_charges(&lib, &args.native_lib, &[0, 1], decode_rows, reserve as u64, capacity, slots)?;
+        admission::verify_target_charges(&lib, &args.native_lib, &[0, 1], decode_rows, reserve as u64, capacity, slots,
+            args.concurrency)?;
     }
     pass.install_attention_plan(attention_plan)?;
     second.install_attention_plan(attention_plan)?;
@@ -494,7 +497,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
             devices[1].run(|| transport.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;
         }
     }
-    let mut prefill_slots = super::prefill_target::PrefillSlots { packed_suffix, slots: slot_passes.into_iter().zip(slot_transports).collect() };
+    let mut prefill_slots = super::prefill_target::PrefillSlots { packed_suffix, prompt_suffixes,
+        slots: slot_passes.into_iter().zip(slot_transports).collect() };
     if expert_layers < 40 {
         let link = &mut prefill_slots.slots[0].1;
         devices[1].run(|| link.get_mut().bootstrap(expert_layers as u32, catalog.nvfp4().is_some()))?;

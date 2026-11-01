@@ -101,7 +101,7 @@ done
 # Every family launches through scripts/launch/run-family.sh (same config file,
 # same container names, so ./stop.sh stops it); the family comes from the
 # checkpoint's config.json.
-if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" ]]; then
+if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" && -d "$CUTEAFD_NAMESPACE_ROOT/hf-home" ]]; then
   export HF_HOME="$(readlink -f "$CUTEAFD_NAMESPACE_ROOT")/hf-home"
 fi
 family="$(release_config_family "$config")"

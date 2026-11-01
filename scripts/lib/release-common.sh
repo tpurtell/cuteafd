@@ -8,6 +8,26 @@ release_die() {
   exit 2
 }
 
+# Resolve on the host that will run Docker. Mount the whole hub so snapshot
+# files' ../../blobs links and companion repositories remain visible.
+release_hub_mounts() {
+  local namespace="$1" site="$2" hf="$3" relative="$4" hub
+  RELEASE_HUB_SNAPSHOT="$(readlink -f "$hf/$relative")" || release_die "missing snapshot: $hf/$relative"
+  [[ -d "$RELEASE_HUB_SNAPSHOT" ]] || release_die "missing snapshot: $hf/$relative"
+  if find "$RELEASE_HUB_SNAPSHOT" -xtype l -print -quit | grep -q .; then
+    release_die "model snapshot has dangling links: $hf/$relative"
+  fi
+  if ((site)); then
+    hub="$(readlink -f "$hf/hub")"
+    [[ -d "$hub" ]] || release_die "missing hub: $hf/hub"
+    RELEASE_HUB_MOUNTS=(-v "$hub:$hub:ro")
+    [[ "$hf/hub" == "$hub" ]] || RELEASE_HUB_MOUNTS+=(-v "$hub:$hf/hub:ro")
+  else
+    [[ -d "$namespace/hf-home" ]] || release_die "missing namespace hub: $namespace/hf-home"
+    RELEASE_HUB_MOUNTS=(-v "$namespace:$namespace:ro")
+  fi
+}
+
 # CUDA and NVML can enumerate cards differently. UUID is the only join key;
 # querying the driver here creates no context or device allocation.
 release_cuda_total_bytes() {
@@ -885,7 +905,7 @@ release_known_key() {
     DECODE_LANES|PREFILL_ROWS|PREFILL_WAVES|PREFILL_SPAN_ROWS) return 0 ;; # Shared prefill units: rows each, units in flight, rows per continuous span (PLAN "Prefill contract").
     PROFILE|PROFILE_DIR|PROFILE_NCU_KERNEL|PROFILE_NCU_COUNT|PROFILE_NCU_SET|PROFILE_NCU_SKIP|PROFILE_NSYS_GPU_METRICS|PROFILE_NSYS_CPU|PROFILE_EXPERT_INPUT_SAMPLE|PROFILE_EXPERT_ROUTE_WEIGHTS) return 0 ;;
     PROFILE_SPARK|PROFILE_SPARK_RANKS|PROFILE_SPARK_NCU_KERNEL|PROFILE_SPARK_NCU_COUNT|PROFILE_SPARK_NCU_SET|PROFILE_SPARK_NCU_SKIP|PROFILE_SPARK_NSYS_GPU_METRICS) return 0 ;;
-    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
+    HTTP_QUEUE_DEPTH|HTTP_QUEUE_WAIT_MS|MODEL_ID|MODEL_VARIANT|MODEL_REVISION|EXPERT_FORMAT|DSPARK_DRAFT_POLICY|DSPARK_DRAFT_LIMIT|V41_FP8_HEAD|RTX_GPUS|RTX_EXPERT_LAYERS|RTX_EXPERT_PEER|COORDINATOR_GPU_HEADROOM_GIB|KV_POOL_TOKENS|KV_POOL_SIZE|HOST_CACHE_BYTES|MEMORY_RESERVATION|MAX_CONTEXT_TOKENS|MAX_OUTPUT_TOKENS|KV_DECODE_RESERVE_CHUNK|KV_RESERVE_DRAIN_BUFFER|KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS|CONCURRENCY|PREFIX_CACHE_ENTRIES|PREFILL_BATCH_TOKENS|SPARK_DEVICE_BUDGET_BYTES|SPARK_REDUCTION_MIN_ROWS|SPARKINFER_EXL3|SPARK_COUNT|SPARK_TP|SPARK_EP|ADDR|EXPERT_PORT|SPARK_[0-7]_HOST|SPARK_[0-7]_LANE_A|SPARK_[0-7]_LANE_B|CUTEAFD_EXPORT_HOST|WIP_BUILD_SEED|COORDINATOR_DOCKER_DEV|COORDINATOR_DOCKER_INFERENCE|SPARK_EXPERT_DOCKER_DEV|SPARK_EXPERT_DOCKER_INFERENCE|COORDINATOR_GPU_BUDGET_GIB|SPARK_HOSTS)
       return 0
       ;;
     *)
@@ -1097,7 +1117,10 @@ release_load_config() {
   ENABLE_BENCH=off
   MEMORY_RESERVATION=
   MAX_CONTEXT_TOKENS=1048576
-  MAX_OUTPUT_TOKENS=393216
+  MAX_OUTPUT_TOKENS=131072
+  KV_DECODE_RESERVE_CHUNK=
+  KV_RESERVE_DRAIN_BUFFER=
+  KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS=
   HTTP_QUEUE_DEPTH=
   HTTP_QUEUE_WAIT_MS=25000
   CONCURRENCY=
@@ -1282,15 +1305,19 @@ release_load_config() {
   release_validate_coordinator_gpu_budget "$COORDINATOR_GPU_BUDGET_GIB"
   [[ -z "$POOL_TOKENS" || "$POOL_TOKENS" == auto || "$POOL_TOKENS" =~ ^[0-9]+$ ]] || release_die "POOL_TOKENS must be auto or a non-negative integer"
   [[ -z "$POOL_TOKENS" || -z "$KV_POOL_SIZE" ]] || release_die "POOL_TOKENS conflicts with KV_POOL_SIZE"
-  for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS MAX_OUTPUT_TOKENS; do
+  for release_integer_name in KV_POOL_TOKENS MAX_CONTEXT_TOKENS KV_DECODE_RESERVE_CHUNK; do
     value="${!release_integer_name}"
     [[ -z "$value" || "$value" =~ ^[1-9][0-9]*$ ]] || release_die "$release_integer_name must be a positive integer"
   done
+  # MAX_OUTPUT_TOKENS <= 0: output is bounded only by the context left after the prompt.
+  [[ -z "$MAX_OUTPUT_TOKENS" || "$MAX_OUTPUT_TOKENS" =~ ^-?[0-9]+$ ]] || release_die "MAX_OUTPUT_TOKENS must be an integer"
+  [[ -z "$KV_RESERVE_DRAIN_BUFFER" || "$KV_RESERVE_DRAIN_BUFFER" =~ ^[0-9]+$ ]] ||
+    release_die "KV_RESERVE_DRAIN_BUFFER must be a non-negative integer"
+  [[ -z "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" || "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS" =~ ^(-1|[0-9]+)$ ]] ||
+    release_die "KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS must be -1 or a non-negative integer"
   if [[ "$mode" == launch ]]; then
     [[ -z "$MAX_CONTEXT_TOKENS" ]] || ((MAX_CONTEXT_TOKENS <= 1048576)) ||
       release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
-    [[ -z "$MAX_OUTPUT_TOKENS" ]] || ((MAX_OUTPUT_TOKENS <= 393216)) ||
-      release_die "MAX_OUTPUT_TOKENS must be in 1..393216"
   fi
   if [[ "$mode" == launch && -n "$KV_POOL_TOKENS" ]]; then
     ((KV_POOL_TOKENS % 64 == 0)) || release_die "KV_POOL_TOKENS must be a multiple of 64"
@@ -2108,3 +2135,13 @@ release_stage_wip_layout() {
   mv "$layout.tmp" "$layout"
 }
 
+
+# The shared KV reservation flags for whichever keys the configuration sets (issue #951).
+release_kv_reserve_args() {
+  local -n release_kv_out="$1"
+  release_kv_out=()
+  [[ -z "${KV_DECODE_RESERVE_CHUNK:-}" ]] || release_kv_out+=(--kv-decode-reserve-chunk "$KV_DECODE_RESERVE_CHUNK")
+  [[ -z "${KV_RESERVE_DRAIN_BUFFER:-}" ]] || release_kv_out+=(--kv-reserve-drain-buffer "$KV_RESERVE_DRAIN_BUFFER")
+  [[ -z "${KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS:-}" ]] ||
+    release_kv_out+=(--kv-early-termination-min-output-tokens "$KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS")
+}

@@ -3,6 +3,13 @@ use clap::{CommandFactory, FromArgMatches};
 use serde::Serialize;
 use std::process::Command;
 
+// Optional allocator instrumentation (2026-10-26): `--features jemalloc`
+// replaces glibc so the coordinator's host heap can be measured with jemalloc's
+// stats (live vs active vs mapped).  The default build keeps glibc + malloc_tune.
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod cli;
 mod commands;
 mod families;
@@ -95,11 +102,18 @@ fn main() -> Result<()> {
     // Before any thread, tracing or CUDA: exec the AVX-512 build when this host
     // has AVX-512 and the image carries it (cuteafd_ffi::host_isa).
     let host_isa = cuteafd_ffi::host_isa::startup()?;
+    // Before any worker thread: pin glibc's mmap threshold so a request's multi-megabyte
+    // transients go back to the kernel on free instead of fragmenting the arenas
+    // (shared::malloc_tune; CUTEAFD_MALLOC_TUNE=off keeps glibc's dynamic threshold).
+    // Apply unconditionally: under the jemalloc build this still tunes glibc, which the
+    // prebuilt native library (libcuteafd_native.so) uses.
+    let malloc = shared::malloc_tune::apply_from_env().to_string();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
     tracing::info!("{host_isa}");
+    tracing::info!("{malloc}");
     tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())
 }
 
@@ -199,6 +213,7 @@ async fn run() -> Result<()> {
         }
         Commands::ServeNative(_) | Commands::ServeMimo(_) | Commands::ServeQwen4(_) | Commands::ServeQwen35(_) | Commands::ServeKimi(_) | Commands::ServeStep5(_) | Commands::ServeGlmf(_)
         | Commands::ServeGlm(_) | Commands::ServeDsv4(_) => {
+            shared::host_heap::start();
             tracing::info!(target: "cuteafd::fabric", source = "sparknest", status = cuteafd_transport::traffic::storage_status(), "local storage traffic source");
             shared::memory_report::monitor("coordinator", std::time::Duration::from_secs(10));
             shared::thermal::monitor("coordinator");
