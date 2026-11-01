@@ -159,6 +159,7 @@ COPY docker/release-entrypoint.sh /usr/local/bin/cuteafd-release-entrypoint
 # schema only, no new verifier. Kernel execution and numerical/device
 # qualification remain the hardware gate the release checklist records.
 RUN for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do \
+      [ -d "$exl3_family" ] || continue; \
       python3 /opt/cuteafd/python/tools/aot/package_exl3_aot.py verify \
         --package "$exl3_family" --sparkinfer-revision "$CUTEAFD_SPARKINFER_COMMIT" \
         --role "$CUTEAFD_ROLE" --runtime "$(python3 -m cutlass.cute.export.aot_config --libdir)/libcute_dsl_runtime.so"; \

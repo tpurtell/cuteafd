@@ -42,6 +42,18 @@ def _snapshot(hf: Path, model: str, config: dict, revision: str = "abc") -> None
         (audio / "model.safetensors").write_bytes(b"stub")
 
 
+def _namespace(tmp_path: Path) -> Path:
+    """A SparkNest-style namespace root whose hf-home is the test hub.
+
+    The launcher only takes the site-hub fallback when no namespace exists, so a
+    test that asserts the namespace mount must provide one explicitly; otherwise
+    the result depends on whether the host running the suite has /mnt/sparknest."""
+    namespace = tmp_path / "sparknest"
+    namespace.mkdir()
+    (namespace / "hf-home").symlink_to(tmp_path / "hf")
+    return namespace
+
+
 def _run(repo: Path, hf: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = {**os.environ, "HF_HOME": str(hf)}
     return subprocess.run(["bash", str(repo / "run.sh"), *args], cwd=repo, env=env,
@@ -1189,10 +1201,12 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
     plan = {"placement_supported": True, "fits": True, "spark_ranks": 1,
             "encoder_plan_hash": "ab" * 32,
             "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}}
+    namespace = _namespace(tmp_path)
     result = _family_launch_result(tmp_path, config, "test/model",
                                   "VISION=rtx\nAUDIO=off\nRTX_GPUS=1\nSPECULATOR=off\nWIP_INSTANCE=plan-test\n",
                                   preferred_ranks=1 if qwen else None, encoder_plan=plan,
-                                  extra_args=("--wip", "slot-test"))
+                                  extra_args=("--wip", "slot-test"),
+                                  extra_env={"CUTEAFD_NAMESPACE_ROOT": str(namespace)})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     plans = [line for line in lines if "cuteafd plan" in line]
@@ -1205,7 +1219,7 @@ def test_wip_startup_plans_use_staged_slot_mounts_and_entrypoint(tmp_path, qwen)
             assert f"wip-run/plan-test/slot-test/serve-default/{part}:/opt/cuteafd/{part}:ro" in preflight
         assert "--entrypoint /opt/cuteafd/share/release-entrypoint.sh" in preflight
         # Draft snapshots resolve under HF_HOME inside the full namespace mount.
-        assert "HF_HOME=/mnt/sparknest/hf-home" in preflight and "/mnt/sparknest:/mnt/sparknest:ro" in preflight
+        assert f"HF_HOME={namespace}/hf-home" in preflight and f"{namespace}:{namespace}:ro" in preflight
 
 
 @pytest.mark.parametrize("budget,total,embedding", [("", 32768, "host"), ("31.8", 98304, "host"), ("", 98304, "gpu")])
@@ -2615,6 +2629,33 @@ def test_glm_template_override_invalid_source_refused_before_workers(tmp_path, s
     assert "cuteafd expertd-native" not in result.stderr and "cuteafd serve-glmf" not in result.stderr
 
 
+@pytest.mark.skipif(Path("/mnt/sparknest/hf-home").is_dir(),
+                    reason="this host has a SparkNest namespace; the site-hub fallback cannot be exercised")
+def test_site_hub_fallback_binds_the_resolved_snapshot(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+                                   with_nest=False)
+    assert result.returncode == 0, result.stderr
+    snapshot = tmp_path / "hf" / "hub" / "models--test--model" / "snapshots" / "abc"
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    assert launches, result.stderr
+    for line in launches:
+        assert f"-v {snapshot}:{snapshot}:ro" in line, line
+        assert "/mnt/sparknest" not in line, line
+
+
+def test_namespace_mount_when_the_site_hub_is_present(tmp_path: Path) -> None:
+    namespace = _namespace(tmp_path)
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
+                                   "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
+                                   extra_env={"CUTEAFD_NAMESPACE_ROOT": str(namespace)})
+    assert result.returncode == 0, result.stderr
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    assert launches, result.stderr
+    for line in launches:
+        assert f"-v {namespace}:{namespace}:ro" in line, line
+
+
 @pytest.mark.parametrize("key, option", [("MIMO_FP8_HEAD", "--fp8-head"), ("MIMO_FP8_O_PROJ", "--fp8-o-proj")])
 @pytest.mark.parametrize("value, expected", [("auto", None), ("on", "true"), ("off", "false")])
 def test_mimo_explicit_target_format_overrides_are_forwarded(tmp_path, key, option, value, expected):
@@ -3835,21 +3876,23 @@ def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
     (9968af44, no #108 ancestry): its `cuteafd plan` refused Spark count 2 without
     HF_HOME and fit with HF_HOME=/hf."""
     _snapshot(tmp_path / "hf", "incoai/GLM-5.3-Flash-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    namespace = _namespace(tmp_path)
     family_config, model = GLMF_TWO_LAYER, "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8"
     result = _family_launch_result(tmp_path, family_config, model, "VISION=off\nAUDIO=off\n",
-                                   extra_args=("--wip", "pre108"))
+                                   extra_args=("--wip", "pre108"),
+                                   extra_env={"CUTEAFD_NAMESPACE_ROOT": str(namespace)})
     assert result.returncode == 0, result.stderr
     lines = result.stderr.splitlines()
     plans = [line for line in lines if "cuteafd plan" in line]
     coordinator = [line for line in lines if "serve-glmf --snapshot" in line]
     assert plans and coordinator
     for line in plans + coordinator:
-        assert "HF_HOME=/mnt/sparknest/hf-home" in line and "/mnt/sparknest:/mnt/sparknest:ro" in line, line
+        assert f"HF_HOME={namespace}/hf-home" in line and f"{namespace}:{namespace}:ro" in line, line
         assert "/root/" not in line, line
     # The default drafter is passed as the same resolved host snapshot path.
     assert f"--draft {tmp_path}/hf/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/" in coordinator[0]
     worker = result.stderr.split("release_serving_docker_args ()", 1)[1]
-    assert "HF_HOME=/mnt/sparknest/hf-home" in worker and "/mnt/sparknest:/mnt/sparknest:ro" in worker
+    assert f"HF_HOME={namespace}/hf-home" in worker and f"{namespace}:{namespace}:ro" in worker
 
 
 @pytest.mark.parametrize("wip", [False, True])

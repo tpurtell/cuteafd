@@ -17,6 +17,21 @@ namespace_hf_home="$namespace_root/hf-home"
 if [[ -n "${CUTEAFD_NAMESPACE_ROOT:-}" ]]; then
   export HF_HOME="$namespace_hf_home"
 fi
+# A site WITHOUT the shared SparkNest namespace (no $namespace_root/hf-home)
+# keeps each host's hub at ${HF_HOME:-$HOME/.cache/huggingface} (the v3.0.1
+# layout). Containers then bind the resolved snapshot directory at its own path
+# instead of the absent namespace root.
+site_hub=0
+if [[ -z "${CUTEAFD_NAMESPACE_ROOT:-}" && ! -d "$namespace_hf_home" ]]; then
+  site_hub=1
+  export HF_HOME="${HF_HOME:-$HOME/.cache/huggingface}"
+fi
+# The containers see the shared namespace hub when it exists, else the site hub.
+if ((site_hub)); then
+  container_hf_home="$HF_HOME"
+else
+  container_hf_home="$namespace_hf_home"
+fi
 config="$repo_root/cuteafd.config"
 restart=0
 restart_all=0
@@ -656,7 +671,7 @@ attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
 fi
-shared_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
+shared_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_SPARK_INTAKE=$intake"
   -e "CUTEAFD_CONSOLE_TEXT=$([[ $console_text == on ]] && echo true || echo false)"
   -e "CUTEAFD_ATTENTION_PLACEMENT=$attention_placement" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill"
   -e "CUTEAFD_SPARK_ADMISSION_TIMEOUT_SECONDS=${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}")
@@ -680,7 +695,7 @@ if [[ -n $idle_park ]]; then
   wait_env_args+=(-e "CUTEAFD_IDLE_PARK_SECONDS=$idle_park")
 fi
 shared_env_args+=("${wait_env_args[@]}")
-shared_worker_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)"
+shared_worker_env_args=(-e "HF_HOME=$container_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)"
   "${wait_env_args[@]}")
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_worker_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
@@ -1004,6 +1019,12 @@ if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gi
   fi
 fi
 snapshot_rel="hub/models--${RELEASE_MODEL_ID//\//--}/snapshots/$RELEASE_MODEL_REVISION"
+if ((site_hub)); then
+  site_snapshot="$(readlink -f "$hf_home/$snapshot_rel")"
+  namespace_mount_args=(-v "$site_snapshot:$site_snapshot:ro")
+else
+  namespace_mount_args=(-v "$namespace_root:$namespace_root:ro")
+fi
 [[ "$(jq -r '.quantization_config.quant_method == "exl3"' "$hf_home/$snapshot_rel/config.json")" != true ]] ||
   release_die "unsupported: EXL3 for DeepSeek V4/V4.1 Flash"
 coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
@@ -1096,7 +1117,7 @@ v41_decode_lanes="$(get DECODE_LANES)"
 [[ -z "$v41_decode_lanes" ]] || count_args+=(--decode-lanes "$v41_decode_lanes")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
-count_mounts=(-e "HF_HOME=$namespace_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} -v "$namespace_root:$namespace_root:ro")
+count_mounts=(-e "HF_HOME=$container_hf_home" ${v41_fp8_head_args[@]+"${v41_fp8_head_args[@]}"} "${namespace_mount_args[@]}")
 if [[ -n "$wip_layout" ]]; then
   count_mounts+=(-v "$wip_layout/bin:/opt/cuteafd/bin:ro" -v "$wip_layout/lib:/opt/cuteafd/lib:ro"
     -v "$wip_layout/share:/opt/cuteafd/share:ro" --entrypoint /opt/cuteafd/bin/cuteafd)
@@ -1487,7 +1508,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator" --restart no "$
   "${wip_mount_args[@]}" \
   "${api_mount_args[@]}" -e "CUTEAFD_IMAGE=$COORDINATOR_DOCKER_INFERENCE" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} \
-  -v "$namespace_root:$namespace_root:ro" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
+  "${namespace_mount_args[@]}" "$COORDINATOR_DOCKER_INFERENCE" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${args[@]}" >/dev/null
 }
 deadline=$((SECONDS + ${CUTEAFD_RELEASE_READY_TIMEOUT_SECONDS:-900}))
 echo "== starting native Spark experts =="
@@ -1558,13 +1579,17 @@ rdma_args=()
 [[ -z "$rdma_env" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP=$rdma_env")
 [[ -z "$execution_lanes" ]] || rdma_args+=(-e "CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES=$execution_lanes")
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
+# No SparkNest namespace on this host -> bind the resolved snapshot itself.
+worker_snapshot="$(readlink -f "$hf_home/$snapshot_rel")"
+if [[ -d "$namespace_root/hf-home" ]]; then worker_mounts=(-v "$namespace_root:$namespace_root:ro")
+else worker_mounts=(-v "$worker_snapshot:$worker_snapshot:ro"); fi
 # A fixed INFO default makes the worker's structured startup evidence
 # (`rank`/`world`/`role`/`intermediate`) observable; without it EnvFilter is
 # ERROR and the readiness line never reaches the container log. This adds no
 # positional argument, so the worker argument contract is unchanged.
 release_serving_docker_args
 cuteafd_cdi_gpu_args all || exit 2
-docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} -v "$namespace_root:$namespace_root:ro" "$image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd expertd-native --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
+docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$name" --restart no "${CUTEAFD_CDI_ARGS[@]}" --network host --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband -e "CUTEAFD_RELEASE_CONFIG_SHA256=$fingerprint" -e "RUST_LOG=$rust_log" "${rdma_args[@]}" "${wip_args[@]}" ${profile_args[@]+"${profile_args[@]}"} "${worker_mounts[@]}" "$image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd expertd-native --snapshot "$worker_snapshot" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --rank "$rank" --world "$world" --device-budget-bytes "$budget" --listen "0.0.0.0:$port" "${topology_args[@]}" "${encoder_args[@]}" >/dev/null
 REMOTE
   pids+=("$!")
 done
@@ -1617,9 +1642,15 @@ revision="$(get MODEL_REVISION)"
 hf_home="${HF_HOME:-$namespace_root/hf-home}"
 hub="$(readlink -f "$hf_home/hub")"
 root="$hub/models--${model//\//--}"
-[[ -n "$revision" ]] || revision="$(<"$root/refs/main")"
+if [[ -z "$revision" ]]; then
+  [[ -r "$root/refs/main" ]] || { echo "missing snapshot $model (no refs/main under $root)" >&2; exit 1; }
+  revision="$(<"$root/refs/main")"
+fi
 snapshot="$(readlink -f "$root/snapshots/$revision")"
 [[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }
+# No SparkNest namespace on this host -> bind the resolved snapshot itself.
+if [[ -d "$namespace_root/hf-home" ]]; then generic_worker_mounts=(-v "$namespace_root:$namespace_root:ro")
+else generic_worker_mounts=(-v "$snapshot:$snapshot:ro"); fi
 # Family, the serving command and the layers with routed experts.
 described="$(python3 "$repo_root/scripts/lib/checkpoint-family.py" "$root/snapshots/$revision/config.json")" || exit 2
 read -r detected model_type first_layer last_layer <<<"$described"
@@ -1789,7 +1820,10 @@ spark_worker_args=""
 # Snapshot of a model id (and optional revision) inside the containers.
 snapshot_of() {
   local id="$1" rev="$2" dir="$hub/models--${1//\//--}"
-  [[ -n "$rev" ]] || rev="$(<"$dir/refs/main")"
+  if [[ -z "$rev" ]]; then
+    [[ -r "$dir/refs/main" ]] || { echo "missing snapshot $id (no refs/main under $dir)" >&2; return 1; }
+    rev="$(<"$dir/refs/main")"
+  fi
   [[ -d "$dir/snapshots/$rev" ]] || { echo "missing snapshot $id@$rev" >&2; return 1; }
   readlink -f "$dir/snapshots/$rev"
 }
@@ -2764,7 +2798,7 @@ audio_encoder_hash=""
   readiness_args=(--require-ready)
   [[ -z "$wip_slot" ]] || readiness_args=()
   # Keep checkpoint paths unchanged inside the full namespace mount.
-  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$namespace_hf_home" -v "$namespace_root:$namespace_root:ro" "${wip_mount_args[@]}" \
+  plan_json="$(docker run --rm --network none "${lane_env_args[@]}" -e "HF_HOME=$container_hf_home" "${generic_worker_mounts[@]}" "${wip_mount_args[@]}" \
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
@@ -3011,7 +3045,7 @@ for ((rank = 0; rank < ranks; rank++)); do
   [[ -z "$(get PROFILE_DIR)" ]] || worker_prep="mkdir -p $(printf '%q' "$(get PROFILE_DIR)") && release_require_writable_state $(printf '%q' "$(get PROFILE_DIR)") && "
   ssh "$host" "$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args); release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; ${worker_prep}docker run -d --name cuteafd-spark-expert-$host-$port --restart no \"\${CUTEAFD_CDI_ARGS[@]}\" --network host \
     --ipc host --ulimit memlock=-1:-1 --device=/dev/infiniband \"\${RELEASE_SERVING_ARGS[@]}\" -e RUST_LOG=info $(printf '%q ' "${shared_worker_env_args[@]}")$spark_worker_env $wip_worker_args $device_map_env$worker_profile \
-    -v $(printf %q "$namespace_root:$namespace_root:ro") '$spark_image' \
+    $(printf '%q ' "${generic_worker_mounts[@]}")'$spark_image' \
     ${worker_wrapper}cuteafd expertd-native --snapshot '$snapshot' --native-lib /opt/cuteafd/lib/libcuteafd_native.so \
     --rank $rank --world $ranks --device-budget-bytes $budget $spark_worker_args \
     --listen 0.0.0.0:$port $encoder_args >/dev/null" &
@@ -3069,7 +3103,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   --ulimit memlock=-1:-1 --device=/dev/infiniband -e RUST_LOG=info "${shared_env_args[@]:0:4}" \
   "${bond_args[@]}" "${bench_nonce_env_args[@]}" "${tp2_env_args[@]}" "${graph_census_args[@]}" "${lane_env_args[@]}" "${thermal_args[@]}" \
   "${shared_env_args[@]:4}" -e "CUTEAFD_IMAGE=$coordinator_image" "${wip_mount_args[@]}" "${device_map_args[@]}" \
-  -v "$namespace_root:$namespace_root:ro" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
+  "${generic_worker_mounts[@]}" -v "$bench_dir:/run/cuteafd/bench" -v "$fidelity_cache:/run/cuteafd/fidelity" -e CUTEAFD_FIDELITY_CACHE=/run/cuteafd/fidelity \
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
