@@ -4,6 +4,7 @@ pub mod audio_tower;
 mod decode;
 mod exif;
 mod muse;
+pub mod muse_vision;
 mod resize;
 mod spans;
 

@@ -179,8 +179,7 @@ def reference_stages(modules, rgb):
             kind = tower.config.layer_types[i]
             x = block(x, cu_seqlens=windows if kind == "window_attention" else cu,
                       position_embeddings=rotary)
-            if (i + 1) % 4 == 0 or i == 49:
-                result[str(i + 1)] = x
+            result[str(i + 1)] = x
         x = x[torch.argsort(permutation)]
         result["52"] = x
         x = tower.ln_post(x)
@@ -235,7 +234,6 @@ def run(args):
             refs = reference_stages(modules, rgb)
             gh, gw = rh // 14, rw // 14
             tokens = gh * gw // 4
-            lut = common.normalization_lut()  # replaced with Muse's checkpoint normalization
             lut = ((np.arange(256, dtype=np.float64) / 255.0).astype(np.float32) - np.float32(.5)) / np.float32(.5)
             lut = np.tile(lut, (3, 1)).copy()
             stages, errors = {}, []
@@ -260,21 +258,45 @@ def run(args):
             if errors:
                 raise RuntimeError(errors)
             stages["56"] = (output.astype(np.uint32) << 16).view(np.float32)
-            comparisons = {key: common.metrics(value, refs[key]) for key, value in stages.items()}
+            metadata = {native: bool(np.array_equal(stages[native], refs[official]))
+                        for native, official in [("-1", "patch_input"), ("-2", "cos"), ("-3", "sin")]}
+            comparisons = {key: common.metrics(value, refs[key]) for key, value in stages.items() if int(key) >= 0}
+            replay = {}
+            if args.replay_blocks:
+                tower = modules[0]
+                device = next(tower.parameters()).device
+                rotary = tuple(torch.from_numpy(refs[name]).to(device, dtype=torch.bfloat16) for name in ("cos", "sin"))
+                cu = torch.tensor([0, gh * gw], device=device, dtype=torch.int32)
+                windows = torch.from_numpy(refs["window_lengths"]).to(device, dtype=torch.int32)
+                with torch.no_grad():
+                    for i, block in enumerate(tower.layers):
+                        previous = stages["51" if i == 0 else str(i)]
+                        actual = torch.from_numpy(previous).to(device, dtype=torch.bfloat16)
+                        expected = block(actual, position_embeddings=rotary,
+                            cu_seqlens=windows if tower.config.layer_types[i] == "window_attention" else cu)
+                        expected = expected.float().cpu().numpy()
+                        row = common.metrics(stages[str(i+1)], expected)
+                        per_row = np.linalg.norm(stages[str(i+1)]-expected, axis=1) / np.maximum(np.linalg.norm(expected, axis=1), 1e-20)
+                        worst = int(np.argmax(per_row))
+                        raster = int(refs["permutation"][worst])
+                        row.update(worst_relative_row=float(per_row[worst]), window_row=worst,
+                            raster_hw=[raster // gw, raster % gw], kind=tower.config.layer_types[i])
+                        replay[str(i+1)] = row
             if not all(str(i) in stages for i in [0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 50, 51, 52, 53, 54, 55, 56]):
                 raise AssertionError("missing native stage observations")
             saved = output.copy()
             encode(OBSERVER())
             repeat = bool(np.array_equal(saved, output))
             result["images"][str(path)] = dict(grid=[gh, gw], tokens=tokens, encode_ms=elapsed,
-                stages=comparisons, byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
+                stages=comparisons, metadata_exact=metadata, block_replay=replay,
+                byte_repeatable=repeat, output_sha256=hashlib.sha256(output.tobytes()).hexdigest())
             if args.dump_stages:
                 args.dump_stages.mkdir(parents=True, exist_ok=True)
                 np.savez(args.dump_stages / (path.stem + ".npz"), **{"native_"+k:v for k,v in stages.items()}, **{"ref_"+k:v for k,v in refs.items()})
         final = Ledger()
         check(lib.cuteafd_vision_get_ledger(owner, C.byref(final)))
         result["final_ledger"] = final.as_dict()
-        result["pass"] = final.device_allocations == 2 and all(row["byte_repeatable"] and all(stage["pass"] for stage in row["stages"].values()) for row in result["images"].values())
+        result["pass"] = final.device_allocations == 2 and all(row["byte_repeatable"] and all(row["metadata_exact"].values()) and all(stage["pass"] for stage in row["stages"].values()) for row in result["images"].values())
         args.output.write_text(json.dumps(result, indent=2) + "\n")
         return 0 if result["pass"] else 1
     finally:
@@ -287,4 +309,5 @@ if __name__ == "__main__":
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--images", type=Path, nargs="+", required=True)
     parser.add_argument("--dump-stages", type=Path)
+    parser.add_argument("--replay-blocks", action="store_true")
     raise SystemExit(run(parser.parse_args()))

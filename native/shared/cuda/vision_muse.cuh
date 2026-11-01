@@ -124,6 +124,9 @@ int encode_muse(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,
   MUSE_LAUNCH((muse_rgb_patches<<<(size_t(n)*1176+255)/256,256,0,stream>>>(o->rgb,o->lut,o->patches,gh,gw)));
   MUSE_LAUNCH((muse_position_metadata<<<(n+255)/256,256,0,stream>>>(o->pos_indices,o->pos_weights,
     o->muse_cos,o->muse_sin,o->col,reinterpret_cast<const float*>(o->weights+s.inv_freq),gh,gw)));
+  MUSE_RUN(observe(o,cb,ctx,-1,o->patches,n,1176,false));
+  MUSE_RUN(observe(o,cb,ctx,-2,o->muse_cos,n,96,false));
+  MUSE_RUN(observe(o,cb,ctx,-3,o->muse_sin,n,96,false));
   MUSE_RUN(muse_program(o,"vision_projection_h1176_o1536",{o->patches,o->weights+s.patch,o->muse_x},{uint64_t(n)}));
   MUSE_RUN(muse_program(o,"vision_position_gather_h1536",{o->weights+s.pos_embed,o->pos_indices,
     o->pos_weights,o->muse_x,o->muse_xt},{uint64_t(n)}));
@@ -159,7 +162,7 @@ int encode_muse(Owner* o,const uint8_t* rgb,uint64_t rgb_bytes,const float* lut,
       {o->mlp,o->weights+b.down,o->weights+b.down_bias,o->muse_proj},{uint64_t(n)}));
     MUSE_RUN(muse_program(o,"vision_residual_h1536",{x,o->muse_proj,xt},{uint64_t(n)}));
     std::swap(x,xt);
-    if((i+1)%4==0 || i==49)MUSE_RUN(observe(o,cb,ctx,i+1,x,n,1536,false));
+    MUSE_RUN(observe(o,cb,ctx,i+1,x,n,1536,false));
   }
   MUSE_RUN(muse_gather(o,x,o->inverse,xt,n));
   MUSE_RUN(observe(o,cb,ctx,52,xt,n,1536,false));
