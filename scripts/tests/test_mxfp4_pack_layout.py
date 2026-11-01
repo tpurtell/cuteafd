@@ -152,6 +152,31 @@ def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.generic_stored_width(4096, 352) == 352
 
 
+def test_s384_split_recipe_is_explicit_decode_only_and_hardware_scoped():
+    for capacity in (1, 16, 80):
+        assert LAYOUTS.native_slice_width(5120, 384, 121, capacity, 192) == 128
+        assert LAYOUTS.native_fc1_k_splits(5120, 384, 121, capacity) == 2
+    for sm, hidden, width, capacity in [(120, 5120, 384, 1), (121, 5120, 576, 16),
+                                      (121, 4096, 384, 16), (121, 5120, 384, 256),
+                                      (121, 5120, 384, 1024), (121, 5120, 384, 4096)]:
+        assert LAYOUTS.native_fc1_k_splits(hidden, width, sm, capacity) == 1
+    assert LAYOUTS.native_slice_width(5120, 384, 121, 256, 192) == 192
+
+
+def test_native_plan_rejects_mixed_decode_splits_and_prefill_splits():
+    data = LAYOUTS.layouts()
+    row = next(row for row in data["native_slices"] if row["width"] == 384)
+    row["fc1_k_splits"][1] = 1
+    with pytest.raises(ValueError, match="share one FC1 K split"):
+        LAYOUTS.validate(data)
+    row["fc1_k_splits"][1] = 2
+    row["capacities"].append(256)
+    row["slices"].append(192)
+    row["fc1_k_splits"].append(2)
+    with pytest.raises(ValueError, match="prefill FC1 K splitting is unqualified"):
+        LAYOUTS.validate(data)
+
+
 def test_native_plan_rejects_duplicate_capacity_keys():
     data = LAYOUTS.layouts()
     data["native_slices"][0]["capacities"][1] = 1
