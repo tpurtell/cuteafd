@@ -608,7 +608,12 @@ impl Pulls {
         unsafe { std::ptr::write_volatile(self.at(slot, rank), reply) };
     }
     /// Clears every descriptor: a pull that runs afterwards copies nothing.
+    /// W48-12 (2026-10-30): a link whose ranks all land in device memory has
+    /// no descriptor block (`base` 0, see `Native`'s construction); clearing
+    /// it wrote through a null pointer when a wave failed (p10.4.2 segfault
+    /// in `spark-exchange` on a client disconnect during a parked prefill).
     fn clear(self, slots: usize) {
+        if self.base == 0 { return; }
         for slot in 0..slots {
             for rank in 0..MAX_INTAKE_RANKS {
                 // SAFETY: as `write`; a racing pull reads the old (retained)
