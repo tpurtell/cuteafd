@@ -180,6 +180,8 @@ async fn run() -> Result<()> {
     if let Commands::Plan(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeMimo(args) = &mut command { args.vision = vision; args.audio = audio; }
     if let Commands::ServeGlmf(args) = &mut command { args.vision = vision; }
+    // Mistral Large 4's tower on the GLM engine; a GLM 5.3 checkpoint has none (vision off).
+    if let Commands::ServeGlm(args) = &mut command { args.vision = vision; }
     if let Commands::ServeQwen4(args) = &mut command {
         args.vision = vision;
     }

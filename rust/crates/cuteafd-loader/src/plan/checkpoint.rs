@@ -14,10 +14,37 @@ pub mod identity;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointFormat { HfIndexed, HfSingle, Exlr8 }
 
+/// The default Hugging Face safetensors index.
+pub const HF_INDEX: &str = "model.safetensors.index.json";
+
+/// The safetensors index a checkpoint declares: `config.json`'s
+/// `transformers_weights` (Mistral's `consolidated.safetensors.index.json`,
+/// honored by transformers' loader), else the standard name. The declared
+/// name must be a plain `*.index.json` file name inside the snapshot.
+pub fn index_name(snapshot: &Path) -> Result<String> {
+    let path = snapshot.join("config.json");
+    if !path.is_file() { return Ok(HF_INDEX.into()); }
+    let config = read_json(&path)?;
+    match config.get("transformers_weights") {
+        None | Some(Value::Null) => Ok(HF_INDEX.into()),
+        Some(Value::String(name)) => {
+            ensure!(name.ends_with(".index.json") && !name.contains(['/', '\\']) && !name.starts_with('.'),
+                "config.json transformers_weights {name:?} is not a safetensors index file name");
+            Ok(name.clone())
+        }
+        Some(other) => anyhow::bail!("config.json transformers_weights must be a file name, found {other}"),
+    }
+}
+
+/// The path of the checkpoint's declared safetensors index.
+pub fn index_path(snapshot: &Path) -> Result<PathBuf> {
+    Ok(snapshot.join(index_name(snapshot)?))
+}
+
 impl CheckpointFormat {
     pub fn detect(snapshot: &Path) -> Result<Self> {
         if super::exlr8::recognizes(snapshot)? { return Ok(Self::Exlr8); }
-        if snapshot.join("model.safetensors.index.json").is_file() { return Ok(Self::HfIndexed); }
+        if index_path(snapshot)?.is_file() { return Ok(Self::HfIndexed); }
         ensure!(snapshot.join("model.safetensors").is_file(),
             "checkpoint has no recognized tensor inventory");
         Ok(Self::HfSingle)
@@ -149,7 +176,7 @@ impl Checkpoint {
             .find(|path| path.is_file())
             .map(|path| crate::formats::exl3_storage::read_storage_metadata(&path, MAX_JSON_BYTES, None))
             .transpose()?;
-        let index_path = snapshot.join("model.safetensors.index.json");
+        let index_path = index_path(snapshot)?;
         let weight_map: BTreeMap<String, String> = if index_path.is_file() {
             #[derive(serde::Deserialize)]
             struct Index { weight_map: BTreeMap<String, String> }
@@ -166,8 +193,8 @@ impl Checkpoint {
             let single = snapshot.join("model.safetensors");
             ensure!(
                 single.is_file(),
-                "{} has neither model.safetensors.index.json nor model.safetensors",
-                snapshot.display()
+                "{} has neither {} nor model.safetensors",
+                snapshot.display(), index_path.file_name().unwrap_or_default().to_string_lossy()
             );
             read_safetensors_metadata(&single)?
                 .into_iter()

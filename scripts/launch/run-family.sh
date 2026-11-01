@@ -1654,6 +1654,24 @@ read -r detected model_type first_layer last_layer <<<"$described"
 [[ -z "$family" || "$family" == "$detected" ]] ||
   { echo "--family $family does not match the checkpoint ($detected, model_type $model_type)" >&2; exit 2; }
 family="$detected"
+# The checkpoint's own family names its deployment plan; Mistral Large 4 runs
+# the GLM 5.3 engine (serve-glm, its keys and lanes) as the engine's ml4 variant. Two GPUs:
+# auto resolves to whole-layer owners (plan and server) until context measures faster; heads
+# and context (its ml42 head split) are explicit requests. SPECULATOR=dspark serves its bundled mtp_dspark drafter; it
+# stays opt-in (default off) until its lossless gate passes on hardware.
+checkpoint_family="$family"
+if [[ "$family" == mistral_large4 ]]; then
+  family=glm5
+  [[ -n "${cfg[SPECULATOR]+set}" ]] || cfg[SPECULATOR]=off
+  case "$(get SPECULATOR off)" in
+    off|dspark) ;;
+    *) release_die "Mistral Large 4 drafts only with its bundled mtp_dspark (SPECULATOR=dspark or off)" ;;
+  esac
+  case "$(get ATTENTION_PLACEMENT auto)" in
+    auto|layers|heads|context) ;;
+    *) release_die "Mistral Large 4 attention placement is auto, layers, heads or context" ;;
+  esac
+fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
 fi
@@ -1927,7 +1945,9 @@ if [[ -z "$speculator" ]]; then
   fi
 fi
 case "$family:$speculator" in
-  qwen4:mtp) ;; # The MTP layer's experts stay local even with Spark backbone experts.
+  qwen4:mtp) ;;
+  glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
+    { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
   *:off|qwen3_5:dspark|qwen3_5:mtp|glm5:dflash2|glm5_flash:dflash2|glm5_flash:dspark|mimo_v2:dflash2|mimo_v2:mtp|kimi_k3:dflash2|step5:mtp|deepseek_v4:dspark) ;;
   *) echo "SPECULATOR=$speculator does not apply to $family" >&2; exit 2 ;;
 esac
@@ -2027,7 +2047,7 @@ case "$speculator" in
     drafter="$(get SPECULATOR_MODEL_ID)"
     [[ -n "$drafter" ]] || drafter="$default_drafter"
     [[ "$family:$speculator" != qwen3_5:dspark || -n "$drafter" ]] || drafter=RadixArk/Qwen3.8-27B-DSpark
-    if [[ $speculator == dspark && $family == deepseek_v4 ]]; then
+    if [[ $speculator == dspark && ( $family == deepseek_v4 || $checkpoint_family == mistral_large4 ) ]]; then
       dspark_args=(--dspark)
     elif [[ -n "$drafter" ]]; then
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
@@ -2811,7 +2831,7 @@ audio_encoder_hash=""
     "$coordinator_image" cuteafd plan "$snapshot" --attention-placement "$attention_placement" --vision "$vision" --audio "$audio" --deployment "${readiness_args[@]}" \
     "${deployment_args[@]}" "${count_args[@]}" "${exlr8_plan_args[@]}" "${spark_budget_args[@]}" \
     --rtx "$plan_rtx" --coordinator-gpu-budget-gib "$plan_gib" --coordinator-weight-budget-gib "$plan_gib" --pool-tokens "$plan_pool" --vision-replicas "$vision_replicas" "${plan_draft_args[@]}")"
-  release_validate_deployment "$plan_json" "$family"
+  release_validate_deployment "$plan_json" "$checkpoint_family"
   RELEASE_RECLAIM_ARGS=()
   ((restart == 0)) || release_coordinator_reclaim_args "$coordinator_name"
   release_admit_coordinator_gpus "$(IFS=,; printf '%s' "${coordinator_uuids[*]}")" "$plan_json" \
@@ -2872,7 +2892,8 @@ if [[ -n "$expert_input" && "$expert_input" != fp8 ]]; then
     fi
   done
 fi
-if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash ) && "$vision" != off ]] &&
+if { [[ ( "$family" == mimo_v2 || "$family" == qwen4 || "$family" == glm5_flash
+          || "$checkpoint_family" == mistral_large4 ) && "$vision" != off ]] &&
    python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get("vision_config") else 1)' "$root/snapshots/$revision/config.json"; } ||
    [[ "$family" == mimo_v2 && "$audio" != off ]]; then
   selected="$(python3 -c '

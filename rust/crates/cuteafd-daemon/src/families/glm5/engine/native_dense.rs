@@ -450,6 +450,103 @@ impl<'a> GlmEngine<'a> {
             ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("query", query)], &[row])
     }
 
+    /// Mistral Large 4's K6 producer: the direct query `wq(x)` scaled per head
+    /// (RoPE on RoPE layers, the rotated tail written into the absorbed query),
+    /// its nope part absorbed through W_UK; on latent owners `wkv_a(x)` cropped
+    /// from its padded store and packed into the layer's FP8 record.
+    #[allow(clippy::too_many_arguments)]
+    /// `query` receives the rows' absorbed query of this rank's heads: `w.query` itself, or
+    /// (`context`) its share of the combined two-GPU query, token rows 2 x heads apart.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ml4_core_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>,
+        rows: usize, cap: &str, kv: Buffer, query: *mut c_void, context: bool) -> Result<()> {
+        let scratch = self.core_scratch(w)?;
+        let programs = self.core_programs(rank)?;
+        let (q, qkv) = (scratch.stage("q")?, scratch.stage("qkv")?);
+        let stream = self.stream_of(rank);
+        let rope = self.cfg.rope(index);
+        let tag = if rope { "" } else { "_nope" };
+        let row = Scalar::I32(rows as i32);
+        let (_, _, cos_sin) = self.rank_caches(rank, 0);
+        // A head split's share runs its 32-head programs (`ml42_*`); `_context` places it in
+        // the combined query (NoPE query scale writes no tail, so it never needs one).
+        let family = self.ml4_attention_family(layer);
+        ensure!(!context || layer.attention_split, "a context query share needs a head-split layer");
+        let placed = if context { "_context" } else { "" };
+        let scale_placed = if context && rope { "_context" } else { "" };
+        self.core_linear(rank, w, layer, "q_b", w.x.buffer, q, rows, None)?;
+        self.run_on(rank, &format!("{family}_query_scale{tag}{scale_placed}_{cap}"), &[("q", q.ptr),
+            ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
+            ("s", layer.ptr("query_scale_s")?), ("b", layer.ptr("query_scale_b")?), ("query", query)], &[row])?;
+        self.run_on(rank, &format!("{family}_absorb{tag}{placed}_{cap}"), &[("a", q.ptr), ("w", layer.ptr("w_uk")?),
+            ("out", query)], &[row])?;
+        if layer.core.contains_key("kv_a") {
+            let width = self.cfg.kv_lora_rank + if rope { self.cfg.qk_rope_head_dim } else { 0 };
+            let stored = layer.core["kv_a"].shape[0];
+            self.core_linear(rank, w, layer, "kv_a", w.x.buffer, q, rows, None)?;
+            let (source_pitch, destination_pitch, bytes, _) = super::super::core_runtime::pack_layout(
+                rows, stored, width, width, 0)?;
+            // SAFETY: the complete stored-N output transform precedes this crop
+            // into the packed `[rows, width]` kv rows, rank-local and disjoint.
+            self.on(rank, || unsafe { programs.copy.launch_rows(qkv, q, bytes, rows,
+                destination_pitch, source_pitch, stream) })?;
+            self.run_on(rank, &format!("ml4_rank_pack{tag}_{cap}"), &[("kv", qkv.ptr),
+                ("kv_a_norm", layer.ptr("kv_a_norm")?), ("positions", w.positions.buffer.ptr),
+                ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("cache", kv.ptr)], &[row])?;
+        }
+        Ok(())
+    }
+
+    /// Mistral Large 4's index producer: `wq_b(LayerNorm(x))` scaled per index
+    /// head, `[wk(x) | weights_proj(x)]`, then the shared epilogue (RoPE skipped
+    /// on NoPE layers) into the index cache, the FP8 query and head weights.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn ml4_core_index_producer(&self, rank: usize, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>,
+        rows: usize, cap: &str, index_cache: Buffer) -> Result<()> {
+        // The K6 core's own stages (no EXLR8 native scratch exists on this path).
+        let scratch = self.core_scratch(w)?;
+        let (iq, kw) = (scratch.stage("iq")?, scratch.stage("kw")?);
+        let row = Scalar::I32(rows as i32);
+        let (_, _, cos_sin) = self.rank_caches(rank, 0);
+        let rope = self.cfg.rope(index);
+        // LayerNorm(x) into the q stage, then wq_b over it.
+        let normed = scratch.stage("q")?;
+        self.run_on(rank, &format!("ml4_index_layer_norm_{cap}"), &[("x", w.x.buffer.ptr),
+            ("weight", layer.ptr("index_q_norm_w")?), ("bias", layer.ptr("index_q_norm_b")?),
+            ("out", normed.ptr)], &[row])?;
+        // wq_b in the checkpoint's own form: the K6 core (the shared trellis path), or
+        // the shipped FP8 block-128 weight through its native projection (never re-quantized).
+        if layer.core.contains_key("index_q") {
+            self.core_linear(rank, w, layer, "index_q", normed, iq, rows, None)?;
+        } else {
+            let fp8 = [("x", normed.ptr), ("w_iq_fp8", layer.ptr("w_iq_fp8")?),
+                ("w_iq_scale", layer.ptr("w_iq_scale")?), ("out", iq.ptr), ("scratch", w.scratch.buffer.ptr)];
+            self.run_on(rank, &format!("ml4_index_q_{cap}"), &fp8, &self.projection_scalars(row, cap))?;
+        }
+        self.run_on(rank, &format!("ml4_index_query_scale_{cap}"), &[("q", iq.ptr),
+            ("positions", w.positions.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr),
+            ("s", layer.ptr("index_scale_s")?), ("b", layer.ptr("index_scale_b")?),
+            ("query", iq.ptr)], &[row])?;
+        // [wk | weights_proj](x), BF16 [rows, 128 + I], both BF16 as shipped.
+        self.run_on(rank, "ml4_index_kw", &[("x", w.x.buffer.ptr), ("w", layer.ptr("w_ik")?),
+            ("out", kw.ptr)], &[row])?;
+        let tag = if rope { "" } else { "_nope" };
+        self.run_on(rank, &format!("ml4_index_post{tag}_{cap}"), &[
+            ("iq", iq.ptr), ("kw", kw.ptr), ("positions", w.positions.buffer.ptr),
+            ("slots", w.slots.buffer.ptr), ("cos_sin", cos_sin.buffer.ptr), ("k_weight", layer.ptr("k_norm_w")?),
+            ("k_bias", layer.ptr("k_norm_b")?), ("q_fp8", w.q_fp8.buffer.ptr),
+            ("head_weights", w.head_weights.buffer.ptr), ("cache", index_cache.ptr)], &[row])
+    }
+
+    pub(super) fn ml4_core_o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
+        cap: &str) -> Result<()> {
+        let values = self.core_scratch(w)?.stage("values")?;
+        self.run_on(rank, &format!("{}_values_{cap}", self.ml4_attention_family(layer)), &[("a", w.attn.buffer.ptr),
+            ("w", layer.ptr("w_uv")?), ("out", values.ptr)], &[Scalar::I32(rows as i32)])?;
+        self.core_linear(rank, w, layer, "o", values, w.delta.buffer, rows,
+            w.core_rows.as_ref().map(|rows| rows[0].buffer))
+    }
+
     pub(super) fn core_o_proj(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, rows: usize,
         cap: &str) -> Result<()> {
         let values = self.core_scratch(w)?.stage("values")?;
@@ -467,8 +564,12 @@ impl<'a> GlmEngine<'a> {
         self.core_linear(rank, w, layer, "gate", w.x.buffer, gate, rows, None)?;
         self.core_linear(rank, w, layer, "up", w.x.buffer, up, rows, None)?;
         let intermediate = layer.core["gate"].shape[0];
-        let prefix = if layer.split { "glm2" } else { "glm" };
-        self.run_on(rank, &format!("{prefix}_stage_swiglu_i{intermediate}"), &[("gate", gate.ptr),
+        let name = match self.cfg.variant.ml4() {
+            // Mistral Large 4's format-neutral SwiGLU (whole and two-GPU widths).
+            Some(_) => format!("ml4_swiglu_i{intermediate}"),
+            None => format!("{}_stage_swiglu_i{intermediate}", if layer.split { "glm2" } else { "glm" }),
+        };
+        self.run_on(rank, &name, &[("gate", gate.ptr),
             ("up", up.ptr), ("hidden", hidden.ptr)], &[Scalar::I32(rows as i32)])?;
         self.core_linear(rank, w, layer, "down", hidden, out, rows,
             w.core_rows.as_ref().map(|rows| rows[1].buffer))
@@ -497,7 +598,7 @@ mod charge_tests {
             index_heads: 32, index_head_dim: 128, index_topk: 2048, indexers: vec![GlmIndexer::Full; 78],
             first_moe_layer: 3, dense_intermediate: 12288, experts: 256, topk: 8, moe_intermediate: 2048,
             shared_experts: 1, routed_scale: 2.5, rope_theta: 8000000.0, rms_norm_eps: 1e-5,
-            mtp_layers: 1, eos_tokens: vec![154820] };
+            mtp_layers: 1, eos_tokens: vec![154820], variant: cuteafd_loader::families::glm5::GlmVariant::Glm };
         let (heads, inter) = (cfg.heads / 2, cfg.dense_intermediate / 2);
         let scratch_bytes = cuteafd_loader::plan::exlr8::dense::scratch_bytes;
         let decode = scratch_bytes(&cfg, heads, inter, NATIVE_DECODE_ROWS);

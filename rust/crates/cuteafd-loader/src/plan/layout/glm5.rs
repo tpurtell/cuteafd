@@ -14,6 +14,14 @@ const SPARK: SparkCharges = SparkCharges { host_bytes: None, wave_bytes: gib(190
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyModel,
     input: &crate::plan::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
     let checkpoint = input.checkpoint();
+    if let Ok(cfg) = GlmDsaConfig::from_hf(&checkpoint.config) {
+        let gpus = options.rtx_bytes.len().clamp(1, 2);
+        let resolved = crate::placement::families::glm5::resolve_attention(&cfg, report.requested_attention, gpus);
+        if resolved != report.requested_attention {
+            report.requested_attention = resolved;
+            report.attention_placement = resolved.unwrap_or(report.attention_placement);
+        }
+    }
     let spark_ranks = match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 };
     let layers = report.requested_attention == Some(crate::placement::AttentionPlacement::Layers);
     let limits = crate::serving_capacity::prefill_waves::PrefillLimits {
@@ -62,12 +70,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if options.host_embedding {
         place_host_embedding(report, checkpoint, &mut devices, &mut waste, &mut notes);
     }
+    // The program namespace (glm, ml4) is the checkpoint's own variant.
+    let program_family = GlmDsaConfig::from_hf(&checkpoint.config).map_or("glm", |cfg| cfg.program_family());
     let core = (|| -> anyhow::Result<_> {
         let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
         let core = crate::families::glm5::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         if core.projections.is_empty() { return Ok(None); }
         let owners = layers.then(|| crate::placement::families::glm5::attention_owners(&cfg, cfg.layers)).transpose()?;
-        let (_, _, _, draft_rows) = drafter_admission(options)?;
+        let (_, _, _, draft_rows) = drafter_admission(options, checkpoint)?;
         anyhow::ensure!(options.glm5_drafter_disabled || draft_rows.is_some(),
             "native K6 drafter head needs its actual DFlash config, not a bytes-only override");
         Ok(Some(crate::families::glm5::core::CoreCharges::from_package(&cfg, &core, cfg.layers,
@@ -78,11 +88,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let item = match (core.as_ref().ok().and_then(Option::as_ref), shape.manifest.as_ref()) {
             (Some(core), Some(manifest)) => {
                 let arch = crate::placement::ArchContext::coordinator(options.rtx_bytes[index], None);
-                let allowance = crate::placement::inventory::loaded_code_allowance("glm-k6", local_package(report), split,
+                let allowance = crate::placement::inventory::loaded_code_allowance(&format!("{program_family}-k6"), local_package(report), split,
                     index as u8, &arch, Some(&core.program_set(manifest, split)));
                 Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
             }
-            _ => runtime_item(shape.manifest.as_ref(), &program_families("glm", split),
+            _ => runtime_item(shape.manifest.as_ref(), &program_families(program_family, split),
                 local_package(report), split, index, options.rtx_bytes[index]),
         };
         device.items.push(item);
@@ -92,7 +102,15 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         spark_layers: if spark_ranks > 0 { (0..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks, prefill_lanes: lanes };
     let mut sparks = spark_devices(report, model, input, options, SPARK, &working,
-        spark_endpoints("glm5", lanes), &mut waste, &mut notes);
+        spark_endpoints(model.spec().family, lanes), &mut waste, &mut notes);
+    // A tower that lands on an RTX is loaded before serving samples admission
+    // memory: reserve it now so onboarding and the pool solve around it (and a
+    // measured overuse sheds onboarded layers), as GLM Flash does. A Spark-bound
+    // tower is charged after the solve, against the Sparks' final expert charge.
+    let towers = towers(report, checkpoint);
+    if rtx_bound_encoder(report, &towers, &devices[..ranks.max(1)], &sparks, options) {
+        resolve_encoder(report, &towers, &mut devices, &mut [], &vec![0; gpus], options, &mut notes);
+    }
     let mut pool_tokens = 0;
     let mut local_layers = 0;
     match core.and_then(|core| placement(report, input, options, &devices[..ranks], shape.manifest.as_ref(),
@@ -143,13 +161,38 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     if local_layers > 0 { notes.push(format!("{local_layers} routed backbone layers resident on RTX")); }
     report.prefill_transports = Some(u64::from(!working.spark_layers.is_empty()));
     // Reapply after admission has selected its executable suffix and lane count.
-    charge_spark_devices(report, model, input, options, SPARK, &working, spark_endpoints("glm5", working.prefill_lanes),
+    charge_spark_devices(report, model, input, options, SPARK, &working, spark_endpoints(model.spec().family, working.prefill_lanes),
         &mut sparks, &mut notes, |device| format!("{} I/O admission", device.name()));
     if report.encoder.is_none() {
-        resolve_encoder(report, &Towers::checkpoint(report), &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
+        resolve_encoder(report, &towers, &mut devices, &mut sparks, &vec![0; gpus], options, &mut notes);
     }
     devices.extend(sparks);
     MemoryLayout { devices, pool_tokens, waste, notes }
+}
+
+/// The checkpoint's bundled tower: Mistral Large 4's Pixtral, else the generic checkpoint bytes.
+fn towers(report: &PlanReport, checkpoint: &Checkpoint) -> Towers {
+    if GlmDsaConfig::from_hf(&checkpoint.config).is_ok_and(|cfg| cfg.variant.ml4().is_some()) {
+        mistral_large4_towers(report, checkpoint)
+    } else {
+        Towers::checkpoint(report)
+    }
+}
+
+/// Whether the encoder will resolve to an RTX: requested there, or automatic
+/// with no Spark holding tower + scratch + 1 GiB beside its expert charge.
+fn rtx_bound_encoder(report: &PlanReport, towers: &Towers, rtx: &[DeviceLayout], sparks: &[DeviceLayout],
+    options: &LayoutOptions) -> bool {
+    use crate::plan::encoder::*;
+    let Ok((weights, scratch)) = towers.vision else { return false };
+    if weights == 0 || report.vision == crate::plan::MediaMode::Off { return false; }
+    let hardware = EncoderHardware { v41: towers.v41,
+        gpus: rtx.iter().map(|_| EncoderGpuBudget { free_bytes: u64::MAX / 4, kv_target_bytes: 0 }).collect(),
+        sparks: sparks.iter().map(|d| EncoderSparkBudget { rank: d.index as usize, host: format!("spark{}", d.index),
+            idle: false, expert_bytes: d.items.iter().filter(|i| i.category == Category::Experts).map(|i| i.bytes).sum(),
+            free_bytes: spark_encoder_headroom(d, options.spark_allocation_budget_bytes) }).collect() };
+    matches!(encoder_placement(report.vision, &hardware, weights, scratch, options.vision_replicas).kind,
+        EncoderKind::Rtx { .. })
 }
 
 pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owners: Option<&[u8]>)
@@ -168,15 +211,23 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         *groups[rank].entry((group.into(), format.into())).or_default() += bytes.max(256);
     };
     let native = std::env::var("CUTEAFD_GLM_BF16").is_ok_and(|v| v == "native");
+    use crate::families::glm5::names::Operand as Op;
+    // Operand names come from the checkpoint's variant (GLM HF names, Mistral
+    // consolidated names); a variant without an operand has no such tensor.
+    let w = |layer: usize, op: Op| cfg.weight(layer, op);
     for layer in 0..layers {
-        let p = format!("model.layers.{layer}");
-        let attn = format!("{p}.self_attn");
-        let qkv = [format!("{attn}.q_a_proj.weight"), format!("{attn}.kv_a_proj_with_mqa.weight")];
-        let attention = [qkv[0].clone(), qkv[1].clone(), format!("{attn}.q_b_proj.weight"),
-            format!("{attn}.kv_b_proj.weight"), format!("{attn}.o_proj.weight")];
-        let core_attention = core.get_weight(&qkv[0]).is_some();
+        // Direct-query variants project the query straight from the hidden
+        // state (no q-LoRA); latent-sharing layers carry no wkv_a / kv_a norm.
+        let kv_a = w(layer, Op::KvA);
+        let q_in = w(layer, Op::QA).unwrap_or_else(|| w(layer, Op::QB).expect("every variant has a query projection"));
+        let qkv: Vec<String> = [Some(q_in.clone()), kv_a.clone()].into_iter().flatten().collect();
+        let q_b = w(layer, Op::QA).and(w(layer, Op::QB));
+        let mut attention = qkv.clone();
+        attention.extend(q_b.iter().cloned());
+        attention.extend([w(layer, Op::KvB).unwrap(), w(layer, Op::O).unwrap()]);
+        let core_attention = core.get_weight(&q_in).is_some();
         let bf16 = native && attention.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16))
-            || core_attention && tensor(&format!("{attn}.kv_b_proj.weight"))?.dtype == DType::Bf16;
+            || core_attention && tensor(&w(layer, Op::KvB).unwrap())?.dtype == DType::Bf16;
         let qkv_rows: u64 = if core_attention { 0 } else {
             qkv.iter().map(|n| tensor(n).map(|t| t.shape[0] as u64)).sum::<anyhow::Result<_>>()?
         };
@@ -187,54 +238,71 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
             Ok((t.shape[0] as u64 * t.shape[1] as u64, (t.shape[0] as u64).div_ceil(128) * (t.shape[1] as u64).div_ceil(128) * 4))
         };
         for rank in 0..ranks {
-            for name in [format!("{p}.input_layernorm.weight"), format!("{p}.post_attention_layernorm.weight")] {
+            for name in [w(layer, Op::InputNorm).unwrap(), w(layer, Op::PostAttentionNorm).unwrap()] {
                 put(rank, "norm", "bf16", tensor(&name)?.byte_length);
             }
             if owners.is_none_or(|owners| owners[layer] as usize == rank) {
                 let attention_ranks = if owners.is_some() { 1 } else { ranks };
-                for name in [format!("{attn}.q_a_layernorm.weight"), format!("{attn}.kv_a_layernorm.weight")] {
+                for name in [w(layer, Op::QANorm), w(layer, Op::KvANorm), w(layer, Op::QueryScaleS), w(layer, Op::QueryScaleB)]
+                    .into_iter().flatten() {
                     put(rank, "norm", "bf16", tensor(&name)?.byte_length);
                 }
                 if core_attention {
-                    for name in [&qkv[0], &qkv[1], &format!("{attn}.q_b_proj.weight"), &format!("{attn}.o_proj.weight")] {
+                    for name in qkv.iter().chain(q_b.iter()).chain([w(layer, Op::O).unwrap()].iter()) {
                         let projection = core.get_weight(name).context("complete GLM native attention group")?;
                         put(rank, "attention", "exl3-k6", projection.resident_bytes(attention_ranks)?);
                     }
                 } else {
-                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, qkv_rows * h * if bf16 { 2 } else { 1 });
+                    // The q-LoRA / latent down projections stay whole; the query up
+                    // (or direct query) and output split by heads.
+                    let whole = if q_b.is_some() { qkv.clone() } else { kv_a.iter().cloned().collect() };
+                    let whole_rows: u64 = whole.iter().map(|n| tensor(n).map(|t| t.shape[0] as u64)).sum::<anyhow::Result<_>>()?;
+                    put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, whole_rows * h * if bf16 { 2 } else { 1 });
                     if !bf16 {
-                        let grid = qkv.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
+                        let grid = whole.iter().map(|n| projection(n).map(|(_, s)| s)).sum::<anyhow::Result<u64>>()?;
                         put(rank, "attention", "fp8-scale", grid);
-                        put(rank, "attention", "fp8-scale", qkv_rows * h.div_ceil(128) * 4);
+                        put(rank, "attention", "fp8-scale", whole_rows * h.div_ceil(128) * 4);
                     }
-                    for name in [format!("{attn}.q_b_proj.weight"), format!("{attn}.o_proj.weight")] {
+                    let split = [q_b.clone().unwrap_or(q_in.clone()), w(layer, Op::O).unwrap()];
+                    for name in split {
                         let (values, scales) = projection(&name)?;
                         put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values / attention_ranks as u64 * if bf16 { 2 } else { 1 });
                         if !bf16 { put(rank, "attention", "fp8-scale", scales / attention_ranks as u64); }
                     }
+                    let _ = qkv_rows;
                 }
-                for width in [cfg.qk_nope_head_dim, cfg.v_head_dim] {
+                for width in [cfg.nope_dim(layer), cfg.v_head_dim] {
                     let values = cfg.heads as u64 / attention_ranks as u64 * cfg.kv_lora_rank as u64 * width as u64;
                     put(rank, "attention", if bf16 { "bf16" } else { "fp8" }, values * if bf16 { 2 } else { 1 });
                     if !bf16 { put(rank, "attention", "fp8-scale", values / 64 * 4); }
                 }
                 if cfg.indexers[layer] == GlmIndexer::Full {
-                    let name = format!("{attn}.indexer.wq_b.weight");
+                    let name = w(layer, Op::IndexQ).unwrap();
+                    // A direct-query variant may carry wq_b in the K6 core (whole, per attention rank).
+                    if let Some(core_q) = cfg.stem(layer, Op::IndexQ).and_then(|stem| core.get_weight(&stem)) {
+                        put(rank, "indexer", "exl3-k6", core_q.resident_bytes(1)?);
+                    } else {
                     let index_bf16 = (native || trellis) && tensor(&name)?.dtype == DType::Bf16;
                     let (values, scales) = projection(&name)?;
                     put(rank, "indexer", if index_bf16 { "bf16" } else { "fp8" }, values * if index_bf16 { 2 } else { 1 });
                     if !index_bf16 { put(rank, "indexer", "fp8-scale", scales); }
-                    let ik = ["wk.weight", "weights_proj.weight"].into_iter().map(|suffix| tensor(&format!("{attn}.indexer.{suffix}"))
+                    }
+                    let ik = [Op::IndexK, Op::IndexWeights].into_iter().map(|op| tensor(&w(layer, op).unwrap())
                         .map(|t| t.shape.iter().product::<usize>() as u64 * 2)).sum::<anyhow::Result<u64>>()?;
                     put(rank, "indexer", "bf16", ik);
-                    for suffix in ["k_norm.weight", "k_norm.bias"] {
-                        put(rank, "indexer", "bf16", tensor(&format!("{attn}.indexer.{suffix}"))?.byte_length);
+                    let k_norm = cfg.stem(layer, Op::IndexKNorm).unwrap();
+                    let mut vectors = vec![format!("{k_norm}.weight"), format!("{k_norm}.bias")];
+                    if let Some(q_norm) = cfg.stem(layer, Op::IndexQNorm) {
+                        vectors.extend([format!("{q_norm}.weight"), format!("{q_norm}.bias")]);
+                    }
+                    vectors.extend([w(layer, Op::IndexQueryScaleS), w(layer, Op::IndexQueryScaleB)].into_iter().flatten());
+                    for name in vectors {
+                        put(rank, "indexer", "bf16", tensor(&name)?.byte_length);
                     }
                 }
             }
             let dense = layer < cfg.first_moe_layer;
-            let mlp = if dense { format!("{p}.mlp") } else { format!("{p}.mlp.shared_experts") };
-            let names = [format!("{mlp}.gate_proj.weight"), format!("{mlp}.up_proj.weight"), format!("{mlp}.down_proj.weight")];
+            let names = [w(layer, Op::Gate).unwrap(), w(layer, Op::Up).unwrap(), w(layer, Op::Down).unwrap()];
             let shared_bf16 = !dense && native && names.iter().all(|n| tensor(n).is_ok_and(|t| t.dtype == DType::Bf16));
             let group = if dense { "dense" } else { "shared_expert" };
             if core.get_weight(&names[0]).is_some() {
@@ -256,13 +324,14 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
                 put(rank, group, "fp8-tensor-scale", 48);
             }
             if !dense && rank == 0 {
-                for suffix in ["weight", "e_score_correction_bias"] {
-                    put(rank, "router", "bf16", tensor(&format!("{p}.mlp.gate.{suffix}"))?.byte_length);
+                for name in [w(layer, Op::Router), w(layer, Op::RouterBias)].into_iter().flatten() {
+                    put(rank, "router", "bf16", tensor(&name)?.byte_length);
                 }
             }
         }
     }
-    for (name, group) in [("model.embed_tokens.weight", "embedding"), ("model.norm.weight", "norm"), ("lm_head.weight", "lm_head")] {
+    let head = format!("{}.weight", cfg.head());
+    for (name, group) in [(cfg.embedding(), "embedding"), (cfg.final_norm(), "norm"), (head.as_str(), "lm_head")] {
         if let Some(projection) = core.get_weight(name) {
             put(0, group, "exl3-k6", projection.resident_bytes(1)?);
             continue;
@@ -270,6 +339,9 @@ pub fn resident_owned(checkpoint: &Checkpoint, ranks: usize, layers: usize, owne
         let t = tensor(name)?;
         let bytes = if t.dtype == DType::F8E4M3 && t.shape.len() == 2 { t.shape.iter().product::<usize>() as u64 * 2 } else { t.byte_length };
         put(0, group, "bf16", bytes);
+    }
+    if let Some(alpha) = cfg.variant.ml4().map(|_| "lerope.alpha") {
+        put(0, "norm", "bf16", tensor(alpha)?.byte_length);
     }
     Ok(groups.into_iter().map(|g| g.into_iter().map(|((group, format), bytes)| (group, format, bytes)).collect()).collect())
 }
@@ -301,10 +373,31 @@ fn failure_hint(mode: crate::placement::AttentionPlacement) -> String {
     }
 }
 
-fn drafter_admission(options: &LayoutOptions) -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>)> {
+fn drafter_admission(options: &LayoutOptions, checkpoint: &Checkpoint)
+    -> anyhow::Result<(u64, u64, Option<usize>, Option<usize>)> {
     use crate::placement::families::glm5 as glm;
     Ok(if options.glm5_drafter_disabled { (0, 0, None, None) }
         else if options.drafter_bytes > 0 { (options.drafter_bytes, 0, None, None) }
+        else if checkpoint.model_type() == Some("mistral_large4") {
+            // The bundled mtp_dspark: its own immutable layout, drafting its whole block.
+            let sequences = usize::try_from(options.glm_draft_sequences())?;
+            let slots = crate::families::glm5::draft_representation::serving_draft_context_slots(
+                sequences, usize::try_from(options.resolved_concurrency("mistral_large4"))?,
+                options.draft_context_slots.map(usize::try_from).transpose()?);
+            let context = if options.context_tokens == 0 { 1 << 20 } else { usize::try_from(options.context_tokens)? };
+            let sms = options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
+                "sm_120", options.rtx_bytes[0]).sms) as usize;
+            let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context, sms)?;
+            let block = layout.capacity().block_rows / sequences;
+            // Prefix marks of its draft windows, by the serving mark rule.
+            let marks = if options.mimo_prefix_entries == 0 { 0 } else {
+                options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
+                    options.resolved_concurrency("mistral_large4"), options.mimo_prefix_entries,
+                    glm::draft_window_mark_bytes(&layout).unwrap_or(0) as u64, options.mimo_prefix_mark_bytes,
+                    options.host_cache_bytes != Some(0))) as usize };
+            (glm::ml4_draft_resident_bytes(&layout, marks)?, layout.weights().max_load_staging, Some(block),
+                Some(layout.capacity().block_rows))
+        }
         else {
             let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
                 let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)
@@ -337,13 +430,13 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     anyhow::ensure!(report.requested_attention != Some(crate::placement::AttentionPlacement::Layers)
         || lanes <= crate::placement::LAYER_PIPELINE_MAX_LANES,
         "layer-owned prefill lacks capacity for {lanes} waves");
-    let (draft, draft_staging, active_drafts, _) = drafter_admission(options)?;
+    let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
     let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let selected_manifest = manifest.map(|m| -> anyhow::Result<_> {
         let mut selected = m.clone();
-        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
-            split_family: (devices.len() == 2).then_some("glm2") };
+        let family = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: cfg.program_family(),
+            split_family: if devices.len() == 2 { cfg.split_program_family() } else { None } };
         cuteafd_core::coordinator_programs::select_attention_plans(&mut selected, attention_plan,
             |name| family.contains(name))?;
         Ok(selected)
@@ -363,7 +456,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
     let manifest_path = options.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let catalog = input.expert_catalog()?;
-    let local = glm::select_local_inventory(&catalog, manifest_path, cfg.layers, devices.len(),
+    let local = glm::select_local_inventory(&cfg, &catalog, manifest_path, cfg.layers, devices.len(),
         rows, lanes, exchange_f32, onboard, false, None)?;
     let tp2_workspace = local.as_ref().map_or([0; 2], |l| l.workspace());
     let serial_workspace = local.as_ref().map_or([0; 2], |l| l.workspace_for(&cfg, rows, 1, exchange_f32));
@@ -375,7 +468,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         experts: local.as_ref().map_or_else(Vec::new, |l| l.experts.clone()), expert_workspace: 0,
         tp2_workspace, requested_pool: options.pool_tokens,
         onboard, full_prefill_logits: options.full_prefill_logits,
-        context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(m,
+        context: selected_manifest.as_ref().and_then(|m| glm::manifest_context(&cfg, m,
             options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
                 "sm_120", options.rtx_bytes[0]).sms) as usize, &attention_plan)) };
     // Auto resolves in the solver (context where the build carries its programs), as at runtime.
@@ -403,7 +496,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let cfg = GlmDsaConfig::from_hf(&checkpoint.config)?;
     let rows = if options.prefill_rows == 0 { 4096 } else { options.prefill_rows };
     let context = if options.context_tokens == 0 { 1 << 20 } else { options.context_tokens };
-    let (draft, draft_staging, active_drafts, _) = drafter_admission(options)?;
+    let (draft, draft_staging, active_drafts, _) = drafter_admission(options, checkpoint)?;
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
         glm::DECODE_ROWS as usize, active_drafts, options.glm5_attention_plan_rows)?;
     let mut manifest = manifest.clone();
@@ -411,7 +504,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
         |name| cuteafd_core::coordinator_programs::CoordinatorPrograms {
             family: "glm", split_family: Some("glm2") }.contains(name))?;
     let scratch = glm::manifest_scratch(&cfg, split, &manifest)?;
-    let context_programs = if split { Some(glm::manifest_context(&manifest,
+    let context_programs = if split { Some(glm::manifest_context(&cfg, &manifest,
         options.physical_sms.unwrap_or_else(|| crate::placement::ArchContext::for_device(
             "sm_120", options.rtx_bytes[0]).sms) as usize, &plan)
         .ok_or_else(|| anyhow::anyhow!("EXLR8 requires GLM context programs in PROGRAMS.json"))?) }
@@ -458,7 +551,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
             Some(glm::exlr8_inventory_with_metadata(&checkpoint.snapshot, manifest_path, cfg.layers, rows, lanes,
                 glm::local_exchange_f32()?, options.exlr8_prefill_activations, metadata)?)
         } else {
-            glm::select_local_inventory(&catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
+            glm::select_local_inventory(&cfg, &catalog, manifest_path, cfg.layers, gpu_count, rows, lanes,
                 glm::local_exchange_f32()?, onboard, false, Some((selected, options.exlr8_prefill_activations)))?
         }
     } else { None };
@@ -498,6 +591,45 @@ mod tests {
     use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
 
     fn native_manifest() -> serde_json::Value { crate::plan::testing::glm5_native_programs() }
+
+    /// GLM 5.3's DFlash2 drafter (an unpaged ring) carries no prefix marks or draft pages: its
+    /// charge is today's for any prefix retention, so the window-mark wiring is a no-op for it.
+    /// Mistral Large 4's window-ring drafter adds exactly its marks.
+    #[test]
+    fn prefix_draft_marks_charge_only_window_ring_drafters() {
+        let glm = tempfile::tempdir().unwrap();
+        write_snapshot(glm.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let drafter = tempfile::tempdir().unwrap();
+        std::fs::write(drafter.path().join("config.json"), serde_json::json!({"hidden_size":6144,
+            "intermediate_size":12288,"num_hidden_layers":5,"num_attention_heads":32,"num_key_value_heads":8,
+            "head_dim":128,"vocab_size":154880,"dflash_config":{"target_layer_ids":[0,8,16,24,32],
+            "conv_group_size":16,"selector_rank":256,"block_size":16}}).to_string()).unwrap();
+        let checkpoint = Checkpoint::coordinator(glm.path(), false, false).unwrap();
+        let options = |entries: u64, budget: u64| LayoutOptions { rtx_bytes: vec![96 << 30],
+            glm5_drafter_snapshot: Some(drafter.path().to_path_buf()), mimo_prefix_entries: entries,
+            mimo_prefix_mark_bytes: budget, ..Default::default() };
+        let base = drafter_admission(&options(0, 0), &checkpoint).unwrap();
+        for (entries, budget) in [(20, 2 << 30), (64, 8 << 30)] {
+            assert_eq!(drafter_admission(&options(entries, budget), &checkpoint).unwrap(), base);
+        }
+        let ml4 = tempfile::tempdir().unwrap();
+        crate::plan::testing::write_mistral_large4_snapshot(ml4.path(), Some(&[1]), true);
+        let checkpoint = Checkpoint::coordinator(ml4.path(), false, false).unwrap();
+        let mut off = options(0, 2 << 30);
+        off.glm5_drafter_snapshot = None;
+        let (cold, ..) = drafter_admission(&off, &checkpoint).unwrap();
+        let mut on = off.clone();
+        on.mimo_prefix_entries = 20;
+        on.prefix_slots = Some(7);
+        let (warm, ..) = drafter_admission(&on, &checkpoint).unwrap();
+        let layout = crate::placement::families::glm5::ml4_draft_layout(ml4.path(),
+            crate::families::glm5::draft_representation::serving_draft_context_slots(
+                on.glm_draft_sequences() as usize, on.resolved_concurrency("mistral_large4") as usize, None),
+            on.glm_draft_sequences() as usize, 1 << 20, 188).unwrap();
+        let mark = crate::placement::families::glm5::draft_window_mark_bytes(&layout).unwrap() as u64;
+        assert_eq!(mark, 16 + layout.window_mark_bytes().unwrap() as u64);
+        assert_eq!(warm - cold, 7 * mark);
+    }
 
     #[test]
     fn exlr8_explicit_stages_preserve_the_pre_namespace_fix_module_charge() {
@@ -708,7 +840,8 @@ mod tests {
             if gpus == 1 {
                 manifest["programs"].as_array_mut().unwrap().retain(|p|
                     !p["name"].as_str().unwrap().starts_with("glm2_")
-                    && !glm::CONTEXT_PROGRAMS.contains(&p["name"].as_str().unwrap()));
+                    && !glm::CONTEXT_PROGRAMS.iter().any(|n| p["name"].as_str().unwrap() == format!("glm_{n}"))
+                    && p["name"] != "glm_paged_staging_gather_kv");
             }
             for context in [1 << 20, default + 128] {
                 for pool_tokens in [None, Some(0)] {
@@ -861,4 +994,37 @@ mod tests {
         assert!(resident_owned(&checkpoint, 2, layers, Some(&[])).is_err());
     }
 
+}
+
+#[cfg(test)]
+mod resident_golden {
+    use super::*;
+    use crate::plan::testing::{fp8, glm5_config, glm5_tensors, write_snapshot};
+
+    /// Every (rank, group, format, bytes) of the GLM fixture at one and two
+    /// ranks and owned attention, pinned so a refactor of the accounting is
+    /// byte-for-byte neutral for GLM 5.x.
+    pub(super) fn glm_resident_fingerprint() -> Vec<String> {
+        let dir = tempfile::tempdir().unwrap();
+        write_snapshot(dir.path(), &glm5_config(), &glm5_tensors(|n, r, k| fp8(n, r, k, None)), None);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = GlmDsaConfig::from_hf(&checkpoint.config).unwrap();
+        let owners = crate::placement::families::glm5::attention_owners(&cfg, 2).unwrap();
+        let mut out = Vec::new();
+        for (label, ranks, owned) in [("tp1", 1, false), ("tp2", 2, false), ("owned", 2, true)] {
+            let resident = resident_owned(&checkpoint, ranks, cfg.layers, owned.then_some(owners.as_slice())).unwrap();
+            for (rank, groups) in resident.iter().enumerate() {
+                for (group, format, bytes) in groups {
+                    out.push(format!("{label} {rank} {group} {format} {bytes}"));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    #[ignore = "prints the fingerprint; run on a base commit to regenerate"]
+    fn print_glm_resident_fingerprint() {
+        for line in glm_resident_fingerprint() { println!("FP {line}"); }
+    }
 }

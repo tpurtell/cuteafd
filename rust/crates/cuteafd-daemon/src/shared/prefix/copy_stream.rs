@@ -194,19 +194,68 @@ impl Drop for PrefixCopies<'_> {
     }
 }
 
-/// Source-contract checks shared by every family's tests: a family's
-/// `PrefixFamily::drain` body (between `fn drain(` and the next `fn `) must
-/// drain through [`PrefixCopies`], never a compute stream.
+/// Source-contract checks inspect the native drain, not a backend trait's
+/// declaration, empty mock or generic device delegation.
 #[cfg(test)]
 pub(crate) fn drain_body(source: &str) -> &str {
-    let start = source.find("fn drain(&self) -> Result<(), BoxError>").expect("a PrefixFamily drain");
-    let body = &source[start + 3..];
-    &body[..body.find("\n    fn ").unwrap_or(body.len())]
+    let signature = "fn drain(&self) -> Result<(), BoxError>";
+    for (start, _) in source.match_indices(signature) {
+        let tail = &source[start + signature.len()..];
+        if !tail.trim_start().starts_with('{') { continue; }
+        let open = start + signature.len() + tail.find('{').unwrap();
+        let mut depth = 0;
+        let close = source[open..].char_indices().find_map(|(offset, ch)| {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {},
+            }
+            (depth == 0).then_some(open + offset)
+        }).expect("a complete drain body");
+        let body: String = source[open + 1..close].chars().filter(|ch| !ch.is_whitespace()).collect();
+        if matches!(body.as_str(), "" | "Ok(())" | "self.device.drain()" | "returnself.device.drain();") {
+            continue;
+        }
+        return &source[start + 3..close + 1];
+    }
+    panic!("a native prefix drain body");
 }
 
 #[cfg(test)]
 mod tests {
     use super::drain_body;
+
+    #[test]
+    fn drain_body_skips_declarations_and_empty_delegations() {
+        let source = "fn drain(&self) -> Result<(), BoxError>;\n\
+            fn drain(&self) -> Result<(), BoxError> {}\n\
+            fn drain(&self) -> Result<(), BoxError> { Ok(()) }\n\
+            fn drain(&self) -> Result<(), BoxError> { self.device.drain() }\n\
+            fn drain(&self) -> Result<(), BoxError> {\n\
+                if true { self.copies.drain()?; }\n\
+                Ok(())\n\
+            }\n\
+            fn next(&self) {}";
+        let body = drain_body(source);
+        assert!(body.contains("copies.drain()"));
+        assert!(body.ends_with("Ok(())\n}"));
+        assert!(!body.contains("fn next"));
+    }
+
+    #[test]
+    #[should_panic(expected = "a native prefix drain body")]
+    fn drain_body_requires_a_native_implementation() {
+        drain_body("fn drain(&self) -> Result<(), BoxError>;\n\
+            fn drain(&self) -> Result<(), BoxError> { self.device.drain() }");
+    }
+
+    #[test]
+    fn drain_body_does_not_skip_a_compute_stream_drain() {
+        let source = "fn drain(&self) -> Result<(), BoxError> { self.engine.synchronize() }\n\
+            fn drain(&self) -> Result<(), BoxError> { self.copies.drain() }";
+        assert!(drain_body(source).contains("engine.synchronize()"));
+        assert!(!drain_body(source).contains("copies.drain()"));
+    }
 
     /// Every `PrefixFamily` implementation drains its copy stream (with the
     /// reader fence), not the engine, lane or bank streams themselves.

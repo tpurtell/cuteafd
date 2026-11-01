@@ -1,0 +1,1170 @@
+[
+ {
+  "capacity": 1,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     4,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 49152,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     4,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 49152,
+    "allocation": "rotation_up",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     4,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 16384,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     4,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 8192,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     4,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 49152,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     1,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 12288,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     32
+    ],
+    "dtype": "torch.int32",
+    "bytes": 128,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     4
+    ],
+    "dtype": "torch.int32",
+    "bytes": 16,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     131072
+    ],
+    "dtype": "torch.float32",
+    "bytes": 524288,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     393216
+    ],
+    "dtype": "torch.float32",
+    "bytes": 1572864,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 16,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     64,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 786432,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     64,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 786432,
+    "allocation": "rotation_up",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     64,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 262144,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     64,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 131072,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     64,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 786432,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     16,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 196608,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     512
+    ],
+    "dtype": "torch.int32",
+    "bytes": 2048,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     64
+    ],
+    "dtype": "torch.int32",
+    "bytes": 256,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     786432
+    ],
+    "dtype": "torch.float32",
+    "bytes": 3145728,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     786432
+    ],
+    "dtype": "torch.float32",
+    "bytes": 3145728,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 80,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     320,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 3932160,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     320,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 3932160,
+    "allocation": "rotation_up",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     320,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 1310720,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     320,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 655360,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     320,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 3932160,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     80,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 983040,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     1408
+    ],
+    "dtype": "torch.int32",
+    "bytes": 5632,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     176
+    ],
+    "dtype": "torch.int32",
+    "bytes": 704,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     786432
+    ],
+    "dtype": "torch.float32",
+    "bytes": 3145728,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     786432
+    ],
+    "dtype": "torch.float32",
+    "bytes": 3145728,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 256,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     1024,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 12582912,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     1024,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 12582912,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     1024,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 4194304,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     1024,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 2097152,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     1024,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 12582912,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     256,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 3145728,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     9088
+    ],
+    "dtype": "torch.int32",
+    "bytes": 36352,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     142
+    ],
+    "dtype": "torch.int32",
+    "bytes": 568,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 1024,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     4096,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 50331648,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     4096,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 50331648,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     4096,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 16777216,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     4096,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 8388608,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     4096,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 50331648,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     1024,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 12582912,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     12160
+    ],
+    "dtype": "torch.int32",
+    "bytes": 48640,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     190
+    ],
+    "dtype": "torch.int32",
+    "bytes": 760,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 2048,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     8192,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 100663296,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     8192,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 100663296,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     8192,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 33554432,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     8192,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 16777216,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     8192,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 100663296,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     2048,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 25165824,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     16256
+    ],
+    "dtype": "torch.int32",
+    "bytes": 65024,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     254
+    ],
+    "dtype": "torch.int32",
+    "bytes": 1016,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 2752,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     11008,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 135266304,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     11008,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 135266304,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     11008,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 45088768,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     11008,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 22544384,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     11008,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 135266304,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     2752,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 33816576,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     24448
+    ],
+    "dtype": "torch.int32",
+    "bytes": 97792,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     382
+    ],
+    "dtype": "torch.int32",
+    "bytes": 1528,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ },
+ {
+  "capacity": 4096,
+  "hidden": 6144,
+  "intermediate": 1024,
+  "experts": 128,
+  "top_k": 4,
+  "trellis_lut": {
+   "file": "trellis_lut.bin",
+   "bytes": 4096,
+   "sha256": "cca11fe5744c9c93a34f4217f342fbc0f74ecc8a007c076582424a505fc9da5e"
+  },
+  "buffers": {
+   "rotation_gate": {
+    "shape": [
+     16384,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 201326592,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "rotation_up": {
+    "shape": [
+     16384,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 201326592,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "fc1": {
+    "shape": [
+     16384,
+     2048
+    ],
+    "dtype": "torch.float16",
+    "bytes": 67108864,
+    "allocation": "fc1",
+    "zero_on_create": false
+   },
+   "activated": {
+    "shape": [
+     16384,
+     1024
+    ],
+    "dtype": "torch.float16",
+    "bytes": 33554432,
+    "allocation": "activated",
+    "zero_on_create": false
+   },
+   "fc2": {
+    "shape": [
+     16384,
+     6144
+    ],
+    "dtype": "torch.float16",
+    "bytes": 201326592,
+    "allocation": "rotation_gate",
+    "zero_on_create": false
+   },
+   "output": {
+    "shape": [
+     4096,
+     6144
+    ],
+    "dtype": "torch.bfloat16",
+    "bytes": 50331648,
+    "allocation": "output",
+    "zero_on_create": false
+   },
+   "packed_route_indices": {
+    "shape": [
+     24448
+    ],
+    "dtype": "torch.int32",
+    "bytes": 97792,
+    "allocation": "packed_route_indices",
+    "zero_on_create": false
+   },
+   "block_expert_ids": {
+    "shape": [
+     382
+    ],
+    "dtype": "torch.int32",
+    "bytes": 1528,
+    "allocation": "block_expert_ids",
+    "zero_on_create": false
+   },
+   "packed_route_count": {
+    "shape": [
+     1
+    ],
+    "dtype": "torch.int32",
+    "bytes": 4,
+    "allocation": "packed_route_count",
+    "zero_on_create": false
+   },
+   "expert_offsets": {
+    "shape": [
+     129
+    ],
+    "dtype": "torch.int32",
+    "bytes": 516,
+    "allocation": "expert_offsets",
+    "zero_on_create": false
+   },
+   "expert_counts": {
+    "shape": [
+     128
+    ],
+    "dtype": "torch.int32",
+    "bytes": 512,
+    "allocation": "expert_counts",
+    "zero_on_create": false
+   },
+   "fc1_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc1_scratch",
+    "zero_on_create": false
+   },
+   "fc2_scratch": {
+    "shape": [
+     3145728
+    ],
+    "dtype": "torch.float32",
+    "bytes": 12582912,
+    "allocation": "fc2_scratch",
+    "zero_on_create": false
+   },
+   "workspace": {
+    "shape": [
+     194
+    ],
+    "dtype": "torch.int32",
+    "bytes": 776,
+    "allocation": "workspace",
+    "zero_on_create": true
+   }
+  }
+ }
+]

@@ -28,7 +28,9 @@ fn state(engine: &GlmEngine<'_>, placement: &GlmPlacement) -> Result<Vec<u8>> {
                         engine.library.copy_d2h(&mut out[first..], view)?;
                         Ok(())
                     };
-                    read(records, local * PAGE_ROWS * RECORD_BYTES, rows * RECORD_BYTES)?;
+                    if let Some((records, row_bytes)) = records {
+                        read(records, local * PAGE_ROWS * row_bytes, rows * row_bytes)?;
+                    }
                     if let Some(index) = index {
                         read(index, local * INDEX_PAGE_BYTES, rows * 128)?;
                         read(index, local * INDEX_PAGE_BYTES + PAGE_ROWS * 128, rows * 4)?;

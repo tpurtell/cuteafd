@@ -35,7 +35,7 @@ EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4")
-EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3")
+EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3", "ml4")
 
 
 def load_file(name, path):
@@ -185,7 +185,7 @@ def jobs(scope):
                    ["--geometry", geometry, "--capacities", exl3_capacity_args[geometry],
                     "--bits", "2,3"])
                   for geometry in EXL3_GEOMETRIES)
-    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
+    for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5"), ("ml4", "4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
@@ -196,6 +196,11 @@ def jobs(scope):
                   for geometry in EXL3_GEOMETRIES)
     result.extend([
         ("kimi-k6-dense", "export_b12x_dsv4_aot.py", ["--geometry", "dense_trellis_k6,kimi_split"]),
+        ("ml4-k6-dense", "export_b12x_dsv4_aot.py",
+         ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "ml4"]),
+        ("ml4", "export_b12x_dsv4_aot.py", ["--geometry", "ml4"]),
+        # With its head split (ml42) and the token-split extras, as context-enabled images build.
+        ("ml4-context", "export_b12x_dsv4_aot.py", ["--geometry", "ml4", "--context-split", "on"]),
         ("glm-k6-dense", "export_b12x_dsv4_aot.py",
          ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "glm"]),
         ("glmf-k6-dense", "export_b12x_dsv4_aot.py",

@@ -81,11 +81,11 @@ impl CheckpointIdentity {
                     "EXLR8 manifest requires an EXLR8 checkpoint"
                 );
                 let (name, header) = if format == CheckpointFormat::HfIndexed {
-                    ("model.safetensors.index.json", false)
+                    (super::index_name(snapshot)?, false)
                 } else {
-                    ("model.safetensors", true)
+                    ("model.safetensors".to_owned(), true)
                 };
-                hash_file(&mut hash, snapshot, name, header)?;
+                hash_file(&mut hash, snapshot, &name, header)?;
                 None
             }
             CheckpointFormat::Exlr8 => {

@@ -808,7 +808,8 @@ fn native_mtp_selection_preserves_checkpoint_ownership() {
         for selected in ["off", "mtp", "dspark", "dflash2", "unknown"] {
             let previous = match (family.id(), selected) {
                 ("mimo_v2" | "qwen4" | "qwen3_5", "mtp") => DraftOwnership::NativeMtp,
-                ("deepseek_v4" | "deepseek_v41", "dspark") => DraftOwnership::BundledDspark,
+                // Mistral Large 4's mtp_dspark ships in its own checkpoint.
+                ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => DraftOwnership::BundledDspark,
                 _ => DraftOwnership::None,
             };
             assert_eq!(DraftOwnership::selected(family.id(), selected), previous,
@@ -1362,13 +1363,15 @@ fn glm5_attention_auto_requires_complete_context_programs() {
         }
         names.extend([format!("glm_index_producer_{capacity}"), format!("glm_index_topk_{mode}_{capacity}")]);
     }
-    names.extend(glm::CONTEXT_PROGRAMS.map(str::to_string));
+    let context: Vec<String> = glm::CONTEXT_PROGRAMS.iter().map(|n| format!("glm_{n}"))
+        .chain(["glm_paged_staging_gather_kv".to_string()]).collect();
+    names.extend(context.iter().cloned());
     names.extend(["glm_sparse_mla_partial_h0_s1_m64", "glm_sparse_mla_partial_h32_s1_m64"].map(str::to_string));
     let path = dir.path().join("PROGRAMS.json");
     // Both partials and every primitive are required; auto (context) and an
     // explicit context fail closed without them, while heads always runs.
     let missing = std::iter::once(None).chain(names.iter().filter(|name|
-        glm::CONTEXT_PROGRAMS.contains(&name.as_str()) || name.starts_with("glm_sparse_mla_partial_"))
+        context.contains(name) || name.starts_with("glm_sparse_mla_partial_"))
         .map(|name| Some(name.as_str()))).chain([Some("no-manifest")]);
     for omitted in missing {
         let programs: Vec<_> = names.iter().filter(|name| omitted != Some(name.as_str()))

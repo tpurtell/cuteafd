@@ -29,6 +29,7 @@ CASES = [
     ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
     ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
+    ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45'),
 ]
 
 
@@ -254,6 +255,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
+    ('mistral_large4', 'Mistral-Large-4-EXL3-K4-Core-K6', 6, 'ML4', 'ml4:exl3-k45', 'ml4:exl3-k45', 'ml4=6', '', {}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
         coordinator, spark, counts, roles, extra):
@@ -416,3 +418,69 @@ def test_kimi_builds_always_package_k6_programs(tmp_path):
     assert '"kimik3,dense_trellis_k6,kimi_split"' in table
     for exporter in ['export_b12x_dense_trellis_k6_aot.py', 'export_b12x_kimi_split_aot.py']:
         assert exporter in table
+
+
+@pytest.mark.parametrize('glm,kimi', [(False, False), (True, False), (False, True)])
+def test_ml4_exports_its_programs_and_k6_shapes_beside_other_families(tmp_path, glm, kimi):
+    cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
+    (tmp_path / 'CMakeLists.txt').write_text('\n'.join([
+        'cmake_minimum_required(VERSION 3.18)', 'project(ml4_scope NONE)',
+        'set(CUTEAFD_CUDA_ARCHITECTURES 120)', 'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)',
+        'set(CUTEAFD_GLM_GEOMETRIES "glm;glm2")', 'set(CUTEAFD_ENABLE_ML4_AOT ON)',
+        f'set(CUTEAFD_ENABLE_GLM_AOT {"ON" if glm else "OFF"})',
+        f'set(CUTEAFD_ENABLE_KIMIK3_AOT {"ON" if kimi else "OFF"})',
+        'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
+        'file(WRITE "${CMAKE_BINARY_DIR}/args.txt" "${CUTEAFD_DSV4_EXPORT_ARGS}")',
+    ]))
+    build = tmp_path / 'build'
+    result = subprocess.run(['cmake', '-S', str(tmp_path), '-B', str(build)],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    args = (build / 'args.txt').read_text().split(';')
+    geometries = args[args.index('--geometry') + 1].split(',')
+    assert geometries.count('ml4') == 1 and geometries.count('dense_trellis_k6') == 1
+    families = args[args.index('--dense-trellis-families') + 1].split(',')
+    assert families[-1] == 'ml4' and ('glm' in families) == glm and ('kimik3' in families) == kimi
+    assert ('glm_stage' in geometries) == glm
+
+
+def test_ml4_engine_program_names_are_exported_stems():
+    """Every ml4_* / ml42_* program name the GLM engine builds for Mistral Large 4 is a stem the
+    exporter emits (ml4_programs for the whole model, ml4_head_split_programs for a head split's
+    share; RoPE stems carry no tag, NoPE ones ``_nope``)."""
+    import re
+    exporter = (ROOT / 'python/tools/aot/export_b12x_dsv4_aot.py').read_text()
+    exported = set()
+    for function, family in (('ml4_programs', 'ml4'), ('ml4_head_split_programs', 'ml42')):
+        body = exporter.split(f'def {function}(')[1].split('\ndef ')[0]
+        for stem in re.findall(r'\(f?"([a-z0-9_{}]+)", "', body):
+            names = {stem}
+            for field, values in (('{tag}', ('', '_nope')), ('{mode}', ('decode', 'prefill')),
+                                  ('{rows}', ('64', '4096')), ('{inter}', ('6144', '12288', '3072'))):
+                names = {n.replace(field, v) for n in names for v in values} if field in stem else names
+            exported |= {f'{family}_{n}' for n in names}
+    engine = ''.join((ROOT / p).read_text() for p in (
+        'rust/crates/cuteafd-daemon/src/families/glm5/engine.rs',
+        'rust/crates/cuteafd-daemon/src/families/glm5/engine/native_dense.rs'))
+    used = re.findall(r'"((?:ml4|\{family\})_[a-z0-9_{}]+)"', engine)
+    assert any(u.startswith('{family}') for u in used) and any(u.startswith('ml4_') for u in used)
+    for pattern in used:
+        assert '_rope' not in pattern, pattern
+        # Positional `{}` hides which tag a call passes (it once asked for `_rope`); name it.
+        assert '{}' not in pattern, f'{pattern}: use named fields'
+        names = {pattern}
+        for field, values in (('{family}', ('ml4', 'ml42')), ('{tag}', ('', '_nope')),
+                              ('{mode}', ('decode', 'prefill')), ('{cap}', ('m64', 'm4096')),
+                              ('{intermediate}', ('6144', '12288', '3072')),
+                              ('{placed}', ('', '_context')), ('{scale_placed}', ('', '_context'))):
+            names = {n.replace(field, v) for n in names for v in values}
+        assert all('{' not in n for n in names), pattern
+        missing = sorted(n for n in names if n not in exported and not n.startswith('ml4_draft')
+                         # Whole-model programs have no _context form; the engine only places a
+                         # head split's share (ml42) into the combined query.
+                         and not (n.startswith('ml4_') and '_context' in n)
+                         # NoPE query scales write no tail: they have no _context form.
+                         and not ('query_scale_nope_context' in n))
+        if pattern.startswith('{family}'):
+            missing = [n for n in missing if not (n.startswith('ml4_') and '_context' in n)]
+        assert not missing, f'{pattern}: not exported: {missing}'

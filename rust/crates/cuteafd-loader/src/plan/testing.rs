@@ -383,7 +383,8 @@ pub fn glm5_tensors(expert: impl Fn(&str, usize, usize) -> Vec<Tensor>) -> Vec<T
 /// programs and the decode/prefill producers, attention, o_proj and dense/MoE FFNs of both shares.
 pub fn glm5_native_programs() -> Value {
     use crate::placement::families::glm5 as glm;
-    let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+    let mut names = glm::CONTEXT_PROGRAMS.iter().map(|name| format!("glm_{name}"))
+        .chain(["glm_paged_staging_gather_kv".to_string()]).collect::<Vec<_>>();
     for (cap, mode) in [("m64", "decode"), ("m4096", "prefill")] {
         names.extend([format!("glm_index_producer_{cap}"), format!("glm_index_topk_{mode}_{cap}")]);
         for (prefix, moe, dense) in [("glm", 2048, 12288), ("glm2", 1024, 6144)] {
@@ -396,6 +397,91 @@ pub fn glm5_native_programs() -> Value {
     json!({"programs": names.into_iter().map(|name|
         json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})).collect::<Vec<_>>()})
 }
+
+/// A native K6 package manifest for `core`: one row policy and its three
+/// dense_trellis_k6 programs per weight geometry, plus the stage programs each
+/// variant's admission checks (GLM's `glm{,2}_stage_*`; Mistral Large 4's
+/// `ml4_*`, its `ml42_*` head-split share and its context-split extras).
+pub fn glm_k6_programs(cfg: &crate::families::glm5::GlmDsaConfig, core: &crate::families::glm5::core::CoreInventory)
+    -> anyhow::Result<Value> {
+    use anyhow::Context as _;
+    use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
+    let mut weights = Vec::new();
+    for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
+        for layer in 0..cfg.layers { weights.extend(core.layer_weights(cfg, layer, ranks, owner)?.into_iter()
+            .flat_map(std::collections::BTreeMap::into_values)); }
+    } }
+    if let Some(head) = core.get_weight(cfg.head()) {
+        weights.push(CoreWeightLayout::new(head, TrellisSide::Output, 0, 1)?);
+    }
+    let mut policies = std::collections::BTreeMap::new();
+    let mut programs = std::collections::BTreeMap::new();
+    for w in weights {
+        let [n, k] = w.shape;
+        let side = if w.side == TrellisSide::Input { 2 } else { 1 };
+        let book = w.codebook.marker();
+        let shape = format!("k{k}_n{n}_s{side}_{book}");
+        let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
+        policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
+            "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
+            "output_program":routes[2]}));
+        let output = if w.stem == cfg.head() { "f32" } else { "bf16" };
+        let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
+            json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
+                "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
+                "splits":k.div_ceil(1024),"ctas_per_sm":4}),
+            json!({"features":n,"output_dtype":output,"max_rows":4096})];
+        let pointers = [vec!["input", "suh", "rotated", "input_block_scales"],
+            vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
+            vec!["input", "svh", "output"]];
+        for i in 0..3 {
+            let name = format!("dense_trellis_k6_{}", routes[i]);
+            programs.insert(name.clone(), json!({"name":name,"capacity_rows":4096,"geometry":geometries[i],
+                "pointers":pointers[i].iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
+                "scalars":vec![json!({"type":"int32"}); if i == 1 { 3 } else { 2 }],
+                "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
+        }
+    }
+    for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
+        for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+            let name = format!("{prefix}_stage_swiglu_i{inter}");
+            programs.insert(name.clone(), json!({"name":name}));
+        }
+        for cap in ["m64", "m4096"] { for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16",
+            "absorb_bf16_context", "query_rope_context"] {
+            let name = format!("{prefix}_stage_{stage}_{cap}");
+            programs.insert(name.clone(), json!({"name":name}));
+        } }
+    }
+    if cfg.variant.ml4().is_some() {
+        // export_b12x_dsv4_aot --geometry ml4: whole-attention stages and their
+        // 32-head share under a head split (`ml42_*`).
+        let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
+        let mut names = vec!["ml4_index_kw".to_string(), "ml4_norm".into(), "ml4_router_scores".into(),
+            "ml4_expert_input_quant".into(), "ml4_index_topk_decode_m64".into(), "ml4_index_topk_prefill_m4096".into(),
+            "ml4_sparse_mla_decode_m64".into(), "ml4_sparse_mla_nope_decode_m64".into(),
+            "ml4_sparse_mla_prefill_m4096".into(), "ml4_sparse_mla_nope_prefill_m4096".into()];
+        for ranks in [1, 2] {
+            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                names.push(format!("ml4_swiglu_i{inter}"));
+            }
+        }
+        for cap in ["m64", "m4096"] {
+            names.extend([format!("ml4_values_{cap}"), format!("ml4_index_query_scale_{cap}"),
+                format!("ml4_index_layer_norm_{cap}"), format!("ml4_index_q_{cap}"), format!("{split}_values_{cap}")]);
+            for tag in ["", "_nope"] {
+                for stage in ["query_scale", "rank_pack", "absorb", "index_post"] {
+                    names.push(format!("ml4_{stage}{tag}_{cap}"));
+                }
+                names.extend([format!("{split}_query_scale{tag}_{cap}"), format!("{split}_absorb{tag}_{cap}")]);
+            }
+        }
+        for name in names { programs.insert(name.clone(), json!({"name": name, "scratch_bytes_at_capacity": {"scratch": 256}})); }
+    }
+    Ok(json!({"families":{"dense_trellis_k6":{"abi_version":1,
+        "row_policies":policies.into_values().collect::<Vec<_>>()}},"programs":programs.into_values().collect::<Vec<_>>()}))
+}
+
 
 /// GLM 5.3 Flash's config with `layers` layers (KDA / MLA alternating, the
 /// first dense).
@@ -1004,4 +1090,117 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
         "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
     path
+}
+
+/// Mistral Large 4's real header inventory (the official FP8 release @f12dabdc,
+/// 56,563 tensors) from the checked-in templates, keeping the routed experts of
+/// `expert_layers` only (`None`: every layer). `quantized`: the K4 experts + K6 core
+/// publication form instead (wq, wkv_a padded to 640, wo, shared expert,
+/// dense FFN and output at K6; wkv_b, indexer wk/weights_proj, norms, router,
+/// embeddings, drafter and vision byte for byte; indexer wq_b kept FP8).
+pub fn mistral_large4_tensors(expert_layers: Option<&[usize]>, quantized: bool) -> Vec<Tensor> {
+    #[derive(serde::Deserialize)]
+    struct Template { pattern: String, axes: Vec<Vec<usize>>, dtype: String, shape: Vec<usize> }
+    let templates: Vec<Template> = serde_json::from_str(include_str!("../families/mistral_large4/official-tensors.json")).unwrap();
+    let dtype = |d: &str| -> &'static str { match d { "BF16" => "BF16", "F32" => "F32", "F8_E4M3" => "F8_E4M3", other => panic!("{other}") } };
+    let mut out = Vec::new();
+    for template in templates {
+        let mut names = vec![template.pattern.clone()];
+        for axis in &template.axes {
+            names = names.into_iter().flat_map(|name| axis.iter().map(move |i| name.replacen("{}", &i.to_string(), 1))).collect();
+        }
+        for name in names {
+            if let Some((layer, _)) = name.strip_prefix("layers.").and_then(|r| r.split_once(".experts."))
+                .and_then(|(l, rest)| Some((l.parse::<usize>().ok()?, rest))) {
+                if expert_layers.is_some_and(|keep| !keep.contains(&layer)) { continue; }
+            }
+            out.push(t(name, dtype(&template.dtype), &template.shape));
+        }
+    }
+    if !quantized { return out; }
+    let core = |stem: &str| -> Option<bool> {
+        if stem == "output" { return Some(false); }
+        let rest = stem.strip_prefix("layers.")?.split_once('.')?.1;
+        match rest {
+            "attention.wq" | "attention.wo" | "shared_experts.w1" | "shared_experts.w2" | "shared_experts.w3"
+            | "feed_forward.w1" | "feed_forward.w2" | "feed_forward.w3" => Some(false),
+            "attention.wkv_a_with_mqa" => Some(true),
+            _ if rest.starts_with("experts.") => Some(false),
+            _ => None,
+        }
+    };
+    let mut quantized = Vec::new();
+    let mut shapes = std::collections::BTreeMap::new();
+    for tensor in &out {
+        if let Some(stem) = tensor.0.strip_suffix(".weight") { shapes.insert(stem.to_owned(), tensor.2.clone()); }
+    }
+    for tensor in out {
+        let (stem, suffix) = crate::plan::format::split_stem(&tensor.0);
+        let Some(pad) = core(stem) else { quantized.push(tensor); continue };
+        if suffix == "qscale_weight" { continue; }
+        let shape = &shapes[stem];
+        let bits = if stem.contains(".experts.") { 4 } else { 6 };
+        let n = if pad { shape[0].next_multiple_of(128) } else { shape[0] };
+        quantized.extend(exl3(stem, n, shape[1], bits));
+    }
+    quantized
+}
+
+/// The compact and full EXL3 K4 + Core-K6 metadata of a Mistral Large 4
+/// publication (GLM 5.3 K4-Core-K6 contract).
+pub fn mistral_large4_exl3_config(tensors: &[Tensor]) -> (Value, Value) {
+    let compact = json!({"bits": 4.0, "checkpoint_format": "exl3", "core_bits": 6.0, "format": "exl3",
+        "head_bits": 6.0, "per_module_metadata": "quantize_config.json:tensor_storage", "quant_method": "exl3"});
+    let mut full = compact.clone();
+    full.as_object_mut().unwrap().extend(json!({"codebook": "mcg", "desc_act": false, "group_size": -1,
+        "lm_head": true, "method": "exl3", "out_scales": "auto", "sym": true}).as_object().unwrap().clone());
+    let projections: Vec<(String, usize, usize, usize)> = tensors.iter().filter_map(|(name, _, shape)| {
+        let stem = name.strip_suffix(".trellis")?;
+        Some((stem.to_owned(), shape[2] / 16, shape[0] * 16, shape[1] * 16))
+    }).collect();
+    (compact, exl3_manifest(&full, &projections))
+}
+
+/// A Mistral Large 4 header snapshot in the release's own layout: config.json,
+/// `consolidated-NNNNN.safetensors` shards (one per layer, sparse payloads)
+/// and the index config.json's `transformers_weights` names.
+/// Mistral Large 4's release config.json (@f12dabdc).
+pub fn mistral_large4_config() -> Value {
+    serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap()
+}
+
+pub fn write_mistral_large4_snapshot(dir: &Path, expert_layers: Option<&[usize]>, quantized: bool) {
+    let tensors = mistral_large4_tensors(expert_layers, quantized);
+    let mut config: Value = serde_json::from_str(include_str!("../families/mistral_large4/official-config.json")).unwrap();
+    if quantized {
+        let (compact, manifest) = mistral_large4_exl3_config(&tensors);
+        config["quantization_config"] = compact;
+        write_quantize_config(dir, &manifest);
+    }
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.strip_prefix("layers.").and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in shards {
+        let file = format!("consolidated-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), &tensors);
+        for (name, ..) in tensors { weight_map.insert(name, Value::String(file.clone())); }
+    }
+    fs::write(dir.join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    fs::write(dir.join("consolidated.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+    // The release's Mistral-format params.json: its mtp block describes the bundled drafter.
+    fs::write(dir.join("params.json"), json!({"softmax_tanh_gating": 30.0, "mtp": {"n_layers": 3, "depth": 3,
+        "ragged_attention": "2048,2048,2048", "target_activation_layers": "1,18,36,54,71", "norm_strategy": "eagle",
+        "dspark": {"markov_rank": 512, "head_type": "rnn", "draft_input": "position_specific"}},
+        // The release's vision_encoder block (@f12dabdc), which names the image markers.
+        "vision_encoder": {"image_token_id": 10, "image_break_token_id": 12, "image_end_token_id": 13,
+            "intermediate_size": 6144, "num_hidden_layers": 30, "num_attention_heads": 16,
+            "mm_projector_id": "patch_merge", "spatial_merge_size": 2, "hidden_size": 2048, "num_channels": 3,
+            "image_size": 1540, "max_image_size": 1540, "patch_size": 14, "rope_theta": 10000.0,
+            "add_pre_mm_projector_layer_norm": true, "adapter_bias": false}}).to_string()).unwrap();
+    fs::write(dir.join("processor_config.json"),
+        include_str!("../families/mistral_large4/official-processor-config.json")).unwrap();
 }

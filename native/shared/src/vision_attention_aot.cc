@@ -134,3 +134,14 @@ extern "C" int32_t cuteafd_vision_pointwise_launch(void* opaque,const char* name
   }
   return cudaErrorInvalidValue;
 }
+
+// Pixtral uses the same table-owned modules as every other vision geometry.
+extern "C" int32_t cuteafd_vision_axial_rotary_d128(void* owner,void* q,void* k,void* cos,void* sin,
+    void* out_q,void* out_k,int32_t rows,void* stream) {
+  void* pointers[]={q,k,cos,sin,out_q,out_k};uint64_t scalars[]={static_cast<uint64_t>(rows)};
+  return cuteafd_vision_pointwise_launch(owner,"vision_axial_rotary_d128_bf16",pointers,scalars,stream);
+}
+extern "C" int32_t cuteafd_vision_rms_h2048(void* owner,void* x,void* weight,void* out,int32_t rows,void* stream) {
+  void* pointers[]={x,weight,weight,weight,weight,weight,out};uint64_t scalars[]={static_cast<uint64_t>(rows)};
+  return cuteafd_vision_pointwise_launch(owner,"vision_rms_bf16_gamma_h2048",pointers,scalars,stream);
+}

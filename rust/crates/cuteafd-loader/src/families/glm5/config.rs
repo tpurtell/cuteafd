@@ -1,4 +1,5 @@
-//! GLM 5.x (glm_moe_dsa) model arguments from the Hugging Face `config.json`.
+//! GLM 5.x (glm_moe_dsa) model arguments from the Hugging Face `config.json`,
+//! and the other MLA + DSA checkpoints the GLM engine runs (`GlmVariant`).
 use anyhow::{ensure, Context, Result};
 use serde_json::Value;
 use std::path::Path;
@@ -11,6 +12,31 @@ use crate::plan::checkpoint::read_json;
 pub enum GlmIndexer {
     Full,
     Shared,
+}
+
+/// How a GLM-engine checkpoint's MLA + DSA layer differs from GLM 5.x, read
+/// from the checkpoint's own config (never a launch key). The engine runs one
+/// layer structure; the variant selects producer and indexer stages and
+/// per-layer records.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GlmVariant {
+    /// GLM 5.x: q-LoRA (`q_a_proj` -> `q_a_layernorm` -> `q_b_proj`), RoPE on
+    /// every layer, the indexer query from the q-LoRA residual, a sigmoid
+    /// noaux_tc router with a correction bias, no head soft cap.
+    Glm,
+    /// Mistral Large 4: `wq` straight from the normed hidden state with a
+    /// per-head scalable-softmax factor, NoPE layers (latent-only 528-byte
+    /// records, query nope = nope + rope), cross-layer latent sharing, the
+    /// indexer query from `wq_b(LayerNorm(h))` with its own query scale, a
+    /// softmax top-k router, interleaved YaRN with LeRoPE, a tanh-capped head.
+    MistralLarge4(Box<crate::families::mistral_large4::Ml4Config>),
+}
+
+impl GlmVariant {
+    pub fn is_glm(&self) -> bool { matches!(self, Self::Glm) }
+    pub fn ml4(&self) -> Option<&crate::families::mistral_large4::Ml4Config> {
+        match self { Self::MistralLarge4(cfg) => Some(cfg), Self::Glm => None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,6 +66,7 @@ pub struct GlmDsaConfig {
     pub rms_norm_eps: f64,
     pub mtp_layers: usize,
     pub eos_tokens: Vec<u32>,
+    pub variant: GlmVariant,
 }
 
 impl GlmDsaConfig {
@@ -47,8 +74,11 @@ impl GlmDsaConfig {
         Self::from_hf(&read_json(&snapshot.join("config.json"))?)
     }
 
-    pub fn from_hf(v: &Value) -> Result<Self> {
-        let v = v.get("text_config").unwrap_or(v);
+    pub fn from_hf(root: &Value) -> Result<Self> {
+        if root["model_type"] == "mistral_large4" {
+            return Self::mistral_large4(crate::families::mistral_large4::Ml4Config::from_hf(root)?);
+        }
+        let v = root.get("text_config").unwrap_or(root);
         ensure!(v["model_type"] == "glm_moe_dsa", "not a glm_moe_dsa config");
         let int = |key: &str| -> Result<usize> {
             v[key].as_u64().map(|x| x as usize).with_context(|| format!("glm_moe_dsa config lacks {key}"))
@@ -127,7 +157,111 @@ impl GlmDsaConfig {
             rms_norm_eps: float("rms_norm_eps")?,
             mtp_layers: v["num_nextn_predict_layers"].as_u64().unwrap_or(0) as usize,
             eos_tokens,
+            variant: GlmVariant::Glm,
         })
+    }
+
+    /// Mistral Large 4 on the GLM engine. `qk_nope_head_dim` is the RoPE
+    /// layers' (NoPE layers widen it by the rope width, see [`Self::nope_dim`]);
+    /// `q_lora_rank` 0 selects the direct query projection.
+    pub fn mistral_large4(cfg: crate::families::mistral_large4::Ml4Config) -> Result<Self> {
+        ensure!(cfg.routed_scale > 0.0 && cfg.experts > 0, "Mistral Large 4 routing geometry");
+        Ok(Self {
+            vocab_size: cfg.vocab_size,
+            hidden: cfg.hidden,
+            layers: cfg.layers,
+            heads: cfg.heads,
+            q_lora_rank: 0,
+            kv_lora_rank: cfg.kv_lora_rank,
+            qk_nope_head_dim: cfg.qk_nope_head_dim,
+            qk_rope_head_dim: cfg.qk_rope_head_dim,
+            v_head_dim: cfg.v_head_dim,
+            index_heads: cfg.index_heads,
+            index_head_dim: cfg.index_head_dim,
+            index_topk: cfg.index_topk,
+            indexers: cfg.indexers.iter().map(|kind| match kind {
+                crate::families::mistral_large4::Ml4Indexer::Full => GlmIndexer::Full,
+                crate::families::mistral_large4::Ml4Indexer::Shared => GlmIndexer::Shared,
+            }).collect(),
+            first_moe_layer: cfg.first_moe_layer,
+            dense_intermediate: cfg.dense_intermediate,
+            experts: cfg.experts,
+            topk: cfg.topk,
+            moe_intermediate: cfg.moe_intermediate,
+            shared_experts: cfg.shared_experts,
+            routed_scale: cfg.routed_scale,
+            rope_theta: cfg.rope_scaling.theta,
+            rms_norm_eps: cfg.rms_norm_eps,
+            mtp_layers: 0,
+            eos_tokens: cfg.eos_tokens.clone(),
+            variant: GlmVariant::MistralLarge4(Box::new(cfg)),
+        })
+    }
+
+    /// Whether layer `layer` applies RoPE (always on GLM 5.x).
+    pub fn rope(&self, layer: usize) -> bool {
+        self.variant.ml4().is_none_or(|cfg| cfg.rope[layer])
+    }
+
+    /// Nope width of layer `layer`'s query/key heads.
+    pub fn nope_dim(&self, layer: usize) -> usize {
+        if self.rope(layer) { self.qk_nope_head_dim } else { self.qk_nope_head_dim + self.qk_rope_head_dim }
+    }
+
+    /// The layer whose latent cache `layer` attends to (itself on GLM 5.x).
+    pub fn kv_source(&self, layer: usize) -> usize {
+        self.variant.ml4().map_or(layer, |cfg| cfg.kv_sources[layer])
+    }
+
+    /// Whether `layer` owns (computes and caches) its latent.
+    pub fn owns_kv(&self, layer: usize) -> bool { self.kv_source(layer) == layer }
+
+    /// FP8 latent record bytes of `layer`: 656 (512 E4M3 + 4 F32 scales + 64
+    /// BF16 RoPE) or 528 without RoPE.
+    pub fn record_bytes(&self, layer: usize) -> usize {
+        self.kv_lora_rank + 4 * (self.kv_lora_rank / 128) + if self.rope(layer) { 2 * self.qk_rope_head_dim } else { 0 }
+    }
+
+    /// The head's tanh soft cap, if any.
+    /// The plan family descriptor this checkpoint is admitted under.
+    pub fn family_id(&self) -> &'static str {
+        if self.variant.is_glm() { "glm5" } else { "mistral_large4" }
+    }
+
+    /// The coordinator program namespace of this variant's own exports
+    /// (`glm_*`, or `ml4_*` from `export_b12x_dsv4_aot --geometry ml4`).
+    pub fn program_family(&self) -> &'static str {
+        if self.variant.is_glm() { "glm" } else { "ml4" }
+    }
+
+    /// The namespace of a head split's share programs (`glm2_*`, Mistral Large 4's `ml42_*`):
+    /// each GPU's half of the heads, under heads and context placement.
+    pub fn split_program_family(&self) -> Option<&'static str> {
+        Some(if self.variant.is_glm() { "glm2" } else { "ml42" })
+    }
+
+    /// Record contracts of this variant's attention layers (`sparse_mla`, and
+    /// Mistral Large 4's NoPE `sparse_mla_nope`): one program kind each.
+    pub fn attention_kinds(&self) -> &'static [&'static str] {
+        if self.variant.is_glm() { &["sparse_mla"] } else { &["sparse_mla", "sparse_mla_nope"] }
+    }
+
+    /// The program kind of layer `layer`'s record contract ([`Self::attention_kinds`]).
+    pub fn attention_kind(&self, layer: usize) -> &'static str {
+        if self.rope(layer) { "sparse_mla" } else { "sparse_mla_nope" }
+    }
+
+    /// Absorbed query / latent width of layer `layer` (576 with RoPE, 512 without).
+    pub fn latent_dim(&self, layer: usize) -> usize {
+        self.kv_lora_rank + if self.rope(layer) { self.qk_rope_head_dim } else { 0 }
+    }
+
+    /// The widest record and absorbed query over every layer (buffers reused across layers).
+    pub fn max_record_bytes(&self) -> usize { (0..self.layers).map(|l| self.record_bytes(l)).max().unwrap_or(0) }
+    pub fn max_latent_dim(&self) -> usize { (0..self.layers).map(|l| self.latent_dim(l)).max().unwrap_or(0) }
+
+    pub fn logit_softcap(&self) -> Option<f64> {
+        self.variant.ml4().map(|cfg| cfg.logit_softcap)
     }
 
     /// The full layer whose top-k selection `layer` uses.

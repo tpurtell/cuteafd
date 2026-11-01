@@ -465,7 +465,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     let enabled = match (family, args.speculator.as_str()) {
         (_, "off") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4" | "step5", "mtp")
-        | ("deepseek_v4" | "deepseek_v41", "dspark") => true,
+        | ("deepseek_v4" | "deepseek_v41" | "mistral_large4", "dspark") => true,
         _ => false,
     };
     anyhow::ensure!(enabled, "SPECULATOR={} does not apply to {family}", args.speculator);

@@ -20,6 +20,8 @@ pub struct LocalEncoder {
     width: usize,
     max_tokens: usize,
     patch_size: usize,
+    /// A span-writing tower (Mistral's Pixtral) emits a marker row per merged row.
+    span_markers: bool,
     queue: VecDeque<Pending>,
     running: Option<Running>,
     next: u64,
@@ -27,6 +29,7 @@ pub struct LocalEncoder {
 impl LocalEncoder {
     pub fn new(service: EncoderService, config: &ProcessorConfig, width: usize, max_tokens: usize) -> Self {
         Self { service, lut: normalization_lut(config), width, max_tokens, patch_size: config.patch as usize,
+            span_markers: config.family == cuteafd_loader::media::ImageFamily::Mistral,
             queue: VecDeque::new(), running: None, next: 0 }
     }
     pub fn healthy(&self) -> bool { self.service.healthy() }
@@ -42,7 +45,8 @@ impl LocalEncoder {
         let (t, h, w) = (*t, *h, *w);
         let patches = (h as usize).checked_mul(w as usize).ok_or(MediaError::Features)?;
         if t != 1 || h == 0 || w == 0 || h % 2 != 0 || w % 2 != 0
-            || job.tokens != patches / 4 || job.tokens > self.max_tokens
+            || job.tokens != cuteafd_ffi::vision::output_rows([h as usize, w as usize], self.span_markers)
+            || job.tokens > self.max_tokens
             || job.hidden_width != self.width
             || self.patch_size.checked_mul(self.patch_size).and_then(|pixels| pixels.checked_mul(3))
                 .and_then(|bytes| patches.checked_mul(bytes)) != Some(rgb8.len()) {

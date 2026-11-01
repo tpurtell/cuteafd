@@ -5,6 +5,7 @@ pub(crate) mod engine;
 pub(crate) mod prefix;
 mod packed_check;
 pub(crate) mod serve;
+pub(crate) mod ml4_media;
 pub(crate) mod landing;
 pub(crate) mod native_dense;
 pub(crate) mod push;
@@ -86,6 +87,10 @@ pub(crate) struct EngineArgs {
     /// layers and drafts on the coordinator GPU.
     #[arg(long)]
     pub draft: Option<PathBuf>,
+    /// Mistral Large 4: draft with the checkpoint's bundled mtp_dspark (params.json
+    /// mtp; mtp_dspark.* tensors) on the shared MLA block-draft path.
+    #[arg(long, conflicts_with = "draft")]
+    pub dspark: bool,
     /// Maximum members of one draft batch, independent of context slots.
     #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_DRAFT_SEQUENCES)]
     pub draft_sequences: usize,
@@ -106,6 +111,10 @@ pub(crate) struct EngineArgs {
     /// Keep every prefill row's logits (glm-golden --nll; 2.5 GiB at 4096 rows).
     #[arg(long, hide = true)]
     pub full_prefill_logits: bool,
+    /// Prefix-cache marks of a window-ring drafter (mtp_dspark): each holds one slot's draft
+    /// windows; serve sets it from the prefix mark rule (0: no retained draft windows).
+    #[arg(long, hide = true, default_value_t = 0)]
+    pub draft_window_marks: usize,
     /// Benchmarks only: MoE layers skip the Spark exchange (routed experts
     /// contribute zero) but keep the route/wire download, the host sync, the
     /// shared expert, the plane uploads and the reduce, timing the
@@ -189,13 +198,13 @@ use cuteafd_loader::plan::spark_executions::SparkBackend;
 /// The decode link plus one prefill link carrying every wave in flight, over
 /// typed owners from the shared admission (one prefill scratch at the ladder
 /// maximum, waves only buffer per-unit I/O).
-fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
+fn spark_model(family: &str, backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
     -> Result<cuteafd_transport::worker_selection::ModelAdmission> {
     ensure!(waves > 0, "GLM Spark admission requires at least one prefill wave");
     let native = backend == SparkBackend::Exlr8;
     let ingress = if native { cuteafd_core::SparkIngress::Fp8K32 }
         else if bf16 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Fp8K32 };
-    let executions = cuteafd_loader::plan::spark_executions::admit_family("glm5", &backend.exports(), None,
+    let executions = cuteafd_loader::plan::spark_executions::admit_family(family, &backend.exports(), None,
         u64::from(unit_rows), waves as u64)?;
     let rings = crate::shared::placement::spark_rings(if native {
         cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
@@ -203,12 +212,12 @@ fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
         vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress },
             cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)?;
-    validate_spark_endpoint_count(model.endpoints.len(), waves)?;
+    validate_spark_endpoint_count(family, model.endpoints.len(), waves)?;
     Ok(model)
 }
 
-fn validate_spark_endpoint_count(endpoints: usize, waves: usize) -> Result<()> {
-    ensure!(endpoints == cuteafd_loader::plan::layout::spark_endpoints("glm5", waves as u64),
+fn validate_spark_endpoint_count(family: &str, endpoints: usize, waves: usize) -> Result<()> {
+    ensure!(endpoints == cuteafd_loader::plan::layout::spark_endpoints(family, waves as u64),
         "GLM Spark endpoint count differs from the planner");
     Ok(())
 }
@@ -258,9 +267,14 @@ mod draft_cli_tests {
         let k4 = SparkBackend::Exl3(cuteafd_core::Exl3RowPolicy::Nearest);
         for backend in [SparkBackend::Fp8, SparkBackend::Exlr8, k4] {
             for (waves, unit) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
-                assert_eq!(spark_model(backend, waves, unit, false)?.executions,
+                assert_eq!(spark_model("glm5", backend, waves, unit, false)?.executions,
                     planned("glm5", backend, None, u64::from(unit), waves as u64), "{backend:?} k{waves}");
             }
+        }
+        // Mistral Large 4 runs this engine under its own descriptor.
+        for (waves, unit) in [(1, 4096), (3, 2752)] {
+            assert_eq!(spark_model("mistral_large4", k4, waves, unit, false)?.executions,
+                planned("mistral_large4", k4, None, u64::from(unit), waves as u64), "ml4 k{waves}");
         }
         Ok(())
     }
@@ -269,7 +283,7 @@ mod draft_cli_tests {
     fn spark_contract_matches_decode_link_and_parallel_prefill_lanes() -> Result<()> {
         for (waves, unit) in [(1, 4096), (2, 4096), (3, 2752), (4, 2048)] {
             for bf16 in [false, true] {
-                let model = spark_model(SparkBackend::Fp8, waves, unit, bf16)?;
+                let model = spark_model("glm5", SparkBackend::Fp8, waves, unit, bf16)?;
                 model.validate(cuteafd_core::ExpertGeometry::GLM5)?;
                 // The decode link and one prefill link carrying every wave in flight.
                 assert_eq!(model.endpoints.len(), 2);
@@ -285,7 +299,7 @@ mod draft_cli_tests {
             }
         }
         for waves in 1..=4 {
-            let native = spark_model(SparkBackend::Exlr8, waves, 4096, false)?;
+            let native = spark_model("glm5", SparkBackend::Exlr8, waves, 4096, false)?;
             native.validate(cuteafd_core::ExpertGeometry::GLM5)?;
             assert_eq!(native.endpoints.len(), 2);
             assert_eq!(native.endpoints[0].capacity, engine::DECODE_ROWS as u32);
@@ -297,10 +311,10 @@ mod draft_cli_tests {
             assert_eq!(native.rings.max_frame_bytes,
                 cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, native.capacity())?);
         }
-        assert!(spark_model(SparkBackend::Fp8, 0, 4096, false).is_err());
-        assert!(validate_spark_endpoint_count(1, 1).is_err());
-        assert!(validate_spark_endpoint_count(3, 3).is_err());
-        assert!(validate_spark_endpoint_count(2, 1).is_ok());
+        assert!(spark_model("glm5", SparkBackend::Fp8, 0, 4096, false).is_err());
+        assert!(validate_spark_endpoint_count("glm5", 1, 1).is_err());
+        assert!(validate_spark_endpoint_count("glm5", 3, 3).is_err());
+        assert!(validate_spark_endpoint_count("glm5", 2, 1).is_ok());
         let source = include_str!("mod.rs");
         let links = source.rsplit("let mut transport = selected_peers.map(").next().unwrap()
             .split("let runtime = tokio::runtime::Builder").next().unwrap();
@@ -698,6 +712,10 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
             && args.exlr8_prefill_activations == Exlr8PrefillActivations::A16,
             "EXLR8 options require a native EXLR8 checkpoint");
     }
+    if args.dspark {
+        ensure!(cfg.variant.ml4().is_some(), "--dspark drafts with Mistral Large 4's bundled mtp_dspark");
+        dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?;
+    }
     if let Some(snapshot) = &args.draft {
         // A native EXLR8 target lends its row-FP8 head through a launcher.
         if !native { dflash::check_snapshot_target_head(&args.snapshot, cfg.hidden, cfg.vocab_size, false)?; }
@@ -731,8 +749,14 @@ impl Opened {
             ensure!(cfg.hidden == self.cfg.hidden && cfg.vocab == self.cfg.vocab_size
                 && cfg.taps.iter().all(|&l| l < self.cfg.layers), "the DFlash2 drafter does not fit this target");
         }
+        // The bundled mtp_dspark drafts its whole block (anchor-as-first).
+        let ml4_draft = args.dspark.then(|| cuteafd_loader::placement::families::glm5::ml4_draft_layout(&args.snapshot,
+            args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences, args.max_context,
+            self.library.sm_count()? as usize)).transpose()?;
+        let draft_width = provisional_drafter.as_ref().map(|cfg| cfg.drafts())
+            .or(ml4_draft.as_ref().map(|layout| layout.capacity().block_rows / layout.capacity().max_batch_sequences));
         let attention_plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-            engine::DECODE_ROWS, provisional_drafter.as_ref().map(|cfg| cfg.drafts()), args.attention_plan_rows)?;
+            engine::DECODE_ROWS, draft_width, args.attention_plan_rows)?;
         let legacy_manifest = args.manifest.with_file_name("DSV4_PROGRAMS.json");
         let manifest_path = if !args.manifest.exists()
             && args.manifest.file_name() == Some("PROGRAMS.json".as_ref()) && legacy_manifest.exists() {
@@ -741,13 +765,16 @@ impl Opened {
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest_path)?)?;
         // GLM 5.3's own programs (`glm_*`, and the head split's `glm2_*`), sampled as the runtime
         // inventory; the image's other families are never launched here.
-        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: "glm",
-            split_family: args.split_device.map(|_| "glm2") };
+        // Mistral Large 4 runs its own `ml4_*` programs (whole attention on each GPU).
+        let selected = cuteafd_core::coordinator_programs::CoordinatorPrograms { family: self.cfg.program_family(),
+            split_family: args.split_device.and(self.cfg.split_program_family()) };
         let programs = programs.with_attention_plan(attention_plan, |name| selected.contains(name))?;
         let stream = self.library.cuda_stream_create()?;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
         let split_device = match args.split_device {
+            // Mistral Large 4 pairs GPUs as whole-layer owners without its share programs.
+            Some(device) if !self.cfg.variant.is_glm() => Some(device),
             Some(device) if programs.spec("glm2_o_m64").is_ok() => Some(device),
             Some(device) => {
                 tracing::info!(device, "no head-split programs (glm2) in this build; serving from --device alone");
@@ -785,6 +812,7 @@ impl Opened {
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let requested = cuteafd_loader::placement::attention::parse(&args.attention_placement)
             .map_err(anyhow::Error::msg)?;
+        let requested = cuteafd_loader::placement::families::glm5::resolve_attention(&self.cfg, requested, devices.len());
         ensure!(requested != Some(cuteafd_loader::placement::AttentionPlacement::Layers) || devices.len() == 2,
             "GLM layers attention requires two coordinator GPUs");
         let owners = (requested == Some(cuteafd_loader::placement::AttentionPlacement::Layers))
@@ -852,18 +880,26 @@ impl Opened {
         let drafter_staging = args.draft.as_deref().map(|snapshot| glm::drafter_staging(snapshot,
             args.draft_context_slots.unwrap_or(20.max(args.draft_sequences)), args.draft_sequences,
             args.draft_fp8 == Some(false))).transpose()?.unwrap_or(0);
+        // mtp_dspark: its admitted layout (weights, rings, arenas), the prefix marks of its
+        // draft windows, and load-time staging.
+        let (drafter_bytes, drafter_staging) = match &ml4_draft {
+            Some(layout) => (cuteafd_loader::placement::families::glm5::ml4_draft_resident_bytes(layout,
+                args.draft_window_marks)?, layout.weights().max_load_staging),
+            None => (drafter_bytes, drafter_staging),
+        };
         let spark_ranks = args.peers.as_deref().map_or(0, |p| p.split(',').count());
         // Token-split attention: the build's programs (GPU0's table; both GPUs load the same).
         let names: Vec<&str> = programs.names().collect();
-        let mut context = (devices.len() == 2).then(|| glm::context_programs(names.iter().copied(),
+        let mut context = (devices.len() == 2).then(|| glm::context_programs(&self.cfg, names.iter().copied(),
             |name| programs.spec(name).ok().map(|p| p.scratch.get("scratch").copied().unwrap_or(0)))).flatten();
         if let Some(context) = &mut context {
             let selected_scratch = devices.iter().map(|&device| -> Result<u64> {
                 self.library.cuda_set_device(device)?;
                 let sms = self.library.sm_count()?;
-                [0, self.cfg.heads / 2].into_iter().map(|begin| {
-                    let name = cuteafd_core::coordinator_programs::attention_partial_program(
-                        &manifest, "glm", begin, engine::DECODE_ROWS, sms, &attention_plan)?;
+                self.cfg.attention_kinds().iter().flat_map(|kind| [0, self.cfg.heads / 2].map(|begin| (*kind, begin)))
+                    .map(|(kind, begin)| {
+                    let name = cuteafd_core::coordinator_programs::attention_partial_program_of(
+                        &manifest, self.cfg.program_family(), kind, begin, engine::DECODE_ROWS, sms, &attention_plan)?;
                     Ok(programs.spec(&name)?.scratch.get("scratch").copied().unwrap_or(0))
                 }).collect::<Result<Vec<_>>>().map(|sizes| sizes.into_iter().max().unwrap_or(0))
             }).collect::<Result<Vec<_>>>();
@@ -877,11 +913,17 @@ impl Opened {
         let core = checkpoint.as_ref().map(|checkpoint| -> Result<_> {
             let core = cuteafd_loader::families::glm5::core::CoreInventory::from_checkpoint(&self.cfg, checkpoint)?;
             if core.projections.is_empty() { return Ok(None); }
-            let draft_rows = args.draft.as_deref().map(|snapshot| -> Result<_> {
-                let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
-                let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
-                args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")
-            }).transpose()?;
+            // Draft rows the K6 target head scores per step: DFlash2's sequences x block, or
+            // mtp_dspark's whole admitted block (the planner's drafter_admission rows).
+            let draft_rows = match (args.draft.as_deref(), &ml4_draft) {
+                (Some(snapshot), _) => Some({
+                    let config = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+                    let (_, block) = cuteafd_loader::families::glm5::draft_representation::draft_geometry(&config)?;
+                    args.draft_sequences.checked_mul(usize::try_from(block)?).context("GLM K6 draft head rows")?
+                }),
+                (None, Some(layout)) => Some(layout.capacity().block_rows),
+                (None, None) => None,
+            };
             Ok(Some(cuteafd_loader::families::glm5::core::CoreCharges::from_package(&self.cfg,
                 &core, layers, devices.len(), owners.as_deref(), args.prefill_rows, prefill_lanes,
                 draft_rows, &manifest)?))
@@ -892,9 +934,9 @@ impl Opened {
             .unwrap_or_else(|| dense_programs.program_set(&manifest, true));
         let pending_code = devices.iter().enumerate().map(|(rank, &device)|
             crate::shared::inventory::pending_code(&self.library, device, rank, devices.len() == 2,
-                if core.is_some() { "glm-k6" } else { "glm" }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
+                &if core.is_some() { format!("{}-k6", self.cfg.program_family()) } else { self.cfg.program_family().to_owned() }, "*", &code_set)).collect::<Result<Vec<_>>>()?;
         let exchange_f32 = glm::local_exchange_f32()?;
-        let local = glm::select_local_inventory(&self.catalog, manifest_path, layers, devices.len(),
+        let local = glm::select_local_inventory(&self.cfg, &self.catalog, manifest_path, layers, devices.len(),
             args.prefill_rows as u64, prefill_lanes as u64, exchange_f32, args.rtx_expert_layers,
             args.skip_routed_experts, args.exlr8_manifest.as_deref()
                 .map(|selected| (selected, args.exlr8_prefill_activations)))?;
@@ -969,7 +1011,7 @@ impl Opened {
                 .collect::<std::result::Result<Vec<std::net::SocketAddr>, _>>()?;
             let admission = crate::shared::placement::SparkAdmission::plan_manifest(&self.snapshot,
                 self.catalog.routed_experts().geometry()?, Some(&self.catalog), &working.spark,
-                peers.len(), None, spark_model(SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
+                peers.len(), None, spark_model(self.cfg.family_id(), SparkBackend::for_catalog(&self.catalog)?, prefill_lanes, u32::try_from(args.prefill_rows.max(engine::DECODE_ROWS))?, spark_bf16)?,
                 args.exlr8_manifest.as_deref())?;
             // The coordinator GPUs' EXL3 TP2 halves join the Spark push group as
             // two more ranks; planning failure leaves them on the mount.
@@ -1134,6 +1176,28 @@ impl Opened {
             tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64,
                 draft_head = "tensor", "DFlash2 drafter resident");
             Some(drafter)
+        } else if let Some(layout) = ml4_draft.clone() {
+            let started = Instant::now();
+            let ml4 = self.cfg.variant.ml4().context("mtp_dspark needs the Mistral Large 4 config")?;
+            let params = cuteafd_loader::plan::checkpoint::read_json(&args.snapshot.join("params.json"))?;
+            let dspark = cuteafd_loader::families::mistral_large4::dspark::Ml4DsparkConfig::from_params(&params, ml4.layers)?;
+            let native = cuteafd_loader::formats::dflash::MlaDflashConfig::ml4(&dspark, ml4)?;
+            let catalog = &self.catalog;
+            let read = |name: &str, shape: &[usize]| -> Result<Vec<u8>> {
+                let tensor = catalog.tensor(name)?;
+                ensure!(tensor.metadata.dtype == cuteafd_core::DType::Bf16 && tensor.metadata.shape == shape,
+                    "{name}: expected BF16 {shape:?}, found {:?} {:?}", tensor.metadata.dtype, tensor.metadata.shape);
+                let mut bytes = vec![0u8; tensor.metadata.byte_length as usize];
+                use std::os::unix::fs::FileExt;
+                std::fs::File::open(catalog.snapshot().join(&tensor.shard))?.read_exact_at(&mut bytes, tensor.metadata.byte_offset)
+                    .with_context(|| format!("reading {name}"))?;
+                Ok(bytes)
+            };
+            let drafter = dflash::DflashDrafter::load_ml4(&self.library, &programs, native, ml4,
+                ml4.logit_softcap as f32, stream, layout, &read)?;
+            drafter.prepare_workspace()?;
+            tracing::info!(elapsed_ms = started.elapsed().as_millis() as u64, "mtp_dspark drafter resident");
+            Some(drafter)
         } else { None };
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
         let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
@@ -1178,6 +1242,8 @@ impl Opened {
             engine.skip_routed_experts()?;
         }
         engine.drafter = drafter;
+        engine.draft_window_marks = if engine.drafter.as_ref().is_some_and(|d| d.mla_windows_only())
+            { args.draft_window_marks } else { 0 };
         engine.bind_draft_core_head()?;
         engine.attention_plan = attention_plan.validate_loaded(engine.drafter.as_ref().map(|d| d.cfg.drafts()))?;
         tracing::info!(plan_rows = engine.attention_plan.rows(),

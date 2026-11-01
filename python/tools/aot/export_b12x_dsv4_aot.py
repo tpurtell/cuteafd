@@ -47,6 +47,7 @@ CHECKPOINT_CONTEXTS = {
     "qwen38": ("Qwen/Qwen3.8-27B", 262144),
     "step5": ("stepfun-ai/Step-5-Preview", 1048576),
     "kimik3": ("moonshotai/Kimi-K3", 1048576),
+    "ml4": ("mistralai/Mistral-Large-4-1T-A52B", 1048576),
 }
 
 
@@ -538,6 +539,160 @@ def glmf_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context
     return programs
 
 
+def ml4_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """Mistral Large 4: the shared GLM primitives at its geometry (RoPE layers on
+    the 656-byte GLM 5.3 contract, NoPE layers on the 528-byte GLM 5.3 Flash
+    one) plus the per-head query scale, the indexer's LayerNorm and the NoPE
+    index epilogue. The dense core is the shared K6 trellis (dense_trellis_k6
+    with the ml4 shapes); the FFN activation is the format-neutral SwiGLU."""
+    from b12x.integration.cuteafd import glm_ffn as ffn
+    from b12x.integration.cuteafd import glm_indexer as idx
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+    from b12x.integration.cuteafd.native_dense import compile_swiglu_split_aot
+
+    from b12x.integration.cuteafd.pointwise import compile_bf16_projection_aot
+
+    rope_g = ml4.rope_attention(g)
+    index_pages = -(-max_context // PAGE_ROWS)
+    kw = g.index_head_dim + g.index_heads
+    out = [
+        ("norm", "norm", {}, lambda: ffn.compile_glm_norm_aot(rope_g)),
+        # The indexer's [wk | weights_proj] over h, BF16 as shipped (modules_to_not_convert).
+        ("index_kw", "bf16_projection", {"width": g.hidden, "outputs": kw},
+         lambda: compile_bf16_projection_aot(width=g.hidden, outputs=kw)),
+        ("router_scores", "router_scores", {}, lambda: ffn.compile_glm_router_scores_aot(rope_g)),
+        ("expert_input_quant", "expert_input_quant", {}, lambda: ffn.compile_glm_expert_input_quant_aot(rope_g)),
+    ]
+    # Whole and two-GPU (intermediate-split) widths of the dense layer and shared expert.
+    for inter in sorted({g.dense_inter, g.moe_inter, g.dense_inter // 2, g.moe_inter // 2}):
+        out.append((f"swiglu_i{inter}", "swiglu_split", {"inter": inter},
+                    lambda i=inter: compile_swiglu_split_aot(inter=i)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        for rope in (True, False):
+            tag = "" if rope else "_nope"
+            out += [
+                (f"query_scale{tag}_m{rows}", "query_scale", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_query_scale_aot(g, rope=rope, max_rows=r)),
+                (f"rank_pack{tag}_m{rows}", "rank_pack", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_rank_pack_aot(g, rope=rope, max_rows=r)),
+                (f"absorb{tag}_m{rows}", "absorb", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope, max_rows=r)),
+                (f"index_post{tag}_m{rows}", "index_post", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_index_post_aot(g, rope=rope, max_rows=r)),
+                (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
+                 # Decode exports one card plan per SM count (the exporter passes sm_count).
+                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
+                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+            ]
+        out += [
+            (f"values_m{rows}", "values", {"max_rows": rows},
+             lambda r=rows: ml4.compile_kv_b_aot(g, stage="values", rope=True, max_rows=r)),
+            (f"index_query_scale_m{rows}", "query_scale", {"rope": False, "heads": g.index_heads, "max_rows": rows},
+             lambda r=rows: ml4.compile_query_scale_aot(g, rope=False, max_rows=r, heads=g.index_heads,
+                                                        head_dim=g.index_head_dim)),
+            # The indexer query over a checkpoint keeping its FP8 block-128 wq_b as shipped.
+            (f"index_q_m{rows}", "index_q", {"mode": mode, "max_rows": rows, "fp8_weights": "only"},
+             lambda mode=mode, r=rows: ml4.compile_index_q_fp8_aot(g, mode=mode, max_rows=r)),
+            (f"index_layer_norm_m{rows}", "layer_norm", {"width": g.hidden, "max_rows": rows},
+             lambda r=rows: ml4.compile_layer_norm_aot(width=g.hidden, max_rows=r, eps=g.index_norm_eps)),
+            (f"index_topk_{mode}_m{rows}", "index_topk", {"mode": mode, "max_rows": rows, "max_pages": index_pages},
+             lambda mode=mode, rows=rows: idx.compile_glm_index_topk_aot(rope_g, max_rows=rows, max_pages=index_pages,
+                                                                          mode=mode)),
+        ]
+    # The bundled mtp_dspark drafter on the shared MLA block-draft path (64-row chunks).
+    draft = ml4.ML4_DRAFT
+    out += [
+        ("draft_producer_m64", "mla_draft_producer", {"max_rows": 64, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_producer_aot(draft, max_rows=64)),
+        ("draft_attention_m64", "mla_draft_attention",
+         {"max_rows": 64, "window_size": draft.window_size, "max_context": max_context, "kv_cache": draft.kv_cache},
+         lambda: ml4.compile_draft_attention_aot(draft, max_rows=64, max_context=max_context)),
+        ("draft_output_m64", "mla_draft_output", {"max_rows": 64},
+         lambda: ml4.compile_draft_output_aot(draft, max_rows=64)),
+    ]
+    return out
+
+
+def ml4_head_split_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
+    """One GPU's share of Mistral Large 4's two-GPU head split (``ml42``, ``g`` = ML4_TP2: 32
+    heads): its heads' query scale, absorb and W_UV, and sparse MLA over a whole history
+    (context prefill's staging), on RoPE (656-byte) and NoPE (528-byte) layers. The
+    ``_context`` producer stages write a share's heads into the combined two-GPU query
+    (token rows 2 x 32 x latent apart). The latent record, indexer, norms, router and
+    SwiGLU stay ``ml4_*`` (one per model); the K6 TP2 shapes are dense_trellis_k6's."""
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+
+    out = []
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        for rope in (True, False):
+            tag = "" if rope else "_nope"
+            combined = 2 * g.heads * (g.kv_lora_rank + (g.qk_rope_dim if rope else 0))
+            out += [
+                (f"query_scale{tag}_m{rows}", "query_scale", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_query_scale_aot(g, rope=rope, max_rows=r)),
+                (f"absorb{tag}_m{rows}", "absorb", {"rope": rope, "max_rows": rows},
+                 lambda r=rows, rope=rope: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope, max_rows=r)),
+                (f"absorb{tag}_context_m{rows}", "absorb", {"rope": rope, "max_rows": rows, "query_row": combined},
+                 lambda r=rows, rope=rope, c=combined: ml4.compile_kv_b_aot(g, stage="absorb", rope=rope,
+                                                                            max_rows=r, query_row=c)),
+                (f"sparse_mla{tag}_{mode}_m{rows}", "sparse_mla", {"rope": rope, "route": mode, "max_rows": rows},
+                 lambda r=rows, rope=rope, mode=mode, sm_count=None: ml4.compile_sparse_mla_aot(
+                     g, rope=rope, route=mode, max_rows=r, sm_count=sm_count)),
+            ]
+            if rope:
+                # NoPE layers write no RoPE tail: their query scale has no output to place.
+                out.append((f"query_scale_context_m{rows}", "query_scale",
+                            {"rope": True, "max_rows": rows, "query_row": combined},
+                            lambda r=rows, c=combined: ml4.compile_query_scale_aot(g, rope=True, max_rows=r,
+                                                                                    query_row=c)))
+        out.append((f"values_m{rows}", "values", {"max_rows": rows},
+                    lambda r=rows: ml4.compile_kv_b_aot(g, stage="values", rope=True, max_rows=r)))
+    return out
+
+
+def ml4_context_split_programs(g, decode_rows: int, max_context: int):
+    """Mistral Large 4's token-split extras (``ml4_*``, the 64-head model): GLM's scored
+    top-k, candidate merge and 32-head LSE combine at its index geometry, and per record
+    contract the 64-head-query partials at 128^-0.5 and the staging gathers (656-byte RoPE
+    ``sparse_mla_partial``/``kv``, 528-byte NoPE ``sparse_mla_nope_partial``/``kv_nope``)."""
+    from b12x.integration.cuteafd import context_split as split
+    from b12x.integration.cuteafd import mistral_large4 as ml4
+
+    rope_g, nope_g = ml4.rope_attention(g), ml4.nope_attention(g)
+    pages = -(-max_context // PAGE_ROWS)
+    half = g.heads // 2
+    out = [
+        (f"scored_index_topk_decode_m{decode_rows}", "scored_index_topk",
+         {"max_rows": decode_rows, "max_pages": pages, "mode": "decode"},
+         lambda: split.compile_scored_index_topk_aot(rope_g, max_rows=decode_rows, max_pages=pages)),
+        ("dsa_candidate_merge", "dsa_candidate_merge", {"topk": g.index_topk},
+         lambda: split.compile_dsa_candidate_merge_aot(topk=g.index_topk)),
+        ("lse_combine2", "lse_combine2", {"heads": half, "has_sink": False},
+         lambda: split.compile_lse_combine2_aot(heads=half, has_sink=False)),
+    ]
+    caps = sorted({cap for cap in (1, 8) if cap < decode_rows} | {decode_rows})
+    for tag, attention in (("", rope_g), ("_nope", nope_g)):
+        plans = {(sms, cap): split.sparse_mla_partial_split_plan(
+            attention, max_rows=cap, head_count=half, sm_count=sms) for sms in (170, 188) for cap in caps}
+        for begin in (0, half):
+            for splits in sorted(set(plans.values())):
+                served = sorted(key for key, s in plans.items() if s == splits)
+                sms_served = sorted({sm for sm, _ in served})
+                out.append((f"sparse_mla{tag}_partial_h{begin}_s{splits}_m{decode_rows}", "sparse_mla_partial",
+                            {"max_rows": decode_rows, "head_begin": begin, "head_count": half,
+                             "num_splits": splits, "device_sm_counts": sms_served, "rope": not tag,
+                             "row_caps": {str(sm): [cap for s2, cap in served if s2 == sm] for sm in sms_served}},
+                            lambda a=attention, begin=begin, splits=splits: split.compile_sparse_mla_partial_aot(
+                                a, max_rows=decode_rows, head_begin=begin, head_count=half, num_splits=splits)))
+    for kind, attention in (("index", None), ("kv", rope_g), ("kv_nope", nope_g)):
+        row_bytes, page_bytes = (128, 8448) if attention is None else (attention.record_bytes, attention.kv_page_bytes)
+        out.append((f"paged_staging_gather_{kind}", "paged_staging_gather",
+                    {"row_bytes": row_bytes, "page_rows": PAGE_ROWS, "page_bytes": page_bytes},
+                    lambda rb=row_bytes, pb=page_bytes: split.compile_paged_staging_gather_aot(
+                        row_bytes=rb, page_rows=PAGE_ROWS, page_bytes=pb)))
+    return out
+
+
 def kimi_kda_programs(g, decode_rows: int, prefill_rows: int, max_context: int):
     """Kimi KDA plus NoPE MLA at 48 heads/rank and 96 heads/context rank."""
     from b12x.integration.cuteafd import glmf, kimi_mla
@@ -893,13 +1048,13 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     requested_dense = set(args.dense_trellis_families.split(","))
-    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf"}:
-        raise SystemExit("--dense-trellis-families takes kimik3, glm and/or glmf")
-    dense_families = tuple(name for name in ("kimik3", "glm", "glmf") if name in requested_dense)
+    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf", "ml4"}:
+        raise SystemExit("--dense-trellis-families takes kimik3, glm, glmf and/or ml4")
+    dense_families = tuple(name for name in ("kimik3", "glm", "glmf", "ml4") if name in requested_dense)
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "ml4") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3 and/or ml4")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -945,6 +1100,19 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "ml4":
+            from b12x.integration.cuteafd.mistral_large4 import ML4, ML4_TP2
+            extent = geometry_context(name, args.max_context)
+            manifest["families"][name] = dataclasses.asdict(ML4)
+            manifest["family_capacities"][name] = {"max_context": extent}
+            work += [(name, *item) for item in ml4_programs(ML4, args.decode_rows, args.prefill_rows, extent)]
+            # One GPU of the two-GPU head split (heads and context placement), after the
+            # whole model's programs.
+            manifest["families"]["ml42"] = dataclasses.asdict(ML4_TP2)
+            manifest["family_capacities"]["ml42"] = {"max_context": geometry_context("ml42", args.max_context)}
+            work += [("ml42", *item) for item in ml4_head_split_programs(ML4_TP2, args.decode_rows,
+                                                                         args.prefill_rows, extent)]
             continue
         if name == "dense_trellis_k6":
             from export_b12x_dense_trellis_k6_aot import programs as dense_programs, row_policies
@@ -1036,6 +1204,11 @@ def main() -> None:
         for name in (n for n in geometries if n in bases):
             work += [(families[name], *item) for item in context_split_programs(
                 bases[name], args.decode_rows, geometry_context(name, args.max_context))]
+        if "ml4" in geometries:
+            # Mistral Large 4's token-split extras: both record contracts' partials and gathers.
+            from b12x.integration.cuteafd.mistral_large4 import ML4
+            work += [("ml4", *item) for item in ml4_context_split_programs(
+                ML4, args.decode_rows, geometry_context("ml4", args.max_context))]
         if "glmf2" in geometries:
             # GLM Flash context keeps the compact index cache on two GPUs: each GPU's share commits
             # its KDA heads and rebuilds the (replicated) index tails in one launch.

@@ -174,7 +174,7 @@ pub fn cache_requirements(
         checkpoint_max_context_tokens: checkpoint_max,
         compiled_index_extent_required: matches!(
             model.spec().family,
-            "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4"
+            "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4" | "mistral_large4"
         ),
         requested_kv_floor_tokens: requested_floor,
         concurrency: 16,
@@ -419,6 +419,40 @@ pub fn glm_cache_geometry(
         } else {
             KvPlacement::Replicated
         },
+        ranks: vec![cost; ranks],
+    })
+}
+
+/// Mistral Large 4: the GLM record layout per latent-cache owner. RoPE owners
+/// hold E4M3 latent + 4 FP32 group scales + BF16 RoPE key (656 B), NoPE owners
+/// the latent part only (528 B); shared-KV readers (39..71 <- 35) hold none.
+/// Every full indexer layer keeps its own 132-byte FP8 index key record.
+pub fn mistral_large4_cache_geometry(
+    cfg: &crate::families::mistral_large4::Ml4Config,
+    ranks: usize,
+) -> Result<FamilyCacheGeometry, CacheGeometryError> {
+    use crate::families::mistral_large4::Ml4Indexer;
+    if ![1, 2].contains(&ranks) || cfg.kv_lora_rank != 512 || cfg.qk_rope_head_dim != 64 || cfg.index_head_dim != 128 {
+        return Err(CacheGeometryError::Unsupported {
+            family: "mistral_large4",
+            what: "record/index or coordinator rank geometry",
+        });
+    }
+    let owners = |rope: bool| cfg.kv_owners().filter(|&layer| cfg.rope[layer] == rope).count() as u64;
+    let indexers = cfg.indexers.iter().filter(|&&kind| kind == Ml4Indexer::Full).count() as u64;
+    let record_bytes = sum("Mistral Large 4 records", &[
+        product("Mistral Large 4 RoPE latent records", &[owners(true), 656])?,
+        product("Mistral Large 4 NoPE latent records", &[owners(false), 528])?,
+        product("Mistral Large 4 index records", &[indexers, 132])?,
+    ])?;
+    let cost = RankCacheGeometry {
+        persistent_unit_bytes: product("Mistral Large 4 pages", &[64, record_bytes])?,
+        context_table_bytes_per_token: product("Mistral Large 4 RoPE table", &[cfg.qk_rope_head_dim as u64, 4])?,
+        ..Default::default()
+    };
+    Ok(FamilyCacheGeometry {
+        logical_unit_rows: 64,
+        placement: if ranks == 1 { KvPlacement::SingleDevice } else { KvPlacement::Replicated },
         ranks: vec![cost; ranks],
     })
 }

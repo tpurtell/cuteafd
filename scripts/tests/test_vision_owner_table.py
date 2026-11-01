@@ -70,12 +70,16 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     entries = json.loads((tmp_path / "build/vision_attention/entries.json").read_text())
-    assert [(e["head_dim"], e["windowed"], e["pointwise_group"], e["programs"]) for e in entries] == [
-        (64, False, "", ["vision_attention_d64"]), (72, False, "", ["vision_attention_d72"])]
+    assert [(e["head_dim"], e["windowed"], e["pointwise_group"]) for e in entries] == [
+        (64, False, ""), (72, False, ""), (128, False, "pixtral")]
+    pixtral = entries[-1]
+    assert pixtral["programs"][0] == "vision_attention_d128_full"
+    assert [p["name"] for p in pixtral["programs"][1:]] == [
+        "vision_axial_rotary_d128_bf16", "vision_rms_bf16_gamma_h2048"]
     command = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in command.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 1
-    assert exports[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
+    assert len(exports) == 3
+    assert any(line.endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120") for line in exports)
     # New registrations must never become outputs of the legacy command.
     contents = (ROOT / "native/cmake/shared/vision_attention.cmake").read_text()
     registration = '''
@@ -103,10 +107,10 @@ endforeach()
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr
     entries = json.loads((build / "vision_attention/entries.json").read_text())
-    assert [(e["head_dim"], e["windowed"]) for e in entries] == [(64, False), (72, False), (96, False), (96, True)]
+    assert [(e["head_dim"], e["windowed"]) for e in entries] == [(64, False), (72, False), (128, False), (96, False), (96, True)]
     rules = (build / "CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 4, exports  # legacy + two attention + one shared pointwise
+    assert len(exports) == 6, exports  # legacy + Pixtral pair + two attention + shared pointwise
     legacy_rule = rules.split("vision_attention/vision_attention_d64.h:", 1)[1].split("vision_attention/vision_attention_d64.o:", 1)[0]
     assert "--group attention" not in legacy_rule
     assert "--group pointwise" not in legacy_rule

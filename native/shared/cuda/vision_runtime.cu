@@ -156,6 +156,9 @@ int mha_attention(Owner* o,int n) {
 #include "vision_glm.cuh"
 #define CUTEAFD_HAVE_GLM_VISION 1
 #endif
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+#include "vision_mistral.cuh"
+#endif
 bool valid_tower(const cuteafd_vision_spec& s) {
   if(s.storage_abi!=3 || !s.depth || !s.blocks || !s.norm1_bias ||
      !s.norm2_bias || !s.q_norm || !s.k_norm)return false;
@@ -165,6 +168,7 @@ bool valid_tower(const cuteafd_vision_spec& s) {
 #ifdef CUTEAFD_HAVE_GLM_VISION
   if(s.reserved==3)return valid_glm(s);
 #endif
+  if(s.reserved==4)return valid_mistral(s);
 #endif
   return false;
 }
@@ -173,6 +177,9 @@ size_t scratch_tower(Owner* o) {
   if(s.abi_version==2 && s.reserved==2)return scratch_qwen(o,s.max_tokens,s.output_width);
 #ifdef CUTEAFD_HAVE_GLM_VISION
   if(s.abi_version==2 && s.reserved==3)return scratch_glm(o,s.max_tokens,s.output_width);
+#endif
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(s.abi_version==2 && s.reserved==4)return scratch_mistral(o,s.max_tokens,s.output_width);
 #endif
   return scratch(o,s.max_tokens,s.output_width);
 }
@@ -219,7 +226,7 @@ extern "C" int32_t cuteafd_vision_create(const cuteafd_vision_spec* s, int32_t d
   scratch_tower(o);
 #ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
   if(s->abi_version==2) {
-    e=cuteafd_vision_attention_create_entry(s->head_dim,0,"",&o->attention);if(e)return fail(e);
+    e=cuteafd_vision_attention_create_entry(s->head_dim,0,s->reserved==4 ? "pixtral" : "",&o->attention);if(e)return fail(e);
   }
 #endif
   e=blas_status(cublasCreate(&o->blas));if(e)return fail(e);
@@ -250,6 +257,9 @@ extern "C" int32_t cuteafd_vision_encode(void* owner, const uint8_t* rgb, uint64
   if(s.abi_version==2 && s.reserved==2)return encode_qwen(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
 #ifdef CUTEAFD_HAVE_GLM_VISION
   if(s.abi_version==2 && s.reserved==3)return encode_glm(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
+#endif
+#ifdef CUTEAFD_HAVE_VISION_ATTENTION_AOT
+  if(s.abi_version==2 && s.reserved==4)return encode_mistral(o,rgb,rgb_bytes,lut,gh,gw,output,output_bytes,cb,ctx);
 #endif
   int64_t count=int64_t(gh)*gw;
   if(!o->uploaded || gh<2 || gw<2 || gh%2 || gw%2 || count>int64_t(s.max_tokens)*4 ||

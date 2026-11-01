@@ -189,7 +189,8 @@ impl LayoutOptions {
         if self.concurrency > 0 { return self.concurrency; }
         match family {
             "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
-            "glm5" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            // Mistral Large 4 runs the GLM 5.3 engine.
+            "glm5" | "mistral_large4" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
@@ -299,7 +300,7 @@ pub fn full_prefill_logits_bytes_with_lanes(family: &str, rows: u64, vocab: u64,
     let (lanes, ordinary_rows) = match family {
         "mimo_v2" => (1, 1),
         "qwen4" => (1, 1),
-        "glm5" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
+        "glm5" | "mistral_large4" => (glm_lanes.clamp(1, 4) as u64, rows.min(64)),
         "glm5_flash" => (1, rows.min(64)),
         _ => return 0,
     };
@@ -358,8 +359,9 @@ pub fn spark_endpoints(family: &str, lanes: u64) -> usize {
         // that endpoint's rings).
         "deepseek_v41" => 3,
         "deepseek_v4" => 2,
-        // The decode link and one prefill link (its waves share that endpoint's rings).
-        "glm5" => 2,
+        // The decode link and one prefill link (its waves share that endpoint's rings);
+        // Mistral Large 4 runs the GLM 5.3 engine.
+        "glm5" | "mistral_large4" => 2,
         "glm5_flash" => 1,
         "mimo_v2" => 2,
         "qwen4" => 1,
@@ -1305,6 +1307,35 @@ pub(crate) fn mimo_scratch_bytes(width: u64) -> u64 {
     [n*1280*4,n*1280*4,n*1280*2,n*1536*2,n*2048*2,n*512*2,n*512*2,n*2048*2,4096*width*2,
      4096*3072*4,4096*1280*4,4096*2*4608*4,4096*4608*2,4096*5120*4,4096*5120*2,4096*width*4,
      n*16*16*3,3*256*4,n*2*4,n*2*4,4096*4,4096*4,4*MIB].into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
+/// Mirrors scratch_mistral (native/shared/cuda/vision_mistral.cuh) at `merged`
+/// [IMG] rows of capacity: four patches each, chunked 4096-row staging, the AOT
+/// attention LSE at its 16K capacity and the BLAS workspace. The output holds
+/// the whole LM span (one marker row per merged row, at most 55).
+pub fn mistral_scratch_bytes(merged: u64) -> u64 {
+    let n = merged * 4;
+    let span = merged + 55;
+    [n*2048*4, n*2048*4, n*2048*2, n*588*2, n*2048*2, n*2048*2, n*2048*2, n*2048*2, span*6144*2,
+     4096*6144*4, 4096*2048*4, 4096*12288*4, 4096*6144*2, 4096*6144*4, 4096*6144*2, 4096*6144*4,
+     n*588, 3*256*4, n*2*4, 16384*16*4, 2*4, 4*MIB]
+        .into_iter().map(|b| b.div_ceil(256)*256).sum()
+}
+
+#[test]
+fn mistral_scratch_is_the_qualifier_figure() {
+    // python/tools/qualify/mistral_large4/qualify-vision.py planner_scratch_bytes(), which
+    // the hardware screen also asserts against cuteafd_vision_required.
+    assert_eq!(mistral_scratch_bytes(55 * 55), 1_148_123_648);
+}
+
+/// Mistral Large 4's bundled Pixtral tower at its 55 x 55 merged capacity.
+pub fn mistral_large4_towers(report: &PlanReport, checkpoint: &super::Checkpoint) -> Towers {
+    let vision = if vision_source_bytes(report) > 0 {
+        super::families::mistral_large4::vision_resident_weights(checkpoint)
+            .map(|weights| (weights, mistral_scratch_bytes(55 * 55)))
+    } else { Ok((0, 512 * MIB)) };
+    Towers { name: "Mistral Large 4", vision, v41: false, audio: no_audio() }
 }
 
 /// Mirrors scratch_qwen, including fixed staging, LSE and the BLAS workspace.

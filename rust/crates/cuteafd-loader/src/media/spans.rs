@@ -185,3 +185,68 @@ impl SpanExpander {
         })
     }
 }
+
+/// Mistral's image layout (`mistral_common` ImageEncoder, HF PixtralProcessor):
+/// the chat template writes one `[IMG]` per image; each becomes its merged
+/// grid's rows, `[IMG]` x w then `[IMG_BREAK]`, the last token `[IMG_END]`.
+/// One [`MediaSpan`] covers all h * (w + 1) positions; the tower fills the
+/// marker positions with the checkpoint's own marker embedding rows.
+#[derive(Debug, Clone, Copy)]
+pub struct MistralSpanExpander {
+    pub image: u32,
+    pub row_break: u32,
+    pub end: u32,
+    pub merge: u32,
+    pub vocabulary: u32,
+}
+impl MistralSpanExpander {
+    pub fn expand(&self, tokens: &[u32], images: &[PreparedImage], context_limit: usize)
+        -> Result<ExpandedMediaPrompt> {
+        let ids = [self.image, self.row_break, self.end];
+        if self.vocabulary == 0 || self.vocabulary >= 1 << 31 || self.merge == 0
+            || ids.iter().any(|&v| v >= self.vocabulary)
+            || self.image == self.row_break || self.image == self.end || self.row_break == self.end {
+            return Err(invalid("invalid Mistral image marker ids or vocabulary"));
+        }
+        if tokens.iter().any(|&v| v >= self.vocabulary) {
+            return Err(invalid("token outside checkpoint vocabulary"));
+        }
+        // The rendered prompt carries bare [IMG] placeholders only; markers are the processor's.
+        if tokens.iter().any(|&v| v == self.row_break || v == self.end) {
+            return Err(invalid("[IMG_BREAK]/[IMG_END] may only come from image expansion"));
+        }
+        if tokens.iter().filter(|&&v| v == self.image).count() != images.len() {
+            return Err(invalid("image placeholder count differs from supplied images"));
+        }
+        let mut expanded_len = tokens.len();
+        let mut grids = Vec::with_capacity(images.len());
+        for image in images {
+            let (h, w, len) = super::mistral_span(image.grid, self.merge);
+            if image.grid.t != 1 || h == 0 || w == 0 || len != image.tokens {
+                return Err(invalid("Mistral image span differs from its merged grid"));
+            }
+            grids.push((h, w));
+            expanded_len = expanded_len.checked_add(len - 1).ok_or_else(|| invalid("image prompt length overflow"))?;
+        }
+        if expanded_len > context_limit {
+            return Err(invalid("expanded image prompt exceeds context limit"));
+        }
+        let mut expanded = Vec::with_capacity(expanded_len);
+        let mut media = Vec::with_capacity(images.len());
+        for &token in tokens {
+            if token != self.image {
+                expanded.push(token);
+                continue;
+            }
+            let index = media.len();
+            let (h, w) = grids[index];
+            media.push(MediaSpan { start: expanded.len(), len: images[index].tokens, key: images[index].key.into() });
+            for _ in 0..h {
+                expanded.extend(std::iter::repeat_n(self.image, w));
+                expanded.push(self.row_break);
+            }
+            *expanded.last_mut().expect("nonempty span") = self.end;
+        }
+        Ok(ExpandedMediaPrompt { tokens: expanded, media })
+    }
+}

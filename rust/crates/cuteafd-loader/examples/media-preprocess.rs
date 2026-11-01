@@ -19,6 +19,7 @@ fn main() -> Result<()> {
             "mimo" => ImageFamily::Mimo,
             "qwen" => ImageFamily::Qwen,
             "glm_flash" => ImageFamily::GlmFlash,
+            "mistral" => ImageFamily::Mistral,
             _ => anyhow::bail!("unknown processor"),
         };
         let config = if family == ImageFamily::GlmFlash && manifest.get("glm_processor").is_some() {

@@ -283,6 +283,25 @@
         }
       ]
     },
+    "ml4:exl3": {
+      "intermediate": 6144,
+      "minimum": 5,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "mistralai/Mistral-Large-4-1T-A52B",
+          "revision": "f12dabdc0c1e99e7f7924461a6f308859b05af4d",
+          "routed_expert_bytes": 515260918272
+        }
+      ]
+    },
     "step5:bf16": {
       "intermediate": 1536,
       "minimum": 5,

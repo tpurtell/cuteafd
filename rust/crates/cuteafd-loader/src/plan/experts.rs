@@ -197,7 +197,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
         && bits.bytes().all(|bit| (b'2'..=b'5').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
-        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
+        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "ml4");
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
         || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));

@@ -6,38 +6,52 @@ pub use crate::formats::trellis_core::{CoreProjection, CoreSplit, ProjectionScra
 use anyhow::{ensure, Context, Result};
 use std::collections::BTreeMap;
 
-pub fn split(cfg: &GlmDsaConfig, stem: &str) -> Option<CoreSplit> {
-    if stem == "lm_head" { return Some(CoreSplit::Whole); }
-    let (layer, leaf) = stem.strip_prefix("model.layers.")?.split_once('.')?;
-    let layer = layer.parse::<usize>().ok()?;
-    if layer >= cfg.layers { return None; }
-    match leaf {
-        "self_attn.q_a_proj" | "self_attn.kv_a_proj_with_mqa" => Some(CoreSplit::Whole),
-        "self_attn.q_b_proj" => Some(CoreSplit::Output),
-        "self_attn.o_proj" => Some(CoreSplit::Input),
-        "mlp.gate_proj" | "mlp.up_proj" if layer < cfg.first_moe_layer => Some(CoreSplit::Output),
-        "mlp.down_proj" if layer < cfg.first_moe_layer => Some(CoreSplit::Input),
-        "mlp.shared_experts.gate_proj" | "mlp.shared_experts.up_proj" if layer >= cfg.first_moe_layer => Some(CoreSplit::Output),
-        "mlp.shared_experts.down_proj" if layer >= cfg.first_moe_layer => Some(CoreSplit::Input),
-        _ => None,
+use super::names::Operand as Op;
+
+/// The K6 core operands of a layer and how each is split over two GPUs: the
+/// q-LoRA / latent down projections whole, the query up (or direct query)
+/// projection by output heads, the output projection by input heads, the FFN
+/// gate/up by output and down by input.
+fn core_operands(cfg: &GlmDsaConfig, layer: usize) -> Vec<(&'static str, Op, CoreSplit)> {
+    let mut operands = vec![("q_a", Op::QA, CoreSplit::Whole), ("kv_a", Op::KvA, CoreSplit::Whole),
+        ("q_b", Op::QB, CoreSplit::Output), ("o", Op::O, CoreSplit::Input), ("gate", Op::Gate, CoreSplit::Output),
+        ("up", Op::Up, CoreSplit::Output), ("down", Op::Down, CoreSplit::Input)];
+    // A direct-query variant's indexer query projection may ship in the K6 core
+    // (replicated on every attention rank, like the GLM indexer's operands).
+    if cfg.variant.ml4().is_some() && cfg.indexers[layer] == super::GlmIndexer::Full {
+        operands.push(("index_q", Op::IndexQ, CoreSplit::Whole));
     }
+    operands
+}
+
+pub fn split(cfg: &GlmDsaConfig, stem: &str) -> Option<CoreSplit> {
+    if stem == cfg.head() { return Some(CoreSplit::Whole); }
+    let layer = stem.strip_prefix(if cfg.variant.is_glm() { "model.layers." } else { "layers." })?
+        .split_once('.')?.0.parse::<usize>().ok()?;
+    if layer >= cfg.layers { return None; }
+    core_operands(cfg, layer).into_iter()
+        .find(|(_, op, _)| cfg.stem(layer, *op).as_deref() == Some(stem)).map(|(_, _, split)| split)
 }
 
 pub fn expected(cfg: &GlmDsaConfig) -> BTreeMap<String, Vec<usize>> {
-    let mut shapes = BTreeMap::from([("lm_head.weight".into(), vec![cfg.vocab_size, cfg.hidden])]);
+    let mut shapes = BTreeMap::from([(format!("{}.weight", cfg.head()), vec![cfg.vocab_size, cfg.hidden])]);
     for layer in 0..cfg.layers {
-        let root = format!("model.layers.{layer}");
-        for (leaf, n, k) in [
-            ("q_a_proj", cfg.q_lora_rank, cfg.hidden),
-            ("kv_a_proj_with_mqa", cfg.kv_lora_rank + cfg.qk_rope_head_dim, cfg.hidden),
-            ("q_b_proj", cfg.heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim), cfg.q_lora_rank),
-            ("o_proj", cfg.hidden, cfg.heads * cfg.v_head_dim),
-        ] { shapes.insert(format!("{root}.self_attn.{leaf}.weight"), vec![n, k]); }
-        let (mlp, inter) = if layer < cfg.first_moe_layer { ("mlp", cfg.dense_intermediate) }
-            else { ("mlp.shared_experts", cfg.moe_intermediate * cfg.shared_experts) };
-        for (leaf, n, k) in [("gate_proj", inter, cfg.hidden), ("up_proj", inter, cfg.hidden),
-            ("down_proj", cfg.hidden, inter)] {
-            shapes.insert(format!("{root}.{mlp}.{leaf}.weight"), vec![n, k]);
+        let q_head = cfg.qk_nope_head_dim + cfg.qk_rope_head_dim;
+        let inter = if layer < cfg.first_moe_layer { cfg.dense_intermediate } else { cfg.moe_intermediate * cfg.shared_experts };
+        let q_in = if cfg.q_lora_rank > 0 { cfg.q_lora_rank } else { cfg.hidden };
+        for (op, n, k) in [
+            (Op::QA, cfg.q_lora_rank, cfg.hidden),
+            (Op::KvA, cfg.kv_lora_rank + if cfg.rope(layer) { cfg.qk_rope_head_dim } else { 0 }, cfg.hidden),
+            (Op::QB, cfg.heads * q_head, q_in),
+            (Op::O, cfg.hidden, cfg.heads * cfg.v_head_dim),
+            (Op::Gate, inter, cfg.hidden), (Op::Up, inter, cfg.hidden), (Op::Down, cfg.hidden, inter),
+        ] {
+            if let Some(name) = cfg.weight(layer, op) { shapes.insert(name, vec![n, k]); }
+        }
+        if cfg.variant.ml4().is_some() && cfg.indexers[layer] == super::GlmIndexer::Full {
+            if let Some(name) = cfg.weight(layer, Op::IndexQ) {
+                shapes.insert(name, vec![cfg.index_heads * cfg.index_head_dim, cfg.hidden]);
+            }
         }
     }
     shapes
@@ -54,13 +68,25 @@ impl CoreStageLayout {
         let intermediate = cfg.dense_intermediate.max(cfg.moe_intermediate * cfg.shared_experts) / ranks;
         let bf16 = |width: usize| rows.checked_mul(width).and_then(|n| n.checked_mul(2))
             .ok_or_else(|| anyhow::anyhow!("GLM K6 stage extent overflow"));
-        Ok(Self { extents: BTreeMap::from([
+        // `qkv`: the packed [q_a | kv_a] rows (direct-query variants: kv_a alone);
+        // `q`: the widest K6 output staged before its crop/pack (q_b or the
+        // direct query, q_a, or the padded kv_a); a direct-query variant's indexer
+        // also stages LayerNorm(x) there (hidden wide, over a head split's 32 heads).
+        let direct = cfg.q_lora_rank == 0;
+        let mut extents = BTreeMap::from([
             ("qkv", bf16(cfg.q_lora_rank + cfg.kv_lora_rank + cfg.qk_rope_head_dim)?),
             ("q", bf16((heads * (cfg.qk_nope_head_dim + cfg.qk_rope_head_dim))
-                .max(cfg.q_lora_rank).max((cfg.kv_lora_rank + cfg.qk_rope_head_dim).next_multiple_of(128)))?),
+                .max(cfg.q_lora_rank).max((cfg.kv_lora_rank + cfg.qk_rope_head_dim).next_multiple_of(128))
+                .max(if direct { cfg.hidden } else { 0 }))?),
             ("gate", bf16(intermediate)?), ("up", bf16(intermediate)?),
             ("hidden", bf16(intermediate)?), ("values", bf16(heads * cfg.v_head_dim)?),
-        ]) })
+        ]);
+        if direct {
+            // The direct-query indexer: its query `wq_b(LayerNorm(x))` and `[wk | weights_proj](x)`.
+            extents.insert("iq", bf16(cfg.index_heads * cfg.index_head_dim)?);
+            extents.insert("kw", bf16(cfg.index_head_dim + cfg.index_heads)?);
+        }
+        Ok(Self { extents })
     }
     pub fn bytes(&self) -> Result<usize> {
         self.extents.values().try_fold(0usize, |total, &n| total.checked_add(n)
@@ -73,13 +99,17 @@ pub struct CoreInventory { pub projections: BTreeMap<String, CoreProjection> }
 
 impl CoreInventory {
     pub fn from_checkpoint(cfg: &GlmDsaConfig, checkpoint: &Checkpoint) -> Result<Self> {
-        let selected = |name: &str| name.starts_with("lm_head.") || name.strip_prefix("model.layers.")
+        let head = format!("{}.", cfg.head());
+        let layers = if cfg.variant.is_glm() { "model.layers." } else { "layers." };
+        let selected = |name: &str| name.starts_with(&head) || name.strip_prefix(layers)
             .and_then(|rest| rest.split_once('.'))
             .is_some_and(|(layer, leaf)| layer.parse::<usize>().is_ok_and(|layer| layer < cfg.layers)
-                && !leaf.contains(".experts."));
+                && !leaf.starts_with("experts.") && !leaf.contains(".experts."));
+        // kv_a may store N128 padding (RoPE latent N576 -> N640).
+        let kv_a: std::collections::BTreeSet<String> = (0..cfg.layers).filter_map(|l| cfg.stem(l, Op::KvA)).collect();
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { split, bits: 6,
-                padded_outputs: stem.ends_with(".self_attn.kv_a_proj_with_mqa") }))?;
+                padded_outputs: kv_a.contains(stem) }))?;
         let inventory = Self { projections };
         inventory.validate_groups(cfg)?;
         Ok(inventory)
@@ -97,16 +127,10 @@ impl CoreInventory {
         ensure!(layer < cfg.layers && matches!(ranks, 1 | 2)
             && owner.is_none_or(|gpu| ranks == 2 && usize::from(gpu) < ranks),
             "GLM native core layer ownership");
-        let root = format!("model.layers.{layer}");
-        let mlp = if layer < cfg.first_moe_layer { "mlp" } else { "mlp.shared_experts" };
         let mut layouts = (0..ranks).map(|_| BTreeMap::new()).collect::<Vec<_>>();
-        for (key, leaf) in [("q_a", "self_attn.q_a_proj".to_owned()),
-            ("kv_a", "self_attn.kv_a_proj_with_mqa".to_owned()),
-            ("q_b", "self_attn.q_b_proj".to_owned()), ("o", "self_attn.o_proj".to_owned()),
-            ("gate", format!("{mlp}.gate_proj")), ("up", format!("{mlp}.up_proj")),
-            ("down", format!("{mlp}.down_proj"))] {
-            let Some(projection) = self.get_weight(&format!("{root}.{leaf}")) else { continue; };
-            let attention = leaf.starts_with("self_attn.");
+        for (key, op, _) in core_operands(cfg, layer) {
+            let Some(projection) = cfg.stem(layer, op).and_then(|stem| self.get_weight(&stem)) else { continue; };
+            let attention = matches!(op, Op::QA | Op::KvA | Op::QB | Op::O | Op::IndexQ);
             let world = if projection.split == CoreSplit::Whole || attention && owner.is_some() { 1 } else { ranks };
             let side = if projection.split == CoreSplit::Input && world > 1 { TrellisSide::Input }
                 else { TrellisSide::Output };
@@ -121,16 +145,12 @@ impl CoreInventory {
 
     pub fn validate_groups(&self, cfg: &GlmDsaConfig) -> Result<()> {
         for layer in 0..cfg.layers {
-            let root = format!("model.layers.{layer}");
-            for (module, leaves) in [
-                ("self_attn", &["q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj"][..]),
-                (if layer < cfg.first_moe_layer { "mlp" } else { "mlp.shared_experts" },
-                    &["gate_proj", "up_proj", "down_proj"][..]),
-            ] {
-                let stems = leaves.iter().map(|leaf| format!("{root}.{module}.{leaf}")).collect::<Vec<_>>();
+            for (module, ops) in [("attention", &[Op::QA, Op::KvA, Op::QB, Op::O][..]),
+                ("ffn", &[Op::Gate, Op::Up, Op::Down][..])] {
+                let stems = ops.iter().filter_map(|op| cfg.stem(layer, *op)).collect::<Vec<_>>();
                 let present = stems.iter().filter(|stem| self.projections.contains_key(*stem)).count();
                 ensure!(present == 0 || present == stems.len(),
-                    "GLM {root}.{module} mixes native and EXL3 storage; complete operator groups required");
+                    "GLM layer {layer} {module} mixes native and EXL3 storage; complete operator groups required");
             }
         }
         Ok(())
@@ -171,7 +191,13 @@ impl CoreRankLayout {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CoreCharges { pub ranks: Vec<CoreRankLayout>, pub programs: Vec<String> }
+pub struct CoreCharges {
+    pub ranks: Vec<CoreRankLayout>,
+    pub programs: Vec<String>,
+    /// The variant's own program namespace (`ml4`) when it has one beside the
+    /// neutral policies; GLM selects `glm`/`glm_stage` (None).
+    pub family: Option<&'static str>,
+}
 impl CoreCharges {
     pub fn from_package(cfg: &GlmDsaConfig, core: &CoreInventory, layers: usize,
         ranks: usize, owners: Option<&[u8]>, unit: usize, slots: usize,
@@ -187,7 +213,7 @@ impl CoreCharges {
                 bodies[rank].extend(weights.into_values());
             }
         }
-        let head = core.get_weight("lm_head").map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
+        let head = core.get_weight(cfg.head()).map(|p| CoreWeightLayout::new(p, TrellisSide::Output, 0, 1)).transpose()?;
         let mut programs = std::collections::BTreeSet::new();
         let mut geometries = std::collections::BTreeSet::new();
         for weight in bodies.iter().flatten().chain(head.iter()) {
@@ -196,7 +222,65 @@ impl CoreCharges {
                 for name in policy_programs(weight, manifest)? { programs.insert(name); }
             }
         }
-        if bodies.iter().any(|body| !body.is_empty()) {
+        if bodies.iter().any(|body| !body.is_empty()) && cfg.variant.ml4().is_some() {
+            // Mistral Large 4's attention stages (export_b12x_dsv4_aot --geometry ml4).
+            let entries = manifest["programs"].as_array().context("Mistral Large 4 stage program inventory")?;
+            for cap in ["m64", "m4096"] {
+                let mut names = vec![format!("ml4_values_{cap}"), format!("ml4_index_query_scale_{cap}"),
+                    format!("ml4_index_layer_norm_{cap}")];
+                for tag in ["", "_nope"] {
+                    for stage in ["query_scale", "rank_pack", "absorb", "index_post"] {
+                        names.push(format!("ml4_{stage}{tag}_{cap}"));
+                    }
+                }
+                for name in names {
+                    ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");
+                    programs.insert(name);
+                }
+            }
+            ensure!(entries.iter().filter(|p| p["name"] == "ml4_index_kw").count() == 1,
+                "Mistral Large 4 K6 requires ml4_index_kw");
+            programs.insert("ml4_index_kw".to_string());
+            // An indexer wq_b kept in its shipped FP8 block-128 form runs the
+            // native FP8 projection (the checkpoint's tensor_storage decides).
+            let fp8_index_q = (0..layers).any(|layer| cfg.indexers[layer] == super::GlmIndexer::Full
+                && cfg.stem(layer, Op::IndexQ).is_some_and(|stem| core.get_weight(&stem).is_none()));
+            if fp8_index_q {
+                for cap in ["m64", "m4096"] {
+                    let name = format!("ml4_index_q_{cap}");
+                    ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1,
+                        "Mistral Large 4 with an FP8 indexer wq_b requires {name}");
+                    programs.insert(name);
+                }
+            }
+            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
+                let name = format!("ml4_swiglu_i{inter}");
+                ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "Mistral Large 4 K6 requires {name}");
+                programs.insert(name);
+            }
+            // A head split (heads or context placement) runs each GPU's 32-head share
+            // (`ml42_*`); context also writes the share into the combined query (`_context`).
+            if ranks == 2 && owners.is_none() {
+                let split = cfg.split_program_family().context("Mistral Large 4 head split family")?;
+                let context = crate::placement::families::glm5::context_programs(cfg,
+                    entries.iter().filter_map(|p| p["name"].as_str()),
+                    |name| entries.iter().any(|p| p["name"] == name).then_some(0)).is_some();
+                for cap in ["m64", "m4096"] {
+                    let mut names = vec![format!("{split}_values_{cap}")];
+                    for tag in ["", "_nope"] {
+                        names.push(format!("{split}_query_scale{tag}_{cap}"));
+                        names.push(format!("{split}_absorb{tag}_{cap}"));
+                        if context { names.push(format!("{split}_absorb{tag}_context_{cap}")); }
+                    }
+                    if context { names.push(format!("{split}_query_scale_context_{cap}")); }
+                    for name in names {
+                        ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1,
+                            "Mistral Large 4 head split requires {name}");
+                        programs.insert(name);
+                    }
+                }
+            }
+        } else if bodies.iter().any(|body| !body.is_empty()) {
             let entries = manifest["programs"].as_array().context("GLM K6 stage program inventory")?;
             for prefix in if owners.is_some() { vec!["glm", "glm2"] }
                 else if ranks == 2 { vec!["glm2"] } else { vec!["glm"] } {
@@ -207,7 +291,7 @@ impl CoreCharges {
                     ensure!(entries.iter().filter(|p| p["name"] == name).count() == 1, "GLM K6 requires {name}");
                 }
                 let context = prefix == "glm2" && owners.is_none()
-                    && crate::placement::families::glm5::context_programs(
+                    && crate::placement::families::glm5::context_programs(cfg,
                         entries.iter().filter_map(|p| p["name"].as_str()),
                         |name| entries.iter().any(|p| p["name"] == name).then_some(0)).is_some();
                 for cap in ["m64", "m4096"] {
@@ -248,7 +332,8 @@ impl CoreCharges {
                 body, target_head, draft_head,
             });
         }
-        let result = Self { ranks: layouts, programs: programs.into_iter().collect() };
+        let result = Self { ranks: layouts, programs: programs.into_iter().collect(),
+            family: (!cfg.variant.is_glm()).then(|| cfg.program_family()) };
         result.bytes(cfg.hidden)?;
         Ok(result)
     }
@@ -258,7 +343,10 @@ impl CoreCharges {
     /// Native GLM explicitly selects its BF16 stages. Add only the neutral
     /// policies actually selected by the checkpoint, not every Kimi export.
     pub fn program_set(&self, manifest: &serde_json::Value, split: bool) -> crate::placement::ProgramSet {
-        let mut set = super::DensePrograms::Trellis.program_set(manifest, split);
+        let mut set = match self.family {
+            Some(family) => crate::placement::ProgramSet::from_manifest(manifest, &[family]),
+            None => super::DensePrograms::Trellis.program_set(manifest, split),
+        };
         set.names.extend(self.programs.iter().cloned());
         set.names.sort(); set.names.dedup();
         set
@@ -272,12 +360,35 @@ fn policy_programs(weight: &crate::formats::trellis_core::CoreWeightLayout,
         crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };
     let side = if weight.side == crate::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 };
     validate_package_geometry(manifest, weight.shape[1], weight.shape[0], side, book, 4096,
-        if weight.stem == "lm_head" { TrellisDType::F32 } else { TrellisDType::Bf16 })
+        // The vocabulary head (GLM `lm_head`, Mistral `output`) produces F32 logits.
+        if matches!(weight.stem.as_str(), "lm_head" | "output") { TrellisDType::F32 } else { TrellisDType::Bf16 })
         .with_context(|| format!("{}: GLM native K6 package", weight.stem))
 }
 
 #[cfg(test)]
 mod tests {
+    /// Every stage a direct-query variant's step writes is admitted at its widest: under a head
+    /// split ML4's 32 heads x 128 (4096) are narrower than the indexer's LayerNorm(x) (6144), and
+    /// its indexer query and [wk | weights_proj] have K6 stages of their own. GLM's are unchanged.
+    #[test]
+    fn direct_query_stages_cover_the_indexer_layer_norm_and_its_outputs() {
+        let ml4 = GlmDsaConfig::from_hf(&crate::families::mistral_large4::config::tests::official()).unwrap();
+        for (ranks, owned) in [(1, false), (2, false), (2, true)] {
+            let stage = CoreStageLayout::new(&ml4, 64, ranks, owned).unwrap();
+            assert!(stage.extents["q"] >= 64 * ml4.hidden * 2, "{ranks} {owned}");
+            assert_eq!(stage.extents["iq"], 64 * ml4.index_heads * ml4.index_head_dim * 2);
+            assert_eq!(stage.extents["kw"], 64 * (ml4.index_head_dim + ml4.index_heads) * 2);
+        }
+        let glm = GlmDsaConfig::from_hf(&crate::plan::testing::glm5_config()).unwrap();
+        for (ranks, owned) in [(1, false), (2, false), (2, true)] {
+            let stage = CoreStageLayout::new(&glm, 64, ranks, owned).unwrap();
+            let heads = glm.heads / if owned { 1 } else { ranks };
+            assert_eq!(stage.extents["q"], 64 * 2 * (heads * (glm.qk_nope_head_dim + glm.qk_rope_head_dim))
+                .max(glm.q_lora_rank).max((glm.kv_lora_rank + glm.qk_rope_head_dim).next_multiple_of(128)));
+            assert!(!stage.extents.contains_key("iq") && !stage.extents.contains_key("kw"));
+        }
+    }
+
     use super::*;
 
     fn checkpoint(cfg: &GlmDsaConfig) -> crate::plan::Checkpoint {
@@ -312,57 +423,7 @@ mod tests {
     }
 
     fn package(cfg: &GlmDsaConfig, core: &CoreInventory) -> Result<serde_json::Value> {
-        use crate::formats::{dense_trellis::TrellisSide, trellis_core::CoreWeightLayout};
-        use serde_json::json;
-        let mut weights = Vec::new();
-        for ranks in [1, 2] { for owner in if ranks == 1 { vec![None] } else { vec![None, Some(0), Some(1)] } {
-            for layer in 0..cfg.layers { weights.extend(core.layer_weights(cfg, layer, ranks, owner)?.into_iter()
-                .flat_map(BTreeMap::into_values)); }
-        } }
-        if let Some(head) = core.get_weight("lm_head") {
-            weights.push(CoreWeightLayout::new(head, TrellisSide::Output, 0, 1)?);
-        }
-        let mut policies = BTreeMap::new();
-        let mut programs = BTreeMap::new();
-        for w in weights {
-            let [n, k] = w.shape;
-            let side = if w.side == TrellisSide::Input { 2 } else { 1 };
-            let book = w.codebook.marker();
-            let shape = format!("k{k}_n{n}_s{side}_{book}");
-            let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
-            policies.insert(shape.clone(), json!({"shape":shape,"input_features":k,"output_features":n,
-                "sharded_side":side,"codebook":book,"native_input":routes[0],"native_program":routes[1],
-                "output_program":routes[2]}));
-            let output = if w.stem == "lm_head" { "f32" } else { "bf16" };
-            let geometries = [json!({"features":k,"input_dtype":"bf16","max_rows":4096}),
-                json!({"abi_version":1,"input_features":k,"output_features":n,"bits":6,"codebook":book,
-                    "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
-                    "splits":k.div_ceil(1024),"ctas_per_sm":4}),
-                json!({"features":n,"output_dtype":output,"max_rows":4096})];
-            let pointers = [vec!["input", "suh", "rotated", "input_block_scales"],
-                vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
-                vec!["input", "svh", "output"]];
-            for i in 0..3 {
-                let name = format!("dense_trellis_k6_{}", routes[i]);
-                programs.insert(name.clone(), json!({"name":name,"capacity_rows":4096,"geometry":geometries[i],
-                    "pointers":pointers[i].iter().map(|name| json!({"name":name})).collect::<Vec<_>>(),
-                    "scalars":vec![json!({"type":"int32"}); if i == 1 { 3 } else { 2 }],
-                    "scratch_bytes_at_capacity":if i == 1 { json!({"partial":4096*k.div_ceil(1024)*n*4}) } else { json!({}) }}));
-            }
-        }
-        for (prefix, ranks) in [("glm", 1), ("glm2", 2)] {
-            for inter in [cfg.dense_intermediate / ranks, cfg.moe_intermediate * cfg.shared_experts / ranks] {
-                let name = format!("{prefix}_stage_swiglu_i{inter}");
-                programs.insert(name.clone(), json!({"name":name}));
-            }
-            for cap in ["m64", "m4096"] { for stage in ["rank_pack", "absorb_bf16", "query_rope", "values_bf16",
-                "absorb_bf16_context", "query_rope_context"] {
-                let name = format!("{prefix}_stage_{stage}_{cap}");
-                programs.insert(name.clone(), json!({"name":name}));
-            } }
-        }
-        Ok(json!({"families":{"dense_trellis_k6":{"abi_version":1,
-            "row_policies":policies.into_values().collect::<Vec<_>>()}},"programs":programs.into_values().collect::<Vec<_>>()}))
+        crate::plan::testing::glm_k6_programs(cfg, core)
     }
 
     #[test]

@@ -18,6 +18,15 @@ pub fn parse_plan_hash(value: &str) -> Result<[u8; 32]> {
     for (i, byte) in hash.iter_mut().enumerate() { *byte = u8::from_str_radix(&value[i*2..i*2+2], 16).context("encoder plan hash")?; }
     Ok(hash)
 }
+/// The image handshake a tower serves (and a coordinator expects): its merged-row
+/// capacity in patches, output width, patch/merge geometry and marker rows.
+pub fn image_handshake(spec: &TowerSpec, processor: &ProcessorConfig, encoder_id: cuteafd_loader::media::EncoderId,
+    plan_hash: [u8; 32]) -> EncoderHandshake {
+    EncoderHandshake { encoder_id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
+        output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge,
+        row_markers: spec.row_markers(), plan_hash }
+}
+
 pub(crate) fn architecture(library: &Path) -> Result<u32> {
     // SAFETY: this is the user-selected, architecture-matching native library.
     let library = unsafe { cuteafd_ffi::NativeLibrary::load(library) }?;
@@ -33,8 +42,7 @@ pub fn start(config: &EncoderWorkerConfig, snapshot: &Path, library: PathBuf, bu
     let ledger = NativeVision::required(&library, &spec.native)?;
     ensure!(ledger.total_bytes() <= budget, "vision tower admission needs {} bytes, budget {budget}", ledger.total_bytes());
     let processor = ProcessorConfig::from_snapshot(snapshot, spec.image_family())?;
-    let handshake = EncoderHandshake { encoder_id: id, max_patches: spec.native.max_tokens * processor.merge.pow(2),
-        output_width: spec.native.output_width, patch_size: processor.patch, merge_size: processor.merge, plan_hash: config.plan_hash };
+    let handshake = image_handshake(&spec, &processor, id, config.plan_hash);
     let service = EncoderService::start(spec, library, 0, ledger.total_bytes())?;
     let server = EncoderServer::start(config.listen.parse().context("encoder listen address")?, handshake, service, normalization_lut(&processor), Duration::from_secs(60))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -89,12 +97,8 @@ pub fn start_encoders(vision: Option<&EncoderWorkerConfig>, audio: Option<&Audio
         let backend = cuteafd_ffi::audio::NativeAudio::backend(&library)?;
         let image_spec = TowerSpec::from_snapshot(snapshot, image_config.max_tokens)?;
         let processor = ProcessorConfig::from_snapshot(snapshot, image_spec.image_family())?;
-        let image_handshake = EncoderHandshake {
-            encoder_id: image_spec.encoder_id(&image_config.revision, sm),
-            max_patches: image_spec.native.max_tokens * processor.merge.pow(2),
-            output_width: image_spec.native.output_width, patch_size: processor.patch,
-            merge_size: processor.merge, plan_hash: image_config.plan_hash,
-        };
+        let image_handshake = image_handshake(&image_spec, &processor,
+            image_spec.encoder_id(&image_config.revision, sm), image_config.plan_hash);
         let audio_spec = super::audio::AudioTowerSpec::from_snapshot(snapshot, cuteafd_loader::media::audio::MAX_CLIP_SAMPLES)?;
         let audio_handshake = super::remote::AudioHandshake {
             encoder_id: audio_spec.plan().encoder_id(&audio_config.revision, sm, &backend),
@@ -180,6 +184,62 @@ mod tests {
         for text in ["cudaMemGetInfo", "allocatable", "MemAvailable", "file cache", "another encoder owner"] {
             assert!(error.contains(text), "{error}");
         }
+    }
+
+    /// A Mistral Large 4 Spark replica and its coordinator agree on the span handshake:
+    /// both build it from the checkpoint (`--encoder-max-tokens` = the plan's span cap).
+    #[test]
+    fn mistral_replica_and_coordinator_agree_on_the_span_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_mistral_large4_snapshot(dir.path(), Some(&[1]), true);
+        let processor = ProcessorConfig::from_snapshot(dir.path(), cuteafd_loader::media::ImageFamily::Mistral).unwrap();
+        let worker = TowerSpec::from_snapshot(dir.path(), processor.max_image_tokens).unwrap();
+        let coordinator = TowerSpec::mistral_large4(dir.path(),
+            super::super::mistral::merged_capacity(processor.max_image_tokens)).unwrap();
+        let id = coordinator.encoder_id("rev", 121);
+        assert_eq!(worker.encoder_id("rev", 121), id);
+        let replica = image_handshake(&worker, &processor, id, [5; 32]);
+        let expected = image_handshake(&coordinator, &processor, id, [5; 32]);
+        assert_eq!(replica, expected);
+        assert_eq!((replica.row_markers, replica.max_patches, replica.output_width), (1, 55 * 55 * 4, 6144));
+    }
+
+    /// Hardware (matching CUDA container): a Mistral Large 4 replica serves its Pixtral span over
+    /// the shared remote channel byte for byte as the same tower encodes it in-process, marker
+    /// rows included. `VISION_SNAPSHOT` (official checkpoint) and `VISION_LIBRARY` (vision AOT).
+    #[test]
+    #[ignore = "requires matching CUDA container, VISION_SNAPSHOT and VISION_LIBRARY"]
+    fn mistral_remote_span_matches_the_local_tower() {
+        use cuteafd_engine::media::{EncodeJob, EncoderClient};
+        let snapshot = std::path::PathBuf::from(std::env::var("VISION_SNAPSHOT").unwrap());
+        let library = std::path::PathBuf::from(std::env::var("VISION_LIBRARY").unwrap());
+        let processor = ProcessorConfig::from_snapshot(&snapshot, cuteafd_loader::media::ImageFamily::Mistral).unwrap();
+        let config = EncoderWorkerConfig { listen: "127.0.0.1:0".into(), plan_hash: [9; 32], revision: "rev".into(),
+            max_tokens: processor.max_image_tokens };
+        let (server, _) = start(&config, &snapshot, library.clone(), 64 << 30).unwrap();
+        let coordinator = TowerSpec::mistral_large4(&snapshot,
+            super::super::mistral::merged_capacity(processor.max_image_tokens)).unwrap();
+        let expected = image_handshake(&coordinator, &processor, coordinator.encoder_id("rev", architecture(&library).unwrap()),
+            [9; 32]);
+        let mut client = super::super::remote::RemoteEncoder::connect(vec![server.address], expected,
+            Duration::from_secs(60)).unwrap();
+        let (gh, gw) = (16usize, 24usize);
+        let rgb: Vec<u8> = (0..gh * 14 * gw * 14 * 3).map(|i| (i * 7 % 251) as u8).collect();
+        let rows = cuteafd_ffi::vision::output_rows([gh, gw], true);
+        let job = EncodeJob::image(cuteafd_core::ImageKey([4; 32]), [1, gh as u32, gw as u32], rgb.clone().into(), rows, 6144);
+        let ticket = client.submit(job).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let remote = loop {
+            if let Some(result) = client.poll(ticket) { break result.unwrap().features; }
+            assert!(std::time::Instant::now() < deadline, "remote encode timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        drop((client, server));
+        let mut local = super::super::VitRuntime::load(coordinator, &library, 0, 64 << 30).unwrap();
+        let mut output = vec![0u16; rows * 6144];
+        local.encode_into(&rgb, [gh, gw], &normalization_lut(&processor), &mut output).unwrap();
+        let local: Vec<u8> = output.iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(&remote[..], &local[..], "remote and in-process Pixtral spans differ");
     }
 
     #[test]
