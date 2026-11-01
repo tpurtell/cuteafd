@@ -161,7 +161,7 @@ fn layout_options(ranks: usize, gpus: usize) -> PlanOptions {
 fn exl3_publication_lays_out_on_the_glm_engine() {
     let dir = snapshot(true, None);
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
-    for (ranks, gpus) in [(6, 1), (6, 2), (4, 2)] {
+    for (ranks, gpus) in [(5, 1), (6, 2), (7, 2), (8, 2)] {
         let report = input.plan(&layout_options(ranks, gpus)).unwrap();
         let memory = report.memory_layout.as_ref().expect("a memory layout");
         assert!(!memory.devices.is_empty(), "{ranks}+{gpus}: {:?}", report.hints);
@@ -177,7 +177,7 @@ fn exl3_publication_lays_out_on_the_glm_engine() {
         }
         println!("ml4 {ranks} Sparks + {gpus} RTX: pool {} tokens, onboard {:?}, fits {}",
             memory.pool_tokens, report.onboard_layers, report.fits);
-        // The Spark scratch is its TP6 package census (spark_slot_bytes), never unknown.
+        // Admitted Spark worlds use their own retained-manifest owner census.
         assert!(!memory.notes.iter().any(|n| n.contains("no calibrated Spark EXL3 scratch")), "{:?}", memory.notes);
     }
 }
