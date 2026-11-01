@@ -823,9 +823,12 @@ impl NativeLibrary {
         let geometry = cuteafd_core::expert_geometry();
         let expected = expected_expert_geometry(geometry, false, role, info.kernel_intermediate)
             .context("native width is not an adjacent shard of the checkpoint")?;
+        let scratch = cuteafd_core::mxfp4_layouts::native_scratch_bytes(geometry.hidden as usize,
+            geometry.experts as usize, geometry.topk as usize, width, role, capacity,
+            geometry.family() == Some("v41")).context("invalid native width scratch recipe")?;
         ensure!(status == 0 && info.role == role && info.abi_version == 2
             && info.input_dtype == 7 && info.hidden_size == geometry.hidden
-            && info.capacity_rows == capacity && info.scratch_bytes > 0
+            && info.capacity_rows == capacity && info.scratch_bytes == scratch
             && (info.experts, info.logical_intermediate, info.kernel_intermediate, info.topk) == expected,
             "adjacent native expert metadata differs from the checkpoint: {info:?}, expected {expected:?}");
         Ok(info)

@@ -110,7 +110,7 @@ def test_selectors_and_explicit(fixture_repo):
     assert family[P + 'SPARK_TP_ROLES'] == ''
     both, _ = SCOPE.derive(repo, path, 'glm-fp8,flash-nvfp4', {})
     all_scope = SCOPE.derive(repo, path, 'all', {})[0]
-    assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp6;tp8'
+    assert all_scope[P + 'SPARK_TP_ROLES'] == 'tp2;tp3;tp5;tp6;tp7;tp8'
     for key in SCOPE.PREVIOUS_RELEASE_FLOOR:
         all_scope[P + key] = both[P + key]
     assert both == all_scope
@@ -334,7 +334,7 @@ def test_release_requirements_use_matrix_and_configs_at_build_revision(tmp_path)
         "import importlib.util, sys; "
         "spec = importlib.util.spec_from_file_location('archived_scopes', sys.argv[1]); "
         "module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module); "
-        "assert 8 in module.native_spark_roles('v41')",
+        "assert 8 in module.native_spark_artifacts('v41')",
         str(archived / 'scripts/lib/wip_aot_scopes.py')],
         check=True, capture_output=True, text=True, timeout=30)
     publisher_helper = repo / 'python/tools/lib/spark_packages.py'

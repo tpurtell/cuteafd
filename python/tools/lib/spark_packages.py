@@ -1,7 +1,9 @@
 """Shared, checkpoint-provenanced Spark package coverage (no CUDA imports)."""
 from __future__ import annotations
 
+import importlib.util
 import json
+from typing import NamedTuple
 from pathlib import Path
 
 RANGES_PATH = Path(__file__).resolve().parents[3] / 'scripts/build/spark-package-ranges.json'
@@ -20,7 +22,7 @@ def width_keys(intermediate: int, unit: int, world: int, *, exl3: bool = False,
     units = intermediate // unit
     if exl3 and units % world:
         return {(True, -(-units // world) * unit)}
-    if native or (nvfp4 and intermediate % (128 * world)):
+    if nvfp4 and intermediate % (128 * world):
         widest = -(-units // world) * unit
         return {(False, -(-widest // 128) * 128)}
     return {(False, units // world * unit), (False, -(-units // world) * unit)}
@@ -38,8 +40,7 @@ def package_worlds(family: str, format: str) -> list[int]:
     available = set().union(*(width_keys(intermediate, unit, n, **options) for n in entry['worlds']))
     # Emit every metadata alias the planner can admit using these same objects.
     return [n for n in range(1, 9)
-            if (not native or intermediate % (n * 32) == 0)
-            and (needed := width_keys(intermediate, unit, n, **options))
+            if (needed := width_keys(intermediate, unit, n, **options))
             and needed <= available]
 
 
@@ -78,14 +79,52 @@ def native_width_inventory(intermediate: int, worlds: list[int]) -> list[int]:
                    for width in native_widths(intermediate, world)}, reverse=True)
 
 
-def native_spark_geometry(family: str = 'v41') -> dict[int, tuple[int, int, int]]:
-    """Covered TP -> (ABI role, logical columns, stored columns)."""
-    intermediate = package_entry(family, 'mxfp4')['intermediate']
-    return {tp: (NATIVE_SPARK_ROLE_IDS[tp], intermediate // tp,
-                 -(-(intermediate // tp) // 128) * 128)
-            for tp in package_worlds(family, 'mxfp4')}
+class NativeArtifact(NamedTuple):
+    role: int
+    logical: int
+    stored: int
+    name: str
+
+    def prefix(self, family: str = "v41") -> str:
+        suffix = "" if self.name == "spark" else "_" + self.name
+        return f"cuteafd_{family}{suffix}_expert_"
 
 
-def native_spark_roles(family: str = 'v41') -> dict[int, tuple[int, int, int]]:
-    """Namespaced Spark roles; canonical TP4 has its separate legacy entry."""
-    return {tp: geometry for tp, geometry in native_spark_geometry(family).items() if tp != 4}
+def native_spark_artifacts(family: str = "v41") -> dict[int, tuple[NativeArtifact, ...]]:
+    """World -> distinct adjacent executable artifacts, including equal worlds.
+
+    Legacy equal-world symbol identities are retained. Source ownership is not
+    an executable key: unequal ranks rotate between these same two artifacts.
+    Load the adjacent policy file explicitly so isolated release archives use
+    their own inputs rather than a publisher checkout on sys.path.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "spark_mxfp4_layouts", Path(__file__).with_name("mxfp4_layouts.py"))
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    hidden = {"v41": 5120, "dsv4f": 4096, "dsv4p": 7168}[family]
+    intermediate = package_entry(family, "mxfp4")["intermediate"]
+    result = {}
+    for world in package_worlds(family, "mxfp4"):
+        widths = native_widths(intermediate, world)
+        unequal = len(widths) > 1
+        result[world] = tuple(NativeArtifact(
+            native_width_role(width) if unequal else NATIVE_SPARK_ROLE_IDS[world],
+            width, policy.stored_width(hidden, width),
+            f"spark_w{width}" if unequal else "spark" if world == 4 else f"spark_tp{world}")
+            for width in widths)
+    return result
+
+
+def native_shard(world: int, rank: int, layer: int, family: str = "v41") -> tuple[int, NativeArtifact]:
+    """Actual checkpoint source offset and artifact for one absolute layer."""
+    artifacts = native_spark_artifacts(family)[world]
+    intermediate = package_entry(family, "mxfp4")["intermediate"]
+    if not 0 <= rank < world or layer < 0:
+        raise ValueError("invalid native shard rank/layer")
+    units = intermediate // 32
+    base, extra = divmod(units, world)
+    canonical = (rank - layer) % world if extra else rank
+    width = 32 * (base + (canonical < extra))
+    first = 32 * (canonical * base + min(canonical, extra))
+    return first, next(artifact for artifact in artifacts if artifact.logical == width)

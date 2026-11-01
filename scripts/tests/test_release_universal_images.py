@@ -42,7 +42,7 @@ POSTCHECK_BLOCK = ("# release-spark-tp-roles-postcheck:start",
                    "# release-spark-tp-roles-postcheck:end")
 GUARD_BLOCK = ("# push-universal-role-guard:start", "# push-universal-role-guard:end")
 
-UNIVERSAL = "tp2;tp3;tp6;tp8"
+UNIVERSAL = "tp2;tp3;tp5;tp6;tp7;tp8"
 
 
 def _between(path: Path, markers: tuple[str, str]) -> str:
@@ -90,7 +90,7 @@ printf 'ROLES=%s\\n' "$spark_tp_roles"
 
 @pytest.mark.parametrize("requested,expected", [
     (UNIVERSAL, UNIVERSAL),
-    ("tp8;tp6;tp2;tp3", UNIVERSAL),          # a permutation is the same set
+    ("tp8;tp7;tp6;tp5;tp2;tp3", UNIVERSAL),          # a permutation is the same set
     ("tp6", "tp6"),                      # bounded single-topology A/B
     ("tp2;tp6", "tp2;tp6"),              # documented non-contiguous subset
     ("", ""),                            # explicit legacy TP4-only rebuild
@@ -112,10 +112,10 @@ printf 'ROLES=%s\\n' "$spark_tp_roles"
 
 
 @pytest.mark.parametrize("raw,fragment", [
-    ("tp5", "accepts only tp2, tp3, tp6 and tp8"),
-    ("tp2;tp5", "accepts only tp2, tp3, tp6 and tp8"),
-    ("spark", "accepts only tp2, tp3, tp6 and tp8"),
-    ("tp2 tp3", "accepts only tp2, tp3, tp6 and tp8"),
+    ("tp9", "accepts only tp2, tp3, tp5, tp6, tp7 and tp8"),
+    ("tp2;tp9", "accepts only tp2, tp3, tp5, tp6, tp7 and tp8"),
+    ("spark", "accepts only tp2, tp3, tp5, tp6, tp7 and tp8"),
+    ("tp2 tp3", "accepts only tp2, tp3, tp5, tp6, tp7 and tp8"),
     ("tp2;;tp3", "is not a ';'-separated role list"),   # no silent narrowing
     ("tp2;", "is not a ';'-separated role list"),
     (";tp2", "is not a ';'-separated role list"),
@@ -141,7 +141,7 @@ def test_role_allowlist_and_comparison_each_exist_once():
     assert "release_spark_tp_roles_canonical() {" not in text
     assert 'release_universal_spark_tp_roles="$(release_spark_tp_roles_default)"' in text
     # Release and WIP use the same allowlist rather than copies that can drift.
-    assert len(re.findall(r"tp2\|tp3\|tp6\|tp8\)", common)) == 1
+    assert len(re.findall(r"tp2\|tp3\|tp5\|tp6\|tp7\|tp8\)", common)) == 1
     assert '*";$spark_tp_roles;"*' not in text, "substring role comparison is back"
 
 
@@ -166,8 +166,8 @@ echo ACCEPTED
 
     for advertised, requested in [
         ("tp2;tp3", UNIVERSAL),            # partial export, full claim
-        ("tp2;tp3;tp6;tp8;tp4", UNIVERSAL),    # foreign token in the label
-        ("tp2;tp3;tp6;tp8", "tp2;tp3"),        # label overstates the request
+        ("tp2;tp3;tp5;tp6;tp7;tp8;tp4", UNIVERSAL),    # foreign token in the label
+        ("tp2;tp3;tp5;tp6;tp7;tp8", "tp2;tp3"),        # label overstates the request
         (UNIVERSAL, ""),                   # a legacy build that baked roles
         ("tp5", UNIVERSAL),                # a label nothing can honor
     ]:
@@ -193,8 +193,8 @@ def test_docker_exported_role_manifest_is_checksummed_per_role():
 
 @pytest.mark.parametrize("advertised,publishable", [
     (UNIVERSAL, True),
-    ("tp8;tp6;tp2;tp3", True),           # a permutation is the same coverage
-    ("tp2;tp3;tp6;tp8;tp4", True),       # more than required still covers it
+    ("tp8;tp7;tp6;tp5;tp2;tp3", True),           # a permutation is the same coverage
+    ("tp2;tp3;tp5;tp6;tp7;tp8;tp4", True),       # more than required still covers it
     ("tp6", False),                  # single-topology subset
     ("tp2;tp3", False),              # missing tp6
     ("tp2 tp3 tp6", False),          # wrong separator: advertises nothing

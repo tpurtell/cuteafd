@@ -113,3 +113,40 @@ def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.native_slice_width(5120, 288, 120, 1, 192) == 192
     assert LAYOUTS.native_slice_width(4096, 352, 121, 16, 128) == 128
     assert LAYOUTS.native_slice_width(5120, 576, 121, 80, 192) == 192
+
+
+def test_native_plan_rejects_duplicate_capacity_keys():
+    data = LAYOUTS.layouts()
+    data["native_slices"][0]["capacities"][1] = 1
+    with pytest.raises(ValueError, match="pair uniquely"):
+        LAYOUTS.validate(data)
+
+
+@pytest.mark.parametrize("family,hidden,intermediate", [
+    ("v41", 5120, 2304), ("dsv4f", 4096, 2048), ("dsv4p", 7168, 3072),
+])
+def test_world_artifacts_match_every_absolute_layer_source_interval(family, hidden, intermediate):
+    spec = importlib.util.spec_from_file_location("mxfp4_native_packages", ROOT / "python/tools/lib/spark_packages.py")
+    packages = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(packages)
+    worlds = packages.native_spark_artifacts(family)
+    assert set(worlds) == set(range(2, 9))
+    for world, artifacts in worlds.items():
+        unequal = (intermediate // 32) % world != 0
+        assert len(artifacts) == (2 if unequal else 1)
+        for artifact in artifacts:
+            assert artifact.stored == LAYOUTS.stored_width(hidden, artifact.logical)
+            assert artifact.stored <= -(-artifact.logical // 128) * 128
+            if unequal:
+                assert artifact.role == 65536 + artifact.logical
+                assert artifact.name == f"spark_w{artifact.logical}"
+            else:
+                assert artifact.role == {2: 5, 3: 6, 4: 1, 6: 7, 8: 8}[world]
+        for layer in (0, 1, 17, 63):
+            shards = sorted(packages.native_shard(world, rank, layer, family) for rank in range(world))
+            cursor = 0
+            for first, artifact in shards:
+                assert first == cursor
+                assert artifact in artifacts
+                cursor += artifact.logical
+            assert cursor == intermediate

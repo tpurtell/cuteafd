@@ -331,11 +331,10 @@ def test_artifact_slug_is_filesystem_safe() -> None:
 @pytest.mark.parametrize("tp", range(1, 10))
 @pytest.mark.parametrize("ep", (1, 2, 3))
 def test_topology_decoder_uses_shared_native_coverage(tp, ep):
-    from spark_packages import native_spark_geometry, ownership_topology
+    from spark_packages import native_spark_artifacts, ownership_topology
     module = _load()
     if ownership_topology(tp, ep):
-        assert module._topology_config({"tp": tp, "ep": ep}) == (
-            None if tp == 4 else tp, native_spark_geometry()[tp][1])
+        assert module._topology_config({"tp": tp, "ep": ep}) == native_spark_artifacts()[tp]
     else:
         with pytest.raises(ValueError, match="unsupported exported topology"):
             module._topology_config({"tp": tp, "ep": ep})

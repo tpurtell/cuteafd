@@ -59,23 +59,26 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
-    def test_native_layer_bytes_follow_shared_padded_geometry(self) -> None:
+    def test_native_layer_bytes_follow_shared_artifact_geometry(self) -> None:
         import importlib.util
         path = ROOT / "python/tools/lib/spark_packages.py"
         spec = importlib.util.spec_from_file_location("weight_packages", path)
         packages = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(packages)
-        geometry = packages.native_spark_geometry()
+        geometry = packages.native_spark_artifacts()
         for count in range(1, 10):
             with self.subTest(count=count):
                 result = source_common(f"release_spark_layer_bytes {count}")
                 self.assertEqual(result.returncode == 0, count in geometry, result.stderr)
                 if count in geometry:
-                    self.assertEqual(int(result.stdout), geometry[count][2] * 3133440)
-        self.assertEqual(geometry[8], (8, 288, 384))
+                    expected = max(384 * (5120 * a.stored * 3 // 2 + 2 * a.stored * 81
+                                          + 5120 * (2 * ((a.logical // 32 + 3) // 4) + 1))
+                                   for a in geometry[count])
+                    self.assertEqual(int(result.stdout), expected)
+        self.assertEqual(geometry[8][0].stored, 288)
 
     def test_retained_canonical_and_owned_tp_counts_use_configured_hosts(self) -> None:
-        for explicit, counts in [(False, range(1, 9)), (True, (2, 3, 4, 6, 8))]:
+        for explicit, counts in [(False, range(1, 9)), (True, range(2, 9))]:
             for count in counts:
                 overlay = [f"SPARK_COUNT={count}",
                            f"SPARK_TP={count}" if explicit else "SPARK_TP=",
@@ -92,7 +95,7 @@ class TopologyConfigTest(unittest.TestCase):
                                      [",".join(f"worker-{rank}" for rank in range(count))])
 
     def test_deleted_worlds_and_unqualified_ownership_refuse(self) -> None:
-        for count in (1, 5, 7):
+        for count in (1, 9):
             with self.subTest(count=count):
                 result = load(f"SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1")
                 self.assertEqual(result.returncode, 2)

@@ -1,7 +1,8 @@
 """ctypes bindings for official TP4 and local dSpark expert qualification."""
 
 import ctypes as C
-from spark_packages import native_spark_roles
+from spark_packages import native_spark_artifacts
+from mxfp4_layouts import stored_width
 
 P = C.c_void_p
 I = C.c_int32
@@ -61,9 +62,6 @@ class Launch(C.Structure):
 assert C.sizeof(Info) == 64 and C.sizeof(Launch) == 392
 
 
-SPARK_TP_PREFIX = {tp: f"cuteafd_v41_spark_tp{tp}_expert_"
-                   for tp in native_spark_roles()}
-
 # Only the five per-family launch-ABI entry points are namespaced. The packer
 # size query and the packer itself are canonical symbols shared by every family.
 FAMILY_SYMBOLS = frozenset({
@@ -82,32 +80,22 @@ def namespaced_symbol(name, prefix):
     return name
 
 
-def expert_symbol_prefix(*, local=False, tp2=False, spark_tp=None, family="v41"):
-    """Native symbol prefix for one expert family.
-
-    `spark_tp=2|3|6|8` selects the replicated-group Spark TP2/TP3/TP6/TP8 AOT families
-    (roles 5/6/7/8); `local`/`tp2` keep the historical RTX families unchanged, and
-    the default is the canonical TP4 family. At most one family may be selected.
-    """
+def expert_symbol_prefix(*, local=False, tp2=False, artifact=None, family="v41"):
+    """Select one executable artifact, never a scalar width for a whole world."""
     assert family in ("v41", "dsv4f", "dsv4p")
-    assert sum(bool(x) for x in (local, tp2, spark_tp is not None)) <= 1
-    if spark_tp is not None:
-        assert spark_tp in SPARK_TP_PREFIX, spark_tp
-        from spark_packages import package_worlds
-        assert spark_tp in package_worlds(family, "mxfp4")
-        prefix = SPARK_TP_PREFIX[spark_tp]
-    elif tp2:
-        prefix = "cuteafd_v41_tp2_expert_"
-    elif local:
-        prefix = "cuteafd_v41_local_expert_"
-    else:
-        prefix = "cuteafd_v41_expert_"
+    assert sum(bool(x) for x in (local, tp2, artifact is not None)) <= 1
+    if artifact is not None:
+        assert artifact in {a for world in native_spark_artifacts(family).values() for a in world}, artifact
+        return artifact.prefix(family)
+    prefix = ("cuteafd_v41_tp2_expert_" if tp2 else
+              "cuteafd_v41_local_expert_" if local else "cuteafd_v41_expert_")
     return prefix.replace("v41", family, 1)
 
 
-def library(path, *, local=False, tp2=False, spark_tp=None, family="v41"):
-    prefix = expert_symbol_prefix(local=local, tp2=tp2, spark_tp=spark_tp, family=family)
+def library(path, *, local=False, tp2=False, artifact=None, family="v41"):
+    prefix = expert_symbol_prefix(local=local, tp2=tp2, artifact=artifact, family=family)
     lib = C.CDLL(path)
+    lib._cuteafd_family = family
     for name, args in {
         "cuteafd_v41_expert_info": [I, C.POINTER(Info)],
         "cuteafd_v41_expert_initialize": [I, C.POINTER(P)],
@@ -135,25 +123,44 @@ def check(code):
     assert code == 0, code
 
 
+def pack_reference(weights, scales, *, stored, coded=True):
+    """Independent layout oracle for the selected artifact's resident planes."""
+    import torch
+    from tests.moe.test_v41_exact_slices import pack
+    from b12x.moe._shared.scale_codes import pack_scale_codes
+
+    logical = weights["w1"].shape[1]
+    exact = stored == logical and logical % 128 != 0
+    assert stored == (logical if exact else (logical + 127) // 128 * 128)
+    packed = pack(weights, scales, exact)
+    if coded:
+        gated = torch.cat([torch.nn.functional.pad(scales[name], (0, 0, 0, stored - logical))
+                           for name in ("w3", "w1")], 1)
+        packed[1] = pack_scale_codes(gated, tensor_name="oracle.w13.scale",
+                                     gated_half_rows=stored).view(torch.uint32).flatten().cuda()
+        packed[3] = pack_scale_codes(scales["w2"], tensor_name="oracle.w2.scale").view(torch.uint32).flatten().cuda()
+    return packed
+
+
 class Native:
-    def __init__(self, lib, capacity, weights, wire, ids, routing, *, coordinator=False, full_backbone=False, tp2=False, spark_tp=None, storage=None, geometry=None):
+    def __init__(self, lib, capacity, weights, wire, ids, routing, *, coordinator=False, full_backbone=False, tp2=False, artifact=None, storage=None, geometry=None):
         import torch
-        assert spark_tp is None or spark_tp in SPARK_TP_PREFIX
-        assert sum((coordinator, full_backbone, tp2, spark_tp is not None)) <= 1
+        assert sum((coordinator, full_backbone, tp2, artifact is not None)) <= 1
         self.lib = lib
         self.info = info = Info()
         self.handle = P()
         check(lib.cuteafd_v41_expert_info(capacity, C.byref(info)))
-        role_geometry = native_spark_roles().get(spark_tp)
-        expected = ((role_geometry[0], 384, 5120, *role_geometry[1:], 6, capacity, 7) if role_geometry else
+        family = lib._cuteafd_family
+        hidden, experts = {"v41": (5120, 384), "dsv4f": (4096, 256), "dsv4p": (7168, 384)}[family]
+        expected = ((artifact.role, experts, hidden, artifact.logical, artifact.stored, 6, capacity, 7) if artifact else
                     (3, 384, 5120, 1152, 1152, 6, capacity, 7) if tp2 else
                     (0, 128, 5120, 2304, 2304, 3, capacity, 1)
                     if coordinator else (2, 384, 5120, 2304, 2304, 6, capacity, 7)
                     if full_backbone else (1, 384, 5120, 576, 640, 6, capacity, 7))
         if geometry is not None:
-            assert not any((coordinator, full_backbone, tp2, spark_tp is not None))
+            assert not any((coordinator, full_backbone, tp2, artifact is not None))
             hidden, intermediate, experts, topk = geometry
-            expected = (1, experts, hidden, intermediate, -(-intermediate // 128) * 128, topk, capacity, 7)
+            expected = (1, experts, hidden, intermediate, stored_width(hidden, intermediate), topk, capacity, 7)
         assert (
             info.abi_version,
             info.role,

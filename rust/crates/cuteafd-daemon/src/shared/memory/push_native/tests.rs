@@ -275,35 +275,42 @@ fn coordinator_suffix_preserves_native_spark_plans() -> Result<()> {
     let root = tempfile::tempdir()?;
     let config = serde_json::json!({"model_type":"deepseek_v4"});
     let args = serde_json::json!({
-        "vocab_size":64,"dim":256,"moe_inter_dim":768,"n_layers":1,"n_heads":4,
+        "vocab_size":64,"dim":256,"moe_inter_dim":768,"n_layers":3,"n_heads":4,
         "n_routed_experts":2,"n_shared_experts":1,"n_activated_experts":1,
         "score_func":"sqrtsoftplus","route_scale":1.5,"swiglu_limit":10.0,
         "q_lora_rank":128,"head_dim":128,"rope_head_dim":64,"o_groups":1,
         "o_lora_rank":128,"window_size":128,"original_seq_len":65536,
         "rope_theta":10000,"rope_factor":16,"beta_fast":32,"beta_slow":1,
         "index_n_heads":4,"index_head_dim":128,"index_topk":512,"hc_mult":4,
-        "hc_sinkhorn_iters":20,"compress_rope_theta":160000,"compress_ratios":[0]
+        "hc_sinkhorn_iters":20,"compress_rope_theta":160000,"compress_ratios":[0,0,0]
     });
     let mut tensors = Vec::new();
-    for expert in 0..2 {
-        for (projection, rows, cols) in [("w1", 768, 256), ("w3", 768, 256), ("w2", 256, 768)] {
-            let prefix = format!("layers.0.ffn.experts.{expert}.{projection}");
-            tensors.push(t(format!("{prefix}.weight"), "I8", &[rows, cols / 2]));
-            tensors.push(t(format!("{prefix}.scale"), "F8_E8M0", &[rows, cols / 32]));
+    for layer in 0..3 {
+        for expert in 0..2 {
+            for (projection, rows, cols) in [("w1", 768, 256), ("w3", 768, 256), ("w2", 256, 768)] {
+                let prefix = format!("layers.{layer}.ffn.experts.{expert}.{projection}");
+                tensors.push(t(format!("{prefix}.weight"), "I8", &[rows, cols / 2]));
+                tensors.push(t(format!("{prefix}.scale"), "F8_E8M0", &[rows, cols / 32]));
+            }
         }
     }
     write_snapshot(root.path(), &config, &tensors, None);
     std::fs::create_dir(root.path().join("inference"))?;
     std::fs::write(root.path().join("inference/config.json"), serde_json::to_vec(&args)?)?;
     let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
-    for world in [4, 6] {
+    for world in [3, 4, 5, 6, 7] {
+        let artifacts = cuteafd_core::tp_units::native_spark_artifacts(256, 768, world)?;
         let plans = (0..world).map(|rank| {
-            let width: usize = 768 / world;
-            let stored = width.div_ceil(128) * 128;
-            let slice = SparkSlice { unit_map: None, layer: 0, first: (rank * width) as u32,
-                width: width as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![] };
-            let bytes = NativePlanes::new(256, width, stored, 2, false)?.bytes;
-            let plan = RankPlan::new(&catalog, &[slice], world, rank, bytes)?;
+            let slices = (0..3).map(|layer| {
+                let shard = cuteafd_core::tp_units::LayerShard::new(768, 32, layer, world, rank)?;
+                let artifact = artifacts.iter().find(|a| a.logical == shard.width).context("missing native artifact")?;
+                Ok(SparkSlice { unit_map: None, layer: layer as u32, first: shard.first as u32,
+                    width: artifact.logical as u32, stored_width: artifact.stored as u32, tiers: vec![], projection_counts: vec![] })
+            }).collect::<Result<Vec<_>>>()?;
+            let bytes = slices.iter().map(|slice|
+                NativePlanes::new(256, slice.width as usize, slice.stored_width as usize, 2, false).map(|p| p.bytes))
+                .collect::<Result<Vec<_>>>()?.into_iter().sum();
+            let plan = RankPlan::new(&catalog, &slices, world, rank, bytes)?;
             Ok((plan.layout.bytes() as u64, plan.placement.clone(),
                 plan.checked(&catalog, root.path(), world, rank)?))
         }).collect::<Result<Vec<_>>>()?;

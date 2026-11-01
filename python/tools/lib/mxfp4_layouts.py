@@ -19,6 +19,8 @@ def layouts() -> dict:
 def validate(data: dict) -> None:
     for row in data["native_slices"]:
         recipes = dict(zip(row["capacities"], row["slices"], strict=True))
+        if len(recipes) != len(row["capacities"]):
+            raise ValueError("native MXFP4 capacities must pair uniquely with slices")
         if len({width for capacity, width in recipes.items() if capacity <= 80}) != 1:
             raise ValueError("native MXFP4 decode capacities must share one slice recipe")
         if any(width not in (64, 128, 192) for width in recipes.values()):

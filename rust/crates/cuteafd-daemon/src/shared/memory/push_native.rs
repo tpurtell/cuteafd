@@ -181,8 +181,10 @@ impl RankPlan {
             let planes = NativePlanes::with_scale_codes(geometry.hidden as usize, slice.width as usize,
                 slice.stored_width as usize, geometry.experts as usize, catalog.nvfp4().is_some(),
                 catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes())?;
-            ensure!(slice.first as usize == rank.checked_mul(planes.intermediate).context("native slice overflow")?,
-                "native push slice start differs from rank");
+            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, 32,
+                slice.layer as usize, world, rank)?;
+            ensure!(slice.first as usize == shard.first && planes.intermediate == shard.width,
+                "native push slice differs from layer ownership");
             let mut hash = Sha256::new();
             hash.update(serde_json::to_vec(slice)?);
             hash.update(format!("{planes:?}"));

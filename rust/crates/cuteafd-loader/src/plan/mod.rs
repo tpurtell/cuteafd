@@ -1143,7 +1143,26 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
         let share = |ranks: usize| -> Option<f64> {
             let contract = contract.as_ref()?;
             let i = intermediate?;
-            experts::stored_slice(i, contract.block, ranks).map(|slice| slice as f64 / i as f64)
+            let recipe = match experts::spark_recipe(&contract.package, i, ranks) {
+                Ok(recipe) => recipe,
+                Err(_) => return experts::stored_slice(i, contract.block, ranks)
+                    .map(|slice| slice as f64 / i as f64),
+            };
+            if !recipe.native_artifacts.is_empty() {
+                let hidden = spec.hidden as u64;
+                let source = hidden * i as u64 * 51 / 32;
+                let widest = recipe.native_artifacts.iter().filter_map(|artifact| {
+                    if contract.package.starts_with("v41:") {
+                        crate::formats::scale_codes::expert_bytes(1, hidden, artifact.logical as u64)
+                    } else {
+                        crate::placement::families::deepseek_v41::resident_bytes(hidden,
+                            artifact.stored as u64, 1, false).ok()
+                    }
+                }).max()?;
+                Some(widest as f64 / source as f64)
+            } else {
+                recipe.widths.iter().max().map(|&slice| slice as f64 / i as f64)
+            }
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);
         report.min_spark_ranks = contract.as_ref().and_then(|c| c.spark_worlds.iter().copied().find(|&r| fits_on(r)));

@@ -146,10 +146,20 @@ impl SparkAssignment {
     pub fn from_catalog(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
         rank: usize, layout: SparkResidentLayout, endpoints: &[cuteafd_core::SparkEndpoint],
         rings: cuteafd_core::SparkRings) -> anyhow::Result<Self> {
+        let geometry = catalog.routed_experts().geometry()?;
+        let mut assignment = Self::resident_from_catalog(catalog, working, rank, layout)?;
+        assignment.io = working.rank_endpoints_io(rank, geometry, endpoints, rings)?;
+        Ok(assignment)
+    }
+
+    /// Header-derived weights only; endpoint transport is charged independently
+    /// by the planner, and added by `from_catalog` for runtime admission.
+    pub(crate) fn resident_from_catalog(catalog: &crate::OfficialV41Catalog,
+        working: &SparkWorkingSet, rank: usize, layout: SparkResidentLayout) -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         let geometry = catalog.routed_experts().geometry()?;
-        let io = working.rank_endpoints_io(rank, geometry, endpoints, rings)?;
-        let mut assignment = Self { rank: u32::try_from(rank)?, resident_bytes: 0, slices: vec![], io };
+        let mut assignment = Self { rank: u32::try_from(rank)?, resident_bytes: 0,
+            slices: vec![], io: SparkIoBytes::default() };
         if !working.selected_ranks().contains(&rank) { return Ok(assignment); }
         ensure!(working.spark_layers.windows(2).all(|pair| pair[0] < pair[1]),
             "Spark layers must be sorted and unique");
@@ -411,6 +421,12 @@ mod tests {
                     experts * (payloads + gate_up + down)
                 };
                 assert_eq!(assignment.resident_bytes, expected);
+                let resident = SparkAssignment::resident_from_catalog(&catalog, &working, 3, layout).unwrap();
+                assert_eq!(resident.resident_bytes, assignment.resident_bytes);
+                assert_eq!(resident.slices, assignment.slices);
+                assert_eq!(resident.io, SparkIoBytes::default());
+                assert!(SparkAssignment::from_catalog(&catalog, &working, 3, layout, &[], rings).is_err(),
+                    "residency-only planning must not bypass runtime endpoint admission");
             }
             for stored_width in [544, 577] {
                 assert!(SparkAssignment::from_catalog(&catalog, &working, 3,
