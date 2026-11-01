@@ -146,21 +146,25 @@ def test_cmake_knows_each_isa_and_keeps_fp_contraction_off():
     assert 'cmake_language(DEFER CALL cuteafd_host_isa_variants)' in text
 
 
-def test_wip_dev_cargo_features_are_dev_only_keyed_and_reach_cargo():
+def test_wip_cargo_features_are_allowlisted_keyed_and_reach_cargo():
     wip = (ROOT / 'wip.sh').read_text()
     key = wip[wip.index('wip_build_key="$('):wip.index('} | sha256sum', wip.index('wip_build_key="$('))]
     assert 'CARGO_FEATURES; do' in key
-    assert 'only dev-* features may be set' in wip
+    assert 'expected jemalloc or dev-* features' in wip
     assert '-e "CUTEAFD_WIP_CARGO_FEATURES=${wip_cargo_features:-}"' in wip
     build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
     assert '--quiet "${cargo_feature_args[@]}"' in build
     # The Rust phase marker changes with the feature set; the native key ignores it.
     assert 'features=%s' in build.split('wip_rust_fingerprint=')[1].split('\n')[0]
     assert "'^CUTEAFD_WIP_(CARGO_FEATURES|" in build
-    check = 'wip_cargo_features="{}"; for feature in ${{wip_cargo_features//,/ }}; do [[ "$feature" =~ ^dev-[a-z0-9-]+$ ]] || exit 3; done'
-    assert subprocess.run(['bash', '-c', check.format('dev-test,dev-x')]).returncode == 0
-    for bad in ('prod', 'dev-test default', 'dev_x'):
-        assert subprocess.run(['bash', '-c', check.format(bad)]).returncode == 3, bad
+    start = wip.index('wip_cargo_features="')
+    check = 'release_die() { exit 3; }\n' + wip[start:wip.index('\nwip_build_key=', start)]
+    for features, expected in [('dev-test,dev-x', 0), ('jemalloc', 0),
+                               ('jemalloc,dev-test', 0), ('prod', 3),
+                               ('dev-test default', 3), ('dev_x', 3)]:
+        result = subprocess.run(['bash', '-c', check],
+                                env={**os.environ, 'CUTEAFD_WIP_CARGO_FEATURES': features})
+        assert result.returncode == expected, features
 
 
 def test_performance_cores_detects_runtime_big_core_frequency(tmp_path):
