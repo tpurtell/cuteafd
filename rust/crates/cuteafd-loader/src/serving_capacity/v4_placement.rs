@@ -174,7 +174,21 @@ mod tp2_tests {
                 assert_eq!((cost.resident_bytes, cost.staging_bytes), (resident, staging));
                 if catalog.exl3().is_some() && !manifest.is_file() { continue; }
                 let workspace = deepseek_v4_tp2_workspace(&catalog, Some(&manifest), 4096).unwrap();
-                assert_eq!(workspace, if family == "flash" { 161453088 } else { 1343287468 });
+                let expected = if family == "flash" {
+                    let shape = catalog.routed_experts();
+                    let (h, w, e, k) = (shape.hidden as u64, shape.intermediate as u64 / 2,
+                        shape.experts as u64, shape.topk as u64);
+                    let pairs = 4096 * k;
+                    let tiles = pairs.div_ceil(128) + e.min(pairs);
+                    let mut arena = 0_u64;
+                    for plane in [(4 + 3 * e + tiles) * 4, pairs * 4, pairs * 4,
+                        tiles * 128 * (w + w / 32).div_ceil(16) * 16,
+                        pairs * 4, pairs * 4, pairs * h * 4, e * 4, e * 4] {
+                        arena = arena.div_ceil(16) * 16 + plane;
+                    }
+                    arena + 4096 * h * 4 // TP2 FP32 token output, outside the kernel arena.
+                } else { 1343287468 };
+                assert_eq!(workspace, expected);
                 eprintln!("TP2 {family} rank{rank}: resident={} staging={} workspace={workspace}", cost.resident_bytes, cost.staging_bytes);
             }
         }
