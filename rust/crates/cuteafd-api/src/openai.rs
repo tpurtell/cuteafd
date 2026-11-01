@@ -880,6 +880,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
     let streaming = converted.stream;
+    // Streamed requests may emit argument deltas as they arrive; a non-streamed
+    // request always buffers, so a call cut at `max_tokens` never returns
+    // partial JSON in `arguments`.
+    let stream_args = chat::stream_args::stream_toolcall_args_enabled(streaming);
     let stop_sequences = converted.parsing_options.stop_sequences.clone();
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let tap = Arc::new(Mutex::new(Tap::default()));
@@ -898,10 +902,10 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render_literals(&raw, thinking.enabled, &mut |text| shield.literal(text, &profile.literal_tokens)).map_err(Rejection::bad)?
             };
-            let parser = kimi::KimiOutputParser::new(kimi::KimiParserOptions { thinking:thinking.enabled,
+            let parser = kimi::KimiOutputParser::with_stream_args(kimi::KimiParserOptions { thinking:thinking.enabled,
                 tools:(tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
                     .then(|| converted.conversation.tools.clone()),
-                stop_sequences:converted.parsing_options.stop_sequences.clone() });
+                stop_sequences:converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Kimi(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Glm(encoding), raw, thinking)) => {
@@ -917,9 +921,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = glm5::GlmOutputParser::new(glm5::GlmParserOptions { thinking: thinking.enabled,
+            let parser = glm5::GlmOutputParser::with_stream_args(glm5::GlmParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone(), id: id.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Glm(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Step5(encoding), raw, _thinking)) => {
@@ -934,9 +938,9 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = step5::Step5OutputParser::new(step5::Step5ParserOptions {
+            let parser = step5::Step5OutputParser::with_stream_args(step5::Step5ParserOptions {
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
@@ -952,15 +956,15 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
             let prompt = if expanded_media_probe { String::new() } else {
                 encoding.render(&raw, &options).map_err(Rejection::bad)?
             };
-            let parser = qwen4::QwenOutputParser::new(qwen4::QwenParserOptions { thinking: thinking.enabled,
+            let parser = qwen4::QwenOutputParser::with_stream_args(qwen4::QwenParserOptions { thinking: thinking.enabled,
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
-                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+                stop_sequences: converted.parsing_options.stop_sequences.clone() }, stream_args);
             (prompt, Vec::new(), OutputProcessor::Qwen(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         None => {
             if expanded_media_probe {
                 // Supplied native ids already contain image rows; do not render another prompt.
-                (String::new(), Vec::new(), OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
+                (String::new(), Vec::new(), OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::with_stream_args(converted.parsing_options, stream_args))))
             } else {
             let rendered = if matches!(profile.encoding, ModelEncoding::DeepseekV4) {
                 DeepseekV4Encoding::new().render_conversation(&converted.conversation)
@@ -974,7 +978,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 rendered
             };
             (rendered.prompt, rendered.image_sources,
-                OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::new(converted.parsing_options))))
+                OutputProcessor::Deepseek(glm5::GlmStreamProcessor::new(generator, deepseek::parser::DeepseekOutputParser::with_stream_args(converted.parsing_options, stream_args))))
             }
         }
     };

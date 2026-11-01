@@ -15,8 +15,14 @@ pub struct Step5OutputParser(QwenOutputParser);
 
 impl Step5OutputParser {
     pub fn new(options: Step5ParserOptions) -> Self {
-        Self(QwenOutputParser::with_turn_markers(QwenParserOptions { thinking: true,
-            tools: options.tools, stop_sequences: options.stop_sequences }, &super::STOP_MARKERS))
+        Self::with_stream_args(options, false)
+    }
+
+    /// [`Self::new`] with the streaming knob set explicitly. Step-5 delegates
+    /// to Qwen's XML grammar, so it inherits Qwen's incremental deltas.
+    pub fn with_stream_args(options: Step5ParserOptions, stream_args: bool) -> Self {
+        Self(QwenOutputParser::with_turn_markers_and_stream_args(QwenParserOptions { thinking: true,
+            tools: options.tools, stop_sequences: options.stop_sequences }, &super::STOP_MARKERS, stream_args))
     }
 }
 
