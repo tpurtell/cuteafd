@@ -6225,3 +6225,171 @@ The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
 Do not replay publication against the deliberately retired standalone paths.
 Full-model generation/serving qualification and K6 engine shape support remain
 separate work; this task branch is pushed for review, not merged.
+
+
+## Muse Spark Open K4 experts / Core K6 (2026-11-01)
+
+TJ authorized the short pilot, full quantization, direct Hub publication and
+SparkNest placement on `quant/muse-spark-k4-core-k6`; no recipe or upload
+approval stop remains. Existing checkout: `~/Developer/cute-worktrees/muse-quant`.
+GPU work uses raptor GPU 0 alone, by UUID under the unchanged fair queue;
+GPU 1 and serving/default/kernel infrastructure are outside this task.
+
+Pinned BF16 source `meta-models/Muse-Spark-Open-816B-A42B` revision
+`0fb02478b02565b2ce7fc57e6051c91172774ac9` contains 2,000 tensors and
+1,644,333,137,920 payload bytes. Files are sealed and local across raptor,
+raptor (D2) and raptor (D3); readiness checks the local-store union because
+`nest where` reports each store separately. Source hashes are checked against
+the actual Hub LFS/Git hashes before GPU admission, without replication.
+
+Implementation: `quantization/muse_spark/`. Quantize 373 attention/bridge/head
+matrices at K6 and 47,616 individual routed matrices at K4 using the pinned
+MCG codec and FP64-congruence calibrated LDLQ. Gate/up expert fusion splits
+axis 1, gate first. Keep 1,503 native tensors byte for byte, including attention
+output gates and bundled vision/audio. Residual gates ship BF16 but promote
+to FP32 in the official native execution. The head stores 202,112 output rows
+with 202,048 logical rows; all whole operands record side 1. Expected output:
+193,459 tensors, 427,855,788,244 payload bytes, 63 shards.
+
+The native xhigh template renders all 1,426 calibration prompts (1,248,980
+tokens), with date frozen to 2026-10-31 and no sorting/truncation/packing.
+The bounded pilot uses 4,764 calibration / 1,812 heldout tokens, layers
+0/1/61, and a separate 2,345-token sliding-window witness. Expected K6 error
+is below the 1e-3 heldout activation-weighted NMSE stop bar; native/staged
+boundaries must be byte-exact and expert error finite and at most 1e-2.
+One pilot launch is enough unless a specific failure needs diagnosis.
+
+Production stages advance causally: quantized QKV -> O inputs -> attention
+residual -> pre-expert projection -> per-expert gate/up -> down inputs ->
+normalized routed outputs -> post-expert projection -> successor layer.
+The official Transformers 5.22.1 modules own all norms, routing and masking.
+The durable user supervisor caps host memory at 78 GiB and owns GPU0 only
+until its container stops; authorized publication is CPU-only afterward.
+Run/tokens/pilot/export state: `~/Developer/cute-worktrees/muse-quant-work/`.
+Use its launcher with `--resume` after OOM; retain checksum-verified stage
+and projection commitments. A numerical failure requires diagnosis of the
+first affected producer/input and its descendants before invalidation; never
+blindly delete cached work or resume across changed numerical identities.
+The independent completed-export reload and native-byte audit precedes upload
+to `wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6`.
+
+The original pilot completed native/staged byte proofs, but its covariance
+producer is superseded. Production attempt `muse-quant-1793466485064710216`
+stopped at layer 1 expert 2 on a Cholesky numerical failure, not OOM. Independent
+FP64 oracles show the original long FP32 covariance product error is 7.97e-6;
+the represented regularized matrix itself is indefinite, so a factorization
+retry or more damping would conceal an inaccurate input. All 785 old quantized
+commitments and their dependent activation stream remain preserved for diagnosis
+and will not seed the clean producer. Source weights, tokens and byte-verified
+original BF16 teacher states are reusable.
+
+Products bounded to 128 real rows pass expert oracles but a full 1,248,980-row
+dense stream still has 1.785e-6 error from the FP32 outer sum. The candidate
+uses unchanged bounded FP32 products with a persistent FP64 outer sum and FP32
+stored covariance. It must clear the unchanged 1e-6 matrix-oracle bar on the
+failed expert, two busy experts and the full dense stream, then a fresh short
+pilot before clean production. Native activation GEMM shapes, row order,
+calibration corpus, damping, Hadamard and packed quantizer are unchanged.
+The GPTQModel helper `05689b25ffc8b27401a4291ab2b8a71c43a83151` is
+published on fork main and pinned here. All 20 independent CPU oracle/boundary
+checks pass. Target GPU witnesses pass all four cases with relative errors
+2.85e-8 (failed expert 2, 1,690 rows), 2.71e-8 (expert 0, 22,028 rows),
+2.67e-8 (expert 56, 152,454 rows) and 3.08e-8 (full dense 1,248,980 rows).
+All four unchanged factorizations pass with the original 0.025 damping.
+Evidence: `muse-quant-work/numerical-1793466485064710216/accurate-sum-witness/`.
+The fresh short pilot exits zero at 2026-10-31 18:36:13 UTC after about
+7.4 minutes. All 21 source outputs match the original teacher byte for byte;
+the three native/staged proofs and separate sliding-window witness also pass.
+Worst selected K6 heldout NMSE is 0.000295418; padded head 0.0000475735;
+worst sampled K4 expert 0.00541509. Existing 1e-3/1e-2 stop bars remain.
+
+Clean production started under durable user unit
+`muse-quant-1793471787847848991` with automatic CPU upload/managed ingest/cleanup.
+Active paths are `muse-quant-work/production-k128` and `export-k128`; the old
+producer/export stay isolated as forensic evidence. Numerical code and fork pin
+are frozen while this producer runs. No upload has occurred yet.
+
+Final CPU continuation now includes publication, supported native SparkNest
+streamed placement directly to six Sparks, verification, and removal of only
+the task-owned local final-weight links. It creates no extra full checkpoint
+on raptor. Source weights, shared stores, receipts and forensic evidence stay.
+Targeted terminal-flow tests pass 54 CPU cases. Issue #940 and draft PR #939
+track continuation; full-model serving qualification remains separate.
+
+TJ requested progress, remaining time and completion status every 30 minutes.
+The user timer `cuteafd-muse-progress.timer` queues an update into this same
+Codex task (`01a192c3-c219-7950-89d1-6efa3f197a15`) through the existing CLI;
+first delivery succeeds at 2026-10-31 21:29 UTC, next at 21:59 UTC. Operational
+script/receipts: `muse-quant-work/progress-updates/`. It reads only task receipts
+and supervisor status; it never probes either GPU or changes numerical source.
+ETA uses the latest six completed layers and elapsed current-layer time; head,
+audit, upload and placement remain separately unestimated until measurable.
+The timer stops after queuing final success only when all completion markers
+match the producer and the durable supervisor exits zero. Failure updates keep
+the original OOM-resume versus numerical-diagnosis recovery instructions.
+At setup, six layers and 5,201/47,989 projections are committed with no new
+crash; remaining layer time is about 23.6 hours (mean 25.61 minutes/layer).
+
+Quantization completed 2026-11-01 20:58:59 UTC (26h22m21s including final
+export/audit) with all 47,989 projections, 63 shards and exact expected payload.
+Independent reload audit passes all 1,503 retained tensors / 16,250,077,184
+bytes and all numerical records. Public upload finished 22:05:40 UTC:
+`wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6` revision
+`89998fb177acd9a862ac8bd4fb79bfd50e940c97`, 142 verified public files.
+
+The CPU continuation stopped before managed writes: SparkNest 0.7.2 returns
+400 with an exact path-specific `invalid argument: PATH not found` for absent
+namespace paths, while the adapter expected 404. Recognize only that exact
+400 body as absence; all other errors still fail. Status-only exception output
+keeps response details private. The adapter fix passes 55 ingest/finish cases
+and a read-only actual missing-ref check. Resume CPU publication/placement
+only; source numerical identity, quantized weights and public revision remain
+unchanged, and no quantization or upload reset is needed.
+
+TJ clarified that managed admission must use hardlink staging and a no-copy
+SparkNest import. Stop the direct upload-API placement continuation while
+resolving that route; do not resume it from scheduled failure prompts.
+The CPU unit was stopped 2026-11-01 22:46:14 UTC. All 63 local final shards
+remain; cleanup has not started. 26 weight shards (175,808,982,704 bytes)
+already have verified Spark copies; retain them for reuse. The managed ref
+was never published, and no managed-complete marker exists. Source quantization
+was a clean layer-0 restart (`resume:false`); the original invalid quantized
+weights and causal activation caches never seeded the repaired producer.
+
+TJ subsequently clarified that the model should be imported and the earlier
+comment was a question about speed, not a requirement to replace the placement
+method. This supersedes the hold above. Resume the existing verified placement,
+reuse all 26 completed Spark weight copies and any checksum-valid owned partial,
+and finish managed verification/cleanup. The hold marker is archived as resolved.
+CPU-only continuation: `muse-quant-1793575200198800108`. No shared SparkNest
+feature/deployment work, requantization or HF reupload is needed.
+
+TJ explicitly requested native SparkNest tools, minimal copies and no further
+weight checksums or SSH verification. This supersedes the extra terminal
+checksum barriers above. The old verifier continuation was stopped; 28 verified
+Spark shards are reused. A filtered hardlink staging view contains only 35
+missing weight shards plus remaining assets (238,777,799,082 bytes). Native
+`nest import --copy --seal all` job 3263500654 handles the unavoidable cross-NVMe
+copy. Per-host metadata aliases batch native RDMA `nest replicate` jobs; the
+coordinator's managed copies are evicted after placement. Existing HF checksums
+are retained as the checksum record; final checks use native job errors/counts,
+sealed sizes, ownership, inventory and offline HF resolution without rehashing
+weight data. Refs are imported last. Native CLI continuation:
+`muse-quant-1793576154865042036`, task-local `native_finish.py`. No SSH is used.
+
+Completed 2026-11-01 23:39:11 UTC (Nov 2 07:39 Taipei), supervisor exit zero.
+Native import job 3263500654 imported the 106 missing files with zero errors;
+six native RDMA jobs placed the remaining data while reusing 28 Spark shards.
+All 142 managed files have the expected sealed sizes/ownership, all 63 weight
+shards have exactly one Spark copy, refs/main names the published revision,
+and offline HF resolution points into the managed hub. Verification followed
+TJ's explicit instruction: use the prior HF checksum record, native job results
+and metadata only; no new weight hashes or SSH checks. Temporary coordinator
+managed copies, export/cache/staging weight links and 122.16 GiB of obsolete
+binary intermediates are retired. Source weights, tokens, scalar receipts,
+all 47,989 error records/CSV, 62 layer timings, logs and numerical failure
+forensics remain. Task-specific compiled staging is removed, GPUs are released,
+and the 30-minute progress timer is disabled. Do not replay the old checksum
+finisher against the intentionally retired local weights; final native command
+sources/results are retained in `muse-quant-work/native_finish.py` and
+`production-k128/native-cli-jobs/`.
