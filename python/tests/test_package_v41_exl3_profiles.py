@@ -1038,6 +1038,71 @@ class PackageProfileTests(unittest.TestCase):
                         self.assertFalse(call.kwargs.get('token_major_rotation', False))
                         self.assertFalse(call.kwargs.get('fused_input_rotation', False))
 
+    def test_ml4_spark_policy_is_exact_and_preserves_unmeasured_cells(self):
+        selected = {
+            768: {256, 2048, 2752, 4096},
+            896: {256, 1024, 2752},
+            1024: {256, 2048, 2752},
+            1152: {256, 1024, 2752, 4096},
+            1280: {256, 2752, 4096},
+        }
+        for width, capacities in selected.items():
+            tile = (64, 128, 64, 256) if width in (896, 1152) else (64, 256, 64, 256)
+            for capacity in (1, 16, 80, 256, 1024, 2048, 2752, 4096, 5504):
+                with self.subTest(width=width, capacity=capacity):
+                    cell = package.spark_ws_cell('ml4', 'spark', width, capacity)
+                    if capacity in capacities:
+                        self.assertEqual(cell, dict(route_block=64, dynamic=True, tile=tile))
+                        self.assertTrue(package.ws_dynamic_tiles('ml4', 'spark', width, capacity))
+                        self.assertEqual(package.ws_tile('ml4', 'spark', width, capacity), tile)
+                    else:
+                        self.assertIsNone(cell)
+                        self.assertFalse(package.ws_dynamic_tiles('ml4', 'spark', width, capacity))
+                        self.assertIsNone(package.ws_tile('ml4', 'spark', width, capacity))
+                    self.assertFalse(package.wire_input('ml4', 'spark', width, capacity))
+                    self.assertIsNone(package.spark_ws_cell('ml4', 'coordinator', width, capacity))
+            self.assertIsNone(package.spark_ws_cell('ml4', 'spark', width + 1, 2752))
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'spark', (4, 5), geometry='ml4',
+                profiles=('tp5-width1280', 'tp5-width1152', 'tp6-width1024', 'tp7-width896',
+                          'tp7-width768', 'tp8-width768'),
+                capacities=(80, 256, 1024, 2048, 2752, 4096))
+            self.assertTrue(calls)
+            for call in calls:
+                width, capacity = call.args[1], call.args[3]
+                qualified = capacity in selected[width]
+                self.assertEqual(call.kwargs.get('ws_dynamic_tiles', False), qualified)
+                if qualified:
+                    self.assertEqual(call.kwargs['tile'], package.SPARK_WS_CELLS['ml4', width, capacity]['tile'])
+                    self.assertEqual(call.kwargs['route_block'], 64)
+                else:
+                    self.assertNotIn('tile', call.kwargs)
+
+    def test_ml4_provisional_coordinator_cell_does_not_extrapolate(self):
+        for width in (6144, 3072):
+            for capacity in (1, 16, 80, 256, 1024, 2048, 2752, 4096, 5504):
+                with self.subTest(width=width, capacity=capacity):
+                    expected = (None if capacity <= 80 else
+                                package._WS_K3_PREROTATE if (width, capacity) == (3072, 2752) else
+                                package._WS_S14_M256 if capacity <= 256 else package._WS_S14)
+                    self.assertEqual(package.coordinator_ws_cell('ml4', 'coordinator', width, capacity), expected)
+        with tempfile.TemporaryDirectory() as temporary:
+            _, _, calls, _ = self.build_fixture(
+                Path(temporary), 'coordinator', (4, 5), geometry='ml4',
+                capacities=(80, 256, 1024, 2048, 2752, 4096))
+            self.assertTrue(calls)
+            for call in calls:
+                width, capacity = call.args[1], call.args[3]
+                if capacity <= 80:
+                    self.assertFalse(call.kwargs.get('warp_specialized', False))
+                    continue
+                tile = ((64, 256, 64, 256) if (width, capacity) == (3072, 2752)
+                        else package.TILE_RTX_MIXED)
+                self.assertEqual(call.kwargs['tile'], tile)
+                self.assertTrue(call.kwargs['ws_dynamic_tiles'])
+                self.assertEqual(call.kwargs['route_block'], 32 if capacity == 256 else 64)
+
     def test_coordinator_fallback_preserves_nearest_same_width_recipe(self):
         self.assertEqual(package.coordinator_ws_cell('glm', 'coordinator', 2048, 2752),
                          dict(route_block=64, dynamic=True))

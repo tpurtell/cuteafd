@@ -274,6 +274,14 @@ mod tests {
         ]) {
             let world = row["world"].as_u64().unwrap() as usize;
             let width = (48usize.div_ceil(world) * 128) as u64;
+            let dynamic: &[u32] = match world {
+                5 => &[256, 2752, 4096],
+                6 => &[256, 2048, 2752],
+                7 => &[256, 1024, 2752],
+                8 => &[256, 2048, 2752, 4096],
+                _ => unreachable!(),
+            };
+            assert_eq!(row["dynamic_capacities"], serde_json::json!(dynamic));
             assert_eq!(ml4_owner_bytes(world, extent(64, 80))?.scratch, decode);
             assert_eq!(ml4_owner_bytes(world, extent(2752, 2752))?.scratch, prefill);
             let largest = ml4_owner_bytes(world, extent(4096, 4096))?;

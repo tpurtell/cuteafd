@@ -1171,6 +1171,8 @@
   },
   {
     "package": "exl3-ml4-k45/tp5-width1280",
+    "policy_allocation_contract": "route64 static/dynamic and N128/N256 share these allocation planes",
+    "dynamic_capacities": [256, 2752, 4096],
     "family": "mistral_large4",
     "format": "exl3",
     "world": 5,
@@ -1190,6 +1192,8 @@
   },
   {
     "package": "exl3-ml4-k45/tp6-width1024",
+    "policy_allocation_contract": "route64 static/dynamic and N128/N256 share these allocation planes",
+    "dynamic_capacities": [256, 2048, 2752],
     "family": "mistral_large4",
     "format": "exl3",
     "world": 6,
@@ -1209,6 +1213,8 @@
   },
   {
     "package": "exl3-ml4-k45/tp7-width896",
+    "policy_allocation_contract": "route64 static/dynamic and N128/N256 share these allocation planes",
+    "dynamic_capacities": [256, 1024, 2752],
     "family": "mistral_large4",
     "format": "exl3",
     "world": 7,
@@ -1228,6 +1234,8 @@
   },
   {
     "package": "exl3-ml4-k45/tp8-width768",
+    "policy_allocation_contract": "route64 static/dynamic and N128/N256 share these allocation planes",
+    "dynamic_capacities": [256, 2048, 2752, 4096],
     "family": "mistral_large4",
     "format": "exl3",
     "world": 8,
