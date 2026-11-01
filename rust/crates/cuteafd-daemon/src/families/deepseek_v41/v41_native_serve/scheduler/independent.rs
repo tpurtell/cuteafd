@@ -93,22 +93,19 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                         requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
                 }
-                // A stalled request (on either lane) resumes at the boundary: stop as soon as
-                // units came back or its client left.
-                let stalled = active.iter().flatten().filter(|r| r.stalled).collect::<Vec<_>>();
-                if !stalled.is_empty() && (requests.borrow().release_epoch() != released_at
-                    || stalled.iter().any(|r| r.job.events.is_closed())) {
+                // A stalled request (on either lane) resumes at the drained boundary: once this
+                // lane has completed a round (every call makes progress), stop when units came
+                // back since the call began or a stalled client left.
+                let stalled = active.iter().flatten().filter(|r| r.stalled).map(|r| r.job.events.is_closed());
+                if resume_due(round_id, stalled, requests.borrow().release_epoch(), released_at) {
                     lease.stop(); return Ok(());
                 }
                 active.iter().enumerate().filter_map(|(slot, r)|
                     r.as_ref().filter(|r| r.lane() == lane && !r.stalled).map(|_| slot)).collect()
             };
-            if members.is_empty() {
-                // Nothing left on this lane: with a request stalled, end the peer's run too so
-                // the boundary plans now rather than at the peer's natural end.
-                if active.borrow().iter().flatten().any(|r| r.stalled) { lease.stop(); }
-                return Ok(());
-            }
+            // An empty lane only returns: the peer keeps running its members and stops at its
+            // own boundary when a stalled request can resume.
+            if members.is_empty() { return Ok(()); }
             ensure!(members.len() <= 8, "independent lane exceeds eight requests");
             // A member whose next round would pass its reservation needs a top-up, which the
             // outer loop plans at a boundary where both lanes have drained.
@@ -401,4 +398,48 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
         probe.finish_state();
     }
     target.and(speculative.map(|_| ())).and(state)
+}
+
+/// Whether a lane that has completed `rounds` rounds stops so a stalled request may resume at the
+/// drained boundary: there is a stalled request (`closed`: its client left), and units were
+/// released since the lanes started (`released_at`) or a stalled client left. A lane always
+/// completes a round first, so every call makes progress.
+pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, epoch: u64, released_at: u64) -> bool {
+    let mut closed = closed.by_ref().peekable();
+    rounds > 0 && closed.peek().is_some() && (epoch != released_at || closed.any(|c| c))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_due;
+
+    /// One stalled request on lane 0, one runnable on lane 1, polled lane 0 first. The empty
+    /// lane returns without stopping its peer, and the runnable lane runs its rounds until units
+    /// come back (then stops at a boundary so the stall is planned again).
+    #[test]
+    fn an_empty_lane_never_stops_a_peer_with_runnable_members() {
+        let source = include_str!("independent.rs").split_once("\n#[cfg(test)]").unwrap().0;
+        let empty = source.split_once("if members.is_empty()").unwrap().1.split_once('\n').unwrap().0;
+        assert_eq!(empty.trim(), "{ return Ok(()); }", "an empty lane only returns");
+        assert_eq!(source.matches("lease.stop();").count(), 3, "admission wake, stalled resume, top-up need");
+        // Model of the joined lanes: stop is shared; lane 0 has no members (its request stalled).
+        let mut stop = false;
+        let (mut rounds, mut epoch) = (0u64, 7u64);
+        let released_at = epoch;
+        for _poll in 0..100 {
+            // Lane 0: empty, returns (and never touches `stop`).
+            // Lane 1: one runnable request.
+            if stop { break; }
+            if resume_due(rounds, [false].into_iter(), epoch, released_at) { stop = true; break; }
+            rounds += 1;
+            if rounds == 40 { epoch += 1; } // its request finished a turn snapshot: units freed
+        }
+        assert!(rounds >= 40, "the runnable lane made progress");
+        assert!(stop, "and stopped at a boundary once units came back");
+        // A closed stalled client stops it at the next boundary, but never before a round.
+        assert!(!resume_due(0, [true].into_iter(), 7, 7));
+        assert!(resume_due(1, [true].into_iter(), 7, 7));
+        // Nothing stalled: never.
+        assert!(!resume_due(5, std::iter::empty(), 8, 7));
+    }
 }

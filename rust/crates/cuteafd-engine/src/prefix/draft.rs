@@ -220,11 +220,17 @@ impl DraftPagePool {
     /// Rows one live reservation can reach with proposal `block` ([`crate::reserve::draft_lifetime_rows`]).
     pub fn lifetime_rows(&self, block: usize) -> usize { crate::reserve::draft_lifetime_rows(self.capacity(), block) }
 
-    /// Pages a live credit can still claim: free pages and unpinned revocable snapshot pages,
-    /// less every live credit not yet materialized.
+    /// Pages a live credit can still claim: free pages and the pages revoking every unpinned
+    /// revocable snapshot would actually free (each of their references is such a snapshot's;
+    /// a page a live sequence or a pinned snapshot shares stays), less every live credit not
+    /// yet materialized.
     pub fn reservable(&self) -> usize {
-        let revocable: usize = self.snapshots.values().filter(|s| s.revocable && s.pins == 0).map(|s| s.pages.len()).sum();
-        (self.free() + revocable).saturating_sub(self.outstanding_credit())
+        let mut held: BTreeMap<u32, u32> = BTreeMap::new();
+        for s in self.snapshots.values().filter(|s| s.revocable && s.pins == 0) {
+            for &page in &s.pages { *held.entry(page).or_default() += 1; }
+        }
+        let freed = held.into_iter().filter(|&(page, n)| self.pool.refs(page) == n).count();
+        (self.free() + freed).saturating_sub(self.outstanding_credit())
     }
 
     /// Bind cold(P) without allocating a page or exposing the previous occupant's bytes.
@@ -404,6 +410,26 @@ impl DraftPagePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reservable_counts_only_snapshot_pages_whose_release_frees_them() {
+        let mut pool = DraftPagePool::new(8 * 64, 1, 1024, 3).unwrap();
+        let binding = pool.bind(0, 0).unwrap();
+        pool.admit(binding, 4 * 64, 1).unwrap();
+        let r = pool.reserve(binding, 0, 4 * 64).unwrap();
+        pool.commit(r, 4 * 64).unwrap();
+        // The live credit: ceil(256/64) + ceil(1/64) + 1 = 6 pages, 4 materialized.
+        assert_eq!(pool.reservable(), 8 - 4 - 2);
+        // A snapshot of the live sequence shares all four of its pages (no tail copy).
+        let (snapshot, copies) = pool.capture(binding).unwrap();
+        assert!(copies.is_empty());
+        pool.retain_snapshot(snapshot).unwrap();
+        // Revoking it frees nothing: the live sequence still holds every page.
+        assert_eq!(pool.reservable(), 8 - 4 - 2);
+        // Once the sequence is released, the snapshot alone holds them: all four come back.
+        pool.release(binding).unwrap();
+        assert_eq!(pool.reservable(), 8);
+    }
 
     #[test]
     fn committed_attention_table_rejects_pending_and_stale_bindings() {

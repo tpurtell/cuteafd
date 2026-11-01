@@ -655,7 +655,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             };
             let capacity = lease.end();
             cache.tick();
-            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages }).collect();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
             let Some(initial_capacity) = reserve.admit(cache, family, &active, &stalled, &holding, &lease) else {
                 drop(holding);
                 // Waits for the drain rule: a retirement or a release retries it.
@@ -926,7 +926,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             prefills.settle(!active.is_empty());
         }
         // Reservation top-ups only between rounds; a refused one stalls the request.
-        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages }).collect();
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
         // Ended requests (early termination, the deadlock break, closed stalls) release their
         // pages inside the round, before anything is granted.
         reserve.round(cache, family, &mut active, &mut stalled, &holding, |cache, mut request| {

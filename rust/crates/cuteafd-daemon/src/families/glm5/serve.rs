@@ -640,7 +640,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             };
             let capacity = lease.end();
             cache.tick();
-            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages }).collect();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
             let Some(rows) = reserve.admit(&cache, &family, &active, &stalled, &holding, &lease) else {
                 drop(holding);
                 // Waits for the drain rule: a retirement or a release retries it.
@@ -887,7 +887,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             prefills.settle(!active.is_empty());
         }
-        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages }).collect();
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
         // Ended requests (early termination, the deadlock break, closed stalls) release their
         // pages inside the round, before anything is granted.
         reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {

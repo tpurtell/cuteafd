@@ -14,9 +14,11 @@
 //! would stall ends with `length`, so its pages count as releasable.
 //!
 //! Candidates for a top-up are served in ascending order of what they still need (equal to the
-//! potential allocation at the default buffer), and the first one refused stalls together with
-//! every candidate after it: the requests that stall are always those with the most potential
-//! allocation remaining, and the one that can finish from what is free always runs.
+//! potential allocation at the default buffer); each is granted only if the drain rule still
+//! holds afterwards, so when grants conflict the requests with the most potential allocation
+//! remaining are the ones that stall, and the one that can finish from what is free always
+//! runs. A refused candidate does not block later ones (a parity pool's other half may still
+//! fit them).
 //!
 //! Everything here is host arithmetic over page counts in the pool's own units ([`Room`]): a
 //! parity pool's two halves separately (logical page `j` comes from half `j % 2`), and the
@@ -424,8 +426,8 @@ impl KvReserve {
 
     /// One round: plan; end the refused requests past the early-termination threshold (their
     /// pages return before anything is granted, then plan again); grant top-ups least need
-    /// first against the pool as it then stands; stall the first refused candidate with every
-    /// one after it. A grant the pool refuses stalls the rest for this round and is retried
+    /// first against the pool as it then stands, skipping (stalling) any the drain rule or the
+    /// pool's halves refuse. A grant the pool refuses stalls the rest for this round and is retried
     /// against the real pool next round; a round where every decoding request stalls and
     /// nothing else can return a page ends the request with the most potential (the deadlock
     /// break), so no round repeats forever.
@@ -440,8 +442,10 @@ impl KvReserve {
             let mut state = demands.clone();
             let mut plan = Vec::new();
             let mut refused = Vec::new();
+            // Least need first. A refused candidate is skipped, not a barrier: in a parity pool
+            // a later candidate may need the other half, and the drain rule (`safe`) already
+            // keeps the ones with the most potential waiting when grants really conflict.
             for &i in &candidates {
-                if !refused.is_empty() { refused.push(i); continue; }
                 match self.grant(&work, &state, i) {
                     Some(pages) => {
                         let (need, draft) = self.charge(&work, &state[i], pages);
@@ -455,6 +459,7 @@ impl KvReserve {
             }
             let mut ending: Vec<usize> = refused.iter().copied()
                 .filter(|&i| self.config.termination.is_some_and(|t| demands[i].produced >= t)).collect();
+            let held: Vec<usize> = demands.iter().map(|d| d.held).collect();
             let settled = ledger.settled() && decoding == demands.len();
             let idle = settled && plan.is_empty() && refused.len() == decoding && decoding > 0;
             drop((demands, state));
@@ -475,9 +480,10 @@ impl KvReserve {
             }
             let mut stalled_now: Vec<usize> = refused;
             for (k, &(i, pages)) in plan.iter().enumerate() {
+                let before = held[i];
                 if ledger.grow(i, pages) {
                     self.stats.top_ups += 1;
-                    self.stats.top_up_pages += pages as u64;
+                    self.stats.top_up_pages += (pages - before) as u64;
                 } else {
                     // The pool and the plan disagree (a capture still queued): wait a round.
                     self.stats.refused_grants += 1;

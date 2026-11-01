@@ -488,6 +488,48 @@ fn parity_pools_charge_odd_allocations_per_half_and_never_deadlock() {
     assert_eq!(Room::parity([0, 0]).need(257, 449), [96, 96]);
 }
 
+/// Re-review finding 2: candidates are tried least need first, but a refusal does not block
+/// later ones. Parity pool of 6 pages, room [0, 1] after admissions: A needs half 0 (refused),
+/// B needs half 1 (fits). B used to be skipped, the round looked all-stalled and settled, and
+/// the deadlock break ended a request with `length` under the default buffer.
+#[test]
+fn a_refused_candidate_does_not_block_one_the_other_half_can_hold() {
+    let mut p = policy(64, 0, -1, 1 << 20);
+    let a = p.lease(64, 100, 1, 6 * ROWS).unwrap();
+    let b = p.lease(128, 96, 1, 6 * ROWS).unwrap();
+    // A holds 2 pages (positions 0-1: [1, 1]) at 128 rows; B holds 3 (positions 0-2: [2, 1]).
+    let a = Demand { lease: a, held: 2, pages: &[], committed: 128, produced: 64, decoding: true, draft: None };
+    let b = Demand { lease: b, held: 3, pages: &[], committed: 192, produced: 64, decoding: true, draft: None };
+    assert!(p.needs_top_up(&a) && p.needs_top_up(&b));
+    assert_eq!((Room::parity([0, 1]).need(2, 3), Room::parity([0, 1]).need(3, 4)), ([1, 0], [0, 1]));
+    struct Two { live: Vec<(Demand<'static>, bool)>, room: Room, ended: usize }
+    impl Ledger for Two {
+        fn room(&self) -> Room { self.room }
+        fn settled(&self) -> bool { true }
+        fn demands(&self) -> (Vec<Demand<'_>>, Vec<bool>) {
+            (self.live.iter().map(|(d, _)| *d).collect(), self.live.iter().map(|(_, s)| *s).collect())
+        }
+        fn end(&mut self, index: usize) { self.live.remove(index); self.ended += 1; }
+        fn grow(&mut self, index: usize, pages: usize) -> bool {
+            let need = self.room.need(self.live[index].0.held, pages);
+            assert!(need[0] <= self.room.halves[0] && need[1] <= self.room.halves[1]);
+            self.room.halves = [self.room.halves[0] - need[0], self.room.halves[1] - need[1]];
+            self.live[index].0.held = pages;
+            true
+        }
+        fn set_stalled(&mut self, index: usize, stalled: bool) { self.live[index].1 = stalled; }
+    }
+    let mut ledger = Two { live: vec![(a, false), (b, false)], room: Room::parity([0, 1]), ended: 0 };
+    p.round(&mut ledger);
+    assert_eq!((ledger.ended, p.stats().deadlock_breaks), (0, 0), "no truncation");
+    assert_eq!((ledger.live[0].1, ledger.live[1].1, ledger.live[1].0.held), (true, false, 4));
+    // The simulator reaches the same state with these two requests in that pool, end to end.
+    let specs = vec![Spec { arrival: 0, prompt: 64, max_output: 100, actual: usize::MAX, step: 1 },
+        Spec { arrival: 0, prompt: 128, max_output: 96, actual: usize::MAX, step: 1 }];
+    let mut p = policy(64, 0, -1, 1 << 20);
+    check_complete(&specs, &simulate(&mut p, parity(6), &specs, &mut Rng(3)));
+}
+
 /// Finding 2: the drafter's credit carries `block / 64 + 1` pages beyond the target pages, and
 /// the draft pool has no such headroom. A request whose lifetime reaches the pool's capacity
 /// used to be granted the same refused top-up every round (a livelock).
@@ -565,6 +607,8 @@ fn ended_requests_release_before_grants_and_counters_match_the_pool() {
     assert_eq!((live.len(), live[0].stalled), (1, false));
     assert!(live[0].held > 271);
     assert_eq!((p.stats().top_ups, p.stats().refused_grants), (1, 0));
+    // The counter adds the pages the grant added, not the size it grew to.
+    assert_eq!(p.stats().top_up_pages as usize, live[0].held - 271);
 }
 
 #[test]

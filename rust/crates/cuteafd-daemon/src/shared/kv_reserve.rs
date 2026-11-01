@@ -81,10 +81,12 @@ pub(crate) trait Reserving {
     fn closed(&self) -> bool;
 }
 
-/// A prefilling request: it holds its admission reservation and is not a top-up candidate.
+/// A prefilling request: it holds its admission reservation (and its drafter's credit) and is
+/// not a top-up candidate.
 pub(crate) struct Holding<'p> {
     pub lease: Lease,
     pub pages: &'p [u32],
+    pub draft: Option<cuteafd_engine::reserve::DraftDemand>,
 }
 
 pub(crate) struct Reserve {
@@ -115,7 +117,7 @@ impl<E: CopyEngine, M: Clone + Default, F: PrefixFamily<M>, A: Reserving<Placeme
                 decoding: true, draft: self.family.draft_demand(a.placement()) }
         });
         let holding = self.holding.iter().map(|h| Demand { lease: h.lease, held: h.pages.len(), pages: h.pages,
-            committed: h.lease.prompt(), produced: 0, decoding: false, draft: None });
+            committed: h.lease.prompt(), produced: 0, decoding: false, draft: h.draft });
         (decoding.chain(holding).collect(), self.decoding.iter().map(|(_, stalled)| *stalled).collect())
     }
     fn end(&mut self, index: usize) {
@@ -178,7 +180,7 @@ impl Reserve {
                 decoding: true, draft: family.draft_demand(a.placement()) }
         });
         let holders = holding.iter().map(|h| Demand { lease: h.lease, held: h.pages.len(), pages: h.pages,
-            committed: h.lease.prompt(), produced: 0, decoding: false, draft: None });
+            committed: h.lease.prompt(), produced: 0, decoding: false, draft: h.draft });
         let demands: Vec<Demand<'_>> = decoding.chain(holders).collect();
         let pages = self.policy.admit(cache.room(family), &demands, lease, family.draft_admission(0),
             !stalled.is_empty())?;
