@@ -744,6 +744,20 @@ mod tests {
     }
 
     #[test]
+    fn expert_usage_is_an_opt_in_native_serve_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        for (flags, usage) in [(vec![], false), (vec!["--expert-usage"], true)] {
+            let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base.into_iter().chain(flags))
+                .unwrap().command else { panic!("expected native serve"); };
+            assert_eq!(args.expert_usage, usage);
+        }
+        // A switch, not a value; native serve only.
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--expert-usage", "on"])).is_err());
+        assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--expert-usage"]).is_err());
+    }
+
+    #[test]
     fn plan_mimo_prefix_marks_stay_experimental_and_off() {
         use clap::{CommandFactory, Parser};
         let super::Commands::Plan(args) = super::Cli::try_parse_from(
@@ -1121,6 +1135,9 @@ pub(crate) struct NativeServeArgs {
     /// 16 GiB). For checkpoint stores with slow random reads.
     #[arg(long)]
     pub engram_warm: bool,
+    /// Count per-layer x per-expert route hits (turns on route capture).
+    #[arg(long, env = "CUTEAFD_V41_EXPERT_USAGE")]
+    pub expert_usage: bool,
     /// Checked Spark vision replicas; omitted for local RTX fallback.
     #[arg(long)]
     pub vision_peers: Option<String>,
