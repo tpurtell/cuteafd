@@ -61,7 +61,8 @@ pub fn native_scratch_bytes(hidden: usize, experts: usize, topk: usize,
     let (hidden, experts, routes) = (hidden as u64, experts as u64,
         u64::from(capacity).checked_mul(topk as u64)?);
     let atomic = !coded && crate::tp_units::native_role_width(role).is_none() && capacity >= 256;
-    let partial_cols = if coded { slice / 4 + slice / 32 } else { hidden };
+    // FC1 activation storage is independent of the weights' scale encoding.
+    let partial_cols = slice / 4 + slice / 32;
     let partial = if atomic { 4 } else {
         (width as u64).div_ceil(slice).checked_mul(routes)?.checked_mul(partial_cols)?.checked_mul(4)?
     };
@@ -91,10 +92,11 @@ mod tests {
         // Independent exporter specs: live/count/prefix/metadata/group/inverse,
         // route partials, output, and two trailing per-expert planes.
         let planes = |hidden: u64, experts: u64, topk: u64, width: u64,
-            tile: u64, capacity: u64, coded: bool, atomic: bool| {
+            tile: u64, capacity: u64, atomic: bool| {
             let routes = capacity * topk;
+            // One byte/activation plus one four-byte scale word per K32 block.
             let partial = if atomic { 4 } else {
-                width.div_ceil(tile) * routes * if coded { tile / 4 + tile / 32 } else { hidden } * 4
+                width.div_ceil(tile) * routes * (tile + tile / 8)
             };
             let mut end = 0u64;
             for size in [4, experts * routes * 4, experts * 4, experts * 8,
@@ -115,7 +117,7 @@ mod tests {
         ] {
             for (capacity, tile) in [1, 16, 80, 256, 1024, 4096].into_iter().zip(tiles) {
                 let atomic = !coded && role < 65536 && capacity >= 256;
-                let expected = planes(hidden, experts, topk, width, tile, capacity, coded, atomic);
+                let expected = planes(hidden, experts, topk, width, tile, capacity, atomic);
                 assert_eq!(native_scratch_bytes(hidden as usize, experts as usize, topk as usize,
                     width as usize, role, capacity as u32, coded), Some(expected));
             }

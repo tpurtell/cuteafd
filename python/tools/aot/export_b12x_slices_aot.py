@@ -225,7 +225,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             if family == "v41" and role == "spark_tp3"
             else None
         )
-        partial_cols = (selected_width // 4 + selected_width // 32) if (family == "v41" and not compact) else hidden
+        # Ordinary FC1 writes FP8 words plus K32 scale words for raw and coded weights.
+        # The hybrid path also reuses this arena for hidden-wide BF16 projections.
+        partial_cols = hidden if compact else selected_width // 4 + selected_width // 32
         specs = [
             (cutlass.Uint32, (capacity, hidden // 4), (wire // 4, 1)),
             (cutlass.Uint8, (capacity, hidden // 32), (wire, 1)),

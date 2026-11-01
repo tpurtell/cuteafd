@@ -1,4 +1,5 @@
 """Compile the real native inverse map and compare an independent tensor permutation."""
+import ast
 import ctypes
 import importlib.util
 from pathlib import Path
@@ -97,6 +98,26 @@ def test_measured_storage_holds_and_generated_native_header_agree(native_map):
         assert native_map.stored(hidden, width) == 0
         with pytest.raises(ValueError):
             LAYOUTS.stored_width(hidden, width)
+
+
+@pytest.mark.parametrize("tile", [64, 128, 192])
+@pytest.mark.parametrize("hidden", [4096, 5120, 7168])
+@pytest.mark.parametrize("compact", [False, True])
+def test_exporter_fc1_partial_matches_kernel_compact_activation_contract(tile, hidden, compact):
+    source = ROOT / "python/tools/aot/export_b12x_slices_aot.py"
+    tree = ast.parse(source.read_text())
+    assignment, = [node for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                   and any(isinstance(target, ast.Name) and target.id == "partial_cols"
+                           for target in node.targets)]
+    expression = compile(ast.Expression(assignment.value), str(source), "eval")
+    # Evaluate the exporter's actual pure expression, without importing CUDA.
+    # family is intentionally absent: raw/coded weight scales share FC1 storage.
+    cols = eval(expression, {"__builtins__": {}},
+                dict(selected_width=tile, hidden=hidden, compact=compact))
+    assert cols == (hidden if compact else tile // 4 + tile // 32)
+    kernel = (ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/w4a8_v41_slice.py").read_text()
+    assert kernel.count("self.slices * self.routes * (self.width // 4 + self.width // 32)") >= 2
+    assert "qs_offset = Int64(self.slices * self.routes * (self.width // 4))" in kernel
 
 
 def test_native_plan_rejects_mixed_decode_tilings():

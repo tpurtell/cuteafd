@@ -44,7 +44,8 @@ pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64
         let routes = product("V4 expert routes", &[capacity, topk])?;
         let atomic = capacity >= 256;
         let planes = intermediate.div_ceil(128);
-        let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, hidden])? };
+        // FC1 stores FP8 words and one u32 scale word per K32 activation block.
+        let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, 128 / 4 + 128 / 32])? };
         let output = product("V4 routed output", &[4, if atomic { capacity } else { routes }, hidden])?;
         let slots = [4, product("V4 packed routes", &[4, experts, routes])?, experts * 4, experts * 8,
             routes * 19 * 4, routes * 4, routes * 4, partial, output, experts * 4, experts * 4];
@@ -120,12 +121,33 @@ mod tp2_tests {
     use super::*;
     #[test]
     fn native_tp2_workspace_matches_export_slots() {
-        // Export widths are 128 at every capacity; ordered output below
-        // m256 dominates the native scratch at m80 for both V4 geometries.
-        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 297139088)] {
+        // Export widths are 128 throughout. Compact FC1 activation storage leaves
+        // m4096 token-output scratch as the largest arena for both geometries.
+        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 274701856)] {
             assert_eq!(deepseek_v4_tp2_native_workspace(h, i, e, k, 4096).unwrap(), expected);
         }
         assert!(deepseek_v4_tp2_native_workspace(4096, 2048, 256, 6, 4097).is_err());
+    }
+    #[test]
+    fn ordered_workspace_uses_compact_activation_storage() {
+        // At the small capacities all native roles have ordered route outputs.
+        // Compare TP1/TP2 planner arenas with the shared Spark exporter census.
+        for (h, i, experts) in [(4096, 2048, 256), (7168, 3072, 384)] {
+            for capacity in [1, 16, 80] {
+                for tp in [1, 2] {
+                    let scratch = cuteafd_core::mxfp4_layouts::native_scratch_bytes(
+                        h as usize, experts as usize, 6, (i / tp) as usize,
+                        if tp == 1 { 0 } else { 2 }, capacity, false).unwrap();
+                    let rows = u64::from(capacity);
+                    let (actual, tail) = if tp == 1 {
+                        (deepseek_v4_native_workspace(h, i, experts, 6, rows).unwrap(), rows * (h * 2 + 48))
+                    } else {
+                        (deepseek_v4_tp2_native_workspace(h, i, experts, 6, rows).unwrap(), rows * h * 4)
+                    };
+                    assert_eq!(actual, scratch + tail, "H{h}/TP{tp}/C{capacity}");
+                }
+            }
+        }
     }
     #[test]
     fn real_tp2_costs_match_catalog_reference() {
