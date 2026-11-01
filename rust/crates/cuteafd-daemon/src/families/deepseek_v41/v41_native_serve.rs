@@ -491,9 +491,12 @@ fn worker(
     drop(slot_storage);
     let packed_suffix = admission::scoped(p, "encoder suffix", ||
         slot_passes[0].new_packed_storage(&lib, capacity as usize))?;
+    let prompt_suffixes = admission::scoped(p, "encoder suffix", || (0..args.concurrency)
+        .map(|_| slot_passes[0].new_prompt_storage(&lib)).collect::<Result<Vec<_>>>())?;
     // Plan == runtime (WP6): the slot set and decode lanes are exactly the
     // planner's charges, nothing retained beyond them.
-    admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots)?;
+    admission::verify_target_charges(&lib, &args.native_lib, &[lib.cuda_get_device()?], decode_rows, reserve as u64, capacity, slots,
+        args.concurrency)?;
     admission::startup_phase(&lib, "v41/workspace:prefill-slots", device_total)?;
     let protocol_v2_timing = protocol_v2_timing();
     // Every replicated layout reserves its exact physical rank plane count; the
@@ -517,7 +520,8 @@ fn worker(
         0 => NativeTp4Wave::with_link(&lib, prefill_link.take().context("prefill link")?),
         _ => NativeTp4Wave::unlinked(&lib, capacity),
     }).collect::<Result<Vec<_>>>()?;
-    let mut prefill_slots = prefill_target::PrefillSlots { packed_suffix, slots: slot_passes.drain(..).zip(slot_transports).collect() };
+    let mut prefill_slots = prefill_target::PrefillSlots { packed_suffix, prompt_suffixes,
+        slots: slot_passes.drain(..).zip(slot_transports).collect() };
     cuteafd_ffi::memory_ledger::relabel_other("v41/transport");
     admission::startup_phase(&lib, "v41/transport", device_total)?;
     pass.install_attention_plan(attention_plan)?;
@@ -704,7 +708,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
                 let mut times = V41PrefillTimes::default();
                 let mut step = V41PrefillStep { lib, runtime, requests, prefill: &mut *prefill_slots, lease,
                     tokens: chunk, chunk_rows, waves, job,
-                    draft: draft.as_deref_mut(), hold, times: &mut times };
+                    draft: draft.as_deref_mut(), hold, times: &mut times, interleaved: false };
                 scores = Some(crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())?);
             } else if cold_step.decode {
                 let (pass, transport) = decode_lane.as_mut()
@@ -736,7 +740,7 @@ fn prefill<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(
     }
     let mut times = V41PrefillTimes::default();
     let mut step = V41PrefillStep { lib, runtime, requests, prefill: prefill_slots, lease, tokens, chunk_rows, waves,
-        job, draft, hold, times: &mut times };
+        job, draft, hold, times: &mut times, interleaved: false };
     crate::shared::prefill_share::run_to_end(&mut step, &mut V41Prefill::new())
 }
 

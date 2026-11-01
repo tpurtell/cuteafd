@@ -41,6 +41,16 @@ impl<L: PartialEq, W: CancelWave> PrefetchSlot<L, W> {
             else { index += 1; }
         }
     }
+    /// Cancels every wave held for an owner other than `lease`; returns how many.
+    pub(crate) fn cancel_others(&mut self, lease: &L) -> usize {
+        let before = self.held.len();
+        let mut index = 0;
+        while index < self.held.len() {
+            if self.held[index].0.lease != *lease { self.held.remove(index).1.cancel(); }
+            else { index += 1; }
+        }
+        before - self.held.len()
+    }
     /// Cancels any held wave.
     pub(crate) fn cancel(&mut self) {
         for (_, mut stale) in self.held.drain(..) { stale.cancel(); }
@@ -73,6 +83,20 @@ mod tests {
     fn key(lease: u32, position: u64, tokens: &[u32]) -> PrefetchKey<u32> { PrefetchKey { lease, position, tokens: tokens.to_vec() } }
     fn wave(id: u32, log: &Rc<RefCell<Vec<String>>>) -> Wave { Wave { id, log: log.clone(), cancelled: false } }
     fn leaked(log: &Rc<RefCell<Vec<String>>>) -> bool { log.borrow().iter().any(|line| line.ends_with("cancelled=false")) }
+
+    #[test]
+    fn another_owners_call_cancels_only_foreign_waves() {
+        let log = Rc::default();
+        let mut slot = PrefetchSlot::default();
+        slot.hold(key(1, 0, &[1]), wave(1, &log));
+        slot.hold(key(2, 0, &[2]), wave(2, &log));
+        slot.hold(key(1, 1, &[3]), wave(3, &log));
+        assert_eq!(slot.cancel_others(&2), 2);
+        assert!(slot.matching(&key(2, 0, &[2])).is_some());
+        assert_eq!(slot.cancel_others(&2), 0);
+        assert!(slot.take_matching(&key(2, 0, &[2])).is_some_and(|mut w| { w.cancel(); true }));
+        assert!(!leaked(&log));
+    }
 
     #[test]
     fn an_exact_reservation_adopts_the_prefetch() {

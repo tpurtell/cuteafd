@@ -233,10 +233,18 @@ pub(super) struct Wake<'p> {
     pub host_pending: bool,
     /// The deferred request and the release epoch it waits past.
     pub retry: Option<(&'p NativeRequest, u64)>,
+    /// Prompts wait in the decode-share queue: the lanes owe decode time until
+    /// this instant, then stop at their next completed boundary for a prefill
+    /// round. None with share 0 (no prompt waits across a decode round).
+    pub prefill_due: Option<Instant>,
 }
 impl Wake<'_> {
     pub fn poll_media(self, completed_rounds: u64) -> bool {
         self.media_pending && completed_rounds > 0
+    }
+    /// A completed lane round passed the decode share's debt (one round at least).
+    pub fn prefill_due(self, completed_rounds: u64) -> bool {
+        completed_rounds > 0 && self.prefill_due.is_some_and(|due| Instant::now() >= due)
     }
     /// `epoch` is the current release epoch: a deferred request retries once
     /// it moved (a request retired) or its client left.
@@ -283,6 +291,17 @@ mod tests {
         assert!(!backlog.ready(16, 16, false, 0));
         assert!(!Wake::default().poll_media(1));
         assert!(!Wake::default().poll_media(u64::MAX));
+    }
+    /// Waiting prompts stop the lanes once the owed decode time has passed,
+    /// after one completed round at least; nothing waits: no stop.
+    #[test]
+    fn owed_decode_time_stops_lanes_after_a_completed_round() {
+        let past = Wake { prefill_due: Some(Instant::now()), ..Default::default() };
+        assert!(!past.prefill_due(0), "one round at least");
+        assert!(past.prefill_due(1));
+        let future = Wake { prefill_due: Some(Instant::now() + Duration::from_secs(60)), ..Default::default() };
+        assert!(!future.prefill_due(5));
+        assert!(!Wake::default().prefill_due(u64::MAX), "share 0 never stops for prefill");
     }
     #[test]
     fn parked_image_limit_preserves_a_text_slot() -> Result<()> {

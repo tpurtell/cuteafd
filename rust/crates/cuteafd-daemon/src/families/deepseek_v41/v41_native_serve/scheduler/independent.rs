@@ -82,10 +82,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id, round_id,
                     "independent lane request retired");
             }
-            // Admission/prefill still uses both execution lanes.
+            // Admission and prefill rounds run between lane sets: both lanes stop.
             let members: Vec<_> = {
                 let active = active.borrow();
-                if wake.poll_media(round_id)
+                if wake.poll_media(round_id) || wake.prefill_due(round_id)
                     || (!wake.media_pending && wake.ready(active.iter().flatten().count(), active.len(), !receive.is_empty(),
                         requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
