@@ -107,7 +107,7 @@ def test_native_artifact_gate_uses_the_serving_tile_and_output_recipe(family):
         assert args[args.index("--width") + 1] == ",".join(
             f"{capacity}:{width}" for capacity in compare_sm.CAPACITIES.split(","))
         assert ("--atomic-min-capacity" in args) == (
-            family != "v41" and not role.startswith("spark_w"))
+            family == "dsv4p" and not role.startswith("spark_w"))
 
 
 @pytest.mark.parametrize("group,names", [
@@ -467,7 +467,9 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
             args = next(args for name, _, args in jobs if name == f"{family}-slices{suffix}")
             assert args[args.index("--geometry") + 1] == family
             assert args[args.index("--role") + 1] == role
-            assert args[args.index("--atomic-min-capacity") + 1] == "256"
+            assert ("--atomic-min-capacity" in args) == (family == "dsv4p")
+            if family == "dsv4p":
+                assert args[args.index("--atomic-min-capacity") + 1] == "256"
 
 
 @pytest.mark.parametrize("geometry", ["glmf", "glmf2", "kimik3"])

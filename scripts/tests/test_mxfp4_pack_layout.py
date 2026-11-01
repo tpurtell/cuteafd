@@ -139,7 +139,7 @@ def test_native_plan_rejects_mixed_decode_tilings():
 def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.native_slice_width(5120, 288, 121, 1, 192) == 128
     assert LAYOUTS.native_slice_width(5120, 288, 121, 16, 192) == 128
-    assert LAYOUTS.native_slice_width(5120, 288, 121, 256, 192) == 64
+    assert LAYOUTS.native_slice_width(5120, 288, 121, 256, 192) == 192
     assert LAYOUTS.native_slice_width(5120, 288, 120, 1, 192) == 192
     assert LAYOUTS.native_slice_width(4096, 352, 121, 16, 128) == 32
     assert LAYOUTS.native_slice_width(4096, 352, 121, 256, 128) == 128
@@ -310,3 +310,55 @@ def test_native_gpu_selftest_forward_oracle_matches_tensor_permutation(
     native_forward_map.forward(actual.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
                                n, k, half, scales, compact)
     np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("hidden,sm,widths", [
+    (4096, 121, [256, 288, 320, 352, 384, 416, 512, 672, 704, 1024]),
+    (5120, 121, [288, 320, 352, 384, 448, 512, 576, 768, 1152]),
+    (4096, 120, [1024, 2048]), (5120, 120, [1152, 2304]),
+])
+def test_native_prefill_inventory_is_hardware_and_capacity_qualified(hidden, sm, widths):
+    for width in widths:
+        for capacity in (256, 1024, 4096):
+            assert LAYOUTS.native_prefill(hidden, width, sm, capacity)
+        for capacity in (1, 16, 80, 128, 512):
+            assert not LAYOUTS.native_prefill(hidden, width, sm, capacity)
+    for width in widths:
+        assert not LAYOUTS.native_prefill(7168, width, sm, 256)
+    assert not LAYOUTS.native_prefill(5120, 288, 120, 256)
+
+
+def test_native_prefill_scratch_matches_pinned_seven_plane_contract():
+    source = ROOT / "third_party/sparkinfer/b12x/moe/_shared/kernels/v4_stream_pipeline.py"
+    tree = ast.parse(source.read_text())
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                 and node.name in ("stream_scratch_specs", "stream_scratch_layout")]
+    namespace = dict(meta_words=lambda e, t: 4 + 3 * e + t,
+                     stream_max_tiles=lambda e, p: (p + 127) // 128 + min(e, p),
+                     mxfp8_down_row_bytes=lambda w: (w + w // 32 + 15) // 16 * 16)
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"), namespace)
+    for row in LAYOUTS.layouts()["native_slices"]:
+        for capacity in row.get("prefill", []):
+            hidden, width = row["hidden"], row["width"]
+            experts = 384 if hidden == 5120 else 256
+            actual, total = LAYOUTS.native_prefill_scratch(capacity, hidden, width, experts, 6)
+            expected, expected_total = namespace["stream_scratch_layout"](capacity, hidden, width, experts, 6)
+            assert tuple(actual) == expected
+            assert total == expected_total
+            assert actual[-1]["shape"] == (capacity * 6, hidden)
+            assert actual[-2]["name"] == "grouped_route"
+            assert actual[-2]["nbytes"] == capacity * 6 * 4
+            assert all(plane["offset"] % 16 == 0 for plane in actual)
+
+
+@pytest.mark.parametrize("failure", ["duplicate", "capacity", "empty"])
+def test_native_prefill_policy_rejects_invalid_recipes(failure):
+    data = LAYOUTS.layouts()
+    if failure == "duplicate":
+        data["native_slices"].append(dict(data["native_slices"][0]))
+    elif failure == "capacity":
+        data["native_slices"][0]["prefill"] = [80]
+    else:
+        data["native_slices"][0].update(capacities=[], slices=[], prefill=[])
+    with pytest.raises(ValueError):
+        LAYOUTS.validate(data)

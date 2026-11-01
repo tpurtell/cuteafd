@@ -5,7 +5,8 @@ use std::sync::OnceLock;
 #[derive(Deserialize)]
 struct StorageHold { hidden: usize, width: usize, stored: usize }
 #[derive(Deserialize)]
-struct SliceRecipe { hidden: usize, width: usize, sm: u32, capacities: Vec<u32>, slices: Vec<usize> }
+struct SliceRecipe { hidden: usize, width: usize, sm: u32, capacities: Vec<u32>, slices: Vec<usize>,
+    #[serde(default)] prefill: Vec<u32> }
 #[derive(Deserialize)]
 struct Ownership { intermediate: usize, world: usize, unit: usize }
 #[derive(Deserialize)]
@@ -14,14 +15,20 @@ struct Layouts { schema: u32, storage_holds: Vec<StorageHold>, native_slices: Ve
 
 fn validate(data: &Layouts) -> Result<(), &'static str> {
     if data.schema != 1 { return Err("unsupported MXFP4 layout schema"); }
+    let mut keys = std::collections::HashSet::new();
     for row in &data.native_slices {
+        if !keys.insert((row.hidden, row.width, row.sm))
+            || row.prefill.iter().enumerate().any(|(i, c)| ![256, 1024, 4096].contains(c) || row.prefill[..i].contains(c))
+            || (row.capacities.is_empty() && row.prefill.is_empty()) {
+            return Err("invalid native MXFP4 prefill recipe");
+        }
         if row.capacities.len() != row.slices.len()
             || row.capacities.iter().enumerate().any(|(i, capacity)| row.capacities[..i].contains(capacity)) {
             return Err("native MXFP4 capacities must pair uniquely with slices");
         }
         let decode: Vec<_> = row.capacities.iter().zip(&row.slices)
             .filter_map(|(&capacity, &slice)| (capacity <= 80).then_some(slice)).collect();
-        if decode.is_empty() || !decode.windows(2).all(|pair| pair[0] == pair[1]) {
+        if (!row.capacities.is_empty() && decode.is_empty()) || !decode.windows(2).all(|pair| pair[0] == pair[1]) {
             return Err("native MXFP4 decode capacities must share one slice recipe");
         }
         if row.slices.iter().any(|slice| ![32, 64, 128, 192].contains(slice)) {
@@ -68,13 +75,39 @@ pub fn native_slice_width(hidden: usize, width: usize, sm: u32, capacity: u32,
         .unwrap_or(matching)
 }
 
+/// Hardware-qualified prefill backend from the same table as native decode.
+pub fn native_prefill(hidden: usize, width: usize, sm: u32, capacity: u32) -> bool {
+    layouts().native_slices.iter().any(|row| row.hidden == hidden && row.width == width
+        && row.sm == sm && row.prefill.contains(&capacity))
+}
+
+/// The seven STREAM planes and two native ABI per-expert trailing planes.
+pub fn native_prefill_scratch_bytes(hidden: usize, width: usize, experts: usize,
+    topk: usize, capacity: u32) -> Option<u64> {
+    stored_width(hidden, width)?;
+    if hidden % 512 != 0 || experts == 0 || topk == 0 || ![256, 1024, 4096].contains(&capacity) { return None; }
+    let (h, w, e) = (hidden as u64, width as u64, experts as u64);
+    let pairs = u64::from(capacity).checked_mul(topk as u64)?;
+    let tiles = pairs.div_ceil(128).checked_add(e.min(pairs))?;
+    let row = w.checked_add(w / 32)?.checked_add(15)?.checked_div(16)?.checked_mul(16)?;
+    let meta = 4u64.checked_add(e.checked_mul(3)?)?.checked_add(tiles)?.checked_mul(4)?;
+    [meta, pairs.checked_mul(4)?, pairs.checked_mul(4)?,
+        tiles.checked_mul(128)?.checked_mul(row)?, pairs.checked_mul(4)?, pairs.checked_mul(4)?,
+        pairs.checked_mul(h)?.checked_mul(4)?, e.checked_mul(4)?, e.checked_mul(4)?]
+        .into_iter().try_fold(0u64, |offset, size| offset.checked_add(15)?
+            .checked_div(16)?.checked_mul(16)?.checked_add(size))
+}
+
 /// `export_b12x_slices_aot.py`'s 16-byte-aligned scratch planes, excluding
-/// shared owner I/O. Ordered route output is retained for width-keyed artifacts;
-/// V4's legacy equal-width prefill objects use token-atomic output.
+/// shared owner I/O. Qualified prefill uses original-route STREAM planes;
+/// unqualified geometries retain their existing native slice recipe.
 pub fn native_scratch_bytes(hidden: usize, experts: usize, topk: usize,
     width: usize, role: u32, capacity: u32, coded: bool) -> Option<u64> {
     stored_width(hidden, width)?;
     if experts == 0 || topk == 0 || ![1, 16, 80, 256, 1024, 4096].contains(&capacity) { return None; }
+    if native_prefill(hidden, width, 121, capacity) {
+        return native_prefill_scratch_bytes(hidden, width, experts, topk, capacity);
+    }
     let matching = if coded && (crate::tp_units::native_role_width(role).is_none() || width % 192 == 0) {
         192
     } else { 128 };
@@ -140,7 +173,10 @@ mod tests {
         ] {
             for (capacity, tile) in [1, 16, 80, 256, 1024, 4096].into_iter().zip(tiles) {
                 let atomic = !coded && role < 65536 && capacity >= 256;
-                let expected = planes(hidden, experts, topk, width, tile, capacity, atomic);
+                let expected = if native_prefill(hidden as usize, width as usize, 121, capacity as u32) {
+                    native_prefill_scratch_bytes(hidden as usize, width as usize, experts as usize,
+                        topk as usize, capacity as u32).unwrap()
+                } else { planes(hidden, experts, topk, width, tile, capacity, atomic) };
                 assert_eq!(native_scratch_bytes(hidden as usize, experts as usize, topk as usize,
                     width as usize, role, capacity as u32, coded), Some(expected));
             }
@@ -155,13 +191,35 @@ mod tests {
     }
 
     #[test]
+    fn stream_scratch_matches_independent_plane_census() {
+        for row in &layouts().native_slices {
+            for &capacity in &row.prefill {
+                let (h, w, e, pairs) = (row.hidden as u64, row.width as u64,
+                    if row.hidden == 5120 { 384u64 } else { 256u64 }, u64::from(capacity) * 6);
+                let chunks = pairs.div_ceil(128) + e.min(pairs);
+                let mut expected = 0u64;
+                for size in [(4 + 3 * e + chunks) * 4, pairs * 4, pairs * 4,
+                    chunks * 128 * (w + w / 32).div_ceil(16) * 16, pairs * 4, pairs * 4,
+                    pairs * h * 4, e * 4, e * 4] {
+                    expected = expected.div_ceil(16) * 16 + size;
+                }
+                assert!(native_prefill(row.hidden, row.width, row.sm, capacity));
+                assert_eq!(native_prefill_scratch_bytes(row.hidden, row.width, e as usize, 6, capacity), Some(expected));
+                for decode in [1, 16, 80] { assert!(!native_prefill(row.hidden, row.width, row.sm, decode)); }
+            }
+        }
+        assert!(!native_prefill(7168, 768, 121, 256));
+        assert!(!native_prefill(5120, 288, 120, 256));
+    }
+
+    #[test]
     fn policy_rejects_capacity_dependent_decode_tiling_and_invalid_tiles() {
         let bundled = include_str!("../../../../scripts/build/mxfp4-layouts.json");
         for failure in 0..4 {
             let mut data: Layouts = serde_json::from_str(bundled).unwrap();
             match failure {
                 0 => data.native_slices[0].slices[1] = 64,
-                1 => data.native_slices[0].slices[3] = 256,
+                1 => data.native_slices[0].slices[2] = 256,
                 2 => data.native_slices[0].capacities[1] = 1,
                 _ => { data.native_slices[0].slices.pop(); }
             }
@@ -169,7 +227,8 @@ mod tests {
         }
         assert_eq!(native_slice_width(5120, 288, 120, 1, 192), 192);
         assert_eq!(native_slice_width(5120, 288, 121, 1, 192), 128);
-        assert_eq!(native_slice_width(5120, 288, 121, 256, 192), 64);
+        assert_eq!(native_slice_width(5120, 288, 121, 256, 192), 192);
+        assert!(native_prefill(5120, 288, 121, 256));
     }
 
     #[test]
