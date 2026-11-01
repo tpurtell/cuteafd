@@ -282,6 +282,26 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     fn draft_page_bytes(&self) -> usize {
         self.mtp.as_ref().map_or_else(|| self.drafter.as_ref().map_or(0, |draft| draft.page_bytes()), |mtp| mtp.page_bytes())
     }
+    fn draft_demand(&self, placement: &Placement) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        match (&self.mtp, &self.drafter) {
+            (Some(mtp), _) => mtp.reservation(placement.slot),
+            (None, Some(draft)) => draft.reservation(placement.slot),
+            (None, None) => None,
+        }
+    }
+    fn draft_reservable(&self) -> Option<usize> {
+        self.mtp.as_ref().map(|mtp| mtp.reservable()).or_else(|| self.drafter.as_ref().and_then(|d| d.reservable()))
+    }
+    fn draft_lifetime_rows(&self) -> Option<usize> {
+        self.mtp.as_ref().map(|mtp| mtp.lifetime_rows()).or_else(|| self.drafter.as_ref().and_then(|d| d.lifetime_rows()))
+    }
+    fn draft_admission(&self, origin: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        match (&self.mtp, &self.drafter) {
+            (Some(_), _) => Some(cuteafd_engine::reserve::DraftDemand { origin, headroom: 2usize.div_ceil(64) + 1, held: 0 }),
+            (None, Some(draft)) => draft.admission(origin),
+            (None, None) => None,
+        }
+    }
     fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
         if let Some(mtp) = &self.mtp { mtp.admit_pages(placement.slot, capacity)?; }
         if let Some(draft) = &self.drafter { draft.admit_pages(placement.slot, capacity)?; }

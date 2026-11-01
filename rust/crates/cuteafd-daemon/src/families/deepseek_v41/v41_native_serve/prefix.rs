@@ -473,7 +473,7 @@ impl<'a> V41Cache<'a> {
     }
 
     /// Units a reservation may still take: free units and units only retained snapshots hold.
-    pub fn reservable(&self) -> usize { self.cache.reservable() }
+    pub fn room(&self) -> cuteafd_engine::reserve::Room { self.cache.target_room() }
     /// No capture is still queued (its units return as an evictable snapshot when it lands).
     pub fn settled(&self) -> bool { self.cache.settled() }
 

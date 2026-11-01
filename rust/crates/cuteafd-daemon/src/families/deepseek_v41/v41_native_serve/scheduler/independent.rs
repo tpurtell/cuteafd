@@ -66,6 +66,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
     prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
     let lane = lease.index();
+    // Units released since this call began (a retirement on either lane) may resume a stalled
+    // request: only the drained boundary between the lanes plans that.
+    let released_at = requests.borrow().release_epoch();
     {
         let mut round_id = 0u64;
         loop {
@@ -90,10 +93,22 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                         requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
                 }
+                // A stalled request (on either lane) resumes at the boundary: stop as soon as
+                // units came back or its client left.
+                let stalled = active.iter().flatten().filter(|r| r.stalled).collect::<Vec<_>>();
+                if !stalled.is_empty() && (requests.borrow().release_epoch() != released_at
+                    || stalled.iter().any(|r| r.job.events.is_closed())) {
+                    lease.stop(); return Ok(());
+                }
                 active.iter().enumerate().filter_map(|(slot, r)|
                     r.as_ref().filter(|r| r.lane() == lane && !r.stalled).map(|_| slot)).collect()
             };
-            if members.is_empty() { return Ok(()); }
+            if members.is_empty() {
+                // Nothing left on this lane: with a request stalled, end the peer's run too so
+                // the boundary plans now rather than at the peer's natural end.
+                if active.borrow().iter().flatten().any(|r| r.stalled) { lease.stop(); }
+                return Ok(());
+            }
             ensure!(members.len() <= 8, "independent lane exceeds eight requests");
             // A member whose next round would pass its reservation needs a top-up, which the
             // outer loop plans at a boundary where both lanes have drained.

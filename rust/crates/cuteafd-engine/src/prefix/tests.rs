@@ -408,9 +408,9 @@ fn extending_a_live_placement_waits_instead_of_failing_and_counts_snapshot_pages
     let mut a = cache.admit_cold(&fake, 1, 1, placement).unwrap().placement;
     let b = cache.admit_cold(&fake, 1, 1, placement).unwrap().placement;
     let rows = cache.pool().page_rows();
-    assert_eq!((cache.reservable(), cache.settled()), (6, true));
+    assert_eq!((cache.room(&fake).total(), cache.settled()), (6, true));
     assert!(cache.extend(&fake, &mut a, 7 * rows).unwrap());
-    assert_eq!((a.pages.len(), cache.reservable()), (7, 0));
+    assert_eq!((a.pages.len(), cache.room(&fake).total()), (7, 0));
     assert!(!cache.extend(&fake, &mut a, 8 * rows).unwrap(), "no page: the request waits");
     assert_eq!(a.pages.len(), 7);
     assert!(cache.extend(&fake, &mut a, 3 * rows).unwrap(), "already reserved");

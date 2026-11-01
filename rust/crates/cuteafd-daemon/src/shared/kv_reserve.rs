@@ -9,7 +9,7 @@
 //! never enters a round, so graph shapes are those of a smaller round: no capture.
 use anyhow::Result;
 use cuteafd_engine::prefix::{PrefixCache, PrefixFamily};
-use cuteafd_engine::reserve::{Action, Demand, KvReserve, Lease, ReserveConfig, ReserveStats};
+use cuteafd_engine::reserve::{Demand, KvReserve, Ledger, Lease, ReserveConfig, ReserveStats, Room};
 use cuteafd_hostcache::copy::CopyEngine;
 
 /// The reservation options, the same in every family.
@@ -87,17 +87,49 @@ pub(crate) struct Holding<'p> {
     pub pages: &'p [u32],
 }
 
-/// One round's outcome for the scheduler.
-#[derive(Default)]
-pub(crate) struct Round<A> {
-    /// Requests that end now with `finish_reason=length` (early termination).
-    pub ended: Vec<A>,
-    /// Stalled requests whose client went away: release them, nothing to send.
-    pub cancelled: Vec<A>,
-}
-
 pub(crate) struct Reserve {
     policy: KvReserve,
+}
+
+/// One serve loop's round over the shared policy ([`KvReserve::round`]): decoding requests are
+/// `active` (running) then `stalled`, holders (prefilling) follow; an ended request is handed to
+/// `end`, which finishes it with `length` and releases its pages before anything is granted.
+struct Glue<'c, 'f, 'h, 'p, E: CopyEngine, M: Clone + Default, F: PrefixFamily<M>, A: Reserving<Placement = F::Placement>,
+    End: FnMut(&mut PrefixCache<E, M>, A)> {
+    cache: &'c mut PrefixCache<E, M>,
+    family: &'f F,
+    decoding: Vec<(A, bool)>,
+    holding: &'h [Holding<'p>],
+    end: End,
+    error: Option<anyhow::Error>,
+}
+
+impl<E: CopyEngine, M: Clone + Default, F: PrefixFamily<M>, A: Reserving<Placement = F::Placement>,
+    End: FnMut(&mut PrefixCache<E, M>, A)> Ledger for Glue<'_, '_, '_, '_, E, M, F, A, End> {
+    fn room(&self) -> Room { self.cache.room(self.family) }
+    fn settled(&self) -> bool { self.cache.settled() }
+    fn demands(&self) -> (Vec<Demand<'_>>, Vec<bool>) {
+        let decoding = self.decoding.iter().map(|(a, _)| {
+            let pages = self.family.pages(a.placement());
+            Demand { lease: *a.lease(), held: pages.len(), pages, committed: a.committed(), produced: a.produced(),
+                decoding: true, draft: self.family.draft_demand(a.placement()) }
+        });
+        let holding = self.holding.iter().map(|h| Demand { lease: h.lease, held: h.pages.len(), pages: h.pages,
+            committed: h.lease.prompt(), produced: 0, decoding: false, draft: None });
+        (decoding.chain(holding).collect(), self.decoding.iter().map(|(_, stalled)| *stalled).collect())
+    }
+    fn end(&mut self, index: usize) {
+        let (request, _) = self.decoding.remove(index);
+        (self.end)(self.cache, request);
+    }
+    fn grow(&mut self, index: usize, pages: usize) -> bool {
+        let rows = pages * self.cache.pool().page_rows();
+        match self.cache.extend(self.family, self.decoding[index].0.placement_mut(), rows) {
+            Ok(grown) => grown,
+            Err(error) => { self.error.get_or_insert(error.into()); false }
+        }
+    }
+    fn set_stalled(&mut self, index: usize, stalled: bool) { self.decoding[index].1 = stalled; }
 }
 
 impl Reserve {
@@ -118,10 +150,13 @@ impl Reserve {
         value
     }
 
-    /// Rows past which a request's KV may not grow: the context, and what the pool can hold
-    /// at all (a lifetime the pool cannot hold ends with `length` there).
-    pub fn limit<E: CopyEngine, M: Clone + Default>(cache: &PrefixCache<E, M>, context: usize) -> usize {
-        context.min(cache.pool().capacity() * cache.pool().page_rows())
+    /// Rows past which a request's KV may not grow: the context, what the pool can hold at all,
+    /// and what the drafter's page pool can hold with its headroom (a lifetime the pools cannot
+    /// hold ends with `length` there).
+    pub fn limit<E: CopyEngine, M: Clone + Default, F: PrefixFamily<M>>(cache: &PrefixCache<E, M>, family: &F,
+        context: usize) -> usize {
+        let target = context.min(cache.pool().capacity() * cache.pool().page_rows());
+        family.draft_lifetime_rows().map_or(target, |rows| target.min(rows))
     }
 
     /// The lease of a request: `output` tokens at most, rounds of `step` rows, within `limit`
@@ -131,70 +166,46 @@ impl Reserve {
         self.policy.lease(prompt, output, step, limit)
     }
 
-    /// Rows to admit a request with, or `None` while it waits behind the drain rule.
+    /// Rows to admit a request with, or `None` while it waits behind the drain rule. `origin`
+    /// is where its drafter's live context starts (its expected restore point, else 0).
     #[allow(clippy::too_many_arguments)]
     pub fn admit<E: CopyEngine, M: Clone + Default, F: PrefixFamily<M>, A: Reserving<Placement = F::Placement>>(
         &mut self, cache: &PrefixCache<E, M>, family: &F, active: &[A], stalled: &[A], holding: &[Holding<'_>],
         lease: &Lease) -> Option<usize> {
-        let demands = self.demands(family, active, stalled, holding);
-        let pages = self.policy.admit(cache.reservable(), &demands, lease, !stalled.is_empty())?;
+        let decoding = active.iter().chain(stalled).map(|a| {
+            let pages = family.pages(a.placement());
+            Demand { lease: *a.lease(), held: pages.len(), pages, committed: a.committed(), produced: a.produced(),
+                decoding: true, draft: family.draft_demand(a.placement()) }
+        });
+        let holders = holding.iter().map(|h| Demand { lease: h.lease, held: h.pages.len(), pages: h.pages,
+            committed: h.lease.prompt(), produced: 0, decoding: false, draft: None });
+        let demands: Vec<Demand<'_>> = decoding.chain(holders).collect();
+        let pages = self.policy.admit(cache.room(family), &demands, lease, family.draft_admission(0),
+            !stalled.is_empty())?;
         Some(self.policy.admission_rows(lease).min(pages * self.policy.page_rows()))
     }
 
-    fn demands<'p, M: Clone + Default, F: PrefixFamily<M>, A: Reserving<Placement = F::Placement>>(
-        &self, family: &F, active: &'p [A], stalled: &'p [A], holding: &'p [Holding<'p>]) -> Vec<Demand<'p>>
-        where F::Placement: 'p {
-        let decoding = active.iter().chain(stalled).map(|a| {
-            let pages = family.pages(a.placement());
-            Demand { lease: *a.lease(), held: pages.len(), pages, committed: a.committed(),
-                produced: a.produced(), decoding: true }
-        });
-        let prefilling = holding.iter().map(|h| Demand { lease: h.lease, held: h.pages.len(), pages: h.pages,
-            committed: h.lease.prompt(), produced: 0, decoding: false });
-        decoding.chain(prefilling).collect()
-    }
-
     /// Plan and apply this round's reservations. On return `active` holds the requests that
-    /// run (grown as needed), `stalled` those that wait, and the result those that end now.
+    /// run (grown as needed) and `stalled` those that wait. A request that ends now (early
+    /// termination, the deadlock break) or a stalled one whose client left is handed to `end`,
+    /// which must finish it (`length`, unless closed) and release its pages at once: the round
+    /// grants from the pool as it stands after those releases.
     pub fn round<E: CopyEngine, M: Clone + Default, F: PrefixFamily<M>, A: Reserving<Placement = F::Placement>>(
         &mut self, cache: &mut PrefixCache<E, M>, family: &F, active: &mut Vec<A>, stalled: &mut Vec<A>,
-        holding: &[Holding<'_>]) -> Result<Round<A>> {
-        let mut out = Round { ended: Vec::new(), cancelled: Vec::new() };
+        holding: &[Holding<'_>], mut end: impl FnMut(&mut PrefixCache<E, M>, A)) -> Result<()> {
         let mut index = 0;
         while index < stalled.len() {
-            if stalled[index].closed() { out.cancelled.push(stalled.remove(index)); } else { index += 1; }
+            if stalled[index].closed() { end(cache, stalled.remove(index)); } else { index += 1; }
         }
-        if active.is_empty() && stalled.is_empty() { return Ok(out); }
-        if !active.iter().chain(stalled.iter()).any(|a| self.policy.needs_top_up(&Demand { lease: *a.lease(),
-            held: family.pages(a.placement()).len(), pages: &[], committed: a.committed(), produced: a.produced(),
-            decoding: true })) {
-            // Nothing to grow: every stalled request resumes (none should be stalled then).
-            active.append(stalled);
-            return Ok(out);
+        if active.is_empty() && stalled.is_empty() { return Ok(()); }
+        let decoding = active.drain(..).map(|a| (a, false)).chain(stalled.drain(..).map(|a| (a, true))).collect();
+        let mut glue = Glue { cache, family, decoding, holding, end: &mut end, error: None };
+        self.policy.round(&mut glue);
+        let Glue { decoding, error, .. } = glue;
+        for (request, is_stalled) in decoding {
+            if is_stalled { stalled.push(request) } else { active.push(request) }
         }
-        let was: Vec<bool> = (0..active.len()).map(|_| false).chain((0..stalled.len()).map(|_| true)).collect();
-        let actions = {
-            let demands = self.demands(family, active, stalled, holding);
-            self.policy.plan(cache.reservable(), &demands, &was, cache.settled())
-        };
-        let mut all: Vec<A> = active.drain(..).chain(stalled.drain(..)).collect();
-        let page_rows = self.policy.page_rows();
-        for (mut request, action) in all.drain(..).zip(actions) {
-            match action {
-                Action::Run => active.push(request),
-                Action::Grow(pages) => {
-                    if cache.extend(family, request.placement_mut(), pages * page_rows)? {
-                        active.push(request);
-                    } else {
-                        // The pool differs from the plan (a capture still queued): wait.
-                        stalled.push(request);
-                    }
-                }
-                Action::Stall => stalled.push(request),
-                Action::Terminate => out.ended.push(request),
-            }
-        }
-        Ok(out)
+        error.map_or(Ok(()), Err)
     }
 }
 
@@ -252,7 +263,7 @@ mod tests {
 
     fn admit(reserve: &mut Reserve, cache: &mut PrefixCache<StubCopyEngine>, family: &Paged, active: &[Request],
         stalled: &[Request], prompt: usize, output: usize) -> Option<Request> {
-        let lease = reserve.lease(prompt, output, 4, Reserve::limit(cache, 1 << 20)).unwrap();
+        let lease = reserve.lease(prompt, output, 4, Reserve::limit(cache, family, 1 << 20)).unwrap();
         let rows = reserve.admit(cache, family, active, stalled, &[], &lease)?;
         let placement = cache.admit_cold(family, prompt, rows, |pages| Placed { pages }).unwrap().placement;
         Some(Request { lease, placement, len: prompt, produced: 1, closed: false })
@@ -290,8 +301,12 @@ mod tests {
         while !(active.is_empty() && stalled.is_empty()) {
             rounds += 1;
             assert!(rounds < 10_000);
-            let round = reserve.round(&mut cache, &family, &mut active, &mut stalled, &[])?;
-            assert!(round.ended.is_empty() && round.cancelled.is_empty(), "nothing ends early by default");
+            let mut ended = 0;
+            reserve.round(&mut cache, &family, &mut active, &mut stalled, &[], |cache, request| {
+                cache.release(&family, &request.placement.pages).unwrap();
+                ended += 1;
+            })?;
+            assert_eq!(ended, 0, "nothing ends early by default");
             saw_stall |= !stalled.is_empty();
             for request in &active {
                 assert!(request.len + 4 <= request.placement.pages.len() * ROWS || request.len + 4 > request.lease.lifetime());
@@ -321,12 +336,11 @@ mod tests {
         }
         let mut ended = 0;
         for _ in 0..2000 {
-            let round = reserve.round(&mut cache, &family, &mut active, &mut stalled, &[])?;
-            for request in round.ended {
+            reserve.round(&mut cache, &family, &mut active, &mut stalled, &[], |cache, request| {
                 assert!(request.produced >= 200, "only past the threshold");
-                cache.release(&family, &request.placement.pages)?;
+                cache.release(&family, &request.placement.pages).unwrap();
                 ended += 1;
-            }
+            })?;
             decode(&mut active, 4);
             let (done, running): (Vec<_>, Vec<_>) = active.drain(..).partition(|r| r.len >= r.lease.end());
             active = running;
@@ -338,8 +352,12 @@ mod tests {
         let (family, mut cache, mut reserve) = setup(24, 256, 0, -1);
         let mut stalled = vec![admit(&mut reserve, &mut cache, &family, &[], &[], 64, 100).unwrap()];
         stalled[0].closed = true;
-        let round = reserve.round(&mut cache, &family, &mut Vec::new(), &mut stalled, &[])?;
-        assert_eq!((round.cancelled.len(), stalled.len()), (1, 0));
+        let mut cancelled = 0;
+        reserve.round(&mut cache, &family, &mut Vec::new(), &mut stalled, &[], |cache, request| {
+            cache.release(&family, &request.placement.pages).unwrap();
+            cancelled += 1;
+        })?;
+        assert_eq!((cancelled, stalled.len()), (1, 0));
         Ok(())
     }
 

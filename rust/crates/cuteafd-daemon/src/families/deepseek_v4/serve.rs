@@ -435,7 +435,7 @@ fn speculative_step(
         engine.decode_rows.saturating_sub(active.len())
             .min(a.job.max_tokens.saturating_sub(a.generated + 1))
             .min(a.capacity.saturating_sub(a.placement.len + 2))
-            .min(reserved_drafts(a.placement.len + 1, a.placement.units.len(), SOURCE_PAGE_TOKENS))
+            .min(reserved_drafts(a.placement.len, a.placement.units.len(), SOURCE_PAGE_TOKENS))
     }).collect();
     let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
     let widths: Vec<_> = std::iter::once(0).chain(shared.policy.widths().iter().copied()).collect();
@@ -792,7 +792,7 @@ fn schedule(
                 continue;
             }
             let lease = match reserve.lease(tokens.len(), job.max_tokens, engine.decode_rows,
-                Reserve::limit(&cache, engine.max_context)) {
+                Reserve::limit(&cache, &family, engine.max_context)) {
                 Ok(lease) => lease,
                 Err(error) => { reject(&job, format!("{error}")); continue; }
             };
@@ -1032,19 +1032,22 @@ fn schedule(
             prefills.settle(!active.is_empty());
         }
         let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.units }).collect();
-        let round = reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding)?;
-        drop(holding);
-        for mut request in round.ended.into_iter().chain(round.cancelled) {
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
             if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
             if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;
-            release(&family, &mut cache, &mut states, &request.placement);
-        }
+            release(&family, cache, &mut states, &request.placement);
+        })?;
+        drop(holding);
         if active.is_empty() {
             if !stalled.is_empty() {
+                // Only stalled requests: wait for a capture or prefill to return pages.
                 publish(stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
+                std::thread::park_timeout(Duration::from_millis(1));
             }
             continue;
         }

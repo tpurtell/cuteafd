@@ -8,7 +8,7 @@ pub(crate) mod layout;
 use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
 use crate::families::deepseek_v41::v41_backbone_cache::{CacheLease, UNIT_TOKENS};
-use cuteafd_engine::reserve::{Action, Demand, KvReserve, Lease, ReserveConfig};
+use cuteafd_engine::reserve::{Demand, KvReserve, Ledger, Lease, Room};
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
@@ -34,7 +34,7 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
         tokens: tokens.to_vec(), image_keys, next_after_commit: None,
-        reserve: KvReserve::new(ReserveConfig::new(16_384, 0, -1, 4).unwrap(), UNIT_TOKENS)
+        reserve: KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 4).unwrap(), UNIT_TOKENS)
             .lease(tokens.len(), 4, 1, usize::MAX).unwrap(), stalled: false };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
@@ -272,23 +272,87 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
 }
 
 /// The drain rule's view of every leased request: decoding ones (stalled or not) from their
-/// slots, and `holders` (waiting on encodes or packed into the admission wave) at their prompt.
-/// Also whether any request is stalled (a new admission waits behind it).
+/// slots, then `holders` (waiting on encodes or packed into the admission wave) at their
+/// prompt. Also the slots of the decoding ones, in the same order.
 fn reserve_demands<'r>(reserve: &KvReserve, requests: &'r Requests<'_>, active: &[Option<Active<'_>>],
-    holders: &[(CacheLease, &admission::Prepared)], verify_rows: usize, limit: usize) -> Result<(Vec<Demand<'r>>, bool)> {
+    holders: &[(CacheLease, &admission::Prepared)], verify_rows: usize, limit: usize)
+    -> Result<(Vec<Demand<'r>>, Vec<usize>)> {
     let mut demands = Vec::new();
-    for request in active.iter().flatten().filter(|r| !r.finished) {
+    let mut slots = Vec::new();
+    for (slot, request) in active.iter().enumerate() {
+        let Some(request) = request.as_ref().filter(|r| !r.finished) else { continue };
         let pages = requests.units(request.lease)?;
         demands.push(Demand { lease: request.reserve, held: pages.len(), pages,
-            committed: requests.cache().committed_end(request.lease)? as usize, produced: request.generated, decoding: true });
+            committed: requests.cache().committed_end(request.lease)? as usize, produced: request.generated,
+            decoding: true, draft: None });
+        slots.push(slot);
     }
     for &(lease, prepared) in holders {
         let pages = requests.units(lease)?;
         let Ok(reserved) = reserve.lease(prepared.prompt.len(), prepared.job.max_tokens, verify_rows, limit) else { continue };
         demands.push(Demand { lease: reserved, held: pages.len(), pages, committed: prepared.prompt.len(), produced: 0,
-            decoding: false });
+            decoding: false, draft: None });
     }
-    Ok((demands, active.iter().flatten().any(|r| r.stalled)))
+    Ok((demands, slots))
+}
+
+/// V4.1's round over the shared policy: units live in `Requests`, decoding requests in their
+/// slots. An ended request finishes with `length` and is retired at once (its units return
+/// before anything is granted); no lane round is in flight.
+struct V41Ledger<'s, 'a, 'd, 'w, 'p, C: DraftChain<'a>> {
+    /// Lease arithmetic for the holders (no counters: the driving policy keeps those).
+    reserve: KvReserve,
+    requests: &'s mut Requests<'a>,
+    active: &'s mut [Option<Active<'a>>],
+    holders: &'s [(CacheLease, &'p admission::Prepared)],
+    prefixes: &'s mut PrefixCache<'a>,
+    draft: Option<&'d mut DraftRuntime<'w, 'a, C>>,
+    verify_rows: usize,
+    limit: usize,
+    error: Option<anyhow::Error>,
+}
+
+impl<'a, C: DraftChain<'a>> V41Ledger<'_, 'a, '_, '_, '_, C> {
+    fn slots(&self) -> Vec<usize> {
+        (0..self.active.len()).filter(|&slot| self.active[slot].as_ref().is_some_and(|r| !r.finished)).collect()
+    }
+    fn fail(&mut self, error: anyhow::Error) { self.error.get_or_insert(error); }
+}
+
+impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
+    fn room(&self) -> Room { self.prefixes.room() }
+    fn settled(&self) -> bool { self.prefixes.settled() }
+    fn demands(&self) -> (Vec<Demand<'_>>, Vec<bool>) {
+        match reserve_demands(&self.reserve, self.requests, self.active, self.holders, self.verify_rows, self.limit) {
+            Ok((demands, slots)) => {
+                let stalled = slots.iter().map(|&slot| self.active[slot].as_ref().unwrap().stalled).collect();
+                (demands, stalled)
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        }
+    }
+    fn end(&mut self, index: usize) {
+        let slot = self.slots()[index];
+        let mut request = self.active[slot].take().unwrap();
+        request.stalled = false;
+        let ended = request.end(InferenceFinishReason::Length)
+            .and_then(|()| retire_request(request, self.requests, self.prefixes, self.draft.as_deref_mut()));
+        if let Err(error) = ended { self.fail(error); }
+        // Return the units to the pool now (the cache releases a retired request's units).
+        if let Err(error) = self.prefixes.tick(self.requests, self.draft.as_deref_mut()) { self.fail(error); }
+    }
+    fn grow(&mut self, index: usize, pages: usize) -> bool {
+        let slot = self.slots()[index];
+        let lease = self.active[slot].as_ref().unwrap().lease;
+        match self.prefixes.extend(self.requests, self.draft.as_deref_mut(), lease, pages * UNIT_TOKENS) {
+            Ok(grown) => grown,
+            Err(error) => { self.fail(error); false }
+        }
+    }
+    fn set_stalled(&mut self, index: usize, stalled: bool) {
+        let slot = self.slots()[index];
+        self.active[slot].as_mut().unwrap().stalled = stalled;
+    }
 }
 
 /// Plan this boundary's reservation top-ups: grow granted requests' units, stall refused ones
@@ -297,33 +361,19 @@ fn reserve_demands<'r>(reserve: &KvReserve, requests: &'r Requests<'_>, active: 
 #[allow(clippy::too_many_arguments)]
 fn reserve_round<'a, C: DraftChain<'a>>(reserve: &mut KvReserve, requests: &mut Requests<'a>,
     active: &mut [Option<Active<'a>>], holders: &[(CacheLease, &admission::Prepared)], prefixes: &mut PrefixCache<'a>,
-    mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, verify_rows: usize, limit: usize) -> Result<()> {
-    let slots: Vec<usize> = (0..active.len()).filter(|&slot| active[slot].as_ref().is_some_and(|r| !r.finished)).collect();
-    let actions = {
-        let (demands, _) = reserve_demands(reserve, requests, active, holders, verify_rows, limit)?;
-        if !demands.iter().any(|d| reserve.needs_top_up(d)) {
-            for &slot in &slots { active[slot].as_mut().unwrap().stalled = false; }
-            return Ok(());
-        }
-        let was: Vec<bool> = slots.iter().map(|&slot| active[slot].as_ref().unwrap().stalled)
-            .chain(std::iter::repeat_n(false, holders.len())).collect();
-        reserve.plan(prefixes.reservable(), &demands, &was, prefixes.settled())
-    };
-    for (&slot, action) in slots.iter().zip(actions) {
-        let request = active[slot].as_mut().unwrap();
-        match action {
-            Action::Run => request.stalled = false,
-            Action::Grow(pages) => {
-                request.stalled = !prefixes.extend(requests, draft.as_deref_mut(), request.lease, pages * UNIT_TOKENS)?;
-            }
-            Action::Stall => request.stalled = true,
-            Action::Terminate => {
-                request.stalled = false;
-                request.end(InferenceFinishReason::Length)?;
-            }
+    draft: Option<&mut DraftRuntime<'_, 'a, C>>, verify_rows: usize, limit: usize) -> Result<()> {
+    // A stalled request whose client left retires now (its units return to the pool).
+    for entry in active.iter_mut() {
+        if entry.as_ref().is_some_and(|r| r.stalled && r.job.events.is_closed()) {
+            let mut request = entry.take().unwrap();
+            request.stalled = false;
+            retire_request(request, requests, prefixes, None::<&mut DraftRuntime<'_, 'a, C>>)?;
         }
     }
-    Ok(())
+    let mut ledger = V41Ledger { reserve: KvReserve::new(reserve.config(), UNIT_TOKENS), requests, active, holders,
+        prefixes, draft, verify_rows, limit, error: None };
+    reserve.round(&mut ledger);
+    ledger.error.map_or(Ok(()), Err)
 }
 
 type PackedAdmission = (admission::Prepared, u64, CacheLease, usize, ImageKeys,
@@ -700,8 +750,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             let rows = {
                 let holders: Vec<_> = media.leased().map(|l| (l.lease, &l.prepared))
                     .chain(admitted.iter().map(|(prepared, _, lease, ..)| (*lease, prepared))).collect();
-                let (demands, any_stalled) = reserve_demands(&reserve, requests, &active, &holders, verify_rows, limit)?;
-                match reserve.admit(prefixes.reservable(), &demands, &new_lease, any_stalled) {
+                let (demands, _) = reserve_demands(&reserve, requests, &active, &holders, verify_rows, limit)?;
+                let any_stalled = active.iter().flatten().any(|r| r.stalled);
+                match reserve.admit(prefixes.room(), &demands, &new_lease, None, any_stalled) {
                     Some(pages) => reserve.admission_rows(&new_lease).min(pages * UNIT_TOKENS),
                     None if busy_slots > 0 || !admitted.is_empty() => {
                         tracing::debug!(busy_slots, "waiting for the KV drain rule");
@@ -2893,7 +2944,7 @@ mod sampling_tests {
         let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
         let mut encoder = cuteafd_engine::media::FakeEncoder::default();
         let media = admission::Media::new(&mut encoder, 4).unwrap();
-        let reserve = KvReserve::new(ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
+        let reserve = KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
         let snapshot = serving_stats(&disabled, &waiter, &media, &reserve, 2);
         assert!(snapshot["admission"]["deferred"].is_u64(), "missing admission deferred in {snapshot}");
         for key in ["top_ups", "stalls", "early_terminations", "deadlock_breaks", "admission_waits"] {

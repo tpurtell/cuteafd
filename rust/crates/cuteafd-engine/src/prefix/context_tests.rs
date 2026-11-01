@@ -387,7 +387,7 @@ fn admission_and_growth_stop_at_either_half_and_waiters_see_it() {
     assert!(matches!(waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), true, |_| false),
         AdmissionPoll::Blocked));
     // Growing to 8 pages needs GPU1's last page.
-    assert_eq!(cache.reservable(), 0, "twice the scarcer half");
+    assert_eq!(cache.room(&fake), crate::reserve::Room::parity([0, 1]), "per half");
     let mut grown = placement(a);
     assert!(cache.extend(&fake, &mut grown, 8 * ROWS).unwrap());
     assert_eq!(cache.pool().free_halves(), [0, 0]);

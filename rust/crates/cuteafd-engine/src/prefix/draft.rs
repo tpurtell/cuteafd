@@ -209,6 +209,24 @@ impl DraftPagePool {
         Ok(())
     }
 
+    /// What `binding`'s live reservation holds, for the KV reservation policy: its origin, the
+    /// headroom `admit` adds for a proposal `block`, and the pages its credit holds.
+    pub fn reservation(&self, binding: DraftBinding, block: usize) -> Result<crate::reserve::DraftDemand> {
+        let s = self.sequence(binding)?;
+        Ok(crate::reserve::DraftDemand { origin: s.origin, headroom: block.div_ceil(DRAFT_PAGE_ROWS) + 1,
+            held: s.credit.max(s.pages.len()) })
+    }
+
+    /// Rows one live reservation can reach with proposal `block` ([`crate::reserve::draft_lifetime_rows`]).
+    pub fn lifetime_rows(&self, block: usize) -> usize { crate::reserve::draft_lifetime_rows(self.capacity(), block) }
+
+    /// Pages a live credit can still claim: free pages and unpinned revocable snapshot pages,
+    /// less every live credit not yet materialized.
+    pub fn reservable(&self) -> usize {
+        let revocable: usize = self.snapshots.values().filter(|s| s.revocable && s.pins == 0).map(|s| s.pages.len()).sum();
+        (self.free() + revocable).saturating_sub(self.outstanding_credit())
+    }
+
     /// Bind cold(P) without allocating a page or exposing the previous occupant's bytes.
     pub fn bind(&mut self, slot: usize, origin: usize) -> Result<DraftBinding> {
         self.vacant(slot)?;

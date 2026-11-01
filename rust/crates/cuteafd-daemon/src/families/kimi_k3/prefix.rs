@@ -209,6 +209,14 @@ impl<'a> KimiPrefix<'a> {
 impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     type Placement = Placement;
     fn draft_page_bytes(&self) -> usize { self.0.draft.as_ref().map_or(0, |draft| draft.common().mla_draft_page_bytes()) }
+    fn draft_demand(&self, placement: &Placement) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        self.0.draft.as_ref()?.common().mla_reservation(placement.slot)
+    }
+    fn draft_reservable(&self) -> Option<usize> { self.0.draft.as_ref()?.common().mla_reservable() }
+    fn draft_lifetime_rows(&self) -> Option<usize> { self.0.draft.as_ref()?.common().mla_lifetime_rows() }
+    fn draft_admission(&self, origin: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        self.0.draft.as_ref()?.common().mla_admission(origin)
+    }
     fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
         if let Some(draft) = &self.0.draft {
             let _scope = draft.device().enter()?;

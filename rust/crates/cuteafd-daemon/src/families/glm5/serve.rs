@@ -634,7 +634,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
             }
-            let lease = match reserve.lease(tokens.len(), job.max_tokens, DECODE_ROWS, Reserve::limit(&cache, engine.max_context)) {
+            let lease = match reserve.lease(tokens.len(), job.max_tokens, DECODE_ROWS, Reserve::limit(&cache, &family, engine.max_context)) {
                 Ok(lease) => lease,
                 Err(error) => { reject(&job, format!("{error}")); continue; }
             };
@@ -888,19 +888,22 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             prefills.settle(!active.is_empty());
         }
         let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages }).collect();
-        let round = reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding)?;
-        drop(holding);
-        for mut request in round.ended.into_iter().chain(round.cancelled) {
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
             if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
             if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;
-            release(&family, &mut cache, &mut free_slots, &request.placement, request.slot);
-        }
+            release(&family, cache, &mut free_slots, &request.placement, request.slot);
+        })?;
+        drop(holding);
         if active.is_empty() {
             if !stalled.is_empty() {
+                // Only stalled requests: wait for a capture or prefill to return pages.
                 publish(stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
+                std::thread::park_timeout(Duration::from_millis(1));
             }
             continue;
         }

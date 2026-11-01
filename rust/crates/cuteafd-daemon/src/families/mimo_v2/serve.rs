@@ -649,7 +649,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             }
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
             let lease = match reserve.lease(ready.job().tokens.len(), ready.job().job.max_tokens, DECODE_ROWS,
-                Reserve::limit(cache, engine.max_context)) {
+                Reserve::limit(cache, family, engine.max_context)) {
                 Ok(lease) => lease,
                 Err(error) => { reject(&ready, format!("{error}")); continue; }
             };
@@ -927,9 +927,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         }
         // Reservation top-ups only between rounds; a refused one stalls the request.
         let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages }).collect();
-        let round = reserve.round(cache, family, &mut active, &mut stalled, &holding)?;
-        drop(holding);
-        for mut request in round.ended.into_iter().chain(round.cancelled) {
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(cache, family, &mut active, &mut stalled, &holding, |cache, mut request| {
             if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
             if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
             requests += 1;
@@ -937,7 +937,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             failures.finished(&request.job.events);
             request.ticket.done(request.generated);
             release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
-        }
+        })?;
+        drop(holding);
         if active.is_empty() {
             if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;

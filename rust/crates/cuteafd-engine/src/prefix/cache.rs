@@ -1069,16 +1069,21 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         Ok(true)
     }
 
-    /// Pages a reservation may still take: free pages plus pages only retained snapshots hold
-    /// (what [`PrefixCache::extend`] and admission can evict). A parity pool counts twice its
-    /// scarcer half, since a sequence takes its pages from both halves in turn.
-    pub fn reservable(&self) -> usize {
-        if !self.pool.is_parity() {
-            return self.pool.free() + self.snapshot_only_pages().count();
-        }
+    /// Capacity a reservation may still take, in the pool's own units: free pages plus pages
+    /// only retained snapshots hold (what [`PrefixCache::extend`] and admission can evict), per
+    /// half of a parity pool, and the drafter's reservable pages.
+    pub fn room<F: PrefixFamily<M>>(&self, family: &F) -> crate::reserve::Room {
+        let room = self.target_room();
+        match family.draft_reservable() { Some(free) => room.with_draft(free), None => room }
+    }
+
+    /// [`PrefixCache::room`] for a family without full-context draft pages.
+    pub fn target_room(&self) -> crate::reserve::Room {
         let mut halves = self.pool.free_halves();
-        for page in self.snapshot_only_pages() { halves[(page & 1) as usize] += 1; }
-        2 * halves[0].min(halves[1])
+        for page in self.snapshot_only_pages() {
+            halves[if self.pool.is_parity() { (page & 1) as usize } else { 0 }] += 1;
+        }
+        crate::reserve::Room { halves, parity: self.pool.is_parity(), draft: None }
     }
 
     /// Whether every retained page is visible to [`PrefixCache::reservable`]: no capture is

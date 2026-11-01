@@ -888,7 +888,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
             // Rows a verify may write past the last kept one come with every reservation.
             let lease = match reserve.lease(ready.job().tokens.len(), ready.job().job.max_tokens, geometry.decode_rows,
-                Reserve::limit(&cache, geometry.max_context)) {
+                Reserve::limit(&cache, &family, geometry.max_context)) {
                 Ok(lease) => lease,
                 Err(error) => { reject(&ready, format!("{error}")); continue; }
             };
@@ -1189,16 +1189,17 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             prefills.settle(!active.is_empty());
         }
         let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: p.placement.units() }).collect();
-        let round = reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding)?;
-        drop(holding);
-        for mut request in round.ended.into_iter().chain(round.cancelled) {
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
             if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
             if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
             request.ticket.done(request.generated);
             requests += 1;
             generated_total += request.generated as u64;
-            release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement));
-        }
+            release(&family, cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement));
+        })?;
+        drop(holding);
         if active.is_empty() {
             if !media.is_empty() || !stalled.is_empty() { std::thread::sleep(Duration::from_millis(1)); }
             continue;
