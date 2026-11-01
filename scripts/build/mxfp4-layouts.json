@@ -4,6 +4,15 @@
   "native_slices": [
     {
       "hidden": 5120,
+      "width": 384,
+      "sm": 121,
+      "capacities": [1, 16, 80],
+      "slices": [128, 128, 128],
+      "fc1_k_splits": [2, 2, 2],
+      "source": "PR217 GB10 shipped legacy192/split1 to legacy128/split2: 1.36/1.29/1.28x; hardware fidelity pending"
+    },
+    {
+      "hidden": 5120,
       "width": 288,
       "sm": 121,
       "capacities": [

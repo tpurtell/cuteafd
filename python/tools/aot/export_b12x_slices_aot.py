@@ -18,7 +18,7 @@ from pathlib import Path
 
 from v41_spark_tp3_launch_geometry import launch_geometry
 from expert_grouping import native_group_macros, slice_group_rows
-from mxfp4_layouts import stored_width, native_slice_width, native_prefill, native_prefill_scratch
+from mxfp4_layouts import stored_width, native_slice_width, native_fc1_k_splits, native_prefill, native_prefill_scratch
 from spark_packages import native_spark_artifacts, native_width_role
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
@@ -244,7 +244,10 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                                                experts=experts, topk=topk, intermediate=intermediate,
                                                hidden=hidden, scale_codes=family == "v41",
                                                exact_storage=kernel_intermediate == intermediate and intermediate % 128 != 0,
-                                               fc2_n_splits=fc2_n_splits(role, capacity, selected_width, hidden)))
+                                               fc2_n_splits=fc2_n_splits(role, capacity, selected_width, hidden),
+                                               fc1_k_splits=(native_fc1_k_splits(
+                                                   hidden, intermediate, props.major * 10 + props.minor, capacity)
+                                                   if role.startswith("spark") else 1)))
         if stream_prefill:
             from b12x.moe._shared.kernels.v4_stream_pipeline import V4StreamPipeline, stream_scratch_layout
             from b12x._lib.utils import make_ptr
@@ -260,6 +263,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                              cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Uint8,
                              cutlass.Float32, cutlass.Int32, cutlass.Float32]
             args = [make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16) for dtype in pointer_types]
+
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
             pipeline = V41HybridPipeline(capacity, selected_width,
