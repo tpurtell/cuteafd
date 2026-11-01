@@ -2,6 +2,7 @@
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
+mod muse;
 mod qwen;
 pub mod local;
 pub mod remote;
@@ -197,6 +198,7 @@ impl TowerSpec {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            Some("muse_spark") => Self::muse(snapshot, max_tokens),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
@@ -205,6 +207,7 @@ impl TowerSpec {
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
+            5 => ImageFamily::Muse,
             _ => ImageFamily::Mimo,
         }
     }
@@ -322,6 +325,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
             cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+            cuteafd_loader::media::ImageFamily::Muse => "muse_spark",
         };
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
     }

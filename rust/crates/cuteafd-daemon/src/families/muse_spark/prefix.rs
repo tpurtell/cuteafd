@@ -33,6 +33,7 @@ pub(crate) struct Placement {
     pub slot: usize,
     pub pages: Vec<u32>,
     pub len: usize,
+    pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
 impl crate::shared::qwen::scheduler::Placement for Placement {
@@ -40,7 +41,7 @@ impl crate::shared::qwen::scheduler::Placement for Placement {
     fn set_len(&mut self, len: usize) { self.len = len; }
     fn units(&self) -> &[u32] { &self.pages }
     fn slot(&self) -> i32 { self.slot as i32 }
-    fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    fn spans(&self) -> &[cuteafd_core::MediaSpan] { self.media.as_ref().map_or(&[], |media| media.spans()) }
 }
 
 /// Bytes of one mark summed over the coordinator ranks (each keeps its KV heads).
