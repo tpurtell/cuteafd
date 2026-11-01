@@ -262,5 +262,6 @@ fn muse_spark_io(device: &mut DeviceLayout, working: &SparkWorkingSet,
 fn muse_owners(device: &mut DeviceLayout, working: &SparkWorkingSet, unit_rows: u64, waves: u64) -> anyhow::Result<()> {
     if !working.selected_ranks().contains(&(device.index as usize)) { return Ok(()); }
     use crate::placement::families::muse_spark::{owner_bytes, spark_executions};
-    crate::plan::layout::spark_slots::charge_owners(device, &spark_executions(waves, unit_rows)?, owner_bytes)
+    crate::plan::layout::spark_slots::charge_owners(device, &spark_executions(waves, unit_rows)?,
+        |extent| owner_bytes(working.spark_ranks, extent))
 }

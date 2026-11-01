@@ -2,6 +2,7 @@
 
 pub(crate) mod api;
 pub(crate) mod console;
+pub(crate) mod malloc_tune;
 pub(crate) mod context;
 pub(crate) mod checkpoint_read;
 pub(crate) mod constraints;
@@ -14,7 +15,9 @@ pub(crate) mod experts;
 pub(crate) mod fp8_linear;
 pub(crate) mod fp8_load_quant;
 pub(crate) mod golden_scores;
+pub(crate) mod host_heap;
 pub(crate) mod inventory;
+pub(crate) mod kv_reserve;
 pub(crate) mod l2_prefetch;
 pub(crate) mod launch_grid;
 pub(crate) mod mapped_table;

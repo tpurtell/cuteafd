@@ -397,7 +397,7 @@ mod tests {
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "serve-qwen35", "--snapshot", "/m",
             "--native-lib", "/lib.so", "--embedding-placement", "gpu", "--vision", "off", "--audio", "off",
             "--max-sequences", "8", "--pool-tokens", "0", "--prefix-cache-entries", "4",
-            "--prefix-cache-mark-mib", "1024", "--listen", "0.0.0.0:8000", "--max-output", "4096"]).unwrap();
+            "--prefix-cache-mark-mib", "1024", "--listen", "0.0.0.0:8000", "--max-output-tokens", "4096"]).unwrap();
         let crate::cli::Commands::ServeQwen35(args) = cli.command else { panic!("dense serving not registered") };
         assert_eq!(args.max_sequences, 8);
         assert_eq!(args.pool_tokens.filter(|&tokens| tokens > 0), None);

@@ -18,7 +18,7 @@
 //! left is not retained. `prompt_cache_hit_tokens` reports the restored rows.
 use super::dflash::{ContextRow, DraftSeq};
 use super::mtp::MtpSeq;
-use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS};
+use super::engine::{MimoEngine, MimoPlacement, DECODE_ROWS, PAGE_ROWS};
 use super::prefix::MimoPrefix;
 use super::serve_failures::FailureRecipients;
 use crate::shared::prefix::CudaCopyEngine;
@@ -32,11 +32,13 @@ use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeSha
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::qwen4::QwenEncoding;
 use cuteafd_api::openai::{
-    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeRequest,
     PromptUsage,
 };
 use crate::shared::console;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
+use crate::shared::kv_reserve::{reserved_drafts, Holding, Reserve, Reserving};
+use cuteafd_engine::reserve::Lease;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,8 +50,6 @@ pub(crate) struct ServeArgs {
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4096)]
-    pub max_output: u32,
     /// Sequences decoding at once (each holds an SWA ring).
     #[arg(long, default_value_t = cuteafd_loader::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
@@ -116,23 +116,6 @@ pub(crate) struct ServeArgs {
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 
-fn initial_reservation(prompt: usize, max_tokens: usize, context: usize) -> usize {
-    prompt.saturating_add(max_tokens.clamp(1024, 8192)).saturating_add(64).min(context)
-}
-
-#[cfg(test)]
-mod reservation_tests {
-    use super::initial_reservation;
-
-    #[test]
-    fn initial_lease_clamps_output_and_context_without_overflow() {
-        assert_eq!(initial_reservation(100, 1, 1 << 20), 1188);
-        assert_eq!(initial_reservation(100, 4000, 1 << 20), 4164);
-        assert_eq!(initial_reservation(100, 100_000, 1 << 20), 8356);
-        assert_eq!(initial_reservation((1 << 20) - 100, 100_000, 1 << 20), 1 << 20);
-        assert_eq!(initial_reservation(usize::MAX, usize::MAX, 1 << 20), 1 << 20);
-    }
-}
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     anyhow::ensure!(args.prefill_chunk_s.is_none_or(|s| s.is_finite() && s > 0.0 && s <= 5.0),
@@ -177,7 +160,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, draft, prefix, vision, audio, media_cache_bytes, remote, remote_audio));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, audio_preparer, health, audio_health)) = media {
         if let Some(preparer) = preparer {
             profile = profile.with_loaded_vision(preparer);
@@ -314,6 +297,7 @@ struct Prefill<'a> {
     cancelled: bool,
     placement: super::engine::MimoPlacement,
     capacity: usize,
+    lease: Lease,
     slot: Option<usize>,
     /// The last prompt row's logits: a whole-prompt hit's retained row, or
     /// (with the prefix cache on) the prefill's, for the prompt snapshot.
@@ -350,6 +334,7 @@ struct Active<'a> {
     /// cache retains turns: what follows its `Turn` snapshot.
     turn: Option<Vec<f32>>,
     capacity: usize,
+    lease: Lease,
     next: u32,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
@@ -428,6 +413,16 @@ impl Active<'_> {
         self.ticket.finishing();
         self.send(InferenceChunk::Finish { finish_reason: finish })
     }
+}
+
+impl Reserving for Active<'_> {
+    type Placement = super::engine::MimoPlacement;
+    fn lease(&self) -> &Lease { &self.lease }
+    fn committed(&self) -> usize { self.placement.len }
+    fn produced(&self) -> usize { self.generated }
+    fn placement(&self) -> &super::engine::MimoPlacement { &self.placement }
+    fn placement_mut(&mut self) -> &mut super::engine::MimoPlacement { &mut self.placement }
+    fn closed(&self) -> bool { self.job.events.is_closed() }
 }
 
 /// The prefix cache over `engine` (always present: with zero entries it is the page allocator).
@@ -529,6 +524,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         &opened.library, snapshot.join("tokenizer.json"), engine.cfg.vocab_size, QwenEncoding::from_snapshot(snapshot)?.tokens().eos.clone());
     let tokenizer = cuteafd_loader::LoadedTokenizer::from_snapshot(snapshot)?;
     let mut active: Vec<Active<'_>> = Vec::new();
+    // Decoding requests waiting for KV pages: they keep their ring, slot and pages, skip rounds.
+    let mut stalled: Vec<Active<'_>> = Vec::new();
+    let mut reserve = Reserve::new(prefix.reserve.config(engine.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut lane = DecodeLane::default();
     // MiMo's only decode lane (`LaneSupport::One`), polled on this thread.
@@ -540,7 +538,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     let config = &opened.checkpoint.config;
     let mut failures = FailureRecipients::default();
-    publish(stats, requests, generated_total, 0, 0, cache, media, preparer);
+    publish(stats, requests, generated_total, 0, 0, cache, media, preparer, &reserve, 0);
     // The API may advertise capacity only after every fallible startup owner exists.
     ready();
     // Keep admitted request owners alive until a fatal cause has reached every
@@ -549,8 +547,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        while active.len() + prefills.len() < max_sequences {
-            let busy = !active.is_empty() || !prefills.is_empty();
+        while active.len() + stalled.len() + prefills.len() < max_sequences {
+            let busy = !active.is_empty() || !stalled.is_empty() || !prefills.is_empty();
             if snapshot_waiter.as_ref().is_some_and(|ready| ready.job().job.events.is_closed()) {
                 snapshot_waiter = None;
             }
@@ -569,7 +567,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                     }
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer);
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer,
+                            &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -588,14 +587,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
-                        let tokens = match probe::prompt_ids(&job.probe,
-                            || Ok(job.encode_prompt(&tokenizer)?)) {
-                            Ok(tokens) => tokens,
-                            Err(error) => {
-                                let _ = job.events.send(Err(NativeFailure::BadRequest(format!("prompt tokenization: {error:#}"))));
-                                continue;
-                            }
-                        };
+                        let Some(tokens) = crate::shared::api::admission_result(&job.events,
+                            probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))) else { continue; };
                         let events = job.events.clone();
                         let (prompt, mut request_media, jobs) = match super::media::prepare(job, tokens, config,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
@@ -631,10 +624,8 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             let reject = |ready: &MediaReady<super::media::Prompt>, message: String| {
                 let _ = ready.job().job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            let constraint = match ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
-                Ok(constraint) => constraint,
-                Err(error) => { reject(&ready, format!("{error:#}")); continue; }
-            };
+            let Some(constraint) = crate::shared::api::admission_result(&ready.job().job.events,
+                ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose()) else { continue; };
             if let Some(probe) = &ready.job().job.probe {
                 if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), engine.prefill_capacity(), DECODE_ROWS) {
                     probe.fail(format!("cold replay: {error:#}"));
@@ -649,8 +640,23 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 break;
             }
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
-            let capacity = ready.job().tokens.len().saturating_add(ready.job().job.max_tokens).min(engine.max_context);
-            let initial_capacity = initial_reservation(ready.job().tokens.len(), ready.job().job.max_tokens, engine.max_context);
+            let lease = match reserve.lease(ready.job().tokens.len(), ready.job().job.max_tokens, DECODE_ROWS,
+                Reserve::limit(cache, family, engine.max_context)) {
+                Ok(lease) => lease,
+                Err(error) => { reject(&ready, format!("{error}")); continue; }
+            };
+            let capacity = lease.end();
+            cache.tick();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
+            let Some(initial_capacity) = reserve.admit(cache, family, &active, &stalled, &holding, &lease) else {
+                drop(holding);
+                // Waits for the drain rule: a retirement or a release retries it.
+                match kv_waiter.defer_until_release(ready, busy, cache.pool().release_epoch()) {
+                    Ok(()) => break,
+                    Err(ready) => { reject(&ready, "prompt leaves no room for output in the GPU KV pool".into()); continue; }
+                }
+            };
+            drop(holding);
             let Some(ring) = free_rings.pop() else {
                 reject(&ready, "SWA rings exhausted".into());
                 continue;
@@ -747,7 +753,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                 }
             } else if logits.is_some() { cuteafd_engine::prefix::PointPlan::default() } else { plan };
             prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
+                placement: admitted.placement, capacity, lease, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 phases: [0.0; 2], ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -861,7 +867,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
                         media: p.media,
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from, turn: None,
-                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
+                        capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
                     };
                     request.next = match p.first {
@@ -911,28 +917,24 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             }
             prefills.settle(!active.is_empty());
         }
+        // Reservation top-ups only between rounds; a refused one stalls the request.
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(cache, family, &mut active, &mut stalled, &holding, |cache, mut request| {
+            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
+            requests += 1;
+            generated_total += request.generated as u64;
+            failures.finished(&request.job.events);
+            request.ticket.done(request.generated);
+            release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
+        })?;
+        drop(holding);
         if active.is_empty() {
-            if !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
+            if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
-        // Grow only before submitting a round. Failed growth ends this sequence
-        // cleanly without reallocating CUDA storage or stealing another live lease.
-        for index in (0..active.len()).rev() {
-            let request = &mut active[index];
-            let rows = request.placement.len.saturating_add(64).min(request.capacity);
-            if let Err(error) = cache.grow(family, &mut request.placement.pages, rows) {
-                tracing::warn!(%error, "MiMo KV growth exhausted; finishing at committed frontier");
-                let mut request = active.remove(index);
-                if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
-                let _ = request.finish(InferenceFinishReason::Length);
-                requests += 1;
-                generated_total += request.generated as u64;
-                failures.finished(&request.job.events);
-                request.ticket.done(request.generated);
-                release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
-            }
-        }
-        if active.is_empty() { continue; }
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, policy.fixed,
             prefix.mimo_prefix_draft, width, &mut lane, &mut active, &mut shared, selector, family, cache,
@@ -967,8 +969,9 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
             release(family, cache, &mut free_rings, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer);
-        console::gauges(|| console::Gauges::prefix_cache(cache, active.len(), prefills.len(),
+        publish(stats, requests, generated_total, active.len(), prefills.len(), cache, media, preparer,
+            &reserve, stalled.len());
+        console::gauges(|| console::Gauges::prefix_cache(cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len() + usize::from(snapshot_waiter.is_some())));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     } })();
@@ -1033,7 +1036,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
     // Rows each sequence may add after its next token.
     let room = DECODE_ROWS.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else { room.min(a.job.max_tokens - a.generated - 1)
-        .min(a.capacity - a.placement.len - 1) }).collect();
+        .min(a.capacity - a.placement.len - 1).min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS)) }).collect();
     let ready: Vec<_> = active.iter().map(|a| match drafter {
         Some(_) => a.slot.is_some(),
         None => engine.mtp.as_ref().is_some_and(|mtp| {
@@ -1350,12 +1353,13 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
 }
 
 /// Serving statistics for `/v1/stats`.
+#[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>) {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
     }
 }

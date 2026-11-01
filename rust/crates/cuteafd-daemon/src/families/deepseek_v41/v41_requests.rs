@@ -255,6 +255,12 @@ impl<'a> Requests<'a> {
             tracing::debug!(%error, "Engram draft look-ahead skipped");
         }
     }
+    /// Before `lease`'s encoder call: cancel encoder prefetch waves other
+    /// prompts hold (their I/O only; they prefetch again at their next call).
+    /// Returns how many were cancelled.
+    pub fn cancel_foreign_prefetch(&mut self, lease: CacheLease) -> usize {
+        self.prefetched.cancel_others(&lease)
+    }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
         self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }
@@ -299,16 +305,6 @@ impl<'a> Requests<'a> {
         ensure!(units.starts_with(&self.units[lease_slot(&self.slots, lease)?]), "unit binding rewrites a request's units");
         self.cache.bind_sources(lease, pages, rows)?;
         let slot = lease_slot(&self.slots, lease)?;
-        self.units[slot] = units;
-        Ok(())
-    }
-    /// Shrink an idle request's binding to `units` (a prefix of its units); the caller releases
-    /// the rest. Rows past the new binding were never written.
-    pub fn rebind_shrunk(&mut self, lease: CacheLease, units: Vec<u32>, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
-        self.request(lease)?;
-        let slot = lease_slot(&self.slots, lease)?;
-        ensure!(self.units[slot].starts_with(&units), "shrunk binding is not a prefix of the request's units");
-        self.cache.rebind_sources(lease, pages, rows)?;
         self.units[slot] = units;
         Ok(())
     }

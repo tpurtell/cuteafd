@@ -145,6 +145,12 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
         }
     }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.pages }
+    /// Each wave uploads the placement's pages; growth happens between rounds only.
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        self.validate(placement, placement.committed)?;
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize { placement.committed }
 
     fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {

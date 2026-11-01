@@ -273,3 +273,116 @@ def test_api_renders_cached_wire_effort_and_default_without_calls(api, monkeypat
 def test_truncated_thinking_is_not_mistaken_for_final_content():
     message = parse_qwen_response("still thinking", [], thinking_prefix=True)
     assert message["reasoning_content"] == "still thinking" and message["content"] == ""
+
+
+class ToolOrderTokenizer(Tokenizer):
+    """A template that serializes tools in their given key order (Mistral tojson)."""
+
+    def apply_chat_template(self, messages, tools=None, tokenize=False, add_generation_prompt=False):
+        return json.dumps(tools) + super().apply_chat_template(messages, tokenize=tokenize,
+                                                               add_generation_prompt=add_generation_prompt)
+
+
+def test_cached_rerender_keeps_original_tool_key_order(api):
+    client, state = api
+    client.renderer = ChatRenderer(ToolOrderTokenizer())
+    request = body()
+    request["tools"] = [{"type": "function", "function": {"name": "read_file", "description": "d",
+                                                          "parameters": {"type": "object"}}}]
+    first = client(copy.deepcopy(request))
+    # A second identical request is a cache hit read back from canonical JSON.
+    second = client(copy.deepcopy(request))
+    assert len(state["calls"]) == 1
+    assert second["probe"]["prompt_ids"] == first["probe"]["prompt_ids"] == client.prompt(request)["probe"]["prompt_ids"]
+    assert bytes(second["probe"]["prompt_ids"]).decode().startswith('[{"type": "function"')
+
+
+class DateTokenizer(Tokenizer):
+    def get_chat_template(self):
+        return "{{ current_date }} template"
+
+    def apply_chat_template(self, messages, tools=None, tokenize=False, add_generation_prompt=False, current_date=None):
+        return f"date={current_date}:" + super().apply_chat_template(messages, tokenize=tokenize,
+                                                                       add_generation_prompt=add_generation_prompt)
+
+
+def test_template_date_is_pinned_and_checked_against_cached_requests(api):
+    import datetime
+    client, state = api
+    today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    client.renderer = ChatRenderer(DateTokenizer(), template_date=today)
+    result = client(body())
+    assert bytes(result["probe"]["prompt_ids"]).decode().startswith(f"date={today}:")
+    client.renderer = ChatRenderer(DateTokenizer(), template_date="2000-01-01")
+    with pytest.raises(ValueError, match="differs from template date"):
+        client(body())
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        ChatRenderer(DateTokenizer(), template_date="yesterday")
+
+
+def test_length_cut_tool_call_is_rendered_verbatim_and_never_executed(api):
+    client, state = api
+    state["message"] = {"role": "assistant", "content": "", "reasoning_content": "r",
+                        "tool_calls": [{"id": "c", "type": "function",
+                                        "function": {"name": "read_file", "arguments": "{\"path\": \"a"}}]}
+    result = client(body())
+    assert result["tool_calls"] == []
+    text = bytes(result["probe"]["generated"]).decode()
+    # Only the text both bounding renders share: never the partial arguments.
+    assert text.startswith("<reasoning>r") and "path" not in text
+
+
+def test_wire_body_keeps_request_key_order_and_keys_its_cache(api, tmp_path):
+    client, state = api
+    request = body()
+    request["tools"] = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
+    client(copy.deepcopy(request))
+    sent = state["calls"][-1]
+    assert list(sent["tools"][0]) == ["type", "function"] and list(sent["tools"][0]["function"]) == ["name", "parameters"]
+    assert client.identity["wire_order"] == "request"
+    # A sorted-wire record never satisfies a request-order client, and vice versa.
+    sorted_client = APIClient(client.renderer, client.cache.directory, checkpoint="official-model", family="qwen3_5",
+                              base=client.endpoint.removesuffix("/chat/completions"), model="official-model",
+                              key_file=client.key_file, wire_order="sorted")
+    assert sorted_client.cache.find({**copy.deepcopy(request), "model": "official-model"}) is None
+
+
+def test_engine_client_sends_local_prompt_ids_and_keeps_engine_ids(tmp_path):
+    from fidelity_generation import EngineClient
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append(payload)
+            ids = payload["spec"]["prompt_ids"]
+            text = "<reasoning>r" + "answer"
+            out = {"probe": {"engine": "fake", "cold": True, "no_speculation": True, "cached_tokens": 0,
+                             "prompt_ids": ids, "generated": list(text.encode())}}
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps(out).encode())
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever)
+    thread.start()
+    tokenizer = Tokenizer()
+    tokenizer._fidelity_parse_completion = lambda text, mode: {"role": "assistant", "reasoning_content": "r", "content": "answer", "tool_calls": []}
+    try:
+        client = EngineClient(ChatRenderer(tokenizer), tmp_path / "cache", checkpoint="m", family="deepseek_v41",
+                              base=f"http://127.0.0.1:{server.server_port}", token=None, identity={})
+        request = {**body(), "response_format": {"type": "json_object"}}
+        result = client(request)
+        assert seen[0]["spec"]["prompt_ids"] == client.renderer.prompt(request)
+        assert seen[0]["spec"]["cold"] and seen[0]["spec"]["no_speculation"]
+        assert "response_format" not in seen[0]["body"] and seen[0]["body"]["temperature"] == 0
+        assert result["probe"]["generated"] == list("<reasoning>ranswer".encode())
+        client(request)
+        assert len(seen) == 1
+    finally:
+        server.shutdown()
+        thread.join()
+        server.server_close()

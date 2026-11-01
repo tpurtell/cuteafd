@@ -42,7 +42,7 @@ def main():
               '--rtx-gpus', '2', '--rtx-expert-layers', str(args.layers),
               '--listen', f'127.0.0.1:{args.port}', '--prefill-batch-tokens', '2048',
               '--concurrency', '16', '--prefix-cache-entries', '24',
-              '--max-context-tokens', '1048576', '--max-output-tokens', '393216',
+              '--max-context-tokens', '1048576', '--max-output-tokens', '131072',
               '--dspark', '--dspark-draft-limit', '7']
     report = dict(scope=__doc__, before_commit=args.before_commit, after_commit=args.after_commit,
                   binary_sha256={k: sha(v) for k, v in binaries.items()},

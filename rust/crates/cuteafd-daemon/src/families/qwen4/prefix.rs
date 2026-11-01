@@ -222,6 +222,12 @@ impl PrefixFamily<Frontier> for Qwen4Prefix<'_, '_> {
         &placement.units
     }
 
+    /// Step tables are rebuilt from the expanded pages; the unit count picks a captured graph.
+    fn extend_pages(&self, placement: &mut Qwen4Placement, units: &[u32]) -> Result<(), BoxError> {
+        placement.extend(units);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &Qwen4Placement) -> usize {
         placement.state_len.min(placement.len)
     }

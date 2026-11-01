@@ -216,7 +216,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
 
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:
-            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
+            self.assertIn('$(declare -f release_die release_hub_mounts release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
             self.assertIn('docker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
             self.assertNotIn('/root/', source)
             self.assertNotIn('-e USER=tj', source)
@@ -694,7 +694,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                 "16",
                 "20",
                 "1048576",
-                "393216",
+                "131072",
                 "0.0.0.0:8000",
                 "19441",
                 "auto",
@@ -734,7 +734,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                 (["--set", "CONCURRENCY=17"], "CONCURRENCY must be in 1..16"),
                 (["--set", "PREFIX_CACHE_ENTRIES=129"], "PREFIX_CACHE_ENTRIES must be in 0..128"),
                 (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
-                (["--set", "MAX_OUTPUT_TOKENS=393217"], "MAX_OUTPUT_TOKENS must be in 1..393216"),
+                (["--set", "MAX_OUTPUT_TOKENS=12k"], "MAX_OUTPUT_TOKENS must be an integer"),
                 (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
                 (["--set", "DSPARK_DRAFT_LIMIT=8"], "DSPARK_DRAFT_LIMIT must be in 1..7"),
                 (["--set", "NOT_A_KEY=1"], "unknown configuration key: NOT_A_KEY"),

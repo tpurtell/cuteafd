@@ -807,13 +807,12 @@ source "$repo_root/scripts/build/host-isa.sh"
 wip_coordinator_host_isa="$(cuteafd_host_isa_list wip "${CUTEAFD_WIP_HOST_ISA:-}")" ||
   release_die "CUTEAFD_WIP_HOST_ISA: ${CUTEAFD_WIP_HOST_ISA:-}"
 wip_coordinator_host_isa="${wip_coordinator_host_isa//$'\n'/ }"
-# Dev-only Cargo features for the coordinator daemon: a
-# space- or comma-separated list of dev-* names, keyed into the build and
-# recorded in the slot's build phases. Production features are never set here.
+# Coordinator Cargo features, keyed into the build and recorded in the slot's
+# build phases. jemalloc is opt-in for the same allocator A/B as release builds.
 wip_cargo_features="${CUTEAFD_WIP_CARGO_FEATURES:-}"
 wip_cargo_features="${wip_cargo_features//,/ }"
 for feature in $wip_cargo_features; do
-  [[ "$feature" =~ ^dev-[a-z0-9-]+$ ]] || release_die "CUTEAFD_WIP_CARGO_FEATURES: only dev-* features may be set ($feature)"
+  [[ "$feature" == jemalloc || "$feature" =~ ^dev-[a-z0-9-]+$ ]] || release_die "CUTEAFD_WIP_CARGO_FEATURES: expected jemalloc or dev-* features ($feature)"
 done
 wip_cargo_features="$(echo $wip_cargo_features)"
 wip_build_key=""

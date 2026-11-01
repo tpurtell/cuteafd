@@ -32,7 +32,6 @@ pub(crate) struct ServeArgs {
     /// Complete per-rank Spark allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
-    #[arg(long, default_value_t = 32768)] pub max_output: u32,
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
@@ -287,7 +286,7 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
 }
 
 pub(crate) async fn run(args: ServeArgs) -> Result<()> {
-    use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile, NativeLimits};
+    use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile};
     args.validate()?;
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
@@ -317,7 +316,7 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         result
     });
     let ready = ready_rx.await.context("Muse Spark worker exited before readiness")??;
-    let limits = NativeLimits::new(u32::try_from(ready.context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(ready.context)?;
     let profile = ready.install(profile)?;
     let hub = crate::shared::console::hub(false, || Ok(crate::shared::console::Layout::new(
         "muse_spark", profile.id.clone(), snapshot.clone())));
@@ -400,6 +399,21 @@ mod tests {
                 assert!(args(&invalid)?.validate().is_err(), "{tower}: {invalid:?}");
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn output_limits_use_the_shared_reservation_args() -> Result<()> {
+        let defaults = args(&["--peers", PEERS])?;
+        assert_eq!(defaults.prefix.reserve.limits(1 << 20)?.output(), 131_072);
+        for value in ["0", "-1"] {
+            let uncapped = args(&["--peers", PEERS, "--max-output-tokens", value])?;
+            assert_eq!(uncapped.prefix.reserve.limits(1 << 20)?.output_for_prompt(1000, usize::MAX)?,
+                (1 << 20) - 1000);
+        }
+        let capped = args(&["--peers", PEERS, "--max-output-tokens", "4096"])?;
+        assert_eq!(capped.prefix.reserve.limits(1 << 20)?.output(), 4096);
+        assert!(args(&["--peers", PEERS, "--max-output", "4096"]).is_err());
         Ok(())
     }
 

@@ -28,8 +28,8 @@ pub static MUSE_SPARK: MuseSpark = MuseSpark;
 const TEXT: &str = "model.language_model.";
 const HEAD: &str = "lm_head.";
 
-/// The EXL3 expert package: whole H4096/I4096 experts (256, top-8), K4 with
-/// the adjacent empty K5 tier, partitioned across ranks (`ep<world>`).
+/// The EXL3 expert package: H4096/I4096 experts (256, top-8), K4 with
+/// the adjacent empty K5 tier, intermediate-sliced across TP ranks.
 pub const PACKAGE: &str = "muse:exl3-k45";
 
 #[derive(Clone)]

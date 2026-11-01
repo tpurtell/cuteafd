@@ -31,7 +31,7 @@ use crate::shared::{console, probe, qwen::scheduler::{self, Backend, Drafts}, pr
 pub(crate) use crate::shared::prefix::{PrefixArgs, Toggle};
 use cuteafd_engine::{media::{EmbeddingCache, MediaAdmission}, prefix::{MarkArena, PrefixCache, PrefixConfig, PrefixFamily}};
 use anyhow::{Context, Result};
-use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile, NativeRequest};
 use std::{path::PathBuf, sync::{Arc, Mutex}, time::Duration};
 use tokio::sync::mpsc;
 
@@ -41,8 +41,6 @@ pub(crate) struct ServeArgs {
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4096)]
-    pub max_output: u32,
     /// Sequences decoding at once (each holds two state slots).
     #[arg(long, default_value_t = 4)]
     pub max_sequences: usize,
@@ -112,7 +110,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, drafts, eos, decode_share, prefix, vision, media_cache_bytes, remote));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
         profile.vision_health = health;

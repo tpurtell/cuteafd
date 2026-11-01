@@ -36,6 +36,10 @@ pub(crate) struct Placement {
     pub media: Option<cuteafd_engine::media::RequestMedia>,
 }
 
+impl Placement {
+    fn extend_pages(&mut self, pages: &[u32]) { self.pages.extend_from_slice(pages); }
+}
+
 impl crate::shared::qwen::scheduler::Placement for Placement {
     fn len(&self) -> usize { self.len }
     fn set_len(&mut self, len: usize) { self.len = len; }
@@ -142,6 +146,13 @@ impl PrefixFamily for MusePrefix<'_, '_> {
 
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.pages }
 
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        // Each rank rebuilds its full-attention page table before the next step.
+        // SWA and DFlash2 use fixed per-slot rings, not reservation-sized pages.
+        placement.extend_pages(pages);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &Placement) -> usize { placement.len }
 
     fn capture(&self, slot: MarkSlot, placement: &Placement, len: usize) -> Result<(), BoxError> {
@@ -192,6 +203,108 @@ impl PrefixFamily for MusePrefix<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::shared::kv_reserve::{Reserve, Reserving};
+    use cuteafd_engine::{prefix::{PrefixCache, PrefixConfig}, reserve::{Lease, ReserveConfig}};
+    use cuteafd_hostcache::copy::StubCopyEngine;
+
+    /// CPU adapter over the live placement's page growth; device metadata is rebuilt
+    /// with the production StepMetadata below, without constructing CUDA owners.
+    struct Paged;
+    impl PrefixFamily for Paged {
+        type Placement = Placement;
+        fn layout(&self) -> FamilyLayout {
+            FamilyLayout { page_rows: PAGE_ROWS as usize, pages: 84, page_bytes: 64, mark_bytes: 0,
+                draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
+        }
+        fn pages<'p>(&self, p: &'p Placement) -> &'p [u32] { &p.pages }
+        fn extend_pages(&self, p: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+            p.extend_pages(pages);
+            Ok(())
+        }
+        fn commit_point(&self, p: &Placement) -> usize { p.len }
+        fn capture(&self, _: MarkSlot, _: &Placement, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn restore(&self, _: Option<MarkSlot>, _: &mut Placement, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn copy_rows(&self, _: TailCopy) -> Result<(), BoxError> { Ok(()) }
+        fn drain(&self) -> Result<(), BoxError> { Ok(()) }
+        fn page_segments(&self, _: u32) -> Vec<DeviceRange> { Vec::new() }
+        fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
+    }
+
+    struct Request { placement: Placement, lease: Lease, produced: usize, initial_rows: usize }
+    impl Reserving for Request {
+        type Placement = Placement;
+        fn lease(&self) -> &Lease { &self.lease }
+        fn committed(&self) -> usize { self.placement.len }
+        fn produced(&self) -> usize { self.produced }
+        fn placement(&self) -> &Placement { &self.placement }
+        fn placement_mut(&mut self) -> &mut Placement { &mut self.placement }
+        fn closed(&self) -> bool { false }
+    }
+
+    #[test]
+    fn reservation_top_up_writes_full_and_sliding_layers_then_stalls_and_resumes() -> Result<()> {
+        use super::super::step::{StepMetadata, StepSequence};
+        let cfg = MuseSparkConfig::from_hf(&cuteafd_loader::plan::testing::muse_spark_config())?;
+        assert!(cfg.attention.contains(&MuseAttention::Full) && cfg.attention.contains(&MuseAttention::Sliding));
+        let ring = cuteafd_loader::families::muse_spark::cache::swa_ring(&cfg)?.rows as usize;
+        let family = Paged;
+        let mut cache = PrefixCache::<StubCopyEngine>::new(family.layout(), PrefixConfig {
+            entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 64 }, None)?;
+        let mut reserve = Reserve::new(ReserveConfig::new(640, 0, -1, 1 << 20)?, PAGE_ROWS as usize);
+        let (mut active, mut stalled) = (Vec::<Request>::new(), Vec::<Request>::new());
+        for slot in 0..3 {
+            let lease = reserve.lease(64, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
+            let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
+            let placement = cache.admit_cold(&family, 64, rows, |pages| Placement { slot, pages, len: 64 })?.placement;
+            let initial_rows = placement.pages.len() * PAGE_ROWS as usize;
+            active.push(Request { placement, lease, produced: 1, initial_rows });
+        }
+        let mut full = vec![vec![usize::MAX; 84 * PAGE_ROWS as usize]; 2];
+        let mut sliding = vec![vec![usize::MAX; 3 * ring]; 2];
+        let (mut saw_stall, mut saw_resume, mut wrote_past_end) = (false, false, false);
+        let mut waited = std::collections::HashSet::new();
+        for _ in 0..4000 {
+            reserve.round(&mut cache, &family, &mut active, &mut stalled, &[], |_, _| panic!("no early end"))?;
+            for request in &stalled { waited.insert(request.placement.slot); }
+            saw_stall |= !stalled.is_empty();
+            for request in &mut active {
+                saw_resume |= waited.contains(&request.placement.slot);
+                let p = &request.placement;
+                let meta = StepMetadata::build(&[StepSequence { slot: p.slot, start: p.len, rows: 4,
+                    pages: &p.pages }], ring, 3, 64, false)?;
+                // Both TP2 ranks receive the rebuilt tables and write the new pages;
+                // SWA remains a fixed ring even once generation wraps its window.
+                for rank in 0..2 {
+                    for row in 0..4 {
+                        let position = meta.positions[row] as usize;
+                        let page_slot = meta.page_slots[row] as usize;
+                        let ring_slot = meta.ring_slots[row] as usize;
+                        full[rank][page_slot] = position;
+                        sliding[rank][ring_slot] = position;
+                        let key_slot = meta.page_table[row * meta.table_stride + position / PAGE_ROWS as usize]
+                            as usize * PAGE_ROWS as usize + position % PAGE_ROWS as usize;
+                        assert_eq!(full[rank][key_slot], position);
+                        assert_eq!(sliding[rank][p.slot * ring + position % ring], position);
+                        wrote_past_end |= position >= request.initial_rows;
+                    }
+                }
+                request.placement.len += 4;
+                request.produced += 4;
+            }
+            let (done, running): (Vec<_>, Vec<_>) = active.drain(..)
+                .partition(|request| request.placement.len >= request.lease.end());
+            active = running;
+            for request in done { cache.release(&family, &request.placement.pages)?; }
+            if active.is_empty() && stalled.is_empty() { break; }
+        }
+        assert!(active.is_empty() && stalled.is_empty());
+        assert!(wrote_past_end && saw_stall && saw_resume);
+        assert!(reserve.stats().top_ups > 0 && reserve.stats().stalls > 0);
+        assert_eq!(cache.pool().free(), 84);
+        Ok(())
+    }
+
     /// The mark arena each rank allocates is the placement's "exact sliding
     /// marks" charge: `slots x (sliding layers x window x record / ranks)`.
     #[test]

@@ -411,6 +411,12 @@ impl PrefixFamily for GlmfPrefix<'_, '_> {
         &placement.units
     }
 
+    /// The step tables are rebuilt from the expanded pages every step.
+    fn extend_pages(&self, placement: &mut GlmfPlacement, units: &[u32]) -> Result<(), BoxError> {
+        placement.extend(units);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &GlmfPlacement) -> usize {
         placement.kda_len.min(placement.len)
     }
