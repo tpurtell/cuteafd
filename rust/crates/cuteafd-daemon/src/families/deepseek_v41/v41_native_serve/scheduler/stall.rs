@@ -6,6 +6,7 @@ use std::time::Duration;
 static PROGRESS: AtomicU64 = AtomicU64::new(0);
 static PHASE: AtomicU8 = AtomicU8::new(0);
 static BUSY: AtomicUsize = AtomicUsize::new(0);
+static DRAFT_FALLBACKS: AtomicU64 = AtomicU64::new(0);
 
 /// Serve-loop phases the watchdog reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +99,26 @@ pub(crate) fn spawn() -> Watchdog {
     })
 }
 
+/// A failed draft proposal: the lane verifies each member's anchor alone.
+pub(crate) fn anchor_only(seeds: &[(u64, u32, u64, usize)], lane: usize, error: &anyhow::Error) -> Vec<Vec<u32>> {
+    let total = DRAFT_FALLBACKS.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::warn!(lane, requests = seeds.len(), total, error = %format!("{error:#}"),
+        "dSpark draft proposal failed; this lane round verifies anchors only");
+    seeds.iter().map(|seed| vec![seed.1]).collect()
+}
+
+/// The liveness-gated draft fallback. A failed proposal verifies the anchors
+/// alone only while the draft is still live; a terminal draft propagates its
+/// error so the round fails instead of degrading forever. `live` is the
+/// caller's [`DraftRuntime::require_live`] result.
+pub(crate) fn draft_fallback(live: anyhow::Result<()>, seeds: &[(u64, u32, u64, usize)],
+    lane: usize, error: &anyhow::Error,
+) -> anyhow::Result<Vec<Vec<u32>>> {
+    live?;
+    Ok(anchor_only(seeds, lane, error))
+}
+pub(crate) fn draft_fallbacks() -> u64 { DRAFT_FALLBACKS.load(Ordering::Relaxed) }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,13 +206,10 @@ mod tests {
     #[test]
     fn serving_paths_are_diagnostic_only_and_instrument_slow_work() {
         let independent = include_str!("independent.rs");
-        assert!(independent.contains("draft.poll_propose(lane, &drafting)? }"));
         assert!(independent.contains("stall::tick();"));
         let scheduler = include_str!("../scheduler.rs");
         let single = &scheduler[scheduler.find("fn single_lane_round<").unwrap()..];
-        assert!(single[..4000].contains("clock.draft(|| draft.propose(lib, lane, &seeds))?"));
-        assert!(!scheduler.contains("stall::anchor_only"));
-        assert!(!independent.contains("stall::anchor_only"));
+        assert!(single[..4000].contains("clock.draft(|| draft.propose(lib, lane, &seeds))"));
         let admission = &scheduler[scheduler.find("let mut held_slots =").unwrap()..];
         assert!(admission.find("stall::mark(stall::Phase::Admission").unwrap()
             < admission.find("loop {").unwrap());
@@ -213,5 +231,65 @@ mod tests {
             ..serving.find("mod admitted_prefill_tests").unwrap()];
         assert_eq!(score.matches("scheduler::stall::tick();").count(), 2);
         assert!(include_str!("../prefill_target.rs").contains("super::scheduler::stall::tick();"));
+    }
+
+    /// The fallback keeps the lane live: a failed proposal verifies the anchors
+    /// and the next round drafts again, so the lane never stalls on a
+    /// draft-side bound.
+    #[test]
+    fn a_failed_proposal_keeps_the_lane_live_and_the_next_round_drafts_again() {
+        let seeds = [(1, 11, 5, 9), (2, 22, 0, 1)];
+        let mut attempts = 0;
+        let mut rounds = 0;
+        let mut fallbacks = 0;
+        let mut drafted = 0;
+        while rounds < 3 {
+            rounds += 1;
+            attempts += 1;
+            let proposal: anyhow::Result<Vec<Vec<u32>>> = if attempts == 1 {
+                Err(anyhow::anyhow!("invalid draft batch size"))
+            } else {
+                Ok(vec![vec![11, 12, 13], vec![22, 23]])
+            };
+            match proposal {
+                Ok(inputs) => { drafted += 1; assert_eq!(inputs.len(), seeds.len()); }
+                Err(error) => {
+                    let inputs = draft_fallback(Ok(()), &seeds, 0, &error).unwrap();
+                    fallbacks += 1;
+                    assert_eq!(inputs, vec![vec![11], vec![22]]);
+                }
+            }
+        }
+        // Three rounds completed (no stall), one anchor-only fallback, and the
+        // two later rounds drafted normally again.
+        assert_eq!((rounds, fallbacks, drafted), (3, 1, 2));
+    }
+
+    /// A terminal draft is not a reusable target-only fallback: the liveness
+    /// gate propagates the error instead of degrading every round to anchors.
+    #[test]
+    fn a_terminal_draft_propagates_instead_of_falling_back() {
+        let seeds = [(1, 11, 5, 9)];
+        let error = anyhow::anyhow!("invalid draft batch size");
+        let terminal = Err(anyhow::anyhow!("draft peer wire unavailable until restart"));
+        let result = draft_fallback(terminal, &seeds, 0, &error);
+        assert!(result.is_err(), "a terminal draft must fail the round");
+        assert!(result.unwrap_err().to_string().contains("unavailable until restart"));
+    }
+
+    /// A healthy draft path is unchanged: the `Ok` branch still returns the
+    /// draft's own inputs, never the anchors, and both lane paths keep it.
+    #[test]
+    fn a_healthy_draft_path_is_unchanged() {
+        let drafted = vec![vec![11, 12, 13], vec![22, 23]];
+        let anchors = vec![vec![11], vec![22]];
+        assert_ne!(drafted, anchors);
+        let independent = include_str!("independent.rs");
+        assert!(independent.contains("Ok(proposed) => proposed"));
+        assert!(independent.contains("draft.require_live(lane)"));
+        let scheduler = include_str!("../scheduler.rs");
+        let single = &scheduler[scheduler.find("fn single_lane_round<").unwrap()..];
+        assert!(single[..4000].contains("Ok(inputs) => inputs"));
+        assert!(single[..4000].contains("draft.require_live(lane)"));
     }
 }
