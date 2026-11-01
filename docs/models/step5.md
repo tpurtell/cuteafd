@@ -23,8 +23,11 @@ Everything is read from `config.json` and the safetensors headers;
 fit: the minimum is 1 RTX PRO 6000 + 3 Sparks, and the maximum is 2 RTX PRO
 6000 + 6 Sparks. Routed layers are onboarded to the RTX by default
 (`RTX_EXPERT_LAYERS` unset is pool-first auto). Once the 2M KV pool fits,
-whole routed layers run on the entry RTX from the `rtx-tp1` package; on the
-maximum card that is about 20 layers. Start from
+one RTX runs whole layers from `rtx-tp1`; two RTX split each onboarded layer
+TP2 through the shared pair and `rtx-tp2`, with F32 partial exchange. The
+96 GiB header-fixture maximum onboards 24 layers; the minimum prioritizes
+its roughly 1.81M-token pool and onboards none. These are planner results,
+not hardware qualification. Start from the published-revision-pinned
 `examples/configs/step5-exl3-k6core-{min,max}.config`.
 
 ## Native MTP
