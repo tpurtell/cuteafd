@@ -123,7 +123,11 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
                 let proposed = {
                     let mut draft = draft.borrow_mut();
-                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &drafting)? }
+                    // W64-1: a failed proposal verifies the anchors only; it never fails the round.
+                    if let Some(draft) = draft.as_deref_mut() { match draft.poll_propose(lane, &drafting) {
+                        Ok(proposed) => proposed,
+                        Err(error) => Some((super::stall::anchor_only(&drafting, lane, &error), 0)),
+                    } }
                     else { Some((drafting.iter().map(|r| vec![r.1]).collect(), 0)) }
                 };
                 if let Some(inputs) = proposed { break inputs; }
@@ -167,6 +171,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             };
             let prepared_us = started.elapsed().as_micros() as u64;
             round_id += 1;
+            super::stall::tick();
             tracing::debug!(target: "cuteafd::lane_schedule", lane, round_id, requests=members.len(),
                 "independent verifier issued");
             let operation: Result<()> = async {

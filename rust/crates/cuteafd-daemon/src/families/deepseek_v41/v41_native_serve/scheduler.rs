@@ -4,6 +4,7 @@ use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
 mod admission;
+pub(super) mod stall;
 pub(crate) mod layout;
 use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
@@ -484,6 +485,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             "native coordinator exact cap differs from validated inventory");
     }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
+    stall::spawn();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
@@ -518,6 +520,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         // This point is reached only after both complete stacks have drained and
         // committed. No cache owner is migrated or retired inside a layer stack.
+        stall::mark(stall::Phase::Retire, active.iter().flatten().count());
         for entry in &mut active {
             if entry.as_ref().is_some_and(|r| r.finished || r.job.events.is_closed()) {
                 retire_request(entry.take().unwrap(), requests, &mut prefixes, draft.as_deref_mut())?;
@@ -712,6 +715,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             admitted.push((prepared, id, lease, slot, image_keys, hit, restore));
         }
         prefix_waiters.extend(next_wave);
+        stall::mark(stall::Phase::Admission, active.iter().flatten().count() + admitted.len());
         let mut packed_scores = prefill_packed_admissions::<P>(lib, runtime, requests, prefill_slots,
             &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
         for (member, (prepared, id, lease, slot, image_keys, hit, restore)) in admitted.into_iter().enumerate() {
@@ -796,6 +800,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
         }
         if active.iter().all(Option::is_none) {
+            stall::mark(stall::Phase::Idle, 0);
             crate::shared::decode_graph::census::idle();
             crate::shared::decode_graph::CaptureWatch::flush();
             if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty() { break; }
@@ -831,6 +836,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 requests=members.iter().map(Vec::len).sum::<usize>(), "graph census decode step begin");
             Instant::now()
         });
+        stall::mark(stall::Phase::Decode, active.iter().flatten().count());
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
             requests, first_transport, second_transport, &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
@@ -844,6 +850,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         if let Err(error) = result {
             tracing::error!(error=%format!("{error:#}"), "native decode round failed");
+            stall::mark(stall::Phase::Failed, active.iter().flatten().count());
             P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
                     for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
             for request in active.iter_mut().flatten() {
@@ -1668,7 +1675,10 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
     prefetch_drafts(requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
-        clock.draft(|| draft.propose(lib, lane, &seeds))?
+        match clock.draft(|| draft.propose(lib, lane, &seeds)) {
+            Ok(inputs) => inputs,
+            Err(error) => stall::anchor_only(&seeds, lane, &error),
+        }
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
     prefetch_drafts(requests, active, members, &inputs);
