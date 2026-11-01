@@ -37,6 +37,16 @@ fn tail_outcome(rows: usize, accepted: usize, neural: usize) -> (usize, usize, u
 pub(crate) use chain::DraftChain;
 mod distributed;
 
+/// The process-wide terminal signal for the expert wire. A draft that runs on
+/// a terminal engine is not a reusable target-only fallback: the lane must
+/// fail the round instead of verifying anchors forever.
+pub(crate) fn require_peer_live() -> Result<()> {
+    if let Some(reason) = cuteafd_transport::health::failure_reason() {
+        anyhow::bail!("draft peer wire unavailable until restart: {reason}");
+    }
+    Ok(())
+}
+
 /// Execution workspaces share a request-indexed bank of persistent draft state.
 pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
     mains: Vec<DsparkMainContext<'w, 'a>>,
@@ -614,6 +624,11 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn windows(&self) -> &[DsparkWindow<'a>; 3] {
         &self.windows
+    }
+    /// Liveness gate for the anchor-only fallback: a terminal draft propagates
+    /// its error instead of silently degrading every round to anchors.
+    pub fn require_live(&self, lane: usize) -> Result<()> {
+        self.chains.get(lane).context("invalid draft lane")?.require_live()
     }
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
