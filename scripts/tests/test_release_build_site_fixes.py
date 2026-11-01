@@ -1,82 +1,102 @@
-"""Release-build site fixes: empty EXL3 scope, ssh image distribution, staging-dir
-measurement, the free-space override and the single-host build.
-
-A deepseek_v41-scoped build ships no V4.1 EXL3 family, so the artifact directory
-gained no exl3/ and Dockerfile.release's unconditional `COPY .../exl3` failed the
-Spark image ("/.cuteafd-release-image/exl3: not found"). Like fp8/, exl3/ always
-exists and the bake-time verify loop skips an unmatched glob.
-
-The Spark staging directory may resolve off a small $HOME (a symlink onto the
-Spark /scratch), so the free-space check measures the filesystem that really
-holds it; CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB overrides the 60 GiB floor. A
-single build host has nobody to copy to, and hosts without rdmapipe fall back to
-`ssh docker save | load` (rdmapipe stays first when present).
-"""
+"""Execute the release script's site-specific checks without builds or hardware."""
 from pathlib import Path
+import os
+import subprocess
+
+import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 
 
-def test_artifacts_script_always_creates_exl3_dir_before_the_family_loop():
-    s = (REPO / "scripts/build/build-release-artifacts.sh").read_text()
-    mk = s.index('install -d "$output_dir/exl3"')
-    loop = s.index('[[ "$release_family" == *:exl3-k* ]] || continue')
-    assert mk < loop
+def block(path, start, end):
+    source = (REPO / path).read_text()
+    return source[source.index(start):source.index(end, source.index(start))]
 
 
-def test_dockerfile_copies_exl3_and_skips_an_empty_family_glob():
-    s = (REPO / "docker/Dockerfile.release").read_text()
-    assert "COPY .cuteafd-release-image/exl3 /opt/cuteafd/lib/exl3" in s
-    loop = s.index("for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do")
-    guard = s.index('[ -d "$exl3_family" ] || continue;', loop)
-    verify = s.index("package_exl3_aot.py verify", loop)
-    assert guard < verify
+def shell(code, *args, env=None):
+    return subprocess.run(["bash", "-euo", "pipefail", "-c", code, "test", *map(str, args)],
+                          env={**os.environ, **(env or {})}, text=True, capture_output=True, timeout=10)
 
 
-def test_build_verifies_dist_exl3_only_when_it_holds_a_package():
-    s = (REPO / "build.sh").read_text()
-    guard = s.index('if compgen -G "$repo_root/dist/$role/exl3/*" >/dev/null; then')
-    verify = s.index('package_exl3_aot.py" verify --package "$repo_root/dist/$role/exl3"')
-    assert guard < verify < s.index("fi", verify)
+@pytest.mark.parametrize("value", ["0", "-1", "31.5", "on", "=on", "1+2", "", "99999999999999999999"])
+def test_remote_free_space_floor_rejects_invalid_values(value):
+    code = block("build.sh", 'remote_min_free_gib=', 'native_build_env_args=()')
+    result = shell('release_die() { echo "$*" >&2; exit 2; };\n' + code,
+                   env={"CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB": value})
+    assert result.returncode == 2
+    assert "CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB" in result.stderr
+    assert "arithmetic" not in result.stderr
 
 
-def test_spark_image_distribution_falls_back_to_ssh_without_rdmapipe():
-    s = (REPO / "build.sh").read_text()
-    assert 'release_die "rdmapipe is required on every Spark build host' not in s
-    fb = s.index("rdmapipe missing on a build host: distributing Spark image over ssh")
-    assert s.index('docker image save $spark_image_quoted"', fb) < s.index('"set -o pipefail; docker image load"', fb)
-    # the identity gates that follow distribution still run for every build host
-    assert fb < s.index('release_die "$host Spark image revision mismatch: $revision"')
+@pytest.mark.parametrize("value", ["1", "32", "60", "120"])
+def test_remote_free_space_floor_accepts_positive_integers(value):
+    code = block("build.sh", 'remote_min_free_gib=', 'native_build_env_args=()')
+    result = shell('release_die() { exit 2; };\n' + code + '\nprintf "%s" "$remote_min_free_gib"',
+                   env={"CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB": value})
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == value
 
 
-def test_rdmapipe_stays_first_when_present():
-    s = (REPO / "build.sh").read_text()
-    rdma = s.index("concurrently distributing Spark image over RDMA")
-    fallback = s.index("rdmapipe missing on a build host: distributing Spark image over ssh")
-    assert rdma < fallback
+def test_remote_free_space_measures_dangling_staging_symlink_target(tmp_path):
+    target = tmp_path / "other-filesystem"
+    target.mkdir()
+    staging = tmp_path / "staging"
+    staging.symlink_to(target / "not-created" / "build")
+    code = block("build.sh", 'p="$(readlink -m "$1")"', '\nREMOTE\n')
+    # Stand in for df so the test observes the chosen filesystem ancestor,
+    # without requiring a second mount or enough free space on the test host.
+    result = shell('df() { printf "Filesystem Blocks Used Available Capacity Mounted\\nfs 1 0 123 0 %s\\n" "$2"; echo "$2" >&2; };\n' + code, staging)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "123"
+    assert result.stderr.strip() == str(target)
+    assert not (target / "not-created").exists()
 
 
-def test_single_build_host_needs_no_rdmapipe():
-    s = (REPO / "build.sh").read_text()
-    guard = s.index('((${#RELEASE_BUILD_HOSTS[@]} > 1)) || rdmapipe_ready=2')
-    probe = s.index('command -v rdmapipe >/dev/null 2>&1', guard)
-    assert guard < probe
-    assert 'echo "== single Spark build host: nothing to distribute =="' in s
+@pytest.mark.parametrize("hosts,rdma,expected", [
+    ("seed", False, "single"), ("seed dst", True, "rdma"), ("seed dst", False, "ssh"),
+])
+def test_image_distribution_uses_rdma_first_with_single_host_and_ssh_fallback(tmp_path, hosts, rdma, expected):
+    log = tmp_path / "ssh.log"
+    code = block("build.sh", 'rdmapipe_ready=1', '\ncoordinator_revision=')
+    setup = '''release_die() { echo "$*" >&2; exit 2; }
+release_ssh() {
+  printf '%s\\n' "$*" >> "$TEST_LOG"
+  if [[ "$*" == *'command -v rdmapipe'* ]]; then [[ "$TEST_RDMA" == yes ]]; return; fi
+  cat >/dev/null
+}
+read -ra RELEASE_BUILD_HOSTS <<< "$TEST_HOSTS"
+seed_host=seed
+SPARK_EXPERT_DOCKER_INFERENCE=example/image:tag
+'''
+    result = shell(setup + code, env={"TEST_HOSTS": hosts, "TEST_RDMA": "yes" if rdma else "no", "TEST_LOG": str(log)})
+    assert result.returncode == 0, result.stderr
+    commands = log.read_text() if log.exists() else ""
+    if expected == "single":
+        assert "nothing to distribute" in result.stdout
+        assert not commands
+    else:
+        assert "docker image save example/image:tag" in commands
+        assert "docker image load" in commands
+        assert ("rdmapipe --send" in commands) == (expected == "rdma")
+        assert ("rdmapipe --recv" in commands) == (expected == "rdma")
 
 
-def test_remote_free_space_measures_the_staging_directory_filesystem():
-    s = (REPO / "build.sh").read_text()
-    block = s.index('release_ssh "$seed_host" bash -s -- "$remote_dir"')
-    resolve = s.index('while [ ! -e "$p" ]; do p="$(dirname "$p")"; done', block)
-    df = s.index('df -Pk "$(readlink -f "$p")"', resolve)
-    assert block < resolve < df
-    # the old $HOME-only probe is gone
-    assert 'df -Pk "$HOME" | awk \'NR == 2 { print $4 }\'' not in s
+def test_artifacts_script_creates_exl3_directory(tmp_path):
+    code = block("scripts/build/build-release-artifacts.sh", 'install -d "$output_dir/exl3"', '\n',)
+    result = shell('output_dir="$1"; ' + code, tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "exl3").is_dir()
 
 
-def test_remote_free_space_floor_is_overridable():
-    s = (REPO / "build.sh").read_text()
-    assert s.count("${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60}") >= 2
-    assert 'release_die "$seed_host build needs at least ${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60} GiB free"' in s
-    assert ('release_die "$seed_host release build root $release_build_root needs at least '
-            '${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60} GiB free"') in s
+def test_dockerfile_empty_exl3_glob_does_not_run_verifier(tmp_path):
+    code = block("docker/Dockerfile.release", 'for exl3_family in /opt/cuteafd/lib/exl3/exl3-*/; do', 'done &&') + 'done'
+    code = code.replace('/opt/cuteafd/lib/exl3', str(tmp_path))
+    result = shell('python3() { echo "unexpected verifier invocation" >&2; return 99; };\n' + code)
+    assert result.returncode == 0, result.stderr
+    assert not result.stderr
+
+
+def test_empty_dist_exl3_does_not_run_verifier(tmp_path):
+    code = block("build.sh", 'if compgen -G "$repo_root/dist/$role/exl3/*"', '    fi') + '    fi'
+    result = shell('repo_root="$1"; role=spark; python3() { return 99; };\n' + code, tmp_path)
+    assert result.returncode == 0, result.stderr

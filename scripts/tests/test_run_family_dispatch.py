@@ -34,7 +34,9 @@ def _snapshot(hf: Path, model: str, config: dict, revision: str = "abc") -> None
     (root / "refs").mkdir(parents=True)
     (root / "refs" / "main").write_text(revision)
     (root / "snapshots" / revision).mkdir(parents=True)
-    (root / "snapshots" / revision / "config.json").write_text(json.dumps(config))
+    (root / "blobs").mkdir(exist_ok=True)
+    (root / "blobs" / f"config-{revision}").write_text(json.dumps(config))
+    (root / "snapshots" / revision / "config.json").symlink_to(f"../../blobs/config-{revision}")
     if config.get("audio_config"):
         audio = root / "snapshots" / revision / "audio_tokenizer"
         audio.mkdir()
@@ -828,7 +830,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                           launcher_source: Path | None = None,
                           deployment_overrides: dict | None = None,
                           probe_fails: bool = False, root_launcher: bool = False,
-                          checkpoint_source: Path | None = None) -> subprocess.CompletedProcess[str]:
+                          checkpoint_source: Path | None = None,
+                          execute_workers: bool = False) -> subprocess.CompletedProcess[str]:
     """Run the real run-family.sh up to its docker calls (docker/ssh/nest/curl are stubs
     that print their argv) and return what it would launch. nvidia-smi reports
     PHYSICAL_GPUS (default 0 and 1, V4.1 0 alone; BUSY_GPUS with 2 GiB free); the deployment plan charges each
@@ -907,6 +910,11 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
                                      if tool == "docker" and container_pids else '') +
                                     (f"case \"$*\" in inspect*) echo '[\"serve-qwen4\",\"--peers\",\"{previous_peers}\"]' ;; esac\n"
                                      if tool == "docker" and previous_peers is not None else ''))
+        if tool == "ssh" and execute_workers:
+            with (bin_dir / tool).open("a") as stream:
+                stream.write('if [[ "$*" == *"release_hub_mounts ()"* ]]; then shift; command="$*"; '
+                             'if [[ -n "${STUB_REMOTE_HF_HOME:-}" ]]; then command="${command//${HF_HOME}/${STUB_REMOTE_HF_HOME}}"; fi; '
+                             'exec bash -c "$command"; fi\n')
         if tool == "ssh" and native_v41:
             with (bin_dir / tool).open("a") as stream:
                 stream.write('case "$*" in *spark_tp_roles*|*"python3 -"*"tp2"*) echo "${STUB_SPARK_ROLES:-tp2}" ;; *"docker container inspect"*) exit 1 ;; esac\n')
@@ -1185,7 +1193,7 @@ def test_serving_coordinator_and_workers_use_host_identity(tmp_path, wip):
     # Nothing may be bind-mounted under the container HOME: Docker would create
     # root-owned parents there, and the non-root coordinator's placement handoff fails.
     assert ":/tmp/cuteafd-home/" not in coordinator
-    worker = result.stderr.split("ssh h0 release_serving_docker_args ()", 1)[1]
+    worker = result.stderr.split("ssh h0 release_die ()", 1)[1]
     assert 'id -u' in worker and 'id -g' in worker
     assert 'release_serving_docker_args; cuteafd_cdi_gpu_args all || exit 2; docker run -d' in worker or ('release_serving_docker_args; cuteafd_cdi_gpu_args all' in worker and 'docker run -d' in worker)
     assert '"${RELEASE_SERVING_ARGS[@]}"' in worker
@@ -2629,18 +2637,21 @@ def test_glm_template_override_invalid_source_refused_before_workers(tmp_path, s
     assert "cuteafd expertd-native" not in result.stderr and "cuteafd serve-glmf" not in result.stderr
 
 
-@pytest.mark.skipif(Path("/mnt/sparknest/hf-home").is_dir(),
-                    reason="this host has a SparkNest namespace; the site-hub fallback cannot be exercised")
 def test_site_hub_fallback_binds_the_resolved_snapshot(tmp_path: Path) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
                                    "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
-                                   with_nest=False)
+                                   with_nest=False,
+                                   extra_env={"CUTEAFD_NAMESPACE_ROOT": str(tmp_path / "absent-namespace")})
     assert result.returncode == 0, result.stderr
     snapshot = tmp_path / "hf" / "hub" / "models--test--model" / "snapshots" / "abc"
     launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
     assert launches, result.stderr
     for line in launches:
-        assert f"-v {snapshot}:{snapshot}:ro" in line, line
+        hub = tmp_path / "hf" / "hub"
+        if line.startswith("docker "):
+            assert f"-v {hub}:{hub}:ro" in line, line
+        else:
+            assert "RELEASE_HUB_MOUNTS" in line, line
         assert "/mnt/sparknest" not in line, line
 
 
@@ -2648,9 +2659,9 @@ def test_namespace_mount_when_the_site_hub_is_present(tmp_path: Path) -> None:
     namespace = _namespace(tmp_path)
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
                                    "RTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
-                                   extra_env={"CUTEAFD_NAMESPACE_ROOT": str(namespace)})
+                                   extra_env={"CUTEAFD_NAMESPACE_ROOT": str(namespace)}, execute_workers=True)
     assert result.returncode == 0, result.stderr
-    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    launches = [line for line in result.stderr.splitlines() if line.startswith("docker run -d")]
     assert launches, result.stderr
     for line in launches:
         assert f"-v {namespace}:{namespace}:ro" in line, line
@@ -3892,7 +3903,7 @@ def test_pre_108_wip_seal_serves_with_hub_under_hf_home(tmp_path):
     # The default drafter is passed as the same resolved host snapshot path.
     assert f"--draft {tmp_path}/hf/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/" in coordinator[0]
     worker = result.stderr.split("release_serving_docker_args ()", 1)[1]
-    assert f"HF_HOME={namespace}/hf-home" in worker and f"{namespace}:{namespace}:ro" in worker
+    assert f"HF_HOME={namespace}/hf-home" in worker and "RELEASE_HUB_MOUNTS" in worker
 
 
 @pytest.mark.parametrize("wip", [False, True])
@@ -4073,7 +4084,8 @@ def test_namespace_root_and_push_endpoint_reach_both_serving_roles(tmp_path):
             assert f"HF_HOME={hf}" in line
             assert f"{hf}/hub/models--zai-org--GLM-5.3-Flash/snapshots/abc" in line
     assert result.stderr.count("CUTEAFD_PUSH_SOCKET=@isolated-push") >= 2
-    assert f"--snapshot '{hf}/hub/models--zai-org--GLM-5.3-Flash/snapshots/abc'" in result.stderr
+    assert f"release_hub_mounts {root} 0 {hf} hub/models--zai-org--GLM-5.3-Flash/snapshots/abc" in result.stderr
+    assert '--snapshot "$RELEASE_HUB_SNAPSHOT"' in result.stderr
 
 
 @pytest.mark.parametrize("format", ["native", "fp8", "exlr8"])
@@ -4160,3 +4172,43 @@ def test_glmf_max_root_launcher_auto_vision_uses_planned_peer(tmp_path: Path, dr
         assert "--vision rtx:1" in serve
         assert "--split-device 1" in serve
         assert "--local-experts" in serve
+
+
+@pytest.mark.parametrize("template_kind", ["id", "snapshot"])
+def test_site_hub_launch_mounts_symlinked_main_draft_and_template(tmp_path, template_kind):
+    hf = tmp_path / "hf"
+    _snapshot(hf, "incoai/GLM-5.3-Flash-DFlash2", {})
+    _snapshot(hf, "vendor/template", {})
+    template = "vendor/template"
+    if template_kind == "snapshot":
+        template = str(hf / "hub/models--vendor--template/snapshots/abc")
+    result = _family_launch_result(tmp_path, GLMF_TWO_LAYER, "test/model",
+        f"CHAT_TEMPLATE_FROM={template}\nVISION=auto\nAUDIO=off\n",
+        extra_env={"CUTEAFD_NAMESPACE_ROOT": str(tmp_path / "absent")},
+        execute_workers=True)
+    assert result.returncode == 0, result.stderr
+    hub = hf / "hub"
+    commands = [shlex.split(line) for line in result.stderr.splitlines()
+                if line.startswith("docker ") and ("cuteafd plan" in line or "cuteafd serve-glmf" in line or "cuteafd expertd-native" in line)]
+    assert len(commands) == 3, result.stderr
+    for command in commands:
+        assert f"{hub}:{hub}:ro" in command
+        assert f"HF_HOME={hf}" in command
+    for command in commands:
+        if "serve-glmf" in command:
+            assert "--draft" in command
+        if "expertd-native" not in command:
+            assert command[command.index("--chat-template-from") + 1] == template
+
+
+def test_missing_remote_site_snapshot_fails_before_worker_docker(tmp_path):
+    remote_hf = tmp_path / "missing-remote-hf"
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v4"}, "test/model",
+        "SPECULATOR=off\nVISION=off\nAUDIO=off\n",
+        extra_env={"CUTEAFD_NAMESPACE_ROOT": str(tmp_path / "absent"),
+                   "STUB_REMOTE_HF_HOME": str(remote_hf)}, execute_workers=True)
+    assert result.returncode != 0
+    assert "missing snapshot" in result.stderr
+    assert not remote_hf.exists()
+    assert not any(line.startswith("docker run -d") and "expertd-native" in line
+                   for line in result.stderr.splitlines())

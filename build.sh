@@ -10,6 +10,12 @@ cuteafd_build_cache_defaults
 native_build_jobs="${CUTEAFD_RELEASE_NATIVE_BUILD_JOBS:-}"
 [[ -z "$native_build_jobs" || "$native_build_jobs" =~ ^[1-9][0-9]*$ ]] ||
   release_die "CUTEAFD_RELEASE_NATIVE_BUILD_JOBS must be a positive integer"
+remote_min_free_gib="${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB-60}"
+[[ "$remote_min_free_gib" =~ ^[1-9][0-9]*$ ]] ||
+  release_die "CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB must be a positive integer"
+# Keep the GiB-to-KiB comparison inside Bash's signed integer range.
+((${#remote_min_free_gib} <= 9)) ||
+  release_die "CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB is too large"
 native_build_env_args=()
 [[ -z "$native_build_jobs" ]] || native_build_env_args=(-e "CMAKE_BUILD_PARALLEL_LEVEL=$native_build_jobs")
 
@@ -740,12 +746,12 @@ local_free_kib="$(df -Pk "$repo_root" | awk 'NR==2 {print $4}')"
 # resolve off a small $HOME, e.g. a symlink onto the Spark /scratch).
 remote_free_kib="$(
   release_ssh "$seed_host" bash -s -- "$remote_dir" <<'REMOTE'
-p="$1"
+p="$(readlink -m "$1")"
 while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
 df -Pk "$(readlink -f "$p")" | awk 'NR == 2 { print $4 }'
 REMOTE
 )"
-((remote_free_kib >= ${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60} * 1024 * 1024)) || release_die "$seed_host build needs at least ${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60} GiB free"
+((remote_free_kib >= $remote_min_free_gib * 1024 * 1024)) || release_die "$seed_host build needs at least $remote_min_free_gib GiB free"
 
 # A relocated build root is its own filesystem decision: the two checks above
 # cover the source tree and the Spark home, not the scratch the container writes.
@@ -764,8 +770,8 @@ if [[ -n "$release_build_root" ]]; then
     release_ssh "$seed_host" \
       "mkdir -p $release_build_root_quoted && df -Pk $release_build_root_quoted | awk 'NR == 2 { print \$4 }'"
   )"
-  ((remote_root_free_kib >= ${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60} * 1024 * 1024)) ||
-    release_die "$seed_host release build root $release_build_root needs at least ${CUTEAFD_RELEASE_REMOTE_MIN_FREE_GIB:-60} GiB free"
+  ((remote_root_free_kib >= $remote_min_free_gib * 1024 * 1024)) ||
+    release_die "$seed_host release build root $release_build_root needs at least $remote_min_free_gib GiB free"
 fi
 
 # Only the coordinator writes local artifacts/reuse proof. Allocate the proof path
