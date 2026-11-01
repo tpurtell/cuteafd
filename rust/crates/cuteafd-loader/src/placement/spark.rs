@@ -195,13 +195,15 @@ impl SparkAssignment {
                     use crate::V41ExpertSelection;
                     ensure!(catalog.exl3().is_none() && catalog.fp8().is_none(),
                         "Spark native layout cannot convert compressed checkpoint headers");
-                    let width = if world == 1 {
-                        ensure!(rank == 0, "single-rank native shard must have rank 0");
-                        geometry.intermediate as usize
+                    use crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry;
+                    let shard = if catalog.nvfp4().is_some() {
+                        V41BackboneTpGeometry::equal(geometry.intermediate as usize,
+                            geometry.hidden as usize, world, rank)?
                     } else {
-                        crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry::new(
-                            geometry.intermediate as usize, geometry.hidden as usize, world, rank)?.intermediate_size()
+                        V41BackboneTpGeometry::new(geometry.intermediate as usize,
+                            geometry.hidden as usize, layer, world, rank)?
                     };
+                    let width = shard.intermediate_size();
                     ensure!(stored_width >= width && stored_width % 32 == 0,
                         "Spark native installed width {stored_width} cannot store logical width {width}");
                     // Check every retained expert's tensor headers, not just config geometry.
@@ -215,7 +217,7 @@ impl SparkAssignment {
                         };
                         ensure!(header_width == width, "Spark native header width {header_width}, expected {width}");
                     }
-                    slice.first = u32::try_from(rank * width)?;
+                    slice.first = u32::try_from(shard.first_intermediate())?;
                     slice.width = u32::try_from(width)?;
                     slice.stored_width = u32::try_from(stored_width)?;
                     if catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes() {

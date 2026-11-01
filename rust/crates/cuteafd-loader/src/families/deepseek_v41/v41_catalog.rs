@@ -1419,6 +1419,110 @@ mod tests {
     }
 
     #[test]
+    fn exact_k32_mount_and_push_reconstruct_every_source_plane() -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        use crate::push_load::builder::{Builder, Destination};
+        let hidden = 256;
+        for intermediate in [2048, 2304, 3072] {
+            let dir = tempfile::tempdir()?;
+            let suffixes = ["w1.weight", "w3.weight", "w2.weight", "w1.scale", "w3.scale", "w2.scale"];
+            let descriptions = suffixes.iter().enumerate().map(|(slot, suffix)| {
+                let divisor = if slot < 3 { 2 } else { 32 };
+                let shape = if slot % 3 == 2 { vec![hidden, intermediate / divisor] }
+                    else { vec![intermediate, hidden / divisor] };
+                (format!("layers.0.ffn.experts.0.{suffix}"),
+                    if slot < 3 { "I8" } else { "F8_E8M0" }, shape)
+            }).collect::<Vec<_>>();
+            let path = dir.path().join("fixture.safetensors");
+            crate::plan::testing::write_safetensors(&path, &descriptions);
+            let metadata = crate::read_safetensors_metadata(&path)?;
+            let file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            let mut originals = std::collections::BTreeMap::new();
+            for tensor in &metadata {
+                let slot = suffixes.iter().position(|suffix| tensor.name.ends_with(suffix)).unwrap();
+                let pitch = tensor.shape[1];
+                let bytes = (0..tensor.byte_length as usize).map(|i|
+                    ((i / pitch * 73 + i % pitch * 37 + (i % pitch) / 251 + slot * 53) % 251 + 1) as u8)
+                    .collect::<Vec<_>>();
+                file.write_all_at(&bytes, tensor.byte_offset)?;
+                originals.insert(slot, bytes);
+            }
+            // Alias one six-plane safetensors payload at every absolute layer;
+            // only ownership changes, so reconstruction has an independent oracle.
+            let mut tensors = Vec::new();
+            for layer in 0..8 { for expert in 0..2 { for source in &metadata {
+                let mut metadata = source.clone();
+                metadata.name = metadata.name.replace("layers.0.", &format!("layers.{layer}."))
+                    .replace("experts.0.", &format!("experts.{expert}."));
+                let axis = usize::from(metadata.name.contains(".w2."));
+                tensors.push(V41Tensor { shard: "fixture.safetensors".into(), metadata,
+                    placement: V41TensorPlacement::BackboneExpertTp4 { layer, expert, axis } });
+            }}}
+            tensors.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+            let catalog = OfficialV41Catalog { reader: Default::default(),
+                format: crate::plan::checkpoint::CheckpointFormat::HfIndexed,
+                config: None, experts: RoutedExpertShape { layers: 8, first_layer: 0, experts: 2,
+                    topk: 1, hidden, intermediate, draft_stages: 0, draft_experts: 0 },
+                snapshot: dir.path().into(), tensors, exl3: None, nvfp4: None, fp8: None };
+            for world in 2..=8 { for layer in 0..world {
+                let mut reconstructed = originals.values().map(|bytes| vec![0u8; bytes.len()]).collect::<Vec<_>>();
+                let mut coverage = vec![0u8; intermediate / 32];
+                for rank in 0..world {
+                    let units = intermediate / 32;
+                    let canonical = if units % world == 0 { rank } else { (rank + world - layer) % world };
+                    let first = (canonical * (units / world) + canonical.min(units % world)) * 32;
+                    let width = (units / world + usize::from(canonical < units % world)) * 32;
+                    coverage[first / 32..(first + width) / 32].iter_mut().for_each(|n| *n += 1);
+                    let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneTp {
+                        layer, expert: rank % 2, world, rank })?;
+                    assert_eq!(staging.intermediate_size(), width);
+                    let mut raw = vec![0; staging.staging_bytes()];
+                    staging.prefetch()?;
+                    staging.read_into(&mut raw, &mut vec![0; staging.minimum_read_scratch_bytes() * hidden])?;
+                    let mut builder = Builder::new(dir.path(), vec![raw.len() as u64]);
+                    builder.v41_regions(&catalog, staging.tensor_names(), staging.tensor_ranges(),
+                        world as u32, rank as u32, Destination { rank: 0, offset: 0, bytes: raw.len() as u64 })?;
+                    let pushed = builder.finish()?;
+                    let mut landed = vec![0; raw.len()];
+                    let file = File::open(&path)?;
+                    for entry in &pushed.plan.entries {
+                        for (source, destination) in pushed.plan.patterns[entry.pattern as usize].runs() {
+                            let start = (entry.dst_base + destination) as usize;
+                            let bytes = pushed.plan.patterns[entry.pattern as usize].run as usize;
+                            file.read_exact_at(&mut landed[start..start + bytes], entry.src_base + source)?;
+                        }
+                    }
+                    assert_eq!(landed, raw, "I{intermediate} TP{world} L{layer} R{rank}: push/mount");
+                    for (slot, range) in staging.tensor_ranges().iter().enumerate() {
+                        let divisor = if slot < 3 { 2 } else { 32 };
+                        let down = slot % 3 == 2;
+                        let pitch = if down { intermediate / divisor } else { hidden / divisor };
+                        let count = if down { hidden } else { width };
+                        let row_width = if down { width / divisor } else { pitch };
+                        let offset = if down { first / divisor } else { first * pitch };
+                        assert_eq!(range.len(), count * row_width);
+                        for row in 0..count {
+                            let source = offset + row * pitch;
+                            let actual = &raw[range.start + row * row_width..range.start + (row + 1) * row_width];
+                            assert_eq!(actual, &originals[&slot][source..source + row_width],
+                                "I{intermediate} TP{world} L{layer} R{rank} plane{slot} row{row}");
+                            reconstructed[slot][source..source + row_width].copy_from_slice(actual);
+                        }
+                    }
+                }
+                assert!(coverage.iter().all(|&n| n == 1));
+                for slot in 0..6 { assert_eq!(reconstructed[slot], originals[&slot]); }
+            }}
+            // Equal NVFP4 geometry remains explicitly separate from MXFP4 rotation.
+            for world in [5, 7] {
+                assert!(super::super::v41_expert_staging::V41BackboneTpGeometry::equal(
+                    intermediate, hidden, world, 0).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn kimi_dispatch_uses_declared_family_before_v41_text_config() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let v41: serde_json::Value = serde_json::from_slice(include_bytes!("official-v41-config.json"))?;

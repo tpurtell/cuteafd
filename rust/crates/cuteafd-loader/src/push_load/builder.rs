@@ -519,6 +519,31 @@ impl Builder {
         Ok(())
     }
 
+    fn native_shard(catalog: &crate::OfficialV41Catalog, name: &str, world: u32, rank: u32)
+        -> Result<(crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry, usize)> {
+        use crate::families::deepseek_v41::v41_expert_staging::V41BackboneTpGeometry;
+        let tensor = catalog.tensor(name)?;
+        let crate::V41TensorPlacement::BackboneExpertTp4 { layer, .. } = tensor.placement else {
+            return Err(invalid("native shard requires a backbone expert"));
+        };
+        let shape = catalog.routed_experts();
+        let shard = V41BackboneTpGeometry::new(shape.intermediate, shape.hidden,
+            layer, world as usize, rank as usize)?;
+        let divisor = match tensor.metadata.dtype {
+            cuteafd_core::DType::I8 | cuteafd_core::DType::U8 => 2,
+            cuteafd_core::DType::F8E8M0 => 32,
+            _ => return Err(invalid("native shard requires MXFP4 weights or UE8M0 scales")),
+        };
+        let expected = if name.contains(".w2.") {
+            [shape.hidden, shape.intermediate / divisor]
+        } else { [shape.intermediate, shape.hidden / divisor] };
+        if tensor.metadata.shape != expected
+            || tensor.metadata.byte_length != (shape.hidden * shape.intermediate / divisor) as u64 {
+            return Err(invalid("native source geometry differs from checkpoint"));
+        }
+        Ok((shard, divisor))
+    }
+
     /// Preserve the existing V4.1 staging region order and its alignment gaps.
     /// MXFP4 and NVFP4 share the same native row/column partition operation;
     /// NVFP4 scalar regions are replicated verbatim rather than TP sliced.
@@ -547,6 +572,23 @@ impl Builder {
             let metadata = &catalog.tensor(name)?.metadata;
             if source.bytes == target.bytes {
                 self.contiguous(&source, 0, source.bytes, target)?;
+            } else if catalog.nvfp4().is_none() && matches!(catalog.tensor(name)?.placement,
+                crate::V41TensorPlacement::BackboneExpertTp4 { .. }) {
+                let (shard, divisor) = Self::native_shard(catalog, name, world, rank)?;
+                let down = name.contains(".w2.");
+                let pitch = if down { shard.full_intermediate_size() / divisor }
+                    else { shard.hidden_size() / divisor };
+                let width = if down { shard.intermediate_size() / divisor } else { pitch };
+                let offset = if down { shard.first_intermediate() / divisor }
+                    else { shard.first_intermediate() * pitch };
+                let rows = if down { shard.hidden_size() } else { shard.intermediate_size() };
+                if target.bytes != (rows * width) as u64 {
+                    return Err(invalid("native staging region differs from exact shard"));
+                }
+                self.rows(&source, offset as u64, u32::try_from(rows)
+                    .map_err(|_| invalid("native row count exceeds u32"))?,
+                    u32::try_from(width).map_err(|_| invalid("native row width exceeds u32"))?,
+                    pitch as u64, width as u64, target)?;
             } else {
                 let rows = *metadata
                     .shape
@@ -596,17 +638,32 @@ impl Builder {
             let plane = usize::from(down) * 2 + usize::from(scale);
             let divisor = if scale { if layout.nvfp4 { 16 } else { 32 } } else { 2 };
             let source = Self::v41_source(catalog, name)?;
-            let expected = mul(mul(layout.hidden as u64, layout.intermediate as u64)?, world as u64)? / divisor;
+            let native_backbone = !layout.nvfp4 && matches!(catalog.tensor(name)?.placement,
+                crate::V41TensorPlacement::BackboneExpertTp4 { .. });
+            let (full_intermediate, first) = if native_backbone {
+                let (shard, source_divisor) = Self::native_shard(catalog, name, world, rank)?;
+                if shard.intermediate_size() != layout.intermediate || shard.hidden_size() != layout.hidden
+                    || source_divisor != divisor as usize {
+                    return Err(invalid("native resident geometry differs from layer shard"));
+                }
+                (shard.full_intermediate_size(), shard.first_intermediate())
+            } else {
+                (layout.intermediate.checked_mul(world as usize)
+                    .ok_or_else(|| invalid("native intermediate extent overflow"))?,
+                    layout.intermediate.checked_mul(rank as usize)
+                        .ok_or_else(|| invalid("native source offset overflow"))?)
+            };
+            let expected = mul(layout.hidden as u64, full_intermediate as u64)? / divisor;
             if source.bytes != expected {
                 return Err(invalid("native source geometry differs from resident plan"));
             }
             let (offset, bytes) = layout.expert_plane(plane, expert)?;
             let half = if gate { layout.kernel_intermediate * layout.hidden / divisor as usize } else { 0 };
-            let source_pitch = if down { layout.intermediate * world as usize / divisor as usize }
+            let source_pitch = if down { full_intermediate / divisor as usize }
                 else { layout.hidden / divisor as usize };
             let width = if down { layout.intermediate / divisor as usize } else { source_pitch };
-            let source_offset = if down { rank as usize * width }
-                else { rank as usize * layout.intermediate * source_pitch };
+            let source_offset = if down { first / divisor as usize }
+                else { first * source_pitch };
             let destination_pitch = if down && layout.nvfp4 {
                 layout.kernel_intermediate / divisor as usize
             } else { width };

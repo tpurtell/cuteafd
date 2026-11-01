@@ -2,13 +2,13 @@
 //!
 //! Besides the fixed RTX/Spark TP4 and RTX-pair TP2 layouts, this module
 //! stages an explicitly selected shard of one official native FP4/E8M0
-//! backbone routed expert for a caller-chosen TP world of 2, 3 or 4. The
+//! backbone routed expert for a caller-chosen TP world of 1 through 8. The
 //! generic selection keeps the same six-region plan (`W1,W3,W2,S1,S3,S2`) and
 //! the same packing meaning as the fixed paths; only the shard geometry is
 //! parameterized.
 use crate::{OfficialV41Catalog, V41TensorPlacement};
 use anyhow::{ensure, Context, Result};
-use cuteafd_core::DType;
+use cuteafd_core::{tp_units::LayerShard, DType};
 use std::ops::Range;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,7 +26,7 @@ pub enum V41ExpertSelection {
     /// Half-width encoder expert on one member of an RTX pair.
     BackboneTp2 { layer: usize, expert: usize, rank: usize },
     /// Explicitly sized TP shard of one official native FP4/E8M0 backbone
-    /// routed expert. `world` is the shard count (2, 3, 4 or 6) and `rank` is
+    /// routed expert. `world` is the shard count (1 through 8) and `rank` is
     /// the shard index. W1/W3 weights and both scale planes slice output rows;
     /// W2 weight and scale slice input columns. Only the official MXFP4
     /// (native FP4/E8M0) checkpoint is accepted: EXL3 and ModelOpt NVFP4
@@ -48,7 +48,8 @@ pub enum V41ExpertSelection {
 /// Validated geometry of one explicit TP shard of an official native FP4/E8M0
 /// backbone routed expert.
 ///
-/// The shard carries `moe_intermediate_size / world` intermediate values.
+/// The shard owns one adjacent interval of whole K32 units. Unequal widths
+/// rotate by absolute layer; equal widths retain their original source ranges.
 /// W1/W3 (and their per-32-value E8M0 scale planes) slice output rows, so the
 /// slice boundary always falls on a whole scale group. W2 instead slices input
 /// columns; because one byte holds two FP4 values and one E8M0 scale covers 32
@@ -61,6 +62,7 @@ pub struct V41BackboneTpGeometry {
     world: usize,
     rank: usize,
     shard_intermediate: usize,
+    first_intermediate: usize,
 }
 
 impl V41BackboneTpGeometry {
@@ -69,6 +71,7 @@ impl V41BackboneTpGeometry {
     pub fn new(
         moe_intermediate_size: usize,
         hidden_size: usize,
+        layer: usize,
         world: usize,
         rank: usize,
     ) -> Result<Self> {
@@ -88,25 +91,11 @@ impl V41BackboneTpGeometry {
             hidden_size % 32 == 0,
             "backbone hidden size {hidden_size} does not align to 32-value scale groups"
         );
-        ensure!(
-            moe_intermediate_size % world == 0,
-            "backbone intermediate size {moe_intermediate_size} is not divisible by TP world {world}"
-        );
-        let shard_intermediate = moe_intermediate_size / world;
-        // W1/W3 output rows and their scale rows both advance by whole rows, so
-        // only the W2 input-column slice needs explicit alignment: one E8M0
-        // scale covers 32 input values and one byte packs two FP4 values.
-        ensure!(
-            shard_intermediate % 32 == 0,
-            "backbone TP shard of {shard_intermediate} intermediate values does not align to 32-value scale groups"
-        );
-        ensure!(
-            (moe_intermediate_size / 2) % world == 0,
-            "backbone TP world {world} splits the packed FP4 W2 rows of {moe_intermediate_size} intermediate values"
-        );
+        let shard = LayerShard::new(moe_intermediate_size, 32, layer, world, rank)?;
+        let shard_intermediate = shard.width;
         // Every staged extent is derived from shard_intermediate * hidden_size;
         // reject geometries whose extents cannot be represented.
-        shard_intermediate
+        moe_intermediate_size
             .checked_mul(hidden_size)
             .context("backbone TP shard extent overflow")?;
         Ok(Self {
@@ -115,8 +104,18 @@ impl V41BackboneTpGeometry {
             world,
             rank,
             shard_intermediate,
+            first_intermediate: shard.first,
         })
     }
+
+    /// NVFP4 keeps its separately qualified, equal-width ownership contract.
+    pub fn equal(intermediate: usize, hidden: usize, world: usize, rank: usize) -> Result<Self> {
+        ensure!(world > 0 && intermediate % world == 0 && (intermediate / world) % 32 == 0,
+            "equal native TP geometry requires whole K32 shards");
+        Self::new(intermediate, hidden, 0, world, rank)
+    }
+
+    pub fn first_intermediate(&self) -> usize { self.first_intermediate }
 
     pub fn world(&self) -> usize {
         self.world
@@ -126,7 +125,7 @@ impl V41BackboneTpGeometry {
         self.rank
     }
 
-    /// Intermediate values carried by this shard (`moe_intermediate_size / world`).
+    /// Exact intermediate values carried by this rank in the selected layer.
     pub fn intermediate_size(&self) -> usize {
         self.shard_intermediate
     }
@@ -172,12 +171,12 @@ impl V41BackboneTpGeometry {
 
     /// Byte offset of this shard inside every packed W2 weight row.
     pub fn w2_weight_column_offset_bytes(&self) -> usize {
-        self.rank * (self.shard_intermediate / 2)
+        self.first_intermediate / 2
     }
 
     /// Byte offset of this shard inside every W2 scale row.
     pub fn w2_scale_column_offset_bytes(&self) -> usize {
-        self.rank * (self.shard_intermediate / 32)
+        self.first_intermediate / 32
     }
 }
 
@@ -215,6 +214,7 @@ impl OfficialV41Catalog {
                 let geometry = V41BackboneTpGeometry::new(
                     config.intermediate,
                     config.hidden,
+                    layer,
                     world,
                     rank,
                 )?;
@@ -321,23 +321,14 @@ impl OfficialV41Catalog {
                     "generic TP staging requires native FP4/E8M0 storage for {name}"
                 );
                 let length = usize::try_from(tensor.metadata.byte_length)?;
-                ensure!(
-                    length > 0 && length % geometry.world() == 0,
-                    "generic TP tensor {name} does not divide into {} shards",
-                    geometry.world()
-                );
-                let size = length / geometry.world();
-                let expected = match slot {
-                    0 | 1 => geometry.w13_weight_shard_bytes(),
-                    3 | 4 => geometry.w13_scale_shard_bytes(),
-                    2 => geometry.w2_weight_shard_bytes(),
-                    _ => geometry.w2_scale_shard_bytes(),
-                };
-                ensure!(
-                    size == expected,
-                    "unexpected native expert extent for {name}: {size} != {expected}"
-                );
-                size
+                let divisor = if slot < 3 { 2 } else { 32 };
+                let expected_shape = if slot == 2 || slot == 5 {
+                    [config.hidden, config.intermediate / divisor]
+                } else { [config.intermediate, config.hidden / divisor] };
+                ensure!(tensor.metadata.shape == expected_shape
+                    && length == config.intermediate * config.hidden / divisor,
+                    "unexpected native source geometry for {name}");
+                geometry.intermediate_size() * config.hidden / divisor
             } else if matches!(selection, V41ExpertSelection::BackboneFull { .. }) {
                 usize::try_from(self.tensor(name)?.metadata.byte_length)?
             } else if matches!(selection, V41ExpertSelection::BackboneTp2 { .. } | V41ExpertSelection::DsparkTp2 { .. }) {
@@ -405,12 +396,22 @@ impl OfficialV41Catalog {
         };
         let metadata = &tensor.metadata;
         let length = usize::try_from(metadata.byte_length)?;
-        ensure!(
-            length > 0 && length % geometry.world() == 0,
-            "expert tensor {name} does not divide into {} TP shards",
-            geometry.world()
-        );
-        let bytes = length / geometry.world();
+        ensure!(metadata.shape.len() == 2, "generic TP read requires a matrix {name}");
+        let divisor = match metadata.dtype {
+            DType::I8 | DType::U8 => 2,
+            DType::F8E8M0 => 32,
+            DType::F8E4M3 if self.nvfp4().is_some() => 16,
+            _ => anyhow::bail!("unsupported native TP dtype for {name}"),
+        };
+        let expected_shape = match axis {
+            0 => [geometry.intermediate, geometry.hidden / divisor],
+            1 => [geometry.hidden, geometry.intermediate / divisor],
+            _ => anyhow::bail!("unsupported backbone expert TP axis {axis} for {name}"),
+        };
+        ensure!(metadata.shape == expected_shape
+            && length == geometry.intermediate * geometry.hidden / divisor,
+            "unexpected native source geometry for {name}");
+        let bytes = geometry.shard_intermediate * geometry.hidden / divisor;
         ensure!(
             dst.len() >= bytes,
             "tensor staging buffer for {name} needs {bytes} bytes"
@@ -422,8 +423,8 @@ impl OfficialV41Catalog {
                     .byte_offset
                     .checked_add(
                         u64::try_from(
-                            bytes
-                                .checked_mul(geometry.rank())
+                            geometry.first_intermediate
+                                .checked_mul(geometry.hidden / divisor)
                                 .context("generic TP row offset overflow")?,
                         )
                         .context("generic TP row offset overflow")?,
@@ -439,12 +440,7 @@ impl OfficialV41Catalog {
                 );
                 let rows = metadata.shape[0];
                 let row_bytes = length / rows;
-                ensure!(
-                    row_bytes > 0 && row_bytes % geometry.world() == 0,
-                    "W2 rows of {name} do not divide into {} TP shards",
-                    geometry.world()
-                );
-                let shard_bytes = row_bytes / geometry.world();
+                let shard_bytes = geometry.shard_intermediate / divisor;
                 ensure!(
                     rows.checked_mul(shard_bytes) == Some(bytes),
                     "W2 TP shard extent mismatch for {name}"
@@ -453,7 +449,7 @@ impl OfficialV41Catalog {
                     scratch.len() >= row_bytes,
                     "W2 scratch needs at least {row_bytes} bytes for {name}"
                 );
-                let column = geometry.rank() * shard_bytes;
+                let column = geometry.first_intermediate / divisor;
                 let rows_per_read = scratch.len() / row_bytes;
                 for start in (0..rows).step_by(rows_per_read) {
                     let count = rows_per_read.min(rows - start);
@@ -519,10 +515,11 @@ impl V41ExpertStaging<'_> {
     pub fn backbone_tp_geometry(
         moe_intermediate_size: usize,
         hidden_size: usize,
+        layer: usize,
         world: usize,
         rank: usize,
     ) -> Result<V41BackboneTpGeometry> {
-        V41BackboneTpGeometry::new(moe_intermediate_size, hidden_size, world, rank)
+        V41BackboneTpGeometry::new(moe_intermediate_size, hidden_size, layer, world, rank)
     }
 
     /// Advise only this expert's physical read ranges, without mapping or loading
@@ -539,8 +536,11 @@ impl V41ExpertStaging<'_> {
                     range.len() as u64
                 }
                 crate::V41TensorPlacement::BackboneExpertTp4 { axis: 0, .. } if self.rank.is_some() => {
+                    let source_offset = if let Some(geometry) = self.geometry {
+                        geometry.first_intermediate * (tensor.metadata.byte_length as usize / geometry.intermediate)
+                    } else { range.len() * self.rank.unwrap() };
                     offset = offset
-                        .checked_add((range.len() as u64) * self.rank.unwrap() as u64)
+                        .checked_add(u64::try_from(source_offset)?)
                         .context("expert prefetch offset overflow")?;
                     range.len() as u64
                 }

@@ -585,6 +585,23 @@ mod tests {
     }
 
     #[test]
+    fn unequal_native_recipes_stay_refused_until_exact_exports_are_installed() {
+        use cuteafd_core::tp_units::LayerShard;
+        for (package, intermediate) in [("v41:mxfp4", 2304), ("dsv4f:mxfp4", 2048),
+            ("dsv4p:mxfp4", 3072)] {
+            for world in 2..=8 {
+                let widths = (0..world).map(|rank|
+                    LayerShard::new(intermediate, 32, 0, world, rank).unwrap().width).collect::<Vec<_>>();
+                assert_eq!(widths.iter().sum::<usize>(), intermediate);
+                if intermediate / 32 % world != 0 {
+                    assert!(matches!(spark_recipe(package, intermediate, world),
+                        Err(SparkRecipeRefusal::NativeUnequal { .. })), "{package} TP{world}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn native_mxfp4_admission_matches_equal_k32_reader_and_exporter() {
         for world in [3, 6] {
             assert!(matches!(spark_recipe("dsv4f:mxfp4", 2048, world),

@@ -102,6 +102,36 @@ pub fn layer_rule(units: usize, world: usize) -> UnitRule {
     }
 }
 
+/// One adjacent exact shard, rotated by layer only when native units do not
+/// divide evenly. Logical and resident columns are the same interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerShard {
+    pub first: usize,
+    pub width: usize,
+}
+
+impl LayerShard {
+    pub fn new(intermediate: usize, unit: usize, layer: usize, world: usize, rank: usize)
+        -> Result<Self, UnitMapError> {
+        if unit == 0 || intermediate == 0 || intermediate % unit != 0
+            || world == 0 || world > intermediate / unit {
+            return Err(UnitMapError::Geometry);
+        }
+        if rank >= world { return Err(UnitMapError::Index); }
+        let units = intermediate / unit;
+        let (base, extra) = (units / world, units % world);
+        let canonical = if layer_rule(units, world) == UnitRule::LayerRotation {
+            ((rank as u128 + world as u128 - (layer % world) as u128) % world as u128) as usize
+        } else { rank };
+        Ok(Self {
+            first: (canonical * base + canonical.min(extra)) * unit,
+            width: (base + usize::from(canonical < extra)) * unit,
+        })
+    }
+
+    pub fn source_range(self) -> Range<usize> { self.first..self.first + self.width }
+}
+
 /// Owner of unit `u` of expert `e` in layer `layer`. All arithmetic is integer
 /// and independent of checkpoint payloads, traffic, and installed packages.
 pub fn unit_owner(
@@ -407,6 +437,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn exact_k32_layer_shards_cover_every_geometry_and_world() {
+        let tables: &[(usize, &[&[usize]])] = &[
+            (2304, &[&[1152, 1152], &[768, 768, 768], &[576; 4],
+                &[480, 480, 448, 448, 448], &[384; 6],
+                &[352, 352, 320, 320, 320, 320, 320], &[288; 8]]),
+            (2048, &[&[1024, 1024], &[704, 672, 672], &[512; 4],
+                &[416, 416, 416, 416, 384], &[352, 352, 352, 352, 320, 320],
+                &[320, 288, 288, 288, 288, 288, 288], &[256; 8]]),
+            (3072, &[&[1536, 1536], &[1024; 3], &[768; 4],
+                &[640, 608, 608, 608, 608], &[512; 6],
+                &[448, 448, 448, 448, 448, 416, 416], &[384; 8]]),
+        ];
+        for &(intermediate, table) in tables {
+            for (index, &widths) in table.iter().enumerate() {
+                let world = index + 2;
+                let unequal = intermediate / 32 % world != 0;
+                let mut totals = vec![0; world];
+                for layer in 0..world {
+                    let mut ranges = Vec::new();
+                    for rank in 0..world {
+                        let shard = LayerShard::new(intermediate, 32, layer, world, rank).unwrap();
+                        let canonical = if unequal { (rank + world - layer) % world } else { rank };
+                        assert_eq!(shard.width, widths[canonical]);
+                        assert_eq!(shard.first, widths[..canonical].iter().sum());
+                        assert_eq!(shard.first % 32, 0);
+                        assert_eq!(shard.width % 32, 0);
+                        let map = RankUnits::new(layer_rule(intermediate / 32, world), 3,
+                            intermediate, 32, layer, world, rank).unwrap();
+                        for expert in 0..3 {
+                            assert_eq!(map.column_ranges(expert).unwrap(), [shard.source_range()]);
+                        }
+                        totals[rank] += shard.width;
+                        ranges.push(shard.source_range());
+                    }
+                    ranges.sort_by_key(|range| range.start);
+                    assert_eq!(ranges[0].start, 0);
+                    assert_eq!(ranges.last().unwrap().end, intermediate);
+                    assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+                }
+                assert_eq!(totals, vec![intermediate; world]);
+            }
+        }
+        for (intermediate, unit, world, rank) in [(0, 32, 2, 0), (2048, 0, 2, 0),
+            (2047, 32, 2, 0), (32, 32, 2, 0), (2048, 32, 0, 0), (2048, 32, 2, 2)] {
+            assert!(LayerShard::new(intermediate, unit, usize::MAX, world, rank).is_err());
+        }
+        assert_eq!(LayerShard::new(2048, 32, usize::MAX, 3, 1).unwrap(),
+            LayerShard::new(2048, 32, usize::MAX % 3, 3, 1).unwrap());
     }
 
     #[test]
