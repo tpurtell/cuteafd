@@ -6376,3 +6376,20 @@ are retained as the checksum record; final checks use native job errors/counts,
 sealed sizes, ownership, inventory and offline HF resolution without rehashing
 weight data. Refs are imported last. Native CLI continuation:
 `muse-quant-1793576154865042036`, task-local `native_finish.py`. No SSH is used.
+
+Completed 2026-11-01 23:39:11 UTC (Nov 2 07:39 Taipei), supervisor exit zero.
+Native import job 3263500654 imported the 106 missing files with zero errors;
+six native RDMA jobs placed the remaining data while reusing 28 Spark shards.
+All 142 managed files have the expected sealed sizes/ownership, all 63 weight
+shards have exactly one Spark copy, refs/main names the published revision,
+and offline HF resolution points into the managed hub. Verification followed
+TJ's explicit instruction: use the prior HF checksum record, native job results
+and metadata only; no new weight hashes or SSH checks. Temporary coordinator
+managed copies, export/cache/staging weight links and 122.16 GiB of obsolete
+binary intermediates are retired. Source weights, tokens, scalar receipts,
+all 47,989 error records/CSV, 62 layer timings, logs and numerical failure
+forensics remain. Task-specific compiled staging is removed, GPUs are released,
+and the 30-minute progress timer is disabled. Do not replay the old checksum
+finisher against the intentionally retired local weights; final native command
+sources/results are retained in `muse-quant-work/native_finish.py` and
+`production-k128/native-cli-jobs/`.
