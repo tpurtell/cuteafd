@@ -97,7 +97,7 @@ fn bundled_media_inventory_is_header_exact_and_never_hides_declared_errors() {
     use crate::placement::families::muse_spark::MediaOptions;
     let dir = tempfile::tempdir().unwrap();
     testing::write_muse_media_snapshot(dir.path(), &[0]);
-    let open = || Checkpoint::coordinator(dir.path(), false, false).unwrap();
+    let open = || Checkpoint::open(dir.path()).unwrap();
     let inventory = MediaOptions::from_checkpoint(&open(), MediaMode::Auto, MediaMode::Auto, 2).unwrap();
     assert_eq!(inventory.vision_bytes.0 + inventory.vision_bytes.1, 4_864_551_264);
     assert_eq!(inventory.audio_bytes, (235_680_768, 10_905_600));
