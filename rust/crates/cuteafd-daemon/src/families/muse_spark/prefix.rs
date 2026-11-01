@@ -256,7 +256,7 @@ mod tests {
         for slot in 0..3 {
             let lease = reserve.lease(64, 3000, 4, Reserve::limit(&cache, &family, 1 << 20))?;
             let rows = reserve.admit(&cache, &family, &active, &stalled, &[], &lease).unwrap();
-            let placement = cache.admit_cold(&family, 64, rows, |pages| Placement { slot, pages, len: 64 })?.placement;
+            let placement = cache.admit_cold(&family, 64, rows, |pages| Placement { slot, pages, len: 64, media: None })?.placement;
             let initial_rows = placement.pages.len() * PAGE_ROWS as usize;
             active.push(Request { placement, lease, produced: 1, initial_rows });
         }
