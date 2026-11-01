@@ -92,7 +92,7 @@ fn header_inventory_accepts_k6_core_and_k4_experts_and_reports_bytes() {
 }
 
 #[test]
-fn whole_expert_ranks_split_the_routed_bytes_evenly() {
+fn rotated_tp_ranks_balance_the_routed_bytes() {
     let dir = snapshot(&all_layers());
     let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     for ranks in [4, 6] {
@@ -105,7 +105,7 @@ fn whole_expert_ranks_split_the_routed_bytes_evenly() {
         let (max, min) = (*spark.iter().max().unwrap(), *spark.iter().min().unwrap());
         // Staggered ownership: ranks differ by at most the rotated remainder.
         assert!(max - min < max / 20, "TP{ranks} expert bytes {spark:?}");
-        eprintln!("muse EP{ranks} expert GiB/rank {:?}; onboard {:?}; pool {}", spark.iter()
+        eprintln!("muse TP{ranks} expert GiB/rank {:?}; onboard {:?}; pool {}", spark.iter()
             .map(|b| format!("{:.1}", *b as f64 / GIB as f64)).collect::<Vec<_>>(), report.onboard_layers, memory.pool_tokens);
     }
 }
@@ -133,6 +133,18 @@ fn plan_matrix(column: usize) {
         assert!(!report.hints.iter().any(|h| h.what.contains("no muse:exl3-k45 layout")), "{rtx} RTX + {ranks}: {:?}",
             report.hints.iter().map(|h| &h.what).collect::<Vec<_>>());
         if ranks >= 4 { assert!(report.fits, "{rtx} RTX + {ranks} must fit (minimum 4): {:?}", report.hints); }
+        if matches!((rtx, ranks), (1, 4) | (2, 6)) {
+            let memory = report.memory_layout.as_ref().unwrap();
+            let spark = memory.devices.iter().find(|device|
+                device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).unwrap();
+            let owners: u64 = spark.items.iter().filter(|item|
+                matches!(item.group.as_str(), "execution owners" | "execution staging"))
+                .map(|item| item.bytes).sum();
+            eprintln!("muse census {rtx}+{ranks}: owners={owners} free={} pool={} onboard={:?}",
+                spark.free_bytes(), memory.pool_tokens, report.onboard_layers);
+            assert_eq!(memory.pool_tokens, if rtx == 1 { 814016 } else { 2097152 },
+                "Spark census must preserve this coordinator-bound pool");
+        }
         if (rtx, ranks) == (2, 6) {
             assert!(report.fits && report.placement_supported, "{:?}", report.hints);
             let memory = report.memory_layout.as_ref().unwrap();

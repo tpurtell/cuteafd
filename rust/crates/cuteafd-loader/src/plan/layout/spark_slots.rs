@@ -140,6 +140,35 @@ pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeome
         pinned_staging: u64::from(extent.staging_rows) * topk * 8 })
 }
 
+/// Muse retains the widest installed TP slice of this world, never a refused
+/// world's wider package. Keep each capacity's allocation owners/aliases so
+/// admission uses the same arena census as the EXL3 worker.
+pub(crate) fn muse_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
+    -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    use std::sync::OnceLock;
+    static CENSUS: OnceLock<Vec<serde_json::Value>> = OnceLock::new();
+    let census = CENSUS.get_or_init(|| serde_json::from_str(include_str!("spark_slot_census.json"))
+        .expect("bundled Spark slot census is valid JSON"));
+    let row = census.iter().find(|row| row["family"] == "muse_spark" && row["format"] == "exl3"
+        && row["world"].as_u64() == Some(world as u64))
+        .with_context(|| format!("no Muse Spark TP{world} EXL3 allocation census"))?;
+    let capacities = cuteafd_core::Exl3RowPolicy::Nearest.capacities(extent.capacity as usize)?;
+    anyhow::ensure!(capacities.last() == Some(&extent.compiled), "Muse owner export and retained capacities disagree");
+    let installed = row["manifests"].as_array().context("Muse census has no capacity witnesses")?;
+    let manifests = capacities.into_iter().map(|capacity| installed.iter()
+        .find(|manifest| manifest["capacity"].as_u64() == Some(u64::from(capacity)))
+        .cloned().with_context(|| format!("Muse Spark TP{world} census has no m{capacity}")))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true)?;
+    let rows = u64::from(extent.capacity);
+    let geometry = cuteafd_core::ExpertGeometry::MUSE_SPARK;
+    let wire_routes = u64::from(geometry.hidden) * 33 / 32 + u64::from(geometry.topk) * 8;
+    // One device and one pinned pair of u32 maps per owner. The pinned maps
+    // are singleton storage, not per-unit staging: do not multiply by waves.
+    Ok(cuteafd_core::OwnerBytes { scratch: retained + rows * 16, io: rows * wire_routes,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
+}
+
 /// Legacy calibrated slot bound (stream, scratch, inputs and staging at
 /// the compiled 4096-row export) for backends without a census.
 fn legacy_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry,
@@ -157,9 +186,11 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
     let geometry = catalog.routed_experts().geometry()?;
     let backend = SparkBackend::for_catalog(catalog)?;
     let groups = native_groups(input, family, working, rank)?;
+    let world = working.spark_ranks;
     let family = family.to_owned();
     Ok(move |extent| match (&groups, backend) {
         (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
+        (_, SparkBackend::Exl3(_)) if family == "muse_spark" => muse_owner_bytes(world, extent),
         (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
         (_, SparkBackend::Native | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
             Ok(legacy_owner_bytes(&family, geometry, extent)),
@@ -211,7 +242,7 @@ mod tests {
     #[test]
     fn planner_charges_every_shipped_native_package_census_at_its_export() {
         let census: serde_json::Value = serde_json::from_str(include_str!("spark_slot_census.json")).unwrap();
-        for row in census.as_array().unwrap() {
+        for row in census.as_array().unwrap().iter().filter(|row| row["format"] != "exl3") {
             let package = row["package"].as_str().unwrap();
             let family = row["family"].as_str().unwrap();
             let format = match row["format"].as_str().unwrap() {
@@ -231,6 +262,55 @@ mod tests {
                 assert_eq!(owner.pinned_staging, rows * topk * 8, "each unit retains packed route planes");
             }
         }
+    }
+
+    #[test]
+    fn muse_census_keeps_each_worlds_own_retained_capacity_set() -> anyhow::Result<()> {
+        // SM121 allocation witnesses, K4/K5 with the empty K5 tier. TP2/TP3
+        // remain honest while refused; admitted worlds never pay their widths.
+        for (world, decode, prefill) in [(2, 26_120_876, 554_677_564),
+            (3, 23_663_276, 470_136_124), (4, 22_188_716, 419_411_260),
+            (5, 21_697_196, 402_502_972), (6, 21_205_676, 385_594_684),
+            (7, 20_714_156, 368_686_396), (8, 20_222_636, 351_778_108)] {
+            for (capacity, compiled, retained) in [(64, 80, decode), (2752, 2752, prefill)] {
+                let owner = muse_owner_bytes(world, extent(capacity, compiled))?;
+                assert_eq!(owner.scratch, retained + u64::from(capacity) * 16, "TP{world} m{compiled}");
+                assert_eq!(owner.io, u64::from(capacity) * (4096 + 128 + 64));
+                assert_eq!(owner.pinned_staging, u64::from(capacity) * 64);
+            }
+            let one = muse_owner_bytes(world, extent(2752, 2752))?;
+            let three = muse_owner_bytes(world, cuteafd_core::OwnerExtent {
+                buffered_units: 3, ..extent(2752, 2752) })?;
+            assert_eq!(one, three, "buffering never multiplies retained arenas or row maps");
+            for compiled in CENSUS_CAPACITIES {
+                let owner = muse_owner_bytes(world, extent(compiled, compiled))?;
+                assert!(owner.scratch > u64::from(compiled) * 16);
+            }
+        }
+        assert!(muse_owner_bytes(1, extent(64, 80)).is_err());
+        assert!(muse_owner_bytes(9, extent(64, 80)).is_err());
+        assert!(muse_owner_bytes(4, extent(64, 256)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn muse_census_preserves_private_state_aliases_and_wire_decode() -> anyhow::Result<()> {
+        let census: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+        for row in census.iter().filter(|row| row["format"] == "exl3") {
+            let world = row["world"].as_u64().unwrap() as usize;
+            let manifests = row["manifests"].as_array().unwrap();
+            assert_eq!(manifests.len(), CENSUS_CAPACITIES.len());
+            for (index, &capacity) in CENSUS_CAPACITIES.iter().enumerate() {
+                assert_eq!(manifests[index]["capacity"], capacity);
+                let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=index], true)?;
+                assert_eq!(muse_owner_bytes(world, extent(capacity, capacity))?.scratch,
+                    retained + u64::from(capacity) * 16);
+                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=index], false)?;
+                let rows: u64 = CENSUS_CAPACITIES[..=index].iter().map(|&rows| u64::from(rows)).sum();
+                assert_eq!(retained - without_wire, rows * 4096 * 2);
+            }
+        }
+        Ok(())
     }
 
     #[test]
