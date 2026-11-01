@@ -53,7 +53,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // at decode width.
     let slots = usize::try_from(prefill.waves)?;
     let span = slots as u64 * rows;
-    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots, mode, window_batch)?;
+    let target = programs.target(v41::owners::DECODE_LANE_ROWS, span, rows, ranks, slots,
+        shape.concurrency, mode, window_batch)?;
     let weights = resident_weights(checkpoint, ranks, false)
         .context("unsupported V4.1 native backbone residency: check non-expert tensor formats and geometry")?;
     let mut devices = options.rtx_bytes.iter().enumerate().map(|(rank, &bytes)| DeviceLayout {

@@ -4,6 +4,7 @@ use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
 mod admission;
+mod queue;
 mod round_failure;
 pub(super) mod stall;
 pub(crate) mod layout;
@@ -226,7 +227,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
 /// the previous key shape when one is bound.
 fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache<'_>,
     kv_waiter: &cuteafd_engine::prefix::DeferredAdmission<admission::Prepared>,
-    media: &admission::Media<C>) -> serde_json::Value {
+    media: &admission::Media<C>, prefilling: usize) -> serde_json::Value {
     // Deliberately exports the cache's whole effective `Config` under
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
@@ -242,6 +243,10 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "admission": kv_waiter.stats(),
         "media": media.stats(),
         "totals": console::totals::snapshot(),
+        // The decode share: prompts waiting to prefill, and encoder prefetch waves a
+        // prompt's call cancelled because another prompt's call came next.
+        "prefill_queue": {"prefilling": prefilling, "prefetch_waves_cancelled":
+            super::prefill_target::PREFETCH_WAVES_CANCELLED.load(std::sync::atomic::Ordering::Relaxed)},
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
     stats
@@ -313,9 +318,13 @@ fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
 
 /// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
 /// media and scoring retain their ordinary prefill transaction.
+/// A prompt the packer may take: its request, lease and whether it must run
+/// alone (it restored a prefix or carried images).
+type PackMember<'p> = (&'p admission::Prepared, CacheLease, bool);
+
 fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
     lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime, requests: &mut Requests<'a>,
-    prefill: &mut super::prefill_target::PrefillSlots<'a, P>, admitted: &[PackedAdmission],
+    prefill: &mut super::prefill_target::PrefillSlots<'a, P>, admitted: &[PackMember<'_>],
     args: &crate::cli::NativeServeArgs, mut draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
     prefixes: &mut PrefixCache<'a>,
 ) -> Result<std::collections::BTreeMap<usize, Result<RetainedScores>>> {
@@ -323,12 +332,12 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
     let mut out = std::collections::BTreeMap::new();
     let limits = packing_limits(args.prefill_packing, args.prefill_batch_tokens as usize,
         args.max_context_tokens as usize, draft.as_ref().map(|d| d.prefill_tap_capacity()), NATIVE_COORDINATOR_EXACT_CAP);
-    let eligible: Vec<_> = admitted.iter().enumerate().filter_map(|(i, (prepared, _, lease, _, _, hit, _))| {
-        (hit.is_none() && prepared.images.is_empty() && !prepared.prompt.is_empty()
+    let eligible: Vec<_> = admitted.iter().enumerate().filter_map(|(i, &(prepared, lease, hit))| {
+        (!hit && prepared.images.is_empty() && !prepared.prompt.is_empty()
             && prepared.prompt.len() <= limits.chunk_rows
             && packing_probe_allowed(&prepared.job.probe)
             && !prepared.job.events.is_closed()
-            && requests.cache().committed_end(*lease).ok() == Some(0)).then_some(i)
+            && requests.cache().committed_end(lease).ok() == Some(0)).then_some(i)
     }).collect();
     let chunks: Vec<_> = eligible.iter().map(|&i| (0, admitted[i].0.prompt.len())).collect();
     for range in prefill_packing::groups(eligible.len(), |range|
@@ -337,7 +346,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
         let indices = &eligible[range.clone()];
         stall::tick();
         let segments = prefill_packing::plan(&chunks[range], &limits)?;
-        let members: Vec<_> = indices.iter().map(|&i| (admitted[i].2, admitted[i].0.prompt.as_slice())).collect();
+        let members: Vec<_> = indices.iter().map(|&i| (admitted[i].1, admitted[i].0.prompt.as_slice())).collect();
         let result = (|| -> Result<Vec<RetainedScores>> {
             prefill_hold(&mut || prefixes.prefill_hold());
             for (_, transport) in &mut prefill.slots { P::begin_request(transport)?; }
@@ -427,19 +436,21 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         let images = super::prefix::media_keys(tokens, &[])?;
         let now = Instant::now();
         admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new() },
-            id, lease, slot, images, None, (now, now)));
+            id, lease, slot, images, (now, now)));
     }
+    let members: Vec<PackMember<'_>> = admitted.iter().map(|(prepared, _, lease, ..)| (prepared, *lease, false)).collect();
     let mut packed = prefill_packed_admissions::<P>(lib, runtime, requests, prefill,
-        &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
+        &members, args, draft.as_deref_mut(), &mut prefixes)?;
+    drop(members);
     ensure!(packed.len() == prompts.len(), "hardware check did not actually pack every prompt");
-    for (_, id, lease, _, _, _, _) in &admitted {
+    for (_, id, lease, _, _, _) in &admitted {
         requests.release_if_present(*lease)?;
         if let Some(draft) = draft.as_deref_mut() { draft.release(*id)?; }
     }
     let mut agree = 0;
     let mut kl_sum = 0.0;
     let mut reference_rows = Vec::new();
-    for (member, (prepared, id, _, slot, _, _, _)) in admitted.into_iter().enumerate() {
+    for (member, (prepared, id, _, slot, _, _)) in admitted.into_iter().enumerate() {
         let lease = requests.admit(slot, id)?;
         if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
         let alone = super::prefill(lib, runtime, requests, prefill, None, lease, &prepared.prompt,
@@ -470,7 +481,196 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
     Ok(reference_rows)
 }
 
-/// Serve until the request channel closes, prefilling each prompt whole at admission.
+
+/// An admitted prompt waiting in the decode-share queue: everything its
+/// admission produced, kept until it joins the running requests.
+pub(super) struct Waiting<'a> {
+    prepared: admission::Prepared,
+    id: u64,
+    lease: CacheLease,
+    image_keys: ImageKeys,
+    /// Prompt rows its restored prefix covered, and that prefix's retained
+    /// logits (a whole-prompt hit selects from them without a call).
+    cached: usize,
+    hit_scores: Option<RetainedScores>,
+    /// It carried images (their spans drop once their features are installed).
+    images: bool,
+    ticket: console::Ticket,
+    constraint: Option<crate::shared::constraints::State<'a>>,
+    decoder: cuteafd_loader::StreamingTokenDecoder,
+    /// Scores of a packed group this prompt joined (it then needs no call).
+    packed: Option<Result<RetainedScores>>,
+}
+type QueuedPrompt<'a, S> = queue::Queued<Waiting<'a>, super::prefill_target::V41Prefill<S>>;
+
+/// The serve loop's side of a round chunk (`queue::Host`): every borrow the
+/// previous admission wave held while prefilling.
+struct Round<'r, 'w, 'a, P: ServingTarget<'w, 'a>> {
+    lib: &'a NativeLibrary,
+    args: &'r crate::cli::NativeServeArgs,
+    runtime: &'r tokio::runtime::Runtime,
+    first: &'r mut P,
+    first_transport: &'r mut P::Transport,
+    second_transport: &'r mut P::Transport,
+    requests: &'r mut Requests<'a>,
+    prefill: &'r mut super::prefill_target::PrefillSlots<'a, P>,
+    draft: Option<&'r mut DraftRuntime<'w, 'a, P::Chain>>,
+    prefixes: &'r mut PrefixCache<'a>,
+    times: &'r mut super::prefill_target::V41PrefillTimes,
+    active: &'r mut [Option<Active<'a>>],
+    /// `--decode-share 0`: whole prompts (`run_to_end`), never interleaved.
+    whole: bool,
+}
+
+impl<'w, 'a, P: ServingTarget<'w, 'a>> Round<'_, 'w, 'a, P> {
+    /// Release a leaving prompt's KV lease and draft slot; a release error is
+    /// logged, never fatal (RV3-5).
+    fn release(&mut self, lease: CacheLease, id: u64) {
+        round_failure::release_admission(&mut *self.requests, self.draft.as_deref_mut(), lease, id);
+    }
+}
+
+impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_target::V41Prefill<P::Suffix>>
+    for Round<'_, 'w, 'a, P> {
+    type Output = RetainedScores;
+    fn run(&mut self, waiting: &mut Waiting<'a>, cursor: &mut super::prefill_target::V41Prefill<P::Suffix>)
+        -> Result<Option<RetainedScores>> {
+        let Waiting { prepared, lease, cached, hit_scores, packed, .. } = waiting;
+        let (job, prompt, lease) = (&prepared.job, prepared.prompt.as_slice(), *lease);
+        ensure!(!job.events.is_closed(), "client disconnected");
+        let first_call = cursor.at_start();
+        // A scoring probe scores before anything else (it never packs) and
+        // always ends its request (`ScoringDone`).
+        if let Some(from) = crate::shared::probe::scoring(&job.probe).filter(|_| first_call) {
+            for (_, transport) in self.prefill.slots.iter_mut() { P::begin_request(transport)?; }
+            let prefixes = &mut *self.prefixes;
+            super::score(self.lib, self.runtime, self.requests, (&mut *self.first, &mut *self.first_transport),
+                &mut *self.prefill, lease, prompt, from, super::PrefillShape::from_args(self.args), job,
+                self.draft.as_deref_mut(), &mut || prefixes.prefill_hold())?;
+        }
+        for (_, transport) in self.prefill.slots.iter_mut() { P::begin_request(transport)?; }
+        if let Some(scores) = packed.take() { return scores.map(Some); }
+        if *cached == prompt.len() {
+            return hit_scores.take().context("exact prefix has no logits").map(Some);
+        }
+        let prefixes = &mut *self.prefixes;
+        let mut hold = || prefixes.prefill_hold();
+        // Cold-step probes keep their whole decode-shaped replay in one chunk.
+        if self.whole || job.probe.as_ref().is_some_and(|probe| !probe.spec.cold_steps.is_empty()) {
+            ensure!(first_call, "a whole prefill resumed mid-prompt");
+            return super::prefill(self.lib, self.runtime, self.requests, &mut *self.prefill,
+                Some((&mut *self.first, &mut *self.first_transport)), lease, prompt,
+                super::PrefillShape::from_args(self.args), job, self.draft.as_deref_mut(), &mut hold).map(Some);
+        }
+        let shape = super::PrefillShape::from_args(self.args);
+        let mut step = super::prefill_target::V41PrefillStep { lib: self.lib, runtime: self.runtime,
+            requests: &mut *self.requests, lease, tokens: prompt, chunk_rows: shape.rows, waves: shape.waves,
+            prefill: &mut *self.prefill, job, draft: self.draft.as_deref_mut(), hold: &mut hold,
+            times: &mut *self.times, interleaved: true };
+        queue::advance(&mut step, cursor, false)
+    }
+
+    fn admit(&mut self, slot: usize, waiting: Waiting<'a>, scores: RetainedScores) -> Result<()> {
+        let Waiting { prepared, id, lease, image_keys, cached, images, mut ticket, mut constraint, decoder, .. } = waiting;
+        let admission::Prepared { job, prompt, .. } = prepared;
+        let events = job.events.clone();
+        let result = (|| -> Result<(u32, Option<RetainedScores>)> {
+            self.requests.record_state(lease, &job.probe, "prompt")?;
+            if crate::shared::probe::wants_first(&job.probe) {
+                crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
+            }
+            if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
+                self.prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
+                let draft_request = draft_id(&self.draft, id);
+                if let Err(error) = self.prefixes.retain(self.requests, self.draft.as_deref_mut(), SnapshotKind::Prompt,
+                    image_keys.tokens(), image_keys.spans(), &scores, lease, draft_request) {
+                    tracing::warn!(%error, "prompt prefix was not retained");
+                }
+            }
+            tracing::debug!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=cached, "native prefix admission");
+            let mask = constraint.as_mut().map(|state| state.mask()).transpose()?.flatten();
+            // The first generated token is emitted-token index 0.
+            Ok((scores.sample(mask, job.sampling, 0)?, Some(scores)))
+        })();
+        let (anchor, next_after_commit) = match result {
+            Ok(value) => value,
+            Err(error) => return queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
+                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
+                    cached, hit_scores: None, images, ticket, constraint, decoder, packed: None }, error),
+        };
+        // The lane it was announced on at admission (queued prompts count in `loads`).
+        let lane = ticket.lane();
+        let mut request = Active { constraint, ticket, lease, job, decoder, anchor, generated: 0, buffered: 0,
+            finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit };
+        request.ticket.first(request.anchor);
+        if let Err(error) = request.emit(&[request.anchor]) {
+            request.failed = !request.job.events.is_closed();
+            let _ = events.send(Err(format!("{error:#}").into()));
+            request.finished = true;
+        }
+        self.active[slot] = Some(request);
+        Ok(())
+    }
+
+    fn fail(&mut self, waiting: Waiting<'a>, error: anyhow::Error) -> Result<()> {
+        let Waiting { prepared, id, lease, mut ticket, .. } = waiting;
+        let events = &prepared.job.events;
+        if error.downcast_ref::<super::ScoringDone>().is_some() {
+            ticket.finishing();
+            ticket.done(0);
+            self.release(lease, id);
+            return Ok(());
+        }
+        // Other completed requests retain their caches.
+        let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
+            .cloned().unwrap_or_else(|| format!("{error:#}").into());
+        let _ = events.send(Err(failure));
+        if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
+        tracing::warn!(%error, "native request admission failed");
+        self.release(lease, id);
+        P::reset_connections(self.first_transport)?; P::reset_connections(self.second_transport)?;
+        for (_, transport) in self.prefill.slots.iter_mut() { P::reset_connections(transport)?; }
+        Ok(())
+    }
+
+    fn rest(&self) -> super::prefill_target::V41Prefill<P::Suffix> { super::prefill_target::V41Prefill::new() }
+}
+
+/// Before a round's first chunk: pack the queued cold whole-unit text
+/// prompts no call has touched yet, as the admission wave did (share 0: the
+/// queue then holds exactly that wave). Members keep their scores until
+/// their own chunk completes them.
+#[allow(clippy::too_many_arguments)]
+fn pack_waiting<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, runtime: &tokio::runtime::Runtime,
+    requests: &mut Requests<'a>, prefill: &mut super::prefill_target::PrefillSlots<'a, P>,
+    waiting: &mut crate::shared::prefill_share::PrefillQueue<QueuedPrompt<'a, P::Suffix>>,
+    args: &crate::cli::NativeServeArgs, draft: Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
+    prefixes: &mut PrefixCache<'a>, whole: bool) -> Result<()> {
+    // The untouched prompts, in queue order (with share 0, the admission wave).
+    let fresh = |entry: &QueuedPrompt<'a, P::Suffix>| entry.cursor.at_start()
+        && entry.request().is_some_and(|w| w.packed.is_none());
+    let members: Vec<PackMember<'_>> = waiting.iter().filter(|entry| fresh(entry)).map(|entry| {
+        let w = entry.request().expect("queued prompts hold their request");
+        (&w.prepared, w.lease, w.cached > 0 || w.images)
+    }).collect();
+    if members.len() < 2 { return Ok(()); }
+    if !whole {
+        // Prompts mid-prefill may hold encoder prefetch waves in the pinned staging.
+        let cancelled = requests.cancel_foreign_prefetch(members[0].1);
+        super::prefill_target::PREFETCH_WAVES_CANCELLED.fetch_add(cancelled as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut packed = prefill_packed_admissions::<P>(lib, runtime, requests, prefill, &members, args, draft, prefixes)?;
+    drop(members);
+    for (member, entry) in waiting.iter_mut().filter(|entry| fresh(entry)).enumerate() {
+        if let Some(scores) = packed.remove(&member) {
+            entry.request.as_mut().expect("queued prompts hold their request").packed = Some(scores);
+        }
+    }
+    Ok(())
+}
+
+/// Serve until the request channel closes: admitted prompts wait in the decode-share
+/// queue (`--decode-share`) and prefill in rounds between decode rounds.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
     runtime: &tokio::runtime::Runtime, receive: &mut mpsc::Receiver<NativeRequest>,
@@ -506,6 +706,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
         if args.prefill_packing == crate::shared::prefill_packing::PackingMode::Exact { 0 }
         else { args.prefill_batch_tokens as usize });
+    // Admitted prompts wait here and prefill in rounds (`--decode-share`); share
+    // 0 prefills every waiting prompt whole before the next step, as before.
+    let mut prefills = args.decode_share.queue::<QueuedPrompt<'a, P::Suffix>>()?;
+    let whole = args.decode_share.decode_share == 0.0;
+    let mut times = super::prefill_target::V41PrefillTimes::default();
     // Keep pending owners outside the fallible loop so every fatal exit can drain them.
     let mut admitted = std::collections::VecDeque::<PackedAdmission>::new();
     let mut media_ready = std::collections::VecDeque::new();
@@ -519,7 +724,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
-                *slot = serving_stats(&prefixes, &kv_waiter, &media);
+                *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len());
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
@@ -545,14 +750,17 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
-        // Admit available work at a completed boundary. Prefill currently owns
-        // both lanes; mixed prefill/decode interleaving is a subsequent policy.
+        // Queued prompts keep the lane they were announced on and decode there.
+        for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }
+        // Admit available work at a completed boundary (both lanes drained):
+        // admitted prompts join the decode-share queue holding their slots.
         let mut intake = receive.len().max(1);
         let mut next_wave = std::collections::VecDeque::new();
         let mut held_slots = std::collections::BTreeSet::new();
         stall::mark(stall::Phase::Admission, active.iter().flatten().count() + media.len() + media_ready.len());
         loop {
-            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len();
+            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len()
+                + prefills.len();
             let backlog = !media.full() && !media.backlog.is_empty();
             stall::mark(stall::Phase::Admission, busy_slots + 1);
             let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.pop_front() {
@@ -560,7 +768,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     "native asynchronous vision preparation");
                 leased.into_admitted()
             } else {
-            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot) && !held_slots.contains(&slot)) else { break };
+            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)
+                && !held_slots.contains(&slot) && !prefills.iter().any(|queued| queued.slot == slot)) else { break };
             let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
                 |prepared| prepared.job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Ready(prepared) => prepared,
@@ -599,13 +808,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             };
             if prepared.job.events.is_closed() { continue; }
-            // An earlier member will publish its prompt snapshot after this wave.
-            // Defer before leasing, while unrelated queued prompts still pack.
+            // An earlier member (this wave or still prefilling) will publish its
+            // prompt snapshot once prefilled. Defer before leasing, while unrelated
+            // queued prompts still pack.
             if prefixes.engine().enabled() && prepared.images.is_empty()
                 && !crate::shared::probe::cold(&prepared.job.probe)
-                && admitted.iter().any(|(earlier, ..)| earlier.images.is_empty()
-                    && !crate::shared::probe::cold(&earlier.job.probe)
-                    && pending_prefix_hit(&prepared.prompt, &earlier.prompt)) {
+                && admitted.iter().map(|(earlier, ..)| (earlier.images.is_empty(), earlier))
+                    .chain(prefills.iter().filter_map(|queued| queued.request())
+                        .map(|waiting| (!waiting.images, &waiting.prepared)))
+                    .any(|(text, earlier)| text && !crate::shared::probe::cold(&earlier.job.probe)
+                        && pending_prefix_hit(&prepared.prompt, &earlier.prompt)) {
                 next_wave.push_back(prepared);
                 continue;
             }
@@ -735,79 +947,35 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         }
         prefix_waiters.extend(next_wave);
         stall::mark(stall::Phase::Admission, active.iter().flatten().count() + admitted.len());
-        let mut packed_scores = prefill_packed_admissions::<P>(lib, runtime, requests, prefill_slots,
-            admitted.make_contiguous(), args, draft.as_deref_mut(), &mut prefixes)?;
-        let mut member = 0;
         while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
-            let result = (|| -> Result<Active<'a>> {
-                let mut constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
+            let (cached, hit_scores) = hit.map_or((0, None), |(end, scores)| (end, scores));
+            let image_count = images.len();
+            drop(images);
+            let ready = (|| -> Result<_> {
+                let constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()
                     .map_err(cuteafd_api::openai::NativeFailure::from_admission_error)?;
                 ensure!(!job.events.is_closed(), "client disconnected");
                 let decoder = cuteafd_loader::streaming_token_decoder(&args.snapshot, false)?;
-                let cached = hit.as_ref().map_or(0, |(end, _)| *end);
-                let image_count = images.len() as u16;
-                drop(images);
                 job.events.send(Ok(InferenceChunk::Ready {
                     system_fingerprint: Some(if draft.is_some() { "cuteafd-native-fp4-kv-dspark" }
                         else { "cuteafd-native-fp4-kv" }.into()),
                     prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
                 }))?;
                 crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
-                ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
-                if let Some(from) = crate::shared::probe::scoring(&job.probe) {
-                    for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
-                    super::score(lib, runtime, requests, (&mut *first, &mut *first_transport), &mut *prefill_slots, lease,
-                        &prompt, from, super::PrefillShape::from_args(args), &job, draft.as_deref_mut(),
-                        &mut || prefixes.prefill_hold())?;
-                }
-                for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
-                let scores = if let Some(result) = packed_scores.remove(&member) { result? }
-                else if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
-                else { prefill(lib, runtime, requests, &mut *prefill_slots, Some((&mut *first, &mut *first_transport)), lease, &prompt,
-                    super::PrefillShape::from_args(args), &job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
-                requests.record_state(lease, &job.probe, "prompt")?;
-                if crate::shared::probe::wants_first(&job.probe) {
-                    crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
-                }
-                if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
-                  prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
-                  let draft_request = draft_id(&draft, id);
-                  if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, image_keys.tokens(),
-                      image_keys.spans(), &scores, lease, draft_request) {
-                    tracing::warn!(%error, "prompt prefix was not retained");
-                  }
-                }
-                tracing::debug!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=cached, "native prefix admission");
-                let mask = constraint.as_mut().map(|state| state.mask()).transpose()?.flatten();
-                // The first generated token is emitted-token index 0.
-                let anchor = scores.sample(mask, job.sampling, 0)?;
-                Ok(Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
-                    lease, job, decoder, anchor, generated: 0, buffered: 0,
-                    finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
-                    })
+                ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count, restore);
+                Ok((constraint, decoder))
             })();
-            member += 1;
-            match result {
-                Ok(mut request) => {
-                    request.ticket.first(request.anchor);
-                    if let Err(error) = request.emit(&[request.anchor]) {
-                        request.failed = !request.job.events.is_closed();
-                        let _ = request.job.events.send(Err(format!("{error:#}").into()));
-                        request.finished = true;
-                    }
-                    active[slot] = Some(request); loads[lane] += 1;
-                }
-                Err(error) if error.downcast_ref::<super::ScoringDone>().is_some() => {
-                    ticket.finishing();
-                    ticket.done(0);
-                    round_failure::release_admission(&mut *requests, draft.as_deref_mut(), lease, id);
-                }
+            match ready {
+                Ok((constraint, decoder)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
+                    cursor: super::prefill_target::V41Prefill::new(),
+                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
+                        image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
+                        packed: None }) }) }
                 Err(error) => {
-                    // Other completed requests retain their caches.
                     let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
                         .cloned().unwrap_or_else(|| format!("{error:#}").into());
                     let _ = events.send(Err(failure));
@@ -819,11 +987,29 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             }
         }
+        // A prefill round at a completed boundary (both decode lanes drained):
+        // one call of each waiting prompt, or every prompt whole with share 0.
+        if prefills.due(active.iter().any(Option::is_some)) {
+            stall::mark(stall::Phase::Admission, active.iter().flatten().count() + prefills.len());
+            let mut round = Round { lib, args, runtime, first: &mut *first, first_transport: &mut *first_transport,
+                second_transport: &mut *second_transport, requests: &mut *requests, prefill: &mut *prefill_slots,
+                draft: draft.as_deref_mut(), prefixes: &mut prefixes, times: &mut times, active: &mut active, whole };
+            // The packed pass runs inside the round's timed window: its time is owed too.
+            let finished = prefills.round_with(&mut round,
+                |round, waiting| pack_waiting::<P>(round.lib, round.runtime, round.requests, round.prefill, waiting,
+                    round.args, round.draft.as_deref_mut(), round.prefixes, round.whole),
+                |round, entry| queue::chunk(round, entry))?;
+            for (_, result) in finished { result?; }
+            prefills.settle(active.iter().any(Option::is_some));
+        }
         if active.iter().all(Option::is_none) {
-            stall::mark(stall::Phase::Idle, 0);
-            crate::shared::decode_graph::census::idle();
-            crate::shared::decode_graph::CaptureWatch::flush();
-            if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty() { break; }
+            // Prompts still prefilling (share > 0) keep the engine busy.
+            if prefills.is_empty() {
+                stall::mark(stall::Phase::Idle, 0);
+                crate::shared::decode_graph::census::idle();
+                crate::shared::decode_graph::CaptureWatch::flush();
+            }
+            if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty() && prefills.is_empty() { break; }
             if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
@@ -856,14 +1042,19 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 requests=members.iter().map(Vec::len).sum::<usize>(), "graph census decode step begin");
             Instant::now()
         });
-        stall::mark(stall::Phase::Decode, active.iter().flatten().count());
+        // Prompts wait with decode time owed: the lanes stop at the first completed
+        // boundary past it (share 0 never gets here with prompts waiting).
+        let cycle = (!whole && !prefills.is_empty()).then(Instant::now);
+        stall::mark(stall::Phase::Decode, active.iter().flatten().count() + prefills.len());
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
             requests, first_transport, second_transport, &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
-                media_slots: media.len(),
-                host_pending: !media.full() && !media.backlog.is_empty(),
-                retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())) }));
+                media_slots: media.len() + prefills.len(),
+                host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),
+                retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
+                prefill_due: cycle.map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
+        if let Some(started) = cycle { prefills.stepped(started.elapsed().as_secs_f64()); }
         if let Some(started) = census_started {
             tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
                 host_ns=started.elapsed().as_nanos() as u64, success=result.is_ok(), "graph census decode step end");
@@ -897,6 +1088,12 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         round_failure::release_admission(requests, draft.as_deref_mut(), lease, id);
     });
     media.stop(requests, draft.as_deref_mut());
+    // Queued prompts (decode share) hold leases too: answer and release them.
+    for mut waiting in prefills.drain().filter_map(|queued| queued.request) {
+        let _ = waiting.prepared.job.events.send(Err(message.clone().into()));
+        waiting.ticket.fail(0);
+        round_failure::release_admission(requests, draft.as_deref_mut(), waiting.lease, waiting.id);
+    }
     result
 }
 
@@ -2390,6 +2587,70 @@ mod sampling_tests {
         }
     }
 
+    /// The serve loop's decode-share contract, at its source (#953):
+    /// - prefill rounds run only between `decode_round` calls (both lanes
+    ///   joined at completed boundaries), so a call never shares the slots or
+    ///   the prefill link with a lane round;
+    /// - share 0 is static: whole prompts, no clocks, no debt, no deadline;
+    /// - images reach the queue only from `media.poll` (features installed);
+    ///   a request whose frontier still needs encodes parks at the encoder;
+    /// - queued prompts hold their slots against admission and idling.
+    #[test]
+    fn serve_runs_rounds_between_drained_decode_rounds_and_share_zero_is_static() {
+        let source = include_str!("scheduler.rs");
+        let serve = &source[source.find("pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>").unwrap()..];
+        let serve = &serve[..serve.find("\n/// Process-wide device-terminal instrumentation.").unwrap()];
+        let round = serve.find("if prefills.due(").unwrap();
+        let decode = serve.find("P::decode_round(").unwrap();
+        assert!(round < decode, "a round runs at the boundary before the decode round");
+        assert_eq!(serve.matches("P::decode_round(").count(), 1);
+        assert_eq!(serve.matches("prefills.round_with(").count(), 1);
+        // The packed pass is inside the round's timed window.
+        let timed = &serve[serve.find("prefills.round_with(").unwrap()..];
+        assert!(timed[..timed.find("queue::chunk(round, entry)").unwrap()].contains("pack_waiting::<P>("));
+        assert_eq!(serve.matches("pack_waiting::<P>(").count(), 1);
+        // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
+        assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
+        // Queued prompts decode on the lane they were announced on (review A4).
+        assert!(serve.contains("for waiting in prefills.iter().filter_map(|queued| queued.request()) { loads[waiting.ticket.lane()] += 1; }"));
+        assert!(serve.contains("Ok((constraint, decoder)) => { loads[lane] += 1; prefills.push("));
+        assert!(serve[round..decode].contains("prefills.settle("));
+        let admit = &source[source.find("    fn admit(&mut self, slot: usize, waiting: Waiting<'a>").unwrap()..];
+        let admit = &admit[..admit.find("\n    }\n").unwrap()];
+        assert!(admit.contains("let lane = ticket.lane();") && !admit.contains("assign("), "{admit}");
+        // Share 0: no clock, no debt, no deadline.
+        assert!(serve.contains("let whole = args.decode_share.decode_share == 0.0;"));
+        assert!(serve.contains("let cycle = (!whole && !prefills.is_empty()).then(Instant::now);"));
+        assert!(serve.contains("prefill_due: cycle.map("));
+        assert!(serve.contains("if let Some(started) = cycle { prefills.stepped("));
+        assert_eq!(serve.matches("prefills.stepped(").count(), 1);
+        // The previous whole-prompt prefill is the share-0 chunk.
+        let host = &source[source.find("    fn run(&mut self, waiting: &mut Waiting<'a>").unwrap()..];
+        let host = &host[..host.find("\n    }\n").unwrap()];
+        assert!(host.contains("if self.whole ||") && host.contains("super::prefill(self.lib"), "{host}");
+        assert!(host.contains("queue::advance(&mut step, cursor, false)"));
+        // Images: queued only once installed; the encoder path never pushes.
+        let media = serve.find("if resume < prepared.prompt.len() {").unwrap();
+        let parked = &serve[media..media + serve[media..].find("continue;").unwrap()];
+        assert!(parked.contains("media.enqueue(leased)") && !parked.contains("prefills.push"), "{parked}");
+        assert!(serve.contains("leased.into_admitted()"));
+        // Queued prompts hold their slots and keep the engine busy.
+        assert!(serve.contains("!prefills.iter().any(|queued| queued.slot == slot)"));
+        assert!(serve.contains("+ prefills.len();"));
+        assert!(serve.contains("media_slots: media.len() + prefills.len(),"));
+        assert!(serve.contains("&& prefills.is_empty() { break; }"));
+    }
+
+    /// The lanes stop at their first completed boundary past the debt, and an
+    /// independent lane checks it beside the media wake.
+    #[test]
+    fn independent_lanes_stop_at_the_prefill_deadline() {
+        let lanes = include_str!("scheduler/independent.rs");
+        assert!(lanes.contains("if wake.poll_media(round_id) || wake.prefill_due(round_id)"));
+        let stop = lanes.find("wake.prefill_due(round_id)").unwrap();
+        assert!(lanes[stop..stop + 400].contains("lease.stop(); return Ok(());"));
+    }
+
     #[test]
     fn packing_preserves_cold_replay_and_pending_prefixes() {
         use cuteafd_api::openai::probe::{Probe, ProbeColdStep, ProbeSpec};
@@ -2829,13 +3090,15 @@ mod sampling_tests {
         let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
         let mut encoder = cuteafd_engine::media::FakeEncoder::default();
         let media = admission::Media::new(&mut encoder, 4).unwrap();
-        let snapshot = serving_stats(&disabled, &waiter, &media);
+        let snapshot = serving_stats(&disabled, &waiter, &media, 2);
         for key in ["output_shrinks", "output_tokens_withheld", "deferred"] {
             assert!(snapshot["admission"][key].is_u64(), "missing admission {key} in {snapshot}");
         }
         for key in ["encodes", "submit_waits", "submit_timeouts", "encode_timeouts"] {
             assert!(snapshot["media"][key].is_u64(), "missing media {key} in {snapshot}");
         }
+        assert_eq!(snapshot["prefill_queue"]["prefilling"], 2);
+        assert!(snapshot["prefill_queue"]["prefetch_waves_cancelled"].is_u64(), "{snapshot}");
         assert!(snapshot["host_cache"].is_null(), "{snapshot}");
         assert!(snapshot["host_cache_config"].is_null(), "{snapshot}");
         for key in COUNTERS {
@@ -2843,7 +3106,7 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media);
+        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0);
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");

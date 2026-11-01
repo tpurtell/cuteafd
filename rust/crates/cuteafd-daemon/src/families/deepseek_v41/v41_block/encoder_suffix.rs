@@ -1,5 +1,12 @@
 use super::*;
 use crate::shared::memory::DeviceAllocation;
+use cuteafd_loader::placement::families::deepseek_v41::owners;
+
+/// One retained row (residual + pre-norm scales) and a prompt's rows: the
+/// planner's constants, so the startup pool is exactly what it charges.
+const ROW_BYTES: usize = owners::ENCODER_SUFFIX_ROW_BYTES as usize;
+const SUFFIX_ROWS: usize = owners::ENCODER_SUFFIX_ROWS as usize;
+const _: () = assert!(ROW_BYTES == 40960 + 16);
 
 /// Source rows and request-local positions of each member's retained CED tail.
 fn packed_tails(segments: &[crate::shared::prefill_packing::Segment])
@@ -30,32 +37,53 @@ pub(crate) struct EncoderSuffix<'a> {
     packed: Option<Vec<crate::shared::prefill_packing::Segment>>,
 }
 impl<'a> EncoderSuffix<'a> {
+    #[cfg(test)]
     pub fn device_bytes(prompt_end: u64) -> Result<usize> {
         ensure!((1..=1048576).contains(&prompt_end), "invalid encoder suffix extent");
-        Ok(prompt_end.min(128) as usize * (40960 + 16))
+        Ok(prompt_end.min(SUFFIX_ROWS as u64) as usize * ROW_BYTES)
     }
+    #[cfg(test)]
     pub fn new(library: &'a NativeLibrary, prompt_end: u64, budget: usize) -> Result<Self> {
         ensure!(Self::device_bytes(prompt_end)? <= budget, "encoder suffix exceeds budget");
-        let start = prompt_end.saturating_sub(128);
-        let rows = (prompt_end - start) as usize;
-        Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::new(library, rows * 40960)?),
-            pre: std::rc::Rc::new(DeviceAllocation::new(library, rows * 16)?), tokens: (start..prompt_end).collect(),
-            next: start, end: prompt_end, binding: QueryBinding::new(19)?, invalid: false, packed: None })
+        let rows = prompt_end.min(SUFFIX_ROWS as u64) as usize;
+        Self::prompt(&Self::arena(library, rows)?, prompt_end)
     }
-    /// One serially reused arena, charged before KV pool admission.
-    pub(crate) fn packed_storage(library: &'a NativeLibrary, unit: usize) -> Result<Self> {
-        ensure!(unit > 0 && unit <= 4096, "invalid packed suffix unit");
-        let rows = unit.min(16 * 128);
+    /// A startup arena of `rows` suffix rows, at rest (no prompt bound).
+    fn arena(library: &'a NativeLibrary, rows: usize) -> Result<Self> {
         Ok(Self { residual: std::rc::Rc::new(DeviceAllocation::new(library, rows * 40960)?),
             pre: std::rc::Rc::new(DeviceAllocation::new(library, rows * 16)?), tokens: Vec::new(),
             next: 0, end: 0, binding: QueryBinding::new(19)?, invalid: true, packed: None })
     }
+    /// One serially reused arena, charged before KV pool admission.
+    pub(crate) fn packed_storage(library: &'a NativeLibrary, unit: usize) -> Result<Self> {
+        ensure!(unit > 0 && unit <= 4096, "invalid packed suffix unit");
+        Self::arena(library, owners::packed_suffix_rows(unit as u64) as usize)
+    }
+    /// One prompt's suffix arena (the final window's rows), allocated at
+    /// startup: the prefill slots hold one per request slot, charged with them.
+    pub(crate) fn prompt_storage(library: &'a NativeLibrary) -> Result<Self> {
+        Self::arena(library, SUFFIX_ROWS)
+    }
+    /// Whether a live prompt or packed group holds this arena.
+    pub(crate) fn in_use(&self) -> bool {
+        std::rc::Rc::strong_count(&self.residual) > 1 || std::rc::Rc::strong_count(&self.pre) > 1
+    }
+    /// Bind a prompt ending at `prompt_end` to `storage`, with no allocation:
+    /// it holds the arena until it drops with its request.
+    pub(crate) fn prompt(storage: &Self, prompt_end: u64) -> Result<Self> {
+        ensure!((1..=1048576).contains(&prompt_end), "invalid encoder suffix extent");
+        ensure!(!storage.in_use(), "encoder suffix arena is already held by a live prompt");
+        let start = prompt_end.saturating_sub(SUFFIX_ROWS as u64);
+        let rows = (prompt_end - start) as usize;
+        ensure!(rows * 40960 <= storage.residual.buffer.bytes && rows * 16 <= storage.pre.buffer.bytes,
+            "prompt suffix exceeds its arena");
+        Ok(Self { residual: storage.residual.clone(), pre: storage.pre.clone(), tokens: (start..prompt_end).collect(),
+            next: start, end: prompt_end, binding: QueryBinding::new(19)?, invalid: false, packed: None })
+    }
     /// Retain each member's CED tail in the startup arena, with no runtime allocation.
     pub(crate) fn packed(storage: &Self,
         segments: &[crate::shared::prefill_packing::Segment]) -> Result<Self> {
-        ensure!(std::rc::Rc::strong_count(&storage.residual) == 1
-            && std::rc::Rc::strong_count(&storage.pre) == 1,
-            "packed suffix arena is already borrowed by a live group");
+        ensure!(!storage.in_use(), "packed suffix arena is already borrowed by a live group");
         let tails = packed_tails(segments)?;
         let tokens: Vec<_> = tails.into_iter().flat_map(|(_, positions)| positions).collect();
         let rows = tokens.len();

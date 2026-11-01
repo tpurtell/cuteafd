@@ -170,8 +170,23 @@ impl<P> PrefillQueue<P> {
     /// [`ROUND_S`], and prompts that ran go behind those that did not.
     /// Returns the prompts that finished (`Ok`) or failed (`Err`); call
     /// [`Self::settle`] once the finished ones joined the running requests.
-    pub fn round(&mut self, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
+    pub fn round(&mut self, chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
+        self.round_since(Instant::now(), chunk)
+    }
+
+    /// [`Self::round`] after `prepare` (e.g. a family's packed pass over the
+    /// waiting prompts) inside the same timed window: its time counts toward
+    /// the round, so the running requests are owed their share of it too.
+    /// `context` is lent to both steps in turn. A `prepare` error ends the
+    /// round before any chunk runs.
+    pub fn round_with<C>(&mut self, context: &mut C, prepare: impl FnOnce(&mut C, &mut Self) -> Result<()>,
+        mut chunk: impl FnMut(&mut C, &mut P) -> Result<Chunk>) -> Result<Vec<(P, Result<()>)>> {
         let started = Instant::now();
+        prepare(context, self)?;
+        Ok(self.round_since(started, |prompt| chunk(context, prompt)))
+    }
+
+    fn round_since(&mut self, started: Instant, mut chunk: impl FnMut(&mut P) -> Result<Chunk>) -> Vec<(P, Result<()>)> {
         let whole = self.share == 0.0;
         let mut out = Vec::new();
         let mut ran = VecDeque::new();
@@ -465,6 +480,25 @@ mod tests {
         queue.stepped(0.002);
         assert!(queue.due(true));
         assert_eq!(log, vec![0]);
+    }
+
+    #[test]
+    fn a_prepared_round_charges_its_preparation_to_the_owed_time() {
+        let mut queue = PrefillQueue::new(0.5);
+        queue.push(Prompt { id: 0, left: 2 });
+        let mut log = Vec::new();
+        let finished = queue.round_with(&mut log, |log, queue| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            log.push(queue.len());
+            Ok(())
+        }, |log, p| { log.push(10 + p.id); p.left -= 1; Ok(if p.left == 0 { Chunk::Done } else { Chunk::More }) }).unwrap();
+        assert!(finished.is_empty());
+        assert_eq!(log, [1, 10]);
+        queue.settle(true);
+        // Share 0.5 owes the round's time, preparation included.
+        assert!(queue.decode_seconds() >= 0.02, "{}", queue.decode_seconds());
+        let failed = queue.round_with(&mut log, |_, _| anyhow::bail!("prepare failed"), |_, _| panic!("no chunk"));
+        assert!(failed.is_err() && queue.len() == 1);
     }
 
     #[test]
