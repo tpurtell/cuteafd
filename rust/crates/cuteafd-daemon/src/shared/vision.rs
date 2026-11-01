@@ -8,6 +8,7 @@ pub mod local;
 pub mod remote;
 pub mod worker;
 pub mod audio;
+pub mod pcm_audio;
 
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{NativeVision, VisionBlock, VisionLedger, VisionSpec, NO_VISION_OFFSET};
