@@ -438,7 +438,9 @@ def test_catalog_includes_all_geometries_and_fused_suspects():
     assert {f"exl3-routes-{name}" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
     assert {"audio", "vision-attention"} <= set(names)
     assert {f"exl3-{name}-k23" for name in compare_sm.EXL3_GEOMETRIES} <= set(names)
-    assert {"exl3-glm-k45", "exl3-qwen4-k45"} <= set(names)
+    assert {"exl3-glm-k45", "exl3-qwen4-k45", "exl3-ml4-k45"} <= set(names)
+    ml4_args = next(args for name, _, args in jobs if name == "exl3-ml4-k45")
+    assert ml4_args[ml4_args.index("--bits") + 1] == "4,5"
     assert not {"exl3-qwen4-k345", "exl3-qwen4-k2345"} & set(names)
     assert {f"context-split-{name}" for name in ("flash", "pro", "glm", "glmf")} <= set(names)
     assert {"v41-fp8", "v41-experts", "v41-index", "v41-router", "v41-attention"} <= set(names)
