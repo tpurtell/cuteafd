@@ -3423,9 +3423,10 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         plans.insert(name.into(), value);
     }
     let actual = Value::Object(plans);
-    let mut expected: Value = serde_json::from_str(include_str!(
+    let historical: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
-    // The fixture now declares its real context ceiling for host admission.
+    let mut expected = historical.clone();
+    // Normalize a clone for current admission; the raw historical value only pins provenance.
     for report in expected.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
         report["cache_requirements"]["concurrency"] = json!(4);
@@ -3458,12 +3459,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     }
     // Complete-header solver/working-set tests check the admitted inventory and
     // exact Spark I/O; this fixture remains the unchanged historical reference.
-    let mut legacy = expected;
+    let mut legacy = historical;
     for report in legacy.as_object_mut().unwrap().values_mut() {
-        report["cache_requirements"]["checkpoint_max_context_tokens"] = Value::Null;
-        // Restore the historical report's hard-coded provenance before hashing it.
-        report["cache_requirements"]["concurrency"] = json!(16);
-        report["cache_requirements"]["state_slots"] = json!(20);
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
         assert_eq!(notes.remove(1), json!("attention placement heads"));

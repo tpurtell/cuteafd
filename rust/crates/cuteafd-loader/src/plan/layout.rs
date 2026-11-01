@@ -124,8 +124,7 @@ pub struct LayoutOptions {
     pub concurrency: u64,
     /// Exact diagnostic engine slots when they differ from active concurrency.
     pub state_slots: Option<u64>,
-    /// The lanes GLM 5.3 Flash's prefix mark arena counts (its 2C + 2 floor), when they differ
-    /// from the admitted active concurrency.
+    /// Diagnostic active-lane override for GLM Flash's budget-limited prefix mark arena.
     pub glmf_mark_lanes: Option<u64>,
     /// Prefix mark arena slots; absent selects the family policy.
     pub prefix_slots: Option<u64>,
@@ -191,6 +190,7 @@ impl LayoutOptions {
             "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
             "glm5" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            "qwen3_5" => 4,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
     }
@@ -653,6 +653,17 @@ mod draft_prefix_tests {
         Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(report.prefill_span_rows, Some(4096));
         Ok(())
+    }
+
+    #[test]
+    fn dense_qwen_default_concurrency_and_active_state_stay_four() {
+        for bytes in [32 << 30, 96 << 30] {
+            let mut options = LayoutOptions { rtx_bytes: vec![bytes], ..Default::default() };
+            assert_eq!(options.resolved_concurrency("qwen3_5"), 4);
+            assert_eq!(options.resolved_state_slots("qwen3_5"), 4);
+            options.concurrency = 32;
+            assert_eq!(options.resolved_state_slots("qwen3_5"), 32);
+        }
     }
 
     #[test]
