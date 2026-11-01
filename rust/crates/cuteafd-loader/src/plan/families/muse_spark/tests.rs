@@ -371,6 +371,13 @@ fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
         assert_eq!(encoder.kind, EncoderKind::Off);
         assert!(encoder.reason.contains("refused"));
     }
+}
+
+#[test]
+fn media_auto_off_disables_component_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
     // Force Auto through Off without changing the text inventory: impossible
     // replica count eliminates Sparks; a capacity just above the text-only
     // layout leaves no room for either tower.
@@ -385,7 +392,9 @@ fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
     let used = text.memory_layout.as_ref().unwrap().devices[0].used_bytes();
     options.vision = MediaMode::Auto;
     options.audio = MediaMode::Auto;
-    options.layout.as_mut().unwrap().rtx_bytes = vec![used + 1024];
+    // The ledger excludes the baseline CUDA context deducted by GpuBudget.
+    let context = crate::placement::ArchContext::for_device("sm_120", used).context_bytes;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![used + context + 1024];
     options.layout.as_mut().unwrap().vision_replicas = 9;
     // Audio has one copy, so remove its Spark candidate by retaining only the
     // text's exact Spark allocation budget.
@@ -394,6 +403,9 @@ fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
         .map(|d| d.used_bytes()).max().unwrap();
     options.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(spark_used);
     let off = input.plan(&options).unwrap();
+    assert!(off.fits, "{:?}", off.hints);
+    assert_eq!(off.encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
+    assert_eq!(off.audio_encoder.as_ref().unwrap().kind, crate::plan::encoder::EncoderKind::Off);
     assert!(off.disabled_media_bytes > 0, "{:?}", off.hints);
     for component in [Component::Vision, Component::Audio] {
         let component = off.components.iter().find(|c| c.component == component).unwrap();
