@@ -437,6 +437,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 compact_group_rows=1 if compact else None,
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,
+                **({"fc1_k_splits": pipeline.fc1.k_splits}
+                   if not compact and not atomic and not coordinator and not stream_prefill else {}),
                 numerical_recipe=recipe,
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
                 native_abi_version=3 if atomic else 2,
