@@ -987,7 +987,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     let mut tally = console::Step::begin(lease.index());
     let (phases_before, engine_before) = (*phases, tally.live().then(|| *engine.profile.borrow()));
     // Rows each sequence may add after its next token.
-    let room = DECODE_ROWS.saturating_sub(active.len());
+    let room = cuteafd_core::concurrency::draft_budget(active.len() as u64, DECODE_ROWS as u64) as usize;
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
             .min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS)) }).collect();

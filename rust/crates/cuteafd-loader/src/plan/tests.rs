@@ -3633,10 +3633,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
-fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
+fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-    for (gib, expected) in [(32, 8), (96, 16)] {
+    for gib in [32, 96] {
+        let expected = crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64;
         let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
@@ -3645,12 +3646,12 @@ fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
         let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
         assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
-        options.layout.as_mut().unwrap().concurrency = if expected == 16 { 8 } else { 16 };
+        options.layout.as_mut().unwrap().concurrency = 16;
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
-        // Both concurrency limits fit the same sixteen physical target rings.
-        assert_eq!(state(&automatic), state(&overridden));
+        // Active rings follow C; retention is a separate budget.
+        assert!(state(&overridden) > state(&automatic));
         options.layout.as_mut().unwrap().mimo_rings = 32;
         let more_rings = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert!(state(&more_rings) > state(&automatic));

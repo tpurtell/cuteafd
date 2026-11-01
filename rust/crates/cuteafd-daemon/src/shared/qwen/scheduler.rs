@@ -1284,7 +1284,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     let mut predicted = None;
     let (steps_before, draft_s_before) = (lane.timing.steps, lane.timing.seconds);
     // Each sequence verifies its next token plus its drafts within the decode programs' rows.
-    let room = geometry.decode_rows.saturating_sub(active.len());
+    let room = cuteafd_core::concurrency::draft_budget(active.len() as u64, geometry.decode_rows as u64) as usize;
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len() - 1)
             .min(reserved_drafts(a.placement.len(), a.placement.units().len(), cache.pool().page_rows())) }).collect();

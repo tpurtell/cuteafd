@@ -1282,7 +1282,7 @@ release_load_config() {
     if [[ "$mode" == stop ]]; then
       [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
     else
-      [[ "$CONCURRENCY" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "CONCURRENCY must be in 1..128"
+      [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
     fi
   fi
   [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] ||

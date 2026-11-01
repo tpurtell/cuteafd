@@ -172,7 +172,9 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];
     let context = ArchContext::coordinator(capacity, None).context_bytes + set.module_bytes();
-    let drafter = options.dense_qwen_drafter_snapshot.as_ref().map(|snapshot| {
+    let draft_anchor_only = options.dense_qwen_drafter_snapshot.is_some()
+        && !crate::formats::block_dspark::supports_sequences(slots);
+    let drafter = options.dense_qwen_drafter_snapshot.as_ref().filter(|_| !draft_anchor_only).map(|snapshot| {
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let draft = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config)?;
         ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
@@ -191,8 +193,12 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         pool_overhead: 0, pool_bounded: vec![] })?;
     let mut items = result.items[0].clone();
     items.push(Item::new(Category::Runtime, "context and native modules", "native", context, Basis::Calibrated));
+    let mut notes = vec![format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv)];
+    if draft_anchor_only {
+        notes.push(format!("dense dSpark native sequence capacity {}; C{slots} serves anchor-only with no drafter allocation",
+            crate::formats::block_dspark::MAX_SEQUENCES));
+    }
     Ok(MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: capacity - (1 << 30), items, kv_tokens: result.pool_tokens }],
-        pool_tokens: result.pool_tokens, waste: vec![], notes: vec![
-            format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv)] })
+        pool_tokens: result.pool_tokens, waste: vec![], notes })
 }

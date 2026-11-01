@@ -1667,8 +1667,8 @@ mod tests {
         }
         // Host-on reserves a fixed staging working set even when mark lanes change.
         let staging = cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS;
-        assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(2)));
-        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(2)));
+        assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(1)));
+        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(1)));
         for concurrency in [16, 64] {
             let args = launcher(concurrency, 20, None);
             assert_eq!(planned(&args.iter().map(String::as_str).collect::<Vec<_>>()),
@@ -1678,8 +1678,8 @@ mod tests {
         }
         let default_sequences = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64;
         assert_eq!(planned(&[]), served(default_sequences, 20, 2048));
-        // Explicit host-off retains the legacy lane floor and entries/budget rule exactly.
-        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (cuteafd_core::prefix::mark_slots_for(16, 20, mark, 2048 << 20) * mark, state(20)));
+        // Host-off retention remains budgeted separately from the C active state slots.
+        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (cuteafd_core::prefix::mark_slots_for(16, 20, mark, 2048 << 20) * mark, state(16)));
         // The other knobs serve-glmf gets reach the layout as given.
         let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);

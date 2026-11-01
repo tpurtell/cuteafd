@@ -1,7 +1,7 @@
 //! Boot-time concurrency formulas. Program capacities remain explicit admission limits.
 use thiserror::Error;
 
-pub const MAX_CONCURRENCY: u64 = 128;
+pub const MAX_CONCURRENCY: u64 = 64;
 /// Internal CLI default; zero remains an explicit request to disable retention.
 pub const AUTO_ENTRIES: usize = usize::MAX;
 
@@ -44,6 +44,24 @@ pub fn validate(family: &str, concurrency: u64) -> Result<(), ConcurrencyError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn high_concurrency_admits_with_bounded_drafts_or_anchor_only() {
+        for family in ["deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5"] {
+            let mut previous = draft_budget(16, 64);
+            for (c, drafts) in [(17, 2), (32, 1), (64, 0)] {
+                validate(family, c).unwrap();
+                let budget = draft_budget(members_per_lane(c, 1), 64);
+                assert_eq!(budget, drafts, "{family} C{c}");
+                assert!(budget <= previous);
+                assert!(c * (1 + budget) <= 64);
+                previous = budget;
+            }
+        }
+        // V4.1's descriptor expansion remains PR B, not a draft-row refusal.
+        assert_eq!(validate("deepseek_v41", 17).unwrap_err().cause, "native request/descriptor program");
+        assert_eq!(draft_budget(0, 64), 0);
+    }
+
     #[test]
     fn every_family_has_explicit_capacity_at_all_concurrencies() {
         for family in ["deepseek_v41", "deepseek_v4", "glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5",

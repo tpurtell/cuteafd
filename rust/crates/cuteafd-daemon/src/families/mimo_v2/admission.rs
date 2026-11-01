@@ -145,7 +145,7 @@ mod draft_prefix_tests {
                             }).unwrap().memory_layout.unwrap();
                             let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
                             assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}: {:?}", layout.notes);
-                            let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
+                            let reservations = draft_prefix_reservations(enabled, draft, slots, concurrency as u64).unwrap();
                             assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
                             assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
                         }

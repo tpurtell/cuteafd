@@ -3522,9 +3522,9 @@ GLMF_RTX_ENCODER_PLAN = {"placement_supported": True, "fits": True, "spark_ranks
       "--replay-records": "shared"},
      {"--concurrency": "16", "--prefix-cache-entries": "6",
       "--prefix-cache-mark-mib": "1971", "--replay-records": "shared"}),
-    # The launcher forwards C128 unchanged; the actual planner names its program-capacity refusal.
-    ("CONCURRENCY=128\n", {"--max-sequences": "128", "--prefix-cache-entries": "160"},
-     {"--concurrency": "128", "--prefix-cache-entries": "160"}),
+    # The launcher forwards the global ceiling and its derived retention unchanged.
+    ("CONCURRENCY=64\n", {"--max-sequences": "64", "--prefix-cache-entries": "80"},
+     {"--concurrency": "64", "--prefix-cache-entries": "80"}),
 ])
 def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, keys, serve, plan):
     """The planner and server derive state and mark lanes from the same explicit concurrency."""
@@ -3635,7 +3635,7 @@ def test_glmf_encoder_placement_refuses_a_bad_sequence_count(tmp_path, value):
     result = _family_launch_result(tmp_path, GLMF_VISION, "zai-org/GLM-5.3-Flash",
                                    f"RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nCONCURRENCY={value}\n",
                                    encoder_plan=GLMF_RTX_ENCODER_PLAN)
-    assert result.returncode == 2 and "CONCURRENCY must be an integer in 1..=128" in result.stderr, result.stderr
+    assert result.returncode == 2 and "CONCURRENCY must be an integer in 1..=64" in result.stderr, result.stderr
     assert not any("cuteafd serve-glmf" in line for line in result.stderr.splitlines())
 
 

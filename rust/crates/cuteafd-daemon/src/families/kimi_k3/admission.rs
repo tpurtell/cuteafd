@@ -1861,7 +1861,7 @@ pub(super) mod tests {
                 1 => i.peer_access = false,
                 2 => i.attention = Some(AttentionPlacement::Context),
                 3 => i.requested_pool = Some(262_143),
-                4 => i.prefix_marks = 0,
+                4 => i.state_slots = cuteafd_core::concurrency::MAX_CONCURRENCY as usize + 1,
                 5 => i.gpus[0].baseline = Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
                 6 => i.fixed[0].basis = Basis::Estimated,
                 7 => i.fixed[0].gpu = 2,
@@ -1870,6 +1870,9 @@ pub(super) mod tests {
             }
             assert!(admit(i).is_err(), "case {case}");
         }
+        let mut no_marks = inputs(&cfg);
+        no_marks.prefix_marks = 0;
+        assert_eq!(admit(no_marks).unwrap().mark_selection.slots, 0);
         let mut i = inputs(&cfg);
         i.requested_pool = Some(2 << 20);
         i.gpus[1].baseline = Baseline::Measured { free_bytes: 2 << 30 };

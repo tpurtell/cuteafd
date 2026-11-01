@@ -110,7 +110,7 @@ pub(crate) struct ServeArgs {
 
 /// Even per-sequence room when a fixed count bypasses the shared draft policy.
 fn verify_room(verify_rows: usize, sequences: usize) -> usize {
-    (verify_rows / sequences.max(1)).max(1) - 1
+    cuteafd_core::concurrency::draft_budget(sequences as u64, verify_rows as u64) as usize
 }
 
 /// Fixed neural count and packed admission prefill.
@@ -1375,15 +1375,13 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     let (draft0, verify0, emit0) = (lane.draft_s, lane.verify_s, lane.emit_s);
     let engine_before = tally.live().then(|| *engine.profile.borrow());
     // Rows each sequence may add after its next token: an even share of the verify budget.
-    // The shared policy spends one budget across the round (D3): each sequence's room is the whole budget
-    // less the other anchors, and the selection keeps the step within `verify_rows`.
-    let room = if shared.is_some() { verify_rows.saturating_sub(active.len()) }
-        else { verify_room(verify_rows, active.len()) };
+    // Both fixed widths and the shared policy respect this per-request cap.
+    let room = verify_room(verify_rows, active.len());
     let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
     // With the wide programs the rows the even share leaves over go to the first sequences that can
     // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
-    if shared.is_none() && engine.decode_rows > DECODE_ROWS {
+    if shared.is_none() && engine.decode_rows > DECODE_ROWS && active.len() <= 16 {
         super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
             let a = &active[i];
             !probe::no_speculation(&a.job.probe)

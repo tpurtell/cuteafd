@@ -424,7 +424,7 @@ pub(crate) struct PlanArgs {
     #[arg(long, value_enum, default_value = "own")]
     pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
     /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -919,10 +919,10 @@ mod tests {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", entries])).is_ok());
         }
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "160"])).is_ok());
-        for concurrency in ["1", "2", "16", "17", "128"] {
+        for concurrency in ["1", "2", "16", "17", "32", "64"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--memory-reservation", "87.5%"])).is_ok());
         }
-        for concurrency in ["0", "129"] {
+        for concurrency in ["0", "65", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
         for (context, output, valid) in [("256", "128", true), ("0", "128", false),
@@ -1192,7 +1192,7 @@ pub(crate) struct NativeServeArgs {
 
 
     /// Maximum active requests, shared by both execution lanes.
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=128))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub concurrency: u32,
 
     /// Buffered HTTP jobs; defaults to concurrency. At most this many additional callers wait.

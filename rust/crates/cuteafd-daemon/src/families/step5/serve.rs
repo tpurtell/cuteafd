@@ -48,7 +48,7 @@ pub(crate) struct ServeArgs {
     mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=128))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,

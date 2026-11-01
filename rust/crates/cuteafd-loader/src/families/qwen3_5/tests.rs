@@ -110,6 +110,44 @@ pub(crate) fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate
 }
 
 #[test]
+fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let draft = tempfile::tempdir().unwrap();
+    let config = json!({"architectures":["DSparkDraftModel"], "hidden_size":4096,
+        "intermediate_size":8192,"num_hidden_layers":1,"num_attention_heads":32,
+        "num_key_value_heads":8,"head_dim":128,"rms_norm_eps":1e-6,
+        "rope_parameters":{"rope_type":"default","rope_theta":10000.0},
+        "vocab_size":64,"hidden_act":"silu","layer_types":["full_attention"],
+        "sliding_window":null,"block_size":7,"markov_rank":256,"markov_head_type":"vanilla",
+        "enable_confidence_head":true,"confidence_head_with_markov":true,
+        "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
+    std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    let mut previous = usize::MAX;
+    for c in [17, 32, 33, 64] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.concurrency = c;
+        layout.state_slots = None;
+        layout.prefix_slots = Some(0);
+        layout.dense_qwen_drafter_snapshot = Some(draft.path().into());
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits && report.native_serving_admitted, "C{c}: {:?}", report.hints);
+        assert_eq!(report.cache_requirements.as_ref().unwrap().concurrency as u64, c);
+        let memory = report.memory_layout.unwrap();
+        let supported = crate::formats::block_dspark::supports_sequences(c as usize);
+        let budget = if supported { cuteafd_core::concurrency::draft_budget(c, 64) as usize } else { 0 };
+        assert!(budget <= previous);
+        previous = budget;
+        assert_eq!(memory.notes.iter().any(|note| note.contains("anchor-only")), !supported);
+        if !supported {
+            options.layout.as_mut().unwrap().dense_qwen_drafter_snapshot = None;
+            let plain = plan::plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+            assert_eq!(memory.devices, plain.devices);
+            assert_eq!(memory.pool_tokens, plain.pool_tokens);
+        }
+    }
+}
+
+#[test]
 fn native_planner_uses_export_contract_and_exact_dense_allocations() {
     let (dir, options, buffers, mut exports) = native_planner_fixture();
     let manifest = options.layout.as_ref().unwrap().workspace_manifest.as_ref().unwrap();

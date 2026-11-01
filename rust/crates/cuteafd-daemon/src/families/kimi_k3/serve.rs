@@ -25,7 +25,7 @@ pub(crate) struct ServeArgs {
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=128))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
     /// Opt in to a checkpoint-native MLA DFlash2 drafter.

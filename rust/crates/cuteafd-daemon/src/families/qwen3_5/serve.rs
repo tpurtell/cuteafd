@@ -529,7 +529,7 @@ pub(crate) struct ServeArgs {
     pub mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=128))]
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=64))]
     pub max_sequences: u8,
     #[arg(long)]
     pub model_id: Option<String>,
@@ -543,9 +543,19 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
+fn resolve_draft_capacity(args: &mut ServeArgs) {
+    if args.draft.is_some() && !cuteafd_loader::formats::block_dspark::supports_sequences(args.max_sequences as usize) {
+        tracing::info!(concurrency = args.max_sequences,
+            "dense dSpark native sequence capacity exceeded; serving anchor-only");
+        args.draft = None;
+        args.draft_fixed = None;
+    }
+}
+
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
     args.prefix.resolve_entries(args.max_sequences as usize);
+    resolve_draft_capacity(&mut args);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
     use std::sync::{Arc, Mutex};
     let api = args.api.load()?;
@@ -746,6 +756,18 @@ mod tests {
         backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
             crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
         super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
+    }
+
+    #[test]
+    fn dense_dspark_capacity_falls_back_without_changing_target_concurrency() {
+        for c in [17, 32, 33, 64] {
+            let mut args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
+                "--draft", "external", "--draft-fixed", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
+            resolve_draft_capacity(&mut args);
+            assert_eq!(usize::from(args.max_sequences), c);
+            assert_eq!(args.draft.is_some(), c <= block_dspark::MAX_SEQUENCES);
+            assert_eq!(args.draft_fixed.is_some(), c <= block_dspark::MAX_SEQUENCES);
+        }
     }
 
     #[test]
