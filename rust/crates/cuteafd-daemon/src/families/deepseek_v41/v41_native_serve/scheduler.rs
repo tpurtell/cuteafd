@@ -13,6 +13,7 @@ use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
 use super::console;
 use crate::shared::draft::clock::RoundClock;
+use crate::shared::repeat_guard::{LoopHit, RepeatGuard};
 
 #[cfg(test)]
 pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
@@ -29,10 +30,10 @@ pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary
     let mut prefixes = PrefixCache::disabled();
     let image_keys = super::prefix::media_keys(tokens, &[])?;
     let mut request = Active { constraint: None, ticket: console::Ticket::new(id, 0, None), lease,
-        job: NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+        job: NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 4, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?, anchor,
         generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
-        tokens: tokens.to_vec(), image_keys, next_after_commit: None };
+        tokens: tokens.to_vec(), image_keys, next_after_commit: None, repeat: RepeatGuard::default() };
     request.emit(&[anchor])?;
     ensure!(!request.finished, "fixture requires a nonterminal continuation anchor");
     let mut active = [Some(request), None];
@@ -78,6 +79,8 @@ pub(super) struct Active<'a> {
     tokens: Vec<u32>,
     image_keys: ImageKeys,
     next_after_commit: Option<RetainedScores>,
+    /// LD-02: exact-repeat loop guard, built at admission from the live knobs.
+    repeat: RepeatGuard,
 }
 impl Active<'_> {
     fn id(&self) -> u64 { self.ticket.id() }
@@ -94,6 +97,8 @@ impl Active<'_> {
         self.anchor = token;
         self.tokens.push(token);
         self.generated += 1;
+        let hit = self.repeat.push(token);
+        let looped = hit.is_some();
         self.buffered += 1;
         let mut chunks = [None, None, None];
         let mut count = 0;
@@ -104,7 +109,19 @@ impl Active<'_> {
                 self.buffered = 0;
             }
         }
-        if token == 1 || self.generated == self.job.max_tokens {
+        if token == 1 || self.generated == self.job.max_tokens || looped {
+            if let Some(hit) = hit.filter(|_| token != 1) {
+                self.job.finish_detail.set_repetition();
+                console::totals::loop_abort();
+                let (rule, period) = match hit {
+                    LoopHit::Repeat => ("repeat", self.repeat.period_hint()),
+                    LoopHit::Fast { period } => ("fast", Some(period as usize)),
+                };
+                tracing::info!(target: "cuteafd::loop_abort", request_id = self.id(), generated = self.generated,
+                    rule, period, run = self.repeat.consecutive(), period_hint = ?self.repeat.period_hint(),
+                    last_ids = ?self.repeat.last_ids(),
+                    "loop abort: repeated block; finishing with length");
+            }
             if let Some(content) = self.decoder.finish()? {
                 push(InferenceChunk::Text { content, content_tokens: self.buffered });
                 self.buffered = 0;
@@ -416,7 +433,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
         if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
         let (events, receive) = mpsc::unbounded_channel();
         receivers.push(receive);
-        let job = NativeRequest { prefix_cache_source: Default::default(), literal_spans: Vec::new(),
+        let job = NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(),
             prompt: String::new(), constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(),
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
@@ -723,6 +740,9 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let mut constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()?;
                 ensure!(!job.events.is_closed(), "client disconnected");
                 let decoder = cuteafd_loader::streaming_token_decoder(&args.snapshot, false)?;
+                // LD-02: the guard is built at admission from the start-time knobs.
+                let repeat = RepeatGuard::new(args.loop_abort_run, args.loop_abort_copies,
+                    args.loop_fast_span, args.loop_fast_copies);
                 let cached = hit.as_ref().map_or(0, |(end, _)| *end);
                 let image_count = images.len() as u16;
                 drop(images);
@@ -763,6 +783,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 Ok(Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
                     lease, job, decoder, anchor, generated: 0, buffered: 0,
                     finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
+                    repeat,
                     })
             })();
             match result {
@@ -3092,5 +3113,139 @@ mod sampling_tests {
         assert_eq!(row.output_row, 3);
         // The device never calls logf, so this must be the host f32::ln bits.
         assert_eq!(row.ln_min_p.to_bits(), 0.05f32.ln().to_bits());
+    }
+}
+
+#[cfg(test)]
+mod loop_abort_tests {
+    use super::*;
+
+    /// A reversible byte tokenizer (ids 0..=255), so `emit_one` can detokenise
+    /// synthetic id streams without a model snapshot.
+    fn byte_tokenizer() -> tempfile::TempDir {
+        let mut extra = 256u32;
+        let mut vocab = serde_json::Map::new();
+        for byte in 0..=255u32 {
+            let character = if (33..=126).contains(&byte) || (161..=172).contains(&byte) || byte >= 174 {
+                char::from_u32(byte).unwrap()
+            } else {
+                let character = char::from_u32(extra).unwrap();
+                extra += 1;
+                character
+            };
+            vocab.insert(character.to_string(), serde_json::json!(byte));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let value = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+            "added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,
+            "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
+            "model":{"type":"WordLevel","vocab":vocab,"unk_token":"?"}});
+        std::fs::write(dir.path().join("tokenizer.json"), value.to_string()).unwrap();
+        dir
+    }
+
+    fn active(dir: &tempfile::TempDir, max_tokens: usize, repeat: RepeatGuard)
+        -> (Active<'static>, mpsc::UnboundedReceiver<Result<InferenceChunk, cuteafd_api::openai::NativeFailure>>) {
+        let (events, receive) = mpsc::unbounded_channel();
+        let request = Active {
+            constraint: None,
+            ticket: console::Ticket::new(1, 0, None),
+            // SAFETY: `emit`/`emit_one` never read the lease; all-zero is a valid
+            // `CacheLease` (three integers, no `Drop`).
+            lease: unsafe { std::mem::zeroed() },
+            job: NativeRequest { prefix_cache_source: Default::default(), finish_detail: Default::default(),
+                literal_spans: Vec::new(), prompt: String::new(), constraint: None, images: Vec::new(),
+                media: Vec::new(), audio: Vec::new(), max_tokens, sampling: Default::default(),
+                stop_token_ids: Vec::new(), events, usage: None, probe: None },
+            decoder: cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap(),
+            anchor: 0, generated: 0, buffered: 0, finished: false, cacheable: false, failed: false,
+            tokens: Vec::new(), image_keys: super::super::prefix::media_keys(&[], &[]).unwrap(),
+            next_after_commit: None, repeat,
+        };
+        (request, receive)
+    }
+
+    /// A 200-id block with no internal repetition (ids 2..=201; 1 is EOS).
+    fn block() -> Vec<u32> { (2..202).collect() }
+
+    fn feed(request: &mut Active<'_>, tokens: &[u32]) -> Vec<InferenceChunk> {
+        let mut chunks = Vec::new();
+        for &token in tokens {
+            for chunk in request.emit_one(token).unwrap().into_iter().flatten() { chunks.push(chunk); }
+            if request.finished { break; }
+        }
+        chunks
+    }
+
+    #[test]
+    fn loop_abort_finishes_with_length_and_sets_detail() {
+        let dir = byte_tokenizer();
+        let (mut request, _receive) = active(&dir, 100_000, RepeatGuard::new(512, 8, 384, 8));
+        let block = block();
+        let mut stream = Vec::new();
+        for _ in 0..9 { stream.extend_from_slice(&block); }
+        let chunks = feed(&mut request, &stream);
+        assert!(request.finished, "the guard must finish the reply");
+        assert!(request.generated < block.len() * 9, "aborted before the ninth copy");
+        assert_eq!(request.job.finish_detail.name(), Some("repetition"));
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Length),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn loop_abort_off_runs_to_max_tokens() {
+        let dir = byte_tokenizer();
+        let (mut request, _receive) = active(&dir, 500, RepeatGuard::new(0, 8, 0, 8));
+        let block = block();
+        let mut stream = Vec::new();
+        for _ in 0..9 { stream.extend_from_slice(&block); }
+        let chunks = feed(&mut request, &stream);
+        assert!(request.finished);
+        assert_eq!(request.generated, 500, "a disabled guard runs to max_tokens");
+        assert_eq!(request.job.finish_detail.name(), None);
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Length),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eos_before_abort_is_a_plain_stop() {
+        let dir = byte_tokenizer();
+        let (mut request, _receive) = active(&dir, 100_000, RepeatGuard::new(512, 8, 384, 8));
+        let chunks = feed(&mut request, &[1]);
+        assert!(request.finished);
+        assert_eq!(request.generated, 1);
+        assert_eq!(request.job.finish_detail.name(), None);
+        match chunks.last().expect("a finish chunk") {
+            InferenceChunk::Finish { finish_reason } =>
+                assert_eq!(*finish_reason, InferenceFinishReason::Stop),
+            other => panic!("last chunk is not Finish: {other:?}"),
+        }
+    }
+
+    /// The distributed fixture (`exercise_distributed_decode`) needs a GPU, so
+    /// this runs only in a GPU window; the offline gate is the three `emit`
+    /// tests above. The source guard below pins the same-round retirement.
+    #[test]
+    #[ignore = "needs a GPU: exercise_distributed_decode"]
+    fn aborted_row_is_retired_in_the_round() {
+        let source = include_str!("scheduler.rs");
+        assert!(source.contains("r.finished || r.job.events.is_closed()"));
+    }
+
+    /// LD-02 chokepoints: one `push` call, one `set_repetition` call, and the
+    /// abort joins the `max_tokens` arm (screwups M1).
+    #[test]
+    fn loop_abort_has_one_chokepoint() {
+        let source = include_str!("scheduler.rs");
+        assert_eq!(source.matches(concat!("self.repeat.", "push(token)")).count(), 1);
+        assert_eq!(source.matches(concat!("finish_detail.", "set_repetition()")).count(), 1);
+        assert!(source.contains("token == 1 || self.generated == self.job.max_tokens || looped"));
+        assert!(source.contains("r.finished || r.job.events.is_closed()"));
     }
 }

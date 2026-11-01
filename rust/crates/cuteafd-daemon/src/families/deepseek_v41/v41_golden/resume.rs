@@ -68,7 +68,7 @@ fn run(queue: &Requests, prompt: &[u32], rows: usize, cold: bool, output_depende
         vec![cuteafd_loader::V41Image::decode(IMAGE_BYTES)?]
     } else { Vec::new() };
     let request = NativeRequest {
-        prefix_cache_source: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images, media: Vec::new(), audio: Vec::new(),
+        prefix_cache_source: Default::default(), finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None, images, media: Vec::new(), audio: Vec::new(),
         max_tokens: rows, sampling: cuteafd_core::TargetSamplingParams::greedy(), stop_token_ids: Vec::new(),
         events, probe: Some(Arc::clone(&probe)), usage: None,
     };

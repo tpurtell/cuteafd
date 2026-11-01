@@ -230,6 +230,7 @@ pub(crate) mod totals {
     static DRAFTED: AtomicU64 = AtomicU64::new(0);
     static VERIFIED: AtomicU64 = AtomicU64::new(0);
     static ACCEPTED: AtomicU64 = AtomicU64::new(0);
+    static LOOP_ABORTS: AtomicU64 = AtomicU64::new(0);
 
     pub fn admitted(prompt: usize, cached: usize) {
         ADMITTED.fetch_add(1, Relaxed);
@@ -239,6 +240,8 @@ pub(crate) mod totals {
     pub fn active() -> u64 { ADMITTED.load(Relaxed).saturating_sub(RETIRED.load(Relaxed)) }
     pub fn retired() { RETIRED.fetch_add(1, Relaxed); }
     pub fn prefill(rows: usize) { PREFILL.fetch_add(rows as u64, Relaxed); }
+    /// A reply the loop guard aborted (LD-02).
+    pub fn loop_abort() { LOOP_ABORTS.fetch_add(1, Relaxed); }
     pub fn output(tokens: usize) { OUTPUT.fetch_add(tokens as u64, Relaxed); }
     pub fn round(drafted: u64, verified: u64, accepted: u64, emitted: u64) {
         ROUNDS.fetch_add(1, Relaxed);
@@ -259,6 +262,7 @@ pub(crate) mod totals {
             "drafted_tokens": DRAFTED.load(Relaxed),
             "verified_drafts": VERIFIED.load(Relaxed),
             "accepted_drafts": ACCEPTED.load(Relaxed),
+            "loop_aborts": LOOP_ABORTS.load(Relaxed),
         })
     }
 }
@@ -628,6 +632,14 @@ mod tests {
         // Unarmed marks are dropped.
         layer_mark(3);
         assert!(LAYER_MARKS.with(|marks| marks.borrow().is_none()));
+    }
+
+    #[test]
+    fn totals_snapshot_has_loop_aborts() {
+        let before = totals::snapshot()["loop_aborts"].as_u64().expect("loop_aborts is a u64");
+        totals::loop_abort();
+        let after = totals::snapshot()["loop_aborts"].as_u64().expect("loop_aborts is a u64");
+        assert_eq!(after, before + 1);
     }
 
     #[test]

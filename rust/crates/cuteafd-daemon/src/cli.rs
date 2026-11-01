@@ -729,6 +729,37 @@ mod tests {
         assert_eq!(args.mapped_scale_preload_gib, 0.0);
     }
 
+    /// LD-01: the loop-abort run defaults to 512 (ON by default on Jonathan's
+    /// direction; the upstream-sync divergence is recorded in the slice RESULT).
+    #[test]
+    fn loop_abort_run_defaults_to_512() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected native serving"); };
+        assert_eq!(args.loop_abort_run, 512);
+        assert_eq!(args.loop_abort_copies, 8);
+        assert_eq!(args.loop_fast_span, 384);
+        assert_eq!(args.loop_fast_copies, 8);
+    }
+
+    /// LD-01: `--loop-abort-run 0` is the kill switch; the range is 0..=65536.
+    #[test]
+    fn loop_abort_run_zero_is_the_kill_switch() {
+        use clap::Parser;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "0"].iter())).unwrap().command else {
+            panic!("expected native serving") };
+        assert_eq!(args.loop_abort_run, 0);
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-run", "65537"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-abort-copies", "1"].iter())).is_err());
+        assert!(super::Cli::try_parse_from(
+            base.iter().chain(["--loop-fast-copies", "65"].iter())).is_err());
+    }
+
     #[test]
     fn engram_warm_is_an_opt_in_native_serve_switch() {
         use clap::Parser;
@@ -1173,6 +1204,32 @@ pub(crate) struct NativeServeArgs {
     /// Default and maximum generated tokens, further bounded by remaining context.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_OUTPUT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=393216))]
     pub max_output_tokens: u32,
+
+    /// Loop abort: end a response with finish_reason=length once this many
+    /// consecutive 32-token shingles are a third-or-later verbatim copy of
+    /// earlier output (LOOP-DETECT-DESIGN-2026-10-30 §3). 0 = off.
+    #[arg(long, default_value_t = 512, env = "CUTEAFD_V41_LOOP_ABORT_RUN",
+        value_parser = clap::value_parser!(u32).range(0..=65536))]
+    pub loop_abort_run: u32,
+
+    /// Loop abort: how many verbatim copies of a block count as a loop (rule R;
+    /// LOOP-DETECT-DESIGN-2026-10-30 §10). 8 = the shipped patience.
+    #[arg(long, default_value_t = 8, env = "CUTEAFD_V41_LOOP_ABORT_COPIES",
+        value_parser = clap::value_parser!(u32).range(2..=64))]
+    pub loop_abort_copies: u32,
+
+    /// Loop abort: the fast short-cycle rule (F) fires once the copies after the
+    /// first span at least this many tokens (LOOP-DETECT-DESIGN-2026-10-30 §9).
+    /// 0 = off.
+    #[arg(long, default_value_t = 384, env = "CUTEAFD_V41_LOOP_FAST_SPAN",
+        value_parser = clap::value_parser!(u32).range(0..=65536))]
+    pub loop_fast_span: u32,
+
+    /// Loop abort: how many identical copies of a short unit count as a loop
+    /// (rule F; LOOP-DETECT-DESIGN-2026-10-30 §10). 8 = the shipped patience.
+    #[arg(long, default_value_t = 8, env = "CUTEAFD_V41_LOOP_FAST_COPIES",
+        value_parser = clap::value_parser!(u32).range(2..=64))]
+    pub loop_fast_copies: u32,
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]
