@@ -188,7 +188,9 @@ release_stop_wip_containers
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('unsupported native Spark topology', result.stderr)
         for count in (5, 7):
-            result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1')
+            result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1\n'
+                                 'SPARK_6_HOST=fixture-rank6\nSPARK_6_LANE_A=10.55.0.7\n'
+                                 'SPARK_6_LANE_B=10.55.1.7')
             self.assertEqual(result.returncode, 0, result.stderr)
 
 

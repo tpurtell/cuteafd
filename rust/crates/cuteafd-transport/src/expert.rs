@@ -713,7 +713,7 @@ mod tests {
         }
         assert!(SparkWorld::owned(SparkTopology::new(1, 1)?).is_err());
         for tp in 2..=cuteafd_core::MAX_SPARK_WORLD {
-            assert!(SparkWorld::owned(SparkTopology::new(tp, 1)?).is_ok(), "TP{tp}");
+            assert!(SparkWorld::owned(SparkTopology::new(u8::try_from(tp)?, 1)?).is_ok(), "TP{tp}");
         }
         assert!(SparkWorld::new(SparkTopology::NATIVE_TP2_EP2, SparkWire::Canonical).is_err());
         Ok(())
