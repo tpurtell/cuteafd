@@ -199,6 +199,8 @@ use cuteafd_api::openai::{
 };
 use crate::shared::console;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
+use crate::shared::kv_reserve::{reserved_drafts, Holding, Reserve, Reserving};
+use cuteafd_engine::reserve::Lease;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -223,6 +225,7 @@ struct Active<'a, P: Placement, D> {
     /// its `Turn` snapshot.
     turn: Option<Vec<f32>>,
     capacity: usize,
+    lease: Lease,
     next: u32,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
@@ -258,6 +261,16 @@ fn select_host(constraint: Option<&mut crate::shared::constraints::State<'_>>,
     Ok(token)
 }
 
+impl<P: Placement, D> Reserving for Active<'_, P, D> {
+    type Placement = P;
+    fn lease(&self) -> &Lease { &self.lease }
+    fn committed(&self) -> usize { self.placement.len() }
+    fn produced(&self) -> usize { self.generated }
+    fn placement(&self) -> &P { &self.placement }
+    fn placement_mut(&mut self) -> &mut P { &mut self.placement }
+    fn closed(&self) -> bool { self.job.events.is_closed() }
+}
+
 impl<P: Placement, D> Active<'_, P, D> {
     fn send(&self, chunk: InferenceChunk) -> Result<()> {
         self.job.events.send(Ok(chunk)).map_err(|_| anyhow::anyhow!("client went away"))
@@ -291,13 +304,18 @@ impl<P: Placement, D> Active<'_, P, D> {
             self.next = token;
             return Ok(false);
         };
+        self.finish(finish)?;
+        Ok(true)
+    }
+
+    /// Flushes buffered text and sends the finish reason.
+    fn finish(&mut self, finish: InferenceFinishReason) -> Result<()> {
         let content = self.decoder.finish()?.unwrap_or_default();
         if !content.is_empty() || self.buffered > 0 {
             self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
         self.ticket.finishing();
-        self.send(InferenceChunk::Finish { finish_reason: finish })?;
-        Ok(true)
+        self.send(InferenceChunk::Finish { finish_reason: finish })
     }
 }
 
@@ -330,6 +348,7 @@ struct Prefill<'a, P, D> {
     cancelled: bool,
     placement: P,
     capacity: usize,
+    lease: Lease,
     seq: D,
     /// A whole-prompt prefix hit's retained logits (its first token is selected from them).
     logits: Option<Vec<f32>>,
@@ -497,12 +516,13 @@ mod verify_tests {
 }
 
 /// Serving statistics for `/v1/stats`.
+#[allow(clippy::too_many_arguments)]
 fn publish<E: Encoder, M: Clone + Default>(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     cache: &PrefixCache<CudaCopyEngine<'_>, M>, media: &MediaAdmission<Prompt, E>,
-    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats) {
+    preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({ "draft_policy": resource::snapshot(),"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(),
+            "prefilling": prefilling, "prefix_cache": cache.stats(), "verify": verify.snapshot(), "kv_reserve": reserve.snapshot(stalled),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         probe::graph_capture_stats(&mut stats);
     }
@@ -544,7 +564,8 @@ mod readiness_tests {
         let source = source.split_once("\nfn media_failure").unwrap().0;
         let releases = source.lines().filter(|line| line.contains("release(&family,")
             || line.contains("release_failed(&family,")).collect::<Vec<_>>();
-        assert_eq!(releases.len(), 8);
+        // Admission, scoring, binding and reconcile failures, early ends and finishes.
+        assert_eq!(releases.len(), 9);
         let round = include_str!("scheduler.rs").split_once("\nasync fn decode_round").unwrap().1;
         let failed = round.lines().filter(|line| line.contains("release_failed(family,")).collect::<Vec<_>>();
         assert_eq!(failed.len(), 1);
@@ -757,6 +778,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
     }, initialized)?;
     let mut free_slots: Vec<i32> = (0..geometry.slots as i32).rev().collect();
     let mut active: Vec<Active<'_, B::Placement, B::Draft>> = Vec::new();
+    // Decoding requests waiting for KV pages: they keep their slot and units, skip rounds.
+    let mut stalled: Vec<Active<'_, B::Placement, B::Draft>> = Vec::new();
+    let mut reserve = Reserve::new(prefix.reserve.config(geometry.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total, mut admissions) = (0u64, 0u64, 0u64);
     let mut lane = DecodeLane { steps: 0, verify_s: 0.0, timing: DraftTiming::default(),
         stats: VerifyStats::new(geometry.decode_rows) };
@@ -770,8 +794,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        while active.len() + prefills.len() < max_sequences {
-            let busy = !active.is_empty() || !prefills.is_empty();
+        while active.len() + stalled.len() + prefills.len() < max_sequences {
+            let busy = !active.is_empty() || !stalled.is_empty() || !prefills.is_empty();
             let ready = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy,
                 |ready| ready.job().job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
@@ -784,7 +808,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     }
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
-                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &lane.stats);
+                        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &lane.stats,
+                            &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -853,17 +878,31 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 Err(error) => { reject(&ready, format!("rotary positions: {error:#}")); continue; }
             };
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
-            let capacity = (ready.job().tokens.len() + ready.job().job.max_tokens).min(geometry.max_context);
+            // Rows a verify may write past the last kept one come with every reservation.
+            let lease = match reserve.lease(ready.job().tokens.len(), ready.job().job.max_tokens, geometry.decode_rows,
+                Reserve::limit(&cache, &family, geometry.max_context)) {
+                Ok(lease) => lease,
+                Err(error) => { reject(&ready, format!("{error}")); continue; }
+            };
+            let capacity = lease.end();
+            cache.tick();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: p.placement.units(), draft: family.draft_demand(&p.placement) }).collect();
+            let Some(extent) = reserve.admit(&cache, &family, &active, &stalled, &holding, &lease) else {
+                drop(holding);
+                // Waits for the drain rule: a retirement or a release retries it.
+                match kv_waiter.defer_until_release(ready, busy, cache.pool().release_epoch()) {
+                    Ok(()) => break,
+                    Err(ready) => { reject(&ready, "prompt leaves no room for output in the GPU KV pool".into()); continue; }
+                }
+            };
+            drop(holding);
             let Some(slot) = free_slots.pop() else {
                 reject(&ready, "state slots exhausted".into());
                 continue;
             };
-            cache.tick();
             let admit_started = Instant::now();
-            // Lookup, fork of the retained units and restore of the state mark (byte-exact), with
-            // room for the rows a verify may write past the last kept one.
+            // Lookup, fork of the retained units and restore of the state mark (byte-exact).
             let build = |units| engine.placement(units, slot);
-            let extent = (capacity + geometry.decode_rows).min(geometry.max_context);
             let request_neural = effective_neural(neural, &ready.job().job.probe);
             let compatible = |saved: &B::Meta, frontier| engine.snapshot_compatible(saved, frontier, request_neural);
             let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), extent, build) }
@@ -954,7 +993,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             // on, in the plan's chunks, overlapping earlier members' work.
             let ahead = if logits.is_none() { engine.read_ahead(&placement, &tokens, resume, &plan.chunks) } else { None };
             prefills.push(Prefill { job, constraint, tokens, keys, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement, capacity, seq, logits, first: None, prompt_row: None,
+                placement, capacity, lease, seq, logits, first: None, prompt_row: None,
                 started: Instant::now(), ahead, busy: 0.0, phases: [0.0; 2], id: admissions, ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -1102,7 +1141,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft: p.seq,
                         outcomes: DraftHistory::default(), proposed: 0, accepted: 0, cycles: 0, turn: None,
-                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
+                        capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(), id: p.id,
                         ticket: p.ticket,
                     };
                     request.next = first;
@@ -1141,8 +1180,20 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             }
             prefills.settle(!active.is_empty());
         }
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: p.placement.units(), draft: family.draft_demand(&p.placement) }).collect();
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
+            if let Some(shared) = shared.as_mut() { shared.release(request.ticket.id()); }
+            if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
+            request.ticket.done(request.generated);
+            requests += 1;
+            generated_total += request.generated as u64;
+            release(&family, cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement));
+        })?;
+        drop(holding);
         if active.is_empty() {
-            if !media.is_empty() { std::thread::sleep(Duration::from_millis(1)); }
+            if !media.is_empty() || !stalled.is_empty() { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
         let cycle = Instant::now();
@@ -1180,8 +1231,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             release(&family, &mut cache, &mut free_slots, &request.placement, geometry.family, || engine.cancel(&request.placement));
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &lane.stats);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &lane.stats,
+            &reserve, stalled.len());
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
+            receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
@@ -1233,7 +1286,8 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
     // Each sequence verifies its next token plus its drafts within the decode programs' rows.
     let room = geometry.decode_rows.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
-        room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len() - 1) }).collect();
+        room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len() - 1)
+            .min(reserved_drafts(a.placement.len(), a.placement.units().len(), cache.pool().page_rows())) }).collect();
     let mut proposals: Vec<Vec<u32>> = match drafts {
         Drafts::None => vec![Vec::new(); active.len()],
         Drafts::Neural { depth, fixed } => {

@@ -48,7 +48,7 @@ def _identity(tp: int) -> dict:
     base = dict(source_commit="abc", source_artifact="manifest:1", model="deepseek-ai/DeepSeek-V4.1-Flash",
                 revision="dba1be0a", rtx_gpus=2, requested_rtx_expert_layers="auto",
                 resolved_rtx_expert_layers=11, spark_first_layer=11,
-                spark_count=4, concurrency=16, max_context_tokens=1048576, max_output_tokens=393216,
+                spark_count=4, concurrency=16, max_context_tokens=1048576, max_output_tokens=131072,
                 kv_pool="default", prefix_cache_entries=20, prefill_batch_tokens=2048,
                 worker_capacity=2048,
                 dspark="on", dspark_draft_limit=7, spark_device_budget_bytes=107374182400, power_caps_watts=400,
@@ -57,7 +57,7 @@ def _identity(tp: int) -> dict:
                                                "native_library_sha256": "h-spark"}},
                 coordinator_argv=["serve-native", "--rtx-gpus", "2", "--prefill-batch-tokens", "2048",
                                   "--concurrency", "16", "--prefix-cache-entries", "20",
-                                  "--max-context-tokens", "1048576", "--max-output-tokens", "393216", "--dspark"] + topology,
+                                  "--max-context-tokens", "1048576", "--max-output-tokens", "131072", "--dspark"] + topology,
                 worker_argv=workers,
                 worker_admissions=[dict(rank=rank, capacity=2048, compiled_capacity=4096,
                     layer_ids=list(range(11, 40)), selection_digest="a" * 64) for rank in range(4)])

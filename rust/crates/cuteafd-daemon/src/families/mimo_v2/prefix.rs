@@ -328,6 +328,12 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
         &placement.pages
     }
 
+    /// Verify copies the placement's pages into its page table every step.
+    fn extend_pages(&self, placement: &mut MimoPlacement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &MimoPlacement) -> usize {
         placement.len
     }

@@ -172,7 +172,7 @@ def test_pinned_pool_returns_headroom_without_changing_the_serving_contract():
     # The protocol concurrency and the per-request limits are untouched.
     assert values["CONCURRENCY"] == "16"
     assert values["MAX_CONTEXT_TOKENS"] == "1048576"
-    assert values["MAX_OUTPUT_TOKENS"] == "393216"
+    assert values["MAX_OUTPUT_TOKENS"] == "131072"
     assert values["PREFILL_BATCH_TOKENS"] == "2048"  # clamped to 256 by the native lane
     assert values["SPARK_COUNT"] == "3"
     assert (values["SPARK_TP"], values["SPARK_EP"]) == ("3", "1")

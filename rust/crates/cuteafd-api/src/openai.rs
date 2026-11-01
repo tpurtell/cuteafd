@@ -234,7 +234,7 @@ pub mod probe;
 pub mod engine;
 #[cfg(test)]
 mod unicode_tests;
-pub use limits::{NativeLimits, MAX_CONTEXT_TOKENS, MAX_OUTPUT_TOKENS};
+pub use limits::{NativeLimits, DEFAULT_MAX_OUTPUT_TOKENS, MAX_CONTEXT_TOKENS};
 #[derive(Debug, Clone)]
 pub enum NativeFailure {
     BadRequest(String),
@@ -2080,9 +2080,9 @@ mod tests {
     #[tokio::test]
     async fn output_limits_reach_worker_and_model_metadata() {
         for (limits, requested, expected) in [
-            (NativeLimits::default(), None, 393_216),
+            (NativeLimits::default(), None, 131_072),
             (NativeLimits::default(), Some(8192), 8192),
-            (NativeLimits::default(), Some(u32::MAX), 393_216),
+            (NativeLimits::default(), Some(u32::MAX), 131_072),
             (NativeLimits::new(256, 128).unwrap(), None, 128),
             (NativeLimits::new(256, 128).unwrap(), Some(8192), 128),
             (NativeLimits::new(256, 128).unwrap(), Some(8), 8),
