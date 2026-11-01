@@ -1721,7 +1721,11 @@ mod tests {
         let tiny = PlanArgs { coordinator_gpu_budget_gib: Some(2.0), ..args(snapshot.path(), 4, true) };
         let mut weight_only = options(&tiny).unwrap();
         weight_only.layout = None;
-        assert!(plan(snapshot.path(), &weight_only).unwrap().fits, "weight inventory fits");
+        let inventory = plan(snapshot.path(), &weight_only).unwrap();
+        assert!(inventory.fits, "weight inventory fits");
+        assert!(!inventory.placement_supported && !inventory.executable());
+        assert!(inventory.hints.iter().any(|h| h.what.contains("MiMo placement")
+            && (h.what.contains("mandatory") || h.what.contains("pool"))), "{:?}", inventory.hints);
         let report = plan(snapshot.path(), &options(&tiny).unwrap()).unwrap();
         assert!(!report.fits && !report.executable());
         assert!(report.hints.iter().any(|h| h.what.contains("MiMo placement")

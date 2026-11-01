@@ -1059,7 +1059,11 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             spark_allocation_budget_bytes: Some(options.spark_budget()), glm5_drafter_disabled: true,
             glmf_drafter_disabled: true, native_mtp_layers: if ownership.uses_checkpoint() { 3 } else { 0 },
             weight_budget_bytes: options.coordinator_budget_bytes, ..Default::default() };
+        // This call derives executable geometry, not the tensor-only fit verdict.
+        // Runtime admission may refuse while the checkpoint weights still fit.
+        let weights_fit = report.fits;
         let _ = family_layout(model.as_ref(), input, &mut report, &mut inventory, options.placement)?;
+        report.fits = weights_fit;
         report.prefill_unit_rows = inventory.prefill_unit_rows;
         report.prefill_waves = Some(inventory.prefill_waves);
     }
