@@ -288,8 +288,8 @@ class PackageProfileTests(unittest.TestCase):
                 for name, value in values.items():
                     stack.enter_context(patch.object(package, name, return_value=value))
                 _, _, calls, _ = self.build_fixture(
-                    Path(temporary), 'spark', (4, 5), geometry='glm',
-                    capacities=(1024,), profiles=('tp2-width1024',))
+                    Path(temporary), 'spark', (4, 5), geometry='muse',
+                    capacities=(1024,), profiles=('tp4-width1024',))
                 self.assertEqual(len(calls), 1)
                 paths.append(calls[0].args[0].parent.name)
         self.assertEqual(paths[0], paths[-1])
