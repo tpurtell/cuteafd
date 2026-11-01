@@ -1715,6 +1715,345 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_update(void* cuda_graph_exec
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// In-place kernel-argument update of a retained graph + its executable.
+//
+// Every kernel node is read through the DRIVER API. The runtime
+// cudaGraphKernelNodeGetParams fills `func` with a runtime host stub; a node
+// launched from a driver-loaded module (the CuTe-DSL AOT score overlay is a
+// cudaLibrary_t kernel) has none and fails with cudaErrorInvalidDeviceFunction
+// (98), which is why p8/p9 recaptured every index-selection round. The driver
+// view (cuGraphKernelNodeGetParams -> CUfunction or CUkernel) works for both
+// runtime and library kernels, and cuFuncGetParamInfo gives each argument's
+// size without a host stub (CUDA >= 12.4; the images are CUDA 13.2).
+// ---------------------------------------------------------------------------
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+#if defined(CUTEAFD_NATIVE_TEST_HOOKS)
+// One-shot, per-thread fault injection for the native selftest only (see the
+// header). 0 = off. Production never sets it; the cost is one TLS load/call.
+static thread_local int g_graph_update_fault_stage = 0;
+
+static bool graph_update_fault(int stage) {
+  if (g_graph_update_fault_stage != stage) { return false; }
+  g_graph_update_fault_stage = 0;
+  return true;
+}
+#else
+static bool graph_update_fault(int) { return false; }
+#endif
+
+static std::string cu_result_text(CUresult result) {
+  const char* name = nullptr;
+  const char* text = nullptr;
+  if (cuGetErrorName(result, &name) != CUDA_SUCCESS) { name = nullptr; }
+  if (cuGetErrorString(result, &text) != CUDA_SUCCESS) { text = nullptr; }
+  return std::string(name != nullptr ? name : "CUDA_ERROR_UNKNOWN") + " ("
+         + std::to_string(static_cast<int>(result)) + "): "
+         + (text != nullptr ? text : "no driver error string");
+}
+
+static cuteafd_status_t fail_cu(cuteafd_status_t status, const char* action, CUresult result) {
+  return fail(status, std::string(action) + ": " + cu_result_text(result));
+}
+
+// A value is a CUDA pointer when the driver resolves it to an allocation it
+// knows: device memory, managed memory, or registered/pinned (incl. mapped)
+// host memory. Interior pointers resolve to their allocation.
+// cuPointerGetAttributes does not fail on unknown addresses (the attributes
+// stay zero), so a scalar probe raises no error, driver or runtime.
+static bool is_cuda_pointer(uint64_t value) {
+  if (value == 0) { return false; }
+  unsigned int memory_type = 0;
+  unsigned int is_managed = 0;
+  CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                      CU_POINTER_ATTRIBUTE_IS_MANAGED};
+  void* data[] = {&memory_type, &is_managed};
+  const CUresult result = cuPointerGetAttributes(
+      2, attributes, data, static_cast<CUdeviceptr>(value));
+  if (result != CUDA_SUCCESS) { return false; }
+  return is_managed != 0 || memory_type == CU_MEMORYTYPE_DEVICE
+         || memory_type == CU_MEMORYTYPE_HOST || memory_type == CU_MEMORYTYPE_UNIFIED;
+}
+
+// Arguments of one kernel node: size per index. Counted with
+// cuFuncGetParamInfo until it reports CUDA_ERROR_INVALID_VALUE (index past the
+// last parameter), which works on every CUDA >= 12.4 without
+// cuFuncGetParamCount. Capped so a corrupt handle cannot loop forever.
+static CUresult kernel_param_sizes(CUfunction func, std::vector<size_t>* sizes) {
+  constexpr size_t kMaxKernelParams = 4096;
+  sizes->clear();
+  for (size_t i = 0; i < kMaxKernelParams; ++i) {
+    size_t offset = 0;
+    size_t size = 0;
+    const CUresult result = cuFuncGetParamInfo(func, i, &offset, &size);
+    if (result == CUDA_ERROR_INVALID_VALUE) { return CUDA_SUCCESS; }
+    if (result != CUDA_SUCCESS) { return result; }
+    sizes->push_back(size);
+  }
+  return CUDA_ERROR_INVALID_VALUE;
+}
+
+// A non-kernel node (memcpy/memset) cannot be rewritten by this API. If it
+// references an old value, refuse the whole update so the caller recaptures
+// instead of leaving that node on a stale pointer while reporting success.
+static bool non_kernel_node_references(const CUgraphNode node, CUgraphNodeType type,
+    const uint64_t* old_values, size_t count) {
+  auto matches = [&](uint64_t value) {
+    for (size_t j = 0; j < count; ++j) {
+      if (old_values[j] == value) { return true; }
+    }
+    return false;
+  };
+  if (type == CU_GRAPH_NODE_TYPE_MEMCPY) {
+    CUDA_MEMCPY3D params = {};
+    if (cuGraphMemcpyNodeGetParams(node, &params) != CUDA_SUCCESS) { return false; }
+    return matches(static_cast<uint64_t>(params.srcDevice))
+           || matches(static_cast<uint64_t>(params.dstDevice))
+           || matches(reinterpret_cast<uint64_t>(params.srcHost))
+           || matches(reinterpret_cast<uint64_t>(params.dstHost));
+  }
+  if (type == CU_GRAPH_NODE_TYPE_MEMSET) {
+    CUDA_MEMSET_NODE_PARAMS params = {};
+    if (cuGraphMemsetNodeGetParams(node, &params) != CUDA_SUCCESS) { return false; }
+    return matches(static_cast<uint64_t>(params.dst));
+  }
+  return false;
+}
+
+static cuteafd_status_t graph_exec_update_pointers_impl(
+    void* cuda_graph_exec, void* cuda_graph, const uint64_t* old_values,
+    const uint64_t* new_values, const uint8_t* widths, const uint8_t* kinds,
+    uint8_t* found, size_t count) {
+  for (size_t i = 0; i < count; ++i) { found[i] = 0; }
+  for (size_t i = 0; i < count; ++i) {
+    if (widths[i] != sizeof(uint32_t) && widths[i] != sizeof(uint64_t)) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph update value width is not 4 or 8 bytes");
+    }
+    if (kinds[i] > 1) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph update value kind is not 0 (scalar) or 1 (pointer)");
+    }
+    if (kinds[i] == 1) {
+      // A pointer argument is 8 bytes on this ABI. Both the captured value and
+      // its replacement must be CUDA pointers; a scalar that merely shares the
+      // numeric value is refused instead of being rewritten as a pointer.
+      if (widths[i] != sizeof(uint64_t)) {
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                    "CUDA graph pointer argument is not 8 bytes; index " + std::to_string(i));
+      }
+      // Identity values are never rewritten, so they need no probe; the
+      // per-round cost stays with the pointers that actually change.
+      if (old_values[i] != new_values[i]
+          && (!is_cuda_pointer(old_values[i]) || !is_cuda_pointer(new_values[i]))) {
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                    "CUDA graph pointer-kind value is not a CUDA pointer; index "
+                        + std::to_string(i));
+      }
+    } else if (widths[i] == sizeof(uint64_t)
+               && (is_cuda_pointer(old_values[i]) || is_cuda_pointer(new_values[i]))) {
+      // An 8-byte scalar must not alias a CUDA pointer: otherwise a pointer
+      // argument with that value would be rewritten as a scalar (or the reverse).
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph scalar-kind value aliases a CUDA pointer; index "
+                      + std::to_string(i));
+    }
+    if (widths[i] == sizeof(uint32_t) && new_values[i] > std::numeric_limits<uint32_t>::max()) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph 32-bit argument replacement overflows");
+    }
+  }
+  // A value that maps to two different replacements cannot be resolved without
+  // knowing which kernel argument the caller meant. Refuse rather than guess.
+  // Widths are part of the identity: a 4-byte and an 8-byte argument with the
+  // same numeric value are distinct kernel parameters.
+  for (size_t i = 0; i < count; ++i) {
+    for (size_t j = i + 1; j < count; ++j) {
+      if (widths[i] == widths[j] && old_values[i] == old_values[j]
+          && new_values[i] != new_values[j]) {
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                    "ambiguous CUDA graph argument substitution");
+      }
+    }
+  }
+  size_t node_count = 0;
+  cudaError_t err = cudaGraphGetNodes(reinterpret_cast<cudaGraph_t>(cuda_graph), nullptr, &node_count);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphGetNodes count failed", err);
+  }
+  std::vector<cudaGraphNode_t> nodes(node_count);
+  if (node_count > 0) {
+    size_t copied = node_count;
+    err = cudaGraphGetNodes(reinterpret_cast<cudaGraph_t>(cuda_graph), nodes.data(), &copied);
+    if (err != cudaSuccess) {
+      return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphGetNodes failed", err);
+    }
+    nodes.resize(copied);
+  }
+  std::vector<size_t> sizes;
+  for (cudaGraphNode_t runtime_node : nodes) {
+    const CUgraphNode node = reinterpret_cast<CUgraphNode>(runtime_node);
+    CUgraphNodeType type;
+    CUresult result = cuGraphNodeGetType(node, &type);
+    if (result != CUDA_SUCCESS) {
+      return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuGraphNodeGetType failed", result);
+    }
+    if (type != CU_GRAPH_NODE_TYPE_KERNEL) {
+      if (non_kernel_node_references(node, type, old_values, count)) {
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                    "CUDA graph non-kernel node references an updated value");
+      }
+      continue;
+    }
+    CUDA_KERNEL_NODE_PARAMS params = {};
+    result = graph_update_fault(1) ? CUDA_ERROR_INVALID_VALUE
+                                   : cuGraphKernelNodeGetParams(node, &params);
+    if (result != CUDA_SUCCESS) {
+      return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuGraphKernelNodeGetParams failed", result);
+    }
+    // CUDA 12+ library kernels may come back as a CUkernel with func == NULL;
+    // the context-bound CUfunction is only used to read the argument layout.
+    CUfunction func = params.func;
+    if (func == nullptr && params.kern != nullptr) {
+      result = cuKernelGetFunction(&func, params.kern);
+      if (result != CUDA_SUCCESS) {
+        return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuKernelGetFunction failed", result);
+      }
+    }
+    if (func == nullptr) {
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph kernel node has neither a CUfunction nor a CUkernel");
+    }
+    result = kernel_param_sizes(func, &sizes);
+    if (result != CUDA_SUCCESS) {
+      return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuFuncGetParamInfo failed", result);
+    }
+    const size_t param_count = sizes.size();
+    if (param_count == 0) { continue; }
+    if (params.kernelParams == nullptr) {
+      // Launches that pass a packed CU_LAUNCH_PARAM_BUFFER (extra) instead of
+      // kernelParams are not rewritten; the caller recaptures.
+      return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                  "CUDA graph kernel node has no kernelParams array");
+    }
+    // The node owns its argument storage; copy it before substituting so the
+    // graph is never mutated outside the CUDA parameter API.
+    std::vector<size_t> offsets(param_count);
+    size_t total = 0;
+    for (size_t i = 0; i < param_count; ++i) {
+      offsets[i] = total;
+      total += sizes[i];
+    }
+    std::vector<uint8_t> storage(total);
+    std::vector<void*> pointers(param_count);
+    for (size_t i = 0; i < param_count; ++i) {
+      if (params.kernelParams[i] == nullptr) {
+        return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                    "CUDA graph kernel argument pointer is null");
+      }
+      std::memcpy(storage.data() + offsets[i], params.kernelParams[i], sizes[i]);
+      pointers[i] = storage.data() + offsets[i];
+    }
+    bool changed = false;
+    for (size_t i = 0; i < param_count; ++i) {
+      if (sizes[i] != sizeof(uint32_t) && sizes[i] != sizeof(uint64_t)) { continue; }
+      uint64_t value = 0;
+      std::memcpy(&value, storage.data() + offsets[i], sizes[i]);
+      // Only probe the argument's kind when its value could match an entry.
+      bool candidate = false;
+      for (size_t j = 0; j < count; ++j) {
+        if (widths[j] == sizes[i] && old_values[j] == value) { candidate = true; break; }
+      }
+      if (!candidate) { continue; }
+      // Match by kind as well as width/value: a scalar entry never rewrites a
+      // pointer argument (or the reverse), even when the numeric values collide.
+      const uint8_t arg_kind =
+          (sizes[i] == sizeof(uint64_t) && is_cuda_pointer(value)) ? 1 : 0;
+      for (size_t j = 0; j < count; ++j) {
+        if (widths[j] != sizes[i] || kinds[j] != arg_kind || value != old_values[j]) { continue; }
+        // Mark every duplicate entry found; the ambiguity check above guarantees
+        // all entries with this width/value share one replacement.
+        found[j] = 1;
+        if (value != new_values[j]) {
+          if (sizes[i] == sizeof(uint32_t)) {
+            const uint32_t replacement = static_cast<uint32_t>(new_values[j]);
+            std::memcpy(storage.data() + offsets[i], &replacement, sizeof(replacement));
+          } else {
+            std::memcpy(storage.data() + offsets[i], &new_values[j], sizeof(new_values[j]));
+          }
+          changed = true;
+        }
+      }
+    }
+    if (!changed) { continue; }
+    CUDA_KERNEL_NODE_PARAMS updated = params;
+    updated.kernelParams = pointers.data();
+    // Preserve func/kern/ctx, grid/block extents and any extra block exactly as
+    // captured; only the kernelParams array is replaced. Launch extents are
+    // therefore stable across an update (the caller keys on geometry).
+    result = graph_update_fault(2) ? CUDA_ERROR_INVALID_VALUE
+                                   : cuGraphKernelNodeSetParams(node, &updated);
+    if (result != CUDA_SUCCESS) {
+      return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuGraphKernelNodeSetParams failed", result);
+    }
+    result = graph_update_fault(3)
+                 ? CUDA_ERROR_INVALID_VALUE
+                 : cuGraphExecKernelNodeSetParams(
+                       reinterpret_cast<CUgraphExec>(cuda_graph_exec), node, &updated);
+    if (result != CUDA_SUCCESS) {
+      return fail_cu(CUTEAFD_STATUS_INTERNAL_ERROR, "cuGraphExecKernelNodeSetParams failed",
+                     result);
+    }
+  }
+  return ok();
+}
+#endif
+
+extern "C" cuteafd_status_t cuteafd_cuda_graph_exec_update_pointers(
+    void* cuda_graph_exec, void* cuda_graph, const uint64_t* old_values,
+    const uint64_t* new_values, const uint8_t* widths, const uint8_t* kinds,
+    uint8_t* found, size_t count) {
+  if (cuda_graph_exec == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph exec update target is null");
+  }
+  if (cuda_graph == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update graph is null");
+  }
+  if (count != 0 && (old_values == nullptr || new_values == nullptr || widths == nullptr
+                     || kinds == nullptr || found == nullptr)) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update value array is null");
+  }
+  // Bound the count so a corrupt caller cannot drive an unbounded loop.
+  if (count > (size_t{1} << 20)) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA graph update value count is too large");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  const cuteafd_status_t status = graph_exec_update_pointers_impl(
+      cuda_graph_exec, cuda_graph, old_values, new_values, widths, kinds, found, count);
+  if (status != CUTEAFD_STATUS_OK) {
+    // ONE chokepoint for the p9 rule: every failure is reported through the
+    // returned status and the per-thread CUDA last-error is cleared, so a
+    // recovered failure (the caller retires and recaptures) can never leak
+    // into the next kernel's launch-status check (p8 crash 2026-10-28).
+    (void)cudaGetLastError();
+  }
+  return status;
+#else
+  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+              "CUDA graph exec pointer update is unavailable in this build");
+#endif
+}
+
+#if defined(CUTEAFD_NATIVE_TEST_HOOKS)
+extern "C" void cuteafd_cuda_graph_update_pointers_inject_fault(int stage) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  g_graph_update_fault_stage = stage;
+#else
+  (void)stage;
+#endif
+}
+#endif
+
 extern "C" cuteafd_status_t cuteafd_cuda_graph_destroy(void* cuda_graph) {
   if (cuda_graph == nullptr) {
     return ok();

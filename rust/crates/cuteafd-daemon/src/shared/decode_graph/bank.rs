@@ -120,6 +120,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     }
 
     pub fn get(&self, key: &K) -> Option<&E> { self.entries.get(key).map(|entry| &entry.exec) }
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut E> { self.entries.get_mut(key).map(|entry| &mut entry.exec) }
     pub fn seen(&self, key: &K) -> bool { self.seen.contains(key) }
 
     /// Retired executables remain owned here until drain_retired. The mean
