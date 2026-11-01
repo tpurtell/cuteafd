@@ -368,6 +368,7 @@ fn apply(input: &super::super::PlanInput, report: &mut PlanReport, options: &Lay
     // Dual's mandatory owner partition and startup graphs are themselves a
     // fixed point. Retain its shipped strict-target inventory preview, not an
     // approximation from the as-yet unpartitioned runtime-only devices.
+    let mut preview_failed = false;
     let budget = if report.encoder.is_none() {
         let requested = inputs.requested_pool;
         inputs.requested_pool = Some(target);
@@ -384,12 +385,12 @@ fn apply(input: &super::super::PlanInput, report: &mut PlanReport, options: &Lay
             Err(error) => {
                 report.placement_supported = false;
                 notes.push(format!("Qwen media admission: {error:#}"));
+                preview_failed = true;
                 None
             }
         }
     } else { None };
-    let admitted = admit_device_encoders(report, &towers, devices, &mut Vec::new(), &[0; 2],
-        budget.as_deref(), options, notes, |_trial, devices| {
+    let mut solve = |_trial: &mut PlanReport, devices: &mut [DeviceLayout]| {
             for (rank, device) in devices.iter().enumerate() {
                 inputs.gpus[rank].baseline = Baseline::Planned { context_bytes: 0, loaded_bytes: device.used_bytes() };
             }
@@ -404,6 +405,12 @@ fn apply(input: &super::super::PlanInput, report: &mut PlanReport, options: &Lay
                 device.kv_tokens = placement.pool_tokens;
             }
             Ok(placement)
-        })?;
-    Ok(admitted)
+    };
+    if preview_failed {
+        // The shipped failed-preview path reports no encoder and still runs
+        // the final text solve once; do not invent a native trial here.
+        return solve(report, devices);
+    }
+    admit_device_encoders(report, &towers, devices, &mut Vec::new(), &[0; 2],
+        budget.as_deref(), options, notes, solve)
 }

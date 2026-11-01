@@ -588,6 +588,40 @@ fn qwen_mapped_ple_host_staging_matches_runtime_allocations() {
 }
 
 #[test]
+fn native_admission_uses_mandatory_budget_without_copying_it_into_the_final_solve() {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item};
+    let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
+    let original = plan(dir.path(), &PlanOptions::default()).unwrap();
+    let gib = 1u64 << 30;
+    let raw = DeviceLayout { kind: DeviceKind::Rtx, index: 0, capacity_bytes: 10 * gib,
+        items: vec![Item::new(Category::Runtime, "context", "", gib, Basis::Exact)], kv_tokens: 0 };
+    let mut inventory = raw.clone();
+    inventory.items.push(Item::new(Category::Weights, "mandatory owners and target pool", "", 8 * gib, Basis::Exact));
+    let towers = layout::Towers { name: "test", vision: Ok((2 * gib, 0)), audio: Ok((0, 0)), v41: false };
+    for mode in [MediaMode::Auto, MediaMode::Rtx(None), MediaMode::Off] {
+        let mut report = original.clone();
+        report.vision = mode;
+        report.audio = MediaMode::Off;
+        report.encoder = None;
+        report.audio_encoder = None;
+        let mut devices = vec![raw.clone()];
+        let mut calls = 0;
+        let result = layout::admit_device_encoders(&mut report, &towers, &mut devices, &mut Vec::new(), &[0],
+            Some(std::slice::from_ref(&inventory)), &layout::LayoutOptions::default(), &mut Vec::new(),
+            |_report, devices| {
+                calls += 1;
+                assert_eq!(devices[0].items, raw.items, "mandatory preview must not be charged twice");
+                Ok(37)
+            }).unwrap();
+        assert_eq!((calls, result), (1, 37));
+        let encoder = report.encoder.unwrap();
+        assert_eq!(encoder.kind, encoder::EncoderKind::Off);
+        assert_eq!(encoder.shortfall, if mode == MediaMode::Off { 0 } else { gib });
+        if mode == MediaMode::Rtx(None) { assert!(!report.placement_supported); }
+    }
+}
+
+#[test]
 fn qwen_local_and_dual_publish_whole_step_geometry_without_a_transport() {
     let config = qwen4_config(4);
     let dir = snapshot(config.clone(), &qwen4_coordinator(&config, false));
