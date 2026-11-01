@@ -28,7 +28,7 @@ pub fn deepseek_v4_expert_cost(catalog: &crate::OfficialV41Catalog, layer: usize
 }
 
 /// Standard rtx_backbone export scratch: 16-byte-aligned native slots,
-/// ordered route output below 256 rows, atomic token output above it.
+/// ordered slice decode and hardware-qualified original-route STREAM prefill.
 /// Mirrors export_b12x_slices_aot.py and expert_families.cmake without CUDA.
 pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64,
     topk: u64, max_rows: u64) -> Result<u64, CacheGeometryError> {
@@ -41,18 +41,27 @@ pub fn deepseek_v4_native_workspace(hidden: u64, intermediate: u64, experts: u64
     let mut scratch = 0;
     for capacity in capacities.into_iter().filter(|&n| n <= maximum)
         .chain(capacities.into_iter().find(|&n| n >= maximum)) {
-        let routes = product("V4 expert routes", &[capacity, topk])?;
-        let atomic = capacity >= 256;
-        let planes = intermediate.div_ceil(128);
-        // FC1 stores FP8 words and one u32 scale word per K32 activation block.
-        let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, 128 / 4 + 128 / 32])? };
-        let output = product("V4 routed output", &[4, if atomic { capacity } else { routes }, hidden])?;
-        let slots = [4, product("V4 packed routes", &[4, experts, routes])?, experts * 4, experts * 8,
-            routes * 19 * 4, routes * 4, routes * 4, partial, output, experts * 4, experts * 4];
-        let mut bytes = 0_u64;
-        for slot in slots {
-            bytes = sum("V4 aligned expert scratch", &[bytes.div_ceil(16) * 16, slot])?;
-        }
+        let stream = cuteafd_core::mxfp4_layouts::native_prefill(hidden as usize,
+            intermediate as usize, 120, capacity as u32);
+        let bytes = if stream {
+            cuteafd_core::mxfp4_layouts::native_prefill_scratch_bytes(hidden as usize,
+                intermediate as usize, experts as usize, topk as usize, capacity as u32)
+                .ok_or(CacheGeometryError::Overflow("V4 native STREAM scratch"))?
+        } else {
+            let routes = product("V4 expert routes", &[capacity, topk])?;
+            let atomic = capacity >= 256;
+            let planes = intermediate.div_ceil(128);
+            // FC1 stores FP8 words and one u32 scale word per K32 activation block.
+            let partial = if atomic { 4 } else { product("V4 ordered partials", &[4, planes, routes, 128 / 4 + 128 / 32])? };
+            let output = product("V4 routed output", &[4, if atomic { capacity } else { routes }, hidden])?;
+            let slots = [4, product("V4 packed routes", &[4, experts, routes])?, experts * 4, experts * 8,
+                routes * 19 * 4, routes * 4, routes * 4, partial, output, experts * 4, experts * 4];
+            let mut bytes = 0_u64;
+            for slot in slots {
+                bytes = sum("V4 aligned expert scratch", &[bytes.div_ceil(16) * 16, slot])?;
+            }
+            bytes
+        };
         scratch = scratch.max(bytes);
     }
     sum("V4 native expert workspace", &[scratch, product("V4 local output/routes", &[maximum, hidden * 2 + topk * 8])?])
@@ -74,7 +83,7 @@ pub fn deepseek_v4_tp2_expert_cost(catalog: &crate::OfficialV41Catalog, layer: u
         * shape.experts as u64, staging_bytes: staging.staging_bytes() as u64 })
 }
 
-/// `rtx_tp2` uses the same slots/atomic threshold as `rtx_backbone`, at I/2,
+/// `rtx_tp2` uses the same hardware-qualified backend as `rtx_backbone`, at I/2,
 /// but its executor output is FP32 and has no TP1 output/route tail.
 pub fn deepseek_v4_tp2_native_workspace(hidden: u64, intermediate: u64, experts: u64,
     topk: u64, max_rows: u64) -> Result<u64, CacheGeometryError> {
@@ -121,9 +130,8 @@ mod tp2_tests {
     use super::*;
     #[test]
     fn native_tp2_workspace_matches_export_slots() {
-        // Export widths are 128 throughout. Compact FC1 activation storage leaves
-        // m4096 token-output scratch as the largest arena for both geometries.
-        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 161453088), (7168, 3072, 384, 6, 274701856)] {
+        // Flash uses original-route STREAM; Pro retains its existing atomic recipe.
+        for (h, i, e, k, expected) in [(4096, 2048, 256, 6, 530717456), (7168, 3072, 384, 6, 274701856)] {
             assert_eq!(deepseek_v4_tp2_native_workspace(h, i, e, k, 4096).unwrap(), expected);
         }
         assert!(deepseek_v4_tp2_native_workspace(4096, 2048, 256, 6, 4097).is_err());

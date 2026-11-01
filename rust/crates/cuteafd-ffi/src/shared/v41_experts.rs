@@ -133,7 +133,16 @@ pub struct V41ExpertReduction {
 }
 impl V41ExpertReduction {
     pub fn validate(&self, info: &V41ExpertInfo) -> Result<()> {
-        ensure!(self.version == 1 && matches!(self.slice_width, 64 | 128 | 192)
+        if self.version == 2 {
+            ensure!(self.slice_width == 128 && self.mma_k == 32 && self.block_threads == 256
+                && self.fc1_k_stage == 128 && self.fc2_k_steps == info.logical_intermediate.div_ceil(32)
+                && self.plane_count == 1 && self.plane_fold == 4 && self.implementation == 3
+                && info.abi_version == 2 && info.kernel_intermediate == info.logical_intermediate
+                && matches!(info.capacity_rows, 256 | 1024 | 4096),
+                "unsupported native STREAM original-route attestation");
+            return Ok(());
+        }
+        ensure!(self.version == 1 && matches!(self.slice_width, 32 | 64 | 128 | 192)
             && self.mma_k == 32 && self.block_threads == 128 && self.fc1_k_stage == 128,
             "unsupported native expert reduction attestation");
         ensure!(self.fc2_k_steps == self.slice_width / self.mma_k
@@ -1589,6 +1598,24 @@ mod tests {
         assert!(info.input_row_bytes().is_err());
         info.input_dtype = 3;
         assert!(info.input_row_bytes().is_err());
+    }
+
+    #[test]
+    fn compiled_stream_attestation_requires_original_routes_and_prefill() {
+        let info = V41ExpertInfo { abi_version: 2, capacity_rows: 256,
+            logical_intermediate: 352, kernel_intermediate: 352, ..Default::default() };
+        let recipe = V41ExpertReduction { version: 2, slice_width: 128, fc2_k_steps: 11,
+            plane_count: 1, plane_fold: 4, implementation: 3, mma_k: 32,
+            block_threads: 256, fc1_k_stage: 128 };
+        recipe.validate(&info).unwrap();
+        for bad in [V41ExpertReduction { plane_fold: 2, ..recipe },
+            V41ExpertReduction { block_threads: 128, ..recipe },
+            V41ExpertReduction { fc2_k_steps: 4, ..recipe },
+            V41ExpertReduction { plane_count: 3, ..recipe }] {
+            assert!(bad.validate(&info).is_err());
+        }
+        assert!(recipe.validate(&V41ExpertInfo { capacity_rows: 80, ..info }).is_err());
+        assert!(recipe.validate(&V41ExpertInfo { abi_version: 3, ..info }).is_err());
     }
 
     #[test]
