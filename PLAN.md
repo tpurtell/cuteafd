@@ -6363,3 +6363,16 @@ reuse all 26 completed Spark weight copies and any checksum-valid owned partial,
 and finish managed verification/cleanup. The hold marker is archived as resolved.
 CPU-only continuation: `muse-quant-1793575200198800108`. No shared SparkNest
 feature/deployment work, requantization or HF reupload is needed.
+
+TJ explicitly requested native SparkNest tools, minimal copies and no further
+weight checksums or SSH verification. This supersedes the extra terminal
+checksum barriers above. The old verifier continuation was stopped; 28 verified
+Spark shards are reused. A filtered hardlink staging view contains only 35
+missing weight shards plus remaining assets (238,777,799,082 bytes). Native
+`nest import --copy --seal all` job 3263500654 handles the unavoidable cross-NVMe
+copy. Per-host metadata aliases batch native RDMA `nest replicate` jobs; the
+coordinator's managed copies are evicted after placement. Existing HF checksums
+are retained as the checksum record; final checks use native job errors/counts,
+sealed sizes, ownership, inventory and offline HF resolution without rehashing
+weight data. Refs are imported last. Native CLI continuation:
+`muse-quant-1793576154865042036`, task-local `native_finish.py`. No SSH is used.
