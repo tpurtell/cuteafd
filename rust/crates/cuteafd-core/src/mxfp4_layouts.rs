@@ -7,7 +7,10 @@ struct StorageHold { hidden: usize, width: usize, stored: usize }
 #[derive(Deserialize)]
 struct SliceRecipe { hidden: usize, width: usize, sm: u32, capacities: Vec<u32>, slices: Vec<usize> }
 #[derive(Deserialize)]
-struct Layouts { schema: u32, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe> }
+struct Ownership { intermediate: usize, world: usize, unit: usize }
+#[derive(Deserialize)]
+struct Layouts { schema: u32, storage_holds: Vec<StorageHold>, native_slices: Vec<SliceRecipe>,
+    ownership: Vec<Ownership>, generic_storage_holds: Vec<StorageHold> }
 
 fn validate(data: &Layouts) -> Result<(), &'static str> {
     if data.schema != 1 { return Err("unsupported MXFP4 layout schema"); }
@@ -21,8 +24,14 @@ fn validate(data: &Layouts) -> Result<(), &'static str> {
         if decode.is_empty() || !decode.windows(2).all(|pair| pair[0] == pair[1]) {
             return Err("native MXFP4 decode capacities must share one slice recipe");
         }
-        if row.slices.iter().any(|slice| ![64, 128, 192].contains(slice)) {
+        if row.slices.iter().any(|slice| ![32, 64, 128, 192].contains(slice)) {
             return Err("invalid native MXFP4 slice width");
+        }
+    }
+    for row in &data.ownership {
+        if ![32, 64, 128].contains(&row.unit) || row.intermediate % row.unit != 0
+            || !(1..=8).contains(&row.world) || row.intermediate / row.unit < row.world {
+            return Err("invalid measured MXFP4 ownership");
         }
     }
     Ok(())
@@ -38,8 +47,20 @@ fn layouts() -> &'static Layouts {
     })
 }
 
-/// The same SM121 recipe the native exporter selects. Existing equal-width
-/// objects retain width 192; adjacent artifacts default to their matching tile.
+/// Measured adjacent ownership; K32 remains the default scale-aligned unit.
+pub fn ownership_unit(intermediate: usize, world: usize) -> usize {
+    layouts().ownership.iter().find(|row| row.intermediate == intermediate && row.world == world)
+        .map_or(32, |row| row.unit)
+}
+
+/// Generic packages may retain a padded extent without changing source ownership.
+pub fn generic_stored_width(hidden: usize, width: usize) -> usize {
+    layouts().generic_storage_holds.iter().find(|row| row.hidden == hidden && row.width == width)
+        .map_or(width, |row| row.stored)
+}
+
+/// The same SM121 recipe the native exporter selects. Unmeasured capacities
+/// retain their matching tile; measured decode recipes are fixed through C80.
 pub fn native_slice_width(hidden: usize, width: usize, sm: u32, capacity: u32,
     matching: usize) -> usize {
     layouts().native_slices.iter().find(|row| row.hidden == hidden && row.width == width && row.sm == sm)
@@ -74,7 +95,7 @@ pub fn native_scratch_bytes(hidden: usize, experts: usize, topk: usize,
             .checked_div(16)?.checked_mul(16)?.checked_add(size))
 }
 
-/// Layout decisions depend on matrix geometry, never a family or Spark count.
+/// Storage decisions depend on matrix geometry, not a family-specific switch.
 /// Holds retain the measured layout pending an explicit qualification decision.
 pub fn stored_width(hidden: usize, width: usize) -> Option<usize> {
     if hidden == 0 || hidden % 256 != 0 || width == 0 || width % 32 != 0 || width > 8192 {
@@ -107,9 +128,11 @@ mod tests {
             end
         };
         for (hidden, experts, topk, width, role, coded, tiles) in [
-            (5120, 384, 6, 576, 1, true, [192; 6]),
+            (5120, 384, 6, 576, 1, true, [128, 128, 128, 192, 192, 192]),
+            (4096, 256, 6, 352, 65888, false, [32, 32, 32, 128, 128, 128]),
             (5120, 384, 6, 288, 8, true, [128, 128, 128, 64, 64, 64]),
-            (5120, 384, 6, 480, 66016, true, [128; 6]),
+            (5120, 384, 6, 512, 66048, true, [128; 6]),
+            (5120, 384, 6, 448, 65984, true, [128; 6]),
             (5120, 384, 6, 352, 65888, true, [128; 6]),
             (4096, 256, 6, 512, 1, false, [128; 6]),
             (4096, 256, 6, 704, 66240, false, [128; 6]),
@@ -151,14 +174,18 @@ mod tests {
 
     #[test]
     fn geometry_selects_exact_storage_or_an_explicit_measurement_hold() {
-        assert_eq!(stored_width(5120, 576), Some(640));
+        assert_eq!(stored_width(5120, 576), Some(576));
+        assert_eq!(ownership_unit(2304, 5), 64);
+        assert_eq!(ownership_unit(2304, 7), 32);
+        assert_eq!(generic_stored_width(6144, 352), 384);
+        assert_eq!(generic_stored_width(4096, 352), 352);
         for width in [288, 320, 352, 448, 480, 768, 1152, 2304] {
             assert_eq!(stored_width(5120, width), Some(width));
         }
         for (hidden, widths) in [(4096, vec![288, 320, 352, 416, 672, 704]),
                                 (7168, vec![416, 448, 608])] {
             for width in widths {
-                assert_eq!(stored_width(hidden, width), Some(width.div_ceil(128) * 128));
+                assert_eq!(stored_width(hidden, width), Some(width));
             }
         }
         for (hidden, width) in [(0, 288), (255, 288), (5120, 0), (5120, 31), (5120, 8224)] {

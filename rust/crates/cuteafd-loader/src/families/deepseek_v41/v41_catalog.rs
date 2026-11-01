@@ -1468,10 +1468,11 @@ mod tests {
                 let mut reconstructed = originals.values().map(|bytes| vec![0u8; bytes.len()]).collect::<Vec<_>>();
                 let mut coverage = vec![0u8; intermediate / 32];
                 for rank in 0..world {
-                    let units = intermediate / 32;
+                    let unit = cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world);
+                    let units = intermediate / unit;
                     let canonical = if units % world == 0 { rank } else { (rank + world - layer) % world };
-                    let first = (canonical * (units / world) + canonical.min(units % world)) * 32;
-                    let width = (units / world + usize::from(canonical < units % world)) * 32;
+                    let first = (canonical * (units / world) + canonical.min(units % world)) * unit;
+                    let width = (units / world + usize::from(canonical < units % world)) * unit;
                     coverage[first / 32..(first + width) / 32].iter_mut().for_each(|n| *n += 1);
                     let staging = catalog.expert_staging(crate::V41ExpertSelection::BackboneTp {
                         layer, expert: rank % 2, world, rank })?;

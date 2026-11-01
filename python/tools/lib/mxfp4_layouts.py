@@ -23,8 +23,23 @@ def validate(data: dict) -> None:
             raise ValueError("native MXFP4 capacities must pair uniquely with slices")
         if len({width for capacity, width in recipes.items() if capacity <= 80}) != 1:
             raise ValueError("native MXFP4 decode capacities must share one slice recipe")
-        if any(width not in (64, 128, 192) for width in recipes.values()):
+        if any(width not in (32, 64, 128, 192) for width in recipes.values()):
             raise ValueError("invalid native MXFP4 slice width")
+
+    for row in data["ownership"]:
+        if (row["unit"] not in (32, 64, 128) or row["intermediate"] % row["unit"]
+                or not 1 <= row["world"] <= 8 or row["intermediate"] // row["unit"] < row["world"]):
+            raise ValueError("invalid measured MXFP4 ownership")
+
+
+def ownership_unit(intermediate: int, world: int) -> int:
+    return next((row["unit"] for row in layouts()["ownership"]
+                 if (row["intermediate"], row["world"]) == (intermediate, world)), 32)
+
+
+def generic_stored_width(hidden: int, width: int) -> int:
+    return next((row["stored"] for row in layouts()["generic_storage_holds"]
+                 if (row["hidden"], row["width"]) == (hidden, width)), width)
 
 
 def stored_width(hidden: int, width: int) -> int:

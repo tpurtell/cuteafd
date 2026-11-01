@@ -86,13 +86,15 @@ impl ExpertLayer {
             Self::BackboneReplicatedTp { layer, rank, world } => (layer, world, rank),
             _ => anyhow::bail!("not a native backbone shard: {self:?}"),
         };
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
         Ok(cuteafd_core::tp_units::LayerShard::new(geometry.intermediate as usize,
-            32, layer, world, rank)?)
+            unit, layer, world, rank)?)
     }
 
     fn unequal_width(self, geometry: cuteafd_core::ExpertGeometry) -> Option<usize> {
         let Self::BackboneReplicatedTp { world, .. } = self else { return None; };
-        if world == 0 || (geometry.intermediate as usize / 32) % world == 0 { return None; }
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
+        if world == 0 || (geometry.intermediate as usize / unit) % world == 0 { return None; }
         self.shard_for_geometry(geometry).ok().map(|shard| shard.width)
     }
 
@@ -290,12 +292,13 @@ mod format_dispatch_tests {
         for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::DEEPSEEK_V4_FLASH,
             ExpertGeometry::DEEPSEEK_V4_PRO] {
             for world in 2..=8 {
-                let unequal = (geometry.intermediate as usize / 32) % world != 0;
+                let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
+                let unequal = (geometry.intermediate as usize / unit) % world != 0;
                 for rank in 0..world {
                     let mut roles = std::collections::BTreeSet::new();
                     for layer in 0..world * 2 {
                         let selected = ExpertLayer::BackboneReplicatedTp { layer, world, rank };
-                        let shard = LayerShard::new(geometry.intermediate as usize, 32, layer, world, rank).unwrap();
+                        let shard = LayerShard::new(geometry.intermediate as usize, unit, layer, world, rank).unwrap();
                         assert_eq!(selected.shard_for_geometry(geometry).unwrap(), shard);
                         let role = selected.role_for_geometry(geometry);
                         assert_eq!(selected.unequal_width(geometry), unequal.then_some(shard.width));

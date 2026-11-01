@@ -172,7 +172,8 @@ fn mxfp4_rank_artifacts(catalog: &crate::OfficialV41Catalog, working: &SparkWork
     let mut retained = Vec::new();
     for &layer in &working.spark_layers {
         if layer < shape.first_layer { continue; }
-        let shard = cuteafd_core::tp_units::LayerShard::new(shape.intermediate, 32,
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(shape.intermediate, working.spark_ranks);
+        let shard = cuteafd_core::tp_units::LayerShard::new(shape.intermediate, unit,
             layer, working.spark_ranks, rank)?;
         let artifact = artifacts.iter().find(|artifact| artifact.logical == shard.width)
             .context("native layer has no matching artifact")?;

@@ -93,14 +93,14 @@ def test_measured_storage_holds_and_generated_native_header_agree(native_map):
     for hidden in (4096, 5120, 7168, 8192):
         for width in WIDTHS:
             assert native_map.stored(hidden, width) == LAYOUTS.stored_width(hidden, width)
-    assert LAYOUTS.stored_width(5120, 576) == 640
+    assert LAYOUTS.stored_width(5120, 576) == 576
     for hidden, width in [(0, 32), (255, 32), (5120, 0), (5120, 33), (5120, 8224)]:
         assert native_map.stored(hidden, width) == 0
         with pytest.raises(ValueError):
             LAYOUTS.stored_width(hidden, width)
 
 
-@pytest.mark.parametrize("tile", [64, 128, 192])
+@pytest.mark.parametrize("tile", [32, 64, 128, 192])
 @pytest.mark.parametrize("hidden", [4096, 5120, 7168])
 @pytest.mark.parametrize("compact", [False, True])
 def test_exporter_fc1_partial_matches_kernel_compact_activation_contract(tile, hidden, compact):
@@ -132,8 +132,15 @@ def test_only_qualified_hardware_recipes_override_matching_arithmetic():
     assert LAYOUTS.native_slice_width(5120, 288, 121, 16, 192) == 128
     assert LAYOUTS.native_slice_width(5120, 288, 121, 256, 192) == 64
     assert LAYOUTS.native_slice_width(5120, 288, 120, 1, 192) == 192
-    assert LAYOUTS.native_slice_width(4096, 352, 121, 16, 128) == 128
-    assert LAYOUTS.native_slice_width(5120, 576, 121, 80, 192) == 192
+    assert LAYOUTS.native_slice_width(4096, 352, 121, 16, 128) == 32
+    assert LAYOUTS.native_slice_width(4096, 352, 121, 256, 128) == 128
+    assert LAYOUTS.native_slice_width(4096, 352, 120, 16, 128) == 128
+    assert LAYOUTS.native_slice_width(5120, 576, 121, 80, 192) == 128
+    assert LAYOUTS.native_slice_width(5120, 576, 121, 256, 192) == 192
+    assert LAYOUTS.ownership_unit(2304, 5) == 64
+    assert LAYOUTS.ownership_unit(2304, 7) == 32
+    assert LAYOUTS.generic_stored_width(6144, 352) == 384
+    assert LAYOUTS.generic_stored_width(4096, 352) == 352
 
 
 def test_native_plan_rejects_duplicate_capacity_keys():
@@ -152,8 +159,10 @@ def test_world_artifacts_match_every_absolute_layer_source_interval(family, hidd
     spec.loader.exec_module(packages)
     worlds = packages.native_spark_artifacts(family)
     assert set(worlds) == set(range(2, 9))
+    if family == "v41":
+        assert [a.logical for a in worlds[5]] == [512, 448]
     for world, artifacts in worlds.items():
-        unequal = (intermediate // 32) % world != 0
+        unequal = (intermediate // LAYOUTS.ownership_unit(intermediate, world)) % world != 0
         assert len(artifacts) == (2 if unequal else 1)
         for artifact in artifacts:
             assert artifact.stored == LAYOUTS.stored_width(hidden, artifact.logical)

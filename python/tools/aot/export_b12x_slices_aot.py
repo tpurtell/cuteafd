@@ -27,7 +27,7 @@ import _pinned_sparkinfer
 
 # Plan-time expert placement roles. Geometry, SM guard and native role id are
 # properties of the role, never of the live row count. `spark` is the historical
-# TP4 shard (576 padded to 640 storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
+# TP4 shard (576 exact storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
 # the replicated-group shards and are already 128-aligned. These pure tables are
 # the authoritative source for the export geometry and are covered by a CPU-only
 # test that needs neither torch nor CUDA.
@@ -40,7 +40,7 @@ ROLE_GEOMETRY = {
     "spark_tp6": (384, 384, 384, 6),
     "spark_tp8": (384, 288, stored_width(5120, 288), 6),
     "rtx_backbone": (384, 2304, 2304, 6),
-    "spark": (384, 576, 640, 6),
+    "spark": (384, 576, stored_width(5120, 576), 6),
 }
 ROLE_SM = {
     "coordinator": (12, 0),
@@ -109,7 +109,7 @@ def expert_plane_bytes(family: str, hidden: int, intermediate: int, stored: int)
 
 def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bool) -> dict:
     """Pinned slice products and fold order, independent of launch capacity."""
-    if width not in (64, 128, 192) or intermediate <= 0 or intermediate % 32:
+    if width not in (32, 64, 128, 192) or intermediate <= 0 or intermediate % 32:
         raise ValueError("unsupported native slice reduction geometry")
     return dict(
         schema=1,
@@ -470,7 +470,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--width",
         required=True,
-        help="64/128/192 or explicit capacity:width pairs, e.g. 1:64,16:192,80:192",
+        help="32/64/128/192 or explicit capacity:width pairs, e.g. 1:64,16:192,80:192",
     )
     parser.add_argument("--atomic-min-capacity", type=int, choices=[256, 1024, 4096],
                         help="Use ABI 3 direct FP32 token accumulation at these larger capacities")
@@ -495,8 +495,8 @@ if __name__ == "__main__":
         else:
             width = int(args.width)
             widths = [width]
-        if any(w not in (64, 128, 192) for w in widths):
-            raise ValueError("width must be 64, 128 or 192")
+        if any(w not in (32, 64, 128, 192) for w in widths):
+            raise ValueError("width must be 32, 64, 128 or 192")
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     export(args.output_dir, capacities, width, args.atomic_min_capacity, args.role,

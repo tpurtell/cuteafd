@@ -945,7 +945,7 @@ pub(crate) fn spark_slices(report: &PlanReport, model: &dyn super::FamilyModel, 
     let exact = recipe.as_ref().filter(|recipe|
         matches!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(_)));
     let bytes = (0..ranks).map(|rank| exact.map_or(stored, |recipe|
-        (routed as f64 * recipe.widths[rank] as f64 / intermediate as f64) as u64)).collect();
+        (routed as f64 * recipe.stored_widths[rank] as f64 / intermediate as f64) as u64)).collect();
     let waste = (exact.is_none() && report.spark_rank_share * ranks as f64 > 1.001).then(|| Waste {
         device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
             128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),

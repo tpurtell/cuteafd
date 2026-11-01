@@ -3467,12 +3467,22 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // Layer 1 rotates native K32 ownership: rank 0 has 320 columns, rank 4 has 352.
+    // Logical K32 ranges rotate; Pro's 352-column owner retains 384 physical columns.
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = families::mimo::MIMO_V2.open(&checkpoint).unwrap();
+    assert_eq!(report.spark_rank_share, 384. / 2048.);
+    let (projected, _) = layout::spark_slices(&report, model.as_ref(), 6, 2048 * 1024);
+    assert_eq!(projected, [384, 384, 384, 384, 320, 320].map(|width| width * 1024));
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
-    // Both widths store 12 down-scale bytes per hidden row, rather than 10/11.
-    let down_scale_padding = |groups: u64| 384 * 6144 * (12 - groups);
-    assert_eq!((experts(0) - down_scale_padding(10)) * 11,
-        (experts(4) - down_scale_padding(11)) * 10);
+    let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
+    for rank in 0..6 {
+        let stored = recipe.stored_width_for_layer(rank, 1).unwrap() as u64;
+        let hidden = 6144;
+        let expected = 384 * (3 * hidden * stored / 2 + 2 * stored * hidden / 32
+            + hidden * stored.div_ceil(128) * 4);
+        assert_eq!(experts(rank), expected, "rank {rank}");
+    }
+    assert!(experts(4) > experts(0));
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
 

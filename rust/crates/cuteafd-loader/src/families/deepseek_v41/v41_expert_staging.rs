@@ -91,7 +91,8 @@ impl V41BackboneTpGeometry {
             hidden_size % 32 == 0,
             "backbone hidden size {hidden_size} does not align to 32-value scale groups"
         );
-        let shard = LayerShard::new(moe_intermediate_size, 32, layer, world, rank)?;
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(moe_intermediate_size, world);
+        let shard = LayerShard::new(moe_intermediate_size, unit, layer, world, rank)?;
         let shard_intermediate = shard.width;
         // Every staged extent is derived from shard_intermediate * hidden_size;
         // reject geometries whose extents cannot be represented.

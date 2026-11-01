@@ -9,6 +9,14 @@ from pathlib import Path
 RANGES_PATH = Path(__file__).resolve().parents[3] / 'scripts/build/spark-package-ranges.json'
 
 
+def layout_policy():
+    spec = importlib.util.spec_from_file_location(
+        "spark_mxfp4_layouts", Path(__file__).with_name("mxfp4_layouts.py"))
+    policy = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(policy)
+    return policy
+
+
 def package_entry(family: str, format: str) -> dict:
     format = 'exl3' if format.startswith('exl3') else format.removesuffix('a4')
     return json.loads(RANGES_PATH.read_text())['entries'][f'{family}:{format}']
@@ -17,6 +25,8 @@ def package_entry(family: str, format: str) -> dict:
 def width_keys(intermediate: int, unit: int, world: int, *, exl3: bool = False,
                native: bool = False, nvfp4: bool = False) -> set[tuple[bool, int]]:
     """Descriptor ABI and stored columns; world/rank do not determine code."""
+    if native and not exl3 and not nvfp4:
+        unit = layout_policy().ownership_unit(intermediate, world)
     if not 1 <= world <= 8 or intermediate % unit or intermediate // unit < world:
         return set()
     units = intermediate // unit
@@ -61,10 +71,11 @@ NATIVE_WIDTH_ROLE_BASE = 65536
 
 
 def native_widths(intermediate: int, world: int) -> list[int]:
-    if not 1 <= world <= 8 or intermediate <= 0 or intermediate % 32 or intermediate // 32 < world:
-        raise ValueError("invalid native K32 shard geometry")
-    units = intermediate // 32
-    return sorted({32 * (units // world), 32 * -(-units // world)}, reverse=True)
+    unit = layout_policy().ownership_unit(intermediate, world)
+    if not 1 <= world <= 8 or intermediate <= 0 or intermediate % unit or intermediate // unit < world:
+        raise ValueError("invalid native shard geometry")
+    units = intermediate // unit
+    return sorted({unit * (units // world), unit * -(-units // world)}, reverse=True)
 
 
 def native_width_role(width: int) -> int:
@@ -75,7 +86,7 @@ def native_width_role(width: int) -> int:
 
 def native_width_inventory(intermediate: int, worlds: list[int]) -> list[int]:
     """Only unequal worlds need additive width-keyed native entry points."""
-    return sorted({width for world in worlds if (intermediate // 32) % world
+    return sorted({width for world in worlds if len(native_widths(intermediate, world)) > 1
                    for width in native_widths(intermediate, world)}, reverse=True)
 
 
@@ -98,10 +109,7 @@ def native_spark_artifacts(family: str = "v41") -> dict[int, tuple[NativeArtifac
     Load the adjacent policy file explicitly so isolated release archives use
     their own inputs rather than a publisher checkout on sys.path.
     """
-    spec = importlib.util.spec_from_file_location(
-        "spark_mxfp4_layouts", Path(__file__).with_name("mxfp4_layouts.py"))
-    policy = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(policy)
+    policy = layout_policy()
     hidden = {"v41": 5120, "dsv4f": 4096, "dsv4p": 7168}[family]
     intermediate = package_entry(family, "mxfp4")["intermediate"]
     result = {}
@@ -122,9 +130,10 @@ def native_shard(world: int, rank: int, layer: int, family: str = "v41") -> tupl
     intermediate = package_entry(family, "mxfp4")["intermediate"]
     if not 0 <= rank < world or layer < 0:
         raise ValueError("invalid native shard rank/layer")
-    units = intermediate // 32
+    unit = layout_policy().ownership_unit(intermediate, world)
+    units = intermediate // unit
     base, extra = divmod(units, world)
     canonical = (rank - layer) % world if extra else rank
-    width = 32 * (base + (canonical < extra))
-    first = 32 * (canonical * base + min(canonical, extra))
+    width = unit * (base + (canonical < extra))
+    first = unit * (canonical * base + min(canonical, extra))
     return first, next(artifact for artifact in artifacts if artifact.logical == width)

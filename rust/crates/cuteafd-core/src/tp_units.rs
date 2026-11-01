@@ -51,14 +51,15 @@ pub struct NativeArtifact {
 /// One world's distinct adjacent artifacts. Equal worlds retain their ABI names.
 pub fn native_spark_artifacts(hidden: usize, intermediate: usize, world: usize)
     -> Result<Vec<NativeArtifact>, UnitMapError> {
+    let unit = crate::mxfp4_layouts::ownership_unit(intermediate, world);
     if !(2..=crate::MAX_SPARK_WORLD).contains(&world) || intermediate == 0
-        || intermediate % 32 != 0 || intermediate / 32 < world {
+        || intermediate % unit != 0 || intermediate / unit < world {
         return Err(UnitMapError::Geometry);
     }
-    let units = intermediate / 32;
+    let units = intermediate / unit;
     let unequal = units % world != 0;
-    let mut widths = vec![units.div_ceil(world) * 32];
-    if unequal { widths.push(units / world * 32); }
+    let mut widths = vec![units.div_ceil(world) * unit];
+    if unequal { widths.push(units / world * unit); }
     widths.into_iter().map(|logical| {
         let role = if unequal { native_width_role(logical).ok_or(UnitMapError::Geometry)? }
             else { match world { 2 => 5, 3 => 6, 4 => 1, 6 => 7, 8 => 8,
@@ -84,7 +85,8 @@ pub fn frozen_admitted_worlds(family: &str, format: &str) -> Option<Vec<usize>> 
 
 /// Descriptor ABI and stored columns determine code, not rank identity.
 pub fn package_width_keys(intermediate: usize, unit: usize, world: usize,
-    exl3: bool, _native: bool, nvfp4: bool) -> Vec<(bool, usize)> {
+    exl3: bool, native: bool, nvfp4: bool) -> Vec<(bool, usize)> {
+    let unit = if native && !exl3 && !nvfp4 { crate::mxfp4_layouts::ownership_unit(intermediate, world) } else { unit };
     if !(1..=crate::MAX_SPARK_WORLD).contains(&world) || unit == 0 || intermediate == 0
         || intermediate % unit != 0 || intermediate / unit < world { return vec![]; }
     let units = intermediate / unit;
@@ -539,7 +541,8 @@ mod tests {
         for (hidden, intermediate) in [(5120, 2304), (4096, 2048), (7168, 3072)] {
             for world in 2..=8 {
                 let artifacts = native_spark_artifacts(hidden, intermediate, world).unwrap();
-                let unequal = intermediate / 32 % world != 0;
+                let unit = crate::mxfp4_layouts::ownership_unit(intermediate, world);
+                let unequal = intermediate / unit % world != 0;
                 assert_eq!(artifacts.len(), if unequal { 2 } else { 1 });
                 for artifact in &artifacts {
                     assert_eq!(artifact.stored, crate::mxfp4_layouts::stored_width(hidden, artifact.logical).unwrap());
@@ -555,7 +558,7 @@ mod tests {
                 }
                 for layer in [0, 1, 17, 63] {
                     for rank in 0..world {
-                        let shard = LayerShard::new(intermediate, 32, layer, world, rank).unwrap();
+                        let shard = LayerShard::new(intermediate, unit, layer, world, rank).unwrap();
                         assert_eq!(artifacts.iter().filter(|a| a.logical == shard.width).count(), 1);
                     }
                 }

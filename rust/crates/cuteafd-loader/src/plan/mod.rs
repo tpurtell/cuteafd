@@ -1161,7 +1161,7 @@ fn place(report: &mut PlanReport, options: &PlanOptions, spec: &ModelSpec, model
                 }).max()?;
                 Some(widest as f64 / source as f64)
             } else {
-                recipe.widths.iter().max().map(|&slice| slice as f64 / i as f64)
+                recipe.stored_widths.iter().max().map(|&slice| slice as f64 / i as f64)
             }
         };
         let fits_on = |ranks: usize| share(ranks).is_some_and(|s| routed as f64 * s <= options.spark_budget() as f64);

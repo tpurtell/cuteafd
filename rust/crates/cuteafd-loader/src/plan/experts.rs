@@ -25,6 +25,7 @@ pub fn stored_slice(intermediate: usize, block: usize, tp: usize) -> Option<usiz
 pub struct SparkRecipe {
     pub slicing: crate::formats::fp8_experts::Slicing,
     pub widths: Vec<usize>,
+    pub stored_widths: Vec<usize>,
     pub rule: cuteafd_core::tp_units::UnitRule,
     pub required_layouts: Vec<String>,
     pub native_artifacts: Vec<cuteafd_core::tp_units::NativeArtifact>,
@@ -53,7 +54,7 @@ impl SparkRecipe {
                 && other.rule == cuteafd_core::tp_units::UnitRule::Contiguous);
         // Different native scale units can describe the same exact contiguous
         // source ranges in mixed-format layers; storage and packages must agree.
-        slicing_matches && self.widths == other.widths && self.rule == other.rule
+        slicing_matches && self.widths == other.widths && self.stored_widths == other.stored_widths && self.rule == other.rule
             && self.required_layouts == other.required_layouts && self.native_artifacts == other.native_artifacts
     }
 
@@ -69,9 +70,8 @@ impl SparkRecipe {
     }
 
     pub fn stored_width_for_layer(&self, rank: usize, layer: usize) -> Option<usize> {
-        let logical = self.width_for_layer(rank, layer)?;
-        if self.native_artifacts.is_empty() { Some(logical) }
-        else { self.native_artifacts.iter().find(|artifact| artifact.logical == logical).map(|artifact| artifact.stored) }
+        if rank >= self.widths.len() { return None; }
+        self.stored_widths.get(self.rank_for_layer(rank, layer)).copied()
     }
 
     /// Validate an explicit Spark package root, never the coordinator tree.
@@ -84,7 +84,7 @@ impl SparkRecipe {
             && selected_slicing != self.slicing && self.widths.windows(2).any(|pair| pair[0] != pair[1]) {
             return Err(InstalledSparkRecipeRefusal::PaddedExactMismatch);
         }
-        let expected = *self.widths.get(rank).ok_or(InstalledSparkRecipeRefusal::InvalidRank {
+        let expected = *self.stored_widths.get(rank).ok_or(InstalledSparkRecipeRefusal::InvalidRank {
             rank, world: self.widths.len(),
         })?;
         if selected_width != expected {
@@ -214,7 +214,9 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    let block = if nvfp4 { 16 } else if mxfp4 { 32 } else { 128 };
+    let block = if nvfp4 { 16 } else if native && mxfp4 {
+        cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world)
+    } else if mxfp4 { 32 } else { 128 };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
@@ -253,6 +255,14 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         vec![stored_slice(intermediate, block, world)
             .ok_or(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block })?; world]
     };
+    let stored_widths = widths.iter().map(|&logical| {
+        if !native_artifacts.is_empty() {
+            native_artifacts.iter().find(|artifact| artifact.logical == logical).expect("derived artifact").stored
+        } else if mxfp4 {
+            let hidden = if family == "mimop" { 6144 } else { 4096 };
+            cuteafd_core::mxfp4_layouts::generic_stored_width(hidden, logical)
+        } else { logical }
+    }).collect();
     let required_layouts = if !native_artifacts.is_empty() {
         native_artifacts.iter().map(|artifact| artifact.name.clone()).collect()
     } else if exl3 {
@@ -262,7 +272,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         let mut unique = widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
         unique.into_iter().map(|width| format!("tp{world}-w{width}")).collect()
     } else { vec![format!("tp{world}")] };
-    Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(block) } else { Slicing::Padded }, widths, rule, required_layouts, native_artifacts })
+    Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(block) } else { Slicing::Padded }, widths, stored_widths, rule, required_layouts, native_artifacts })
 }
 
 #[cfg(test)]
@@ -284,6 +294,7 @@ mod tests {
         assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(32));
         assert_eq!(recipe.rule, UnitRule::LayerRotation);
         assert_eq!(recipe.widths, [352, 352, 352, 352, 320, 320]);
+        assert_eq!(recipe.stored_widths, [384, 384, 384, 384, 320, 320]);
         assert_eq!(recipe.required_layouts, ["tp6-w352", "tp6-w320"]);
         for layer in [0, 3, 40, 77] {
             let widths = (0..6).map(|rank| recipe.width_for_layer(rank, layer).unwrap()).collect::<Vec<_>>();
@@ -508,16 +519,16 @@ mod tests {
         };
         put("tp6", "libcuteafd_fp8moe.so");
         put("tp6-w352", "libcuteafd_fp8moe.so");
-        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 352),
+        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384),
             Err(InstalledSparkRecipeRefusal::MissingArtifact(_))));
         put("tp6-w320", "libcuteafd_fp8moe.so");
-        assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 352).is_ok());
+        assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384).is_ok());
         assert!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(32), 320).is_ok());
         assert!(matches!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(32), 352),
             Err(InstalledSparkRecipeRefusal::WidthMismatch { .. })));
         assert!(matches!(recipe.validate_installed(root.path(), 6, Slicing::Blocks(32), 320),
             Err(InstalledSparkRecipeRefusal::InvalidRank { .. })));
-        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Padded, 352),
+        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Padded, 384),
             Err(InstalledSparkRecipeRefusal::PaddedExactMismatch)));
         let exl3 = spark_recipe("glm:exl3-k45", 2048, 6).unwrap();
         assert!(matches!(exl3.validate_installed(root.path(), 0, Slicing::Blocks(128), 384),
@@ -572,7 +583,8 @@ mod tests {
                     assert_eq!(result.is_ok(), worlds.contains(&world), "{context}: {result:?}");
                     let Ok(recipe) = result else { continue };
                     let unit = if package.contains("nvfp4") { 16 }
-                        else if package.ends_with("mxfp4") || matches!(package, "mimof:fp8" | "mimop:fp8") { 32 }
+                        else if package.ends_with("mxfp4") { cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world) }
+                        else if matches!(package, "mimof:fp8" | "mimop:fp8") { 32 }
                         else { 128 };
                     if (intermediate / unit) % world == 0 {
                         assert_eq!(recipe.rule, UnitRule::Contiguous, "{context}");
@@ -604,7 +616,7 @@ mod tests {
                 assert_eq!(recipe.native_artifacts, native_spark_artifacts(hidden, intermediate, world).unwrap());
                 for layer in [0, 1, 17, 63] {
                     for rank in 0..world {
-                        let shard = LayerShard::new(intermediate, 32, layer, world, rank).unwrap();
+                        let shard = LayerShard::new(intermediate, cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world), layer, world, rank).unwrap();
                         assert_eq!(recipe.width_for_layer(rank, layer), Some(shard.width));
                         assert_eq!(recipe.stored_width_for_layer(rank, layer),
                             cuteafd_core::mxfp4_layouts::stored_width(hidden, shard.width));

@@ -38,7 +38,8 @@ impl ScalePlan {
         for (layer, planes, base) in layers {
             if !planes.scale_codes { continue; }
             let geometry = catalog.routed_experts();
-            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, 32, layer, world, rank)?;
+            let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate, world);
+            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, unit, layer, world, rank)?;
             ensure!(shard.width == planes.intermediate, "native scale shard differs from resident planes");
             for expert in 0..planes.experts {
                 let (names, _) = names(catalog, layer, expert, world, rank)?;
@@ -181,7 +182,9 @@ impl RankPlan {
             let planes = NativePlanes::with_scale_codes(geometry.hidden as usize, slice.width as usize,
                 slice.stored_width as usize, geometry.experts as usize, catalog.nvfp4().is_some(),
                 catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes())?;
-            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, 32,
+            let unit = if catalog.nvfp4().is_some() { 32 }
+                else { cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate, world) };
+            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, unit,
                 slice.layer as usize, world, rank)?;
             ensure!(slice.first as usize == shard.first && planes.intermediate == shard.width,
                 "native push slice differs from layer ownership");
