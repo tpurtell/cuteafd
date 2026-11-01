@@ -453,6 +453,7 @@ ATTENTION_PLAN_ROWS
 AUDIO
 CONCURRENCY
 DECODE_LANES
+DECODE_SHARE
 CONSOLE_ASSETS
 CONSOLE_TEXT
 COORDINATOR_DOCKER_DEV
@@ -1467,6 +1468,8 @@ args+=("${v41_kv_args[@]}")
 [[ -z "${PREFILL_PACKING:-}" ]] || args+=(--prefill-packing "$PREFILL_PACKING")
 [[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
 [[ -z "${V41_PREFILL_WAVES:-}" ]] || args+=(--prefill-waves "$V41_PREFILL_WAVES")
+# DECODE_SHARE: as for every family (the engine's default 0.2; 0 prefills whole prompts).
+[[ -z "$(get DECODE_SHARE)" ]] || args+=(--decode-share "$(get DECODE_SHARE)")
 [[ -z "${V41_PREFILL_RESERVE_ROWS:-}" ]] || args+=(--prefill-reserve-rows "$V41_PREFILL_RESERVE_ROWS")
 [[ -z "${COORDINATOR_GPU_BUDGET_GIB:-}" ]] || args+=(--coordinator-gpu-budget-gib "$COORDINATOR_GPU_BUDGET_GIB")
 [[ -z "${SERVED_MODEL_ID:-}" ]] || args+=(--model-id "$SERVED_MODEL_ID")

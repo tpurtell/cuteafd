@@ -58,6 +58,35 @@ enum PrefillState<S> {
 
 impl<S> V41Prefill<S> {
     pub(crate) fn new() -> Self { Self { state: PrefillState::Start } }
+    /// No call ran yet (packing and scoring take only such prompts).
+    pub(crate) fn at_start(&self) -> bool { matches!(self.state, PrefillState::Start) }
+}
+
+/// The decode share's chunk: one call, the indivisible unit `prompt_units`
+/// cuts (see [`V41PrefillTimes::encoder_unit`]).
+pub(crate) const ONE_CALL: ChunkBudget = ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 };
+
+/// The row spans of the calls a cold prompt of `tokens` prefills in from
+/// `cached`, one [`ONE_CALL`] unit at a time: the encoder's calls, then the
+/// decoder replay (`tokens..tokens`).
+#[cfg(test)]
+pub(crate) fn one_call_spans(tokens: usize, cached: usize, chunk_rows: usize, waves: usize) -> Vec<Range<usize>> {
+    let times = V41PrefillTimes::default();
+    let streamed = (tokens - cached).div_ceil(chunk_rows) > 1;
+    let mut next = cached;
+    let mut spans = Vec::new();
+    loop {
+        match times.encoder_unit(tokens, chunk_rows, waves, next, cached, streamed, ONE_CALL) {
+            V41Unit::DecoderReplay => { spans.push(tokens..tokens); return spans; }
+            V41Unit::ReplayChunk(range) | V41Unit::Single(range) => { next = range.end; spans.push(range); }
+            V41Unit::Stream(units) => {
+                let span = units[0].start..units.last().unwrap().end;
+                next = span.end;
+                spans.push(span);
+            }
+            V41Unit::Continuation(_) => unreachable!("cold prompts encode"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -120,6 +149,11 @@ fn stream_units(rows: usize, chunk_rows: usize, waves: usize) -> Result<Vec<std:
 }
 
 impl V41PrefillTimes {
+    /// The encoder's next unit from `next`. [`ChunkBudget::WHOLE`] streams
+    /// the rest of the prompt; any other budget runs exactly one call (one
+    /// replay window, one single unit, or one stream call of `waves` units of
+    /// `chunk_rows`), the indivisible boundary `prompt_units` cuts at: a
+    /// call's units are cut from its rows, so a smaller split would move them.
     fn encoder_unit(&self, tokens: usize, chunk_rows: usize, waves: usize, next: usize,
         replay_end: usize, streamed: bool, budget: ChunkBudget) -> V41Unit {
         if next < replay_end {
@@ -129,23 +163,15 @@ impl V41PrefillTimes {
         let end = (next + chunk_rows).min(tokens);
         if !streamed { return V41Unit::Single(next..end); }
         let whole = budget.target.is_none() && budget.row_cap == usize::MAX;
-        if whole && waves > 1 && chunk_rows % 64 == 0 {
+        let span = if whole { tokens - next } else { (tokens - next).min((waves * chunk_rows).max(1)) };
+        if waves > 1 && chunk_rows % 64 == 0 {
             // The shared cut: full units of the configured (captured) width and one tail.
-            if let Ok(units) = stream_units(tokens - next, chunk_rows, waves) {
+            if let Ok(units) = stream_units(span, chunk_rows, waves) {
                 return V41Unit::Stream(units.into_iter().map(|unit| next + unit.start..next + unit.end).collect());
             }
         }
-        let mut chunks = vec![next..end];
-        let mut next = end;
-        while next < tokens && (whole || chunks.len() < 2) {
-            let end = (next + chunk_rows).min(tokens);
-            let rows = end - chunks[0].start;
-            if !whole && (rows > budget.row_cap || budget.target.is_some_and(|target|
-                self.estimate(2, rows) > target)) { break; }
-            chunks.push(next..end);
-            next = end;
-        }
-        V41Unit::Stream(chunks)
+        V41Unit::Stream((next..next + span).step_by(chunk_rows.max(1))
+            .map(|start| start..(start + chunk_rows).min(next + span)).collect())
     }
 
     fn estimate(&self, kind: usize, rows: usize) -> Duration {
@@ -177,7 +203,14 @@ pub(crate) struct V41PrefillStep<'s, 'w, 'a, P: PrefillTarget<'a>, C: DraftChain
     pub(crate) draft: Option<&'s mut DraftRuntime<'w, 'a, C>>,
     pub(crate) hold: &'s mut dyn FnMut() -> Result<()>,
     pub(crate) times: &'s mut V41PrefillTimes,
+    /// Other prompts' calls run between this prompt's (decode share): their
+    /// held encoder prefetch waves are cancelled before this prompt's calls.
+    pub(crate) interleaved: bool,
 }
+
+/// Encoder prefetch waves cancelled because another prompt's call came next
+/// (decode share > 0 only; exported in the serving stats).
+pub(crate) static PREFETCH_WAVES_CANCELLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, C> {
     /// Whether `rows` uncached prompt rows run as units on the shared
@@ -206,7 +239,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> V41PrefillStep<'_, '_, 'a, P, 
             cursor.state = PrefillState::Continuation { next: cached };
             return Ok(());
         }
-        let suffix = self.prefill.slot0().0.new_suffix(self.lib, end)?;
+        let suffix = self.prefill.prompt_suffix(end)?;
         let next = if stage == CacheStage::EncoderReplay {
             let start = self.requests.cache().history_end(self.lease)? as usize;
             ensure!(cached - start <= 128, "encoder prefix replay exceeds one window");
@@ -269,6 +302,12 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
         super::scheduler::stall::tick();
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
         self.initialize(cursor)?;
+        if self.interleaved && matches!(unit.work, V41Unit::Single(_) | V41Unit::Stream(_)) {
+            // Another prompt's held prefetch waves would hold the pinned prefill
+            // staging this call's units gather into.
+            let cancelled = self.requests.cancel_foreign_prefetch(self.lease);
+            PREFETCH_WAVES_CANCELLED.fetch_add(cancelled as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         match (&unit.work, &mut cursor.state) {
             (V41Unit::ReplayChunk(range) | V41Unit::Single(range), PrefillState::Encoder { suffix, next, .. }) => {
                 let chunk = &self.tokens[range.clone()];
@@ -315,8 +354,9 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
                             self.prefill.slots.len());
                         let unit_rows = stream_units(rows, self.chunk_rows, waves)?;
                         let chunks: Vec<_> = unit_rows.iter().map(|range| &self.tokens[at + range.start..at + range.end]).collect();
-                        // The next call's first units, cut as that call will cut them.
-                        let ahead: Vec<&[u32]> = lookahead(at + rows..span.end, self.chunk_rows, waves)?
+                        // The next call's first units, cut as that call will cut them
+                        // (it may run in a later round: its span is the prompt's rest).
+                        let ahead: Vec<&[u32]> = lookahead(at + rows..self.tokens.len(), self.chunk_rows, waves)?
                             .into_iter().map(|range| &self.tokens[range]).collect();
                         let mut slots: Vec<(&mut P, &mut P::Transport)> = self.prefill.slots.iter_mut()
                             .map(|(pass, transport)| (pass, transport)).collect();
@@ -398,11 +438,21 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
 pub(crate) struct PrefillSlots<'a, P: PrefillTarget<'a>> {
     pub slots: Vec<(P, P::Transport)>,
     pub packed_suffix: P::Suffix,
+    /// One prompt suffix arena per request slot, allocated at startup and
+    /// charged with the slots (`owners::encoder_suffix_bytes`): every prompt
+    /// mid-encoder holds one until its decoder replay.
+    pub prompt_suffixes: Vec<P::Suffix>,
 }
 impl<'a, P: PrefillTarget<'a>> PrefillSlots<'a, P> {
     pub(crate) fn slot0(&mut self) -> (&mut P, &mut P::Transport) {
         let (pass, transport) = &mut self.slots[0];
         (pass, transport)
+    }
+    /// Bind a prompt ending at `end` to a free startup suffix arena.
+    fn prompt_suffix(&self, end: u64) -> Result<P::Suffix> {
+        let free = self.prompt_suffixes.iter().find(|storage| !P::suffix_in_use(storage))
+            .context("every encoder suffix arena is held (more prompts mid-encoder than request slots)")?;
+        P::bind_suffix(free, end)
     }
 }
 
@@ -423,7 +473,13 @@ pub(crate) trait PrefillTarget<'a>: VerificationTarget<'a> + Sized {
         members: &[(CacheLease, &[u32])], suffix: &mut Self::Suffix) -> Result<()>;
     async fn commit_packed_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
         batch: &mut RequestBatch, draft: Option<&mut DraftRuntime<'_, 'a, C>>, accepted: &[u32]) -> Result<()>;
+    #[cfg(test)]
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix>;
+    /// One prompt's suffix arena on the encoder GPU (startup, charged).
+    fn new_prompt_storage(&self, lib: &'a NativeLibrary) -> Result<Self::Suffix>;
+    fn suffix_in_use(storage: &Self::Suffix) -> bool;
+    /// A prompt's suffix on `storage`, with no allocation.
+    fn bind_suffix(storage: &Self::Suffix, end: u64) -> Result<Self::Suffix>;
     /// # Safety
     /// Batch and suffix belong to this request and layout; all owners remain
     /// live through completion/cancellation, with no conflicting access.
@@ -468,9 +524,13 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
         // SAFETY: the caller retains all packed owners until the shared executor drains.
         unsafe { Self::execute_packed_encoder_unit(slots, prefill, requests, members, suffix).await }
     }
+    #[cfg(test)]
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?)
     }
+    fn new_prompt_storage(&self, lib: &'a NativeLibrary) -> Result<Self::Suffix> { EncoderSuffix::prompt_storage(lib) }
+    fn suffix_in_use(storage: &Self::Suffix) -> bool { storage.in_use() }
+    fn bind_suffix(storage: &Self::Suffix, end: u64) -> Result<Self::Suffix> { EncoderSuffix::prompt(storage, end) }
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()> {
         self.set_attention_decode(false);
@@ -531,8 +591,16 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
         // SAFETY: the caller retains all packed owners until the shared executor drains.
         unsafe { Self::execute_packed_encoder_unit(slots, prefill, requests, members, suffix).await }
     }
+    #[cfg(test)]
     fn new_suffix(&self, lib: &'a NativeLibrary, end: u64) -> Result<Self::Suffix> {
         self.encoder_device()?.own(|| EncoderSuffix::new(lib, end, EncoderSuffix::device_bytes(end)?))
+    }
+    fn new_prompt_storage(&self, lib: &'a NativeLibrary) -> Result<Self::Suffix> {
+        self.encoder_device()?.own(|| EncoderSuffix::prompt_storage(lib))
+    }
+    fn suffix_in_use(storage: &Self::Suffix) -> bool { storage.get().in_use() }
+    fn bind_suffix(storage: &Self::Suffix, end: u64) -> Result<Self::Suffix> {
+        storage.device.own(|| EncoderSuffix::prompt(storage.get(), end))
     }
     async unsafe fn encoder_part(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         transport: &mut Self::Transport, suffix: &mut Self::Suffix) -> Result<()> {
@@ -631,22 +699,53 @@ mod prefill_tests {
         }
     }
 
+    /// The decode share's chunk is exactly one call: the units a whole
+    /// stream's call loop cuts for that call (`stream_units` of up to
+    /// `waves × chunk_rows` rows), never a sub-call split that would move a
+    /// unit's rows (and so its row bucket).
     #[test]
-    fn bounded_stream_keeps_at_least_one_and_at_most_two_ordered_chunks() {
+    fn one_call_is_the_whole_streams_next_call() {
         let mut times = V41PrefillTimes::default();
         times.observe(2, 256, Duration::from_micros(256));
-        let budget = ChunkBudget { target: Some(Duration::from_micros(511)), row_cap: usize::MAX };
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true, budget)), [0..256]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
-            ChunkBudget { target: Some(Duration::from_micros(512)), ..budget })), [0..256, 256..512]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
-            ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 })), [0..256]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
-            ChunkBudget { target: Some(Duration::from_secs(1)), row_cap: 511 })), [0..256]);
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true,
-            ChunkBudget { target: Some(Duration::from_secs(1)), row_cap: 512 })), [0..256, 256..512]);
-        // A streamed prompt's final singleton must not switch to encoder_part.
-        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 1024, 0, true, budget)), [1024..1050]);
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 0, 0, true, ONE_CALL)), [0..256]);
+        assert_eq!(stream(times.encoder_unit(1050, 256, 1, 1024, 0, true, ONE_CALL)), [1024..1050]);
+        assert_eq!(stream(times.encoder_unit(20000, 2752, 3, 0, 0, true, ONE_CALL)), [0..2752, 2752..5504, 5504..8256]);
+        // The tail call re-cuts its rows as the whole stream's call loop does.
+        assert_eq!(stream(times.encoder_unit(10000, 2752, 3, 8256, 0, true, ONE_CALL)),
+            stream_units(1744, 2752, 3).unwrap().into_iter().map(|u| 8256 + u.start..8256 + u.end).collect::<Vec<_>>());
+        // Replay windows and single units are calls already.
+        assert!(matches!(times.encoder_unit(1024, 80, 1, 128, 256, true, ONE_CALL), V41Unit::ReplayChunk(r) if r == (128..208)));
+        assert!(matches!(times.encoder_unit(1050, 256, 1, 950, 950, false, ONE_CALL), V41Unit::Single(r) if r == (950..1050)));
+    }
+
+    /// Calls a prompt runs one per round line up with `prompt_units`' calls
+    /// (the Engram look-ahead's plan) and cover the prompt exactly, so a
+    /// prompt split across rounds resumes at the next call's first unit.
+    #[test]
+    fn one_call_spans_follow_prompt_units_calls() {
+        for (chunk_rows, waves) in [(2752usize, 3usize), (1024, 3), (4096, 2), (2048, 4), (256, 1), (80, 1)] {
+            for cached in [0usize, 300] {
+                for rest in [1usize, chunk_rows, chunk_rows + 1, waves * chunk_rows, 2 * waves * chunk_rows + 17, 65536] {
+                    let tokens = cached + rest;
+                    let spans = one_call_spans(tokens, cached, chunk_rows, waves);
+                    assert_eq!(spans.last().unwrap(), &(tokens..tokens), "ends with the decoder replay");
+                    let calls = &spans[..spans.len() - 1];
+                    assert_eq!(calls[0].start, cached);
+                    assert!(calls.windows(2).all(|w| w[0].end == w[1].start), "{calls:?}");
+                    assert_eq!(calls.last().unwrap().end, tokens);
+                    if rest.div_ceil(chunk_rows) > 1 {
+                        let plan = prompt_units(cached, cached, tokens, chunk_rows, waves).unwrap();
+                        let starts: Vec<usize> = plan.calls.iter().map(|&unit| if unit == 0 { cached }
+                            else { plan.ends[unit - 1] as usize }).collect();
+                        assert_eq!(calls.iter().map(|c| c.start).collect::<Vec<_>>(), starts,
+                            "rows {chunk_rows} waves {waves} cached {cached} rest {rest}");
+                        assert!(calls.iter().all(|c| c.len() <= waves * chunk_rows));
+                    } else {
+                        assert_eq!(calls, [cached..tokens]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -661,8 +760,7 @@ mod prefill_tests {
         assert_eq!((units[0].start, units.last().unwrap().end), (0, 65536));
         assert_eq!(stream(times.encoder_unit(8492, 2752, 3, 300, 300, true, ChunkBudget::WHOLE)),
             [300..3052, 3052..5804, 5804..8492]);
-        let budget = ChunkBudget { target: Some(Duration::ZERO), row_cap: 0 };
-        assert_eq!(stream(times.encoder_unit(8192, 2752, 3, 0, 0, true, budget)), [0..2752]);
+        assert_eq!(stream(times.encoder_unit(8192, 2752, 3, 0, 0, true, ONE_CALL)), [0..2752, 2752..5504, 5504..8192]);
     }
 
     #[test]

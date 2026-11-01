@@ -61,14 +61,12 @@ impl Leased {
     }
     /// Release the lease and draft slot without answering the client.
     pub fn release<'a, C: DraftChain<'a>>(&self, requests: &mut Requests<'a>,
-        draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
-        let target = requests.release_if_present(self.lease);
-        let speculative = draft.map(|draft| draft.release(self.id)).transpose();
-        target.and(speculative.map(|_| ()))
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>) {
+        round_failure::release_admission(requests, draft, self.lease, self.id);
     }
     /// Answer the client with `error` (unavailable unless typed) and release.
     pub fn fail<'a, C: DraftChain<'a>>(self, error: anyhow::Error, requests: &mut Requests<'a>,
-        draft: Option<&mut DraftRuntime<'_, 'a, C>>) -> Result<()> {
+        draft: Option<&mut DraftRuntime<'_, 'a, C>>) {
         let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>().cloned()
             .unwrap_or_else(|| cuteafd_api::openai::NativeFailure::Unavailable(format!("{error:#}")));
         let _ = self.prepared.job.events.send(Err(failure));
@@ -135,10 +133,10 @@ impl<C: EncoderClient> Media<C> {
     /// Retire waiters whose client left, then collect the requests whose
     /// features are all installed. A failed encode answers its client.
     pub fn poll<'a, D: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
-        mut draft: Option<&mut DraftRuntime<'_, 'a, D>>) -> Result<Vec<Leased>> {
+        mut draft: Option<&mut DraftRuntime<'_, 'a, D>>) -> Vec<Leased> {
         for slot in 0..self.leased.len() {
             if self.leased[slot].as_ref().is_some_and(|leased| leased.prepared.job.events.is_closed()) {
-                self.leased[slot].take().unwrap().release(requests, draft.as_deref_mut())?;
+                self.leased[slot].take().unwrap().release(requests, draft.as_deref_mut());
             }
         }
         let mut ready = Vec::new();
@@ -149,30 +147,31 @@ impl<C: EncoderClient> Media<C> {
                     // V4.1 restores before it encodes, so the waiter's resume is exact.
                     debug_assert!(waiter.retries() == 0 && !waiter.cold(), "V4.1 media waiter reconciled");
                     let (slot, media) = waiter.into_parts();
-                    let request = self.leased[slot].take().context("media waiter without a request")?;
+                    let Some(request) = self.leased[slot].take() else {
+                        tracing::error!(slot, "media waiter without a request");
+                        continue;
+                    };
                     match install(requests, &request, &media) {
                         Ok(()) => ready.push(request),
-                        Err(error) => request.fail(error, requests, draft.as_deref_mut())?,
+                        Err(error) => request.fail(error, requests, draft.as_deref_mut()),
                     }
                 }
                 MediaPoll::Failed(slot, error) => {
                     if let Some(request) = self.leased[slot].take() {
-                        request.fail(media_failure(error), requests, draft.as_deref_mut())?;
+                        request.fail(media_failure(error), requests, draft.as_deref_mut());
                     }
                 }
                 MediaPoll::Pending | MediaPoll::Empty => break,
             }
         }
-        Ok(ready)
+        ready
     }
     /// Answer every waiter and release its owners (the scheduler stopped).
     pub fn stop<'a, D: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,
         mut draft: Option<&mut DraftRuntime<'_, 'a, D>>) {
         let unavailable = || cuteafd_api::openai::NativeFailure::Unavailable("vision admission stopped".into());
         for request in self.leased.iter_mut().filter_map(Option::take) {
-            if let Err(error) = request.fail(anyhow::anyhow!(unavailable()), requests, draft.as_deref_mut()) {
-                tracing::warn!(%error, "releasing stopped image owners");
-            }
+            request.fail(anyhow::anyhow!(unavailable()), requests, draft.as_deref_mut());
         }
         for prepared in self.backlog.drain(..) { let _ = prepared.job.events.send(Err(unavailable())); }
         let _ = self.admission.poll(|_| true);
@@ -232,14 +231,23 @@ pub(super) fn media_failure(error: MediaError) -> anyhow::Error {
 pub(super) struct Wake<'p> {
     pub media_pending: bool,
     pub media_slots: usize,
-    /// Image requests wait host-side for an encoder waiter slot.
+    /// Admissible work waits host-side: image requests for an encoder waiter
+    /// slot, or prompts deferred behind another's pending prompt snapshot.
     pub host_pending: bool,
     /// The deferred request and the release epoch it waits past.
     pub retry: Option<(&'p NativeRequest, u64)>,
+    /// Prompts wait in the decode-share queue: the lanes owe decode time until
+    /// this instant, then stop at their next completed boundary for a prefill
+    /// round. None with share 0 (no prompt waits across a decode round).
+    pub prefill_due: Option<Instant>,
 }
 impl Wake<'_> {
     pub fn poll_media(self, completed_rounds: u64) -> bool {
         self.media_pending && completed_rounds > 0
+    }
+    /// A completed lane round passed the decode share's debt (one round at least).
+    pub fn prefill_due(self, completed_rounds: u64) -> bool {
+        completed_rounds > 0 && self.prefill_due.is_some_and(|due| Instant::now() >= due)
     }
     /// `epoch` is the current release epoch: a deferred request retries once
     /// it moved (a request retired) or its client left.
@@ -359,6 +367,27 @@ mod tests {
         assert!(!backlog.ready(16, 16, false, 0));
         assert!(!Wake::default().poll_media(1));
         assert!(!Wake::default().poll_media(u64::MAX));
+    }
+    /// Waiting prompts stop the lanes once the owed decode time has passed,
+    /// after one completed round at least; nothing waits: no stop.
+    #[test]
+    fn owed_decode_time_stops_lanes_after_a_completed_round() {
+        let past = Wake { prefill_due: Some(Instant::now()), ..Default::default() };
+        assert!(!past.prefill_due(0), "one round at least");
+        assert!(past.prefill_due(1));
+        let future = Wake { prefill_due: Some(Instant::now() + Duration::from_secs(60)), ..Default::default() };
+        assert!(!future.prefill_due(5));
+        assert!(!Wake::default().prefill_due(u64::MAX), "share 0 never stops for prefill");
+    }
+    /// A prompt deferred behind another's pending prompt snapshot (a prefix
+    /// waiter) wakes the lanes like a host-side image backlog: with nothing
+    /// else to do it would wait a whole active generation (#976 review A2).
+    #[test]
+    fn a_prefix_waiter_wakes_the_lanes_at_a_free_slot() {
+        let waiter = Wake { host_pending: true, ..Default::default() };
+        assert!(waiter.ready(1, 16, false, 0), "an empty HTTP queue still admits the waiter");
+        assert!(!waiter.ready(16, 16, false, 0), "no slot: keep decoding");
+        assert!(!Wake::default().ready(1, 16, false, 0));
     }
     #[test]
     fn parked_image_limit_preserves_a_text_slot() -> Result<()> {

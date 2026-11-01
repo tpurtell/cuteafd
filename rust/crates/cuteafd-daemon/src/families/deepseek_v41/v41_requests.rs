@@ -255,6 +255,12 @@ impl<'a> Requests<'a> {
             tracing::debug!(%error, "Engram draft look-ahead skipped");
         }
     }
+    /// Before `lease`'s encoder call: cancel encoder prefetch waves other
+    /// prompts hold (their I/O only; they prefetch again at their next call).
+    /// Returns how many were cancelled.
+    pub fn cancel_foreign_prefetch(&mut self, lease: CacheLease) -> usize {
+        self.prefetched.cancel_others(&lease)
+    }
     pub fn release(&mut self, lease: CacheLease) -> Result<()> {
         self.prefetched.cancel_owner(&lease);
         if self.cache.request_id(lease).is_ok() { self.cache.ensure_releasable(lease)?; }

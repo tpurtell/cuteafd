@@ -87,6 +87,7 @@ def load_tokenizer(path, *, chat=False):
             if _digest(encoder) != encoder_hash:
                 raise ValueError("checkpoint chat encoder changed while loading")
             tokenizer._fidelity_encode_messages = module.encode_messages
+            tokenizer._fidelity_parse_completion = getattr(module, "parse_message_from_completion_text", None)
             tokenizer._fidelity_chat_identity = {
                 "chat_template_kind": "checkpoint_encoder",
                 "chat_template_sha256": encoder_hash,
