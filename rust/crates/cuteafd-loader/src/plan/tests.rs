@@ -4357,6 +4357,47 @@ fn glm5_flash_auto_vision_preserves_pool_floor_but_explicit_rtx_is_strict() {
 }
 
 #[test]
+fn glm_flash_auto_sparks_reserves_tower_before_optional_experts() {
+    use super::encoder::EncoderKind;
+    let mut cfg = glm5_flash_config(16);
+    cfg["text_config"]["n_routed_experts"] = json!(8);
+    cfg["vision_config"] = json!({"depth":24,"hidden_size":1024,"intermediate_size":4096,
+        "num_heads":16,"out_hidden_size":4096,"patch_size":14,"temporal_patch_size":2,
+        "spatial_merge_size":2,"projection_intermediate_size":10240,"in_channels":3,
+        "attention_bias":true,"hidden_act":"silu","rms_norm_eps":1e-5,"swiglu_limit":10.0});
+    let mut tensors = glm5_flash_tensors(&cfg);
+    tensors.extend(super::families::glm::glm_flash_vision_tensors().into_iter()
+        .map(|(name, shape)| t(format!("model.visual.{name}"), "BF16", &shape)));
+    let dir = snapshot(cfg, &tensors);
+    let share = dir.path().join("share");
+    std::fs::create_dir_all(&share).unwrap();
+    let programs: Vec<_> = ["mhc_post_pre", "kda", "kda_w8", "mla_producer", "o", "ffn_i2048",
+        "ffn_i12288", "index_producer"].into_iter().flat_map(|name|
+            ["m64", "m4096"].map(move |cap| format!("glmf_{name}_{cap}")))
+        .chain(["glmf_mhc_pre", "glmf_sparse_mla_decode_m64", "glmf_sparse_mla_prefill_m4096",
+            "glmf_index_topk_decode_m64", "glmf_index_topk_prefill_m4096"].map(str::to_string))
+        .map(|name| json!({"name":name,"scratch_bytes_at_capacity":{"scratch":4096}})).collect();
+    let manifest = share.join("PROGRAMS.json");
+    std::fs::write(&manifest, json!({"capacities":{"max_context":262144},"programs":programs}).to_string()).unwrap();
+    // The Spark physical ceiling leaves no native tower room, forcing Auto to
+    // test an RTX reservation through the unchanged pool-first solver.
+    let options = PlanOptions { vision: MediaMode::Auto,
+        attention_placement: Some(AttentionPlacement::Heads),
+        layout: Some(layout::LayoutOptions { rtx_bytes: vec![24 << 30; 2], spark_bytes: 1 << 30,
+            context_tokens: 262144, pool_tokens: Some(262144),
+            glmf_drafter_disabled: true, graph_budget_bytes: Some(64 << 20),
+            workspace_manifest: Some(manifest), host_memory: Some((128 << 30, 128 << 30)),
+            ..Default::default() }), ..sparks(4) };
+    let auto = plan(dir.path(), &options).unwrap();
+    assert!(auto.placement_supported, "{}", render(&auto));
+    assert_eq!(auto.encoder.as_ref().unwrap().kind, EncoderKind::Rtx { gpu: 1 }, "{}", render(&auto));
+    let repeated = plan(dir.path(), &options).unwrap();
+    assert_eq!(serde_json::to_value(&auto).unwrap(), serde_json::to_value(&repeated).unwrap());
+    let explicit = plan(dir.path(), &PlanOptions { vision: MediaMode::Rtx(Some(1)), ..options }).unwrap();
+    assert_eq!(auto.solver_placement, explicit.solver_placement);
+}
+
+#[test]
 fn glm_flash_explicit_spark_vision_refuses_without_an_expert_worker() {
     use super::encoder::EncoderKind;
     let mut cfg = glm5_flash_config(2);

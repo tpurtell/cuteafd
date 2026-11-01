@@ -606,7 +606,14 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
-    match model.placement(input, report, options, requested) {
+    let towers = match report.family.as_deref() {
+        Some("glm5_flash") => Some(layout::glm_flash_towers(report, input.checkpoint())),
+        _ => None,
+    };
+    let admission = if let Some(towers) = towers {
+        Some(layout::admit_layout_encoders(model, input, report, options, requested, &towers))
+    } else { model.placement(input, report, options, requested) };
+    match admission {
         Some(Ok(memory)) => {
             report.native_serving_admitted = model.native_serving_admission();
             Ok(memory)

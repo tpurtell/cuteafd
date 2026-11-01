@@ -188,6 +188,8 @@ pub struct LayoutOptions {
     pub workspace_manifest: Option<std::path::PathBuf>,
     /// Per-GPU budget for resident weights (`--coordinator-weight-budget-gib`).
     pub weight_budget_bytes: u64,
+    /// Native media demands installed before the family's pool-first solve.
+    pub encoder_items: Vec<Vec<Item>>,
 }
 
 impl LayoutOptions {
@@ -292,6 +294,7 @@ impl Default for LayoutOptions {
             glmf_kda_fp32_partials: false,
             workspace_manifest: None,
             weight_budget_bytes: u64::MAX,
+            encoder_items: Vec::new(),
         }
     }
 }
@@ -1201,6 +1204,106 @@ pub fn v41_towers(report: &PlanReport) -> Towers {
     let source = vision_source_bytes(report);
     Towers { name: "V4.1", vision: Ok((source, if source > 0 { v41::vision_scratch_bytes() } else { 512 * MIB })),
         v41: true, audio: no_audio() }
+}
+
+pub(crate) fn encoder_items(name: &str, placement: &super::encoder::EncoderPlacement) -> Vec<Item> {
+    vec![Item::new(Category::Weights, format!("{name} tower"),
+        if name == "vision" { "BF16 + FP32 vectors" } else { "FP32 native" }, placement.weights, Basis::Formula),
+        Item::new(Category::Workspace, format!("{name} scratch"), "resident", placement.scratch, Basis::Formula)]
+}
+
+/// Family callbacks return the actual admitted layout. Media is installed in
+/// their baselines before solving, so optional expert onboarding cannot win a
+/// race for native tower storage.
+pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &super::PlanInput,
+    report: &mut PlanReport, options: &mut LayoutOptions, requested: ExpertPlacement,
+    towers: &Towers) -> anyhow::Result<MemoryLayout> {
+    use super::{encoder::*, MediaMode};
+    let bytes = |mode, inventory: &Result<(u64, u64), String>| -> anyhow::Result<(u64, u64)> {
+        if mode == MediaMode::Off { return Ok((0, 0)); }
+        inventory.clone().map_err(anyhow::Error::msg)
+    };
+    let vision = bytes(report.vision, &towers.vision)?;
+    let audio = bytes(report.audio, &towers.audio)?;
+    let requests = [EncoderRequest { mode: report.vision, weights: vision.0, scratch: vision.1, copies: options.vision_replicas },
+        EncoderRequest { mode: report.audio, weights: audio.0, scratch: audio.1, copies: 1 }];
+    let hardware = EncoderHardware { v41: towers.v41,
+        gpus: options.rtx_bytes.iter().map(|&free_bytes| EncoderGpuBudget { free_bytes, kv_target_bytes: 0 }).collect(),
+        sparks: (0..requested.spark_ranks()).map(|rank| EncoderSparkBudget { rank, host: format!("spark{rank}"),
+            idle: false, expert_bytes: 0, free_bytes: options.spark_bytes }).collect() };
+    let original = report.clone();
+    let original_options = options.clone();
+    let mut failed = None;
+    let outcome = admit_encoders(&requests, &hardware, |selected| {
+        let mut trial = original.clone();
+        let mut opts = original_options.clone();
+        trial.encoder = Some(selected[0].clone());
+        trial.audio_encoder = (trial.audio != MediaMode::Off).then(|| selected[1].clone());
+        opts.encoder_items = vec![Vec::new(); opts.rtx_bytes.len()];
+        for (name, encoder) in ["vision", "audio"].into_iter().zip(selected) {
+            if let EncoderKind::Rtx { gpu } = encoder.kind {
+                opts.encoder_items[gpu].extend(encoder_items(name, encoder));
+            }
+        }
+        let mut memory = model.placement(input, &mut trial, &mut opts, requested)
+            .ok_or_else(|| anyhow::anyhow!("family has no placement adapter"))??;
+        if !trial.placement_supported || !trial.fits || memory.pool_tokens == 0 {
+            let reason = memory.notes.join("; ");
+            failed = Some((trial, opts, memory));
+            anyhow::bail!("{reason}");
+        }
+        // Spark layouts include the selected suffix's resident weights, I/O and
+        // execution owners. Never create a vision-only worker or charge a host
+        // that the successful solve did not retain.
+        for (name, encoder) in ["vision", "audio"].into_iter().zip(selected) {
+            for rank in encoder.spark_ranks() {
+                let device = memory.devices.iter_mut().find(|device| device.kind == DeviceKind::Spark
+                    && device.index as usize == rank).ok_or_else(|| anyhow::anyhow!(
+                        "vision-only Spark workers are not supported; set VISION=rtx or RTX_EXPERT_LAYERS"))?;
+                let required = encoder.admitted_bytes().checked_add(GIB)
+                    .ok_or_else(|| anyhow::anyhow!("media Spark reservation overflow"))?;
+                anyhow::ensure!(spark_encoder_headroom(device, opts.spark_allocation_budget_bytes) >= required,
+                    "Spark {rank} native {name} tower + scratch + 1 GiB exceeds physical/allocation budget");
+                device.items.extend(encoder_items(name, encoder));
+            }
+        }
+        Ok((trial, opts, memory))
+    });
+    let (selected, (mut accepted, resolved, mut memory)) = match outcome {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            if let Some((mut trial, opts, mut memory)) = failed {
+                trial.placement_supported = false;
+                trial.fits = false;
+                trial.hints.push(super::Hint { what: format!("native media admission: {error:#}"),
+                    how: "Select a fitting native encoder placement, pool or Spark layout.".into() });
+                memory.notes.push(format!("native media admission: {error:#}"));
+                *report = trial;
+                *options = opts;
+                return Ok(memory);
+            }
+            return Err(error);
+        }
+    };
+    for (name, encoder) in ["vision", "audio"].into_iter().zip(&selected) {
+        if name == "audio" && original.audio == MediaMode::Off { continue; }
+        if encoder.kind == EncoderKind::Off {
+            let component = if name == "vision" { Component::Vision } else { Component::Audio };
+            if let Some(c) = accepted.components.iter_mut().find(|c| c.component == component)
+                .filter(|c| c.status != Status::Unused && c.status != Status::Disabled) {
+                accepted.disabled_media_bytes += c.bytes;
+                c.bytes = 0;
+                c.status = Status::Disabled;
+            }
+            if name == "audio" { accepted.audio = MediaMode::Off; }
+        }
+        memory.notes.push(format!("{name} {:?}: {}; {} bytes admitted; shortfall {} bytes",
+            encoder.kind, encoder.reason, encoder.admitted_bytes(), encoder.shortfall));
+    }
+    accepted.native_serving_admitted = model.native_serving_admission();
+    *report = accepted;
+    *options = resolved;
+    Ok(memory)
 }
 
 /// Places the media towers beside a layout's devices: `kv` is each GPU's KV
