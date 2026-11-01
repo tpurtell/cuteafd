@@ -193,7 +193,7 @@ pub(super) fn layout(
         requested_pool: opts.pool_tokens,
         marks: MarkRule {
             lanes: sequences,
-            entries: usize::try_from(opts.mimo_prefix_entries)?,
+            entries: usize::try_from(opts.prefix_entries("step5"))?,
             budget_bytes: opts.mimo_prefix_mark_bytes,
             host: opts.host_cache_bytes != Some(0),
         },

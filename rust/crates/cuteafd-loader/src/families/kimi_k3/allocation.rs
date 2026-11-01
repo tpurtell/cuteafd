@@ -269,7 +269,7 @@ pub fn graph_rows(verify: usize, capacity: usize) -> Vec<usize> {
 pub fn graphs(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<GraphSet> {
     ensure!((1..=2).contains(&lanes) && (1..=UNIT_ROWS_MAX).contains(&capacity)
-        && (1..=64).contains(&slots) && verify <= 64, "Kimi graph geometry");
+        && (1..=128).contains(&slots) && verify <= 64, "Kimi graph geometry");
     let mut counts = [0; 2];
     for (rank, count) in counts.iter_mut().enumerate() {
         for rows in graph_rows(verify, capacity) {
@@ -304,7 +304,7 @@ pub fn kda_demands(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize,
 
 pub fn kda_demands_for_layers(layers: usize, slots: usize, marks: usize, lanes: usize,
     rank: u8) -> Result<[Demand; 4]> {
-    ensure!((1..=64).contains(&slots) && marks > 0 && (1..=2).contains(&lanes)
+    ensure!((1..=128).contains(&slots) && marks > 0 && (1..=2).contains(&lanes)
         && rank < 2, "Kimi KDA state geometry");
     let state = 48 * 128 * 128 * 4 + 3 * 3 * 6144 * 2;
     let replay = 64 * 48 * (3 * 128 * 4 + 4 + 3 * 128 * 2);

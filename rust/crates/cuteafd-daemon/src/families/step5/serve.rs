@@ -48,7 +48,7 @@ pub(crate) struct ServeArgs {
     mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     listen: String,
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=128))]
     max_sequences: u8,
     #[arg(long)]
     model_id: Option<String>,
@@ -407,7 +407,9 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("step5", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
     let api = args.api.load()?;
@@ -420,7 +422,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         Some(format!("{organization}/{model}"))
     })).context("Step-5 requires --model-id for a snapshot without HF identity")?;
     let profile = ModelProfile::new(model, ModelEncoding::Step5(encoding));
-    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
+    let (queue, mut receive) = tokio::sync::mpsc::channel(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let engine_args = args.clone();

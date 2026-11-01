@@ -221,7 +221,7 @@ pub fn mark_slots_for(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u
     if entries == 0 { return 0; }
     let floor = lanes.max(1).saturating_mul(2).saturating_add(2);
     let wanted = entries.saturating_mul(2).saturating_add(2);
-    wanted.min(budget_bytes / slot_bytes.max(1)).max(floor)
+    wanted.max(floor).min(budget_bytes / slot_bytes.max(1))
 }
 
 /// A fixed staging ring: two asynchronous captures, or a capture and a serialized restore.

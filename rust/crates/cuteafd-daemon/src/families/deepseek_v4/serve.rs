@@ -80,7 +80,9 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
     if position > 0 && input_rows == 1 { probe::ScorePath::Decode } else { probe::ScorePath::Prefill }
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.engine.max_sequences);
     let api = args.api.load()?;
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,

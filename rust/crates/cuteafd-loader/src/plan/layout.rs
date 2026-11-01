@@ -120,9 +120,9 @@ pub struct LayoutOptions {
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
-    /// Concurrent sequences (state slots = concurrency + 2).
+    /// Concurrent sequences (state slots = ceil(5 * concurrency / 4)).
     pub concurrency: u64,
-    /// Exact engine slots when they differ from concurrency + 2.
+    /// Exact engine slots when they differ from ceil(5 * concurrency / 4).
     pub state_slots: Option<u64>,
     /// The lanes GLM 5.3 Flash's prefix mark arena counts (its 2C + 2 floor), when they differ
     /// from concurrency: serve-glmf counts at most `DECODE_ROWS` (64) decoding sequences.
@@ -195,6 +195,12 @@ impl LayoutOptions {
         }
     }
 
+    pub fn prefix_entries(&self, family: &str) -> u64 {
+        if self.mimo_prefix_entries == u64::MAX {
+            cuteafd_core::concurrency::prefix_entries(self.resolved_concurrency(family))
+        } else { self.mimo_prefix_entries }
+    }
+
     pub fn glm_draft_sequences(&self) -> u64 {
         self.draft_sequences.unwrap_or(crate::families::glm5::draft_representation::DEFAULT_DRAFT_SEQUENCES as u64)
     }
@@ -256,7 +262,7 @@ impl Default for LayoutOptions {
             state_slots: None,
             glmf_mark_lanes: None,
             prefix_slots: None,
-            mimo_prefix_entries: 20,
+            mimo_prefix_entries: u64::MAX,
             mimo_prefix_mark_bytes: 2 * GIB,
             mimo_prefix_draft: false,
             mimo_rings: 16,

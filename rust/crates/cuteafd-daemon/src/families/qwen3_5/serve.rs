@@ -529,7 +529,7 @@ pub(crate) struct ServeArgs {
     pub mtp: u8,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=64))]
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=128))]
     pub max_sequences: u8,
     #[arg(long)]
     pub model_id: Option<String>,
@@ -543,7 +543,9 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
     use std::sync::{Arc, Mutex};
     let api = args.api.load()?;

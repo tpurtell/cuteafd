@@ -82,7 +82,9 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("glm5", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
         super::native_activation(&args.engine, cfg.first_moe_layer, cfg.layers, true)?;
@@ -135,7 +137,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks, false);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
     layout.speculator = args.engine.draft.as_ref().map(|_| console::Speculator {
         name: "DFlash2".into(), positions: 8, policy });
@@ -177,7 +179,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
+        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
             ranks, &prefix, args.token_io.token_select, || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(engine.max_context));

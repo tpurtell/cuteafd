@@ -979,7 +979,7 @@ case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or 
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
-((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "CONCURRENCY must be in 1..128"
 [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
 [[ "$MAX_OUTPUT_TOKENS" =~ ^-?[0-9]+$ ]] || release_die "MAX_OUTPUT_TOKENS must be an integer (<= 0: bounded only by the context)"

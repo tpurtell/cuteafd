@@ -167,7 +167,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     ensure!(options.state_slots.is_none_or(|n| n == slots as u64), "dense state slots must equal concurrency");
     let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
-        options.mimo_prefix_entries, mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+        options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
     let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);

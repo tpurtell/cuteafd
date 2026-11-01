@@ -25,7 +25,7 @@ pub(crate) struct ServeArgs {
     /// Complete per-rank allocation ceiling, estimated until the first worker census.
     #[arg(long)] pub spark_budget_gib: Option<f64>,
     #[arg(long, default_value = "0.0.0.0:8000")] pub listen: String,
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=64))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u8).range(1..=128))]
     pub max_sequences: u8,
     #[arg(long)] pub model_id: Option<String>,
     /// Opt in to a checkpoint-native MLA DFlash2 drafter.
@@ -86,7 +86,9 @@ impl ServeArgs {
     }
 }
 
-pub(crate) async fn run(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("kimi_k3", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     args.validate()?;
     let api = args.api.load()?;
     let encoding = Arc::new(KimiEncoding::from_snapshot(&args.snapshot)?);

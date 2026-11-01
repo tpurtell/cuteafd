@@ -75,10 +75,10 @@ pub const MAX_RESOURCE_CLASSES: usize = 4;
 /// Smoothing of a seeded policy's relative prediction error.
 const ERROR_RATE: f64 = 0.1;
 /// Independent evidence regimes for resource costs and confidence calibration.
-pub const CONCURRENCY_BUCKETS: usize = 4;
+pub const CONCURRENCY_BUCKETS: usize = 6;
 /// C1, C2-4, C5-8 and C9+.
 pub fn draft_concurrency_bucket(requests: usize) -> usize {
-    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, _ => 3 }
+    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, 9..=16 => 3, 17..=32 => 4, _ => 5 }
 }
 /// Reached samples before a position uses its own calibration.
 const POOLED_BELOW: u64 = 32;
@@ -905,7 +905,7 @@ impl DraftPolicy {
 
     /// The simple rule's per-position predicted against realized acceptance,
     /// `[group][native, tail][position]` with groups [`REPORT_GROUPS`].
-    pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; 4]> {
+    pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; crate::CONCURRENCY_BUCKETS]> {
         self.simple.as_ref().map(SimpleDraft::reliability)
     }
     /// The simple rule's cutoff now for a selection over `requests`, for reports.

@@ -34,6 +34,7 @@ pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, Greedy
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;
+pub mod concurrency;
 pub mod thermal;
 pub mod push_outcome;
 pub mod memory_layout;

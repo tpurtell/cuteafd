@@ -252,7 +252,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     } else { 0 };
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-        concurrency, options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+        concurrency, options.prefix_entries("mimo_v2"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let graphs = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, options.mimo_decode_graphs)?;
     let mut runtime = Vec::new();
     for rank in 0..ranks {

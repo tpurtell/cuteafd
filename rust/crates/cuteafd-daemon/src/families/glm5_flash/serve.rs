@@ -145,7 +145,9 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("glm5_flash", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
@@ -207,7 +209,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences;
     let policy = match args.draft_fixed {
         Some(n) => format!("fixed {n}"),
         None => "adaptive".to_string(),
@@ -239,8 +241,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
-    args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some()));
-    let lanes = max_sequences.min(DECODE_ROWS);
+    args.serving_graph_policy = Some((max_sequences, args.draft.is_some()));
+    let lanes = max_sequences;
     // Without entries no mark is taken: pool marks keep no unit back and need no room in the pool.
     let marks = args.prefix_marks.with_entries(prefix.prefix_cache_entries);
     if marks != args.prefix_marks {

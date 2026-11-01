@@ -94,7 +94,7 @@ impl KdaLayout {
         ensure!(cfg.layers == cfg.attention.len() && cfg.kda_heads == 96
             && cfg.kda_head_dim == 128 && cfg.kda_conv == 4,
             "Kimi KDA state layout differs from native geometry");
-        ensure!((1..=64).contains(&slots) && marks > 0 && (1..=2).contains(&lanes),
+        ensure!((1..=128).contains(&slots) && marks > 0 && (1..=2).contains(&lanes),
             "Kimi KDA state slot/mark/lane geometry");
         let mut layers = 0;
         let ordinals = cfg.attention.iter().map(|kind| if *kind == KimiAttention::Kda {

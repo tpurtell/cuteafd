@@ -102,7 +102,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let geometry = crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
             index, state.bytes(), decode_rows, attention.mode, 0)?;
         let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-            options.glmf_mark_lanes.unwrap_or(sequences), options.mimo_prefix_entries,
+            options.glmf_mark_lanes.unwrap_or(sequences), options.prefix_entries("glm5_flash"),
             geometry.ranks.iter().map(|r| r.retained_mark_bytes).sum(), options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
         let shared = if options.glmf_shared_replay { crate::serving_capacity::glm_flash_kda_replay_bytes_rows(&cfg, cfg.layers, ranks, decode_rows)? } else { 0 };
         let step_workspace = |placement: &ExpertPlacement, lanes| manifest.and_then(|m|
@@ -223,7 +223,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         let inputs = glmf::GlmfInputs { automatic_context: options.context_tokens == 0, attention, cfg: &cfg, layers: cfg.layers, local_tp2_exl3: local_tp2_exl3 && !native, gpus: baselines, pending_code: vec![0; ranks],
             headroom_bytes: options.headroom_bytes, spark_ranks, prefill_lanes: lanes, prefill_rows: rows,
             decode_rows, partial_bytes: if options.glmf_kda_fp32_partials && !native_kda { 4 } else { 2 }, max_context: context, sequences, speculation: draft > 0, state_slots: options.state_slots.unwrap_or(sequences.max(8)),
-            mark_slots: marks, pool_marks: options.glmf_pool_marks && options.mimo_prefix_entries > 0,
+            mark_slots: marks, pool_marks: options.glmf_pool_marks && options.prefix_entries("glm5_flash") > 0,
             index, kda_state_bytes: state.bytes(), shared_replay: options.glmf_shared_replay, representation,
             resident, workspace, local_workspace, graphs, experts,
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },

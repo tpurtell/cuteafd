@@ -445,8 +445,8 @@ pub(crate) struct PlanArgs {
     #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
     pub(crate) media_cache_bytes: Option<u64>,
     /// MiMo and GLM 5.3 Flash retained snapshots per bank for --layout (matches serving).
-    #[arg(long, default_value_t = 20)]
-    pub(crate) prefix_cache_entries: u64,
+    #[arg(long)]
+    pub(crate) prefix_cache_entries: Option<u64>,
     /// MiMo and GLM 5.3 Flash device positional-mark budget for --layout, MiB.
     #[arg(long, default_value_t = 2048)]
     pub(crate) prefix_cache_mark_mib: u64,
@@ -879,7 +879,7 @@ mod tests {
         assert_eq!(args.max_context_tokens, 1_048_576);
         assert_eq!(args.reserve.limits(args.max_context_tokens as usize).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
-        assert_eq!(args.prefix_cache_entries, 20);
+        assert_eq!(args.resolved_prefix_entries(), 20);
         assert_eq!(args.dspark_draft_limit, 5);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
@@ -1194,7 +1194,7 @@ pub(crate) struct NativeServeArgs {
 
 
     /// Maximum active requests, shared by both execution lanes.
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=128))]
     pub concurrency: u32,
 
     /// Buffered HTTP jobs; defaults to concurrency. At most this many additional callers wait.
@@ -1206,7 +1206,7 @@ pub(crate) struct NativeServeArgs {
     pub http_queue_wait_ms: u64,
 
     /// Retained completed turns, plus a separate prompt-repeat bank of this size; zero disables reuse.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(0..=128))]
+    #[arg(long, default_value_t = u32::MAX)]
     pub prefix_cache_entries: u32,
 
     /// Pinned snapshot memory: auto sizes full-context KV for concurrency + 4,
@@ -1324,6 +1324,14 @@ impl NativeServeArgs {
 }
 
 /// When the host snapshot cache copies a retained snapshot (see `cuteafd_hostcache::config::StoreMode`).
+impl NativeServeArgs {
+    pub(crate) fn resolved_prefix_entries(&self) -> u32 {
+        if self.prefix_cache_entries == u32::MAX {
+            cuteafd_core::concurrency::prefix_entries(u64::from(self.concurrency)) as u32
+        } else { self.prefix_cache_entries }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum HostCacheStore {
     OnRetain,

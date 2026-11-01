@@ -335,8 +335,8 @@ pub(super) fn worker(args: crate::cli::NativeServeArgs, mut receive: mpsc::Recei
     // the native plans and AOT packages, sample with no draft allocation, solve
     // with the drafter as a shared Movable, then load with the admitted bytes.
     let draft_width = if args.dspark_draft_limit > 5 { 7 } else { 5 };
-    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
+    ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
+    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let dspark_inventory = if args.dspark {
         Some(devices[1].run(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::distributed_inventory(
             &lib, &catalog, capacity, args.concurrency, draft_width, args.tp2_dspark_experts,
