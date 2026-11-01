@@ -139,15 +139,7 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
             let stream = self.streams[index];
             planes.push(rank.device.run(|| rank.step.upload(rank.device.library, unit.slot, &meta, true, wave.clone(), stream))?);
             super::forward::embed(self.cfg, rank, &lane, self.table, tokens, stream)?;
-            if !media.indices.is_empty() {
-                // The official model scatters projected features AFTER the
-                // weightless text embedding norm, on every head-split rank.
-                // Reuse admitted scratch; inject_host drains it before normal
-                // producers overwrite residual/token_ids in a later unit.
-                rank.device.run(|| Ok(rank.device.library.embedding_injection()?.inject_host(
-                    &media.features, &media.indices, lane.plane("residual")?, lane.plane("token_ids")?,
-                    lane.rows("hidden", rows)?, rows, self.cfg.hidden, 1, stream)?))?;
-            }
+            super::forward::inject_media(self.cfg, rank, &lane, &media, rows, stream)?;
             lanes.push(lane);
         }
         self.units[unit.index] = Some(UnitState { lanes, planes, wave: None });
@@ -248,7 +240,9 @@ mod tests {
         let begin = source.split("fn begin_unit(").nth(1).unwrap().split("fn attention(").next().unwrap();
         assert!(begin.contains("rank.lane.views.slot(unit.slot)"));
         assert!(begin.contains("rank.step.upload(rank.device.library, unit.slot, &meta, true"));
-        assert!(begin.contains("super::forward::embed(self.cfg, rank, &lane"));
+        let embed = begin.find("super::forward::embed(self.cfg, rank, &lane").unwrap();
+        let inject = begin.find("super::forward::inject_media(self.cfg, rank, &lane, &media, rows, stream)").unwrap();
+        assert!(embed < inject);
         assert!(source.contains("rank.device_with(cfg, self.streams[index], &state.lanes[index])"));
     }
 
