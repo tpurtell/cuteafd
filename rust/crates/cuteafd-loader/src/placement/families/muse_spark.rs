@@ -124,6 +124,7 @@ pub struct MuseRequest {
     pub drafter: Option<MuseDrafter>,
     pub spark_budget: SparkBudgetInventory,
     pub media: Option<MediaAdmission>,
+    admitted_placement: Option<Placement>,
     /// Per layer, per coordinator rank: the operands the device packs.
     pub layouts: Vec<Vec<LayerLayout>>,
     pub global: GlobalLayout,
@@ -166,7 +167,7 @@ impl MuseRequest {
             scratch: options.vision_bytes.1, copies: options.replicas },
             EncoderRequest { mode: options.audio, weights: options.audio_bytes.0,
                 scratch: options.audio_bytes.1, copies: 1 }];
-        let (selected, (request, budget, spark_items)) = admit_encoders(&requests, &hardware, |selected| {
+        let (selected, (request, budget, spark_items, placed)) = admit_encoders(&requests, &hardware, |selected| {
             let mut request = self.request.clone();
             let mut budget = self.spark_budget.clone();
             let mut spark_items = vec![Vec::new(); budget.resident.len()];
@@ -200,12 +201,17 @@ impl MuseRequest {
             }
             ensure!(spark_items.iter().all(Vec::is_empty) || placed.onboard_layers < budget.layers.len(),
                 "Muse Spark media requires a retained expert worker; select RTX media or retain Spark experts");
-            Ok((request, budget, spark_items))
+            Ok((request, budget, spark_items, placed))
         })?;
+        self.admitted_placement = Some(placed);
         self.request = request;
         self.spark_budget = budget;
         self.media = Some(MediaAdmission { vision: selected[0].clone(), audio: selected[1].clone(), spark_items });
         Ok(())
+    }
+
+    pub fn admitted_placement(&self) -> Result<Placement> {
+        self.admitted_placement.clone().map(Ok).unwrap_or_else(|| solve(&self.request).map_err(Into::into))
     }
 
     pub fn check_media_workers(&self, placed: &Placement) -> Result<()> {
@@ -402,7 +408,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         executor,
     };
     spark_budget.constrain(&mut request)?;
-    Ok(MuseRequest { request, local, drafter, spark_budget, media: None, layouts, global, projections })
+    Ok(MuseRequest { request, local, drafter, spark_budget, media: None, admitted_placement: None, layouts, global, projections })
 }
 
 /// The step metadata a rank allocates: a bank per in-flight prefill slot and a

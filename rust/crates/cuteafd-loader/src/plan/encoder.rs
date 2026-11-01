@@ -298,4 +298,50 @@ mod tests {
         assert_eq!(encoder_placement(MediaMode::Off, &h, GIB, GIB, 1).admitted_bytes(), 0);
         assert_eq!(encoder_placement(MediaMode::Rtx(Some(5)), &h, GIB, GIB, 1).kind, EncoderKind::Off);
     }
+    #[test]
+    fn native_trials_reuse_first_success_in_deterministic_order() {
+        let hardware = hw(2, 2, 96);
+        let requests = [EncoderRequest { mode: MediaMode::Auto, weights: GIB, scratch: GIB, copies: 1 }];
+        let mut visited = Vec::new();
+        let (selected, token) = admit_encoders(&requests, &hardware, |selected| {
+            visited.push(selected[0].kind.clone());
+            anyhow::ensure!(selected[0].kind == EncoderKind::Rtx { gpu: 1 }, "Spark unavailable");
+            Ok(37)
+        }).unwrap();
+        assert_eq!(visited, vec![EncoderKind::Spark { rank: 1 }, EncoderKind::Spark { rank: 0 }, EncoderKind::Rtx { gpu: 1 }]);
+        assert_eq!(selected[0].kind, EncoderKind::Rtx { gpu: 1 });
+        assert_eq!(token, 37);
+    }
+
+    #[test]
+    fn auto_target_pruning_uses_one_off_solve() {
+        let hardware = hw(1, 0, 9);
+        let requests = [EncoderRequest { mode: MediaMode::Auto, weights: GIB, scratch: GIB, copies: 1 }];
+        let mut calls = 0;
+        let (selected, ()) = admit_encoders(&requests, &hardware, |selected| {
+            calls += 1;
+            assert_eq!(selected[0].kind, EncoderKind::Off);
+            Ok(())
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(selected[0].shortfall, GIB);
+        assert_eq!(selected[0].reason, "tower would reduce the requested KV target");
+    }
+
+    #[test]
+    fn mixed_trials_charge_prior_modality_once_and_backtrack_without_panicking() {
+        let mut hardware = hw(1, 2, 96);
+        for spark in &mut hardware.sparks { spark.free_bytes = 6 * GIB; spark.expert_bytes = 0; }
+        let requests = [EncoderRequest { mode: MediaMode::Auto, weights: 2 * GIB, scratch: GIB, copies: 1 },
+            EncoderRequest { mode: MediaMode::Auto, weights: 2 * GIB, scratch: GIB, copies: 1 }];
+        let (selected, ()) = admit_encoders(&requests, &hardware, |selected| {
+            anyhow::ensure!(selected[0].kind == EncoderKind::Spark { rank: 1 }, "retry first tower");
+            Ok(())
+        }).unwrap();
+        assert_eq!(selected[0].kind, EncoderKind::Spark { rank: 1 });
+        assert_eq!(selected[1].kind, EncoderKind::Spark { rank: 0 });
+        let failure = admit_encoders::<()>(&requests, &hardware, |_| anyhow::bail!("no capacity"));
+        assert!(failure.unwrap_err().to_string().contains("no capacity"));
+    }
+
 }

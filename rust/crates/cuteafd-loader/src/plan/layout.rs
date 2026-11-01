@@ -1209,7 +1209,8 @@ pub fn v41_towers(report: &PlanReport) -> Towers {
 pub(crate) fn encoder_items(name: &str, placement: &super::encoder::EncoderPlacement) -> Vec<Item> {
     vec![Item::new(Category::Weights, format!("{name} tower"),
         if name == "vision" { "BF16 + FP32 vectors" } else { "FP32 native" }, placement.weights, Basis::Formula),
-        Item::new(Category::Workspace, format!("{name} scratch"), "resident", placement.scratch, Basis::Formula)]
+        Item::new(Category::Workspace, format!("{name} scratch"),
+            if name == "audio" { "resident BLAS/FFT included" } else { "resident" }, placement.scratch, Basis::Formula)]
 }
 
 /// Family callbacks return the actual admitted layout. Media is installed in

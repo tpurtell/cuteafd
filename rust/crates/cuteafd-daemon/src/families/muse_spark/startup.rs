@@ -82,7 +82,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_wide_format: options.partial_wide_format,
         local: options.local, drafter: options.drafter, fixed, startup: Vec::new() })?;
     if let Some(media) = &options.media { built.admit_media(media)?; }
-    let placed = cuteafd_loader::placement::solve(&built.request)?;
+    let placed = built.admitted_placement()?;
     built.local.check(&placed)?;
     built.request.executor.check(&placed)?;
     built.check_media_workers(&placed)?;

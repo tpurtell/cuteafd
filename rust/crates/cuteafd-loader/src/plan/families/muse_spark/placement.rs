@@ -145,7 +145,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         model.core.projections.len(), if model.core.complete(cfg) { "complete" } else { "partial: BF16 rest" }));
     let rings = crate::placement::families::muse_spark::ring_rows(cfg).unwrap_or(0)
         * cfg.kv_record_bytes() as u64 * cfg.sliding_layers() as u64;
-    let placed = match solve(&built.request) {
+    let placed = match built.admitted_placement() {
         Ok(placed) => placed,
         Err(error) => {
             refusal(report, format!("Muse Spark coordinator admission refused: {error}"),
