@@ -402,7 +402,8 @@ mod tests {
                 prefill_lanes: 1, ..Default::default() };
             let endpoints = [SparkEndpoint { ring_depth: None, capacity: 80, ingress: SparkIngress::Fp8K32 }];
             let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
-            for stored_width in if nvfp4 { vec![576, 640] } else { vec![640] } {
+            let native_stored = cuteafd_core::mxfp4_layouts::stored_width(5120, 576).unwrap();
+            for stored_width in if nvfp4 { vec![576, 640] } else { vec![native_stored] } {
                 let layout = if nvfp4 { SparkResidentLayout::Nvfp4 { world: 4, rank: 3, stored_width } }
                     else { SparkResidentLayout::Native { world: 4, rank: 3 } };
                 let assignment = SparkAssignment::from_catalog(&catalog, &working, 3,
@@ -413,8 +414,8 @@ mod tests {
                     super::super::families::deepseek_v41::resident_bytes(
                         5120, stored_width as u64, 384, true).unwrap()
                 } else {
-                    // Coded packages pad each FC1 half to N128; FC2 keeps logical K576.
-                    let (hidden, logical, stored, experts) = (5120u64, 576u64, 640u64, 384u64);
+                    // Independent coded-plane arithmetic; only storage comes from policy.
+                    let (hidden, logical, stored, experts) = (5120u64, 576u64, native_stored as u64, 384u64);
                     let payloads = hidden * stored + hidden * stored / 2;
                     let gate_up = 2 * stored * (1 + 2 * (hidden / 128));
                     let down = hidden * (1 + 2 * logical.div_ceil(128));

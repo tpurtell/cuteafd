@@ -251,9 +251,9 @@ pub fn v41_rank_count_supported(ranks: u32) -> bool {
 }
 
 /// Expected `(experts, logical, kernel, topk)` for one `(family, role)` pair
-/// under the process geometry. Each role is one tensor-parallel slice of the
-/// routed experts; kernels store it padded to 128, and the NVFP4 Spark TP4
-/// family also accepts the exact extent. Roles 0 and 4 are the dSpark draft
+/// under the process geometry. Native Spark roles and stored extents come from
+/// the shared world-to-artifacts contract; NVFP4 retains its frozen padded or
+/// exact extent. Roles 0 and 4 are the dSpark draft
 /// experts (128 experts, top-3), whose shape does not follow the target model.
 fn expected_expert_geometry(
     geometry: cuteafd_core::ExpertGeometry,
@@ -261,16 +261,14 @@ fn expected_expert_geometry(
     role: u32,
     kernel_intermediate: u32,
 ) -> Option<(u32, u32, u32, u32)> {
-    if !nvfp4 {
-        if let Some(width) = cuteafd_core::tp_units::native_role_width(role) {
-            let intermediate = geometry.intermediate as usize;
-            let units = intermediate / 32;
-            let admitted = (2..=cuteafd_core::MAX_SPARK_WORLD).any(|world| units % world != 0
-                && [units / world * 32, units.div_ceil(world) * 32].contains(&width));
-            if !admitted { return None; }
-            let stored = cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden as usize, width)?;
-            return Some((geometry.experts, width as u32, stored as u32, geometry.topk));
-        }
+    if !nvfp4 && (cuteafd_core::tp_units::native_role_width(role).is_some()
+        || matches!(role, 1 | 5 | 6 | 7 | 8)) {
+        return (2..=cuteafd_core::MAX_SPARK_WORLD).find_map(|world|
+            cuteafd_core::tp_units::native_spark_artifacts(geometry.hidden as usize,
+                geometry.intermediate as usize, world).ok()?.into_iter()
+                .find(|artifact| artifact.role == role)
+                .map(|artifact| (geometry.experts, artifact.logical as u32,
+                    artifact.stored as u32, geometry.topk)));
     }
     let draft = |intermediate: u32| Some((128, intermediate, intermediate, 3));
     let tp = match (nvfp4, role) {
@@ -1240,8 +1238,10 @@ mod tests {
         assert_eq!(expected_expert_geometry(V41, true, 6, 768), Some((384, 768, 768, 6)));
         assert_eq!(expected_expert_geometry(V41, true, 7, 384), Some((384, 384, 384, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 9, 384), None);
-        // Historical Spark TP4 padding and RTX TP2 role semantics are unchanged.
-        assert_eq!(expected_expert_geometry(V41, false, 1, 640), Some((384, 576, 640, 6)));
+        // TP4 follows the measured storage table; RTX TP2 role semantics are unchanged.
+        let logical = V41.intermediate / 4;
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(V41.hidden as usize, logical as usize).unwrap() as u32;
+        assert_eq!(expected_expert_geometry(V41, false, 1, stored), Some((384, logical, stored, 6)));
         assert_eq!(expected_expert_geometry(V41, false, 3, 1152), Some((384, 1152, 1152, 6)));
         // Unknown or cross-family pairs still fail closed.
         // A role-7 artifact with a 768 kernel cannot match the 384 expectation.
@@ -1279,11 +1279,15 @@ mod tests {
     fn native_width_metadata_uses_checkpoint_adjacent_geometry() {
         for geometry in [V41, cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH,
             cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO] {
-            let units = geometry.intermediate as usize / 32;
+            let intermediate = geometry.intermediate as usize;
             for width in (32..=8192).step_by(32) {
                 let role = cuteafd_core::tp_units::native_width_role(width).unwrap();
-                let adjacent = (2..=8).any(|world| units % world != 0
-                    && [units / world * 32, units.div_ceil(world) * 32].contains(&width));
+                let adjacent = (2..=8).any(|world| {
+                    let unit = cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world);
+                    let units = intermediate / unit;
+                    units % world != 0
+                        && [units / world * unit, units.div_ceil(world) * unit].contains(&width)
+                });
                 let result = expected_expert_geometry(geometry, false, role, 0);
                 assert_eq!(result.is_some(), adjacent);
                 if let Some((experts, logical, stored, topk)) = result {

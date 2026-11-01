@@ -912,7 +912,7 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--topologies", default="tp2,tp3,tp4",
                         help="world or artifact tags (tp2..tp8, or e.g. "
-                             "tp5-spark_w480). Select one artifact per output "
+                             "tp5-spark_wWIDTH). Select one artifact per output "
                              "file when a world has adjacent widths.")
     parser.add_argument("--ep-degree", type=int, choices=(1, 2, 3), default=1,
                         help="ownership groups; 1 = this rank owns everything")

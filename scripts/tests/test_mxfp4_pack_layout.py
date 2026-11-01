@@ -4,6 +4,7 @@ import ctypes
 import importlib.util
 from pathlib import Path
 import shutil
+import sys
 import subprocess
 
 import numpy as np
@@ -14,10 +15,13 @@ SPEC = importlib.util.spec_from_file_location(
     "mxfp4_layouts", ROOT / "python/tools/lib/mxfp4_layouts.py")
 LAYOUTS = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(LAYOUTS)
-WIDTHS = sorted({32 * (intermediate // 32 // world + extra)
-                 for intermediate in (2048, 2304, 3072)
-                 for world in range(2, 9)
-                 for extra in (0, int(intermediate // 32 % world != 0))} | {32, 64, 96})
+PACKAGE_SPEC = importlib.util.spec_from_file_location(
+    "mxfp4_native_packages", ROOT / "python/tools/lib/spark_packages.py")
+PACKAGES = importlib.util.module_from_spec(PACKAGE_SPEC)
+PACKAGE_SPEC.loader.exec_module(PACKAGES)
+WIDTHS = sorted({artifact.logical for family in ("v41", "dsv4f", "dsv4p")
+                 for artifacts in PACKAGES.native_spark_artifacts(family).values()
+                 for artifact in artifacts} | {32, 64, 96})
 
 
 @pytest.fixture(scope="module")
@@ -42,6 +46,9 @@ void coordinates(uint64_t* output, uint64_t count, uint32_t n, uint32_t k,
 uint32_t stored(uint32_t hidden, uint32_t width) {
   return cuteafd_mxfp4_stored_width(hidden, width);
 }
+uint32_t ownership(uint32_t intermediate, uint32_t world) {
+  return cuteafd_mxfp4_ownership_unit(intermediate, world);
+}
 ''')
     module = directory / "map.so"
     subprocess.run([compiler, "-std=c11", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra",
@@ -54,6 +61,8 @@ uint32_t stored(uint32_t hidden, uint32_t width) {
     library.coordinates.restype = None
     library.stored.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
     library.stored.restype = ctypes.c_uint32
+    library.ownership.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    library.ownership.restype = ctypes.c_uint32
     return library
 
 
@@ -180,3 +189,124 @@ def test_world_artifacts_match_every_absolute_layer_source_interval(family, hidd
                 assert artifact in artifacts
                 cursor += artifact.logical
             assert cursor == intermediate
+
+
+def test_generated_ownership_policy_matches_independent_native_fixture(native_map):
+    for intermediate in (2048, 2304, 3072):
+        for world in range(1, 9):
+            assert native_map.ownership(intermediate, world) == LAYOUTS.ownership_unit(intermediate, world)
+
+
+@pytest.mark.parametrize("family", ["v41", "dsv4f", "dsv4p"])
+@pytest.mark.parametrize("world", range(2, 9))
+def test_cmake_native_artifact_selection_uses_world_inventory(tmp_path, family, world):
+    generated = tmp_path / "artifacts.cmake"
+    subprocess.run([sys.executable, str(ROOT / "python/tools/lib/spark_packages.py"),
+                    "--cmake", str(generated)], check=True, capture_output=True, text=True)
+    source = (ROOT / "native/cmake/shared/mxfp4_widths.cmake").read_text()
+    selection = source[:source.index("foreach(key IN LISTS native_width_keys)")]
+    tp_source = (ROOT / "native/cmake/families/deepseek_v41/v41_spark_tp_experts.cmake").read_text()
+    tp_selection = tp_source[tp_source.index("set(CUTEAFD_V41_SPARK_TP_SELECTED)"):
+                             tp_source.index("set(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)")]
+    family_source = (ROOT / "native/cmake/shared/expert_families.cmake").read_text()
+    family_selection = family_source[family_source.index("foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)"):
+                                     family_source.index('  set(device_handles "")')]
+    family_selection += '\nlist(APPEND selected_family_roles "${family}:${role}")\nendforeach()\n'
+    script = tmp_path / "select.cmake"
+    script.write_text('cmake_minimum_required(VERSION 3.24)\n'
+                      f'include("{generated}")\n'
+                      'set(CUTEAFD_ENABLE_V41_EXPERT_AOT ON)\n'
+                      'set(CUTEAFD_V41_EXPERT_ROLE spark)\n'
+                      f'set(CUTEAFD_SPARK_TP_ROLES tp{world})\n'
+                      f'set(CUTEAFD_EXPERT_FAMILIES {family}:spark_tp{world})\n'
+                      + selection + '\n' + tp_selection
+                      + f'\nset(CUTEAFD_NATIVE_EXPERT_FAMILIES dsv4f:spark_tp{world} dsv4p:spark_tp{world})\n'
+                      + family_selection
+                      + '\nmessage(STATUS "keys=${native_width_keys}")\n'
+                      + 'message(STATUS "equal=${CUTEAFD_V41_SPARK_TP_SELECTED}")\n'
+                      + 'message(STATUS "families=${selected_family_roles}")\n')
+    result = subprocess.run(["cmake", "-P", str(script)], check=True, capture_output=True,
+                            text=True, timeout=30)
+    keys = {f"{f}:{a.logical}" for f in {"v41", family}
+            for a in PACKAGES.native_spark_artifacts(f)[world] if a.name.startswith("spark_w")}
+    actual = next(line.removeprefix("-- keys=") for line in result.stdout.splitlines()
+                  if line.startswith("-- keys="))
+    assert set(actual.split(";")) - {""} == keys
+    equal = next(line.removeprefix("-- equal=") for line in result.stdout.splitlines()
+                 if line.startswith("-- equal="))
+    expected = [f"tp{world}" for a in PACKAGES.native_spark_artifacts()[world]
+                if a.name == f"spark_tp{world}"]
+    assert (equal.split(";") if equal else []) == expected
+    selected = next(line.removeprefix("-- families=") for line in result.stdout.splitlines()
+                    if line.startswith("-- families="))
+    expected_families = {f"{f}:{a.name}" for f in ("dsv4f", "dsv4p")
+                         for a in PACKAGES.native_spark_artifacts(f)[world]
+                         if a.name == f"spark_tp{world}"}
+    assert set(selected.split(";")) - {""} == expected_families
+
+
+def test_exporter_admission_matches_only_world_artifacts():
+    spec = importlib.util.spec_from_file_location(
+        "native_export_artifacts", ROOT / "python/tools/aot/export_b12x_slices_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    for family, shape in exporter.FAMILY_GEOMETRY.items():
+        artifacts = {artifact.name: artifact for group in PACKAGES.native_spark_artifacts(family).values()
+                     for artifact in group}
+        for name, artifact in artifacts.items():
+            assert exporter.role_geometry(family, name) == (
+                shape["experts"], artifact.logical, artifact.stored, shape["topk"])
+        for width in range(32, shape["intermediate"] + 1, 32):
+            name = f"spark_w{width}"
+            if name not in artifacts:
+                with pytest.raises(ValueError, match="no native Spark artifact"):
+                    exporter.role_geometry(family, name)
+
+
+@pytest.fixture(scope="module")
+def native_forward_map(tmp_path_factory):
+    compiler = shutil.which("c++")
+    if not compiler:
+        pytest.skip("C++ compiler unavailable")
+    directory = tmp_path_factory.mktemp("mxfp4-forward-map")
+    text = (ROOT / "native/tests/v41_expert_pack_geometry_selftest.cc").read_text()
+    compact = text[text.index("uint64_t compact_index("):text.index("// Direct port of the device")]
+    payload = text[text.index("uint64_t payload_index("):text.index("void claim_w13(")]
+    source = directory / "forward.cc"
+    source.write_text('#include <algorithm>\n#include <cstdint>\n' + compact + payload + r'''
+extern "C" void forward(uint64_t* output, uint32_t n, uint32_t k, uint32_t half,
+                        int scales, int compact) {
+  const uint32_t columns = k / (scales ? 32 : 8);
+  for (uint32_t row = 0; row < n; ++row)
+    for (uint32_t col = 0; col < columns; ++col) {
+      uint64_t index;
+      if (compact) index = compact_index(row, col, n, columns, half, scales);
+      else if (!scales) index = payload_index(row, col, n, k, half, false);
+      else index = (uint64_t(row / 256) * ((k + 127) / 128) + col / 4) * 1024
+          + (row % 256) * 4 + col % 4;
+      output[index] = (uint64_t(row) << 32) | col;
+    }
+}
+''')
+    module = directory / "forward.so"
+    subprocess.run([compiler, "-std=c++17", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra",
+                    "-Werror", str(source), "-o", str(module)], check=True, capture_output=True)
+    library = ctypes.CDLL(str(module))
+    library.forward.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_uint32, ctypes.c_uint32,
+                               ctypes.c_uint32, ctypes.c_int, ctypes.c_int]
+    library.forward.restype = None
+    return library
+
+
+@pytest.mark.parametrize("width", WIDTHS)
+@pytest.mark.parametrize("scales", [False, True])
+@pytest.mark.parametrize("gated", [False, True])
+def test_native_gpu_selftest_forward_oracle_matches_tensor_permutation(
+        native_forward_map, width, scales, gated):
+    compact = bool(width % 128)
+    n, k, half = (2 * width, 512, width) if gated else (512, width, 0)
+    expected = tensor_permutation(n, k, half, scales, compact)
+    actual = np.full_like(expected, np.iinfo(np.uint64).max)
+    native_forward_map.forward(actual.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+                               n, k, half, scales, compact)
+    np.testing.assert_array_equal(actual, expected)

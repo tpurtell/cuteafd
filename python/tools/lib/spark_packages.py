@@ -70,7 +70,7 @@ NATIVE_SPARK_ROLE_IDS = {2: 5, 3: 6, 4: 1, 6: 7, 8: 8}
 NATIVE_WIDTH_ROLE_BASE = 65536
 
 
-def native_widths(intermediate: int, world: int) -> list[int]:
+def _native_widths(intermediate: int, world: int) -> list[int]:
     unit = layout_policy().ownership_unit(intermediate, world)
     if not 1 <= world <= 8 or intermediate <= 0 or intermediate % unit or intermediate // unit < world:
         raise ValueError("invalid native shard geometry")
@@ -82,12 +82,6 @@ def native_width_role(width: int) -> int:
     if width <= 0 or width % 32 or width > 8192:
         raise ValueError("invalid native artifact width")
     return NATIVE_WIDTH_ROLE_BASE + width
-
-
-def native_width_inventory(intermediate: int, worlds: list[int]) -> list[int]:
-    """Only unequal worlds need additive width-keyed native entry points."""
-    return sorted({width for world in worlds if len(native_widths(intermediate, world)) > 1
-                   for width in native_widths(intermediate, world)}, reverse=True)
 
 
 class NativeArtifact(NamedTuple):
@@ -114,7 +108,7 @@ def native_spark_artifacts(family: str = "v41") -> dict[int, tuple[NativeArtifac
     intermediate = package_entry(family, "mxfp4")["intermediate"]
     result = {}
     for world in package_worlds(family, "mxfp4"):
-        widths = native_widths(intermediate, world)
+        widths = _native_widths(intermediate, world)
         unequal = len(widths) > 1
         result[world] = tuple(NativeArtifact(
             native_width_role(width) if unequal else NATIVE_SPARK_ROLE_IDS[world],
@@ -137,3 +131,22 @@ def native_shard(world: int, rank: int, layer: int, family: str = "v41") -> tupl
     width = unit * (base + (canonical < extra))
     first = unit * (canonical * base + min(canonical, extra))
     return first, next(artifact for artifact in artifacts if artifact.logical == width)
+
+
+def cmake_artifacts() -> str:
+    """Build consumers select the same world artifacts as staging and admission."""
+    lines = ["# Generated from spark_packages.native_spark_artifacts."]
+    for family in ("v41", "dsv4f", "dsv4p"):
+        for world, artifacts in native_spark_artifacts(family).items():
+            names = ";".join(artifact.name for artifact in artifacts)
+            lines.append(f'set(CUTEAFD_NATIVE_ARTIFACTS_{family}_{world} "{names}")')
+    return "\n".join([*lines, ""])
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cmake", type=Path, required=True)
+    args = parser.parse_args()
+    args.cmake.write_text(cmake_artifacts())

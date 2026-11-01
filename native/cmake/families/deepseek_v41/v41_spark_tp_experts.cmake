@@ -21,8 +21,9 @@ set(CUTEAFD_V41_SPARK_TP_SELECTED)
 foreach(tp IN LISTS CUTEAFD_SPARK_TP_ROLES)
   if(tp MATCHES "^tp[2-8]$")
     string(REGEX REPLACE "^tp" "" world "${tp}")
-    math(EXPR unequal "72 % ${world}")
-    if(world EQUAL 4 OR NOT unequal EQUAL 0)
+    set(artifacts_var "CUTEAFD_NATIVE_ARTIFACTS_v41_${world}")
+    set(role "spark_tp${world}")
+    if(NOT role IN_LIST ${artifacts_var})
       continue() # Adjacent-width objects are built by shared/mxfp4_widths.cmake.
     endif()
     if(tp IN_LIST CUTEAFD_V41_SPARK_TP_SELECTED)
@@ -118,6 +119,8 @@ foreach(tp IN LISTS CUTEAFD_V41_SPARK_TP_SELECTED)
       "${CMAKE_CURRENT_SOURCE_DIR}/${wrapper_src}"
       "${width_stamp}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

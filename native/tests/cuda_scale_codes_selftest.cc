@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cuteafd_experts.h"
+#include "cuteafd_mxfp4_layouts.h"
 #include "picojson.h"
 
 namespace {
@@ -169,13 +170,14 @@ void real_expert(const std::filesystem::path& snapshot, const picojson::value& i
   std::copy(down.bytes.begin(), down.bytes.end(), pinned.data + up.bytes.size() + gate.bytes.size());
   require(up.rows % 32 == 0, prefix + ": invalid K32 geometry");
   for (size_t world = 1; world <= 8; ++world) {
-    const size_t units = up.rows / 32, base = units / world, extra = units % world;
+    const size_t unit = cuteafd_mxfp4_ownership_unit(up.rows, world);
+    const size_t units = up.rows / unit, base = units / world, extra = units % world;
     for (size_t layer = 0; layer < world; ++layer) {
      for (size_t rank = 0; rank < world; ++rank) {
       const size_t canonical = extra ? (rank + world - layer) % world : rank;
-      const size_t width = 32 * (base + size_t(canonical < extra));
-      const size_t first = 32 * (canonical * base + std::min(canonical, extra));
-      const size_t stored = width;
+      const size_t width = unit * (base + size_t(canonical < extra));
+      const size_t first = unit * (canonical * base + std::min(canonical, extra));
+      const size_t stored = cuteafd_mxfp4_stored_width(down.rows, width);
       Plane s13(plane_bytes(2 * stored, up.columns));
       Plane s2(plane_bytes(down.rows, width / 32));
       const size_t up_start = first * up.columns;

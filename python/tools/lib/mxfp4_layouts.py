@@ -65,7 +65,11 @@ def header() -> str:
              "  if (!hidden || hidden % 256 || !width || width % 32 || width > 8192) return 0;"]
     for row in layouts()["storage_holds"]:
         lines.append(f"  if (hidden == {row['hidden']} && width == {row['width']}) return {row['stored']};")
-    return "\n".join([*lines, "  return width;", "}", ""])
+    lines += ["  return width;", "}",
+              "static inline uint32_t cuteafd_mxfp4_ownership_unit(uint32_t intermediate, uint32_t world) {"]
+    for row in layouts()["ownership"]:
+        lines.append(f"  if (intermediate == {row['intermediate']} && world == {row['world']}) return {row['unit']};")
+    return "\n".join([*lines, "  return 32;", "}", ""])
 
 
 if __name__ == "__main__":

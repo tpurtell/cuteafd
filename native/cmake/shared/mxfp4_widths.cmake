@@ -1,4 +1,4 @@
-# Unequal native K32 ownership reuses one artifact for each adjacent logical width.
+# Unequal native whole-scale-unit ownership reuses one artifact for each adjacent logical width.
 # Neither rank nor absolute layer is part of the executable key.
 if(NOT CUTEAFD_ENABLE_V41_EXPERT_AOT OR NOT CUTEAFD_V41_EXPERT_ROLE STREQUAL "spark")
   return()
@@ -18,21 +18,15 @@ foreach(request IN LISTS native_width_requests)
   string(REPLACE ":" ";" parts "${request}")
   list(GET parts 0 family)
   list(GET parts 1 world)
-  if(family STREQUAL "v41")
-    set(intermediate 2304)
-  elseif(family STREQUAL "dsv4f")
-    set(intermediate 2048)
-  else()
-    set(intermediate 3072)
+  set(artifacts_var "CUTEAFD_NATIVE_ARTIFACTS_${family}_${world}")
+  if(NOT DEFINED ${artifacts_var})
+    message(FATAL_ERROR "No native Spark artifacts for ${request}")
   endif()
-  math(EXPR units "${intermediate} / 32")
-  math(EXPR remainder "${units} % ${world}")
-  if(remainder EQUAL 0)
-    continue()
-  endif()
-  math(EXPR low "(${units} / ${world}) * 32")
-  math(EXPR high "${low} + 32")
-  list(APPEND native_width_keys "${family}:${low}" "${family}:${high}")
+  foreach(role IN LISTS ${artifacts_var})
+    if(role MATCHES "^spark_w([0-9]+)$")
+      list(APPEND native_width_keys "${family}:${CMAKE_MATCH_1}")
+    endif()
+  endforeach()
 endforeach()
 list(REMOVE_DUPLICATES native_width_keys)
 foreach(key IN LISTS native_width_keys)
@@ -80,6 +74,7 @@ ${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc\"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
       "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

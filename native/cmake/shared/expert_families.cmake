@@ -49,14 +49,9 @@ foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
   set(role "${CMAKE_MATCH_2}")
   if(role MATCHES "^spark_tp([2-8])$")
     set(world "${CMAKE_MATCH_1}")
-    if(family STREQUAL "dsv4f")
-      set(units 64)
-    else()
-      set(units 96)
-    endif()
-    math(EXPR unequal "${units} % ${world}")
-    if(NOT unequal EQUAL 0)
-      continue() # Shared geometry-derived width objects replace a false equal role.
+    set(artifacts_var "CUTEAFD_NATIVE_ARTIFACTS_${family}_${world}")
+    if(NOT role IN_LIST ${artifacts_var})
+      continue() # The shared artifact inventory selects equal or adjacent roles.
     endif()
   endif()
   set(device_handles "")
@@ -118,6 +113,8 @@ ${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41
       "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
       "${stamp}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}

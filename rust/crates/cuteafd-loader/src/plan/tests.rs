@@ -1131,7 +1131,9 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                 else { "v41:mxfp4 (expertd-native)" });
             let packed = |tp: u64| {
                 let (hidden, logical, experts) = (5120u64, 2304 / tp, 384u64);
-                let stored = logical.div_ceil(128) * 128;
+                let stored = if nvfp4 { logical.div_ceil(128) * 128 } else {
+                    cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64
+                };
                 if nvfp4 { experts * (3 * hidden * stored * 9 / 16 + 16) }
                 else {
                     let payloads = hidden * stored + hidden * stored / 2;
@@ -1910,9 +1912,11 @@ fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
         ("mimop:fp8 (MXFP4)", 32, &[2, 6, 7, 8][..]));
-    // The generic recipe advertises logical K32 ownership, not its H128
-    // package's physical extent: ceil(64 / 6) blocks = 352 columns.
-    assert!((report.spark_rank_share - 352.0 / 2048.0).abs() < 1e-12);
+    // Admission charges the widest physical package, independently of ownership.
+    let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
+    let widest = recipe.widths.iter().map(|&logical|
+        cuteafd_core::mxfp4_layouts::generic_stored_width(6144, logical)).max().unwrap();
+    assert!((report.spark_rank_share - widest as f64 / 2048.0).abs() < 1e-12);
 }
 
 #[test]
@@ -2222,9 +2226,10 @@ fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
         assert_eq!(report.experts.as_ref().unwrap().package,
             if v41 { "v41:mxfp4 (expertd-native)" } else { "dsv4f:mxfp4 (expertd-native)" });
         // Independent resident-plane arithmetic, after the single local layer.
-        let (hidden, logical, stored, experts, remote) = if v41 {
-            (5120u64, 576u64, 640u64, 384u64, 39u64)
-        } else { (4096, 512, 512, 256, 3) };
+        let (hidden, logical, experts, remote) = if v41 {
+            (5120u64, 576u64, 384u64, 39u64)
+        } else { (4096, 512, 256, 3) };
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;
         let payload = hidden * stored * 3 / 2;
         let scales = if v41 {
             2 * stored * (1 + 2 * (hidden / 128))

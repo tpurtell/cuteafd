@@ -499,7 +499,10 @@ mod tests {
                     assert!(case <= 1);
                     assert_eq!(after["padded"], false);
                     assert_eq!(before["source_block_columns"], 128);
-                    assert_eq!(after["source_block_columns"], 32);
+                    let intermediate = if case == 0 { 2304 } else { 3072 };
+                    let world = after["sparks"].as_u64().unwrap() as usize;
+                    let unit = cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world);
+                    assert_eq!(after["source_block_columns"], unit);
                     before["source_block_columns"] = after["source_block_columns"].clone();
                     changes += 1;
                 }

@@ -772,7 +772,6 @@ mod tests {
 
     #[test]
     fn spark_residency_uses_the_worker_package_slice_policy() {
-        use crate::formats::fp8_experts::Slicing;
         use crate::placement::families::mimo_v2::expert_layer_bytes;
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
@@ -792,16 +791,26 @@ mod tests {
             items: vec![], kv_tokens: 0,
         }).collect::<Vec<_>>();
         spark_experts(&input, &options, &mut sparks, 0).unwrap();
+        let (hidden, experts, intermediate) = (tensors.shape().hidden as u64,
+            tensors.shape().experts as u64, tensors.shape().intermediate as u64);
+        let mut padding = 0;
         for spark in &sparks {
+            let rank = spark.index as usize;
+            let logical = recipe.width_for_layer(rank, 1).unwrap() as u64;
+            let stored = recipe.stored_width_for_layer(rank, 1).unwrap() as u64;
+            let expected = experts * (3 * hidden * stored / 2 + 2 * stored * hidden / 32
+                + hidden * stored.div_ceil(128) * 4);
+            assert_eq!(spark.used_bytes(), expected, "rank {rank}");
             assert_eq!(spark.used_bytes(), expert_layer_bytes(&tensors.for_layer_metadata(1).unwrap(),
-                6, spark.index as usize, recipe.slicing).unwrap());
+                6, rank, recipe.slicing).unwrap());
+            // Gate/up padding and each down-scale row's independent u32 pitch.
+            padding += experts * (3 * hidden * (stored - logical) / 2
+                + 2 * (stored - logical) * hidden / 32
+                + hidden * (stored.div_ceil(128) * 4 - logical / 32));
         }
         assert!(sparks[0].used_bytes() < sparks[4].used_bytes());
-        // Each down-scale row rounds its K32 group count up to four bytes.
-        let scale_padding = tensors.shape().hidden * tensors.shape().experts
-            * (4 * (12 - 11) + 2 * (12 - 10));
-        assert_eq!(sparks.iter().map(DeviceLayout::used_bytes).sum::<u64>(),
-            expert_layer_bytes(tensors, 1, 0, Slicing::Padded).unwrap() + scale_padding as u64);
+        let full = experts * (3 * hidden * intermediate / 2 + 3 * hidden * intermediate / 32);
+        assert_eq!(sparks.iter().map(DeviceLayout::used_bytes).sum::<u64>(), full + padding);
     }
 
     #[test]

@@ -207,8 +207,12 @@ fn real_1017_coded_scale_plan_file_order_has_bounded_staging_and_no_holes() -> R
 #[test]
 fn native_plane_geometry_keeps_tp4_tp6_mount_admission() -> Result<()> {
     for nvfp4 in [false, true] {
-        for (world, stored) in [(4, 640), (6, 384)] {
-            let planes = NativePlanes::new(5120, 2304 / world, stored, 384, nvfp4)?;
+        for world in [4, 6] {
+            let logical: usize = 2304 / world;
+            let stored = if nvfp4 { logical.div_ceil(128) * 128 } else {
+                cuteafd_core::mxfp4_layouts::stored_width(5120, logical).unwrap()
+            };
+            let planes = NativePlanes::new(5120, logical, stored, 384, nvfp4)?;
             let resident = cuteafd_loader::placement::families::deepseek_v41::resident_bytes(
                 5120, stored as u64, 384, nvfp4)?;
             assert_eq!(planes.bytes as u64, resident);
@@ -232,7 +236,9 @@ fn installed_native_rank_plan_tp4_tp6_rejects_changed_worker_placement() -> Resu
         let mut plans = Vec::new();
         for rank in 0..world {
             let width = geometry.intermediate as usize / world;
-            let stored = width.div_ceil(128) * 128;
+            let stored = if nvfp4 { width.div_ceil(128) * 128 } else {
+                cuteafd_core::mxfp4_layouts::stored_width(geometry.hidden, width).unwrap()
+            };
             let slice = SparkSlice { unit_map: None, layer: 0, first: (rank * width) as u32,
                 width: width as u32, stored_width: stored as u32, tiers: vec![], projection_counts: vec![] };
             let resident = NativePlanes::with_scale_codes(geometry.hidden, width, stored,
