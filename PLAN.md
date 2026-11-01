@@ -6225,3 +6225,63 @@ The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
 Do not replay publication against the deliberately retired standalone paths.
 Full-model generation/serving qualification and K6 engine shape support remain
 separate work; this task branch is pushed for review, not merged.
+
+## Step-5 Preview EXL3 K4 / Core K6 release (2026-11-01)
+
+Completed and published:
+https://huggingface.co/wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6
+Revision `83d47a384eabc07ea6fcfaac4779b0e5f013ce89`. Source: Step-5-Preview-BF16 at
+`7734b7ffac118d70d8398bfa3eb0fab007eb45b1`.
+
+The release has 96 shards, 375,913 tensors and 315,357,147,520 indexed
+payload bytes (293.699 GiB). All 93,600 transformed matrices were rebuilt
+from layer 0 with the corrected K128 FP32 XTX accumulator; no predecessor
+lineage or earlier-accumulator matrices remain. GPTQModel main/pin is
+`25dd11c391ce6bf3ceadf8722e8274c3cde7079a`. Sigma=.025, seed=787,
+native FP32 residual/BF16 boundaries and serialized reconstruction are
+unchanged. Calibration is the pinned public panel: 1,426 prompts,
+1,105,269 native tokens, with exact native tokenizer backend preservation.
+
+Target core and main head are K6 (645 matrices); routed experts are K4
+on layers 3–87 (89,760) and K6 on layers 88–90 (3,168). All three MTP
+cores and stage-local heads are K4 (27). The 1,513 native tensors,
+including all 667 vision tensors, both licenses and tokenizer assets are
+preserved byte-for-byte. MTP consumes the raw final target residual with
+successive token/absolute-position shifts, independently checked against
+pinned vLLM source and the bounded native/serialized pilot.
+
+Baseline 217 CPU checks passed in the matching SM120 image. Subsequent
+launcher/handoff fixes pass 27 targeted recovery cases. The 324.35-second
+GPU pilot passed 105 format rows and all six native checks, including an
+actual seven-projection production-layer transaction and byte-exact replay
+from its assembled shard. Independent final managed audit passes all
+headers, layouts/scales, fixed origins, native source bytes, metadata,
+index, diagnostics and publication/import manifests. Its 96 imported
+weight hashes match archived assembly receipts; producer/publisher/import
+checks cover full trellis hashes. No full-model serving/quality claim.
+Engine integration/qualification remains separate (#792, #911).
+
+SparkNest adopted 205 release files with --no-copy (0 copied bytes), then
+placed exactly one managed copy of every file on the six RDMA Sparks:
+ostrich 19 weight shards; dodo, emu and kiwi 15 each; rhea and moa 16 each.
+Weights total about 48.3–49.6 GiB per host. Managed snapshot:
+`/mnt/sparknest/hf-home/hub/models--wrldsuksgo2mars--Step-5-Preview-EXL3-K4-Core-K6/snapshots/83d47a384eabc07ea6fcfaac4779b0e5f013ce89`.
+HF refs/main matches this revision. No off-grid target copy remains.
+
+Standalone export, alternate HF cache leaf, reflink import staging,
+rolling activations and packed recovery weights are removed. Obsolete
+pilot tensor payloads are retired; calibration tokens, code, logs, scalar
+metrics and audit receipts remain. Original source and shared caches were
+untouched. All task services are stopped/disabled and GPU leases released.
+The final CPU-only unit was step5-core-k6-1793519523192738670 (exit 0).
+Do not restart the completed or superseded producers.
+
+Run receipts: `~/.cache/cuteafd/quantization/step5-k4-core-k6/production/`.
+Independent audit: `~/.cache/cuteafd/builds/step5-quant-export/final-managed-audit.json`.
+Placement/cleanup audits: `~/.cache/cuteafd/builds/step5-core-k6/final-*-audit.json`
+and `final-obsolete-payload-retirement.json`. Recipe/final tensor size table:
+`~/step5-core-quant.md`. Implementation: `quantization/step5/core_k6/`.
+The replay-safe handoff tolerates the exact SparkNest mirror notice and
+new+skipped import counts, retaining strict success, zero-copy, complete
+inventory and managed checksum checks. Launcher retries are two minutes
+apart for brief coordinator outages; numerical producer source is sealed.
