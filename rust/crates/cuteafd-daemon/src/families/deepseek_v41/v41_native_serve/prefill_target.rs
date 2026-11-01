@@ -266,6 +266,7 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 
     fn execute(&mut self, cursor: &mut Self::Cursor, unit: &PrefillUnit<V41Unit>) -> Result<Option<RetainedScores>> {
+        super::scheduler::stall::tick();
         use crate::families::deepseek_v41::v41_backbone_cache::CacheWork;
         self.initialize(cursor)?;
         match (&unit.work, &mut cursor.state) {
