@@ -297,6 +297,29 @@ def test_attention_plan_rows_rejects_invalid_launcher_values(tmp_path: Path, val
     assert "ATTENTION_PLAN_ROWS must be auto or a positive integer" in result.stderr
 
 
+_V41_CONCURRENCY_KEYS = ("MODEL_REVISION=\nSPECULATOR=off\nVISION=off\nRTX_GPUS=1\n"
+                         "RTX_EXPERT_LAYERS=0\nSPARK_COUNT=2\nSPARK_1_HOST=h1\n"
+                         "SPARK_1_LANE_A=10.0.0.2\nADDR=0.0.0.0:18000\nCONCURRENCY=8\n")
+
+
+def test_decode_share_reaches_the_coordinator(tmp_path: Path) -> None:
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},
+                                   "deepseek-ai/DeepSeek-V4.1-Flash",
+                                   _V41_CONCURRENCY_KEYS + "DECODE_SHARE=0.2\n")
+    assert result.returncode == 0, result.stderr
+    launches = [line for line in result.stderr.splitlines() if "docker run -d" in line]
+    assert any("--decode-share 0.2" in line for line in launches)
+
+
+def test_v41_mix_keys_are_retired(tmp_path: Path) -> None:
+    for index, key in enumerate(["V41_MIX", "V41_MIX_ROUNDS"]):
+        result = _family_launch_result(tmp_path / str(index), {"model_type": "deepseek_v41"},
+                                       "deepseek-ai/DeepSeek-V4.1-Flash",
+                                       _V41_CONCURRENCY_KEYS + f"{key}=unit\n")
+        assert result.returncode != 0, f"{key} was accepted"
+        assert f"unknown configuration key: {key}" in result.stderr
+
+
 @pytest.mark.parametrize("value", [None, "on", "off"])
 def test_thermal_report_key_defaults_on_and_reaches_the_coordinator(tmp_path: Path, value) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "mimo_v2_flash", "num_hidden_layers": 2,
