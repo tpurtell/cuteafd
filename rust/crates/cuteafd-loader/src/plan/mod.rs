@@ -62,23 +62,18 @@ pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, Plan
 
 fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value) -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
-    let muse = config["model_type"] == "muse_spark";
-    if muse && config.get("audio_config").is_none_or(serde_json::Value::is_null) {
-        return if mode == MediaMode::Auto { Ok(MediaMode::Off) } else {
-            Err(PlanError::InvalidOption { option: "audio placement", reason: "checkpoint has no bundled Muse audio tower".into() })
-        };
-    }
-    let validation = if muse {
-        crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ())
-    } else {
-        crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
-            crate::media::audio_tower::AudioStorage::Fp32).map(|_| ())
+    use crate::media::AudioTowerKind;
+    let invalid = |reason| PlanError::InvalidOption { option: "audio placement", reason };
+    let Some(kind) = AudioTowerKind::from_config(config).map_err(invalid)? else {
+        return if mode == MediaMode::Auto { Ok(MediaMode::Off) }
+            else { Err(invalid("checkpoint has no bundled audio tower".into())) };
     };
-    match validation {
-        Ok(_) => Ok(mode),
-        Err(_) if mode == MediaMode::Auto && !muse => Ok(MediaMode::Off),
-        Err(error) => Err(PlanError::InvalidOption { option: "audio placement", reason: error.to_string() }),
-    }
+    match kind {
+        AudioTowerKind::MusePcm => crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ()),
+        AudioTowerKind::MimoRvq => crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+            crate::media::audio_tower::AudioStorage::Fp32).map(|_| ()),
+    }.map_err(|error| invalid(format!("declared {kind:?} audio tower: {error}")))?;
+    Ok(mode)
 }
 
 const GIB: f64 = (1u64 << 30) as f64;

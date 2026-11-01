@@ -1964,6 +1964,29 @@ fn audio_defaults_off_without_qualified_bundle_and_explicit_placement_refuses() 
 }
 
 #[test]
+fn declared_audio_kind_is_checkpoint_native_and_invalid_towers_never_disable_auto() {
+    use crate::media::AudioTowerKind;
+    let cases = [
+        (json!({"model_type":"muse_spark", "audio_config":{"model_type":"muse_spark_audio"}}),
+            Some(AudioTowerKind::MusePcm), "MusePcm"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"audio_channels":20}}),
+            Some(AudioTowerKind::MimoRvq), "MimoRvq"),
+        (json!({"model_type":"mimo_v2", "audio_config":{"model_type":"unknown_audio"}}),
+            None, "unknown_audio"),
+        (json!({"model_type":"qwen4_exp", "audio_config":{}}), None, "qwen4_exp"),
+    ];
+    for (config, kind, named) in cases {
+        let declared = AudioTowerKind::from_config(&config);
+        if let Some(kind) = kind { assert_eq!(declared.unwrap(), Some(kind)); }
+        else { assert!(declared.unwrap_err().contains(named)); }
+        let dir = snapshot(config, &[]);
+        let error = resolve_audio(MediaMode::Auto, dir.path()).unwrap_err().to_string();
+        assert!(error.contains(named), "{error}");
+        assert_eq!(resolve_audio(MediaMode::Off, dir.path()).unwrap(), MediaMode::Off);
+    }
+}
+
+#[test]
 #[ignore = "slow tier: scans mounted multimodal checkpoint inventories (>60s); cpu-gate --slow"]
 fn mounted_mimo_audio_inventory_is_independently_admitted() {
     use encoder::EncoderKind;

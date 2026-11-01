@@ -461,7 +461,8 @@ def test_kimi_delegates_unservable_counts_to_planner(tmp_path, ranks):
 
 # --- Muse Spark (#923) -----------------------------------------------------------
 
-MUSE = {"model_type": "muse_spark", "vision_config": {"depth": 2}, "audio_config": {},
+MUSE = {"model_type": "muse_spark", "vision_config": {"depth": 2},
+        "audio_config": {"model_type": "muse_spark_audio"},
         "text_config": {"model_type": "muse_spark_text", "num_hidden_layers": 62,
                         "mlp_layer_types": ["sparse"] * 62}}
 MUSE_ID = "meta-models/Muse-Spark-Open-816B-A42B"
@@ -470,7 +471,9 @@ MUSE_ID = "meta-models/Muse-Spark-Open-816B-A42B"
 def _muse(tmp_path: Path, keys: str = "", *, wip: bool = True, **kwargs):
     return _family_launch_result(tmp_path, MUSE, MUSE_ID, "SPARK_COUNT=6\nRTX_GPUS=2\n" + _hosts(6) + keys,
                                  extra_args=("--wip", "muse") if wip else (),
-                                 encoder_plan=kwargs.pop("encoder_plan", PLANNED), **kwargs)
+                                 encoder_plan=kwargs.pop("encoder_plan", {**PLANNED, "spark_ranks": 6,
+                                     "encoder_plan_hash": "ab" * 32, "encoder": None,
+                                     "audio_encoder": {"kind": {"kind": "off"}, "replicas": []}}), **kwargs)
 
 
 def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> None:
@@ -482,17 +485,42 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert (_flag(serve, "--device"), _flag(serve, "--split-device")) == ("0", "1")
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert _flag(serve, "--prefix-cache-entries") == "20"
-    for absent in ("--max-context", "--pool-tokens", "--vision", "--audio", "--draft", "--mtp", "--kv-cache",
+    assert _flag(serve, "--vision") == _flag(serve, "--audio") == "off"
+    for absent in ("--max-context", "--pool-tokens", "--draft", "--mtp", "--kv-cache",
                    "--prefill-packing", "--expert-partial-bf16-max-rows", "--expert-partial-wide-format"):
         assert absent not in serve.split(), absent
     workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
     assert len(workers) == 6 and all("--world 6 " in worker for worker in workers)
     plan = _line(result, "cuteafd plan")
     assert _flag(plan, "--speculator") == "off" and "--drafter-snapshot" not in plan.split()
-    assert "--vision off --audio off" in plan
+    assert "--vision auto --audio auto" in plan
     lines = result.stderr.splitlines()
     probe = next(i for i, line in enumerate(lines) if "dst=/opt/cuteafd-serve-probe" in line)
     assert lines[probe].endswith("serve-muse --help ")
+
+
+@pytest.mark.parametrize("vision,audio", [("spark", "spark"), ("rtx", "spark"), ("off", "spark"), ("spark", "rtx")])
+def test_muse_generic_media_plan_handoff(tmp_path: Path, vision: str, audio: str) -> None:
+    def placed(kind, index):
+        return {"kind": {"kind": kind, **({"rank": index} if kind == "spark" else {"gpu": index})}, "replicas": []}
+    plan = {**PLANNED, "spark_ranks": 6, "encoder_plan_hash": "ab" * 32,
+            "encoder": None if vision == "off" else placed(vision, 0),
+            "audio_encoder": placed(audio, 1)}
+    result = _muse(tmp_path, f"VISION={'off' if vision == 'off' else 'auto'}\nAUDIO=auto\n", encoder_plan=plan)
+    serve = _line(result, "cuteafd serve-muse --snapshot")
+    assert _flag(serve, "--vision") == ("off" if vision == "off" else f"{vision}:0")
+    assert _flag(serve, "--audio") == f"{audio}:1"
+    if vision == "spark":
+        assert _flag(serve, "--vision-peers") == "10.0.0.1:19442"
+        assert _flag(serve, "--encoder-plan-hash") == "ab" * 32
+        assert _flag(serve, "--encoder-revision") == "abc"
+    if audio == "spark":
+        assert _flag(serve, "--audio-peers") == "10.0.0.2:19443"
+        assert _flag(serve, "--audio-encoder-plan-hash") == "ab" * 32
+        assert _flag(serve, "--audio-encoder-revision") == "abc"
+    workers = [line for line in result.stderr.splitlines() if "cuteafd expertd-native" in line]
+    assert sum("--encoder " in worker for worker in workers) == (vision == "spark")
+    assert sum("--audio-encoder " in worker for worker in workers) == (audio == "spark")
 
 
 def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
@@ -533,7 +561,6 @@ def test_muse_dflash2_resolves_one_snapshot_for_plan_and_serve(tmp_path: Path, d
 
 @pytest.mark.parametrize("keys,diagnostic", [
     ("ATTENTION_PLACEMENT=layers\n", "supports only ATTENTION_PLACEMENT=auto"),
-    ("VISION=rtx\n", "bundled media execution is not qualified"),
     ("SPECULATOR=mtp\n", "SPECULATOR=mtp does not apply to muse_spark"),
     ("PREFILL_PACKING=unrestricted\n", "Muse Spark has no packed prefill yet (#923)"),
     ("RTX_EXPERT_LAYERS=max\n", "Muse Spark RTX_EXPERT_LAYERS is auto or a fixed routed-layer count"),

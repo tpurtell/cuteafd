@@ -3782,20 +3782,20 @@ def test_mimo_audio_auto_without_admitted_owner_serves_text(tmp_path, tower, rea
     assert ("audio auto disabled" in result.stderr) == tower
 
 
-@pytest.mark.parametrize("model_type,width,tower,want", [
-    ("mimo_v2", 4096, True, "auto"), ("mimo_v2", 6144, True, "auto"),
-    ("mimo_v2", 4096, False, "off"), ("mimo_v2", 128, True, "off"),
-    ("deepseek_v41", 4096, True, "off"), ("qwen4_exp", 4096, True, "off"),
-    ("glm5_next", 4096, True, "off"), ("deepseek_v4", 4096, True, "off"),
+@pytest.mark.parametrize("declaration,want", [
+    ({"model_type": "mimo_v2", "audio_config": {"audio_channels": 20}}, "auto"),
+    ({"model_type": "muse_spark", "audio_config": {"model_type": "muse_spark_audio"}}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": {"model_type": "unknown_audio"}}, "auto"),
+    ({"model_type": "qwen4_exp", "audio_config": {}}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": "invalid"}, "auto"),
+    ({"model_type": "mimo_v2", "audio_config": None}, "off"),
+    ({"model_type": "mimo_v2"}, "off"),
 ])
-def test_release_audio_default_resolves_per_snapshot(tmp_path, model_type, width, tower, want):
+def test_release_audio_default_resolves_per_snapshot(tmp_path, declaration, want):
     snapshot = tmp_path / "snapshot"
     snapshot.mkdir()
-    (snapshot / "config.json").write_text(json.dumps({"model_type": model_type, "hidden_size": width, "audio_config": {"audio_channels": 20}}))
-    if tower:
-        (snapshot / "audio_tokenizer").mkdir()
-        (snapshot / "audio_tokenizer/config.json").write_text("{}")
-        (snapshot / "audio_tokenizer/model.safetensors").write_bytes(b"stub")
+    (snapshot / "config.json").write_text(json.dumps(declaration))
+    # The shell preserves declarations; the planner validates types, geometry and headers.
     config = tmp_path / "release.config"
     config.write_text("SPARK_COUNT=4\n" + "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i+1}\nSPARK_{i}_LANE_B=10.0.1.{i+1}\n" for i in range(4)))
     script = f'source "{ROOT}/scripts/lib/release-common.sh"; release_load_config "$1"; test "$AUDIO" = auto; release_resolve_audio_mode "$AUDIO" "$2"'

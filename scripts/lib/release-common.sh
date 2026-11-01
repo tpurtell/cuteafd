@@ -1030,21 +1030,15 @@ except (OSError, ValueError, KeyError, TypeError):
 ' "$index" "$state" "$kda" "$geometry" >/dev/null 2>&1
 }
 
-# Header-only eligibility; the Rust planner validates the complete tower contract.
+# Absence alone disables auto. The planner maps the checkpoint's declared tower
+# kind and refuses unsupported config, headers or geometry rather than hiding it.
 release_resolve_audio_mode() {
   local mode="$1" snapshot="$2"
   [[ "$mode" == auto ]] || { printf '%s' "$mode"; return; }
-  python3 - "$snapshot" <<'PY'
+  python3 -I - "$snapshot" <<'PY'
 import json, pathlib, sys
-p = pathlib.Path(sys.argv[1])
-try:
-    c = json.loads((p / "config.json").read_text())
-    qualified = (c.get("model_type") == "mimo_v2" and c.get("hidden_size") in (4096, 6144)
-                 and bool(c.get("audio_config")) and (p / "audio_tokenizer/config.json").is_file()
-                 and (p / "audio_tokenizer/model.safetensors").is_file())
-except (OSError, ValueError):
-    qualified = False
-print("auto" if qualified else "off")
+c = json.loads((pathlib.Path(sys.argv[1]) / "config.json").read_text())
+print("auto" if c.get("audio_config") is not None else "off")
 PY
 }
 

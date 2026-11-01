@@ -121,9 +121,12 @@ pub enum BundledAudioSpec {
 impl BundledAudioSpec {
     pub fn from_snapshot(snapshot: &Path, max_samples: usize) -> Result<Self> {
         let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
-        if config["model_type"] == "muse_spark" {
-            Ok(Self::Pcm(super::pcm_audio::PcmTowerSpec::from_snapshot(snapshot, max_samples)?))
-        } else { Ok(Self::Mimo(AudioTowerSpec::from_snapshot(snapshot, max_samples)?)) }
+        use cuteafd_loader::media::AudioTowerKind;
+        match AudioTowerKind::from_config(&config).map_err(VisionError::Unsupported)? {
+            Some(AudioTowerKind::MusePcm) => Ok(Self::Pcm(super::pcm_audio::PcmTowerSpec::from_snapshot(snapshot, max_samples)?)),
+            Some(AudioTowerKind::MimoRvq) => Ok(Self::Mimo(AudioTowerSpec::from_snapshot(snapshot, max_samples)?)),
+            None => Err(VisionError::Unsupported("checkpoint has no bundled audio tower".into())),
+        }
     }
     pub fn required_bytes(&self, library: &Path) -> Result<u64> {
         match self { Self::Mimo(spec) => Ok(NativeAudio::required(library, spec.native())?.total_bytes()?),

@@ -9,6 +9,23 @@ pub mod muse_vision;
 mod resize;
 mod spans;
 
+/// Bundled audio execution selected by the checkpoint's declaration, not its LM family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioTowerKind { MimoRvq, MusePcm }
+impl AudioTowerKind {
+    pub fn from_config(config: &serde_json::Value) -> std::result::Result<Option<Self>, String> {
+        let Some(audio) = config.get("audio_config").filter(|value| !value.is_null()) else { return Ok(None) };
+        if !audio.is_object() { return Err("audio_config must be an object".into()); }
+        match audio.get("model_type") {
+            Some(kind) if kind == "muse_spark_audio" => Ok(Some(Self::MusePcm)),
+            Some(kind) => Err(format!("unsupported bundled audio_config.model_type {kind}; add a tower exporter/kernel")),
+            None if config["model_type"] == "mimo_v2" => Ok(Some(Self::MimoRvq)),
+            None => Err(format!("unsupported bundled audio_config without model_type for root {}; add a tower exporter/kernel",
+                config["model_type"])),
+        }
+    }
+}
+
 pub use cuteafd_core::{ImageKey, MediaSpan};
 pub use decode::{decode, decode_bounded, AlphaPolicy, DecodePolicy};
 use serde::{Deserialize, Serialize};
