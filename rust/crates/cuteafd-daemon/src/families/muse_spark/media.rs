@@ -202,6 +202,21 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn every_admitted_image_extent_has_exact_feature_and_marker_spans() -> Result<()> {
+        let binding = binding();
+        let key = cuteafd_core::ImageKey([3; 32]).into();
+        for count in 1..=4096 {
+            let (tokens, spans) = binding.expand(&[1, 7, 2], &[(TowerKind::Image, count, key)], 32, 4100)?;
+            assert_eq!(tokens.len(), count + 4);
+            assert_eq!(spans, [MediaSpan { start: 2, len: count, key }]);
+            assert_eq!(tokens[1], 8);
+            assert!(tokens[2..2 + count].iter().all(|&id| id == 7));
+            assert_eq!(&tokens[2 + count..], &[9, 2]);
+            binding.coordinates(&tokens, &RequestMedia::new(spans, 8, tokens.len())?)?;
+        }
+        Ok(())
+    }
+    #[test]
     fn malformed_media_is_rejected_before_allocation() {
         let input = [(TowerKind::Image, 4, cuteafd_core::ImageKey([0; 32]).into())];
         for tokens in [&[13][..], &[7, 7], &[8, 7, 9], &[32], &[]] {

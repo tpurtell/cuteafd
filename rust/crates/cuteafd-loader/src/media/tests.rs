@@ -139,6 +139,49 @@ fn glm_reads_standard_nested_image_processor_without_video_parameters() {
     }
 }
 #[test]
+fn muse_processor_reads_native_config_and_temporal_raster_patches() {
+    let dir = tempfile::tempdir().unwrap();
+    let document = serde_json::json!({"image_processor": {
+        "patch_size":14, "merge_size":2, "temporal_patch_size":2,
+        "max_image_tokens":4096, "resample":1, "image_mean":[0.5,0.5,0.5],
+        "image_std":[0.5,0.5,0.5], "do_rescale":true, "rescale_factor":1.0/255.0
+    }});
+    std::fs::write(dir.path().join("processor_config.json"), serde_json::to_vec(&document).unwrap()).unwrap();
+    let config = ProcessorConfig::from_snapshot(dir.path(), ImageFamily::Muse).unwrap();
+    assert_eq!(config.resample, Resample::Lanczos);
+    assert_eq!(config.resize_shape(55, 55).unwrap(), (28, 28));
+    assert_eq!(config.resize_shape(57, 57).unwrap(), (84, 84));
+    assert_eq!(config.resize_shape(100, 100).unwrap(), (112, 112));
+    let image = config.prepare_rgb(rgb(84, 56), EncoderId([0; 32])).unwrap();
+    assert_eq!((image.grid.h, image.grid.w, image.tokens), (4, 6, 6));
+    let patches = image.patches(&config).unwrap();
+    for row in 0..4usize {
+        for column in 0..6usize {
+            for temporal in 0..2 {
+                for channel in 0..3 {
+                    for py in 0..14 {
+                        for px in 0..14 {
+                            let input = image.rgb8[(((row*14+py)*84+column*14+px)*3)+channel];
+                            let value = (f64::from(input) / 255.0) as f32;
+                            let at = (((row*6+column)*2+temporal)*3+channel)*196+py*14+px;
+                            assert_eq!(patches[at], (value-0.5)/0.5);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(config.with_detail(true).effective_max(), 256);
+    // Match the official fallback geometry, but reject its unsupported output
+    // before resize or encoder allocation for pathological aspect ratios.
+    assert!(config.prepare_rgb(rgb(1_000_000, 1), EncoderId([0; 32])).is_err());
+    let mut bad = document;
+    bad["image_processor"]["do_rescale"] = serde_json::json!(false);
+    std::fs::write(dir.path().join("processor_config.json"), serde_json::to_vec(&bad).unwrap()).unwrap();
+    assert!(ProcessorConfig::from_snapshot(dir.path(), ImageFamily::Muse).is_err());
+}
+
+#[test]
 fn span_expansion_rejects_literal_markers_and_preserves_native_ids() {
     let config = serde_json::json!({"image_token_id":12,"vision_start_token_id":11,"vision_end_token_id":13});
     let expander = SpanExpander::from_config(&config, 100).unwrap();
