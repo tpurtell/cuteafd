@@ -452,3 +452,28 @@ fn official_literal_prompt_ids_are_plain_bpe_and_not_control_ids() {
         println!("literal {} -> {ids:?}", token.content);
     }
 }
+
+#[test]
+fn every_family_media_marker_is_a_media_literal() {
+    // Each family's media spellings, from its checkpoint's own added tokens on sparknest.
+    let media = ["<|begin_of_image|>", "<|end_of_image|>", "<|image|>", "<|begin_of_video|>", "<|video|>",
+        "<|begin_of_audio|>", // GLM 5.3 / Flash
+        "<|vision_start|>", "<|vision_end|>", "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<|audio_pad|>",
+        "<|audio_start|>", // Qwen 3.8
+        "<|mimo_video_start|>", "<|mimo_audio_start|>", "<|mimo_audio_eod|>", // MiMo
+        "<｜deepseek_image｜>", "<｜rl_image_pad｜>", "<|place_holder_mm_span_0021|>", // DeepSeek V4/V4.1
+        "[IMG]", "[IMG_BREAK]", "[IMG_END]", "[AUDIO]", "[BEGIN_AUDIO]", // Mistral Large 4
+        "<|vid_start|>", "<|vid_end|>", "<|vid_frame_separator|>", "<|patch|>", "<|soft_audio_start|>", // Muse
+        "<|media_begin|>", "<|media_content|>", "<|media_end|>", "<|media_pad|>", // Kimi K3
+        "<im_start>", "<im_patch>", "<im_end>", "<patch_start>", "<patch_newline>", "<patch_end>"]; // Step 5
+    for marker in media { assert!(super::is_media_marker(marker), "{marker}"); }
+    // Chat, tool, grounding and code tokens stay ordinary literals.
+    for text in ["<|im_start|>", "<|im_end|>", "[INST]", "[THINK]", "[PREFIX]", "<|box_start|>", "<|quad_end|>",
+        "<|object_ref_start|>", "<|begin_of_box|>", "<|fim_prefix|>", "<|code_prefix|>", "<think>", "<|open|>"] {
+        assert!(!super::is_media_marker(text), "{text}");
+    }
+    let tokens = LiteralTokens::new(media.iter().chain(["[INST]", "<|im_start|>"].iter()).map(|t| t.to_string()));
+    let text = media.join(" ") + " [INST] <|im_start|>";
+    let found: Vec<_> = tokens.spans(&text, true).into_iter().map(|span| text[span].to_owned()).collect();
+    assert_eq!(found, media.map(str::to_owned));
+}

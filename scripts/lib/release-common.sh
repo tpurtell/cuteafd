@@ -8,6 +8,26 @@ release_die() {
   exit 2
 }
 
+# Resolve on the host that will run Docker. Mount the whole hub so snapshot
+# files' ../../blobs links and companion repositories remain visible.
+release_hub_mounts() {
+  local namespace="$1" site="$2" hf="$3" relative="$4" hub
+  RELEASE_HUB_SNAPSHOT="$(readlink -f "$hf/$relative")" || release_die "missing snapshot: $hf/$relative"
+  [[ -d "$RELEASE_HUB_SNAPSHOT" ]] || release_die "missing snapshot: $hf/$relative"
+  if find "$RELEASE_HUB_SNAPSHOT" -xtype l -print -quit | grep -q .; then
+    release_die "model snapshot has dangling links: $hf/$relative"
+  fi
+  if ((site)); then
+    hub="$(readlink -f "$hf/hub")"
+    [[ -d "$hub" ]] || release_die "missing hub: $hf/hub"
+    RELEASE_HUB_MOUNTS=(-v "$hub:$hub:ro")
+    [[ "$hf/hub" == "$hub" ]] || RELEASE_HUB_MOUNTS+=(-v "$hub:$hf/hub:ro")
+  else
+    [[ -d "$namespace/hf-home" ]] || release_die "missing namespace hub: $namespace/hf-home"
+    RELEASE_HUB_MOUNTS=(-v "$namespace:$namespace:ro")
+  fi
+}
+
 # CUDA and NVML can enumerate cards differently. UUID is the only join key;
 # querying the driver here creates no context or device allocation.
 release_cuda_total_bytes() {

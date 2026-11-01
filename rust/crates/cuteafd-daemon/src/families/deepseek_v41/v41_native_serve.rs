@@ -902,6 +902,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
     };
     probe.row(from, &first.logits()?);
     for step in plan.steps(from, tokens.len()) {
+        scheduler::stall::tick();
         ensure!(!job.events.is_closed(), "client disconnected");
         let chunk = &tokens[step.clone()];
         let selected = plan.head_rows(probe, &step)?;
@@ -939,6 +940,7 @@ fn score<'a, P: PrefillTarget<'a>, C: DraftChain<'a>>(lib: &'a NativeLibrary, ru
         if plan.path == crate::shared::probe::ScorePath::Prefill {
             probe.scored_prefill_chunk(step.start + 1, chunk.len());
         }
+        scheduler::stall::tick();
     }
     let _ = job.events.send(Ok(InferenceChunk::Finish { finish_reason: InferenceFinishReason::Length }));
     Err(ScoringDone.into())

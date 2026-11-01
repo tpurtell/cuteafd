@@ -1210,3 +1210,20 @@ fn a_reset_with_waves_outstanding_cancels_without_poisoning_health() {
     assert!(format!("{error:#}").contains("waves outstanding"), "{error:#}");
     assert_eq!((cancelled.load(Ordering::SeqCst), abandoned.load(Ordering::SeqCst)), (0, 1));
 }
+
+/// W48-12: a link whose ranks all land in device memory has no pull
+/// descriptor block (base 0). A failed wave must still release its waiters
+/// without touching descriptors (p10.4.2 wrote through a null pointer here:
+/// SIGSEGV in `spark-exchange` when a parked prefill's client disconnected).
+#[test]
+fn fail_without_a_descriptor_block_writes_no_descriptor() {
+    let slots = 128;
+    let (mut native, _control, _pulls) = ring_backend(Ring::new(2, 2, 4, 16), slots);
+    native.pulls = Pulls { base: 0 };
+    native.landing = 0b11;
+    Pulls { base: 0 }.clear(slots);
+    Backend::fail(&mut native, 7);
+    for rank in 0..2 {
+        assert!(reached(native.words.load(Counter::Arrived(rank)), 7), "rank {rank} not released");
+    }
+}

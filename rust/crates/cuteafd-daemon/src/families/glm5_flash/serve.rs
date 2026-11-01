@@ -966,14 +966,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
-                        let tokens = match probe::prompt_ids(&job.probe,
-                            || Ok(job.encode_prompt(&tokenizer)?)) {
-                            Ok(tokens) => tokens,
-                            Err(error) => {
-                                let _ = job.events.send(Err(NativeFailure::BadRequest(format!("prompt tokenization: {error:#}"))));
-                                continue;
-                            }
-                        };
+                        let Some(tokens) = crate::shared::api::admission_result(&job.events,
+                            probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))) else { continue; };
                         let events = job.events.clone();
                         let (prompt, mut request_media, jobs) = match super::media::prepare(job, tokens, &config,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
@@ -1008,10 +1002,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let reject = |ready: &MediaReady<super::media::Prompt>, message: String| {
                 let _ = ready.job().job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            let constraint = match ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
-                Ok(constraint) => constraint,
-                Err(error) => { reject(&ready, format!("{error:#}")); continue; }
-            };
+            let Some(constraint) = crate::shared::api::admission_result(&ready.job().job.events,
+                ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose()) else { continue; };
             if let Some(probe) = &ready.job().job.probe {
                 if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), engine.prefill_capacity(), DECODE_ROWS) {
                     probe.fail(format!("cold replay: {error:#}"));
