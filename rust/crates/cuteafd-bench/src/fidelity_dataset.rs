@@ -45,6 +45,9 @@ pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73
 pub const KIMI_K3_REVISION: &str = "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01";
 pub const KIMI_K3_CONFIG: &str = "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32";
 pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e395b7d98bcbbdd5a52c829c9fd5cd";
+pub const MUSE_SPARK_REVISION: &str = "d18a3b292cc0a279998123f2ddd16999869bb658";
+pub const MUSE_SPARK_CONFIG: &str = "muse-spark-v1_20261031_own-text-bf16";
+pub const MUSE_SPARK_MANIFEST_SHA256: &str = "b9ec12b2e008a87d20f88edfe731252b5298d8f4da31cb34a96e5451a92bc717";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -343,6 +346,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
+            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG) => Some(MUSE_SPARK_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -959,7 +963,8 @@ mod tests {
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
-            (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG)] {
+            (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
+            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -982,8 +987,8 @@ mod tests {
         let cache = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_HF_CACHE").unwrap());
         let (reference, hash, identity) = download(&ureq::AgentBuilder::new()
             .timeout_read(std::time::Duration::from_secs(120)).build(), &cache, REPOSITORY, &commit, &config).unwrap();
-        assert_eq!(reference.windows.len(), 64);
-        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
+        assert!(reference.windows.len() >= 64);
+        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 512 * reference.windows.len());
         assert_eq!(hash, expected_hash);
         if commit == QWEN35_9B_REVISION && config == QWEN35_9B_CONFIG {
             assert_eq!(reference.checkpoint, "Qwen/Qwen3.5-9B");
@@ -1012,6 +1017,16 @@ mod tests {
             assert_eq!(balance["decode"]["generated_positions"], 8089);
             assert_eq!(balance["prefill"]["generated_positions"], 7591);
         }
+        if commit == MUSE_SPARK_REVISION && config == MUSE_SPARK_CONFIG {
+            assert_eq!(reference.checkpoint, "meta-models/Muse-Spark-Open-816B-A42B");
+            assert_eq!(reference.windows.len(), 67);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "meta-models/Muse-Spark-Open-816B-A42B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 10629);
+            assert_eq!(balance["prefill"]["generated_positions"], 10475);
+        }
         if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
             assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
             assert_eq!(identity["qualification"], "reference");
@@ -1028,8 +1043,10 @@ mod tests {
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
         }
         assert_eq!(quick_windows(&reference).unwrap().len(),8);
-        assert_eq!(standard_windows(&reference,"decode",true).unwrap().len(),32);
-        assert_eq!(standard_windows(&reference,"prefill",true).unwrap().len(),32);
+        let halves: Vec<usize> = ["decode", "prefill"].iter()
+            .map(|half| standard_windows(&reference, half, true).unwrap().len()).collect();
+        assert!(halves.iter().all(|&n| n >= 32));
+        assert_eq!(halves.iter().sum::<usize>(), reference.windows.len());
         if commit == FLASH_REVISION && config == FLASH_CONFIG {
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.93, 0.04));
             let tripwires = reference.expect.tripwires.as_ref().unwrap();

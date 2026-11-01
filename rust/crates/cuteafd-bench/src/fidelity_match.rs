@@ -23,6 +23,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "Qwen/Qwen3.5-9B", siblings: &["Qwen/Qwen3.5-9B"], revision: dataset::QWEN35_9B_REVISION, config: dataset::QWEN35_9B_CONFIG },
     Publication { root: "Qwen/Qwen3.8-27B", siblings: &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"], revision: dataset::QWEN38_27B_REVISION, config: dataset::QWEN38_27B_CONFIG },
     Publication { root: "moonshotai/Kimi-K3", siblings: &["moonshotai/Kimi-K3"], revision: dataset::KIMI_K3_REVISION, config: dataset::KIMI_K3_CONFIG },
+    Publication { root: "meta-models/Muse-Spark-Open-816B-A42B", siblings: &["meta-models/Muse-Spark-Open-816B-A42B"], revision: dataset::MUSE_SPARK_REVISION, config: dataset::MUSE_SPARK_CONFIG },
     Publication { root: "stepfun-ai/Step-5-Preview-BF16", siblings: &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"], revision: dataset::STEP5_REVISION, config: dataset::STEP5_CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash"], revision: dataset::REVISION, config: dataset::CONFIG },
     Publication { root: "deepseek-ai/DeepSeek-V4.1-Flash-1017", siblings: &["deepseek-ai/DeepSeek-V4.1-Flash-1017"], revision: dataset::V41_1017_REVISION, config: dataset::V41_1017_CONFIG },
@@ -39,6 +40,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("stepfun-ai/Step-5-Preview-BF16", &["stepfun-ai/Step-5-Preview-BF16", "stepfun-ai/Step-5-Preview", "stepfun-ai/Step-5-Preview-NVFP4"]),
     ("Qwen/Qwen3.5-9B", &["Qwen/Qwen3.5-9B"]),
     ("Qwen/Qwen3.8-27B", &["Qwen/Qwen3.8-27B", "Qwen/Qwen3.8-27B-FP8"]),
+    ("meta-models/Muse-Spark-Open-816B-A42B", &["meta-models/Muse-Spark-Open-816B-A42B"]),
 ];
 
 pub fn official_root(model: &str) -> Option<&'static str> {
@@ -333,6 +335,23 @@ mod tests {
             (root, dataset::KIMI_K3_REVISION, dataset::KIMI_K3_CONFIG));
         assert_eq!(r.resolved_chain, vec![vec!["test/kimi-quant".to_string(), root.to_string()]]);
         assert!(resolve_in("someone/Kimi-K3-NVFP4", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn muse_root_and_card_quant_resolve_to_bf16_root_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = "meta-models/Muse-Spark-Open-816B-A42B";
+        add(tmp.path(), root, "license: other");
+        let official = resolve_in(root, None, tmp.path()).unwrap();
+        assert_eq!(official.reference_root, root);
+        assert_eq!((official.revision.as_str(), official.config.as_str()),
+            (dataset::MUSE_SPARK_REVISION, dataset::MUSE_SPARK_CONFIG));
+        let quant = add(tmp.path(), "test/muse-quant", "base_model: meta-models/Muse-Spark-Open-816B-A42B\nbase_model_relation: quantized");
+        let r = resolve_in("test/muse-quant", Some(&quant), tmp.path()).unwrap();
+        assert_eq!(r.reference_match, "base_model");
+        assert_eq!((r.reference_root.as_str(), r.revision.as_str(), r.config.as_str()),
+            (root, dataset::MUSE_SPARK_REVISION, dataset::MUSE_SPARK_CONFIG));
+        assert!(resolve_in("someone/Muse-Spark-Open-816B-A42B-EXL3", None, tmp.path()).is_err());
     }
 
     #[test]
