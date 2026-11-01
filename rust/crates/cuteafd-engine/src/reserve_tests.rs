@@ -87,10 +87,22 @@ struct Pool {
     draft_block: usize,
     /// Pages a queued capture holds, per half, and the steps until it lands.
     pending: Option<([usize; 2], usize)>,
+    /// V4.1's release path: a retired request's units wait in `Requests::released_units`,
+    /// invisible to the room until the loop reclaims them (`Some(reclaim before reading)`).
+    deferred: Option<bool>,
+    released: [usize; 2],
 }
 
 impl Pool {
     fn capacity_rows(&self) -> usize { (self.free[0] + self.free[1]) * ROWS }
+    fn retire(&mut self, held: usize) {
+        for j in 0..held { self.released[if self.parity { j % 2 } else { 0 }] += 1; }
+    }
+    fn reclaim(&mut self) {
+        self.free[0] += self.released[0];
+        self.free[1] += self.released[1];
+        self.released = [0; 2];
+    }
     fn take(&mut self, from: usize, to: usize) -> bool {
         let mut need = [0; 2];
         for j in from..to { need[if self.parity { j % 2 } else { 0 }] += 1; }
@@ -240,7 +252,8 @@ fn simulate(p: &mut KvReserve, pool: Pool, specs: &[Spec], rng: &mut Rng) -> Out
             queue.push_back(order[next]);
             next += 1;
         }
-        // Admission, FIFO, against the pool as it stands.
+        // Admission, FIFO, against the pool as it stands (after reclaiming retirements).
+        if pool.deferred == Some(true) { pool.reclaim(); }
         while let Some(&head) = queue.front() {
             let s = specs[head];
             let lease = p.lease(s.prompt, s.max_output, s.step, CONTEXT.min(limit)).unwrap();
@@ -268,13 +281,14 @@ fn simulate(p: &mut KvReserve, pool: Pool, specs: &[Spec], rng: &mut Rng) -> Out
             assert!(l.committed <= l.held * ROWS, "prefill wrote past its reservation");
             progressed = true;
         }
+        if pool.deferred == Some(true) { pool.reclaim(); }
         let before = live.len();
         let stalls_before = p.stats().stalls;
         p.round(&mut Sim { pool: &mut pool, live: &mut live, finished: &mut finished });
         if live.len() < before || p.stats().stalls > stalls_before { pressure += 1; progressed |= live.len() < before; }
         let held: usize = live.iter().map(|l| l.held).sum();
-        assert!(held + pool.free[0] + pool.free[1] + pool.pending.map_or(0, |(h, _)| h[0] + h[1]) == capacity / ROWS,
-            "page accounting");
+        assert!(held + pool.free[0] + pool.free[1] + pool.pending.map_or(0, |(h, _)| h[0] + h[1])
+            + pool.released[0] + pool.released[1] == capacity / ROWS, "page accounting");
         if let (Some(cap), Some(free)) = (draft_capacity, pool.draft_free) {
             let credit: usize = live.iter().map(|l| l.draft_credit).sum();
             assert_eq!(credit + free, cap, "draft accounting");
@@ -299,7 +313,9 @@ fn simulate(p: &mut KvReserve, pool: Pool, specs: &[Spec], rng: &mut Rng) -> Out
         for &(i, finish) in done.iter().rev() {
             let l = live.remove(i);
             // A turn snapshot sometimes holds the request's pages for a few steps.
-            if pool.pending.is_none() && rng.range(0, 3) == 0 {
+            if pool.deferred.is_some() {
+                pool.retire(l.held);
+            } else if pool.pending.is_none() && rng.range(0, 3) == 0 {
                 let mut held = [0; 2];
                 for j in 0..l.held { held[if pool.parity { j % 2 } else { 0 }] += 1; }
                 pool.pending = Some((held, rng.range(1, 4)));
@@ -318,8 +334,13 @@ fn simulate(p: &mut KvReserve, pool: Pool, specs: &[Spec], rng: &mut Rng) -> Out
     Outcome { finished, allowed, stats: p.stats(), peak_concurrency: peak, pressure_rounds: pressure }
 }
 
-fn uniform(pages: usize) -> Pool { Pool { free: [pages, 0], parity: false, draft_free: None, draft_block: 0, pending: None } }
-fn parity(pages: usize) -> Pool { Pool { free: [pages / 2, pages / 2], parity: true, draft_free: None, draft_block: 0, pending: None } }
+fn uniform(pages: usize) -> Pool {
+    Pool { free: [pages, 0], parity: false, draft_free: None, draft_block: 0, pending: None, deferred: None, released: [0; 2] }
+}
+fn parity(pages: usize) -> Pool {
+    Pool { free: [pages / 2, pages / 2], parity: true, draft_free: None, draft_block: 0, pending: None, deferred: None,
+        released: [0; 2] }
+}
 fn drafted(mut pool: Pool, block: usize) -> Pool {
     // The real draft pool: as many 64-row pages as the target pool's rows, no headroom.
     pool.draft_free = Some(pool.capacity_rows().div_ceil(64));
@@ -528,6 +549,34 @@ fn a_refused_candidate_does_not_block_one_the_other_half_can_hold() {
         Spec { arrival: 0, prompt: 128, max_output: 96, actual: usize::MAX, step: 1 }];
     let mut p = policy(64, 0, -1, 1 << 20);
     check_complete(&specs, &simulate(&mut p, parity(6), &specs, &mut Rng(3)));
+}
+
+/// Re-review 2, finding 1: V4.1 parks a retired request's units in `released_units` until the
+/// loop reclaims them. A room read before the reclaim missed them, so a settled pool looked full:
+/// the deadlock break ended a live request (or admission refused with nothing busy). Reclaiming
+/// before admission and the reservation round keeps the default buffer whole.
+#[test]
+fn released_units_are_reclaimed_before_admission_and_the_round() {
+    let specs: Vec<Spec> = (0..12).map(|i| Spec { arrival: i * 3, prompt: 2000 + 500 * i, max_output: 30_000,
+        actual: if i % 3 == 0 { usize::MAX } else { 4000 + 1000 * i }, step: 8 }).collect();
+    let pages = (2 * (8000 + 30_000 + 8usize)).div_ceil(ROWS);
+    for shape in [uniform(pages), parity(pages)] {
+        let reclaiming = Pool { deferred: Some(true), ..shape.clone() };
+        let mut p = policy(4096, 0, -1, 30_000);
+        let outcome = simulate(&mut p, reclaiming, &specs, &mut Rng(21));
+        check_complete(&specs, &outcome);
+        assert!(outcome.stats.stalls > 0, "the schedule is under pressure");
+    }
+    // Without the reclaim the same schedule breaks: a request ends with `length`.
+    let stranded = Pool { deferred: Some(false), ..uniform(pages) };
+    let mut p = policy(4096, 0, -1, 30_000);
+    let mut specs_once = specs.clone();
+    specs_once.truncate(6);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(||
+        simulate(&mut p, stranded, &specs_once, &mut Rng(21))));
+    // Either the simulation could not finish or the policy broke a false deadlock.
+    assert!(result.as_ref().map_or(true, |o| o.stats.deadlock_breaks > 0
+        || o.finished.iter().flatten().any(|(f, _)| *f == Finish::Early)), "the hazard is real");
 }
 
 /// Finding 2: the drafter's credit carries `block / 64 + 1` pages beyond the target pages, and

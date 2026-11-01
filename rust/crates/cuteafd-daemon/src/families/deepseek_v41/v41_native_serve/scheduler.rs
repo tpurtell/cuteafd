@@ -362,15 +362,17 @@ impl<'a, C: DraftChain<'a>> Ledger for V41Ledger<'_, 'a, '_, '_, '_, C> {
 #[allow(clippy::too_many_arguments)]
 fn reserve_round<'a, C: DraftChain<'a>>(reserve: &mut KvReserve, requests: &mut Requests<'a>,
     active: &mut [Option<Active<'a>>], holders: &[(CacheLease, &admission::Prepared)], prefixes: &mut PrefixCache<'a>,
-    draft: Option<&mut DraftRuntime<'_, 'a, C>>, verify_rows: usize, limit: usize) -> Result<()> {
-    // A stalled request whose client left retires now (its units return to the pool).
+    mut draft: Option<&mut DraftRuntime<'_, 'a, C>>, verify_rows: usize, limit: usize) -> Result<()> {
+    // A stalled request whose client left retires now (its units and draft slot return).
     for entry in active.iter_mut() {
         if entry.as_ref().is_some_and(|r| r.stalled && r.job.events.is_closed()) {
             let mut request = entry.take().unwrap();
             request.stalled = false;
-            retire_request(request, requests, prefixes, None::<&mut DraftRuntime<'_, 'a, C>>)?;
+            retire_request(request, requests, prefixes, draft.as_deref_mut())?;
         }
     }
+    // Every retirement so far (this boundary's and the ones above) is free before planning.
+    prefixes.reclaim(requests, draft.as_deref_mut())?;
     let mut ledger = V41Ledger { reserve: KvReserve::new(reserve.config(), UNIT_TOKENS), requests, active, holders,
         prefixes, draft, verify_rows, limit, error: None };
     reserve.round(&mut ledger);
@@ -665,6 +667,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 retire_request(entry.take().unwrap(), requests, &mut prefixes, draft.as_deref_mut())?;
             }
         }
+        // Their units are free for admission and the reservation round only once reclaimed.
+        prefixes.reclaim(requests, draft.as_deref_mut())?;
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
@@ -751,6 +755,8 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     "prompt leaves no room for output in the GPU KV pool; shorten the prompt or increase the pool".into())));
                 continue;
             };
+            // Units of requests released inside this admission wave count as free too.
+            prefixes.reclaim(requests, draft.as_deref_mut())?;
             let rows = {
                 let holders: Vec<_> = media.leased().map(|l| (l.lease, &l.prepared))
                     .chain(admitted.iter().map(|(prepared, _, lease, ..)| (*lease, prepared))).collect();

@@ -9,14 +9,17 @@ pub(super) fn run<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(runtime: &to
     active: &mut [Option<Active<'a>>], draft: Option<&mut DraftRuntime<'_, 'a, C>>,
     prefixes: &mut PrefixCache<'a>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
 ) -> Result<()> {
+    // Units released since both lanes started (a retirement on either lane, in any round) may
+    // resume a stalled request: one epoch for both, sampled before either lane runs.
+    let released_at = requests.release_epoch();
     let requests = RefCell::new(requests);
     let active = RefCell::new(active);
     let draft = RefCell::new(draft);
     let prefixes = RefCell::new(prefixes);
     let set = LaneSet::default();
     runtime.block_on(set.run(
-        |lease| lane(lease, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake),
-        |lease| lane(lease, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake),
+        |lease| lane(lease, first, first_transport, &requests, &active, &draft, &prefixes, receive, wake, released_at),
+        |lease| lane(lease, second, second_transport, &requests, &active, &draft, &prefixes, receive, wake, released_at),
     ))
 }
 
@@ -64,11 +67,11 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
     transport: &mut P::Transport, requests: &RefCell<&mut Requests<'a>>,
     active: &RefCell<&mut [Option<Active<'a>>]>, draft: &RefCell<Option<&mut DraftRuntime<'_, 'a, C>>>,
     prefixes: &RefCell<&mut PrefixCache<'a>>, receive: &mpsc::Receiver<NativeRequest>, wake: admission::Wake<'_>,
+    released_at: u64,
 ) -> Result<()> {
     let lane = lease.index();
-    // Units released since this call began (a retirement on either lane) may resume a stalled
-    // request: only the drained boundary between the lanes plans that.
-    let released_at = requests.borrow().release_epoch();
+    // Whether this lane did work this call: a round or a retirement.
+    let mut worked = false;
     {
         let mut round_id = 0u64;
         loop {
@@ -79,6 +82,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                 entry.as_ref().filter(|r| r.lane() == lane && (r.finished || r.job.events.is_closed()))
                     .map(|_| slot)).collect();
             for slot in retired {
+                worked = true;
                 let request = active.borrow_mut()[slot].take().unwrap();
                 let request_id = request.id();
                 retire(lane, request, requests, prefixes, draft).await?;
@@ -93,19 +97,15 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                         requests.borrow().release_epoch())) {
                     lease.stop(); return Ok(());
                 }
-                // A stalled request (on either lane) resumes at the drained boundary: once this
-                // lane has completed a round (every call makes progress), stop when units came
-                // back since the call began or a stalled client left.
                 let stalled = active.iter().flatten().filter(|r| r.stalled).map(|r| r.job.events.is_closed());
-                if resume_due(round_id, stalled, requests.borrow().release_epoch(), released_at) {
-                    lease.stop(); return Ok(());
+                match boundary(round_id + u64::from(worked), stalled, requests.borrow().release_epoch(), released_at,
+                    active.iter().enumerate().filter_map(|(slot, r)|
+                        r.as_ref().filter(|r| r.lane() == lane && !r.stalled).map(|_| slot))) {
+                    Boundary::Stop => { lease.stop(); return Ok(()); }
+                    Boundary::Done => return Ok(()),
+                    Boundary::Run(members) => members,
                 }
-                active.iter().enumerate().filter_map(|(slot, r)|
-                    r.as_ref().filter(|r| r.lane() == lane && !r.stalled).map(|_| slot)).collect()
             };
-            // An empty lane only returns: the peer keeps running its members and stops at its
-            // own boundary when a stalled request can resume.
-            if members.is_empty() { return Ok(()); }
             ensure!(members.len() <= 8, "independent lane exceeds eight requests");
             // A member whose next round would pass its reservation needs a top-up, which the
             // outer loop plans at a boundary where both lanes have drained.
@@ -401,10 +401,30 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     target.and(speculative.map(|_| ())).and(state)
 }
 
-/// Whether a lane that has completed `rounds` rounds stops so a stalled request may resume at the
-/// drained boundary: there is a stalled request (`closed`: its client left), and units were
-/// released since the lanes started (`released_at`) or a stalled client left. A lane always
-/// completes a round first, so every call makes progress.
+/// A lane's decision at a completed boundary (after its own retirements).
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Boundary {
+    /// Stop both lanes: a stalled request can resume at the drained boundary.
+    Stop,
+    /// Nothing runnable on this lane: return without stopping the peer, which keeps running its
+    /// members and stops at its own boundary when a stalled request can resume.
+    Done,
+    /// Run a round over these slots.
+    Run(Vec<usize>),
+}
+
+/// The boundary decision every V4.1 lane makes ([`resume_due`], then its runnable members).
+pub(super) fn boundary(work: u64, stalled: impl Iterator<Item = bool>, epoch: u64, released_at: u64,
+    members: impl Iterator<Item = usize>) -> Boundary {
+    if resume_due(work, stalled, epoch, released_at) { return Boundary::Stop; }
+    let members: Vec<usize> = members.collect();
+    if members.is_empty() { Boundary::Done } else { Boundary::Run(members) }
+}
+
+/// Whether a lane that has done `work` (rounds plus retirements) stops so a stalled request may
+/// resume at the drained boundary: there is a stalled request (`closed`: its client left), and
+/// units were released since both lanes started (`released_at`) or a stalled client left. A
+/// lane does some work first, so every call makes progress.
 pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, epoch: u64, released_at: u64) -> bool {
     let mut closed = closed.by_ref().peekable();
     rounds > 0 && closed.peek().is_some() && (epoch != released_at || closed.any(|c| c))
@@ -412,35 +432,107 @@ pub(super) fn resume_due(rounds: u64, mut closed: impl Iterator<Item = bool>, ep
 
 #[cfg(test)]
 mod tests {
-    use super::resume_due;
+    use super::{boundary, Boundary};
+    use crate::shared::serve::lanes::{LaneLease, LaneSet};
+    use std::cell::{Cell, RefCell};
 
-    /// One stalled request on lane 0, one runnable on lane 1, polled lane 0 first. The empty
-    /// lane returns without stopping its peer, and the runnable lane runs its rounds until units
-    /// come back (then stops at a boundary so the stall is planned again).
-    #[test]
-    fn an_empty_lane_never_stops_a_peer_with_runnable_members() {
-        let source = include_str!("independent.rs").split_once("\n#[cfg(test)]").unwrap().0;
-        let empty = source.split_once("if members.is_empty()").unwrap().1.split_once('\n').unwrap().0;
-        assert_eq!(empty.trim(), "{ return Ok(()); }", "an empty lane only returns");
-        assert_eq!(source.matches("lease.stop();").count(), 3, "admission wake, stalled resume, top-up need");
-        // Model of the joined lanes: stop is shared; lane 0 has no members (its request stalled).
-        let mut stop = false;
-        let (mut rounds, mut epoch) = (0u64, 7u64);
-        let released_at = epoch;
-        for _poll in 0..100 {
-            // Lane 0: empty, returns (and never touches `stop`).
-            // Lane 1: one runnable request.
-            if stop { break; }
-            if resume_due(rounds, [false].into_iter(), epoch, released_at) { stop = true; break; }
-            rounds += 1;
-            if rounds == 40 { epoch += 1; } // its request finished a turn snapshot: units freed
+    /// A request of the lane model: its lane, stalled or not, client closed, rounds it still runs
+    /// before finishing (its turn then frees units).
+    #[derive(Clone, Debug)]
+    struct Req { lane: usize, stalled: bool, closed: bool, left: u32 }
+
+    /// The two lanes of one `independent::run` call over shared state, driven by the real
+    /// `LaneSet` (one stop cell, `tokio::join!` polling lane 0 first) and the real `boundary`
+    /// decision. Rounds yield like the device waits do. Returns rounds run per lane.
+    async fn model_lane(lease: LaneLease<'_>, active: &RefCell<Vec<Option<Req>>>, epoch: &Cell<u64>,
+        released_at: u64, rounds: &[Cell<u32>; 2]) -> anyhow::Result<()> {
+        let index = lease.index();
+        let (mut round_id, mut worked) = (0u64, false);
+        loop {
+            if lease.stopping() { return Ok(()); }
+            // Retire this lane's finished or closed requests (no await on the close path).
+            let slots = active.borrow().len();
+            for slot in 0..slots {
+                let done = active.borrow()[slot].as_ref()
+                    .is_some_and(|r| r.lane == index && !r.stalled && (r.left == 0 || r.closed));
+                if done {
+                    active.borrow_mut()[slot] = None;
+                    epoch.set(epoch.get() + 1);
+                    worked = true;
+                }
+            }
+            let decision = {
+                let active = active.borrow();
+                boundary(round_id + u64::from(worked),
+                    active.iter().flatten().filter(|r| r.stalled).map(|r| r.closed), epoch.get(), released_at,
+                    active.iter().enumerate().filter_map(|(slot, r)|
+                        r.as_ref().filter(|r| r.lane == index && !r.stalled).map(|_| slot)))
+            };
+            let members = match decision {
+                Boundary::Stop => { lease.stop(); return Ok(()); }
+                Boundary::Done => return Ok(()),
+                Boundary::Run(members) => members,
+            };
+            for slot in members { active.borrow_mut()[slot].as_mut().unwrap().left -= 1; }
+            rounds[index].set(rounds[index].get() + 1);
+            round_id += 1;
+            tokio::task::yield_now().await;
         }
-        assert!(rounds >= 40, "the runnable lane made progress");
-        assert!(stop, "and stopped at a boundary once units came back");
-        // A closed stalled client stops it at the next boundary, but never before a round.
-        assert!(!resume_due(0, [true].into_iter(), 7, 7));
-        assert!(resume_due(1, [true].into_iter(), 7, 7));
-        // Nothing stalled: never.
-        assert!(!resume_due(5, std::iter::empty(), 8, 7));
+    }
+
+    /// The two lanes of one `independent::run` call over shared state, driven by the real
+    /// `LaneSet` (one stop cell, `tokio::join!` polling lane 0 first) and the real `boundary`
+    /// decision. Rounds yield like the device waits do. Returns rounds run per lane.
+    fn run_lanes(active: &RefCell<Vec<Option<Req>>>, epoch: &Cell<u64>) -> [u32; 2] {
+        let rounds = [Cell::new(0u32), Cell::new(0u32)];
+        let released_at = epoch.get();
+        let set = LaneSet::default();
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        runtime.block_on(set.run(|lease| model_lane(lease, active, epoch, released_at, &rounds),
+            |lease| model_lane(lease, active, epoch, released_at, &rounds))).unwrap();
+        [rounds[0].get(), rounds[1].get()]
+    }
+
+    /// One stalled request on lane 0 and one runnable request on lane 1. The empty lane returns
+    /// without stopping its peer; the runnable request runs to its end (freeing units), and the
+    /// lanes stop at that boundary so the stall is planned again. Never a call with no work.
+    #[test]
+    fn a_stalled_and_a_runnable_request_make_progress_until_units_return() {
+        let active = RefCell::new(vec![Some(Req { lane: 0, stalled: true, closed: false, left: 50 }),
+            Some(Req { lane: 1, stalled: false, closed: false, left: 30 })]);
+        let epoch = Cell::new(7);
+        let rounds = run_lanes(&active, &epoch);
+        assert_eq!(rounds, [0, 30], "the runnable lane ran its request to the end");
+        assert_eq!(epoch.get(), 8, "its retirement freed units");
+        assert!(active.borrow()[1].is_none() && active.borrow()[0].as_ref().unwrap().stalled);
+        // Next call: nothing runnable, the stalled request has not resumed (the outer loop's
+        // reservation round resumes it): no lane runs, no round, no spin inside the call.
+        assert_eq!(run_lanes(&active, &epoch), [0, 0]);
+    }
+
+    /// Lane 0's only member is a closed client retired in round 0, which frees units; the peer
+    /// lane (polled second) must see that release and stop at its next boundary instead of
+    /// running until its own top-up need.
+    #[test]
+    fn a_round_zero_retirement_on_one_lane_resumes_a_stall_on_the_other() {
+        let active = RefCell::new(vec![Some(Req { lane: 0, stalled: false, closed: true, left: 50 }),
+            Some(Req { lane: 1, stalled: true, closed: false, left: 50 }),
+            Some(Req { lane: 1, stalled: false, closed: false, left: 1000 })]);
+        let epoch = Cell::new(3);
+        let rounds = run_lanes(&active, &epoch);
+        assert_eq!(epoch.get(), 4);
+        assert!(rounds[1] <= 1, "lane 1 stopped at its first boundary, not after {} rounds", rounds[1]);
+        assert!(active.borrow()[2].as_ref().unwrap().left >= 999);
+    }
+
+    /// A closed stalled client also stops the lanes at the next boundary after some work.
+    #[test]
+    fn a_closed_stalled_client_stops_the_lanes_after_a_round() {
+        let active = RefCell::new(vec![Some(Req { lane: 0, stalled: true, closed: true, left: 5 }),
+            Some(Req { lane: 1, stalled: false, closed: false, left: 100 })]);
+        let epoch = Cell::new(0);
+        assert_eq!(run_lanes(&active, &epoch), [0, 1]);
+        assert_eq!(boundary(0, [true].into_iter(), 0, 0, [1].into_iter()), Boundary::Run(vec![1]));
+        assert_eq!(boundary(5, std::iter::empty(), 9, 0, std::iter::empty()), Boundary::Done);
     }
 }

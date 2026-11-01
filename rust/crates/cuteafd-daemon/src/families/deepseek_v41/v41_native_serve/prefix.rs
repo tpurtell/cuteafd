@@ -413,7 +413,8 @@ impl<'a> V41Cache<'a> {
         self.cache.tick();
         Ok(())
     }
-    fn reclaim<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>)
+    /// Return released requests' units to the pool, so [`V41Cache::room`] sees them.
+    pub fn reclaim<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>)
         -> Result<()> {
         let released = requests.take_released_units();
         if released.is_empty() { return Ok(()); }
@@ -473,6 +474,8 @@ impl<'a> V41Cache<'a> {
     }
 
     /// Units a reservation may still take: free units and units only retained snapshots hold.
+    /// Capacity a reservation may take. Call [`V41Cache::reclaim`] after retiring requests first:
+    /// a released request's units are free only once reclaimed.
     pub fn room(&self) -> cuteafd_engine::reserve::Room { self.cache.target_room() }
     /// No capture is still queued (its units return as an evictable snapshot when it lands).
     pub fn settled(&self) -> bool { self.cache.settled() }
