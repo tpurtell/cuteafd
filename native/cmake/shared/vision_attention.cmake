@@ -108,6 +108,20 @@ add_custom_command(
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting full-image head64/head72 BF16 vision attention offline"
   VERBATIM)
+foreach(mode full windows)
+  set(windowed)
+  set(windowed_args)
+  if(mode STREQUAL "windows")
+    set(windowed WINDOWED)
+    set(windowed_args --windowed)
+  endif()
+  cuteafd_vision_owner_entry(d96_${mode} HEAD_DIM 96 ${windowed}
+    PROGRAMS vision_attention_d96_${mode}
+    ARGS --group attention --head-dim 96 ${windowed_args}
+    POINTWISE_GROUP muse
+    POINTWISE_PROGRAMS vision_axial_rotary_d96_f32 vision_position_gather_h1536
+    POINTWISE_ARGS --group pointwise --head-dim 96 --hidden 1536 --learned-position)
+endforeach()
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
 list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
 list(REMOVE_DUPLICATES CUTEAFD_VISION_ATTENTION_OUTPUTS)
