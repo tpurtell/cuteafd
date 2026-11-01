@@ -351,6 +351,12 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     }
     fn layout(&self) -> FamilyLayout { self.layout }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    /// Each pass rebinds the slot's page list; rebind now so captures see the same list.
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.units.extend_from_slice(pages);
+        self.engine.borrow_mut().bind_slot(placement.slot, &placement.units)?;
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize { placement.len.min(placement.state_len) }
 
     fn bind(&self, placement: &mut Placement) -> Result<(), BoxError> {

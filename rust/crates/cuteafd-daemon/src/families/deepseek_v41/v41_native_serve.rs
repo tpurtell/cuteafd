@@ -150,7 +150,7 @@ fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
     let api = if http { Some(args.api.load()?) } else { None };
     let listen = args.listen.clone();
     let snapshot = args.snapshot.clone();
-    let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
+    let limits = args.reserve.limits(args.max_context_tokens as usize)?;
     let (send, receive) = mpsc::channel(args.http_queue_depth.unwrap_or(args.concurrency) as usize);
     let http_queue_wait = Duration::from_millis(args.http_queue_wait_ms);
     let (ready, readiness) = oneshot::channel();

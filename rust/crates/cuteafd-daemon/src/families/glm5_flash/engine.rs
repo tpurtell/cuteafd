@@ -630,6 +630,13 @@ impl GlmfPlacement {
         Self { units, pages, pool_pages, slot, len: 0, kda_len: 0 }
     }
 
+    /// Appends freshly reserved units (a decode top-up) with their MLA and pool pages.
+    pub fn extend(&mut self, units: &[u32]) {
+        self.pages.extend(units.iter().flat_map(|&u| (0..UNIT_PAGES as i32).map(move |i| u as i32 * UNIT_PAGES as i32 + i)));
+        self.pool_pages.extend(units.iter().map(|&u| u as i32));
+        self.units.extend_from_slice(units);
+    }
+
     pub fn record(&self, position: usize) -> Result<i64> {
         let page = *self.pages.get(position / PAGE_ROWS).context("position past the sequence's pages")?;
         Ok(i64::from(page) * PAGE_ROWS as i64 + (position % PAGE_ROWS) as i64)
@@ -5508,6 +5515,14 @@ mod tp2_tests {
 #[cfg(test)]
 mod prefill_lane_tests {
     use super::{KdaState, MAX_PREFILL_WAVES};
+
+    #[test]
+    fn a_decode_top_up_matches_a_placement_built_over_all_its_units() {
+        let mut grown = super::GlmfPlacement::new(vec![5, 1], 2);
+        grown.extend(&[8, 3]);
+        let whole = super::GlmfPlacement::new(vec![5, 1, 8, 3], 2);
+        assert_eq!((&grown.units, &grown.pages, &grown.pool_pages), (&whole.units, &whole.pages, &whole.pool_pages));
+    }
 
 
 

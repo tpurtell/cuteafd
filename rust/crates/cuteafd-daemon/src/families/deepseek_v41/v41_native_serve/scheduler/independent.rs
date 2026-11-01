@@ -91,10 +91,25 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     lease.stop(); return Ok(());
                 }
                 active.iter().enumerate().filter_map(|(slot, r)|
-                    r.as_ref().filter(|r| r.lane() == lane).map(|_| slot)).collect()
+                    r.as_ref().filter(|r| r.lane() == lane && !r.stalled).map(|_| slot)).collect()
             };
             if members.is_empty() { return Ok(()); }
             ensure!(members.len() <= 8, "independent lane exceeds eight requests");
+            // A member whose next round would pass its reservation needs a top-up, which the
+            // outer loop plans at a boundary where both lanes have drained.
+            {
+                let active = active.borrow();
+                let requests = requests.borrow();
+                let verify_rows = draft.borrow().as_ref().map_or(1, |d| d.max_verify_rows());
+                let mut short = false;
+                for &slot in &members {
+                    let r = active[slot].as_ref().unwrap();
+                    let need = requests.cache().committed_end(r.lease)? as usize
+                        + (r.job.max_tokens - r.generated).min(verify_rows);
+                    short |= need > requests.units(r.lease)?.len() * UNIT_TOKENS;
+                }
+                if short { lease.stop(); return Ok(()); }
+            }
             let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
             let started = Instant::now();
             // Reserve target capacity and snapshot this lane's seeds, then release
@@ -107,7 +122,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     let r = active[slot].as_ref().unwrap();
                     (r.lease, (r.job.max_tokens-r.generated).min(verify_rows) as u32)
                 }).collect();
-                // Units cover each request's declared lifetime: validate the bindings only.
+                // The boundary check above reserved every member's round: validate the bindings only.
                 requests.cache().check_append_capacity(&capacity)?;
                 members.iter().map(|&slot| {
                     let r = active[slot].as_ref().unwrap();

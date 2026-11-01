@@ -302,16 +302,6 @@ impl<'a> Requests<'a> {
         self.units[slot] = units;
         Ok(())
     }
-    /// Shrink an idle request's binding to `units` (a prefix of its units); the caller releases
-    /// the rest. Rows past the new binding were never written.
-    pub fn rebind_shrunk(&mut self, lease: CacheLease, units: Vec<u32>, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
-        self.request(lease)?;
-        let slot = lease_slot(&self.slots, lease)?;
-        ensure!(self.units[slot].starts_with(&units), "shrunk binding is not a prefix of the request's units");
-        self.cache.rebind_sources(lease, pages, rows)?;
-        self.units[slot] = units;
-        Ok(())
-    }
     /// A request's committed Engram position and compressed lookback (chronological).
     pub fn engram_lookback(&self, lease: CacheLease) -> Result<(u64, Vec<Option<u32>>)> {
         let request = self.request(lease)?;

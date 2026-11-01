@@ -258,6 +258,17 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
     fn pages<'p>(&self, placement: &'p V41Placement) -> &'p [u32] {
         &placement.units
     }
+    /// Extends every source's page table (the slot keeps its committed rows); runs at a drained
+    /// boundary, so no append is pending on the slot.
+    fn extend_pages(&self, placement: &mut V41Placement, units: &[u32]) -> Result<(), BoxError> {
+        let committed = self.requests.borrow().cache().committed_end(placement.lease).map_err(boxed)? as usize;
+        placement.units.extend_from_slice(units);
+        if let Err(error) = self.bind_units(placement, committed) {
+            placement.units.truncate(placement.units.len() - units.len());
+            return Err(boxed(error));
+        }
+        Ok(())
+    }
     fn commit_point(&self, placement: &V41Placement) -> usize {
         placement.len
     }
@@ -415,8 +426,8 @@ impl<'a> V41Cache<'a> {
 
     /// Admit a request leased at `lease` (fresh, its draft request admitted as `draft_id`):
     /// look `keys` up (media-keyed copy of `native`), allocate units for `capacity` tokens
-    /// (prompt plus its declared output), restore. Pool pressure is `SourcePoolExhausted`; a
-    /// restore that fails is a miss.
+    /// (its reservation: prompt plus a decode chunk), restore. Pool pressure is
+    /// `SourcePoolExhausted`; a restore that fails is a miss.
     #[allow(clippy::too_many_arguments)]
     pub fn admit<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, mut draft: Option<&mut DraftRuntime<'_, 'a, C>>,
         lease: CacheLease, draft_id: Option<u64>, keys: &[u32], native: &[u32], media: &[MediaSpan], capacity: usize,
@@ -449,35 +460,22 @@ impl<'a> V41Cache<'a> {
         Ok(Restored { cached: admitted.resume, scores, plan, source: admitted.source })
     }
 
-    /// Whether `work` (each request's remaining declared tokens) fits the units bound to it.
-    pub fn fits(&self, requests: &Requests<'a>, work: &[(CacheLease, u32)]) -> Result<bool> {
-        match requests.cache().check_append_capacity(work) {
-            Ok(()) => Ok(true),
-            Err(error) if exhausted(&error) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Give back the units of an idle request past what `keep_tokens` needs (its output
-    /// allowance shrank to fit the pool).
-    pub fn trim<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
-        lease: CacheLease, keep_tokens: usize) -> Result<()> {
-        let mut units = requests.units(lease)?.to_vec();
-        let keep = keep_tokens.div_ceil(UNIT_TOKENS).max(1);
-        if units.len() <= keep { return Ok(()); }
-        let dropped = units.split_off(keep);
-        let (pages, rows) = {
-            let cache = requests.cache();
-            let committed = cache.committed_end(lease)? as usize;
-            (cache.unit_pages(&units), cache.source_rows(committed))
-        };
-        requests.rebind_shrunk(lease, units, [&pages[0], &pages[1], &pages[2], &pages[3]], rows)?;
+    /// Grow a live request's units to cover `rows` tokens (a decode reservation top-up), at a
+    /// drained boundary. `Ok(false)` when the pool cannot supply them now: the request stalls.
+    pub fn extend<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>, draft: Option<&mut DraftRuntime<'_, 'a, C>>,
+        lease: CacheLease, rows: usize) -> Result<bool> {
+        self.reclaim(requests, None::<&mut DraftRuntime<'_, 'a, C>>)?;
+        let units = requests.units(lease)?.to_vec();
+        let len = requests.cache().committed_end(lease)? as usize;
+        let mut placement = V41Placement { units, lease, draft: None, len, plan: None };
         let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
-        self.cache.release(&family, &dropped).map_err(|e| anyhow::anyhow!("{e}"))
+        self.cache.extend(&family, &mut placement, rows).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Units a pool of `free` units plus every snapshot-only unit could still give.
-    pub fn could_fit(&self, units: usize) -> bool { self.cache.could_free(units) }
+    /// Units a reservation may still take: free units and units only retained snapshots hold.
+    pub fn reservable(&self) -> usize { self.cache.reservable() }
+    /// No capture is still queued (its units return as an evictable snapshot when it lands).
+    pub fn settled(&self) -> bool { self.cache.settled() }
 
     /// Retain a snapshot of `lease` at its committed frontier (synchronously).
     #[allow(clippy::too_many_arguments)]

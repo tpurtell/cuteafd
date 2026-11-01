@@ -488,15 +488,6 @@ impl<'a> BackboneCache<'a> {
         }
         Ok(())
     }
-    /// Shrink a request's source bindings to `pages` (a prefix of each); see `SourceCache::rebind`.
-    pub fn rebind_sources(&mut self, lease: CacheLease, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
-        let sources = self.request(lease)?.sources;
-        for (((state, lease), pages), rows) in self.sources.iter_mut().zip(sources).zip(pages).zip(rows) {
-            let device = state.device;
-            device.run(|| state.rebind(lease, pages, rows))?;
-        }
-        Ok(())
-    }
     /// Each source's rows per model token and page count, in `sources()` order.
     pub fn source_geometry(&self) -> [(usize, usize); 4] {
         std::array::from_fn(|i| {

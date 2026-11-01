@@ -877,7 +877,7 @@ mod tests {
             panic!("expected native serving");
         };
         assert_eq!(args.max_context_tokens, 1_048_576);
-        assert_eq!(args.max_output_tokens, 393_216);
+        assert_eq!(args.reserve.limits(args.max_context_tokens as usize).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
         assert_eq!(args.prefix_cache_entries, 20);
         assert_eq!(args.dspark_draft_limit, 5);
@@ -1170,9 +1170,9 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
     pub max_context_tokens: u32,
 
-    /// Default and maximum generated tokens, further bounded by remaining context.
-    #[arg(long, default_value_t = cuteafd_api::openai::MAX_OUTPUT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=393216))]
-    pub max_output_tokens: u32,
+    /// Output limit and KV decode reservation (`--max-output-tokens`, `--kv-*`).
+    #[command(flatten)]
+    pub reserve: crate::shared::kv_reserve::ReserveArgs,
 
     /// Exact global KV/index byte budget (B/MB/GB/MiB/GiB), rounded down to page groups.
     #[arg(long)]

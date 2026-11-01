@@ -135,6 +135,12 @@ impl PrefixFamily for GlmPrefix<'_, '_> {
         &placement.pages
     }
 
+    /// Verify rebuilds its page table from the placement every step.
+    fn extend_pages(&self, placement: &mut GlmPlacement, pages: &[u32]) -> Result<(), BoxError> {
+        placement.pages.extend_from_slice(pages);
+        Ok(())
+    }
+
     fn commit_point(&self, placement: &GlmPlacement) -> usize {
         placement.len
     }

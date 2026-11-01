@@ -18,6 +18,9 @@ use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
+use crate::shared::kv_reserve::{reserved_drafts, Holding, Reserve, Reserving};
+use cuteafd_engine::reserve::Lease;
+use super::metadata::SOURCE_PAGE_TOKENS;
 use crate::shared::draft::{binding::{self, DraftPass, RoundRecord, RoundRequest}, clock::RoundClock,
     evidence::{Censor, DraftSource, Evidence}, resource, runtime::SharedPolicy};
 use crate::shared::draft_policy::DraftHistory;
@@ -26,7 +29,7 @@ use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use cuteafd_engine::prefix::{After, MarkArena, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::{
-    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure,
     NativeRequest, PromptUsage,
 };
 use std::path::Path;
@@ -46,8 +49,6 @@ pub(crate) struct ServeArgs {
     /// Longest sequence; 0 selects checkpoint full, bounded by compiled support and the admitted pool.
     #[arg(long, default_value_t = 0)]
     pub max_context: u32,
-    #[arg(long, default_value_t = 4096)]
-    pub max_output: u32,
     /// Public model id; defaults to the snapshot's Hugging Face id.
     #[arg(long)]
     pub model_id: Option<String>,
@@ -98,7 +99,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_context, decode_share, prefix, packing));
     let max_context = ready_rx.await.context("engine failed before it was ready")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub.clone(), api.serve(profile.clone(), &args.engine.snapshot)?);
@@ -228,6 +229,7 @@ struct Prefill<'a> {
     cancelled: bool,
     placement: Placement,
     capacity: usize,
+    lease: Lease,
     /// A whole-prompt prefix hit's retained logits (its first token is selected from them).
     logits: Option<Vec<f32>>,
     /// The first generated token, selected after the last chunk, and that
@@ -247,6 +249,7 @@ struct Active<'a> {
     constraint: Option<crate::shared::constraints::State<'a>>,
     placement: Placement,
     capacity: usize,
+    lease: Lease,
     next: u32,
     /// Prompt and emitted tokens: the rows of the placement, then `next`.
     history: Vec<u32>,
@@ -293,14 +296,29 @@ impl Active<'_> {
             self.next = token;
             return Ok(false);
         };
+        self.finish(finish)?;
+        Ok(true)
+    }
+
+    /// Flushes buffered text and sends the finish reason.
+    fn finish(&mut self, finish: InferenceFinishReason) -> Result<()> {
         let content = self.decoder.finish()?.unwrap_or_default();
         if !content.is_empty() || self.buffered > 0 {
             self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
         self.ticket.finishing();
-        self.send(InferenceChunk::Finish { finish_reason: finish })?;
-        Ok(true)
+        self.send(InferenceChunk::Finish { finish_reason: finish })
     }
+}
+
+impl Reserving for Active<'_> {
+    type Placement = Placement;
+    fn lease(&self) -> &Lease { &self.lease }
+    fn committed(&self) -> usize { self.placement.len }
+    fn produced(&self) -> usize { self.generated }
+    fn placement(&self) -> &Placement { &self.placement }
+    fn placement_mut(&mut self) -> &mut Placement { &mut self.placement }
+    fn closed(&self) -> bool { self.job.events.is_closed() }
 }
 
 /// Commits a selected token to the request's grammar.
@@ -417,6 +435,7 @@ fn speculative_step(
         engine.decode_rows.saturating_sub(active.len())
             .min(a.job.max_tokens.saturating_sub(a.generated + 1))
             .min(a.capacity.saturating_sub(a.placement.len + 2))
+            .min(reserved_drafts(a.placement.len + 1, a.placement.units.len(), SOURCE_PAGE_TOKENS))
     }).collect();
     let requests: Vec<_> = active.iter().zip(&limits).map(|(request, &room)| (request.ticket.id(), room)).collect();
     let widths: Vec<_> = std::iter::once(0).chain(shared.policy.widths().iter().copied()).collect();
@@ -607,11 +626,13 @@ fn release(family: &Dsv4Prefix<'_, '_>, cache: &mut PrefixCache<CudaCopyEngine<'
 }
 
 /// Serving statistics for `/v1/stats`.
+#[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(), "draft_policy": resource::snapshot()});
+            "prefilling": prefilling, "prefix_cache": cache.stats(), "draft_policy": resource::snapshot(),
+            "kv_reserve": reserve.snapshot(stalled)});
     }
 }
 
@@ -708,6 +729,9 @@ fn schedule(
     let mut grammars = crate::shared::constraints::Compiler::new(
         &loaded.library, loaded.snapshot.join("tokenizer.json"), engine.cfg.vocab_size);
     let mut active: Vec<Active<'_>> = Vec::new();
+    // Decoding requests waiting for KV units: they keep their state slot and units, skip rounds.
+    let mut stalled: Vec<Active<'_>> = Vec::new();
+    let mut reserve = Reserve::new(prefix.reserve.config(engine.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let chunk_limit = engine.prefill_capacity().min(engine.max_context);
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
@@ -720,8 +744,8 @@ fn schedule(
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         // Admit while sequence slots and decode rows remain.
-        while !states.is_empty() && active.len() + prefills.len() < engine.decode_rows {
-            let busy = !active.is_empty() || !prefills.is_empty();
+        while !states.is_empty() && active.len() + stalled.len() + prefills.len() < engine.decode_rows {
+            let busy = !active.is_empty() || !stalled.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
                 cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
@@ -729,7 +753,7 @@ fn schedule(
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        publish(stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                         match receive.blocking_recv() {
                             Some(job) => job,
@@ -767,13 +791,28 @@ fn schedule(
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
             }
-            let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-            let state = states.pop().expect("checked");
+            let lease = match reserve.lease(tokens.len(), job.max_tokens, engine.decode_rows,
+                Reserve::limit(&cache, engine.max_context)) {
+                Ok(lease) => lease,
+                Err(error) => { reject(&job, format!("{error}")); continue; }
+            };
+            let capacity = lease.end();
             cache.tick();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.units }).collect();
+            let Some(rows) = reserve.admit(&cache, &family, &active, &stalled, &holding, &lease) else {
+                drop(holding);
+                // Waits for the drain rule: a retirement or a release retries it.
+                match kv_waiter.defer_until_release(job, busy, cache.pool().release_epoch()) {
+                    Ok(()) => break,
+                    Err(job) => { reject(&job, "prompt leaves no room for output in the GPU KV pool".into()); continue; }
+                }
+            };
+            drop(holding);
+            let state = states.pop().expect("checked");
             let admit_started = Instant::now();
             // Lookup, fork of the retained units and restore of the mark (byte-exact).
             let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(&family, lookup, capacity, true, |units| Placement::new(state, units)) {
+            let admitted = match cache.admit(&family, lookup, rows, true, |units| Placement::new(state, units)) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     states.push(state);
@@ -848,7 +887,7 @@ fn schedule(
                 }
             };
             prefills.push(Prefill { job, constraint, tokens, resume, plan, chunks: 0, cancelled: false,
-                placement: admitted.placement, capacity, logits, first: None, prompt_row: None,
+                placement: admitted.placement, capacity, lease, logits, first: None, prompt_row: None,
                 started: Instant::now(), busy: 0.0, ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -972,7 +1011,7 @@ fn schedule(
                 };
                 let mut request = Active {
                     decoder, job: p.job, constraint: p.constraint, placement: p.placement, capacity: p.capacity,
-                    next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
+                    lease: p.lease, next: first, history: p.tokens, turn: None, generated: 0, draft_calls: 0, buffered: 0, started: Instant::now(),
                     ticket: p.ticket, drafts: DraftHistory::default(),
                 };
                 let emitted = request.emit(first, eos);
@@ -992,7 +1031,21 @@ fn schedule(
             }
             prefills.settle(!active.is_empty());
         }
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.units }).collect();
+        let round = reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding)?;
+        drop(holding);
+        for mut request in round.ended.into_iter().chain(round.cancelled) {
+            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
+            request.ticket.done(request.generated);
+            requests += 1;
+            generated_total += request.generated as u64;
+            release(&family, &mut cache, &mut states, &request.placement);
+        }
         if active.is_empty() {
+            if !stalled.is_empty() {
+                publish(stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
+            }
             continue;
         }
         let cycle = Instant::now();
@@ -1024,8 +1077,9 @@ fn schedule(
             release(&family, &mut cache, &mut states, &request.placement);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
+            receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }

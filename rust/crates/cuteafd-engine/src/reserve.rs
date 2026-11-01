@@ -86,10 +86,13 @@ pub struct Lease {
     prompt: usize,
     /// Rows one round may write past the committed frontier (verify rows).
     step: usize,
-    /// Rows the request may commit: prompt + maximum output, within the context and the pool.
-    /// Rounds never write past it (their verify rows are clamped to it).
+    /// Rows the request may commit (its logical capacity): prompt + maximum output, within the
+    /// limit. It finishes with `length` there.
     end: usize,
-    /// Rows guaranteed under the drain buffer (`end` with the default buffer).
+    /// Rows its reservation may reach: the end plus one round's rows (a verify writes proposal
+    /// rows past the last kept one), within the limit.
+    lifetime: usize,
+    /// Rows guaranteed under the drain buffer (the lifetime with the default buffer).
     allowance: usize,
 }
 
@@ -99,9 +102,11 @@ impl Lease {
     /// The request's logical capacity: it finishes with `length` here.
     pub fn end(&self) -> usize { self.end }
     /// Rows the reservation may reach.
-    pub fn lifetime(&self) -> usize { self.end }
+    pub fn lifetime(&self) -> usize { self.lifetime }
     /// Rows the next round needs reserved, from `committed` rows.
-    pub fn round_rows(&self, committed: usize) -> usize { committed.saturating_add(self.step).min(self.end).max(committed) }
+    pub fn round_rows(&self, committed: usize) -> usize {
+        committed.saturating_add(self.step).min(self.lifetime).max(committed)
+    }
     /// Output tokens the lease allows.
     pub fn output(&self) -> usize { self.end - self.prompt }
 }
@@ -181,11 +186,12 @@ impl KvReserve {
         let step = step.max(1);
         let end = prompt.saturating_add(output).min(limit);
         if output == 0 || end <= prompt { return Err(NoRoom { prompt, limit }); }
+        let lifetime = end.saturating_add(step).min(limit);
         let allowance = match self.config.drain_buffer {
-            None => end,
-            Some(buffer) => prompt.saturating_add(buffer).saturating_add(step).min(end),
+            None => lifetime,
+            Some(buffer) => prompt.saturating_add(buffer).saturating_add(step).min(lifetime),
         };
-        Ok(Lease { prompt, step, end, allowance })
+        Ok(Lease { prompt, step, end, lifetime, allowance })
     }
 
     /// Rows a reservation grows to from `base` rows when it must hold `need`: the next chunk
@@ -198,7 +204,7 @@ impl KvReserve {
 
     /// Rows an admission reserves: the prompt and its first round, plus one chunk.
     pub fn admission_rows(&self, lease: &Lease) -> usize {
-        self.target_rows(lease.prompt, lease.round_rows(lease.prompt), lease.end)
+        self.target_rows(lease.prompt, lease.round_rows(lease.prompt), lease.lifetime)
     }
 
     pub fn admission_pages(&self, lease: &Lease) -> usize { self.pages_for(self.admission_rows(lease)) }
@@ -221,7 +227,7 @@ impl KvReserve {
 
     /// Pages still to come before the end of its life.
     pub fn potential(&self, demand: &Demand) -> usize {
-        self.pages_for(demand.lease.end).saturating_sub(demand.held)
+        self.pages_for(demand.lease.lifetime).saturating_sub(demand.held)
     }
 
     /// Banker's safety: some order lets every request reach its guaranteed end. Releasing a
@@ -280,7 +286,7 @@ impl KvReserve {
             if !refused {
                 let round = d.lease.round_rows(d.committed);
                 let minimal = self.pages_for(round).saturating_sub(d.held);
-                let full = self.pages_for(self.target_rows(d.held * self.page_rows, round, d.lease.end))
+                let full = self.pages_for(self.target_rows(d.held * self.page_rows, round, d.lease.lifetime))
                     .saturating_sub(d.held).max(minimal);
                 let grant = [full, minimal].into_iter().find(|&grant| grant <= available && {
                     let mut trial = d;

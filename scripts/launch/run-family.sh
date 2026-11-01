@@ -157,6 +157,9 @@ POOL_TOKENS
 PREFIX_CACHE_ENTRIES
 HOST_CACHE_BYTES
 MAX_OUTPUT_TOKENS
+KV_DECODE_RESERVE_CHUNK
+KV_RESERVE_DRAIN_BUFFER
+KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS
 THERMAL
 API_KEY_FILE
 ENABLE_BENCH
@@ -473,6 +476,9 @@ L2_PREFETCH
 MAPPED_SCALE_PRELOAD_GIB
 MAX_CONTEXT_TOKENS
 MAX_OUTPUT_TOKENS
+KV_DECODE_RESERVE_CHUNK
+KV_RESERVE_DRAIN_BUFFER
+KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS
 MEMORY_RESERVATION
 MODEL_ID
 MODEL_REVISION
@@ -967,7 +973,7 @@ case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2"
 ((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
 [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
-[[ "$MAX_OUTPUT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_OUTPUT_TOKENS <= 393216)) || release_die "MAX_OUTPUT_TOKENS must be in 1..393216"
+[[ "$MAX_OUTPUT_TOKENS" =~ ^-?[0-9]+$ ]] || release_die "MAX_OUTPUT_TOKENS must be an integer (<= 0: bounded only by the context)"
 [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] && ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) || release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
 [[ -z "$KV_POOL_SIZE" || "$KV_POOL_SIZE" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "KV_POOL_SIZE has an invalid unit"
 [[ -z "$MEMORY_RESERVATION" || "$MEMORY_RESERVATION" =~ ^[0-9]+([.][0-9]{1,6})?((B|MB|GB|MiB|GiB)|%)$ ]] || release_die "MEMORY_RESERVATION has an invalid unit"
@@ -1447,6 +1453,8 @@ fi
 start_coordinator() {
 echo "== starting native RTX coordinator =="
 local -a args=(--vision "$VISION" --audio "$AUDIO" serve-native "${vision_args[@]}" --snapshot "$(readlink -f "$hf_home/$snapshot_rel")" --native-lib /opt/cuteafd/lib/libcuteafd_native.so --peers "$peers" --rtx-gpus "$RELEASE_RTX_GPUS" --embedding-placement "$EMBEDDING" --listen "$ADDR" --prefill-batch-tokens "$PREFILL_BATCH_TOKENS" --concurrency "$CONCURRENCY" --prefix-cache-entries "$PREFIX_CACHE_ENTRIES" --max-context-tokens "$MAX_CONTEXT_TOKENS" --max-output-tokens "$MAX_OUTPUT_TOKENS" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
+release_kv_reserve_args v41_kv_args
+args+=("${v41_kv_args[@]}")
 [[ -z "${PREFILL_PACKING:-}" ]] || args+=(--prefill-packing "$PREFILL_PACKING")
 [[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
 [[ -z "${V41_PREFILL_WAVES:-}" ]] || args+=(--prefill-waves "$V41_PREFILL_WAVES")
@@ -2025,6 +2033,13 @@ fi
 # snapshots per bank (prompts, turns; 0 = off), HOST_CACHE_BYTES of pinned host memory for
 # retention (auto by default, e.g. 64GiB explicitly; 0 = off). POOL_TOKENS: paged KV tokens shared by
 # live sequences and retained snapshots.
+# KV reservation by decode chunks (every family): KV_DECODE_RESERVE_CHUNK tokens per top-up,
+# KV_RESERVE_DRAIN_BUFFER (0 = the whole remaining output), KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS.
+kv_reserve_args=()
+[[ -z "$(get KV_DECODE_RESERVE_CHUNK)" ]] || kv_reserve_args+=(--kv-decode-reserve-chunk "$(get KV_DECODE_RESERVE_CHUNK)")
+[[ -z "$(get KV_RESERVE_DRAIN_BUFFER)" ]] || kv_reserve_args+=(--kv-reserve-drain-buffer "$(get KV_RESERVE_DRAIN_BUFFER)")
+[[ -z "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)" ]] ||
+  kv_reserve_args+=(--kv-early-termination-min-output-tokens "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)")
 case $family in
   mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
     family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
@@ -3073,7 +3088,7 @@ docker run -d "${RELEASE_SERVING_ARGS[@]}" --name "$coordinator_name" --restart 
   "${api_mount_args[@]}" "${chat_template_mounts[@]}" "${trace_args[@]}" "${probe_args[@]}" ${profile_args[@]+"${profile_args[@]}"} ${profile_wrapper_args[@]+"${profile_wrapper_args[@]}"} "$coordinator_image" ${profile_wrapper[@]+"${profile_wrapper[@]}"} cuteafd "${coordinator_budget_args[@]}" $serve --snapshot "$snapshot" \
   --native-lib /opt/cuteafd/lib/libcuteafd_native.so "${peer_args[@]}" --listen "$addr" \
   --max-sequences "$effective_concurrency" "${context_args[@]}" \
-  --max-output "$(get MAX_OUTPUT_TOKENS 4096)" "${dspark_args[@]}" \
+  --max-output-tokens "$(get MAX_OUTPUT_TOKENS 131072)" "${kv_reserve_args[@]}" "${dspark_args[@]}" \
   "${family_args[@]}" "${draft_args[@]}" "${served_args[@]}" >/dev/null
 url="$(release_probe_url "$addr")"
 ready_deadline=$((SECONDS + 900))

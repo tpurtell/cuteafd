@@ -268,6 +268,20 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     }
     fn layout(&self) -> FamilyLayout { self.0.layout }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    /// The bound frontier carries the unit list every submission and commit compares.
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        let mut live = self.0.live.borrow_mut();
+        let frontier = live.get_mut(placement.slot).and_then(Option::as_mut).ok_or("Kimi prefix slot is not bound")?;
+        if frontier.units != placement.units || frontier.len != placement.len {
+            return Err("Kimi growth differs from the bound frontier".into());
+        }
+        let mut units = placement.units.clone();
+        units.extend_from_slice(pages);
+        self.validate(&Placement { units: units.clone(), ..placement.clone() }, placement.len)?;
+        frontier.units.clone_from(&units);
+        placement.units = units;
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize {
         self.0.live.borrow().get(placement.slot).and_then(Option::as_ref)
             .filter(|frontier| frontier.units == placement.units && frontier.len == placement.len

@@ -44,15 +44,15 @@ fn admission_reserves_the_prompt_plus_a_chunk_rounded_down_to_a_page() {
 #[test]
 fn a_tail_under_half_a_chunk_reserves_the_whole_lifetime() {
     let p = policy(16_384, 0, -1, 131_072);
-    // Lifetime 1000 + 20000: the chunk target 17344 leaves 3656 < 8192, so all of it.
+    // Lifetime 1000 + 20000 + 8: the chunk target 17344 leaves 3664 < 8192, so all of it.
     let lease = p.lease(1000, 20_000, 8, 1 << 20).unwrap();
-    assert_eq!(p.admission_rows(&lease), 21_000);
+    assert_eq!(p.admission_rows(&lease), 21_008);
     // A tail of at least half a chunk keeps the chunk.
     let lease = p.lease(1000, 30_000, 8, 1 << 20).unwrap();
     assert_eq!(p.admission_rows(&lease), 17_344);
     // Short outputs reserve their lifetime at once.
     let lease = p.lease(1000, 100, 8, 1 << 20).unwrap();
-    assert_eq!(p.admission_rows(&lease), 1100);
+    assert_eq!(p.admission_rows(&lease), 1108);
 }
 
 #[test]
@@ -60,7 +60,8 @@ fn lease_respects_the_context_and_refuses_no_room() {
     let p = policy(16_384, 0, -1, 131_072);
     let lease = p.lease(1000, 131_072, 8, 4096).unwrap();
     assert_eq!((lease.end(), lease.lifetime(), lease.output()), (4096, 4096, 3096));
-    // The last round's rows stay within the end.
+    assert_eq!(p.lease(1000, 2000, 8, 4096).unwrap().lifetime(), 3008);
+    // The last round's rows stay within the limit.
     assert_eq!((lease.round_rows(4090), lease.round_rows(4096)), (4096, 4096));
     assert_eq!(p.lease(4096, 10, 8, 4096), Err(NoRoom { prompt: 4096, limit: 4096 }));
     assert!(p.lease(10, 0, 8, 4096).is_err());
@@ -81,7 +82,7 @@ fn top_up_grows_one_chunk_when_the_next_round_would_pass_the_reservation() {
     assert_eq!(p.plan(10_000, &[d], &[false], true), vec![Action::Grow(527)]);
     // The last top-up takes the tail when under half a chunk would remain.
     let d = decoding(&p, 1000, 40_000, 527, 33_725);
-    assert_eq!(p.plan(10_000, &[d], &[false], true), vec![Action::Grow(p.pages_for(41_000))]);
+    assert_eq!(p.plan(10_000, &[d], &[false], true), vec![Action::Grow(p.pages_for(41_008))]);
     assert_eq!(p.stats().top_ups, 2);
 }
 
@@ -114,7 +115,7 @@ fn the_request_with_the_most_potential_stalls_first() {
     let available = p.need(&short);
     assert!(p.safe(available, demands));
     let actions = p.plan(available, &demands, &[false; 3], true);
-    assert_eq!(actions, vec![Action::Stall, Action::Grow(p.pages_for(10_000)), Action::Stall]);
+    assert_eq!(actions, vec![Action::Stall, Action::Grow(p.pages_for(10_008)), Action::Stall]);
     // With room for everyone, nobody stalls.
     let actions = p.plan(available + 200, &demands, &[false; 3], true);
     assert!(actions.iter().all(|a| matches!(a, Action::Grow(_))), "{actions:?}");
@@ -419,7 +420,7 @@ fn simulator_early_termination_happens_only_past_the_threshold_where_a_stall_wou
 #[test]
 fn shared_pages_return_only_with_their_last_holder() {
     let p = policy(4096, 0, -1, 1 << 20);
-    let lease = p.lease(640, 640, 1, 1 << 20).unwrap();
+    let lease = p.lease(640, 639, 1, 1 << 20).unwrap();
     // Two forks of one 10-page snapshot, each needing 10 more pages; 10 free.
     let a: Vec<u32> = (0..10).collect();
     let b: Vec<u32> = (0..10).collect();
