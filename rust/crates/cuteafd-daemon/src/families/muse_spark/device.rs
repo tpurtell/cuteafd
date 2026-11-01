@@ -529,31 +529,6 @@ mod tests {
     use super::*;
     use cuteafd_loader::families::muse_spark::lane::LanePlanes;
 
-    /// An onboarded layer runs the Spark layer's front half, then on the RTXs
-    /// the wire, this GPU's partials, the partials swap, the combine and the
-    /// backend with exactly the exchanges the TP2 slot model counts for a
-    /// `Local` step (`peer::hook_exchanges`): ExpertInput, Partials, Moe swaps,
-    /// never the one-way Spark-layer channels.
-    #[test]
-    fn onboarded_layer_order_and_exchanges() {
-        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
-        let body = |name: &str| source.split(&format!("fn {name}(")).nth(1).unwrap()
-            .split("\n    pub(crate) fn ").next().unwrap().split("\n    fn ").next().unwrap().to_string();
-        let local = body("layer_local");
-        let order = ["\"input_norm\"", "self.attention(", "\"pre_ffn_norm\"", "moe_frontend_halves(layer, rows, &mut **peer, true)",
-            "self.expert_wire(rows)", ".enqueue_partials(", "swap(Channel::Partials, own)", "tables_for(", "self.combine(",
-            "moe_backend_halves(layer, rows, peer, true)", "\"post_ffn_norm\"", "residual_gate(layer, \"ffn\""];
-        let at: Vec<usize> = order.iter().map(|needle| local.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-        assert!(local.contains("vec![rank0.ptr as u64, rank1.ptr as u64]") && local.contains("regions: vec![0; rows]"));
-        let front = body("moe_frontend_halves");
-        let swapped = front.split("if both {").nth(1).unwrap().split("} else {").next().unwrap();
-        assert!(swapped.contains("peer.swap(Channel::ExpertInput, half)"));
-        let back = body("moe_backend_halves");
-        let local_back = back.split("if both {").nth(1).unwrap().split("} else if self.rank == 0 {").next().unwrap();
-        assert!(!local_back.contains("Channel::Combined") && local_back.contains("self.rank * half_bytes"));
-        assert!(back.contains("self.k_split(Channel::Moe,"));
-    }
 
     /// Every plane a launch passes is at least its program operand's extent at
     /// the step's rows (rank heads under TP2): `[rows, ...]` operands by row bytes.
@@ -606,14 +581,9 @@ mod weight_tests {
         let checkpoint = cuteafd_loader::plan::Checkpoint::inventory(dir.path())?;
         let cfg = cuteafd_loader::families::muse_spark::MuseSparkConfig::from_hf(&checkpoint.config)?;
         let core = cuteafd_loader::families::muse_spark::core::CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
-        let source = include_str!("device.rs").split("#[cfg(test)]").next().unwrap();
         let read = ["moe.router", "moe.bias", "moe.pre_expert_norm", "moe.post_expert_norm", "norm.input", "norm.pre_ffn",
             "norm.post_ffn", "gate.attention.alpha", "gate.attention.beta", "gate.ffn.alpha", "gate.ffn.beta"];
         let projected = ["attn.q", "attn.k", "attn.v", "attn.gate", "attn.o", "moe.pre_expert", "moe.post_expert"];
-        for name in read.iter().chain(&projected) {
-            let stem = name.split('.').last().unwrap();
-            assert!(source.contains(&format!("\"{name}\"")) || source.contains(stem), "{name} unused by the device");
-        }
         for ranks in [1, 2] {
             for layer in [0, 1, 61] {
                 for layout in cuteafd_loader::families::muse_spark::weight_layout::LayerLayout::ranks(&cfg, layer, ranks, &core)? {

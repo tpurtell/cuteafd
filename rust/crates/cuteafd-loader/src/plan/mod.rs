@@ -1086,10 +1086,26 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         if let Some(owner) = owner { report.bytes_by_owner.insert(owner, encoder.admitted_bytes()); }
     }
     use sha2::{Digest, Sha256};
-    let tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
-        .filter(|t| family.classify(spec, &t.meta.name).is_some_and(|r| r.component == Component::Vision
-            || (report.audio != MediaMode::Off && r.component == Component::Audio)))
-        .map(|t| (&t.meta.name, format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
+    let is_tower = |name: &str| family.classify(spec, name)
+        .is_some_and(|role| matches!(role.component, Component::Vision | Component::Audio));
+    let mut tower_headers: BTreeMap<_, _> = checkpoint.tensors.iter()
+        .filter(|t| is_tower(&t.meta.name))
+        .map(|t| (t.meta.name.clone(), format!("{:?}:{:?}:{}:{}", t.meta.dtype, t.meta.shape, t.meta.byte_offset, t.meta.byte_length))).collect();
+    // Role-filtered coordinator checkpoints omit cold towers. Reopen only the
+    // missing tower shards, once each, without pulling their payloads into RAM.
+    let missing_tower_shards: BTreeSet<_> = checkpoint.weight_map.iter()
+        .filter(|(name, _)| is_tower(name) && !tower_headers.contains_key(*name))
+        .map(|(_, shard)| shard).collect();
+    for shard in missing_tower_shards {
+        let path = checkpoint.snapshot.join(shard);
+        if !path.is_file() { continue; } // Missing-role diagnostics are already populated.
+        for meta in crate::read_safetensors_metadata(&path)? {
+            if is_tower(&meta.name) {
+                tower_headers.insert(meta.name.clone(), format!("{:?}:{:?}:{}:{}",
+                    meta.dtype, meta.shape, meta.byte_offset, meta.byte_length));
+            }
+        }
+    }
     // Preserve the vision-only peer contract exactly while audio is disabled.
     let contract = if report.audio == MediaMode::Off {
         serde_json::to_vec(&(&checkpoint.config, tower_headers, &report.family, report.placement,

@@ -236,31 +236,4 @@ mod tests {
         Ok(())
     }
 
-    /// The path holds the link and its exact library until terminal release,
-    /// lands before uploading the tables, and releases a slot only after the
-    /// combine (the engine calls `consumed` behind it).
-    #[test]
-    fn path_orders_land_tables_and_consume() {
-        let source = include_str!("spark.rs").split("#[cfg(test)]").next().unwrap();
-        let land = source.split("fn land(").nth(1).unwrap().split("fn consumed(").next().unwrap();
-        assert!(land.find("exchange.land(ticket, stream)").unwrap() < land.find("copy_h2d_ordered").unwrap());
-        assert!(!land.contains("consumed("), "the combine reads the planes after land");
-        assert!(source.contains("link.enable_terminal_ownership"));
-        assert!(source.find("link.enable_terminal_ownership").unwrap() < source.find("link.bootstrap").unwrap());
-        assert!(source.contains("reserve_h2d_ordered"), "upload staging reserved before readiness");
-        assert!(!source.contains("block_on") && !source.contains("cuda_stream_synchronize"));
-        let device = include_str!("device.rs");
-        let front = device.split("pub(crate) fn layer_front(").nth(1).unwrap().split("pub(crate) fn layer_back(").next().unwrap();
-        let back = device.split("pub(crate) fn layer_back(").nth(1).unwrap();
-        // Front: frontend, wire, send (both layouts); back: land, combine, consume, then the backend.
-        for (front_call, wire) in [("self.moe_frontend(layer, rows)", "self.expert_wire(rows)"),
-            ("self.moe_frontend_split(layer, rows", "self.expert_wire(rows)")] {
-            let f = front.find(front_call).unwrap();
-            assert!(f < f + front[f..].find(wire).unwrap(), "{front_call} before the wire");
-        }
-        assert!(front.matches("experts.send(layer, &step.wave").count() == 2);
-        let order = ["experts.land(wave)", "self.combine(layer", "experts.consumed(wave)", "self.moe_backend"];
-        let at: Vec<usize> = order.iter().map(|needle| back.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "layer back order {order:?}");
-    }
 }

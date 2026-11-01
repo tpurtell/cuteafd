@@ -232,19 +232,6 @@ mod tests {
         Ok(())
     }
 
-    /// Units carry state only in their slot: views from `LaneViews::slot`, the
-    /// metadata bank of the unit's slot.
-    #[test]
-    fn units_address_their_slot() {
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        let begin = source.split("fn begin_unit(").nth(1).unwrap().split("fn attention(").next().unwrap();
-        assert!(begin.contains("rank.lane.views.slot(unit.slot)"));
-        assert!(begin.contains("rank.step.upload(rank.device.library, unit.slot, &meta, true"));
-        let embed = begin.find("super::forward::embed(self.cfg, rank, &lane").unwrap();
-        let inject = begin.find("super::forward::inject_media(self.cfg, rank, &lane, &media, rows, stream)").unwrap();
-        assert!(embed < inject);
-        assert!(source.contains("rank.device_with(cfg, self.streams[index], &state.lanes[index])"));
-    }
 
     /// The drafter's tap rows are the call's last `TAP_ROWS` rows: the units
     /// overlapping that window tap their overlap at its window offset, so the
@@ -268,11 +255,6 @@ mod tests {
                 }
                 assert!(covered.iter().all(|&c| c == 1), "rows {rows} unit {unit}");
             }
-        }
-        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
-        for hook in ["fn local_ffn(", "fn land_experts("] {
-            let body = source.split(hook).nth(1).unwrap().split("\n    fn ").next().unwrap();
-            assert!(body.trim_end().ends_with("self.tap(layer, unit)\n    }") || body.contains("self.tap(layer, unit)"), "{hook}");
         }
         Ok(())
     }

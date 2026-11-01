@@ -340,3 +340,102 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     let refused = input.plan(&with_draft).unwrap();
     assert!(refused.hints.iter().any(|h| h.what.contains("softcap/output_multiplier differ")), "{:?}", refused.hints);
 }
+
+#[test]
+fn media_auto_off_and_explicit_refusals_keep_named_diagnostics() {
+    use crate::plan::encoder::EncoderKind;
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &all_layers());
+    let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+    let mut options = with_layout(1, 6);
+    // Text fits at a fixed small pool, but neither tower can occupy the absent
+    // second RTX or the deliberately tiny Spark allocation budget.
+    let layout = options.layout.as_mut().unwrap();
+    layout.context_tokens = 4096;
+    layout.pool_tokens = Some(4096);
+    layout.spark_bytes = 1;
+    layout.spark_allocation_budget_bytes = Some(1);
+    let auto = input.plan(&options).unwrap();
+    for (component, encoder) in [(Component::Vision, auto.encoder.as_ref()),
+        (Component::Audio, auto.audio_encoder.as_ref())] {
+        // If even the text pool is refused, both explicit ownership diagnostics
+        // must still survive. Auto fallback itself is covered below.
+        assert!(encoder.is_some(), "{component:?}: {:?}", auto.hints);
+    }
+    options.vision = MediaMode::Rtx(Some(8));
+    options.audio = MediaMode::Spark(Some(8));
+    let refused = input.plan(&options).unwrap();
+    assert!(!refused.fits && !refused.placement_supported);
+    for encoder in [refused.encoder.as_ref(), refused.audio_encoder.as_ref()] {
+        let encoder = encoder.expect("media refusal has an ownership diagnostic");
+        assert_eq!(encoder.kind, EncoderKind::Off);
+        assert!(encoder.reason.contains("refused"));
+    }
+    // Force Auto through Off without changing the text inventory: impossible
+    // replica count eliminates Sparks; a capacity just above the text-only
+    // layout leaves no room for either tower.
+    let mut options = with_layout(1, 6);
+    options.vision = MediaMode::Off;
+    options.audio = MediaMode::Off;
+    let opts = options.layout.as_mut().unwrap();
+    opts.context_tokens = 4096;
+    opts.pool_tokens = Some(4096);
+    opts.onboard = Some(crate::placement::Onboard::Layers(0));
+    let text = input.plan(&options).unwrap();
+    let used = text.memory_layout.as_ref().unwrap().devices[0].used_bytes();
+    options.vision = MediaMode::Auto;
+    options.audio = MediaMode::Auto;
+    options.layout.as_mut().unwrap().rtx_bytes = vec![used + 1024];
+    options.layout.as_mut().unwrap().vision_replicas = 9;
+    // Audio has one copy, so remove its Spark candidate by retaining only the
+    // text's exact Spark allocation budget.
+    let spark_used = text.memory_layout.as_ref().unwrap().devices.iter()
+        .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark)
+        .map(|d| d.used_bytes()).max().unwrap();
+    options.layout.as_mut().unwrap().spark_allocation_budget_bytes = Some(spark_used);
+    let off = input.plan(&options).unwrap();
+    assert!(off.disabled_media_bytes > 0, "{:?}", off.hints);
+    for component in [Component::Vision, Component::Audio] {
+        let component = off.components.iter().find(|c| c.component == component).unwrap();
+        assert_eq!(component.status, Status::Disabled);
+        assert_eq!(component.bytes, 0);
+    }
+}
+
+#[test]
+fn coordinator_media_hash_includes_vision_and_pcm_tensor_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    testing::write_muse_media_snapshot(dir.path(), &[0]);
+    let hash = || {
+        let checkpoint = Checkpoint::coordinator(dir.path(), false, false).unwrap();
+        assert!(checkpoint.tensors.iter().all(|t| !t.meta.name.starts_with("model.audio_tower.")
+            && !crate::media::muse_vision::is_tensor(&t.meta.name)));
+        PlanInput::from_checkpoint(checkpoint).plan(&PlanOptions {
+            vision: MediaMode::Off, audio: MediaMode::Off,
+            placement: ExpertPlacement::from_spark_ranks(6), ..Default::default()
+        }).unwrap().encoder_plan_hash
+    };
+    let mut previous = hash();
+    let path = dir.path().join("model-00000.safetensors");
+    // Change only a tower header, not config or text tensors. F16 has the same
+    // storage extent as BF16; disabled towers do not require runnable numerics.
+    for prefix in ["model.vision", "model.audio_tower."] {
+        use std::io::{Read, Seek, Write};
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).unwrap();
+        let mut length = [0; 8];
+        file.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0; u64::from_le_bytes(length) as usize];
+        file.read_exact(&mut bytes).unwrap();
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let name = header.as_object().unwrap().keys().find(|name| name.starts_with(prefix)).unwrap().clone();
+        header[&name]["dtype"] = serde_json::json!("F16");
+        let mut updated = serde_json::to_vec(&header).unwrap();
+        assert!(updated.len() <= bytes.len());
+        updated.resize(bytes.len(), b' ');
+        file.seek(std::io::SeekFrom::Start(8)).unwrap();
+        file.write_all(&updated).unwrap();
+        let next = hash();
+        assert_ne!(previous, next, "{prefix}");
+        previous = next;
+    }
+}

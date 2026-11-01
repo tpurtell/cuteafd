@@ -1304,6 +1304,18 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
     let (selected, (mut accepted, resolved, mut memory)) = match outcome {
         Ok(accepted) => accepted,
         Err(error) => {
+            if failed.is_none() {
+                // No candidate reached the solver (absent device/replica). Keep
+                // the text layout and resolve the explicit refusal on its devices.
+                let mut trial = original.clone();
+                let mut opts = original_options.clone();
+                trial.vision = MediaMode::Off;
+                trial.audio = MediaMode::Off;
+                opts.encoder_items = vec![Vec::new(); opts.rtx_bytes.len()];
+                let memory = model.placement(input, &mut trial, &mut opts, requested)
+                    .ok_or_else(|| anyhow::anyhow!("family has no placement adapter"))??;
+                failed = Some((trial, opts, memory));
+            }
             if let Some((mut trial, opts, mut memory)) = failed {
                 // Unsupported text geometry still reports media ownership from
                 // the failing solve's actual devices, not an absent encoder.
@@ -1335,12 +1347,7 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
         if name == "audio" && original.audio == MediaMode::Off { continue; }
         if encoder.kind == EncoderKind::Off {
             let component = if name == "vision" { Component::Vision } else { Component::Audio };
-            if let Some(c) = accepted.components.iter_mut().find(|c| c.component == component)
-                .filter(|c| c.status != Status::Unused && c.status != Status::Disabled) {
-                accepted.disabled_media_bytes += c.bytes;
-                c.bytes = 0;
-                c.status = Status::Disabled;
-            }
+            disable_media_component(&mut accepted, component);
             if name == "audio" { accepted.audio = MediaMode::Off; }
         }
         media_notes.push(format!("{name} {:?}: {}; {} bytes admitted; shortfall {} bytes",
@@ -1354,6 +1361,15 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
     *report = accepted;
     *options = resolved;
     Ok(memory)
+}
+
+pub(crate) fn disable_media_component(report: &mut PlanReport, component: Component) {
+    if let Some(c) = report.components.iter_mut().find(|c| c.component == component)
+        .filter(|c| c.status != Status::Unused && c.status != Status::Disabled) {
+        report.disabled_media_bytes += c.bytes;
+        c.bytes = 0;
+        c.status = Status::Disabled;
+    }
 }
 
 /// Admit at a family's materialized mandatory-inventory boundary. The callback

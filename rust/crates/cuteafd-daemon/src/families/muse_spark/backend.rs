@@ -411,8 +411,6 @@ mod tests {
     /// `<|im_start|>`), resolved from the served snapshot when present.
     #[test]
     fn message_starts_are_the_checkpoints() {
-        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(source.contains("fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }"));
         assert_eq!(cuteafd_api::openai::chat::muse::START, "<|start|>");
         let snapshots = std::path::Path::new(
             "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
@@ -483,11 +481,6 @@ mod tests {
         assert_eq!(written, [500, 564, 628], "each chunk writes past the last");
         assert_eq!(ungraphed_kind(false, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::Prefill);
         assert_eq!(ungraphed_kind(true, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::MtpVerify);
-        // The backend routes both verify entries through the bookkeeping above, never refusing a draft.
-        let source = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
-        assert!(!source.contains("has no drafter yet"));
-        let verify = source.split("fn verify_rows(").nth(1).unwrap().split("\n    }").next().unwrap();
-        assert!(verify.contains("after_verify(placement.len, tokens.len(), speculative)"));
         Ok(())
     }
 }

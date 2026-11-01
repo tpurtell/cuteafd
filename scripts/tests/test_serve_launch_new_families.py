@@ -510,6 +510,7 @@ def test_muse_generic_media_plan_handoff(tmp_path: Path, vision: str, audio: str
     serve = _line(result, "cuteafd serve-muse --snapshot")
     assert _flag(serve, "--vision") == ("off" if vision == "off" else f"{vision}:0")
     assert _flag(serve, "--audio") == f"{audio}:1"
+    assert "--audio-encoder-backend" not in serve.split()
     if vision == "spark":
         assert _flag(serve, "--vision-peers") == "10.0.0.1:19442"
         assert _flag(serve, "--encoder-plan-hash") == "ab" * 32

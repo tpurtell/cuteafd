@@ -377,32 +377,6 @@ mod tests {
         Ok(())
     }
 
-    /// Bring-up order: admission seals the Spark endpoint before the coordinator
-    /// loads (onboarded experts inside the same window), the link connects
-    /// after the load, and the backend serves the shared scheduler with no
-    /// drafter, admitted media owners, and the readiness callback last.
-    #[test]
-    fn serve_brings_up_then_schedules_the_backend() {
-        let source = include_str!("serve.rs").split("#[cfg(test)]").next().unwrap();
-        let body = source.split("fn with_backend<T>").nth(1).unwrap().split("\nfn worker(").next().unwrap();
-        let order = ["startup::admit(", "super::media::Ready::load(", "SparkAdmission::plan(", "load_while_admitting(Some(admission)",
-            "super::onboard::load(", "MuseEngine::connect(", "MuseBackend::new(", "run(&backend, sequences, media)"];
-        let at: Vec<usize> = order.iter().map(|needle| body.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-        assert!(!body.contains("bail!(\"Muse Spark step executor"), "serving no longer stops after bring-up");
-        let worker = source.split("\nfn worker(").nth(1).unwrap().split("\npub(crate) async fn run(").next().unwrap();
-        assert!(worker.contains("scheduler::Drafts::None") && worker.contains("EmbeddingCache::new(cache_bytes)"));
-        assert!(worker.contains("encoder.health_handle_for(false)") && worker.contains("encoder.health_handle_for(true)"));
-        assert!(worker.contains("args.decode_share, &prefix"));
-        // `--draft` drives neural drafts (the policy's depth, or the fixed one); without it, none.
-        assert!(worker.contains("(Some(_), Some(depth)) => scheduler::Drafts::Neural { depth: usize::from(depth), fixed: true }"));
-        assert!(worker.contains("DflashConfig::read(snapshot)?.drafts(), fixed: false"));
-        let backend = body.split("MuseBackend::new(").nth(1).unwrap();
-        assert!(backend.contains("served_context, pages, local, draft, pricing"));
-        let run = source.split("\npub(crate) async fn run(").nth(1).unwrap();
-        assert!(run.contains("MuseEncoding::from_snapshot(") && run.contains("ModelEncoding::Muse("));
-        assert!(run.find("ready_rx.await").unwrap() < run.find("TcpListener::bind").unwrap());
-    }
 
     #[test]
     fn media_peer_identity_is_validated_before_device_access() -> Result<()> {

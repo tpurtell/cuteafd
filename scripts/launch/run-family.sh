@@ -3078,13 +3078,19 @@ if ((${#audio_encoder_ranks[@]})); then
     host="$(get "SPARK_${audio_rank}_HOST")"
     backend="$(ssh "$host" "docker logs cuteafd-spark-expert-$host-$port 2>&1" | python3 -c '
 import re,sys
-matches=re.findall(r"mimo_audio_fp32_v1/cuda[0-9]+/cufft[0-9]+/cublas[0-9.]+/cute_aot_sm121/export[0-9a-f]{64}",sys.stdin.read())
+matches=[backend for line in sys.stdin if "audio encoder ready" in line
+    for backend in re.findall(r"\bbackend=\"?([^\s\"]+)", line)]
 assert matches and len(set(matches))==1, "missing or conflicting ready audio backend identity"
 print(matches[0])')"
     [[ -z "$audio_backend" || "$audio_backend" == "$backend" ]] || release_die "audio replicas have different backend exports"
     audio_backend="$backend"
   done
-  family_args+=(--audio-encoder-backend "$audio_backend")
+  # RVQ backends identify architecture-specific exports; PCM has a fixed protocol identity.
+  if [[ "$family" == mimo_v2 ]]; then
+    family_args+=(--audio-encoder-backend "$audio_backend")
+  else
+    [[ "$audio_backend" == pcm-bf16-aot-v1 ]] || release_die "unexpected PCM audio backend: $audio_backend"
+  fi
 fi
 peer_csv="$(IFS=,; echo "${peers[*]}")"
 peer_args=()

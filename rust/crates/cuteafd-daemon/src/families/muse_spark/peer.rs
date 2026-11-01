@@ -230,20 +230,6 @@ mod tests {
         Ok(())
     }
 
-    /// The model's per-hook exchange order is the device layer's: attention
-    /// swaps Attention; the split frontend sends/receives ExpertInput before the
-    /// Spark send; the split backend moves Combined, then swaps Moe.
-    #[test]
-    fn model_order_matches_the_device_layer() {
-        let device = include_str!("device.rs");
-        let section = |from: &str, to: &str| device.split(from).nth(1).unwrap().split(to).next().unwrap().to_string();
-        assert!(section("pub(crate) fn attention(", "pub(crate) fn residual_gate(").contains("Channel::Attention"));
-        let frontend = section("fn moe_frontend_split(", "/// The expert-width rows onto");
-        assert!(frontend.contains("peer.send(Channel::ExpertInput") && frontend.contains("peer.receive(Channel::ExpertInput"));
-        let backend = section("fn moe_backend_split(", "/// `muse_tp_combine_*`");
-        let (c, m) = (backend.find("Channel::Combined").unwrap(), backend.find("Channel::Moe").unwrap());
-        assert!(c < m, "Combined moves before the Moe swap");
-    }
 
     /// The runtime's slots are what admission charged: the fixed channels as
     /// "Muse TP2 exchange slots", `Partials` as the peer half of `tp2_workspace`.

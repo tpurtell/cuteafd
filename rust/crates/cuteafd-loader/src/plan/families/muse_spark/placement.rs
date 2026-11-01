@@ -125,6 +125,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let media = crate::placement::families::muse_spark::MediaOptions::from_checkpoint(input.checkpoint(),
         report.vision, report.audio, opts.vision_replicas).and_then(|options| built.admit_media(&options));
     if let Err(error) = media {
+        for component in [Component::Vision, Component::Audio] {
+            let encoder = crate::plan::encoder::EncoderPlacement {
+                kind: crate::plan::encoder::EncoderKind::Off, weights: 0, scratch: 0, replicas: Vec::new(),
+                reason: format!("Muse bundled media admission refused: {error:#}"), shortfall: 0,
+            };
+            if component == Component::Vision { report.encoder = Some(encoder); }
+            else { report.audio_encoder = Some(encoder); }
+        }
         refusal(report, format!("Muse bundled media admission refused: {error:#}"),
             "Use the bundled BF16 towers, a fitting encoder placement, or explicitly disable media.");
         return memory;
@@ -132,7 +140,13 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     if let Some(media) = &built.media {
         report.encoder = Some(media.vision.clone());
         report.audio_encoder = Some(media.audio.clone());
-        if media.audio.kind == crate::plan::encoder::EncoderKind::Off { report.audio = crate::plan::MediaMode::Off; }
+        if media.vision.kind == crate::plan::encoder::EncoderKind::Off {
+            crate::plan::layout::disable_media_component(report, Component::Vision);
+        }
+        if media.audio.kind == crate::plan::encoder::EncoderKind::Off {
+            crate::plan::layout::disable_media_component(report, Component::Audio);
+            report.audio = crate::plan::MediaMode::Off;
+        }
     }
     let embedding = built.global.embedding as u64;
     let head = built.global.head_bytes() as u64;

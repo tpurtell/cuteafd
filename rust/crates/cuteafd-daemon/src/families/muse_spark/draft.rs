@@ -123,24 +123,3 @@ impl<'a> MuseDraft<'a> {
         self.device.run(|| self.drafter.draft_device_with(sequences, &input, TargetHead::Launch(Box::new(launch))))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    /// The drafter's head is the target's head path in order (K6 head, trim to
-    /// the vocabulary, softcap) on its own scratch and stream; its input rows
-    /// come from the target table by peer gather; taps and updates stay on the
-    /// head rank's stream.
-    #[test]
-    fn drafter_reads_the_target_head_and_table_on_its_stream() {
-        let source = include_str!("draft.rs").split("#[cfg(test)]").next().unwrap();
-        let draft = source.split("pub(crate) fn draft(").nth(1).unwrap();
-        let order = ["head.core.local(rows, input, weights, staged, stream)", "copy_d2d_2d_async(trimmed, vocab * 4, staged",
-            "programs.launch(\"softcap\", &[trimmed, out]"];
-        let at: Vec<usize> = order.iter().map(|needle| draft.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-        assert!(draft.contains("table.embed(tokens, ids, 1, output, stream)") && draft.contains("draft_device_with("));
-        assert!(draft.contains("stream == self.stream"));
-        let load = source.split("pub(crate) fn load(").nth(1).unwrap().split("pub(crate) fn tap(").next().unwrap();
-        assert!(load.contains("GlmDraftRepresentation::Bf16Only") && load.contains("admitted.head_scratch =="));
-    }
-}

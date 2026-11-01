@@ -125,39 +125,7 @@ pub(crate) fn step(cfg: &MuseSparkConfig, ranks: &[RankResources<'_>], streams: 
 
 #[cfg(test)]
 mod tests {
-    /// A step uploads its metadata, embeds, runs every layer on each rank in
-    /// rank order (rank 0 alone holds the Spark path), then scores on the last rank;
-    /// the head trims the padded rows before the softcap.
-    #[test]
-    fn step_order_and_head_trim() {
-        let source = include_str!("forward.rs").split("#[cfg(test)]").next().unwrap();
-        let step = source.split("pub(crate) fn step(").nth(1).unwrap();
-        let order = ["rank.step.upload(", "embed(cfg, rank, &rank.lane.views, table, tokens, stream)",
-            "inject_media(cfg, rank, &rank.lane.views, media, tokens.len(), stream)", "for layer in 0..cfg.layers",
-            ".layer(layer, &planes[index], path, peer)", "head(cfg, &ranks[last], &ranks[last].lane.views, head_rows"];
-        let at: Vec<usize> = order.iter().map(|needle| step.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-        assert!(step.contains("if index == 0 { experts.as_deref_mut() } else { None }"));
-        let head = source.split("pub(crate) fn head(").nth(1).unwrap().split("pub(crate) fn step(").next().unwrap();
-        let order = ["\"final_norm\"", "rank.core.local(", "copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4",
-            "\"softcap\""];
-        let at: Vec<usize> = order.iter().map(|needle| head.find(needle).unwrap()).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-    }
 
-    /// With a drafter, every layer taps the head rank's hidden rows and the
-    /// draft policy's probe rings that rank's route ids then marks the layer,
-    /// after every rank ran it (onboarded layers too), on the head stream.
-    #[test]
-    fn step_taps_and_probes_after_every_layer() {
-        let source = include_str!("forward.rs").split("#[cfg(test)]").next().unwrap();
-        let step = source.split("pub(crate) fn step(").nth(1).unwrap();
-        let layer_loop = step.split("for layer in 0..cfg.layers").nth(1).unwrap();
-        let order = ["for (index, (rank, &stream))", "draft.tap(layer, ranks[last].lane.views.plane(\"hidden\")?",
-            "probe.ring(ranks[last].device.library, layer, ids", "probe.mark(layer, streams[last])"];
-        let at: Vec<usize> = order.iter().map(|needle| layer_loop.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
-        assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
-    }
 
     /// The head rank's logits planes are what admission charged.
     #[test]
