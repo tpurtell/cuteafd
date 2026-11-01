@@ -46,6 +46,8 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T
     entry: &mut Queued<T, C>) -> Result<Chunk> {
     let request = entry.request.as_mut().context("a queued prompt already left")?;
     let outcome = host.run(request, &mut entry.cursor);
+    // Watchdog progress: a chunk (a call, or a whole prompt) completed.
+    super::stall::tick();
     if matches!(outcome, Ok(None)) { return Ok(Chunk::More); }
     let request = entry.request.take().expect("checked above");
     entry.cursor = host.rest();

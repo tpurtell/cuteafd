@@ -477,3 +477,15 @@ def test_profile_spark_wraps_the_selected_v41_worker_and_ncu_skip_reaches_the_co
             assert not any("graceful-stop" in option for option in run["options"])
             assert run["command"][:2] == ["cuteafd", "expertd-native"]
     assert sorted(ranks) == list(range(len(workers)))
+
+
+def test_v41_site_hub_reaches_coordinator_and_each_remote_worker(tmp_root):
+    current = capture(ROOT, CASES[0], site_hub=True)
+    assert len(current["containers"]) > 1
+    for container in current["containers"]:
+        run = parse_run(container["argv"])
+        assert run["env"]["HF_HOME"] == "<root>/hf"
+        assert "<root>/hf/hub:<root>/hf/hub:ro" in run["mounts"]
+        assert not any("/mnt/sparknest:" in mount for mount in run["mounts"])
+        command = run["command"]
+        assert command[command.index("--snapshot") + 1].startswith("<root>/hf/hub/")

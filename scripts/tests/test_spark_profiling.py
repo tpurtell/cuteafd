@@ -184,7 +184,7 @@ def test_family_launch_wraps_only_the_selected_spark_ranks(tmp_path):
     # The wrapper sits between the image and the served command.
     assert rank1.index('--force-overwrite=true') < rank1.index('cuteafd expertd-native')
     # Spark push binds the whole SparkNest namespace (#587), not the old /hf/hub alias.
-    assert rank1.index(':ro ') < rank1.index('/bin/bash -c ') < rank1.index('cuteafd expertd-native')
+    assert rank1.index('${RELEASE_HUB_MOUNTS[@]}') < rank1.index('/bin/bash -c ') < rank1.index('cuteafd expertd-native')
     for worker in workers:
         assert f'mkdir -p {prof} && release_require_writable_state {prof} && docker run' in worker
 
@@ -229,7 +229,7 @@ def test_v41_worker_puts_the_spark_wrapper_between_image_and_command():
     positional = ['image', 'name', '0', '107374182400', '19441', 'snapshot', 'fingerprint', '4',
                   '0', '', '', '', '', '', 'info', '__none__']
     tail = ['--profile-args', '-e', 'CUTEAFD_PROFILE_HOST=emu', *GRACEFUL, '--profile-wrapper', '/bin/bash', '-c', 'script', 'x', 'ncu', '--set', 'full']
-    result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n'
+    result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n'
                              + remote.replace(' >/dev/null', ''), 'test', *positional, *tail], cwd=ROOT, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     arguments = result.stdout.splitlines()
@@ -238,7 +238,7 @@ def test_v41_worker_puts_the_spark_wrapper_between_image_and_command():
     assert arguments[image + 8:image + 10] == ['cuteafd', 'expertd-native']
     assert arguments.index('cuteafd.graceful-stop=1') < image and '--profile-wrapper' not in arguments
     # Without a wrapper the worker command is unchanged.
-    result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n'
+    result = subprocess.run(['bash', '-euc', 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n'
                              + remote.replace(' >/dev/null', ''), 'test', *positional, '--profile-args', '--profile-wrapper'],
                             cwd=ROOT, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr

@@ -396,6 +396,7 @@ impl Ticket {
         if std::mem::replace(&mut self.done, true) { return; }
         if let Some(usage) = &self.usage { usage.retired(generated as u64, reason); }
         totals::retired();
+        crate::shared::host_heap::on_request_retired();
         lifecycle(Event::Retire { id: self.id, at: Instant::now(), reason, generated: generated as u32 });
     }
 }

@@ -9,6 +9,12 @@ repository.workspace = true
 name = "cuteafd"
 path = "src/main.rs"
 
+[features]
+# Optional allocator instrumentation (2026-10-26): jemalloc as the global
+# allocator so the coordinator's host heap can be measured with jemalloc's
+# stats.  Off by default; the default build keeps glibc + malloc_tune.
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
@@ -34,6 +40,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url = "=2.5.8"
+tikv-jemalloc-ctl = { version = "0.6.1", optional = true, features = ["stats", "use_std"] }
+tikv-jemallocator = { version = "0.6.1", optional = true, features = ["stats"] }
 
 [dev-dependencies]
 cuteafd-ffi = { path = "../cuteafd-ffi", features = ["test-support"] }

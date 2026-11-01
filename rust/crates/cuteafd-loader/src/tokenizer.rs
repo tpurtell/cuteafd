@@ -37,6 +37,11 @@ pub struct LoadedTokenizer {
 /// Byte ranges in a rendered prompt originating from literal token spellings.
 pub type LiteralSpans = Vec<std::ops::Range<usize>>;
 
+/// The loaded tokenizer could not encode request text (not a load or span error).
+#[derive(Debug, thiserror::Error)]
+#[error("prompt tokenization: {0}")]
+pub struct PromptEncodingError(String);
+
 /// Whether an added token is a media marker a user or tool must not materialize
 /// from text. Each family's spellings (checked against its checkpoint's tokenizer):
 /// `<|image|>`/`<|vision_pad|>`/`<|audio_pad|>`/`<|video_pad|>` words (GLM, Qwen, MiMo,
@@ -187,7 +192,7 @@ impl LoadedTokenizer {
             Ok(self
                 .tokenizer
                 .encode_fast(text, false)
-                .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?
+                .map_err(|err| PromptEncodingError(err.to_string()))?
                 .get_ids()
                 .to_vec())
         };
@@ -214,7 +219,7 @@ impl LoadedTokenizer {
                 "invalid literal prompt span");
             ids.extend(self.encode_ids(&text[end..span.start])?);
             ids.extend_from_slice(literal.encode_fast(&text[span.clone()], false)
-                .map_err(|error| anyhow::anyhow!("encoding literal prompt text: {error}"))?.get_ids());
+                .map_err(|error| PromptEncodingError(error.to_string()))?.get_ids());
             end = span.end;
         }
         ids.extend(self.encode_ids(&text[end..])?);
@@ -229,7 +234,7 @@ impl LoadedTokenizer {
         let token_ids = if add_special_tokens {
             self.tokenizer
                 .encode(text.to_owned(), true)
-                .map_err(|err| anyhow::anyhow!("encoding tokenizer text: {err}"))?
+                .map_err(|err| PromptEncodingError(err.to_string()))?
                 .get_ids()
                 .to_vec()
         } else {
