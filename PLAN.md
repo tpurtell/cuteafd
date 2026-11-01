@@ -6490,3 +6490,16 @@ Continue watching this service; it will upload, verify public bytes, adopt
 through the no-copy bridge, spread onto the six Sparks, then retire owned
 standalone payloads. Final managed-snapshot independent checker is prepared
 under ~/.cache/cuteafd/builds/step5-quant-export/. Do not re-quantize.
+
+PUBLICATION VERIFIED (2026-11-01 07:42 UTC): public HF revision
+83d47a384eabc07ea6fcfaac4779b0e5f013ce89 contains all 96 shards and 205 release
+files; remote SHA checks and anonymous access pass. SparkNest has already
+adopted the snapshot on maxq with zero copied bytes. Its updated CLI emits
+a mirrored-status line before JSON and reports replayed files as skipped;
+the Step-5 handoff now handles that exact notice and counts new+skipped
+files while preserving all success/zero-copy/complete-managed-SHA guards.
+27 targeted recovery CPU cases pass. Current CPU-only publication/handoff
+unit: step5-core-k6-1793519523192738670. It reuses the verified publication and is
+verifying the managed snapshot before six-Spark placement and cleanup.
+No quantization or numerical source changed. Full final managed audit
+remains pending until import/placement complete.
