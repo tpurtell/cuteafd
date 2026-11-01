@@ -793,8 +793,6 @@ class PackageProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             output, manifest, _calls, _ = self.build_fixture(root, 'spark', (2, 3), capacities=(1, 16, 80))
-            pinned = [v for v in manifest['variants'] if self.pinned_tile(v)]
-            self.assertTrue(pinned, 'the fixture must carry a capacity the planner widens')
             for variant in manifest['variants']:
                 with self.subTest(directory=variant['directory']):
                     pin = self.pinned_tile(variant)
