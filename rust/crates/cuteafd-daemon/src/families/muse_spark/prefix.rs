@@ -213,7 +213,7 @@ mod tests {
     impl PrefixFamily for Paged {
         type Placement = Placement;
         fn layout(&self) -> FamilyLayout {
-            FamilyLayout { page_rows: PAGE_ROWS as usize, pages: 48, page_bytes: 64, mark_bytes: 0,
+            FamilyLayout { page_rows: PAGE_ROWS as usize, pages: 84, page_bytes: 64, mark_bytes: 0,
                 draft_bytes: 0, rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: Default::default() }
         }
         fn pages<'p>(&self, p: &'p Placement) -> &'p [u32] { &p.pages }
@@ -259,7 +259,7 @@ mod tests {
             let initial_rows = placement.pages.len() * PAGE_ROWS as usize;
             active.push(Request { placement, lease, produced: 1, initial_rows });
         }
-        let mut full = vec![vec![usize::MAX; 48 * PAGE_ROWS as usize]; 2];
+        let mut full = vec![vec![usize::MAX; 84 * PAGE_ROWS as usize]; 2];
         let mut sliding = vec![vec![usize::MAX; 3 * ring]; 2];
         let (mut saw_stall, mut saw_resume, mut wrote_past_end) = (false, false, false);
         let mut waited = std::collections::HashSet::new();
@@ -300,7 +300,7 @@ mod tests {
         assert!(active.is_empty() && stalled.is_empty());
         assert!(wrote_past_end && saw_stall && saw_resume);
         assert!(reserve.stats().top_ups > 0 && reserve.stats().stalls > 0);
-        assert_eq!(cache.pool().free(), 48);
+        assert_eq!(cache.pool().free(), 84);
         Ok(())
     }
 
