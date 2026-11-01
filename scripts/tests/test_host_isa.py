@@ -5,6 +5,7 @@ override, the exec plan) is tested in rust/crates/cuteafd-ffi/src/host_isa.rs.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
