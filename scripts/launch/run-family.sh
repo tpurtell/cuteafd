@@ -139,6 +139,7 @@ MODEL_REVISION
 SPARK_COUNT
 SPARK_HOSTS
 EXPERT_BACKEND
+EXPERT_SLICE_UNIT
 COORDINATOR_DOCKER_INFERENCE
 COORDINATOR_DOCKER_DEV
 WIP_INSTANCE
@@ -459,6 +460,7 @@ EMBEDDING
 ENABLE_BENCH
 ENGRAM_WARM
 EXPERT_FORMAT
+EXPERT_SLICE_UNIT
 EXPERT_PORT
 FP8_EXPERT_PREFILL
 GATEWAY
@@ -680,8 +682,17 @@ if [[ -n $idle_park ]]; then
   wait_env_args+=(-e "CUTEAFD_IDLE_PARK_SECONDS=$idle_park")
 fi
 shared_env_args+=("${wait_env_args[@]}")
+# p12 scale-06a (site fork): EXPERT_SLICE_UNIT (32|128) reaches the coordinator and Spark workers as CUTEAFD_EXPERT_SLICE_UNIT.
+expert_slice_unit="$(get EXPERT_SLICE_UNIT "")"
+if [[ -n $expert_slice_unit ]]; then
+  [[ $expert_slice_unit =~ ^(32|128)$ ]] || release_die "EXPERT_SLICE_UNIT must be 32 or 128"
+  shared_env_args+=(-e "CUTEAFD_EXPERT_SLICE_UNIT=$expert_slice_unit")
+fi
 shared_worker_env_args=(-e "HF_HOME=$namespace_hf_home" -e "CUTEAFD_FP8_EXPERT_PREFILL=$fp8_prefill" -e "CUTEAFD_THERMAL=$(get THERMAL on)"
   "${wait_env_args[@]}")
+if [[ -n $expert_slice_unit ]]; then
+  shared_worker_env_args+=(-e "CUTEAFD_EXPERT_SLICE_UNIT=$expert_slice_unit")
+fi
 if [[ -n "${CUTEAFD_PUSH_SOCKET:-}" ]]; then
   shared_worker_env_args+=(-e "CUTEAFD_PUSH_SOCKET=$CUTEAFD_PUSH_SOCKET")
 fi

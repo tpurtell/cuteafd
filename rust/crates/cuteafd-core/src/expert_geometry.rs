@@ -14,6 +14,57 @@ use serde::{Deserialize, Serialize};
 /// Native EXLR8 workers reuse one device arena across serial request chunks.
 pub const EXLR8_EXECUTION_ROWS: usize = 64;
 
+/// Stored intermediate width of a V4.1 expert slice: whole `unit`-column
+/// blocks. Unit 32 stores the logical width exactly (one K32 scale block);
+/// unit 128 pads to the historical N128 resident layout. This is the ONE
+/// chokepoint for the V4.1 stored-width arithmetic.
+pub fn v41_stored_intermediate(logical: u32, unit: u32) -> u32 {
+    match unit {
+        32 => logical,
+        _ => logical.div_ceil(128) * 128,
+    }
+}
+
+/// Resident expert-slice column unit. `U128` is the historical padded layout
+/// and the binary default; `U32` is the exact 32-column layout (the site key
+/// flips the default once the kernel qualifies).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertSliceUnit {
+    U32,
+    U128,
+}
+
+impl ExpertSliceUnit {
+    /// Columns per stored unit.
+    pub const fn columns(self) -> u32 {
+        match self {
+            Self::U32 => 32,
+            Self::U128 => 128,
+        }
+    }
+}
+
+impl std::str::FromStr for ExpertSliceUnit {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "32" => Ok(Self::U32),
+            "128" => Ok(Self::U128),
+            other => Err(format!("expert slice unit must be 32 or 128, got {other:?}")),
+        }
+    }
+}
+
+impl std::fmt::Display for ExpertSliceUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::U32 => "32",
+            Self::U128 => "128",
+        })
+    }
+}
+
 /// Capacity-specific execution payload from the selected installed packages.
 /// Mapped request/reply rings retain each network unit separately; device I/O
 /// and scratch are reused in stream order by one execution owner.
@@ -581,5 +632,38 @@ mod tests {
         assert_eq!(kimi.row_bytes(), 7168);
         assert_eq!(kimi.compact_wire_bytes(1, true), Some((336 + 3584 * 2, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
+    }
+
+    #[test]
+    fn v41_stored_intermediate_pads_only_at_unit_128() {
+        assert_eq!(v41_stored_intermediate(576, 32), 576);
+        assert_eq!(v41_stored_intermediate(576, 128), 640);
+        assert_eq!(v41_stored_intermediate(384, 32), 384);
+        assert_eq!(v41_stored_intermediate(384, 128), 384);
+        assert_eq!(v41_stored_intermediate(288, 32), 288);
+        assert_eq!(v41_stored_intermediate(288, 128), 384);
+    }
+
+    #[test]
+    fn expert_slice_unit_parses_32_and_128_only() {
+        use std::str::FromStr;
+        assert_eq!(ExpertSliceUnit::from_str("32").unwrap(), ExpertSliceUnit::U32);
+        assert_eq!(ExpertSliceUnit::from_str("128").unwrap(), ExpertSliceUnit::U128);
+        assert!(ExpertSliceUnit::from_str("64").is_err());
+        assert_eq!(ExpertSliceUnit::U32.columns(), 32);
+        assert_eq!(ExpertSliceUnit::U128.columns(), 128);
+        assert_eq!(ExpertSliceUnit::U32.to_string(), "32");
+        assert_eq!(ExpertSliceUnit::U128.to_string(), "128");
+    }
+
+    #[test]
+    fn v41_stored_width_has_one_chokepoint() {
+        for (name, source) in [
+            ("layer.rs", include_str!("../../cuteafd-daemon/src/shared/experts/layer.rs")),
+            ("v41_experts.rs", include_str!("../../cuteafd-ffi/src/shared/v41_experts.rs")),
+        ] {
+            assert!(!source.contains("div_ceil(128) * 128"),
+                "{name} must call v41_stored_intermediate, not pad inline");
+        }
     }
 }

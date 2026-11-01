@@ -486,11 +486,11 @@ def build(args: argparse.Namespace) -> None:
             widths = sorted(set(exact_widths(base.intermediate, tp)), reverse=True)
             if tp > 1 and widths and base.with_tp(tp).slice * tp > base.intermediate:
                 layouts += [f"tp{tp}-w{w}" for w in widths if f"tp{tp}-w{w}" not in layouts]
-    # Fine-unit MXFP4 programs coexist with the qualified H128 layouts while
-    # balanced placement is gated. One width is selected for each rank/layer.
+    # Fine-unit MXFP4 programs are the default storage; the H128 layouts stay
+    # beside them as the fallback programs. One width is selected per rank/layer.
     if args.exact_slices and base.weights == "mxfp4" and args.role == "spark":
-        for tp in range(1, 9):
-            if f"tp{tp}" in layouts and base.intermediate // 128 % tp:
+        for tp in range(2, 9):
+            if f"tp{tp}" in layouts and base.intermediate % 32 == 0 and base.intermediate // 32 >= tp:
                 layouts += [f"tp{tp}-w{width}" for width in sorted(set(exact_widths(base.intermediate, tp, 32)), reverse=True)
                             if f"tp{tp}-w{width}" not in layouts]
     wire = input_kind(args.role, base.weights, args.input) == "wire"

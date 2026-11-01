@@ -570,7 +570,8 @@ impl<'a> ExpertWeights<'a> {
                     use cuteafd_loader::formats::scale_codes::Rows;
                     let hidden = catalog.routed_experts().hidden;
                     let logical = intermediate as usize;
-                    let stored = logical.div_ceil(128) * 128;
+                    // scale-06b: thread the configured ExpertSliceUnit here.
+                    let stored = cuteafd_core::expert_geometry::v41_stored_intermediate(logical as u32, 128) as usize;
                     let first_row = match plan.selection() {
                         V41ExpertSelection::Backbone { rank, .. }
                         | V41ExpertSelection::BackboneTp2 { rank, .. }
@@ -674,7 +675,8 @@ impl<'a> ExpertWeights<'a> {
                 Job::NativePlane { intermediate, plane: 2, at: gate_bytes, bytes: bytes - gate_bytes, dst: plane(2, expert) },
             ] }, std::ptr::null_mut())?;
             if catalog.mxfp4_scale_codes() {
-                let stored = (intermediate as usize).div_ceil(128) * 128;
+                // scale-06b: thread the configured ExpertSliceUnit here.
+                let stored = cuteafd_core::expert_geometry::v41_stored_intermediate(intermediate, 128) as usize;
                 let hidden = catalog.routed_experts().hidden;
                 for (slot, start_row) in [(4, 0), (3, stored), (5, 0)] {
                     let tensor = catalog.tensor(&n[slot])?;
@@ -842,7 +844,8 @@ impl<'a> ExpertWeights<'a> {
                                 use cuteafd_loader::formats::scale_codes::Rows;
                                 let hidden = catalog.routed_experts().hidden;
                                 let logical = rank_plans[rank][lane].intermediate_size();
-                                let stored = logical.div_ceil(128) * 128;
+                                // scale-06b: thread the configured ExpertSliceUnit here.
+                                let stored = cuteafd_core::expert_geometry::v41_stored_intermediate(logical as u32, 128) as usize;
                                 let targets = [3usize, 4, 5].map(|slot| {
                                     let job = &jobs[slot];
                                     let slice = job.slices[rank];

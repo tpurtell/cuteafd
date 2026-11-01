@@ -190,6 +190,16 @@ use cuteafd_core::tp_units::package_width_keys;
 /// Step-5 TP6 geometry is registered for qualification; its hardware gate is pending.
 /// Package availability is separate from the CPU-qualified transport range.
 pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<SparkRecipe, SparkRecipeRefusal> {
+    spark_recipe_with_unit(package, intermediate, world,
+        cuteafd_core::expert_geometry::ExpertSliceUnit::U128)
+}
+
+/// Unit-aware recipe: `unit` selects the stored expert-slice column unit. The
+/// historical `spark_recipe` is the `U128` wrapper, so existing callers keep
+/// their exact behaviour. At unit 32 native MXFP4 stores exact 32-column
+/// slices, so unequal shards (including TP5 and TP7) are admitted.
+pub fn spark_recipe_with_unit(package: &str, intermediate: usize, world: usize,
+    unit: cuteafd_core::expert_geometry::ExpertSliceUnit) -> Result<SparkRecipe, SparkRecipeRefusal> {
     use crate::formats::fp8_experts::Slicing;
     let key = package.split_whitespace().next().unwrap_or(package);
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
@@ -210,9 +220,12 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
     }
-    // Native family roles and staging require equal whole-K32 shards. Generic
-    // MXFP4 tail exports do not make those native roles executable by themselves.
-    if native && mxfp4 && (intermediate % world != 0 || intermediate / world % 32 != 0) {
+    // Native MXFP4 at unit 32 stores exact 32-column slices, so unequal shards
+    // are allowed; at unit 128 the historical equal whole-K32 rule stands.
+    let native_mxfp4_u32 = native && mxfp4
+        && unit == cuteafd_core::expert_geometry::ExpertSliceUnit::U32;
+    if native && mxfp4 && !native_mxfp4_u32
+        && (intermediate % world != 0 || intermediate / world % 32 != 0) {
         return Err(SparkRecipeRefusal::NativeUnequal { intermediate, world });
     }
     let coverage_key = format!("{family}:{}", if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { format });
@@ -223,9 +236,23 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         return Err(SparkRecipeRefusal::Deprecated { package: key.into(), world, worlds });
     }
     let packaged_intermediate = coverage["intermediate"].as_u64().unwrap_or(0) as usize;
-    let required = package_width_keys(intermediate, block, world, exl3, native, nvfp4);
+    // Exact-32 native MXFP4 packages carry one program per distinct rank width,
+    // so the packaged set is the exact width keys, not the padded H128 keys.
+    let width_keys = |intermediate: usize, world: usize| -> Vec<(bool, usize)> {
+        if native_mxfp4_u32 {
+            let rule = cuteafd_core::tp_units::layer_rule(intermediate / block, world);
+            let mut widths = (0..world).filter_map(|rank|
+                cuteafd_core::tp_units::RankUnits::new(rule, 1, intermediate, block, 0, world, rank)
+                    .ok().map(|map| map.resident_units() * block)).collect::<Vec<_>>();
+            widths.sort_unstable(); widths.dedup();
+            widths.into_iter().map(|width| (false, width)).collect()
+        } else {
+            package_width_keys(intermediate, block, world, exl3, native, nvfp4)
+        }
+    };
+    let required = width_keys(intermediate, world);
     let available = worlds.iter().flat_map(|&count|
-        package_width_keys(packaged_intermediate, block, count, exl3, native, nvfp4))
+        width_keys(packaged_intermediate, count))
         .collect::<std::collections::BTreeSet<_>>();
     if required.is_empty() || !required.iter().all(|width| available.contains(width)) {
         return Err(SparkRecipeRefusal::MissingPackage { package: key.into(), world });
@@ -235,7 +262,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     // rotate contiguous native-unit ranges by layer, retaining NVFP4 padding.
     let rule = if compact { cuteafd_core::tp_units::UnitRule::Rotated }
         else { cuteafd_core::tp_units::layer_rule(intermediate / block, world) };
-    let exact = exl3 || (!native && (!nvfp4 || intermediate % (128 * world) == 0));
+    let exact = exl3 || native_mxfp4_u32
+        || (!native && (!nvfp4 || intermediate % (128 * world) == 0));
     let widths = if compact {
         vec![(intermediate / block).div_ceil(world) * block; world]
     } else if exact {
@@ -265,6 +293,45 @@ mod tests {
         let layers = model.spec().layers.iter().enumerate()
             .filter_map(|(layer, spec)| (spec.ffn == super::super::spec::FfnKind::Moe).then_some(layer)).collect::<Vec<_>>();
         super::checkpoint_spark_recipe(checkpoint, world, &layers)
+    }
+
+    #[test]
+    fn exact32_native_mxfp4_recipe_uses_32_column_blocks() {
+        use crate::formats::fp8_experts::Slicing;
+        use cuteafd_core::expert_geometry::ExpertSliceUnit;
+        let tp4 = spark_recipe_with_unit("v41:mxfp4", 2304, 4, ExpertSliceUnit::U32).unwrap();
+        assert_eq!(tp4.slicing, Slicing::Blocks(32));
+        assert_eq!(tp4.widths, [576; 4]);
+        assert_eq!(tp4.required_layouts, ["tp4"]);
+        let tp6 = spark_recipe_with_unit("v41:mxfp4", 2304, 6, ExpertSliceUnit::U32).unwrap();
+        assert_eq!(tp6.slicing, Slicing::Blocks(32));
+        assert_eq!(tp6.widths, [384; 6]);
+        assert_eq!(tp6.required_layouts, ["tp6"]);
+        // Unit 128 is the historical padded recipe, byte-identical to today.
+        let padded = spark_recipe_with_unit("v41:mxfp4", 2304, 4, ExpertSliceUnit::U128).unwrap();
+        assert_eq!(padded.slicing, Slicing::Padded);
+        assert_eq!(padded.widths, [640; 4]);
+        assert_eq!(padded, spark_recipe("v41:mxfp4", 2304, 4).unwrap());
+    }
+
+    #[test]
+    fn exact32_native_mxfp4_admits_tp5_and_tp7() {
+        use crate::formats::fp8_experts::Slicing;
+        use cuteafd_core::expert_geometry::ExpertSliceUnit;
+        // The packaged set used to stop at 2|3|4|6; exact-32 closes 5 and 7.
+        let tp5 = spark_recipe_with_unit("v41:mxfp4", 2304, 5, ExpertSliceUnit::U32).unwrap();
+        assert_eq!(tp5.slicing, Slicing::Blocks(32));
+        assert_eq!(tp5.widths, [480, 480, 448, 448, 448]);
+        assert_eq!(tp5.required_layouts, ["tp5-w480", "tp5-w448"]);
+        let tp7 = spark_recipe_with_unit("v41:mxfp4", 2304, 7, ExpertSliceUnit::U32).unwrap();
+        assert_eq!(tp7.slicing, Slicing::Blocks(32));
+        assert_eq!(tp7.widths, [352, 352, 320, 320, 320, 320, 320]);
+        assert_eq!(tp7.required_layouts, ["tp7-w352", "tp7-w320"]);
+        // Unit 128 keeps the historical equal-shard refusal for 5 and 7.
+        assert!(matches!(spark_recipe_with_unit("v41:mxfp4", 2304, 5, ExpertSliceUnit::U128),
+            Err(SparkRecipeRefusal::NativeUnequal { .. })));
+        assert!(matches!(spark_recipe_with_unit("v41:mxfp4", 2304, 7, ExpertSliceUnit::U128),
+            Err(SparkRecipeRefusal::NativeUnequal { .. })));
     }
 
     #[test]

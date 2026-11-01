@@ -574,6 +574,9 @@ pub(crate) struct NativeExpertDaemonArgs {
     /// Spark tensor-parallel world; one rank supports whole Qwen EXL3 experts.
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=8))]
     pub(crate) world: u32,
+    /// Resident expert-slice column unit: 32 (exact) or 128 (padded, default).
+    #[arg(long, env = "CUTEAFD_EXPERT_SLICE_UNIT", default_value = "128")]
+    pub(crate) expert_slice_unit: cuteafd_core::expert_geometry::ExpertSliceUnit,
     /// Replicated-group tensor-parallel degree inside one group (opt-in; all-or-none with --spark-ep).
     #[arg(long, requires = "spark_ep", value_parser = parse_spark_tp)]
     pub(crate) spark_tp: Option<u8>,
@@ -741,6 +744,37 @@ mod tests {
         // A switch, not a value; native serve only.
         assert!(super::Cli::try_parse_from(base.into_iter().chain(["--engram-warm", "on"])).is_err());
         assert!(super::Cli::try_parse_from(["cuteafd", "plan", "/model", "--engram-warm"]).is_err());
+    }
+
+    #[test]
+    fn expert_slice_unit_defaults_to_128_and_parses_32() {
+        use clap::Parser;
+        use cuteafd_core::expert_geometry::ExpertSliceUnit;
+        let base = ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"];
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected native serve"); };
+        assert_eq!(args.expert_slice_unit, ExpertSliceUnit::U128);
+        let super::Commands::ServeNative(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--expert-slice-unit", "32"])).unwrap().command
+            else { panic!("expected native serve"); };
+        assert_eq!(args.expert_slice_unit, ExpertSliceUnit::U32);
+        assert!(super::Cli::try_parse_from(
+            base.into_iter().chain(["--expert-slice-unit", "64"])).is_err());
+    }
+
+    #[test]
+    fn expert_slice_unit_reaches_the_spark_worker() {
+        use clap::Parser;
+        use cuteafd_core::expert_geometry::ExpertSliceUnit;
+        let base = ["cuteafd", "expertd-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--device-budget-bytes", "1000", "--rank", "0"];
+        let super::Commands::Expertd(args) = super::Cli::try_parse_from(base).unwrap().command
+            else { panic!("expected expertd-native"); };
+        assert_eq!(args.expert_slice_unit, ExpertSliceUnit::U128);
+        let super::Commands::Expertd(args) = super::Cli::try_parse_from(
+            base.into_iter().chain(["--expert-slice-unit", "32"])).unwrap().command
+            else { panic!("expected expertd-native"); };
+        assert_eq!(args.expert_slice_unit, ExpertSliceUnit::U32);
     }
 
     #[test]
@@ -1195,6 +1229,10 @@ pub(crate) struct NativeServeArgs {
     /// Maximum active requests, shared by both execution lanes.
     #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]
     pub concurrency: u32,
+
+    /// Resident expert-slice column unit: 32 (exact) or 128 (padded, default).
+    #[arg(long, env = "CUTEAFD_EXPERT_SLICE_UNIT", default_value = "128")]
+    pub expert_slice_unit: cuteafd_core::expert_geometry::ExpertSliceUnit,
 
     /// Buffered HTTP jobs; defaults to concurrency. At most this many additional callers wait.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4096))]

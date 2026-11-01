@@ -258,7 +258,9 @@ fn expected_expert_geometry(
     nvfp4: bool,
     role: u32,
     kernel_intermediate: u32,
+    unit: cuteafd_core::expert_geometry::ExpertSliceUnit,
 ) -> Option<(u32, u32, u32, u32)> {
+    use cuteafd_core::expert_geometry::{v41_stored_intermediate, ExpertSliceUnit};
     let draft = |intermediate: u32| Some((128, intermediate, intermediate, 3));
     let tp = match (nvfp4, role) {
         (false, 0) => return draft(2304),
@@ -272,8 +274,23 @@ fn expected_expert_geometry(
         _ => return None,
     };
     let logical = geometry.slice(tp).filter(|value| value % 32 == 0)?;
-    let padded = logical.div_ceil(128) * 128;
-    let kernel = if nvfp4 && kernel_intermediate == logical { logical } else { padded };
+    let padded = v41_stored_intermediate(logical, 128);
+    let stored = v41_stored_intermediate(logical, unit.columns());
+    let kernel = match unit {
+        // Unit 32 stores the exact width; the image may still carry the padded
+        // program, so both are accepted.
+        ExpertSliceUnit::U32 => {
+            if kernel_intermediate == stored || kernel_intermediate == padded {
+                kernel_intermediate
+            } else { stored }
+        }
+        // Unit 128 is exactly the historical padded layout (NVFP4 may be exact).
+        ExpertSliceUnit::U128 => {
+            if nvfp4 && kernel_intermediate == logical { logical }
+            else if !nvfp4 && kernel_intermediate == logical && logical != padded { return None; }
+            else { padded }
+        }
+    };
     Some((geometry.experts, logical, kernel, geometry.topk))
 }
 
@@ -853,7 +870,8 @@ impl NativeLibrary {
                 "Spark TP2/TP3/TP6 require the native FP8 K32 input representation"
             );
         }
-        let expected = expected_expert_geometry(geometry, nvfp4, info.role, info.kernel_intermediate)
+        let expected = expected_expert_geometry(geometry, nvfp4, info.role, info.kernel_intermediate,
+            cuteafd_core::expert_geometry::ExpertSliceUnit::U128)
             .ok_or_else(|| anyhow::anyhow!("unknown V4.1 expert role {} for interface {interface}", info.role))?;
         ensure!(
             (
@@ -1134,6 +1152,7 @@ impl V41ExpertKernel<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_core::expert_geometry::ExpertSliceUnit;
     const V41: cuteafd_core::ExpertGeometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V41;
 
     unsafe extern "C" fn stub_group_rows(capacity: i32, rows: i32, out: *mut u32) -> i32 {
@@ -1178,33 +1197,52 @@ mod tests {
     fn expected_geometry_covers_spark_tp2_tp3_tp6_without_touching_rtx_tp2() {
         // Replicated-group Spark shards: TP2 1152 and TP3 768 are unpadded, and
         // pure TP6 384 stores exactly its 2304/6 slice with no padding.
-        assert_eq!(expected_expert_geometry(V41, false, 5, 1152), Some((384, 1152, 1152, 6)));
-        assert_eq!(expected_expert_geometry(V41, false, 6, 768), Some((384, 768, 768, 6)));
-        assert_eq!(expected_expert_geometry(V41, false, 7, 384), Some((384, 384, 384, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 5, 1152, ExpertSliceUnit::U128), Some((384, 1152, 1152, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 6, 768, ExpertSliceUnit::U128), Some((384, 768, 768, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 7, 384, ExpertSliceUnit::U128), Some((384, 384, 384, 6)));
         // Whole-block NVFP4 Spark roles preserve the same logical geometry.
-        assert_eq!(expected_expert_geometry(V41, true, 6, 768), Some((384, 768, 768, 6)));
-        assert_eq!(expected_expert_geometry(V41, true, 7, 384), Some((384, 384, 384, 6)));
-        assert_eq!(expected_expert_geometry(V41, false, 9, 384), None);
+        assert_eq!(expected_expert_geometry(V41, true, 6, 768, ExpertSliceUnit::U128), Some((384, 768, 768, 6)));
+        assert_eq!(expected_expert_geometry(V41, true, 7, 384, ExpertSliceUnit::U128), Some((384, 384, 384, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 9, 384, ExpertSliceUnit::U128), None);
         // Historical Spark TP4 padding and RTX TP2 role semantics are unchanged.
-        assert_eq!(expected_expert_geometry(V41, false, 1, 640), Some((384, 576, 640, 6)));
-        assert_eq!(expected_expert_geometry(V41, false, 3, 1152), Some((384, 1152, 1152, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 1, 640, ExpertSliceUnit::U128), Some((384, 576, 640, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 3, 1152, ExpertSliceUnit::U128), Some((384, 1152, 1152, 6)));
         // Unknown or cross-family pairs still fail closed.
         // A role-7 artifact with a 768 kernel cannot match the 384 expectation.
-        assert_eq!(expected_expert_geometry(V41, false, 7, 768), Some((384, 384, 384, 6)));
-        assert_eq!(expected_expert_geometry(V41, true, 5, 1152), None);
+        assert_eq!(expected_expert_geometry(V41, false, 7, 768, ExpertSliceUnit::U128), Some((384, 384, 384, 6)));
+        assert_eq!(expected_expert_geometry(V41, true, 5, 1152, ExpertSliceUnit::U128), None);
+    }
+
+    #[test]
+    fn expected_geometry_accepts_exact32_storage() {
+        // TP4 576 is stored exactly at unit 32; the padded 640 program is also
+        // accepted because the image carries both.
+        assert_eq!(expected_expert_geometry(V41, false, 1, 576, ExpertSliceUnit::U32),
+            Some((384, 576, 576, 6)));
+        assert_eq!(expected_expert_geometry(V41, false, 1, 640, ExpertSliceUnit::U32),
+            Some((384, 576, 640, 6)));
+    }
+
+    #[test]
+    fn expected_geometry_refuses_exact32_kernel_at_unit_128() {
+        // A 576 kernel is not a valid unit-128 stored width for TP4.
+        assert_eq!(expected_expert_geometry(V41, false, 1, 576, ExpertSliceUnit::U128), None);
+        // The padded 640 kernel remains the unit-128 expectation.
+        assert_eq!(expected_expert_geometry(V41, false, 1, 640, ExpertSliceUnit::U128),
+            Some((384, 576, 640, 6)));
     }
 
     #[test]
     fn expected_geometry_follows_deepseek_v4_flash() {
         let flash = cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH;
-        assert_eq!(expected_expert_geometry(flash, false, 1, 512), Some((256, 512, 512, 6)));
-        assert_eq!(expected_expert_geometry(flash, false, 5, 1024), Some((256, 1024, 1024, 6)));
-        assert_eq!(expected_expert_geometry(flash, false, 2, 2048), Some((256, 2048, 2048, 6)));
+        assert_eq!(expected_expert_geometry(flash, false, 1, 512, ExpertSliceUnit::U128), Some((256, 512, 512, 6)));
+        assert_eq!(expected_expert_geometry(flash, false, 5, 1024, ExpertSliceUnit::U128), Some((256, 1024, 1024, 6)));
+        assert_eq!(expected_expert_geometry(flash, false, 2, 2048, ExpertSliceUnit::U128), Some((256, 2048, 2048, 6)));
         // 2048 does not split into three or six K/32-exact slices.
-        assert_eq!(expected_expert_geometry(flash, false, 6, 0), None);
-        assert_eq!(expected_expert_geometry(flash, false, 7, 0), None);
+        assert_eq!(expected_expert_geometry(flash, false, 6, 0, ExpertSliceUnit::U128), None);
+        assert_eq!(expected_expert_geometry(flash, false, 7, 0, ExpertSliceUnit::U128), None);
         // The dSpark draft shape does not follow the target geometry.
-        assert_eq!(expected_expert_geometry(flash, false, 0, 2304), Some((128, 2304, 2304, 3)));
+        assert_eq!(expected_expert_geometry(flash, false, 0, 2304, ExpertSliceUnit::U128), Some((128, 2304, 2304, 3)));
     }
 
     #[test]
@@ -1214,9 +1252,9 @@ mod tests {
             (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH, 256, 256, 256),
             (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO, 384, 384, 384),
         ] {
-            assert_eq!(expected_expert_geometry(geometry, false, 8, stored),
+            assert_eq!(expected_expert_geometry(geometry, false, 8, stored, ExpertSliceUnit::U128),
                 Some((experts, logical, stored, 6)));
-            assert_eq!(expected_expert_geometry(geometry, true, 8, stored), None);
+            assert_eq!(expected_expert_geometry(geometry, true, 8, stored, ExpertSliceUnit::U128), None);
         }
     }
 
@@ -1504,7 +1542,8 @@ mod tests {
         assert_eq!(std::mem::size_of::<V41ExpertReduction>(), 36);
         for (intermediate, planes) in [(576, 9), (1152, 18), (768, 12), (384, 6)] {
             let info = V41ExpertInfo { abi_version: 2, logical_intermediate: intermediate,
-                kernel_intermediate: intermediate.div_ceil(128) * 128, ..Default::default() };
+                kernel_intermediate: cuteafd_core::expert_geometry::v41_stored_intermediate(intermediate, 128),
+                ..Default::default() };
             let recipe = V41ExpertReduction { version: 1, slice_width: 64, fc2_k_steps: 2,
                 plane_count: planes, plane_fold: 1, implementation: 1,
                 mma_k: 32, block_threads: 128, fc1_k_stage: 128 };
