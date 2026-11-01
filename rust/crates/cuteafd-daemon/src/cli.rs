@@ -1166,6 +1166,12 @@ pub(crate) struct NativeServeArgs {
     #[arg(long, default_value_t = 8192, value_parser = clap::value_parser!(u32).range(64..=8192))]
     pub prefill_reserve_rows: u32,
 
+    /// Share of the time running requests keep while prompts prefill (the
+    /// shared prefill_share rule every other family uses). 0 prefills whole
+    /// prompts before the next decode step (the previous behaviour).
+    #[command(flatten)]
+    pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
+
     /// Total prompt plus generated tokens; compressed cache is reserved at startup.
     #[arg(long, default_value_t = cuteafd_api::openai::MAX_CONTEXT_TOKENS, value_parser = clap::value_parser!(u32).range(1..=1048576))]
     pub max_context_tokens: u32,

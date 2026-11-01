@@ -4,6 +4,7 @@ use crate::families::deepseek_v41::v41_target_pass::VerificationTarget;
 use crate::families::deepseek_v41::v41_target_head::TargetSamplingRowRequest;
 mod independent;
 mod admission;
+mod mixed;
 pub(crate) mod layout;
 use layout::ServingTarget;
 use super::scores::{ScoreRows, VOCAB};
@@ -13,6 +14,7 @@ use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use super::prefix::{draft_id, keyed, ImageKeys, V41Cache as PrefixCache, SnapshotKind};
 use super::console;
 use crate::shared::draft::clock::RoundClock;
+use crate::shared::prefill_share::{Chunk, ChunkBudget, run_unit};
 
 #[cfg(test)]
 pub(crate) fn exercise_distributed_decode<'t, 'd, 'a: 'd>(lib: &'a NativeLibrary,
@@ -239,6 +241,7 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         "dspark_policy": super::speculative::policy_snapshot(),
         "admission": kv_waiter.stats(),
         "media": media.stats(),
+        "share": mixed::stats::snapshot(),
         "totals": console::totals::snapshot(),
     });
     crate::shared::probe::graph_capture_stats(&mut stats);
@@ -465,6 +468,95 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
     Ok(reference_rows)
 }
 
+/// Turn a prefilled prompt into a running request: announce it, commit the
+/// prompt state, retain its snapshot, and emit the first token. `scores` is the
+/// prompt's first-token row (packed, whole-prompt hit, or the shared prefill
+/// round's output). The scoring probe and the inline prefill run before this,
+/// on the admission path, so a parked prompt never reaches them.
+#[allow(clippy::too_many_arguments)]
+fn activate<'w, 'a, P: ServingTarget<'w, 'a>>(
+    args: &crate::cli::NativeServeArgs,
+    requests: &mut Requests<'a>, prefill_slots: &mut super::prefill_target::PrefillSlots<'a, P>,
+    first_transport: &mut P::Transport, second_transport: &mut P::Transport,
+    draft: &mut Option<&mut DraftRuntime<'w, 'a, P::Chain>>,
+    prefixes: &mut PrefixCache<'a>, compiler: &mut crate::shared::constraints::Compiler<'a>,
+    loads: &mut [usize; 2], active: &mut [Option<Active<'a>>],
+    prepared: admission::Prepared, id: u64, lease: CacheLease, slot: usize,
+    image_keys: ImageKeys, hit: Option<(usize, Option<RetainedScores>)>, restore: (Instant, Instant),
+    scores: Result<RetainedScores>,
+) -> Result<()> {
+    let lane = cuteafd_loader::plan::decode_lanes::assign(*loads);
+    let events = prepared.job.events.clone();
+    let admission::Prepared { job, prompt, images } = prepared;
+    let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
+    let result = (|| -> Result<Active<'a>> {
+        let mut constraint = job.constraint.as_ref().map(|spec| compiler.matcher(spec)).transpose()?;
+        ensure!(!job.events.is_closed(), "client disconnected");
+        let decoder = cuteafd_loader::streaming_token_decoder(&args.snapshot, false)?;
+        let cached = hit.as_ref().map_or(0, |(end, _)| *end);
+        let image_count = images.len() as u16;
+        drop(images);
+        job.events.send(Ok(InferenceChunk::Ready {
+            system_fingerprint: Some(if draft.is_some() { "cuteafd-native-fp4-kv-dspark" }
+                else { "cuteafd-native-fp4-kv" }.into()),
+            prompt_usage: PromptUsage { prompt_tokens: prompt.len(), prompt_cache_hit_tokens: cached },
+        }))?;
+        crate::shared::probe::admitted(&job.probe, "deepseek_v41", &prompt, cached);
+        ticket.announce(prompt.len(), cached, job.max_tokens, constraint.is_some(), image_count as usize, restore);
+        let scores = scores?;
+        requests.record_state(lease, &job.probe, "prompt")?;
+        if crate::shared::probe::wants_first(&job.probe) {
+            crate::shared::probe::host_row(&job.probe, prompt.len(), &scores.logits()?);
+        }
+        if cached != prompt.len() && !crate::shared::probe::cold(&job.probe) {
+          prefixes.capture_session(job.usage.as_ref().map(|u| u.session_id().to_owned()));
+          let draft_request = draft_id(draft, id);
+          if let Err(error) = prefixes.retain(requests, draft.as_deref_mut(), SnapshotKind::Prompt, image_keys.tokens(),
+              image_keys.spans(), &scores, lease, draft_request) {
+            tracing::warn!(%error, "prompt prefix was not retained");
+          }
+        }
+        tracing::debug!(request_id=id, prompt_tokens=prompt.len(), cached_tokens=cached, "native prefix admission");
+        let mask = constraint.as_mut().map(|state| state.mask()).transpose()?.flatten();
+        // The first generated token is emitted-token index 0.
+        let anchor = scores.sample(mask, job.sampling, 0)?;
+        Ok(Active { constraint, ticket: std::mem::replace(&mut ticket, console::Ticket::new(id, 0, None)),
+            lease, job, decoder, anchor, generated: 0, buffered: 0,
+            finished: false, cacheable: false, failed: false, tokens: prompt, image_keys, next_after_commit: Some(scores),
+            })
+    })();
+    match result {
+        Ok(mut request) => {
+            request.ticket.first(request.anchor);
+            if let Err(error) = request.emit(&[request.anchor]) {
+                request.failed = !request.job.events.is_closed();
+                let _ = request.job.events.send(Err(format!("{error:#}").into()));
+                request.finished = true;
+            }
+            active[slot] = Some(request); loads[lane] += 1;
+        }
+        Err(error) if error.downcast_ref::<super::ScoringDone>().is_some() => {
+            ticket.finishing();
+            ticket.done(0);
+            requests.release_if_present(lease)?;
+            if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
+        }
+        Err(error) => {
+            // Other completed requests retain their caches.
+            let failure = error.downcast_ref::<cuteafd_api::openai::NativeFailure>()
+                .cloned().unwrap_or_else(|| format!("{error:#}").into());
+            let _ = events.send(Err(failure));
+            if events.is_closed() { ticket.cancel() } else { ticket.fail(0) }
+            tracing::warn!(%error, "native request admission failed");
+            requests.release_if_present(lease)?;
+            if let Some(draft) = draft.as_deref_mut() { draft.release(id)?; }
+            P::reset_connections(first_transport)?; P::reset_connections(second_transport)?;
+            for (_, transport) in prefill_slots.slots.iter_mut() { P::reset_connections(transport)?; }
+        }
+    }
+    Ok(())
+}
+
 /// Serve until the request channel closes, prefilling each prompt whole at admission.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, args: &crate::cli::NativeServeArgs,
@@ -495,6 +587,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
     // Admitted (leased, restored) requests whose images the restored frontier
     // still needs wait here for their encodes; decode keeps running.
     let mut media = admission::Media::new(&mut *vision, args.concurrency as usize)?;
+    // Admitted prompts wait here and prefill in rounds, leaving running streams
+    // their share of the time (the shared prefill_share rule). Share 0 prefills
+    // whole prompts before the next decode step, the previous behaviour.
+    let mut prefills = args.decode_share.queue::<mixed::Parked<P::Suffix>>()?.one_wave_rounds();
     let mut stats_published = Instant::now();
     let limits = cuteafd_api::openai::NativeLimits::new(args.max_context_tokens, args.max_output_tokens)?;
     crate::shared::prefill_packing::log_mode(args.prefill_packing,
@@ -514,7 +610,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
-            live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(!kv_waiter.is_empty())));
+            live.push(console_gauges(&active, requests, &prefixes, receive.len() + prefills.len(), Some(!kv_waiter.is_empty())));
         }
         // This point is reached only after both complete stacks have drained and
         // committed. No cache owner is migrated or retired inside a layer stack.
@@ -526,22 +622,24 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let mut loads = crate::shared::serve::lanes::rebalance(&mut active,
             |entry| entry.as_ref().map(Active::lane),
             |entry, lane| entry.as_mut().unwrap().ticket.set_lane(lane));
-        // Admit available work at a completed boundary. Prefill currently owns
-        // both lanes; mixed prefill/decode interleaving is a subsequent policy.
+        // Admit available work at a completed boundary. Admitted prompts wait in
+        // the shared prefill queue; the round below interleaves them with decode.
         let mut media_ready = media_ready.into_iter();
         let mut intake = receive.len().max(1);
         let mut admitted: Vec<PackedAdmission> = Vec::new();
         let mut next_wave = std::collections::VecDeque::new();
         let mut held_slots = std::collections::BTreeSet::new();
         loop {
-            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len();
+            let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len()
+                + held_slots.len() + prefills.len();
             let backlog = !media.full() && !media.backlog.is_empty();
             let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.next() {
                 tracing::info!(request_id=leased.id, encoder_ms=leased.started.elapsed().as_secs_f64()*1000.0,
                     "native asynchronous vision preparation");
                 leased.into_admitted()
             } else {
-            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot) && !held_slots.contains(&slot)) else { break };
+            let Some(slot) = (0..active.len()).find(|&slot| active[slot].is_none() && !media.holds(slot)
+                && !held_slots.contains(&slot) && !prefills.iter().any(|p| p.slot == slot)) else { break };
             let mut prepared = match kv_waiter.poll(0, requests.release_epoch(), busy_slots > 0,
                 |prepared| prepared.job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Ready(prepared) => prepared,
@@ -554,7 +652,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 let job = if busy_slots == 0 && !closed {
                     // Going idle: publish final occupancy so the console does not show stale lanes.
                     if let Some(live) = console::live() {
-                        live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
+                        live.push(console_gauges(&active, requests, &prefixes, receive.len() + prefills.len(), Some(false)));
                     }
                     match receive.blocking_recv() {
                         Some(job) => {
@@ -715,6 +813,22 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let mut packed_scores = prefill_packed_admissions::<P>(lib, runtime, requests, prefill_slots,
             &admitted, args, draft.as_deref_mut(), &mut prefixes)?;
         for (member, (prepared, id, lease, slot, image_keys, hit, restore)) in admitted.into_iter().enumerate() {
+            let cached = hit.as_ref().map_or(0, |(end, _)| *end);
+            let packed = packed_scores.remove(&member);
+            // A packed member and a whole-prompt hit are already prefilled. Every
+            // other prompt prefills whole inline unless other streams decode and
+            // the share is positive, in which case it waits in the shared queue.
+            if mixed::parks_member(packed.is_some(), args.decode_share.decode_share, !active.is_empty(),
+                &prepared.job, cached, prepared.prompt.len()) {
+                prefills.push(mixed::Parked { prepared, id, lease, slot, image_keys, hit, restore,
+                    cursor: super::prefill_target::V41Prefill::new(),
+                    times: super::prefill_target::V41PrefillTimes::default(), scores: None,
+                    parked_at: Instant::now() });
+                mixed::stats::PARKED_NOW.store(prefills.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            // The previous admission path, unchanged: scoring probe, then the
+            // packed/hit/prefill scores, then activation.
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
             let admission::Prepared { job, prompt, images } = prepared;
@@ -740,7 +854,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                         &mut || prefixes.prefill_hold())?;
                 }
                 for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
-                let scores = if let Some(result) = packed_scores.remove(&member) { result? }
+                let scores = if let Some(result) = packed { result? }
                 else if cached == prompt.len() { hit.expect("complete prefix hit").1.context("exact prefix has no logits")? }
                 else { prefill(lib, runtime, requests, &mut *prefill_slots, Some((&mut *first, &mut *first_transport)), lease, &prompt,
                     super::PrefillShape::from_args(args), &job, draft.as_deref_mut(), &mut || prefixes.prefill_hold())? };
@@ -795,10 +909,49 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             }
         }
+        // One prefill round: each waiting prompt runs one chunk (one lane wave)
+        // in arrival order, and the running requests are owed their share of the
+        // round's time before the next round.
+        if prefills.due(!active.is_empty()) {
+            let started = Instant::now();
+            let budget = ChunkBudget { target: None, row_cap: args.prefill_batch_tokens as usize };
+            let finished = prefills.round(|p| {
+                for (_, transport) in prefill_slots.slots.iter_mut() { P::begin_request(transport)?; }
+                let mut step = super::prefill_target::V41PrefillStep {
+                    lib, runtime, requests, prefill: &mut *prefill_slots, lease: p.lease,
+                    tokens: &p.prepared.prompt, chunk_rows: args.prefill_batch_tokens as usize,
+                    waves: usize::from(args.prefill_waves), job: &p.prepared.job,
+                    draft: draft.as_deref_mut(), hold: &mut || prefixes.prefill_hold(),
+                    times: &mut p.times,
+                };
+                match run_unit(&mut step, &mut p.cursor, budget)? {
+                    Some(scores) => { p.scores = Some(scores); Ok(Chunk::Done) }
+                    None => Ok(Chunk::More),
+                }
+            });
+            mixed::stats::CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            mixed::stats::CALL_MS_LAST.store(started.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed);
+            for (parked, result) in finished {
+                let wait_ms = parked.parked_at.elapsed().as_millis() as u64;
+                mixed::stats::PARK_WAIT_MS_MAX.fetch_max(wait_ms, std::sync::atomic::Ordering::Relaxed);
+                let scores = match result {
+                    Ok(()) => parked.scores.context("finished prefill produced no scores"),
+                    Err(error) => Err(error),
+                };
+                activate(args, requests, prefill_slots, first_transport, second_transport,
+                    &mut draft, &mut prefixes, &mut compiler, &mut loads, &mut active,
+                    parked.prepared, parked.id, parked.lease, parked.slot, parked.image_keys, parked.hit,
+                    parked.restore, scores)?;
+            }
+            mixed::stats::PARKED_NOW.store(prefills.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            prefills.settle(!active.is_empty());
+        }
         if active.iter().all(Option::is_none) {
             crate::shared::decode_graph::census::idle();
             crate::shared::decode_graph::CaptureWatch::flush();
-            if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty() { break; }
+            if closed && media.is_empty() && kv_waiter.is_empty() && prefix_waiters.is_empty()
+                && prefills.is_empty() { break; }
             if media.len() > 0 { std::thread::sleep(Duration::from_millis(1)); }
             continue;
         }
@@ -831,6 +984,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 requests=members.iter().map(Vec::len).sum::<usize>(), "graph census decode step begin");
             Instant::now()
         });
+        let cycle = Instant::now();
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second,
             requests, first_transport, second_transport, &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
@@ -853,9 +1007,19 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 request.failed = true;
             }
         }
+        // The decode steps just run pay down the share a prefill round owed them.
+        prefills.stepped(cycle.elapsed().as_secs_f64());
     }
     Ok(())
     })();
+    // A fatal target/transport error must not orphan parked prompts or their leases.
+    for parked in prefills.drain().collect::<Vec<_>>() {
+        let _ = parked.prepared.job.events.send(Err(cuteafd_api::openai::NativeFailure::Unavailable(
+            "prefill admission stopped".into())));
+        requests.release_if_present(parked.lease)?;
+        if let Some(draft) = draft.as_deref_mut() { draft.release(parked.id)?; }
+    }
+    mixed::stats::PARKED_NOW.store(0, std::sync::atomic::Ordering::Relaxed);
     // A fatal target/transport error must not orphan encoder tickets or cache owners.
     media.stop(requests, draft.as_deref_mut());
     result
@@ -3092,5 +3256,27 @@ mod sampling_tests {
         assert_eq!(row.output_row, 3);
         // The device never calls logf, so this must be the host f32::ln bits.
         assert_eq!(row.ln_min_p.to_bits(), 0.05f32.ln().to_bits());
+    }
+}
+
+#[cfg(test)]
+mod share_tests {
+    /// Share 0 is the previous rule by construction: the admission branch only
+    /// pushes a prompt into the shared queue when `parks_member` accepts it, and
+    /// `parks` is false at share 0, so the queue is never touched and the inline
+    /// `prefill` path runs whole prompts exactly as before (design §5.1).
+    #[test]
+    fn share_zero_never_parks_and_never_touches_the_queue() {
+        let source = include_str!("scheduler.rs");
+        let serve = &source[source.find("pub(super) fn serve<").unwrap()..];
+        let serve = &serve[..serve.find("\n}\n").unwrap_or(serve.len())];
+        let gate = serve.find("if mixed::parks_member(").expect("admission consults the park predicate");
+        let push = serve.find("prefills.push(mixed::Parked").expect("the park branch pushes");
+        let inline = serve.find("else { prefill(lib, runtime, requests").expect("the inline path prefills whole");
+        assert!(gate < push, "the queue is only pushed behind the park predicate");
+        assert!(push < inline, "the inline path is the non-park branch");
+        assert!(serve.contains("prefills.due(!active.is_empty())"), "the round is gated on due()");
+        assert!(serve.contains("prefills.settle(!active.is_empty())"), "the round settles the debt");
+        assert!(serve.contains("prefills.stepped(cycle.elapsed()"), "decode steps pay the debt");
     }
 }

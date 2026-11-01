@@ -683,6 +683,21 @@ mod prefill_tests {
         assert_eq!(times.estimate(2, 100), Duration::from_micros(120));
         assert_eq!(times.estimate(3, 100), Duration::from_millis(10));
     }
+
+    /// The shared queue changes only *when* other sequences step, never the
+    /// rows a prompt's chunks are cut at: a long prompt's call plan is the same
+    /// cut the whole-prompt stream makes (design §5.3).
+    #[test]
+    fn long_prompt_chunks_are_cut_at_the_same_rows_as_the_whole_prompt_stream() {
+        let plan = prompt_units(0, 0, 10_000, 2752, 3).unwrap();
+        assert_eq!(plan.ends, vec![2752, 5504, 8256, 10_000]);
+        assert_eq!(plan.calls, vec![0, 3]);
+        assert_eq!(plan.depth, 3);
+        // A restored frontier keeps the same cut from its end.
+        let plan = prompt_units(300, 300, 10_000, 2752, 3).unwrap();
+        assert_eq!(plan.ends, vec![3052, 5804, 8556, 10_000]);
+        assert_eq!(plan.calls, vec![0, 3]);
+    }
 }
 
 #[cfg(test)]
