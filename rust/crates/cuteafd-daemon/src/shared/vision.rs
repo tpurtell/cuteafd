@@ -2,11 +2,13 @@
 //! MiMo arithmetic/order is ported from Hugh Madden's mimo26f-afd v1.3.0,
 //! crates/mimo26-coordinator/src/vision.rs; weights are resident, never transient.
 mod glm_flash;
+mod muse;
 mod qwen;
 pub mod local;
 pub mod remote;
 pub mod worker;
 pub mod audio;
+pub mod pcm_audio;
 
 use cuteafd_core::DType;
 use cuteafd_ffi::vision::{NativeVision, VisionBlock, VisionLedger, VisionSpec, NO_VISION_OFFSET};
@@ -197,6 +199,7 @@ impl TowerSpec {
             Some("mimo_v2") => Self::mimo(snapshot, max_tokens),
             Some("qwen4_exp") => Self::qwen(snapshot, max_tokens.min(cuteafd_loader::media::QWEN_MAX_IMAGE_TOKENS)),
             Some("glm5_next") => Self::glm_flash(snapshot, max_tokens),
+            Some("muse_spark") => Self::muse(snapshot, max_tokens),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
         }
     }
@@ -205,6 +208,7 @@ impl TowerSpec {
         match self.native.reserved {
             2 => ImageFamily::Qwen,
             3 => ImageFamily::GlmFlash,
+            5 => ImageFamily::Muse,
             _ => ImageFamily::Mimo,
         }
     }
@@ -322,6 +326,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Mimo => "mimo_v2",
             cuteafd_loader::media::ImageFamily::Qwen => "qwen4",
             cuteafd_loader::media::ImageFamily::GlmFlash => "glm5_flash",
+            cuteafd_loader::media::ImageFamily::Muse => "muse_spark",
         };
         cuteafd_loader::media::EncoderId::derive(family, revision, &headers, 1, sm)
     }
@@ -458,6 +463,7 @@ pub struct EncoderService {
     owner: Option<JoinHandle<()>>,
     pub ledger: VisionLedger,
     pub audio_ledger: Option<cuteafd_ffi::audio::AudioLedger>,
+    audio_geometry: Option<cuteafd_core::media::AudioTokenGeometry>,
     healthy: Arc<AtomicBool>,
 }
 impl EncoderService {
@@ -502,11 +508,12 @@ impl EncoderService {
             }
         }
         if let Some(config) = &audio {
-            let required = cuteafd_ffi::audio::NativeAudio::required(&library, config.spec.native())?.total_bytes()?;
-            if required > config.admitted_bytes {
-                return Err(VisionError::Unsupported(format!("audio admission needs {required}, got {}", config.admitted_bytes)));
+            let required = config.required_bytes(&library)?;
+            if required > config.admitted_bytes() {
+                return Err(VisionError::Unsupported(format!("audio admission needs {required}, got {}", config.admitted_bytes())));
             }
         }
+        let audio_geometry = audio.as_ref().map(audio::AudioOwnerConfig::geometry);
         let (queue, jobs) = mpsc::sync_channel::<Work>(2);
         let (ready, readiness) = mpsc::sync_channel(1);
         let healthy = Arc::new(AtomicBool::new(false));
@@ -517,7 +524,7 @@ impl EncoderService {
                 let _health = OwnerHealth(owner_health.clone());
                 // Query in the allocating owner/context, before loading either tower.
                 let vision_bytes = vision.as_ref().map_or(0, |(_, bytes)| *bytes);
-                let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes);
+                let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
                 let preflight = vision_bytes.checked_add(audio_bytes)
                     .ok_or_else(|| VisionError::Unsupported("media reservation overflow".into()))
                     .and_then(|required| worker::check_cuda_room(&library, device, required)
@@ -587,6 +594,7 @@ impl EncoderService {
                 owner: Some(owner),
                 ledger,
                 audio_ledger,
+                audio_geometry,
                 healthy,
             }),
             Ok(Err(error)) => {
@@ -608,6 +616,7 @@ impl EncoderService {
     pub fn submit(&self, job: EncodeJob) -> Result<EncoderTicket> {
         self.submit_job(EncoderJob::Vision(job))
     }
+    pub fn audio_geometry(&self) -> Option<cuteafd_core::media::AudioTokenGeometry> { self.audio_geometry }
     pub fn submit_audio(&self, job: audio::AudioEncodeJob) -> Result<EncoderTicket> {
         if self.audio_ledger.is_none() {
             return Err(VisionError::Unsupported("audio encoder is not loaded".into()));
@@ -747,12 +756,13 @@ mod tests {
     fn shared_queue_orders_modalities_and_rejects_disabled_audio() {
         let (queue, jobs) = mpsc::sync_channel(2);
         let mut service = EncoderService { queue: Some(queue), owner: None,
-            ledger: Default::default(), audio_ledger: None,
+            ledger: Default::default(), audio_ledger: None, audio_geometry: None,
             healthy: Arc::new(AtomicBool::new(true)) };
         let audio_job = || audio::AudioEncodeJob { pcm: vec![0.0; 481].into(),
             output: vec![0; 4096], fp32_scratch: vec![0.0; 4096] };
         assert!(matches!(service.submit_audio(audio_job()), Err(VisionError::Unsupported(_))));
         service.audio_ledger = Some(Default::default());
+        service.audio_geometry = Some(cuteafd_core::media::AudioTokenGeometry::MimoRvq);
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = observed.clone();
         let (gate, wait) = mpsc::sync_channel(0);

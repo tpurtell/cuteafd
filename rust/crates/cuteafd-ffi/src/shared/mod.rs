@@ -23,4 +23,5 @@ pub(crate) mod v41_router;
 pub(crate) mod token_io;
 pub mod vision;
 pub mod audio;
+pub mod pcm_audio;
 pub(crate) mod vocab_head;

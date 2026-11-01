@@ -230,7 +230,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
     tracing::info!(drafter = ?args.draft, onboarded = onboarded.len(), "Muse Spark drafter");
     let backend = super::backend::MuseBackend::new(&cfg, &ranks, streams, &embedding, &mut engine.link,
         engine.peer.as_ref(), usize::try_from(prefill.unit_rows)?, usize::try_from(prefill.waves)?, sequences,
-        served_context, pages, local, draft, pricing)?;
+        served_context, pages, local, draft, pricing, super::media::Binding::from_snapshot(&args.snapshot, cfg.vocab_size)?)?;
     run(&backend, sequences)
 }
 

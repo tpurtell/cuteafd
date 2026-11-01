@@ -3,6 +3,7 @@
 //! coordinator backend on the shared lane/prefill/decode design.
 #![allow(dead_code)]
 pub(crate) mod admission;
+pub(crate) mod audio;
 pub(crate) mod backend;
 pub(crate) mod block;
 pub(crate) mod core;
@@ -11,6 +12,7 @@ pub(crate) mod engine;
 pub(crate) mod experts;
 pub(crate) mod forward;
 pub(crate) mod lane;
+pub(crate) mod media;
 pub(crate) mod onboard;
 pub(crate) mod draft;
 pub(crate) mod peer;

@@ -1160,6 +1160,14 @@ pub fn fp32_audio_tower(checkpoint: &super::Checkpoint) -> Result<(u64, u64), St
         .map(|scratch| (plan.weight_bytes(), scratch)).map_err(|e| e.to_string())
 }
 
+/// Bundled causal BF16 PCM weights and fixed sixteen-token streaming scratch.
+pub fn pcm_audio_tower(checkpoint: &super::Checkpoint) -> Result<(u64, u64), String> {
+    let plan = crate::media::pcm_audio::PcmAudioPlan::from_snapshot(&checkpoint.snapshot)
+        .map_err(|e| e.to_string())?;
+    crate::media::pcm_audio::scratch_bytes(crate::media::audio::MAX_CLIP_SAMPLES)
+        .map(|scratch| (plan.weight_bytes(), scratch)).map_err(|e| e.to_string())
+}
+
 /// MiMo's bundled towers: FP32 vectors in the measured 4096-token native
 /// ledger (fixed 4096-row GEMM staging and the 4 MiB BLAS workspace), and its
 /// FP32 audio tower.

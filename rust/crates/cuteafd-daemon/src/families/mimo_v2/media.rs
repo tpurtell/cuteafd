@@ -115,6 +115,7 @@ impl ReadyVision {
             let spec = audio_spec.take().context("remote audio requires enabled checkpoint audio tower")?;
             let id = spec.plan().encoder_id(&remote.revision, 121, &remote.backend);
             let expected = crate::shared::vision::remote::AudioHandshake {
+                geometry: cuteafd_core::media::AudioTokenGeometry::MimoRvq,
                 encoder_id: id, plan_hash: remote.plan_hash, max_samples: spec.native().max_samples,
                 output_width: spec.native().output_width,
             };
@@ -156,9 +157,9 @@ impl ReadyVision {
                 audio_preparer = Some(Arc::new(cuteafd_api::openai::media::audio::AudioPreparer::new(
                     spec.plan().encoder_id(revision, sm, &backend), slots.clone())));
                 let bytes = cuteafd_ffi::audio::NativeAudio::required(&args.native_lib, spec.native())?.total_bytes()?;
-                Ok(crate::shared::vision::audio::AudioOwnerConfig { spec, admitted_bytes: bytes })
+                Ok(crate::shared::vision::audio::AudioOwnerConfig::Mimo { spec, admitted_bytes: bytes })
             }).transpose()?;
-            let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes);
+            let audio_bytes = audio.as_ref().map_or(0, |config| config.admitted_bytes());
             library.cuda_set_device(gpu)?;
             let loaded = (|| -> Result<_> {
                 let (free, total) = library.cuda_memory_info()?;

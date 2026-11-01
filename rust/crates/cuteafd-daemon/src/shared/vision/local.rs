@@ -35,7 +35,7 @@ impl LocalEncoder {
         job.validate()?;
         if job.hidden_width != self.width { return Err(MediaError::Features); }
         let EncodeInput::Image { grid: [t, h, w], rgb8 } = &job.input else {
-            return if matches!(&job.input, EncodeInput::Audio { geometry, .. } if geometry.is_mimo())
+            return if matches!(&job.input, EncodeInput::Audio { geometry, .. } if Some(*geometry) == self.service.audio_geometry())
                 && self.service.audio_ledger.is_some() { Ok(()) }
                 else { Err(MediaError::Encoder("audio encoder not loaded".into())) };
         };
@@ -71,7 +71,7 @@ impl EncoderClient for LocalEncoder {
                     rgb: rgb8.clone(), grid: [grid[1] as usize, grid[2] as usize],
                     lut: self.lut.clone(), output }),
                 EncodeInput::Audio { pcm, .. } => self.service.submit_audio(super::audio::AudioEncodeJob {
-                    pcm: pcm.clone(), fp32_scratch: vec![0.0; output.len()], output }),
+                    pcm: pcm.clone(), fp32_scratch: if self.service.audio_geometry().is_some_and(|g| g.is_mimo()) { vec![0.0; output.len()] } else { Vec::new() }, output }),
             };
             match submitted {
                 Ok(ticket) => self.running = Some(Running { pending, ticket, started }),
@@ -121,11 +121,52 @@ mod tests {
     use std::sync::{atomic::Ordering, mpsc};
 
     #[test]
+    fn pcm_audio_uses_shared_owner_without_fp32_scratch() {
+        use cuteafd_core::media::AudioTokenGeometry;
+        let geometry = AudioTokenGeometry::PcmPatches { samples_per_token: 1920 };
+        let (queue, jobs) = mpsc::sync_channel::<super::super::Work>(2);
+        let owner = std::thread::spawn(move || {
+            while let Ok(work) = jobs.recv() {
+                let super::super::EncoderJob::Audio(mut job) = work.job else {
+                    panic!("expected PCM job");
+                };
+                assert!(job.fp32_scratch.is_empty());
+                assert_eq!(job.output.len(), job.pcm.len().div_ceil(1920) * 8192);
+                job.output.fill(0x3f80);
+                let _ = work.reply.send(Ok(job.output));
+            }
+        });
+        let service = EncoderService {
+            queue: Some(queue), owner: Some(owner), ledger: Default::default(),
+            audio_ledger: Some(Default::default()), audio_geometry: Some(geometry),
+            healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
+        let mut encoder = LocalEncoder::new(service, &config, 8192, 256);
+        let wrong = media::EncodeJob::audio(media::AudioKey([0; 32]), vec![0.0; 1921].into(), 1, 8192);
+        assert!(encoder.submit(wrong).is_err());
+        let job = media::EncodeJob::audio_with_geometry(media::AudioKey([1; 32]),
+            vec![0.0; 1921].into(), 2, 8192, geometry);
+        let id = encoder.submit(job).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(output) = encoder.poll(id) {
+                let output = output.unwrap();
+                assert_eq!(output.features.len(), 2 * 8192 * 2);
+                assert!(output.features.chunks_exact(2).all(|v| v == [0x80, 0x3f]));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
     fn rgb_extent_uses_the_processor_patch_size() {
         use cuteafd_loader::media::ImageFamily;
         for family in [ImageFamily::Mimo, ImageFamily::Qwen, ImageFamily::GlmFlash] {
             let (queue, _jobs) = mpsc::sync_channel::<super::super::Work>(2);
-            let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None,
+            let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None, audio_geometry: None,
                 healthy: Arc::new(std::sync::atomic::AtomicBool::new(false)) };
             let config = ProcessorConfig::for_family(family);
             let encoder = LocalEncoder::new(service, &config, 2, 256);
@@ -145,7 +186,7 @@ mod tests {
         let owner_health = health.clone();
         let owner = std::thread::spawn(move || { let _health = super::super::OwnerHealth(owner_health); });
         owner.join().unwrap();
-        let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None, healthy: health };
+        let service = EncoderService { queue: Some(queue), owner: None, ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: health };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Qwen);
         let encoder = LocalEncoder::new(service, &config, 2, 256);
         assert!(!encoder.healthy());
@@ -164,7 +205,7 @@ mod tests {
                 let _ = work.reply.send(Ok(job.output));
             }
         });
-        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
         for n in 0..2 {
@@ -198,7 +239,7 @@ mod tests {
                 let _ = work.reply.send(Ok(job.output));
             }
         });
-        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
+        let service = EncoderService { queue: Some(queue), owner: Some(owner), ledger: Default::default(), audio_ledger: None, audio_geometry: None, healthy: Arc::new(std::sync::atomic::AtomicBool::new(true)) };
         let config = ProcessorConfig::for_family(cuteafd_loader::media::ImageFamily::Mimo);
         let mut encoder = LocalEncoder::new(service, &config, 2, 256);
         let mut ids = (0..64u8).map(|i| encoder.submit(media::EncodeJob::image(ImageKey([i; 32]), [1, 2, 2], vec![i; 3072].into(), 1, 2)).unwrap()).collect::<Vec<_>>();

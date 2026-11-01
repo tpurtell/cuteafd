@@ -51,14 +51,32 @@ impl std::str::FromStr for MediaMode {
     }
 }
 
-/// Auto enables only the complete, qualified MiMo V2.6 Flash/Pro tower.
+/// Resolve only complete bundled MiMo RVQ or Muse BF16 PCM checkpoint geometry.
 /// Explicit placement still reports missing or unsupported checkpoint tensors.
 pub fn resolve_audio(mode: MediaMode, snapshot: &Path) -> Result<MediaMode, PlanError> {
     if mode == MediaMode::Off { return Ok(mode); }
-    match crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
-        crate::media::audio_tower::AudioStorage::Fp32) {
+    let config: serde_json::Value = crate::read_json_file(&snapshot.join("config.json"))
+        .map_err(|error| PlanError::InvalidOption { option: "audio placement", reason: error.to_string() })?;
+    resolve_audio_config(mode, snapshot, &config)
+}
+
+fn resolve_audio_config(mode: MediaMode, snapshot: &Path, config: &serde_json::Value) -> Result<MediaMode, PlanError> {
+    if mode == MediaMode::Off { return Ok(mode); }
+    let muse = config["model_type"] == "muse_spark";
+    if muse && config.get("audio_config").is_none_or(serde_json::Value::is_null) {
+        return if mode == MediaMode::Auto { Ok(MediaMode::Off) } else {
+            Err(PlanError::InvalidOption { option: "audio placement", reason: "checkpoint has no bundled Muse audio tower".into() })
+        };
+    }
+    let validation = if muse {
+        crate::media::pcm_audio::PcmAudioPlan::from_snapshot(snapshot).map(|_| ())
+    } else {
+        crate::media::audio_tower::AudioTowerPlan::from_snapshot(snapshot,
+            crate::media::audio_tower::AudioStorage::Fp32).map(|_| ())
+    };
+    match validation {
         Ok(_) => Ok(mode),
-        Err(_) if mode == MediaMode::Auto => Ok(MediaMode::Off),
+        Err(_) if mode == MediaMode::Auto && !muse => Ok(MediaMode::Off),
         Err(error) => Err(PlanError::InvalidOption { option: "audio placement", reason: error.to_string() }),
     }
 }
@@ -651,7 +669,7 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         spark_budget_bytes: options.spark_budget(),
         requested_attention: options.attention_placement,
         vision: options.vision,
-        audio: resolve_audio(options.audio, &checkpoint.snapshot)?,
+        audio: resolve_audio_config(options.audio, &checkpoint.snapshot, &checkpoint.config)?,
         disabled_media_bytes: 0,
         encoder: None,
         audio_encoder: None,
