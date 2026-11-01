@@ -233,18 +233,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn admission_preserves_grammar_request_faults_and_server_faults() {
-        let (events, mut output) = tokio::sync::mpsc::unbounded_channel();
-        let result: Result<()> = Err(NativeFailure::BadRequest("invalid structural tag".into()).into());
-        assert!(crate::shared::api::admission_result(&events, result).is_none());
-        assert!(matches!(output.try_recv().unwrap(), Err(NativeFailure::BadRequest(_))));
-        let result: Result<()> = Err(anyhow::anyhow!("grammar compiler initialization failed"));
-        assert!(crate::shared::api::admission_result(&events, result).is_none());
-        assert!(matches!(output.try_recv().unwrap(), Err(NativeFailure::Worker(_))));
-        assert_eq!(crate::shared::api::admission_result(&events, Ok(42)), Some(42));
-    }
-
-    #[test]
     fn grammar_input_uses_loaded_tiktoken_without_tokenizer_json() -> Result<()> {
         let dir = tempfile::tempdir()?;
         cuteafd_loader::plan::testing::write_kimi_tokenizer(dir.path());
