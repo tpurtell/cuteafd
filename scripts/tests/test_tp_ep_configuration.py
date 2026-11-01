@@ -366,7 +366,7 @@ PREFILL_BATCH_TOKENS=2048
 CONCURRENCY=16
 PREFIX_CACHE_ENTRIES=20
 MAX_CONTEXT_TOKENS=1048576
-MAX_OUTPUT_TOKENS=393216
+MAX_OUTPUT_TOKENS=131072
 HTTP_QUEUE_WAIT_MS=25000
 RTX_EXPERT_LAYERS=auto
 HOST_CACHE_BYTES=auto
@@ -394,6 +394,7 @@ gpu_request=device=uuid0,uuid1
 gpu_uuid_csv=uuid0,uuid1
 fingerprint=test
 hf_home=/models
+site_hub=0
 namespace_root=/mnt/sparknest
 COORDINATOR_DOCKER_INFERENCE=coordinator-image
 SPARK_EXPERT_DOCKER_INFERENCE=spark-image
@@ -616,7 +617,7 @@ resolved_decode_lanes=2
         source = (ROOT / "scripts/launch/run-family.sh").read_text()
         _, remote = source.split("echo \"== starting native Spark experts ==\"", 1)[1].split("<<'REMOTE' &", 1)
         remote = remote.split("\nREMOTE", 1)[0].replace(" >/dev/null", "")
-        harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; docker() { printf "%s\\n" "$@"; }\n' + remote
+        harness = 'source scripts/lib/release-common.sh; source scripts/lib/cdi-gpus.sh; HF_HOME="$(mktemp -d)"; trap \'rm -rf "$HF_HOME"\' EXIT; mkdir -p "$HF_HOME/hub" "$HF_HOME/snapshot"; CUTEAFD_SITE_HUB=1; docker() { printf "%s\\n" "$@"; }\n' + remote
         explicit = subprocess.run(
             ["bash", "-euc", harness, "test", "image", "name", "1",
              "107374182400", "19441", "snapshot", "fingerprint", "4", "1", "2", "2"],
@@ -1473,6 +1474,7 @@ model_is_exl3={exl3}
 exl3_family_tag={family}
 wip_slot={wip_slot}
 HOME={home}
+hf_home="$HOME/.cache/huggingface"
 unset HF_HOME
 """
 
@@ -1492,8 +1494,8 @@ unset HF_HOME
                   wip_slot: str = '""') -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
-            # HF_HOME is unset below, so the remote resolves the snapshot under
-            # $HOME/.cache/huggingface.
+            # The preflight must receive hf_home explicitly, not depend on an
+            # inherited HF_HOME in its remote shell.
             (home / ".cache/huggingface/hub/models--x--M/snapshots/rev").mkdir(parents=True)
             stub = home / "bin"
             stub.mkdir()

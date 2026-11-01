@@ -75,7 +75,7 @@ pub fn report(failed: bool) -> Report {
             warmup_s: Some(14.2), prompt_token_ratio: None,
             capacity: Some(Capacity { kv_tokens: Some(14_710_000), max_tokens: None, kv_pages: Some(28_728),
                 kv_format: Some("FP4 compressed (CSA/HCA) + FP8 window".into()), max_requests: Some(16),
-                max_context: Some(1 << 20), max_output: Some(393_216), host_cache_bytes: Some(64 << 30) }) },
+                max_context: Some(1 << 20), max_output: Some(131_072), host_cache_bytes: Some(64 << 30) }) },
         quality, seconds: 151.0, thermal: None, fabric: vec![],
     };
     Report {

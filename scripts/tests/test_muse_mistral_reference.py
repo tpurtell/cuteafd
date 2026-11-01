@@ -80,6 +80,12 @@ def test_muse_layer_major_matches_official_model(tmp_path):
             tensors[key] = value.bfloat16()
     official.load_state_dict({k[len(muse.PREFIX):]: v.float() for k, v in tensors.items() if k.startswith(muse.PREFIX)},
                              strict=False)
+    # As shipped: the (1 + w) norm weights are BF16 parameters in the official module.
+    for layer in official.layers:
+        for name in muse.NATIVE_DTYPE:
+            parent, _, leaf = name.rpartition(".")
+            owner = layer.get_submodule(parent)
+            owner._parameters[leaf] = torch.nn.Parameter(owner._parameters[leaf].bfloat16(), requires_grad=False)
     snapshot = write_checkpoint(tmp_path, tensors, "model.safetensors.index.json")
     ids = torch.randint(1, config.vocab_size, (1, 23))
     with torch.inference_mode():
@@ -242,25 +248,159 @@ def test_mistral_fixed_geometry_prefix_is_bit_exact_and_matches_untiled():
     assert ((long - untiled).norm() / untiled.norm()).item() < 1e-5
 
 
-@contextlib.contextmanager
 def stable_topk(reference):
-    """Untiled official indexer whose only change is the stable tie rule."""
-    previous = torch.Tensor.topk
+    return mistral.stable_ties(reference)
 
-    def topk(self, k, dim=-1, largest=True, sorted=True):
-        if self.dtype == torch.float32 and dim == -1 and largest:
-            return mistral.fixed_index_topk(self, k)
-        return previous(self, k, dim=dim, largest=largest, sorted=sorted)
-    original = reference.MistralLarge4TextIndexer.forward
 
-    def forward(self, *args, **kwargs):
-        torch.Tensor.topk = topk
-        try:
-            return original(self, *args, **kwargs)
-        finally:
-            torch.Tensor.topk = previous
-    reference.MistralLarge4TextIndexer.forward = forward
-    try:
-        yield
-    finally:
-        reference.MistralLarge4TextIndexer.forward = original
+# ---- layer-major goldens end to end on CPU (prefix proof, official arm, resume) ----
+
+def synthetic_panel(tmp_path, family, snapshot, vocab, lengths):
+    import hashlib as _h
+    from fidelity_windows import SET_SCHEMA, bucket, set_hash
+    generator = torch.Generator().manual_seed(1)
+    windows = []
+    for i, length in enumerate(lengths):
+        tokens = torch.randint(1, vocab, (length,), generator=generator).tolist()
+        start = length - 64
+        windows.append({"id": f"w{i}", "block": "E", "bucket": bucket(start), "tokens": tokens,
+                        "roles": ["ctx"] * (start + 10) + ["gen"] * (length - start - 10), "score_from": start})
+    manifest = {"schema": SET_SCHEMA, "family": family, "model": "fixture", "checkpoint": "fixture",
+                "version": "test", "quick_windows": ["w0"], "windows": windows,
+                "tokenizer_sha256": _h.sha256((snapshot / "tokenizer.json").read_bytes()).hexdigest()}
+    manifest["set_sha256"] = set_hash(manifest)
+    path = tmp_path / "windows.json"
+    path.write_text(json.dumps(manifest))
+    return path
+
+
+def run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel):
+    import layer_major
+    import types
+    monkeypatch.setattr(layer_major, "DEVICE", "cpu")
+    monkeypatch.setattr(layer_major.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=2 ** 41))
+    out = tmp_path / "golden"
+    args = types.SimpleNamespace(snapshot=snapshot, windows=panel, out=out, layers=None, prefix_only=False,
+                                 wait_shards=0, routes=tmp_path / "routes")
+    layer_major.run(args, family, extras_root=getattr(args, "routes", None) if family.name == "muse_spark" else None)
+    return out
+
+
+def fixture_snapshot(tmp_path, tensors, index_name):
+    snapshot = write_checkpoint(tmp_path, tensors, index_name)
+    (snapshot / "config.json").write_text("{}")
+    (snapshot / "tokenizer.json").write_text("{}")
+    return snapshot
+
+
+def test_muse_golden_qualifies_scores_resumes_and_writes_routes(tmp_path, monkeypatch):
+    from families.muse_spark import golden
+    from transformers.models.muse_spark import modeling_muse_spark as reference
+    config = tiny_muse_config()
+    official = reference.MuseSparkTextModel(config).eval()
+    randomize(official)
+    tensors = {muse.PREFIX + k: v.detach().bfloat16() for k, v in official.state_dict().items() if "rotary" not in k}
+    for key in list(tensors):
+        if key.endswith(("mlp.gate.weight", "e_score_correction_bias")):
+            tensors[key] = tensors[key].float()
+    tensors[muse.HEAD] = (torch.randn(config.vocab_size, config.hidden_size) * 0.3).bfloat16()
+    snapshot = fixture_snapshot(tmp_path, tensors, "model.safetensors.index.json")
+    monkeypatch.setattr(muse, "load_official", lambda s: (reference, config))
+    monkeypatch.setattr(muse, "source_identity", lambda: {"fixture": True})
+    monkeypatch.setattr(torch.nn.Module, "cuda", lambda self, *a, **k: self)
+    family = golden.Family.__new__(golden.Family)
+    family.reference, family.config = reference, config
+    family.checkpoint, family.layers, family.dtype, family.outer = muse.Checkpoint(snapshot), config.num_hidden_layers, torch.float32, None
+    family.rotary = reference.MuseSparkTextRotaryEmbedding(config)
+    panel = synthetic_panel(tmp_path, "muse_spark", snapshot, config.vocab_size, [700, 300])
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
+    assert meta["scored_tokens"] == 128 and len(meta["seconds_per_layer"]) == config.num_hidden_layers
+    routes = tmp_path / "routes" / "layer000"
+    ids = __import__("numpy").fromfile(routes / "w0.ids.bin", dtype="<i2").reshape(700, 2)
+    assert ids.min() >= 0 and ids.max() < config.num_local_experts
+    assert json.loads((routes / "index.json").read_text())["files"]
+    # Resume after completion reuses the proof and reproduces identical logits.
+    first = (out / "windows" / "w0" / "logits.bin").read_bytes()
+    family.outer = None
+    run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    assert (out / "windows" / "w0" / "logits.bin").read_bytes() == first
+
+
+def test_mistral_golden_threads_shared_kv_and_topk_across_layers(tmp_path, monkeypatch):
+    from families.mistral_large4 import golden
+    from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
+    config = tiny_mistral_config()
+    official = reference.MistralLarge4TextModel(config).eval()
+    randomize(official)
+    head = torch.randn(config.vocab_size, config.hidden_size) * 0.3
+    tensors, _ = mistral_checkpoint(official, config, head)
+    snapshot = fixture_snapshot(tmp_path, tensors, "consolidated.safetensors.index.json")
+    monkeypatch.setattr(mistral, "load_official", lambda s: (reference, config))
+    monkeypatch.setattr(mistral, "source_identity", lambda: {"fixture": True})
+    family = golden.Family.__new__(golden.Family)
+    family.reference, family.config = reference, config
+    family.checkpoint, family.layers, family.dtype = mistral.Checkpoint(snapshot), config.num_hidden_layers, torch.float32
+    family.outer, family.rotary = None, None
+    family.source = {i: s for i, s in enumerate(config.kv_source_layers) if s != i}
+    family.stores = set(family.source.values())
+    family.last_reader = {s: max(i for i, x in family.source.items() if x == s) for s in family.stores}
+    panel = synthetic_panel(tmp_path, "mistral_large4", snapshot, config.vocab_size, [700, 260])
+    out = run_golden(tmp_path, monkeypatch, golden, family, snapshot, panel)
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["prefix_qualification"]["passed"] and meta["official_forward"]["passed"]
+    # Layer-major logits equal the official full model run on the same window (stable top-k).
+    window = json.loads(panel.read_text())["windows"][1]
+    ids = torch.tensor([window["tokens"]])
+    state = {}
+    with torch.inference_mode(), stable_topk(reference):
+        official_full = reference.MistralLarge4TextModel(config).eval()
+        checkpoint = mistral.Checkpoint(snapshot)
+        outer = mistral.load_outer(checkpoint, config, device="cpu", dtype=torch.float32)
+        hidden = torch.nn.functional.embedding(ids, outer["embed"])
+        shared, topk = {}, None
+        for index in range(config.num_hidden_layers):
+            layer = mistral.load_layer(checkpoint, config, index, device="cpu", dtype=torch.float32)
+            hidden, topk = mistral.layer_forward(layer, config, hidden, outer["rotary"], shared, topk)
+        expected = mistral.logits(outer["norm"](hidden[0, window["score_from"] - 1:-1]), outer["head"], config).numpy()
+    import numpy as np
+    actual = np.fromfile(out / "windows" / "w1" / "logits.bin", dtype="<f4").reshape(expected.shape)
+    assert np.abs(actual - expected).max() / np.abs(expected).max() < 1e-5
+
+
+def test_muse_centered_norm_weights_keep_the_official_bf16_add(tmp_path):
+    from transformers.models.muse_spark import modeling_muse_spark as reference
+    config = tiny_muse_config()
+    official = reference.MuseSparkTextModel(config).eval()
+    randomize(official)
+    tensors = {muse.PREFIX + k: v.detach().bfloat16() for k, v in official.state_dict().items() if "rotary" not in k}
+    snapshot = write_checkpoint(tmp_path, tensors, "model.safetensors.index.json")
+    layer = muse.load_layer(muse.Checkpoint(snapshot), config, 0, device="cpu", dtype=torch.float32)
+    for name in muse.NATIVE_DTYPE:
+        assert layer.get_parameter(name).dtype == torch.bfloat16
+    assert layer.self_attn.q_proj.weight.dtype == torch.float32
+    assert layer.post_attention_residual_gate.gate.dtype == torch.float32
+
+
+def test_muse_ordered_experts_equal_the_official_cpu_accumulation():
+    from transformers.models.muse_spark import modeling_muse_spark as reference
+    config = tiny_muse_config()
+    moe = reference.MuseSparkMoE(config).eval()
+    randomize(moe)
+    hidden = torch.randn(37, config.moe_hidden_size)
+    _, weights, index = moe.gate(torch.randn(37, config.hidden_size))
+    with torch.inference_mode():
+        official = moe.experts(hidden, index, weights)
+        ordered = muse.ordered_experts(moe.experts, hidden, index, weights)
+    assert torch.equal(official, ordered)
+
+
+def test_mistral_ordered_experts_equal_the_official_cpu_accumulation():
+    from transformers.models.mistral_large4 import modeling_mistral_large4 as reference
+    config = tiny_mistral_config()
+    moe = reference.MistralLarge4TextMoE(config).eval()
+    randomize(moe)
+    hidden = torch.randn(37, config.hidden_size)
+    _, weights, index = moe.gate(hidden)
+    with torch.inference_mode():
+        assert torch.equal(moe.experts(hidden, index, weights), mistral.ordered_experts(moe.experts, hidden, index, weights))

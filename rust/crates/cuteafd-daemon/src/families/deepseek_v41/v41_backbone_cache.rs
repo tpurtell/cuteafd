@@ -33,6 +33,11 @@ pub(crate) struct CacheLease {
     slot: usize,
     generation: u64,
 }
+#[cfg(test)]
+impl CacheLease {
+    /// An unbound identity for CPU-only scheduler lifecycle tests; never used with a cache.
+    pub(crate) fn unbound_for_test(slot: usize) -> Self { Self { owner: 0, slot, generation: 0 } }
+}
 struct Request {
     id: u64,
     version: u64,
@@ -485,15 +490,6 @@ impl<'a> BackboneCache<'a> {
         for (((state, lease), pages), rows) in self.sources.iter_mut().zip(sources).zip(pages).zip(rows) {
             let device = state.device;
             device.run(|| state.bind(lease, pages, rows))?;
-        }
-        Ok(())
-    }
-    /// Shrink a request's source bindings to `pages` (a prefix of each); see `SourceCache::rebind`.
-    pub fn rebind_sources(&mut self, lease: CacheLease, pages: [&[u32]; 4], rows: [usize; 4]) -> Result<()> {
-        let sources = self.request(lease)?.sources;
-        for (((state, lease), pages), rows) in self.sources.iter_mut().zip(sources).zip(pages).zip(rows) {
-            let device = state.device;
-            device.run(|| state.rebind(lease, pages, rows))?;
         }
         Ok(())
     }

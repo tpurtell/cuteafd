@@ -41,7 +41,7 @@ mod readiness_tests {
         let ready = inner.find("    ready();").unwrap();
         let loop_at = inner.find("loop {").unwrap();
         assert!(inner.find("prefix::DeferredAdmission").unwrap() < ready && ready < loop_at);
-        assert!(inner[..ready].contains("publish(stats, requests, generated_total, 0, 0, cache, media, preparer);"));
+        assert!(inner[..ready].contains("publish(stats, requests, generated_total, 0, 0, cache, media, preparer, &reserve, 0);"));
         assert!(!inner[ready..loop_at].contains('?'), "no fallible startup work may follow readiness");
         let prefix = source.split_once("\nfn prefix_cache_with").unwrap().1
             .split_once("\n/// Gives a finished").unwrap().0;

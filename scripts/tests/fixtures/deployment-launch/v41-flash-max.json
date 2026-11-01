@@ -135,7 +135,7 @@
       "--max-context-tokens",
       "1048576",
       "--max-output-tokens",
-      "393216",
+      "131072",
       "--console-secret-file",
       "/run/cuteafd-console-secret",
       "--usage-dir",

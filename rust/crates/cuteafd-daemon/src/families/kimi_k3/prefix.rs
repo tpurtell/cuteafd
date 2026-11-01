@@ -209,6 +209,14 @@ impl<'a> KimiPrefix<'a> {
 impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     type Placement = Placement;
     fn draft_page_bytes(&self) -> usize { self.0.draft.as_ref().map_or(0, |draft| draft.common().mla_draft_page_bytes()) }
+    fn draft_demand(&self, placement: &Placement) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        self.0.draft.as_ref()?.common().mla_reservation(placement.slot)
+    }
+    fn draft_reservable(&self) -> Option<usize> { self.0.draft.as_ref()?.common().mla_reservable() }
+    fn draft_lifetime_rows(&self) -> Option<usize> { self.0.draft.as_ref()?.common().mla_lifetime_rows() }
+    fn draft_admission(&self, origin: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        self.0.draft.as_ref()?.common().mla_admission(origin)
+    }
     fn admit_draft_pages(&self, placement: &mut Placement, capacity: usize) -> Result<(), BoxError> {
         if let Some(draft) = &self.0.draft {
             let _scope = draft.device().enter()?;
@@ -268,6 +276,20 @@ impl PrefixFamily<SnapshotMeta> for KimiPrefix<'_> {
     }
     fn layout(&self) -> FamilyLayout { self.0.layout }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.units }
+    /// The bound frontier carries the unit list every submission and commit compares.
+    fn extend_pages(&self, placement: &mut Placement, pages: &[u32]) -> Result<(), BoxError> {
+        let mut live = self.0.live.borrow_mut();
+        let frontier = live.get_mut(placement.slot).and_then(Option::as_mut).ok_or("Kimi prefix slot is not bound")?;
+        if frontier.units != placement.units || frontier.len != placement.len {
+            return Err("Kimi growth differs from the bound frontier".into());
+        }
+        let mut units = placement.units.clone();
+        units.extend_from_slice(pages);
+        self.validate(&Placement { units: units.clone(), ..placement.clone() }, placement.len)?;
+        frontier.units.clone_from(&units);
+        placement.units = units;
+        Ok(())
+    }
     fn commit_point(&self, placement: &Placement) -> usize {
         self.0.live.borrow().get(placement.slot).and_then(Option::as_ref)
             .filter(|frontier| frontier.units == placement.units && frontier.len == placement.len

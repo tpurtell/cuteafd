@@ -17,7 +17,9 @@
 use crate::shared::speculation::dflash::{ContextRow, DraftSeq, TAP_ROWS};
 use crate::shared::draft_policy::DraftHistory;
 use crate::shared::draft::evidence::{Censor, DraftSource};
-use super::engine::{GlmEngine, GlmPlacement, DECODE_ROWS};
+use super::engine::{GlmEngine, GlmPlacement, DECODE_ROWS, PAGE_ROWS};
+use crate::shared::kv_reserve::{reserved_drafts, Holding, Reserve, Reserving};
+use cuteafd_engine::reserve::Lease;
 use super::prefix::GlmPrefix;
 use crate::shared::prefix::CudaCopyEngine;
 use crate::shared::prefix::{PrefixArgs, Toggle};
@@ -30,7 +32,7 @@ use crate::shared::prefill_share::{Chunk, DecodeShareArgs};
 use anyhow::{ensure, Context, Result};
 use cuteafd_api::openai::chat::glm5::{GlmEncoding, GlmThinkingOff};
 use cuteafd_api::openai::{
-    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeRequest,
     PromptUsage,
 };
 use crate::shared::spark_intake::SparkLink;
@@ -47,8 +49,6 @@ pub(crate) struct ServeArgs {
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4096)]
-    pub max_output: u32,
     /// Sequences decoding at once (at most the decode programs' 64 rows).
     #[arg(long, default_value_t = cuteafd_loader::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
@@ -110,7 +110,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, prefix));
     let max_context = ready_rx.await.context("engine failed before it was ready")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     cuteafd_bench::context::phase("engine loaded");
     let router = cuteafd_api::openai::router_for_model(queue, limits, stats, Duration::from_secs(25),
         hub.clone(), api.serve(profile.clone(), &snapshot)?);
@@ -207,6 +207,7 @@ struct Prefill<'a> {
     cancelled: bool,
     placement: GlmPlacement,
     capacity: usize,
+    lease: Lease,
     slot: Option<usize>,
     /// The last row's logits on the host: a whole-prompt cache hit's retained
     /// row, or the prefill's last row downloaded for the prompt snapshot.
@@ -242,6 +243,7 @@ struct Active<'a> {
     /// its `Turn` snapshot.
     turn: Option<Vec<f32>>,
     capacity: usize,
+    lease: Lease,
     next: u32,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
@@ -278,6 +280,16 @@ fn take(constraint: Option<&mut crate::shared::constraints::State<'_>>, selected
         state.accept(token)?;
     }
     Ok(token)
+}
+
+impl Reserving for Active<'_> {
+    type Placement = GlmPlacement;
+    fn lease(&self) -> &Lease { &self.lease }
+    fn committed(&self) -> usize { self.placement.len }
+    fn produced(&self) -> usize { self.generated }
+    fn placement(&self) -> &GlmPlacement { &self.placement }
+    fn placement_mut(&mut self) -> &mut GlmPlacement { &mut self.placement }
+    fn closed(&self) -> bool { self.job.events.is_closed() }
 }
 
 impl Active<'_> {
@@ -327,13 +339,18 @@ impl Active<'_> {
             self.next = token;
             return Ok(false);
         };
+        self.finish(finish)?;
+        Ok(true)
+    }
+
+    /// Flushes buffered text and sends the finish reason.
+    fn finish(&mut self, finish: InferenceFinishReason) -> Result<()> {
         let content = self.decoder.finish()?.unwrap_or_default();
         if !content.is_empty() || self.buffered > 0 {
             self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
         self.ticket.finishing();
-        self.send(InferenceChunk::Finish { finish_reason: finish })?;
-        Ok(true)
+        self.send(InferenceChunk::Finish { finish_reason: finish })
     }
 }
 
@@ -487,11 +504,12 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
 }
 
 /// Serving statistics for `/v1/stats`.
+#[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
-    cache: &PrefixCache<CudaCopyEngine<'_>>) {
+    cache: &PrefixCache<CudaCopyEngine<'_>>, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
-            "prefilling": prefilling, "prefix_cache": cache.stats(),
+            "prefilling": prefilling, "prefix_cache": cache.stats(), "kv_reserve": reserve.snapshot(stalled),
             "draft_policy": crate::shared::draft::resource::snapshot()});
     }
 }
@@ -551,6 +569,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         SharedPolicy::with_geometry(geometry, resource::Prior::Selector(d.selector_fit("glm5", false)?), draft_seed())
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
+    // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.
+    let mut stalled: Vec<Active<'_>> = Vec::new();
+    let mut reserve = Reserve::new(prefix.reserve.config(engine.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total, mut admitted_total) = (0u64, 0u64, 0u64);
     let mut selector = TokenSelector::new(&opened.library, select, engine.cfg.vocab_size, DECODE_ROWS)?;
     // Host seconds per step phase since the last completed request: draft
@@ -570,8 +591,8 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        while active.len() + prefills.len() < max_sequences {
-            let busy = !active.is_empty() || !prefills.is_empty();
+        while active.len() + stalled.len() + prefills.len() < max_sequences {
+            let busy = !active.is_empty() || !stalled.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
                 cuteafd_engine::prefix::AdmissionPoll::Ready(job) => job,
@@ -579,7 +600,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                     if !busy {
                         // Idle: publish the state the server waits in (captures and releases done).
                         cache.tick();
-                        publish(stats, requests, generated_total, 0, 0, &cache);
+                        publish(stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
                         match receive.blocking_recv() {
                             Some(job) => job,
@@ -600,26 +621,36 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                 reject(&job, format!("scoring: {error:#}"));
                 continue;
             }
-            let constraint = match job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
-                Ok(constraint) => constraint,
-                Err(error) => {
-                    reject(&job, format!("{error:#}"));
-                    continue;
-                }
-            };
-            let tokens = probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))?;
+            let Some(constraint) = crate::shared::api::admission_result(&job.events,
+                job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose()) else { continue; };
+            let Some(tokens) = crate::shared::api::admission_result(&job.events,
+                probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))) else { continue; };
             let cold = probe::cold(&job.probe);
             if tokens.is_empty() || tokens.len() >= engine.max_context {
                 reject(&job, format!("prompt of {} tokens is outside 1..{}", tokens.len(), engine.max_context));
                 continue;
             }
-            let capacity = (tokens.len() + job.max_tokens).min(engine.max_context);
-            let slot = free_slots.pop();
+            let lease = match reserve.lease(tokens.len(), job.max_tokens, DECODE_ROWS, Reserve::limit(&cache, &family, engine.max_context)) {
+                Ok(lease) => lease,
+                Err(error) => { reject(&job, format!("{error}")); continue; }
+            };
+            let capacity = lease.end();
             cache.tick();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
+            let Some(rows) = reserve.admit(&cache, &family, &active, &stalled, &holding, &lease) else {
+                drop(holding);
+                // Waits for the drain rule: a retirement or a release retries it.
+                match kv_waiter.defer_until_release(job, busy, cache.pool().release_epoch()) {
+                    Ok(()) => break,
+                    Err(job) => { reject(&job, "prompt leaves no room for output in the GPU KV pool".into()); continue; }
+                }
+            };
+            drop(holding);
+            let slot = free_slots.pop();
             let admit_started = Instant::now();
             // Lookup and fork of the retained pages (byte-exact: the pages are the whole state).
             let lookup: &[u32] = if cold { &[] } else { &tokens };
-            let admitted = match cache.admit(&family, lookup, capacity, true, |pages| GlmPlacement { pages, len: 0 }) {
+            let admitted = match cache.admit(&family, lookup, rows, true, |pages| GlmPlacement { pages, len: 0 }) {
                 Ok(admitted) => admitted,
                 Err(error) => {
                     free_slots.extend(slot);
@@ -689,7 +720,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = if logits.is_some() { PointPlan::default() } else { plan };
             prefills.push(Prefill { job, constraint, tokens, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement: admitted.placement, capacity, slot, logits, first: None, started: Instant::now(), busy: 0.0,
+                placement: admitted.placement, capacity, lease, slot, logits, first: None, started: Instant::now(), busy: 0.0,
                 id: admitted_total, ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -809,7 +840,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         counts: [0; 3],
                         decoder: cuteafd_loader::streaming_token_decoder(&opened.snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
-                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
+                        capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
                     };
                     request.next = match (p.first, &logits) {
@@ -852,7 +883,24 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             }
             prefills.settle(!active.is_empty());
         }
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.pages, draft: family.draft_demand(&p.placement) }).collect();
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
+            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
+            request.ticket.done(request.generated);
+            requests += 1;
+            generated_total += request.generated as u64;
+            release(&family, cache, &mut free_slots, &request.placement, request.slot);
+        })?;
+        drop(holding);
         if active.is_empty() {
+            if !stalled.is_empty() {
+                // Only stalled requests: wait for a capture or prefill to return pages.
+                publish(stats, requests, generated_total, 0, prefills.len(), &cache, &reserve, stalled.len());
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
             continue;
         }
         let cycle = Instant::now();
@@ -895,8 +943,9 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             release(&family, &mut cache, &mut free_slots, &request.placement, request.slot);
         }
         cache.tick();
-        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len()));
+        publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
+            receive.len() + kv_waiter.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
@@ -938,7 +987,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
     // Rows each sequence may add after its next token.
     let room = DECODE_ROWS.saturating_sub(active.len());
     let limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
-        room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
+        room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
+            .min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS)) }).collect();
     // Skip/block decisions use the same resource prices as post-draft lengths.
     let eligible: Vec<_> = active.iter().zip(&limits).filter(|(a, limit)| a.slot.is_some() && **limit > 0)
         .map(|(a, &limit)| (a.ticket.id(), limit)).take(drafter.map_or(0, |d| d.max_batch_sequences())).collect();

@@ -3,6 +3,19 @@ use cuteafd_api::openai::{auth::{ApiKey, Auth}, health::HealthWitness, ModelProf
 use anyhow::Context;
 use std::{path::PathBuf, sync::Arc};
 
+/// Admission errors terminate only this request, never the scheduler's receive loop.
+pub(crate) fn admission_result<T>(events: &tokio::sync::mpsc::UnboundedSender<
+    Result<cuteafd_api::openai::InferenceChunk, cuteafd_api::openai::NativeFailure>>,
+    result: anyhow::Result<T>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            let _ = events.send(Err(cuteafd_api::openai::NativeFailure::from_admission_error(error)));
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ApiArgs {
     /// Require a bearer key from this file on /v1/* (health stays open).

@@ -26,7 +26,8 @@ from fidelity_windows import MAX_TOKENS, SET_SCHEMA, bucket, canonical, set_hash
 from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
-FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3")
+FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3",
+            "muse_spark", "mistral_large4")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -136,11 +137,56 @@ def legacy_window(reference: dict) -> dict:
             "tokens": tokens[:end], "roles": ["ctx"] * end, "score_from": start}
 
 
+# Recipe v2 (TJ, 2026-10-31): continue a window's turn through its tool calls until it
+# holds 512 generated rows, no tool clause where no tools are declared, and trailing
+# context wrapped in a checkpoint-native user turn (#431). v1 stays the default.
+RECIPES = ("v1", "v2")
+V2_MAX_TURNS = 8
+V2_TOOL_UNAVAILABLE = "Tool unavailable in this session; answer directly from the provided text."
+
+
+def recipe_identity(recipe):
+    if recipe == "v1":
+        return None
+    rules = {"id": "own-text-v2", "continue_until_scored_generated": 512,
+             "scored_end": "assistant-turn end maximizing scored generated rows, earliest on ties", "max_turns_per_window": V2_MAX_TURNS,
+             "tool_clause": "only when tools are declared", "tool_unavailable_result": V2_TOOL_UNAVAILABLE,
+             "trailing_context": "checkpoint-native user turn after the final assistant turn when the renderer keeps "
+                                 "the scored turn as an exact token prefix; otherwise v1 raw repository text",
+             "earlier_turn_roles": "gen only where the earlier prompt+generation is an exact token prefix",
+             "json_mode": "response_format dropped when the provider's JSON mode changes prompt_tokens; "
+                          "the window prompt's own JSON instruction remains"}
+    return {**rules, "sha256": hashlib.sha256(canonical(rules)).hexdigest()}
+
+
+ORIGINAL_BLOCKS = {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10}
+
+
+def allocation_note(windows, ids):
+    """Plain metadata: why a set has more windows than the original allocation."""
+    from fidelity_split import standard_half
+    def strata(selected):
+        counts = {}
+        for w in selected:
+            counts[w["bucket"]] = counts.get(w["bucket"], 0) + 1
+        return dict(sorted(counts.items()))
+    added = [w for w in windows if w["id"] in ids]
+    return {"reason": "8-16K B windows added (2026-10-31) so each standard half reaches the new-set floor of "
+                      "10,000 scored generated rows (target 10,200); same B prompt/target rule continued past b11",
+            "added_windows": {wid: standard_half(wid) for wid in ids},
+            "original_blocks": ORIGINAL_BLOCKS, "original_strata": strata([w for w in windows if w["id"] not in ids]),
+            "added_strata": strata(added), "resulting_strata": strata(windows)}
+
+
 def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: dict,
               tokenizer, probe, root: pathlib.Path = ROOT, recordings: list[dict] | None = None,
               files: list[str] | None = None, legacy_reference: dict | None = None,
-              legacy_provenance: dict | None = None) -> dict:
-    if getattr(probe, "identity", {}).get("text_source") not in ("api", "hf"):
+              legacy_provenance: dict | None = None, recipe: str = "v1", topup_b: int = 0) -> dict:
+    if recipe not in RECIPES:
+        raise ValueError("unknown fidelity text recipe")
+    if recipe == "v2" and (getattr(probe, "identity", {}).get("text_source") not in ("api", "hf", "engine") or recordings):
+        raise ValueError("recipe v2 is defined for own-text api/hf generation without recordings")
+    if getattr(probe, "identity", {}).get("text_source") not in ("api", "hf", "engine"):
         arm_policy(arm, checkpoint)
     elif arm.get("checkpoint") != checkpoint:
         raise ValueError("generation checkpoint differs from requested checkpoint")
@@ -167,10 +213,12 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             for turn in session["turns"]:
                 snapshots.append((session["messages"][:turn["messages"]], recording.get("tools", agentic.TOOLS)))
 
-    def generate(name, block, messages, target, tools=None, extra=None):
+    def generate(name, block, messages, target, tools=None, extra=None, executor=None, history=None):
         # Size by rendered IDs, never truncate a chat template or original history.
         base = copy.deepcopy(messages)
-        base.insert(0, {"role": "system", "content": f"Fidelity fixture {name}; think carefully and use the repository tools when appropriate."})
+        clause = ("; think carefully and use the repository tools when appropriate."
+                  if recipe == "v1" or tools else "; think carefully.")
+        base.insert(0, {"role": "system", "content": f"Fidelity fixture {name}{clause}"})
         count = max(0, target * 3 - len(canonical(base)))
         for attempt in range(8):
             body = {"model": model, "messages": copy.deepcopy(base), "temperature": 0,
@@ -200,6 +248,16 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             raise ContextCap(f"{name}: rendered prompt plus generation exceeds 16K cap")
         body["max_tokens"] = 1024
         chat = probe(body)
+        json_mode = None
+        if recipe == "v2" and body.get("response_format") and provider_prompt_offset(chat):
+            # The provider's JSON mode injects text our checkpoint render lacks; the window's
+            # own prompt already asks for JSON, so ask again without the provider switch.
+            json_mode = {"dropped_response_format": body.pop("response_format"),
+                         "provider_prompt_offset": provider_prompt_offset(chat)}
+            sample = probe.prompt({**body, "max_tokens": 1})
+            if len(sample["probe"]["prompt_ids"]) + 1024 > MAX_TOKENS:
+                raise ContextCap(f"{name}: rendered prompt plus generation exceeds 16K cap")
+            chat = probe(body)
         server = chat.get("server", {})
         if server.get("model", checkpoint) != checkpoint or server.get("family", family) != family:
             raise ValueError("probe server checkpoint/family differs from generation manifest")
@@ -216,12 +274,37 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             raise ContextCap(f"{name}: reconstructed assistant span exceeds 16K cap")
         tokens = prompt + generated
         roles = ["ctx"] * len(prompt) + ["gen"] * len(generated)
-        start = len(prompt) + max(0, len(generated) - 512)
+        turns = [{"generated_tokens": len(generated), "prompt_tokens": len(prompt)}]
+        continuation, final_chat = {}, None
+        if recipe == "v2":
+            limit = {"A": 2048 if target < 2048 else 8192 if target < 8192 else MAX_TOKENS - 1,
+                     "B": MAX_TOKENS - 1}.get(block, MAX_TOKENS - 1)
+            tokens, roles, chat, body, turns, continuation, final_chat = continue_window(
+                name, body, chat, tokens, roles, turns, executor, history, limit)
+            prompt, generated = chat["probe"]["prompt_ids"], chat["probe"]["generated"]
+        if recipe == "v2":
+            # The last 512 positions of the in-window conversation, never inside the
+            # window's fixed opening prompt.
+            start = max(turns[0]["prompt_tokens"], len(tokens) - 512)
+        else:
+            start = len(prompt) + max(0, len(generated) - 512)
         # Short turns remain short: trailing human code supplies ctx rows, not
         # fabricated assistant output. These rows never carry the gen bar.
-        padding = max(0, 512 - len(generated))
-        tokens += corpus_ids[:padding]
-        roles += ["ctx"] * padding
+        padding = max(0, start + 512 - len(tokens))
+        trailing = None
+        if recipe == "v2" and padding:
+            native = native_trailing_context(body, chat, tokens, roles, padding)
+            if native is not None:
+                tokens, roles = native
+                trailing = "native user turn"
+            else:
+                # The checkpoint renderer rewrites the scored turn (e.g. drops its reasoning)
+                # once a user turn follows; keep exact ids with the v1 raw text instead.
+                tokens, roles = tokens + corpus_ids[:padding], roles + ["ctx"] * padding
+                trailing = "raw repository text (renderer rewrites the scored turn)"
+        elif padding:
+            tokens += corpus_ids[:padding]
+            roles += ["ctx"] * padding
         expected_bucket = "0-2K" if target < 2048 else "2-8K" if target < 8192 else "8-16K"
         if block in ("A", "B") and bucket(start) != expected_bucket:
             raise BucketMismatch(f"{name}: history lands in {bucket(start)}, expected {expected_bucket}; supply a shorter recording/history")
@@ -231,10 +314,99 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                                        "engine": chat["probe"]["engine"], "server": server,
                                        "generated_tokens": len(generated),
                                        "trailing_ctx": padding}})
+        if recipe == "v2":
+            windows[-1]["provenance"].update(turns=turns, scored_generated=roles[start:].count("gen"),
+                                             **continuation)
+            if trailing is not None:
+                windows[-1]["provenance"]["trailing_context"] = trailing
+            if json_mode is not None:
+                windows[-1]["provenance"]["json_mode"] = json_mode
         if "generation_provenance" in chat:
             windows[-1]["provenance"]["generation"] = chat["generation_provenance"]
         print(f"{name}: prompt={len(prompt)} generated={len(generated)}", file=sys.stderr, flush=True)
-        return chat
+        # v2: the conversation (and the next fixture window) continues from the last turn.
+        return final_chat if recipe == "v2" else chat
+
+    def provider_prompt_offset(chat):
+        usage = (chat.get("generation_provenance") or {}).get("usage") or {}
+        reported = usage.get("prompt_tokens")
+        return 0 if reported is None else reported - len(chat["probe"]["prompt_ids"])
+
+    def continue_window(name, body, chat, tokens, roles, turns, executor, history, limit):
+        """v2: answer tool calls in-window and ask again until 512 generated rows."""
+        info = {"ended_with_tool_calls": False, "earlier_turns_ctx": 0, "tool_errors": 0}
+        opening = turns[0]["prompt_tokens"]
+        snapshots = [(tokens, roles, chat, body, len(turns))]
+        # Scored rows are the window's last 512 positions; tool results there are ctx.
+        while roles[-512:].count("gen") < 512 and chat.get("tool_calls") and len(turns) < V2_MAX_TURNS:
+            calls = chat["tool_calls"]
+            assistant = {"role": "assistant", "content": chat.get("content", ""),
+                         "reasoning_content": chat.get("reasoning", ""), "tool_calls": calls}
+            results = []
+            for call in calls:
+                if executor is None:
+                    output = V2_TOOL_UNAVAILABLE
+                else:
+                    output, error = executor(call["function"]["name"], call["function"]["arguments"])
+                    info["tool_errors"] += int(error is not None)
+                results.append({"role": "tool", "tool_call_id": call["id"], "content": output})
+            following = copy.deepcopy(body)
+            following["messages"] += [assistant, *results]
+            sample = probe.prompt(following)
+            size = len(sample["probe"]["prompt_ids"])
+            if size + 1024 > MAX_TOKENS:
+                info["ended_at_context_cap"] = True
+                break
+            if size + 1024 - 512 > limit:
+                # Keep the window's scheduled context stratum; stop before it moves.
+                info["ended_at_stratum"] = True
+                break
+            next_chat = probe(following)
+            prompt, generated = next_chat["probe"]["prompt_ids"], next_chat["probe"]["generated"]
+            if prompt != sample["probe"]["prompt_ids"]:
+                raise ValueError(f"{name}: unstable continuation prompt rendering")
+            if len(prompt) + len(generated) > MAX_TOKENS:
+                info["ended_at_context_cap"] = True
+                break
+            # Earlier turns keep their gen labels only when their exact ids reappear
+            # at the same positions; any template rewrite of history makes them ctx.
+            if prompt[:len(tokens)] == tokens:
+                carried = roles + ["ctx"] * (len(prompt) - len(tokens))
+            else:
+                carried = ["ctx"] * len(prompt)
+                info["earlier_turns_ctx"] += 1
+            tokens, roles = prompt + generated, carried + ["gen"] * len(generated)
+            if history is not None:
+                history += [assistant, *results]
+            body, chat = following, next_chat
+            turns.append({"generated_tokens": len(generated), "prompt_tokens": len(prompt)})
+            snapshots.append((tokens, roles, chat, body, len(turns)))
+        info["ended_with_tool_calls"] = bool(chat.get("tool_calls"))
+        # The window ends at the assistant-turn end whose last 512 positions hold the
+        # most generated rows (earliest on ties); later turns stay out of this window,
+        # never relabelled, and the conversation still continues for the next window.
+        scored = [r[max(opening, len(r) - 512):].count("gen") for _, r, *_ in snapshots]
+        best = scored.index(max(scored))
+        tokens, roles, window_chat, body, kept = snapshots[best]
+        info.update(scored_end_turn=kept, turns_generated=len(turns))
+        return tokens, roles, window_chat, body, turns[:kept], info, chat
+
+    def native_trailing_context(body, chat, tokens, roles, padding):
+        """#431: trailing repository text as a checkpoint-native user turn (all ctx)."""
+        if not hasattr(probe, "conversation"):
+            raise ValueError("recipe v2 needs the backend's checkpoint chat renderer")
+        assistant = {"role": "assistant", "content": chat.get("content", ""),
+                     "reasoning_content": chat.get("reasoning", "")}
+        if chat.get("tool_calls"):
+            assistant["tool_calls"] = chat["tool_calls"]
+        text = corpus[:max(4096, padding * 8)]
+        rendered = probe.conversation(body, body["messages"] + [assistant, {"role": "user", "content": text}])
+        if rendered[:len(tokens)] != tokens:
+            return None
+        suffix = rendered[len(tokens):len(tokens) + padding]
+        if len(suffix) != padding:
+            raise ValueError("native trailing context is shorter than the required padding")
+        return tokens + suffix, roles + ["ctx"] * padding
 
     def fresh_task(i):
         workspace = agentic.Workspace()
@@ -249,6 +421,10 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         return workspace, [{"role": "system", "content": system},
                            {"role": "user", "content": tasks[i % len(tasks)]}]
 
+    def agentic_turn(workspace, messages):
+        # v2 answers a window's own tool calls in-window; v1 leaves them to the next window.
+        return {"executor": workspace.execute, "history": messages} if recipe == "v2" and not snapshots else {}
+
     workspace, messages = None, None
     for i in range(26):
         if snapshots:
@@ -259,7 +435,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             tools = agentic.TOOLS
         target = 1024 if i < 8 else 4096 if i < 20 else 10240
         try:
-            chat = generate(f"a{i:02d}", "A", messages, target, tools)
+            chat = generate(f"a{i:02d}", "A", messages, target, tools, **agentic_turn(workspace, messages))
         except (BucketMismatch, ContextCap) as error:
             if isinstance(error, ContextCap) and windows:
                 windows[-1]["provenance"]["ended_at_context_cap"] = True
@@ -268,7 +444,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             # A growing tool history can leave the scheduled length stratum.
             # Start the next deterministic fixture task instead of truncating it.
             workspace, messages = fresh_task(i)
-            chat = generate(f"a{i:02d}", "A", messages, target, tools)
+            chat = generate(f"a{i:02d}", "A", messages, target, tools, **agentic_turn(workspace, messages))
         if not snapshots:
             malformed = 0
             for recovery in range(3):
@@ -295,7 +471,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     break
                 prior = windows.pop()
                 try:
-                    chat = generate(f"a{i:02d}", "A", messages, target, tools)
+                    chat = generate(f"a{i:02d}", "A", messages, target, tools, **agentic_turn(workspace, messages))
                 except (BucketMismatch, ContextCap) as error:
                     if isinstance(error, ContextCap):
                         prior["provenance"]["ended_at_context_cap"] = True
@@ -306,7 +482,9 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
             windows[-1]["provenance"]["malformed_tool_calls"] = malformed
             windows[-1]["provenance"]["tool_error_retries"] = recovery
         windows[-1]["provenance"].setdefault("ended_at_context_cap", False)
-    for i in range(12):
+    if topup_b and recipe != "v2":
+        raise ValueError("top-up windows are defined for recipe v2 sets only")
+    for i in range(12 + topup_b):
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
     for i in range(10):
         ids = token_ids(tokenizer, (root / files[i % len(files)]).read_text())
@@ -320,7 +498,8 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         prompt = STRUCTURED[i] + " Reply in JSON." if i < 3 else "Select and call the correct tool to read, search or edit the fixture repository. " + agentic.TASKS[(i - 3) % len(agentic.TASKS)]["prompt"]
         generate(f"d{i:02d}", "D", [{"role": "user", "content": prompt}], 1024 + (i % 3) * 512,
                  agentic.TOOLS if i >= 3 else None,
-                 {"response_format": {"type": "json_object"}} if i < 3 else None)
+                 {"response_format": {"type": "json_object"}} if i < 3 else None,
+                 executor=agentic.Workspace().execute if i >= 3 else None)
     for i, prompt in enumerate(MATH + [f"Explain the repository design in {files[j]} in detail." for j in range(5)]):
         generate(f"e{i:02d}", "E", [{"role": "user", "content": prompt}], 768 + (i % 3) * 512)
     quick = ["legacy", "a00", "a04", "a08", "a12", "a20", "a24", "b00", "b08", "c00", "d00", "e00"]
@@ -338,7 +517,21 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
                     "context_cap": MAX_TOKENS, "temperature": 0, "seed": 0, "reasoning_effort": "high",
                     "blocks": {"A": 26, "B": 12, "C": 10, "D": 6, "E": 10},
                     "prompt_roles": "conditioning history ctx; current assistant span gen"}, "windows": windows}
-    if getattr(probe, "identity", {}).get("text_source") in ("api", "hf"):
+    manifest["recipe"]["blocks"] = {block: sum(w["block"] == block for w in windows) for block in "ABCDE"}
+    manifest["recipe"]["windows"] = len(windows)
+    if topup_b:
+        manifest["allocation_note"] = allocation_note(windows, [f"b{12 + k:02d}" for k in range(topup_b)])
+    from fidelity_split import standard_layout
+    standard_layout(windows)
+    if recipe == "v2":
+        manifest["recipe"]["json_mode_dropped_windows"] = sorted(
+            w["id"] for w in windows if "json_mode" in w.get("provenance", {}))
+        manifest["recipe"]["trailing_context_windows"] = {
+            kind: sum(w.get("provenance", {}).get("trailing_context") == kind for w in windows)
+            for kind in ("native user turn", "raw repository text (renderer rewrites the scored turn)")}
+        manifest["recipe"].update(version=recipe_identity(recipe),
+            prompt_roles="conditioning history and tool results ctx; this window's assistant turns gen")
+    if getattr(probe, "identity", {}).get("text_source") in ("api", "hf", "engine"):
         manifest["reference_snapshot"] = {
             key: arm[key] for key in ("checkpoint", "snapshot_revision", "config_sha256", "tokenizer_sha256")}
         for key in ("tokenizer_kind", "tokenizer_files"):
@@ -638,15 +831,25 @@ def main(argv=None):
     p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
-    p.add_argument("--backend", choices=("probe", "api", "hf"), default="probe")
+    p.add_argument("--backend", choices=("probe", "api", "hf", "engine"), default="probe",
+                   help="engine: greedy text from our engine on the official checkpoint, prompts rendered locally")
+    p.add_argument("--engine-base", help="engine server base URL for --backend engine")
     p.add_argument("--api-base", help="OpenAI-compatible API base, including /v1 if required")
     p.add_argument("--api-model")
     p.add_argument("--api-key-file", type=pathlib.Path)
     p.add_argument("--api-options", type=pathlib.Path, help="JSON provider controls/deviations, recorded in provenance")
     p.add_argument("--response-cache", type=pathlib.Path, help="required resumable private cache for api/hf")
+    p.add_argument("--api-wire-order", choices=("request", "sorted"), default="request",
+                   help="JSON key order sent to the provider; 'sorted' only to reuse a verified pre-2026-10-31 cache")
     p.add_argument("--snapshot", type=pathlib.Path, help="local HF checkpoint for generation")
     p.add_argument("--bench-token")
     p.add_argument("--timeout", type=float, default=1800)
+    p.add_argument("--template-date", help="YYYY-MM-DD (UTC) for templates that render the current date; "
+                   "every cached response must carry that request date")
+    p.add_argument("--topup-b", type=int, default=0,
+                   help="append this many 8-16K B windows (b12, ...) to reach the new-set row floor")
+    p.add_argument("--recipe", choices=RECIPES, default="v1",
+                   help="own-text recipe; v2 continues tool turns in-window and wraps trailing context")
     p.add_argument("--out", type=pathlib.Path)
     a = p.parse_args(argv)
     if not a.version or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in a.version):
@@ -720,7 +923,7 @@ def main(argv=None):
                 p.error("--tokenizer must match the generation snapshot")
             config = json.loads((snapshot / "config.json").read_text())
             tokenizer = load_tokenizer(a.tokenizer, chat=True)
-            renderer = ChatRenderer(tokenizer)
+            renderer = ChatRenderer(tokenizer, template_date=a.template_date)
             identity = {**tokenizer_pin,
                         "config_sha256": hashlib.sha256((snapshot / "config.json").read_bytes()).hexdigest(),
                         "snapshot_revision": snapshot.name,
@@ -730,7 +933,14 @@ def main(argv=None):
                     p.error("API backend requires --api-base, --api-model and --api-key-file")
                 probe = APIClient(renderer, a.response_cache, checkpoint=a.checkpoint, family=a.family,
                     base=a.api_base, model=a.api_model, key_file=a.api_key_file, timeout=a.timeout,
-                    extra_body=json.loads(a.api_options.read_text()) if a.api_options else None, identity=identity)
+                    extra_body=json.loads(a.api_options.read_text()) if a.api_options else None, identity=identity,
+                    wire_order=a.api_wire_order)
+            elif a.backend == "engine":
+                if not a.engine_base:
+                    p.error("engine backend requires --engine-base")
+                from fidelity_generation import EngineClient
+                probe = EngineClient(renderer, a.response_cache, checkpoint=a.checkpoint, family=a.family,
+                                     base=a.engine_base, token=a.bench_token, identity=identity, timeout=a.timeout)
             else:
                 if a.family != "qwen3_5" or config.get("model_type") != "qwen3_5":
                     p.error("HF backend requires the official dense Qwen3.5 reference")
@@ -743,7 +953,7 @@ def main(argv=None):
             recordings=[json.loads(path.read_text()) for path in a.recording],
             files=json.loads(a.file_list.read_text()) if a.file_list else None,
             legacy_reference=json.loads(a.legacy_reference.read_bytes()),
-            legacy_provenance={"path": a.legacy_reference.name,
+            recipe=a.recipe, topup_b=a.topup_b, legacy_provenance={"path": a.legacy_reference.name,
                 "sha256": hashlib.sha256(a.legacy_reference.read_bytes()).hexdigest()})
     manifest["tokenizer_sha256"] = tokenizer_identity(a.tokenizer.parent)["tokenizer_sha256"]
     manifest["set_sha256"] = set_hash(manifest)

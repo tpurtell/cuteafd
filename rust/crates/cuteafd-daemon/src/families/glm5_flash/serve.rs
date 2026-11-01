@@ -24,7 +24,7 @@
 //! at its last chunk; a decode whose client left is not retained.
 //! `prompt_cache_hit_tokens` reports the restored rows; `/v1/stats` carries
 //! the cache's counters.
-use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, WIDE_DECODE_ROWS};
+use super::engine::{GlmfEngine, GlmfPlacement, DECODE_ROWS, PAGE_ROWS, WIDE_DECODE_ROWS};
 use super::prefix::{GlmfPrefix, PrefixMarks};
 use super::packing;
 use cuteafd_engine::media::{EmbeddingCache, MediaAdmission, MediaPoll, MediaReady, MediaWaiter, RequestMedia, MediaKeys};
@@ -33,6 +33,8 @@ use crate::shared::prefix::{PrefixArgs, Toggle};
 use crate::shared::probe;
 use crate::shared::console;
 use crate::shared::serve::lanes::{self, LaneCommit, LaneLease, LaneSet};
+use crate::shared::kv_reserve::{reserved_drafts, Holding, Reserve, Reserving};
+use cuteafd_engine::reserve::Lease;
 use cuteafd_engine::prefix::{After, PointPlan, PointPolicy, PrefixCache, PrefixConfig, PrefixFamily, SnapshotKind};
 use crate::shared::speculation::dflash::{ContextRow, Draft, DraftSeq, TAP_ROWS};
 use crate::shared::draft::evidence::{Censor, DraftSource};
@@ -43,7 +45,7 @@ use crate::shared::prefill_share::{add_phases, isolated_phases, Chunk, DecodeSha
 use anyhow::{Context, Result};
 use cuteafd_api::openai::chat::glm5::{GlmEncoding, GlmThinkingOff};
 use cuteafd_api::openai::{
-    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeLimits, NativeRequest,
+    InferenceChunk, InferenceFinishReason, ModelEncoding, ModelProfile, NativeFailure, NativeRequest,
     PromptUsage,
 };
 use std::path::PathBuf;
@@ -57,8 +59,6 @@ pub(crate) struct ServeArgs {
     pub engine: super::EngineArgs,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
-    #[arg(long, default_value_t = 4096)]
-    pub max_output: u32,
     /// Sequences decoding at once (each holds two KDA state slots).
     #[arg(long, default_value_t = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
@@ -177,7 +177,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let worker = tokio::task::spawn_blocking(move ||
         serve_loop(engine_args, receive, ready_tx, worker_stats, max_sequences, policy, decode_share, prefix, vision, media_cache_bytes, remote));
     let (max_context, media) = ready_rx.await.context("engine failed before it was ready")??;
-    let limits = NativeLimits::new(u32::try_from(max_context)?, args.max_output)?;
+    let limits = args.prefix.reserve.limits(max_context)?;
     if let Some((preparer, health)) = media {
         profile = profile.with_loaded_vision(preparer);
         profile.vision_health = health;
@@ -314,6 +314,7 @@ struct Prefill<'a> {
     cancelled: bool,
     placement: GlmfPlacement,
     capacity: usize,
+    lease: Lease,
     slot: Option<usize>,
     /// A whole-prompt prefix hit's retained logits (its first token is selected from them).
     logits: Option<Vec<f32>>,
@@ -354,6 +355,7 @@ struct Active<'a> {
     /// its `Turn` snapshot.
     turn: Option<Vec<f32>>,
     capacity: usize,
+    lease: Lease,
     next: u32,
     decoder: cuteafd_loader::StreamingTokenDecoder,
     generated: usize,
@@ -542,14 +544,29 @@ impl Active<'_> {
             self.next = token;
             return Ok(false);
         };
+        self.finish(finish)?;
+        Ok(true)
+    }
+
+    /// Flushes buffered text and sends the finish reason.
+    fn finish(&mut self, finish: InferenceFinishReason) -> Result<()> {
         let content = self.decoder.finish()?.unwrap_or_default();
         if !content.is_empty() || self.buffered > 0 {
             self.send(InferenceChunk::Text { content, content_tokens: self.buffered })?;
         }
         self.ticket.finishing();
-        self.send(InferenceChunk::Finish { finish_reason: finish })?;
-        Ok(true)
+        self.send(InferenceChunk::Finish { finish_reason: finish })
     }
+}
+
+impl Reserving for Active<'_> {
+    type Placement = GlmfPlacement;
+    fn lease(&self) -> &Lease { &self.lease }
+    fn committed(&self) -> usize { self.placement.len }
+    fn produced(&self) -> usize { self.generated }
+    fn placement(&self) -> &GlmfPlacement { &self.placement }
+    fn placement_mut(&mut self) -> &mut GlmfPlacement { &mut self.placement }
+    fn closed(&self) -> bool { self.job.events.is_closed() }
 }
 
 const DIGEST_SEED: u64 = 0xcbf2_9ce4_8422_2325;
@@ -827,13 +844,15 @@ fn prefill_memory_sample() -> serde_json::Value {
 }
 
 /// Serving statistics for `/v1/stats`.
+#[allow(clippy::too_many_arguments)]
 fn publish(stats: &Mutex<serde_json::Value>, requests: u64, generated: u64, active: usize, prefilling: usize,
     ring_misses: u64, cache: &PrefixCache<CudaCopyEngine<'_>>, media: &MediaAdmission<super::media::Prompt, super::media::Encoder>,
     preparer: Option<&cuteafd_api::openai::media::MediaPreparer>, verify: &VerifyStats,
-    memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>) {
+    memory_boundaries: &std::cell::RefCell<Vec<serde_json::Value>>, reserve: &Reserve, stalled: usize) {
     if let Ok(mut stats) = stats.lock() {
         *stats = serde_json::json!({"requests": requests, "generated_tokens": generated, "active": active,
             "prefilling": prefilling, "draft_ring_misses": ring_misses, "prefix_cache": cache.stats(),
+            "kv_reserve": reserve.snapshot(stalled),
             "verify": verify.snapshot(), "draft_policy": super::draft_binding::snapshot(),
             "media": media.stats(cache.stats().media_key_collisions, preparer.map_or(0, |p| p.memo_hits()))});
         crate::shared::probe::graph_capture_stats(&mut stats);
@@ -893,6 +912,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         _ => None,
     };
     let mut active: Vec<Active<'_>> = Vec::new();
+    // Decoding requests waiting for KV units: they keep their KDA slot, ring and units, skip rounds.
+    let mut stalled: Vec<Active<'_>> = Vec::new();
+    let mut reserve = Reserve::new(prefix.reserve.config(engine.max_context)?, cache.pool().page_rows());
     let (mut requests, mut generated_total) = (0u64, 0u64);
     let mut trace = crate::shared::speculation_trace::Trace::open()?;
     let memory_boundaries = std::cell::RefCell::new(Vec::<serde_json::Value>::new());
@@ -904,15 +926,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     let mut prefills = decode_share.queue::<Prefill<'_>>()?;
     let mut kv_waiter = cuteafd_engine::prefix::DeferredAdmission::<MediaReady<super::media::Prompt>>::default();
     publish(stats, requests, generated_total, 0, 0, ring_misses, &cache, media, preparer, &lane.stats,
-        &memory_boundaries);
+        &memory_boundaries, &reserve, 0);
     ready();
     loop {
         engine.require_live()?;
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        while active.len() + prefills.len() < max_sequences {
-            let busy = !active.is_empty() || !prefills.is_empty();
+        while active.len() + stalled.len() + prefills.len() < max_sequences {
+            let busy = !active.is_empty() || !stalled.is_empty() || !prefills.is_empty();
             let ready = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy,
                 |ready| ready.job().job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
@@ -926,7 +948,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                     MediaPoll::Pending | MediaPoll::Empty => {
                         cache.tick();
                         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
-                            media, preparer, &lane.stats, &memory_boundaries);
+                            media, preparer, &lane.stats, &memory_boundaries, &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
                             match receive.blocking_recv() { Some(job) => job, None => return Ok(()) }
                         } else {
@@ -944,14 +966,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                             let _ = job.events.send(Err(NativeFailure::Unavailable("vision encoder unavailable".into())));
                             continue;
                         }
-                        let tokens = match probe::prompt_ids(&job.probe,
-                            || Ok(job.encode_prompt(&tokenizer)?)) {
-                            Ok(tokens) => tokens,
-                            Err(error) => {
-                                let _ = job.events.send(Err(NativeFailure::BadRequest(format!("prompt tokenization: {error:#}"))));
-                                continue;
-                            }
-                        };
+                        let Some(tokens) = crate::shared::api::admission_result(&job.events,
+                            probe::prompt_ids(&job.probe, || Ok(job.encode_prompt(&tokenizer)?))) else { continue; };
                         let events = job.events.clone();
                         let (prompt, mut request_media, jobs) = match super::media::prepare(job, tokens, &config,
                             engine.cfg.vocab_size, engine.cfg.hidden, engine.max_context) {
@@ -986,10 +1002,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let reject = |ready: &MediaReady<super::media::Prompt>, message: String| {
                 let _ = ready.job().job.events.send(Err(NativeFailure::BadRequest(message)));
             };
-            let constraint = match ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose() {
-                Ok(constraint) => constraint,
-                Err(error) => { reject(&ready, format!("{error:#}")); continue; }
-            };
+            let Some(constraint) = crate::shared::api::admission_result(&ready.job().job.events,
+                ready.job().job.constraint.as_ref().map(|spec| grammars.matcher(spec)).transpose()) else { continue; };
             if let Some(probe) = &ready.job().job.probe {
                 if let Err(error) = probe.spec.validate_cold_steps(ready.job().tokens.len(), engine.prefill_capacity(), DECODE_ROWS) {
                     probe.fail(format!("cold replay: {error:#}"));
@@ -998,7 +1012,23 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                 }
             }
             let cold = ready.cold() || probe::cold(&ready.job().job.probe);
-            let capacity = (ready.job().tokens.len() + ready.job().job.max_tokens).min(engine.max_context);
+            let lease = match reserve.lease(ready.job().tokens.len(), ready.job().job.max_tokens, verify_rows,
+                Reserve::limit(&cache, &family, engine.max_context)) {
+                Ok(lease) => lease,
+                Err(error) => { reject(&ready, format!("{error}")); continue; }
+            };
+            let capacity = lease.end();
+            cache.tick();
+            let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.units, draft: family.draft_demand(&p.placement) }).collect();
+            let Some(rows) = reserve.admit(&cache, &family, &active, &stalled, &holding, &lease) else {
+                drop(holding);
+                // Waits for the drain rule: a retirement or a release retries it.
+                match kv_waiter.defer_until_release(ready, busy, cache.pool().release_epoch()) {
+                    Ok(()) => break,
+                    Err(ready) => { reject(&ready, "prompt leaves no room for output in the GPU KV pool".into()); continue; }
+                }
+            };
+            drop(holding);
             let Some(kda) = free_kda.pop() else {
                 reject(&ready, "KDA state slots exhausted".into());
                 continue;
@@ -1010,8 +1040,8 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let admit_started = Instant::now();
             // Lookup, fork of the retained pages and restore of the mark (byte-exact).
             let build = |units| GlmfPlacement::new(units, kda);
-            let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), capacity, build) }
-                else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), capacity, true, build) };
+            let admission = if cold { cache.admit_cold(&family, ready.job().tokens.len(), rows, build) }
+                else { cache.admit_media(&family, ready.job().keys.tokens(), ready.job().keys.spans(), rows, true, build) };
             let admitted = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -1089,7 +1119,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             let logits = admitted.after.and_then(|after| after.logits).map(|logits| logits.to_vec());
             let plan = cold_replay_plan(&job.probe, plan, logits.is_some());
             prefills.push(Prefill { job, constraint, tokens, keys, media: request_media, done: resume, resume, plan, chunks: 0, cancelled: false,
-                placement: admitted.placement, capacity, slot, logits, first: None, prompt_row: None,
+                placement: admitted.placement, capacity, lease, slot, logits, first: None, prompt_row: None,
                 started: Instant::now(), busy: 0.0, phases: [0.0; 3], packed: 0, ticket });
         }
         if prefills.due(!active.is_empty()) {
@@ -1181,7 +1211,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         counts: [0; 4],
                         decoder: cuteafd_loader::streaming_token_decoder(snapshot, false)?,
                         job: p.job, constraint: p.constraint, placement: p.placement, draft_from: resume, turn: None,
-                        capacity: p.capacity, next: 0, generated: 0, buffered: 0, started: Instant::now(),
+                        capacity: p.capacity, lease: p.lease, next: 0, generated: 0, buffered: 0, started: Instant::now(),
                         ticket: p.ticket,
                     };
                     request.next = first;
@@ -1216,9 +1246,21 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             }
             prefills.settle(!active.is_empty());
         }
+        let holding: Vec<Holding<'_>> = prefills.iter().map(|p| Holding { lease: p.lease, pages: &p.placement.units, draft: family.draft_demand(&p.placement) }).collect();
+        // Ended requests (early termination, the deadlock break, closed stalls) release their
+        // pages inside the round, before anything is granted.
+        reserve.round(&mut cache, &family, &mut active, &mut stalled, &holding, |cache, mut request| {
+            if let Some(shared) = shared.as_mut() { shared.policy.release(request.ticket.id()); }
+            if !request.job.events.is_closed() { let _ = request.finish(InferenceFinishReason::Length); }
+            request.ticket.done(request.generated);
+            requests += 1;
+            generated_total += request.generated as u64;
+            release(&family, cache, &mut free_kda, &mut free_slots, &request.placement, request.slot);
+        })?;
+        drop(holding);
         if active.is_empty() {
             crate::shared::decode_graph::CaptureWatch::flush();
-            if !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
+            if !media.is_empty() || !stalled.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
             continue;
         }
         let cycle = Instant::now();
@@ -1260,8 +1302,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
         }
         cache.tick();
         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache, media, preparer,
-            &lane.stats, &memory_boundaries);
-        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len(), prefills.len(), receive.len() + kv_waiter.len() + media.len()));
+            &lane.stats, &memory_boundaries, &reserve, stalled.len());
+        console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
+            receive.len() + kv_waiter.len() + media.len()));
         prefills.stepped(cycle.elapsed().as_secs_f64());
     }
 }
@@ -1344,6 +1387,10 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             !probe::no_speculation(&a.job.probe)
                 && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
         });
+    }
+    // Verify writes stay inside each request's reserved units.
+    for (limit, a) in limits.iter_mut().zip(active.iter()) {
+        *limit = (*limit).min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS));
     }
     let eligible: Vec<_> = active.iter().enumerate()
         .filter(|&(i, a)| a.slot.is_some() && limits[i] > 0)

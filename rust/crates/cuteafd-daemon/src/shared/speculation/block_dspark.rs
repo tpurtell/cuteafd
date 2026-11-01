@@ -693,6 +693,24 @@ impl<'a> DsparkDrafter<'a> {
         Ok(())
     }
 
+    /// The slot's live draft page reservation (`None` for windowed drafters).
+    pub(crate) fn reservation(&self, slot: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        let context = self.paged.as_ref()?;
+        let state = context.state.borrow();
+        let binding = state.binding(slot).ok()?;
+        state.pool.reservation(binding, self.cfg.block).ok()
+    }
+    pub(crate) fn lifetime_rows(&self) -> Option<usize> {
+        self.paged.as_ref().map(|context| context.state.borrow().pool.lifetime_rows(self.cfg.block))
+    }
+    pub(crate) fn reservable(&self) -> Option<usize> {
+        self.paged.as_ref().map(|context| context.state.borrow().pool.reservable())
+    }
+    pub(crate) fn admission(&self, origin: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
+        self.paged.as_ref().map(|_| cuteafd_engine::reserve::DraftDemand {
+            origin, headroom: self.cfg.block.div_ceil(cuteafd_engine::prefix::DRAFT_PAGE_ROWS) + 1, held: 0 })
+    }
+
     pub(crate) fn admit_pages(&self, slot: usize, end: usize) -> Result<()> {
         if let Some(context) = &self.paged {
             let mut state = context.state.borrow_mut();

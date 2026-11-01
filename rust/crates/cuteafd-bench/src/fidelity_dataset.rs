@@ -45,6 +45,12 @@ pub const V41_1017_MANIFEST_SHA256: &str = "0eb4afedef4561ac86876d6c8285e2e0ab73
 pub const KIMI_K3_REVISION: &str = "a98e1b9d6b622eec1ccc66fd21b5d48ff11d7c01";
 pub const KIMI_K3_CONFIG: &str = "kimi-k3-v2_20261019_own-text-effort-matched-mxfp4-f32";
 pub const KIMI_K3_MANIFEST_SHA256: &str = "815442612c25cd1fb5c3b1eb9dde2deb93e395b7d98bcbbdd5a52c829c9fd5cd";
+pub const MUSE_SPARK_REVISION: &str = "d18a3b292cc0a279998123f2ddd16999869bb658";
+pub const MUSE_SPARK_CONFIG: &str = "muse-spark-v1_20261031_own-text-bf16";
+pub const MUSE_SPARK_MANIFEST_SHA256: &str = "b9ec12b2e008a87d20f88edfe731252b5298d8f4da31cb34a96e5451a92bc717";
+pub const MISTRAL_LARGE4_REVISION: &str = "71eb39bd490cfa1af7a32edc94476a35eb475c01";
+pub const MISTRAL_LARGE4_CONFIG: &str = "mistral-large4-v1_20261031_own-text-fp8";
+pub const MISTRAL_LARGE4_MANIFEST_SHA256: &str = "2b5e0490bf433bf62adeaade9c1d4c782bf39704ba2dd94c9b201cec4c5d38ff";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -61,6 +67,8 @@ pub fn quick_windows(reference: &Reference) -> Result<Vec<Window>> {
 }
 
 pub const STANDARD_TIER: &str = "standard-v2";
+/// sha256 of the sealed 64 ids (decode then prefill, newline-joined); the rule past
+/// them is part of the sealed split, so extended sets keep this identity.
 pub const STANDARD_SPLIT_SHA256: &str = "2af36f78359d9ce7f37d0d2d4740c57ca11f0a77734bc13e774d37e416eee65b";
 pub const STANDARD_FALLBACK: &str = "decode only; prefill not admitted";
 // Window ids, positions and blocks are model-independent; buckets/gen rows depend on tokenization/generations.
@@ -68,27 +76,87 @@ const STANDARD_BUCKET_DIFF_MAX: i32 = 3;
 /// Scored generated rows each standard half needs to load (TJ, 2026-10-20).
 /// Every published set clears it; new sets are packaged against 10,000.
 pub const STANDARD_GENERATED_MIN: usize = 6_500;
+/// One source for Python and Rust: the sealed 64-id split and the continuation rule.
+const SPLIT_JSON: &str = include_str!("../../../../python/reference/fidelity_split.json");
 
-/// Sealed after balancing all seven published text sets, not sampled at runtime.
-/// Each half has A/B/C/D/E counts 13/6/5/3/5. The singleton legacy anchor
-/// belongs to prefill; decode has the comparable context-only C windows.
-pub const STANDARD_DECODE: [&str; 32] = [
-    "a00", "a01", "a04", "a05", "a08", "a09", "a10", "a12", "a17", "a19", "a21", "a24", "a25",
-    "b01", "b02", "b06", "b07", "b08", "b10", "c01", "c04", "c06", "c08", "c09",
-    "d01", "d02", "d04", "e00", "e02", "e05", "e06", "e07",
-];
-pub const STANDARD_PREFILL: [&str; 32] = [
-    "a02", "a03", "a06", "a07", "a11", "a13", "a14", "a15", "a16", "a18", "a20", "a22", "a23",
-    "b00", "b03", "b04", "b05", "b09", "b11", "c00", "c02", "c03", "c05", "c07",
-    "d00", "d03", "d05", "e01", "e03", "e04", "e08", "legacy",
-];
+pub struct Split { pub decode: Vec<String>, pub prefill: Vec<String>, blocks: Vec<(String, String)>,
+                   anchor: String, anchor_block: String }
+
+pub fn split() -> &'static Split {
+    static SPLIT: std::sync::OnceLock<Split> = std::sync::OnceLock::new();
+    SPLIT.get_or_init(|| {
+        let raw: Value = serde_json::from_str(SPLIT_JSON).expect("sealed split JSON");
+        let ids = |half: &str| raw["sealed"][half].as_array().expect("sealed half").iter()
+            .map(|v| v.as_str().expect("id").to_owned()).collect::<Vec<_>>();
+        let blocks = raw["blocks"].as_object().expect("blocks").iter()
+            .map(|(block, prefix)| (block.clone(), prefix.as_str().expect("prefix").to_owned())).collect();
+        let split = Split { decode: ids("decode"), prefill: ids("prefill"), blocks,
+                            anchor: raw["anchor"]["id"].as_str().expect("anchor").to_owned(),
+                            anchor_block: raw["anchor"]["block"].as_str().expect("anchor block").to_owned() };
+        let joined = split.decode.iter().chain(&split.prefill).cloned().collect::<Vec<_>>().join("\n");
+        assert_eq!(digest(joined.as_bytes()), STANDARD_SPLIT_SHA256, "sealed split changed");
+        split
+    })
+}
+
+/// Half of any window id: the sealed table, then decode-first alternation past each
+/// block's sealed range (the first new id goes to decode).
+pub fn standard_half(id: &str) -> Result<&'static str> {
+    let split = split();
+    if split.decode.iter().any(|w| w == id) { return Ok("decode"); }
+    if split.prefill.iter().any(|w| w == id) { return Ok("prefill"); }
+    let (prefix, number) = id.split_at(1.min(id.len()));
+    let index: usize = number.parse().ok().filter(|_| number.len() == 2 || number.len() == 3)
+        .with_context(|| format!("window id {id} outside the standard split"))?;
+    ensure!(split.blocks.iter().any(|(_, p)| p == prefix), "window id {id} outside the standard split");
+    let sealed = split.decode.iter().chain(&split.prefill).filter(|w| w.starts_with(prefix) && w.as_str() != split.anchor).count();
+    ensure!(index >= sealed, "window id {id} outside the standard split");
+    Ok(if (index - sealed) % 2 == 0 { "decode" } else { "prefill" })
+}
+
+/// Exact ids a set with these per-block window counts must contain, derived from the
+/// windows present (block counts include the anchor in its block).
+pub fn standard_layout(reference: &Reference) -> Result<std::collections::BTreeMap<String, usize>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let split = split();
+    let mut counts = BTreeMap::new();
+    for w in &reference.windows { *counts.entry(w.block.clone()).or_insert(0usize) += 1; }
+    let mut expected = BTreeSet::new();
+    for (block, count) in &counts {
+        let prefix = &split.blocks.iter().find(|(b, _)| b == block)
+            .with_context(|| format!("block {block} outside the standard split"))?.1;
+        let anchored = usize::from(*block == split.anchor_block);
+        ensure!(*count >= anchored, "block {block} lacks its anchor");
+        for index in 0..count - anchored { expected.insert(format!("{prefix}{index:02}")); }
+        if anchored == 1 { expected.insert(split.anchor.clone()); }
+    }
+    let present: BTreeSet<_> = reference.windows.iter().map(|w| w.id.clone()).collect();
+    ensure!(present.len() == reference.windows.len() && present == expected,
+        "dataset window ids differ from its declared block counts (gap, duplicate or misnamed window)");
+    for w in &reference.windows {
+        let prefix = &split.blocks.iter().find(|(b, _)| *b == w.block).unwrap().1;
+        ensure!(w.id == split.anchor || w.id.starts_with(prefix.as_str()), "window {} block {} differs", w.id, w.block);
+        standard_half(&w.id)?;
+    }
+    Ok(counts)
+}
+
+pub fn standard_ids(reference: &Reference, path: &str) -> Result<Vec<String>> {
+    standard_layout(reference)?;
+    let mut ids = Vec::new();
+    for w in &reference.windows { if standard_half(&w.id)? == path { ids.push(w.id.clone()); } }
+    // Sealed order first, then extension ids in window order.
+    let sealed = if path == "decode" { &split().decode } else { &split().prefill };
+    ids.sort_by_key(|id| sealed.iter().position(|s| s == id).unwrap_or(usize::MAX));
+    Ok(ids)
+}
 
 pub fn standard_balance(reference: &Reference) -> Value {
     let mut balance = json!({});
-    for (path, ids) in [("decode", STANDARD_DECODE), ("prefill", STANDARD_PREFILL)] {
+    for path in ["decode", "prefill"] {
         let mut buckets = std::collections::BTreeMap::new();
         let mut generated = 0usize;
-        for w in reference.windows.iter().filter(|w| ids.contains(&w.id.as_str())) {
+        for w in reference.windows.iter().filter(|w| standard_half(&w.id).ok() == Some(path)) {
             *buckets.entry(w.bucket.as_str()).or_insert(0usize) += 1;
             generated += w.positions.iter().filter(|p| w.roles[p.pos] == "gen").count();
         }
@@ -102,28 +170,25 @@ pub fn prefill_admitted(settings: &[crate::report::Setting]) -> bool {
         && s.value.as_deref().is_some_and(|v| matches!(v, "true" | "on" | "1")))
 }
 
-/// Fail closed if a future publication changes the sealed split's composition.
+/// Fail closed unless the set's windows are exactly its declared block counts under
+/// the sealed split rule; then check per-half rows and bucket balance.
 pub fn standard_windows(reference: &Reference, path: &str, admitted: bool) -> Result<Vec<Window>> {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     reference.validate()?;
-    let ids: BTreeSet<_> = STANDARD_DECODE.iter().chain(&STANDARD_PREFILL).copied().collect();
-    ensure!(reference.windows.len() == 64 && ids.len() == 64
-        && reference.windows.iter().all(|w| ids.contains(w.id.as_str()) && w.positions.len() == 512),
-        "dataset differs from sealed standard-v2 windows");
-    let halves: Vec<Vec<_>> = [STANDARD_DECODE, STANDARD_PREFILL].iter().map(|ids|
-        ids.iter().map(|id| reference.windows.iter().find(|w| w.id == *id).unwrap()).collect()).collect();
+    standard_layout(reference)?;
+    ensure!(reference.windows.iter().all(|w| w.positions.len() == 512), "dataset differs from 512-row standard windows");
+    let halves: Vec<Vec<&Window>> = ["decode", "prefill"].iter().map(|half| {
+        let ids = standard_ids(reference, half).unwrap();
+        ids.iter().map(|id| reference.windows.iter().find(|w| &w.id == id).unwrap()).collect()
+    }).collect();
     let mut buckets = Vec::new();
     for half in &halves {
-        let mut blocks = BTreeMap::new();
         let mut counts = BTreeMap::new();
         let mut roles = BTreeMap::new();
         for w in half {
-            *blocks.entry(w.block.as_str()).or_insert(0) += 1;
             *counts.entry(w.bucket.as_str()).or_insert(0i32) += 1;
             for p in &w.positions { *roles.entry(w.roles[p.pos].as_str()).or_insert(0usize) += 1; }
         }
-        ensure!(blocks == BTreeMap::from([("A",13), ("B",6), ("C",5), ("D",3), ("E",5)]),
-            "standard-v2 block stratification differs");
         ensure!(roles.get("ctx").copied().unwrap_or(0) > 0,
             "standard-v2 requires context and generated rows in each half");
         let generated = roles.get("gen").copied().unwrap_or(0);
@@ -284,6 +349,8 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (STEP5_REVISION, STEP5_CONFIG) => Some(STEP5_MANIFEST_SHA256),
             (V41_1017_REVISION, V41_1017_CONFIG) => Some(V41_1017_MANIFEST_SHA256),
             (KIMI_K3_REVISION, KIMI_K3_CONFIG) => Some(KIMI_K3_MANIFEST_SHA256),
+            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG) => Some(MUSE_SPARK_MANIFEST_SHA256),
+            (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG) => Some(MISTRAL_LARGE4_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -351,9 +418,8 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
     qualification_label(&qualification, manifest)?;
     if matches!(qualification["kind"].as_str(), Some("reference" | "reference_only")) {
         ensure!(panel["checkpoint"] == manifest["checkpoint"]
-            && manifest["checkpoint"] == manifest["root_checkpoint"]["id"]
-            && panel["windows"].as_array().is_some_and(|w| w.len() == 64),
-            "reference-only panel identity or coverage differs");
+            && manifest["checkpoint"] == manifest["root_checkpoint"]["id"],
+            "reference-only panel identity differs");
     }
     let mut reference: Reference = serde_json::from_value(json!({"name":manifest["config"],
         "models":[manifest["checkpoint"]],"vocab":manifest["vocab"],"expect":manifest["expect"],
@@ -393,6 +459,10 @@ pub fn load(root: &Path, manifest: &Value) -> Result<Reference> {
         reference.windows.push(window);
     }
     reference.validate()?;
+    if matches!(qualification["kind"].as_str(), Some("reference" | "reference_only")) {
+        // Coverage is exactly the set's own block counts under the sealed split rule.
+        standard_layout(&reference)?;
+    }
     Ok(reference)
 }
 
@@ -452,6 +522,16 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
                     "transformers_source_sha256", "compressed_tensors_source_sha256"]
                     .iter().all(|key| hash(&source[key], 64))
                 && padding_valid
+        } else if manifest["family"] == "muse_spark" || manifest["family"] == "mistral_large4" {
+            // Official transformers 5.22.1 modeling (pinned file hashes), our adapter and runner.
+            let family = manifest["family"].as_str().unwrap_or_default();
+            let modeling = format!("modeling_{family}_sha256");
+            let configuration = format!("configuration_{family}_sha256");
+            source["revision"] == manifest["root_checkpoint"]["revision"]
+                && source["checkpoint"] == manifest["root_checkpoint"]["id"]
+                && source["transformers"] == "5.22.1"
+                && [modeling.as_str(), configuration.as_str(), "masking_utils_sha256", "reference_adapter_sha256",
+                    "layer_major_sha256", "golden_sha256"].iter().all(|key| hash(&source[*key], 64))
         } else {
             hash(&source["modeling_sha256"], 64) && hash(&source["source_tree_sha256"], 64)
         };
@@ -469,7 +549,9 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             && hash(&qualification["reference_validation"]["full_seal_sha256"], 64)
             && proof["lengths"] == json!([576, 640]) && proof["score_from"] == 64
             && proof["logits_sha256"].as_array().is_some_and(|a| a.len() == 2 && a.iter().all(|h| hash(h, 64)))
-            && qualification["scored_tokens"] == 32768
+            // Every window scores 512 rows; the set's own window count fixes the total.
+            && manifest["files"].as_array().is_some_and(|files| files.len() >= 64
+                && qualification["scored_tokens"] == json!(512 * files.len()))
             && qualification["reference_validation"]["scored_tokens"] == qualification["scored_tokens"]
             && qualification["reference_validation"]["nll"].as_f64().zip(qualification["nll"].as_f64())
                 .is_some_and(|(a, b)| a.is_finite() && (a - b).abs() <= 1e-8)
@@ -548,7 +630,7 @@ mod tests {
             "stored_shape":[128], "loaded_shape":[96], "tail_shape":[32], "tail_dtype":"F32",
             "tail_bitwise_zero":true, "tail_sha256":digest(&[0u8;128])})).collect();
         let manifest = json!({"family":"kimi_k3", "set_sha256":"sealed", "vocab":163840,
-            "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}});
+            "root_checkpoint":{"id":"moonshotai/Kimi-K3", "revision":revision}, "files":vec![json!({}); 64]});
         let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference",
             "set_sha256":"sealed", "qualifies":true, "engine_parity":false, "nll":0.7, "scored_tokens":32768,
             "reference_validation":{"passed":true,"engine_parity":false,"set_sha256":"sealed",
@@ -765,12 +847,12 @@ mod tests {
                 pos, next:0, next_lp:0.0, top:vec![Top{id:0,lp:0.0}], tail_lp:f64::NEG_INFINITY }).collect();
             reference.windows.push(w);
         }
-        let seal = STANDARD_DECODE.iter().chain(&STANDARD_PREFILL).copied().collect::<Vec<_>>().join("\n");
+        let seal = split().decode.iter().chain(&split().prefill).cloned().collect::<Vec<_>>().join("\n");
         assert_eq!(digest(seal.as_bytes()),STANDARD_SPLIT_SHA256);
         let decode = standard_windows(&reference,"decode",true).unwrap();
         let prefill = standard_windows(&reference,"prefill",true).unwrap();
-        assert_eq!(decode.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_DECODE);
-        assert_eq!(prefill.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_PREFILL);
+        assert_eq!(decode.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().decode);
+        assert_eq!(prefill.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().prefill);
         assert_eq!((decode.len(),prefill.len()),(32,32));
         let ids: BTreeSet<_> = decode.iter().chain(&prefill).map(|w| &w.id).collect();
         assert_eq!(ids.len(),64);
@@ -783,7 +865,7 @@ mod tests {
         assert_eq!((gen(&decode),gen(&prefill)),(8998,8658));
         assert!(prefill.iter().any(|w| w.id == "legacy"));
         reference.windows.reverse();
-        assert_eq!(standard_windows(&reference,"decode",true).unwrap().iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_DECODE);
+        assert_eq!(standard_windows(&reference,"decode",true).unwrap().iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().decode);
         assert_eq!(standard_windows(&reference,"decode",false).unwrap().len(),64);
         assert!(standard_windows(&reference,"prefill",false).is_err());
         let saved = reference.clone();
@@ -791,12 +873,12 @@ mod tests {
         assert!(standard_windows(&reference,"decode",true).is_err());
         reference = saved.clone();
         for w in &mut reference.windows {
-            if STANDARD_DECODE.contains(&w.id.as_str()) { w.roles.fill("ctx".into()); }
+            if split().decode.contains(&w.id) { w.roles.fill("ctx".into()); }
         }
         assert!(standard_windows(&reference,"decode",true).is_err());
         reference = saved.clone();
         for w in &mut reference.windows {
-            if STANDARD_DECODE.contains(&w.id.as_str()) && w.block != "C" { w.roles.fill("gen".into()); }
+            if split().decode.contains(&w.id) && w.block != "C" { w.roles.fill("gen".into()); }
         }
         assert!(standard_windows(&reference,"decode",true).is_ok());
         assert!(standard_windows(&reference,"prefill",true).is_ok());
@@ -804,7 +886,7 @@ mod tests {
         for keep in [STANDARD_GENERATED_MIN, STANDARD_GENERATED_MIN - 1] {
             reference = saved.clone();
             let mut excess = 8998 - keep;
-            for w in reference.windows.iter_mut().filter(|w| STANDARD_DECODE.contains(&w.id.as_str())) {
+            for w in reference.windows.iter_mut().filter(|w| split().decode.contains(&w.id)) {
                 for pos in w.positions.iter().map(|p| p.pos).collect::<Vec<_>>() {
                     if excess > 0 && w.roles[pos] == "gen" { w.roles[pos] = "ctx".into(); excess -= 1; }
                 }
@@ -813,7 +895,7 @@ mod tests {
         }
         reference = saved;
         for w in &mut reference.windows {
-            if STANDARD_DECODE.contains(&w.id.as_str()) { w.bucket = "2-8K".into(); }
+            if split().decode.contains(&w.id) { w.bucket = "2-8K".into(); }
         }
         assert!(standard_windows(&reference,"decode",true).is_err());
     }
@@ -856,8 +938,8 @@ mod tests {
                 .filter(|role| *role == "gen").count();
             let decode = standard_windows(&reference,"decode",true).unwrap_or_else(|e| panic!("{config}: {e}"));
             let prefill = standard_windows(&reference,"prefill",true).unwrap_or_else(|e| panic!("{config}: {e}"));
-            assert_eq!(decode.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_DECODE);
-            assert_eq!(prefill.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), STANDARD_PREFILL);
+            assert_eq!(decode.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().decode);
+            assert_eq!(prefill.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(), split().prefill);
             assert_eq!((gen(&decode), gen(&prefill)), (decode_gen, prefill_gen), "{config}");
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], decode_gen);
@@ -885,7 +967,8 @@ mod tests {
         for (revision, config) in [(MIMO_PRO_REVISION, MIMO_PRO_CONFIG),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG), (QWEN35_9B_REVISION, QWEN35_9B_CONFIG),
             (QWEN38_27B_REVISION, QWEN38_27B_CONFIG), (STEP5_REVISION, STEP5_CONFIG),
-            (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG)] {
+            (V41_1017_REVISION, V41_1017_CONFIG), (KIMI_K3_REVISION, KIMI_K3_CONFIG),
+            (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -908,8 +991,8 @@ mod tests {
         let cache = PathBuf::from(std::env::var("CUTEAFD_FIDELITY_HF_CACHE").unwrap());
         let (reference, hash, identity) = download(&ureq::AgentBuilder::new()
             .timeout_read(std::time::Duration::from_secs(120)).build(), &cache, REPOSITORY, &commit, &config).unwrap();
-        assert_eq!(reference.windows.len(), 64);
-        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 32768);
+        assert!(reference.windows.len() >= 64);
+        assert_eq!(reference.windows.iter().map(|w| w.positions.len()).sum::<usize>(), 512 * reference.windows.len());
         assert_eq!(hash, expected_hash);
         if commit == QWEN35_9B_REVISION && config == QWEN35_9B_CONFIG {
             assert_eq!(reference.checkpoint, "Qwen/Qwen3.5-9B");
@@ -938,6 +1021,26 @@ mod tests {
             assert_eq!(balance["decode"]["generated_positions"], 8089);
             assert_eq!(balance["prefill"]["generated_positions"], 7591);
         }
+        if commit == MUSE_SPARK_REVISION && config == MUSE_SPARK_CONFIG {
+            assert_eq!(reference.checkpoint, "meta-models/Muse-Spark-Open-816B-A42B");
+            assert_eq!(reference.windows.len(), 67);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "meta-models/Muse-Spark-Open-816B-A42B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 10629);
+            assert_eq!(balance["prefill"]["generated_positions"], 10475);
+        }
+        if commit == MISTRAL_LARGE4_REVISION && config == MISTRAL_LARGE4_CONFIG {
+            assert_eq!(reference.checkpoint, "mistralai/Mistral-Large-4-1T-A52B");
+            assert_eq!(reference.windows.len(), 64);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], "mistralai/Mistral-Large-4-1T-A52B");
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            let balance = standard_balance(&reference);
+            assert_eq!(balance["decode"]["generated_positions"], 11435);
+            assert_eq!(balance["prefill"]["generated_positions"], 10678);
+        }
         if commit == KIMI_K3_REVISION && config == KIMI_K3_CONFIG {
             assert_eq!(reference.checkpoint, "moonshotai/Kimi-K3");
             assert_eq!(identity["qualification"], "reference");
@@ -954,8 +1057,10 @@ mod tests {
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
         }
         assert_eq!(quick_windows(&reference).unwrap().len(),8);
-        assert_eq!(standard_windows(&reference,"decode",true).unwrap().len(),32);
-        assert_eq!(standard_windows(&reference,"prefill",true).unwrap().len(),32);
+        let halves: Vec<usize> = ["decode", "prefill"].iter()
+            .map(|half| standard_windows(&reference, half, true).unwrap().len()).collect();
+        assert!(halves.iter().all(|&n| n >= 32));
+        assert_eq!(halves.iter().sum::<usize>(), reference.windows.len());
         if commit == FLASH_REVISION && config == FLASH_CONFIG {
             assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.93, 0.04));
             let tripwires = reference.expect.tripwires.as_ref().unwrap();
@@ -1070,11 +1175,15 @@ mod tests {
             let manifest_bytes = std::fs::read(root.join("manifest.json")).unwrap();
             let manifest: Value = serde_json::from_slice(&manifest_bytes).unwrap();
             let reference = load(&root, &manifest).unwrap();
-            assert_eq!(reference.windows.len(), 64);
+            assert!(reference.windows.len() >= 64);
             assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+            let mut total = 0;
             for shape in ["decode", "prefill"] {
-                assert_eq!(standard_windows(&reference, shape, true).unwrap().len(), 32);
+                let n = standard_windows(&reference, shape, true).unwrap().len();
+                assert_eq!(n, standard_ids(&reference, shape).unwrap().len());
+                total += n;
             }
+            assert_eq!(total, reference.windows.len());
             let qualification: Value = serde_json::from_slice(&std::fs::read(root.join("qualification.json")).unwrap()).unwrap();
             let expected = if qualification["kind"] == "reference_only" { "reference-only qualified" } else { "reference" };
             assert_eq!(qualification_label(&qualification, &manifest).unwrap(), expected);
@@ -1146,7 +1255,8 @@ mod tests {
     fn reference_requires_complete_non_engine_evidence() {
         let identity = json!({"checkpoint":"Qwen/Qwen3.5-9B", "snapshot_revision":"a".repeat(40),
             "config_sha256":"b".repeat(64), "tokenizer_sha256":"c".repeat(64)});
-        let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)}});
+        let manifest = json!({"set_sha256":"set", "vocab":248320, "root_checkpoint":{"id":"Qwen/Qwen3.5-9B", "revision":"a".repeat(40)},
+            "files":vec![json!({}); 64]});
         let qualification = json!({"schema":"cuteafd.fidelity.qualification/1", "kind":"reference", "qualifies":true, "engine_parity":false,
             "set_sha256":"set", "nll":1.2, "scored_tokens":32768,
             "reference_validation":{"passed":true, "engine_parity":false, "set_sha256":"set",
@@ -1270,5 +1380,92 @@ mod tests {
         assert!(tensor(&bytes,"x","U32",&[2]).is_err());
         bytes.pop(); assert!(tensor(&bytes,"x","U32",&[1]).is_err());
         assert!(tensor(&[],"x","U32",&[1]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    fn layout(blocks: &[(&str, usize)]) -> Reference {
+        let mut reference: Reference = serde_json::from_value(json!({"name":"t", "models":[], "vocab":1,
+            "schema":"cuteafd.fidelity.reference/2", "checkpoint":"t", "set_sha256":"t",
+            "expect":{"top1_min":0.9,"kl_max":0.06}})).unwrap();
+        for (block, count) in blocks {
+            let prefix = block.to_ascii_lowercase();
+            let numbered = count - usize::from(*block == "E");
+            let mut ids: Vec<String> = (0..numbered).map(|i| format!("{prefix}{i:02}")).collect();
+            if *block == "E" { ids.push("legacy".into()); }
+            for id in ids {
+                let n = 512;
+                reference.windows.push(Window { id, block: (*block).into(), bucket: "8-16K".into(), tokens: vec![0; n + 1],
+                    roles: vec!["gen".into(); n + 1], score_from: 1, top_k: 1, media: vec![],
+                    positions: (1..=n).map(|pos| CompactPosition { pos, next: 0, next_lp: 0.0,
+                        top: vec![Top { id: 0, lp: 0.0 }], tail_lp: f64::NEG_INFINITY }).collect() });
+            }
+        }
+        reference
+    }
+
+    #[test]
+    fn sealed_allocation_reproduces_the_sealed_halves() {
+        let reference = layout(&[("A", 26), ("B", 12), ("C", 10), ("D", 6), ("E", 10)]);
+        assert_eq!(standard_ids(&reference, "decode").unwrap(), split().decode);
+        assert_eq!(standard_ids(&reference, "prefill").unwrap(), split().prefill);
+    }
+
+    #[test]
+    fn extended_b_block_continues_decode_first() {
+        let reference = layout(&[("A", 26), ("B", 15), ("C", 10), ("D", 6), ("E", 10)]);
+        assert_eq!(standard_layout(&reference).unwrap()["B"], 15);
+        let decode = standard_ids(&reference, "decode").unwrap();
+        let prefill = standard_ids(&reference, "prefill").unwrap();
+        assert_eq!((decode.len(), prefill.len()), (34, 33));
+        assert_eq!(&decode[32..], ["b12", "b14"]);
+        assert_eq!(&prefill[32..], ["b13"]);
+        assert_eq!(standard_half("b15").unwrap(), "prefill");
+    }
+
+    #[test]
+    fn gaps_duplicates_and_foreign_ids_fail_closed() {
+        let mut gap = layout(&[("A", 26), ("B", 15), ("C", 10), ("D", 6), ("E", 10)]);
+        gap.windows.retain(|w| w.id != "b13");
+        assert!(standard_layout(&gap).is_err());
+        let mut misnamed = layout(&[("A", 26), ("B", 15), ("C", 10), ("D", 6), ("E", 10)]);
+        misnamed.windows.iter_mut().find(|w| w.id == "b14").unwrap().block = "A".into();
+        assert!(standard_layout(&misnamed).is_err());
+        let mut duplicate = layout(&[("A", 26), ("B", 12), ("C", 10), ("D", 6), ("E", 10)]);
+        let copy = duplicate.windows[0].clone();
+        duplicate.windows.push(copy);
+        assert!(standard_layout(&duplicate).is_err());
+        assert!(standard_half("b05x").is_err() && standard_half("z12").is_err() && standard_half("b11").is_ok());
+    }
+
+    #[test]
+    fn staged_sets_load_with_their_own_counts() {
+        // Locally staged Muse (B = 15) and Mistral (64) sets, when present.
+        for (path, b) in [("~/.cache/cuteafd/builds/fidelity-muse-mistral/muse/windows-v2.json", 15usize),
+                          ("~/.cache/cuteafd/builds/fidelity-muse-mistral/mistral/windows-v2.json", 12)] {
+            let path = PathBuf::from(path.replace('~', &std::env::var("HOME").unwrap_or_default()));
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let panel: Value = serde_json::from_slice(&bytes).unwrap();
+            let mut reference = layout(&[]);
+            for raw in panel["windows"].as_array().unwrap() {
+                let n = raw["tokens"].as_array().unwrap().len();
+                let start = raw["score_from"].as_u64().unwrap() as usize;
+                reference.windows.push(Window { id: raw["id"].as_str().unwrap().into(), block: raw["block"].as_str().unwrap().into(),
+                    bucket: raw["bucket"].as_str().unwrap().into(), tokens: vec![0; n],
+                    roles: raw["roles"].as_array().unwrap().iter().map(|r| r.as_str().unwrap().into()).collect(),
+                    score_from: start, top_k: 1, media: vec![],
+                    positions: (start..n).map(|pos| CompactPosition { pos, next: 0, next_lp: 0.0,
+                        top: vec![Top { id: 0, lp: 0.0 }], tail_lp: f64::NEG_INFINITY }).collect() });
+            }
+            assert_eq!(standard_layout(&reference).unwrap()["B"], b);
+            for half in ["decode", "prefill"] {
+                let windows = standard_windows(&reference, half, true).unwrap();
+                let generated = windows.iter().flat_map(|w| w.positions.iter().map(|p| &w.roles[p.pos])).filter(|r| *r == "gen").count();
+                assert!(generated >= 10_000, "{path:?} {half} {generated}");
+            }
+        }
     }
 }
