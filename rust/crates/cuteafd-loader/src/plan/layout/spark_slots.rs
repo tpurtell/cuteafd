@@ -282,9 +282,10 @@ mod tests {
             let three = muse_owner_bytes(world, cuteafd_core::OwnerExtent {
                 buffered_units: 3, ..extent(2752, 2752) })?;
             assert_eq!(one, three, "buffering never multiplies retained arenas or row maps");
-            for compiled in CENSUS_CAPACITIES {
-                let owner = muse_owner_bytes(world, extent(compiled, compiled))?;
-                assert!(owner.scratch > u64::from(compiled) * 16);
+            for capacity in CENSUS_CAPACITIES {
+                let compiled = *cuteafd_core::Exl3RowPolicy::Nearest.capacities(capacity as usize)?.last().unwrap();
+                let owner = muse_owner_bytes(world, extent(capacity, compiled))?;
+                assert!(owner.scratch > u64::from(capacity) * 16);
             }
         }
         assert!(muse_owner_bytes(1, extent(64, 80)).is_err());
@@ -302,11 +303,14 @@ mod tests {
             assert_eq!(manifests.len(), CENSUS_CAPACITIES.len());
             for (index, &capacity) in CENSUS_CAPACITIES.iter().enumerate() {
                 assert_eq!(manifests[index]["capacity"], capacity);
-                let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=index], true)?;
-                assert_eq!(muse_owner_bytes(world, extent(capacity, capacity))?.scratch,
+                let capacities = cuteafd_core::Exl3RowPolicy::Nearest.capacities(capacity as usize)?;
+                let compiled = *capacities.last().unwrap();
+                let retained_index = CENSUS_CAPACITIES.iter().position(|&rows| rows == compiled).unwrap();
+                let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], true)?;
+                assert_eq!(muse_owner_bytes(world, extent(capacity, compiled))?.scratch,
                     retained + u64::from(capacity) * 16);
-                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=index], false)?;
-                let rows: u64 = CENSUS_CAPACITIES[..=index].iter().map(|&rows| u64::from(rows)).sum();
+                let without_wire = crate::serving_capacity::exl3_workspace_bytes(&manifests[..=retained_index], false)?;
+                let rows: u64 = capacities.iter().map(|&rows| u64::from(rows)).sum();
                 assert_eq!(retained - without_wire, rows * 4096 * 2);
             }
         }
