@@ -265,6 +265,8 @@ def jobs(scope):
         ("vision-d128-pointwise", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "pointwise", "--head-dim", "128", "--hidden", "2048", "--bf16-products", "--bf16-before-gamma"]),
         ("vision-d96-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention"]),
         ("vision-d96-windows", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--windowed"]),
+        # Covers Muse transformer programs using the exporter's shared geometry.
+        ("vision-transformer", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "transformer"]),
         ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
         ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
