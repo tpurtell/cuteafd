@@ -123,11 +123,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             let (drafted, draft_us) = if drafting.is_empty() { (Vec::new(), 0) } else { loop {
                 let proposed = {
                     let mut draft = draft.borrow_mut();
-                    // W64-1: a failed proposal verifies the anchors only; it never fails the round.
-                    if let Some(draft) = draft.as_deref_mut() { match draft.poll_propose(lane, &drafting) {
-                        Ok(proposed) => proposed,
-                        Err(error) => Some((super::stall::anchor_only(&drafting, lane, &error), 0)),
-                    } }
+                    if let Some(draft) = draft.as_deref_mut() { draft.poll_propose(lane, &drafting)? }
                     else { Some((drafting.iter().map(|r| vec![r.1]).collect(), 0)) }
                 };
                 if let Some(inputs) = proposed { break inputs; }

@@ -334,6 +334,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
         packing_group_fits(&chunks[range], &limits)) {
         if range.len() == 1 { continue; }
         let indices = &eligible[range.clone()];
+        stall::tick();
         let segments = prefill_packing::plan(&chunks[range], &limits)?;
         let members: Vec<_> = indices.iter().map(|&i| (admitted[i].2, admitted[i].0.prompt.as_slice())).collect();
         let result = (|| -> Result<Vec<RetainedScores>> {
@@ -347,6 +348,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
                 .map(|(pass, transport)| (pass, transport)).collect(), &mut link, requests, &members, &mut suffix) });
             P::restore_link(&mut prefill.slots[0].1, link)?;
             encoded?;
+            stall::tick();
             let work = members.iter().map(|&(lease, tokens)| {
                 let start = requests.begin_decoder_replay(lease)?;
                 Ok(crate::families::deepseek_v41::v41_backbone_cache::CacheWork { lease,
@@ -365,6 +367,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
                 let scores = bytes.chunks_exact(scores::ROW_BYTES).map(|row|
                     RetainedScores::new(VOCAB, row.to_vec())).collect::<Result<Vec<_>>>()?;
                 runtime.block_on(pass.commit_packed_prefill(requests, &mut batch, draft.as_deref_mut(), &accepted))?;
+                stall::tick();
                 Ok(scores)
             })();
             if replay.is_err() { pass.discard(&mut batch)?; }
@@ -485,7 +488,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             "native coordinator exact cap differs from validated inventory");
     }
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
-    stall::spawn();
+    let _stall_watch = stall::spawn();
     let mut active: Vec<Option<Active<'a>>> = (0..args.concurrency).map(|_| None).collect();
     let mut compiler = crate::shared::constraints::Compiler::new(lib, args.snapshot.join("tokenizer.json"), VOCAB);
     let mut id = 0u64;
@@ -536,9 +539,11 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         let mut admitted: Vec<PackedAdmission> = Vec::new();
         let mut next_wave = std::collections::VecDeque::new();
         let mut held_slots = std::collections::BTreeSet::new();
+        stall::mark(stall::Phase::Admission, active.iter().flatten().count() + media.len() + media_ready.len());
         loop {
             let busy_slots = active.iter().flatten().count() + media.len() + media_ready.len() + held_slots.len();
             let backlog = !media.full() && !media.backlog.is_empty();
+            stall::mark(stall::Phase::Admission, busy_slots + 1);
             let (prepared, id, lease, slot, image_keys, hit, restore) = if let Some(leased) = media_ready.next() {
                 tracing::info!(request_id=leased.id, encoder_ms=leased.started.elapsed().as_secs_f64()*1000.0,
                     "native asynchronous vision preparation");
@@ -555,12 +560,14 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 if intake == 0 { break; }
                 intake -= 1;
                 let job = if busy_slots == 0 && !closed {
+                    stall::mark(stall::Phase::Idle, 0);
                     // Going idle: publish final occupancy so the console does not show stale lanes.
                     if let Some(live) = console::live() {
                         live.push(console_gauges(&active, requests, &prefixes, receive.len(), Some(false)));
                     }
                     match receive.blocking_recv() {
                         Some(job) => {
+                            stall::mark(stall::Phase::Admission, 1);
                             crate::shared::decode_graph::census::idle();
                             job
                         }
@@ -1675,10 +1682,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
     prefetch_drafts(requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
-        match clock.draft(|| draft.propose(lib, lane, &seeds)) {
-            Ok(inputs) => inputs,
-            Err(error) => stall::anchor_only(&seeds, lane, &error),
-        }
+        clock.draft(|| draft.propose(lib, lane, &seeds))?
     } else { seeds.iter().map(|r| vec![r.1]).collect() };
     if let Some(draft) = draft.as_deref_mut() { extend_inputs(draft, active, members, &mut inputs)?; }
     prefetch_drafts(requests, active, members, &inputs);
