@@ -279,7 +279,21 @@ def public_panel(panel):
     return public
 
 
-def package(source, out, config, tokenizer_path, license_path):
+def identity_note(path, set_id):
+    """An audited equivalence between the computed set and a later manifest of the same tokens."""
+    proof = json.loads(Path(path).read_text())
+    if proof.get('old_set') != set_id or proof.get('all_equal') is not True or not proof.get('windows'):
+        raise ValueError('identity proof does not cover this set with all windows equal')
+    if any(not w.get('equal') for w in proof['windows']):
+        raise ValueError('identity proof has a differing window')
+    return dict(equivalent_set_sha256=proof['new_set'], computed_rules_sha256=proof['old_rules'],
+                equivalent_rules_sha256=proof['new_rules'], windows=len(proof['windows']),
+                proof_sha256=digest(Path(path)),
+                statement='Logits were computed on this set; the equivalent set has byte-identical window tokens, '
+                          'roles and score geometry and differs only in recipe metadata.')
+
+
+def package(source, out, config, tokenizer_path, license_path, identity=None):
     if out.exists() or not config or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.' for c in config) or config in ('.', '..'):
         raise ValueError('output must be fresh and config must be a safe component')
     read = lambda name: json.loads(contained(source, name).read_text())
@@ -367,6 +381,9 @@ def package(source, out, config, tokenizer_path, license_path):
         raise ValueError('sealed runtime provenance differs')
     runtime = read('platform.json')
     provenance['runtime'] = validate_runtime_platform(runtime)
+    equivalence = identity_note(identity, set_id) if identity else None
+    if equivalence:
+        provenance['equivalent_set'] = equivalence
     generated_rows = standard_generated_rows(panel)
     require_new_set_generated_rows(generated_rows)
     role_metrics = reference_role_metrics(validation)
@@ -409,7 +426,7 @@ def package(source, out, config, tokenizer_path, license_path):
             f'{panel_description}'
             'The bench quick subset is legacy,a00,a04,a08,a20,c00,d00,e00 (4,096 rows).\n\n'
             '## Qualification\n\n'
-            f'32,768 scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
+            f'{meta["scored_tokens"]:,} scored positions; reference NLL {meta["nll"]:.15f} nat/token.\n'
             f'{reference_role_note(role_metrics)}'
             f'{standard_generated_note(generated_rows)}'
             'The 576/640-token prefix probes have 512 byte-identical common F32 rows and zero argmax disagreements.\n'
@@ -425,6 +442,9 @@ def package(source, out, config, tokenizer_path, license_path):
             + (f'## Panel Caveat\n\n{caveat}\n\n' if caveat else '') +
             '## Provenance And Privacy\n\n'
             f'Source set: `{set_id}`. Raw deployment settings and local paths are omitted.\n'
+            + (f'Equivalent set: `{equivalence["equivalent_set_sha256"]}` (recipe rules `{equivalence["equivalent_rules_sha256"][:12]}`; '
+               f'computed under `{equivalence["computed_rules_sha256"][:12]}`) has byte-identical tokens, roles and score geometry '
+               f'in all {equivalence["windows"]} windows; audit proof sha256 `{equivalence["proof_sha256"]}`.\n' if equivalence else '') +
             'Public text and metadata pass credential/private-key/personal-data screening. Original public MIT notice is preserved verbatim.\n'
             'Reference data is MIT licensed; the official checkpoint remains subject to its own upstream license.\n')
     validate_public_text(card, scored_text=True)
@@ -440,8 +460,10 @@ def main():
     for name in ('source', 'out', 'tokenizer', 'license'):
         parser.add_argument('--' + name, required=True, type=Path)
     parser.add_argument('--config', required=True)
+    parser.add_argument('--identity-proof', type=Path, help='audited token-identity proof to a later manifest')
     args = parser.parse_args()
-    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license), indent=2))
+    print(json.dumps(package(args.source, args.out, args.config, args.tokenizer, args.license,
+                             args.identity_proof), indent=2))
     print('Staged only; no upload or engine qualification performed.')
 
 

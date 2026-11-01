@@ -1,5 +1,6 @@
 """Reference-only publication storage and privacy contracts, without hardware."""
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
@@ -270,3 +271,18 @@ def test_v41_root_arithmetic_maps_to_official_fp8_mxfp4():
     assert precision.startswith('official FP8 block dense + MXFP4 experts')
     with pytest.raises(ValueError, match='unrecognized'):
         packager.reference_precision(dict(root_arithmetic=dict(arithmetic='x', source='y')), dict())
+
+
+def test_identity_note_binds_the_computed_set_and_requires_all_windows_equal(tmp_path):
+    proof = dict(old_set='a' * 64, new_set='b' * 64, old_rules='c' * 64, new_rules='d' * 64, all_equal=True,
+                 windows=[dict(id='a00', equal=True), dict(id='a01', equal=True)])
+    path = tmp_path / 'proof.json'
+    path.write_text(json.dumps(proof))
+    note = packager.identity_note(path, 'a' * 64)
+    assert note['equivalent_set_sha256'] == 'b' * 64 and note['windows'] == 2
+    with pytest.raises(ValueError, match='does not cover'):
+        packager.identity_note(path, 'e' * 64)
+    proof['windows'][1]['equal'] = False
+    path.write_text(json.dumps(proof))
+    with pytest.raises(ValueError, match='differing window'):
+        packager.identity_note(path, 'a' * 64)
