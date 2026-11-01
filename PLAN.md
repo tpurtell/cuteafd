@@ -6355,3 +6355,11 @@ already have verified Spark copies; retain them for reuse. The managed ref
 was never published, and no managed-complete marker exists. Source quantization
 was a clean layer-0 restart (`resume:false`); the original invalid quantized
 weights and causal activation caches never seeded the repaired producer.
+
+TJ subsequently clarified that the model should be imported and the earlier
+comment was a question about speed, not a requirement to replace the placement
+method. This supersedes the hold above. Resume the existing verified placement,
+reuse all 26 completed Spark weight copies and any checksum-valid owned partial,
+and finish managed verification/cleanup. The hold marker is archived as resolved.
+CPU-only continuation: `muse-quant-1793575200198800108`. No shared SparkNest
+feature/deployment work, requantization or HF reupload is needed.
