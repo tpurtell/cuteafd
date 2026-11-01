@@ -99,6 +99,13 @@ pub(crate) fn live() -> &'static LiveLimits {
     LIVE.get_or_init(|| LiveLimits::new(1, 1))
 }
 
+/// The effective admission bound for a family: its allocated ceiling, lowered
+/// by the live limit. A family that installs limits admits against this, so a
+/// POST lowering the limit takes effect at the next admission.
+pub(crate) fn admission_bound(allocated: usize) -> usize {
+    allocated.min(live().concurrency() as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,6 +160,16 @@ mod tests {
         assert_eq!(limits.concurrency(), 2);
         assert_eq!(limits.set_concurrency(16).unwrap(), 16);
         assert_eq!(limits.allocated(), 16, "the ceiling never moves");
+    }
+
+    /// A family admits against the live limit, never above its allocated
+    /// ceiling. The global `OnceLock` may already be set by another test, so
+    /// the assertion reads the live value rather than assuming one.
+    #[test]
+    fn admission_bound_follows_the_live_limit() {
+        let live_now = live().concurrency() as usize;
+        assert_eq!(admission_bound(usize::MAX), live_now);
+        assert_eq!(admission_bound(1), 1.min(live_now));
     }
 
     /// A second install with different values is refused, not silently

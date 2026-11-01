@@ -573,7 +573,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        while active.len() + prefills.len() < max_sequences {
+        while active.len() + prefills.len() < crate::shared::limits::admission_bound(max_sequences) {
             let busy = !active.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,

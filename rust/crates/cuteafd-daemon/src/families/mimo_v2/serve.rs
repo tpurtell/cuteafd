@@ -552,7 +552,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
-        while active.len() + prefills.len() < max_sequences {
+        while active.len() + prefills.len() < crate::shared::limits::admission_bound(max_sequences) {
             let busy = !active.is_empty() || !prefills.is_empty();
             if snapshot_waiter.as_ref().is_some_and(|ready| ready.job().job.events.is_closed()) {
                 snapshot_waiter = None;
