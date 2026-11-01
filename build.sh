@@ -842,6 +842,7 @@ timeout --foreground "$export_timeout" docker run --rm --name "$coordinator_expo
   -e "NVIDIA_VISIBLE_DEVICES=$export_gpu_uuid" \
   "${release_build_user_args[@]}" \
   "${compiler_cache_args[@]}" \
+  -e "CUTEAFD_RELEASE_COORDINATOR_FEATURES=${CUTEAFD_RELEASE_COORDINATOR_FEATURES:-}" \
   -e "CUTEAFD_RELEASE_EXPERT_FAMILIES=${CUTEAFD_RELEASE_EXPERT_FAMILIES:-}" \
   -e "CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS=${CUTEAFD_RELEASE_GENERIC_SPARK_COUNTS:-}" \
   -e "CUTEAFD_RELEASE_FP8_MOE_BF16_FAMILIES=$bf16_families" \
