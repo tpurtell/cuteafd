@@ -140,7 +140,9 @@ fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<Encod
         weights: request.weights, kind, replicas, reason: reason.into(), shortfall: 0,
     };
     if matches!(request.mode, MediaMode::Auto | MediaMode::Spark(_)) {
-        let mut ranks = hardware.sparks.iter().collect::<Vec<_>>();
+        let required = request.weights.saturating_add(request.scratch).saturating_add(GIB)
+            .saturating_add(if hardware.v41 { V41_SPARK_CUDA_OVERHEAD_BYTES } else { 0 });
+        let mut ranks = hardware.sparks.iter().filter(|spark| spark.free_bytes >= required).collect::<Vec<_>>();
         ranks.sort_by_key(|s| (!s.idle, s.expert_bytes, std::cmp::Reverse(s.free_bytes), s.rank));
         if let MediaMode::Spark(Some(rank)) = request.mode {
             if let Some(index) = ranks.iter().position(|s| s.rank == rank) { ranks.swap(0, index); }
@@ -159,7 +161,8 @@ fn candidates(request: &EncoderRequest, hardware: &EncoderHardware) -> Vec<Encod
     }
     if matches!(request.mode, MediaMode::Auto | MediaMode::Rtx(_)) {
         let gpu = rtx_encoder_gpu(request.mode, hardware.v41, hardware.gpus.len());
-        if gpu < hardware.gpus.len() {
+        if hardware.gpus.get(gpu).is_some_and(|budget| request.mode != MediaMode::Auto
+            || budget.free_bytes >= request.weights.saturating_add(request.scratch).saturating_add(budget.kv_target_bytes)) {
             result.push(make(EncoderKind::Rtx { gpu }, Vec::new(),
                 "RTX: KV target preserved after tower + scratch admission"));
         }
@@ -179,20 +182,34 @@ pub fn admit_encoders<T>(requests: &[EncoderRequest], hardware: &EncoderHardware
         solve: &mut impl FnMut(&[EncoderPlacement]) -> anyhow::Result<T>) -> anyhow::Result<T> {
         if index == requests.len() { return solve(selected); }
         let request = &requests[index];
+        let hardware_base = hardware;
+        let mut hardware = hardware.clone();
+        for placement in selected.iter() {
+            if let EncoderKind::Rtx { gpu } = placement.kind {
+                hardware.gpus[gpu].free_bytes = hardware.gpus[gpu].free_bytes.saturating_sub(placement.admitted_bytes());
+            }
+            for rank in placement.spark_ranks() {
+                if let Some(spark) = hardware.sparks.iter_mut().find(|spark| spark.rank == rank) {
+                    spark.free_bytes = spark.free_bytes.saturating_sub(placement.admitted_bytes());
+                }
+            }
+        }
         let mut reasons = Vec::new();
-        for candidate in candidates(request, hardware) {
+        for candidate in candidates(request, &hardware) {
             selected.push(candidate);
-            match visit(requests, hardware, index + 1, selected, solve) {
+            match visit(requests, hardware_base, index + 1, selected, solve) {
                 Ok(result) => return Ok(result),
                 Err(error) => reasons.push(format!("{:?}: {error:#}", selected[index].kind)),
             }
             selected.truncate(index);
         }
-        let reason = format!("no native tower candidate fits the pool floor: {}", reasons.join("; "));
+        let diagnostic = encoder_placement(request.mode, &hardware, request.weights, request.scratch, request.copies);
+        let reason = if reasons.is_empty() { diagnostic.reason.clone() }
+            else { format!("no native tower candidate fits the pool floor: {}", reasons.join("; ")) };
         if request.mode == MediaMode::Auto {
             selected.push(EncoderPlacement { kind: EncoderKind::Off, weights: 0, scratch: 0,
-                replicas: Vec::new(), reason, shortfall: 0 });
-            let result = visit(requests, hardware, index + 1, selected, solve);
+                replicas: Vec::new(), reason, shortfall: diagnostic.shortfall });
+            let result = visit(requests, hardware_base, index + 1, selected, solve);
             if result.is_err() { selected.truncate(index); }
             result
         } else { anyhow::bail!("{reason}") }

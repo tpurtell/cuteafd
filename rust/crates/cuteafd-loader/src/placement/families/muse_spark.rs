@@ -155,62 +155,56 @@ impl MuseRequest {
             });
             return Ok(());
         }
-        let mut probe = self.request.clone();
-        if probe.pool.requested.is_none() { probe.pool.ceiling = probe.pool.target; }
-        let placed = solve(&probe).context("Muse mandatory target before media admission")?;
-        let mut hardware = EncoderHardware { v41: false,
-            gpus: probe.inventory.gpus.iter().zip(&placed.items).map(|(gpu, items)| {
-                let used = items.iter().map(|item| item.bytes).sum::<u64>();
-                EncoderGpuBudget { free_bytes: gpu.available().saturating_sub(used), kv_target_bytes: 0 }
-            }).collect(),
-            sparks: (0..self.spark_budget.resident.len()).map(|rank| -> Result<_> {
-                Ok(EncoderSparkBudget { rank, host: format!("spark{rank}"), idle: false,
-                    expert_bytes: self.spark_budget.resident[rank][placed.onboard_layers..].iter().sum(),
-                    free_bytes: self.spark_budget.budget.saturating_sub(
-                        self.spark_budget.rank_bytes(rank, placed.onboard_layers)?) })
-            }).collect::<Result<_>>()? };
-        let mut spark_items = vec![Vec::new(); hardware.sparks.len()];
-        let mut select = |mode, bytes: (u64, u64), copies, name: &str| -> Result<EncoderPlacement> {
-            let selected = encoder_placement(mode, &hardware, bytes.0, bytes.1, copies);
-            ensure!(selected.kind != EncoderKind::Off || matches!(mode, MediaMode::Off | MediaMode::Auto),
-                "requested Muse {name} placement unavailable: {} ({} bytes short)", selected.reason, selected.shortfall);
-            let items = [Item::new(Category::Weights, format!("{name} tower"), "BF16 native", selected.weights, Basis::Exact),
-                Item::new(Category::Workspace, format!("{name} scratch"), "resident", selected.scratch, Basis::Exact)];
-            match selected.kind {
-                EncoderKind::Rtx { gpu } => {
-                    for item in items { self.request.fixed.push(Demand::new(u8::try_from(gpu)?,
+        let hardware = EncoderHardware { v41: false,
+            gpus: self.request.inventory.gpus.iter().map(|gpu| EncoderGpuBudget {
+                free_bytes: gpu.available(), kv_target_bytes: 0 }).collect(),
+            sparks: (0..self.spark_budget.resident.len()).map(|rank| EncoderSparkBudget {
+                rank, host: format!("spark{rank}"), idle: false,
+                expert_bytes: self.spark_budget.resident[rank].iter().sum(),
+                free_bytes: self.spark_budget.budget }).collect() };
+        let requests = [EncoderRequest { mode: options.vision, weights: options.vision_bytes.0,
+            scratch: options.vision_bytes.1, copies: options.replicas },
+            EncoderRequest { mode: options.audio, weights: options.audio_bytes.0,
+                scratch: options.audio_bytes.1, copies: 1 }];
+        let (selected, (request, budget, spark_items)) = admit_encoders(&requests, &hardware, |selected| {
+            let mut request = self.request.clone();
+            let mut budget = self.spark_budget.clone();
+            let mut spark_items = vec![Vec::new(); budget.resident.len()];
+            for (name, selected) in ["vision", "audio"].into_iter().zip(selected) {
+                let items = [Item::new(Category::Weights, format!("{name} tower"), "BF16 native", selected.weights, Basis::Exact),
+                    Item::new(Category::Workspace, format!("{name} scratch"), "resident", selected.scratch, Basis::Exact)];
+                if let EncoderKind::Rtx { gpu } = selected.kind {
+                    for item in items { request.fixed.push(Demand::new(u8::try_from(gpu)?,
                         item.category, item.group, item.bytes, item.basis)); }
-                    hardware.gpus[gpu].free_bytes = hardware.gpus[gpu].free_bytes.checked_sub(selected.admitted_bytes())
-                        .context("Muse media RTX headroom")?;
-                }
-                EncoderKind::Spark { .. } => {
-                    ensure!(placed.onboard_layers < self.spark_budget.layers.len(),
-                        "Muse Spark media requires an admitted expert worker");
+                } else {
                     for rank in selected.spark_ranks() {
                         spark_items[rank].extend(items.iter().cloned());
-                        self.spark_budget.overhead[rank] = self.spark_budget.overhead[rank]
-                            .checked_add(selected.admitted_bytes()).context("Muse Spark media overhead")?;
-                        hardware.sparks[rank].free_bytes = hardware.sparks[rank].free_bytes
-                            .checked_sub(selected.admitted_bytes()).context("Muse media Spark headroom")?;
+                        budget.overhead[rank] = budget.overhead[rank].checked_add(selected.admitted_bytes())
+                            .context("Muse Spark media overhead")?;
                     }
                 }
-                EncoderKind::Off => (),
-                EncoderKind::SparkIdle { .. } => anyhow::bail!("Muse idle-host encoder requires an expert worker"),
             }
-            Ok(selected)
-        };
-        let vision = select(options.vision, options.vision_bytes, options.replicas, "vision")?;
-        let audio = select(options.audio, options.audio_bytes, 1, "audio")?;
-        // Keep the common Spark admission guard free; it is not native allocation.
-        for (rank, items) in spark_items.iter_mut().enumerate().filter(|(_, items)| !items.is_empty()) {
-            let guard = 1 << 30;
-            self.spark_budget.overhead[rank] = self.spark_budget.overhead[rank]
-                .checked_add(guard).context("Muse Spark media guard")?;
-            items.push(Item::new(Category::Reserved, "media admission guard", "not allocated", guard, Basis::Formula)
-                .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
-        }
-        self.spark_budget.constrain(&mut self.request)?;
-        self.media = Some(MediaAdmission { vision, audio, spark_items });
+            for (rank, items) in spark_items.iter_mut().enumerate().filter(|(_, items)| !items.is_empty()) {
+                let guard = 1 << 30;
+                budget.overhead[rank] = budget.overhead[rank].checked_add(guard).context("Muse Spark media guard")?;
+                items.push(Item::new(Category::Reserved, "media admission guard", "not allocated", guard, Basis::Formula)
+                    .with_lifetime(cuteafd_core::memory_layout::ItemLifetime::PostReadyReserve));
+            }
+            budget.constrain(&mut request)?;
+            let placed = solve(&request)?;
+            if request.pool.requested.is_none() && requests.iter().zip(selected).any(|(request, selected)|
+                request.mode == MediaMode::Auto && matches!(selected.kind, EncoderKind::Rtx { .. })) {
+                ensure!(placed.pool_tokens >= request.pool.target,
+                    "auto native tower would reduce the requested KV target {} to {}",
+                    request.pool.target, placed.pool_tokens);
+            }
+            ensure!(spark_items.iter().all(Vec::is_empty) || placed.onboard_layers < budget.layers.len(),
+                "Muse Spark media requires a retained expert worker; select RTX media or retain Spark experts");
+            Ok((request, budget, spark_items))
+        })?;
+        self.request = request;
+        self.spark_budget = budget;
+        self.media = Some(MediaAdmission { vision: selected[0].clone(), audio: selected[1].clone(), spark_items });
         Ok(())
     }
 

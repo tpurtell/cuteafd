@@ -1252,6 +1252,17 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
             failed = Some((trial, opts, memory));
             anyhow::bail!("{reason}");
         }
+        let auto_rtx = requests.iter().zip(selected).any(|(request, selected)|
+            request.mode == MediaMode::Auto && matches!(selected.kind, EncoderKind::Rtx { .. }));
+        if auto_rtx && opts.pool_tokens.filter(|&tokens| tokens > 0).is_none() {
+            let context = if opts.context_tokens > 0 { opts.context_tokens }
+                else { Shape::resolve(&mut trial.clone(), model, &mut opts.clone(),
+                    ShapePolicy::manifest_bounded()).context_tokens };
+            let target = crate::placement::PoolPolicy::resolve(&opts.rtx_bytes, context, None, 256,
+                requested.spark_ranks() == 0).target;
+            anyhow::ensure!(memory.pool_tokens >= target,
+                "auto native tower would reduce the requested KV target {target} to {}", memory.pool_tokens);
+        }
         // Spark layouts include the selected suffix's resident weights, I/O and
         // execution owners. Never create a vision-only worker or charge a host
         // that the successful solve did not retain.
@@ -1273,6 +1284,19 @@ pub(crate) fn admit_layout_encoders(model: &dyn super::FamilyModel, input: &supe
         Ok(accepted) => accepted,
         Err(error) => {
             if let Some((mut trial, opts, mut memory)) = failed {
+                // Unsupported text geometry still reports media ownership from
+                // the failing solve's actual devices, not an absent encoder.
+                for device in &mut memory.devices {
+                    device.items.retain(|item| !item.group.starts_with("vision ") && !item.group.starts_with("audio "));
+                }
+                trial.vision = original.vision;
+                trial.audio = original.audio;
+                let mut sparks = memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark).cloned().collect::<Vec<_>>();
+                let mut rtx = memory.devices.iter().filter(|device| device.kind == DeviceKind::Rtx).cloned().collect::<Vec<_>>();
+                let kv = vec![0; rtx.len()];
+                resolve_encoder(&mut trial, towers, &mut rtx, &mut sparks, &kv, &opts, &mut memory.notes);
+                memory.devices = rtx;
+                memory.devices.extend(sparks);
                 trial.placement_supported = false;
                 trial.fits = false;
                 trial.hints.push(super::Hint { what: format!("native media admission: {error:#}"),
