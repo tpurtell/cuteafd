@@ -157,24 +157,24 @@ extern "C" void _mlir_cuteafd_vision_axial_rotary_entry(void** a,int n){
  assert(n==9);assert(*static_cast<int32_t*>(a[6])==17);*static_cast<int*>(a[8])=0;}
 int main(){
  void *a=nullptr,*b=nullptr,*c=nullptr;
- assert(cuteafd_vision_attention_create(64,&a)==0);
- assert(cuteafd_vision_attention_create(64,&b)==0);
+ assert(cuteafd_vision_attention_create_entry(64,0,"",&a)==0);
+ assert(cuteafd_vision_attention_create_entry(64,0,"",&b)==0);
  assert(init[0]==1 && loads[0]==1);
- device=1;assert(cuteafd_vision_attention_create(64,&c)==0);assert(loads[0]==2);
+ device=1;assert(cuteafd_vision_attention_create_entry(64,0,"",&c)==0);assert(loads[0]==2);
  assert(cuteafd_vision_attention_launch(a,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,.5f,nullptr)==cudaErrorInvalidDevice);
  assert(cuteafd_vision_attention_launch(c,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,.5f,nullptr)==0);
  assert(calls[0]==1);
  assert(cuteafd_vision_attention_destroy(a)==0 && unloads==0);
  assert(cuteafd_vision_attention_destroy(b)==0 && unloads==0);
  assert(cuteafd_vision_attention_destroy(c)==0 && unloads==1);
- fail=19;assert(cuteafd_vision_attention_create(72,&a)==19 && a==nullptr);assert(unloads==2);
- fail=0;assert(cuteafd_vision_attention_create(72,&a)==0);assert(init[1]==2);
+ fail=19;assert(cuteafd_vision_attention_create_entry(72,0,"",&a)==19 && a==nullptr);assert(unloads==2);
+ fail=0;assert(cuteafd_vision_attention_create_entry(72,0,"",&a)==0);assert(init[1]==2);
  fail_unload=23;assert(cuteafd_vision_attention_destroy(a)==23);
- fail_unload=0;assert(cuteafd_vision_attention_create(72,&a)==0);assert(init[1]==2);
+ fail_unload=0;assert(cuteafd_vision_attention_create_entry(72,0,"",&a)==0);assert(init[1]==2);
  assert(cuteafd_vision_attention_destroy(a)==0);
  assert(cuteafd_vision_attention_create_entry(64,1,"",&a)==cudaErrorInvalidValue && a==nullptr);
  assert(cuteafd_vision_attention_create_entry(64,0,"missing",&a)==cudaErrorInvalidValue);
- assert(cuteafd_vision_attention_create(96,&a)==cudaErrorInvalidValue);
+ assert(cuteafd_vision_attention_create_entry(96,0,"",&a)==cudaErrorInvalidValue);
  assert(cuteafd_vision_attention_create_entry(96,0,"d96_f32",&a)==0);
  assert(cuteafd_vision_attention_launch(a,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,.5f,nullptr)==0);
  void* ptrs[6]{};uint64_t scalar=17;
@@ -182,7 +182,7 @@ int main(){
  assert(cuteafd_vision_pointwise_launch(a,"missing",ptrs,&scalar,nullptr)==cudaErrorInvalidValue);
  assert(cuteafd_vision_pointwise_launch(a,"vision_axial_rotary",ptrs,nullptr,nullptr)==cudaErrorInvalidValue);
  assert(cuteafd_vision_attention_destroy(a)==0);
- device=32;assert(cuteafd_vision_attention_create(64,&a)==cudaErrorInvalidDevice);
+ device=32;assert(cuteafd_vision_attention_create_entry(64,0,"",&a)==cudaErrorInvalidDevice);
  assert(cuteafd_vision_attention_destroy(nullptr)==0);
 }
 """

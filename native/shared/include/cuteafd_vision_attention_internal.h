@@ -3,7 +3,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-int32_t cuteafd_vision_attention_create(int32_t head_dim, void** owner);
 // An entry owns its attention and pointwise modules on the creating device.
 int32_t cuteafd_vision_attention_create_entry(int32_t head_dim, int32_t windowed,
     const char* pointwise_group, void** owner);

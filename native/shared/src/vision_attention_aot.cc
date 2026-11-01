@@ -103,9 +103,6 @@ extern "C" int32_t cuteafd_vision_attention_create_entry(int32_t dim,int32_t win
   if(status) { delete owner;return status; }
   ++entry->references;*out=owner;return 0;
 }
-extern "C" int32_t cuteafd_vision_attention_create(int32_t dim,void** out) {
-  return cuteafd_vision_attention_create_entry(dim,0,"",out);
-}
 extern "C" int32_t cuteafd_vision_attention_destroy(void* opaque) {
   if(!opaque)return 0;
   auto* owner=static_cast<Attention*>(opaque);
