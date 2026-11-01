@@ -216,7 +216,7 @@ printf '%s\0' "${RELEASE_SERVING_ARGS[@]}"
 
     def test_all_serving_launchers_use_shared_identity_and_nonroot_mounts(self) -> None:
         for source in [v41_source(), FAMILY.read_text()]:
-            self.assertIn('$(declare -f release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
+            self.assertIn('$(declare -f release_die release_hub_mounts release_serving_docker_args release_require_writable_state cuteafd_cdi_require cuteafd_cdi_gpu_args)', source)
             self.assertIn('docker run -d "${RELEASE_SERVING_ARGS[@]}"', source)
             self.assertNotIn('/root/', source)
             self.assertNotIn('-e USER=tj', source)
