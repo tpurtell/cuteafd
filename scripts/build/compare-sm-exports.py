@@ -113,7 +113,7 @@ def jobs(scope):
             result.append((name, "export_b12x_slices_aot.py",
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
                             "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128",
-                            "--atomic-min-capacity", "256", "--standard-names"]))
+                            *(["--atomic-min-capacity", "256"] if family == "dsv4p" else []), "--standard-names"]))
     for family in ("v41", "dsv4f", "dsv4p"):
         packages = load_file("compare_spark_packages", ROOT / "python/tools/lib/spark_packages.py")
         artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
@@ -124,7 +124,7 @@ def jobs(scope):
             result.append((f"{family}-{role}", "export_b12x_slices_aot.py",
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
                             "--width", ",".join(f"{capacity}:{width}" for capacity in CAPACITIES.split(",")),
-                            *(["--atomic-min-capacity", "256"] if family != "v41" and not role.startswith("spark_w") else []),
+                            *(["--atomic-min-capacity", "256"] if family == "dsv4p" and not role.startswith("spark_w") else []),
                             "--standard-names"]))
     result.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),

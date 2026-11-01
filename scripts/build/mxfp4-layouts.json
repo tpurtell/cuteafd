@@ -9,20 +9,19 @@
       "capacities": [
         1,
         16,
-        80,
-        256,
-        1024,
-        4096
+        80
       ],
       "slices": [
         128,
         128,
-        128,
-        64,
-        64,
-        64
+        128
       ],
-      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; strict F32 and invariants"
+      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; strict F32 and invariants",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 5120,
@@ -31,20 +30,19 @@
       "capacities": [
         1,
         16,
-        80,
-        256,
-        1024,
-        4096
+        80
       ],
       "slices": [
         128,
         128,
-        128,
-        128,
-        128,
         128
       ],
-      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; padded-matching recipe"
+      "source": "#928 tilings5 cassowary, adfaedf71c97d321237c44b3333ab8d745696ccb; padded-matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 5120,
@@ -60,7 +58,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 5120,
@@ -76,7 +79,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 5120,
@@ -92,7 +100,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 4096,
@@ -108,7 +121,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 4096,
@@ -124,7 +142,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 4096,
@@ -140,7 +163,12 @@
         32,
         32
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 4096,
@@ -156,7 +184,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 4096,
@@ -172,7 +205,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 4096,
@@ -188,7 +226,12 @@
         128,
         128
       ],
-      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+      "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     },
     {
       "hidden": 7168,
@@ -237,6 +280,162 @@
         128
       ],
       "source": "#928 GB10 study7/tile9; accepted decode winner; prefill retains matching recipe"
+    },
+    {
+      "hidden": 4096,
+      "width": 256,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 384,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 512,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 1024,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 384,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 512,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 768,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 1152,
+      "sm": 121,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 1024,
+      "sm": 120,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 4096,
+      "width": 2048,
+      "sm": 120,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 1152,
+      "sm": 120,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
+    },
+    {
+      "hidden": 5120,
+      "width": 2304,
+      "sm": 120,
+      "capacities": [],
+      "slices": [],
+      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
+      "prefill": [
+        256,
+        1024,
+        4096
+      ]
     }
   ],
   "ownership": [

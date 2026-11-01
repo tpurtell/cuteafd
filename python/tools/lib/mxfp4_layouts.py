@@ -17,11 +17,19 @@ def layouts() -> dict:
 
 
 def validate(data: dict) -> None:
+    keys = set()
     for row in data["native_slices"]:
+        key = (row["hidden"], row["width"], row["sm"])
+        prefill = row.get("prefill", [])
+        if key in keys or len(set(prefill)) != len(prefill) or any(c not in (256, 1024, 4096) for c in prefill):
+            raise ValueError("invalid native MXFP4 prefill recipe")
+        keys.add(key)
+        if not row["capacities"] and not prefill:
+            raise ValueError("empty native MXFP4 recipe")
         recipes = dict(zip(row["capacities"], row["slices"], strict=True))
         if len(recipes) != len(row["capacities"]):
             raise ValueError("native MXFP4 capacities must pair uniquely with slices")
-        if len({width for capacity, width in recipes.items() if capacity <= 80}) != 1:
+        if recipes and len({width for capacity, width in recipes.items() if capacity <= 80}) != 1:
             raise ValueError("native MXFP4 decode capacities must share one slice recipe")
         if any(width not in (32, 64, 128, 192) for width in recipes.values()):
             raise ValueError("invalid native MXFP4 slice width")
@@ -56,6 +64,36 @@ def native_slice_width(hidden: int, width: int, sm: int, capacity: int,
             return dict(zip(row["capacities"], row["slices"], strict=True)).get(
                 capacity, matching_width)
     return matching_width
+
+
+def native_prefill(hidden: int, width: int, sm: int, capacity: int) -> bool:
+    """Qualified native STREAM recipe, independent of role names and live rows."""
+    return any((row["hidden"], row["width"], row["sm"]) == (hidden, width, sm)
+               and capacity in row.get("prefill", []) for row in layouts()["native_slices"])
+
+
+def native_prefill_scratch(capacity: int, hidden: int, width: int,
+                           experts: int, topk: int) -> tuple[list[dict], int]:
+    """Pure counterpart of the pinned STREAM's seven caller-owned planes."""
+    if capacity not in (256, 1024, 4096) or hidden <= 0 or hidden % 512 or width <= 0 or width % 32 or experts <= 0 or topk <= 0:
+        raise ValueError("invalid native V4 prefill geometry")
+    pairs = capacity * topk
+    tiles = (pairs + 127) // 128 + min(experts, pairs)
+    row_bytes = (width + width // 32 + 15) // 16 * 16
+    specs = [("meta", "i32", (4 + 3 * experts + tiles,)),
+             ("pair_row", "i32", (pairs,)), ("pair_pos", "i32", (pairs,)),
+             ("act", "u8", (tiles * 128 * row_bytes,)),
+             ("grouped_routing", "f32", (pairs,)), ("grouped_route", "i32", (pairs,)),
+             ("output", "f32", (pairs, hidden))]
+    offset, planes = 0, []
+    for name, dtype, shape in specs:
+        size = 1 if dtype == "u8" else 4
+        for extent in shape:
+            size *= extent
+        offset = (offset + 15) // 16 * 16
+        planes.append(dict(name=name, dtype=dtype, shape=shape, offset=offset, nbytes=size))
+        offset += size
+    return planes, offset
 
 
 def header() -> str:
