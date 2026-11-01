@@ -74,10 +74,13 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
         (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse")]
     assert entries[0]["programs"] == ["vision_attention_d64"]
     assert entries[1]["programs"] == ["vision_attention_d72"]
+    exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
+    inventory = subprocess.check_output(["python3", str(exporter), "--list-transformer-programs"], text=True).strip().split(";")
+    assert len(inventory) == 14
     for item, mode in zip(entries[2:], ("full", "windows"), strict=True):
         assert item["programs"][0] == f"vision_attention_d96_{mode}"
         assert [p["name"] for p in item["programs"][1:]] == [
-            "vision_axial_rotary_d96_f32", "vision_position_gather_h1536"]
+            "vision_axial_rotary_d96_f32", "vision_position_gather_h1536", *inventory]
     assert entries[2]["programs"][1:] == entries[3]["programs"][1:]
     rules = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]

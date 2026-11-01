@@ -108,6 +108,14 @@ add_custom_command(
     ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
   COMMENT "Exporting full-image head64/head72 BF16 vision attention offline"
   VERBATIM)
+set(muse_exporter "${CMAKE_CURRENT_LIST_DIR}/../../../python/tools/aot/export_b12x_vision_aot.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${muse_exporter}")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${muse_exporter}" --list-transformer-programs
+  RESULT_VARIABLE muse_inventory_status OUTPUT_VARIABLE muse_transformer_programs
+  OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(NOT muse_inventory_status EQUAL 0 OR NOT muse_transformer_programs)
+  message(FATAL_ERROR "Cannot read Muse transformer export inventory")
+endif()
 foreach(mode full windows)
   set(windowed)
   set(windowed_args)
@@ -119,8 +127,8 @@ foreach(mode full windows)
     PROGRAMS vision_attention_d96_${mode}
     ARGS --group attention --head-dim 96 ${windowed_args}
     POINTWISE_GROUP muse
-    POINTWISE_PROGRAMS vision_axial_rotary_d96_f32 vision_position_gather_h1536
-    POINTWISE_ARGS --group pointwise --head-dim 96 --hidden 1536 --learned-position)
+    POINTWISE_PROGRAMS vision_axial_rotary_d96_f32 vision_position_gather_h1536 ${muse_transformer_programs}
+    POINTWISE_ARGS --group pointwise --head-dim 96 --hidden 1536 --learned-position --with-transformer)
 endforeach()
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)
 list(APPEND CUTEAFD_VISION_ATTENTION_OUTPUTS ${owner_outputs})
