@@ -418,21 +418,35 @@ SPARK_WS_CELLS = {
     ('qwen4', 384): dict(dynamic=True, tile=(64, 192, 64, 256)),
     ('qwen4', 256): dict(dynamic=False, tile=(64, 256, 64, 256)),
     ('qwen4', 128): dict(dynamic=True, tile=(64, 128, 64, 256)),
+    # Muse K4, 2026-11-01 GB10: all low/median/high-Gini route fixtures
+    # and random routes improve with exact expert-partial replies (#923).
+    # Only measured capacities qualify; unresolved cells retain their controls.
+    ('muse', 1024, 1024): dict(route_block=64, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 896, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 2048): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 896, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 768, 256): dict(route_block=32, dynamic=True, tile=(64, 256, 64, 256)),
+    ('muse', 640, 256): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 1024): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 2752): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
+    ('muse', 640, 4096): dict(route_block=64, dynamic=True, tile=(64, 128, 64, 256)),
 }
 
 
 def spark_ws_cell(geometry: str, role: str, width: int, capacity: int) -> dict | None:
     if role != 'spark' or capacity <= 80:
         return None
-    return SPARK_WS_CELLS.get((geometry, width))
+    return SPARK_WS_CELLS.get((geometry, width, capacity), SPARK_WS_CELLS.get((geometry, width)))
 
 
 def ws_route_block(geometry: str, role: str, width: int, capacity: int) -> int:
     """Packed-route M block of a warp-specialized prefill export (see
     `warp_specialized`); every cell whose measured arm split the block by
     capacity carries its own row count here."""
-    cell = coordinator_ws_cell(geometry, role, width, capacity)
-    return cell['route_block'] if cell else 64
+    cell = (coordinator_ws_cell(geometry, role, width, capacity)
+            or spark_ws_cell(geometry, role, width, capacity))
+    return cell.get('route_block', 64) if cell else 64
 
 
 def warp_specialized(geometry: str, role: str, width: int, capacity: int) -> bool:
