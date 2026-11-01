@@ -1381,11 +1381,10 @@ mod media_tests {
     #[test]
     fn shared_signed_output_limits_are_not_a_family_cap() {
         for maximum in [-1, 0, 32768, 131072] {
-            let mut prefix = crate::shared::prefix::PrefixArgs::default();
-            prefix.reserve.max_output_tokens = maximum;
-            let limits = prefix.reserve.limits(262144).unwrap();
-            assert_eq!(limits.output, if maximum <= 0 { 262144 } else { maximum as u32 });
-            assert!(prefix.reserve.config(262144).is_ok());
+            let reserve = crate::shared::kv_reserve::ReserveArgs { max_output_tokens: maximum, ..Default::default() };
+            let limits = reserve.limits(262144).unwrap();
+            assert_eq!(limits.output(), if maximum <= 0 { 262144 } else { maximum as u32 });
+            assert!(reserve.config(262144).is_ok());
         }
     }
 
