@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod draft;
+pub mod rtx_onboard;
 pub mod families;
 pub mod inventory;
 mod pool;

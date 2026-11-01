@@ -465,7 +465,7 @@ pub(super) mod tests {
             rope_scaling: None, scale_full: false, scale_sliding: false,
             activation: Vec::new(), shared_activation: Vec::new(),
         };
-        Step5CacheLayout::new(&config, ranks, context, mtp, step, kv_format).unwrap()
+        Step5CacheLayout::new(&config, ranks, context, mtp, step, step, kv_format).unwrap()
     }
 
     #[test]

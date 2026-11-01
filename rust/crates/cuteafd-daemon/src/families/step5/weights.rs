@@ -78,8 +78,11 @@ fn pack(
 }
 
 pub(super) fn validate_live_weights(device: i32, weights: &[Allocation<'_>]) -> Result<()> {
-    ensure!(!weights.is_empty() && weights.iter().all(|weight| {
-        let buffer = weight.buffer;
+    validate_live_buffers(device, &weights.iter().map(|w| w.buffer).collect::<Vec<_>>())
+}
+
+pub(super) fn validate_live_buffers(device: i32, weights: &[CuteafdDeviceBuffer]) -> Result<()> {
+    ensure!(!weights.is_empty() && weights.iter().all(|buffer| {
         !buffer.ptr.is_null() && buffer.device_id == device && buffer.bytes >= 256
     }), "Step-5 live native weight allocation inventory");
     Ok(())
@@ -256,6 +259,7 @@ mod tests {
             rank,
             ranks: 2,
             operands: vec![],
+            core: Default::default(),
             resident_bytes: 0,
         }
     }

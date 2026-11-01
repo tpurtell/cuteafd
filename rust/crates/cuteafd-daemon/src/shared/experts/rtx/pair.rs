@@ -204,8 +204,19 @@ impl PackedRoutes {
     }
 }
 
+/// Who publishes a layer's canonical routes (and, for a source-only router,
+/// its FP8 K32 wire rows) to the peer.
+#[derive(Debug, Clone, Copy)]
+struct Broadcast {
+    source: usize,
+    wire: bool,
+}
+
 pub(crate) struct Pair<'a> {
     pub layers: Vec<usize>,
+    /// Input bytes per row a source broadcast carries (the backends' input
+    /// dtype: FP8 K32 wire or BF16 rows); 0 when routes only.
+    wire_row_bytes: usize,
     ranks: [RefCell<Box<dyn RtxExpertLayer + 'a>>; 2],
     pub combine: FusedCombine<'a>,
     pub routes: PeerExchange<'a>,
@@ -227,6 +238,7 @@ pub(crate) struct Pair<'a> {
 }
 
 impl<'a> Pair<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         library: &'a NativeLibrary,
         devices: [RankDevice; 2],
@@ -237,6 +249,27 @@ impl<'a> Pair<'a> {
         lanes: usize,
         exchange: ExchangeDtype,
     ) -> Result<Self> {
+        Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, lanes, exchange, false)
+    }
+
+    /// As [`Self::new`]; with `wire`, each route slot also holds `max_rows`
+    /// input rows in the backends' input dtype (FP8 K32 wire or BF16), so a
+    /// layer whose router lives on one rank can publish its routes and input
+    /// to the peer ([`Self::enqueue_from`]).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_wire(
+        library: &'a NativeLibrary,
+        devices: [RankDevice; 2],
+        ranks: [Box<dyn RtxExpertLayer + 'a>; 2],
+        hidden: usize,
+        topk: usize,
+        max_rows: usize,
+        lanes: usize,
+        exchange: ExchangeDtype,
+        wire: bool,
+    ) -> Result<Self> {
+        let fp8 = ranks[0].uses_fp8_input();
+        let wire_row_bytes = match (wire, fp8) { (false, _) => 0, (true, true) => hidden + hidden / 32, (true, false) => hidden * 2 };
         let layers = ranks[0].layers().to_vec();
         ensure!(
             !layers.is_empty() && layers.windows(2).all(|ids| ids[0] < ids[1])
@@ -263,7 +296,7 @@ impl<'a> Pair<'a> {
             library,
             devices,
             2 * lanes,
-            PackedRoutes::new(max_rows, topk).bytes,
+            PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes,
         )?;
         for (rank, producer) in devices.into_iter().enumerate() {
             routes.require_cooperative_producer_stream(rank, producer)?;
@@ -276,6 +309,7 @@ impl<'a> Pair<'a> {
             .unwrap_or(0);
         Ok(Self {
             layers,
+            wire_row_bytes,
             ranks: ranks.map(RefCell::new),
             combine: FusedCombine::new(library, exchange)?,
             routes,
@@ -504,10 +538,60 @@ impl<'a> Pair<'a> {
         lane: usize,
         rows: usize,
         input: ExpertInput,
+        routes: Routes,
+        scratch: CuteafdDeviceBuffer,
+        shared: *const u16,
+        out: *mut c_void,
+        abort: &mut dyn FnMut(),
+    ) -> Result<()> {
+        let broadcast = (self.source.get() == RouteSource::Broadcast).then_some(Broadcast { source: 0, wire: false });
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.enqueue_with(rank, layer, lane, rows, input, routes, scratch, shared, out, broadcast, abort) }
+    }
+
+    /// As [`Self::enqueue`], for a layer whose router, routes and input rows
+    /// exist only on `source`: the source packs routes and input into its
+    /// `scratch` and pushes them over the peer exchange (device-driven, no host
+    /// hop); the peer waits, then runs its half on the received rows.
+    /// # Safety
+    /// As [`Self::enqueue`]. On the peer, `input` and `routes` are ignored; on
+    /// the source, `input` is in the backends' input dtype and `scratch` holds
+    /// `PackedRoutes` plus the input rows. Requires a pair built with
+    /// [`Self::new_with_wire`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue_from(
+        &self,
+        rank: usize,
+        source: usize,
+        layer: usize,
+        lane: usize,
+        rows: usize,
+        input: ExpertInput,
+        routes: Routes,
+        scratch: CuteafdDeviceBuffer,
+        shared: *const u16,
+        out: *mut c_void,
+        abort: &mut dyn FnMut(),
+    ) -> Result<()> {
+        ensure!(source < 2 && self.wire_row_bytes > 0, "source broadcast needs a wire-capable pair");
+        // SAFETY: forwarded unchanged; the caller upholds this function's contract.
+        unsafe { self.enqueue_with(rank, layer, lane, rows, input, routes, scratch, shared, out,
+            Some(Broadcast { source, wire: true }), abort) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn enqueue_with(
+        &self,
+        rank: usize,
+        layer: usize,
+        lane: usize,
+        rows: usize,
+        mut input: ExpertInput,
         mut routes: Routes,
         scratch: CuteafdDeviceBuffer,
         shared: *const u16,
         out: *mut c_void,
+        broadcast: Option<Broadcast>,
         abort: &mut dyn FnMut(),
     ) -> Result<()> {
         let mut aborted = false;
@@ -520,7 +604,9 @@ impl<'a> Pair<'a> {
         let result = self.routes.on(rank, || {
             let stream = self.devices[rank].stream;
             let packed = PackedRoutes::new(rows, self.topk);
-            let unit = if self.checking.get() { self.active.borrow().get(lane).copied().flatten() } else { None };
+            // A source broadcast's peer has no routes of its own to check.
+            let receives = broadcast.is_some_and(|b| b.wire && b.source != rank);
+            let unit = if self.checking.get() && !receives { self.active.borrow().get(lane).copied().flatten() } else { None };
             if let Some(unit) = unit {
                 let mut checks = self.checks.borrow_mut();
                 let storage = checks.as_mut().context("route diagnostics not started")?
@@ -558,11 +644,13 @@ impl<'a> Pair<'a> {
                     )?;
                 }
             }
-            if self.source.get() == RouteSource::Broadcast {
+            if let Some(Broadcast { source, wire }) = broadcast {
                 let at = 2 * lane + layer % 2;
-                if rank == 0 {
+                let wire_bytes = if wire { rows * self.wire_row_bytes } else { 0 };
+                let extent = packed.bytes + wire_bytes;
+                if rank == source {
                     ensure!(
-                        packed.bytes <= scratch.bytes,
+                        extent <= scratch.bytes,
                         "router scratch cannot pack canonical routes"
                     );
                     // SAFETY: logits are consumed; aligned canonical sections fit this rank's scratch.
@@ -593,16 +681,39 @@ impl<'a> Pair<'a> {
                             packed.section,
                             stream,
                         )?;
+                        if wire {
+                            let rows_ptr = match input {
+                                ExpertInput::Fp8K32(rows) | ExpertInput::Bf16(rows) => rows,
+                            };
+                            ensure!(matches!(input, ExpertInput::Fp8K32(_)) == self.uses_fp8_input(),
+                                "source broadcast input differs from the backends' input dtype");
+                            self.library.copy_d2d_async(
+                                CuteafdDeviceBuffer {
+                                    ptr: scratch.ptr.cast::<u8>().add(packed.bytes).cast(),
+                                    bytes: wire_bytes,
+                                    ..scratch
+                                },
+                                CuteafdDeviceBuffer { ptr: rows_ptr, bytes: wire_bytes, ..scratch },
+                                wire_bytes,
+                                stream,
+                            )?;
+                        }
                     }
-                    self.routes.push(0, at, scratch.ptr, packed.bytes)?;
+                    self.routes.push(source, at, scratch.ptr, extent)?;
                 } else {
-                    self.routes.wait(1, at)?;
-                    let received = self.routes.recv(1, at)?;
-                    // SAFETY: rank0 published the packed canonical sections before this stream's wait.
+                    self.routes.wait(rank, at)?;
+                    let received = self.routes.recv(rank, at)?;
+                    // SAFETY: the source published the packed canonical sections (and
+                    // wire rows) before this stream's wait.
                     routes = Routes {
                         ids: received,
                         weights: unsafe { received.cast::<u8>().add(packed.weights).cast() },
                     };
+                    if wire {
+                        // SAFETY: as above; the input rows follow the packed routes.
+                        let rows = unsafe { received.cast::<u8>().add(packed.bytes).cast() };
+                        input = if self.uses_fp8_input() { ExpertInput::Fp8K32(rows) } else { ExpertInput::Bf16(rows) };
+                    }
                 }
             }
             let mut backend = self.ranks[rank].borrow_mut();
@@ -611,14 +722,14 @@ impl<'a> Pair<'a> {
                 backend.enqueue(layer, rows, input, routes, stream, &mut abort_once)?;
                 self.combine_output(&**backend, shared, out, rows, stream)?;
             }
-            if self.source.get() == RouteSource::Broadcast {
+            if let Some(Broadcast { source, .. }) = broadcast {
                 let at = 2 * lane + layer % 2;
-                // A publication is not consumption: rank0 must not overwrite
-                // canonical rows until rank1's backend has finished reading them.
-                if rank == 0 {
-                    self.routes.wait(0, at)?;
+                // A publication is not consumption: the source must not overwrite
+                // canonical rows until the peer's backend has finished reading them.
+                if rank == source {
+                    self.routes.wait(source, at)?;
                 } else {
-                    self.routes.signal(1, at)?;
+                    self.routes.signal(rank, at)?;
                 }
             }
             Ok(())
@@ -1088,6 +1199,27 @@ impl SubmissionOwners for TestSubmission<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// GLM's legacy pair keeps its exact behavior: rank 0 publishes routes only
+    /// when the route check selected broadcast, slots carry no wire, and the
+    /// generalized source broadcast reduces to the same push, wait and signal.
+    #[test]
+    fn legacy_enqueue_is_the_rank0_routes_only_source_broadcast() {
+        let source = include_str!("pair.rs");
+        let body = |name: &str| source.split(name).nth(1).unwrap().split("\n    }\n").next().unwrap().to_string();
+        let enqueue = body("    pub(crate) unsafe fn enqueue(\n");
+        assert!(enqueue.contains("(self.source.get() == RouteSource::Broadcast).then_some(Broadcast { source: 0, wire: false })"));
+        let new = body("    pub(crate) fn new(\n");
+        assert!(new.contains("Self::new_with_wire(library, devices, ranks, hidden, topk, max_rows, lanes, exchange, false)"));
+        let with = source.split("    pub(crate) fn new_with_wire(").nth(1).unwrap();
+        assert!(with.contains("let wire_row_bytes = match (wire, fp8) { (false, _) => 0,"));
+        assert!(with.contains("PackedRoutes::new(max_rows, topk).bytes + max_rows * wire_row_bytes"));
+        let core = source.split("    unsafe fn enqueue_with(").nth(1).unwrap();
+        assert!(core.contains("let wire_bytes = if wire { rows * self.wire_row_bytes } else { 0 };"));
+        assert!(core.contains("self.routes.push(source, at, scratch.ptr, extent)?;"));
+        assert!(core.contains("self.routes.wait(rank, at)?;"));
+        assert!(core.contains("self.routes.wait(source, at)?;") && core.contains("self.routes.signal(rank, at)?;"));
+    }
+
     #[test]
     fn owner_policy_bytes_equal_native_and_reducer_allocation_requests() -> anyhow::Result<()> {
         use super::{OwnerPair, OwnerPolicy};

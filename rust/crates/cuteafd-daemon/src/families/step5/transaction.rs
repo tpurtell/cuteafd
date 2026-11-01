@@ -144,7 +144,9 @@ impl<'a> Staging<'a> {
             bytes <= available,
             "Step-5 staging needs {bytes} bytes, admitted only {available}"
         );
-        let rows = usize::try_from(cache.layout().ring.step)?;
+        // Positions, requests and raw region rows span the whole step; ring
+        // writes are per unit (`ring.step`).
+        let rows = usize::try_from(cache.layout().step_rows)?;
         let retained = retained_wave_rows(rows, sequences)?;
         let regions = (rows + 7) / 8;
         let sparse = if cache.layout().ranks[cache.rank()].regions.is_empty() { None } else {
@@ -502,7 +504,7 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
             ensure!(
                 !cache.poisoned.get()
                     && rows <= stage.rows
-                    && rows as u64 <= cache.layout().ring.step
+                    && rows as u64 <= cache.layout().step_rows
                     && end as u64 <= cache.layout().context
                     && placement.sequence < cache.sequences(),
                 "Step-5 step outside admitted capacity"

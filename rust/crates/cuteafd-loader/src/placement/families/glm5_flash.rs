@@ -425,67 +425,14 @@ pub fn request_for_working_set(i: &GlmfInputs<'_>, working: &GlmfWorkingSet) -> 
     })
 }
 
-/// Exact header-only layer residency for the EXL3 and fp8moe loaders.
-pub fn expert_costs(catalog: &crate::OfficialV41Catalog, tp2: bool) -> anyhow::Result<Vec<ExpertCost>> {
-    use crate::formats::fp8_experts::{Fp8Projection, Slicing};
-    let shape = catalog.routed_experts();
-    let cost = |layer, tp, rank| -> anyhow::Result<Bytes2> {
-        let resident = if let Some(exl3) = catalog.exl3() {
-            exl3.residency(crate::V41Exl3Layer::Backbone(layer), tp, rank)?.device_arena_layout()?.1 as u64
-        } else if let Some(fp8) = catalog.fp8() {
-            Fp8Projection::ALL.iter().try_fold(0u64, |sum, &p| -> anyhow::Result<u64> {
-                let (w, _) = fp8.slice_bytes_with(p, tp, rank, Slicing::Blocks(128))?;
-                Ok(sum + (shape.experts * w).max(256) as u64 + fp8.scale_region_bytes_with(p, tp, rank, Slicing::Blocks(128))?.max(256) as u64)
-            })?
-        } else { anyhow::bail!("GLM Flash routed experts need EXL3 or fp8moe") };
-        Ok(Bytes2 { resident, staging: 0 })
-    };
-    (shape.first_layer..shape.layers).map(|layer| Ok(ExpertCost { whole: cost(layer, 1, 0)?,
-        half: if tp2 { [cost(layer, 2, 0)?, cost(layer, 2, 1)?] } else { [Bytes2::default(); 2] },
-        tp2, spark_ok: true })).collect()
-}
+/// Exact header-only layer residency: the shared RTX onboarding costs.
+pub use crate::placement::rtx_onboard::expert_costs;
 
-/// Exact compiled package arenas; missing packages fail closed, never become zero scratch.
+/// Exact compiled package arenas (`fp8-glmf*` or EXL3); missing packages fail
+/// closed, never become zero scratch.
 pub fn expert_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::path::Path>, rows: u64,
     tp: usize) -> anyhow::Result<u64> {
-    anyhow::ensure!([1, 2].contains(&tp), "GLM Flash RTX experts need TP1 or TP2");
-    anyhow::ensure!((1..=4096).contains(&rows), "GLM Flash expert capacity must be 1..=4096 rows");
-    let shape = catalog.routed_experts();
-    let lib = inventory::image_lib(manifest);
-    if let Some(exl3) = catalog.exl3() {
-        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-        let stem = format!("exl3-glmf-k{tiers}");
-        let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent().unwrap();
-        let root = [parent.join("exl3").join(&stem), lib.join("exl3").join(&stem)]
-            .into_iter().find(|p| p.join(format!("rtx-tp{tp}")).is_dir())
-            .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp{tp} package"))?;
-        let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::GLM5_FLASH)
-            .capacities(usize::try_from(rows)?)?;
-        let manifests = capacities.into_iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
-            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(root.join(format!("rtx-tp{tp}/m{capacity}/v41_exl3.json")))?)?;
-            anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
-                && value["intermediate"].as_u64() == Some((shape.intermediate / tp) as u64)
-                && value["experts"].as_u64() == Some(shape.experts as u64), "GLM Flash EXL3 package geometry mismatch");
-            Ok(value)
-        }).collect::<anyhow::Result<Vec<_>>>()?;
-        return Ok(cache::exl3_workspace_bytes(&manifests, true)? + rows.max(1) * shape.hidden as u64 * if tp == 2 { 4 } else { 2 });
-    }
-    let fp8 = catalog.fp8().ok_or_else(|| anyhow::anyhow!("GLM Flash fp8moe catalog missing"))?;
-    let name = fp8.format().package_name("glmf");
-    if fp8.format() == crate::formats::fp8_experts::ExpertFormat::Nvfp4 {
-        anyhow::ensure!(lib.join("fp8").join(&name).join(format!("tp{tp}")).is_dir(),
-            "missing GLM Flash {name}/tp{tp} package");
-    }
-    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(lib.join("fp8").join(&name).join("manifest.json"))?)?;
-    let scratch = inventory::fp8moe_scratch_bytes(&value, &format!("tp{tp}"), rows)
-        .ok_or_else(|| anyhow::anyhow!("missing GLM Flash tp{tp} scratch for {rows} rows"))?;
-    let bf16 = lib.join("fp8").join(format!("{name}-bf16"));
-    let sibling = if bf16.join(format!("tp{tp}")).is_dir() {
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(bf16.join("manifest.json"))?)?;
-        inventory::fp8moe_scratch_bytes(&manifest, &format!("tp{tp}"), rows)
-            .ok_or_else(|| anyhow::anyhow!("missing BF16-input GLM Flash scratch"))?
-    } else { 0 };
-    Ok(scratch.max(sibling) + if tp == 2 { rows * shape.hidden as u64 * 2 } else { 0 })
+    crate::placement::rtx_onboard::expert_workspace(catalog, manifest, rows, tp, "glmf")
 }
 
 /// Family-specific canonical selection and solved-home validation over the shared set.

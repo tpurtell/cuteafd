@@ -268,14 +268,18 @@ GEOMETRIES = {
     # Qwen 3.8 Flash Next (qwen4_exp): 512 experts, softmax top-10, unclamped SiLU.
     'qwen4': (2560, 640, 512, 10),
     'kimik3': (3584, 3072, 896, 16),
+    # Step-5: 352 experts, top-8, post-SiLU clamp at 7 (K4 experts, K6 tails 88-90).
+    'step5': (4096, 1536, 352, 8),
 }
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
-SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None}
+SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0}
+# Activation per geometry, mirroring cuteafd_core::ExpertGeometry::activation.
+ACTIVATIONS = {'kimik3': 'situ', 'step5': 'silu_post_clamp'}
 
 
 def activation(geometry: str) -> str:
-    return 'situ' if geometry == 'kimik3' else 'silu'
+    return ACTIVATIONS.get(geometry, 'silu')
 
 
 def swiglu_limit(geometry: str) -> float | None:

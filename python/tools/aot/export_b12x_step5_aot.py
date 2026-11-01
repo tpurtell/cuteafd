@@ -43,6 +43,13 @@ def builders(heads, group, summary_capacity=131072, max_staged_regions=513):
             "region_commit": lambda: c.compile_region_commit_aot(
                 max_staged_regions=max_staged_regions, capacity=summary_capacity),
         }
+    if group == "native":
+        # Native K6/K4 gate and up are separate projections; this group is last,
+        # so every earlier program keeps its table index and object.
+        from b12x.integration.cuteafd import pointwise as p
+        return {f"post_silu_split_w{width}_c{int(limit)}": (
+                    lambda width=width, limit=limit: p.compile_post_silu_split_aot(width=width, limit=limit))
+                for width in (1536, 13824) for limit in (7.0, 10.0)}
     if group not in ("pointwise", "projections"):
         raise ValueError(f"unknown Step-5 export group: {group}")
     import torch
@@ -108,7 +115,7 @@ def programs(heads, max_rows, max_context):
     capacity = (max_context + 7) // 8
     maximum = (max_rows + 14) // 8
     return [(name, name, {"max_rows": max_rows}, build)
-            for group in ("pointwise", "projections", "attention", "metadata")
+            for group in ("pointwise", "projections", "attention", "metadata", "native")
             for name, build in builders(heads, group, capacity, maximum).items()]
 
 
@@ -116,7 +123,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--heads", type=int, choices=(32, 64), default=64)
-    parser.add_argument("--group", choices=("pointwise", "projections", "attention", "metadata", "region-scores"), default="pointwise")
+    parser.add_argument("--group", choices=("pointwise", "projections", "attention", "metadata", "region-scores", "native"), default="pointwise")
     parser.add_argument("--summary-capacity", type=int, default=131072)
     parser.add_argument("--max-staged-regions", type=int, default=513)
     args = parser.parse_args()

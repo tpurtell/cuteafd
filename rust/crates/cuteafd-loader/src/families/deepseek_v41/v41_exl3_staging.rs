@@ -382,7 +382,7 @@ mod tests {
             for world in [2, 3, 4, 6] {
                 for layer in [0, 3, 77] {
                     for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
-                        for bits in 2..=5 {
+                        for bits in 2..=6 {
                             let down = kind == V41Exl3ProjectionKind::Down;
                             let projection = V41Exl3Projection { name: "test".into(), kind, bits,
                                 input_features: if down { intermediate } else { 128 },
@@ -484,7 +484,7 @@ mod tests {
     #[test]
     fn shared_tp2_union_covers_each_projection_once() -> Result<()> {
         for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
-            for bits in 2..=5 {
+            for bits in 2..=6 {
                 let (input, output) = if kind == V41Exl3ProjectionKind::Down { (2304, 128) } else { (128, 2304) };
                 let projection = V41Exl3Projection { name: "test".into(), kind, bits,
                     input_features: input, output_features: output };
@@ -547,7 +547,7 @@ mod tests {
             } else {
                 (128, 2304)
             };
-            for bits in 2..=5 {
+            for bits in 2..=6 {
                 let p = V41Exl3Projection {
                     name: "test".into(),
                     kind,

@@ -409,6 +409,27 @@
         }
       ]
     },
+    "step5:exl3": {
+      "intermediate": 1536,
+      "minimum": 3,
+      "maximum": 6,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-Core-K6",
+          "revision": "83d47a384eabc07ea6fcfaac4779b0e5f013ce89",
+          "routed_expert_bytes": 298356157440
+        }
+      ],
+      "provenance_note": "Published safetensors headers at the pinned revision: 371712 routed tensors, 298356157440 bytes. Minimum 3 from the planner (2 Sparks need 138.9 GiB/rank), maximum 6 from the shared width cap (1536 / 256); real-header plans checked on #925."
+    },
     "v41:nvfp4": {
       "intermediate": 2304,
       "minimum": 2,

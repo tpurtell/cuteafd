@@ -11,7 +11,7 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{Basis, Category, DeviceKind, DeviceLayout, Item, MemoryLayout};
 
 #[derive(Debug, thiserror::Error)]
-#[error("Step-5 layout is unqualified: {0}; use two RTX PRO 6000 for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
+#[error("Step-5 layout is unqualified: {0}; use one or two RTX PRO 6000 for EXL3, two for FP8 or one for NVFP4, with a covered Spark width and enough memory")]
 struct Unqualified(&'static str);
 
 pub(super) fn layout(
@@ -26,25 +26,30 @@ pub(super) fn layout(
         "Step-5 admission requires complete safetensors headers; missing safetensors headers"
     );
     let nvfp4 = model.formats.iter().any(|f| f == "nvfp4-g16-w4a4");
-    let coordinators = if nvfp4 { 1 } else { 2 };
+    let exl3 = model.is_exl3();
+    // Coordinator GPUs are a placement qualification: EXL3 runs on one or two
+    // RTX; the official releases keep their qualified GPU counts. Spark worlds
+    // come from the shared width-class package ranges for every format, and a
+    // frozen format admits only the worlds it shipped on.
+    let coordinators = if exl3 { opts.rtx_bytes.len() } else if nvfp4 { 1 } else { 2 };
     let spark_ranks = requested.spark_ranks();
-    let format = if nvfp4 { "nvfp4" } else { "fp8" };
-    // A frozen format admits only its shipped worlds (NVFP4: 1 RTX + 4), not
-    // every world its Spark package once covered.
+    let format = if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { "fp8" };
+    let package = if exl3 { format!("step5:{}", model.exl3_package().context("Step-5 EXL3 expert tiers")?) }
+        else { format!("step5:{format}") };
     let worlds = cuteafd_core::tp_units::frozen_admitted_worlds("step5", format)
         .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
     // The recipe names an impossible Spark count first; a valid count a
     // frozen format never shipped on refuses with its deprecation.
-    crate::plan::experts::spark_recipe(&format!("step5:{format}"), 1536, spark_ranks)?;
-    if let Some(refusal) = crate::plan::experts::frozen_refusal(&format!("step5:{format}"), spark_ranks) {
+    crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
+    if let Some(refusal) = crate::plan::experts::frozen_refusal(&package, spark_ranks) {
         anyhow::bail!("Step-5 layout is unqualified: {refusal}");
     }
     ensure!(
-        nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
+        exl3 || nvfp4 || model.formats.iter().any(|f| f == "fp8-block128"),
         Unqualified("BF16 target format")
     );
     ensure!(
-        opts.rtx_bytes.len() == coordinators
+        matches!(coordinators, 1 | 2) && opts.rtx_bytes.len() == coordinators
             && worlds.contains(&spark_ranks)
             && opts.rtx_bytes.iter().all(|&bytes| bytes > 32 << 30),
         Unqualified("coordinator/Spark count or 5090")
@@ -63,12 +68,9 @@ pub(super) fn layout(
             && report.audio == MediaMode::Off,
         Unqualified("host embedding, draft or media owners")
     );
-    ensure!(
-        opts.onboard
-            .is_none_or(|onboard| matches!(onboard, Onboard::Layers(0) | Onboard::Auto))
-            && opts.local_expert_layers.is_none_or(|n| n == 0),
-        Unqualified("coordinator-local routed experts")
-    );
+    // Every format onboards through the shared RTX expert path (pool first by
+    // default); only all-local routed experts are unqualified.
+    ensure!(opts.local_expert_layers.is_none_or(|n| n == 0), Unqualified("coordinator-local routed experts"));
     let shape = crate::plan::layout::resolve_prefill(report, opts, spark_ranks,
         crate::plan::Family::prefill_limits(&super::STEP5))?;
     let checked_rows = usize::try_from(shape.unit_rows)?;
@@ -147,8 +149,12 @@ pub(super) fn layout(
         }
     }
     let catalog = input.expert_catalog()?;
-    let format = catalog.fp8().context("Step-5 requires native expert headers")?.format();
-    let package = format.package_name("step5");
+    let package = match catalog.exl3() {
+        Some(manifest) => format!("exl3-step5-k{}",
+            manifest.decoder_tiers().iter().map(usize::to_string).collect::<String>()),
+        None => catalog.fp8().context("Step-5 requires native FP8, NVFP4 or EXL3 expert headers")?
+            .format().package_name("step5"),
+    };
     let mut code = Vec::new();
     let inventory = Inventory {
         gpus: opts
@@ -198,6 +204,8 @@ pub(super) fn layout(
         peer_diagnostics: false,
         pending_code: code,
         startup: vec![],
+        onboard: super::admission::OnboardInputs::new(input.expert_catalog()?, opts.workspace_manifest.as_deref(),
+            checked_rows, coordinators, waves, opts.onboard.unwrap_or(Onboard::Auto))?,
     };
     let admitted = admission::forecast_mtp(input.checkpoint(), &inputs, opts.native_mtp_layers)?;
     report.attention_placement = admitted.placement.attention_placement;
@@ -249,17 +257,28 @@ pub(super) fn layout(
             kv_tokens: memory.pool_tokens,
         });
     }
+    // The solver's homes are the plan: onboarded layers leave the Spark working set.
+    let rtx_layers = admitted.placement.layers.iter().enumerate()
+        .filter(|(_, l)| matches!(l.experts, ExpertHome::RtxWhole { .. } | ExpertHome::RtxTp2))
+        .map(|(layer, _)| layer).collect::<Vec<_>>();
     let working = SparkWorkingSet {
-        rtx_layers: vec![],
-        spark_layers: (3..91).collect(),
+        spark_layers: (3..91).filter(|layer| !rtx_layers.contains(layer)).collect(),
+        rtx_layers,
         spark_ranks,
         prefill_lanes: 1,
     };
+    if let Some(reason) = super::admission::onboarding_unavailable(input.expert_catalog()?, coordinators) {
+        memory.notes.push(reason.into());
+    }
+    if !working.rtx_layers.is_empty() {
+        memory.notes.push(format!("Step-5 RTX onboarding: {} routed layers {} {:?}", working.rtx_layers.len(),
+            if coordinators == 2 { "split TP2 over both RTX" } else { "whole on the RTX" }, working.rtx_layers));
+    }
     let capacity = u32::try_from(shape.unit_rows)?;
     let endpoints = (0..admitted.ownership.routed_endpoints()?)
         .map(|_| cuteafd_core::SparkEndpoint { ring_depth: None,
             capacity,
-            ingress: if nvfp4 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Native }
+            ingress: if nvfp4 && !exl3 { cuteafd_core::SparkIngress::Bf16 } else { cuteafd_core::SparkIngress::Native }
         })
         .collect::<Vec<_>>();
     let rings = cuteafd_core::SparkRings {
@@ -274,18 +293,9 @@ pub(super) fn layout(
         &working.spark_layers,
     )?;
     for rank in 0..spark_ranks {
-        let assignment = SparkAssignment::from_catalog(
-            &catalog,
-            &working,
-            rank,
-            SparkResidentLayout::Fp8 {
-                world: spark_ranks,
-                rank,
-                slicing: recipe.slicing,
-            },
-            &endpoints,
-            rings,
-        )?;
+        let layout = if exl3 { SparkResidentLayout::Exl3 { world: spark_ranks, rank } }
+            else { SparkResidentLayout::Fp8 { world: spark_ranks, rank, slicing: recipe.slicing } };
+        let assignment = SparkAssignment::from_catalog(&catalog, &working, rank, layout, &endpoints, rings)?;
         ensure!(
             assignment.resident_bytes
                 <= opts
@@ -306,8 +316,9 @@ pub(super) fn layout(
             items: vec![
                 Item::new(
                     Category::Experts,
-                    if nvfp4 { "native NVFP4 TP4 and BF16 tails" } else { "native FP8 TP6 and BF16 tails" },
-                    if nvfp4 { "W4A4" } else { "W8A16" },
+                    if exl3 { "EXL3 K4 experts and K6 tails" } else if nvfp4 { "native NVFP4 TP4 and BF16 tails" }
+                        else { "native FP8 TP6 and BF16 tails" },
+                    if exl3 { "MCG W4A16" } else if nvfp4 { "W4A4" } else { "W8A16" },
                     assignment.resident_bytes,
                     Basis::Exact,
                 ),

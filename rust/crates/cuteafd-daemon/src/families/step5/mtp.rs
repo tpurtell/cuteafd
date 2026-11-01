@@ -38,6 +38,8 @@ fn validate_programs(norm: &ProgramSpec, eh: &ProgramSpec, rows: usize) -> Resul
 pub(super) struct InputPlan {
     layout: RankWeightLayout,
     weights: Vec<WeightOperand>,
+    /// The stage's native K4 eh_proj `.weight` name (EXL3 checkpoints).
+    native: Option<String>,
     rows: usize,
     epsilon: f32,
     bytes: u64,
@@ -48,9 +50,15 @@ impl InputPlan {
         let layout = RankWeightLayout::for_mtp_stage(checkpoint, stage)?;
         let cfg = Config::parse(checkpoint)?;
         let prefix = format!("model.layers.{}.", cfg.layers + stage);
+        let eh_name = format!("{prefix}eh_proj.weight");
+        let native = layout.core.get(&eh_name).map(|core| {
+            ensure!(core.shape == [H, 2 * H] && core.ranks == 1, "Step-5 native eh_proj geometry");
+            Ok(eh_name.clone())
+        }).transpose()?;
+        let bf16_eh: &[(&str, DType, Vec<usize>)] = &[("eh_proj.weight", DType::Bf16, vec![H, 2 * H])];
         let weights = [("enorm.weight", DType::F32, vec![H]),
-            ("hnorm.weight", DType::F32, vec![H]),
-            ("eh_proj.weight", DType::Bf16, vec![H, 2 * H])].into_iter()
+            ("hnorm.weight", DType::F32, vec![H])].into_iter()
+            .chain(if native.is_some() { &[][..] } else { bf16_eh }.iter().cloned())
             .map(|(suffix, dtype, shape)| {
                 let name = format!("{prefix}{suffix}");
                 let weight = layout.operands.iter().find(|w| w.name == name)
@@ -61,10 +69,16 @@ impl InputPlan {
             }).collect::<Result<Vec<_>>>()?;
         validate_programs(programs.spec("step5_final_norm")?,
             programs.spec("step5_mtp_eh")?, rows)?;
+        let native_bytes = match &native {
+            Some(name) => (layout.core[name].bytes as u64).checked_add(
+                cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(2 * H, H, rows)?.bytes()? as u64)
+                .context("Step-5 native eh overflow")?,
+            None => 0,
+        };
         let bytes = weights.iter().map(|w| w.allocation_bytes)
-            .chain(planes(rows)?.into_iter().map(|n| n as u64))
+            .chain(planes(rows)?.into_iter().map(|n| n as u64)).chain([native_bytes])
             .try_fold(0u64, u64::checked_add).context("Step-5 predictor input byte overflow")?;
-        Ok(Self { layout, weights, rows, epsilon: cfg.norm_eps, bytes })
+        Ok(Self { layout, weights, native, rows, epsilon: cfg.norm_eps, bytes })
     }
 
     pub(super) fn bytes(&self) -> u64 { self.bytes }
@@ -75,6 +89,7 @@ struct InputWeights<'a> {
     eh: Program<'a>,
     weights: Vec<Allocation<'a>>,
     epsilon: f32,
+    native: Option<(super::native::NativeLinear<'a>, super::native::NativeScratch<'a>)>,
 }
 
 pub(super) struct InputOwner<'a> {
@@ -99,7 +114,15 @@ impl<'a> InputOwner<'a> {
             let weights = plan.weights.iter()
                 .map(|w| load_operand(device, checkpoint, &plan.layout, w))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(Rc::new(InputWeights { norm, eh, weights, epsilon: plan.epsilon }))
+            let native = plan.native.as_ref().map(|name| -> Result<_> {
+                let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
+                    plan.rows, |n| n == name)?;
+                let layout = layer.scratch_layout(plan.rows)?.context("native eh scratch")?;
+                let linear = Rc::try_unwrap(layer.linears.remove(name).context("native eh")?)
+                    .map_err(|_| anyhow::anyhow!("native eh aliased"))?;
+                Ok((linear, super::native::NativeScratch::allocate(device, &layout)?))
+            }).transpose()?;
+            Ok(Rc::new(InputWeights { norm, eh, weights, epsilon: plan.epsilon, native }))
         })?;
         Self::workspace(stream, immutable, plan.rows, arena)
     }
@@ -139,8 +162,14 @@ impl<'a> InputOwner<'a> {
                     &scalars, self.stream.raw)?;
                 library.glm_dflash_tap(p(1), p(3), rows, H, 2 * H, 0, self.stream.raw)?;
                 library.glm_dflash_tap(p(2), p(3), rows, H, 2 * H, H, self.stream.raw)?;
-                self.immutable.eh.launch(&[p(3), w(2), p(4)],
-                    &[Scalar::I32(rows as i32)], self.stream.raw)?;
+                if let Some((linear, scratch)) = &self.immutable.native {
+                    let view = |n: usize, width: usize| CuteafdDeviceBuffer { bytes: rows * width * 2,
+                        ..self.planes[n].buffer };
+                    linear.launch(rows, view(3, 2 * H), view(4, H), &scratch.scratch, self.stream.raw)?;
+                } else {
+                    self.immutable.eh.launch(&[p(3), w(2), p(4)],
+                        &[Scalar::I32(rows as i32)], self.stream.raw)?;
+                }
                 library.cuda_zero_bytes_async(self.planes[5].buffer, rows * H * 4, self.stream.raw)?;
                 library.cuda_accumulate_bf16_to_f32_async(self.planes[4].buffer,
                     self.planes[5].buffer, rows * H, self.stream.raw)?;
@@ -287,7 +316,7 @@ impl<'a> StageOwner<'a> {
         let sliding = state.sliding.iter().find(|s| s.mtp && s.layer == 92 + self.stage)
             .context("Step-5 predictor cache layer missing")?;
         ensure!(cache.layout().kv_format == self.kv_format && sliding.query_heads == 64
-            && sliding.key.bytes == cache.layout().ring.rows * self.kv_format.plane_record_bytes(4, 192) as u64
+            && sliding.key.bytes == cache.layout().mtp_ring.rows * self.kv_format.plane_record_bytes(4, 192) as u64
             && sliding.value.bytes == sliding.key.bytes,
             "Step-5 predictor cache KV geometry");
         let length = *state.mtp_lengths.get(self.stage).context("Step-5 predictor length missing")?;
@@ -308,7 +337,7 @@ impl<'a> StageOwner<'a> {
             "Step-5 predictor lane row capacity/cache binding");
         cache.validate_reset(sequence)?;
         let coordinates = Coordinates::new(self.stage, base, rows,
-            cache.layout().context, cache.layout().ring)?;
+            cache.layout().context, cache.layout().mtp_ring)?;
         let components = self.cache_components(cache, sequence)?;
         cache.drain()?;
         let mut encoded = [0; 8];
@@ -335,7 +364,7 @@ impl<'a> StageOwner<'a> {
         ensure!(cache.predictor_frontier(sequence, self.stage)? == base,
             "Step-5 live predictor submission evidence differs from its frontier");
         let coordinates = Coordinates::new(self.stage, base, rows,
-            cache.layout().context, cache.layout().ring)?;
+            cache.layout().context, cache.layout().mtp_ring)?;
         let components = self.cache_components(cache, sequence)?;
         let inputs = [self.input.planes[4].buffer, self.input.planes[5].buffer];
         cache.busy[sequence as usize].set(true);
@@ -356,7 +385,7 @@ impl<'a> StageOwner<'a> {
         let element = if self.stage == 0 { 2 } else { 4 };
         let target = self.input.planes[5].buffer;
         let ring = cuteafd_core::prefix::AppendRing { window: cache.layout().mtp_hidden_rows
-            - cache.layout().ring.step, step: cache.layout().ring.step, rows: cache.layout().mtp_hidden_rows };
+            - cache.layout().step_rows, step: cache.layout().step_rows, rows: cache.layout().mtp_hidden_rows };
         self.stream.device.run(|| {
             for run in ring.runs(base, rows as u64).context("Step-5 predictor source history extent")? {
                 let input = slice(source, run.slot as usize * H * element, run.rows as usize * H * element)?;
@@ -481,7 +510,7 @@ impl<'e, 'a> StageStep<'e, 'a> {
             compact.enqueue(stream, projected, rows, 64)?
         } else { projected };
         let row_bytes = owner.kv_format.plane_record_bytes(4, 192);
-        for run in self.cache.layout().ring.proposal(self.coordinates.base, rows as u64)
+        for run in self.cache.layout().mtp_ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor proposal ring")? {
             for (target, source) in self.components[..2].iter().copied().zip(projected) {
                 let source = slice(source, run.offset as usize * row_bytes, run.rows as usize * row_bytes)?;
@@ -499,11 +528,11 @@ impl<'e, 'a> StageStep<'e, 'a> {
                 extent: (self.coordinates.end + owner.stage as u64 + 1) as usize, heads: 64, kv_format: owner.kv_format },
             start: 0, key: self.components[0], value: self.components[1], summaries: None,
             table: owner.metadata[3].buffer, table_width: self.coordinates.table.len(),
-            pages: self.cache.layout().ring.rows as usize / 64,
+            pages: self.cache.layout().mtp_ring.rows as usize / 64,
         })?;
         let history_ring = cuteafd_core::prefix::AppendRing {
-            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().ring.step,
-            step: self.cache.layout().ring.step, rows: self.cache.layout().mtp_hidden_rows };
+            window: self.cache.layout().mtp_hidden_rows - self.cache.layout().step_rows,
+            step: self.cache.layout().step_rows, rows: self.cache.layout().mtp_hidden_rows };
         for run in history_ring.proposal(self.coordinates.base, rows as u64)
             .context("Step-5 predictor own history ring")? {
             let source = slice(owner.attention.output(), run.offset as usize * H * 4, run.rows as usize * H * 4)?;
@@ -823,7 +852,7 @@ mod tests {
         let cfg = Config::parse(&checkpoint)?;
         let kv_format: Qwen4KvCache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
-        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format)?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, 64, kv_format)?;
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);
@@ -924,7 +953,7 @@ mod tests {
         let cfg = Config::parse(&checkpoint)?;
         let kv_format: Qwen4KvCache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
-        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, kv_format)?;
+        let layout = cuteafd_loader::serving_capacity::step5::Step5CacheLayout::new(&cfg, 1, 1024, 3, 64, 64, kv_format)?;
         let mut cache = CacheRank::new(device, layout.clone(), 0, 1, 2, 1, usize::MAX)?;
         let contract = CoordinatorContract::from_checkpoint(&checkpoint)?;
         let rope = Rc::new(TargetTables::load(device, &programs, &contract, "step5_", u64::MAX, &[])?);

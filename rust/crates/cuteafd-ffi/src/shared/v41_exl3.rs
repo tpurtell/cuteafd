@@ -59,7 +59,7 @@ impl V41Exl3Info {
         let tier_count = words[6] as usize;
         let bits: [u32; 4] = words[11..15].try_into().unwrap();
         ensure!(
-            bits[..tier_count].iter().all(|bit| (2..=5).contains(bit))
+            bits[..tier_count].iter().all(|bit| (2..=6).contains(bit))
                 && bits[tier_count..].iter().all(|bit| *bit == 0)
                 && bits[..tier_count]
                     .iter()

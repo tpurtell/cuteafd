@@ -179,7 +179,7 @@ impl<'a> KimiRecords<'_, 'a> {
         let svh = vector("svh", n0, local_n)?;
         ensure!(payload.buffer.bytes + suh.buffer.bytes + svh.buffer.bytes == layout.bytes,
             "{stem}: K6 shard differs from admitted bytes");
-        Ok(CoreWeights { payload, suh, svh, shape: layout.shape, side: layout.side, codebook: layout.codebook })
+        Ok(CoreWeights { payload, suh, svh, shape: layout.shape, side: layout.side, bits: layout.bits, codebook: layout.codebook })
     }
 
     /// One rank's global weights, allocated from `layout`.

@@ -172,6 +172,16 @@ mod tests {
             serde_json::json!({"capacities": {"max_context": 1048576}, "programs": entries});
         let path = dir.path().join("PROGRAMS.json");
         std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+        // The coordinator fp8moe packages a two-RTX FP8 card onboards TP2 through.
+        for name in ["fp8-step5", "fp8-step5-nvfp4a4"] {
+            let root = dir.path().join("fp8").join(name);
+            for tp in ["tp1", "tp2"] { std::fs::create_dir_all(root.join(tp))?; }
+            let capacities = |scale: u64| [1u64, 16, 80, 256, 1024, 4096].map(|capacity|
+                serde_json::json!({"capacity": capacity, "scratch_bytes": capacity * scale}));
+            std::fs::write(root.join("manifest.json"), serde_json::to_vec(&serde_json::json!({"layouts": {
+                "tp1": {"capacities": capacities(65536)}, "tp2": {"capacities": capacities(32768)}}}))?)?;
+        }
+        let catalog = cuteafd_loader::read_expert_catalog(dir.path())?;
         let prefixes: &[&str] = if ranks == 2 { &["step5", "step52"] } else { &["step5"] };
         let programs = ProgramSet::from_manifest(&manifest, prefixes);
         let checkpoint = Checkpoint::coordinator(dir.path(), false, false)?;
@@ -273,6 +283,9 @@ mod tests {
                 peer_diagnostics: false,
                 pending_code: code,
                 startup: vec![],
+                // As serve-step5 builds them: pool-first RTX onboarding.
+                onboard: cuteafd_loader::plan::families::step5::admission::OnboardInputs::new(&catalog,
+                    Some(&path), unit, ranks, waves, cuteafd_loader::placement::Onboard::Auto)?,
             };
             let live = checkpoint_admission(&checkpoint, &inputs);
             if !report.wip_launchable() {

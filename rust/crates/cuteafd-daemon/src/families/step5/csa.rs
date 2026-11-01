@@ -179,10 +179,12 @@ struct CsaWeights<'a> {
     kv_format: Qwen4KvCache,
     rope: std::rc::Rc<TargetTables<'a>>,
     layer: usize,
-    weights: Vec<Allocation<'a>>,
+    /// Native q/k/v/o slots (1, 2, 3, 7) hold no BF16 allocation.
+    weights: Vec<Option<Allocation<'a>>>,
     programs: Vec<Program<'a>>,
     residual: Program<'a>,
     epsilon: f32,
+    native: Option<super::native::NativeAttention<'a>>,
 }
 
 pub(super) struct CsaLayer<'a> {
@@ -190,6 +192,7 @@ pub(super) struct CsaLayer<'a> {
     stream: Stream<'a>,
     ffn: Option<DenseFfn<'a>>,
     planes: Vec<Plane<'a>>,
+    native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     admission: Admission,
     immutable: std::rc::Rc<CsaWeights<'a>>,
 }
@@ -213,7 +216,7 @@ impl<'a> CsaLayer<'a> {
         kv_format: Qwen4KvCache,
     ) -> Result<Self> {
         Self::load_layout(device, programs, checkpoint, layer_id, rows, rope, available,
-            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format)
+            reservations, RankWeightLayout::from_checkpoint(checkpoint, 0, 1)?, true, None, kv_format, None)
     }
 
     pub fn for_execution(
@@ -229,12 +232,14 @@ impl<'a> CsaLayer<'a> {
         arena: &Arena<'a>,
         ownership: &cuteafd_loader::plan::families::step5::ownership::ExecutionOwnership,
         kv_format: Qwen4KvCache,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     ) -> Result<Self> {
         let local = ownership.layer(layer, rank)?;
         ensure!(local.query_heads == 64 && local.kv_heads == 4,
             "Step-5 CSA needs a whole native attention owner");
         Self::load_layout(device, programs, checkpoint, layer, rows, rope, available,
-            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false, Some((arena, 0)), kv_format)
+            reservations, RankWeightLayout::for_execution(checkpoint, rank, ownership)?, false, Some((arena, 0)),
+            kv_format, native_scratch)
     }
 
     fn load_layout(
@@ -250,6 +255,7 @@ impl<'a> CsaLayer<'a> {
         include_dense: bool,
         arena: Option<(&Arena<'a>, usize)>,
         kv_format: Qwen4KvCache,
+        native_scratch: Option<std::rc::Rc<super::native::NativeScratch<'a>>>,
     ) -> Result<Self> {
         let contract = CoordinatorContract::from_checkpoint(checkpoint)?;
         let layer = contract
@@ -296,14 +302,21 @@ impl<'a> CsaLayer<'a> {
             "self_attn.sparse_indexer_k_norm.bias",
             "self_attn.sparse_indexer_w.weight",
         ];
+        let native_slots = super::native::ATTENTION_SLOTS.iter()
+            .filter(|&&slot| layout.core.contains_key(&format!("model.layers.{layer_id}.{}", suffixes[slot])))
+            .count();
+        ensure!(native_slots == 0 || native_slots == 4, "CSA layer {layer_id} mixes native and BF16 q/k/v/o");
+        let native_layer = native_slots == 4;
         let weights = suffixes
             .iter()
-            .map(|s| {
+            .enumerate()
+            .map(|(slot, s)| {
+                if native_layer && super::native::ATTENTION_SLOTS.contains(&slot) { return Ok(None); }
                 layout
                     .operands
                     .iter()
                     .find(|w| w.name == format!("model.layers.{layer_id}.{s}"))
-                    .with_context(|| format!("CSA operand {s}"))
+                    .with_context(|| format!("CSA operand {s}")).map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
         for (w, (dtype, shape)) in weights.iter().zip([
@@ -323,6 +336,7 @@ impl<'a> CsaLayer<'a> {
             (DType::Bf16, vec![256]),
             (DType::Bf16, vec![16, H]),
         ]) {
+            let Some(w) = w else { continue };
             ensure!(
                 w.dtype == dtype && w.shape == shape,
                 "CSA weight shape/dtype: {}",
@@ -336,7 +350,10 @@ impl<'a> CsaLayer<'a> {
             rows,
             &weights
                 .iter()
+                .flatten()
                 .map(|w| w.allocation_bytes)
+                .chain(super::native::ATTENTION_SLOTS.iter().filter(|_| native_layer).map(|&slot|
+                    layout.core[&format!("model.layers.{layer_id}.{}", suffixes[slot])].bytes as u64))
                 .chain(dense.as_ref().map(DensePlan::bytes))
                 .collect::<Vec<_>>(),
             if rope.is_none() {
@@ -394,7 +411,8 @@ impl<'a> CsaLayer<'a> {
             ("step5_attn_out", Q, H),
             ("step5_index_q", H, H),
             ("step5_index_kz", H, 256),
-        ] {
+        ].into_iter().filter(|(name, ..)| !native_layer
+            || !matches!(*name, "step5_attn_q" | "step5_attn_kv" | "step5_attn_out")) {
             let g = &programs.spec(name)?.geometry;
             ensure!(
                 g["width"] == width
@@ -497,18 +515,37 @@ impl<'a> CsaLayer<'a> {
         let ffn = dense
             .map(|plan| DenseFfn::load_plan(device, programs, checkpoint, plan))
             .transpose()?;
+        let native = super::native::NativeAttention::load(device, programs, checkpoint, &layout, layer_id,
+            rows.min(4096), Q, KV, H)?;
+        ensure!(native.is_some() == native_layer, "CSA native attention inventory");
+        ensure!(native.as_ref().is_none_or(|n| n.o.side() == cuteafd_loader::formats::dense_trellis::TrellisSide::Output),
+            "CSA attention is whole-owned; its native o_proj is never K-split");
         let weights = weights
             .into_iter()
-            .map(|w| load_operand(device, checkpoint, &layout, w))
+            .map(|w| w.map(|w| load_operand(device, checkpoint, &layout, w)).transpose())
             .collect::<Result<Vec<_>>>()?;
-        Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { kv_format, rope, layer: layer_id, weights,
-            programs: resolved, residual, epsilon: contract.norms.input }), ffn, arena)
+        let mut owner = Self::workspace(device, admission, std::rc::Rc::new(CsaWeights { kv_format, rope, layer: layer_id, weights,
+            programs: resolved, residual, epsilon: contract.norms.input, native }), ffn, arena)?;
+        owner.native_scratch = match (&owner.immutable.native, native_scratch) {
+            (None, _) => None,
+            (Some(_), Some(shared)) => Some(shared),
+            (Some(native), None) => Some(std::rc::Rc::new(super::native::NativeScratch::allocate(device,
+                &native.scratch_layout(rows.min(4096))?)?)),
+        };
+        Ok(owner)
     }
 
     /// Fresh metadata and attention/FFN planes, with no checkpoint or program reload.
     pub(super) fn new_lane(&self) -> Result<Self> {
         let ffn = self.ffn.as_ref().map(DenseFfn::new_lane).transpose()?;
-        Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)
+        let mut lane = Self::workspace(self.stream.device, self.admission.clone(), self.immutable.clone(), ffn, None)?;
+        if let Some(shared) = &self.native_scratch { lane.native_scratch = Some(shared.sibling(self.stream.device)?); }
+        Ok(lane)
+    }
+
+    /// A BF16 operand slot; native slots never reach a BF16 program.
+    fn weight(&self, slot: usize) -> *mut std::ffi::c_void {
+        self.immutable.weights[slot].as_ref().map_or(std::ptr::null_mut(), |w| w.buffer.ptr)
     }
 
     fn workspace(device: Device<'a>, admission: Admission,
@@ -516,7 +553,7 @@ impl<'a> CsaLayer<'a> {
         let planes = scratch::planes(device, &admission.planes, arena)?;
         let stream = Stream::new(device)?;
         let rows = admission.rows;
-        let owner = Self { stream, ffn, planes, admission, immutable };
+        let owner = Self { stream, ffn, planes, native_scratch: None, admission, immutable };
         if arena.is_none() {
             for (plane, data) in [
                 (
@@ -622,8 +659,8 @@ impl<'a> CsaLayer<'a> {
             stage,
             &[
                 self.ptr(input, start * width * 2),
-                self.immutable.weights[weight].buffer.ptr,
-                self.immutable.weights[bias].buffer.ptr,
+                self.weight(weight),
+                self.weight(bias),
                 cos.ptr,
                 sin.ptr,
                 positions.ptr.wrapping_byte_add(start * 8),
@@ -661,7 +698,7 @@ impl<'a> CsaLayer<'a> {
             let count = (rows - start).min(4096);
             let scalar = [Scalar::I32(count as i32)];
             let p = |i| self.ptr(i, start * H * 2);
-            let w = |i: usize| self.immutable.weights[i].buffer.ptr;
+            let w = |i: usize| self.weight(i);
             self.launch_on(
                 stream,
                 0,
@@ -676,6 +713,16 @@ impl<'a> CsaLayer<'a> {
                 ],
                 &[scalar[0], Scalar::F32(self.immutable.epsilon)],
             )?;
+            if let Some(native) = &self.immutable.native {
+                let scratch = &self.native_scratch.as_ref().context("CSA native scratch")?.scratch;
+                let view = |plane: usize, width: usize| CuteafdDeviceBuffer {
+                    ptr: self.ptr(plane, start * width * 2), bytes: count * width * 2,
+                    ..self.planes[plane].buffer };
+                native.q.launch(count, view(NORM, H), view(QRAW, Q), scratch, stream.raw)?;
+                native.k.launch(count, view(NORM, H), view(KRAW, KV), scratch, stream.raw)?;
+                native.v.launch(count, view(NORM, H), view(VALUE, KV), scratch, stream.raw)?;
+            }
+            let bf16_qkv = self.immutable.native.is_none();
             for (stage, weight, out, width) in [
                 (1, 1, QRAW, Q),
                 (2, 2, KRAW, KV),
@@ -684,7 +731,7 @@ impl<'a> CsaLayer<'a> {
                 (6, 8, IQRAW, H),
                 (7, 9, IKRAW, 256),
                 (7, 10, IZ, 256),
-            ] {
+            ].into_iter().filter(|(_, weight, ..)| bf16_qkv || !matches!(weight, 1 | 2 | 3)) {
                 self.launch_on(
                     stream,
                     stage,
@@ -834,7 +881,8 @@ impl<'a> CsaLayer<'a> {
     }
 
     pub fn validate_live_weights(&self, device: Device<'_>) -> Result<()> {
-        super::weights::validate_live_weights(device.id, &self.immutable.weights)
+        let live = self.immutable.weights.iter().flatten().map(|w| w.buffer).collect::<Vec<_>>();
+        super::weights::validate_live_buffers(device.id, &live)
     }
 
     pub fn input(&self) -> CuteafdDeviceBuffer {
@@ -1017,16 +1065,23 @@ impl<'a> CsaLayer<'a> {
             ],
             &scalar,
         )?;
-        self.launch_on(
-            stream,
-            16,
-            &[
-                self.ptr(GATED, start * Q * 2),
-                self.immutable.weights[7].buffer.ptr,
-                self.ptr(DELTA, start * H * 2),
-            ],
-            &scalar,
-        )?;
+        if let Some(native) = &self.immutable.native {
+            let scratch = &self.native_scratch.as_ref().context("CSA native scratch")?.scratch;
+            let view = |plane: usize, width: usize| CuteafdDeviceBuffer {
+                ptr: self.ptr(plane, start * width * 2), bytes: rows * width * 2, ..self.planes[plane].buffer };
+            native.o.launch(rows, view(GATED, Q), view(DELTA, H), scratch, stream.raw)?;
+        } else {
+            self.launch_on(
+                stream,
+                16,
+                &[
+                    self.ptr(GATED, start * Q * 2),
+                    self.weight(7),
+                    self.ptr(DELTA, start * H * 2),
+                ],
+                &scalar,
+            )?;
+        }
         stream.device.run(|| {
             // SAFETY: this tile's residual and delta are retained by the stream-first owner.
             unsafe {
@@ -1649,7 +1704,7 @@ mod tests {
                                 start * H * 2
                             },
                         ),
-                        chain.immutable.weights[weight].buffer.ptr,
+                        chain.weight(weight),
                         chain.ptr(plane, start * width * 2),
                     ],
                     &[Scalar::I32(count as i32)],
@@ -1704,7 +1759,7 @@ mod tests {
                 10,
                 &[
                     chain.ptr(NORM, start * H * 2),
-                    chain.immutable.weights[14].buffer.ptr,
+                    chain.weight(14),
                     chain.ptr(IW, start * 16 * 4),
                     chain.ptr(IWSCR, start * 16 * 2),
                 ],

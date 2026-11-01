@@ -317,6 +317,14 @@ def test_step5_dispatches_to_serve_step5(tmp_path: Path, model: str, gpus: int, 
     assert lines[probe].endswith("serve-step5 --help ") and probe < lines.index(plan)
 
 
+def test_step5_fixed_rtx_expert_layers_reach_serve(tmp_path: Path) -> None:
+    keys = "SPARK_COUNT=6\nRTX_GPUS=2\nRTX_EXPERT_LAYERS=10\n" + _hosts(6)
+    serve = _line(_step5(tmp_path / "fixed", keys), "cuteafd serve-step5 --snapshot")
+    assert _flag(serve, "--rtx-expert-layers") == "10"
+    result = _step5(tmp_path / "invalid", "SPARK_COUNT=6\nRTX_GPUS=2\nRTX_EXPERT_LAYERS=half\n" + _hosts(6))
+    assert result.returncode != 0
+
+
 @pytest.mark.parametrize("model,gpus,sparks", [(STEP5_FP8, 2, ranks) for ranks in (4, 5, 6)] + [(STEP5_NVFP4, 1, 4)])
 @pytest.mark.parametrize("value,expected", [(None, "fp8"), ("bf16", "bf16"), ("fp8", "fp8")])
 def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, sparks, value, expected) -> None:
@@ -335,7 +343,6 @@ def test_step5_cache_format_matches_plan_and_serve(tmp_path: Path, model, gpus, 
     ("SPARK_COUNT=0\n", "Step-5 has no local-expert layout"),
     ("EXPERT_BACKEND=local\nSPARK_COUNT=0\n", "Step-5 has no local-expert layout"),
     ("EMBEDDING=host\n", "step5 serves GPU token embeddings only"),
-    ("RTX_EXPERT_LAYERS=4\n", "unused configuration key: RTX_EXPERT_LAYERS"),
     ("SPECULATOR_MODEL_ID=x/y\n", "unused configuration key: SPECULATOR_MODEL_ID"),
     ("SPECULATOR_MODEL_REVISION=abc\n", "unused configuration key: SPECULATOR_MODEL_REVISION"),
     ("SPECULATOR_DRAFTS=adaptive\n", "unused configuration key: SPECULATOR_DRAFTS"),
