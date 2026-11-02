@@ -53,6 +53,8 @@ pub enum ModelEncoding {
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
+    /// Muse Spark: the checkpoint's template and recipient-addressed messages.
+    Muse(Arc<muse::MuseEncoding>),
 }
 
 impl ModelEncoding {
@@ -60,6 +62,7 @@ impl ModelEncoding {
     pub fn supports_thinking_off(&self) -> bool {
         match self {
             Self::Step5(encoding) => encoding.supports_thinking_off(),
+            Self::Muse(_) => false,
             _ => true,
         }
     }
@@ -72,6 +75,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => encoding.tokens().eos.clone(),
             Self::Kimi(encoding) => encoding.eos_token_ids(),
             Self::Step5(encoding) => encoding.tokens().eos.clone(),
+            Self::Muse(encoding) => encoding.tokens().eos.clone(),
         }
     }
 
@@ -82,6 +86,7 @@ impl ModelEncoding {
             Self::Qwen(encoding) => Some(encoding.tokens().think_close),
             Self::Kimi(_) => None,
             Self::Step5(encoding) => Some(encoding.tokens().think_close),
+            Self::Muse(_) => None,
         }
     }
 }
@@ -206,6 +211,13 @@ impl ModelProfile {
                 ids.dedup();
                 ids
             }
+            ModelEncoding::Muse(encoding) => {
+                let mut ids = encoding.stop_token_ids();
+                ids.extend(&self.eos_token_ids);
+                ids.sort_unstable();
+                ids.dedup();
+                ids
+            }
             ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 | ModelEncoding::Kimi(_) => self.eos_token_ids.clone(),
         }
     }
@@ -223,7 +235,7 @@ mod admission;
 mod constraints;
 mod tools;
 pub mod chat;
-use chat::{deepseek, glm5, kimi, qwen4, step5};
+use chat::{deepseek, glm5, kimi, muse, qwen4, step5};
 pub use constraints::NativeConstraint;
 mod images;
 pub mod media;
@@ -583,6 +595,7 @@ enum Templated {
     Qwen(Arc<qwen4::QwenEncoding>),
     Kimi(Arc<kimi::KimiEncoding>),
     Step5(Arc<step5::Step5Encoding>),
+    Muse(Arc<muse::MuseEncoding>),
 }
 
 impl Templated {
@@ -597,6 +610,11 @@ impl Templated {
                 step5::prompt::validate_thinking(body)?;
                 Ok(glm5::GlmThinking { enabled: true, effort: None })
             }
+            Self::Muse(_) => {
+                muse::prompt::validate_thinking(body)?;
+                muse::prompt::template_effort(body)?;
+                Ok(glm5::GlmThinking { enabled: true, effort: None })
+            }
         }
     }
 }
@@ -608,6 +626,7 @@ enum OutputProcessor {
     Qwen(glm5::GlmStreamProcessor<ChatGenerator, qwen4::QwenOutputParser>),
     Kimi(glm5::GlmStreamProcessor<ChatGenerator, kimi::KimiOutputParser>),
     Step5(glm5::GlmStreamProcessor<ChatGenerator, step5::Step5OutputParser>),
+    Muse(glm5::GlmStreamProcessor<ChatGenerator, muse::MuseOutputParser>),
 }
 
 impl OutputProcessor {
@@ -618,6 +637,7 @@ impl OutputProcessor {
             Self::Qwen(processor) => Box::pin(processor.process(input)),
             Self::Kimi(processor) => Box::pin(processor.process(input)),
             Self::Step5(processor) => Box::pin(processor.process(input)),
+            Self::Muse(processor) => Box::pin(processor.process(input)),
         }
     }
 }
@@ -755,6 +775,7 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         ModelEncoding::Qwen(encoding) => Some(Templated::Qwen(encoding.clone())),
         ModelEncoding::Kimi(encoding) => Some(Templated::Kimi(encoding.clone())),
         ModelEncoding::Step5(encoding) => Some(Templated::Step5(encoding.clone())),
+        ModelEncoding::Muse(encoding) => Some(Templated::Muse(encoding.clone())),
         ModelEncoding::DeepseekV4 | ModelEncoding::DeepseekV41 => None,
     };
     let assistance = match body.get("tool_decoding_assistance") {
@@ -865,17 +886,21 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
         Some((Templated::Glm(_), _, _)) => tools::ToolSyntax::GlmXml,
         Some((Templated::Qwen(_), _, _)) | Some((Templated::Step5(_), _, _)) => tools::ToolSyntax::QwenXml,
         Some((Templated::Kimi(_), _, _)) => tools::ToolSyntax::KimiXtml,
+        Some((Templated::Muse(_), _, _)) => tools::ToolSyntax::MuseAtem,
         None => tools::ToolSyntax::Dsml,
     };
     let tool_constraints = tools::ToolConstraints::new(&converted.conversation.tools,
         converted.conversation.tool_choice, selection.required, parallel,
         assistance || response_format.as_ref().is_some_and(|v| v["type"] != "text"), syntax).map_err(Rejection::bad)?;
-    let constraint = match profile.encoding.think_close_token_id() {
+    let constraint = if matches!(profile.encoding, ModelEncoding::Muse(_)) {
+        constraints::muse_response_constraint(response_format.clone(), tool_constraints.as_ref())
+            .map_err(Rejection::bad)?
+    } else { match profile.encoding.think_close_token_id() {
         Some(token) => constraints::response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref(), token),
         None => constraints::kimi_response_constraint(response_format.clone(), converted.conversation.thinking_mode,
             tool_constraints.as_ref()),
-    }.map_err(Rejection::bad)?;
+    }.map_err(Rejection::bad)? };
     let validator = tools::CompletionValidator::new(response_validator, tool_constraints);
     let tools_declared = !converted.conversation.tools.is_empty();
     let stop_token_ids = profile.stop_token_ids(tools_declared);
@@ -938,6 +963,24 @@ pub(crate) fn build(profile: &ModelProfile, limits: NativeLimits, headers: &axum
                 tools: tools_declared.then(|| converted.conversation.tools.clone()),
                 stop_sequences: converted.parsing_options.stop_sequences.clone() });
             (prompt, Vec::new(), OutputProcessor::Step5(glm5::GlmStreamProcessor::new(generator, parser)))
+        }
+        Some((Templated::Muse(encoding), raw, _thinking)) => {
+            let tool_choice = match (selection.name(), selection.required) {
+                (Some(name), _) => muse::MuseToolChoice::Named(name.to_owned()),
+                (None, true) => muse::MuseToolChoice::Required,
+                (None, false) => muse::MuseToolChoice::Auto,
+            };
+            let options = muse::MusePromptOptions {
+                tool_names: converted.conversation.tools.iter().map(|tool| tool.name.clone()).collect(),
+                tool_choice, response_format };
+            let prompt = if expanded_media_probe { String::new() } else {
+                encoding.render(&raw, &options).map_err(Rejection::bad)?
+            };
+            let parser = muse::MuseOutputParser::new(muse::MuseParserOptions {
+                tools: (tools_declared && converted.conversation.tool_choice != deepseek_recipe_core::tools::ToolChoice::None)
+                    .then(|| converted.conversation.tools.clone()),
+                stop_sequences: converted.parsing_options.stop_sequences.clone() });
+            (prompt, Vec::new(), OutputProcessor::Muse(glm5::GlmStreamProcessor::new(generator, parser)))
         }
         Some((Templated::Qwen(encoding), raw, thinking)) => {
             let tool_choice = match (selection.name(), selection.required) {
@@ -1644,6 +1687,99 @@ mod tests {
             }
             worker.await.unwrap();
         }
+    }
+
+    /// Muse renders its own prompt, stops at its EOS ids and routes the
+    /// recipient-addressed messages: reasoning, content and a released call.
+    #[tokio::test]
+    async fn muse_dispatch_routes_recipients_and_tool_calls() {
+        for streaming in [false, true] {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let worker = tokio::spawn(async move {
+                let job = rx.recv().await.unwrap();
+                assert!(job.prompt.starts_with("<|begin_of_text|><|start|>system<|message|>"));
+                assert!(job.prompt.ends_with("<|start|>assistant") && job.prompt.contains("Reasoning strength: 32."));
+                assert_eq!(job.stop_token_ids, vec![200_001, 200_008]);
+                assert!(job.constraint.is_none());
+                let text = " to=self<|message|>Plan<|eom|><|start|>assistant to=commentary<|message|>Checking.<|eom|>\
+                    <|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n\
+                    <atem:parameter name=\"city\">Oslo</atem:parameter>\n</atem:invoke>\n</atem:function_calls>";
+                for event in [
+                    InferenceChunk::Ready { system_fingerprint: None,
+                        prompt_usage: PromptUsage { prompt_tokens: 12, prompt_cache_hit_tokens: 0 } },
+                    InferenceChunk::Text { content: text.into(), content_tokens: 30 },
+                    InferenceChunk::Finish { finish_reason: InferenceFinishReason::Stop },
+                ] { job.events.send(Ok(event)).unwrap(); }
+            });
+            let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
+            assert_eq!(engine::system_placement(&profile), engine::SystemPlacement::Anywhere);
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let body = json!({"model": "muse-test", "messages": [{"role": "user", "content": "Weather?"}],
+                "reasoning_effort": "medium", "max_tokens": 64, "stream": streaming,
+                "tools": [{"type": "function", "function": {"name": "get_weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]});
+            let response = app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            if streaming {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                assert!(text.contains("reasoning_content") && text.contains("Checking.") && text.contains("get_weather"));
+                assert!(text.contains("\"finish_reason\":\"tool_calls\""));
+            } else {
+                let result: Value = serde_json::from_slice(&bytes).unwrap();
+                let message = &result["choices"][0]["message"];
+                assert_eq!((message["reasoning_content"].as_str(), message["content"].as_str()), (Some("Plan"), Some("Checking.")));
+                assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+                assert_eq!(serde_json::from_str::<Value>(message["tool_calls"][0]["function"]["arguments"].as_str().unwrap())
+                    .unwrap(), json!({"city": "Oslo"}));
+                assert_eq!(result["choices"][0]["finish_reason"], "tool_calls");
+            }
+            worker.await.unwrap();
+        }
+    }
+
+    /// Constrained Muse requests carry the native recipient-turn grammar:
+    /// strict or required tools (atem `muse_tool_schema` tags), assistance and
+    /// structured response formats; unconstrained ones carry none. Thinking off
+    /// still refuses (the template always reasons).
+    #[tokio::test]
+    async fn muse_constrained_requests_carry_the_native_turn_grammar() {
+        let weather = json!({"type": "function", "function": {"name": "get_weather",
+            "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}});
+        let mut strict = weather.clone();
+        strict["function"]["strict"] = json!(true);
+        let send = |extra: Value| async move {
+            let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("muse-test", ModelEncoding::Muse(Arc::new(muse::fixtures::encoding())));
+            let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(5), ConsoleHub::disabled(), profile);
+            let mut body = json!({"model": "muse-test", "messages": [{"role": "user", "content": "Reply in JSON"}],
+                "max_tokens": 8});
+            for (key, value) in extra.as_object().unwrap() { body[key] = value.clone(); }
+            let task = tokio::spawn(app.oneshot(axum::http::Request::post("/v1/chat/completions")
+                .header("content-type", "application/json").body(Body::from(body.to_string())).unwrap()));
+            let job = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await.ok().flatten();
+            let response = if job.is_none() { task.await.ok().and_then(Result::ok) } else { task.abort(); None };
+            let status = response.map(|response| response.status());
+            (job.map(|job| job.constraint.map(|c| c.0)), status)
+        };
+        for extra in [json!({"tools": [weather.clone()], "tool_choice": "required"}), json!({"tools": [strict.clone()]}),
+            json!({"tools": [weather.clone()], "tool_decoding_assistance": true}),
+            json!({"response_format": {"type": "json_object"}})] {
+            let (job, status) = send(extra.clone()).await;
+            let grammar = job.flatten().unwrap_or_else(|| panic!("{extra}: no native constraint (status {status:?})"));
+            assert!(grammar.contains(" to=self<|message|>") && grammar.contains("<|eom|><|start|>assistant"), "{extra}");
+            if extra.get("tools").is_some() {
+                assert!(grammar.contains("muse_tool_schema") && grammar.contains(" to=get_weather<|message|>"), "{extra}");
+            }
+        }
+        let (job, _) = send(json!({"tools": [weather]})).await;
+        assert_eq!(job, Some(None), "plain auto tools stay unconstrained");
+        let (job, status) = send(json!({"enable_thinking": false})).await;
+        assert!(job.is_none() && status == Some(StatusCode::BAD_REQUEST));
     }
 
     #[tokio::test]

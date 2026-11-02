@@ -23,7 +23,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 # Official V4.1 releases, for builds whose checkpoint metadata is not local.
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
-                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3')
+                        qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE')
 
 
 def require_mapping(family):
@@ -92,6 +92,13 @@ def family_scopes(cards, config_reader):
             scopes.add('kimik3:exl3-k23')
             if count:
                 counts.add(f'kimik3={tp}')
+        if family == 'muse_spark':
+            # EXL3 K4 experts, intermediate-sliced on the Sparks (partial replies) and
+            # whole or TP2 on onboarded RTX layers: one package on both roles.
+            env['CUTEAFD_WIP_' + PROGRAM_SWITCHES[family] + '_AOT'] = 'ON'
+            scopes.add('muse:exl3-k45')
+            if count:
+                counts.add(f"muse={int(values.get('SPARK_TP', count))}")
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:

@@ -528,6 +528,28 @@ pub fn write_qwen4_exl3_capacities(dir: &Path, tiers: &str) -> std::path::PathBu
     programs
 }
 
+/// The coordinator EXL3 capacity manifests Muse onboarding reads (rtx-tp1 and
+/// rtx-tp2 of `exl3-muse-k45`, F32 out) under `share/exl3`, beside a
+/// PROGRAMS.json the fixture writes too; returns that PROGRAMS.json.
+pub fn write_muse_exl3_capacities(dir: &Path) -> std::path::PathBuf {
+    let share = dir.join("share");
+    for (layout, intermediate) in [("rtx-tp1", 4096), ("rtx-tp2", 2048)] {
+        for capacity in crate::placement::inventory::exl3_capacities(4096) {
+            let path = share.join("exl3/exl3-muse-k45").join(format!("{layout}/m{capacity}"));
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("v41_exl3.json"), serde_json::to_vec(&json!({
+                "capacity": capacity, "hidden": 4096, "experts": 256, "intermediate": intermediate, "top_k": 8,
+                "bits": [4, 5], "output_dtype": "fp32", "input_format": "e4m3_k32", "trellis_lut": {"bytes": 32},
+                "buffers": {"scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 4096 * 8,
+                    "zero_on_create": false}}
+            })).unwrap()).unwrap();
+        }
+    }
+    let programs = share.join("PROGRAMS.json");
+    if !programs.exists() { fs::write(&programs, b"{}").unwrap(); }
+    programs
+}
+
 /// Every Qwen routed expert of every layer as complete EXL3 projections at
 /// `bits`, a BF16 router per layer, and the storage map.
 pub fn qwen4_exl3(layers: usize, bits: usize) -> (Vec<Tensor>, Value) {
@@ -1004,4 +1026,130 @@ pub fn write_kimi_installed_inventory(root: &std::path::Path, spark: bool) -> st
         "geometry":"kimik3","role":if spark {"spark"} else {"coordinator"},
         "sparkinfer_revision":revision,"variants":variants}).to_string()).unwrap();
     path
+}
+
+/// Muse Spark Open 816B-A42B `config.json` (meta-models rev 0fb02478) as an
+/// EXL3 K4 + Core-K6 publication declares it; towers trimmed to their types.
+pub fn muse_spark_config() -> Value {
+    let layers = 62;
+    let full = |l: usize| (layers - 1 - l) % 4 == 0;
+    let text = json!({
+        "model_type": "muse_spark_text", "attention_bias": false, "attention_dropout": 0.0,
+        "bos_token_id": 200000, "eos_token_id": 200001, "pad_token_id": 200018,
+        "final_logit_softcapping": 20.0, "head_dim": 64, "hidden_act": "silu", "hidden_size": 8192,
+        "initializer_range": 0.02, "intermediate_size": 16384,
+        "layer_rope_theta": (0..layers).map(|l| if full(l) { json!(0) } else { json!(500000.0) }).collect::<Vec<_>>(),
+        "layer_types": (0..layers).map(|l| if full(l) { "full_attention" } else { "sliding_attention" }).collect::<Vec<_>>(),
+        "max_position_embeddings": 1048576, "mlp_layer_types": vec!["sparse"; layers],
+        "moe_hidden_size": 4096, "moe_intermediate_size": 4096, "num_attention_heads": 128,
+        "num_experts_per_tok": 8, "num_hidden_layers": layers, "num_key_value_heads": 16,
+        "num_local_experts": 256, "num_shared_experts": 0, "output_multiplier": 0.17677669529663687,
+        "post_norm_eps": 1e-8, "qk_scale_factor": 5.4730064863875, "residual_gate_temperature": 0.3,
+        "rms_norm_eps": 1e-5, "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+        "routed_scaling_factor": 1.0, "sliding_window": 2048, "tie_word_embeddings": false,
+        "use_cache": true, "vocab_size": 202048,
+    });
+    json!({
+        "architectures": ["MuseSparkForConditionalGeneration"], "model_type": "muse_spark",
+        "audio_token_id": 200038, "image_token_id": 200092, "video_token_id": 200091, "dtype": "bfloat16",
+        "quantization_config": {"bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "checkpoint_format": "exl3",
+            "codebook": "mcg", "format": "exl3", "method": "exl3", "quant_method": "exl3", "lm_head": true,
+            "per_module_metadata": "quantize_config.json:tensor_storage"},
+        "text_config": text,
+        "vision_config": {"model_type": "muse_spark_vision", "hidden_size": 1536, "num_hidden_layers": 50},
+        "audio_config": {"model_type": "muse_spark_audio", "out_hidden_size": 8192},
+    })
+}
+
+/// Muse Spark EXL3 K4 + Core-K6 headers: K6 attention q/k/v/o, pre/post expert
+/// projections and head; BF16 norms, residual gates, output gate, embedding;
+/// FP32 router. Routed experts (K4, split per expert) only on `expert_layers`.
+pub fn muse_spark_tensors(expert_layers: &[usize]) -> (Vec<Tensor>, Vec<(String, usize, usize, usize)>) {
+    let (h, q, kv, e, v) = (8192, 8192, 1024, 4096, 202048);
+    let p = "model.language_model";
+    let mut out = vec![t(format!("{p}.embed_tokens.weight"), "BF16", &[v, h]),
+        t(format!("{p}.norm.weight"), "BF16", &[h])];
+    // The K6 head is stored at whole 128-row blocks: 202,112 rows for 202,048 logical.
+    let stored = v.next_multiple_of(128);
+    let mut projections = vec![("lm_head".to_string(), 6, h, stored)];
+    out.extend(exl3("lm_head", stored, h, 6));
+    for layer in 0..62 {
+        let b = format!("{p}.layers.{layer}");
+        for norm in ["input_layernorm", "pre_feedforward_layernorm", "post_feedforward_layernorm"] {
+            out.push(t(format!("{b}.{norm}.weight"), "BF16", &[h]));
+        }
+        for gate in ["post_attention_residual_gate", "post_feedforward_residual_gate"] {
+            out.push(t(format!("{b}.{gate}.gate"), "BF16", &[h]));
+        }
+        out.push(t(format!("{b}.self_attn.gate_proj.weight"), "BF16", &[q, h]));
+        for (proj, n, k) in [("q_proj", q, h), ("k_proj", kv, h), ("v_proj", kv, h), ("o_proj", h, q)] {
+            let name = format!("{b}.self_attn.{proj}");
+            out.extend(exl3(&name, n, k, 6));
+            projections.push((name, 6, k, n));
+        }
+        for (proj, n, k) in [("pre_expert_proj", e, h), ("post_expert_proj", h, e)] {
+            let name = format!("{b}.mlp.{proj}");
+            out.extend(exl3(&name, n, k, 6));
+            projections.push((name, 6, k, n));
+        }
+        out.push(t(format!("{b}.mlp.pre_expert_norm.weight"), "BF16", &[e]));
+        out.push(t(format!("{b}.mlp.experts.post_expert_norm.weight"), "BF16", &[e]));
+        out.push(t(format!("{b}.mlp.gate.weight"), "F32", &[256, h]));
+        out.push(t(format!("{b}.mlp.gate.e_score_correction_bias"), "F32", &[256]));
+        if expert_layers.contains(&layer) {
+            for expert in 0..256 {
+                for (proj, n, k) in [("gate_proj", 4096, e), ("up_proj", 4096, e), ("down_proj", e, 4096)] {
+                    let name = format!("{b}.mlp.experts.{expert}.{proj}");
+                    out.extend(exl3(&name, n, k, 4));
+                    projections.push((name, 4, k, n));
+                }
+            }
+        }
+    }
+    out.push(t("model.vision_tower.patch_embedder.patch_embedding.weight", "BF16", &[1536, 3, 2, 14, 14]));
+    out.push(t("model.vision_projection.weight", "BF16", &[8192, 4096]));
+    out.push(t("model.audio_tower.proj.weight", "BF16", &[8192, 2048]));
+    (out, projections)
+}
+
+/// One shard per layer (the 15K-entry expert headers of a layer stay below the
+/// header bound), the index, `config.json` and `quantize_config.json`.
+/// Routed experts are written for `expert_layers` only; the index still names
+/// every layer's experts so the inventory is complete.
+pub fn write_muse_spark_snapshot(dir: &Path, expert_layers: &[usize]) {
+    let (tensors, mut projections) = muse_spark_tensors(expert_layers);
+    let mut shards = std::collections::BTreeMap::<usize, Vec<Tensor>>::new();
+    for tensor in tensors {
+        let shard = tensor.0.split(".layers.").nth(1).and_then(|tail| tail.split('.').next())
+            .and_then(|layer| layer.parse::<usize>().ok()).map_or(0, |layer| layer + 1);
+        shards.entry(shard).or_default().push(tensor);
+    }
+    let mut weight_map = serde_json::Map::new();
+    for (index, tensors) in &shards {
+        let file = format!("model-{index:05}.safetensors");
+        write_safetensors(&dir.join(&file), tensors);
+        for (name, ..) in tensors { weight_map.insert(name.clone(), Value::String(file.clone())); }
+    }
+    // Absent shards: experts of the other layers, indexed but not local.
+    for layer in (0..62).filter(|layer| !expert_layers.contains(layer)) {
+        let file = format!("model-experts-{layer:05}.safetensors");
+        for expert in 0..256 {
+            for (proj, n, k) in [("gate_proj", 4096, 4096), ("up_proj", 4096, 4096), ("down_proj", 4096, 4096)] {
+                let name = format!("model.language_model.layers.{layer}.mlp.experts.{expert}.{proj}");
+                for (tensor, ..) in exl3(&name, n, k, 4) { weight_map.insert(tensor, Value::String(file.clone())); }
+                projections.push((name, 4, k, n));
+            }
+        }
+    }
+    fs::write(dir.join("config.json"), muse_spark_config().to_string()).unwrap();
+    fs::write(dir.join("model.safetensors.index.json"), json!({"weight_map": weight_map}).to_string()).unwrap();
+    let mut compact = exl3_compact(4);
+    for key in ["core_bits", "head_bits"] { compact[key] = json!(6.0); }
+    compact["lm_head"] = json!(true);
+    let mut manifest = exl3_manifest(&compact, &projections);
+    // The quantizer records the head's logical and N128-padded stored extents.
+    manifest["tensor_storage"]["lm_head"]["out_features"] = json!(202048);
+    manifest["tensor_storage"]["lm_head"]["stored_out_features"] = json!(202112);
+    manifest["tensor_storage"]["lm_head"]["in_features"] = json!(8192);
+    write_quantize_config(dir, &manifest);
 }

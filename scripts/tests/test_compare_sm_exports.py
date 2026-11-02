@@ -403,6 +403,37 @@ def test_step5_export_groups_bind_native_geometry(heads, suffix, group):
     assert job == (f"step5-{group}{suffix}", "export_b12x_step5_aot.py", expected)
 
 
+@pytest.mark.parametrize("heads,suffix", [(128, ""), (64, "-tp2")])
+@pytest.mark.parametrize("group", ["pointwise", "projections", "attention"])
+def test_muse_export_groups_bind_native_geometry(heads, suffix, group):
+    job = next(job for job in compare_sm.jobs("all") if job[0] == f"muse-{group}{suffix}")
+    assert job == (f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
+                   ["--heads", str(heads), "--group", group])
+    dense = next(job for job in compare_sm.jobs("all") if job[0] == "muse-k6-dense")
+    assert dense[2] == ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]
+
+
+def test_tp_partial_groups_are_generic_and_combine_ranks_are_runtime():
+    jobs = {name: (exporter, args) for name, exporter, args in compare_sm.jobs("all")}
+    assert jobs["expert-partial"] == ("export_b12x_expert_partial_aot.py", [])
+    assert jobs["muse-tp-combine"] == ("export_b12x_muse_aot.py", ["--group", "tp-combine"])
+
+
+def test_muse_tp_combine_exports_only_once(monkeypatch):
+    module_path = ROOT / "python/tools/aot/export_b12x_muse_aot.py"
+    spec = importlib.util.spec_from_file_location("muse_unique_combine_exports", module_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace())
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "builders", lambda heads, group, max_rows=4096:
+                        {group: lambda: None})
+    whole = [name for name, *_ in module.programs(128)]
+    tp2 = [name for name, *_ in module.programs(64)]
+    assert whole.count("tp-combine") == 1
+    assert "tp-combine" not in tp2
+
+
 @pytest.mark.parametrize("heads", [32, 64])
 def test_step5_projection_operands_keep_checkpoint_materialization_boundaries(monkeypatch, heads):
     import types

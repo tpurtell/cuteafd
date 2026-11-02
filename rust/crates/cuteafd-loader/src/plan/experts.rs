@@ -205,7 +205,7 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
         && bits.bytes().all(|bit| (b'2'..=b'5').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
-        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3");
+        && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "muse");
     let nvfp4 = (matches!(format, "nvfp4" | "nvfp4a4") && matches!(family, "v41" | "glm" | "glmf" | "qwen4"))
         || (family == "step5" && format == "nvfp4");
     let mxfp4 = (format == "mxfp4" && native) || (format == "fp8" && matches!(family, "mimof" | "mimop"));
@@ -285,6 +285,20 @@ mod tests {
         let layers = model.spec().layers.iter().enumerate()
             .filter_map(|(layer, spec)| (spec.ffn == super::super::spec::FfnKind::Moe).then_some(layer)).collect::<Vec<_>>();
         super::checkpoint_spark_recipe(checkpoint, world, &layers)
+    }
+
+    #[test]
+    fn muse_slices_experts_like_every_exl3_family() {
+        // I 4096 = 32 H128 units: TP4 even, TP6 compact (5 or 6 units per rank).
+        let tp4 = spark_recipe("muse:exl3-k45", 4096, 4).unwrap();
+        assert_eq!(tp4.widths, vec![1024; 4]);
+        let tp6 = spark_recipe("muse:exl3-k45", 4096, 6).unwrap();
+        assert!(tp6.required_layouts.iter().all(|l| l.starts_with("tp6-compact-rank")), "{:?}", tp6.required_layouts);
+        // Odd worlds come from the shared range data (#941): a compact layout whose
+        // stored width is the widest rank's ceil(32 / 5) = 7 blocks, rotated by layer.
+        let tp5 = spark_recipe("muse:exl3-k45", 4096, 5).unwrap();
+        assert_eq!(tp5.widths, vec![896; 5]);
+        assert!(tp5.required_layouts.iter().all(|l| l.starts_with("tp5-compact-rank")), "{:?}", tp5.required_layouts);
     }
 
     #[test]

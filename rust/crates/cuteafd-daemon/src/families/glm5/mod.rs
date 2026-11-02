@@ -201,8 +201,8 @@ fn spark_model(backend: SparkBackend, waves: usize, unit_rows: u32, bf16: bool)
         cuteafd_transport::expert::native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, executions.capacity())?
     } else { 64 << 20 })?;
     let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress },
-            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress }], rings, executions)?;
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity: engine::DECODE_ROWS as u32, ingress, partial_reply_bytes: None },
+            cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit_rows, ingress, partial_reply_bytes: None }], rings, executions)?;
     validate_spark_endpoint_count(model.endpoints.len(), waves)?;
     Ok(model)
 }

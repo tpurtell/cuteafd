@@ -47,6 +47,9 @@ pub fn spark_owner_workspace_bytes(owners: impl IntoIterator<Item = SparkOwnerWo
     })
 }
 
+/// Debug response header bytes a partial reply frame may carry (no row indices).
+pub const PARTIAL_RESPONSE_HEADER_BYTES: usize = 128;
+
 /// One persistent coordinator-to-Spark connection, resolved before allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +59,12 @@ pub struct SparkEndpoint {
     /// Overrides only this connection's depth; other endpoints keep the model default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring_depth: Option<usize>,
+    /// Partial-reply endpoints (`EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES`): the
+    /// largest per-rank partial payload any admitted wave replies (the family's
+    /// worst region mix at its unit, cutoff and sequences). Sizes the response
+    /// frame instead of the compact BF16 plane; absent for every other endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial_reply_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,12 +242,31 @@ impl SparkEndpoint {
             }
             _ => request,
         };
+        // A partial reply is never row-indexed: header plus the region payload.
+        let response = match self.partial_reply_bytes {
+            Some(bytes) => usize::try_from(bytes).ok()?.checked_add(PARTIAL_RESPONSE_HEADER_BYTES)?,
+            None => response,
+        };
         Some((request, response))
+    }
+
+    /// The frame this endpoint needs: the model's budget, or this endpoint's
+    /// larger partial reply (one SEND per frame, never chunked).
+    pub fn frame_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
+        let (request, response) = self.wire_bytes(geometry)?;
+        Some(if self.partial_reply_bytes.is_some() { rings.max_frame_bytes.max(request).max(response) }
+            else { rings.max_frame_bytes })
     }
 
     pub fn ring_bytes(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<usize> {
         let (request, response) = self.wire_bytes(geometry)?;
-        geometry.ring_bytes_for_wire(request, response, self.resolved_rings(rings)?, 1)
+        geometry.ring_bytes_for_wire(request, response, self.endpoint_rings(geometry, rings)?, 1)
+    }
+
+    /// Rings resolved for this endpoint: its depth, and its own frame budget.
+    pub fn endpoint_rings(self, geometry: ExpertGeometry, rings: SparkRings) -> Option<SparkRings> {
+        let resolved = self.resolved_rings(rings)?;
+        Some(SparkRings { max_frame_bytes: self.frame_bytes(geometry, resolved)?, ..resolved })
     }
 }
 
@@ -276,6 +304,10 @@ impl ExpertGeometry {
 
     /// Step-5 routed target layers 3..91 (layer 91 is dense).
     pub const STEP5: Self = Self { hidden: 4096, experts: 352, topk: 8, intermediate: 1536, layers: 91 };
+    /// Muse Spark: experts see the 4096-wide `pre_expert_proj` stream (not the
+    /// 8192 residual); 62 routed layers, sigmoid top-8, each expert's output
+    /// RMS-normalized before its routing weight.
+    pub const MUSE_SPARK: Self = Self { hidden: 4096, experts: 256, topk: 8, intermediate: 4096, layers: 62 };
 
     /// BF16 bytes of one hidden-width row (a routed input or a rank partial).
     pub const fn row_bytes(&self) -> u32 {
@@ -332,19 +364,33 @@ impl ExpertGeometry {
             (Self::QWEN4, "qwen4"),
             (Self::STEP5, "step5"),
             (Self::KIMI_K3, "kimik3"),
+            (Self::MUSE_SPARK, "muse"),
         ]
         .into_iter()
         .find_map(|(shape, family)| self.same_shape(&shape).then_some(family))
     }
 
+    /// Whether this geometry's Spark replies are per-expert partials
+    /// (`EXPERT_PROTOCOL_V2_FLAG_PARTIAL_REPLIES`: a per-expert output norm the
+    /// coordinator applies), not the weighted top-k sum.
+    pub fn partial_replies(&self) -> bool { self.same_shape(&Self::MUSE_SPARK) }
+
+    /// Upper bound of one rank's partial reply payload at `capacity` rows: every
+    /// routed (row, expert) as a BF16 record (the widest reply format). The
+    /// admitted endpoint carries the exact worst mix; this bounds the frame.
+    pub fn partial_reply_bound(&self, capacity: u32) -> Option<usize> {
+        self.partial_replies().then(|| (capacity as usize).checked_mul(self.topk as usize)?
+            .checked_mul(self.hidden as usize * 2)).flatten()
+    }
+
     /// Routed-expert SwiGLU clamp: DeepSeek and GLM 5.3 Flash clamp gate/up at
-    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo
-    /// and Qwen 3.8 Flash Next are unclamped (`None`).
+    /// 10; Step-5 clamps post-SiLU at 7 (see `activation`). GLM 5.x, MiMo,
+    /// Qwen 3.8 Flash Next and Muse Spark are unclamped (`None`).
     pub fn swiglu_limit(&self) -> Option<f32> {
         if self.same_shape(&Self::STEP5) { return Some(7.0); }
         (!self.same_shape(&Self::GLM5) && !self.same_shape(&Self::MIMO_V2_FLASH)
             && !self.same_shape(&Self::MIMO_V26_PRO) && !self.same_shape(&Self::QWEN4)
-            && !self.same_shape(&Self::KIMI_K3)).then_some(10.0)
+            && !self.same_shape(&Self::KIMI_K3) && !self.same_shape(&Self::MUSE_SPARK)).then_some(10.0)
     }
 
     /// Expert arithmetic; existing families retain their legacy rounding exactly.
@@ -474,7 +520,7 @@ mod tests {
 
     #[test]
     fn endpoint_ring_depth_resolves_default_and_rejects_invalid_depths() {
-        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None };
+        let endpoint = SparkEndpoint { capacity: 4096, ingress: SparkIngress::Fp8K32, ring_depth: None, partial_reply_bytes: None };
         let geometry = ExpertGeometry::DEEPSEEK_V41;
         let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8,
             slot_bytes: 8 << 20, alignment: 4096 };
@@ -500,10 +546,44 @@ mod tests {
         assert_eq!(serde_json::from_value::<SparkEndpoint>(serialized).unwrap(), endpoint);
     }
 
+    /// A partial-reply endpoint's response frame is its admitted worst reply
+    /// plus a header, and its own frame budget covers it; every other endpoint
+    /// keeps the compact response and the model budget (serde-identical seal).
+    #[test]
+    fn partial_reply_endpoint_sizes_its_own_frame() {
+        let geometry = ExpertGeometry::MUSE_SPARK;
+        let rings = SparkRings { max_frame_bytes: 64 << 20, depth: 8, slot_bytes: 8 << 20, alignment: 4096 };
+        let plain = SparkEndpoint { capacity: 2752, ingress: SparkIngress::Fp8K32, ring_depth: Some(4),
+            partial_reply_bytes: None };
+        assert_eq!(plain.frame_bytes(geometry, rings), Some(64 << 20));
+        assert!(serde_json::to_value(plain).unwrap().get("partial_reply_bytes").is_none());
+        let reply = 96 << 20;
+        let partial = SparkEndpoint { partial_reply_bytes: Some(reply), ..plain };
+        let (request, response) = partial.wire_bytes(geometry).unwrap();
+        assert_eq!(response, reply as usize + PARTIAL_RESPONSE_HEADER_BYTES);
+        assert_eq!(request, plain.wire_bytes(geometry).unwrap().0);
+        let frame = partial.frame_bytes(geometry, rings).unwrap();
+        assert_eq!(frame, response);
+        let resolved = partial.endpoint_rings(geometry, rings).unwrap();
+        assert_eq!((resolved.max_frame_bytes, resolved.depth), (frame, 4));
+        // Four slots of the worst frame per direction, page aligned.
+        let page = |bytes: usize| bytes.div_ceil(4096) * 4096;
+        assert_eq!(partial.ring_bytes(geometry, rings), Some((page(request.max(8 << 20)) + page(response)) * 4));
+        let encoded = serde_json::to_value(partial).unwrap();
+        assert_eq!(encoded["partial_reply_bytes"], reply);
+        assert_eq!(serde_json::from_value::<SparkEndpoint>(encoded).unwrap(), partial);
+        // A small partial reply never shrinks the model budget.
+        let small = SparkEndpoint { partial_reply_bytes: Some(1 << 20), ..plain };
+        assert_eq!(small.frame_bytes(geometry, rings), Some(64 << 20));
+        assert!(geometry.partial_replies() && !ExpertGeometry::GLM5.partial_replies());
+        assert_eq!(geometry.partial_reply_bound(2752), Some(2752 * 8 * 8192));
+        assert_eq!(ExpertGeometry::KIMI_K3.partial_reply_bound(2752), None);
+    }
+
     #[test]
     fn native_endpoint_reserves_bf16_maximum() {
         for capacity in [1, 80, 2048, 2752, 4096] {
-            let native = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Native };
+            let native = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Native, partial_reply_bytes: None };
             let bf16 = SparkEndpoint { ingress: SparkIngress::Bf16, ..native };
             let fp8 = SparkEndpoint { ingress: SparkIngress::Fp8K32, ..native };
             assert_eq!(native.wire_bytes(ExpertGeometry::STEP5), bf16.wire_bytes(ExpertGeometry::STEP5));
@@ -516,7 +596,7 @@ mod tests {
     #[test]
     fn endpoint_response_prefix_is_bounded_by_admitted_rows() {
         for capacity in [0, 1, 640, 4096, 4097, u32::MAX] {
-            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16 };
+            let endpoint = SparkEndpoint { ring_depth: None, capacity, ingress: SparkIngress::Bf16, partial_reply_bytes: None };
             assert_eq!(endpoint.response_prefix_bytes(), if (1..=4096).contains(&capacity) {
                 Some(128 + capacity as usize * 4)
             } else { None });
@@ -581,5 +661,11 @@ mod tests {
         assert_eq!(kimi.row_bytes(), 7168);
         assert_eq!(kimi.compact_wire_bytes(1, true), Some((336 + 3584 * 2, 4 + 3584 * 2 + 96)));
         assert_eq!(ExpertGeometry::QWEN4.slice(4), Some(160));
+        let muse = ExpertGeometry::MUSE_SPARK;
+        assert_eq!(muse.family(), Some("muse"));
+        assert_eq!(muse.swiglu_limit(), None);
+        assert_eq!(muse.activation(), crate::FfnActivation::SiluBf16Product { limit: None });
+        // Rows on the wire are the 4096-wide pre-expert stream, not the 8192 residual.
+        assert_eq!(muse.row_bytes(), 8192);
     }
 }

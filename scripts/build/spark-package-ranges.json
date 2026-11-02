@@ -474,6 +474,28 @@
           "routed_expert_bytes": 388288498176
         }
       ]
+    },
+    "muse:exl3": {
+      "intermediate": 4096,
+      "minimum": 4,
+      "maximum": 8,
+      "basis": "planner",
+      "worlds": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "meta-models/Muse-Spark-Open-816B-A42B",
+          "revision": "0fb02478",
+          "routed_expert_bytes": null
+        }
+      ]
     }
   },
   "provenance_notes": {

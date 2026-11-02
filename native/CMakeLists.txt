@@ -53,6 +53,7 @@ option(CUTEAFD_ENABLE_QWEN4_AOT "Build the Qwen 3.8 Flash Next coordinator progr
 option(CUTEAFD_ENABLE_QWEN_DENSE_AOT "Build dense Qwen 3.5/3.8 BF16 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_STEP5_AOT "Build Step-5 coordinator programs (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_KIMIK3_AOT "Build Kimi K3 coordinator programs (same table as DeepSeek V4)" OFF)
+option(CUTEAFD_ENABLE_MUSE_AOT "Build Muse Spark coordinator programs, K6 core and the partial-reply epilogue (same table as DeepSeek V4)" OFF)
 option(CUTEAFD_ENABLE_EXLR8_AOT "Build the EXLR8 programs into the program table (SM120: shared-expert K1 and rotated glue beside the family programs; SM121: routed K1 serving alone)" OFF)
 set(CUTEAFD_DSV4_GEOMETRY "flash,pro,flash2,pro2" CACHE STRING
   "DeepSeek V4 program geometries, comma-separated: flash, pro; flash2 / pro2 their two-GPU head splits")
@@ -185,10 +186,10 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
     message(FATAL_ERROR "Pinned XGrammar schema factory no longer matches the V4.1 extension")
   endif()
   string(REPLACE "#include \"json_schema_converter.h\""
-    "#include \"json_schema_converter.h\"\n#include \"xgrammar_v41_tools.h\""
+    "#include \"json_schema_converter.h\"\n#include \"xgrammar_v41_tools.h\"\n#include \"xgrammar_muse_tools.h\""
     CUTEAFD_SCHEMA_SOURCE "${CUTEAFD_SCHEMA_SOURCE}")
   string(REPLACE "${CUTEAFD_SCHEMA_FACTORY}"
-    "switch (json_format) {\n    case static_cast<JSONFormat>(5): {\n      V41ToolCallingConverter converter(ref_resolver);\n      return converter.Convert(spec);\n    }\n    case JSONFormat::kJSON:"
+    "switch (json_format) {\n    case static_cast<JSONFormat>(5): {\n      V41ToolCallingConverter converter(ref_resolver);\n      return converter.Convert(spec);\n    }\n    case static_cast<JSONFormat>(6): {\n      MuseToolCallingConverter converter(ref_resolver);\n      return converter.Convert(spec);\n    }\n    case JSONFormat::kJSON:"
     CUTEAFD_SCHEMA_SOURCE "${CUTEAFD_SCHEMA_SOURCE}")
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_schema.cc" "${CUTEAFD_SCHEMA_SOURCE}")
   list(FILTER CUTEAFD_XGRAMMAR_SOURCES EXCLUDE REGEX "/cpp/json_schema_converter\\.cc$")
@@ -207,7 +208,8 @@ if(CUTEAFD_ENABLE_XGRAMMAR)
   list(APPEND CUTEAFD_XGRAMMAR_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_unicode.cc")
   list(APPEND CUTEAFD_XGRAMMAR_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/v41_xgrammar_schema.cc"
     "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_regular.cc"
-    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_v41_tools.cc")
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_v41_tools.cc"
+    "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/xgrammar_muse_tools.cc")
   add_library(cuteafd_xgrammar STATIC ${CUTEAFD_XGRAMMAR_SOURCES})
   target_include_directories(cuteafd_xgrammar PRIVATE
     "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/cpp" "${CMAKE_CURRENT_SOURCE_DIR}/shared/src")
@@ -235,7 +237,7 @@ if(CUTEAFD_EXPERT_FAMILIES MATCHES ":(fp8|nvfp4)" OR "step5:bf16" IN_LIST CUTEAF
 endif()
 if(CUTEAFD_ENABLE_AUDIO_AOT OR CUTEAFD_ENABLE_VISION_ATTENTION_AOT OR CUTEAFD_ENABLE_V41_EXPERT_AOT OR CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT OR
    CUTEAFD_ENABLE_V41_TP2_EXPERT_AOT OR CUTEAFD_ENABLE_EXL3_PACKAGES OR CUTEAFD_ENABLE_V41_NVFP4_AOT OR CUTEAFD_ENABLE_V41_FP8_AOT OR CUTEAFD_ENABLE_V41_ATTENTION_AOT OR CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR
-   CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
+   CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_FP8_EXPERT_FAMILIES)
   set(CUTEAFD_BUILD_SPARKINFER_AOT ON)
 endif()
 if(CUTEAFD_BUILD_SPARKINFER_AOT)
@@ -432,7 +434,18 @@ include(cmake/shared/mxfp4_widths.cmake)
 if(CUTEAFD_FP8_EXPERT_FAMILIES)
   include(cmake/shared/fp8_moe.cmake)
 endif()
-if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)
+# Expert families whose experts carry a per-expert output norm reply per-expert
+# partials (shared EXL3 worker epilogue): their Spark image carries the
+# expert_partial programs in its program table.
+set(CUTEAFD_PARTIAL_REPLY_FAMILIES muse)
+set(CUTEAFD_PARTIAL_REPLY_PROGRAMS OFF)
+foreach(entry IN LISTS CUTEAFD_EXPERT_FAMILIES)
+  string(REGEX MATCH "^[a-z0-9]+" family "${entry}")
+  if(entry MATCHES ":exl3-k" AND family IN_LIST CUTEAFD_PARTIAL_REPLY_FAMILIES)
+    set(CUTEAFD_PARTIAL_REPLY_PROGRAMS ON)
+  endif()
+endforeach()
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS)
   include(cmake/shared/dsv4_programs.cmake)
 endif()
 if(CUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT)
@@ -503,7 +516,7 @@ if(CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS)
   add_dependencies(cuteafd_native ${CUTEAFD_V41_SPARK_TP_EXPERT_TARGETS})
   target_include_directories(cuteafd_native PRIVATE ${CUTEAFD_V41_SPARK_TP_EXPERT_INCLUDE_DIRS})
 endif()
-if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_EXLR8_AOT)
+if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR CUTEAFD_ENABLE_MUSE_AOT OR CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS)
   add_dependencies(cuteafd_native cuteafd_dsv4_programs_export)
   target_include_directories(cuteafd_native PRIVATE "${CUTEAFD_DSV4_DIR}")
   # Whole archive: the table in dsv4_programs.cc names every program symbol.

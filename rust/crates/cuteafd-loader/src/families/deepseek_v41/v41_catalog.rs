@@ -842,6 +842,9 @@ fn read_expert_catalog_with_checkpoint(snapshot: &Path, config: &serde_json::Val
     if kimi_catalog_config(config) {
         return read_kimi_expert_catalog(snapshot, config, checkpoint);
     }
+    if crate::families::muse_spark::MuseSparkConfig::is_muse_spark(config) {
+        return read_muse_spark_expert_catalog(snapshot, config, checkpoint);
+    }
     if config.get("model_type").and_then(serde_json::Value::as_str) == Some("glm5_next") {
         return read_glm_dsa_expert_catalog(snapshot, config, checkpoint);
     }
@@ -914,6 +917,24 @@ fn read_kimi_expert_catalog(snapshot: &Path, config: &serde_json::Value,
     };
     ensure!(catalog.experts.draft_stages == 0, "Kimi K3 has no native draft expert stages");
     Ok(catalog)
+}
+
+/// Muse Spark routed experts: every layer is MoE and the experts run at the
+/// `moe_hidden_size` width of the coordinator's `pre_expert_proj` stream. Only
+/// EXL3 publications (split per expert, `model.language_model.layers.L.mlp.
+/// experts.E.{gate,up,down}_proj`) have an expert package; the BF16 release
+/// fuses each layer's experts into `[256, ...]` tensors.
+fn read_muse_spark_expert_catalog(snapshot: &Path, config: &serde_json::Value,
+    checkpoint: Option<&crate::plan::Checkpoint>) -> Result<OfficialV41Catalog> {
+    let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(config)?;
+    ensure!(config["quantization_config"]["quant_method"] == "exl3",
+        "Muse Spark routed experts serve from an EXL3 publication (K4 experts + K6 core); \
+         the BF16 release's fused [256, ...] expert tensors have no expert package");
+    let shape = RoutedExpertShape { layers: cfg.layers, first_layer: 0, experts: cfg.experts,
+        topk: cfg.topk, hidden: cfg.expert_hidden, intermediate: cfg.moe_intermediate,
+        draft_stages: 0, draft_experts: 0 };
+    // muse:exl3-k45 (uniform K4 publishes with the adjacent empty K5 tier).
+    exl3_catalog_or_read(snapshot, shape, &[4, 5], checkpoint)
 }
 
 /// GLM 5.x (glm_moe_dsa) and GLM 5.3 Flash (glm5_next) routed experts. Only EXL3 publications serve from
@@ -1293,9 +1314,12 @@ fn deepseek_v4_exl3_catalog_input(snapshot: &Path, weight_map: &BTreeMap<String,
             None => {
                 // Experts past the backbone (a native MTP layer) stay on the coordinator.
                 let past_backbone = hf_layer(&tensor.name).is_some_and(|layer| layer >= manifest.experts.layers);
+                // Only numbered expert projections are EXL3 modules; per-layer
+                // expert-side tensors (Muse Spark's post_expert_norm) are not.
+                let numbered = tensor.name.split_once(".experts.").is_some_and(|(_, tail)|
+                    tail.split('.').next().is_some_and(|id| id.parse::<usize>().is_ok()));
                 ensure!(
-                    past_backbone
-                        || !tensor.name.contains(".experts."),
+                    past_backbone || !numbered,
                     "routed expert tensor {} is not in the EXL3 storage map",
                     tensor.name
                 );

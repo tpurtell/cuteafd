@@ -705,6 +705,44 @@ impl<'a> Exl3Tp2<'a> {
     }
 }
 
+impl Exl3Tp2<'_> {
+    /// Per-expert partial replies of `layer` for `rows` rows (families with a
+    /// per-expert output norm, combined by the coordinator): the EXL3 core on
+    /// this rank's half, then the shared partial-reply epilogue writing every
+    /// routed (row, slot)'s unweighted BF16 partial into `out` (`plan`'s BF16
+    /// region; RTX holders reply BF16 at every width). The same core and
+    /// epilogue the Spark worker runs, so the bytes are the Sparks'.
+    ///
+    /// # Safety
+    /// `wire` and `routes` are this rank's FP8 K32 rows and route ids/weights,
+    /// written on `stream` before this call; `out` is an exclusive device
+    /// allocation of at least the plan's payload, live through the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn enqueue_partials(&mut self, layer: usize, rows: usize, wire: *mut c_void, routes: Routes,
+        epilogue: &mut crate::shared::experts::exl3::partial::PartialEpilogue<'_>,
+        plan: &cuteafd_transport::PartialReplyPlan, out: CuteafdDeviceBuffer, stream: *mut c_void) -> Result<()> {
+        ensure!(self.layers.contains(&layer) && (1..=self.max_rows).contains(&rows) && plan.regions.len() == rows,
+            "EXL3 TP2 partial layer/rows not resident");
+        ensure!(!wire.is_null() && !routes.ids.is_null() && !routes.weights.is_null(), "null EXL3 TP2 partial input");
+        let buffer = |ptr, width| CuteafdDeviceBuffer { ptr, bytes: rows * width, device_id: self.device.id, flags: 0 };
+        let inputs = [buffer(wire, self.geometry.hidden as usize * 33 / 32),
+            buffer(routes.ids, self.geometry.topk as usize * 4), buffer(routes.weights, self.geometry.topk as usize * 4)];
+        let ids = inputs[1];
+        let selected = self.execution_index(rows)?;
+        let resident = super::resident_index(&self.layers, layer)?;
+        let (topk, width) = (self.geometry.topk as usize, self.geometry.hidden as usize);
+        self.device.run(|| {
+            let executions = self.executions.as_mut().expect("initialized EXL3 rank");
+            // SAFETY: the caller's inputs and output contract; the core's sources are
+            // this execution's own, read by the epilogue on the same stream.
+            unsafe {
+                let sources = executions[selected].launch_layer_core(resident, inputs, rows, stream)?;
+                epilogue.launch(plan, rows, topk, width, sources, ids, out, stream)
+            }
+        })
+    }
+}
+
 impl RtxExpertLayer for Exl3Tp2<'_> {
     fn shard(&self) -> RtxShard {
         self.shard

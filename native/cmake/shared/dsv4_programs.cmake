@@ -7,18 +7,23 @@
 # (CUTEAFD_ENABLE_QWEN4_AOT, geometry "qwen4") share one table and manifest.
 # EXLR8 (CUTEAFD_ENABLE_EXLR8_AOT, geometry "exlr8") joins the same table last:
 # on SM120 the fork's coordinator programs beside the family programs, on SM121
-# (the Spark expert build) its routed serving programs alone.
+# (the Spark expert build) its routed serving programs.
+# SM121 builds the Spark programs only: the union of what the enabled expert
+# families need (EXLR8's routed serving programs, and the partial-reply
+# epilogue `expert_partial` for families listed in CUTEAFD_PARTIAL_REPLY_FAMILIES).
 set(CUTEAFD_FAMILY_PROGRAMS OFF)
 if(CUTEAFD_ENABLE_DSV4_AOT OR CUTEAFD_ENABLE_GLM_AOT OR CUTEAFD_ENABLE_MIMO_AOT OR CUTEAFD_ENABLE_GLMF_AOT OR
-   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT)
+   CUTEAFD_ENABLE_QWEN4_AOT OR CUTEAFD_ENABLE_QWEN_DENSE_AOT OR CUTEAFD_ENABLE_STEP5_AOT OR CUTEAFD_ENABLE_KIMIK3_AOT OR
+   CUTEAFD_ENABLE_MUSE_AOT)
   set(CUTEAFD_FAMILY_PROGRAMS ON)
 endif()
 if(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^120")
   set(CUTEAFD_EXLR8_ROLE coordinator)
-elseif(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^121" AND CUTEAFD_ENABLE_EXLR8_AOT AND NOT CUTEAFD_FAMILY_PROGRAMS)
+elseif(CUTEAFD_CUDA_ARCHITECTURES MATCHES "^121" AND (CUTEAFD_ENABLE_EXLR8_AOT OR CUTEAFD_PARTIAL_REPLY_PROGRAMS)
+       AND NOT CUTEAFD_FAMILY_PROGRAMS)
   set(CUTEAFD_EXLR8_ROLE spark)
 else()
-  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the EXLR8 Spark programs)")
+  message(FATAL_ERROR "coordinator programs require the SM120 build (SM121 builds only the Spark programs)")
 endif()
 set(CUTEAFD_PROGRAM_GEOMETRY "")
 if(CUTEAFD_ENABLE_DSV4_AOT)
@@ -80,16 +85,35 @@ if(CUTEAFD_ENABLE_KIMIK3_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},kimik3,dense_trellis_k6,kimi_split")
   endif()
 endif()
+if(CUTEAFD_ENABLE_MUSE_AOT)
+  # Muse: whole and head-split coordinator programs, the shared K6 core (by
+  # geometry) and the partial-reply epilogue (RTX-onboarded expert layers).
+  if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+    set(CUTEAFD_PROGRAM_GEOMETRY "muse,muse2,expert_partial")
+  else()
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},muse,muse2,expert_partial")
+  endif()
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT)
+    set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
+  endif()
+endif()
 set(CUTEAFD_DENSE_TRELLIS_FAMILIES "")
+if(CUTEAFD_ENABLE_MUSE_AOT)
+  list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES muse)
+endif()
 if(CUTEAFD_ENABLE_KIMIK3_AOT)
   list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES kimik3)
 endif()
 if(CUTEAFD_ENABLE_GLM_AOT)
   list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES glm)
-  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_MUSE_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
   endif()
   set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glm_stage,glm2_stage")
+endif()
+if(CUTEAFD_EXLR8_ROLE STREQUAL "spark" AND CUTEAFD_PARTIAL_REPLY_PROGRAMS)
+  # The Spark partial-reply epilogue (before EXLR8, which stays last).
+  set(CUTEAFD_PROGRAM_GEOMETRY "expert_partial")
 endif()
 if(CUTEAFD_ENABLE_EXLR8_AOT)
   # Last: every family program keeps its object and table index.
@@ -107,7 +131,7 @@ if(CUTEAFD_ENABLE_EXLR8_AOT)
 endif()
 if(CUTEAFD_ENABLE_GLMF_AOT)
   list(APPEND CUTEAFD_DENSE_TRELLIS_FAMILIES glmf)
-  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_GLM_AOT)
+  if(NOT CUTEAFD_ENABLE_KIMIK3_AOT AND NOT CUTEAFD_ENABLE_GLM_AOT AND NOT CUTEAFD_ENABLE_MUSE_AOT)
     set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},dense_trellis_k6")
   endif()
   set(CUTEAFD_PROGRAM_GEOMETRY "${CUTEAFD_PROGRAM_GEOMETRY},glmf_stage,glmf2_stage")

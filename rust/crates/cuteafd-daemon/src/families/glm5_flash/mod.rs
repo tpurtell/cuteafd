@@ -1997,7 +1997,7 @@ impl Opened {
                 &cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(catalog)?.exports(),
                 Some(u32::try_from(args.decode_rows)?), args.prefill_rows as u64, args.prefill_waves as u64)?;
             let model = cuteafd_transport::worker_selection::ModelAdmission::new(
-                vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
+                vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
                 crate::shared::placement::spark_rings(64 << 20)?, executions)?;
             let admission = crate::shared::placement::SparkAdmission::plan(source, geometry, self.experts.as_ref(),
                 &working, peers.len(), None, model)?;

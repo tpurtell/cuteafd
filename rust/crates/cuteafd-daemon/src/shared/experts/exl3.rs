@@ -9,6 +9,9 @@ use cuteafd_loader::{OfficialV41Catalog, V41Exl3Layer, V41Exl3Residency};
 const JOBS_PER_EXPERT: usize = 9;
 const BANKS: usize = 2;
 pub(crate) mod execution;
+pub(crate) mod partial;
+#[cfg(test)]
+mod partial_screen;
 pub(crate) mod worker;
 
 /// Family-qualified package name for one decoder-tier pair.
@@ -80,7 +83,7 @@ pub(crate) fn planned_residency(catalog: &OfficialV41Catalog, layer: ExpertLayer
     let spark = matches!(layer, ExpertLayer::BackboneExl3Tp { .. });
     let (layer, world, rank) = residency_selection(layer)?;
     let manifest = catalog.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?;
-    if spark { manifest.balanced_residency(layer, world, rank) }
+    if spark { catalog.exl3_spark_residency(layer, world, rank) }
         else { manifest.residency(layer, world, rank) }
 }
 

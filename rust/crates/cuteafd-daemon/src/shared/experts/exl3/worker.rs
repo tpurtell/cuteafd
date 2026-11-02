@@ -136,9 +136,17 @@ pub(crate) struct Exl3Worker<'a> {
     /// A deferred request whose expert timing publishes at [`Self::complete`]:
     /// (request id, layer, rows, executor id).
     pending: super::super::execution::timing::PendingUnits<'a>,
+    /// Per-expert partial replies (models with a per-expert output norm): the
+    /// epilogue that replaces the weighted top-k sum for flagged requests.
+    partial: Option<super::partial::PartialEpilogue<'a>>,
 }
 
 impl<'a> Exl3Worker<'a> {
+    /// Serve flagged partial-reply requests with `epilogue` (resolved at startup).
+    pub(crate) fn install_partial_epilogue(&mut self, epilogue: super::partial::PartialEpilogue<'a>) {
+        self.partial = Some(epilogue);
+    }
+
     fn capacities(capacity: u32) -> Result<Vec<u32>> {
         Ok(Exl3RowPolicy::active().capacities(capacity as usize)?)
     }
@@ -326,6 +334,7 @@ impl<'a> Exl3Worker<'a> {
             executor_id,
             deferred: false,
             pending: super::super::execution::timing::PendingUnits::new(library, 1)?,
+            partial: None,
         })
     }
 
@@ -533,16 +542,28 @@ impl<'a> Exl3Worker<'a> {
         if let Some(timing) = &self.worker_timing {
             unsafe { timing.record(0, self.stream.raw)?; }
         }
+        let partial = request.partial_plan()?;
         let output = unsafe {
-            match destination {
-                Some(output) => execution.launch_layer_into(
+            match (destination, partial.as_ref()) {
+                // Partial replies: the core, then the per-region epilogue into the reply slot.
+                (Some(output), Some(plan)) => {
+                    let epilogue = self.partial.as_mut()
+                        .context("partial-reply request reached a worker without the epilogue")?;
+                    let sources = execution.launch_layer_core(self.layer, inputs, request.rows() as usize, self.stream.raw)?;
+                    let geometry = cuteafd_core::expert_geometry();
+                    epilogue.launch(plan, request.rows() as usize, geometry.topk as usize, geometry.hidden as usize,
+                        sources, inputs[1], output, self.stream.raw)?;
+                    output
+                }
+                (None, Some(_)) => anyhow::bail!("partial-reply requests are served into a mapped reply slot only"),
+                (Some(output), None) => execution.launch_layer_into(
                     self.layer,
                     inputs,
                     request.rows() as usize,
                     self.stream.raw,
                     output,
                 )?,
-                None => execution.launch_layer(
+                (None, None) => execution.launch_layer(
                     self.layer,
                     inputs,
                     request.rows() as usize,

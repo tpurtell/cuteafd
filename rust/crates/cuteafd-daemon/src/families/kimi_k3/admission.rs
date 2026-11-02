@@ -818,7 +818,7 @@ pub(super) mod tests {
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: cfg.dense.iter().enumerate()
             .filter_map(|(layer, dense)| (!dense).then_some(layer)).collect(), spark_ranks: 6, prefill_lanes: 1 };
         let spark = SparkBudgetInventory::exl3(&catalog, &working,
-            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+            &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: 4096, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_loader::families::kimi_k3::SPARK_DEFAULT_BUDGET_BYTES,
             cuteafd_loader::families::kimi_k3::spark_reserve_bytes(2, 4096)?)?;
@@ -1228,7 +1228,7 @@ pub(super) mod tests {
                 spark_ranks: 6, prefill_lanes: 1 };
             let rings = cuteafd_loader::plan::layout::spark_ring_geometry(1);
             let spark = SparkBudgetInventory::exl3(&catalog, &working,
-                &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32 }],
+                &[cuteafd_core::SparkEndpoint { ring_depth: None, capacity: unit as u32, ingress: cuteafd_core::SparkIngress::Fp8K32, partial_reply_bytes: None }],
                 cuteafd_core::SparkRings { max_frame_bytes: rings.max_frame_bytes, depth: rings.depth,
                     slot_bytes: rings.slot_bytes, alignment: rings.alignment }, spark_bytes,
                 cuteafd_loader::families::kimi_k3::spark_reserve_bytes(waves as u64, unit as u64)?)?;

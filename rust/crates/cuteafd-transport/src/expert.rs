@@ -31,14 +31,17 @@ pub const V41_PARTIAL_ROW_BYTES: u32 = V41_HIDDEN * 2;
 /// never this frame bound. Keep the ordinary transport default as the floor.
 pub fn native_frame_budget(geometry: cuteafd_core::ExpertGeometry, capacity: u32) -> Result<usize> {
     let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None,
-        capacity, ingress: cuteafd_core::SparkIngress::Bf16
-    };
+        capacity, ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
     let (request, response) = endpoint.wire_bytes(geometry)
         .context("invalid native frame capacity or geometry")?;
     let debug_bytes = crate::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN
         - crate::EXPERT_PROTOCOL_V2_RESPONSE_HEADER_LEN;
+    // Partial-reply geometries: one unchunked SEND of every routed BF16 record at most.
+    let partial = geometry.partial_reply_bound(capacity).map_or(Some(0), |bytes|
+        bytes.checked_add(crate::EXPERT_PROTOCOL_V2_RESPONSE_DEBUG_HEADER_LEN))
+        .context("native partial frame budget overflow")?;
     Ok(request.max(response).checked_add(debug_bytes)
-        .context("native frame budget overflow")?.max(crate::DEFAULT_MAX_FRAME_BYTES))
+        .context("native frame budget overflow")?.max(partial).max(crate::DEFAULT_MAX_FRAME_BYTES))
 }
 
 fn validate_frame_budget(capacity: u32, max_frame_bytes: usize) -> Result<()> {
@@ -339,9 +342,18 @@ impl<'a> BackboneRequest<'a> {
         .context("native output row bytes overflow")
     }
     pub fn plane_bytes(&self) -> Result<usize> {
+        if let Some(plan) = self.view.partial_plan()? {
+            let geometry = cuteafd_core::expert_geometry();
+            return Ok(plan.payload(geometry.topk as usize, geometry.hidden as usize)?.3);
+        }
         (self.rows() as usize)
             .checked_mul(self.output_row_bytes()? as usize)
             .context("route plane byte overflow")
+    }
+    /// The request's partial-reply regions (the worker writes each row's partials
+    /// into the region its descriptor names), when the request asks for them.
+    pub fn partial_plan(&self) -> Result<Option<crate::PartialReplyPlan>> {
+        self.view.partial_plan()
     }
     /// Fill caller-owned GPU-upload arrays without reordering or rounding routes.
     pub fn copy_routes_into(&self, ids: &mut [i32], weights: &mut [f32]) -> Result<()> {
@@ -414,7 +426,8 @@ impl<'a> BackboneRequest<'a> {
             row_count: self.rows(),
             output_dim: cuteafd_core::expert_geometry().hidden,
             output_dtype: self.output_dtype(),
-            output_row_stride_bytes: self.output_row_bytes()?,
+            // Partial replies carry two regions, not rows: stride 0.
+            output_row_stride_bytes: if self.view.partial_replies() { 0 } else { self.output_row_bytes()? },
             output_payload_bytes: self.plane_bytes()? as u64,
             status: ExpertProtocolV2Status::Ok,
             // Request-only admission flags never appear in a response.
@@ -644,7 +657,7 @@ mod tests {
                 let budget = native_frame_budget(geometry, capacity)?;
                 assert_eq!(budget, indexed_reply.max(request).max(crate::DEFAULT_MAX_FRAME_BYTES));
                 let endpoint = cuteafd_core::SparkEndpoint { ring_depth: None, capacity,
-                    ingress: cuteafd_core::SparkIngress::Bf16 };
+                    ingress: cuteafd_core::SparkIngress::Bf16, partial_reply_bytes: None };
                 let (input, output) = endpoint.wire_bytes(geometry).unwrap();
                 assert_eq!(output + 32, indexed_reply);
                 assert!(input + 32 <= budget && output + 32 <= budget);
@@ -660,6 +673,11 @@ mod tests {
             assert!(native_frame_budget(cuteafd_core::ExpertGeometry::GLM5, capacity).is_err());
         }
         assert_eq!(crate::TcpTransportConfig::default().max_frame_bytes, 64 << 20);
+        // Partial-reply geometry: the budget admits one unchunked SEND of every
+        // routed BF16 record (the endpoint seals the exact worst mix below it).
+        let muse = cuteafd_core::ExpertGeometry::MUSE_SPARK;
+        assert_eq!(native_frame_budget(muse, 2752)?, 2752 * 8 * 8192 + 128);
+        assert_eq!(native_frame_budget(muse, 64)?, 64 << 20);
         Ok(())
     }
 

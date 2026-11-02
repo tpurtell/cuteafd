@@ -16,7 +16,7 @@ pub(super) fn spark_model(backend: cuteafd_loader::plan::spark_executions::Spark
     let executions = cuteafd_loader::plan::spark_executions::admit_family("qwen4", &backend.exports(), None,
         rows as u64, waves)?;
     cuteafd_transport::worker_selection::ModelAdmission::new(
-        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress }],
+        vec![cuteafd_core::SparkEndpoint { ring_depth: None, capacity, ingress, partial_reply_bytes: None }],
         crate::shared::placement::spark_rings(64 << 20)?, executions)
 }
 

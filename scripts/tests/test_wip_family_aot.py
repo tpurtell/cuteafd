@@ -29,6 +29,7 @@ CASES = [
     ('step5', 'Step-5-Preview-NVFP4', 4, 'STEP5', 'step5:nvfp4'),
     ('step5', 'Step-5-Preview', 6, 'STEP5', 'step5:fp8'),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23'),
+    ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45'),
 ]
 
 
@@ -254,6 +255,7 @@ def test_unknown_family_has_no_silent_empty_scope(operation, tmp_path):
      {'CUTEAFD_WIP_AUDIO_AOT': 'ON', 'CUTEAFD_WIP_MIMO_GEOMETRIES': 'mimop'}),
     ('qwen4', 'Qwen3.8-Flash-Next-EXL3', 0, 'QWEN4', 'qwen4:exl3-k45;qwen4:nvfp4', '', '', '', {}),
     ('kimi_k3', 'Kimi-K3-EXL3-K2', 6, 'KIMIK3', 'kimik3:exl3-k23', 'kimik3:exl3-k23', 'kimik3=6', '', {}),
+    ('muse_spark', 'Muse-Spark-Open-EXL3-K4-Core-K6', 6, 'MUSE', 'muse:exl3-k45', 'muse:exl3-k45', 'muse=6', '', {}),
 ])
 def test_existing_family_scope_outputs_are_unchanged(family, model, count, program,
         coordinator, spark, counts, roles, extra):

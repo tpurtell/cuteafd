@@ -864,7 +864,9 @@ def main() -> None:
                              "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
                              "dense_trellis_k6 (native K6 core projections)")
     parser.add_argument("--dense-trellis-families", default="kimik3",
-                        help="architecture tables for dense_trellis_k6: kimik3,glm,glmf (no checkpoint reads)")
+                        help="architecture tables for dense_trellis_k6: kimik3,glm,glmf,muse (no checkpoint reads)")
+    parser.add_argument("--expert-partial-width", type=int, default=4096)
+    parser.add_argument("--expert-partial-topk", type=int, default=8)
     parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
                         help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
                              "family programs), spark = routed K1 serving and grouping, all = every program")
@@ -893,13 +895,13 @@ def main() -> None:
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     requested_dense = set(args.dense_trellis_families.split(","))
-    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf"}:
-        raise SystemExit("--dense-trellis-families takes kimik3, glm and/or glmf")
-    dense_families = tuple(name for name in ("kimik3", "glm", "glmf") if name in requested_dense)
+    if not requested_dense or requested_dense - {"kimik3", "glm", "glmf", "muse"}:
+        raise SystemExit("--dense-trellis-families takes kimik3, glm, glmf and/or muse")
+    dense_families = tuple(name for name in ("kimik3", "glm", "glmf", "muse") if name in requested_dense)
     if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
+                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "expert_partial", "exlr8", "exlr8_dense", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3") for name in geometries):
         raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, expert_partial, exlr8, exlr8_dense, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split and/or kimik3")
     if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf") for name in geometries):
         raise SystemExit("--context-split-only takes flash, pro, glm and/or glmf")
     kimi_kda = None
@@ -907,7 +909,7 @@ def main() -> None:
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
     props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries != ["exlr8"]):
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and geometries not in (["exlr8"], ["expert_partial"])):
         raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
@@ -945,6 +947,20 @@ def main() -> None:
             manifest["families"][name] = {"abi_version": 1}
             work += [(name, suffix, "kimi_split", {"max_rows": capacity}, thunk)
                      for suffix, thunk, capacity in kimi_split_programs()]
+            continue
+        if name == "expert_partial":
+            from export_b12x_expert_partial_aot import programs as partial_programs
+            manifest["families"][name] = {"width": args.expert_partial_width,
+                                          "topk": args.expert_partial_topk}
+            work += [(name, *item) for item in partial_programs(
+                args.expert_partial_width, args.expert_partial_topk, args.prefill_rows)]
+            continue
+        if name in ("muse", "muse2"):
+            from export_b12x_muse_aot import programs as muse_programs
+            heads = 128 if name == "muse" else 64
+            manifest["families"][name] = {"heads": heads, "kv_heads": heads // 8, "head_dim": 64,
+                                           "hidden": 8192, "window": 2048}
+            work += [(name, *item) for item in muse_programs(heads, args.prefill_rows)]
             continue
         if name == "dense_trellis_k6":
             from export_b12x_dense_trellis_k6_aot import programs as dense_programs, row_policies

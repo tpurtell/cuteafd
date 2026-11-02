@@ -146,6 +146,34 @@ impl V41Exl3Residency {
     }
 }
 
+impl OfficialV41Catalog {
+    /// Whether the routed experts carry a per-expert output norm (Muse Spark's
+    /// `mlp.experts.post_expert_norm`), applied to each expert's complete output
+    /// before its routing weight. Every holder of an expert (Spark slices, RTX
+    /// TP2 halves, a whole RTX layer) replies per-expert partials and the
+    /// coordinator's partial combine sums, norms and weights them.
+    pub fn per_expert_output_norm(&self) -> bool {
+        // One binary search on the first routed layer's norm name (the catalog is
+        // sorted); planners call this per layer and rank, so never scan.
+        self.post_expert_norm_name(self.routed_experts().first_layer)
+            .is_some_and(|name| self.tensor(&name).is_ok())
+    }
+
+    /// `...layers.L.mlp.experts.post_expert_norm.weight` in the checkpoint's EXL3 naming.
+    fn post_expert_norm_name(&self, layer: usize) -> Option<String> {
+        let manifest = self.exl3()?;
+        let down = manifest.naming.projection(false, layer, 0, V41Exl3ProjectionKind::Down);
+        down.split_once(".experts.").map(|(prefix, _)| format!("{prefix}.experts.post_expert_norm.weight"))
+    }
+
+    /// The checkpoint's Spark residency for `rank` of `world`: the balanced
+    /// intermediate split (every family; a per-expert output norm moves to the
+    /// coordinator's combine).
+    pub fn exl3_spark_residency(&self, layer: V41Exl3Layer, world: usize, rank: usize) -> Result<V41Exl3Residency> {
+        self.exl3().context("EXL3 residency requires a routed EXL3 checkpoint")?.balanced_residency(layer, world, rank)
+    }
+}
+
 impl V41Exl3Manifest {
     /// Plan whole-unit balanced owned-byte storage.
     /// Divisible geometry returns the legacy plan verbatim, including descriptors.

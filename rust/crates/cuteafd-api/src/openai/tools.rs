@@ -42,6 +42,9 @@ pub(super) enum ToolSyntax {
     QwenXml,
     /// Kimi XTML; assisted decoding uses its native JSON-object call form.
     KimiXtml,
+    /// Muse `<atem:function_calls>` in a tool-addressed message
+    /// (`muse_tool_schema`, the project's native atem parameter grammar).
+    MuseAtem,
 }
 
 pub(super) struct ToolConstraints {
@@ -53,6 +56,18 @@ pub(super) struct ToolConstraints {
     pub triggered: Option<Value>,
     parallel: bool,
     validators: BTreeMap<String, Option<jsonschema::JSONSchema>>,
+}
+
+/// The template's `esc_header`: a recipient name as the header prints it.
+pub(super) fn muse_header(name: &str) -> String {
+    name.replace("<|", "< |").replace("<image>", "< image>").replace("<video>", "< video>")
+        .replace("<audio>", "< audio>").replace(['\r', '\n'], " ")
+}
+
+/// The template's `esc_attr`: a name as the invoke attribute prints it.
+pub(super) fn muse_attribute(name: &str) -> String {
+    muse_header(name).replace('&', "&amp;").replace('"', "&quot;").replace('\'', "&#39;")
+        .replace('<', "&lt;").replace('>', "&gt;")
 }
 
 impl ToolConstraints {
@@ -95,12 +110,25 @@ impl ToolConstraints {
                 ToolSyntax::QwenXml => json!({"type":"tag", "begin":format!("<tool_call>\n<function={}>\n", tool.name),
                     "content":{"type":"json_schema", "json_schema":schema, "style":"qwen_xml", "any_order":false},
                     "end":"\n</function>\n</tool_call>"}),
+                // One tool message (the template's render_atem), opened after `<|start|>assistant`.
+                ToolSyntax::MuseAtem => json!({"type":"tag",
+                    "begin":format!(" to={}<|message|><atem:function_calls>\n<atem:invoke name=\"{}\">\n",
+                        muse_header(&tool.name), muse_attribute(&tool.name)),
+                    "content":{"type":"muse_tool_schema", "strict":strict, "json_schema":schema},
+                    "end":"\n</atem:invoke>\n</atem:function_calls>"}),
             });
         }
         if !(assistance || strict_requested || required) {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
+            // Parallel calls are consecutive tool messages; the response
+            // composition (`muse_response_constraint`) owns the optional branch.
+            ToolSyntax::MuseAtem => {
+                let calls = json!({"type":"tags_with_separator", "tags":tags, "separator":"<|eom|><|start|>assistant",
+                    "at_least_one":true, "stop_after_first":!parallel});
+                (calls.clone(), calls)
+            }
             ToolSyntax::KimiXtml => {
                 let calls = json!({"type":"tag", "begin":"<|open|>tools<|sep|>",
                     "content":{"type":"tags_with_separator", "tags":tags, "separator":"",

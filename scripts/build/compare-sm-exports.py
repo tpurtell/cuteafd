@@ -145,6 +145,14 @@ def jobs(scope):
         ("step5-metadata", "export_b12x_step5_aot.py", ["--heads", "64", "--group", "metadata"]),
         ("step5-metadata-tp2", "export_b12x_step5_aot.py", ["--heads", "32", "--group", "metadata"]),
     ])
+    for heads, suffix in ((128, ""), (64, "-tp2")):
+        for group in ("pointwise", "projections", "attention"):
+            result.append((f"muse-{group}{suffix}", "export_b12x_muse_aot.py",
+                           ["--heads", str(heads), "--group", group]))
+    result.append(("muse-tp-combine", "export_b12x_muse_aot.py", ["--group", "tp-combine"]))
+    result.append(("expert-partial", "export_b12x_expert_partial_aot.py", []))
+    result.append(("muse-k6-dense", "export_b12x_dsv4_aot.py",
+                   ["--geometry", "dense_trellis_k6", "--dense-trellis-families", "muse"]))
     for role in ("rtx_backbone", "rtx_tp2", "dspark_tp2"):
         args = ["--role", role, "--rows", CAPACITIES, "--width", "192", "--standard-names"]
         result.append((f"v41-slices-{role}", "export_b12x_slices_aot.py", args))
@@ -190,6 +198,9 @@ def jobs(scope):
     for geometry, bits in (("glm", "4,5"), ("qwen4", "4,5")):
         result.append((f"exl3-{geometry}-k" + bits.replace(",", ""), "package_exl3_aot.py",
                        ["--geometry", geometry, "--capacities", EXL3_CAPACITIES, "--bits", bits]))
+    # Muse Spark: TP-resident K4/K5 experts; the generic partial epilogue is separate.
+    result.append(("exl3-muse-k45", "package_exl3_aot.py",
+                   ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
@@ -256,6 +267,8 @@ def jobs(scope):
         ("vision-d128-pointwise", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "pointwise", "--head-dim", "128", "--hidden", "2048", "--bf16-products", "--bf16-before-gamma"]),
         ("vision-d96-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention"]),
         ("vision-d96-windows", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--windowed"]),
+        # Covers Muse transformer programs using the exporter's shared geometry.
+        ("vision-transformer", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "transformer"]),
         ("vision-d128-attention", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "attention", "--head-dim", "128"]),
         ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])

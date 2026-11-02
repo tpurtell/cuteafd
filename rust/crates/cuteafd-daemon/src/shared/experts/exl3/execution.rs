@@ -402,6 +402,22 @@ struct LayerBinding {
     sum: Table,
     expert_map: CuteafdDeviceBuffer,
     output_slot: usize,
+    /// The core's FC2 workspace (rotated F16 down outputs) and the layer's
+    /// down-projection svh: the partial-reply epilogue's sources.
+    fc2: CuteafdDeviceBuffer,
+    svh: CuteafdDeviceBuffer,
+    local_experts: usize,
+}
+
+/// What the per-expert partial-reply epilogue reads after the core ran:
+/// the rotated FC2 rows, the layer's svh, and the global-to-local expert map.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PartialSources {
+    pub fc2: CuteafdDeviceBuffer,
+    pub svh: CuteafdDeviceBuffer,
+    pub expert_map: CuteafdDeviceBuffer,
+    pub local_experts: usize,
+    pub experts: usize,
 }
 
 /// Native contexts retained from inventory through the last execution/graph.
@@ -725,6 +741,9 @@ impl<'a> Exl3Execution<'a> {
                 core,
                 sum,
                 expert_map: weight.buffer("global_to_combined")?,
+                fc2: *pointers.get("fc2").context("missing EXL3 FC2 workspace")?,
+                svh: weight.buffer("down_svh")?,
+                local_experts: weight.layout.experts,
                 output_slot: meta.objects[1]
                     .pointer_slots
                     .iter()
@@ -897,6 +916,35 @@ impl<'a> Exl3Execution<'a> {
             .launch_sum(&binding.sum.pointers, &binding.sum.scalars, stream)?;
         output.bytes = rows * self.hidden * self.output_element_bytes;
         Ok(output)
+    }
+
+    /// The core only (wire decode, routes, gate/up and down into FC2), for the
+    /// per-expert partial-reply epilogue that replaces the weighted top-k sum.
+    ///
+    /// # Safety
+    /// Same contract as `launch_layer`; the caller runs the epilogue on `stream`
+    /// before any later launch reuses the FC2 workspace.
+    pub(crate) unsafe fn launch_layer_core(&mut self, layer: usize, inputs: [CuteafdDeviceBuffer; 3], rows: usize,
+        stream: *mut c_void) -> Result<PartialSources> {
+        let mut inputs = inputs;
+        ensure!(rows > 0 && rows <= self.capacity, "EXL3 live rows exceed capacity");
+        ensure!(self.library.cuda_get_device()? == self.device, "EXL3 execution on wrong device");
+        let binding = self.layers.get_mut(layer).context("EXL3 layer is not bound")?;
+        if let Some(decoded) = &self.wire {
+            self.modules.owner.wire.as_ref().context("missing retained EXL3 wire decoder")?.decode(inputs[0], decoded.buffer, rows, stream)?;
+            inputs[0] = decoded.buffer;
+        }
+        if let Some(routes) = &self.modules.owner.routes {
+            self.route_pointers[0] = inputs[1].ptr;
+            self.route_pointers[1] = binding.expert_map.ptr;
+            self.route_bytes[1] = binding.expert_map.bytes as u64;
+            self.route_bytes[0] = inputs[1].bytes as u64;
+            routes.launch(&self.route_pointers, &self.route_bytes, rows as i32, stream)?;
+        }
+        binding.core.bind(&inputs, rows);
+        self.modules.owner.kernel.launch_core(&binding.core.pointers, &binding.core.scalars, stream)?;
+        Ok(PartialSources { fc2: binding.fc2, svh: binding.svh, expert_map: binding.expert_map,
+            local_experts: binding.local_experts, experts: binding.expert_map.bytes / 4 })
     }
 }
 

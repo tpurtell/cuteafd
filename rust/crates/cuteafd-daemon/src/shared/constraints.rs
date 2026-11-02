@@ -336,6 +336,72 @@ mod tests {
         }
     }
 
+    /// Muse's recipient turn under constraint, through the API's own request
+    /// path and the checkpoint tokenizer: reasoning, commentary, a strict atem
+    /// call (required) or a JSON answer, the stop token at completion, and the
+    /// schema still enforced. Skips without the library or the snapshot.
+    #[tokio::test]
+    async fn muse_atem_constraints_drive_the_recipient_turn() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::json;
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else {
+            eprintln!("skipping: CUTEAFD_NATIVE_LIB is not set");
+            return;
+        };
+        let snapshots = std::path::Path::new(
+            "/mnt/sparknest/hf-home/hub/models--meta-models--Muse-Spark-Open-816B-A42B/snapshots");
+        let Some(Ok(snapshot)) = std::fs::read_dir(snapshots).ok().and_then(|mut entries| entries.next()) else {
+            eprintln!("skipping: Muse snapshot absent");
+            return;
+        };
+        let snapshot = snapshot.path();
+        // SAFETY: the test retains this native DSO until all matchers are gone.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let encoding = Arc::new(openai::chat::muse::MuseEncoding::from_snapshot(&snapshot).unwrap());
+        let tokenizer = cuteafd_loader::cached_tokenizer(&snapshot).unwrap();
+        let encode = |text: &str| tokenizer.encode_ids(text).unwrap();
+        for required in [false, true] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("muse-fixture", ModelEncoding::Muse(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(serde_json::Value::Null)),
+                std::time::Duration::from_secs(25), cuteafd_api::openai::ConsoleHub::disabled(), profile);
+            let body = json!({"model":"muse-fixture", "messages":[{"role":"user","content":"Weather? Answer in JSON."}],
+                "tool_choice":if required {"required"} else {"auto"},
+                "tools":[{"type":"function","function":{"name":"get_weather","strict":true,
+                    "parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer","maximum":7}},
+                        "required":["city","days"],"additionalProperties":false}}}],
+                "response_format":{"type":"json_object"}});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            let mut compiler = Compiler::with_vocab(&library, snapshot.join("tokenizer.json"), 202048,
+                encoding.tokens().eos.clone());
+            let spec = request.constraint.as_ref().unwrap();
+            let lead = " to=self<|message|>Think about it.<|eom|><|start|>assistant to=commentary<|message|>Checking.<|eom|><|start|>assistant";
+            let call = " to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n\
+                <atem:parameter name=\"city\">台北</atem:parameter>\n<atem:parameter name=\"days\">3</atem:parameter>\n\
+                </atem:invoke>\n</atem:function_calls>";
+            let answer = " to=user<|message|>{\"ok\": true}";
+            let mut run = |text: &str| -> Result<bool> {
+                let mut state = compiler.matcher(spec)?;
+                for token in encode(text) { if state.accept(token).is_err() { return Ok(false); } }
+                let done = state.matcher.is_completed()?;
+                if done { state.accept(200_008)?; }
+                Ok(done)
+            };
+            assert!(run(&format!("{lead}{call}")).unwrap(), "required={required}: the call completes");
+            assert_eq!(run(&format!("{lead}{answer}")).unwrap(), !required, "required={required}: a JSON answer");
+            assert!(!run(&format!("{lead}{}", call.replace(">3<", ">9<"))).unwrap(), "schema maximum enforced");
+            assert!(!run(&format!("{lead}{}", call.replace(">3<", ">three<"))).unwrap(), "integer type enforced");
+            assert!(!run(&format!("{lead} to=user<|message|>not json")).unwrap(), "response format enforced");
+            assert!(!run(&format!(" to=get_weather<|message|>{call}")).unwrap(), "reasoning comes first");
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
     /// The XGrammar matcher's mask buffer is reused across rows and
     /// `fill_bitmask` returns whether that row needs a mask at all. A row whose
     /// grammar allows every token must be recorded as `None`; recording the

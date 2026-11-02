@@ -98,7 +98,7 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
         &cuteafd_loader::placement::SparkWorkingSet { rtx_layers: vec![], spark_layers: layers.clone(),
             spark_ranks: world, prefill_lanes: 1 }, world, None,
         ModelAdmission::new(vec![SparkEndpoint { ring_depth: None, capacity: MAX_ROWS as u32,
-                ingress: SparkIngress::Fp8K32 }],
+                ingress: SparkIngress::Fp8K32, partial_reply_bytes: None }],
             spark_rings(config.max_frame_bytes)?, super::tp_gate::gate_executions(&catalog, MAX_ROWS as u32)?)?,
         Some(&manifest))?.select(&peers)?;
     let zero = DeviceAllocation::new(&library, MAX_ROWS * row_bytes)?;

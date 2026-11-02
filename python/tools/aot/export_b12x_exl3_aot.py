@@ -234,7 +234,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                                   force_blocks_per_sm=blocks_per_sm, **rotation, **schedule)
     output.mkdir(parents=True, exist_ok=True)
     objects = []
-    for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", launch.topk_sum.compiled)]:
+    sum_compiled = launch.topk_sum.compiled
+    for label, compiled in [("v41_exl3_core", launch.compiled), ("v41_exl3_sum", sum_compiled)]:
         compiled.export_to_c(str(output), label, "cuteafd_" + label)
         header = (output / (label + ".h")).read_text()
         wrapper = re.search(r"static inline int32_t (cute_dsl_\w+_wrapper)\((.*?)\) \{", header, re.S)
