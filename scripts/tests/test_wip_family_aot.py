@@ -172,7 +172,7 @@ def test_every_build_aot_switch_is_forwarded_to_coordinator_container():
     command = wip.split('local -a coordinator_build=(docker exec', 1)[1].split(
         '"$coordinator_container"', 1)[0]
     # EXLR8 is passed via an optional -e array; inspect its definition too.
-    for array in set(re.findall(r'\$\{([a-z_]+)\[@\]', command)):
+    for array in set(re.findall(r'\$\{([a-z0-9_]+)\[@\]', command)):
         command += '\n' + '\n'.join(re.findall(r'\b' + array + r'=\([^\n]*', wip))
     forwarded = set(re.findall(r'-e\s+[\"\']?(CUTEAFD_WIP_[A-Z0-9_]+_AOT)=', command))
     assert required and required <= forwarded, sorted(required - forwarded)
