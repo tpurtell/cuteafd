@@ -445,8 +445,11 @@ fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill
     chunks.len() <= 16 && crate::shared::prefill_packing::plan(chunks, limits).is_ok()
 }
 
-fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
-    !earlier.is_empty() && prompt.starts_with(earlier)
+fn pending_prefix_hit(prompt: &[u32], earlier: &[u32], retried: bool, donor_retried: bool,
+    retained: usize, whole: bool) -> bool {
+    // Only a strict extension may wait, once, for a donor finishing this round.
+    whole && !retried && !donor_retried && !earlier.is_empty() && earlier.len() < prompt.len()
+        && retained < earlier.len() && prompt.starts_with(earlier)
 }
 
 /// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
@@ -568,7 +571,7 @@ pub(crate) fn exercise_packed_prefill<'w, 'a: 'w>(
             max_tokens: 1, sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None };
         let images = super::prefix::media_keys(tokens, &[])?;
         let now = Instant::now();
-        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new() },
+        admitted.push((admission::Prepared { job, prompt: tokens.to_vec(), images: Vec::new(), prefix_deferred: false },
             id, lease, slot, images, (now, now)));
     }
     let members: Vec<PackMember<'_>> = admitted.iter().map(|(prepared, _, lease, ..)| (prepared, *lease, false)).collect();
@@ -730,7 +733,7 @@ impl<'w, 'a, P: ServingTarget<'w, 'a>> queue::Host<Waiting<'a>, super::prefill_t
         let (anchor, next_after_commit) = match result {
             Ok(value) => value,
             Err(error) => return queue::Host::<_, super::prefill_target::V41Prefill<P::Suffix>>::fail(self,
-                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease, image_keys,
+                Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new(), prefix_deferred: false }, id, lease, image_keys,
                     cached, hit_scores: None, images, ticket, constraint, decoder, packed: None, reserve }, error),
         };
         // The lane it was announced on at admission (queued prompts count in `loads`).
@@ -951,16 +954,16 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 }
             };
             if prepared.job.events.is_closed() { continue; }
-            // An earlier member (this wave or still prefilling) will publish its
-            // prompt snapshot once prefilled. Defer before leasing, while unrelated
-            // queued prompts still pack.
-            if prefixes.engine().enabled() && prepared.images.is_empty()
-                && !crate::shared::probe::cold(&prepared.job.probe)
-                && admitted.iter().map(|(earlier, ..)| (earlier.images.is_empty(), earlier))
-                    .chain(prefills.iter().filter_map(|queued| queued.request())
-                        .map(|waiting| (!waiting.images, &waiting.prepared)))
-                    .any(|(text, earlier)| text && !crate::shared::probe::cold(&earlier.job.probe)
-                        && pending_prefix_hit(&prepared.prompt, &earlier.prompt)) {
+            // Only whole-prompt rounds guarantee a donor finishes before decoding.
+            // Otherwise restore a retained prefix or prefill without waiting.
+            if whole && prefixes.engine().enabled() && prepared.images.is_empty()
+                && !prepared.prefix_deferred && !crate::shared::probe::cold(&prepared.job.probe)
+                && admitted.iter().any(|(earlier, ..)| earlier.images.is_empty()
+                    && !earlier.job.events.is_closed() && !crate::shared::probe::cold(&earlier.job.probe)
+                    && pending_prefix_hit(&prepared.prompt, &earlier.prompt, prepared.prefix_deferred,
+                        earlier.prefix_deferred, prefixes.engine().peek(&prepared.prompt, true), whole)) {
+                prepared.prefix_deferred = true;
+                tracing::debug!(prompt_tokens=prepared.prompt.len(), "native pending prefix deferred once");
                 next_wave.push_back(prepared);
                 continue;
             }
@@ -1020,7 +1023,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             };
             let events = prepared.job.events.clone();
             let admitted = (|| -> Result<_> {
-                let admission::Prepared { job, prompt, images } = &mut prepared;
+                let admission::Prepared { job, prompt, images, .. } = &mut prepared;
                 if let Some(draft) = draft.as_deref_mut() { draft.admit(id)?; }
                 let image_keys = super::prefix::media_keys(prompt, images)?;
                 if !images.is_empty() {
@@ -1105,7 +1108,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         while let Some((prepared, id, lease, slot, image_keys, hit, restore)) = admitted.pop_front() {
             let lane = cuteafd_loader::plan::decode_lanes::assign(loads);
             let events = prepared.job.events.clone();
-            let admission::Prepared { job, prompt, images } = prepared;
+            let admission::Prepared { job, prompt, images, prefix_deferred } = prepared;
             let mut ticket = console::Ticket::new(id, lane as u8, job.usage.clone());
             let (cached, hit_scores) = hit.map_or((0, None), |(end, scores)| (end, scores));
             let image_count = images.len();
@@ -1128,7 +1131,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             match ready {
                 Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
                     cursor: super::prefill_target::V41Prefill::new(),
-                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
+                    request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new(), prefix_deferred }, id, lease,
                         image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
                         packed: None, reserve }) }) }
                 Err(error) => {
@@ -2830,11 +2833,38 @@ mod sampling_tests {
         let replay = Probe::new(ProbeSpec { cold: true,
             cold_steps: vec![ProbeColdStep { end: 4, decode: false }], ..Default::default() });
         assert!(!packing_probe_allowed(&Some(replay)));
-        assert!(pending_prefix_hit(&[1, 2, 3], &[1, 2]));
-        assert!(pending_prefix_hit(&[1, 2], &[1, 2]));
-        assert!(!pending_prefix_hit(&[1, 3], &[1, 2]));
-        assert!(!pending_prefix_hit(&[1], &[1, 2]));
-        assert!(!pending_prefix_hit(&[1], &[]));
+        assert!(pending_prefix_hit(&[1, 2, 3], &[1, 2], false, false, 0, true));
+        assert!(!pending_prefix_hit(&[1, 2], &[1, 2], false, false, 0, true));
+        assert!(!pending_prefix_hit(&[1, 3], &[1, 2], false, false, 0, true));
+        assert!(!pending_prefix_hit(&[1], &[1, 2], false, false, 0, true));
+        assert!(!pending_prefix_hit(&[1], &[], false, false, 0, true));
+    }
+
+    #[test]
+    fn pending_prefix_wait_is_bounded_and_cannot_chain() {
+        let donor = [1, 2];
+        let extension = [1, 2, 3];
+        assert!(pending_prefix_hit(&extension, &donor, false, false, 0, true));
+        // Even a missing/failed donor cannot make the retried request wait again.
+        assert!(!pending_prefix_hit(&extension, &donor, true, false, 0, true));
+        assert!(!pending_prefix_hit(&[1, 2, 3, 4], &extension, false, true, 0, true));
+        assert!(!pending_prefix_hit(&extension, &donor, false, false, donor.len(), true));
+        // A positive decode share can spread a cold donor over several rounds.
+        assert!(!pending_prefix_hit(&extension, &donor, false, false, 0, false));
+        for _ in 0..16 {
+            assert!(!pending_prefix_hit(&donor, &donor, false, false, 0, true));
+            assert!(!pending_prefix_hit(&[1], &donor, false, false, 0, true));
+        }
+        // Simulate the old repeated-boundary chain with a new donor each time.
+        let mut retried = false;
+        let mut waits = 0;
+        for _ in 0..16 {
+            if pending_prefix_hit(&extension, &donor, retried, false, 0, true) {
+                retried = true;
+                waits += 1;
+            }
+        }
+        assert_eq!(waits, 1);
     }
 
     #[test]
