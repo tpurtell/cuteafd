@@ -307,14 +307,14 @@ def test_loaded_meta_crosscheck_matches_the_manifest_arm() -> None:
         logical_intermediate, kernel_intermediate, topk = 768, 768, 6
         capacity_rows = 80
 
-    assert q.verify_loaded_meta(Meta(), _manifest(), 80, 3) is not None
+    assert q.verify_loaded_meta(Meta(), _manifest(), 80, q.native_spark_artifacts()[3][0]) is not None
     Meta.capacity_rows = 1
     with pytest.raises(SystemExit):
-        q.verify_loaded_meta(Meta(), _manifest(), 80, 3)
+        q.verify_loaded_meta(Meta(), _manifest(), 80, q.native_spark_artifacts()[3][0])
     Meta.capacity_rows = 80
     Meta.kernel_intermediate = 640
     with pytest.raises(SystemExit):
-        q.verify_loaded_meta(Meta(), _manifest(), 80, 3)
+        q.verify_loaded_meta(Meta(), _manifest(), 80, q.native_spark_artifacts()[3][0])
 
 
 def test_route_weight_modes_are_named_and_nonuniform_when_requested() -> None:

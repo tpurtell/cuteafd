@@ -86,10 +86,10 @@ impl SparkAdmission {
                     SparkResidentLayout::Exl3 { world: tp, rank: shard }
                 } else if catalog.fp8().is_some() {
                     SparkResidentLayout::Fp8 { world: tp, rank: shard, slicing: recipe.slicing }
-                } else {
-                    SparkResidentLayout::Native { world: tp, rank: shard,
+                } else if catalog.nvfp4().is_some() {
+                    SparkResidentLayout::Nvfp4 { world: tp, rank: shard,
                         stored_width: *recipe.widths.get(shard).context("Spark recipe has no rank width")? }
-                };
+                } else { SparkResidentLayout::Native { world: tp, rank: shard } };
                 SparkAssignment::from_catalog(catalog, working, rank, layout, &model.endpoints, model.rings)
                     .with_context(|| format!("Spark admission rank {rank} checkpoint assignment"))
             }).collect::<Result<Vec<_>>>()?

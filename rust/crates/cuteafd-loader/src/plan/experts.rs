@@ -20,19 +20,23 @@ pub fn stored_slice(intermediate: usize, block: usize, tp: usize) -> Option<usiz
 
 /// A build recipe is independent of the coordinator's installed package tree.
 /// Generic exact-width packages use one program per distinct rank extent;
-/// native MXFP4/NVFP4 retain their calibrated padded storage.
+/// native MXFP4 names its distinct logical/storage artifacts; NVFP4 stays frozen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparkRecipe {
     pub slicing: crate::formats::fp8_experts::Slicing,
     pub widths: Vec<usize>,
+    pub stored_widths: Vec<usize>,
     pub rule: cuteafd_core::tp_units::UnitRule,
     pub required_layouts: Vec<String>,
+    pub native_artifacts: Vec<cuteafd_core::tp_units::NativeArtifact>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InstalledSparkRecipeRefusal {
     #[error("missing installed Spark package artifact: {0}")]
     MissingArtifact(std::path::PathBuf),
+    #[error("native Spark artifacts require shared-library metadata attestation, not a generic package directory")]
+    NativeAttestationRequired,
     #[error("padded Spark storage conflicts with the recipe's unequal exact rank widths")]
     PaddedExactMismatch,
     #[error("Spark rank {rank} selected width {selected}, but the recipe requires {expected}")]
@@ -50,8 +54,8 @@ impl SparkRecipe {
                 && other.rule == cuteafd_core::tp_units::UnitRule::Contiguous);
         // Different native scale units can describe the same exact contiguous
         // source ranges in mixed-format layers; storage and packages must agree.
-        slicing_matches && self.widths == other.widths && self.rule == other.rule
-            && self.required_layouts == other.required_layouts
+        slicing_matches && self.widths == other.widths && self.stored_widths == other.stored_widths && self.rule == other.rule
+            && self.required_layouts == other.required_layouts && self.native_artifacts == other.native_artifacts
     }
 
     pub fn rank_for_layer(&self, rank: usize, layer: usize) -> usize {
@@ -65,16 +69,22 @@ impl SparkRecipe {
         self.widths.get(self.rank_for_layer(rank, layer)).copied()
     }
 
+    pub fn stored_width_for_layer(&self, rank: usize, layer: usize) -> Option<usize> {
+        if rank >= self.widths.len() { return None; }
+        self.stored_widths.get(self.rank_for_layer(rank, layer)).copied()
+    }
+
     /// Validate an explicit Spark package root, never the coordinator tree.
     /// Installation can narrow a registered recipe but cannot create one.
     pub fn validate_installed(&self, root: &std::path::Path, rank: usize,
         selected_slicing: crate::formats::fp8_experts::Slicing, selected_width: usize)
         -> Result<(), InstalledSparkRecipeRefusal> {
+        if !self.native_artifacts.is_empty() { return Err(InstalledSparkRecipeRefusal::NativeAttestationRequired); }
         if matches!(self.slicing, crate::formats::fp8_experts::Slicing::Blocks(_))
             && selected_slicing != self.slicing && self.widths.windows(2).any(|pair| pair[0] != pair[1]) {
             return Err(InstalledSparkRecipeRefusal::PaddedExactMismatch);
         }
-        let expected = *self.widths.get(rank).ok_or(InstalledSparkRecipeRefusal::InvalidRank {
+        let expected = *self.stored_widths.get(rank).ok_or(InstalledSparkRecipeRefusal::InvalidRank {
             rank, world: self.widths.len(),
         })?;
         if selected_width != expected {
@@ -111,14 +121,12 @@ pub fn frozen_refusal(contract: &str, world: usize) -> Option<SparkRecipeRefusal
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SparkRecipeRefusal {
-    #[error("geometry-invalid: intermediate {intermediate} cannot give {world} ranks nonempty whole-{block} row slices; native MXFP4 requires equal whole-K32 shards: add per-rank adjacent-width staging and matching native Spark role exports before admitting unequal widths")]
+    #[error("geometry-invalid: intermediate {intermediate} cannot give {world} ranks nonempty whole-{block} row slices")]
     GeometryInvalid { intermediate: usize, world: usize, block: usize },
     #[error("missing Spark package recipe: {package} TP{world}; export its balanced per-rank widths in package_exl3_aot.py (EXL3) or package_fp8_moe_aot.py (FP8/NVFP4), register spark_recipe, and include those layouts in the Spark image")]
     MissingPackage { package: String, world: usize },
     #[error("NVFP4 is deprecated; Spark worlds {worlds:?}; requested {package} TP{world}")]
     Deprecated { package: String, world: usize, worlds: Vec<usize> },
-    #[error("native MXFP4 requires equal whole-K32 shards for intermediate {intermediate}, TP{world}; add native roles taking unequal whole-K32 shards, rotated by layer, and rank-sized staging")]
-    NativeUnequal { intermediate: usize, world: usize },
     #[error("unknown Spark package recipe: {0}")]
     UnknownPackage(String),
     #[error("{0}")]
@@ -206,14 +214,11 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     if !(exl3 || nvfp4 || mxfp4 || fp8 || bf16) {
         return Err(SparkRecipeRefusal::UnknownPackage(package.into()));
     }
-    let block = if nvfp4 { 16 } else if mxfp4 { 32 } else { 128 };
+    let block = if nvfp4 { 16 } else if native && mxfp4 {
+        cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world)
+    } else if mxfp4 { 32 } else { 128 };
     if !(1..=8).contains(&world) || intermediate == 0 || intermediate % block != 0 || intermediate / block < world {
         return Err(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block });
-    }
-    // Native family roles and staging require equal whole-K32 shards. Generic
-    // MXFP4 tail exports do not make those native roles executable by themselves.
-    if native && mxfp4 && (intermediate % world != 0 || intermediate / world % 32 != 0) {
-        return Err(SparkRecipeRefusal::NativeUnequal { intermediate, world });
     }
     let coverage_key = format!("{family}:{}", if exl3 { "exl3" } else if nvfp4 { "nvfp4" } else { format });
     let coverage = cuteafd_core::tp_units::spark_package_entry(&coverage_key);
@@ -235,7 +240,12 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     // rotate contiguous native-unit ranges by layer, retaining NVFP4 padding.
     let rule = if compact { cuteafd_core::tp_units::UnitRule::Rotated }
         else { cuteafd_core::tp_units::layer_rule(intermediate / block, world) };
-    let exact = exl3 || (!native && (!nvfp4 || intermediate % (128 * world) == 0));
+    let native_artifacts = if native && mxfp4 {
+        let hidden = match family { "v41" => 5120, "dsv4f" => 4096, "dsv4p" => 7168, _ => unreachable!() };
+        cuteafd_core::tp_units::native_spark_artifacts(hidden, intermediate, world)
+            .map_err(SparkRecipeRefusal::Placement)?
+    } else { Vec::new() };
+    let exact = exl3 || mxfp4 || (!native && (!nvfp4 || intermediate % (128 * world) == 0));
     let widths = if compact {
         vec![(intermediate / block).div_ceil(world) * block; world]
     } else if exact {
@@ -245,14 +255,24 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
         vec![stored_slice(intermediate, block, world)
             .ok_or(SparkRecipeRefusal::GeometryInvalid { intermediate, world, block })?; world]
     };
-    let required_layouts = if exl3 {
+    let stored_widths = widths.iter().map(|&logical| {
+        if !native_artifacts.is_empty() {
+            native_artifacts.iter().find(|artifact| artifact.logical == logical).expect("derived artifact").stored
+        } else if mxfp4 {
+            let hidden = if family == "mimop" { 6144 } else { 4096 };
+            cuteafd_core::mxfp4_layouts::generic_stored_width(hidden, logical)
+        } else { logical }
+    }).collect();
+    let required_layouts = if !native_artifacts.is_empty() {
+        native_artifacts.iter().map(|artifact| artifact.name.clone()).collect()
+    } else if exl3 {
         let tag = if compact { "-compact" } else { "" };
         (0..world).map(|rank| format!("tp{world}{tag}-rank{rank}")).collect()
     } else if exact && widths.iter().any(|width| *width != widths[0]) {
         let mut unique = widths.clone(); unique.sort_unstable_by(|a, b| b.cmp(a)); unique.dedup();
         unique.into_iter().map(|width| format!("tp{world}-w{width}")).collect()
     } else { vec![format!("tp{world}")] };
-    Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(block) } else { Slicing::Padded }, widths, rule, required_layouts })
+    Ok(SparkRecipe { slicing: if exact { Slicing::Blocks(block) } else { Slicing::Padded }, widths, stored_widths, rule, required_layouts, native_artifacts })
 }
 
 #[cfg(test)]
@@ -288,6 +308,7 @@ mod tests {
         assert_eq!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(32));
         assert_eq!(recipe.rule, UnitRule::LayerRotation);
         assert_eq!(recipe.widths, [352, 352, 352, 352, 320, 320]);
+        assert_eq!(recipe.stored_widths, [384, 384, 384, 384, 320, 320]);
         assert_eq!(recipe.required_layouts, ["tp6-w352", "tp6-w320"]);
         for layer in [0, 3, 40, 77] {
             let widths = (0..6).map(|rank| recipe.width_for_layer(rank, layer).unwrap()).collect::<Vec<_>>();
@@ -428,7 +449,7 @@ mod tests {
         }
         assert!(spark_worlds("v41:exl3-k23", 2304).is_empty());
         assert!(spark_worlds("dsv4f:exl3-k23", 2048).is_empty());
-        assert_eq!(spark_worlds("v41:mxfp4", 2304), [2, 3, 4, 6, 8]);
+        assert_eq!(spark_worlds("v41:mxfp4", 2304), [2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(spark_worlds("v41:nvfp4", 2304), [2, 3, 4, 6]);
         for package in ["qwen4:nvfp4", "qwen4:exl3-k45", "qwen4:fp8"] {
             for world in [7, 8] {
@@ -512,16 +533,16 @@ mod tests {
         };
         put("tp6", "libcuteafd_fp8moe.so");
         put("tp6-w352", "libcuteafd_fp8moe.so");
-        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 352),
+        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384),
             Err(InstalledSparkRecipeRefusal::MissingArtifact(_))));
         put("tp6-w320", "libcuteafd_fp8moe.so");
-        assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 352).is_ok());
+        assert!(recipe.validate_installed(root.path(), 0, Slicing::Blocks(32), 384).is_ok());
         assert!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(32), 320).is_ok());
         assert!(matches!(recipe.validate_installed(root.path(), 4, Slicing::Blocks(32), 352),
             Err(InstalledSparkRecipeRefusal::WidthMismatch { .. })));
         assert!(matches!(recipe.validate_installed(root.path(), 6, Slicing::Blocks(32), 320),
             Err(InstalledSparkRecipeRefusal::InvalidRank { .. })));
-        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Padded, 352),
+        assert!(matches!(recipe.validate_installed(root.path(), 0, Slicing::Padded, 384),
             Err(InstalledSparkRecipeRefusal::PaddedExactMismatch)));
         let exl3 = spark_recipe("glm:exl3-k45", 2048, 6).unwrap();
         assert!(matches!(exl3.validate_installed(root.path(), 0, Slicing::Blocks(128), 384),
@@ -545,10 +566,10 @@ mod tests {
         use crate::formats::fp8_experts::Slicing;
         use cuteafd_core::tp_units::{RankUnits, UnitRule};
         let cases: &[(&str, usize, &[usize])] = &[
-            ("v41:mxfp4", 2304, &[2, 3, 4, 6, 8]),
+            ("v41:mxfp4", 2304, &[2, 3, 4, 5, 6, 7, 8]),
             ("v41:nvfp4", 2304, &[2, 3, 4, 6]),
-            ("dsv4f:mxfp4", 2048, &[2, 4, 8]),
-            ("dsv4p:mxfp4", 3072, &[2, 3, 4, 6, 8]),
+            ("dsv4f:mxfp4", 2048, &[2, 3, 4, 5, 6, 7, 8]),
+            ("dsv4p:mxfp4", 3072, &[2, 3, 4, 5, 6, 7, 8]),
             ("dsv4p:exl3-k23", 3072, &[2, 3, 4, 5, 6, 7, 8]),
             ("glm:fp8", 2048, &[2, 3, 4, 5, 6, 7, 8]),
             ("glm:nvfp4", 2048, &[2, 3, 4, 6]),
@@ -576,7 +597,8 @@ mod tests {
                     assert_eq!(result.is_ok(), worlds.contains(&world), "{context}: {result:?}");
                     let Ok(recipe) = result else { continue };
                     let unit = if package.contains("nvfp4") { 16 }
-                        else if package.ends_with("mxfp4") || matches!(package, "mimof:fp8" | "mimop:fp8") { 32 }
+                        else if package.ends_with("mxfp4") { cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world) }
+                        else if matches!(package, "mimof:fp8" | "mimop:fp8") { 32 }
                         else { 128 };
                     if (intermediate / unit) % world == 0 {
                         assert_eq!(recipe.rule, UnitRule::Contiguous, "{context}");
@@ -599,19 +621,25 @@ mod tests {
     }
 
     #[test]
-    fn native_mxfp4_admission_matches_equal_k32_reader_and_exporter() {
-        for world in [3, 6] {
-            assert!(matches!(spark_recipe("dsv4f:mxfp4", 2048, world),
-                Err(SparkRecipeRefusal::NativeUnequal { .. })));
+    fn native_artifacts_match_rotated_source_and_measured_storage() {
+        use cuteafd_core::tp_units::{native_spark_artifacts, LayerShard};
+        for (package, hidden, intermediate) in [("v41:mxfp4", 5120, 2304),
+            ("dsv4f:mxfp4", 4096, 2048), ("dsv4p:mxfp4", 7168, 3072)] {
+            for world in 2..=8 {
+                let recipe = spark_recipe(package, intermediate, world).unwrap();
+                assert_eq!(recipe.native_artifacts, native_spark_artifacts(hidden, intermediate, world).unwrap());
+                for layer in [0, 1, 17, 63] {
+                    for rank in 0..world {
+                        let shard = LayerShard::new(intermediate, cuteafd_core::mxfp4_layouts::ownership_unit(intermediate, world), layer, world, rank).unwrap();
+                        assert_eq!(recipe.width_for_layer(rank, layer), Some(shard.width));
+                        assert_eq!(recipe.stored_width_for_layer(rank, layer),
+                            cuteafd_core::mxfp4_layouts::stored_width(hidden, shard.width));
+                    }
+                }
+                assert!(matches!(recipe.validate_installed(std::path::Path::new("/nonexistent"), 0,
+                    recipe.slicing, recipe.widths[0]), Err(InstalledSparkRecipeRefusal::NativeAttestationRequired)));
+            }
         }
-        for world in [2, 4] {
-            assert!(spark_recipe("dsv4f:mxfp4", 2048, world).is_ok());
-        }
-        for world in [2, 3, 4, 6] {
-            assert!(spark_recipe("dsv4p:mxfp4", 3072, world).is_ok());
-        }
-        assert!(spark_recipe("mimof:fp8", 2048, 3).is_ok());
-        assert!(spark_recipe("mimop:fp8", 2048, 6).is_ok());
     }
 
     #[test]

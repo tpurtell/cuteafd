@@ -62,7 +62,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         return memory;
     }
     // One request builder for planning and serving startup (plan == runtime).
-    let slots = opts.state_slots.unwrap_or(if opts.concurrency > 0 { opts.concurrency } else { 16 });
+    let slots = opts.resolved_state_slots("muse_spark");
     let catalog = match input.expert_catalog() {
         Ok(catalog) => catalog,
         Err(error) => {

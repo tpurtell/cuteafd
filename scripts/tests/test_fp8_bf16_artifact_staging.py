@@ -75,6 +75,7 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
     class Geometry:
         intermediate: int = 2048
         weights: str = "mxfp4"
+        hidden: int = 4096
         tp: int = 1
 
         def with_tp(self, tp):
@@ -91,6 +92,9 @@ def test_mxfp4_exact_k32_widths_reuse_existing_tail_abi():
         tp, geometry = package_tool.layout_geometry(base, f"tp3-w{width}")
         assert tp == 3
         assert geometry.slice == width
+    pro = replace(base, hidden=6144)
+    assert package_tool.layout_geometry(pro, "tp6-w352")[1].slice == 384
+    assert package_tool.layout_geometry(pro, "tp6-w320")[1].slice == 320
     for width in (656, 688, 736):
         with pytest.raises(SystemExit, match="no rank"):
             package_tool.layout_geometry(base, f"tp3-w{width}")

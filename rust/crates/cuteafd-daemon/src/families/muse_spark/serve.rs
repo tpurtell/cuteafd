@@ -82,6 +82,7 @@ impl ServeArgs {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        cuteafd_core::concurrency::validate("muse_spark", u64::from(self.max_sequences))?;
         let devices = self.devices();
         cuteafd_loader::placement::families::muse_spark::executor(devices.len())?;
         ensure!(devices.iter().all(|&device| device >= 0)
@@ -252,9 +253,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     })
 }
 
-pub(crate) async fn run(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::muse::MuseEncoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
     let encoding = Arc::new(MuseEncoding::from_snapshot(&snapshot)?);
@@ -265,7 +267,8 @@ pub(crate) async fn run(args: ServeArgs) -> Result<()> {
         Some(format!("{organization}/{model}"))
     })).context("Muse Spark requires --model-id for a snapshot without HF identity")?;
     let profile = ModelProfile::new(model, ModelEncoding::Muse(encoding));
-    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
+    let (queue, mut receive) = tokio::sync::mpsc::channel(
+        cuteafd_core::concurrency::queue_depth(u64::from(args.max_sequences)) as usize);
     let stats = Arc::new(std::sync::Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let engine_args = args.clone();
@@ -336,6 +339,26 @@ mod tests {
         for peers in ["127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4", PEERS] {
             args(&["--peers", peers])?.validate()?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn boot_concurrency_resolves_retention_and_names_native_refusals() -> Result<()> {
+        for c in [1u8, 4, 16, 17, 32, 64, 65] {
+            let mut args = args(&["--peers", PEERS])?;
+            args.max_sequences = c;
+            if c > 64 {
+                let error = args.validate().unwrap_err().to_string();
+                assert!(error.contains("muse_spark") && error.contains("decode program capacity 64"));
+                continue;
+            }
+            args.validate()?;
+            args.prefix.resolve_entries(usize::from(c));
+            assert_eq!(args.prefix.prefix_cache_entries, 20.max((usize::from(c) * 5).div_ceil(4)));
+            assert_eq!(cuteafd_core::concurrency::state_slots(u64::from(c)), u64::from(c));
+            assert_eq!(cuteafd_core::concurrency::queue_depth(u64::from(c)), u64::from(c));
+        }
+        assert_eq!(cuteafd_loader::families::muse_spark::lane::HEAD_ROWS, 64);
         Ok(())
     }
 

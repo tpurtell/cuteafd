@@ -94,7 +94,7 @@ impl KdaLayout {
         ensure!(cfg.layers == cfg.attention.len() && cfg.kda_heads == 96
             && cfg.kda_head_dim == 128 && cfg.kda_conv == 4,
             "Kimi KDA state layout differs from native geometry");
-        ensure!((1..=64).contains(&slots) && marks > 0 && (1..=2).contains(&lanes),
+        ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots) && (1..=2).contains(&lanes),
             "Kimi KDA state slot/mark/lane geometry");
         let mut layers = 0;
         let ordinals = cfg.attention.iter().map(|kind| if *kind == KimiAttention::Kda {
@@ -192,7 +192,7 @@ impl KdaLayout {
         };
         let state = allocate(state, "kv/kimi KDA state")?;
         let conv = allocate(conv, "kv/kimi KDA convolution")?;
-        let marks = allocate(marks, "prefix/kimi KDA marks")?;
+        let marks = (marks > 0).then(|| allocate(marks, "prefix/kimi KDA marks")).transpose()?;
         let replay = (0..self.lanes).map(|_| allocate(replay, "workspace/kimi KDA replay"))
             .collect::<Result<Vec<_>>>()?;
         let tables = (0..self.lanes).map(|_| allocate(self.slots * 3 * 4, "workspace/kimi KDA commit tables"))
@@ -221,7 +221,7 @@ pub(crate) struct KdaBank<'a> {
     readers: Vec<Rc<Stream<'a>>>,
     state: Rc<Allocation<'a>>,
     conv: Rc<Allocation<'a>>,
-    marks: Rc<Allocation<'a>>,
+    marks: Option<Rc<Allocation<'a>>>,
     replay: Vec<Rc<Allocation<'a>>>,
     tables: Vec<Rc<Allocation<'a>>>,
     layout: KdaLayout,
@@ -263,7 +263,8 @@ impl<'a> KdaBank<'a> {
 
     pub(crate) fn mark(&self, layer: usize, mark: usize) -> Result<[CuteafdDeviceBuffer; 2]> {
         let [(state, state_bytes), (conv, conv_bytes)] = self.layout.mark_ranges(layer, mark)?;
-        Ok([view(self.marks.buffer, state, state_bytes)?, view(self.marks.buffer, conv, conv_bytes)?])
+        let marks = self.marks.as_ref().context("Kimi prefix mark storage is disabled")?;
+        Ok([view(marks.buffer, state, state_bytes)?, view(marks.buffer, conv, conv_bytes)?])
     }
 
     pub(crate) fn commit_operands(&self, lane: usize) -> Result<[CuteafdDeviceBuffer; 4]> {
@@ -271,10 +272,10 @@ impl<'a> KdaBank<'a> {
         Ok([self.state.buffer, self.conv.buffer, self.replay[lane].buffer, self.tables[lane].buffer])
     }
 
-    pub(crate) fn mark_owner(&self) -> Rc<Allocation<'a>> { self.marks.clone() }
+    pub(crate) fn mark_owner(&self) -> Option<Rc<Allocation<'a>>> { self.marks.clone() }
 
     pub(crate) fn owners(&self) -> Vec<Rc<Allocation<'a>>> {
-        [&self.state, &self.conv, &self.marks].into_iter().chain(self.replay.iter()).chain(self.tables.iter()).cloned().collect()
+        [&self.state, &self.conv].into_iter().chain(self.marks.iter()).chain(self.replay.iter()).chain(self.tables.iter()).cloned().collect()
     }
 }
 
@@ -390,7 +391,7 @@ mod tests {
         let cfg = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         let allocation = || Allocation::new(device, 16).map(Rc::new);
         let bank = KdaBank { stream: Stream { device, raw: std::ptr::null_mut() }, readers: readers.clone(),
-            state: allocation()?, conv: allocation()?, marks: allocation()?,
+            state: allocation()?, conv: allocation()?, marks: Some(allocation()?),
             replay: vec![allocation()?, allocation()?], tables: vec![allocation()?, allocation()?],
             layout: KdaLayout::new(&cfg, 1, 1, 2)? };
         for (lane, stream) in readers.iter().enumerate() {
@@ -491,7 +492,11 @@ mod tests {
         assert!(layout.slot_ranges(0, 64).is_err());
         assert!(layout.mark_ranges(0, 2).is_err());
         assert!(layout.demands(2).is_err());
-        for (slots, marks, lanes) in [(0, 1, 1), (65, 1, 1), (1, 0, 1), (1, 1, 0), (1, 1, 3), (1, usize::MAX, 1)] {
+        let no_marks = KdaLayout::new(&cfg, 16, 0, 1)?;
+        assert_eq!(no_marks.extents()?[3], 0);
+        assert_eq!(no_marks.demands(1)?[2].bytes, 0);
+        assert!(no_marks.mark_ranges(0, 0).is_err());
+        for (slots, marks, lanes) in [(0, 1, 1), (129, 1, 1), (1, 1, 0), (1, 1, 3), (1, usize::MAX, 1)] {
             assert!(KdaLayout::new(&cfg, slots, marks, lanes).is_err());
         }
         Ok(())

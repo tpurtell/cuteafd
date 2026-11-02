@@ -4,6 +4,7 @@ pub const MAX_SPARK_WORLD: usize = 8;
 const _: () = assert!(MAX_SPARK_WORLD <= u8::BITS as usize);
 
 pub mod tp_units;
+pub mod mxfp4_layouts;
 pub mod dense_attention;
 pub mod ffn_activation;
 pub use ffn_activation::FfnActivation;
@@ -33,6 +34,7 @@ pub use dspark_verify::{verify_dspark_greedy, verify_dspark_greedy_vocab, Greedy
 mod engram;
 pub mod prefix;
 pub mod serving_capacity;
+pub mod concurrency;
 pub mod thermal;
 pub mod push_outcome;
 pub mod memory_layout;

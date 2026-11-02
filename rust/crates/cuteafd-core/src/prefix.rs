@@ -221,7 +221,7 @@ pub fn mark_slots_for(lanes: u64, entries: u64, slot_bytes: u64, budget_bytes: u
     if entries == 0 { return 0; }
     let floor = lanes.max(1).saturating_mul(2).saturating_add(2);
     let wanted = entries.saturating_mul(2).saturating_add(2);
-    wanted.min(budget_bytes / slot_bytes.max(1)).max(floor)
+    wanted.max(floor).min(budget_bytes / slot_bytes.max(1))
 }
 
 /// A fixed staging ring: two asynchronous captures, or a capture and a serialized restore.
@@ -892,6 +892,17 @@ mod tests {
 #[cfg(test)]
 mod staging_tests {
     use super::*;
+    #[test]
+    fn device_mark_budget_overrides_lane_floor() {
+        for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+            let entries = crate::concurrency::prefix_entries(c);
+            for budget in [0, 1, 1023, 1024, 2048, 8192] {
+                let slots = mark_slots_for(c, entries, 1024, budget);
+                assert!(slots * 1024 <= budget, "C{c}: {slots} marks exceed {budget}");
+            }
+            assert_eq!(mark_slots_for(c, 0, 1024, u64::MAX), 0);
+        }
+    }
     #[test]
     fn host_working_set_is_constant_and_host_off_is_legacy() {
         for lanes in [1, 2, 8, 16, 128] {

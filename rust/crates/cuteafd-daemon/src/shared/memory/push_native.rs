@@ -37,6 +37,10 @@ impl ScalePlan {
         let mut plan = Self::default();
         for (layer, planes, base) in layers {
             if !planes.scale_codes { continue; }
+            let geometry = catalog.routed_experts();
+            let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate, world);
+            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, unit, layer, world, rank)?;
+            ensure!(shard.width == planes.intermediate, "native scale shard differs from resident planes");
             for expert in 0..planes.experts {
                 let (names, _) = names(catalog, layer, expert, world, rank)?;
                 // A step must complete within one source tensor: projections
@@ -46,8 +50,8 @@ impl ScalePlan {
                     let tensor = catalog.tensor(&names[slot])?;
                     let row_bytes = tensor.metadata.shape[1];
                     let rows = if down { 0..planes.hidden }
-                        else { rank * planes.intermediate..(rank + 1) * planes.intermediate };
-                    let cols = if down { rank * planes.intermediate / 32..(rank + 1) * planes.intermediate / 32 }
+                        else { shard.source_range() };
+                    let cols = if down { shard.first / 32..(shard.first + shard.width) / 32 }
                         else { 0..row_bytes };
                     let rect = Rect { name: names[slot].clone(), path: catalog.snapshot().join(&tensor.shard),
                         base: tensor.metadata.byte_offset, row_bytes, rows, cols };
@@ -178,8 +182,12 @@ impl RankPlan {
             let planes = NativePlanes::with_scale_codes(geometry.hidden as usize, slice.width as usize,
                 slice.stored_width as usize, geometry.experts as usize, catalog.nvfp4().is_some(),
                 catalog.nvfp4().is_none() && catalog.mxfp4_scale_codes())?;
-            ensure!(slice.first as usize == rank.checked_mul(planes.intermediate).context("native slice overflow")?,
-                "native push slice start differs from rank");
+            let unit = if catalog.nvfp4().is_some() { 32 }
+                else { cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate, world) };
+            let shard = cuteafd_core::tp_units::LayerShard::new(geometry.intermediate, unit,
+                slice.layer as usize, world, rank)?;
+            ensure!(slice.first as usize == shard.first && planes.intermediate == shard.width,
+                "native push slice differs from layer ownership");
             let mut hash = Sha256::new();
             hash.update(serde_json::to_vec(slice)?);
             hash.update(format!("{planes:?}"));

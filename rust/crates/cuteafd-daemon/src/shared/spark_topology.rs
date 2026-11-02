@@ -259,7 +259,14 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
             };
             assert_eq!(peers, 8, "{key}: lost peers in launch/parse");
             require_world(world(resolve(tp, ep, peers, "launch-chain")?, peers)?, &catalog)?;
-            if family == "v41" { assert_eq!(captured["layer_bytes"], 1_203_240_960u64); }
+            if family == "v41" {
+                // TP8 retains logical/stored S288: payloads plus coded K32 scales.
+                let (hidden, width, experts) = (5120u64, 288u64, 384u64);
+                let payloads = hidden * width * 3 / 2;
+                let scales = 2 * width * (1 + 2 * (hidden / 128))
+                    + hidden * (1 + 2 * (width / 32).div_ceil(4));
+                assert_eq!(captured["layer_bytes"], experts * (payloads + scales));
+            }
             let hidden = catalog.routed_experts().geometry()?.hidden as u64;
             let rows = deployment.prefill_unit_rows;
             let waves = deployment.prefill_waves;

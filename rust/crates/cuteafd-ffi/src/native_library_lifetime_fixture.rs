@@ -78,9 +78,17 @@ impl Fixture {
         anyhow::ensure!(status.success(), "fixture module filesystem check failed");
         let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let (c_object, cc_object) = (directory.join("fixture.o"), directory.join("kernels.o"));
+        let status = Command::new("python3")
+            .arg(repo.join("python/tools/lib/mxfp4_layouts.py"))
+            .arg("--header")
+            .arg(directory.join("cuteafd_mxfp4_layouts.h"))
+            .status()?;
+        anyhow::ensure!(status.success(), "generating CPU fixture MXFP4 layouts failed");
         let status = Command::new("cc")
             .args(["-c", "-fPIC", "-O0", "-Wall", "-Wextra", "-Werror"])
             .arg(fixtures.join("native_library_lifetime.c"))
+            .arg("-I")
+            .arg(&directory)
             .arg("-o")
             .arg(&c_object)
             .env("TMPDIR", &directory)

@@ -1126,7 +1126,7 @@ release_load_config() {
   HTTP_QUEUE_WAIT_MS=25000
   CONCURRENCY=
   RELEASE_CONCURRENCY_EXPLICIT=0
-  PREFIX_CACHE_ENTRIES=20
+  PREFIX_CACHE_ENTRIES=auto
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
   SPARK_DEVICE_BUDGET_BYTES=107374182400
@@ -1283,11 +1283,11 @@ release_load_config() {
     if [[ "$mode" == stop ]]; then
       [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
     else
-      [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+      [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
     fi
   fi
-  [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] ||
-    release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
+  [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] ||
+    release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
   [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] || release_die "PREFILL_BATCH_TOKENS must be non-negative"
   if [[ "$mode" == launch ]]; then
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||
@@ -1510,9 +1510,9 @@ release_spark_values() {
 # ---------------------------------------------------------------------------
 
 # Release and WIP must advertise the same compiled extra Spark roles. TP4 is
-# built separately; keep the qualified default until new roles have exports.
+# built separately; unequal worlds select deduplicated width artifacts.
 release_spark_tp_roles_default() {
-  printf '%s\n' 'tp2;tp3;tp6;tp8'
+  printf '%s\n' 'tp2;tp3;tp5;tp6;tp7;tp8'
 }
 
 release_spark_tp_roles_canonical() {
@@ -1525,8 +1525,8 @@ release_spark_tp_roles_canonical() {
   IFS=';' read -ra parts <<<"$raw"
   for entry in "${parts[@]}"; do
     case "$entry" in
-      tp2|tp3|tp6|tp8) ;;
-      *) release_die "$source_name accepts only tp2, tp3, tp6 and tp8, got: $entry" ;;
+      tp2|tp3|tp5|tp6|tp7|tp8) ;;
+      *) release_die "$source_name accepts only tp2, tp3, tp5, tp6, tp7 and tp8, got: $entry" ;;
     esac
     for prior in ${selected[@]+"${selected[@]}"}; do
       [[ "$prior" != "$entry" ]] ||
@@ -2024,8 +2024,8 @@ release_select_build_hosts() {
 }
 
 # V4.1 routed weight per layer and rank, excluding runtime headroom.
-# Native K32 tensors cost 3,133,440 bytes per stored intermediate column;
-# use the package's padded geometry, not the unpadded 2304/TP tensor window.
+# Native payload and coded scales use the actual artifact resident extents.
+# Unequal worlds return the largest per-layer rank allocation for this bound.
 release_spark_layer_bytes() {
   local tp="$1" format="${2:-native}"
   if [[ "$format" == nvfp4 ]]; then
@@ -2046,8 +2046,13 @@ import importlib.util, sys
 spec = importlib.util.spec_from_file_location('spark_packages', sys.argv[1])
 packages = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packages)
-_, _, stored = packages.native_spark_geometry()[int(sys.argv[2])]
-print(stored * 3133440)
+def layer_bytes(artifact):
+    hidden, experts = 5120, 384
+    logical, stored = artifact.logical, artifact.stored
+    planes = (hidden * stored, 2 * stored * (2 * ((hidden // 32 + 3) // 4) + 1),
+              hidden * stored // 2, hidden * (2 * ((logical // 32 + 3) // 4) + 1))
+    return experts * sum(planes)
+print(max(map(layer_bytes, packages.native_spark_artifacts()[int(sys.argv[2])])))
 PYWEIGHTS
 }
 

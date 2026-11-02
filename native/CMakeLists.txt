@@ -320,6 +320,21 @@ endif()
 if(CUTEAFD_ENABLE_CUDA)
   enable_language(CUDA)
   find_package(CUDAToolkit REQUIRED)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json")
+  execute_process(COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+    --header "${CMAKE_CURRENT_BINARY_DIR}/cuteafd_mxfp4_layouts.h"
+    COMMAND_ERROR_IS_FATAL ANY)
+  execute_process(COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+    --cmake "${CMAKE_CURRENT_BINARY_DIR}/cuteafd_mxfp4_artifacts.cmake"
+    COMMAND_ERROR_IS_FATAL ANY)
+  include("${CMAKE_CURRENT_BINARY_DIR}/cuteafd_mxfp4_artifacts.cmake")
   # Extract the real undocumented registration ABI; upgrades must match our
   # forwarding static_assert rather than silently corrupting registrations.
   file(READ "${CUDAToolkit_INCLUDE_DIRS}/crt/host_runtime.h" CUTEAFD_CUDA_HOST_RUNTIME)
@@ -415,6 +430,7 @@ endif()
 if(NOT CUTEAFD_EXPERT_FAMILIES STREQUAL "")
   include(cmake/shared/expert_families.cmake)
 endif()
+include(cmake/shared/mxfp4_widths.cmake)
 if(CUTEAFD_FP8_EXPERT_FAMILIES)
   include(cmake/shared/fp8_moe.cmake)
 endif()
@@ -630,10 +646,10 @@ if(CUTEAFD_ENABLE_CUDA)
   add_test(NAME cuteafd_v41_expert_pack_tp3_selftest
     COMMAND cuteafd_v41_expert_pack_tp3_selftest)
   set_tests_properties(cuteafd_v41_expert_pack_tp3_selftest PROPERTIES SKIP_RETURN_CODE 77)
-  # Geometry-driven packer check: every native extent, including the padded TP4
-  # 576 -> 640 storage, in one parameterized device test.
+  # Geometry-driven packer check: aligned and compact exact native extents.
   add_executable(cuteafd_v41_expert_pack_geometry_selftest
     tests/v41_expert_pack_geometry_selftest.cc)
+  target_include_directories(cuteafd_v41_expert_pack_geometry_selftest PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_libraries(cuteafd_v41_expert_pack_geometry_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_v41_expert_pack_geometry_selftest
     COMMAND cuteafd_v41_expert_pack_geometry_selftest)
@@ -684,7 +700,7 @@ if(CUTEAFD_ENABLE_CUDA)
   set_tests_properties(cuteafd_cuda_fp8_load_quant_selftest PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
   add_executable(cuteafd_cuda_scale_codes_selftest tests/cuda_scale_codes_selftest.cc)
   target_include_directories(cuteafd_cuda_scale_codes_selftest PRIVATE
-    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/3rdparty/picojson")
+    "${CUTEAFD_XGRAMMAR_SOURCE_DIR}/3rdparty/picojson" "${CMAKE_CURRENT_BINARY_DIR}")
   target_link_libraries(cuteafd_cuda_scale_codes_selftest PRIVATE cuteafd_native CUDA::cudart)
   add_test(NAME cuteafd_cuda_scale_codes_selftest COMMAND cuteafd_cuda_scale_codes_selftest)
   set_tests_properties(cuteafd_cuda_scale_codes_selftest PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)

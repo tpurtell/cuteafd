@@ -76,8 +76,8 @@ pub(crate) struct EngineArgs {
     /// Sliding-attention and native-MTP ring format, independent of full KV.
     #[arg(long, value_enum, default_value = "int8")]
     pub swa_kv_cache: SwaKvCacheArg,
-    /// Sequences with a sliding-window ring.
-    #[arg(long, default_value_t = 16)]
+    /// Sequences with a sliding-window ring (0 derives from concurrency).
+    #[arg(long, default_value_t = 0)]
     pub rings: usize,
     #[arg(long, default_value_t = 0)]
     pub prefill_rows: usize,
@@ -943,6 +943,8 @@ impl Opened {
             args.prefill_rows, args.prefill_waves)?;
         let depth = shape.waves as usize;
         let mut resolved = args.clone();
+        resolved.rings = cuteafd_core::concurrency::request_slots(
+            serving.map_or(1, |(_, concurrency)| concurrency) as u64, resolved.rings as u64) as usize;
         resolved.prefill_rows = shape.unit_rows as usize;
         resolved.prefill_waves = depth;
         engine::prefill_span_rows(resolved.prefill_span_rows, resolved.prefill_rows)?;

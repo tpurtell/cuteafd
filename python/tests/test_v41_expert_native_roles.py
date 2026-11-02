@@ -37,14 +37,10 @@ def test_symbol_prefix_selects_new_spark_families() -> None:
     assert module.expert_symbol_prefix() == "cuteafd_v41_expert_"
     assert module.expert_symbol_prefix(local=True) == "cuteafd_v41_local_expert_"
     assert module.expert_symbol_prefix(tp2=True) == "cuteafd_v41_tp2_expert_"
-    assert module.expert_symbol_prefix(spark_tp=2) == "cuteafd_v41_spark_tp2_expert_"
-    assert module.expert_symbol_prefix(spark_tp=3) == "cuteafd_v41_spark_tp3_expert_"
-    assert module.expert_symbol_prefix(spark_tp=6) == "cuteafd_v41_spark_tp6_expert_"
-    assert module.SPARK_TP_PREFIX == {
-        2: "cuteafd_v41_spark_tp2_expert_",
-        3: "cuteafd_v41_spark_tp3_expert_",
-        6: "cuteafd_v41_spark_tp6_expert_",
-    }
+    for family in ("v41", "dsv4f", "dsv4p"):
+        for artifacts in module.native_spark_artifacts(family).values():
+            for artifact in artifacts:
+                assert module.expert_symbol_prefix(artifact=artifact, family=family) == artifact.prefix(family)
 
 
 def test_only_launch_abi_symbols_are_namespaced() -> None:
@@ -66,22 +62,14 @@ def test_only_launch_abi_symbols_are_namespaced() -> None:
 
 def test_symbol_families_are_mutually_exclusive() -> None:
     module = _load()
-    for kwargs in (
-        {"local": True, "tp2": True},
-        {"spark_tp": 2, "tp2": True},
-        {"spark_tp": 3, "local": True},
-        {"spark_tp": 6, "tp2": True},
-        {"spark_tp": 2, "spark_tp": 3, "tp2": True},
-    ):
+    artifact = module.native_spark_artifacts()[2][0]
+    for kwargs in ({"local": True, "tp2": True}, {"artifact": artifact, "tp2": True},
+                   {"artifact": artifact, "local": True}):
         with pytest.raises(AssertionError):
             module.expert_symbol_prefix(**kwargs)
-    # Only the built degrees 2/3/6 are valid; an unbuilt degree must be rejected
-    # rather than silently resolving to a missing symbol family.
-    for unsupported in (4, 5, 7):
-        with pytest.raises(AssertionError):
-            module.expert_symbol_prefix(spark_tp=unsupported)
-    assert module.expert_symbol_prefix(spark_tp=2) == "cuteafd_v41_spark_tp2_expert_"
-    assert module.expert_symbol_prefix(spark_tp=6) == "cuteafd_v41_spark_tp6_expert_"
+    from spark_packages import NativeArtifact
+    with pytest.raises(AssertionError):
+        module.expert_symbol_prefix(artifact=NativeArtifact(9, 384, 384, "spark_tp6"))
 
 
 @pytest.mark.parametrize("family", ("dsv4f", "dsv4p"))
@@ -93,7 +81,6 @@ def test_native_v4_family_symbols_keep_shared_packer(family) -> None:
     assert module.namespaced_symbol("cuteafd_pack_expert_async", prefix) == "cuteafd_pack_expert_async"
     assert module.namespaced_symbol("cuteafd_set_expert_hidden", prefix) == "cuteafd_set_expert_hidden"
     assert module.expert_symbol_prefix(family=family, tp2=True) == f"cuteafd_{family}_tp2_expert_"
-    assert module.expert_symbol_prefix(family=family, spark_tp=2) == f"cuteafd_{family}_spark_tp2_expert_"
-    for unsupported in (3, 6):
-        with pytest.raises(AssertionError):
-            module.expert_symbol_prefix(family=family, spark_tp=unsupported)
+    for artifacts in module.native_spark_artifacts(family).values():
+        for artifact in artifacts:
+            assert module.expert_symbol_prefix(family=family, artifact=artifact) == artifact.prefix(family)

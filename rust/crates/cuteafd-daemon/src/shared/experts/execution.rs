@@ -41,7 +41,7 @@ fn validate_live_rows(rows: usize, live: u32) -> std::result::Result<(), NativeE
 /// 5/6/7/8). The full-width RTX backbone (role 2) owns its separate local reducer
 /// and never enters this execution.
 pub(super) fn compact_output_role(role: u32) -> bool {
-    matches!(role, 1 | 5 | 6 | 7 | 8)
+    matches!(role, 1 | 5 | 6 | 7 | 8) || cuteafd_core::tp_units::native_role_width(role).is_some()
 }
 
 /// Admit the exact states owned by this wave before allocating their scratch.
@@ -106,6 +106,15 @@ struct DecodeExecution<'library> {
     slots: [*mut c_void; 44],
 }
 
+struct NativeWidthState<'library> {
+    kernel: V41ExpertKernel<'library>,
+    scratch: DeviceAllocation<'library>,
+    decode: Option<DecodeExecution<'library>>,
+    small: Option<DecodeExecution<'library>>,
+    reduction_plan: Option<super::ExpertReductionPlan>,
+    slots: [*mut c_void; 44],
+}
+
 /// One exclusive wave's buffers and graph borrow immutable resident weights.
 /// Upstream producers and transport must obey this owner's stream/lifetime contract.
 pub(crate) struct ExpertExecution<'weights, 'library> {
@@ -132,7 +141,8 @@ pub(crate) struct ExpertExecution<'weights, 'library> {
     output: Option<DeviceAllocation<'library>>,
     pub(crate) shared: Option<DeviceAllocation<'library>>,
     slots: [*mut c_void; 44],
-    graph: Option<(*mut c_void, u32, bool)>,
+    graph: Option<(*mut c_void, u32, bool, u32, u32)>,
+    alternate_widths: Vec<NativeWidthState<'library>>,
     /// Replicated-group index this worker owns; set once at startup for an
     /// explicit `TP×EP` topology, `None` for every legacy path. The group is
     /// independent of the resident layer, so rebinding a layer never changes it.
@@ -165,6 +175,51 @@ impl<'library> ExpertWeights<'library> {
             usize::try_from(layer.select_info(library, 80, nvfp4)?.scratch_bytes)?
         } else { 0 };
         ExpertExecutionBudget::from_info(info, live, decode, small)
+    }
+    pub(crate) fn plan_execution_layers(layers: impl IntoIterator<Item = ExpertLayer>,
+        library: &NativeLibrary, compiled: u32, live: u32, nvfp4: bool) -> Result<ExpertExecutionBudget> {
+        let mut roles = Vec::new();
+        let mut budgets = Vec::new();
+        for layer in layers {
+            if roles.contains(&layer.role()) { continue; }
+            roles.push(layer.role());
+            budgets.push(Self::plan_execution(layer, library, compiled, live, nvfp4)?);
+        }
+        ensure!(!budgets.is_empty() && budgets.len() <= 2,
+            "native owner needs one or two adjacent width states");
+        let mut budget = budgets[0];
+        for other in &budgets[1..] {
+            budget.scratch_bytes = budget.scratch_bytes.checked_add(other.scratch_bytes)
+                .context("native width scratch overflow")?;
+            budget.decode_scratch_bytes = budget.decode_scratch_bytes.checked_add(other.decode_scratch_bytes)
+                .context("native width decode scratch overflow")?;
+            budget.small_scratch_bytes = budget.small_scratch_bytes.checked_add(other.small_scratch_bytes)
+                .context("native width grouped scratch overflow")?;
+            ensure!(budget.hidden_bytes == other.hidden_bytes && budget.routing_bytes == other.routing_bytes
+                && budget.output_and_shared_bytes == other.output_and_shared_bytes,
+                "native width states cannot share their I/O geometry");
+        }
+        Ok(budget)
+    }
+
+    pub(crate) fn execution_layers(layers: &[Self], compiled: u32, live: u32,
+        available: usize) -> Result<ExpertExecution<'_, 'library>> {
+        let first = layers.first().context("native execution has no resident layers")?;
+        let library = first.buffers[0].library;
+        let budget = Self::plan_execution_layers(layers.iter().map(|weight| weight.layer),
+            library, compiled, live, first.is_nvfp4())?;
+        ensure!(budget.total()? <= available, "native width execution exceeds device budget");
+        let mut execution = first.execution(compiled, live, available)?;
+        for weight in layers {
+            if weight.layer.role() == execution.kernel.info().role
+                || execution.alternate_widths.iter().any(|state| state.kernel.info().role == weight.layer.role()) {
+                continue;
+            }
+            ensure!(execution.alternate_widths.is_empty(), "more than two native width states");
+            execution.add_width(weight, compiled)?;
+        }
+        execution.budget = budget;
+        Ok(execution)
     }
     pub fn execution(
         &self,
@@ -304,6 +359,7 @@ impl<'library> ExpertWeights<'library> {
             deferred: false,
             pending: timing::PendingUnits::new(library, 1)?,
             graph: None,
+            alternate_widths: Vec::new(),
             native_group: None,
             live_capacity: live,
             budget,
@@ -335,6 +391,37 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         self.native_group = group;
         Ok(())
     }
+    fn add_width(&mut self, weights: &'weights ExpertWeights<'library>, compiled: u32) -> Result<()> {
+        let prepare = |rows, name| -> Result<DecodeExecution<'library>> {
+            let kernel = weights.layer.select_kernel(self.library, rows, weights.is_nvfp4())?;
+            ensure!(kernel.info().input_dtype == self.kernel.info().input_dtype,
+                "native width states have different input formats");
+            let scratch = DeviceAllocation::named(self.library,
+                usize::try_from(kernel.info().scratch_bytes)?, name)?;
+            let mut slots = self.slots;
+            // SAFETY: the new state owns its scratch; all retained states share
+            // the same admitted I/O and execute serially on this owner's stream.
+            unsafe {
+                kernel.bind_scratch(scratch.buffer.ptr, scratch.buffer.bytes as u64, &mut slots)?;
+            }
+            weights.bind(&kernel, &mut slots)?;
+            // SAFETY: initialization is drained before publishing this state.
+            let initialized = unsafe { kernel.initialize_scratch(scratch.buffer.ptr,
+                scratch.buffer.bytes as u64, self.stream.raw) };
+            let drained = unsafe { self.library.cuda_stream_synchronize(self.stream.raw) };
+            if drained.is_err() { self.library.quarantine_module_after_failed_drain(); }
+            initialized.and(drained)?;
+            Ok(DecodeExecution { kernel, scratch, slots })
+        };
+        let reduction_plan = native_reduction_plan(weights.layer, self.library, compiled, weights.is_nvfp4())?;
+        let main = prepare(compiled, "experts/workspace/alternate_main_scratch")?;
+        let decode = if compiled > 1 { Some(prepare(1, "experts/workspace/alternate_serial_scratch")?) } else { None };
+        let small = if compiled > 80 { Some(prepare(80, "experts/workspace/alternate_grouped_scratch")?) } else { None };
+        self.alternate_widths.push(NativeWidthState { kernel: main.kernel, scratch: main.scratch,
+            slots: main.slots, decode, small, reduction_plan });
+        Ok(())
+    }
+
     /// Rebind uncaptured launch arguments; the stream orders shared workspace use.
     /// Captured graphs retain weight addresses and cannot be rebound.
     pub fn bind_layer(&mut self, weights: &'weights ExpertWeights<'library>) -> Result<()> {
@@ -348,6 +435,17 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         );
         ensure!(self._weights.is_nvfp4() == weights.is_nvfp4(),
             "cannot rebind expert workspace across quantization families");
+        if self.kernel.info().role != weights.layer.role() {
+            let state = self.alternate_widths.iter_mut()
+                .find(|state| state.kernel.info().role == weights.layer.role())
+                .context("native width state was not initialized before readiness")?;
+            std::mem::swap(&mut self.kernel, &mut state.kernel);
+            std::mem::swap(&mut self.scratch, &mut state.scratch);
+            std::mem::swap(&mut self.decode, &mut state.decode);
+            std::mem::swap(&mut self.small, &mut state.small);
+            std::mem::swap(&mut self.reduction_plan, &mut state.reduction_plan);
+            std::mem::swap(&mut self.slots, &mut state.slots);
+        }
         // Launch copies its pointer arguments; rebinding uncaptured arguments
         // cannot mutate earlier work, and stream order protects shared scratch.
         let mut slots = self.slots;
@@ -443,6 +541,20 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         use cuteafd_transport::worker_selection::{ExpertGroupingSelector, InstalledExpertGrouping, InstalledExpertVariant};
         let mut kernels = vec![&self.kernel];
         kernels.extend([&self.decode, &self.small].into_iter().flatten().map(|state| &state.kernel));
+        for state in &self.alternate_widths {
+            ensure!(state.kernel.group_rows() == self.kernel.group_rows(),
+                "native width states disagree on main grouping");
+            let alternate = [&state.kernel, state.decode.as_ref().map_or(&state.kernel, |s| &s.kernel),
+                state.small.as_ref().map_or(&state.kernel, |s| &s.kernel)];
+            for (left, right) in kernels.iter().zip(alternate) {
+                ensure!(left.info().capacity_rows == right.info().capacity_rows,
+                    "native width states disagree on compiled capacities");
+                for rows in 1..=left.info().capacity_rows as usize {
+                    ensure!(left.group_rows_for(rows)? == right.group_rows_for(rows)?,
+                        "native width states disagree on grouping at rows {rows}");
+                }
+            }
+        }
         let variants = kernels.into_iter().map(|kernel| InstalledExpertVariant::from_queries(
             kernel.info().capacity_rows as usize, |rows| kernel.group_rows_for(rows))).collect::<Result<Vec<_>>>()?;
         let report = InstalledExpertGrouping::new(loaded, rank, self.live_capacity as usize,
@@ -561,7 +673,8 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
         let captured = unsafe { self.library.cuda_graph_end_capture(self.stream.raw) };
         match (launch, captured) {
             (Ok(()), Ok(graph)) => {
-                self.graph = Some((graph, rows, include_shared));
+                self.graph = Some((graph, rows, include_shared, self.kernel.info().role,
+                    self.kernel.info().logical_intermediate));
                 Ok(())
             }
             (Err(error), Ok(graph)) => {
@@ -578,7 +691,9 @@ impl<'weights, 'library> ExpertExecution<'weights, 'library> {
     /// The captured rows' inputs (and optional shared output) must satisfy launch's
     /// contract, with writes ordered before replay and reads ordered after it.
     pub unsafe fn replay(&mut self) -> Result<()> {
-        let (graph, _, _) = self.graph.context("expert graph has not been captured")?;
+        let (graph, _, _, role, width) = self.graph.context("expert graph has not been captured")?;
+        ensure!(role == self.kernel.info().role && width == self.kernel.info().logical_intermediate,
+            "captured expert graph belongs to a different width state");
         unsafe { self.library.cuda_graph_launch(graph, self.stream.raw) }
     }
 }
@@ -587,7 +702,7 @@ impl Drop for ExpertExecution<'_, '_> {
         if let Err(error) = self.synchronize() {
             tracing::error!(%error,"draining V4.1 expert execution");
         }
-        if let Some((graph, _, _)) = self.graph.take() {
+        if let Some((graph, _, _, _, _)) = self.graph.take() {
             if let Err(error) = unsafe { self.library.cuda_graph_exec_destroy(graph) } {
                 tracing::error!(%error,"destroying V4.1 expert execution graph");
             }

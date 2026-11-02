@@ -489,3 +489,16 @@ def test_v41_site_hub_reaches_coordinator_and_each_remote_worker(tmp_root):
         assert not any("/mnt/sparknest:" in mount for mount in run["mounts"])
         command = run["command"]
         assert command[command.index("--snapshot") + 1].startswith("<root>/hf/hub/")
+
+
+def test_no_literal_sixteen_request_admission_bound() -> None:
+    """Native descriptor limits live in the shared capacity registry, not callers."""
+    import re
+
+    literal = re.compile(r"1\s*\.\.=\s*16[^\n]*(?:concurrency|max_sequences)|(?:concurrency|max_sequences)[^\n]*1\s*\.\.=\s*16")
+    offenders = []
+    for path in (ROOT / "rust" / "crates").rglob("*.rs"):
+        for line, text in enumerate(path.read_text().splitlines(), 1):
+            if literal.search(text):
+                offenders.append(f"{path.relative_to(ROOT)}:{line}: {text.strip()}")
+    assert not offenders, "\n".join(offenders)

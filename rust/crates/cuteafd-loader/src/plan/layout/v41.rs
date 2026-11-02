@@ -29,14 +29,14 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     report.prefill_span_rows = Some(prefill.span_rows);
     let ranks = options.rtx_bytes.len();
     ensure!((1..=2).contains(&ranks), "V4.1 requires one or two coordinator GPUs");
-    ensure!((1..=16).contains(&shape.concurrency), "V4.1 concurrency must be 1..16");
+    cuteafd_core::concurrency::validate("deepseek_v41", shape.concurrency)?;
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.mimo_prefix_entries, 1, u64::MAX, options.host_cache_bytes != Some(0)));
+    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(0, options.prefix_entries("deepseek_v41"), 1, u64::MAX, options.host_cache_bytes != Some(0)));
     ensure!(marks == 0 || (marks >= 2 && marks % 2 == 0 && marks <= 258),
         "V4.1 prefix slots must be zero or 2 * retained turns + 2 (at most 258)");
     // Immutable COW tails retain the configured conversations, independently of staging marks.
-    let turns = if options.host_cache_bytes != Some(0) && marks > 0 { options.mimo_prefix_entries }
+    let turns = if options.host_cache_bytes != Some(0) && marks > 0 { options.prefix_entries("deepseek_v41") }
         else { marks.saturating_sub(2) / 2 };
     let dspark = shape.native_layers > 0;
     ensure!(!dspark || shape.native_layers == 3, "V4.1 dSpark retains all three stages");
@@ -292,6 +292,8 @@ mod tests {
 }
 
 fn update_sparks(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet, devices: &mut [DeviceLayout]) -> Result<()> {
+    // Native MXFP4 is charged centrally by charge_spark_devices at each placement.
+    if catalog.exl3().is_none() && catalog.nvfp4().is_none() { return Ok(()); }
     let shape = catalog.routed_experts();
     for device in devices {
         let bytes = if let Some(exl3) = catalog.exl3() {
@@ -300,12 +302,12 @@ fn update_sparks(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
                     device.index as usize)?.device_arena_layout()?.1 as u64).context("V4.1 Spark EXL3 residency overflow")
             })?
         } else {
-            ensure!(working.spark_ranks > 0 && shape.intermediate % working.spark_ranks == 0,
-                "V4.1 Spark expert width is not divisible by rank count");
-            let width = shape.intermediate as u64 / working.spark_ranks as u64;
-            let per_layer = if catalog.nvfp4().is_some() { nvfp4_expert_bytes(shape.experts as u64, shape.hidden as u64, width) }
-                else { native_expert_bytes(shape.experts as u64, shape.hidden as u64, width) };
-            per_layer.checked_mul(working.spark_layers.len() as u64).context("V4.1 Spark residency overflow")?
+            let rank = device.index as usize;
+            let layout = if catalog.nvfp4().is_some() {
+                let width = shape.intermediate.div_ceil(working.spark_ranks).div_ceil(128) * 128;
+                placement::SparkResidentLayout::Nvfp4 { world: working.spark_ranks, rank, stored_width: width }
+            } else { placement::SparkResidentLayout::Native { world: working.spark_ranks, rank } };
+            placement::SparkAssignment::resident_from_catalog(catalog, working, rank, layout)?.resident_bytes
         };
         if let Some(item) = device.items.iter_mut().find(|i| i.group == "routed_expert") { item.bytes = bytes; item.basis = Basis::Formula; }
     }

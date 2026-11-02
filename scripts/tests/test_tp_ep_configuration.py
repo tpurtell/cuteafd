@@ -59,23 +59,26 @@ SPARK_5_LANE_B=
 
 
 class TopologyConfigTest(unittest.TestCase):
-    def test_native_layer_bytes_follow_shared_padded_geometry(self) -> None:
+    def test_native_layer_bytes_follow_shared_artifact_geometry(self) -> None:
         import importlib.util
         path = ROOT / "python/tools/lib/spark_packages.py"
         spec = importlib.util.spec_from_file_location("weight_packages", path)
         packages = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(packages)
-        geometry = packages.native_spark_geometry()
+        geometry = packages.native_spark_artifacts()
         for count in range(1, 10):
             with self.subTest(count=count):
                 result = source_common(f"release_spark_layer_bytes {count}")
                 self.assertEqual(result.returncode == 0, count in geometry, result.stderr)
                 if count in geometry:
-                    self.assertEqual(int(result.stdout), geometry[count][2] * 3133440)
-        self.assertEqual(geometry[8], (8, 288, 384))
+                    expected = max(384 * (5120 * a.stored * 3 // 2 + 2 * a.stored * 81
+                                          + 5120 * (2 * ((a.logical // 32 + 3) // 4) + 1))
+                                   for a in geometry[count])
+                    self.assertEqual(int(result.stdout), expected)
+        self.assertEqual(geometry[8][0].stored, 288)
 
     def test_retained_canonical_and_owned_tp_counts_use_configured_hosts(self) -> None:
-        for explicit, counts in [(False, range(1, 9)), (True, (2, 3, 4, 6, 8))]:
+        for explicit, counts in [(False, range(1, 9)), (True, range(2, 9))]:
             for count in counts:
                 overlay = [f"SPARK_COUNT={count}",
                            f"SPARK_TP={count}" if explicit else "SPARK_TP=",
@@ -92,11 +95,12 @@ class TopologyConfigTest(unittest.TestCase):
                                      [",".join(f"worker-{rank}" for rank in range(count))])
 
     def test_deleted_worlds_and_unqualified_ownership_refuse(self) -> None:
-        for count in (1, 5, 7):
+        for count in (1, 9):
             with self.subTest(count=count):
                 result = load(f"SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1")
                 self.assertEqual(result.returncode, 2)
-                self.assertIn("unsupported native Spark topology", result.stderr)
+                message = "unsupported native Spark topology" if count == 1 else "SPARK_TP must be in 1..8"
+                self.assertIn(message, result.stderr)
 
     def test_out_of_range_inventory_keys_refuse(self) -> None:
         for rank in (8, 9):
@@ -277,11 +281,18 @@ class ExampleConfigTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         gpus, layers, count, tp, ep, budget, layer_bytes = result.stdout.splitlines()
         self.assertEqual((gpus, layers, count, tp, ep), ("1", "5", "3", "3", "1"))
-        self.assertEqual(int(layer_bytes), 2406481920)
+        # Native V4.1 uses coded UE8M0 scales, not the raw-scale estimate:
+        # payloads + (base byte + packed K32 deltas) for gate/up and down.
+        hidden, width, experts = 5120, 2304 // 3, 384
+        expected = experts * (hidden * width * 3 // 2
+                              + 2 * width * (1 + 2 * (hidden // 128))
+                              + hidden * (1 + 2 * ((width // 32 + 3) // 4)))
+        self.assertEqual(int(layer_bytes), expected)
+        self.assertEqual(expected, 2338258944)
         self.assertEqual(40 - int(layers), 35)
-        self.assertEqual(40 * int(layer_bytes), 96259276800)
-        self.assertEqual(35 * int(layer_bytes), 84226867200)
-        self.assertEqual(int(budget) - 35 * int(layer_bytes), 24892452864)
+        self.assertEqual(40 * int(layer_bytes), 93530357760)
+        self.assertEqual(35 * int(layer_bytes), 81839063040)
+        self.assertEqual(int(budget) - 35 * int(layer_bytes), 27280257024)
 
     def test_six_host_examples_use_the_connected_fifth_and_sixth_sparks(self) -> None:
         for name in ("tp3ep2-native.config", "tp2ep3-native.config", "tp6ep1-native.config"):
@@ -875,7 +886,7 @@ class BuildScopeTest(unittest.TestCase):
             # The published Spark image is universal: one build serves every
             # approved topology, so an explicit TP3 config must not narrow the
             # built role set to tp3 alone.
-            self.assertIn("V41 Spark expert roles: tp2;tp3;tp6", result.stdout)
+            self.assertIn("V41 Spark expert roles: tp2;tp3;tp5;tp6;tp7;tp8", result.stdout)
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else "")
 
     def test_wip_dry_run_six_host_official_only_scope(self) -> None:

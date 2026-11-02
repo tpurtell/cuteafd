@@ -177,8 +177,8 @@ pub fn cache_requirements(
             "glm5" | "glm5_flash" | "qwen4" | "deepseek_v4"
         ),
         requested_kv_floor_tokens: requested_floor,
-        concurrency: 16,
-        state_slots: 20,
+        concurrency: cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency,
+        state_slots: cuteafd_core::concurrency::state_slots(u64::from(cuteafd_core::serving_capacity::CapacityPolicy::default().concurrency)) as u32,
         target_only_layouts: layouts,
         unavailable_layouts: failures,
     }))
@@ -1343,7 +1343,7 @@ mod tests {
         assert_eq!(requirements.requested_kv_floor_tokens, Some(2 << 20));
         assert_eq!(
             (requirements.concurrency, requirements.state_slots),
-            (16, 20)
+            (4, 4)
         );
         assert!(!requirements.compiled_index_extent_required);
         assert_eq!(requirements.target_only_layouts.len(), 2);

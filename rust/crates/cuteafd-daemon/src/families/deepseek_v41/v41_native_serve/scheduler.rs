@@ -222,7 +222,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         tracing::warn!(conversations_50k, desired = args.concurrency + 4,
             "host prefix quota holds fewer 50K conversations than concurrency plus four");
     }
-    let host = if config.enabled() && args.prefix_cache_entries > 0 {
+    let host = if config.enabled() && args.resolved_prefix_entries() > 0 {
         let rows = cuteafd_core::coordinator_programs::v41_live_rows(args.prefill_batch_tokens)
             .context("invalid V4.1 prefill capacity for host logits")?;
         let logits = cuteafd_core::memory_layout::host_logits_bytes(
@@ -235,7 +235,7 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
         tracing::info!(target: "cuteafd::host_cache", config = ?config, "host snapshot cache enabled");
         Some((config, engine))
     } else { None };
-    let entries = args.prefix_cache_entries as usize;
+    let entries = args.resolved_prefix_entries() as usize;
     let prefix = cuteafd_engine::prefix::PrefixConfig { entries, mark_slots: cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX, host.is_some()) as usize,
         keep_logits: true, min_tokens: 1 };
     PrefixCache::new(arenas, prefix, true, host, layout)

@@ -1311,7 +1311,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
                 }
             }
             let pending: usize = active.iter().map(|a| a.draft.pending_rows()).sum();
-            if resource::trim_budget(&mut depths, geometry.decode_rows) { predicted = None; }
+            if resource::trim_budget_with_priors(&mut depths, geometry.decode_rows, &neural_confidence, |i| active[i].ticket.id()) { predicted = None; }
             let rows: usize = depths.iter().map(|d| d + 1).sum();
             if depths.iter().any(|&d| d > 0) || pending + rows > geometry.decode_rows / 2 {
                 let mut seqs: Vec<DraftSeq<'_, _, _>> = active.iter_mut().zip(&depths).map(|(a, &depth)| DraftSeq {

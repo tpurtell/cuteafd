@@ -731,8 +731,8 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
         with tempfile.TemporaryDirectory() as home:
             env = {**os.environ, "HOME": home, "PATH": "/usr/bin:/bin"}
             for args, message in (
-                (["--set", "CONCURRENCY=17"], "CONCURRENCY must be in 1..16"),
-                (["--set", "PREFIX_CACHE_ENTRIES=129"], "PREFIX_CACHE_ENTRIES must be in 0..128"),
+                (["--set", "CONCURRENCY=65"], "CONCURRENCY must be in 1..64"),
+                (["--set", "PREFIX_CACHE_ENTRIES=-1"], "PREFIX_CACHE_ENTRIES must be auto or non-negative"),
                 (["--set", "MAX_CONTEXT_TOKENS=1048577"], "MAX_CONTEXT_TOKENS must be in 1..1048576"),
                 (["--set", "MAX_OUTPUT_TOKENS=12k"], "MAX_OUTPUT_TOKENS must be an integer"),
                 (["--set", "RTX_GPUS=3"], "RTX_GPUS must be auto, 1, or 2"),
@@ -749,6 +749,13 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" "$EXPERT_FORMAT" "$SPARKINFER_EXL3" 
                     result = subprocess.run(["./run.sh", *args], cwd=ROOT, capture_output=True, text=True, env=env)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn(message, result.stderr)
+            for override in ["CONCURRENCY=17", "CONCURRENCY=64", "PREFIX_CACHE_ENTRIES=129"]:
+                with self.subTest(override=override):
+                    result = subprocess.run(["./run.sh", "--set", override], cwd=ROOT,
+                                            capture_output=True, text=True, env=env)
+                    self.assertNotIn("CONCURRENCY must", result.stderr)
+                    self.assertNotIn("PREFIX_CACHE_ENTRIES must", result.stderr)
+                    self.assertIn("model snapshot is missing", result.stderr)
 
 
 class V10BuildTargetTest(unittest.TestCase):
@@ -800,7 +807,7 @@ class V10BuildTargetTest(unittest.TestCase):
         self.assertIn(f"coordinator image: {coordinator}", default)
         self.assertIn(f"spark image: {spark}", default)
         # The promoted default carries the universal role set.
-        self.assertIn("tp2;tp3;tp6", default)
+        self.assertIn("tp2;tp3;tp5;tp6;tp7;tp8", default)
 
 
     def test_all_examples_use_the_promoted_pair(self) -> None:
@@ -849,7 +856,7 @@ class V11ReleaseBuildTargetTest(unittest.TestCase):
         self.assertIn("release tag: v11", v11)
         self.assertIn("coordinator image: ghcr.io/tpurtell/cuteafd-coordinator:v11", v11)
         self.assertIn("spark image: ghcr.io/tpurtell/cuteafd-spark-expert:v11", v11)
-        self.assertIn("tp2;tp3;tp6", v11)
+        self.assertIn("tp2;tp3;tp5;tp6;tp7;tp8", v11)
 
 
 if __name__ == "__main__":

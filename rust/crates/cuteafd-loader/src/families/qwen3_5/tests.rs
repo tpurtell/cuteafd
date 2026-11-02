@@ -52,7 +52,7 @@ fn tensors(fp8: bool) -> Vec<Tensor> {
     out
 }
 
-fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement::families::qwen3_5::NativeBuffers, Value) {
+pub(crate) fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement::families::qwen3_5::NativeBuffers, Value) {
     use crate::placement::families::qwen3_5::NativeBuffers;
     let dir = tempfile::tempdir().unwrap();
     let raw = config(4096, 12288, 16, 32, 4);
@@ -102,11 +102,45 @@ fn native_planner_fixture() -> (tempfile::TempDir, PlanOptions, crate::placement
     std::fs::write(&manifest, serde_json::to_vec(&exports).unwrap()).unwrap();
     let options = PlanOptions { placement: ExpertPlacement::Local, vision: plan::MediaMode::Off,
         audio: plan::MediaMode::Off, layout: Some(plan::layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
-            rtx_bytes: vec![96 << 30], concurrency: 4, prefix_slots: Some(10), native_mtp_layers: 0,
+            rtx_bytes: vec![96 << 30], concurrency: 4, state_slots: Some(4), prefix_slots: Some(10), native_mtp_layers: 0,
             pool_tokens: Some(262144), workspace_manifest: Some(manifest.clone()),
             dense_qwen_kv: crate::families::qwen4::Qwen4KvCache::Bf16, ..Default::default() }),
         ..Default::default() };
     (dir, options, buffers, exports)
+}
+
+#[test]
+fn native_dspark_high_concurrency_admits_and_matches_anchor_only_inventory() {
+    let (dir, mut options, _, _) = native_planner_fixture();
+    let draft = tempfile::tempdir().unwrap();
+    let config = json!({"architectures":["DSparkDraftModel"], "hidden_size":4096,
+        "intermediate_size":8192,"num_hidden_layers":1,"num_attention_heads":32,
+        "num_key_value_heads":8,"head_dim":128,"rms_norm_eps":1e-6,
+        "rope_parameters":{"rope_type":"default","rope_theta":10000.0},
+        "vocab_size":64,"hidden_act":"silu","layer_types":["full_attention"],
+        "sliding_window":null,"block_size":7,"markov_rank":256,"markov_head_type":"vanilla",
+        "enable_confidence_head":true,"confidence_head_with_markov":true,
+        "dflash_config":{"projector_type":"dspark","mask_token_id":63,"target_layer_ids":[0]}});
+    std::fs::write(draft.path().join("config.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+    for c in [17, 32, 33, 64] {
+        let layout = options.layout.as_mut().unwrap();
+        layout.concurrency = c;
+        layout.state_slots = None;
+        layout.prefix_slots = Some(0);
+        layout.dense_qwen_drafter_snapshot = Some(draft.path().into());
+        let report = plan::plan(dir.path(), &options).unwrap();
+        assert!(report.fits && report.native_serving_admitted, "C{c}: {:?}", report.hints);
+        assert_eq!(report.cache_requirements.as_ref().unwrap().concurrency as u64, c);
+        let memory = report.memory_layout.unwrap();
+        let supported = crate::formats::block_dspark::supports_sequences(c as usize);
+        assert_eq!(memory.notes.iter().any(|note| note.contains("anchor-only")), !supported);
+        if !supported {
+            options.layout.as_mut().unwrap().dense_qwen_drafter_snapshot = None;
+            let plain = plan::plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+            assert_eq!(memory.devices, plain.devices);
+            assert_eq!(memory.pool_tokens, plain.pool_tokens);
+        }
+    }
 }
 
 #[test]
@@ -206,7 +240,7 @@ fn dense_default_prefix_geometry_releases_retention_with_host() {
         assert_eq!(mark, expected_mark);
         let old = mark_slots_for(16, 20, mark, 2 << 30);
         let staged = mark_slots_with_host(16, 20, mark, 2 << 30, true);
-        assert_eq!((old, staged), (if layers == 32 { 41 } else { 34 }, 2));
+        assert_eq!((old, staged), (if layers == 32 { 41 } else { 13 }, 2));
         println!("{name}: C16 entries=20 mark_bytes={mark} slots={old}->{staged} arena_GiB={:.6}->{:.6} freed_GiB={:.6}",
             old as f64 * mark as f64 / (1u64 << 30) as f64,
             staged as f64 * mark as f64 / (1u64 << 30) as f64,

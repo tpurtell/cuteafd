@@ -51,7 +51,7 @@ pub(crate) struct NativeDraft<'a> {
     producer: RefCell<crate::shared::memory::device::Event<'a>>,
     consumed: RefCell<crate::shared::memory::device::Event<'a>>,
     context_pending: Cell<bool>,
-    window_marks: Rc<Allocation<'a>>,
+    window_marks: Option<Rc<Allocation<'a>>>,
     window_bytes: usize,
     /// A K6 target head (no BF16 operand to borrow): the target rank's K6
     /// programs and this drafter's own head scratch, used only on the bridge stream.
@@ -234,13 +234,15 @@ impl<'a> NativeDraft<'a> {
     pub(crate) fn device(&self) -> crate::shared::memory::device::Device<'a> { self.owners.draft.device }
     pub(crate) fn common(&self) -> &DflashDrafter<'a> { &self.owners.draft }
     pub(crate) fn frontier(&self, slot: usize) -> Result<(usize, usize)> { self.common().mla_frontier(slot) }
-    pub(crate) fn mark_owner(&self) -> Rc<Allocation<'a>> { self.window_marks.clone() }
+    pub(crate) fn mark_owner(&self) -> Option<Rc<Allocation<'a>>> { self.window_marks.clone() }
+    pub(crate) fn mark_bytes(&self) -> usize { self.window_bytes }
     pub(crate) fn mark_segments(&self, mark: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!(mark < self.marks, "Kimi draft window mark outside admission");
+        let window_marks = self.window_marks.as_ref().context("Kimi draft prefix marks are disabled")?;
         let windows = self.common().mla_window_segments(0)?;
         let mut offset = mark * self.window_bytes;
         windows.into_iter().map(|window| {
-            let view = crate::shared::prefix::view(self.window_marks.buffer, offset, window.bytes)?;
+            let view = crate::shared::prefix::view(window_marks.buffer, offset, window.bytes)?;
             offset += window.bytes;
             Ok(view)
         }).collect()

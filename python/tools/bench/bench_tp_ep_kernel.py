@@ -55,13 +55,9 @@ from b12x._lib.utils import current_cuda_stream  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[3]
 
-# One shard geometry per topology: the TP degree fixes how wide this rank's
-# slice is, so the per-rank intermediate comes with it. `tp6` is the pure
-# six-way split of the official 2304 (384 per rank, no padding); TP2/TP3 are the
-# replicated-group degrees and TP4 is the historical padded shard.
-from spark_packages import native_spark_geometry
-TP_GEOMETRIES = tuple((tp, geometry[1], f"tp{tp}")
-                      for tp, geometry in native_spark_geometry().items())
+from spark_packages import native_spark_artifacts, native_shard
+TP_GEOMETRIES = tuple((tp, artifact, f"tp{tp}-{artifact.name}")
+                      for tp, artifacts in native_spark_artifacts().items() for artifact in artifacts)
 # The slice kernel asserts width in (64, 128, 192); anything else cannot be
 # exported, so the harness must not silently accept it.
 SUPPORTED_SLICE_WIDTHS = (64, 128, 192)
@@ -669,7 +665,7 @@ def _timed_condition(graph, expected, rows, case, options, label):
     return warm, amortised, cold
 
 
-def measure_group(options, tp_degree, intermediate, width, experts):
+def measure_group(options, tp_degree, artifact, width, experts):
     """Measure ONE live row count for one (topology, width) on one compiled case.
 
     Exactly one positive row count is accepted per invocation (enforced in
@@ -677,6 +673,9 @@ def measure_group(options, tp_degree, intermediate, width, experts):
     request is rejected rather than measured. The case is built once per geometry
     and the single live row count is uploaded into it.
     """
+    intermediate = artifact.logical
+    tp_rank = next(rank for rank in range(tp_degree)
+                   if native_shard(tp_degree, rank, options.layer)[1] == artifact)
     from b12x._lib.utils import current_cuda_stream
     from tests.moe.test_v41_expert_numerics import reference
     import cutlass
@@ -684,8 +683,9 @@ def measure_group(options, tp_degree, intermediate, width, experts):
     capacity = options.capacity
     # Operand source. `checkpoint` reads REAL weights, but only for the experts
     # the requested live histograms actually route to; unused dense slots are
-    # zeroed. The dense bank is allocated at the FULL width the caller requests
-    # (`intermediate * tp_degree`), so its size follows that width and the expert
+    # zeroed. The dense bank has the checkpoint's full intermediate width 2304,
+    # independent of whether the selected rank owns the wider adjacent shard;
+    # its size follows that width and the expert
     # count; the identity records the exact byte count and every record carries
     # the measured peak. These are packed 8-bit bytes, never an FP32 dequantised
     # bank. Do not restate a figure here -- read it from the record.
@@ -710,15 +710,15 @@ def measure_group(options, tp_degree, intermediate, width, experts):
                               label=bench.bank_label(len(active), experts))),
               flush=True)
         logical = bench.checkpoint_selected_operands(
-            options.snapshot, options.layer, experts, intermediate * tp_degree,
+            options.snapshot, options.layer, experts, 2304,
             active, torch, expect_revision=options.expect_revision)
     else:
-        logical = bench.LogicalWeights.synthetic(experts, intermediate * tp_degree,
+        logical = bench.LogicalWeights.synthetic(experts, 2304,
                                                  torch)
     case = bench.build_case(width, intermediate, experts, capacity, 6, logical,
-                            torch, tp_degree)
-    case.install_rank(0, tp_degree)
-    local = bench.rank_logical_slice(logical, 0, tp_degree, intermediate, torch)
+                            torch, tp_degree, tp_rank=tp_rank, layer=options.layer)
+    case.install_rank(tp_rank, tp_degree)
+    local = bench.rank_logical_slice(logical, tp_rank, tp_degree, intermediate, torch, layer=options.layer)
     callable_id = id(case.full)
 
     full_weights = torch.full((capacity, 6), 1.0 / 6, device="cuda",
@@ -911,15 +911,14 @@ def parse_args(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--topologies", default="tp2,tp3,tp4",
-                        help="comma list of tp2,tp3,tp4,tp6 (each implies its "
-                             "own per-rank intermediate: 1152 / 768 / 576 / 384; "
-                             "tp6 is the pure six-way split of the official 2304)")
+                        help="world or artifact tags (tp2..tp8, or e.g. "
+                             "tp5-spark_wWIDTH). Select one artifact per output "
+                             "file when a world has adjacent widths.")
     parser.add_argument("--ep-degree", type=int, choices=(1, 2, 3), default=1,
                         help="ownership groups; 1 = this rank owns everything")
     parser.add_argument("--widths", default="192",
-                        help="comma list of intermediate slice widths; each must "
-                             "be 64/128/192 and divide the topology's per-rank "
-                             "intermediate exactly (tp6 384 = 2*192 = 3*128 = 6*64)")
+                        help="comma list of 64/128/192 compute tiles; native "
+                             "K32 tails are masked within the final tile")
     parser.add_argument("--rows", default="1,2,8,16,80")
     parser.add_argument("--experts", type=int, default=8)
     parser.add_argument("--operands", choices=("synthetic", "checkpoint"),
@@ -986,30 +985,24 @@ def parse_args(argv=None):
         parser.error("rows must not exceed capacity")
     if options.operands == "checkpoint" and options.snapshot is None:
         parser.error("--operands checkpoint requires --snapshot")
-    # Width must be a real export tile (the slice kernel asserts 64/128/192) and
-    # must tile the topology's per-rank intermediate exactly, so a request that
-    # would need storage padding or an extra partial slice fails before any GPU
-    # work. TP6's 384 is 2*192, 3*128 and 6*64 -- all three tile exactly.
+    # K32 source tails need not divide the compute tile; the final tile is masked.
     wanted = {t for t in options.topologies.split(",") if t}
-    if not wanted or not any(g[2] in wanted for g in TP_GEOMETRIES):
+    if not wanted or not any(g[2] in wanted or f"tp{g[0]}" in wanted for g in TP_GEOMETRIES):
         parser.error(f"no topology selected by --topologies {options.topologies!r}")
     for width in options.widths:
         if width not in SUPPORTED_SLICE_WIDTHS:
             parser.error(
                 f"--widths must be {SUPPORTED_SLICE_WIDTHS}, got {width}")
-    for tp_degree, intermediate, tag in TP_GEOMETRIES:
-        if tag not in wanted:
-            continue
-        for width in options.widths:
-            if intermediate % width:
-                parser.error(
-                    f"--widths {width} does not tile {tag} per-rank intermediate "
-                    f"{intermediate} exactly (slices would leave a partial tile)")
     return options
 
 
 def main(argv=None):
     options = parse_args(argv)
+    wanted = {t for t in options.topologies.split(",") if t}
+    geometries = [g for g in TP_GEOMETRIES if g[2] in wanted or f"tp{g[0]}" in wanted]
+    if len(geometries) * len(options.widths) * len(options.rows) != 1:
+        raise SystemExit("exactly one artifact, compute tile and live-row count per output file is required; "
+                         "select an artifact tag for an unequal world")
     _require_blackwell()
     props = torch.cuda.get_device_properties(0)
     l2 = props.L2_cache_size
@@ -1071,19 +1064,14 @@ def main(argv=None):
                "weights only for the active experts, unused slots zeroed; this "
                "is not a full real expert bank"],
     )
-    # One shard geometry per topology: TP degree fixes how wide this rank's
-    # slice is, so intermediate comes with it. TP6 is the pure six-way split of
-    # the official 2304 and is the only geometry whose per-rank intermediate is
-    # 384 (no 128-alignment padding).
-    wanted = {t for t in options.topologies.split(",") if t}
-    geometries = [g for g in TP_GEOMETRIES if g[2] in wanted]
+    # Unequal worlds expose adjacent artifacts; each output times one of them.
     records = []
-    for tp_degree, intermediate, tag in geometries:
+    for tp_degree, artifact, tag in geometries:
         for width in options.widths:
             print(json.dumps(dict(starting=tag, tp_degree=tp_degree,
-                                  intermediate=intermediate, width=width)),
+                                  intermediate=artifact.logical, artifact=artifact.name, width=width)),
                   flush=True)
-            records.extend(measure_group(options, tp_degree, intermediate,
+            records.extend(measure_group(options, tp_degree, artifact,
                                          width, options.experts))
     options.output.parent.mkdir(parents=True, exist_ok=True)
     # One width and therefore exactly one record per file: the consolidation

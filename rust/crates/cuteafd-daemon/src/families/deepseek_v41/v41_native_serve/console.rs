@@ -142,7 +142,7 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     layout.extra = json!({
         "prefill_chunk_rows": args.prefill_batch_tokens,
         "max_context_tokens": args.max_context_tokens,
-        "prefix_cache_entries": args.prefix_cache_entries,
+        "prefix_cache_entries": args.resolved_prefix_entries(),
         "lane_capacity": 8,
     });
     let dspark = args.dspark;
