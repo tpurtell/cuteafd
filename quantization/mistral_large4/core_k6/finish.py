@@ -14,9 +14,9 @@ def main():
     parser.add_argument('--publish-only',action='store_true',help='CPU-only publication and storage finalization')
     args=parser.parse_args()
     root=args.root.expanduser().resolve()
-    # Archive completion deliberately retires standalone weight paths. Never
-    # invoke the publisher against those retired paths on an idempotent retry.
-    if (root/'archive-complete.json').exists():
+    # Published artifacts already passed remote validation. Resume only native
+    # storage work, without repeating the publisher or rereading all weights.
+    if (root/'publication-complete.json').exists() or (root/'archive-complete.json').exists():
         from mistral_large4.core_k6.archive import archive
         archive(root)
         return

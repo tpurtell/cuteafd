@@ -50,3 +50,10 @@ def test_completed_archive_revalidates_without_retired_publisher_paths(tmp_path,
     root,calls=fixture(tmp_path,monkeypatch,archived=True)
     finish.main()
     assert calls==[('archive',root)]
+
+
+def test_published_retry_skips_publisher_and_resumes_native_storage(tmp_path,monkeypatch):
+    root,calls=fixture(tmp_path,monkeypatch)
+    (root/'publication-complete.json').write_text('{}')
+    finish.main()
+    assert calls==[('archive',root)]

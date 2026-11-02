@@ -6289,19 +6289,14 @@ published Hub hashes. The bounded GPU pilot runs under user unit
 `mistral-core-k6-1793465295342526983`; final pilot/production results are
 not yet claimed.
 
-The CPU finalizer is `finish.py`: publish first, then `archive.py`. Native
-SparkNest cannot adopt a Developer file directly into its D2/D3 disk stores
-without copying to the primary disk. Instead, finalization sends disjoint
-published shards to the six Sparks, one network copy per shard, then imports
-each partial HF snapshot offline using hardlinks on that Spark's primary
-filesystem. The shared namespace joins those additive snapshots. No storage
-policy changes are needed. Check all managed hashes and exactly one assigned
-sealed Spark copy per weight before recording `archive-complete.json` and
-removing this task's staging and standalone weight hardlinks. Keep metadata,
-scalar evidence, model card, receipts, corpus, logs and the managed revision.
-A completed-archive retry verifies the managed snapshot without replaying the
-publisher against its retired standalone paths. Storage/finalizer/lifecycle
-checks add17+3+43 CPU cases, with no actual import or transfer yet.
+The CPU finalizer publishes once, then delegates storage to native SparkNest:
+`nest hf import --offline` permits copying, followed by a native placement
+plan at factor1/6 across ostrich,dodo,emu,kiwi,rhea,moa. TJ superseded the
+original no-copy constraint and custom SSH/rsync checks on2026-11-02.
+Trust native import/placement job results and sealed-copy metadata; do not
+add another weight hash pass or remote file checks. Durable job IDs support
+storage retries without replaying the validated publisher. Retire only this
+task's local standalone weights after native completion, retaining evidence.
 
 The short GPU pilot passed in563.50 seconds (2026-10-31T16:57:47UTC), exit0:
 all72 frozen-source layers,24 native byte-exact block proofs,7 separate
@@ -6310,5 +6305,22 @@ heldout NMSE is3.15245e-4 (<1e-3); routed K4 witness is3.15434e-4 (<0.05).
 No OOM or numerical crash occurred. Keep the proposed K6/core, K4/routed and
 native exclusions. Full production started2026-10-31T17:02:39UTC under unit
 `mistral-core-k6-1793466152658395709`, with authorized CPU upload and
-zero-copy distributed import enabled. Producer files/fork/calibration are
+distributed import enabled (the native copy-permitted path above supersedes it). Producer files/fork/calibration are
 frozen; recover this run explicitly with its existing launcher and --resume.
+
+Production completed2026-11-02T01:20:47UTC:72/72 layers and27,688/27,688
+projections,73 shards,112,003 tensors,540,617,010,400 payload bytes. The
+independent export audit passed and all1,251 retained native tensors matched
+byte-for-byte. No numerical/OOM failures or numerical restarts occurred.
+Published2026-11-02T02:44:39UTC at
+https://huggingface.co/wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6
+revision `03c80aebaa483d55760703ae5bc0c9734c9d67d6`, with remote and anonymous
+checks complete. Native import job3263500808 finished in27.249s; native
+placement job3263500849 moved the remaining89,445,357,508B to moa in22.284s
+and removed redundant managed copies. Numerical producers remain frozen.
+The CPU supervisor was deliberately stopped to replace the custom storage
+path with this user-requested native path; this was not a quant failure.
+Focused finalizer/archive/launcher checks:55 passed. Full-model quality and
+serving qualification remain separate. Production layer15 attention.wo has
+a0.006871 regularized-Hessian relative error; the report preserves this
+outlier separately from the short pilot's unregularized heldout NMSE.
