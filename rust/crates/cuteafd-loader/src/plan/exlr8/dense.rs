@@ -267,6 +267,12 @@ fn component(
 }
 
 fn inventory_candidates(snapshot: &Path) -> Result<Vec<(PathBuf, Header)>> {
+    Ok(inventory_headers(snapshot)?.into_iter().filter_map(|(path, header, vision)|
+        (!vision).then_some((path, header))).collect())
+}
+
+/// Bundled plain vision remains in checkpoint identity, but is not native dense storage.
+pub(super) fn inventory_headers(snapshot: &Path) -> Result<Vec<(PathBuf, Header, bool)>> {
     use crate::plan::{checkpoint::Checkpoint, family, Component};
     // Construct only the configuration view: opening the checkpoint inventory here recurses.
     let checkpoint = Checkpoint { snapshot: snapshot.into(), config: super::read_json(&snapshot.join("config.json"))?,
@@ -280,9 +286,10 @@ fn inventory_candidates(snapshot: &Path) -> Result<Vec<(PathBuf, Header)>> {
         let names: Vec<_> = entries.keys().filter(|name| *name != "__metadata__").collect();
         let vision = model.spec().vision && !names.is_empty() && names.iter().all(|name|
             family.classify(model.spec(), name).is_some_and(|role| role.component == Component::Vision));
-        if vision { continue; }
-        header.validate().map_err(|error| DenseError::NativeMetadata { path: path.clone(), reason: format!("{error:#}") })?;
-        paths.push((path, header));
+        if !vision {
+            header.validate().map_err(|error| DenseError::NativeMetadata { path: path.clone(), reason: format!("{error:#}") })?;
+        }
+        paths.push((path, header, vision));
     }
     Ok(paths)
 }
@@ -1563,12 +1570,24 @@ mod tests {
         std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
         write(&["model.visual.patch_embed.proj.weight"]);
         assert!(inventory_candidates(root.path()).unwrap().is_empty());
+        std::fs::create_dir(root.path().join("experts")).unwrap();
+        let index = serde_json::to_vec(&json!({"__metadata__": {"format": "exlr8-v2", "scheme": "exlr8-e4m3-v2"}})).unwrap();
+        let mut file = File::create(root.path().join("experts/exlr8-layer-000.index.safetensors")).unwrap();
+        file.write_all(&(index.len() as u64).to_le_bytes()).unwrap();
+        file.write_all(&index).unwrap();
+        let catalog = crate::plan::exlr8::catalog_headers(root.path()).unwrap();
+        assert!(catalog.contains(&path));
+        let checkpoint = crate::plan::exlr8::inventory(root.path(), config.clone(), |_| true).unwrap();
+        assert_eq!(checkpoint.tensors.len(), 1);
+        assert_eq!(checkpoint.tensors[0].meta.name, "model.visual.patch_embed.proj.weight");
         write(&["model.visual.patch_embed.proj.weight", "model.language_model.norm.weight"]);
         assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
+        assert!(crate::plan::exlr8::catalog_headers(root.path()).is_err());
         write(&["model.visual.patch_embed.proj.weight"]);
         config.as_object_mut().unwrap().remove("vision_config");
         std::fs::write(root.path().join("config.json"), config.to_string()).unwrap();
         assert!(matches!(DenseRecord::inventory(root.path()), Err(DenseError::NativeMetadata { path: p, .. }) if p == path));
+        assert!(crate::plan::exlr8::catalog_headers(root.path()).is_err());
     }
 
     #[test]

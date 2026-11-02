@@ -340,6 +340,56 @@ capture_native_exlr8_launch(*map(Path, sys.argv[2:]))
 }
 
 #[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_flash_exlr8_min_max_preserve_worker_budget_and_pending_refusal() {
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
+        .expect("explicit Flash snapshot required"));
+    let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("explicit current exporter manifest required"));
+    assert!(snapshot.join("config.json").is_file() && programs.is_file());
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    for (name, gpus, ranks) in [("min", "1", 4), ("max", "2", 6)] {
+        for explicit in [None, Some("104")] {
+            let mut command = Command::new("timeout");
+            command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"]).arg(&snapshot)
+                .args(["--deployment", "--rtx", gpus, "--spark-ranks", &ranks.to_string(),
+                    "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
+                    "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB");
+            if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
+            let output = command.output().unwrap();
+            assert!(output.status.success(), "{name}, budget={explicit:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(deployment["family"], "glm5_flash");
+            assert_eq!(deployment["exlr8"]["manifest"], "k4");
+            assert_eq!(deployment["wip_launchable"], false);
+            assert_eq!(deployment["report"]["native_serving_admitted"], false);
+            assert_eq!(deployment["spark_ranks"], ranks);
+            let devices = deployment["memory_layout"]["devices"].as_array().unwrap().iter()
+                .filter(|device| device["kind"] == "spark").collect::<Vec<_>>();
+            assert_eq!(devices.len(), ranks as usize);
+            let expected = explicit.map_or(108u64, |_| 104) << 30;
+            for (rank, device) in devices.iter().enumerate() {
+                assert_eq!(device["index"], rank);
+                assert_eq!(device["worker_budget_bytes"], expected);
+                assert_eq!(device["capacity_bytes"], expected);
+                assert_eq!(device["items"][0]["bytes"], deployment["spark_requirements"]["resident_bytes_per_rank"][rank]);
+            }
+            let temporary = tempfile::tempdir().unwrap();
+            let path = temporary.path().join("flash-deployment.json");
+            std::fs::write(&path, &output.stdout).unwrap();
+            let python = Command::new("python3").args(["-I", "-c", r#"
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]) / 'scripts/tests'))
+from test_run_family_dispatch import capture_pending_native_exlr8_deployment
+capture_pending_native_exlr8_deployment(Path(sys.argv[2]))
+"#]).arg(&root).arg(&path).output().unwrap();
+            assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
+        }
+    }
+}
+
+#[test]
 fn installed_glm_exlr8_min_max_plans_pass_launcher_worker_budget() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     run_installed_glm_exlr8_worker_budget(

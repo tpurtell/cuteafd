@@ -1092,6 +1092,34 @@ def capture_native_exlr8_launch(snapshot: Path, deployment_path: Path, temporary
         assert int(worker[worker.index("--device-budget-bytes") + 1]) == devices[rank]["worker_budget_bytes"]
 
 
+def capture_pending_native_exlr8_deployment(deployment_path: Path) -> None:
+    """Inspect the actual launcher functions without bypassing pending adapter admission."""
+    deployment = json.loads(deployment_path.read_text())
+    assert deployment["family"] == "glm5_flash"
+    assert not deployment["executable"] and not deployment["wip_launchable"]
+    source = (ROOT / "scripts/launch/run-family.sh").read_text()
+    functions = []
+    for name in ("release_spark_worker_budget", "release_validate_deployment"):
+        match = re.search(rf"^{name}\(\) \{{\n.*?^\}}$", source, re.MULTILINE | re.DOTALL)
+        assert match, f"missing actual launcher function {name}"
+        functions.append(match.group())
+    script = '\n'.join(functions) + r'''
+release_die() { printf '%s\n' "$*" >&2; exit 1; }
+wip_slot=native-budget-test
+plan="$(cat "$1")"
+release_spark_worker_budget "$plan" "$2"
+release_validate_deployment "$plan" glm5_flash
+'''
+    result = subprocess.run(["bash", "-euc", script, "pending-native", str(deployment_path),
+                             str(deployment["spark_ranks"])], capture_output=True, text=True)
+    devices = [device for device in deployment["memory_layout"]["devices"] if device["kind"] == "spark"]
+    assert len(devices) == deployment["spark_ranks"]
+    assert {device["worker_budget_bytes"] for device in devices} == {int(result.stdout.strip())}
+    assert result.returncode != 0
+    assert "GLM Flash EXLR8 native execution adapter is not wired" in result.stderr
+    assert "invalid deployment specification" in result.stderr
+
+
 def capture_real_eight_rank_launch(snapshot: Path, deployment_path: Path, temporary: Path) -> dict:
     """Rust contract supplies actual headers/deployment; only hardware is stubbed."""
     deployment = json.loads(deployment_path.read_text())

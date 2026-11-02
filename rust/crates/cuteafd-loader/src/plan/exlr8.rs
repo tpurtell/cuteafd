@@ -231,9 +231,10 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     let package = if family.id() == "glm5_flash" { "glmf:exlr8" } else { "glm:exlr8" };
     report.experts = Some(super::family::ExpertContract { package: package.into(), block: 128,
         spark_worlds: (1..=8).collect(), local: Ok(format!("{package} coordinator native experts")) });
-    report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
-        how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
-    if !adapter_ready { report.hints.push(native::AdapterPending::Flash.hint()); }
+    if adapter_ready {
+        report.hints.push(super::Hint { what: "EXLR8 native runtime is WIP admitted, not quality-qualified".into(),
+            how: "Spark resident bytes are exact; K1 workspace/host staging and rings are checked by worker live admission before loading weights.".into() });
+    } else { report.hints.push(native::AdapterPending::Flash.hint()); }
     report.placement = if selected_world == 0 { ExpertPlacement::Local }
         else { ExpertPlacement::Sparks { ranks: selected_world } };
     report.min_spark_ranks = Some(selected_world);
@@ -417,16 +418,17 @@ pub fn recognizes(snapshot: &Path) -> Result<bool> {
 
 /// Native header sources; payload shards are deliberately not scanned.
 pub(crate) fn catalog_headers(snapshot: &Path) -> Result<Vec<PathBuf>> {
-    let mut headers = files(snapshot, "dense")?;
+    let mut headers = dense::inventory_headers(snapshot)?.into_iter()
+        .map(|(path, _, _)| path).collect::<Vec<_>>();
     ensure!(!headers.is_empty(), "EXLR8 dense inventory is empty");
     let indices = files(snapshot, "experts")?.into_iter().filter(|path|
         path.file_name().and_then(|name| name.to_str()).is_some_and(|name|
             name.starts_with("exlr8-layer-") && name.ends_with(".index.safetensors")))
         .collect::<Vec<_>>();
     ensure!(!indices.is_empty(), "EXLR8 expert index inventory is empty");
+    for path in &indices { Header::open(path)?.validate()?; }
     headers.extend(indices);
     headers.sort();
-    for path in &headers { Header::open(path)?.validate()?; }
     Ok(headers)
 }
 
@@ -439,10 +441,11 @@ pub(crate) fn inventory(snapshot: &Path, config: Value, needed: impl Fn(&str) ->
     for path in catalog_headers(snapshot)? {
         let shard = path.strip_prefix(snapshot)?.to_str().context("non-UTF8 native shard")?.to_owned();
         shard_bytes = shard_bytes.checked_add(path.metadata()?.len()).context("native inventory overflow")?;
+        let native = Header::open(&path)?.value["__metadata__"]["format"] == FORMAT;
         for mut meta in crate::read_safetensors_metadata(&path)? {
-            // Local native names repeat across shards. Preserve their physical
-            // namespace instead of pretending these are HF weight tensors.
-            let name = format!("{shard}::{}", meta.name);
+            // Local native names repeat across shards; bundled plain vision
+            // keeps its qualified HF names for the shared encoder loader.
+            let name = if native { format!("{shard}::{}", meta.name) } else { meta.name.clone() };
             weight_map.insert(name.clone(), shard.clone());
             if needed(&name) {
                 meta.name = name;

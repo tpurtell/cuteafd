@@ -145,8 +145,9 @@ impl<'a> DeploymentSpec<'a> {
             let intermediate = report.spec.as_ref().and_then(|spec| spec.moe.as_ref())
                 .context("Spark deployment requires routed expert geometry")?.intermediate;
             if native.is_none() { super::experts::spark_recipe(&experts.package, intermediate, topology.tp)?; }
-            else { ensure!(family == "glm5" && (1..=8).contains(&ranks) && experts.package == "glm:exlr8",
-                "EXLR8 deployment requires GLM native canonical Sparks"); }
+            else { ensure!((1..=8).contains(&ranks) && matches!((family, experts.package.as_str()),
+                ("glm5", "glm:exlr8") | ("glm5_flash", "glmf:exlr8")),
+                "EXLR8 deployment requires a matching native family/package and canonical Sparks"); }
         }
         ensure!(options.peers.is_empty() || options.peers.len() >= ranks,
             "deployment peer inventory does not cover selected Spark ranks");
@@ -309,6 +310,31 @@ mod tests {
         options.spark_ep = None;
         options.speculator = "auto".into();
         assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+    }
+
+    #[test]
+    fn native_flash_deployment_keeps_pending_adapter_unlaunchable() {
+        use crate::plan::exlr8::{NativePlan, NativeSelection, SparkRequirements};
+        for gpus in [1, 2] {
+            let (_dir, mut report) = fixture(gpus, 4);
+            report.family = Some("glm5_flash".into());
+            report.experts.as_mut().unwrap().package = "glmf:exlr8".into();
+            report.runtime = Some(crate::plan::RuntimeStatus::Planned);
+            report.native_serving_admitted = false;
+            report.placement_supported = false;
+            report.hints.push(crate::plan::exlr8::native::AdapterPending::Flash.hint());
+            let mut native = NativePlan { report,
+                selection: NativeSelection { manifest: "k4".into(), set_id: "flash-set".into() },
+                sparks: SparkRequirements { resident_bytes_per_rank: vec![100; 4],
+                    k1_workspace: "checked_by_worker_live_admission" } };
+            let options = DeploymentOptions { rtx_gpus: gpus, speculator: "off".into(), ..Default::default() };
+            let deployment = DeploymentSpec::from_exlr8(&native, &options).unwrap();
+            assert!(!deployment.executable && !deployment.wip_launchable);
+            assert_eq!(deployment.exlr8.unwrap().manifest, "k4");
+            assert_eq!(deployment.memory_layout, native.report.memory_layout.as_ref().unwrap());
+            native.report.experts.as_mut().unwrap().package = "glm:exlr8".into();
+            assert!(DeploymentSpec::from_exlr8(&native, &options).is_err());
+        }
     }
 
     #[test]
