@@ -11,6 +11,7 @@ pub mod native_dense;
 pub mod native_dense_glue;
 pub mod glm_stage;
 pub mod projected_kda;
+pub mod projected_index;
 pub mod exlr8;
 pub mod dense_trellis;
 pub(crate) mod l2_prefetch;

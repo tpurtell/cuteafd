@@ -25,7 +25,9 @@ fn flash_native_stages_charge_separate_projected_inputs_once() -> Result<()> {
             assert_eq!(stage.extents["beta"], (rows * cfg.kda_heads / ranks * 2).max(256));
             assert_eq!(stage.extents["aux"], rows * 128 * 2);
             let old = crate::families::glm5_flash::core_admission::CoreStageLayout::new(&cfg, rows, ranks, false, 4096)?;
-            assert_eq!(stage.bytes()?, old.bytes()? + ["decay", "output_gate", "beta", "aux"].iter()
+            assert_eq!(stage.extents["index_query"], rows * 32 * 128 * 2);
+            assert_eq!(stage.extents["index_packed"], rows * 288 * 2);
+            assert_eq!(stage.bytes()?, old.bytes()? + ["decay", "output_gate", "beta", "aux", "index_query", "index_packed"].iter()
                 .map(|name| stage.extents[name]).sum::<usize>());
         }
     }

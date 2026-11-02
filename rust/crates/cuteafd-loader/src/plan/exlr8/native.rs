@@ -79,6 +79,9 @@ impl FlashStageLayout {
         extents.insert("beta", bytes(cfg.kda_heads / ranks)?.max(256));
         // Auxiliary low-rank projections run sequentially before f_b/g_b.
         extents.insert("aux", bytes(auxiliary_width)?.max(256));
+        // The indexer is replicated even when attention heads are split.
+        extents.insert("index_query", bytes(cuteafd_ffi::projected_index::HEADS * 128)?.max(256));
+        extents.insert("index_packed", bytes(256 + cuteafd_ffi::projected_index::HEADS)?.max(256));
         Ok(Self { extents })
     }
     pub fn bytes(&self) -> Result<usize> {
@@ -136,6 +139,16 @@ impl FlashCharges {
                     cuteafd_ffi::glm_stage::validate_entry(&spec, entry)?;
                 }
                 stage_scratch[index] = stage_scratch[index].max(usize::try_from(spec.scratch.get("scratch").copied().unwrap_or(0))?);
+                programs.insert(name);
+            }
+            let prefix = if ranks == 1 { "glmf_stage" } else { "glmf2_stage" };
+            let capacities = if !is_decode { vec![4096] } else if decode == 128 { vec![64, 128] } else { vec![64] };
+            for capacity in capacities {
+                let name = format!("{prefix}_index_projected_c_m{capacity}");
+                let spec = super::workspace::program_spec(manifest, &name)?;
+                let entry = entries.iter().find(|e| e["name"] == name).context("native Flash index stage entry")?;
+                let layout = cuteafd_ffi::projected_index::validate_entry(&spec, entry)?;
+                stage_scratch[index] = stage_scratch[index].max(layout.scratch);
                 programs.insert(name);
             }
         }
