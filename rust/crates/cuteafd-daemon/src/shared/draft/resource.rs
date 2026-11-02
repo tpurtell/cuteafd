@@ -642,7 +642,7 @@ mod tests {
         // GLM/GLMF/MiMo call this cap after draft generation (including fixed
         // and run_draft cold shortcuts); Qwen/Kimi/Step cap before generation.
         // V4's selected lengths pass through the same policy fallback.
-        for family in ["glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "deepseek_v4"] {
+        for family in ["glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "deepseek_v4", "muse_spark"] {
             for count in [17, 32, 64] {
                 let sure = vec![0.99; 7];
                 let poor = vec![0.; 7];

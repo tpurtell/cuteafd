@@ -74,6 +74,12 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mark_slots = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots,
         opts.mimo_prefix_entries, crate::placement::families::muse_spark::mark_bytes(cfg, 1),
         opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)));
+    if opts.host_cache_bytes == Some(0) {
+        memory.notes.push(format!("Muse host prefix tier off: retains {mark_slots} exact prefix marks; \
+            {} B/mark across {gpus} GPU(s), device mark budget {} B{}",
+            crate::placement::families::muse_spark::mark_bytes(cfg, 1), opts.mimo_prefix_mark_bytes,
+            if opts.prefix_slots.is_some() { " (explicit slot override)" } else { "" }));
+    }
     let inputs = crate::placement::families::muse_spark::MuseInputs { cfg, core: &model.core, catalog, mark_slots,
         gpus: opts.rtx_bytes.iter().map(|bytes| GpuBudget { capacity_bytes: *bytes, headroom_bytes: opts.headroom_bytes,
             baseline: Baseline::Planned { context_bytes: ArchContext::for_device("sm_120", *bytes).context_bytes,

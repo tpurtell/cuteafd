@@ -142,8 +142,25 @@ fn plan_matrix(column: usize) {
                 .map(|item| item.bytes).sum();
             eprintln!("muse census {rtx}+{ranks}: owners={owners} free={} pool={} onboard={:?}",
                 spark.free_bytes(), memory.pool_tokens, report.onboard_layers);
-            assert_eq!(memory.pool_tokens, if rtx == 1 { 814016 } else { 2097152 },
-                "Spark census must preserve this coordinator-bound pool");
+            let cfg = crate::families::muse_spark::MuseSparkConfig::from_hf(&testing::muse_spark_config()).unwrap();
+            let mark_bytes = crate::placement::families::muse_spark::mark_bytes(&cfg, 1);
+            let budget = layout::LayoutOptions::default().mimo_prefix_mark_bytes;
+            let marks = budget / mark_bytes;
+            let devices: Vec<_> = memory.devices.iter().filter(|device|
+                device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).collect();
+            let prefix_bytes: u64 = devices.iter().flat_map(|device| &device.items).filter(|item|
+                item.category == cuteafd_core::memory_layout::Category::Prefix).map(|item| item.bytes).sum();
+            assert_eq!(prefix_bytes, marks * mark_bytes, "host-off marks obey the aggregate byte budget");
+            assert!(memory.notes.iter().any(|note|
+                note.contains(&format!("host prefix tier off: retains {marks} exact prefix marks"))));
+            let record_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 / rtx as u64;
+            let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
+            let pool_from_ledger = devices.iter().map(|device| {
+                let fixed: u64 = device.items.iter().filter(|item| item.group != "records").map(|item| item.bytes).sum();
+                (device.capacity_bytes - fixed) / (record_bytes * page_rows) * page_rows
+            }).min().unwrap().min(cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+            assert_eq!(memory.pool_tokens, pool_from_ledger, "pool first, derived from the exact ledger");
+            if rtx == 2 { assert_eq!(memory.pool_tokens, 2 << 20); }
         }
         if (rtx, ranks) == (2, 6) {
             assert!(report.fits && report.placement_supported, "{:?}", report.hints);
@@ -311,7 +328,33 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     assert_eq!(group(1), expected.owned + expected.scratch + expected.head_scratch + expected.runtime);
     assert_eq!(expected.runtime, (16 * 8 * 4 + 62 * 64 * 8 * 4) as u64, "draft ids + probe ring");
     assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
-    assert!(drafted.solver_placement.as_ref().unwrap().pool_tokens < plain.solver_placement.as_ref().unwrap().pool_tokens);
+    assert!(placed.pool_tokens <= plain.solver_placement.as_ref().unwrap().pool_tokens);
+    // One RTX cannot reach the pool cap: the exact drafter charge must displace KV pages.
+    let single = with_layout(1, 6);
+    let mut single_draft = single.clone();
+    single_draft.layout.as_mut().unwrap().muse_drafter_snapshot = Some(drafter.path().to_path_buf());
+    let single_plain = input.plan(&single).unwrap();
+    let single_drafted = input.plan(&single_draft).unwrap();
+    assert!(single_plain.fits && single_drafted.fits, "{:?}", single_drafted.hints);
+    let memory = single_plain.memory_layout.as_ref().unwrap();
+    let device = memory.devices.iter().find(|device|
+        device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
+    let charged = expected.owned + expected.scratch + expected.head_scratch + expected.runtime;
+    let draft_device = single_drafted.memory_layout.as_ref().unwrap().devices.iter().find(|device|
+        device.kind == cuteafd_core::memory_layout::DeviceKind::Rtx).unwrap();
+    assert_eq!(draft_device.items.iter().filter(|item| item.group == "Drafter").map(|item| item.bytes).sum::<u64>(), charged);
+    let fixed = |device: &cuteafd_core::memory_layout::DeviceLayout| device.items.iter()
+        .filter(|item| item.group != "records").map(|item| item.bytes).sum::<u64>();
+    assert_eq!(fixed(draft_device) - fixed(device), charged);
+    let page_rows = crate::families::muse_spark::cache::PAGE_ROWS;
+    let page_bytes = (cfg.kv_record_bytes() * cfg.full_layers()) as u64 * page_rows;
+    let available = device.capacity_bytes - fixed(device);
+    assert!(memory.pool_tokens < cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
+    assert_eq!(memory.pool_tokens, available / page_bytes * page_rows);
+    let displaced_pages = available / page_bytes - (available - charged) / page_bytes;
+    assert!(displaced_pages > 0);
+    assert_eq!(memory.pool_tokens - single_drafted.memory_layout.as_ref().unwrap().pool_tokens,
+        displaced_pages * page_rows, "drafter bytes displace exactly the whole-page KV difference");
     // A drafter trained against another head refuses before placement.
     let mut other: serde_json::Value = config.clone();
     other["dflash_config"]["output_multiplier"] = serde_json::json!(0.125);
