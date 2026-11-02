@@ -76,7 +76,9 @@ fn report_census_reuses_only_checkpoint_facts_across_options() {
             (3, MediaMode::Rtx(Some(0)), spec::DraftOwnership::None, 4096),
             (4, MediaMode::Off, spec::DraftOwnership::NativeMtp, 1024),
         ] {
-            let options = PlanOptions { vision: media, audio: media, draft_ownership: Some(draft),
+            let options = PlanOptions { vision: media,
+                audio: if media == MediaMode::Auto { MediaMode::Auto } else { MediaMode::Off },
+                draft_ownership: Some(draft),
                 mapped_scale_host_budget_bytes: Some(64 << 30), mapped_scale_preload_bytes: reserve,
                 layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                     host_cache_bytes: Some(0), pool_tokens: Some(4096), prefill_reserve_rows: Some(reserve),
@@ -95,6 +97,11 @@ fn report_census_reuses_only_checkpoint_facts_across_options() {
             assert!(input.model.get().is_some() && input.modelopt.get().is_some()
                 && input.module_numerics.get().is_some());
         }
+        // Explicit audio requires a bundled tower; a warm census must not
+        // bypass that option-dependent refusal or change its error.
+        let options = PlanOptions { audio: MediaMode::Rtx(Some(0)), ..sparks(4) };
+        assert_eq!(input.plan(&options).unwrap_err().to_string(),
+            make_input().plan(&options).unwrap_err().to_string());
     }
 }
 
