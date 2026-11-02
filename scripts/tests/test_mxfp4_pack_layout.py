@@ -165,7 +165,8 @@ def test_s384_split_recipe_is_explicit_decode_only_and_hardware_scoped():
 
 def test_native_plan_rejects_mixed_decode_splits_and_prefill_splits():
     data = LAYOUTS.layouts()
-    row = next(row for row in data["native_slices"] if row["width"] == 384)
+    row = next(row for row in data["native_slices"]
+               if (row["hidden"], row["width"], row["sm"]) == (5120, 384, 121))
     row["fc1_k_splits"][1] = 1
     with pytest.raises(ValueError, match="share one FC1 K split"):
         LAYOUTS.validate(data)
