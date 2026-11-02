@@ -194,7 +194,8 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
     from functools import partial
     from b12x.integration.cuteafd.glmf_split import (
         compile_glmf_kda_core_aot, compile_glmf_stage_aot,
-        compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot)
+        compile_glmf_projected_kda_aot, compile_glmf_fp8_stage_aot,
+        compile_glmf_projected_index_c_aot)
     out = []
     # Wide decode still selects the narrow stage for batches of at most 64 rows.
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
@@ -220,6 +221,10 @@ def glmf_stage_programs(g, decode_rows: int, prefill_rows: int):
                           mode="decode" if rows in decode_caps else "prefill")
             out.append((f"{stage}_fp8_m{rows}", "attention_stage", params,
                         partial(compile_glmf_fp8_stage_aot, g, **params)))
+    for rows in sorted(decode_caps | {prefill_rows}):
+        params = dict(max_rows=rows, verify_rows=rows if rows in decode_caps else 64)
+        out.append((f"index_projected_c_m{rows}", "index_producer", params,
+                    partial(compile_glmf_projected_index_c_aot, g, **params)))
     return out
 
 

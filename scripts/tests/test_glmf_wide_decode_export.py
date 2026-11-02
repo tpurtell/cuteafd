@@ -67,7 +67,7 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 9 * len(caps)
+    assert len(calls) == len(programs) == 10 * len(caps)
     for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
@@ -88,6 +88,10 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
                 "attention_stage", "glmf_split", "compile_glmf_fp8_stage_aot", (geometry,))
             assert params == kwargs == {"stage": stage, "max_rows": rows,
                                        "mode": "decode" if rows in decode_caps else "prefill"}
+        op, params, (module, compiler, args, kwargs) = calls[f"index_projected_c_m{rows}"]
+        assert (op, module, compiler, args) == (
+            "index_producer", "glmf_split", "compile_glmf_projected_index_c_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows, "verify_rows": rows if rows in decode_caps else 64}
         for inter in intermediates:
             op, params, (_, compiler, args, kwargs) = calls[f"swiglu_i{inter}_m{rows}"]
             assert op == "swiglu_split"
@@ -151,7 +155,7 @@ def test_flash_wide_native_stages_preserve_narrow_catalog(exporter):
     wide = exporter.glmf_stage_programs(GEOMETRY, 128, 4096)
     describe = lambda programs: {name: (op, params, thunk()) for name, op, params, thunk in programs}
     narrow, wide = describe(narrow), describe(wide)
-    assert len(narrow) == 18 and len(wide) == 27
+    assert len(narrow) == 20 and len(wide) == 30
     assert {name: wide[name] for name in narrow} == narrow
     assert all(name.endswith("_m128") for name in wide.keys() - narrow.keys())
     assert "g, max(args.decode_rows, args.glmf_wide_decode_rows), args.prefill_rows)" in EXPORTER.read_text()
