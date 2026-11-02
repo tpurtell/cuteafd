@@ -41,10 +41,13 @@ def main() -> int:
     harness = load(HARNESS, "loop_harness")
     db = replay.sqlite3.connect(replay.DB, uri=True)
     tk = Tokenizer.from_file(replay.TOK)
+    provider = getattr(replay, "PROVIDER", None)
     q = ("select m.id, json_extract(m.data,'$.modelID'), json_extract(m.data,'$.agent') from message m "
          "where m.time_created>=? and json_extract(m.data,'$.role')='assistant' "
-         "and json_extract(m.data,'$.providerID')='llmgw' and json_extract(m.data,'$.modelID') in (?,?)")
-    msgs = db.execute(q, (replay.T0, *replay.MODELS)).fetchall()
+         + ("and json_extract(m.data,'$.providerID')=? " if provider else "")
+         + "and json_extract(m.data,'$.modelID') in (?,?)")
+    args = (replay.T0, *((provider,) if provider else ()), *replay.MODELS)
+    msgs = db.execute(q, args).fetchall()
     rows = []
     for mid, model, agent in msgs:
         for si, s in enumerate(replay.steps_of(db, mid)):
