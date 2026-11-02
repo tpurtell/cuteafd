@@ -47,7 +47,7 @@ fn published_flash_native_facts_match_resident_bridge_and_owned_mla() -> Result<
         .context("CUTEAFD_EXLR8_FLASH_SNAPSHOT required")?);
     let config: Value = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
     let cfg = crate::families::glm5_flash::GlmNextConfig::from_hf(&config)?;
-    let catalog = crate::families::deepseek_v41::v41_catalog::read_official_v41_catalog(&snapshot)?;
+    let catalog = crate::families::deepseek_v41::v41_catalog::read_expert_catalog(&snapshot)?;
     assert_eq!(catalog.routed_experts().layers, cfg.layers);
     assert_eq!(catalog.routed_experts().first_layer, 3);
     assert_eq!(catalog.routed_experts().experts, cfg.experts);
