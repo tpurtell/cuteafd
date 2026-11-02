@@ -72,14 +72,14 @@ def test_width_parser_distinguishes_auto_from_an_explicit_scalar():
 def test_manifest_identity_must_match_the_measured_arm():
     q = _load_qualifier()
     manifest = dict(spark_tp_degree=6,
-                    geometry=dict(intermediate=384, experts=q.ARENA_EXPERTS))
-    assert q.verify_manifest_identity(manifest, 384, 6) is manifest
+                    role="spark_tp6", geometry=dict(intermediate=384, kernel_intermediate=384, hidden=5120, topk=6, experts=q.ARENA_EXPERTS))
+    assert q.verify_manifest_identity(manifest, q.native_spark_artifacts()[6][0], 6) is manifest
     wrong_degree = dict(manifest, spark_tp_degree=3)
     wrong_intermediate = dict(manifest, geometry=dict(intermediate=768, experts=q.ARENA_EXPERTS))
     wrong_experts = dict(manifest, geometry=dict(intermediate=384, experts=128))
     for bad in (wrong_degree, wrong_intermediate, wrong_experts):
         with pytest.raises(SystemExit):
-            q.verify_manifest_identity(bad, 384, 6)
+            q.verify_manifest_identity(bad, q.native_spark_artifacts()[6][0], 6)
 
 
 def test_tensor_hash_is_content_addressed_and_includes_dtype():
@@ -354,7 +354,7 @@ def test_run_timing_branch_executes_with_mocks_and_emits_the_record_schema(tmp_p
     manifest_path = tmp_path / "v41_experts.json"
     manifest_path.write_text(json.dumps(dict(
         role="spark_tp6", spark_tp_degree=6,
-        geometry=dict(experts=q.ARENA_EXPERTS, intermediate=384),
+        geometry=dict(experts=q.ARENA_EXPERTS, intermediate=384, kernel_intermediate=384, hidden=5120, topk=6),
         variants=[dict(capacity_rows=1, width=64), dict(capacity_rows=80, width=192)])))
 
     q.report_compiled_widths = lambda *a, **k: {1: 64, 80: 192}
@@ -422,7 +422,7 @@ def test_run_timing_branch_executes_with_mocks_and_emits_the_record_schema(tmp_p
 
     options = SimpleNamespace(
         manifest=manifest_path, native_lib=tmp_path / "lib.so", width=None,
-        spark_tp=6, tp4_legacy=False, capacities="1,80", timing_rows="1,8",
+        spark_tp=6, tp_rank=0, layer=0, capacities="1,80", timing_rows="1,8",
         active_counts="6", cold_bytes=1024, timing_seed=0x51, repeats=2,
         warm_replays=2, single_replays=2, cold_replays=2,
         route_weights="geometric", rel_tolerance=q.REL_TOL,
@@ -436,7 +436,7 @@ def test_run_timing_branch_executes_with_mocks_and_emits_the_record_schema(tmp_p
     assert [(r["capacity"], r["rows"], r["active"]) for r in records] == [
         (1, 1, 6), (80, 1, 6), (80, 8, 6)]
     for record in records:
-        for key in ("kind", "status", "role", "spark_tp", "tp4_legacy", "capacity",
+        for key in ("kind", "status", "role", "spark_tp", "artifact", "capacity",
                     "rows", "active", "abi_version", "valid_route_count",
                     "weighted_route_count", "intermediate", "kernel_intermediate",
                     "width", "timing_seed", "input_sha256", "route_sha256",

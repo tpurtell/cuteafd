@@ -375,8 +375,17 @@ impl ExpertReductionPlan {
             }
             Ok((info.capacity_rows as usize, recipe))
         }).collect::<anyhow::Result<Vec<_>>>()?;
-        Self::new(&variants)
+        Self::native_recipes(&variants)
             .context("native MXFP4 decode differs from canonical m1 slice/fold recipe")
+    }
+
+    fn native_recipes(variants: &[(usize, cuteafd_ffi::V41ExpertReduction)]) -> anyhow::Result<Self> {
+        use anyhow::{ensure, Context};
+        let canonical = &variants.iter().find(|(capacity, _)| *capacity == 1)
+            .context("native package needs canonical m1 reduction")?.1;
+        ensure!(variants.iter().all(|(capacity, recipe)| *capacity > 80 || recipe == canonical),
+            "native decode capacities must share one slice/fold recipe");
+        Self::new(variants)
     }
 
     pub(crate) fn execution_index(
@@ -406,6 +415,23 @@ impl ExpertReductionPlan {
 #[cfg(test)]
 mod reduction_tests {
     use super::ExpertReductionPlan;
+
+    #[test]
+    fn native_plan_rejects_mixed_decode_tilings_below_80() {
+        use cuteafd_ffi::V41ExpertReduction;
+        let recipe = V41ExpertReduction { version: 1, slice_width: 128, fc2_k_steps: 4,
+            plane_count: 3, plane_fold: 1, implementation: 1, mma_k: 32,
+            block_threads: 128, fc1_k_stage: 128 };
+        let variants = [(1, recipe), (16, recipe), (80, recipe),
+            (4096, V41ExpertReduction { slice_width: 64, fc2_k_steps: 2, plane_count: 5, ..recipe })];
+        ExpertReductionPlan::native_recipes(&variants).unwrap();
+        for index in 0..3 {
+            let mut bad = variants;
+            bad[index].1 = V41ExpertReduction { slice_width: 64, fc2_k_steps: 2,
+                plane_count: 5, ..recipe };
+            assert!(ExpertReductionPlan::native_recipes(&bad).is_err(), "capacity {}", bad[index].0);
+        }
+    }
 
     #[test]
     fn native_owned_state_order_freezes_serial_and_grouped_decode() {

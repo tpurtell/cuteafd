@@ -979,8 +979,8 @@ case "$v41_engram_warm" in on|off) ;; *) release_die "ENGRAM_WARM must be on or 
 case "$RTX_GPUS" in auto|1|2) ;; *) release_die "RTX_GPUS must be auto, 1, or 2" ;; esac
 [[ "$RTX_EXPERT_LAYERS" == auto || "$RTX_EXPERT_LAYERS" =~ ^[0-9]+$ ]] ||
   release_die "DeepSeek V4.1 RTX_EXPERT_LAYERS must be auto, all, N or N% with a readable checkpoint; max needs experts-first admission"
-((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
-[[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] || release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
+((!RELEASE_CONCURRENCY_EXPLICIT)) || [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
+[[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] || release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
 [[ "$MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]*$ ]] && ((MAX_CONTEXT_TOKENS <= 1048576)) || release_die "MAX_CONTEXT_TOKENS must be in 1..1048576"
 [[ "$MAX_OUTPUT_TOKENS" =~ ^-?[0-9]+$ ]] || release_die "MAX_OUTPUT_TOKENS must be an integer (<= 0: bounded only by the context)"
 [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] && ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) || release_die "PREFILL_BATCH_TOKENS must be in 80..4096"
@@ -1013,6 +1013,7 @@ profile_bytes="$(release_cuda_total_bytes "$RELEASE_COORDINATOR_GPU_UUID")" || r
 profile="$(release_coordinator_profile "$profile_bytes" "$COORDINATOR_GPU_BUDGET_GIB")" || release_die "cannot resolve coordinator capacity profile"
 read -r profile_gib default_concurrency <<<"$profile"
 ((RELEASE_CONCURRENCY_EXPLICIT)) || CONCURRENCY="$default_concurrency"
+[[ "$PREFIX_CACHE_ENTRIES" != auto ]] || PREFIX_CACHE_ENTRIES=$((CONCURRENCY <= 16 ? 20 : (5 * CONCURRENCY + 3) / 4))
 if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
   if [[ -z "${cfg_overrides[EMBEDDING]:-}" ]] && ! grep -Eq '^[[:space:]]*EMBEDDING[[:space:]]*=[[:space:]]*[^#[:space:]]' "$config"; then
     EMBEDDING=host
@@ -1955,6 +1956,9 @@ profile="$(release_coordinator_profile "$profile_bytes" "$coordinator_budget")" 
 read -r profile_gib default_concurrency <<<"$profile"
 [[ "$family" != qwen3_5 ]] || default_concurrency=4
 effective_concurrency="$(get CONCURRENCY "$default_concurrency")"
+[[ "$effective_concurrency" =~ ^[0-9]+$ ]] && ((effective_concurrency >= 1 && effective_concurrency <= 64)) || release_die "CONCURRENCY must be an integer in 1..=64"
+effective_prefix_entries="$(get PREFIX_CACHE_ENTRIES auto)"
+[[ "$effective_prefix_entries" != auto ]] || effective_prefix_entries=$((effective_concurrency <= 16 ? 20 : (5 * effective_concurrency + 3) / 4))
 if [[ "$family" == mimo_v2 ]]; then
   if python3 -c 'import sys; sys.exit(not(float(sys.argv[1]) <= 32))' "$profile_gib"; then
     [[ -n "${cfg[EMBEDDING]:-}" ]] || embedding=host
@@ -2070,7 +2074,7 @@ kv_reserve_args=()
   kv_reserve_args+=(--kv-early-termination-min-output-tokens "$(get KV_EARLY_TERMINATION_MIN_OUTPUT_TOKENS)")
 case $family in
   mimo_v2|glm5|glm5_flash|qwen4|qwen3_5|deepseek_v4|kimi_k3|step5)
-    family_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
+    family_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ "$(get HOST_CACHE_BYTES auto)" == 0 ]] || family_args+=(--host-cache-bytes "$(get HOST_CACHE_BYTES auto)") ;;
 esac
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash ) && $vision != off ]]; then
@@ -2692,14 +2696,14 @@ audio_encoder_hash=""
   plan_draft_args+=(--host-cache-bytes "$plan_host_cache")
   [[ "$(get FULL_PREFILL_LOGITS off)" != on ]] || plan_draft_args+=(--full-prefill-logits)
   if [[ "$family" == qwen3_5 ]]; then
-    plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --state-slots "$effective_concurrency" --prefill-rows 4096
-      --prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)")
+    plan_draft_args+=(--kv-cache "$dense_qwen_kv_cache" --prefill-rows 4096
+      --prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
   fi
   if [[ "$family" == mimo_v2 ]]; then
     plan_draft_args+=(--mimo-swa-kv-cache "$mimo_swa_kv")
-    plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES 20)"
-      --context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
+    plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
+    plan_draft_args+=(--context-tokens "$(get MAX_CONTEXT_TOKENS "$default_context")"
       --expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
@@ -2711,18 +2715,9 @@ audio_encoder_hash=""
       plan_draft_args+=(--mimo-prefix-draft)
     fi
   fi
-  # GLM 5.3 Flash: the counts serve-glmf allocates for the keys a launch sets (unset keys keep
-  # the planner's defaults, which are serving's). Its recurrent state holds max(--slots, which
-  # is 8, --max-sequences) slots, and its prefix mark arena counts min(--max-sequences,
-  # DECODE_ROWS = 64) lanes, so both go to the plan as such beside the sequences.
+  # Rust resolves recurrent storage and prefix defaults from the same concurrency.
   if [[ "$family" == glm5_flash ]]; then
-    glmf_sequences="$effective_concurrency"
-    if [[ -n "$glmf_sequences" ]]; then
-      [[ "$glmf_sequences" =~ ^[1-9][0-9]*$ ]] || { echo "CONCURRENCY must be a positive sequence count" >&2; exit 2; }
-      plan_draft_args+=(--state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"
-        --mark-lanes "$((glmf_sequences < 64 ? glmf_sequences : 64))")
-    fi
-    [[ -z "$(get PREFIX_CACHE_ENTRIES)" ]] || plan_draft_args+=(--prefix-cache-entries "$(get PREFIX_CACHE_ENTRIES)")
+    plan_draft_args+=(--prefix-cache-entries "$effective_prefix_entries")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     # The plan resolves VISION=auto as serve-glmf would serve it: with the template source serving
     # gets, vision stays on; without one, a checkpoint template that cannot mark images plans text.

@@ -89,6 +89,7 @@ impl ServeArgs {
     }
 
     fn validate(&self) -> Result<()> {
+        cuteafd_core::concurrency::validate("step5", u64::from(self.max_sequences))?;
         let shape = self.shape()?;
         ensure!(self.device >= 0 && self.split_device.is_none_or(|d| d >= 0 && d != self.device),
             "Step-5 needs one GPU or two distinct actual GPUs");
@@ -447,9 +448,10 @@ fn worker(args: &ServeArgs, receive: &mut tokio::sync::mpsc::Receiver<cuteafd_ap
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::step5::Step5Encoding, ModelEncoding, ModelProfile};
     args.validate()?;
+    args.prefix.resolve_entries(usize::from(args.max_sequences));
     let api = args.api.load()?;
     let snapshot = args.snapshot.clone();
     let encoding = Arc::new(Step5Encoding::from_snapshot(&snapshot)?);
@@ -460,7 +462,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         Some(format!("{organization}/{model}"))
     })).context("Step-5 requires --model-id for a snapshot without HF identity")?;
     let profile = ModelProfile::new(model, ModelEncoding::Step5(encoding));
-    let (queue, mut receive) = tokio::sync::mpsc::channel(16);
+    let (queue, mut receive) = tokio::sync::mpsc::channel(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let engine_args = args.clone();
@@ -504,6 +506,25 @@ mod tests {
             "--native-lib", "/lib.so", "--peers", "127.0.0.1:1,127.0.0.1:2,127.0.0.1:3,127.0.0.1:4"]).unwrap();
         let crate::cli::Commands::ServeStep5(args) = cli.command else { panic!("Step-5 dispatch") };
         args
+    }
+
+    #[test]
+    fn boot_concurrency_resolves_retention_and_names_native_refusals() -> Result<()> {
+        for c in [1u8, 4, 16, 17, 32, 64, 65] {
+            let mut args = args();
+            args.max_sequences = c;
+            if c > 64 {
+                let error = args.validate().unwrap_err().to_string();
+                assert!(error.contains("step5") && error.contains("decode program capacity 64"));
+                continue;
+            }
+            args.validate()?;
+            args.prefix.resolve_entries(usize::from(c));
+            assert_eq!(args.prefix.prefix_cache_entries, 20.max((5 * usize::from(c)).div_ceil(4)));
+            assert_eq!(cuteafd_core::concurrency::state_slots(u64::from(c)), u64::from(c));
+            assert_eq!(cuteafd_core::concurrency::queue_depth(u64::from(c)), u64::from(c));
+        }
+        Ok(())
     }
 
     #[test]

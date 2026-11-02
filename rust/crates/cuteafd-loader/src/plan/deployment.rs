@@ -405,7 +405,7 @@ mod tests {
             for unqualified in [7, 8] {
                 report.spark_ranks = unqualified;
                 let result = DeploymentSpec::from_report(&report, &options);
-                if package == "v41:mxfp4" && unqualified == 8 {
+                if package == "v41:mxfp4" {
                     assert!(result.is_ok());
                 } else {
                     assert!(result.is_err());

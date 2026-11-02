@@ -476,82 +476,45 @@ def _read_tensor(snapshot: Path, weight_map, key: str):
 
 
 def rank_logical_slice(logical: LogicalWeights, tp_rank: int, tp_degree: int,
-                       intermediate: int, torch_module) -> LogicalWeights:
-    """The logical (UNPACKED) operand slice one physical rank actually computes.
-
-    A single rank's output must be compared against the oracle built from this
-    slice. The full-width oracle applies only after every rank's plane has been
-    summed.
-    """
+                       intermediate: int, torch_module, *, layer=0) -> LogicalWeights:
+    """Actual adjacent source interval of a rank at the absolute layer."""
+    full = logical.weights["w1"].shape[1]
+    units, remainder = divmod(full, 32)
+    assert remainder == 0 and units >= tp_degree and 0 <= tp_rank < tp_degree
+    base, extra = divmod(units, tp_degree)
+    canonical = (tp_rank - layer) % tp_degree if extra else tp_rank
+    first = 32 * (canonical * base + min(canonical, extra))
+    actual = 32 * (base + (canonical < extra))
+    assert actual == intermediate, (tp_rank, layer, actual, intermediate)
     return LogicalWeights(
-        weights={name: _slice_logical(logical.weights[name], name, tp_rank,
-                                      intermediate, torch_module)
+        weights={name: _slice_logical(logical.weights[name], name, first, actual, torch_module)
                  for name in ("w1", "w3", "w2")},
-        scales={name: _slice_scale(logical.scales[name], name, tp_rank,
-                                   intermediate, torch_module)
+        scales={name: _slice_scale(logical.scales[name], name, first, actual, torch_module)
                 for name in ("w1", "w3", "w2")},
         source_mode=logical.source_mode + "+rank_slice",
         identity=dict(logical.identity, tp_rank=tp_rank, tp_degree=tp_degree,
-                      intermediate=intermediate),
-        experts=logical.experts,
-    )
+                      layer=layer, first=first, intermediate=actual),
+        experts=logical.experts)
 
 
-def _slice_logical(tensor, name, tp_rank, intermediate, torch_module):
-    lo = tp_rank * intermediate
-    hi = lo + intermediate
-    if name in ("w1", "w3"):
-        return tensor[:, lo:hi, :]
-    # w2 contracts over the intermediate axis, at half rate in the last dim.
-    return tensor[:, :, lo // 2:hi // 2]
+def _slice_logical(tensor, name, first, intermediate, torch_module):
+    hi = first + intermediate
+    return tensor[:, first:hi, :] if name in ("w1", "w3") else tensor[:, :, first // 2:hi // 2]
 
 
-def _slice_scale(tensor, name, tp_rank, intermediate, torch_module):
-    lo = tp_rank * intermediate
-    hi = lo + intermediate
-    if name in ("w1", "w3"):
-        return tensor[:, lo:hi, :]
-    # w2's logical scale is [E, rows, K//32]; the K axis is the last one.
-    return tensor[:, :, lo // 32:hi // 32]
+def _slice_scale(tensor, name, first, intermediate, torch_module):
+    hi = first + intermediate
+    return tensor[:, first:hi, :] if name in ("w1", "w3") else tensor[:, :, first // 32:hi // 32]
 
 
 def rank_operands(logical: LogicalWeights, tp_rank: int, tp_degree: int,
-                  intermediate: int, torch_module):
-    """Derive one TP rank's logical slice, then repack it for the kernel.
-
-    w1/w3 are sliced along N (intermediate rows); w2 is sliced along K
-    (intermediate columns). Scales follow the same axis. Slicing the *logical*
-    tensors and then repacking is exactly what the native loader does with the
-    official checkpoint, so this is the same arithmetic path, not a model of it.
-    """
-    from b12x.moe.fused_moe._impl import (
-        _logical_weight_to_w4a8_rp_inplace, _e8m0_scale_to_w4a8_sfb_inplace)
-
-    full = intermediate * tp_degree
-    lo = tp_rank * intermediate
-    hi = lo + intermediate
-
-    def w(name):
-        return _slice_logical(logical.weights[name], name, tp_rank, intermediate,
-                              torch_module).contiguous()
-
-    def s(name):
-        return _slice_scale(logical.scales[name], name, tp_rank, intermediate,
-                            torch_module).contiguous()
-
-    assert logical.weights["w1"].shape[1] == full, (
-        logical.weights["w1"].shape, full)
-    w13 = _logical_weight_to_w4a8_rp_inplace(
-        torch_module.cat([w("w3"), w("w1")], 1).clone(),
-        size_k=HIDDEN, size_n=intermediate * 2, gated_half_rows=intermediate)
-    s13 = _e8m0_scale_to_w4a8_sfb_inplace(
-        torch_module.cat([s("w3"), s("w1")], 1).clone(), weight_E=logical.experts,
-        rows=intermediate * 2, k_dim=HIDDEN, gated_half_rows=intermediate)
-    w2 = _logical_weight_to_w4a8_rp_inplace(
-        w("w2").clone(), size_k=intermediate, size_n=HIDDEN)
-    s2 = _e8m0_scale_to_w4a8_sfb_inplace(
-        s("w2").clone(), weight_E=logical.experts, rows=HIDDEN, k_dim=intermediate)
-    return [t.view(torch.uint32).flatten() for t in (w13, s13, w2, s2)]
+                  intermediate: int, torch_module, *, layer=0):
+    """Slice source tensors before the independent exact/padded layout oracle."""
+    from _v41_expert_native import pack_reference
+    from mxfp4_layouts import stored_width
+    local = rank_logical_slice(logical, tp_rank, tp_degree, intermediate, torch_module, layer=layer)
+    return pack_reference(local.weights, local.scales,
+                          stored=stored_width(HIDDEN, intermediate), coded=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -562,7 +525,7 @@ class Case:
     """One compiled pipeline on one geometry, with its exact scratch buffers."""
 
     def __init__(self, width, intermediate, experts, capacity, topk, logical,
-                 torch_module, tp_degree=1):
+                 torch_module, tp_degree=1, *, tp_rank=0, layer=0):
         import cutlass
         import cutlass.cute as cute
         from cutlass.cute.runtime import from_dlpack
@@ -572,13 +535,15 @@ class Case:
         self.width = width
         self.intermediate = intermediate
         self.tp_degree = tp_degree
+        self.layer = layer
         self.experts = experts
         self.capacity = capacity
         self.topk = topk
         self.logical = logical
         self.torch = torch_module
         t = torch_module
-        self.kernel_intermediate = (intermediate + 127) // 128 * 128
+        from mxfp4_layouts import stored_width
+        self.kernel_intermediate = stored_width(HIDDEN, intermediate)
         self.slices = (intermediate + width - 1) // width
 
         self.x = t.randn(capacity, HIDDEN, device="cuda").mul_(0.5).bfloat16()
@@ -611,7 +576,7 @@ class Case:
         # layout rounds the intermediate extent up to a 128 multiple, so an
         # intermediate of 576 produces 640-wide storage. Guessing the size from
         # the logical width would under-allocate TP4.
-        first = rank_operands(logical, 0, self.tp_degree, intermediate, t)
+        first = rank_operands(logical, tp_rank, self.tp_degree, intermediate, t, layer=layer)
         self._weight_buffers = [
             t.zeros_like(tensor).view(t.uint32).flatten().clone()
             for tensor in first
@@ -624,7 +589,8 @@ class Case:
         self._args = [from_dlpack(v, assumed_align=16) for v in self._values]
         self.stream = current_cuda_stream()
         self.pipeline = V41SlicePipeline(capacity, width, experts=experts,
-                                         topk=topk, intermediate=intermediate)
+                                         topk=topk, intermediate=intermediate,
+                                         exact_storage=self.kernel_intermediate == intermediate and intermediate % 128 != 0)
         # Every stage is compiled against the exact argument list that stage
         # declares; the stages do not share a signature and must not be forced
         # to. `full` is the production callable.
@@ -666,8 +632,7 @@ class Case:
         # over exactly what the exporter allocates, and the native packer defines
         # the prepared per-expert bytes; disagreeing with either is a latent
         # out-of-bounds, so both are checked here instead of trusted.
-        self.expected_elements = exporter_weight_elements(experts,
-                                                          self.kernel_intermediate)
+        self.expected_elements = [n // 4 for n in native_packer_bytes(intermediate, experts)[0]]
         self.native_bytes, self.native_padded = native_packer_bytes(
             intermediate, experts)
         actual_elements = [b.numel() for b in self._weight_buffers]
@@ -706,7 +671,7 @@ class Case:
     def install_rank(self, tp_rank, tp_degree):
         """Copy one physical rank's packed slice into the persistent buffers."""
         packed = rank_operands(self.logical, tp_rank, tp_degree,
-                               self.intermediate, self.torch)
+                               self.intermediate, self.torch, layer=self.layer)
         # Every rank of one geometry must produce the same prepared sizes. A
         # mismatch means the packing or the slicing differs per rank, which would
         # silently corrupt the forward, so fail loudly instead.
@@ -749,37 +714,23 @@ class Case:
         return self.out[: rows * self.topk].view(rows, self.topk, HIDDEN).clone()
 
 
-def exporter_weight_elements(experts: int, kernel_intermediate: int):
-    """The EXACT element counts `export_b12x_slices_aot.py` allocates.
-
-    Source: python/tools/aot/export_b12x_slices_aot.py, the `specs` list:
-        Uint32 (experts * kernel_intermediate * n,) for n in (1280, 80, 640, 40)
-    in the (w13, s13, w2, s2) slot order. These are uint32 elements, so the byte
-    count is 4x. This is the contract the compiled kernel strides over, so the
-    runtime buffers must match it exactly -- neither more nor less.
-    """
-    return [experts * kernel_intermediate * n for n in (1280, 80, 640, 40)]
-
-
 def native_packer_bytes(intermediate: int, experts: int, hidden: int = HIDDEN):
-    """Per-expert bytes from the native packer's own size function.
+    """Raw-scale native plane bytes at the shared measured stored width.
 
-    Source: native/shared/cuda/expert_pack.cu, `cuteafd_expert_packed_sizes`:
-        padded = align_up(intermediate, 128)
-        bytes  = [padded*hidden, padded*hidden/16, hidden*padded/2,
-                  hidden*padded/32]
-    Returned scaled to the full resident expert count.
+    Mirrors `cuteafd_expert_packed_sizes`, scaled to the resident expert count.
+    Coded-scale native packages use their separate scale-code extent contract.
     """
-    padded = (intermediate + 127) // 128 * 128
+    from mxfp4_layouts import stored_width
+    padded = stored_width(hidden, intermediate)
     per_expert = [padded * hidden, padded * hidden // 16,
                   hidden * padded // 2, hidden * padded // 32]
     return [value * experts for value in per_expert], padded
 
 
 def build_case(width, intermediate, experts, capacity, topk, logical, torch_module,
-               tp_degree=1):
+               tp_degree=1, *, tp_rank=0, layer=0):
     return Case(width, intermediate, experts, capacity, topk, logical,
-                torch_module, tp_degree)
+                torch_module, tp_degree, tp_rank=tp_rank, layer=layer)
 
 
 # --------------------------------------------------------------------------- #
@@ -790,14 +741,15 @@ def run_python_matrix(options, torch_module):
     from tests.moe.test_v41_expert_numerics import reference
 
     tp_degree = options.tp_degree
+    from spark_packages import native_shard
     intermediate = options.intermediate
     if options.snapshot is not None:
         logical = LogicalWeights.checkpoint(
             options.snapshot, options.layer, options.experts,
-            intermediate * tp_degree, torch_module)
+            OFFICIAL_INTERMEDIATE, torch_module)
     else:
         logical = LogicalWeights.synthetic(
-            options.experts, intermediate * tp_degree, torch_module)
+            options.experts, OFFICIAL_INTERMEDIATE, torch_module)
 
     # One shared input across every case and arm, so the oracle and the kernel
     # always see identical activations.
@@ -805,12 +757,18 @@ def run_python_matrix(options, torch_module):
     shared_x = torch_module.randn(options.capacity, HIDDEN, generator=gen,
                                   device="cuda").mul_(0.5).bfloat16()
     cases = {}
-    for width in options.widths:
-        case = build_case(width, intermediate, options.experts, options.capacity,
-                          options.topk, logical, torch_module)
-        case.x = shared_x
-        case._quantize_input()
-        cases[width] = case
+    for tp_rank in range(tp_degree):
+        rank_width = (native_shard(tp_degree, tp_rank, options.layer)[1].logical
+                      if tp_degree != 1 else OFFICIAL_INTERMEDIATE)
+        for width in options.widths:
+            key = (width, rank_width)
+            if key not in cases:
+                case = build_case(width, rank_width, options.experts, options.capacity,
+                                  options.topk, logical, torch_module, tp_degree,
+                                  tp_rank=tp_rank, layer=options.layer)
+                case.x = shared_x
+                case._quantize_input()
+                cases[key] = case
 
     base = torch_module.arange(options.capacity * options.topk, device="cuda",
                                dtype=torch.int32).reshape(
@@ -827,15 +785,17 @@ def run_python_matrix(options, torch_module):
             pressure.fill_(1)
 
     records = []
-    for width, case in cases.items():
+    for (width, intermediate), case in cases.items():
         for tp_rank in range(tp_degree):
+            if tp_degree != 1 and native_shard(tp_degree, tp_rank, options.layer)[1].logical != intermediate:
+                continue
             hashes = case.install_rank(tp_rank, tp_degree)
             # A single physical rank computes only its own N/K shard, so its
             # output must be compared against the oracle built from THAT shard.
             # Using the full-width operands here would compare a shard against a
             # full-width expert and fail for a reason that is not a defect.
             local = rank_logical_slice(logical, tp_rank, tp_degree, intermediate,
-                                       torch_module)
+                                       torch_module, layer=options.layer)
             for rows in options.rows:
                 for label, (owner_rank, note) in MASK_CASES.items():
                     # Ownership is an EXPERT-PARALLEL property, not a
@@ -1023,14 +983,11 @@ def parse_args(argv=None):
             "--phase split.")
     if max(options.rows) > options.capacity:
         parser.error("rows must not exceed capacity")
-    # The degree fixes the per-rank intermediate (the official 2304 divided by
-    # the degree). A mismatch would slice a different width than the topology
-    # claims, so fail closed instead of silently measuring the wrong shard.
-    expected_intermediate = OFFICIAL_INTERMEDIATE // options.tp_degree
-    if options.intermediate != expected_intermediate:
-        parser.error(
-            f"--intermediate {options.intermediate} does not match --tp-degree "
-            f"{options.tp_degree} (expected {expected_intermediate})")
+    from spark_packages import native_spark_artifacts
+    widths = ({OFFICIAL_INTERMEDIATE} if options.tp_degree == 1 else
+              {a.logical for a in native_spark_artifacts()[options.tp_degree]})
+    if options.intermediate not in widths:
+        parser.error(f"--intermediate {options.intermediate} is not an artifact of TP{options.tp_degree}: {sorted(widths)}")
     return options
 
 

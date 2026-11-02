@@ -65,9 +65,8 @@ impl Fp8Head {
     }
 }
 
-/// Native MXFP4 packer storage, including the padding of each intermediate
-/// slice. This applies to full RTX experts and each independently packed TP
-/// Spark/RTX slice; dividing a full layer's bytes misses TP4's 576->640 pad.
+/// Native MXFP4 packer storage from the measured storage policy. Full RTX
+/// experts and independently packed TP slices each retain their own scale bases.
 pub fn native_expert_bytes(experts: u64, hidden: u64, intermediate: u64) -> u64 {
     crate::formats::scale_codes::expert_bytes(experts, hidden, intermediate)
         .expect("validated V4.1 coded expert geometry")
@@ -288,7 +287,12 @@ mod tests {
 
     #[test]
     fn snapshot_and_expert_placement_keep_physical_owners() {
-        assert_eq!(native_expert_bytes(384, 5120, 576), 1_948_876_800);
+        let (experts, hidden, logical) = (384u64, 5120u64, 576u64);
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;
+        let payload = 3 * hidden * stored / 2;
+        let scales = 2 * stored * (1 + 2 * (hidden / 128))
+            + hidden * (1 + 2 * logical.div_ceil(128));
+        assert_eq!(native_expert_bytes(experts, hidden, logical), experts * (payload + scales));
         let one = prefix_bytes(20, true, 1);
         let two = prefix_bytes(20, true, 2);
         assert_eq!(one[0], two.iter().sum::<u64>());

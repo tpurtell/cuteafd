@@ -42,11 +42,18 @@ set(CUTEAFD_EXPERT_FAMILY_WIDTH "1:128,16:128,80:128,256:128,1024:128,4096:128")
 set(expert_ops info initialize output_kind group_rows bind_scratch initialize_scratch_async launch)
 
 foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
-  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp2|spark_tp3|spark_tp6|spark_tp8|rtx_backbone|rtx_tp2)$")
-    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp2|spark_tp3|spark_tp6|spark_tp8|rtx_backbone|rtx_tp2)")
+  if(NOT entry MATCHES "^(dsv4f|dsv4p):(spark|spark_tp[2-8]|rtx_backbone|rtx_tp2)$")
+    message(FATAL_ERROR "CUTEAFD_EXPERT_FAMILIES entry ${entry} must be (dsv4f|dsv4p):(spark|spark_tp[2-8]|rtx_backbone|rtx_tp2)")
   endif()
   set(family "${CMAKE_MATCH_1}")
   set(role "${CMAKE_MATCH_2}")
+  if(role MATCHES "^spark_tp([2-8])$")
+    set(world "${CMAKE_MATCH_1}")
+    set(artifacts_var "CUTEAFD_NATIVE_ARTIFACTS_${family}_${world}")
+    if(NOT role IN_LIST ${artifacts_var})
+      continue() # The shared artifact inventory selects equal or adjacent roles.
+    endif()
+  endif()
   set(device_handles "")
   if(role MATCHES "^rtx_")
     set(wanted coordinator)
@@ -71,8 +78,12 @@ foreach(entry IN LISTS CUTEAFD_NATIVE_EXPERT_FAMILIES)
   set(dir "${CMAKE_CURRENT_BINARY_DIR}/${family}_${role}_experts")
   set(variant_header "${family}_${role}_expert_variants.h")
   set(stamp "${CMAKE_CURRENT_BINARY_DIR}/${family}_${role}_width.stamp")
+  set(atomic_args)
+  if(family STREQUAL "dsv4p")
+    set(atomic_args --atomic-min-capacity 256)
+  endif()
   file(GENERATE OUTPUT "${stamp}"
-    CONTENT "family=${family}\nrole=${role}\nwidth=${CUTEAFD_EXPERT_FAMILY_WIDTH}\natomic_min_capacity=256\n")
+    CONTENT "family=${family}\nrole=${role}\nwidth=${CUTEAFD_EXPERT_FAMILY_WIDTH}\natomic_args=${atomic_args}\n")
   set(renames "")
   foreach(op IN LISTS expert_ops)
     string(APPEND renames "#define cuteafd_expert_${op} ${symbol}_expert_${op}\n")
@@ -98,7 +109,7 @@ ${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/aot/export_b12x_slices_aot.py"
       --output-dir "${dir}" --geometry "${family}" --role "${role}"
       --rows "${rows_arg}" --width "${CUTEAFD_EXPERT_FAMILY_WIDTH}"
-      --atomic-min-capacity 256 --standard-names
+      ${atomic_args} --standard-names
     COMMAND "${CMAKE_COMMAND}" -E copy
       "${dir}/v41_expert_variants.h" "${dir}/${variant_header}"
     DEPENDS
@@ -106,6 +117,10 @@ ${device_handles}${renames}#include \"${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41
       "${CMAKE_CURRENT_SOURCE_DIR}/shared/src/v41_experts.cc"
       "${stamp}"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/expert_grouping.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/spark_packages.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/spark-package-ranges.json"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/tools/lib/mxfp4_layouts.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../scripts/build/mxfp4-layouts.json"
       ${CUTEAFD_SPARKINFER_PROVENANCE_INPUTS} ${CUTEAFD_SPARKINFER_EXPORT_INPUTS}
     COMMENT "Exporting ${family} ${role} routed-expert kernels"
     VERBATIM

@@ -180,7 +180,7 @@ impl<'a> Admission<'a> {
         self.draft_allocated = true;
         allocate(layout)
     }
-    pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Rc<crate::shared::memory::device::Allocation<'a>>> {
+    pub(crate) fn allocate_draft_marks(&mut self, device: Device<'a>) -> Result<Option<Rc<crate::shared::memory::device::Allocation<'a>>>> {
         ensure!(device.id == self.devices[1] && !self.draft_marks_allocated, "Kimi draft mark allocation owner");
         let layout = self.draft.as_ref().context("Kimi draft marks without admitted draft")?;
         let bytes = layout.window_mark_bytes()?.checked_mul(usize::try_from(self.mark_selection.slots)?)
@@ -188,7 +188,7 @@ impl<'a> Admission<'a> {
         ensure!(self.placement.items[1].iter().filter(|item| item.group == DRAFT_MARKS)
             .map(|item| item.bytes).collect::<Vec<_>>() == vec![bytes as u64], "Kimi draft mark charge differs from arena");
         self.draft_marks_allocated = true;
-        Ok(Rc::new(crate::shared::memory::device::Allocation::new(device, bytes.max(256))?))
+        (bytes > 0).then(|| crate::shared::memory::device::Allocation::new(device, bytes).map(Rc::new)).transpose()
     }
     pub(crate) fn draft_layout(&self) -> Option<&MlaDraftRuntimeLayout> { self.draft.as_ref() }
 
@@ -580,6 +580,11 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
             if let Some(graphs) = &graphs {
                 candidate.fixed.extend((0..2).map(|rank| super::graphs::demand(&graphs.inventory, rank)));
             }
+            let admit_marks = |trial: &PlacementRequest| -> Result<_> {
+                if legacy_marks == 0 {
+                    Ok((solve(trial)?, MarkSelection { legacy_slots: 0, slots: 0, reduction_reason: None }))
+                } else { Ok(solve_with_marks(trial, legacy_marks as u64, 1, &mark_demands)?) }
+            };
             let (placed, marks, layout) = if let Some(layout) = &draft {
                 let initial = candidate.pool.requested.unwrap_or(candidate.pool.target);
                 settle_pool((initial, ()), |tokens, _| -> Result<_> {
@@ -591,11 +596,11 @@ pub(crate) fn admit<'a>(mut inputs: Inputs<'_>) -> Result<Admission<'a>> {
                     trial.startup.push(peak);
                     trial.pool.target = trial.pool.target.min(tokens);
                     trial.pool.ceiling = trial.pool.ceiling.min(tokens);
-                    let (placed, marks) = solve_with_marks(&trial, legacy_marks as u64, 1, &mark_demands)?;
+                    let (placed, marks) = admit_marks(&trial)?;
                     Ok((placed.pool_tokens, (), (placed, marks, Some(layout))))
                 })?
             } else {
-                let (placed, marks) = solve_with_marks(&candidate, legacy_marks as u64, 1, &mark_demands)?;
+                let (placed, marks) = admit_marks(&candidate)?;
                 (placed, marks, None)
             };
             if let Some(graphs) = &graphs { super::graphs::check_placement(cfg, &placed, &graphs.keys)?; }
@@ -659,7 +664,7 @@ fn request(i: Inputs<'_>) -> Result<PlacementRequest> {
     ensure!(i.devices.iter().all(|device| *device >= 0) && i.devices[0] != i.devices[1],
         "Kimi admitted devices must be distinct CUDA ordinals");
     ensure!(i.attention != Some(AttentionPlacement::Context), "Kimi context attention has no query/LSE exchange ABI");
-    ensure!((1..=64).contains(&i.state_slots) && i.prefix_marks > 0
+    ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&i.state_slots)
         && (1..=cuteafd_loader::families::kimi_k3::allocation::LANE_ROWS_MAX).contains(&i.rows)
         && (1..=2).contains(&i.lanes), "Kimi native admission slot/prefix/row/lane geometry");
     let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(i.rows, i.waves, i.unit_rows)?
@@ -1856,7 +1861,7 @@ pub(super) mod tests {
                 1 => i.peer_access = false,
                 2 => i.attention = Some(AttentionPlacement::Context),
                 3 => i.requested_pool = Some(262_143),
-                4 => i.prefix_marks = 0,
+                4 => i.state_slots = cuteafd_core::concurrency::MAX_CONCURRENCY as usize + 1,
                 5 => i.gpus[0].baseline = Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
                 6 => i.fixed[0].basis = Basis::Estimated,
                 7 => i.fixed[0].gpu = 2,
@@ -1865,6 +1870,9 @@ pub(super) mod tests {
             }
             assert!(admit(i).is_err(), "case {case}");
         }
+        let mut no_marks = inputs(&cfg);
+        no_marks.prefix_marks = 0;
+        assert_eq!(admit(no_marks).unwrap().mark_selection.slots, 0);
         let mut i = inputs(&cfg);
         i.requested_pool = Some(2 << 20);
         i.gpus[1].baseline = Baseline::Measured { free_bytes: 2 << 30 };

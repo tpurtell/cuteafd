@@ -47,7 +47,7 @@ def test_every_planner_width_covered_world_has_a_package_alias():
         emitted = packages.package_worlds(family, format)
         for world in range(1, 9):
             needed = packages.width_keys(intermediate, unit, world, **options)
-            admitted = bool(needed) and needed <= available and (not native or intermediate % (32 * world) == 0)
+            admitted = bool(needed) and needed <= available
             assert (world in emitted) == admitted, (key, world, needed, available)
     # TP5 needs no new CUDA class: its H128 program is already TP4's narrow
     # extent. The old default exporter omitted this metadata alias.
@@ -181,11 +181,11 @@ def test_whole_matrix_exl3_count_enumeration(record_property):
         Path(output).write_text(json.dumps(dict(exl3_objects=results, layout_keys=keys), indent=2) + '\n')
 
 
-def test_variable_world_harness_tables_and_fixed_tile_refusals_without_cuda():
+def test_variable_world_harness_artifacts_and_partial_tiles_without_cuda():
     import argparse
     import ast
-    from spark_packages import native_spark_geometry, package_worlds
-    expected = native_spark_geometry()
+    from spark_packages import native_spark_artifacts, package_worlds
+    expected = native_spark_artifacts()
     for relative, symbol in [("python/tools/bench/bench_tp_ep_kernel.py", "TP_GEOMETRIES"),
                              ("python/tools/bench/benchmark_v41_ep_groups.py", "TP_DEGREES")]:
         path = ROOT / relative
@@ -200,13 +200,11 @@ def test_variable_world_harness_tables_and_fixed_tile_refusals_without_cuda():
         if symbol == "TP_DEGREES":
             assert namespace[symbol] == (1, *package_worlds("v41", "mxfp4"))
         else:
-            assert namespace[symbol] == tuple((tp, row[1], f"tp{tp}") for tp, row in expected.items())
+            assert namespace[symbol] == tuple((tp, artifact, f"tp{tp}-{artifact.name}") for tp, artifacts in expected.items() for artifact in artifacts)
             for world in range(1, 10):
                 argv = ["--topologies", f"tp{world}", "--widths", "192", "--rows", "1", "--output", "/unused.json"]
-                if world in expected and expected[world][1] % 192 == 0:
+                if world in expected:
                     assert namespace["parse_args"](argv).topologies == f"tp{world}"
                 else:
-                    # TP8 is packaged but its logical 288-column shard does not
-                    # tile this exact-tile-only diagnostic's widths.
                     with pytest.raises(SystemExit):
                         namespace["parse_args"](argv)

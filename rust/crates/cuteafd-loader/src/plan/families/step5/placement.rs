@@ -40,7 +40,9 @@ pub(super) fn layout(
         .unwrap_or_else(|| cuteafd_core::tp_units::spark_package_worlds("step5", format));
     // The recipe names an impossible Spark count first; a valid count a
     // frozen format never shipped on refuses with its deprecation.
-    crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
+    if spark_ranks > 0 {
+        crate::plan::experts::spark_recipe(&package, 1536, spark_ranks)?;
+    }
     if let Some(refusal) = crate::plan::experts::frozen_refusal(&package, spark_ranks) {
         anyhow::bail!("Step-5 layout is unqualified: {refusal}");
     }
@@ -77,11 +79,7 @@ pub(super) fn layout(
     // Hop lanes, return slots and Spark owner units.
     let waves = usize::try_from(shape.waves)?;
 
-    let sequences = usize::try_from(if opts.concurrency == 0 {
-        16
-    } else {
-        opts.concurrency
-    })?;
+    let sequences = usize::try_from(opts.resolved_concurrency("step5"))?;
     ensure!(
         opts.state_slots.is_none_or(|n| n == sequences as u64),
         Unqualified("sequence-slot mismatch")
@@ -197,7 +195,7 @@ pub(super) fn layout(
         requested_pool: opts.pool_tokens,
         marks: MarkRule {
             lanes: sequences,
-            entries: usize::try_from(opts.mimo_prefix_entries)?,
+            entries: usize::try_from(opts.prefix_entries("step5"))?,
             budget_bytes: opts.mimo_prefix_mark_bytes,
             host: opts.host_cache_bytes != Some(0),
         },

@@ -35,8 +35,9 @@ impl NativePlanes {
                 && intermediate > 0
                 && intermediate % 32 == 0
                 && kernel_intermediate >= intermediate
-                && kernel_intermediate % (if nvfp4 { 64 } else { 128 }) == 0
-                && (nvfp4 || kernel_intermediate == intermediate.div_ceil(128) * 128)
+                && kernel_intermediate % (if nvfp4 { 64 } else { 32 }) == 0
+                && (nvfp4 || Some(kernel_intermediate)
+                    == cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate))
                 && kernel_intermediate <= 8192
                 && experts > 0,
             "invalid native push geometry"
@@ -121,15 +122,19 @@ mod tests {
     use super::*;
     #[test]
     fn scratch_is_the_actual_rank_plane_not_the_whole_layer() -> Result<()> {
-        for (width, scratch) in [(2304, 11_796_480), (576, 3_276_800), (384, 1_966_080)] {
-            let layout = NativePlanes::new(5120, width, width.div_ceil(128) * 128, 256, false)?;
+        for width in [2304, 576, 384] {
+            let stored = cuteafd_core::mxfp4_layouts::stored_width(5120, width).unwrap();
+            let scratch = 5120 * stored;
+            let layout = NativePlanes::new(5120, width, stored, 256, false)?;
             assert_eq!(layout.scratch_bytes(), scratch);
             assert!(layout.bytes > scratch * 256);
+            let invalid = if stored == width { stored + 32 } else { width };
+            assert!(NativePlanes::new(5120, width, invalid, 256, false).is_err());
         }
         let nv = NativePlanes::new(5120, 576, 640, 256, true)?;
         assert_eq!(nv.scratch_bytes(), 409_600);
         assert_eq!(nv.scalar_bytes(), 6144);
-        assert!(NativePlanes::new(5120, 576, 576, 256, false).is_err());
+        assert!(NativePlanes::new(5120, 576, 577, 256, false).is_err());
         Ok(())
     }
 }

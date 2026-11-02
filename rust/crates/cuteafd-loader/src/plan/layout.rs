@@ -120,12 +120,11 @@ pub struct LayoutOptions {
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
-    /// Concurrent sequences (state slots = concurrency + 2).
+    /// Concurrent sequences; automatic active state slots equal concurrency.
     pub concurrency: u64,
-    /// Exact engine slots when they differ from concurrency + 2.
+    /// Exact diagnostic engine slots when they differ from active concurrency.
     pub state_slots: Option<u64>,
-    /// The lanes GLM 5.3 Flash's prefix mark arena counts (its 2C + 2 floor), when they differ
-    /// from concurrency: serve-glmf counts at most `DECODE_ROWS` (64) decoding sequences.
+    /// Diagnostic active-lane override for GLM Flash's budget-limited prefix mark arena.
     pub glmf_mark_lanes: Option<u64>,
     /// Prefix mark arena slots; absent selects the family policy.
     pub prefix_slots: Option<u64>,
@@ -135,7 +134,7 @@ pub struct LayoutOptions {
     pub mimo_prefix_mark_bytes: u64,
     /// Retain warm external MiMo drafter context with prefix marks (candidate opt-in).
     pub mimo_prefix_draft: bool,
-    /// MiMo target rings (serving default: 16, at least concurrency).
+    /// MiMo target rings (zero derives concurrency).
     pub mimo_rings: u64,
     /// Sliding/native-MTP ring storage, independent of the full-attention pool.
     pub mimo_swa_kv: crate::families::mimo_v2::MimoKvCache,
@@ -191,8 +190,23 @@ impl LayoutOptions {
             "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
             "glm5" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            "qwen3_5" => 4,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
+    }
+
+    pub fn resolved_state_slots(&self, family: &str) -> u64 {
+        self.state_slots.unwrap_or_else(|| cuteafd_core::concurrency::state_slots(self.resolved_concurrency(family)))
+    }
+
+    pub fn mimo_rings(&self) -> u64 {
+        cuteafd_core::concurrency::request_slots(self.resolved_concurrency("mimo_v2"), self.mimo_rings)
+    }
+
+    pub fn prefix_entries(&self, family: &str) -> u64 {
+        if self.mimo_prefix_entries == u64::MAX {
+            cuteafd_core::concurrency::prefix_entries(self.resolved_concurrency(family))
+        } else { self.mimo_prefix_entries }
     }
 
     pub fn glm_draft_sequences(&self) -> u64 {
@@ -256,10 +270,10 @@ impl Default for LayoutOptions {
             state_slots: None,
             glmf_mark_lanes: None,
             prefix_slots: None,
-            mimo_prefix_entries: 20,
+            mimo_prefix_entries: u64::MAX,
             mimo_prefix_mark_bytes: 2 * GIB,
             mimo_prefix_draft: false,
-            mimo_rings: 16,
+            mimo_rings: 0,
             mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
             draft_sequences: None,
@@ -674,6 +688,17 @@ mod draft_prefix_tests {
     }
 
     #[test]
+    fn dense_qwen_default_concurrency_and_active_state_stay_four() {
+        for bytes in [32 << 30, 96 << 30] {
+            let mut options = LayoutOptions { rtx_bytes: vec![bytes], ..Default::default() };
+            assert_eq!(options.resolved_concurrency("qwen3_5"), 4);
+            assert_eq!(options.resolved_state_slots("qwen3_5"), 4);
+            options.concurrency = 32;
+            assert_eq!(options.resolved_state_slots("qwen3_5"), 32);
+        }
+    }
+
+    #[test]
     fn full_context_defaults_preserve_dynamic_families_and_bound_indexed_families() {
         let manifest = serde_json::json!({"capacities": {"max_context": 131072}});
         for policy in [ContextPolicy::Checkpoint, ContextPolicy::ManifestBounded] {
@@ -965,21 +990,19 @@ pub struct SparkCharges {
     pub basis: Basis,
 }
 
-/// Each Spark rank's routed slice bytes from the checkpoint (`routed` source
-/// bytes): exact 128-row block packages store their own widths, other
-/// packages pad every rank to the widest slice (reported as waste).
+/// Initial source-byte projection. Header-derived native resident bytes replace
+/// this projection when selected layers and rank ownership are known.
 pub(crate) fn spark_slices(report: &PlanReport, model: &dyn super::FamilyModel, ranks: usize, routed: u64)
     -> (Vec<u64>, Option<Waste>) {
     let stored = (routed as f64 * report.spark_rank_share) as u64;
     let even = routed / ranks.max(1) as u64;
     let package = report.experts.as_ref().map_or("", |e| e.package.as_str());
     let intermediate = model.spec().moe.as_ref().map_or(0, |m| m.intermediate);
-    let recipe = (!package.starts_with("v41")).then(||
-        super::experts::spark_recipe(package, intermediate, ranks).ok()).flatten();
+    let recipe = super::experts::spark_recipe(package, intermediate, ranks).ok();
     let exact = recipe.as_ref().filter(|recipe|
         matches!(recipe.slicing, crate::formats::fp8_experts::Slicing::Blocks(_)));
     let bytes = (0..ranks).map(|rank| exact.map_or(stored, |recipe|
-        (routed as f64 * recipe.widths[rank] as f64 / intermediate as f64) as u64)).collect();
+        (routed as f64 * recipe.stored_widths[rank] as f64 / intermediate as f64) as u64)).collect();
     let waste = (exact.is_none() && report.spark_rank_share * ranks as f64 > 1.001).then(|| Waste {
         device: format!("spark x{ranks}"), what: format!("routed slices padded to the widest \
             128-row slice ({:.1}% of the even share) on every rank", 100.0 * (stored - even) as f64 / even as f64),
@@ -1035,6 +1058,19 @@ pub(crate) fn charge_spark_devices(report: &mut PlanReport, model: &dyn super::F
     devices: &mut [DeviceLayout], notes: &mut Vec<String>, what: impl Fn(&DeviceLayout) -> String) {
     let checkpoint = input.checkpoint();
     for device in devices {
+        match input.native_spark_resident(working, device.index as usize) {
+            Ok(Some(bytes)) => {
+                if let Some(item) = device.items.iter_mut().find(|item| item.group == "routed_expert") {
+                    item.bytes = bytes;
+                    item.basis = Basis::Formula;
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                report.placement_supported = false;
+                notes.push(format!("{} native resident admission: {error:#}", what(device)));
+            }
+        }
         let io = spark_geometry(model).ok_or(crate::placement::PlacementError::Inventory("Spark experts need routed geometry"))
             .and_then(|geometry| u32::try_from(options.spark_capacity_rows)
                 .map_err(|_| crate::placement::PlacementError::Overflow("Spark capacity"))
@@ -1425,7 +1461,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
             crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_heads as u64, cfg.head_dim as u64, options.draft_kv_cache)?
         } else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency), options.draft_kv_cache)
+            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings(), options.draft_kv_cache)
                 .map_err(anyhow::Error::msg)?.0
         } else { 0 };
         mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;

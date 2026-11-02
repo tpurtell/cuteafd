@@ -145,7 +145,7 @@ mod draft_prefix_tests {
                             }).unwrap().memory_layout.unwrap();
                             let bytes = |name| layout.devices[0].items.iter().filter(|i| i.group == name).map(|i| i.bytes).sum::<u64>();
                             assert_eq!(bytes("marks"), target * slots, "C{concurrency}, warm={enabled}, MiB={mib}: {:?}", layout.notes);
-                            let reservations = draft_prefix_reservations(enabled, draft, slots, 16).unwrap();
+                            let reservations = draft_prefix_reservations(enabled, draft, slots, concurrency as u64).unwrap();
                             assert_eq!(bytes("DFlash context marks"), reservations.first().map_or(0, |r| r.bytes));
                             assert_eq!(bytes("DFlash valid-floor transfer"), reservations.get(1).map_or(0, |r| r.bytes));
                         }
@@ -995,7 +995,7 @@ mod tests {
     }
 
     #[test]
-    fn serving_mark_arena_reserves_actual_concurrency_even_above_nominal_budget() {
+    fn serving_mark_arena_honors_zero_budget_and_host_staging() {
         use clap::Parser;
         #[derive(Parser)]
         struct Cli {
@@ -1003,9 +1003,8 @@ mod tests {
             prefix: crate::shared::prefix::PrefixArgs,
         }
         let cli = Cli::parse_from(["serve", "--prefix-cache-mark-mib", "0"]);
-        // Sixteen live requests need capture/restore slots even when retained
-        // entry marks do not fit the nominal mark-cache budget.
-        assert_eq!(mark_slots(&cli.prefix, 16, 37_500_000).unwrap(), 34);
+        // Device-only retention is disabled when no complete mark fits.
+        assert_eq!(mark_slots(&cli.prefix, 16, 37_500_000).unwrap(), 0);
         let hosted = Cli::parse_from(["serve", "--prefix-cache-mark-mib", "0", "--host-cache-bytes", "auto"]);
         assert_eq!(mark_slots(&hosted.prefix, 16, 37_500_000).unwrap(), 2);
         let disabled = Cli::parse_from(["serve", "--prefix-cache-entries", "0"]);

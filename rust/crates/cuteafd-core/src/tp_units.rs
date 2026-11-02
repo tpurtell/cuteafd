@@ -26,6 +26,51 @@ pub fn spark_package_entry(key: &str) -> &'static serde_json::Value {
         "../../../../scripts/build/spark-package-ranges.json")).expect("checked package ranges"))["entries"][key]
 }
 
+/// Additive width-keyed native ABI roles never encode Spark count or rank.
+pub const NATIVE_WIDTH_ROLE_BASE: u32 = 65536;
+
+pub fn native_width_role(width: usize) -> Option<u32> {
+    (width > 0 && width % 32 == 0 && width <= 8192)
+        .then(|| NATIVE_WIDTH_ROLE_BASE + width as u32)
+}
+
+pub fn native_role_width(role: u32) -> Option<usize> {
+    let width = role.checked_sub(NATIVE_WIDTH_ROLE_BASE)? as usize;
+    (native_width_role(width) == Some(role)).then_some(width)
+}
+
+/// Executable identity and resident geometry, independent of source ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeArtifact {
+    pub role: u32,
+    pub logical: usize,
+    pub stored: usize,
+    pub name: String,
+}
+
+/// One world's distinct adjacent artifacts. Equal worlds retain their ABI names.
+pub fn native_spark_artifacts(hidden: usize, intermediate: usize, world: usize)
+    -> Result<Vec<NativeArtifact>, UnitMapError> {
+    let unit = crate::mxfp4_layouts::ownership_unit(intermediate, world);
+    if !(2..=crate::MAX_SPARK_WORLD).contains(&world) || intermediate == 0
+        || intermediate % unit != 0 || intermediate / unit < world {
+        return Err(UnitMapError::Geometry);
+    }
+    let units = intermediate / unit;
+    let unequal = units % world != 0;
+    let mut widths = vec![units.div_ceil(world) * unit];
+    if unequal { widths.push(units / world * unit); }
+    widths.into_iter().map(|logical| {
+        let role = if unequal { native_width_role(logical).ok_or(UnitMapError::Geometry)? }
+            else { match world { 2 => 5, 3 => 6, 4 => 1, 6 => 7, 8 => 8,
+                _ => return Err(UnitMapError::Geometry) } };
+        let stored = crate::mxfp4_layouts::stored_width(hidden, logical).ok_or(UnitMapError::Geometry)?;
+        let name = if unequal { format!("spark_w{logical}") }
+            else if world == 4 { "spark".to_owned() } else { format!("spark_tp{world}") };
+        Ok(NativeArtifact { role, logical, stored, name })
+    }).collect()
+}
+
 /// A frozen (deprecated) format's admitted Spark worlds: the cards it shipped
 /// or was admitted on before it froze. Its packaged worlds may be wider (a
 /// historical role or a tail sibling's layout), but a frozen format never
@@ -41,11 +86,12 @@ pub fn frozen_admitted_worlds(family: &str, format: &str) -> Option<Vec<usize>> 
 /// Descriptor ABI and stored columns determine code, not rank identity.
 pub fn package_width_keys(intermediate: usize, unit: usize, world: usize,
     exl3: bool, native: bool, nvfp4: bool) -> Vec<(bool, usize)> {
+    let unit = if native && !exl3 && !nvfp4 { crate::mxfp4_layouts::ownership_unit(intermediate, world) } else { unit };
     if !(1..=crate::MAX_SPARK_WORLD).contains(&world) || unit == 0 || intermediate == 0
         || intermediate % unit != 0 || intermediate / unit < world { return vec![]; }
     let units = intermediate / unit;
     if exl3 && units % world != 0 { return vec![(true, units.div_ceil(world) * unit)]; }
-    if native || (nvfp4 && intermediate % (128 * world) != 0) {
+    if nvfp4 && intermediate % (128 * world) != 0 {
         return vec![(false, (units.div_ceil(world) * unit).div_ceil(128) * 128)];
     }
     let mut widths = vec![(false, units / world * unit)];
@@ -67,7 +113,7 @@ pub fn spark_package_worlds(family: &str, format: &str) -> Vec<usize> {
         package_width_keys(intermediate, unit, world, exl3, native, false)).collect::<std::collections::BTreeSet<_>>();
     (1..=crate::MAX_SPARK_WORLD).filter(|&world| {
         let needed = package_width_keys(intermediate, unit, world, exl3, native, false);
-        (!native || intermediate % (32 * world) == 0) && !needed.is_empty()
+        !needed.is_empty()
             && needed.iter().all(|key| available.contains(key))
     }).collect()
 }
@@ -100,6 +146,36 @@ pub fn layer_rule(units: usize, world: usize) -> UnitRule {
     } else {
         UnitRule::LayerRotation
     }
+}
+
+/// One adjacent exact shard, rotated by layer only when native units do not
+/// divide evenly. Logical and resident columns are the same interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerShard {
+    pub first: usize,
+    pub width: usize,
+}
+
+impl LayerShard {
+    pub fn new(intermediate: usize, unit: usize, layer: usize, world: usize, rank: usize)
+        -> Result<Self, UnitMapError> {
+        if unit == 0 || intermediate == 0 || intermediate % unit != 0
+            || world == 0 || world > intermediate / unit {
+            return Err(UnitMapError::Geometry);
+        }
+        if rank >= world { return Err(UnitMapError::Index); }
+        let units = intermediate / unit;
+        let (base, extra) = (units / world, units % world);
+        let canonical = if layer_rule(units, world) == UnitRule::LayerRotation {
+            ((rank as u128 + world as u128 - (layer % world) as u128) % world as u128) as usize
+        } else { rank };
+        Ok(Self {
+            first: (canonical * base + canonical.min(extra)) * unit,
+            width: (base + usize::from(canonical < extra)) * unit,
+        })
+    }
+
+    pub fn source_range(self) -> Range<usize> { self.first..self.first + self.width }
 }
 
 /// Owner of unit `u` of expert `e` in layer `layer`. All arithmetic is integer
@@ -406,6 +482,91 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn exact_k32_layer_shards_cover_every_geometry_and_world() {
+        let tables: &[(usize, &[&[usize]])] = &[
+            (2304, &[&[1152, 1152], &[768, 768, 768], &[576; 4],
+                &[480, 480, 448, 448, 448], &[384; 6],
+                &[352, 352, 320, 320, 320, 320, 320], &[288; 8]]),
+            (2048, &[&[1024, 1024], &[704, 672, 672], &[512; 4],
+                &[416, 416, 416, 416, 384], &[352, 352, 352, 352, 320, 320],
+                &[320, 288, 288, 288, 288, 288, 288], &[256; 8]]),
+            (3072, &[&[1536, 1536], &[1024; 3], &[768; 4],
+                &[640, 608, 608, 608, 608], &[512; 6],
+                &[448, 448, 448, 448, 448, 416, 416], &[384; 8]]),
+        ];
+        for &(intermediate, table) in tables {
+            for (index, &widths) in table.iter().enumerate() {
+                let world = index + 2;
+                let unequal = intermediate / 32 % world != 0;
+                let mut totals = vec![0; world];
+                for layer in 0..world {
+                    let mut ranges = Vec::new();
+                    for rank in 0..world {
+                        let shard = LayerShard::new(intermediate, 32, layer, world, rank).unwrap();
+                        let canonical = if unequal { (rank + world - layer) % world } else { rank };
+                        assert_eq!(shard.width, widths[canonical]);
+                        assert_eq!(shard.first, widths[..canonical].iter().sum::<usize>());
+                        assert_eq!(shard.first % 32, 0);
+                        assert_eq!(shard.width % 32, 0);
+                        let map = RankUnits::new(layer_rule(intermediate / 32, world), 3,
+                            intermediate, 32, layer, world, rank).unwrap();
+                        for expert in 0..3 {
+                            assert_eq!(map.column_ranges(expert).unwrap(), [shard.source_range()]);
+                        }
+                        totals[rank] += shard.width;
+                        ranges.push(shard.source_range());
+                    }
+                    ranges.sort_by_key(|range| range.start);
+                    assert_eq!(ranges[0].start, 0);
+                    assert_eq!(ranges.last().unwrap().end, intermediate);
+                    assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+                }
+                assert_eq!(totals, vec![intermediate; world]);
+            }
+        }
+        for (intermediate, unit, world, rank) in [(0, 32, 2, 0), (2048, 0, 2, 0),
+            (2047, 32, 2, 0), (32, 32, 2, 0), (2048, 32, 0, 0), (2048, 32, 2, 2)] {
+            assert!(LayerShard::new(intermediate, unit, usize::MAX, world, rank).is_err());
+        }
+        assert_eq!(LayerShard::new(2048, 32, usize::MAX, 3, 1).unwrap(),
+            LayerShard::new(2048, 32, usize::MAX % 3, 3, 1).unwrap());
+    }
+
+    #[test]
+    fn native_world_artifacts_cover_rotated_shards_and_keep_equal_abi_ids() {
+        for (hidden, intermediate) in [(5120, 2304), (4096, 2048), (7168, 3072)] {
+            for world in 2..=8 {
+                let artifacts = native_spark_artifacts(hidden, intermediate, world).unwrap();
+                let unit = crate::mxfp4_layouts::ownership_unit(intermediate, world);
+                let unequal = intermediate / unit % world != 0;
+                assert_eq!(artifacts.len(), if unequal { 2 } else { 1 });
+                for artifact in &artifacts {
+                    assert_eq!(artifact.stored, crate::mxfp4_layouts::stored_width(hidden, artifact.logical).unwrap());
+                    assert!(artifact.stored <= artifact.logical.div_ceil(128) * 128);
+                    if unequal {
+                        assert_eq!(native_role_width(artifact.role), Some(artifact.logical));
+                        assert_eq!(artifact.name, format!("spark_w{}", artifact.logical));
+                    } else {
+                        let role = match world { 2 => 5, 3 => 6, 4 => 1, 6 => 7, 8 => 8, _ => unreachable!() };
+                        assert_eq!(artifact.role, role);
+                        assert_eq!(artifact.name, if world == 4 { "spark".to_owned() } else { format!("spark_tp{world}") });
+                    }
+                }
+                for layer in [0, 1, 17, 63] {
+                    for rank in 0..world {
+                        let shard = LayerShard::new(intermediate, unit, layer, world, rank).unwrap();
+                        assert_eq!(artifacts.iter().filter(|a| a.logical == shard.width).count(), 1);
+                    }
+                }
+            }
+        }
+        for (hidden, intermediate, world) in [(255, 2304, 4), (5120, 0, 4),
+            (5120, 2303, 4), (5120, 2304, 1), (5120, 2304, 9)] {
+            assert!(native_spark_artifacts(hidden, intermediate, world).is_err());
         }
     }
 

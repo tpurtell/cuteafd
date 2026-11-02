@@ -11,7 +11,7 @@ pub mod native;
 pub mod coordinator;
 pub mod ownership;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub struct Step5;
 pub static STEP5: Step5 = Step5;

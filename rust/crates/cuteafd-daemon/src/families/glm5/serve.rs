@@ -82,7 +82,9 @@ fn model_id(snapshot: &std::path::Path) -> Option<String> {
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("glm5", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     if cuteafd_loader::plan::exlr8::recognizes(&args.engine.snapshot)? {
         let cfg = cuteafd_loader::families::glm5::GlmDsaConfig::read(&args.engine.snapshot)?;
         super::native_activation(&args.engine, cfg.first_moe_layer, cfg.layers, true)?;
@@ -94,7 +96,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Glm(Arc::new(encoding)),
     );
-    let (queue, receive) = mpsc::channel::<NativeRequest>(16);
+    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
@@ -135,7 +137,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     let sparks = args.engine.peers.as_deref().map_or(0, |peers| peers.split(',').count());
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks, false);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "shared resource-priced + agreed copies".to_string(), |n| format!("fixed {n}"));
     layout.speculator = args.engine.draft.as_ref().map(|_| console::Speculator {
         name: "DFlash2".into(), positions: 8, policy });
@@ -177,7 +179,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         let ranks = args.peers.as_deref().map_or(4, |peers| peers.split(',').count());
         let spark = transport.is_some();
         console::layer_classes(engine.weights.layers.iter().map(|l| console::layer_class(l.dense, spark)).collect());
-        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences.min(DECODE_ROWS), policy,
+        schedule(engine, &opened, &mut receive, transport, runtime, &stats, max_sequences, policy,
             ranks, &prefix, args.token_io.token_select, || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(engine.max_context));
@@ -250,18 +252,6 @@ struct Active<'a> {
     buffered: usize,
     started: Instant,
     ticket: console::Ticket,
-}
-
-/// Fixed diagnostic counts still share one verifier budget, anchors included.
-fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
-    let mut rows = lengths.len() + lengths.iter().sum::<usize>();
-    let trimmed = rows > budget;
-    while rows > budget {
-        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
-        lengths[index] -= 1;
-        rows -= 1;
-    }
-    trimmed
 }
 
 /// Stops censor an unjudged continuation, never a disagreeing draft token.
@@ -1054,7 +1044,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmEngine<'_>, opened: &Ope
         }
         _ => vec![0; active.len()],
     };
-    if trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
+    if resource::trim_budget_with_priors(&mut planned, DECODE_ROWS, &priors, |i| active[i].ticket.id()) { predicted = None; }
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
         let full = copies[i].as_ref().map(|c| c.tokens.as_slice())
             .unwrap_or_else(|| drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice()));
@@ -1341,11 +1331,12 @@ mod draft_tests {
     #[test]
     fn fixed_counts_keep_every_anchor_inside_the_global_budget() {
         let mut lengths = [7; 16];
-        assert!(trim_budget(&mut lengths, 64));
+        assert!(crate::shared::draft::resource::trim_budget(&mut lengths, 64));
         assert_eq!(lengths.len() + lengths.iter().sum::<usize>(), 64);
-        assert!(lengths.iter().all(|&length| length == 3));
+        assert_eq!(&lengths[..6], &[7; 6]);
+        assert_eq!(&lengths[7..], &[0; 9]);
         let mut lengths = [32, 0, 0, 0];
-        assert!(!trim_budget(&mut lengths, 64));
+        assert!(!crate::shared::draft::resource::trim_budget(&mut lengths, 64));
         assert_eq!(lengths, [32, 0, 0, 0]);
     }
 }

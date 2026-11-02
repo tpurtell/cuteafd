@@ -114,16 +114,18 @@ def jobs(scope):
             result.append((name, "export_b12x_slices_aot.py",
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
                             "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128",
-                            "--atomic-min-capacity", "256", "--standard-names"]))
+                            *(["--atomic-min-capacity", "256"] if family == "dsv4p" else []), "--standard-names"]))
     for family in ("v41", "dsv4f", "dsv4p"):
-        for role in ("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8"):
-            if family == "dsv4f" and role in ("spark_tp3", "spark_tp6"):
-                continue  # 2048 cannot split into equal whole-K32 thirds/sixths.
+        packages = load_file("compare_spark_packages", ROOT / "python/tools/lib/spark_packages.py")
+        artifacts = {artifact.name: artifact for values in packages.native_spark_artifacts(family).values()
+                     for artifact in values}
+        for role, artifact in artifacts.items():
+            width = 192 if family == "v41" and (
+                not role.startswith("spark_w") or artifact.logical % 192 == 0) else 128
             result.append((f"{family}-{role}", "export_b12x_slices_aot.py",
                            ["--geometry", family, "--role", role, "--rows", CAPACITIES,
-                            "--width", "1:128,16:128,80:128,256:128,1024:128,4096:128"
-                            if family != "v41" else "1:192,16:192,80:192,256:192,1024:192,4096:192",
-                            *(["--atomic-min-capacity", "256"] if family != "v41" else []),
+                            "--width", ",".join(f"{capacity}:{width}" for capacity in CAPACITIES.split(",")),
+                            *(["--atomic-min-capacity", "256"] if family == "dsv4p" and not role.startswith("spark_w") else []),
                             "--standard-names"]))
     result.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", CAPACITIES]),

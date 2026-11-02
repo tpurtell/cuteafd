@@ -23,7 +23,7 @@ use cuteafd_loader::families::kimi_k3::allocation::{graph_rows, verify_graph_row
 /// with its speculative single-sequence attention, the C1 verify shape.
 pub(crate) fn inventory(cfg: &KimiK3Config, lanes: usize, capacity: usize, slots: usize, verify: usize,
     resident: impl Fn(usize, usize) -> bool) -> Result<StartupGraphs<Key>> {
-    ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=64).contains(&slots), "Kimi graph lane/row capacity");
+    ensure!((1..=2).contains(&lanes) && (1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "Kimi graph lane/row capacity");
     let mut keys = Vec::new();
     for lane in 0..lanes {
         for rank in 0..2 {
@@ -193,7 +193,7 @@ mod tests {
         let small = inventory(&cfg, 1, 4096, 4, 0, |_, _| true)?;
         assert!(!small.keys.iter().any(|key| matches!(key.op,
             Op::Attention { sequences, .. } if sequences > 4)));
-        for (lanes, rows, slots) in [(0, 1, 1), (1, 0, 1), (1, 4097, 1), (1, 1, 0), (1, 1, 65)] {
+        for (lanes, rows, slots) in [(0, 1, 1), (1, 0, 1), (1, 4097, 1), (1, 1, 0), (1, 1, 161)] {
             assert!(inventory(&cfg, lanes, rows, slots, 0, |_, _| true).is_err());
         }
         // Verify widths add exact rows and speculative single-sequence attention only.

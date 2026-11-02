@@ -49,6 +49,38 @@ fn planner_timings_charge_metadata_once_and_preserve_reports() {
 }
 
 #[test]
+fn native_spark_resident_reuses_headers_without_reusing_placement_totals() {
+    use crate::placement::{SparkAssignment, SparkResidentLayout, SparkWorkingSet};
+    for v41 in [true, false] {
+        let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
+        let input = PlanInput::open(dir.path()).unwrap();
+        let catalog = input.expert_catalog().unwrap();
+        assert!(input.native_spark_headers.get().is_none());
+        let initialized = || input.native_spark_headers.get().unwrap().iter()
+            .filter(|entry| entry.get().is_some()).count();
+        for world in 2..=cuteafd_core::MAX_SPARK_WORLD {
+            for layers in [vec![0], vec![1], vec![0, 1], vec![]] {
+                let working = SparkWorkingSet { spark_layers: layers, spark_ranks: world,
+                    prefill_lanes: 1, ..Default::default() };
+                for rank in 0..world {
+                    let expected = SparkAssignment::resident_from_catalog(catalog, &working, rank,
+                        SparkResidentLayout::Native { world, rank }).unwrap().resident_bytes;
+                    assert_eq!(input.native_spark_resident(&working, rank).unwrap(), Some(expected),
+                        "v41={v41} world={world} rank={rank} layers={:?}", working.spark_layers);
+                }
+            }
+            assert_eq!(initialized(), 2, "world/rotation/onboarding changes reuse only the checked headers");
+        }
+        let invalid = SparkWorkingSet { spark_layers: vec![0, 0], spark_ranks: 4,
+            prefill_lanes: 1, ..Default::default() };
+        assert!(input.native_spark_resident(&invalid, 0).unwrap_err().to_string().contains("sorted and unique"));
+        let invalid = SparkWorkingSet { spark_layers: vec![catalog.routed_experts().layers], ..invalid };
+        assert!(input.native_spark_resident(&invalid, 0).unwrap_err().to_string().contains("outside routed"));
+        assert_eq!(initialized(), 2);
+    }
+}
+
+#[test]
 fn spark_count_resolution_reuses_the_preflight_checkpoint() {
     let dir = snapshot(mimo_flash_config(), &mimo_flash_tensors());
     let input = PlanInput::open(dir.path()).unwrap();
@@ -267,6 +299,53 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
                 }
                 assert_eq!(bytes("staging/tables-and-sync"), (unit + 64) * geometry.hidden as u64 * 8 + (2 << 20));
                 assert_eq!(bytes("scoring/full-logits"), span * vocab * 4);
+            }
+        }
+    }
+}
+
+#[test]
+fn boot_concurrency_full_plan_matrix() {
+    let mut fixtures = shared_wave_snapshots();
+    fixtures.push(("deepseek_v41", strict_v41_snapshot(false)));
+    fixtures.push(("mimo_v2", snapshot(mimo_flash_config(), &mimo_flash_tensors())));
+    let kimi = tempfile::tempdir().unwrap();
+    write_kimi_snapshot(kimi.path(), false);
+    fixtures.push(("kimi_k3", kimi));
+    fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
+    fixtures.push(("step5", families::step5::tests::exl3_snapshot()));
+    let (dense, dense_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+    fixtures.push(("qwen3_5", dense));
+    for (family, dir) in fixtures {
+        let input = PlanInput::open(dir.path()).unwrap();
+        for gpus in [1, 2] {
+            for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+                let mut options = if family == "qwen3_5" { dense_options.clone() }
+                    else { wave_plan_options(dir.path(), 4) };
+                let layout = options.layout.as_mut().unwrap();
+                layout.state_slots = None;
+                layout.rtx_bytes = vec![96 << 30; gpus];
+                layout.concurrency = c;
+                let (report, phases) = input.plan_with_timings(&options);
+                assert!(phases.total() < std::time::Duration::from_secs(10),
+                    "{family} C{c} GPUs={gpus}: {phases:?}");
+                let report = report.unwrap();
+                assert_eq!(report.family.as_deref(), Some(family));
+                if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
+                    assert!(!report.fits && !report.placement_supported);
+                    assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
+                        "{family} C{c}: {}", render(&report));
+                } else {
+                    let cache = report.cache_requirements.as_ref().unwrap();
+                    assert_eq!(u64::from(cache.concurrency), c);
+                    assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+                    if !report.fits || !report.placement_supported {
+                        let memory = report.memory_layout.as_ref().unwrap();
+                        assert!(!report.hints.is_empty() || !memory.notes.is_empty()
+                            || memory.devices.iter().any(|device| device.used_bytes() > device.capacity_bytes),
+                            "{family} C{c}: refusal must name its cause");
+                    }
+                }
             }
         }
     }
@@ -1048,7 +1127,7 @@ fn deepseek_v41_components_formats_and_placement() {
     assert_eq!(component(&report, Component::MappedTable).owner, Owner::HostMapped);
     assert!(component(&report, Component::MappedTable).formats.contains_key("fp8-block1x32/ue8m0"));
     assert_eq!(component(&report, Component::SpeculatorExpert).owner, Owner::Rtx);
-    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, [2, 3, 4, 6, 8]);
+    assert_eq!(report.experts.as_ref().unwrap().spark_worlds, (2..=8).collect::<Vec<_>>());
     assert!(!report.executable());
     assert!(report.hints.iter().any(|h| h.what.contains("native placement refused")));
 }
@@ -1117,7 +1196,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
     for nvfp4 in [false, true] {
         let dir = strict_v41_snapshot(nvfp4);
         let catalog = crate::read_expert_catalog(dir.path()).unwrap();
-        for (ranks, gpus) in [(3, 1), (6, 2)] {
+        for (ranks, gpus) in [(3, 1), (4, 1), (6, 2)] {
             let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
                 rtx_bytes: vec![96 << 30; gpus], local_expert_layers: Some(1),
                 workspace_manifest: v41_workspace(dir.path()),
@@ -1127,10 +1206,13 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
             assert!(report.placement_supported, "{}", render(&report));
             let memory = report.memory_layout.as_ref().unwrap();
             let experts = report.experts.as_ref().unwrap();
-            assert!(experts.package.starts_with(if nvfp4 { "v41:nvfp4" } else { "v41:mxfp4" }));
+            assert_eq!(experts.package, if nvfp4 { "v41:nvfp4 (expertd-native)" }
+                else { "v41:mxfp4 (expertd-native)" });
             let packed = |tp: u64| {
                 let (hidden, logical, experts) = (5120u64, 2304 / tp, 384u64);
-                let stored = logical.div_ceil(128) * 128;
+                let stored = if nvfp4 { logical.div_ceil(128) * 128 } else {
+                    cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64
+                };
                 if nvfp4 { experts * (3 * hidden * stored * 9 / 16 + 16) }
                 else {
                     let payloads = hidden * stored + hidden * stored / 2;
@@ -1909,8 +1991,11 @@ fn mimo_pro_complete_inventory_needs_its_packaged_worlds() {
     let contract = report.experts.as_ref().unwrap();
     assert_eq!((contract.package.as_str(), contract.block, contract.spark_worlds.as_slice()),
         ("mimop:fp8 (MXFP4)", 32, &[2, 6, 7, 8][..]));
-    // TP6 of 2048 in 32-row blocks: 352 rows, stored 384 wide.
-    assert!((report.spark_rank_share - 384.0 / 2048.0).abs() < 1e-12);
+    // Admission charges the widest physical package, independently of ownership.
+    let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
+    let widest = recipe.widths.iter().map(|&logical|
+        cuteafd_core::mxfp4_layouts::generic_stored_width(6144, logical)).max().unwrap();
+    assert!((report.spark_rank_share - widest as f64 / 2048.0).abs() < 1e-12);
 }
 
 #[test]
@@ -2206,6 +2291,42 @@ fn deepseek_v4_plan_reads_the_runtime_config_source() {
 }
 
 #[test]
+fn native_display_suffix_does_not_skip_v41_or_v4_resident_census() {
+    use cuteafd_core::memory_layout::{Basis, Category, DeviceKind};
+    for v41 in [true, false] {
+        let dir = if v41 { strict_v41_snapshot(false) } else { v4_snapshot() };
+        let report = plan(dir.path(), &PlanOptions { layout: Some(layout::LayoutOptions {
+            host_memory: Some((128 << 30, 128 << 30)), host_cache_bytes: Some(0),
+            rtx_bytes: vec![96 << 30], local_expert_layers: Some(1),
+            workspace_manifest: v41.then(|| dir.path().join("share/PROGRAMS.json")),
+            pool_tokens: Some(262_144), prefill_rows: 256, ..Default::default()
+        }), ..sparks(4) }).unwrap();
+        assert!(report.placement_supported, "{}", render(&report));
+        assert_eq!(report.experts.as_ref().unwrap().package,
+            if v41 { "v41:mxfp4 (expertd-native)" } else { "dsv4f:mxfp4 (expertd-native)" });
+        // Independent resident-plane arithmetic, after the single local layer.
+        let (hidden, logical, experts, remote) = if v41 {
+            (5120u64, 576u64, 384u64, 39u64)
+        } else { (4096, 512, 256, 3) };
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden as usize, logical as usize).unwrap() as u64;
+        let payload = hidden * stored * 3 / 2;
+        let scales = if v41 {
+            2 * stored * (1 + 2 * (hidden / 128))
+                + hidden * (1 + 2 * (logical / 32).div_ceil(4))
+        } else { hidden * stored * 3 / 32 };
+        let expected = remote * experts * (payload + scales);
+        let memory = report.memory_layout.as_ref().unwrap();
+        assert_eq!(memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark).count(), 4);
+        for device in memory.devices.iter().filter(|device| device.kind == DeviceKind::Spark) {
+            let resident = device.items.iter().find(|item| item.group == "routed_expert").unwrap();
+            assert_eq!(resident.basis, Basis::Formula);
+            assert_eq!(resident.bytes, expected, "{}", render(&report));
+            assert_eq!(device.by_category()[&Category::Experts], expected);
+        }
+    }
+}
+
+#[test]
 fn v4_plan_shared_span_matches_unit_rows_and_waves() {
     let dir = v4_snapshot();
     for (unit, waves) in [(2048, 1), (2048, 2), (2048, 3), (4096, 1), (4096, 2), (2752, 3)] {
@@ -2427,7 +2548,7 @@ fn spark_rank_options_follow_transport_and_packages() {
             workspace_manifest: v41_workspace(dsv41.path()), ..Default::default()
         }), ..options.clone() };
         let v41 = plan(dsv41.path(), &v41_options).unwrap();
-        assert_eq!(v41.placement_supported, matches!(ranks, 2 | 3 | 4 | 6 | 8), "v41 {ranks}: {}", render(&v41));
+        assert_eq!(v41.placement_supported, matches!(ranks, 2..=8), "v41 {ranks}: {}", render(&v41));
     }
 }
 
@@ -2941,7 +3062,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * 8 + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 4 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -3303,11 +3424,14 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         plans.insert(name.into(), value);
     }
     let actual = Value::Object(plans);
-    let mut expected: Value = serde_json::from_str(include_str!(
+    let historical: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
-    // The fixture now declares its real context ceiling for host admission.
+    let mut expected = historical.clone();
+    // Normalize a clone for current admission; the raw historical value only pins provenance.
     for report in expected.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
+        report["cache_requirements"]["concurrency"] = json!(4);
+        report["cache_requirements"]["state_slots"] = json!(4);
     }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
@@ -3336,9 +3460,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     }
     // Complete-header solver/working-set tests check the admitted inventory and
     // exact Spark I/O; this fixture remains the unchanged historical reference.
-    let mut legacy = expected;
+    let mut legacy = historical;
     for report in legacy.as_object_mut().unwrap().values_mut() {
-        report["cache_requirements"]["checkpoint_max_context_tokens"] = Value::Null;
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
         assert_eq!(notes.remove(1), json!("attention placement heads"));
@@ -3430,12 +3553,22 @@ fn layout_places_every_device_and_names_padded_spark_slices() {
     assert!(layout.pool_tokens > 0 && layout.pool_tokens <= cuteafd_core::serving_capacity::DEFAULT_GPU_KV_TOKENS);
     assert_eq!(layout.pool_tokens % 64, 0);
     assert!(layout.devices.iter().filter(|d| d.kind == DeviceKind::Rtx).all(|d| d.free_bytes() >= 0));
-    // Layer 1 rotates native K32 ownership: rank 0 has 320 columns, rank 4 has 352.
+    // Logical K32 ranges rotate; Pro's 352-column owner retains 384 physical columns.
+    let checkpoint = Checkpoint::open(dir.path()).unwrap();
+    let model = families::mimo::MIMO_V2.open(&checkpoint).unwrap();
+    assert_eq!(report.spark_rank_share, 384. / 2048.);
+    let (projected, _) = layout::spark_slices(&report, model.as_ref(), 6, 2048 * 1024);
+    assert_eq!(projected, [384, 384, 384, 384, 320, 320].map(|width| width * 1024));
     let experts = |i: usize| layout.devices[2 + i].by_category()[&Category::Experts];
-    // Both widths store 12 down-scale bytes per hidden row, rather than 10/11.
-    let down_scale_padding = |groups: u64| 384 * 6144 * (12 - groups);
-    assert_eq!((experts(0) - down_scale_padding(10)) * 11,
-        (experts(4) - down_scale_padding(11)) * 10);
+    let recipe = experts::spark_recipe("mimop:fp8", 2048, 6).unwrap();
+    for rank in 0..6 {
+        let stored = recipe.stored_width_for_layer(rank, 1).unwrap() as u64;
+        let hidden = 6144;
+        let expected = 384 * (3 * hidden * stored / 2 + 2 * stored * hidden / 32
+            + hidden * stored.div_ceil(128) * 4);
+        assert_eq!(experts(rank), expected, "rank {rank}");
+    }
+    assert!(experts(4) > experts(0));
     assert!(!layout.waste.iter().any(|w| w.what.contains("padded")), "{:?}", layout.waste);
 }
 
@@ -3501,10 +3634,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
-fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
+fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-    for (gib, expected) in [(32, 8), (96, 16)] {
+    for gib in [32, 96] {
+        let expected = crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64;
         let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
@@ -3513,12 +3647,12 @@ fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
         let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
         assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
-        options.layout.as_mut().unwrap().concurrency = if expected == 16 { 8 } else { 16 };
+        options.layout.as_mut().unwrap().concurrency = 16;
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
-        // Both concurrency limits fit the same sixteen physical target rings.
-        assert_eq!(state(&automatic), state(&overridden));
+        // Active rings follow C; retention is a separate budget.
+        assert!(state(&overridden) > state(&automatic));
         options.layout.as_mut().unwrap().mimo_rings = 32;
         let more_rings = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert!(state(&more_rings) > state(&automatic));
@@ -3778,7 +3912,7 @@ fn default_uses_all_sparks_and_explicit_unsupported_count_refuses() {
 #[test]
 fn v41_32gib_counts_share_pool_and_local_layer_admission() {
     let dir = strict_v41_snapshot(false);
-    for ranks in [2, 3, 4, 6] {
+    for ranks in 2..=6 {
         let options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(262_144), prefill_rows: 256,
             ..Default::default()
@@ -3788,7 +3922,7 @@ fn v41_32gib_counts_share_pool_and_local_layer_admission() {
         if ranks == 2 {
             assert!(!report.executable(), "two native shards exceed Spark memory");
             assert!(report.hints.last().unwrap().what.contains("spark0 full memory layout"));
-            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 6]"));
+            assert!(report.hints.last().unwrap().what.contains("counts that work: [3, 4, 5, 6]"));
         } else {
             assert!(report.executable(), "{}", render(&report));
             assert_eq!(report.memory_layout.as_ref().unwrap().pool_tokens, 262_144);
@@ -4451,7 +4585,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
 }
 
 /// GLM 5.3 Flash's layout reserves the mark arena its server allocates at the default knobs
-/// (`MarkArena::slots_for`: 2C + 2 for its 147.6 MB FP32 marks, where it reserved a flat 18),
+/// (`MarkArena::slots_for`: 14 complete 147.6 MB FP32 marks in the 2 GiB budget),
 /// and its state carries the speculative replay records.
 #[test]
 fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
@@ -4460,7 +4594,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
         .get(&Category::Prefix).copied().unwrap_or(0);
     let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
         rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) };
-    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
+    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: 14 fit independently of C.
     let mut config = glm5_flash_config(45);
     config["text_config"]["layer_types"] = json!((0..45)
         .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
@@ -4469,12 +4603,12 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!((rank.retained_mark_bytes, rank.speculative_replay_bytes), (147_619_840, 321_421_312));
     let tensors = glm5_flash_tensors(&config);
     let dir = snapshot(config, &tensors);
-    for (concurrency, slots) in [(1, 14), (8, 18), (16, 34)] {
+    for (concurrency, slots) in [(1, 14), (8, 14), (16, 14)] {
         let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
         assert_eq!(cuteafd_core::prefix::mark_slots_for(concurrency, 20, rank.retained_mark_bytes, 2 << 30), slots);
         assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
         let state: u64 = memory.devices[0].items.iter().filter(|i| ["KDA state and replay", "DSA index tails and replay", "commit tables"].contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency.max(8)
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency
             + rank.speculative_replay_bytes);
     }
     // At the default 2M pool cap the released arena becomes reported free headroom.
@@ -4483,11 +4617,11 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let legacy = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
     capped.layout.as_mut().unwrap().host_cache_bytes = None;
     let staged = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
-    let released = (34 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
+    let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
     assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(), released as i64);
-    assert_eq!(released, 4_723_834_880);
+    assert_eq!(released, 1_771_438_080);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);
@@ -4545,14 +4679,14 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let fewer = (none.pool_tokens - pool.pool_tokens) as i64 * unit as i64 / 256;
     assert_eq!(none.devices[0].free_bytes() - pool.devices[0].free_bytes(),
         (GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - fewer);
-    // Against the arena the server would allocate at 16 sequences (34 marks of 147.6 MB), pool marks
+    // Against the budgeted arena (14 marks of 147.6 MB), pool marks
     // free the arena's bytes less the reserved unit, for the pool (up to its target) or as free memory.
     let arena = layout(false, None);
-    assert_eq!(item(&arena, "marks"), 34 * rank.retained_mark_bytes);
+    assert_eq!(item(&arena, "marks"), 14 * rank.retained_mark_bytes);
     assert!(pool.pool_tokens >= arena.pool_tokens, "{} {}", pool.pool_tokens, arena.pool_tokens);
     let more = (pool.pool_tokens - arena.pool_tokens) as i64 * unit as i64 / 256;
     assert_eq!(pool.devices[0].free_bytes() - arena.devices[0].free_bytes(),
-        (34 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
+        (14 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
 }
 
 

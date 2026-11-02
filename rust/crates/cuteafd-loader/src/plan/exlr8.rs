@@ -123,6 +123,11 @@ fn native_options(selected: &str, options: &super::PlanOptions, speculator: &str
     };
     ensure!(matches!(speculator, "off" | "dflash2"), "EXLR8 native deployment supports off or dflash2 speculation");
     let mut resolved_layout = options.layout.clone().context("EXLR8 native deployment requires --layout")?;
+    let concurrency = resolved_layout.resolved_concurrency("glm5");
+    cuteafd_core::concurrency::validate("glm5", concurrency)?;
+    if resolved_layout.mimo_prefix_entries == u64::MAX {
+        resolved_layout.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
+    }
     resolved_layout.glm5_drafter_disabled = speculator == "off";
     let gpu_count = resolved_layout.rtx_bytes.len();
     ensure!((1..=2).contains(&gpu_count), "EXLR8 native deployment requires 1..=2 RTX GPUs");
@@ -187,6 +192,11 @@ pub(super) fn native_plan_of(input: &super::PlanInput, selected: &str,
     report.exlr8_prefill_activations = Some(layout.exlr8_prefill_activations);
     report.spec = Some(model.spec().clone());
     report.cache_requirements = crate::serving_capacity::cache_requirements(model.as_ref(), &checkpoint.config)?;
+    if let Some(cache) = report.cache_requirements.as_mut() {
+        let concurrency = layout.resolved_concurrency("glm5");
+        cache.concurrency = u32::try_from(concurrency)?;
+        cache.state_slots = u32::try_from(layout.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
+    }
     let mut components = BTreeMap::<Component, (usize, u64)>::new();
     for record in &records {
         let role = family.classify(model.spec(), &record.tensor)
@@ -1169,6 +1179,17 @@ mod tests {
         let missing = Path::new("/no-native-checkpoint");
         let error = |o: &super::super::PlanOptions, manifest, draft| native_plan(missing, manifest, o, draft)
             .err().unwrap().to_string();
+        for concurrency in [1, 4, 16, 17, 32, 64, 65, 128] {
+            options.layout.as_mut().unwrap().concurrency = concurrency;
+            if concurrency <= 64 {
+                let (_, _, _, layout) = native_options("up1", &options, "off").unwrap();
+                assert_eq!(layout.mimo_prefix_entries, cuteafd_core::concurrency::prefix_entries(concurrency));
+            } else {
+                let reason = error(&options, "up1", "off");
+                assert!(reason.contains("glm5") && reason.contains("decode program capacity 64"), "{reason}");
+            }
+        }
+        options.layout.as_mut().unwrap().concurrency = 0;
         assert!(!error(&options,"up1","off").contains("rotation"));
         assert!(error(&options,"other","off").contains("manifest"));
         assert!(!error(&options,"up1","dflash2").contains("speculation"));

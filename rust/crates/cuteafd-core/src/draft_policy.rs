@@ -75,10 +75,10 @@ pub const MAX_RESOURCE_CLASSES: usize = 4;
 /// Smoothing of a seeded policy's relative prediction error.
 const ERROR_RATE: f64 = 0.1;
 /// Independent evidence regimes for resource costs and confidence calibration.
-pub const CONCURRENCY_BUCKETS: usize = 4;
-/// C1, C2-4, C5-8 and C9+.
+pub const CONCURRENCY_BUCKETS: usize = 6;
+/// C1, C2-4, C5-8, C9-16, C17-32 and C33+.
 pub fn draft_concurrency_bucket(requests: usize) -> usize {
-    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, _ => 3 }
+    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, 9..=16 => 3, 17..=32 => 4, _ => 5 }
 }
 /// Reached samples before a position uses its own calibration.
 const POOLED_BELOW: u64 = 32;
@@ -905,7 +905,7 @@ impl DraftPolicy {
 
     /// The simple rule's per-position predicted against realized acceptance,
     /// `[group][native, tail][position]` with groups [`REPORT_GROUPS`].
-    pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; 4]> {
+    pub fn simple_reliability(&self) -> Option<&[[Vec<Reliability>; 2]; crate::CONCURRENCY_BUCKETS]> {
         self.simple.as_ref().map(SimpleDraft::reliability)
     }
     /// The simple rule's cutoff now for a selection over `requests`, for reports.
@@ -3288,7 +3288,7 @@ mod tests {
 
     #[test]
     fn concurrency_boundaries_and_bucket_exploration_are_independent() {
-        assert_eq!([0, 1, 2, 4, 5, 8, 9, 16, 128].map(draft_concurrency_bucket), [0, 0, 1, 1, 2, 2, 3, 3, 3]);
+        assert_eq!([0, 1, 2, 4, 5, 8, 9, 16, 17, 32, 33, 128].map(draft_concurrency_bucket), [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5]);
         let mut policy = DraftPolicy::new(placement(5), PolicySeed::weak(7), false).unwrap();
         policy.engaged[0] = true;
         policy.engaged[3] = true;

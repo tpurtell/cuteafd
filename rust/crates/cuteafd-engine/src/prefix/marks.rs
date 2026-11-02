@@ -64,14 +64,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn arena_sizing_keeps_the_lane_floor_and_the_byte_budget() {
+    fn arena_sizing_honors_the_byte_budget() {
         const MIB: usize = 1 << 20;
         // MiMo V2.6 Pro: 39.3 MB marks, 20 entries per bank, 2 GiB budget: all 42 fit.
         assert_eq!(MarkArena::slots_for(1, 20, 39_321_600, 2048 * MIB, false), 42);
         // GLM 5.3 Flash: 141 MiB marks, same budget: 14 slots.
         assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 2048 * MIB, false), 14);
-        // The floor wins over a tiny budget; a disabled cache takes nothing.
-        assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 0, false), 6);
+        // A tiny budget never reserves unbudgeted live-request marks.
+        assert_eq!(MarkArena::slots_for(2, 20, 141 * MIB, 0, false), 0);
         assert_eq!(MarkArena::slots_for(2, 0, 141 * MIB, 2048 * MIB, false), 0);
     }
 

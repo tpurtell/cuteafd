@@ -183,12 +183,15 @@ release_stop_wip_containers
                     result = self.config(f'SPARK_COUNT={count}{topology}')
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn('must be in', result.stderr)
-        # TP1 and NVFP4 TP5 remain canonical package contracts, not native
-        # ownership layouts.
-        for count in (1, 5, 7):
-            result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1')
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn('unsupported native Spark topology', result.stderr)
+        # Native ownership is qualified for TP2..TP8; TP1 remains canonical.
+        result = self.config('SPARK_COUNT=1\nSPARK_TP=1\nSPARK_EP=1')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('unsupported native Spark topology', result.stderr)
+        for count in (5, 7):
+            result = self.config(f'SPARK_COUNT={count}\nSPARK_TP={count}\nSPARK_EP=1\n'
+                                 'SPARK_6_HOST=fixture-rank6\nSPARK_6_LANE_A=10.55.0.7\n'
+                                 'SPARK_6_LANE_B=10.55.1.7')
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
     def test_daemon_remote_arguments_preserve_world(self):

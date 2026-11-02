@@ -36,7 +36,7 @@ fn fixture(kind: &str) -> (Value, Vec<FixtureTensor>) {
     (config,tensors)
 }
 
-pub(super) fn snapshot(kind: &str) -> tempfile::TempDir {
+pub(crate) fn snapshot(kind: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let (config,tensors) = fixture(kind);
     testing::write_snapshot(dir.path(), &config, &tensors, None);
@@ -663,8 +663,8 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             }
         }
         let (slots, arena) = layout.prefix_arena_bytes(16, 20, 2 << 30).unwrap();
-        assert_eq!(slots, 34);
-        assert!(arena.iter().sum::<u64>() > 2 << 30);
+        assert_eq!(slots, (2 << 30) / layout.ranks.iter().map(|r| r.bytes).sum::<u64>());
+        assert!(arena.iter().sum::<u64>() <= 2 << 30);
         assert_eq!(arena[0], slots * layout.ranks[0].bytes);
         assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
         assert!(layout.snapshot_spans(ranks, 0, &[]).is_err());
@@ -1364,7 +1364,7 @@ fn prefill_selection_preserves_overrides_and_never_retries_on_capacity() {
 /// (`quantization/step5/core_k6/recipe.py`): target attention/FFN/lm_head K6,
 /// routed experts per expert K4 (3-87) and K6 (88-90), MTP dense and stage
 /// heads K4, native tensors otherwise. One shard per layer, sparse payloads.
-pub(super) fn exl3_snapshot() -> tempfile::TempDir {
+pub(crate) fn exl3_snapshot() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let (mut config, tensors) = fixture("bf16");
     let declaration = serde_json::json!({"quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",

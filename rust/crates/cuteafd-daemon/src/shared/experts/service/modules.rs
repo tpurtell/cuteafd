@@ -115,17 +115,26 @@ impl<'a> WarmModules<'a> {
                 }).collect::<Result<Vec<_>>>()?;
             return Ok(Self::Exl3(Some(modules)));
         }
-        let layer = config.selection(0)?;
+        let started = std::time::Instant::now();
         let nvfp4 = catalog.nvfp4().is_some();
         let compiled = config.compiled_capacity()?;
-        let info = layer.select_info(library, compiled, nvfp4)?;
-        let mut capacities = vec![compiled];
-        if crate::shared::experts::execution::compact_output_role(info.role) {
-            if compiled > 1 { capacities.push(1); }
-            if compiled > 80 { capacities.push(80); }
+        let mut roles = Vec::new();
+        let mut kernels = Vec::new();
+        for index in config.resident_layers(catalog.routed_experts().layers)? {
+            let layer = config.selection(index)?;
+            if roles.contains(&layer.role()) { continue; }
+            roles.push(layer.role());
+            ensure!(roles.len() <= 2, "native rank has more than two adjacent width roles");
+            let info = layer.select_info(library, compiled, nvfp4)?;
+            let mut capacities = vec![compiled];
+            if crate::shared::experts::execution::compact_output_role(info.role) {
+                if compiled > 1 { capacities.push(1); }
+                if compiled > 80 { capacities.push(80); }
+            }
+            for rows in capacities { kernels.push(layer.select_kernel(library, rows, nvfp4)?); }
         }
-        let kernels = capacities.into_iter().map(|rows| layer.select_kernel(library, rows, nvfp4))
-            .collect::<Result<Vec<_>>>()?;
+        tracing::info!(rank = config.rank, width_states = roles.len(), kernel_states = kernels.len(),
+            warm_ms = started.elapsed().as_secs_f64() * 1000., "native width modules warmed");
         Ok(Self::Native { _kernels: kernels })
     }
 

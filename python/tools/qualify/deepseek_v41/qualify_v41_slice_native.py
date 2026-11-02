@@ -7,7 +7,7 @@ _sys.path[:0] = [str(_Path(__file__).resolve().parents[2] / _d) for _d in ("lib"
 
 import argparse
 import json
-from spark_packages import native_spark_roles
+from spark_packages import native_spark_artifacts
 
 
 CAPACITIES = (1, 16, 80, 256, 1024, 4096)
@@ -38,7 +38,7 @@ def parse_args(argv=None):
     parser.add_argument("--full-backbone", action="store_true", help="Check full-width RTX backbone geometry")
     parser.add_argument("--local-entrypoints", action="store_true", help="Use namespaced full-backbone symbols in a combined library")
     family = parser.add_mutually_exclusive_group()
-    family.add_argument("--spark-tp", type=int, choices=tuple(native_spark_roles()))
+    family.add_argument("--spark-tp", type=int, choices=tuple(native_spark_artifacts()))
     family.add_argument("--tp2", action="store_true")
     parser.add_argument("--require-ordered", action="store_true",
                         help="Reject token-atomic ABI 3 (candidate correctness gate)")
@@ -67,43 +67,29 @@ def main():
     from _v41_expert_native import Native, library
     from tests.moe.test_v41_grouped_slices import _check_grouped_slices
 
+    artifacts = (None,) if options.full_backbone or options.tp2 else native_spark_artifacts()[options.spark_tp or 4]
+    for artifact in artifacts:
+        qualify_artifact(options, capacities, artifact, torch, Native, library, _check_grouped_slices)
+
+
+def qualify_artifact(options, capacities, artifact, torch, Native, library, _check_grouped_slices):
     checked = set()
     repeat_records = []
     lib = library(options.native_lib, local=options.local_entrypoints,
-                  tp2=options.tp2, spark_tp=options.spark_tp)
+                  tp2=options.tp2, artifact=artifact)
     owners = {}
     full_weights = None
     resident_weights = None
-
-    def coded_weights(weights, experts, intermediate, hidden):
-        from b12x.moe._shared.scale_codes import pack_scale_codes
-
-        def logical_scales(packed, rows, columns, half=None):
-            # Undo the oracle's N256/K128 scale swizzle before lossless coding.
-            stored = packed.view(torch.uint8).reshape(
-                experts, -1, (columns + 3) // 4, 32, 8, 4)
-            grid = stored.permute(0, 1, 3, 4, 2, 5).reshape(
-                experts, -1, ((columns + 3) // 4) * 4)[..., :columns]
-            if half is not None:
-                padded = (half + 127) // 128 * 128
-                grid = torch.cat((grid[:, :half], grid[:, padded:padded + half]), 1)
-            return grid[:, :rows].contiguous()
-
-        w13, s13, w2, s2 = weights
-        s13 = pack_scale_codes(
-            logical_scales(s13, intermediate * 2, hidden // 32, intermediate),
-            tensor_name="oracle.w13.scale", gated_half_rows=intermediate)
-        s2 = pack_scale_codes(logical_scales(s2, hidden, intermediate // 32),
-                             tensor_name="oracle.w2.scale")
-        return [w13, s13.view(torch.uint32).flatten(), w2, s2.view(torch.uint32).flatten()]
 
     def check(**case):
         nonlocal full_weights, resident_weights
         rows = case["rows"]
         weights, wire, ids_cpu, routing = case["native_inputs"]
         if resident_weights is None:
-            resident_weights = coded_weights(weights, 128 if options.full_backbone else 32,
-                                            case["intermediate"], case["hidden"])
+            from _v41_expert_native import pack_reference
+            from mxfp4_layouts import stored_width
+            resident_weights = pack_reference(case["weights"], case["scales"],
+                stored=stored_width(case["hidden"], case["intermediate"]))
         weights = resident_weights
         capacity = (case["capacity"] if options.repeat_equality is not None else
                     1 if rows == 1 else 16 if rows <= 16 else 80)
@@ -126,7 +112,7 @@ def main():
             rw = torch.empty(capacity, 6, device="cuda")
             native = Native(lib, capacity, weights, wire, ids, rw,
                             full_backbone=options.full_backbone, tp2=options.tp2,
-                            spark_tp=options.spark_tp)
+                            artifact=artifact)
             assert not options.require_ordered or native.info.abi_version == 2, (
                 capacity, native.info.abi_version, "ordered ABI 2 required")
             ids.fill_(-1)
@@ -210,16 +196,17 @@ def main():
         )
 
     intermediate = (2304 if options.full_backbone else 1152 if options.tp2 else
-                    2304 // options.spark_tp if options.spark_tp else 576)
+                    artifact.logical)
+    exact = artifact is not None and artifact.stored == intermediate and intermediate % 128 != 0
     if options.repeat_equality is not None:
         for capacity in sorted(capacities):
             row_counts = sorted({capacity, 128} if capacity == 256 else {capacity})
             _check_grouped_slices(options.width, after_case=check, n=intermediate,
-                                  topk=6, capacity=capacity, row_counts=row_counts)
+                                  topk=6, capacity=capacity, row_counts=row_counts, exact_storage=exact)
             _, _, _, graph = owners.pop(capacity)
             graph.reset()
     else:
-        _check_grouped_slices(options.width, after_case=check, n=intermediate, topk=6)
+        _check_grouped_slices(options.width, after_case=check, n=intermediate, topk=6, exact_storage=exact)
     assert checked == capacities, (checked, capacities)
     for _, _, _, graph in owners.values():
         graph.reset()

@@ -245,8 +245,9 @@ impl<'a> NativePrograms<'a> {
     /// batch table). Excludes local expert / TP2 FFN arenas.
     pub fn prefill_slots(&self, reserve: u64, unit: u64, ranks: usize, slots: usize, concurrency: u64,
         head_mode: Fp8Head, window_batch: bool) -> Result<Vec<Demand>> {
+        cuteafd_core::concurrency::validate("deepseek_v41", concurrency)?;
         ensure!((1..=4096).contains(&unit) && unit <= reserve && reserve <= 8256 && matches!(ranks, 1 | 2)
-            && (1..=4).contains(&slots) && (1..=16).contains(&concurrency) && (!window_batch || ranks == 1),
+            && (1..=4).contains(&slots) && (!window_batch || ranks == 1),
             "invalid V4.1 prefill slot geometry");
         let (r, u) = (reserve, unit);
         let mut out = Vec::new();
