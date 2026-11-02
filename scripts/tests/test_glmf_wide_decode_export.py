@@ -67,7 +67,15 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
     calls = {stem: (op, params, thunk()) for stem, op, params, thunk in programs}
     decode_caps = {decode_rows} | ({64} if decode_rows == 128 else set())
     caps = decode_caps | {prefill_rows}
-    assert len(calls) == len(programs) == 10 * len(caps)
+    assert len(calls) == len(programs) == 11 * len(caps)
+    existing = []
+    for rows in sorted(caps):
+        existing.extend([f"kda_core_m{rows}", *[f"{stage}_m{rows}" for stage in ("rank_norm", "absorb", "values")],
+                         *[f"swiglu_i{inter}_m{rows}" for inter in sorted(intermediates)]])
+    for rows in sorted(caps):
+        existing.extend([f"kda_projected_m{rows}", f"absorb_fp8_m{rows}", f"values_fp8_m{rows}"])
+    existing.extend(f"index_projected_c_m{rows}" for rows in sorted(caps))
+    assert list(calls) == existing + [f"index_projected_keys_m{rows}" for rows in sorted(caps)]
     for rows in caps:
         op, params, (module, compiler, args, kwargs) = calls[f"kda_core_m{rows}"]
         assert (op, module, compiler) == ("kda_core", "glmf_split", "compile_glmf_kda_core_aot")
@@ -92,6 +100,10 @@ def test_flash_native_stage_catalog_preserves_projection_boundaries(exporter, in
         assert (op, module, compiler, args) == (
             "index_producer", "glmf_split", "compile_glmf_projected_index_c_aot", (geometry,))
         assert params == kwargs == {"max_rows": rows, "verify_rows": rows if rows in decode_caps else 64}
+        op, params, (module, compiler, args, kwargs) = calls[f"index_projected_keys_m{rows}"]
+        assert (op, module, compiler, args) == (
+            "index_producer", "glmf_split", "compile_glmf_projected_index_keys_aot", (geometry,))
+        assert params == kwargs == {"max_rows": rows}
         for inter in intermediates:
             op, params, (_, compiler, args, kwargs) = calls[f"swiglu_i{inter}_m{rows}"]
             assert op == "swiglu_split"
