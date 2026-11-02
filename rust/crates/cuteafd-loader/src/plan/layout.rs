@@ -120,12 +120,11 @@ pub struct LayoutOptions {
     pub mla_kv: cuteafd_core::MlaCacheFormat,
     /// Keep this much of every GPU free for runtime growth.
     pub headroom_bytes: u64,
-    /// Concurrent sequences (state slots = concurrency + 2).
+    /// Concurrent sequences; automatic active state slots equal concurrency.
     pub concurrency: u64,
-    /// Exact engine slots when they differ from concurrency + 2.
+    /// Exact diagnostic engine slots when they differ from active concurrency.
     pub state_slots: Option<u64>,
-    /// The lanes GLM 5.3 Flash's prefix mark arena counts (its 2C + 2 floor), when they differ
-    /// from concurrency: serve-glmf counts at most `DECODE_ROWS` (64) decoding sequences.
+    /// Diagnostic active-lane override for GLM Flash's budget-limited prefix mark arena.
     pub glmf_mark_lanes: Option<u64>,
     /// Prefix mark arena slots; absent selects the family policy.
     pub prefix_slots: Option<u64>,
@@ -135,7 +134,7 @@ pub struct LayoutOptions {
     pub mimo_prefix_mark_bytes: u64,
     /// Retain warm external MiMo drafter context with prefix marks (candidate opt-in).
     pub mimo_prefix_draft: bool,
-    /// MiMo target rings (serving default: 16, at least concurrency).
+    /// MiMo target rings (zero derives concurrency).
     pub mimo_rings: u64,
     /// Sliding/native-MTP ring storage, independent of the full-attention pool.
     pub mimo_swa_kv: crate::families::mimo_v2::MimoKvCache,
@@ -191,8 +190,23 @@ impl LayoutOptions {
             "glm5_flash" => crate::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64,
             "glm5" => crate::families::glm5::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
             "mimo_v2" => crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64,
+            "qwen3_5" => 4,
             _ => cuteafd_core::serving_capacity::default_concurrency(self.rtx_bytes.first().copied().unwrap_or(0)),
         }
+    }
+
+    pub fn resolved_state_slots(&self, family: &str) -> u64 {
+        self.state_slots.unwrap_or_else(|| cuteafd_core::concurrency::state_slots(self.resolved_concurrency(family)))
+    }
+
+    pub fn mimo_rings(&self) -> u64 {
+        cuteafd_core::concurrency::request_slots(self.resolved_concurrency("mimo_v2"), self.mimo_rings)
+    }
+
+    pub fn prefix_entries(&self, family: &str) -> u64 {
+        if self.mimo_prefix_entries == u64::MAX {
+            cuteafd_core::concurrency::prefix_entries(self.resolved_concurrency(family))
+        } else { self.mimo_prefix_entries }
     }
 
     pub fn glm_draft_sequences(&self) -> u64 {
@@ -256,10 +270,10 @@ impl Default for LayoutOptions {
             state_slots: None,
             glmf_mark_lanes: None,
             prefix_slots: None,
-            mimo_prefix_entries: 20,
+            mimo_prefix_entries: u64::MAX,
             mimo_prefix_mark_bytes: 2 * GIB,
             mimo_prefix_draft: false,
-            mimo_rings: 16,
+            mimo_rings: 0,
             mimo_swa_kv: crate::families::mimo_v2::MimoKvFormats::default().sliding,
             mimo_expert_input: Default::default(),
             draft_sequences: None,
@@ -639,6 +653,17 @@ mod draft_prefix_tests {
         Shape::resolve(&mut report, model.as_ref(), &mut options, ShapePolicy::manifest_bounded());
         assert_eq!(report.prefill_span_rows, Some(4096));
         Ok(())
+    }
+
+    #[test]
+    fn dense_qwen_default_concurrency_and_active_state_stay_four() {
+        for bytes in [32 << 30, 96 << 30] {
+            let mut options = LayoutOptions { rtx_bytes: vec![bytes], ..Default::default() };
+            assert_eq!(options.resolved_concurrency("qwen3_5"), 4);
+            assert_eq!(options.resolved_state_slots("qwen3_5"), 4);
+            options.concurrency = 32;
+            assert_eq!(options.resolved_state_slots("qwen3_5"), 32);
+        }
     }
 
     #[test]
@@ -1404,7 +1429,7 @@ fn selected_host_geometry(report: &mut PlanReport, options: &LayoutOptions, chec
             crate::families::mimo_v2::draft_representation::mimo_draft_mark_bytes(cfg.layers as u64, cfg.kv_heads as u64, cfg.head_dim as u64, options.draft_kv_cache)?
         } else if dir.join("config.json").is_file() {
             let config = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
-            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings.max(shape.concurrency), options.draft_kv_cache)
+            mimo_draft_prefix_bytes(&config, 1, options.mimo_rings(), options.draft_kv_cache)
                 .map_err(anyhow::Error::msg)?.0
         } else { 0 };
         mark_bytes = mark_bytes.checked_add(draft).context("MiMo draft mark overflow")?;

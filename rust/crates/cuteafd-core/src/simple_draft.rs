@@ -184,10 +184,10 @@ pub const OFFSET_PRIOR: f64 = 3.;
 const OFFSET_DECAY: f64 = 0.9;
 /// Bound on a request's logit offset.
 const OFFSET_LIMIT: f64 = 3.;
-/// Reporting-only concurrency groups: C1, C2-4, C5-8, C9+.
-pub const REPORT_GROUPS: [&str; 4] = ["c1", "c2-4", "c5-8", "c9+"];
+/// Reporting-only concurrency groups: C1, C2-4, C5-8, C9-16, C17-32, C33+.
+pub const REPORT_GROUPS: [&str; crate::CONCURRENCY_BUCKETS] = ["c1", "c2-4", "c5-8", "c9-16", "c17-32", "c33+"];
 fn report_group(requests: usize) -> usize {
-    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, _ => 3 }
+    match requests { 0..=1 => 0, 2..=4 => 1, 5..=8 => 2, 9..=16 => 3, 17..=32 => 4, _ => 5 }
 }
 
 fn solve3(mut m: [[f64; 3]; 3], mut y: [f64; 3]) -> Option<[f64; 3]> {
@@ -331,7 +331,7 @@ pub(crate) struct SimpleDraft {
     pending: Option<SimpleSelection>,
     last: Option<SimpleRound>,
     /// `[group][native, tail][position]`.
-    reliability: [[Vec<Reliability>; 2]; 4],
+    reliability: [[Vec<Reliability>; 2]; crate::CONCURRENCY_BUCKETS],
 }
 
 impl SimpleDraft {
@@ -351,7 +351,7 @@ impl SimpleDraft {
     /// The selection awaiting its round's observation.
     pub fn pending(&self) -> Option<&SimpleSelection> { self.pending.as_ref() }
     /// `[group][native, tail][position]`, groups as [`REPORT_GROUPS`].
-    pub fn reliability(&self) -> &[[Vec<Reliability>; 2]; 4] { &self.reliability }
+    pub fn reliability(&self) -> &[[Vec<Reliability>; 2]; crate::CONCURRENCY_BUCKETS] { &self.reliability }
     /// Platt-calibrated conditional acceptance per position.
     fn platt(&self, confidence: &[f64]) -> Vec<f64> {
         confidence.iter().zip(&self.calibration).map(|(&p, platt)| platt.apply(p)).collect()

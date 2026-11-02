@@ -74,7 +74,7 @@ impl Drop for PageLease<'_, '_> {
 }
 
 /// Most sequences one draft step takes (the Markov kernel's limit).
-pub(crate) const MAX_SEQUENCES: usize = 32;
+pub(crate) const MAX_SEQUENCES: usize = cuteafd_loader::formats::block_dspark::MAX_SEQUENCES;
 
 /// Whether `snapshot` holds a Speculators dSpark checkpoint.
 pub(crate) fn is_dspark(snapshot: &Path) -> Result<bool> {

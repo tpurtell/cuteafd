@@ -633,6 +633,22 @@ fn family_layout(model: &dyn FamilyModel, input: &PlanInput, report: &mut PlanRe
     options: &mut layout::LayoutOptions, requested: ExpertPlacement)
     -> anyhow::Result<cuteafd_core::memory_layout::MemoryLayout> {
     let _timer = PhaseTimer::new(&input.phases.layout, &[&input.phases.catalog]);
+    let family = report.family.as_deref().unwrap_or("unknown");
+    let concurrency = options.resolved_concurrency(family);
+    if let Err(error) = cuteafd_core::concurrency::validate(family, concurrency) {
+        report.fits = false;
+        report.placement_supported = false;
+        let reason = error.to_string();
+        report.hints.push(Hint { what: reason.clone(), how: "Use a supported boot-time concurrency or add the named program capacity.".into() });
+        return Ok(cuteafd_core::memory_layout::MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![reason] });
+    }
+    if options.mimo_prefix_entries == u64::MAX {
+        options.mimo_prefix_entries = cuteafd_core::concurrency::prefix_entries(concurrency);
+    }
+    if let Some(cache) = report.cache_requirements.as_mut() {
+        cache.concurrency = u32::try_from(concurrency)?;
+        cache.state_slots = u32::try_from(options.state_slots.unwrap_or(cuteafd_core::concurrency::state_slots(concurrency)))?;
+    }
     match model.placement(input, report, options, requested) {
         Some(Ok(memory)) => {
             report.native_serving_admitted = model.native_serving_admission();

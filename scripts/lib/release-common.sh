@@ -1125,7 +1125,7 @@ release_load_config() {
   HTTP_QUEUE_WAIT_MS=25000
   CONCURRENCY=
   RELEASE_CONCURRENCY_EXPLICIT=0
-  PREFIX_CACHE_ENTRIES=20
+  PREFIX_CACHE_ENTRIES=auto
   PREFILL_BATCH_TOKENS=2048
   RELEASE_PREFILL_EXPLICIT=0
   SPARK_DEVICE_BUDGET_BYTES=107374182400
@@ -1282,11 +1282,11 @@ release_load_config() {
     if [[ "$mode" == stop ]]; then
       [[ "$CONCURRENCY" =~ ^[1-9][0-9]*$ ]] || release_die "CONCURRENCY must be positive"
     else
-      [[ "$CONCURRENCY" =~ ^([1-9]|1[0-6])$ ]] || release_die "CONCURRENCY must be in 1..16"
+      [[ "$CONCURRENCY" =~ ^([1-9]|[1-5][0-9]|6[0-4])$ ]] || release_die "CONCURRENCY must be in 1..64"
     fi
   fi
-  [[ "$PREFIX_CACHE_ENTRIES" =~ ^([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8])$ ]] ||
-    release_die "PREFIX_CACHE_ENTRIES must be in 0..128"
+  [[ "$PREFIX_CACHE_ENTRIES" == auto || "$PREFIX_CACHE_ENTRIES" =~ ^[0-9]+$ ]] ||
+    release_die "PREFIX_CACHE_ENTRIES must be auto or non-negative"
   [[ "$PREFILL_BATCH_TOKENS" =~ ^[0-9]+$ ]] || release_die "PREFILL_BATCH_TOKENS must be non-negative"
   if [[ "$mode" == launch ]]; then
     ((PREFILL_BATCH_TOKENS >= 80 && PREFILL_BATCH_TOKENS <= 4096)) ||

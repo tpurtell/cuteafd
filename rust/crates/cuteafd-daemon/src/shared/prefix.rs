@@ -21,7 +21,7 @@ pub(crate) struct PrefixArgs {
     #[arg(skip)]
     pub scoring_host_bytes: u64,
     /// Device snapshots per bank; the host tier is limited only by --host-cache-bytes.
-    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = 20)]
+    #[arg(long, env = "CUTEAFD_PREFIX_CACHE_ENTRIES", default_value_t = cuteafd_core::concurrency::AUTO_ENTRIES)]
     pub prefix_cache_entries: usize,
     /// Device mark budget in MiB. With host retention, two staging marks are reserved;
     /// host-off retains the legacy entry/budget count with two per decoding sequence plus two.
@@ -93,6 +93,12 @@ impl MarkRule {
 }
 
 impl PrefixArgs {
+    pub fn resolve_entries(&mut self, concurrency: usize) {
+        if self.prefix_cache_entries == cuteafd_core::concurrency::AUTO_ENTRIES {
+            self.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(concurrency as u64) as usize;
+        }
+    }
+
     pub fn with_scoring(&self, rows: usize, lane_rows: usize, vocab: usize) -> Result<Self> {
         let mut args = self.clone();
         args.scoring_host_bytes = cuteafd_core::memory_layout::host_logits_bytes(rows as u64, lane_rows as u64, vocab as u64)
@@ -102,7 +108,7 @@ impl PrefixArgs {
 
     /// The device mark arena's knobs for `lanes` decoding sequences.
     pub fn mark_rule(&self, lanes: usize) -> MarkRule {
-        MarkRule { lanes, entries: self.prefix_cache_entries,
+        MarkRule { lanes, entries: if self.prefix_cache_entries == cuteafd_core::concurrency::AUTO_ENTRIES { cuteafd_core::concurrency::prefix_entries(lanes as u64) as usize } else { self.prefix_cache_entries },
             budget_bytes: (self.prefix_cache_mark_mib as u64).saturating_mul(1 << 20), host: self.host_cache_bytes.enabled() }
     }
 
@@ -294,7 +300,8 @@ mod tests {
 
     #[test]
     fn prefix_knobs_default_on_with_the_host_tier_off() {
-        let cli = Cli::parse_from(["serve"]);
+        let mut cli = Cli::parse_from(["serve"]);
+        cli.prefix.resolve_entries(16);
         assert_eq!((cli.prefix.prefix_cache_entries, cli.prefix.host_cache_bytes), (20, HostBudget::Bytes(0)));
         assert_eq!(cli.prefix.host_cache_evict_tokens, 16 * 1024);
         assert_eq!(Cli::parse_from(["serve", "--host-cache-evict-tokens", "0"]).prefix.host_cache_evict_tokens, 0);

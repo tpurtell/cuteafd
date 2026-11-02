@@ -1731,8 +1731,8 @@ fn alternating_whole_refuses_owner_overflow_instead_of_moving_layers() {
 }
 
 #[test]
-fn fitting_glm_flash_and_mimo_pro_keep_their_legacy_mark_counts() {
-    for (mark_bytes, expected) in [(147_619_840, 34), (39_321_600, 42)] {
+fn fitting_glm_flash_and_mimo_pro_keep_their_budgeted_mark_counts() {
+    for (mark_bytes, expected) in [(147_619_840, 14), (39_321_600, 42)] {
         let slots = cuteafd_core::prefix::mark_slots_for(16, 20, mark_bytes, 2 << 30);
         assert_eq!(slots, expected);
         let mut req = request(2, 44 * GIB, 2, 6, Onboard::Auto);
@@ -1756,7 +1756,7 @@ fn kimi_c8_marks_reduce_only_after_context_and_fixed_floors() {
     // This fixture's KV rate is 16 GiB/rank at 1M tokens. All other
     // operands are fixed: 8 active states plus weights and workspaces.
     let mark = 224_686_080;
-    let legacy = cuteafd_core::prefix::mark_slots_for(8, 20, 2 * mark, 2 << 30);
+    let legacy = cuteafd_core::prefix::mark_slots_for(8, 8, 2 * mark, 16 << 30);
     assert_eq!(legacy, 18);
     let parts = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "Kimi exact KDA marks", mark, Basis::Exact)).collect::<Vec<_>>();

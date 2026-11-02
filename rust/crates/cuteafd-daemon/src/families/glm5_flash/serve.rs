@@ -108,9 +108,9 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-/// Even per-sequence room when a fixed count bypasses the shared draft policy.
+/// Per-request upper bound; the policy or final global cap shares the rows.
 fn verify_room(verify_rows: usize, sequences: usize) -> usize {
-    (verify_rows / sequences.max(1)).max(1) - 1
+    verify_rows.saturating_sub(sequences)
 }
 
 /// Fixed neural count and packed admission prefill.
@@ -145,7 +145,9 @@ pub(crate) fn auto_vision(mode: cuteafd_loader::plan::MediaMode, snapshot: &std:
     })
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("glm5_flash", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
     let encoding = if super::media::vision_config(args.vision, &snapshot)?.is_none() {
@@ -160,11 +162,11 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| model_id(&snapshot)).context("model id")?,
         ModelEncoding::Glm(Arc::new(encoding)),
     );
-    let (queue, receive) = mpsc::channel::<NativeRequest>(16);
+    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.slots = engine_args.slots.max(args.max_sequences);
+    engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;
     (engine_args.draft_context_slots, engine_args.draft_sequences) = draft_capacity(args.max_sequences,
         engine_args.draft_sequences, engine_args.draft_context_slots);
     let (worker_stats, max_sequences, decode_share) = (stats.clone(), args.max_sequences, args.decode_share);
@@ -207,7 +209,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> Result<console::Layout> {
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences;
     let policy = match args.draft_fixed {
         Some(n) => format!("fixed {n}"),
         None => "adaptive".to_string(),
@@ -239,8 +241,8 @@ fn serve_loop(mut args: super::EngineArgs, mut receive: mpsc::Receiver<NativeReq
     ready: tokio::sync::oneshot::Sender<Result<(usize, VisionReady)>>, stats: Arc<Mutex<serde_json::Value>>, max_sequences: usize,
     policy: Policy, decode_share: DecodeShareArgs, prefix: PrefixArgs,
     vision: cuteafd_loader::plan::MediaMode, media_cache_bytes: Option<u64>, remote: Option<super::media::RemoteVision>) -> Result<()> {
-    args.serving_graph_policy = Some((max_sequences.min(DECODE_ROWS), args.draft.is_some()));
-    let lanes = max_sequences.min(DECODE_ROWS);
+    args.serving_graph_policy = Some((max_sequences, args.draft.is_some()));
+    let lanes = max_sequences;
     // Without entries no mark is taken: pool marks keep no unit back and need no room in the pool.
     let marks = args.prefix_marks.with_entries(prefix.prefix_cache_entries);
     if marks != args.prefix_marks {
@@ -1372,22 +1374,10 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
     let mut tally = console::Step::begin(lease.index());
     let (draft0, verify0, emit0) = (lane.draft_s, lane.verify_s, lane.emit_s);
     let engine_before = tally.live().then(|| *engine.profile.borrow());
-    // Rows each sequence may add after its next token: an even share of the verify budget.
-    // The shared policy spends one budget across the round (D3): each sequence's room is the whole budget
-    // less the other anchors, and the selection keeps the step within `verify_rows`.
-    let room = if shared.is_some() { verify_rows.saturating_sub(active.len()) }
-        else { verify_room(verify_rows, active.len()) };
+    // Each request may use leftover rows; selection spends one global budget.
+    let room = verify_room(verify_rows, active.len());
     let mut limits: Vec<usize> = active.iter().map(|a| if probe::no_speculation(&a.job.probe) { 0 } else {
         room.min(a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1) }).collect();
-    // With the wide programs the rows the even share leaves over go to the first sequences that can
-    // draft once more (127 rows at 16 sequences: 15 draft 7, one 6); 64 rows keep the even share.
-    if shared.is_none() && engine.decode_rows > DECODE_ROWS {
-        super::engine::hand_out_remainder(&mut limits, room, verify_rows, |i| {
-            let a = &active[i];
-            !probe::no_speculation(&a.job.probe)
-                && room < (a.job.max_tokens - a.generated - 1).min(a.capacity - a.placement.len - 1)
-        });
-    }
     // Verify writes stay inside each request's reserved units.
     for (limit, a) in limits.iter_mut().zip(active.iter()) {
         *limit = (*limit).min(reserved_drafts(a.placement.len, a.placement.pages.len(), PAGE_ROWS));
@@ -1454,7 +1444,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
             _ => None,
         }).collect();
     let mut predicted = None;
-    let planned = match (fixed, shared.as_mut()) {
+    let mut planned = match (fixed, shared.as_mut()) {
         // No draft pass ran: every sequence verifies its next token alone.
         (None, Some(_)) if drafted_width == 0 => vec![0; active.len()],
         (None, Some(shared)) => {
@@ -1476,6 +1466,8 @@ async fn decode_round(lease: LaneLease<'_>, engine: &GlmfEngine<'_>, opened: &Op
         // No neural drafter means no speculative proposal.
         (None, None) => vec![0; active.len()],
     };
+    if super::draft_binding::trim_budget_with_priors(&mut planned, verify_rows, &shared_priors,
+        |i| active[i].ticket.id()) { predicted = None; }
     // A history continuation never competes with or replaces the confident prefix.
     let sequences: Vec<Vec<u32>> = active.iter().enumerate().map(|(i, a)| {
         let full = drafted[i].as_ref().map_or(&[][..], |d| d.tokens.as_slice());
@@ -2157,7 +2149,8 @@ mod verify_rows_tests {
             }
             let proposals: Vec<(Vec<u32>, Vec<f32>)> = history.iter().map(|h| drafts(h)).collect();
             let room = verify_room(64, streams);
-            let ks = vec![room.min(7); streams];
+            let mut ks = vec![room.min(7); streams];
+            crate::shared::draft::resource::trim_budget(&mut ks, 64);
             for (i, ((tokens_i, _), &k)) in proposals.iter().zip(&ks).enumerate() {
                 let rows: Vec<u32> = std::iter::once(next[i]).chain(tokens_i[..k].iter().copied()).collect();
                 verified += rows.len();
@@ -2176,7 +2169,7 @@ mod verify_rows_tests {
     }
 
     #[test]
-    fn even_room_verification_emits_target_greedy_tokens() {
+    fn global_budget_verification_emits_target_greedy_tokens() {
         let (emissions, _) = decode(16, 48);
         for (s, emitted) in emissions.iter().enumerate() {
             let mut context = vec![s as u32, s as u32 * 7 % VOCAB];
@@ -2188,9 +2181,9 @@ mod verify_rows_tests {
     }
 
     #[test]
-    fn room_is_the_even_share_of_the_verify_budget() {
-        assert_eq!([1, 2, 9, 16, 64, 65].map(|s| verify_room(64, s)), [63, 31, 6, 3, 0, 0]);
-        assert_eq!([1, 16, 17].map(|s| verify_room(127, s)), [126, 6, 6]);
+    fn room_leaves_all_remaining_rows_available_to_each_request() {
+        assert_eq!([1, 2, 9, 16, 64, 65].map(|s| verify_room(64, s)), [63, 62, 55, 48, 0, 0]);
+        assert_eq!([1, 16, 17].map(|s| verify_room(127, s)), [126, 111, 110]);
     }
 
     #[test]

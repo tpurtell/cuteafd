@@ -152,7 +152,10 @@ def test_pinned_pool_is_a_whole_page_group_count_that_clears_minimum_admission()
     assert selector.parse_bytes(values["KV_POOL_SIZE"]) // selector.GROUP_BYTES == 28_276
     assert selector.parse_bytes(values["KV_POOL_SIZE"]) - global_bytes < selector.GROUP_BYTES
     # The launcher's own `desired_groups` rejects anything below this.
-    minimum = 2 * int(values["CONCURRENCY"]) + 2 * int(values["PREFIX_CACHE_ENTRIES"])
+    concurrency = int(values["CONCURRENCY"])
+    entries = values["PREFIX_CACHE_ENTRIES"]
+    entries = max(20, (5 * concurrency + 3) // 4) if entries == "auto" else int(entries)
+    minimum = 2 * concurrency + 2 * entries
     assert groups >= minimum, (groups, minimum)
     # One maximum-context request plus its full output allowance still fits.
     tokens = global_bytes // selector.GROUP_BYTES * 512

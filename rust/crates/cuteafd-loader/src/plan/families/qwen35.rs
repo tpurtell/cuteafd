@@ -163,17 +163,18 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         }
     }
     ensure!(scratch > 0, "dense native prefill requires nonzero scratch");
-    let slots = usize::try_from(if options.concurrency == 0 { 4 } else { options.concurrency })?;
-    ensure!(options.state_slots.is_none_or(|n| n == slots as u64), "dense state slots must equal concurrency");
+    let slots = usize::try_from(options.resolved_state_slots("qwen3_5"))?;
     let mark = NativeBuffers::new(cfg, scratch as usize, slots, 0, options.full_prefill_logits)?.mark_bytes;
-    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(slots as u64,
-        options.mimo_prefix_entries, mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+    let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(options.resolved_concurrency("qwen3_5"),
+        options.prefix_entries("qwen3_5"), mark as u64, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let buffers = NativeBuffers::new(cfg, scratch as usize, slots, usize::try_from(marks)?, options.full_prefill_logits)?;
     let weights = NativeWeights::native(input.checkpoint(), cfg, norm.context("missing GDN precision")?)?;
     let (layers, fixed) = weights.demands(cfg, &buffers, slots);
     let capacity = options.rtx_bytes[0];
     let context = ArchContext::coordinator(capacity, None).context_bytes + set.module_bytes();
-    let drafter = options.dense_qwen_drafter_snapshot.as_ref().map(|snapshot| {
+    let draft_anchor_only = options.dense_qwen_drafter_snapshot.is_some()
+        && !crate::formats::block_dspark::supports_sequences(slots);
+    let drafter = options.dense_qwen_drafter_snapshot.as_ref().filter(|_| !draft_anchor_only).map(|snapshot| {
         let config = serde_json::from_slice(&std::fs::read(snapshot.join("config.json"))?)?;
         let draft = crate::formats::block_dspark::BlockDsparkConfig::from_json(&config)?;
         ensure!(draft.hidden == cfg.hidden && draft.vocab == cfg.vocab && draft.taps.iter().all(|&layer| layer < cfg.attention.len()),
@@ -192,8 +193,12 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         pool_overhead: 0, pool_bounded: vec![] })?;
     let mut items = result.items[0].clone();
     items.push(Item::new(Category::Runtime, "context and native modules", "native", context, Basis::Calibrated));
+    let mut notes = vec![format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv)];
+    if draft_anchor_only {
+        notes.push(format!("dense dSpark native sequence capacity {}; C{slots} serves anchor-only with no drafter allocation",
+            crate::formats::block_dspark::MAX_SEQUENCES));
+    }
     Ok(MemoryLayout { devices: vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
         capacity_bytes: capacity - (1 << 30), items, kv_tokens: result.pool_tokens }],
-        pool_tokens: result.pool_tokens, waste: vec![], notes: vec![
-            format!("Native dense admission: {} KV, exact GDN state, no captured graphs; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv)] })
+        pool_tokens: result.pool_tokens, waste: vec![], notes })
 }

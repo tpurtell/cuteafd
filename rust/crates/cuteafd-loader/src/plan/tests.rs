@@ -304,6 +304,52 @@ fn host_prefill_waves_keep_unit_scratch_and_independent_return_slots() {
     }
 }
 
+#[test]
+fn boot_concurrency_full_plan_matrix() {
+    let mut fixtures = shared_wave_snapshots();
+    fixtures.push(("deepseek_v41", strict_v41_snapshot(false)));
+    fixtures.push(("mimo_v2", snapshot(mimo_flash_config(), &mimo_flash_tensors())));
+    let kimi = tempfile::tempdir().unwrap();
+    write_kimi_snapshot(kimi.path(), false);
+    fixtures.push(("kimi_k3", kimi));
+    fixtures.push(("step5", families::step5::tests::snapshot("fp8")));
+    let (dense, dense_options, _, _) = crate::families::qwen3_5::tests::native_planner_fixture();
+    fixtures.push(("qwen3_5", dense));
+    for (family, dir) in fixtures {
+        let input = PlanInput::open(dir.path()).unwrap();
+        for gpus in [1, 2] {
+            for c in [1, 4, 16, 17, 32, 64, 65, 128] {
+                let mut options = if family == "qwen3_5" { dense_options.clone() }
+                    else { wave_plan_options(dir.path(), 4) };
+                let layout = options.layout.as_mut().unwrap();
+                layout.state_slots = None;
+                layout.rtx_bytes = vec![96 << 30; gpus];
+                layout.concurrency = c;
+                let (report, phases) = input.plan_with_timings(&options);
+                assert!(phases.total() < std::time::Duration::from_secs(10),
+                    "{family} C{c} GPUs={gpus}: {phases:?}");
+                let report = report.unwrap();
+                assert_eq!(report.family.as_deref(), Some(family));
+                if let Err(error) = cuteafd_core::concurrency::validate(family, c) {
+                    assert!(!report.fits && !report.placement_supported);
+                    assert!(report.hints.iter().any(|hint| hint.what.contains(&error.to_string())),
+                        "{family} C{c}: {}", render(&report));
+                } else {
+                    let cache = report.cache_requirements.as_ref().unwrap();
+                    assert_eq!(u64::from(cache.concurrency), c);
+                    assert_eq!(u64::from(cache.state_slots), cuteafd_core::concurrency::state_slots(c));
+                    if !report.fits || !report.placement_supported {
+                        let memory = report.memory_layout.as_ref().unwrap();
+                        assert!(!report.hints.is_empty() || !memory.notes.is_empty()
+                            || memory.devices.iter().any(|device| device.used_bytes() > device.capacity_bytes),
+                            "{family} C{c}: refusal must name its cause");
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn shared_wave_snapshots() -> Vec<(&'static str, tempfile::TempDir)> {
     let flash = glm5_flash_config(2);
     let qwen = qwen4_config(4);
@@ -3015,7 +3061,7 @@ fn glm5_flash_layout_charges_the_wide_decode_rows() {
         let geometry = glm_flash_rank_cache_geometry_rows(&cfg, 2, 1, GlmfIndexCache::Keys, 4, rows).unwrap();
         let rank = &geometry.ranks[0];
         assert_eq!(item(report, "state").map(|(_, bytes, _)| bytes), Some(rank.fixed_state_bytes
-            + rank.active_state_per_sequence_bytes * 8 + rank.speculative_replay_bytes));
+            + rank.active_state_per_sequence_bytes * 4 + rank.speculative_replay_bytes));
     }
     // 128 rows: +64,606,464 B of decode workspace, the wide selector, one KDA layer's 64 more record rows.
     let steps = |report| item(report, "steps").unwrap().1;
@@ -3377,11 +3423,14 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
         plans.insert(name.into(), value);
     }
     let actual = Value::Object(plans);
-    let mut expected: Value = serde_json::from_str(include_str!(
+    let historical: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/glmf-startup-plans.json")).unwrap();
-    // The fixture now declares its real context ceiling for host admission.
+    let mut expected = historical.clone();
+    // Normalize a clone for current admission; the raw historical value only pins provenance.
     for report in expected.as_object_mut().unwrap().values_mut() {
         report["cache_requirements"]["checkpoint_max_context_tokens"] = json!(1_048_576);
+        report["cache_requirements"]["concurrency"] = json!(4);
+        report["cache_requirements"]["state_slots"] = json!(4);
     }
     // The shared solver cannot admit this historical A_log-only checkpoint.
     // Preserve the old snapshot/hash as provenance, but require a named refusal
@@ -3410,9 +3459,8 @@ fn glm5_flash_startup_inventory_preserves_reference_plan_json() {
     }
     // Complete-header solver/working-set tests check the admitted inventory and
     // exact Spark I/O; this fixture remains the unchanged historical reference.
-    let mut legacy = expected;
+    let mut legacy = historical;
     for report in legacy.as_object_mut().unwrap().values_mut() {
-        report["cache_requirements"]["checkpoint_max_context_tokens"] = Value::Null;
         assert_eq!(report.as_object_mut().unwrap().shift_remove("attention_placement"), Some(json!("heads")));
         let notes = report["memory_layout"]["notes"].as_array_mut().unwrap();
         assert_eq!(notes.remove(1), json!("attention placement heads"));
@@ -3585,10 +3633,11 @@ fn mimo_small_card_auto_embedding_and_full_context() {
 }
 
 #[test]
-fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
+fn mimo_native_default_concurrency_is_preserved_and_rings_follow_overrides() {
     let dir = tempfile::tempdir().unwrap();
     write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
-    for (gib, expected) in [(32, 8), (96, 16)] {
+    for gib in [32, 96] {
+        let expected = crate::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES as u64;
         let mut options = PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)),
             rtx_bytes: vec![gib << 30], ..Default::default()
         }), ..sparks(4) };
@@ -3597,12 +3646,12 @@ fn mimo_concurrency_default_follows_logical_capacity_and_is_overridable() {
         let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert_eq!(automatic.pool_tokens, explicit.pool_tokens);
         assert_eq!(automatic.devices[0].used_bytes(), explicit.devices[0].used_bytes());
-        options.layout.as_mut().unwrap().concurrency = if expected == 16 { 8 } else { 16 };
+        options.layout.as_mut().unwrap().concurrency = 16;
         let overridden = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         let state = |layout: &cuteafd_core::memory_layout::MemoryLayout| layout.devices[0].items.iter()
             .find(|item| item.group == "state").unwrap().bytes;
-        // Both concurrency limits fit the same sixteen physical target rings.
-        assert_eq!(state(&automatic), state(&overridden));
+        // Active rings follow C; retention is a separate budget.
+        assert!(state(&overridden) > state(&automatic));
         options.layout.as_mut().unwrap().mimo_rings = 32;
         let more_rings = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
         assert!(state(&more_rings) > state(&automatic));
@@ -4535,7 +4584,7 @@ fn qwen_image_cap_is_visible_and_auto_preserves_zero_spark_kv() {
 }
 
 /// GLM 5.3 Flash's layout reserves the mark arena its server allocates at the default knobs
-/// (`MarkArena::slots_for`: 2C + 2 for its 147.6 MB FP32 marks, where it reserved a flat 18),
+/// (`MarkArena::slots_for`: 14 complete 147.6 MB FP32 marks in the 2 GiB budget),
 /// and its state carries the speculative replay records.
 #[test]
 fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
@@ -4544,7 +4593,7 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
         .get(&Category::Prefix).copied().unwrap_or(0);
     let layout = |rtx: u64, concurrency: u64| PlanOptions { layout: Some(layout::LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), drafter_bytes: 256 << 20,
         rtx_bytes: vec![rtx], concurrency, pool_tokens: Some(0), host_cache_bytes: Some(0), ..Default::default() }), ..sparks(4) };
-    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: the 2C + 2 floor (18 at C8, 34 at C16).
+    // GLM 5.3 Flash: 34 KDA layers, 147.6 MB marks: 14 fit independently of C.
     let mut config = glm5_flash_config(45);
     config["text_config"]["layer_types"] = json!((0..45)
         .map(|l| if l % 4 == 3 { "deepseek_sparse_attention" } else { "linear_attention" }).collect::<Vec<_>>());
@@ -4553,12 +4602,12 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     assert_eq!((rank.retained_mark_bytes, rank.speculative_replay_bytes), (147_619_840, 321_421_312));
     let tensors = glm5_flash_tensors(&config);
     let dir = snapshot(config, &tensors);
-    for (concurrency, slots) in [(1, 14), (8, 18), (16, 34)] {
+    for (concurrency, slots) in [(1, 14), (8, 14), (16, 14)] {
         let memory = plan(dir.path(), &layout(96 << 30, concurrency)).unwrap().memory_layout.unwrap();
         assert_eq!(cuteafd_core::prefix::mark_slots_for(concurrency, 20, rank.retained_mark_bytes, 2 << 30), slots);
         assert_eq!(marks(&memory), slots * rank.retained_mark_bytes);
         let state: u64 = memory.devices[0].items.iter().filter(|i| ["KDA state and replay", "DSA index tails and replay", "commit tables"].contains(&i.group.as_str())).map(|i| i.bytes).sum();
-        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency.max(8)
+        assert_eq!(state, rank.fixed_state_bytes + rank.active_state_per_sequence_bytes * concurrency
             + rank.speculative_replay_bytes);
     }
     // At the default 2M pool cap the released arena becomes reported free headroom.
@@ -4567,11 +4616,11 @@ fn glm5_flash_layout_reserves_the_mark_arena_its_server_allocates() {
     let legacy = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
     capped.layout.as_mut().unwrap().host_cache_bytes = None;
     let staged = plan(dir.path(), &capped).unwrap().memory_layout.unwrap();
-    let released = (34 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
+    let released = (14 - cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS) * rank.retained_mark_bytes;
     assert_eq!((legacy.pool_tokens, staged.pool_tokens), (2_097_152, 2_097_152));
     assert_eq!(marks(&legacy) - marks(&staged), released);
     assert_eq!(staged.devices[0].free_bytes() - legacy.devices[0].free_bytes(), released as i64);
-    assert_eq!(released, 4_723_834_880);
+    assert_eq!(released, 1_771_438_080);
     // An explicit arena (0: none) is taken as given.
     let mut none = layout(96 << 30, 16);
     none.layout.as_mut().unwrap().prefix_slots = Some(0);
@@ -4629,14 +4678,14 @@ fn glm_flash_pool_marks_charge_their_reserved_unit_beside_the_pool() {
     let fewer = (none.pool_tokens - pool.pool_tokens) as i64 * unit as i64 / 256;
     assert_eq!(none.devices[0].free_bytes() - pool.devices[0].free_bytes(),
         (GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - fewer);
-    // Against the arena the server would allocate at 16 sequences (34 marks of 147.6 MB), pool marks
+    // Against the budgeted arena (14 marks of 147.6 MB), pool marks
     // free the arena's bytes less the reserved unit, for the pool (up to its target) or as free memory.
     let arena = layout(false, None);
-    assert_eq!(item(&arena, "marks"), 34 * rank.retained_mark_bytes);
+    assert_eq!(item(&arena, "marks"), 14 * rank.retained_mark_bytes);
     assert!(pool.pool_tokens >= arena.pool_tokens, "{} {}", pool.pool_tokens, arena.pool_tokens);
     let more = (pool.pool_tokens - arena.pool_tokens) as i64 * unit as i64 / 256;
     assert_eq!(pool.devices[0].free_bytes() - arena.devices[0].free_bytes(),
-        (34 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
+        (14 * rank.retained_mark_bytes - GLMF_POOL_MARK_RESERVED_UNITS * unit) as i64 - more);
 }
 
 

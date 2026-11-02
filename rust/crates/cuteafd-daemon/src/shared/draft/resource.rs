@@ -124,12 +124,28 @@ pub(crate) fn choose_block(policy: &mut DraftPolicy, requests: &[(u64, usize)], 
     Ok(chosen.is_none_or(|action| action == 1))
 }
 
-/// Fixed diagnostic counts still share the verifier budget, anchors included.
+/// Fallbacks without confidence discard younger requests' tails first.
 pub(crate) fn trim_budget(lengths: &mut [usize], budget: usize) -> bool {
+    trim_budget_with_priors(lengths, budget, &[] as &[&[f64]], |i| i as u64)
+}
+
+/// Preserve every anchor and proposal prefix. Discard the least likely surviving
+/// tail first; equal or missing evidence favors older requests, never equal quotas.
+pub(crate) fn trim_budget_with_priors<P: AsRef<[f64]>>(lengths: &mut [usize], budget: usize,
+    priors: &[P], request_id: impl Fn(usize) -> u64) -> bool {
     let mut rows = lengths.len() + lengths.iter().sum::<usize>();
     let trimmed = rows > budget;
+    if !trimmed { return false; }
+    let survival: Vec<Vec<f64>> = priors.iter().map(|prior| {
+        let mut product = 1.;
+        prior.as_ref().iter().map(|&p| { product *= p; product }).collect()
+    }).collect();
     while rows > budget {
-        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| lengths[i]) else { break };
+        let survival = |i: usize| {
+            survival.get(i).and_then(|p| p.get(lengths[i] - 1)).copied().unwrap_or(0.)
+        };
+        let Some(index) = (0..lengths.len()).filter(|&i| lengths[i] > 0).min_by(|&a, &b|
+            survival(a).total_cmp(&survival(b)).then_with(|| request_id(b).cmp(&request_id(a)))) else { break };
         lengths[index] -= 1;
         rows -= 1;
     }
@@ -350,7 +366,7 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
         // The simple rule owns every length: no cold floor, no lone-request reference.
         let mut lengths = policy.select_drafted_within(false, &cores, width, max_rows, drafted_requests).ok().flatten()
             .map_or_else(|| vec![0; cores.len()], |selection| selection.lengths);
-        fit_budget(&mut lengths, max_rows);
+        trim_budget_with_priors(&mut lengths, max_rows, &confidence, |i| candidates[i].id);
         binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
         return Selection { lengths, predicted: None };
     }
@@ -382,7 +398,7 @@ pub(crate) fn select_drafted(policy: &mut DraftPolicy, candidates: &[Candidate<'
             predicted = None;
         }
     }
-    if fit_budget(&mut lengths, max_rows) { predicted = None; }
+    if trim_budget_with_priors(&mut lengths, max_rows, &confidence, |i| candidates[i].id) { predicted = None; }
     binding::trace_selection(policy, &cores, width, drafted_requests, max_rows, &lengths);
     Selection { lengths, predicted }
 }
@@ -437,20 +453,6 @@ pub(crate) fn decision_trace(policy: &mut DraftPolicy, candidates: &[Candidate<'
         "platt": policy.calibration(candidates.len()),
         "position_reached": policy.stats().position_reached,
         "cost": {"layers": cost.layers, "round": cost.round, "draft": cost.draft}})
-}
-
-/// Trims the longest drafts one row at a time until every request's anchor
-/// and drafts fit `max_rows`; true when it trimmed.
-fn fit_budget(lengths: &mut [usize], max_rows: usize) -> bool {
-    let mut rows: usize = lengths.len() + lengths.iter().sum::<usize>();
-    let trimmed = rows > max_rows;
-    while rows > max_rows {
-        let Some(longest) = (0..lengths.len()).filter(|&i| lengths[i] > 0).max_by_key(|&i| (lengths[i], usize::MAX - i))
-            else { break };
-        lengths[longest] -= 1;
-        rows -= 1;
-    }
-    trimmed
 }
 
 /// One verified request of a GLM Flash round.
@@ -633,6 +635,56 @@ mod tests {
         assert_eq!(finish_censor(true, 2, &rows, Some(12), &[12]), Some(Censor::Eos));
         assert_eq!(finish_censor(true, 2, &rows, Some(12), &[]), Some(Censor::OutputLimit));
         assert_eq!(finish_censor(true, 4, &rows, Some(99), &[99]), Some(Censor::Eos));
+    }
+
+    #[test]
+    fn every_family_high_concurrency_uses_one_confidence_ranked_row_budget() {
+        // GLM/GLMF/MiMo call this cap after draft generation (including fixed
+        // and run_draft cold shortcuts); Qwen/Kimi/Step cap before generation.
+        // V4's selected lengths pass through the same policy fallback.
+        for family in ["glm5", "glm5_flash", "mimo_v2", "qwen4", "qwen3_5", "kimi_k3", "step5", "deepseek_v4"] {
+            for count in [17, 32, 64] {
+                let sure = vec![0.99; 7];
+                let poor = vec![0.; 7];
+                let priors: Vec<_> = (0..count).map(|i| if i == 0 { sure.clone() } else { poor.clone() }).collect();
+                let check = |lengths: &[usize]| {
+                    assert!(count + lengths.iter().sum::<usize>() <= 64, "{family} C{count}: {lengths:?}");
+                    if count < 64 {
+                        assert!(lengths[0] > 64 / count - 1, "{family} C{count}: {lengths:?}");
+                        assert_eq!(lengths[count - 1], 0, "{family} C{count}: {lengths:?}");
+                    } else {
+                        // All 64 rows are anchors: a nonzero draft is impossible.
+                        assert!(lengths.iter().all(|&n| n == 0));
+                    }
+                };
+                // Fixed widths bypass policy selection; an unprimed/no-spec
+                // member has no proposals but still consumes its anchor.
+                let mut fixed = vec![7; count];
+                fixed[count - 1] = 0;
+                trim_budget_with_priors(&mut fixed, 64, &priors, |i| i as u64);
+                check(&fixed);
+                for mode in [cuteafd_core::DraftMode::Shared, cuteafd_core::DraftMode::Simple] {
+                    let mut policy = DraftPolicy::seeded(geometry(&homes(true), 288, 8, 64, 7, 0).unwrap(), seed()).unwrap();
+                    policy.set_draft_mode(mode);
+                    let candidates: Vec<_> = priors.iter().enumerate().map(|(i, prior)| Candidate {
+                        id: i as u64, prior, limit: if i == count - 1 { 0 } else { 64 - count },
+                        selector: true, cold: true }).collect();
+                    let selected = select_drafted(&mut policy, &candidates, 7, 64, count - 1);
+                    check(&selected.lengths);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn global_cap_removes_low_survival_tails_then_younger_requests() {
+        let mut lengths = [3, 3, 3];
+        let priors = [vec![0.99; 3], vec![0.1; 3], vec![0.99; 3]];
+        trim_budget_with_priors(&mut lengths, 9, &priors, |i| [10, 20, 30][i]);
+        assert_eq!(lengths, [3, 0, 3]);
+        let mut unknown = [7, 7, 7];
+        trim_budget_with_priors(&mut unknown, 10, &[] as &[&[f64]], |i| [30, 10, 20][i]);
+        assert_eq!(unknown, [0, 7, 0]);
     }
 
     #[test]
@@ -986,10 +1038,10 @@ mod tests {
         // Survival, not a fixed count: one probe draft for the hopeless block,
         // the confident one up to the cold drafts.
         assert_eq!((selection.lengths, selection.predicted), (vec![1, COLD_DRAFTS, 5], None));
-        // Eight rows: three anchors and five drafts, trimmed from the longest.
+        // Preserve the policy's asymmetric allocation, trimming only the cold floor.
         let tight = select(&mut policy, &candidates, 7, 8);
         assert_eq!(tight.lengths.iter().sum::<usize>() + 3, 8, "{:?}", tight.lengths);
-        assert!(tight.lengths.iter().max().unwrap() - tight.lengths.iter().min().unwrap() <= 1);
+        assert_eq!(tight.lengths, [1, 4, 0]);
     }
 
     /// #222: GLM 5.3's first long C1 decode spent up to 40 rounds before the

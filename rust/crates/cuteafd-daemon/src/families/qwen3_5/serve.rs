@@ -543,7 +543,19 @@ pub(crate) struct ServeArgs {
     pub api: crate::shared::api::ApiArgs,
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+fn resolve_draft_capacity(args: &mut ServeArgs) {
+    if args.draft.is_some() && !cuteafd_loader::formats::block_dspark::supports_sequences(args.max_sequences as usize) {
+        tracing::info!(concurrency = args.max_sequences,
+            "dense dSpark native sequence capacity exceeded; serving anchor-only");
+        args.draft = None;
+        args.draft_fixed = None;
+    }
+}
+
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("qwen3_5", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
+    resolve_draft_capacity(&mut args);
     use cuteafd_api::openai::{chat::qwen4::QwenEncoding, ModelEncoding, ModelProfile};
     use std::sync::{Arc, Mutex};
     let api = args.api.load()?;
@@ -558,7 +570,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
     let profile = ModelProfile::new(model, ModelEncoding::Qwen(encoding));
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu),
         "dense target currently admits GPU token embeddings only");
-    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(16);
+    let (queue, mut receive) = tokio::sync::mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
@@ -573,6 +585,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             library.cuda_set_device(engine_args.device)?;
             let programs = library.programs()?.with_manifest(&engine_args.manifest)?;
             let lanes = usize::from(engine_args.max_sequences);
+            let slots = cuteafd_core::concurrency::state_slots(lanes as u64) as usize;
             let reader = crate::shared::qwen::weights::WeightReader { library: &library, checkpoint: &checkpoint };
             let mtp_admission = (engine_args.mtp > 0).then(|| super::engine::mtp::Admission::new(
                 &reader, &header.config, &programs)).transpose()?;
@@ -584,7 +597,7 @@ pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
             ensure!(engine_args.draft_fixed.is_none() || engine_args.draft.is_some(), "--draft-fixed requires --draft");
             let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint,
                 header.config, engine_args.pool_tokens.filter(|&tokens| tokens > 0),
-                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), lanes,
+                draft_config.or_else(|| mtp_admission.as_ref().map(|admission| admission.bytes)), slots,
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache, engine_args.full_prefill_logits)?);
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
@@ -743,6 +756,18 @@ mod tests {
         backend.selector = RefCell::new(Some(crate::shared::token_io::TokenSelector::new(&library,
             crate::shared::token_io::SelectPlacement::Device, engine.borrow().cfg.vocab, 1)?));
         super::super::engine::prefix::check_backend_frontiers(&engine, &[1, 2, 3, 4], &backend, family, true)
+    }
+
+    #[test]
+    fn dense_dspark_capacity_falls_back_without_changing_target_concurrency() {
+        for c in [17, 32, 33, 64] {
+            let mut args = Cli::try_parse_from(["dense", "--snapshot", "checkpoint", "--native-lib", "native.so",
+                "--draft", "external", "--draft-fixed", "3", "--max-sequences", &c.to_string()]).unwrap().serve;
+            resolve_draft_capacity(&mut args);
+            assert_eq!(usize::from(args.max_sequences), c);
+            assert_eq!(args.draft.is_some(), c <= block_dspark::MAX_SEQUENCES);
+            assert_eq!(args.draft_fixed.is_some(), c <= block_dspark::MAX_SEQUENCES);
+        }
     }
 
     #[test]

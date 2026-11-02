@@ -80,13 +80,15 @@ fn prefix_score_path(position: usize, input_rows: usize) -> probe::ScorePath {
     if position > 0 && input_rows == 1 { probe::ScorePath::Decode } else { probe::ScorePath::Prefill }
 }
 
-pub(crate) async fn run_serve(args: ServeArgs) -> Result<()> {
+pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("deepseek_v4", args.engine.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.engine.max_sequences);
     let api = args.api.load()?;
     let profile = ModelProfile::new(
         args.model_id.clone().or_else(|| model_id(&args.engine.snapshot)).context("model id")?,
         ModelEncoding::DeepseekV4,
     );
-    let (queue, receive) = mpsc::channel::<NativeRequest>(16);
+    let (queue, receive) = mpsc::channel::<NativeRequest>(cuteafd_core::concurrency::queue_depth(args.engine.max_sequences as u64) as usize);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
@@ -744,7 +746,7 @@ fn schedule(
             anyhow::bail!("expert wire unavailable until restart: {reason}");
         }
         // Admit while sequence slots and decode rows remain.
-        while !states.is_empty() && active.len() + stalled.len() + prefills.len() < engine.decode_rows {
+        while !states.is_empty() && active.len() + stalled.len() + prefills.len() < engine.shape.sequences {
             let busy = !active.is_empty() || !stalled.is_empty() || !prefills.is_empty();
             let job = match kv_waiter.poll(cache.pool().admission_free(), cache.pool().release_epoch(), busy, |job| job.events.is_closed()) {
                 cuteafd_engine::prefix::AdmissionPoll::Blocked => break,
