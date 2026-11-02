@@ -217,6 +217,12 @@ impl Client {
         self.get("/v1/stats")
     }
 
+    /// The console owns V4.1's decode counters, including on older releases.
+    pub fn decode_counters(&self) -> Option<Value> {
+        let snapshot = self.get("/v1/console/snapshot").ok()?;
+        snapshot.get("g")?.get("totals").cloned()
+    }
+
     /// The server's report clock (`/v1/thermal` `now_s`): the query time a window is
     /// measured on. A GPU's sample time is `current.gpus[].sampled_s` and is not this
     /// mark. `None` when the server has no throttle report (older build, or no NVML).

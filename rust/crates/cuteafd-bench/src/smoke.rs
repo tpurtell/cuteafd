@@ -1004,11 +1004,11 @@ pub fn run(args: SmokeArgs) -> Result<()> {
     eprintln!("{} entries, {} to run, build {build}, up to {} at once", entries.len(), pending.len(), args.parallel);
     if args.dry_run {
         for e in &pending {
-            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_purge={} sweep_tokens={} sweep_prompts={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
+            eprintln!("  {} api_key_file={} family={} gpus={:?} sparks={:?} locks={:?} levels={:?} post_load_c1={} post_load_repeat={} prefill_lengths={:?} prefill_repeat={} prefill_purge={} sweep_tokens={} sweep_prompts={:?} sweep_c1_contexts={:?} baseline={} window={} lossless_set={} lossless_dump={:?} context_lengths={:?} context_levels={:?} context_suffix={} fabric={} worker_stop={} set={:?}",
                 e.name, e.set.get("API_KEY_FILE").map_or("-", String::as_str), e.family.as_deref().unwrap_or("?"), e.gpus, e.sparks, locks_for(e), e.levels,
                 e.post_load_c1.unwrap_or(false), e.post_load_repeat.unwrap_or(false), e.prefill_lengths,
                 e.prefill_repeat.unwrap_or(false), e.prefill_purge.is_some(),
-                e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.sweep_prompts.unwrap_or_default(), e.baseline.unwrap_or(true), e.window.is_some(),
+                e.sweep_tokens.unwrap_or(crate::sweep::TOKENS), e.sweep_prompts.unwrap_or_default(), e.sweep_c1_contexts, e.baseline.unwrap_or(true), e.window.is_some(),
                 e.lossless_set.as_deref().unwrap_or("default"), e.lossless_dump, e.context_lengths, e.context_levels, e.context_suffix.unwrap_or(0), e.fabric.unwrap_or(true),
                 WORKER_STOP, e.set);
         }

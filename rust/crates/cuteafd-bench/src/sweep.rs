@@ -203,9 +203,9 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
     let tables = mapped_counters(client);
-    let before = client.stats().ok();
+    let before = client.decode_counters();
     let (results, occupancy) = observed_wave(client, || batch(&prompts.timed));
-    let draft_counters = draft_delta(before.as_ref(), client.stats().ok().as_ref());
+    let draft_counters = draft_delta(before.as_ref(), client.decode_counters().as_ref());
     let results = uncached(results)?;
     let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
@@ -240,7 +240,7 @@ fn context_prompts(context: u64, style: usize) -> Prompts {
 
 fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
     let delta = |key: &str| {
-        after?["totals"][key].as_u64()?.checked_sub(before?["totals"][key].as_u64()?)
+        after?[key].as_u64()?.checked_sub(before?[key].as_u64()?)
     };
     let rounds = delta("verification_rounds")?;
     let drafted = delta("drafted_tokens")?;
@@ -430,8 +430,8 @@ mod tests {
         assert_ne!(a.warm, a.timed);
         assert!(a.timed[0].ends_with(CONTENT[1].1));
         assert!(context_prompts(0, 0).timed[0].ends_with(CONTENT[0].1));
-        let before = serde_json::json!({"totals":{"verification_rounds":10,"drafted_tokens":40,"accepted_drafts":20}});
-        let after = serde_json::json!({"totals":{"verification_rounds":14,"drafted_tokens":56,"accepted_drafts":30}});
+        let before = serde_json::json!({"verification_rounds":10,"drafted_tokens":40,"accepted_drafts":20});
+        let after = serde_json::json!({"verification_rounds":14,"drafted_tokens":56,"accepted_drafts":30});
         assert_eq!(draft_delta(Some(&before), Some(&after)).unwrap()["accepted_per_step"], 2.5);
         assert!(draft_delta(None, Some(&after)).is_none());
     }
