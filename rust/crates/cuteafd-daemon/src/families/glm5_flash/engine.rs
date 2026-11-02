@@ -4406,6 +4406,10 @@ impl<'a> GlmfEngine<'a> {
                 let input = cuteafd_ffi::CuteafdDeviceBuffer { ptr: x, bytes: logit_rows*h*2, ..w.x.buffer };
                 head.launch(weights, input, w.logits.buffer, logit_rows, self.stream)
             },
+            GlmfHead::RowFp8(owner) => {
+                // SAFETY: normalized rows and output logits are live on the owner's stream.
+                unsafe { owner.head_logits(x, w.logits.buffer.ptr.cast(), logit_rows, self.stream) }
+            },
             GlmfHead::Fp8 { .. } => self.timed("glmf_head_fp8", || {
                 // SAFETY: `x` holds `logit_rows` normalized rows and `w.logits` their
                 // FP32 logits (the workspace's logit capacity); the engine stream orders them.
@@ -4428,6 +4432,10 @@ impl<'a> GlmfEngine<'a> {
                 None => TargetHead::Launch(Box::new(|_, _, _, _| anyhow::bail!("K6 draft head runtime not bound"))),
             },
             GlmfHead::Bf16(head) => TargetHead::Bf16(head),
+            GlmfHead::RowFp8(owner) => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
+                // SAFETY: the drafter supplies live normalized rows/output on the target device.
+                unsafe { owner.head_logits(x, logits, rows, stream) }
+            })),
             fp8 @ GlmfHead::Fp8 { .. } => TargetHead::Launch(Box::new(move |x, logits, rows, stream| {
                 // SAFETY: the drafter passes its live normalized rows and logits
                 // workspace for `rows` rows, on the stream it launches the head on.

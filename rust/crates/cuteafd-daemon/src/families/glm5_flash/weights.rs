@@ -54,6 +54,8 @@ pub(crate) struct GlmfLayer<'a> {
     pub split: bool,
     pub attention_share: AttentionShare,
     pub(crate) core: std::collections::BTreeMap<String, crate::shared::dense_trellis::CoreWeights<'a>>,
+    pub(crate) native: HashMap<String, DeviceAllocation<'a>>,
+    pub(crate) native_projections: HashMap<&'static str, crate::shared::experts::exlr8::dense_weights::NativeProjection>,
     operands: HashMap<&'static str, DeviceAllocation<'a>>,
 }
 
@@ -83,6 +85,11 @@ impl GlmfLayer<'_> {
     pub fn bytes(&self) -> usize {
         self.operands.values().map(|a| a.buffer.bytes).sum::<usize>()
             + self.core.values().map(|w| w.payload.buffer.bytes + w.suh.buffer.bytes + w.svh.buffer.bytes).sum::<usize>()
+            + self.native.values().map(|w| w.buffer.bytes).sum::<usize>()
+    }
+
+    pub fn native(&self, key: &str) -> Result<CuteafdDeviceBuffer> {
+        Ok(self.native.get(key).with_context(|| format!("layer has no native operand {key}"))?.buffer)
     }
 }
 
@@ -123,12 +130,12 @@ impl GlmfWeights<'_> {
         for (index, layer) in self.layers.iter().enumerate().filter(|(_, l)| l.attention == GlmNextAttention::Kda) {
             let (bf16, fp8) = (layer.has("w_in") || layer.has("w_o"), layer.has("w_in_fp8") || layer.has("w_o_fp8"));
             ensure!(!(bf16 && fp8), "KDA layer {index} holds BF16 and FP8 in/out projections");
-            let native = layer.core.contains_key("self_attn.q_proj");
+            let native = layer.core.contains_key("self_attn.q_proj") || layer.native_projections.contains_key("q");
             ensure!(!native || !(bf16 || fp8), "KDA layer {index} has native and converted copies");
             ensure!(native || fp8 == (kda_fp8 != super::fp8::KdaFp8::Off),
                 "KDA layer {index}: --kda-fp8 {kda_fp8:?} but {} projections are resident", if fp8 { "FP8" } else { "BF16" });
         }
-        ensure!(matches!(self.head, super::head::GlmfHead::K6(_))
+        ensure!(matches!(self.head, super::head::GlmfHead::K6(_) | super::head::GlmfHead::RowFp8(_))
             || matches!(self.head, super::head::GlmfHead::Fp8 { .. }) == fp8_head,
             "--fp8-head {fp8_head} but the resident head is {}", self.head.name());
         Ok(self.residency())
@@ -777,7 +784,8 @@ impl<'a> GlmfLoader<'a> {
             ensure!(layouts.len() == expected, "native Flash requires complete attention and FFN operator groups");
             let core = layouts.into_iter().map(|(name, layout)| Ok((name, self.core_weights(layout, rank)?)))
                 .collect::<Result<_>>()?;
-            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands })
+            Ok(GlmfLayer { attention, dense, split: ranks == 2, attention_share, core, operands,
+                native: HashMap::new(), native_projections: HashMap::new() })
         }).collect()
     }
 
@@ -871,7 +879,7 @@ impl<'a> GlmfLoader<'a> {
             ops.insert("gate.bias", self.f32(&[format!("{p}.mlp.gate.e_score_correction_bias")])?);
         }
         Ok(GlmfLayer { attention, dense, split: false, attention_share: AttentionShare::Whole,
-            core: Default::default(), operands: ops })
+            core: Default::default(), operands: ops, native: HashMap::new(), native_projections: HashMap::new() })
     }
 
     /// GPUs of the head split this loader fills (1: no split).
@@ -1267,7 +1275,100 @@ impl<'a> GlmfLoader<'a> {
                 &[format!("{p}.mlp.gate.e_score_correction_bias")]))?);
         }
         Ok(ops.into_iter().zip(attention_shares).map(|(operands, attention_share)|
-            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), operands }).collect())
+            GlmfLayer { attention, dense, split: true, attention_share, core: Default::default(), operands,
+                native: HashMap::new(), native_projections: HashMap::new() }).collect())
+    }
+
+    /// EXLR8 operands follow the shared native records and the admitted layer owners.
+    /// Projection bytes stay native; only the original F32 convolution/mHC ABI widens BF16.
+    #[allow(clippy::type_complexity)]
+    pub fn native_model(&self, cfg: &GlmNextConfig, plan: &LayerExecutionPlan,
+        records: &[crate::shared::experts::exlr8::dense_weights::NativeDenseRecords],
+        vocabulary: std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>)
+        -> Result<(GlmfWeights<'a>, Vec<Vec<GlmfLayer<'a>>>)> {
+        use crate::shared::experts::exlr8::dense_weights::{self, PlainPack};
+        ensure!(records.len() == self.ranks() && !records.is_empty() && plan.modes().len() <= cfg.layers,
+            "native Flash records or layer plan extent");
+        for (rank, records) in records.iter().enumerate() {
+            ensure!(records.plan.rank == rank && records.plan.world == self.ranks()
+                && records.layers.len() == plan.modes().len(), "native Flash rank or layer admission mismatch");
+        }
+        ensure!(self.kda_nvfp4.is_none() && !self.kda_output_shard,
+            "native Flash does not convert checkpoint projections");
+        let timing = crate::shared::memory::load_timing::Split::start();
+        let mut shares: Vec<Vec<GlmfLayer<'a>>> = (0..self.ranks()).map(|_| Vec::new()).collect();
+        for (layer, &mode) in plan.modes().iter().enumerate() {
+            let attention = cfg.attention[layer];
+            let dense = cfg.dense[layer];
+            ensure!(attention == GlmNextAttention::Mla || self.ranks() == 1 || mode == LayerMode::HeadSplit,
+                "native KDA retains head ownership");
+            ensure!(self.ranks() == 1 || !matches!(mode, LayerMode::Whole { ffn: FfnMode::Owner, .. }),
+                "native Flash FFNs retain intermediate ownership");
+            let attention_shares = AttentionShare::bind(mode, self.ranks())?;
+            let p = format!("{PREFIX}layers.{layer}");
+            for (rank, (share, attention_share)) in shares.iter_mut().zip(attention_shares).enumerate() {
+                let source = records[rank].layers.get(layer).context("native Flash layer records")?;
+                ensure!(source.layer == layer, "native Flash layer record order");
+                let part = self.on_rank(rank, || -> Result<GlmfLayer<'a>> {
+                    let stream = if rank == 0 { self.stream } else { self.peers[rank-1].stream };
+                    let _format = cuteafd_ffi::memory_ledger::format("native");
+                    let packs = if attention == GlmNextAttention::Kda {
+                        vec![PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
+                            .map(|kind| format!("{p}.self_attn.{kind}_conv1d.weight")).collect() }]
+                    } else { vec![] };
+                    let mut native = dense_weights::load_layer_packed(self.library, &self.dense, source, &packs, stream)?;
+                    let mut operands = HashMap::new();
+                    let mut take = |key: &'static str, tensor: String| {
+                        if let Some(allocation) = native.remove(&tensor) { operands.insert(key, allocation); }
+                    };
+                    for (site, keys) in [("attn", ["attn.fn", "attn.scale", "attn.base"]),
+                        ("ffn", ["ffn.fn", "ffn.scale", "ffn.base"])] {
+                        for (key, suffix) in keys.into_iter().zip(["fn", "scale", "base"]) {
+                            take(key, format!("{p}.hc_{site}_{suffix}"));
+                        }
+                    }
+                    for (key, leaf) in [("input_norm", "input_layernorm.weight"),
+                        ("post_norm", "post_attention_layernorm.weight"), ("gate.bias", "mlp.gate.e_score_correction_bias"),
+                        ("a_log", "self_attn.A_log"), ("dt_bias", "self_attn.dt_bias"), ("o_norm", "self_attn.o_norm.weight"),
+                        ("q_a_norm", "self_attn.q_a_layernorm.weight"), ("kv_a_norm", "self_attn.kv_a_layernorm.weight"),
+                        ("k_norm_w", "self_attn.indexer.k_norm.weight"), ("k_norm_b", "self_attn.indexer.k_norm.bias"),
+                        ("ape", "self_attn.indexer.index_kpool_compress_ape"),
+                        ("index_gate", "self_attn.indexer.index_kpool_compress_gate")] {
+                        take(key, format!("{p}.{leaf}"));
+                    }
+                    for key in ["conv_w", "w_uk_fp8", "w_uk_scale", "w_uv_fp8", "w_uv_scale"] { take(key, key.into()); }
+                    take("gate", dense_weights::key("router", "bf16"));
+                    ensure!(["attn.fn", "attn.scale", "attn.base", "ffn.fn", "ffn.scale", "ffn.base", "input_norm", "post_norm"]
+                        .iter().all(|name| operands.contains_key(name)), "{p}: native Flash common operands");
+                    if !dense { ensure!(operands.contains_key("gate") && operands.contains_key("gate.bias"),
+                        "{p}: native Flash router operands"); }
+                    if attention == GlmNextAttention::Kda {
+                        ensure!(["conv_w", "a_log", "dt_bias", "o_norm"].iter().all(|name| operands.contains_key(name)),
+                            "{p}: native Flash recurrent operands");
+                    } else {
+                        let owns = !matches!(mode, LayerMode::Whole { gpu, .. } if self.ranks() == 2 && usize::from(gpu) != rank);
+                        ensure!(source.kv_b.is_some() == owns, "{p}: loaded MLA owner differs from execution plan");
+                    }
+                    Ok(GlmfLayer { attention, dense, split: self.ranks() == 2, attention_share, operands, native,
+                        native_projections: source.projections.iter().map(|(&name, (projection, _))| (name, projection.clone())).collect(),
+                        core: Default::default() })
+                })?;
+                share.push(part);
+            }
+        }
+        let norm = dense_weights::landed(self.library, &self.dense, &format!("{PREFIX}norm.weight"),
+            &records[0].norm, cuteafd_loader::plan::exlr8::dense::DenseTransform::Identity, self.stream)?;
+        for (rank, layers) in shares.iter().enumerate() {
+            let loaded = layers.iter().map(GlmfLayer::bytes).sum::<usize>()
+                + if rank == 0 { norm.buffer.bytes } else { 0 };
+            ensure!(loaded == records[rank].plan.resident_bytes,
+                "native Flash rank {rank}: loader bytes {loaded} differ from admitted {}", records[rank].plan.resident_bytes);
+        }
+        let mut shares = shares.into_iter();
+        let weights = GlmfWeights { layers: shares.next().context("native Flash rank0")?, norm,
+            head: super::head::GlmfHead::RowFp8(vocabulary) };
+        timing.log("glm5_flash native dense");
+        Ok((weights, shares.collect()))
     }
 
     /// The admitted layer plan: rank 0's weights (its

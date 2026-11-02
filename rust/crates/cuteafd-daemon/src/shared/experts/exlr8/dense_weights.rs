@@ -159,19 +159,52 @@ fn widen_steps(name: &str, component: &DenseComponent, device: i32, dst: Cuteafd
 
 /// Allocate only the admitted resident representation; source bytes are either
 /// landed unchanged or staged load-only for the existing lossless Widen job.
-fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, component: &DenseComponent,
+pub(crate) fn landed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, name: &str, component: &DenseComponent,
     transform: DenseTransform, stream: *mut std::ffi::c_void) -> Result<DeviceAllocation<'a>> {
-    let bytes = transform.resident_bytes(component)?;
     let allocation = DeviceAllocation::new(library, transform.allocation_bytes(component)?)?;
+    land_into(library, load, name, component, transform, allocation.buffer, stream)?;
+    Ok(allocation)
+}
+
+fn land_into(library: &NativeLibrary, load: &DenseLoad<'_>, name: &str, component: &DenseComponent,
+    transform: DenseTransform, destination: CuteafdDeviceBuffer, stream: *mut std::ffi::c_void) -> Result<()> {
+    let bytes = transform.resident_bytes(component)?;
+    ensure!(!destination.ptr.is_null() && destination.bytes >= bytes, "native landing destination extent");
     let device = library.cuda_get_device()?;
+    ensure!(destination.device_id == device, "native landing destination device");
     match transform {
-        DenseTransform::Identity => load.operand(Operand { device, buffer: allocation.buffer,
+        DenseTransform::Identity => load.operand(Operand { device, buffer: destination,
             lands: vec![(source_rect(name, component, transform)?, 0)], bytes })?,
         DenseTransform::WidenBf16 => {
-            for step in widen_steps(name, component, device, allocation.buffer)? { load.step(step, stream)?; }
+            for step in widen_steps(name, component, device, destination)? { load.step(step, stream)?; }
         }
     }
-    Ok(allocation)
+    Ok(())
+}
+
+/// Named plain records may land directly into one kernel's packed operand.
+/// Total allocator bytes must equal the original separately admitted records;
+/// logical bytes are contiguous and no unpacked resident copies are allocated.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PlainPack {
+    pub name: String,
+    pub components: Vec<String>,
+}
+
+fn packed_plain_layout(records: &LayerRecords, pack: &PlainPack) -> Result<(usize, Vec<usize>)> {
+    ensure!(!pack.name.is_empty() && !pack.components.is_empty(), "empty native plain pack");
+    let mut unique = HashSet::new();
+    let (mut logical, mut admitted) = (0usize, 0usize);
+    let mut offsets = Vec::new();
+    for name in &pack.components {
+        ensure!(unique.insert(name), "duplicate native plain pack component {name}");
+        let (component, transform) = records.plain.get(name).context("native plain pack component missing")?;
+        offsets.push(logical);
+        logical = logical.checked_add(transform.resident_bytes(component)?).context("native plain pack extent")?;
+        admitted = admitted.checked_add(transform.allocation_bytes(component)?).context("native plain pack admission")?;
+    }
+    ensure!(allocation(logical) == admitted, "native plain pack changes admitted allocation bytes");
+    Ok((admitted, offsets))
 }
 
 fn allocate_absorbed<T>(layout: &cuteafd_loader::plan::exlr8::dense::KvBLayout,
@@ -188,8 +221,20 @@ pub(crate) fn key(projection: &str, component: &str) -> String { format!("n.{pro
 /// [`key`]; `kv_b` split per head for heads `h0..h0 + heads` into the FP8
 /// programs' `w_uk_fp8`/`w_uk_scale`/`w_uv_fp8`/`w_uv_scale`.
 pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
-    stream: *mut std::ffi::c_void)
-    -> Result<HashMap<String, DeviceAllocation<'a>>> {
+    stream: *mut std::ffi::c_void) -> Result<HashMap<String, DeviceAllocation<'a>>> {
+    load_layer_packed(library, load, records, &[], stream)
+}
+
+pub(crate) fn load_layer_packed<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, records: &LayerRecords,
+    packs: &[PlainPack], stream: *mut std::ffi::c_void) -> Result<HashMap<String, DeviceAllocation<'a>>> {
+    let mut consumed = HashSet::new();
+    let mut outputs = HashSet::new();
+    let layouts = packs.iter().map(|pack| {
+        ensure!(outputs.insert(&pack.name) && !records.plain.contains_key(&pack.name)
+            && !pack.name.starts_with("n.") && !pack.name.starts_with("w_"), "native plain pack output collision");
+        for name in &pack.components { ensure!(consumed.insert(name.as_str()), "native plain record packed twice"); }
+        packed_plain_layout(records, pack)
+    }).collect::<Result<Vec<_>>>()?;
     let mut out = HashMap::new();
     for (stem, (projection, slice)) in &records.projections {
         ensure!(!matches!(projection.encoding, DenseEncoding::F32 | DenseEncoding::F16 | DenseEncoding::RowFp8),
@@ -200,7 +245,24 @@ pub(crate) fn load_layer<'a>(library: &'a NativeLibrary, load: &DenseLoad<'a>, r
         }
     }
     for (tensor, (component, transform)) in &records.plain {
-        out.insert(tensor.clone(), landed(library, load, tensor, component, *transform, stream)?);
+        if !consumed.contains(tensor.as_str()) {
+            out.insert(tensor.clone(), landed(library, load, tensor, component, *transform, stream)?);
+        }
+    }
+    for (pack, (bytes, offsets)) in packs.iter().zip(layouts) {
+        let allocation = DeviceAllocation::new(library, bytes)?;
+        for (name, offset) in pack.components.iter().zip(offsets) {
+            let (component, transform) = &records.plain[name];
+            let extent = transform.resident_bytes(component)?;
+            ensure!(offset.checked_add(extent).is_some_and(|end| end <= allocation.buffer.bytes),
+                "native packed component outside allocation");
+            let destination = CuteafdDeviceBuffer {
+                // SAFETY: checked disjoint component subrange in this live allocation.
+                ptr: unsafe { allocation.buffer.ptr.cast::<u8>().add(offset) }.cast(),
+                bytes: extent, ..allocation.buffer };
+            land_into(library, load, name, component, *transform, destination, stream)?;
+        }
+        out.insert(pack.name.clone(), allocation);
     }
     // kv_b: whole heads per step, staged rows and the whole grid.
     let Some((kv_b, layout)) = &records.kv_b else { return Ok(out) };
@@ -399,6 +461,42 @@ mod tests {
                 eprintln!("{family} TP{world} rank{rank}: resident={actual}, widened={widened}, load_host={}", loaded.plan.read_staging_bytes);
             } }
         }
+    }
+
+    #[test]
+    fn packed_plain_records_keep_logical_offsets_and_exact_admitted_bytes() {
+        let root = fixture("flash");
+        let config = configs()["flash"].clone();
+        let cfg = cuteafd_loader::families::glm5_flash::GlmNextConfig::from_hf(&config).unwrap();
+        for world in [1, 2] { for rank in 0..world {
+            let records = NativeDenseRecords::new(root.path(), cfg.layers, world, rank, &BTreeMap::new()).unwrap();
+            let layer = &records.layers[0];
+            let prefix = DenseSelection::from_hf(&config).unwrap().layer_prefix(0).unwrap();
+            let pack = PlainPack { name: "conv_w".into(), components: ["q", "k", "v"].iter()
+                .map(|kind| format!("{prefix}.self_attn.{kind}_conv1d.weight")).collect() };
+            let (bytes, offsets) = packed_plain_layout(layer, &pack).unwrap();
+            let component_bytes = cfg.kda_heads / world * cfg.kda_head_dim * 4 * 4;
+            assert_eq!(offsets, vec![0, component_bytes, 2 * component_bytes]);
+            assert_eq!(bytes, 3 * component_bytes);
+            assert_eq!(bytes, pack.components.iter().map(|name| {
+                let (component, transform) = &layer.plain[name];
+                assert_eq!(*transform, DenseTransform::WidenBf16);
+                transform.allocation_bytes(component).unwrap()
+            }).sum::<usize>());
+            let mut invalid = PlainPack { name: "conv_w".into(), components: pack.components.clone() };
+            invalid.components[1] = invalid.components[0].clone();
+            assert!(packed_plain_layout(layer, &invalid).is_err());
+            invalid.components[1] = "absent".into();
+            assert!(packed_plain_layout(layer, &invalid).is_err());
+            let mut small = LayerRecords { layer: 0, projections: HashMap::new(), kv_b: None, plain: HashMap::new() };
+            for name in ["a", "b"] {
+                let mut component = layer.plain[&pack.components[0]].0.clone();
+                component.shape = vec![1]; component.source.bytes = 2; component.window = None;
+                small.plain.insert(name.into(), (component, DenseTransform::Identity));
+            }
+            assert!(packed_plain_layout(&small, &PlainPack { name: "packed".into(), components: vec!["a".into(), "b".into()] }).is_err(),
+                "packing must not silently change per-record allocator padding");
+        } }
     }
 
     #[test]

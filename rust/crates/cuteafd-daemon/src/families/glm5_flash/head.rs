@@ -33,6 +33,8 @@ pub(crate) fn fp8_head_spans(rows: usize) -> impl Iterator<Item = (usize, usize)
 pub(crate) enum GlmfHead<'a> {
     K6(crate::shared::dense_trellis::CoreWeights<'a>),
     Bf16(DeviceAllocation<'a>),
+    /// Checkpoint row-FP8; the embedding and drafter retain this same owner.
+    RowFp8(std::rc::Rc<crate::shared::token_io::native::NativeVocabulary<'a>>),
     Fp8 { values: DeviceAllocation<'a>, scales: DeviceAllocation<'a> },
 }
 
@@ -41,6 +43,7 @@ impl<'a> GlmfHead<'a> {
         match self {
             Self::K6(weight) => vec![weight.payload.buffer, weight.suh.buffer, weight.svh.buffer],
             Self::Bf16(weight) => vec![weight.buffer],
+            Self::RowFp8(owner) => vec![owner.head.payload(), owner.head.scales()],
             Self::Fp8 { values, scales } => vec![values.buffer, scales.buffer],
         }
     }
@@ -53,6 +56,7 @@ impl<'a> GlmfHead<'a> {
         match self {
             Self::K6(_) => "K6",
             Self::Bf16(_) => "BF16",
+            Self::RowFp8(_) => "row-FP8",
             Self::Fp8 { .. } => "FP8",
         }
     }
@@ -61,7 +65,7 @@ impl<'a> GlmfHead<'a> {
     pub fn bf16(&self) -> Option<&DeviceAllocation<'a>> {
         match self {
             Self::Bf16(weight) => Some(weight),
-            Self::Fp8 { .. } | Self::K6(_) => None,
+            Self::Fp8 { .. } | Self::K6(_) | Self::RowFp8(_) => None,
         }
     }
 
