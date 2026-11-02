@@ -1058,10 +1058,12 @@ def main() -> None:
         else:
             cfg = GLM53_FLASH
             exlr8_work = exlr8_programs(role=args.exlr8_role, hidden=cfg.hidden,
-                units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts)
+                units=cfg.moe_inter // 128, top_k=cfg.top_k, experts=cfg.routed_experts,
+                swiglu_limit=cfg.swiglu_limit)
             family = "exlr8_glmf"
             geometry = {"hidden": cfg.hidden, "units": cfg.moe_inter // 128,
-                        "top_k": cfg.top_k, "experts": cfg.routed_experts}
+                        "top_k": cfg.top_k, "experts": cfg.routed_experts,
+                        "swiglu_limit": cfg.swiglu_limit}
         manifest["families"][family] = {**geometry, "role": args.exlr8_role,
                                        "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
         work += [(family, *item) for item in exlr8_work]
