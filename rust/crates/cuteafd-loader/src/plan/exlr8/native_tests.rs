@@ -51,7 +51,7 @@ fn published_flash_native_facts_match_resident_bridge_and_owned_mla() -> Result<
     let records = DenseRecord::inventory(&snapshot)?;
     let routed = cfg.dense.iter().enumerate().filter_map(|(layer, &dense)| (!dense).then_some(layer)).collect::<Vec<_>>();
     for ranks in [1, 2] {
-        let shared = super::shared_expert_resident(&metadata, &routed, ranks)?;
+        let shared = crate::plan::exlr8::shared_expert_resident(&metadata, &routed, ranks)?;
         let facts = DenseFacts::new(records.clone(), DenseSelection::from_hf(&config)?, cfg.layers, shared)?;
         let mut owners = BTreeMap::new();
         for owned in [false, true] {

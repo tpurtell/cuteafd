@@ -1,5 +1,6 @@
 //! GLM Flash plan adapter. All coordinator admission is the runtime's shared request.
 use super::*;
+use anyhow::Context;
 use crate::plan::spark_executions::SparkBackend;
 use crate::placement::{self, families::glm5_flash as glmf, Baseline, Onboard};
 use crate::families::glm5_flash::{GlmNextConfig, resident};
