@@ -150,6 +150,9 @@ if(context_split_aot STREQUAL "only")
   endif()
   list(JOIN context_geometries "," CUTEAFD_PROGRAM_GEOMETRY)
 endif()
+if(CUTEAFD_PROGRAM_GEOMETRY STREQUAL "")
+  message(FATAL_ERROR "Coordinator program geometry is empty; enable the required family AOT programs")
+endif()
 set(CUTEAFD_DSV4_EXPORT_ARGS --geometry "${CUTEAFD_PROGRAM_GEOMETRY}"
   --decode-rows "${CUTEAFD_DSV4_DECODE_ROWS}" --prefill-rows "${CUTEAFD_DSV4_PREFILL_ROWS}"
   --glmf-wide-decode-rows "${CUTEAFD_GLMF_WIDE_DECODE_ROWS}"

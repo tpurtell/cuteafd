@@ -38,7 +38,8 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
     let (h, vocab, stored) = (cfg.hidden, cfg.vocab_size, weights.shape[0]);
     let device = rank.device_with(cfg, stream, lane);
     let count = rows.len();
-    ensure!(count > 0 && rows.end <= lane.rows, "Muse head rows {rows:?} outside the step");
+    ensure!(count > 0 && count <= HEAD_ROWS && rows.end <= lane.rows,
+        "Muse head rows {rows:?} outside the step or its {HEAD_ROWS}-row capacity");
     let hidden = view(lane.plane("hidden")?, rows.start * h * 2, count * h * 2);
     let normed = view(lane.plane("normed")?, rows.start * h * 2, count * h * 2);
     // SAFETY: lane planes and the final norm weight are live on this device, ordered on `stream`.
@@ -48,10 +49,9 @@ pub(crate) fn head(cfg: &MuseSparkConfig, rank: &RankResources<'_>, lane: &super
     }
     // One launch scores at most HEAD_ROWS rows (the head program's capacity and its
     // planes); the backend scores wider steps in calls of at most that many.
-    ensure!(count <= HEAD_ROWS, "Muse head scores at most {HEAD_ROWS} rows per call, not {count}");
     let staged = Buffer { bytes: count * stored * 4, ..stored_plane.buffer };
     let trimmed = Buffer { bytes: count * vocab * 4, ..trimmed.buffer };
-    rank.core.local(count, normed, weights, staged, stream)?;
+    rank.core.head_f32(count, normed, weights, staged, stream)?;
     // SAFETY: both planes are this device's, distinct, and ordered on `stream`.
     unsafe { rank.device.library.copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4, vocab * 4, count, stream)?; }
     // The softcap reads the trimmed rows and writes the logits contiguously into the stored plane.
@@ -124,7 +124,7 @@ mod tests {
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
         assert!(step.contains("if index == 0 { experts.as_deref_mut() } else { None }"));
         let head = source.split("pub(crate) fn head(").nth(1).unwrap().split("pub(crate) fn step(").next().unwrap();
-        let order = ["\"final_norm\"", "rank.core.local(", "copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4",
+        let order = ["\"final_norm\"", "rank.core.head_f32(", "copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4",
             "\"softcap\""];
         let at: Vec<usize> = order.iter().map(|needle| head.find(needle).unwrap()).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");

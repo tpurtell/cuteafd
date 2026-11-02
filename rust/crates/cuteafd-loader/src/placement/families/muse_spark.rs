@@ -58,6 +58,7 @@ pub struct MuseInputs<'a> {
     pub gpus: Vec<GpuBudget>,
     pub spark_ranks: usize,
     pub prefill: PrefillPlan,
+    pub full_prefill_logits: bool,
     /// Active sequence slots (each owns its sliding rings).
     pub slots: u64,
     /// Device mark slots from the shared prefix-mark rule (`mark_slots_with_host`):
@@ -86,6 +87,8 @@ pub struct MuseInputs<'a> {
 /// The request plus what the caller reports or uploads from it.
 pub struct MuseRequest {
     pub request: PlacementRequest,
+    /// Optional head-rank scoring output, charged before pool/onboarding admission.
+    pub prefill_logits_bytes: usize,
     /// The coordinator package state the request was built with.
     pub local: LocalPackage,
     /// The drafter the request charged on the head GPU.
@@ -121,7 +124,7 @@ pub fn mark_bytes(cfg: &MuseSparkConfig, ranks: usize) -> u64 {
 pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
     let MuseInputs { cfg, core, catalog, gpus, spark_ranks, prefill, slots, mark_slots, context, automatic_context,
         requested_pool, onboard, spark_budget_bytes, partial_bf16_max_rows, partial_wide_format, local,
-        drafter, fixed: runtime_fixed, startup } = inputs;
+        drafter, full_prefill_logits, fixed: runtime_fixed, startup } = inputs;
     let ranks = gpus.len();
     let (executor, modes) = executor(ranks)?;
     // Onboarding always enters the solve: a missing package never turns an
@@ -215,6 +218,13 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         global.head.as_ref().map_or(cfg.vocab_size, |head| head.shape[0]), cfg.vocab_size)?;
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Workspace, "Muse head logits",
         (stored + trimmed) as u64, Basis::Exact));
+    let prefill_logits_bytes = if full_prefill_logits {
+        crate::families::muse_spark::lane::prefill_logits_bytes(usize::try_from(prefill.span_rows)?, cfg.vocab_size)?
+    } else { 0 };
+    if prefill_logits_bytes > 0 {
+        fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Workspace, "Muse prefill logits",
+            prefill_logits_bytes as u64, Basis::Exact));
+    }
     fixed.push(Demand::new(u8::try_from(ranks - 1)?, Category::Weights, "lm head (K6)", global.head_bytes() as u64,
         Basis::Exact));
     // Spark partial replies land on the coordinator: per wave slot, every rank's
@@ -286,7 +296,7 @@ pub fn request(inputs: MuseInputs<'_>) -> Result<MuseRequest> {
         executor,
     };
     spark_budget.constrain(&mut request)?;
-    Ok(MuseRequest { request, local, drafter, spark_budget, layouts, global, projections })
+    Ok(MuseRequest { request, prefill_logits_bytes, local, drafter, spark_budget, layouts, global, projections })
 }
 
 /// The step metadata a rank allocates: a bank per in-flight prefill slot and a

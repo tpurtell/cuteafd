@@ -113,7 +113,7 @@ impl<'a> MuseDraft<'a> {
             let out = Buffer { ptr: logits.cast(), bytes: rows * vocab * 4, device_id: device, flags: 0 };
             // The target head path (`forward::head` after its final norm, which the
             // drafter's own final norm replaces): K6 head, trim, softcap.
-            head.core.local(rows, input, weights, staged, stream)?;
+            head.core.head_f32(rows, input, weights, staged, stream)?;
             // SAFETY: the drafter's own planes, distinct, ordered on its stream.
             unsafe {
                 library.copy_d2d_2d_async(trimmed, vocab * 4, staged, stored * 4, vocab * 4, rows, stream)?;
@@ -134,7 +134,7 @@ mod tests {
     fn drafter_reads_the_target_head_and_table_on_its_stream() {
         let source = include_str!("draft.rs").split("#[cfg(test)]").next().unwrap();
         let draft = source.split("pub(crate) fn draft(").nth(1).unwrap();
-        let order = ["head.core.local(rows, input, weights, staged, stream)", "copy_d2d_2d_async(trimmed, vocab * 4, staged",
+        let order = ["head.core.head_f32(rows, input, weights, staged, stream)", "copy_d2d_2d_async(trimmed, vocab * 4, staged",
             "programs.launch(\"softcap\", &[trimmed, out]"];
         let at: Vec<usize> = order.iter().map(|needle| draft.find(needle).unwrap()).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");

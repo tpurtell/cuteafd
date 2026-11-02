@@ -840,11 +840,29 @@ def test_fixture_and_spark_argument_refusals(env, capsys, extra, match):
     assert not runs(env)
 
 
-def test_raw_family_requires_raw_mode(env, capsys):
+@pytest.mark.parametrize('family', ['kimi', 'muse'])
+def test_raw_family_requires_raw_mode(env, capsys, family):
     write_slot(env['home'], 'i1')
-    argv = ['--task', 'gr', '--family', 'kimi', '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
+    argv = ['--task', 'gr', '--family', family, '--model', 'org/model', '--arm', 'a=i1:s1', '--', '--x']
     assert golden.main(argv) == 2
     assert 'has no golden subcommand' in capsys.readouterr().err
+
+
+def test_muse_command_runs_from_sealed_slot_without_sparks(env):
+    write_slot(env['home'], 'i1')
+    command = ['python3', '-m', 'pytest', '-q',
+               'python/tests/test_dense_trellis_k6_exports.py::test_muse_f32_head_chunk_row_invariance']
+    argv = ['--task', 'gr', '--family', 'muse', '--model', 'org/model', '--arm', 'a=i1:s1',
+            '--gpus', '0', '--command', '--env', 'CUTEAFD_MUSE_HEAD_GPU_TEST=1', '--', *command]
+    assert golden.main(argv) == 0
+    call = runs(env)[0]
+    assert call[-len(command):] == command
+    assert call[call.index('-w') + 1] == '/workspace/cuteafd'
+    assert '--network' not in call
+    assert any('/coordinator/workspace:/workspace/cuteafd:ro' in arg for arg in call)
+    record = json.loads((env['home'] / '.cache/cuteafd/builds/gr/golden/a/r1/argv.json').read_text())
+    assert record['mode'] == 'command' and record['gpus'] == [0]
+    assert record['arm_env']['CUTEAFD_MUSE_HEAD_GPU_TEST'] == '1'
 
 
 def test_dense_native_test_without_sparks(env, monkeypatch):

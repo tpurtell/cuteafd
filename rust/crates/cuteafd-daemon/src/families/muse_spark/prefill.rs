@@ -8,8 +8,8 @@
 //! Hooks: `begin_unit` uploads the unit's metadata into its slot bank and
 //! embeds its tokens; `attention` + `send_experts` are the layer's front half
 //! (`RankDevice::layer_front`, the Spark send on rank 0); `land_experts` is the
-//! back half; `end_unit` scores the call's last row on the head rank when the
-//! unit holds it; `commit_unit` has nothing to publish (K|V records and ring
+//! back half; `end_unit` scores the requested suffix on the head rank before
+//! its unit slot is reused; `commit_unit` has nothing to publish (K|V records and ring
 //! rows were written by the layers; the caller commits the frontier).
 //! Onboarded layers (RTX experts, `FfnRoute::Local`) run whole in `local_ffn`.
 use super::{device::{PeerExchange, StepPlanes}, engine::RankResources, experts::{SparkExperts, Wave, WaveSegment, WaveStep},
@@ -29,6 +29,19 @@ pub(crate) struct PrefillCall<'c> {
     pub pages: &'c [u32],
     pub ring_rows: usize,
     pub slots: usize,
+    pub logit_rows: usize,
+}
+
+/// Head microbatches within a unit, paired with their output-suffix row offset.
+fn score_chunks(total: usize, requested: usize, unit: std::ops::Range<usize>)
+    -> Result<Vec<(std::ops::Range<usize>, usize)>> {
+    ensure!(requested <= total && unit.start <= unit.end && unit.end <= total, "Muse prefill score range");
+    let first = total - requested;
+    let from = unit.start.max(first);
+    Ok((from..unit.end).step_by(cuteafd_loader::families::muse_spark::lane::HEAD_ROWS).map(|start| {
+        let end = (start + cuteafd_loader::families::muse_spark::lane::HEAD_ROWS).min(unit.end);
+        (start - unit.start..end - unit.start, start - first)
+    }).collect())
 }
 
 /// A unit's per-rank state between hooks.
@@ -47,7 +60,7 @@ pub(crate) struct MusePrefill<'h, 'r, 'a> {
     /// The drafter: units in the call's final `TAP_ROWS` rows tap their rows there.
     pub draft: Option<&'h super::draft::MuseDraft<'a>>,
     units: Vec<Option<UnitState>>,
-    /// The call's last row's logits (set by the unit holding it).
+    /// Contiguous requested logits, retained by the head rank (not a unit slot).
     pub logits: Option<Buffer>,
 }
 
@@ -181,12 +194,28 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
     }
 
     fn end_unit(&mut self, unit: &Unit) -> Result<()> {
-        if unit.rows.end != self.call.tokens.len() { return Ok(()); }
+        let chunks = score_chunks(self.call.tokens.len(), self.call.logit_rows, unit.rows.clone())?;
+        if chunks.is_empty() { return Ok(()); }
         let last = self.ranks.len() - 1;
         let state = self.units[unit.index].as_ref().context("Muse prefill unit not begun")?;
-        let rows = unit.rows.len();
         let (rank, lane, stream) = (&self.ranks[last], &state.lanes[last], self.streams[last]);
-        self.logits = Some(rank.device.run(|| super::forward::head(self.cfg, rank, lane, rows - 1..rows, stream))?);
+        for (rows, offset) in chunks {
+            let logits = rank.device.run(|| super::forward::head(self.cfg, rank, lane, rows, stream))?;
+            if self.call.logit_rows == 1 {
+                self.logits = Some(logits);
+            } else {
+                let output = rank.prefill_logits.as_ref().context("Muse prefill logits not admitted")?.buffer;
+                let at = offset * self.cfg.vocab_size * 4;
+                ensure!(at <= output.bytes && logits.bytes <= output.bytes - at, "Muse prefill logits output range");
+                let target = Buffer { ptr: output.ptr.cast::<u8>().wrapping_add(at).cast(), bytes: logits.bytes, ..output };
+                rank.device.run(|| {
+                    // SAFETY: both allocations outlive the call; the head, copy and next scratch reuse
+                    // are ordered on the head stream, before this unit's lane slot can be reused.
+                    unsafe { rank.device.library.copy_d2d_async(target, logits, logits.bytes, stream) }
+                })?;
+                self.logits = Some(Buffer { bytes: self.call.logit_rows * self.cfg.vocab_size * 4, ..output });
+            }
+        }
         Ok(())
     }
 
@@ -199,6 +228,36 @@ impl PrefillHooks for MusePrefill<'_, '_, '_> {
 #[cfg(test)]
 mod tests {
     use crate::shared::prefill_pipeline::{prefill_schedule, sequence_units, FfnRoute, Step};
+
+    #[test]
+    fn scored_suffix_tiles_units_and_head_microbatches() -> anyhow::Result<()> {
+        use cuteafd_loader::families::muse_spark::lane::HEAD_ROWS;
+        for total in [1usize, 63, 64, 65, 700, 2752, 8256, 8257] {
+            for unit in [64usize, 1024, 2752, 4096] {
+                for requested in [0, 1, total / 2, total] {
+                    let mut covered = vec![0u8; requested];
+                    let mut starts: Vec<_> = (0..total).step_by(unit).collect();
+                    starts.reverse(); // Completion order cannot affect the output row offsets.
+                    for start in starts {
+                        let rows = start..(start + unit).min(total);
+                        for (chunk, offset) in super::score_chunks(total, requested, rows.clone())? {
+                            assert!(!chunk.is_empty() && chunk.len() <= HEAD_ROWS && chunk.end <= rows.len());
+                            assert_eq!(start + chunk.start, total - requested + offset);
+                            for row in &mut covered[offset..offset + chunk.len()] { *row += 1; }
+                        }
+                    }
+                    assert!(covered.iter().all(|&n| n == 1), "total {total}, unit {unit}, requested {requested}");
+                }
+            }
+        }
+        assert!(super::score_chunks(64, 65, 0..64).is_err());
+        assert!(super::score_chunks(64, 64, 0..65).is_err());
+        let source = include_str!("prefill.rs").split("#[cfg(test)]").next().unwrap();
+        let end = source.split("fn end_unit(").nth(1).unwrap().split("fn commit_unit(").next().unwrap();
+        assert!(end.find("super::forward::head(").unwrap() < end.find("copy_d2d_async(").unwrap());
+        assert!(end.contains("rank.prefill_logits.as_ref()"));
+        Ok(())
+    }
 
     /// The hooks run a layer's whole front half in `send_experts`: correct only
     /// if the shared schedule always follows a unit's attention step with that

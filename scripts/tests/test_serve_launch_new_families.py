@@ -495,6 +495,14 @@ def test_muse_dispatches_to_serve_muse_with_its_own_defaults(tmp_path: Path) -> 
     assert lines[probe].endswith("serve-muse --help ")
 
 
+@pytest.mark.parametrize("setting", ["", "off", "on"])
+def test_muse_prefill_scoring_is_launch_admitted(tmp_path: Path, setting: str) -> None:
+    result = _muse(tmp_path, f"FULL_PREFILL_LOGITS={setting}\n" if setting else "")
+    serve, plan = _line(result, "cuteafd serve-muse --snapshot"), _line(result, "cuteafd plan")
+    assert serve.split().count("--full-prefill-logits") == int(setting == "on")
+    assert plan.split().count("--full-prefill-logits") == int(setting == "on")
+
+
 def test_muse_forwards_typed_keys_when_set(tmp_path: Path) -> None:
     result = _muse(tmp_path, "RTX_EXPERT_LAYERS=3\nPOOL_TOKENS=1048576\nMAX_CONTEXT_TOKENS=262144\n"
                              "CONCURRENCY=8\nEXPERT_PARTIAL_BF16_MAX_ROWS=128\nEXPERT_PARTIAL_WIDE_FORMAT=fp8\n"

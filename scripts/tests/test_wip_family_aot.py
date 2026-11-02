@@ -2,6 +2,7 @@
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -162,6 +163,44 @@ def test_missing_metadata_fails_closed_unless_family_is_explicit(tmp_path, monke
     assert aot.config_family(dict(MODEL_ID='test/unavailable', FAMILY='glm5')) == 'glm5'
     with pytest.raises(ValueError, match='no WIP AOT scope mapping for unknown'):
         aot.config_family(dict(FAMILY='unknown'))
+
+
+def test_every_build_aot_switch_is_forwarded_to_coordinator_container():
+    build = (ROOT / 'scripts/build/build-wip-artifacts.sh').read_text()
+    required = set(re.findall(r'CUTEAFD_WIP_[A-Z0-9_]+_AOT\b', build))
+    wip = (ROOT / 'wip.sh').read_text()
+    command = wip.split('local -a coordinator_build=(docker exec', 1)[1].split(
+        '"$coordinator_container"', 1)[0]
+    # EXLR8 is passed via an optional -e array; inspect its definition too.
+    for array in set(re.findall(r'\$\{([a-z0-9_]+)\[@\]', command)):
+        command += '\n' + '\n'.join(re.findall(r'\b' + array + r'=\([^\n]*', wip))
+    forwarded = set(re.findall(r'-e\s+[\"\']?(CUTEAFD_WIP_[A-Z0-9_]+_AOT)=', command))
+    assert required and required <= forwarded, sorted(required - forwarded)
+
+
+@pytest.mark.parametrize('mode', ['empty', 'muse', 'spark-partial'])
+def test_program_geometry_is_validated_at_configure_time(tmp_path, mode):
+    cmake = ROOT / 'native/cmake/shared/dsv4_programs.cmake'
+    (tmp_path / 'CMakeLists.txt').write_text('\n'.join([
+        'cmake_minimum_required(VERSION 3.18)', 'project(muse_scope NONE)',
+        f'set(CUTEAFD_CUDA_ARCHITECTURES {121 if mode == "spark-partial" else 120})',
+        'set(CUTEAFD_CONTEXT_SPLIT_AOT OFF)',
+        f'set(CUTEAFD_ENABLE_MUSE_AOT {"ON" if mode == "muse" else "OFF"})',
+        'set(CUTEAFD_PARTIAL_REPLY_PROGRAMS ON)',
+        'add_custom_target(cuteafd_verify_sparkinfer_source)', f'include("{cmake}")',
+        'file(WRITE "${CMAKE_BINARY_DIR}/geometry.txt" "${CUTEAFD_PROGRAM_GEOMETRY}")',
+    ]))
+    build = tmp_path / 'build'
+    result = subprocess.run(['cmake', '-S', str(tmp_path), '-B', str(build)],
+                            capture_output=True, text=True, timeout=30)
+    if mode == 'empty':
+        assert result.returncode != 0
+        assert 'Coordinator program geometry is empty' in result.stdout + result.stderr
+        assert not (build / 'geometry.txt').exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        expected = 'muse,muse2,expert_partial,dense_trellis_k6' if mode == 'muse' else 'expert_partial'
+        assert (build / 'geometry.txt').read_text() == expected
 
 
 def test_seal_guard_is_forwarded_after_native_build():

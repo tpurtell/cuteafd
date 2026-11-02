@@ -272,3 +272,64 @@ def test_muse_geometries_dtypes_and_existing_family_order(monkeypatch):
         combined = module["programs"](families=(family, "muse"), input_dtype="bf16")
         assert [item[:3] for item in combined[:len(baseline)]] == [item[:3] for item in baseline]
         assert len({item[0] for item in combined}) == len(combined)
+
+
+@pytest.mark.skipif(os.environ.get("CUTEAFD_MUSE_HEAD_GPU_TEST") != "1",
+                    reason="opt-in SM120 Muse head byte-invariance gate")
+def test_muse_f32_head_chunk_row_invariance():
+    """Real Muse geometry: the complete target/drafter head, not a mock GEMM."""
+    import torch
+    from b12x.integration.cuteafd.muse import compile_softcap_aot
+    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_transform import (
+        compile_trellis_input_aot, compile_trellis_output_aot,
+    )
+
+    assert torch.cuda.get_device_capability() == (12, 0), "Muse coordinator head needs SM120"
+    k, stored, vocab, capacity = 8192, 202112, 202048, 64
+    torch.manual_seed(923)
+    x = (torch.randn((128, k), device="cuda") * .03).bfloat16()
+    suh = (torch.randn(k, device="cuda") * .2).half()
+    svh = (torch.randn(stored, device="cuda") * .2).half()
+    payload = torch.randint(0, 256, (k * stored * 6 // 8,), dtype=torch.uint8, device="cuda")
+    rotated = torch.empty((capacity, k), dtype=torch.bfloat16, device="cuda")
+    pointers = torch.tensor([rotated.data_ptr()], dtype=torch.int64, device="cuda")
+    scales = torch.empty(k // 128, dtype=torch.float16, device="cuda")
+    partial = torch.empty((capacity, k // 1024, stored), device="cuda")
+    acc = torch.empty((capacity, stored), device="cuda")
+    staged = torch.empty_like(acc)
+    trimmed = torch.empty((capacity, vocab), device="cuda")
+    result = torch.empty((128, vocab), device="cuda")
+    # Production packages have wide capacity; live head scratch remains 64 rows.
+    inp = compile_trellis_input_aot(features=k, input_dtype="bf16", output_dtype="bf16", max_rows=4096)
+    core = compile_trellis_linear_aot(input_features=k, output_features=stored, bits=6,
+        codebook="mcg", sharded_side=1, rotation_count=1, input_dtype="bf16", max_rows=4096)
+    out = compile_trellis_output_aot(features=stored, output_dtype="f32", max_rows=4096)
+    softcap = compile_softcap_aot(vocab=vocab)
+    ctas = torch.cuda.get_device_properties(0).multi_processor_count * 4
+
+    def project(first, live):
+        inp.launch(x[first:first + live], suh, rotated, scales, scalars=(live, ctas))
+        core.launch(pointers, payload, scales, partial.flatten(), acc.flatten(), scalars=(live, 0, ctas))
+        out.launch(acc, svh, staged, scalars=(live, ctas))
+
+    # Retain pre-softcap F32 bytes too: softcap BF16 rounding must not hide drift.
+    expected = torch.empty((128, stored), dtype=torch.float32, device="cpu")
+    for first in (0, 64):
+        project(first, capacity)
+        expected[first:first + capacity].copy_(staged.cpu())
+        trimmed.copy_(staged[:, :vocab])
+        softcap.launch(trimmed, result[first:first + capacity], scalars=(capacity,))
+    assert torch.isfinite(expected).all()
+    expected_softcap = result.cpu()
+    for chunk in (1, 16, 64):
+        for first in range(0, 128, chunk):
+            project(first, chunk)
+            actual = staged[:chunk].cpu()
+            assert torch.equal(actual.view(torch.int32), expected[first:first + chunk].view(torch.int32)), (
+                f"Muse F32 head depends on chunk rows={chunk}, first={first}")
+            trimmed[:chunk].copy_(staged[:chunk, :vocab])
+            softcap.launch(trimmed, result[first:first + chunk], scalars=(chunk,))
+        assert torch.equal(result.cpu().view(torch.int32), expected_softcap.view(torch.int32)), (
+            f"Muse trimmed/softcapped head depends on chunk rows={chunk}")
+        print(f"Muse head byte-invariant: chunk={chunk}, rows=128, second_chunk=64", flush=True)

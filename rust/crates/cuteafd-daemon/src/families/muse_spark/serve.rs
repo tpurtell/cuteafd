@@ -46,6 +46,8 @@ pub(crate) struct ServeArgs {
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     /// Prefill unit rows, at most 4096; unset follows the shared wave policy.
     #[arg(long)] pub prefill_rows: Option<usize>,
+    /// Admit all-row prefill logits for fidelity scoring before KV sizing.
+    #[arg(long)] pub full_prefill_logits: bool,
     /// Prefill units in flight on the one Spark transport; unset follows the shared policy.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=4))]
     pub prefill_waves: Option<u8>,
@@ -132,7 +134,7 @@ fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend::MuseBacke
         measured: inventory.gpus.iter().map(|sample| startup::Measured { total_bytes: sample.total_bytes,
             free_bytes: sample.free_bytes, untracked_bytes: sample.context_bytes }).collect(),
         headroom_bytes: 2 << 30, spark_ranks: args.peers.len(), prefill: args.prefill()?,
-        slots: u64::from(args.max_sequences),
+        full_prefill_logits: args.full_prefill_logits, slots: u64::from(args.max_sequences),
         mark_slots: args.prefix.mark_rule(usize::from(args.max_sequences))
             .slots(cuteafd_loader::placement::families::muse_spark::mark_bytes(&cfg, 1) as usize) as u64,
         max_context: args.max_context,
