@@ -211,23 +211,30 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
     let thermal = client.thermal_since(mark);
     let errors = results.iter().filter(|r| r.is_err()).count();
+    let requests = request_timings(&results, &prompts.timed);
     let ok: Vec<Timed> = results.into_iter().filter_map(Result::ok).collect();
     if ok.is_empty() {
         bail!("C{c} {phase}: every request failed");
     }
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
-    use sha2::{Digest, Sha256};
-    let requests = ok.iter().zip(&prompts.timed).map(|(r, prompt)| RequestTiming { sent_s: r.sent, ttft_s: r.chat.timing.ttft_s,
-        first_s: r.first(), last_s: r.last(), completion_tokens: r.chat.timing.completion_tokens,
-        cached_tokens: r.chat.timing.cached_tokens, prompt_tokens: r.chat.timing.prompt_tokens,
-        prompt_sha256: format!("{:x}", Sha256::digest(prompt.as_bytes())) }).collect();
     ttft.sort_by(f64::total_cmp);
     let ttft_p95_s = ttft[(ttft.len() * 95).div_ceil(100).saturating_sub(1)];
     let point = Point { c, phase: phase.into(), context: context_style.map(|(n, _)| n),
         style: context_style.map(|(_, style)| CONTENT[style].0.into()), draft_counters, aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
         ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, prompts: set, ttft_p95_s, requests, occupancy };
     Ok((point, prompts))
+}
+
+fn request_timings(results: &[Result<Timed>], prompts: &[String]) -> Vec<RequestTiming> {
+    use sha2::{Digest, Sha256};
+    results.iter().zip(prompts).filter_map(|(result, prompt)| {
+        let r = result.as_ref().ok()?;
+        Some(RequestTiming { sent_s: r.sent, ttft_s: r.chat.timing.ttft_s,
+            first_s: r.first(), last_s: r.last(), completion_tokens: r.chat.timing.completion_tokens,
+            cached_tokens: r.chat.timing.cached_tokens, prompt_tokens: r.chat.timing.prompt_tokens,
+            prompt_sha256: format!("{:x}", Sha256::digest(prompt.as_bytes())) })
+    }).collect()
 }
 
 /// Fixed corpus reference lengths, not a per-server fit: all release arms send
@@ -482,6 +489,23 @@ mod tests {
         }
         assert_eq!(serde_json::from_str::<PromptSet>(r#""shared""#).unwrap(), PromptSet::Shared);
         assert!(serde_json::from_str::<PromptSet>(r#""unknown""#).is_err());
+    }
+
+    #[test]
+    fn failed_requests_do_not_shift_successful_prompt_hashes() {
+        use sha2::{Digest, Sha256};
+        let results = vec![Err(anyhow::anyhow!("refused")), Ok(Timed {
+            chat: crate::client::Chat { timing: crate::report::StreamTiming {
+                prompt_tokens: 17, completion_tokens: 4, ttft_s: 0.5, decode_s: 1.0,
+                ..Default::default() }, ..Default::default() }, sent: 0.25,
+        }), Err(anyhow::anyhow!("cancelled"))];
+        let prompts = vec!["first".into(), "second".into(), "third".into()];
+        let timings = request_timings(&results, &prompts);
+        assert_eq!(timings.len(), 1);
+        assert_eq!(timings[0].prompt_sha256, format!("{:x}", Sha256::digest(b"second")));
+        assert_eq!(timings[0].prompt_tokens, 17);
+        assert_eq!(timings[0].first_s, 0.75);
+        assert_eq!(timings[0].last_s, 1.75);
     }
 
     #[test]
