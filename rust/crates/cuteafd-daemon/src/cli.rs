@@ -729,8 +729,8 @@ mod tests {
         assert_eq!(args.mapped_scale_preload_gib, 0.0);
     }
 
-    /// LD-01: the loop-abort run defaults to 512 (ON by default on Jonathan's
-    /// direction; the upstream-sync divergence is recorded in the slice RESULT).
+    /// LD-01: the loop-abort run defaults to 512 (ON by default; the
+    /// upstream-sync divergence is recorded in the slice RESULT).
     #[test]
     fn loop_abort_run_defaults_to_512() {
         use clap::Parser;

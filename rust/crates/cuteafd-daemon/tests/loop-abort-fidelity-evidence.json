@@ -48,7 +48,7 @@
     }
   },
   "long_generation_control": {
-    "corpus": "replica-d opencode assistant steps since 2026-10-22 22:00Z (providerID=llmgw, modelID in thinker,dsv41)",
+    "corpus": "production gateway assistant steps since 2026-10-22 22:00Z (providerID=<gateway>, modelID in <served aliases>)",
     "measured": "2026-11-01",
     "messages": 38465,
     "steps": 38350,

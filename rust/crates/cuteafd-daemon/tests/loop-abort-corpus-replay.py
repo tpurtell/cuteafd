@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Replay the shipped loop detector (rules R and F) over the local opencode
-corpus: every assistant step replica-d served since 2026-10-22 22:00Z.
+corpus: every assistant step the production replica served since 2026-10-22 22:00Z.
 
 This is the long-generation control the review asked for: the fidelity windows
 are capped at 1,024 generated tokens, so rule R can only fire on periods <= ~170
@@ -8,23 +8,24 @@ there and rule F (>= 385 identical tokens) cannot fire at all. The opencode
 corpus has real 32k-token generations, so both rules are exercised.
 
 Read-only on the opencode DB (`mode=ro`). Reuses the DB reader from
-`v2/cuteafd/loop-replay-2026-10-30.py` and the detector port from
-`loop-abort-fidelity-harness.py`.
+`loop-replay.py` and the detector port from `loop-abort-fidelity-harness.py`
+(both beside this file).
 
-Run (allied):
-  /home/jsimon/ocr-agent/venv/bin/python -I \
-    rust/crates/cuteafd-daemon/tests/loop-abort-corpus-replay.py
+Run:
+  python3 -I rust/crates/cuteafd-daemon/tests/loop-abort-corpus-replay.py
 """
 import collections
 import importlib.util
+import os
 import statistics
 import sys
 import time
 
 from tokenizers import Tokenizer
 
-REPLAY = "/home/jsimon/dgxraid/v2/cuteafd/loop-replay-2026-10-30.py"
-HARNESS = "/home/jsimon/dgxraid/build-queue/cuteafd/loop-abort-fidelity-harness.py"
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPLAY = os.environ.get("LOOP_REPLAY", os.path.join(HERE, "loop-replay.py"))
+HARNESS = os.environ.get("LOOP_HARNESS", os.path.join(HERE, "loop-abort-fidelity-harness.py"))
 CONTROL_SAMPLE = 500
 
 
