@@ -503,6 +503,31 @@ pub struct PlanInput {
     catalog: OnceLock<anyhow::Result<crate::OfficialV41Catalog>>,
     /// Source headers do not change when placement searches worlds or prefill shapes.
     native_spark_headers: OnceLock<Vec<OnceLock<Result<(), String>>>>,
+    module_numerics: OnceLock<anyhow::Result<BTreeMap<String, checkpoint::ModuleNumerics>>>,
+    modelopt: OnceLock<Result<Option<crate::formats::modelopt::ModelOpt>, crate::formats::modelopt::ModelOptError>>,
+    model: OnceLock<Result<Box<dyn FamilyModel>, ConfigError>>,
+    census: OnceLock<ReportCensus>,
+}
+
+// Only checkpoint facts live here. Ownership, media policy and all admission
+// decisions are resolved again for each candidate over this input.
+struct ReportCensus {
+    components: BTreeMap<Component, ComponentCensus>,
+    unclassified: Vec<String>,
+    mapped_names: usize,
+    scales: usize,
+    scale_bytes: u64,
+    table_bytes: u64,
+    routed_operands: BTreeMap<String, QuantOperand>,
+}
+
+struct ComponentCensus {
+    tensors: usize,
+    groups: usize,
+    source_bytes: u64,
+    formats: BTreeMap<String, usize>,
+    rejected: usize,
+    rejections: Vec<Rejection>,
 }
 
 impl PlanInput {
@@ -511,14 +536,16 @@ impl PlanInput {
         let (checkpoint, validation) = Checkpoint::open_with_header_validation(snapshot)?;
         Ok(Self { checkpoint, header_validation: Some(validation), catalog: OnceLock::new(),
             open_time: start.elapsed(), open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
-            native_spark_headers: OnceLock::new() })
+            native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
+            modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() })
     }
 
     /// Any role's checkpoint (`Checkpoint::open`, `::inventory`, `::coordinator`).
     pub fn from_checkpoint(checkpoint: Checkpoint) -> Self {
         Self { checkpoint, header_validation: None, catalog: OnceLock::new(),
             open_time: Duration::ZERO, open_reported: AtomicBool::new(false), phases: PhaseCounters::default(),
-            native_spark_headers: OnceLock::new() }
+            native_spark_headers: OnceLock::new(), module_numerics: OnceLock::new(),
+            modelopt: OnceLock::new(), model: OnceLock::new(), census: OnceLock::new() }
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {
@@ -698,7 +725,8 @@ fn plan_of(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanE
     Ok(report)
 }
 
-pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> anyhow::Result<PlanReport> {
+pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::Result<PlanReport> {
+    let checkpoint = input.checkpoint();
     Ok(PlanReport {
         mapped_placement: Default::default(),
         host_budget_bytes: 0,
@@ -717,7 +745,10 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
         family: None,
         architectures: checkpoint.architectures(),
         quantization: None,
-        module_numerics: checkpoint.declared_module_numerics()?,
+        module_numerics: match input.module_numerics.get_or_init(|| checkpoint.declared_module_numerics()) {
+            Ok(numerics) => numerics.clone(),
+            Err(error) => return Err(anyhow::anyhow!("{error:#}")),
+        },
         precision_optimizations: Vec::new(),
         numerics_deviations: Vec::new(),
         runtime: None,
@@ -757,14 +788,96 @@ pub(crate) fn empty_report(checkpoint: &Checkpoint, options: &PlanOptions) -> an
     })
 }
 
+fn report_census(checkpoint: &Checkpoint, family: &dyn Family, model: &dyn FamilyModel,
+    modelopt: Option<&crate::formats::modelopt::ModelOpt>) -> ReportCensus {
+    let spec = model.spec();
+    let mut unclassified = Vec::new();
+    // Classify every tensor, then group each component's tensors by stem: one
+    // operand per logical weight, checked against the family's contract.
+    let mut by_component: BTreeMap<Component, Vec<&checkpoint::CheckpointTensor>> = BTreeMap::new();
+    let mut roles: std::collections::HashMap<&str, TensorRole> = std::collections::HashMap::new();
+    for tensor in &checkpoint.tensors {
+        match family.classify(spec, &tensor.meta.name) {
+            Some(role) => {
+                roles.insert(format::split_stem(&tensor.meta.name).0, role.clone());
+                by_component.entry(role.component).or_default().push(tensor);
+            }
+            None => unclassified.push(tensor.meta.name.clone()),
+        }
+    }
+    // Count logical random-read tensors, not storage shards or global scalars.
+    let mapped = by_component.get(&Component::MappedTable).map(Vec::as_slice).unwrap_or(&[]);
+    let mut names = BTreeSet::new();
+    let mut scales = 0;
+    let mut scale_bytes = 0;
+    let mut table_bytes = 0;
+    for tensor in mapped {
+        let meta = &tensor.meta;
+        if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
+        let (stem, suffix) = format::split_stem(&meta.name);
+        let suffix = if suffix.starts_with("strided_") { "strided" } else { suffix };
+        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv" | "strided") { continue }
+        // Qwen splits one row space into shard_N tensors.
+        let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
+        if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {
+            scales += 1;
+        }
+        if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
+        table_bytes += meta.byte_length;
+    }
+    // Rows join the scales only where the runtime preloads every table.
+    let table_bytes = if model.mapped_table_preload() { table_bytes } else { 0 };
+    let mut components = BTreeMap::new();
+    // Routed-expert operands by label, for the placement contract.
+    let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
+    for (component, tensors) in &by_component {
+        let groups = format::group_tensor_refs(tensors.iter().copied());
+        let mut formats: BTreeMap<String, usize> = BTreeMap::new();
+        let mut rejected = 0usize;
+        let mut rejections = Vec::new();
+        for (stem, members) in &groups {
+            let role = roles.get(stem.as_str()).cloned().unwrap_or_else(|| TensorRole::new(*component));
+            let verdict = match format::detect(members) {
+                Ok(mut operand) => {
+                    let declared = modelopt.as_ref().map_or(Ok(()), |m| m.check(stem, &operand));
+                    let accepted = declared.and_then(|()| model.accepts(&role, stem, &mut operand));
+                    *formats.entry(operand.label()).or_default() += 1;
+                    if accepted.is_ok() && *component == Component::RoutedExpert {
+                        routed_operands.entry(operand.label()).or_insert(operand);
+                    }
+                    accepted.map_err(|reason| Rejection { tensor: stem.clone(), reason })
+                }
+                Err(malformed) => {
+                    *formats.entry("malformed".into()).or_default() += 1;
+                    Err(Rejection { tensor: malformed.tensor, reason: malformed.reason })
+                }
+            };
+            if let Err(rejection) = verdict {
+                rejected += 1;
+                if rejections.len() < REJECTIONS_KEPT {
+                    rejections.push(rejection);
+                }
+            }
+        }
+        components.insert(*component, ComponentCensus {
+            tensors: tensors.len(), groups: groups.len(),
+            source_bytes: tensors.iter().map(|tensor| tensor.meta.byte_length).sum(),
+            formats, rejected, rejections,
+        });
+    }
+    ReportCensus { components, unclassified, mapped_names: names.len(), scales,
+        scale_bytes, table_bytes, routed_operands }
+}
+
 fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanReport, PlanError> {
     options.validate()?;
     let checkpoint = input.checkpoint();
-    let mut report = empty_report(checkpoint, options)?;
+    let mut report = empty_report(input, options)?;
     // ModelOpt exports describe what they quantized; each weight's tensors
     // must agree with that description.
-    let modelopt = match crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config) {
-        Ok(modelopt) => modelopt,
+    let modelopt = match input.modelopt.get_or_init(||
+        crate::formats::modelopt::ModelOpt::read(&checkpoint.snapshot, &checkpoint.config)) {
+        Ok(modelopt) => modelopt.as_ref(),
         Err(error) => {
             report.hints.push(Hint {
                 what: format!("unreadable quantization metadata: {error}"),
@@ -820,10 +933,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         report.max_image_tokens = Some(crate::media::QWEN_MAX_IMAGE_TOKENS);
     }
     report.runtime = Some(family.runtime());
-    let model = match family.open(&checkpoint).and_then(|mut model| {
-        model.configure(options)?;
+    let model = match input.model.get_or_init(|| family.open(checkpoint).and_then(|mut model| {
+        model.configure()?;
         Ok(model)
-    }) {
+    })) {
         Ok(model) => model,
         Err(error) => {
             report.hints.push(Hint {
@@ -832,7 +945,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                     (cuteafd-loader/src/families/{}/config.rs); extend it and the engine together.",
                     family.id(), family.id()),
             });
-            report.config_error.get_or_insert(error.0);
+            report.config_error.get_or_insert_with(|| error.0.clone());
             return Ok(report);
         }
     };
@@ -891,88 +1004,29 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         }),
     }
 
-    // Classify every tensor, then group each component's tensors by stem: one
-    // operand per logical weight, checked against the family's contract.
-    let mut by_component: BTreeMap<Component, Vec<&checkpoint::CheckpointTensor>> = BTreeMap::new();
-    let mut roles: std::collections::HashMap<&str, TensorRole> = std::collections::HashMap::new();
-    for tensor in &checkpoint.tensors {
-        match family.classify(spec, &tensor.meta.name) {
-            Some(role) => {
-                roles.insert(format::split_stem(&tensor.meta.name).0, role.clone());
-                by_component.entry(role.component).or_default().push(tensor);
-            }
-            None => report.unclassified.push(tensor.meta.name.clone()),
-        }
-    }
-    // Count logical random-read tensors, not storage shards or global scalars.
-    let mapped = by_component.get(&Component::MappedTable).map(Vec::as_slice).unwrap_or(&[]);
-    let mut names = BTreeSet::new();
-    let mut scales = 0;
-    let mut scale_bytes = 0;
-    let mut table_bytes = 0;
-    for tensor in mapped {
-        let meta = &tensor.meta;
-        if meta.shape.len() != 2 || meta.shape[0] <= 1 { continue }
-        let (stem, suffix) = format::split_stem(&meta.name);
-        let suffix = if suffix.starts_with("strided_") { "strided" } else { suffix };
-        if !matches!(suffix, "weight" | "scale" | "weight_scale" | "weight_scale_inv" | "strided") { continue }
-        // Qwen splits one row space into shard_N tensors.
-        let logical = stem.rsplit_once(".shard_").map_or(stem, |(prefix, _)| prefix);
-        if names.insert((logical.to_owned(), suffix.to_owned())) && matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") {
-            scales += 1;
-        }
-        if matches!(suffix, "scale" | "weight_scale" | "weight_scale_inv") { scale_bytes += meta.byte_length; }
-        table_bytes += meta.byte_length;
-    }
-    // Rows join the scales only where the runtime preloads every table.
-    let table_bytes = if model.mapped_table_preload() { table_bytes } else { 0 };
+    let census = input.census.get_or_init(|| report_census(checkpoint, family, model.as_ref(), modelopt));
+    report.unclassified = census.unclassified.clone();
+    let ReportCensus { mapped_names, scales, scale_bytes, table_bytes, .. } = *census;
     let host_budget = if scales == 0 && table_bytes == 0 { 0 } else {
         options.mapped_scale_host_budget_bytes.unwrap_or_else(||
             crate::formats::mapped_preload::host_budget_bytes().unwrap_or(0))
     };
     report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
-        names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget)
+        mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes, host_budget)
         .admit_tables(table_bytes);
     if report.mapped_placement.preloaded_bytes > 0 {
         report.bytes_by_owner.insert("host-preloaded".into(), report.mapped_placement.preloaded_bytes);
     }
     // The expert staging's own verdict on the routed experts.
-    let catalog = (family.expert_catalog() && by_component.contains_key(&Component::RoutedExpert))
+    let catalog = (family.expert_catalog() && census.components.contains_key(&Component::RoutedExpert))
         .then(|| input.expert_catalog());
     report.expert_storage = catalog.as_ref().and_then(|catalog| catalog.as_ref().ok()?.exl3().map(|m| m.storage));
     let catalog_error = catalog.and_then(Result::err).map(|error| format!("{error:#}"));
     let mut hinted = BTreeSet::new();
-    // Routed-expert operands by label, for the placement contract.
-    let mut routed_operands: BTreeMap<String, QuantOperand> = BTreeMap::new();
-    for (component, tensors) in &by_component {
-        let groups = format::group_tensor_refs(tensors.iter().copied());
-        let mut formats: BTreeMap<String, usize> = BTreeMap::new();
-        let mut rejected = 0usize;
-        let mut rejections = Vec::new();
-        for (stem, members) in &groups {
-            let role = roles.get(stem.as_str()).cloned().unwrap_or_else(|| TensorRole::new(*component));
-            let verdict = match format::detect(members) {
-                Ok(mut operand) => {
-                    let declared = modelopt.as_ref().map_or(Ok(()), |m| m.check(stem, &operand));
-                    let accepted = declared.and_then(|()| model.accepts(&role, stem, &mut operand));
-                    *formats.entry(operand.label()).or_default() += 1;
-                    if accepted.is_ok() && *component == Component::RoutedExpert {
-                        routed_operands.entry(operand.label()).or_insert(operand);
-                    }
-                    accepted.map_err(|reason| Rejection { tensor: stem.clone(), reason })
-                }
-                Err(malformed) => {
-                    *formats.entry("malformed".into()).or_default() += 1;
-                    Err(Rejection { tensor: malformed.tensor, reason: malformed.reason })
-                }
-            };
-            if let Err(rejection) = verdict {
-                rejected += 1;
-                if rejections.len() < REJECTIONS_KEPT {
-                    rejections.push(rejection);
-                }
-            }
-        }
+    for (component, facts) in &census.components {
+        let mut rejected = facts.rejected;
+        let mut rejections = facts.rejections.clone();
+        let formats = &facts.formats;
         if let (Component::RoutedExpert, Some(error)) = (component, &catalog_error) {
             rejected += 1;
             rejections.insert(0, Rejection { tensor: "routed experts (read_expert_catalog)".into(), reason: error.clone() });
@@ -991,7 +1045,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
             if let Some(first) = rejections.first() {
                 report.hints.push(Hint {
                     what: format!("{}: {rejected} of {} weights not executable, e.g. {}: {}", component.label(),
-                        groups.len(), first.tensor, first.reason),
+                        facts.groups, first.tensor, first.reason),
                     how: "The family's tensor contract (plan/families/) mirrors its loaders; a new format needs \
                         the loader staging and kernels first, then the contract."
                         .into(),
@@ -1004,7 +1058,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                 }
             }
         }
-        let source_bytes: u64 = tensors.iter().map(|t| t.meta.byte_length).sum();
+        let source_bytes = facts.source_bytes;
         if disabled && matches!(component, Component::Vision | Component::Audio) {
             report.disabled_media_bytes += source_bytes;
         }
@@ -1013,15 +1067,15 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         report.components.push(ComponentPlan {
             component: *component,
             owner,
-            tensors: tensors.len(),
+            tensors: facts.tensors,
             bytes,
-            formats,
+            formats: formats.clone(),
             status,
             rejected,
             rejections,
         });
     }
-    place(&mut report, options, spec, model.as_ref(), &routed_operands);
+    place(&mut report, options, spec, model.as_ref(), &census.routed_operands);
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
@@ -1037,7 +1091,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
                     usize::try_from(layout_options.prefill_waves)?)?)
             })()?;
             report.mapped_placement = crate::formats::mapped_preload::MappedPlacement::resolve(
-                names.len(), scales, scale_bytes, options.mapped_scale_preload_bytes,
+                mapped_names, scales, scale_bytes, options.mapped_scale_preload_bytes,
                 shape.preload_budget(host_budget, layout::engram_row_bytes(input.checkpoint())?)).admit_tables(table_bytes);
             report.bytes_by_owner.remove("host-preloaded");
             if report.mapped_placement.preloaded_bytes > 0 {

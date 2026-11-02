@@ -604,8 +604,7 @@ fn header_native_k6_core_is_admitted_by_default() -> Result<()> {
     testing::write_kimi_core_snapshot(dir.path(),false);
     let checkpoint=Checkpoint::open(dir.path())?;
     let mut model=Model::open(&checkpoint)?;
-    let options=PlanOptions::default();
-    model.configure(&options).map_err(anyhow::Error::msg)?;
+    model.configure().map_err(anyhow::Error::msg)?;
     assert!(model.native_serving_admission());
     for (stem,projection) in &model.core.projections {
         let members=checkpoint.tensors.iter().filter(|t|format::split_stem(&t.meta.name).0==stem)
