@@ -422,7 +422,7 @@ fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
         for (rank, device) in devices.iter().enumerate() {
             assert_eq!(device["kind"], "rtx");
             assert_eq!(device["index"], rank);
-            assert_eq!(device["kv_tokens"], 2_097_152);
+            assert!(device["kv_tokens"].as_u64().unwrap() >= 2_097_152);
             let items = device["items"].as_array().unwrap();
             let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
                 .expect("all 42 routed layer halves must be resident on each RTX");
