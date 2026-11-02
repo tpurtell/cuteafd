@@ -6,6 +6,22 @@ use crate::families::glm5_flash::{GlmNextConfig, resident};
 
 pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
     input: &super::super::PlanInput, options: &mut LayoutOptions) -> MemoryLayout {
+    layout_with_native(report, model, input, options, None)
+}
+
+pub(crate) fn native_layout(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &mut LayoutOptions,
+    facts: &crate::plan::exlr8::native::DenseFacts, metadata: &crate::plan::exlr8::residency::MetadataInput)
+    -> anyhow::Result<MemoryLayout> {
+    let memory = layout_with_native(report, model, input, options, Some((facts, metadata)));
+    anyhow::ensure!(report.solver_placement.is_some(), "{}", report.hints.iter()
+        .map(|hint| hint.what.as_str()).collect::<Vec<_>>().join("; "));
+    Ok(memory)
+}
+
+fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyModel,
+    input: &super::super::PlanInput, options: &mut LayoutOptions,
+    exlr8: Option<(&crate::plan::exlr8::native::DenseFacts, &crate::plan::exlr8::residency::MetadataInput)>) -> MemoryLayout {
     let auto_vision_retry = (report.spark_ranks == 0 && report.vision == super::super::MediaMode::Auto)
         .then(|| (report.clone(), options.clone()));
     let prefill = match resolve_prefill(report, options, report.spark_ranks,
@@ -56,26 +72,41 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         if decode_rows > 64 && manifest.is_some_and(|m| crate::serving_capacity::glmf_manifest_scratch(m)("glmf_mhc_post_pre_m128").is_none()) {
             anyhow::bail!("wide decode needs CUTEAFD_GLMF_WIDE_DECODE_ROWS=128");
         }
-        let core = crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
-        let native = !core.projections.is_empty();
-        let native_kda = core.scratch_mask(&cfg, cfg.layers).kda;
+        let core = if exlr8.is_some() { crate::families::glm5_flash::core::CoreInventory::default() }
+            else { crate::families::glm5_flash::core::CoreInventory::from_checkpoint(&cfg, checkpoint)? };
+        let native = exlr8.is_some() || !core.projections.is_empty();
+        let native_mask = if exlr8.is_some() { crate::serving_capacity::GlmfCoreScratch { kda: true, mla: true, ffn: true } }
+            else { core.scratch_mask(&cfg, cfg.layers) };
+        let native_kda = native_mask.kda;
+        let whole_mla = |first: usize| {
+            let mut next = first;
+            cfg.attention.iter().enumerate().filter_map(|(layer, kind)| {
+                if attention.mode != placement::AttentionPlacement::Layers
+                    || *kind != crate::families::glm5_flash::GlmNextAttention::Mla { return None; }
+                let owner = next; next ^= 1; Some((layer, owner))
+            }).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let native_resident = |first| -> anyhow::Result<_> {
+            let facts = exlr8.context("native EXLR8 facts")?.0;
+            resident::native_resident(&facts.selection, cfg.layers, &facts.plans(&whole_mla(first))?, &facts.shared_bytes)
+        };
         let mut representation = options.glmf_representation;
         if native_kda {
             representation.kda_fp8 = false;
             representation.output_shard = false;
         }
-        if core.get_weight("lm_head").is_some() { representation.fp8_head = false; }
+        if native { representation.fp8_head = false; }
         let state = options.glmf_kda_state;
         anyhow::ensure!(!native || state == crate::serving_capacity::GlmfKdaState::F32,
-            "native K6 requires F32 KDA state programs");
+            "native Flash requires F32 KDA state programs");
         anyhow::ensure!(state == crate::serving_capacity::GlmfKdaState::F32 || ranks == 1,
             "BF16 KDA state needs one GPU; head-split BF16 state is not yet qualified");
         notes.push(format!("KDA projections: {}, state: {state:?}; shared target/draft head: {}",
-            if native { "native K6" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
-            if native { "native K6" } else if representation.fp8_head { "FP8" } else { "BF16" }));
-        let mut resident = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
-            attention.mode, attention.first_owner as usize)
-            .map_err(anyhow::Error::msg)?;
+            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if representation.kda_fp8 { "FP8" } else { "BF16" },
+            if exlr8.is_some() { "native EXLR8" } else if native { "native K6" } else if representation.fp8_head { "FP8" } else { "BF16" }));
+        let mut resident = if exlr8.is_some() { native_resident(attention.first_owner as usize)? }
+            else { resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
+                attention.mode, attention.first_owner as usize).map_err(anyhow::Error::msg)? };
         let host_embedding = options.host_embedding || (options.rtx_bytes[0] <= 32 * GIB && !options.force_gpu_embedding);
         if host_embedding {
             checkpoint.require_untied_embedding("model.language_model.embed_tokens.weight")?;
@@ -83,8 +114,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             notes.push("embedding placement: host (single pinned mapped copy)".into());
         }
         let alternate_resident = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
-            let mut ranks = resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
-                attention.mode, 1 - attention.first_owner as usize).map_err(anyhow::Error::msg)?;
+            let mut ranks = if exlr8.is_some() { native_resident(1 - attention.first_owner as usize)? }
+                else { resident::resident_weights_placed(checkpoint, &cfg, cfg.layers, ranks, representation,
+                    attention.mode, 1 - attention.first_owner as usize).map_err(anyhow::Error::msg)? };
             if host_embedding { ranks[0].embedding = 0; }
             Ok::<_, anyhow::Error>(ranks)
         }).transpose()?;
@@ -94,11 +126,16 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             .unwrap_or_else(glmf::default_onboard);
         let max_rows = crate::serving_capacity::glmf_expert_rows(rows, decode_rows);
         let tp = if ranks == 2 { 2 } else { 1 };
-        let scratch = glmf::expert_workspace(&catalog, options.workspace_manifest.as_deref(), max_rows, tp);
+        let scratch = if let Some((_, metadata)) = exlr8 {
+            crate::plan::exlr8::native::flash_routed_workspace(metadata, &cfg,
+                manifest.context("native Flash requires PROGRAMS.json")?, ranks, max_rows)
+        } else { glmf::expert_workspace(&catalog, options.workspace_manifest.as_deref(), max_rows, tp) };
         let needed = spark_ranks == 0 || (onboard != Onboard::Auto && onboard.layers(shape.layers - shape.first_layer) != Some(0));
         let available = match scratch { Ok(bytes) => Some(bytes), Err(error) if needed => return Err(error), Err(error) => {
             notes.push(format!("RTX expert onboarding unavailable: {error}")); None } };
-        let experts = glmf::expert_costs(&catalog, ranks == 2 && available.is_some())?;
+        let experts = if let Some((_, metadata)) = exlr8 {
+            crate::plan::exlr8::routed_expert_costs(metadata, &(shape.first_layer..cfg.layers).collect::<Vec<_>>())?
+        } else { glmf::expert_costs(&catalog, ranks == 2 && available.is_some())? };
         let geometry = crate::serving_capacity::glm_flash_placed_cache_geometry_rows(&cfg, cfg.layers, ranks,
             index, state.bytes(), decode_rows, attention.mode, 0)?;
         let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
@@ -109,8 +146,8 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             glmf_step_workspace(m, checkpoint, placement, lanes, rows, context, decode_rows, shared,
                 index == crate::serving_capacity::GlmfIndexCache::Compact,
                 ranks == 2, representation, options.glmf_prefill_expanded && !native_kda,
-                available.is_some() && (ranks == 2 || catalog.fp8().is_some()),
-                options.glmf_kda_fp32_partials && !native_kda, state));
+                exlr8.is_none() && available.is_some() && (ranks == 2 || catalog.fp8().is_some()),
+                options.glmf_kda_fp32_partials && !native_kda, state, Some(native_mask)));
         let mut workspace = step_workspace(&report.placement, lanes);
         let mut local_workspace = step_workspace(&ExpertPlacement::Local, lanes);
         if (workspace.is_none() || local_workspace.is_none()) && manifest.is_some() {
@@ -165,7 +202,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 glmf::drafter_bridge_inventory(&config, slots, batch)? } else { None };
             (bytes, scratch, bridge)
         };
-        let core_charge = if native {
+        let core_charge = if native && exlr8.is_none() {
             let owners = (attention.mode == placement::AttentionPlacement::Layers).then(|| {
                 let mut next = attention.first_owner as u8;
                 cfg.attention.iter().map(|kind| {
@@ -189,12 +226,31 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             }
             notes.push("native K6 body and head; exact compressed owners and projection scratch".into());
         }
+        let native_charge = exlr8.map(|(facts, _)| crate::plan::exlr8::native::FlashCharges::from_manifest(
+            facts, &cfg, &whole_mla(attention.first_owner as usize), rows as usize, lanes as usize,
+            decode_rows as usize, manifest.context("native Flash requires PROGRAMS.json")?)).transpose()?;
+        if let Some(charge) = &native_charge {
+            for profile in [&mut workspace, &mut local_workspace] {
+                for (rank, bytes) in charge.bytes(cfg.hidden)?.into_iter().enumerate() {
+                    profile.push(glmf::GlmfBufferDemand::new(glmf::GlmfComponent::Always, rank as u8,
+                        Category::Workspace, "native EXLR8 core/shared expert", bytes, Basis::Exact));
+                }
+            }
+            notes.push("native EXLR8 body/head; shared format-owned residency and scratch".into());
+        }
         let local_tp2_exl3 = ranks == 2 && spark_ranks == 0 && catalog.exl3().is_some();
         let mut baselines = Vec::new();
         for rank in 0..ranks {
             let total = options.rtx_bytes[rank];
-            let package = if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" };
-            let runtime = if let (Some(charge), Some(manifest)) = (&core_charge, manifest) {
+            let package = if exlr8.is_some() { "glmf:exlr8" } else if local_tp2_exl3 { "exl3-tp2-local" } else if catalog.exl3().is_some() { "exl3" } else { "fp8" };
+            let runtime = if let (Some(charge), Some(manifest)) = (&native_charge, manifest) {
+                let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2", "exlr8_glmf"]);
+                set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
+                let arch = placement::ArchContext::coordinator(total, None);
+                let allowance = placement::inventory::loaded_code_allowance("glmf", package,
+                    ranks == 2, rank as u8, &arch, Some(&set));
+                Item::new(Category::Runtime, "context+modules", "", arch.context_bytes + allowance.bytes, allowance.basis)
+            } else if let (Some(charge), Some(manifest)) = (&core_charge, manifest) {
                 let mut set = placement::ProgramSet::from_manifest(manifest, &["glmf", "glmf2"]);
                 set.names.extend(charge.programs.iter().cloned()); set.names.sort(); set.names.dedup();
                 let arch = placement::ArchContext::coordinator(total, None);
@@ -229,7 +285,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             expert_workspace: if ranks == 1 { available.unwrap_or(0) } else { 0 },
             tp2_workspace: if ranks == 2 { [available.unwrap_or(0); 2] } else { [0; 2] },
             drafter_bytes: draft, drafter_scratch, drafter_bridge, requested_pool: options.pool_tokens.filter(|&n| n > 0), onboard,
-            full_prefill_logits: if options.full_prefill_logits && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
+            full_prefill_logits: if options.full_prefill_logits && exlr8.is_none() && core.get_weight("lm_head").is_none() { full_prefill_logits_bytes("glm5_flash", rows, cfg.vocab_size as u64) } else { 0 } };
         let (placed, _, working) = glmf::solve_attention_working_set_with_graphs(&inputs,
             alternate_resident.as_deref(), target, options.context_tokens == 0,
             options.physical_sms.unwrap_or(placement::ArchContext::coordinator(options.rtx_bytes[0], None).sms) as usize,
@@ -283,7 +339,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             *report = original;
             *options = original_options;
             report.vision = super::super::MediaMode::Off;
-            let mut result = layout(report, model, input, options);
+            let mut result = layout_with_native(report, model, input, options, exlr8);
             report.vision = super::super::MediaMode::Auto;
             let reason = "auto vision disabled to preserve the GLM Flash KV pool floor";
             if let Some(encoder) = &mut report.encoder { encoder.reason = reason.into(); }
@@ -320,7 +376,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
             notes.push(reason);
         }
     }
-    if let Some(working) = selected.filter(|working| working.spark_ranks > 0) {
+    if let Some(working) = selected.filter(|working| working.spark_ranks > 0 && exlr8.is_none()) {
         let total = report.components.iter().filter(|c| c.component == Component::RoutedExpert).map(|c| c.bytes).sum::<u64>();
         let routed = model.spec().moe_layers().max(1);
         let remaining = total.saturating_sub(total / routed as u64 * working.rtx_layers.len() as u64);
