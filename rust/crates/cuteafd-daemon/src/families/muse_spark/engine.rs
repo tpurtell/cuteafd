@@ -50,6 +50,7 @@ pub(crate) struct RankResources<'a> {
     /// Head rank: the K6 head's F32 rows at the stored width, then the
     /// softcapped logits trimmed to the vocabulary (`lane::head_planes`).
     pub head: Option<(Allocation<'a>, Allocation<'a>)>,
+    pub prefill_logits: Option<Allocation<'a>>,
 }
 
 /// The step metadata planes beyond the lane (`StepTables`, as admitted).
@@ -142,9 +143,13 @@ impl<'a> RankResources<'a> {
             }
             None => None,
         };
+        let prefill_logits = if globals.head.is_some() && built.prefill_logits_bytes > 0 {
+            let _scope = cuteafd_ffi::memory_ledger::scope("workspace/muse prefill logits");
+            Some(Allocation::new(device, built.prefill_logits_bytes)?)
+        } else { None };
         let wire_grid = crate::shared::launch_grid::Fp8QuantizeGrid::new(device.run(|| library.sm_count())?, None)?;
         Ok(Self { device, programs: bound, core, layers, kv, lane, rope, _rotary: rotary, tp2, ranks, rank, wire_grid, step,
-            globals, head })
+            globals, head, prefill_logits })
     }
 
     /// The device layer's view of this rank for one step on `stream`.

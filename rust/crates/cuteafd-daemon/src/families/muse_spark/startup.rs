@@ -41,6 +41,7 @@ pub(crate) struct Options<'a> {
     pub headroom_bytes: u64,
     pub spark_ranks: usize,
     pub prefill: cuteafd_loader::serving_capacity::prefill_waves::PrefillPlan,
+    pub full_prefill_logits: bool,
     pub slots: u64,
     /// Device mark slots from the shared prefix rule (`PrefixArgs::mark_rule`).
     pub mark_slots: u64,
@@ -74,7 +75,8 @@ pub(crate) fn admit(options: Options<'_>) -> Result<(shared::MuseRequest, Placem
     }).collect::<Result<Vec<_>>>()?;
     let context = options.max_context.unwrap_or(options.cfg.max_position as u64);
     shared::placement(shared::MuseInputs { cfg: options.cfg, core: options.core, catalog: options.catalog,
-        gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill, slots: options.slots,
+        gpus: budgets, spark_ranks: options.spark_ranks, prefill: options.prefill,
+        full_prefill_logits: options.full_prefill_logits, slots: options.slots,
         mark_slots: options.mark_slots, context,
         automatic_context: options.max_context.is_none(), requested_pool: options.pool_tokens,
         onboard: options.onboard, spark_budget_bytes: options.spark_budget_bytes,
@@ -169,6 +171,7 @@ mod tests {
                 manifest: &preflight(&path, gpus)?,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
+                full_prefill_logits: opts.full_prefill_logits,
                 headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, false),
@@ -215,7 +218,8 @@ mod tests {
         let cfg = MuseSparkConfig::from_hf(&checkpoint.config)?;
         let core = CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut refused = 0;
-        for (gpus, sparks) in [(2, 6), (2, 4), (1, 6)] {
+        for (gpus, sparks, full_prefill_logits) in [(2, 6, false), (2, 4, false), (1, 6, false),
+            (1, 4, true), (2, 6, true)] {
             // A complete image: the program manifest with the coordinator EXL3 package beside it.
             let image = dir.path().join(format!("image-{gpus}"));
             let path = testing::write_muse_exl3_capacities(&image);
@@ -223,6 +227,7 @@ mod tests {
             let total = cuteafd_loader::placement::inventory::PRO_TOTAL_BYTES;
             let opts = LayoutOptions { host_memory: Some((256 << 30, 256 << 30)), rtx_bytes: vec![total; gpus],
                 head_split: gpus == 2, host_cache_bytes: Some(0), workspace_manifest: Some(path.clone()),
+                full_prefill_logits,
                 ..Default::default() };
             let report = input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(sparks),
                 layout: Some(opts.clone()), ..Default::default() })?;
@@ -239,6 +244,7 @@ mod tests {
                 manifest: &inventory,
                 measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                     untracked_bytes: arch.context_bytes }; gpus],
+                full_prefill_logits: opts.full_prefill_logits,
                 headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
                 mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                     shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),
@@ -249,7 +255,15 @@ mod tests {
                 partial_wide_format: Default::default(),
                 local: shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?,
                 drafter: None })?;
-            assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks");
+            assert_eq!(live, planned, "{gpus} RTX + {sparks} Sparks, scoring {full_prefill_logits}");
+            for gpu in 0..gpus {
+                let output = live.items[gpu].iter().find(|item| item.group == "Muse prefill logits");
+                if full_prefill_logits && gpu == gpus - 1 {
+                    assert_eq!(output.context("scoring output charge")?.bytes,
+                        cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(
+                            usize::try_from(prefill.span_rows)?, cfg.vocab_size)? as u64);
+                } else { assert!(output.is_none(), "scoring allocation absent on non-head/default serving"); }
+            }
             assert!(live.pool_tokens > 0);
             // The same image without its package: startup refuses whenever the placement
             // onboards, never serving the layers from the Sparks instead.
@@ -261,6 +275,7 @@ mod tests {
                     manifest: &inventory,
                     measured: vec![Measured { total_bytes: total, free_bytes: total - arch.context_bytes,
                         untracked_bytes: arch.context_bytes }; gpus],
+                    full_prefill_logits: opts.full_prefill_logits,
                     headroom_bytes: opts.headroom_bytes, spark_ranks: sparks, prefill, slots: 16,
                     mark_slots: cuteafd_core::prefix::mark_slots_with_host(16, opts.mimo_prefix_entries,
                         shared::mark_bytes(&cfg, 1), opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0)),

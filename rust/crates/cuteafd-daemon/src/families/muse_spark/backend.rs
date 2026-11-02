@@ -213,7 +213,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     fn geometry(&self) -> scheduler::Geometry {
         scheduler::Geometry { family: "muse_spark", vocab_size: self.cfg.vocab_size, max_context: self.context,
             slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: HEAD_ROWS,
-            full_prefill_logits: false }
+            full_prefill_logits: self.ranks.last().is_some_and(|rank| rank.prefill_logits.is_some()) }
     }
     /// Every Muse message opens with `<|start|>` (turn boundaries for prefix marks).
     fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }
@@ -260,7 +260,13 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
 
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], logit_rows: usize, _pool: &RefPagePool)
         -> Result<Option<DeviceLogits>> {
-        ensure!(logit_rows <= 1, "Muse prefill scores its last row only");
+        ensure!(logit_rows <= tokens.len(), "Muse prefill logit rows exceed tokens");
+        if logit_rows > 1 {
+            let output = self.ranks.last().and_then(|rank| rank.prefill_logits.as_ref())
+                .context("Muse prefill scoring requires --full-prefill-logits at launch")?;
+            ensure!(cuteafd_loader::families::muse_spark::lane::prefill_logits_bytes(logit_rows,
+                self.cfg.vocab_size)? <= output.buffer.bytes, "Muse prefill scoring exceeds admitted rows");
+        }
         let units = crate::shared::prefill_pipeline::prefill_units(tokens.len(), self.unit_rows, self.waves, 64)?
             .into_iter().enumerate().map(|(index, rows)| crate::shared::prefill_pipeline::Unit { index, sequence: 0,
                 segments: Vec::new(), rows, layers: 0..self.cfg.layers, slot: index % self.waves, barrier: false })
@@ -270,7 +276,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         let mut experts = self.experts.borrow_mut();
         let mut local = self.local.borrow_mut();
         let call = PrefillCall { request: placement.slot as u64 + 1, slot: placement.slot, start: placement.len, tokens,
-            pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots };
+            pages: &placement.pages, ring_rows: self.ring_rows, slots: self.slots, logit_rows };
         let mut hooks = MusePrefill::new(self.cfg, self.ranks, self.streams.clone(), self.table, &mut **experts, peers,
             call, &mut local, self.draft.as_ref(), units.len())?;
         crate::shared::prefill_pipeline::run_prefill_units(&mut hooks, &units, self.waves)?;
@@ -278,7 +284,7 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         drop(hooks);
         placement.len += tokens.len();
         if logit_rows == 0 { return Ok(None); }
-        Ok(Some(self.logits(logits.context("Muse prefill scored no last row")?, 1)))
+        Ok(Some(self.logits(logits.context("Muse prefill scored no rows")?, logit_rows)))
     }
 
     /// Scores every row of every sequence (an anchor and its drafts) from its
