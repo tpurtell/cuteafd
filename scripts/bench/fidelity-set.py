@@ -543,8 +543,137 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
     return manifest
 
 
-def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures, tokenizer_sha256):
+def real_vision_fixtures(path, destination, snapshot):
+    """Admit pinned source bytes and publish reproducible resize cases."""
+    import io
+    from PIL import Image
+    from fidelity_media import HEX, processor_contract, publish_immutable, read_fixture
+    contract = processor_contract(snapshot)
+    document = json.loads(path.read_bytes())
+    images = document.get("images", [])
+    if not isinstance(images, list) or not 1 <= len(images) <= 64:
+        raise ValueError("vision manifest needs 1..64 pinned images")
+    destination.mkdir(parents=True, exist_ok=True)
+    records, sources = [], {}
+    for index, item in enumerate(images):
+        name = item.get("file")
+        if (not isinstance(name, str) or not name or "\\" in name
+                or pathlib.Path(name).is_absolute() or any(p in ("", ".", "..") for p in name.split("/"))
+                or not isinstance(item.get("sha256"), str) or not HEX.fullmatch(item["sha256"])):
+            raise ValueError("vision source requires a relative path and SHA256")
+        if name in sources:
+            raise ValueError("duplicate vision source file")
+        fixture = {"path": name, "sha256": item["sha256"]}
+        data = read_fixture(path.parent, {"fixture": fixture})
+        with Image.open(io.BytesIO(data)) as image:
+            if image.format not in ("PNG", "JPEG") or image.width * image.height > 16_777_216:
+                raise ValueError("vision source exceeds PNG/JPEG pixel admission")
+            image.verify()
+        target = destination / name
+        if not target.resolve().is_relative_to(destination.resolve()):
+            raise ValueError("vision destination escapes fixture root")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        publish_immutable(target, data)
+        sources[name] = (data, fixture)
+        records.append({"id": f"real_{index:02d}", "fixture": fixture,
+            "provenance": {"source": fixture, "kind": item.get("kind", "image")}})
+    config = json.loads((snapshot / "processor_config.json").read_bytes()) if (snapshot / "processor_config.json").exists() else json.loads((snapshot / "preprocessor_config.json").read_bytes())
+    patch = config.get("image_processor", config)["patch_size"]
+    if type(patch) is not int or not 1 <= patch <= 64:
+        raise ValueError("invalid checkpoint image patch size")
+    cases = document.get("resize", [])
+    if (not isinstance(cases, list) or len(cases) > 64
+            or any(not isinstance(case, str) for case in cases) or len(set(cases)) != len(cases)):
+        raise ValueError("resize cases must be a unique list of at most 64 strings")
+    for index, case in enumerate(cases):
+        match = re.fullmatch(r"(.+)@([1-9][0-9]{0,3})x([1-9][0-9]{0,3})", case) if isinstance(case, str) else None
+        if not match or match[1] not in sources:
+            raise ValueError("resize case must name a pinned FILE@GHxGW")
+        name, gh, gw = match[1], int(match[2]), int(match[3])
+        if (gh % contract["merge"] or gw % contract["merge"]
+                or gh * gw * patch * patch > 16_777_216):
+            raise ValueError("resize grid exceeds shared processor geometry")
+        data, source = sources[name]
+        with Image.open(io.BytesIO(data)) as image:
+            resized = image.convert("RGB").resize((gw * patch, gh * patch), Image.Resampling.BICUBIC)
+            output = io.BytesIO()
+            resized.save(output, format="PNG")
+        encoded = output.getvalue()
+        fixture = {"path": "resize_" + hashlib.sha256(case.encode()).hexdigest()[:20] + ".png",
+            "sha256": hashlib.sha256(encoded).hexdigest()}
+        publish_immutable(destination / fixture["path"], encoded)
+        records.append({"id": f"resize_{index:02d}", "fixture": fixture,
+            "provenance": {"source": source, "case": case, "grid": [1, gh, gw],
+                "resize": "Pillow RGB bicubic", "derived_sha256": fixture["sha256"]}})
+    return records, contract
+
+
+def build_real_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures,
+                          tokenizer_sha256, vision_manifest, snapshot):
+    import base64
+    from fidelity_media import validate_media
+    arm_policy(arm, checkpoint)
+    records, contract = real_vision_fixtures(vision_manifest, fixtures, snapshot)
+    windows, servers = [], []
+    manifest_hash = hashlib.sha256(vision_manifest.read_bytes()).hexdigest()
+    for item in [*records, {"id": "text_control"}]:
+        text = "Describe the visible content and explain its details carefully. Do not invent unreadable details. Give a detailed answer of at least 800 words."
+        content = [{"type": "text", "text": text}]
+        if "fixture" in item:
+            from fidelity_media import read_fixture
+            data = read_fixture(fixtures, {"fixture": item["fixture"]})
+            content.insert(0, {"type": "image_url", "image_url": {
+                "url": "data:image/" + ("png" if data.startswith(b"\x89PNG") else "jpeg") + ";base64," + base64.b64encode(data).decode(), "detail": "auto"}})
+        else:
+            content[0]["text"] = "Explain how to inspect a document, photograph, diagram, screenshot and chart faithfully, without inventing details. Give a detailed answer of at least 800 words."
+        body = {"model": model, "messages": [{"role": "user", "content": content}],
+            "max_tokens": 2048, "temperature": 0, "seed": 0, "reasoning_effort": "high", "stream": False}
+        chat = probe(body)
+        record, server = chat["probe"], chat.get("server", {})
+        if server.get("model") != checkpoint or server.get("family") != family:
+            raise ValueError("media generation server identity differs from manifest")
+        spans = record.get("media", [])
+        expected = int("fixture" in item)
+        if not isinstance(spans, list) or len(spans) != expected:
+            raise ValueError("media probe must bind exactly the requested prepared image")
+        spans = [{**{k: span[k] for k in ("start", "len", "kind", "key", "grid")}, "fixture": item["fixture"]} for span in spans]
+        if "grid" in item.get("provenance", {}) and spans[0]["grid"] != item["provenance"]["grid"]:
+            raise ValueError("prepared resize grid differs from pinned resize case")
+        generated, prompt = record["generated"], record["prompt_ids"]
+        if len(prompt) + len(generated) > MAX_TOKENS:
+            raise ValueError("vision window exceeds context cap")
+        if not 576 <= len(generated) <= body["max_tokens"]:
+            raise ValueError("vision golden needs at least 576 real generated tokens for prefix qualification")
+        tokens, roles = prompt + generated, ["ctx"] * len(prompt) + ["gen"] * len(generated)
+        start = len(tokens) - 512
+        validate_media(spans, tokens, roles, start, processor=contract)
+        windows.append({"id": item["id"], "block": "vision" if spans else "E", "bucket": bucket(start),
+            "tokens": tokens, "roles": roles, "score_from": start, **({"media": spans} if spans else {}),
+            "provenance": {"fixture_manifest_sha256": manifest_hash, **item.get("provenance", {}),
+                "prompt_sha256": hashlib.sha256(canonical(body)).hexdigest(), "engine": record["engine"],
+                "generated_tokens": len(generated), "server": server}})
+        servers.append(server)
+    if any(server != servers[0] for server in servers):
+        raise ValueError("server changed during media generation")
+    result = {"schema": SET_SCHEMA, "family": family, "model": model, "checkpoint": checkpoint,
+        "version": version, "generation_arm": arm, "generation_server": servers[0],
+        "tokenizer_sha256": tokenizer_sha256, "image_processor": contract,
+        "quick_windows": [windows[0]["id"], "text_control"], "fixtures_sha256": manifest_hash,
+        "recipe": {"windows": len(windows), "positions_per_window": 512,
+            "quick_windows": 2, "prompt_roles": "image/text ctx; actual assistant output gen"}, "windows": windows}
+    result["set_sha256"] = set_hash(result)
+    return validate_set(result)
+
+
+def build_vision_set(*, family, model, checkpoint, version, arm, probe, fixtures, tokenizer_sha256,
+                     vision_manifest=None, snapshot=None):
     """Independent media panel: never rewrite a frozen 64-window text publication."""
+    if vision_manifest is not None:
+        if snapshot is None:
+            raise ValueError("--vision-manifest requires the checkpoint snapshot")
+        return build_real_vision_set(family=family, model=model, checkpoint=checkpoint, version=version,
+            arm=arm, probe=probe, fixtures=fixtures, tokenizer_sha256=tokenizer_sha256,
+            vision_manifest=vision_manifest, snapshot=snapshot)
     import base64
     from fidelity_media import read_fixture, validate_media
     if family not in ("mimo_v2", "qwen4", "glm5_flash"):
@@ -828,7 +957,8 @@ def main(argv=None):
     p.add_argument("--legacy-source-sha256")
     p.add_argument("--legacy-source-revision", help="public source commit for PLAN.md")
     p.add_argument("--recording", action="append", type=pathlib.Path, default=[])
-    p.add_argument("--media-fixtures", type=pathlib.Path, help="build a separate 8-window vision panel from fixtures.json")
+    p.add_argument("--media-fixtures", type=pathlib.Path, help="legacy fixture directory, or destination for --vision-manifest copies")
+    p.add_argument("--vision-manifest", type=pathlib.Path, help="SHA-pinned real images with optional FILE@GHxGW resize cases")
     p.add_argument("--file-list", type=pathlib.Path, help="JSON array of first-party repo-relative paths")
     p.add_argument("--base-url", default="http://127.0.0.1:8000")
     p.add_argument("--backend", choices=("probe", "api", "hf", "engine"), default="probe",
@@ -862,6 +992,8 @@ def main(argv=None):
             p.error("--file-list may contain only tracked first-party Rust, Python or CUDA files")
         if any(path.startswith("third_party/") for path in files):
             p.error("third-party sources are not part of the fidelity recipe")
+    if a.vision_manifest and (not a.media_fixtures or not a.snapshot):
+        p.error("--vision-manifest requires --media-fixtures destination and --snapshot")
     if not a.media_fixtures and not a.legacy_reference and not a.pinned_text and not a.retokenize_text:
         p.error("text recipe requires --legacy-reference; use the sealed legacy window from a published manifest")
     if not a.retokenize_text and any((a.legacy_source, a.legacy_source_sha256, a.legacy_source_revision)):
@@ -909,7 +1041,8 @@ def main(argv=None):
             p.error("--media-fixtures cannot combine with text recipe recordings/files/legacy reference")
         manifest = build_vision_set(family=a.family, model=a.model, checkpoint=a.checkpoint, version=a.version,
             arm=json.loads(a.arm_manifest.read_text()), probe=ProbeClient(a.base_url, a.bench_token, a.timeout),
-            fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest())
+            fixtures=a.media_fixtures, tokenizer_sha256=hashlib.sha256(a.tokenizer.read_bytes()).hexdigest(),
+            vision_manifest=a.vision_manifest, snapshot=a.snapshot)
     else:
         arm = json.loads(a.arm_manifest.read_text())
         probe = ProbeClient(a.base_url, a.bench_token, a.timeout)

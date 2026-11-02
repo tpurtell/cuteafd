@@ -99,6 +99,18 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     result = builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
         arm=arm, probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
     assert len(result["windows"]) == 8 and len(result["quick_windows"]) == 2
+    # Pin the original builder's complete legacy body, not two calls to the new path.
+    import ast
+    function = next(n for n in ast.parse(pathlib.Path(builder.__file__).read_text()).body
+                    if isinstance(n, ast.FunctionDef) and n.name == "build_vision_set")
+    function.args.kwonlyargs = function.args.kwonlyargs[:-2]
+    function.args.kw_defaults = function.args.kw_defaults[:-2]
+    del function.body[1]  # The sole new statement dispatches --vision-manifest.
+    assert hashlib.sha256(ast.dump(function, include_attributes=False).encode()).hexdigest() == (
+        "bfc3c3bebc7d46288ef4c83a9bdb862c559f744314e53671f8f0962622a1a1f6")
+    assert builder.canonical(result) == builder.canonical(builder.build_vision_set(
+        family="mimo_v2", model="model", checkpoint="model", version="media1", arm=arm,
+        probe=probe, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64, vision_manifest=None))
     assert all(w["block"] == "vision" and set(w["roles"][w["score_from"]:]) == {"gen"} for w in result["windows"])
     tasks = [body["messages"][1]["content"][1]["text"] for body in requests]
     assert "visible line of code" in tasks[0] and "Python parser" in tasks[2]
@@ -124,6 +136,96 @@ def test_fixture_bytes_reproduce_and_vision_recipe(tmp_path):
     with pytest.raises(ValueError, match="prepared image"):
         builder.build_vision_set(family="mimo_v2", model="model", checkpoint="model", version="media1",
             arm=arm, probe=missing, fixtures=tmp_path / "one", tokenizer_sha256="c" * 64)
+
+
+@pytest.fixture
+def real_vision_input(tmp_path):
+    import json
+    from PIL import Image
+    root = tmp_path / "sources"
+    snapshot = tmp_path / "snapshot"
+    root.mkdir()
+    snapshot.mkdir()
+    Image.new("RGB", (56, 56), (80, 120, 160)).save(root / "photo.png")
+    digest = hashlib.sha256((root / "photo.png").read_bytes()).hexdigest()
+    manifest = root / "manifest.json"
+    manifest.write_text(json.dumps({"images": [{"file": "photo.png", "sha256": digest}],
+        "resize": ["photo.png@4x4"]}))
+    (snapshot / "config.json").write_text(json.dumps({"text_config": {"vocab_size": 32},
+        "vision_config": {"patch_size": 14}, "spatial_merge_size": 2, "image_token_index": 9}))
+    (snapshot / "processor_config.json").write_text(json.dumps({"spatial_merge_size": 2,
+        "image_processor": {"image_processor_type": "PixtralImageProcessor", "patch_size": 14}}))
+    (snapshot / "params.json").write_text(json.dumps({"vision_encoder": {
+        "image_token_id": 9, "image_break_token_id": 8, "image_end_token_id": 7}}))
+    return manifest, snapshot, tmp_path / "fixtures"
+
+
+def test_real_vision_manifest_pins_resizes_and_scores_following_text(real_vision_input):
+    from fidelity_media import processor_contract
+    manifest, snapshot, destination = real_vision_input
+    builder = load_script("fidelity-set")
+    records, contract = builder.real_vision_fixtures(manifest, destination, snapshot)
+    assert contract == processor_contract(snapshot)
+    assert len(records) == 2 and records[1]["provenance"]["grid"] == [1, 4, 4]
+    assert records[1]["provenance"]["derived_sha256"] == records[1]["fixture"]["sha256"]
+    calls = []
+    def probe(body):
+        calls.append(body)
+        image = body["messages"][0]["content"][0]["type"] == "image_url"
+        return {"probe": {"engine": "fake", "prompt_ids": [1, 9, 9, 8, 9, 9, 7, 2] if image else [1, 2],
+            "generated": [3] * 600, "media": [{"start": 1, "len": 6, "grid": [1, 4, 4],
+                "key": "a" * 64, "kind": "image"}] if image else []},
+            "server": {"model": "model", "family": "mistral_large4"}}
+    arm = {"checkpoint": "model", "head": "bf16", "activations": "bf16", "kv": "bf16",
+        "state": "bf16", "speculation": False, "prefix_cache": False}
+    result = builder.build_vision_set(family="mistral_large4", model="model", checkpoint="model",
+        version="real1", arm=arm, probe=probe, fixtures=destination, tokenizer_sha256="c" * 64,
+        vision_manifest=manifest, snapshot=snapshot)
+    assert [w["id"] for w in result["windows"]] == ["real_00", "resize_00", "text_control"]
+    for window in result["windows"]:
+        assert set(window["roles"][window["score_from"]:]) == {"gen"}
+        for image in window.get("media", []):
+            assert image["start"] + image["len"] <= window["score_from"]
+    assert not result["windows"][-1].get("media") and len(calls) == 3
+    assert result["windows"][0]["media"][0]["fixture"] == records[0]["fixture"]
+
+
+@pytest.mark.parametrize("mutation,match", [
+    ("hash", "pinned media identity"), ("path", "relative path"),
+    ("resize", "pinned FILE"), ("pixels", "geometry"), ("merge", "image merge"),
+])
+def test_real_vision_manifest_rejects_unbound_inputs(real_vision_input, mutation, match):
+    import json
+    manifest, snapshot, destination = real_vision_input
+    document = json.loads(manifest.read_text())
+    if mutation == "hash":
+        document["images"][0]["sha256"] = "0" * 64
+    elif mutation == "path":
+        document["images"][0]["file"] = "../photo.png"
+    elif mutation == "resize":
+        document["resize"] = ["unbound.png@4x4"]
+    elif mutation == "pixels":
+        document["resize"] = ["photo.png@2048x2048"]
+    else:
+        processor = json.loads((snapshot / "processor_config.json").read_text())
+        processor["spatial_merge_size"] = True
+        (snapshot / "processor_config.json").write_text(json.dumps(processor))
+        config = json.loads((snapshot / "config.json").read_text())
+        config["spatial_merge_size"] = True
+        (snapshot / "config.json").write_text(json.dumps(config))
+    manifest.write_text(json.dumps(document))
+    with pytest.raises(ValueError, match=match):
+        load_script("fidelity-set").real_vision_fixtures(manifest, destination, snapshot)
+
+
+def test_shared_processor_contract_supports_legacy_processor_not_family_name(tmp_path):
+    import json
+    from fidelity_media import processor_contract
+    (tmp_path / "config.json").write_text("{}")
+    for kind in ("Qwen2VLImageProcessor", "Glm5NextImageProcessor"):
+        (tmp_path / "preprocessor_config.json").write_text(json.dumps({
+            "image_processor_type": kind, "patch_size": 16, "merge_size": 2}))
+        assert processor_contract(tmp_path) == {"merge": 2, "row_markers": 0}
 
 
 def span():

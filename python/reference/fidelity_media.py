@@ -13,6 +13,39 @@ import secrets
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 
 
+def processor_contract(snapshot):
+    """The shared image-span layout, derived from the checkpoint processor."""
+    snapshot = Path(snapshot)
+    config = json.loads((snapshot / "config.json").read_bytes())
+    path = snapshot / "processor_config.json"
+    document = json.loads(path.read_bytes()) if path.exists() else {}
+    processor = document.get("image_processor")
+    if processor is None:
+        processor = json.loads((snapshot / "preprocessor_config.json").read_bytes())
+    kind = processor.get("image_processor_type", "")
+    if kind in ("PixtralImageProcessor", "PixtralImageProcessorPil"):
+        merge = document.get("spatial_merge_size")
+        vision = json.loads((snapshot / "params.json").read_bytes())["vision_encoder"]
+        ids = [vision.get(k) for k in ("image_token_id", "image_break_token_id", "image_end_token_id")]
+        vocab = config.get("text_config", config)["vocab_size"]
+        if (processor.get("patch_size") != config["vision_config"]["patch_size"]
+                or merge != config.get("spatial_merge_size")
+                or config.get("image_token_index") != ids[0]
+                or any(type(n) is not int or not 0 <= n < vocab for n in ids) or len(set(ids)) != 3):
+            raise ValueError("checkpoint processor geometry or image markers disagree")
+        contract = {"merge": merge, "row_markers": 1, "image_token_id": ids[0],
+            "row_break_token_id": ids[1], "end_token_id": ids[2]}
+    elif kind in ("Qwen2VLImageProcessor", "Qwen2VLImageProcessorPil", "Qwen2VLImageProcessorFast",
+                  "Glm5NextImageProcessor", "Glm5NextImageProcessorPil", "Glm5NextImageProcessorFast"):
+        contract = {"merge": processor.get("merge_size", 2), "row_markers": 0}
+    else:
+        raise ValueError(f"unsupported shared image processor: {kind}")
+    merge = contract["merge"]
+    if type(merge) is not int or not 1 <= merge <= 8:
+        raise ValueError("invalid checkpoint image merge")
+    return contract
+
+
 def image_extent(grid, contract=None):
     """Same patch-grid/merge/row-marker contract as the serving processor."""
     contract = contract or {"merge": 2, "row_markers": 0}
