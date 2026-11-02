@@ -341,19 +341,20 @@ capture_native_exlr8_launch(*map(Path, sys.argv[2:]))
 
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
-fn installed_flash_exlr8_min_max_preserve_worker_budget_and_pending_refusal() {
+fn installed_flash_exlr8_bounded_spark_plans_preserve_worker_budget_and_pending_refusal() {
     let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
         .expect("explicit Flash snapshot required"));
     let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
         .expect("explicit current exporter manifest required"));
     assert!(snapshot.join("config.json").is_file() && programs.is_file());
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    for (name, gpus, ranks) in [("min", "1", 4), ("max", "2", 6)] {
+    for (name, gpus, ranks) in [("bounded-1rtx-4spark", "1", 4), ("bounded-2rtx-6spark", "2", 6)] {
         for explicit in [None, Some("104")] {
             let mut command = Command::new("timeout");
             command.args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"]).arg(&snapshot)
+                // Keep a Spark suffix for this wire-budget proof; automatic TP2 can onboard every layer.
                 .args(["--deployment", "--rtx", gpus, "--spark-ranks", &ranks.to_string(),
-                    "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
+                    "--rtx-expert-layers", "1", "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
                     "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB");
             if let Some(budget) = explicit { command.args(["--spark-budget-gib", budget]); }
             let output = command.output().unwrap();
@@ -386,6 +387,48 @@ from test_run_family_dispatch import capture_pending_native_exlr8_deployment
 capture_pending_native_exlr8_deployment(Path(sys.argv[2]))
 "#]).arg(&root).arg(&path).output().unwrap();
             assert!(python.status.success(), "{name}: {}", String::from_utf8_lossy(&python.stderr));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT and current CUTEAFD_DEPLOYMENT_TEST_PROGRAMS"]
+fn installed_flash_exlr8_automatic_tp2_max_is_zero_spark_and_pending() {
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_EXLR8_FLASH_SNAPSHOT")
+        .expect("explicit Flash snapshot required"));
+    let programs = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS")
+        .expect("explicit current exporter manifest required"));
+    assert!(snapshot.join("config.json").is_file() && programs.is_file());
+    // A requested Spark ceiling must not attach idle workers when all routed layers fit locally.
+    for ranks in ["0", "6"] {
+        let output = Command::new("timeout").args(["30", env!("CARGO_BIN_EXE_cuteafd"), "plan"])
+            .arg(&snapshot).args(["--deployment", "--rtx", "2", "--spark-ranks", ranks,
+                "--vision", "off", "--audio", "off", "--speculator", "off", "--exlr8-manifest", "k4",
+                "--workspace-manifest"]).arg(&programs).env_remove("COORDINATOR_GPU_BUDGET_GIB")
+            .output().unwrap();
+        assert!(output.status.success(), "requested ranks={ranks}: {}", String::from_utf8_lossy(&output.stderr));
+        let deployment: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(deployment["family"], "glm5_flash");
+        assert_eq!(deployment["exlr8"]["manifest"], "k4");
+        assert_eq!(deployment["spark_ranks"], 0);
+        assert_eq!(deployment["spark_requirements"]["resident_bytes_per_rank"], serde_json::json!([]));
+        assert_eq!(deployment["report"]["fits"], true);
+        assert_eq!(deployment["report"]["runtime"], "planned");
+        assert_eq!(deployment["report"]["placement_supported"], false);
+        assert_eq!(deployment["executable"], false);
+        assert_eq!(deployment["wip_launchable"], false);
+        let devices = deployment["memory_layout"]["devices"].as_array().unwrap();
+        assert_eq!(devices.len(), 2);
+        for (rank, device) in devices.iter().enumerate() {
+            assert_eq!(device["kind"], "rtx");
+            assert_eq!(device["index"], rank);
+            assert_eq!(device["kv_tokens"], 2_097_152);
+            let items = device["items"].as_array().unwrap();
+            let routed = items.iter().find(|item| item["group"] == "TP2 expert layer halves 3..45")
+                .expect("all 42 routed layer halves must be resident on each RTX");
+            assert!(routed["bytes"].as_u64().unwrap() > 70u64 << 30);
+            let resident = items.iter().map(|item| item["bytes"].as_u64().unwrap()).sum::<u64>();
+            assert!(resident <= device["capacity_bytes"].as_u64().unwrap());
         }
     }
 }
