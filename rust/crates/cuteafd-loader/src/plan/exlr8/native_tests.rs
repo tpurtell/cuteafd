@@ -42,6 +42,92 @@ fn flash_native_stages_charge_separate_projected_inputs_once() -> Result<()> {
     Ok(())
 }
 
+fn index_stage_fixture(prefix: &str, capacity: usize, compact: bool) -> Value {
+    use serde_json::json;
+    let replay = if capacity == 128 { 128 } else { 64 };
+    let mut pointers = vec![
+        ("iq", "bfloat16", "[rows,32,128]".to_string(), "in"),
+        ("kw", "bfloat16", "[rows,288]".into(), "in"),
+    ];
+    let inputs = if compact {
+        vec![("pool_slots", "int64"), ("positions", "int64"), ("kda_slots", "int32"), ("seq_first", "int32")]
+    } else { vec![("slots", "int64"), ("pool_slots", "int64")] };
+    pointers.extend(inputs.into_iter().map(|(name, dtype)| (name, dtype, "[rows]".into(), "in")));
+    pointers.extend([
+        ("k_norm_w", "bfloat16", "[128]".into(), "in"),
+        ("k_norm_b", "bfloat16", "[128]".into(), "in"),
+        ("ape", "bfloat16", "[4,128]".into(), "in"),
+    ]);
+    if compact {
+        pointers.extend([("tails", "uint8", "[slots,1552]".into(), "inout"),
+            ("replay", "bfloat16", format!("[{replay},256]"), "out")]);
+    } else { pointers.push(("token_keys", "bfloat16", "[record_slots,256]".into(), "inout")); }
+    pointers.extend([
+        ("index_cache", "uint8", "[pool_pages,8448]".into(), "inout"),
+        ("q_fp8", "float8_e4m3fn", "[rows,32,128]".into(), "out"),
+        ("head_weights", "float32", "[rows,32]".into(), "out"),
+    ]);
+    if compact { pointers.push(("scratch", "uint8", "[index_keys_scratch]".into(), "scratch")); }
+    let mut geometry = json!({"hidden":4096,"index_heads":32,"index_head_dim":128,"index_kpool":4,
+        "page_rows":64,"max_rows":capacity,"index_norm_eps":1e-6,"projected_inputs":true});
+    if compact { geometry["tail_bytes"] = json!(1552); geometry["replay_rows"] = json!(replay); }
+    else { geometry["token_key_row_bytes"] = json!(512); }
+    let kind = if compact { "c" } else { "keys" };
+    json!({"name":format!("{prefix}_index_projected_{kind}_m{capacity}"),"op":"index_producer",
+        "capacity_rows":capacity,"geometry":geometry,
+        "pointers":pointers.into_iter().map(|(name,dtype,shape,role)| json!({"name":name,"dtype":dtype,"shape":shape,"role":role})).collect::<Vec<_>>(),
+        "scalars":if compact { json!([{"name":"rows","type":"int32"},{"name":"spec","type":"int32"}]) }
+            else { json!([{"name":"rows","type":"int32"}]) },
+        "scratch_bytes_at_capacity":if compact { json!({"scratch":capacity*512}) } else { json!({}) }})
+}
+
+#[test]
+fn flash_index_admission_selects_effective_cache_without_fallback() -> Result<()> {
+    use crate::serving_capacity::GlmfIndexCache::{Compact, Keys};
+    for prefix in ["glmf_stage", "glmf2_stage"] {
+        for capacity in [64, 128, 4096] {
+            for (cache, other, compact) in [(Compact, Keys, true), (Keys, Compact, false)] {
+                let entry = index_stage_fixture(prefix, capacity, compact);
+                let manifest = serde_json::json!({"programs":[entry.clone()]});
+                let (name, scratch) = flash_index_stage(&manifest, prefix, capacity, cache)?;
+                assert_eq!(name, entry["name"].as_str().unwrap());
+                assert_eq!(scratch, if compact { capacity * 512 } else { 0 });
+                assert!(flash_index_stage(&manifest, prefix, capacity, other).is_err());
+                let mut invalid = manifest.clone();
+                invalid["programs"][0]["geometry"]["index_heads"] = serde_json::json!(16);
+                assert!(flash_index_stage(&invalid, prefix, capacity, cache).is_err());
+                let duplicate = serde_json::json!({"programs":[entry.clone(),entry]});
+                assert!(flash_index_stage(&duplicate, prefix, capacity, cache).is_err());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires CUTEAFD_FLASH_STAGE_ABIS with actual TP1/TP2 exporter listings"]
+fn exported_flash_index_admission_selects_effective_cache() -> Result<()> {
+    use crate::serving_capacity::GlmfIndexCache::{Compact, Keys};
+    let paths = std::env::var_os("CUTEAFD_FLASH_STAGE_ABIS").context("actual stage ABI paths required")?;
+    let mut checked = BTreeSet::new();
+    for path in std::env::split_paths(&paths) {
+        let manifest: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let prefix = if manifest["programs"].as_array().context("stage programs")?.iter()
+            .any(|entry| entry["name"].as_str().is_some_and(|name| name.starts_with("glmf2_stage_"))) {
+            "glmf2_stage"
+        } else { "glmf_stage" };
+        for capacity in [64, 128, 4096] {
+            for cache in [Compact, Keys] {
+                let (name, scratch) = flash_index_stage(&manifest, prefix, capacity, cache)?;
+                assert_eq!(scratch, if cache == Compact { capacity * 512 } else { 0 });
+                checked.insert(name);
+            }
+        }
+    }
+    assert_eq!(checked.len(), 12);
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires CUTEAFD_EXLR8_FLASH_SNAPSHOT published checkpoint headers"]
 fn published_flash_native_facts_match_resident_bridge_and_owned_mla() -> Result<()> {

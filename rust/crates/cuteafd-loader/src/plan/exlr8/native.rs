@@ -112,7 +112,8 @@ pub struct FlashCharges { pub ranks: Vec<FlashRankLayout>, pub programs: BTreeSe
 impl FlashCharges {
     #[allow(clippy::too_many_arguments)]
     pub fn from_manifest(facts: &DenseFacts, cfg: &crate::families::glm5_flash::GlmNextConfig,
-        whole_mla: &BTreeMap<usize, usize>, rows: usize, waves: usize, decode: usize, manifest: &Value) -> Result<Self> {
+        whole_mla: &BTreeMap<usize, usize>, rows: usize, waves: usize, decode: usize,
+        index_cache: crate::serving_capacity::GlmfIndexCache, manifest: &Value) -> Result<Self> {
         ensure!(facts.layers == cfg.layers && (1..=4).contains(&waves) && matches!(decode, 64 | 128),
             "native Flash execution geometry");
         let ranks = facts.shared_bytes.len();
@@ -144,11 +145,8 @@ impl FlashCharges {
             let prefix = if ranks == 1 { "glmf_stage" } else { "glmf2_stage" };
             let capacities = if !is_decode { vec![4096] } else if decode == 128 { vec![64, 128] } else { vec![64] };
             for capacity in capacities {
-                let name = format!("{prefix}_index_projected_c_m{capacity}");
-                let spec = super::workspace::program_spec(manifest, &name)?;
-                let entry = entries.iter().find(|e| e["name"] == name).context("native Flash index stage entry")?;
-                let layout = cuteafd_ffi::projected_index::validate_entry(&spec, entry)?;
-                stage_scratch[index] = stage_scratch[index].max(layout.scratch);
+                let (name, scratch) = flash_index_stage(manifest, prefix, capacity, index_cache)?;
+                stage_scratch[index] = stage_scratch[index].max(scratch);
                 programs.insert(name);
             }
         }
@@ -169,6 +167,21 @@ impl FlashCharges {
         Ok(Self { ranks: layouts, programs })
     }
     pub fn bytes(&self, hidden: usize) -> Result<Vec<u64>> { self.ranks.iter().map(|r| r.bytes(hidden)).collect() }
+}
+
+fn flash_index_stage(manifest: &Value, prefix: &str, capacity: usize,
+    cache: crate::serving_capacity::GlmfIndexCache) -> Result<(String, usize)> {
+    use crate::serving_capacity::GlmfIndexCache;
+    let kind = match cache { GlmfIndexCache::Compact => "c", GlmfIndexCache::Keys => "keys" };
+    let name = format!("{prefix}_index_projected_{kind}_m{capacity}");
+    let spec = super::workspace::program_spec(manifest, &name)?;
+    let entry = manifest["programs"].as_array().context("native Flash programs")?.iter()
+        .find(|entry| entry["name"] == name).context("native Flash index stage entry")?;
+    let scratch = match cache {
+        GlmfIndexCache::Compact => cuteafd_ffi::projected_index::validate_entry(&spec, entry)?.scratch,
+        GlmfIndexCache::Keys => { cuteafd_ffi::projected_index::validate_keys_entry(&spec, entry)?; 0 },
+    };
+    Ok((name, scratch))
 }
 
 /// Both ranks execute one stream-serialized routed arena; pair lane payloads are separate.

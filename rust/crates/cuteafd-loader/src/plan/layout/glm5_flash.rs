@@ -229,7 +229,7 @@ fn layout_with_native(report: &mut PlanReport, model: &dyn super::super::FamilyM
         }
         let native_charge = exlr8.map(|(facts, _)| crate::plan::exlr8::native::FlashCharges::from_manifest(
             facts, &cfg, &whole_mla(attention.first_owner as usize), rows as usize, lanes as usize,
-            decode_rows as usize, manifest.context("native Flash requires PROGRAMS.json")?)).transpose()?;
+            decode_rows as usize, index, manifest.context("native Flash requires PROGRAMS.json")?)).transpose()?;
         if let Some(charge) = &native_charge {
             for profile in [&mut workspace, &mut local_workspace] {
                 for (rank, bytes) in charge.bytes(cfg.hidden)?.into_iter().enumerate() {
