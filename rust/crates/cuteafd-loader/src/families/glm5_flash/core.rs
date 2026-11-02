@@ -361,7 +361,17 @@ mod tests {
             assert!(report.executable(), "{}", crate::plan::render(&report));
             let layout = report.memory_layout.as_ref().unwrap();
             assert!(layout.devices.iter().take(gpus).all(|d| d.items.iter().any(|i| i.group == "native K6 core")));
-            assert_eq!(layout.devices.iter().filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Spark).count(), if gpus == 1 { 2 } else { 0 });
+            let serialized = serde_json::to_value(&report)?;
+            let devices = serialized["memory_layout"]["devices"].as_array().unwrap();
+            let sparks: Vec<_> = devices.iter().filter(|device| device["kind"] == "spark").collect();
+            let ranks = if gpus == 1 { 2 } else { 0 };
+            assert_eq!(report.spark_ranks, ranks);
+            assert_eq!(sparks.len(), ranks);
+            for (rank, device) in sparks.iter().enumerate() {
+                assert_eq!(device["index"], rank);
+                assert!(device["worker_budget_bytes"].as_u64().unwrap() > 0);
+                assert_eq!(device["capacity_bytes"], device["worker_budget_bytes"]);
+            }
         }
         Ok(())
     }

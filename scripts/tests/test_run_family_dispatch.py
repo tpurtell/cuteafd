@@ -802,9 +802,6 @@ def test_glmf_selection_starts_after_solve_and_seals_before_opening_lanes() -> N
     assert "admission::step_workspace_demands(" in admission
     normalization = body.split("let mut selected_args = args.clone();", 1)[1].split("let args = &selected_args;", 1)[0]
     assert "if " not in normalization, "zero-peer exchanges must also use admitted effective lanes"
-    planner = (ROOT / "rust/crates/cuteafd-loader/src/plan/layout/glm5_flash.rs").read_text()
-    assert "Ok((placed, working))" in planner and "selected = Some(working);" in planner
-    assert "0..working.spark_ranks" in planner and "selected.filter(|working| working.spark_ranks > 0)" in planner
     loader = (ROOT / "rust/crates/cuteafd-loader/src/placement/families/glm5_flash.rs").read_text()
     request = loader.split("pub fn request_for_working_set(", 1)[1].split("/// Exact header-only", 1)[0]
     assert "working.demands(&fixed).cloned().collect()" in request
