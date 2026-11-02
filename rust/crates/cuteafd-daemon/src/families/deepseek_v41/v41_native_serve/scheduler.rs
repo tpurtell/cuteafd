@@ -446,10 +446,9 @@ fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill
 }
 
 fn pending_prefix_hit(prompt: &[u32], earlier: &[u32], retried: bool, donor_retried: bool,
-    retained: usize, whole: bool) -> bool {
-    // Only a strict extension may wait, once, for a donor finishing this round.
-    whole && !retried && !donor_retried && !earlier.is_empty() && earlier.len() < prompt.len()
-        && retained < earlier.len() && prompt.starts_with(earlier)
+    whole: bool) -> bool {
+    // Preserve identical/containing-prefix reuse, but never chain waiter donors.
+    whole && !retried && !donor_retried && !earlier.is_empty() && prompt.starts_with(earlier)
 }
 
 /// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
@@ -961,7 +960,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                 && admitted.iter().any(|(earlier, ..)| earlier.images.is_empty()
                     && !earlier.job.events.is_closed() && !crate::shared::probe::cold(&earlier.job.probe)
                     && pending_prefix_hit(&prepared.prompt, &earlier.prompt, prepared.prefix_deferred,
-                        earlier.prefix_deferred, prefixes.engine().peek(&prepared.prompt, true), whole)) {
+                        earlier.prefix_deferred, whole)) {
                 prepared.prefix_deferred = true;
                 tracing::debug!(prompt_tokens=prepared.prompt.len(), "native pending prefix deferred once");
                 next_wave.push_back(prepared);
@@ -2833,38 +2832,36 @@ mod sampling_tests {
         let replay = Probe::new(ProbeSpec { cold: true,
             cold_steps: vec![ProbeColdStep { end: 4, decode: false }], ..Default::default() });
         assert!(!packing_probe_allowed(&Some(replay)));
-        assert!(pending_prefix_hit(&[1, 2, 3], &[1, 2], false, false, 0, true));
-        assert!(!pending_prefix_hit(&[1, 2], &[1, 2], false, false, 0, true));
-        assert!(!pending_prefix_hit(&[1, 3], &[1, 2], false, false, 0, true));
-        assert!(!pending_prefix_hit(&[1], &[1, 2], false, false, 0, true));
-        assert!(!pending_prefix_hit(&[1], &[], false, false, 0, true));
+        assert!(pending_prefix_hit(&[1, 2, 3], &[1, 2], false, false, true));
+        assert!(pending_prefix_hit(&[1, 2], &[1, 2], false, false, true));
+        assert!(!pending_prefix_hit(&[1, 3], &[1, 2], false, false, true));
+        assert!(!pending_prefix_hit(&[1], &[1, 2], false, false, true));
+        assert!(!pending_prefix_hit(&[1], &[], false, false, true));
     }
 
     #[test]
     fn pending_prefix_wait_is_bounded_and_cannot_chain() {
         let donor = [1, 2];
         let extension = [1, 2, 3];
-        assert!(pending_prefix_hit(&extension, &donor, false, false, 0, true));
+        assert!(pending_prefix_hit(&extension, &donor, false, false, true));
         // Even a missing/failed donor cannot make the retried request wait again.
-        assert!(!pending_prefix_hit(&extension, &donor, true, false, 0, true));
-        assert!(!pending_prefix_hit(&[1, 2, 3, 4], &extension, false, true, 0, true));
-        assert!(!pending_prefix_hit(&extension, &donor, false, false, donor.len(), true));
+        assert!(!pending_prefix_hit(&extension, &donor, true, false, true));
+        assert!(!pending_prefix_hit(&[1, 2, 3, 4], &extension, false, true, true));
         // A positive decode share can spread a cold donor over several rounds.
-        assert!(!pending_prefix_hit(&extension, &donor, false, false, 0, false));
-        for _ in 0..16 {
-            assert!(!pending_prefix_hit(&donor, &donor, false, false, 0, true));
-            assert!(!pending_prefix_hit(&[1], &donor, false, false, 0, true));
-        }
-        // Simulate the old repeated-boundary chain with a new donor each time.
-        let mut retried = false;
-        let mut waits = 0;
-        for _ in 0..16 {
-            if pending_prefix_hit(&extension, &donor, retried, false, 0, true) {
-                retried = true;
-                waits += 1;
+        assert!(!pending_prefix_hit(&extension, &donor, false, false, false));
+        // Equality keeps the baseline restore fast path and has the same one-wave bound.
+        for prompt in [&donor[..], &extension[..]] {
+            let mut retried = false;
+            let mut waits = 0;
+            for _ in 0..16 {
+                if pending_prefix_hit(prompt, &donor, retried, false, true) {
+                    retried = true;
+                    waits += 1;
+                }
             }
+            assert_eq!(waits, 1);
+            assert!(!pending_prefix_hit(prompt, &donor, false, true, true));
         }
-        assert_eq!(waits, 1);
     }
 
     #[test]
