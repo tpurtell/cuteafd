@@ -130,7 +130,7 @@ pub struct RankProjections {
 
 /// Per rank: the K6 geometries of every layer plus the head on the head rank
 /// (`ranks - 1`), with the scratch planned at `rows` (head at most 64 rows:
-/// the decode/verify width; prefill scores only its last row per unit).
+/// the decode/verify width; wider prefill/drafter scoring uses head microbatches).
 pub fn projections(cfg: &MuseSparkConfig, core: &CoreInventory, ranks: usize, rows: usize)
     -> Result<Vec<RankProjections>> {
     let mut out = vec![RankProjections { programs: BTreeMap::new(), scratch: None }; ranks];
