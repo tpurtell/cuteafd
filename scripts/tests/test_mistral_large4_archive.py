@@ -121,3 +121,10 @@ def test_native_job_host_failures_are_not_silenced(monkeypatch):
         error=None, hosts={'moa': dict(failed=['disk error'])})))
     with pytest.raises(ValueError, match='job did not complete'):
         storage._wait(1)
+
+
+def test_native_ref_group_is_part_of_the_selected_checkpoint(artifact):
+    root, _, _, _, _, plan = artifact
+    plan['steps'][0]['copies'].append(dict(group=str(storage.NAMESPACE_HUB /
+        ('models--' + storage.TARGET_REPO.replace('/', '--')) / 'refs')))
+    assert storage.archive(root)['status'] == 'complete'

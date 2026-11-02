@@ -83,8 +83,9 @@ def _placement(plan):
             or set(goal.get("hosts", [])) != set(HOSTS)
             or abs(goal.get("factor", 0) - 1 / len(HOSTS)) > 1e-9):
         raise ValueError("SparkNest placement is not the authorized six-Spark spread")
+    refs_group = str(NAMESPACE_HUB / ("models--" + TARGET_REPO.replace("/", "--")) / "refs")
     for step in plan.get("steps", []):
-        if any(row.get("group") != TARGET_REPO for row in step.get("copies", [])):
+        if any(row.get("group") not in (TARGET_REPO, refs_group) for row in step.get("copies", [])):
             raise ValueError("SparkNest placement includes another checkpoint")
     return plan
 
