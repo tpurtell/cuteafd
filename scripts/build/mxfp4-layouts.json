@@ -4,6 +4,16 @@
   "native_slices": [
     {
       "hidden": 5120,
+      "width": 384,
+      "sm": 121,
+      "capacities": [1, 16, 80],
+      "slices": [128, 128, 128],
+      "fc1_k_splits": [2, 2, 2],
+      "prefill": [256, 1024, 4096],
+      "source": "PR217 GB10 legacy192/split1 to legacy128/split2: 1.36/1.29/1.28x; TP6 standard-v2 fidelity passed; PR219 ordered STREAM prefill"
+    },
+    {
+      "hidden": 5120,
       "width": 288,
       "sm": 121,
       "capacities": [
@@ -323,19 +333,6 @@
     {
       "hidden": 4096,
       "width": 1024,
-      "sm": 121,
-      "capacities": [],
-      "slices": [],
-      "source": "PR219 route52; three shipped controls, spread-aware non-regression, deterministic original-slot routes",
-      "prefill": [
-        256,
-        1024,
-        4096
-      ]
-    },
-    {
-      "hidden": 5120,
-      "width": 384,
       "sm": 121,
       "capacities": [],
       "slices": [],
