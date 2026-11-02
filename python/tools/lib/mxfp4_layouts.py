@@ -37,7 +37,7 @@ def validate(data: dict) -> None:
         split_recipes = dict(zip(row["capacities"], splits, strict=True))
         if any(split not in (1, 2, 4, 8) for split in splits):
             raise ValueError("invalid native MXFP4 FC1 K split")
-        if len({split for capacity, split in split_recipes.items() if capacity <= 80}) != 1:
+        if split_recipes and len({split for capacity, split in split_recipes.items() if capacity <= 80}) != 1:
             raise ValueError("native MXFP4 decode capacities must share one FC1 K split")
         if any(split != 1 for capacity, split in split_recipes.items() if capacity > 80):
             raise ValueError("native MXFP4 prefill FC1 K splitting is unqualified")
@@ -102,6 +102,7 @@ def native_prefill_scratch(capacity: int, hidden: int, width: int,
         planes.append(dict(name=name, dtype=dtype, shape=shape, offset=offset, nbytes=size))
         offset += size
     return planes, offset
+
 
 def native_fc1_k_splits(hidden: int, width: int, sm: int, capacity: int) -> int:
     for row in layouts()["native_slices"]:
