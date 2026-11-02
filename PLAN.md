@@ -6225,3 +6225,90 @@ The managed snapshot is under `/mnt/sparknest/hf-home/hub/` at
 Do not replay publication against the deliberately retired standalone paths.
 Full-model generation/serving qualification and K6 engine shape support remain
 separate work; this task branch is pushed for review, not merged.
+
+## Mistral Large 4 K4 experts / Core K6 (2026-11-01)
+
+TJ authorized the complete quant, a short pilot, autonomous numerical-failure
+cache assessment, ordinary-OOM resume, and direct publication without another
+approval stop. This supersedes QUANT_BRIEF.md's pilot and publication pauses.
+Work stays on `quant/mistral-large4-k4-core-k6` in the existing `mistral-quant`
+worktree; no engine changes or integration/release pushes are authorized.
+Only raptor GPU1 (`GPU-95f8f212-9131-df99-fd53-7535965197d7`) is exposed to
+its bounded container, under the existing fair queue. GPU0 and other jobs
+remain untouched. Host RSS admission is 74 GiB; the container caps memory
+and swap together at 78 GiB. Work/output are on the Developer NVMe; builds
+and temporary test/compiler files use the task's root-NVMe build directory.
+
+Pinned source is `mistralai/Mistral-Large-4-1T-A52B` at
+`f12dabdc0c1e99e7f7924461a6f308859b05af4d`. No official BF16 sibling was
+found; execute original block-128 FP8 times its positive power-of-two qscale,
+then BF16. All original payloads are audited against Hub LFS/Git hashes.
+SparkNest downloaded the complete model across physical local raptor disks
+including D2/D3; their union is local readiness, with no loading replicas.
+The native Tekken v15 renderer uses reasoning_effort high and preserves
+special-like user strings as text. Full public-panel calibration is 1,426
+whole prompts and 1,126,268 tokens, without packing, truncation or padding.
+
+Implementation is `quantization/mistral_large4/core_k6/`. Recipe: 424 K6
+core/head and 27,264 K4 routed projections, standard MCG 0xCBAC1FED,
+seed 787, sigma 0.025, automatic scales. Preserve 1,251 original tensors
+byte-for-byte: BF16 kv_b, FP8 indexer including its original qscales,
+routers/norms, embeddings, vision and bundled native dSpark. Self-owned
+NoPE kv_a retains the name wkv_a_with_mqa with width512; RoPE width576 uses
+stored640 padding and crops only after full reconstruction. Nine reused
+layers have no kv_a. Expected export: 73 shards, 112,003 tensors,
+540,617,010,400 payload bytes (503.49 GiB). Routed bytes require about
+79.98 GiB per Spark at TP6; TP4 needs119.97 GiB before runtime overhead.
+
+Calibrate each causal stage against reconstructed quantized predecessors,
+finish K4 experts and replay the whole block before its successor. Every
+frontier carries exact shared DSA selections and layer35's compressed NoPE
+KV through later reuse. Raw dense XTX contains actual corpus rows only;
+cold routed experts use native router ranks5-8 in rank-major/corpus order,
+then missing-count identity rows to reach1024. Phase manifests, projection
+receipts, audited shards and successor frontier are ordered retirement
+barriers. Resume checks numerical identity and hashes; launcher/publisher
+changes do not masquerade as changes to numerical producers. Numerical
+failures require dependency-aware review; never delete valid predecessors
+merely because an uncommitted current phase failed.
+
+The launcher runs a durable user systemd unit. Its guard stops this task's
+container before releasing GPU1, then authorized upload runs CPU-only.
+Independent completed-export validation must pass before publication; remote
+object hashes, anonymous revision and weight HEAD are checked. Publication
+target is `wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6`. Keep the source
+Mistral Ecosystem Open-Weight License intact. Serving, full-model quality and
+engine-format qualification are separate from projection/native math checks.
+Local run/evidence/export: `~/Developer/cute-worktrees/mistral-quant-work/`.
+
+Tracking: issue #937, draft PR #938. Initial implementation is sealed at
+`e7bb052f9`; 141 focused CPU cases pass and the affected native/pilot26
+pass again after removing a false-positive class-name secret-scanner trigger.
+All68 source files (1,060,613,131,585 bytes including assets) match their
+published Hub hashes. The bounded GPU pilot runs under user unit
+`mistral-core-k6-1793465295342526983`; final pilot/production results are
+not yet claimed.
+
+The CPU finalizer is `finish.py`: publish first, then `archive.py`. Native
+SparkNest cannot adopt a Developer file directly into its D2/D3 disk stores
+without copying to the primary disk. Instead, finalization sends disjoint
+published shards to the six Sparks, one network copy per shard, then imports
+each partial HF snapshot offline using hardlinks on that Spark's primary
+filesystem. The shared namespace joins those additive snapshots. No storage
+policy changes are needed. Check all managed hashes and exactly one assigned
+sealed Spark copy per weight before recording `archive-complete.json` and
+removing this task's staging and standalone weight hardlinks. Keep metadata,
+scalar evidence, model card, receipts, corpus, logs and the managed revision.
+A completed-archive retry verifies the managed snapshot without replaying the
+publisher against its retired standalone paths. Storage/finalizer/lifecycle
+checks add17+3+43 CPU cases, with no actual import or transfer yet.
+
+The short GPU pilot passed in563.50 seconds (2026-10-31T16:57:47UTC), exit0:
+all72 frozen-source layers,24 native byte-exact block proofs,7 separate
+2,205-token sparse/KV proofs and16 serialized candidates. Worst tested K6
+heldout NMSE is3.15245e-4 (<1e-3); routed K4 witness is3.15434e-4 (<0.05).
+No OOM or numerical crash occurred. Keep the proposed K6/core, K4/routed and
+native exclusions. Full production started2026-10-31T17:02:39UTC under unit
+`mistral-core-k6-1793466152658395709`, with authorized CPU upload and
+zero-copy distributed import enabled. Producer files/fork/calibration are
+frozen; recover this run explicitly with its existing launcher and --resume.
