@@ -145,8 +145,8 @@ pub(super) fn check(serve: crate::cli::NativeServeArgs, tokens: &[u32], at: &[us
         let (name, value) = line.split_once('=')?;
         (name.trim() == key).then(|| value.trim())
     }));
-    let entries = config_value("PREFIX_CACHE_ENTRIES").map(str::parse::<usize>).transpose()?
-        .unwrap_or(serve.prefix_cache_entries as usize);
+    let entries = config_value("PREFIX_CACHE_ENTRIES").filter(|value| *value != "auto")
+        .map(str::parse::<usize>).transpose()?.unwrap_or(serve.resolved_prefix_entries() as usize);
     ensure!(entries > 0, "--resume-at requires a device prefix cache");
     let (queue, worker) = if let Some(url) = url {
         use cuteafd_api::openai::auth::ApiKey;

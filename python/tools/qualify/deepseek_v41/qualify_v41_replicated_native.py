@@ -61,7 +61,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from spark_packages import native_spark_roles
+from spark_packages import native_spark_artifacts, native_shard
 from _v41_expert_native import Info, L, Native, P, check, library
 from v41_spark_tp3_launch_geometry import LaunchGeometryError, manifest_geometry
 
@@ -72,13 +72,6 @@ def _load_native_dependencies():
     import _pinned_sparkinfer  # noqa: F401
     from tests.moe.test_v41_grouped_slices import _check_grouped_slices
 
-# Stable role ids and checkpoint-derived geometry share the package policy.
-SPARK_TP_GEOMETRY = native_spark_roles()
-SPARK_TP_ROLE = {tp: geometry[0] for tp, geometry in SPARK_TP_GEOMETRY.items()}
-SPARK_TP_INTERMEDIATE = {tp: geometry[1] for tp, geometry in SPARK_TP_GEOMETRY.items()}
-SPARK_TP_KERNEL_INTERMEDIATE = {tp: geometry[2] for tp, geometry in SPARK_TP_GEOMETRY.items()}
-LEGACY_TP4_ROLE = 1
-LEGACY_TP4_LOGICAL, LEGACY_TP4_STORAGE = 576, 640
 ARENA_EXPERTS = 384
 SENTINEL = 384
 REL_TOL, COS_TOL = 0.01, 0.9999
@@ -95,36 +88,14 @@ DEFAULT_SNAPSHOT = (
 )
 
 
-def assert_native_role_geometry(lib, capacity, *, tp_degree=None, tp4_legacy=False):
-    """Fail closed unless the loaded library really is the requested role family.
-
-    `--width` selects which exported variant the fixture exercises; it does not
-    prove the shared library was built with that role. Read the role id and the
-    per-rank storage extent straight out of the native info struct for one
-    precompiled capacity, so a TP6 run against a TP2/TP3/TP4-only library (or a
-    library whose padded extent disagrees) stops here instead of silently
-    measuring another topology's kernel.
-    """
+def assert_native_role_geometry(lib, capacity, *, artifact):
+    """Attest the requested executable, including logical and resident extents."""
     meta = Info()
     check(lib.cuteafd_v41_expert_info(capacity, C.byref(meta)))
-    if tp4_legacy:
-        expected = (LEGACY_TP4_ROLE, LEGACY_TP4_LOGICAL, LEGACY_TP4_STORAGE)
-    else:
-        expected = (
-            SPARK_TP_ROLE[tp_degree],
-            SPARK_TP_INTERMEDIATE[tp_degree],
-            SPARK_TP_KERNEL_INTERMEDIATE[tp_degree],
-        )
-    role, logical, storage = expected
+    expected = (artifact.role, artifact.logical, artifact.stored)
     actual = (meta.role, meta.logical_intermediate, meta.kernel_intermediate)
-    assert actual == expected, (
-        f"native library does not expose the requested role at capacity "
-        f"{capacity}: got role={meta.role} logical={meta.logical_intermediate} "
-        f"storage={meta.kernel_intermediate}, expected role={role} "
-        f"logical={logical} storage={storage}")
-    assert meta.experts == ARENA_EXPERTS and meta.hidden_size == 5120, (
-        meta.experts, meta.hidden_size)
-    assert meta.topk == 6, meta.topk
+    assert actual == expected, ("native library does not expose the requested artifact", actual, expected)
+    assert (meta.experts, meta.hidden_size, meta.topk) == (ARENA_EXPERTS, 5120, 6)
     return meta
 
 
@@ -266,24 +237,20 @@ def assert_rows_covered(rows_list, capacities):
             for rows in rows_list if rows <= capacity]
 
 
-def verify_manifest_identity(manifest, expected_intermediate, expected_degree):
-    """The supplied manifest must describe the arm being measured, not another."""
+def verify_manifest_identity(manifest, artifact, world):
+    """Require membership in the requested world's executable artifact set."""
+    if artifact not in native_spark_artifacts()[world]:
+        raise SystemExit("artifact is not part of the requested Spark world")
     geometry = manifest.get("geometry") or {}
-    degree = manifest.get("spark_tp_degree")
-    if degree != expected_degree:
-        raise SystemExit(
-            f"manifest spark_tp_degree={degree!r} does not match the requested "
-            f"TP degree {expected_degree}")
-    if geometry.get("intermediate") != expected_intermediate:
-        raise SystemExit(
-            f"manifest intermediate={geometry.get('intermediate')!r} does not "
-            f"match the requested logical intermediate {expected_intermediate}")
-    if geometry.get("experts") != ARENA_EXPERTS:
-        raise SystemExit(f"manifest experts={geometry.get('experts')!r} != {ARENA_EXPERTS}")
-    role = manifest.get("role")
-    if expected_degree in SPARK_TP_ROLE and role is not None and role != f"spark_tp{expected_degree}":
-        raise SystemExit(
-            f"manifest role={role!r} is not the requested spark_tp{expected_degree}")
+    expected_degree = None if artifact.name.startswith("spark_w") else world
+    if manifest.get("spark_tp_degree") != expected_degree:
+        raise SystemExit("manifest spark_tp_degree does not match the requested artifact")
+    if manifest.get("role") != artifact.name:
+        raise SystemExit("manifest role does not match the requested artifact")
+    for key, value in (("intermediate", artifact.logical), ("kernel_intermediate", artifact.stored),
+                       ("experts", ARENA_EXPERTS), ("hidden", 5120), ("topk", 6)):
+        if geometry.get(key) != value:
+            raise SystemExit(f"manifest {key}={geometry.get(key)!r} != requested {value}")
     return manifest
 
 
@@ -328,7 +295,7 @@ def verify_manifest_device(manifest, device):
     return manifest
 
 
-def verify_loaded_meta(meta, manifest, capacity, degree):
+def verify_loaded_meta(meta, manifest, capacity, artifact):
     """Cross-check the loaded native info struct against the manifest arm.
 
     The role table proves the family; this proves the manifest's model geometry
@@ -337,7 +304,7 @@ def verify_loaded_meta(meta, manifest, capacity, degree):
     """
     geometry = manifest.get("geometry") or {}
     expected = {
-        "role": SPARK_TP_ROLE.get(degree),
+        "role": artifact.role,
         "experts": geometry.get("experts"),
         "hidden_size": geometry.get("hidden"),
         "logical_intermediate": geometry.get("intermediate"),
@@ -345,7 +312,7 @@ def verify_loaded_meta(meta, manifest, capacity, degree):
         "topk": geometry.get("topk"),
         "capacity_rows": capacity,
     }
-    if degree == SPARK_TP3_DEGREE and (
+    if artifact.name == "spark_tp3" and (
             geometry.get("hidden") is None
             or geometry.get("kernel_intermediate") is None):
         raise SystemExit(
@@ -701,8 +668,9 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
     """
     capacities = sorted({int(x) for x in options.capacities.split(",")})
     manifest = json.loads(Path(options.manifest).read_text())
-    degree = 4 if options.tp4_legacy else options.spark_tp
-    verify_manifest_identity(manifest, intermediate, degree)
+    degree = options.spark_tp
+    artifact = native_shard(degree, options.tp_rank, options.layer)[1]
+    verify_manifest_identity(manifest, artifact, degree)
     compiled = report_compiled_widths(options.manifest, intermediate, capacities,
                                       requested_width=options.width)
     rows_list = parse_timing_rows(options.timing_rows)
@@ -727,13 +695,11 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
     for capacity in capacities:
         # Confirm the library actually exposes this role family and extent
         # before any AOT variant is exercised or timed.
-        assert_native_role_geometry(
-            lib, capacity, tp_degree=options.spark_tp,
-            tp4_legacy=options.tp4_legacy)
+        assert_native_role_geometry(lib, capacity, artifact=artifact)
         meta = Info()
         check(lib.cuteafd_v41_expert_info(capacity, C.byref(meta)))
         assert meta.role == role, (capacity, meta.role)
-        verify_loaded_meta(meta, manifest, capacity, degree)
+        verify_loaded_meta(meta, manifest, capacity, artifact)
         generator = torch_module.Generator(device="cuda").manual_seed(seed)
         x = torch_module.randn(capacity, 5120, generator=generator,
                                device="cuda").mul_(0.5).bfloat16()
@@ -742,7 +708,7 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
         ids = torch_module.empty(capacity, 6, dtype=torch_module.int32, device="cuda")
         rw = torch_module.empty(capacity, 6, device="cuda")
         native = Native(lib, capacity, arena, wire, ids, rw,
-                        spark_tp=options.spark_tp)
+                        artifact=artifact)
         # C1: the native scratch extent must equal the manifest variant's recorded
         # core scratch, so a mismatched library/manifest pair cannot be timed.
         variant = next((entry for entry in manifest.get("variants", [])
@@ -856,7 +822,7 @@ def _run_timing(options, torch_module, lib, arena, intermediate, role, gids, bas
                 record = dict(
                     kind="native_timing", status="ok", role=role,
                     spark_tp=options.spark_tp,
-                    tp4_legacy=bool(options.tp4_legacy), capacity=capacity,
+                    artifact=artifact.name, capacity=capacity,
                     rows=rows, active=active, abi_version=meta.abi_version,
                     valid_route_count=valid_routes,
                     weighted_route_count=weighted_routes,
@@ -939,11 +905,8 @@ def run_checkpoint(options, torch_module, lib):
 
     snapshot = options.snapshot
     index = json.loads((snapshot / "model.safetensors.index.json").read_text())["weight_map"]
-    role = (LEGACY_TP4_ROLE if options.tp4_legacy
-            else SPARK_TP_ROLE[options.spark_tp])
-    intermediate = (576 if options.tp4_legacy
-                    else SPARK_TP_INTERMEDIATE[options.spark_tp])
-    lo = options.tp_rank * intermediate
+    lo, artifact = native_shard(options.spark_tp, options.tp_rank, options.layer)
+    role, intermediate = artifact.role, artifact.logical
     hi = lo + intermediate
     gids = [int(x) for x in options.expert_ids.split(",")]
     assert gids and len(gids) <= ARENA_EXPERTS
@@ -952,8 +915,7 @@ def run_checkpoint(options, torch_module, lib):
     # library built without the tp6 role would otherwise fail later with a
     # confusing symbol/geometry error, or worse, measure another topology.
     probe_capacity = min(int(x) for x in options.capacities.split(","))
-    assert_native_role_geometry(lib, probe_capacity, tp_degree=options.spark_tp,
-                                tp4_legacy=options.tp4_legacy)
+    assert_native_role_geometry(lib, probe_capacity, artifact=artifact)
     if getattr(options, "manifest", None) is not None:
         report_compiled_widths(
             options.manifest, intermediate,
@@ -1003,33 +965,22 @@ def run_checkpoint(options, torch_module, lib):
         check(lib.cuteafd_pack_expert_async(src, dst, intermediate, stream))
     torch_module.cuda.synchronize()
 
-    # Cross-check the native packer against the b12x repack the Python pipeline
-    # uses. Reported, not asserted: a mismatch is evidence, not a reason to hide
-    # the numeric result.
+    # Check payload packing independently, then install lossless coded scales.
+    from _v41_expert_native import pack_reference
+    repacked = pack_reference(weights, scales, stored=artifact.stored)
     repack_mismatch = None
     if options.compare_repack:
-        rp13 = _logical_weight_to_w4a8_rp_inplace(
-            torch_module.cat([weights["w3"], weights["w1"]], 1).clone(),
-            size_k=5120, size_n=2 * intermediate, gated_half_rows=intermediate)
-        rs13 = _e8m0_scale_to_w4a8_sfb_inplace(
-            torch_module.cat([scales["w3"], scales["w1"]], 1).clone(),
-            weight_E=len(gids), rows=2 * intermediate, k_dim=5120,
-            gated_half_rows=intermediate)
-        rw2 = _logical_weight_to_w4a8_rp_inplace(
-            weights["w2"].clone(), size_k=intermediate, size_n=5120)
-        rs2 = _e8m0_scale_to_w4a8_sfb_inplace(
-            scales["w2"].clone(), weight_E=len(gids), rows=5120, k_dim=intermediate)
-        repacked = [t.view(torch_module.uint32).flatten()
-                    for t in (rp13, rs13, rw2, rs2)]
         repack_mismatch = 0
         for k in range(len(gids)):
-            for i in range(4):
+            for i in (0, 2):
                 words = per[i] // 4
-                native_words = arena[i][(base + k) * per[i]:(base + k + 1) * per[i]] \
-                    .view(torch_module.uint32)
-                repack_mismatch += int(
-                    (native_words != repacked[i][k * words:(k + 1) * words]).sum().item())
-        del repacked, rp13, rs13, rw2, rs2
+                native_words = arena[i][(base + k) * per[i]:(base + k + 1) * per[i]].view(torch_module.uint32)
+                repack_mismatch += int((native_words != repacked[i][k * words:(k + 1) * words]).sum().item())
+        assert repack_mismatch == 0, (artifact.name, "native payload pack mismatch", repack_mismatch)
+    for i in (1, 3):
+        per_coded = repacked[i].numel() // len(gids)
+        arena[i] = torch_module.zeros(ARENA_EXPERTS * per_coded, dtype=torch_module.uint32, device="cuda")
+        arena[i][base * per_coded:(base + len(gids)) * per_coded].copy_(repacked[i])
 
     if options.timing:
         return _run_timing(options, torch_module, lib, arena, intermediate, role,
@@ -1044,7 +995,7 @@ def run_checkpoint(options, torch_module, lib):
         meta = Info()
         check(lib.cuteafd_v41_expert_info(capacity, C.byref(meta)))
         assert meta.role == role
-        expect_abi = 2 if capacity <= 80 else 3
+        expect_abi = 2 if capacity <= 80 or artifact.name.startswith("spark_w") else 3
         assert meta.abi_version == expect_abi, (capacity, meta.abi_version)
 
         x = torch_module.randn(capacity, 5120, device="cuda").mul_(0.5).bfloat16()
@@ -1052,8 +1003,8 @@ def run_checkpoint(options, torch_module, lib):
         ids = torch_module.empty(capacity, 6, dtype=torch_module.int32, device="cuda")
         rw = torch_module.empty(capacity, 6, device="cuda")
         native = Native(lib, capacity, arena, wire, ids, rw,
-                        spark_tp=options.spark_tp)
-        assert native.token_accumulation == (capacity > 80)
+                        artifact=artifact)
+        assert native.token_accumulation == (expect_abi == 3)
         if native.token_accumulation:
             assert native.info.abi_version == 3
         candidates = [m for m in live_rows if m <= capacity]
@@ -1340,10 +1291,8 @@ def parse_args(argv=None):
                              "this flag a uniform-weight comparison is rejected")
     parser.add_argument("--output", type=Path, default=None,
                         help="write the emitted timing/comparison records to this file")
-    parser.add_argument("--spark-tp", type=int, choices=tuple(SPARK_TP_ROLE),
+    parser.add_argument("--spark-tp", type=int, choices=tuple(native_spark_artifacts()),
                         help="Covered namespaced native Spark TP degree")
-    parser.add_argument("--tp4-legacy", action="store_true",
-                        help="Use role 1 TP4 (I=576, pad 640) for the timing baseline")
     parser.add_argument("--width", type=parse_width, default="auto",
                         help="fixture slice width, or 'auto' to trust and record the "
                              "per-capacity widths compiled into --manifest (capacity 1 "
@@ -1400,8 +1349,10 @@ def parse_args(argv=None):
     if options.native_lib is None:
         parser.error("--native-lib is required unless --aggregate is used")
     options.snapshot = Path(options.snapshot)
-    if (options.spark_tp is None) == (not options.tp4_legacy):
-        parser.error(f"select exactly one of --spark-tp {tuple(SPARK_TP_ROLE)} or --tp4-legacy")
+    if options.spark_tp is None:
+        parser.error("--spark-tp is required")
+    if not 0 <= options.tp_rank < options.spark_tp or options.layer < 0:
+        parser.error("invalid Spark rank or absolute layer")
     if options.timing and options.checkpoint:
         parser.error("--timing and --checkpoint are mutually exclusive")
     if not (options.timing or options.checkpoint):
@@ -1422,129 +1373,9 @@ def main():
         aggregate_results(options)
         return
     _load_native_dependencies()
-    lib = library(options.native_lib, spark_tp=options.spark_tp)
-    if options.checkpoint or options.timing:
-        run_checkpoint(options, torch, lib)
-        return
-
-    capacities = {int(x) for x in options.capacities.split(",")}
-    if not capacities or not capacities <= {1, 16, 80}:
-        parser.error("synthetic capacities must be a nonempty subset of 1,16,80; "
-                     "use --checkpoint for 256/1024/4096")
-    row_filter = {int(x) for x in options.rows.split(",")} if options.rows else None
-    intermediate = SPARK_TP_INTERMEDIATE[options.spark_tp]
-    # The synthetic grouped-slices path needs a concrete slice width; `auto`
-    # (the manifest-driven mode used by --timing) resolves to the historical
-    # default here because this path has no manifest to read.
-    fixture_width = options.width if options.width is not None else 192
-
-    owners = {}
-    state = {"arena": None, "base_experts": None}
-    checked = set()
-
-    def arena_weights(weights, base_experts):
-        """Pad the fixture's resident-expert operands into a full 384-expert arena."""
-        if state["arena"] is not None:
-            assert state["base_experts"] == base_experts
-            return state["arena"]
-        padded = []
-        for weight in weights:
-            per_expert = weight.numel() // base_experts
-            arena = torch.zeros(ARENA_EXPERTS * per_expert, dtype=weight.dtype,
-                                device=weight.device)
-            arena[(ARENA_EXPERTS - base_experts) * per_expert:].copy_(
-                weight.reshape(-1))
-            padded.append(arena)
-        state["arena"], state["base_experts"] = padded, base_experts
-        return padded
-
-    # The fixture populates a fixed resident expert count (32 for these widths);
-    # derive it from the packed tensor extent, never from the routed ids.
-    w13_words_per_expert = intermediate * 1280  # kernel_intermediate == intermediate
-
-    def check(**case):
-        rows = case["rows"]
-        if row_filter is not None and rows not in row_filter:
-            return
-        capacity = 1 if rows == 1 else 16 if rows <= 16 else 80
-        if capacity not in capacities:
-            return
-        weights, wire, ids_cpu, routing = case["native_inputs"]
-        base_experts, remainder = divmod(int(weights[0].numel()), w13_words_per_expert)
-        assert remainder == 0 and base_experts > 0, (
-            "packed w13 extent is not a whole number of resident experts",
-            weights[0].numel(), w13_words_per_expert)
-        assert int(ids_cpu.max().item()) < base_experts, "routed id exceeds resident experts"
-        arena = arena_weights(weights, base_experts)
-        offset = ARENA_EXPERTS - base_experts
-
-        if capacity not in owners:
-            ids = torch.empty(capacity, 6, dtype=torch.int32, device="cuda")
-            rw = torch.empty(capacity, 6, device="cuda")
-            native = Native(lib, capacity, arena, wire, ids, rw,
-                            spark_tp=options.spark_tp)
-            assert native.info.role == SPARK_TP_ROLE[options.spark_tp], native.info.role
-            ids.fill_(-1)
-            rw.zero_()
-            native.run(1)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                native.run(capacity)
-            owners[capacity] = (native, ids, rw, graph)
-        native, ids, rw, graph = owners[capacity]
-
-        ids.fill_(-1)
-        ids[:rows].copy_(ids_cpu + offset)
-        rw.zero_()
-        rw[:rows].copy_(routing)
-
-        native.output.fill_(float("nan"))
-        allocated = torch.cuda.memory_allocated()
-        graph.replay()
-        assert torch.cuda.memory_allocated() == allocated, "replay allocated"
-
-        expected = case["expected"]
-        topk = native.info.topk
-        if native.token_accumulation:
-            actual = native.output[:rows]
-        else:
-            actual = native.output[: rows * topk].view(rows, topk, 5120).sum(1)
-        assert bool(torch.isfinite(actual).all()), "non-finite native output"
-        rel = ((actual - expected).norm() / expected.norm()).item()
-        cosine = torch.nn.functional.cosine_similarity(
-            actual.flatten(), expected.flatten(), dim=0).item()
-        assert rel < REL_TOL and cosine > COS_TOL, (case["case"], rel, cosine)
-
-        # Sentinel masking (id 384, weight 0) must yield an exact zero row.
-        masked_zero = None
-        if rows >= 1:
-            ids[rows - 1].fill_(SENTINEL)
-            rw[rows - 1].zero_()
-            native.output.fill_(float("nan"))
-            graph.replay()
-            torch.cuda.synchronize()
-            if native.token_accumulation:
-                masked_zero = native.output[rows - 1]
-            else:
-                masked_zero = native.output[(rows - 1) * topk: rows * topk].sum(0)
-            assert bool((masked_zero == 0).all()), "masked row is not exact zero"
-            masked_zero = float(masked_zero.abs().max().item())
-
-        checked.add(capacity)
-        print("NATIVE " + json.dumps(dict(
-            case=case["case"], spark_tp=options.spark_tp,
-            role=native.info.role, width=fixture_width,
-            intermediate=native.info.logical_intermediate,
-            kernel_intermediate=native.info.kernel_intermediate,
-            abi_version=native.info.abi_version, topk=topk, capacity=capacity,
-            rows=rows, experts=ARENA_EXPERTS, rel_l2=rel, cosine=cosine,
-            masked_zero=masked_zero, scratch_bytes=native.storage.numel()),
-            sort_keys=True), flush=True)
-
-    _check_grouped_slices(fixture_width, after_case=check, n=intermediate, topk=6)
-    assert checked == capacities, (checked, capacities)
-    for native, _, _, graph in owners.values():
-        graph.reset()
+    artifact = native_shard(options.spark_tp, options.tp_rank, options.layer)[1]
+    lib = library(options.native_lib, artifact=artifact)
+    run_checkpoint(options, torch, lib)
 
 
 if __name__ == "__main__":

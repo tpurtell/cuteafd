@@ -165,6 +165,48 @@ pub(crate) fn ml4_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
         pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
 }
 
+/// Native width states coexist, while their stream and live I/O are shared.
+fn mxfp4_owner_bytes(geometry: cuteafd_core::ExpertGeometry,
+    artifacts: &[cuteafd_core::tp_units::NativeArtifact], coded: bool,
+    extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    anyhow::ensure!(!artifacts.is_empty() && artifacts.len() <= 2,
+        "native owner needs one or two retained width states");
+    let mut scratch = 0u64;
+    let mut capacities = vec![extent.compiled];
+    if extent.compiled > 1 { capacities.push(1); }
+    if extent.compiled > 80 { capacities.push(80); }
+    for artifact in artifacts {
+        for &capacity in &capacities {
+            let bytes = cuteafd_core::mxfp4_layouts::native_scratch_bytes(geometry.hidden as usize,
+                geometry.experts as usize, geometry.topk as usize, artifact.logical,
+                artifact.role, capacity, coded).context("invalid native owner scratch geometry")?;
+            scratch = scratch.checked_add(bytes).context("native width scratch sum overflow")?;
+        }
+    }
+    Ok(cuteafd_core::OwnerBytes { scratch,
+        io: u64::from(extent.capacity) * (u64::from(geometry.hidden) * 97 / 32
+            + u64::from(geometry.topk) * 8),
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
+}
+
+fn mxfp4_rank_artifacts(catalog: &crate::OfficialV41Catalog, working: &SparkWorkingSet,
+    rank: usize) -> anyhow::Result<Vec<cuteafd_core::tp_units::NativeArtifact>> {
+    let shape = catalog.routed_experts();
+    let artifacts = cuteafd_core::tp_units::native_spark_artifacts(shape.hidden,
+        shape.intermediate, working.spark_ranks)?;
+    let mut retained = Vec::new();
+    for &layer in &working.spark_layers {
+        if layer < shape.first_layer { continue; }
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(shape.intermediate, working.spark_ranks);
+        let shard = cuteafd_core::tp_units::LayerShard::new(shape.intermediate, unit,
+            layer, working.spark_ranks, rank)?;
+        let artifact = artifacts.iter().find(|artifact| artifact.logical == shard.width)
+            .context("native layer has no matching artifact")?;
+        if !retained.contains(artifact) { retained.push(artifact.clone()); }
+    }
+    Ok(retained)
+}
+
 /// Legacy calibrated slot bound (stream, scratch, inputs and staging at
 /// the compiled 4096-row export) for backends without a census.
 fn legacy_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeometry,
@@ -183,13 +225,22 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
     let backend = SparkBackend::for_catalog(catalog)?;
     let groups = native_groups(input, family, working, rank)?;
     let world = working.spark_ranks;
+    let artifacts = if matches!(backend, SparkBackend::Native) && catalog.nvfp4().is_none() {
+        Some(mxfp4_rank_artifacts(catalog, working, rank)?)
+    } else { None };
+    let coded = catalog.mxfp4_scale_codes();
     let family = family.to_owned();
-    Ok(move |extent| match (&groups, backend) {
-        (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
-        (_, SparkBackend::Exl3(_)) if family == "mistral_large4" => ml4_owner_bytes(world, extent),
-        (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
-        (_, SparkBackend::Native | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
-            Ok(legacy_owner_bytes(&family, geometry, extent)),
+    Ok(move |extent| {
+        if let Some(artifacts) = &artifacts {
+            return mxfp4_owner_bytes(geometry, artifacts, coded, extent);
+        }
+        match (&groups, backend) {
+            (Some((geometry, formats)), SparkBackend::Fp8) => fp8_owner_bytes(&family, *geometry, formats, extent),
+            (_, SparkBackend::Exl3(_)) if family == "mistral_large4" => ml4_owner_bytes(world, extent),
+            (_, SparkBackend::Exl3(_)) => exl3_owner_bytes(&family, geometry, extent),
+            (_, SparkBackend::Native | SparkBackend::Exlr8 | SparkBackend::Fp8) =>
+                Ok(legacy_owner_bytes(&family, geometry, extent)),
+        }
     })
 }
 
@@ -233,6 +284,41 @@ mod tests {
     fn extent(capacity: u32, compiled: u32) -> cuteafd_core::OwnerExtent {
         cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill, capacity, compiled,
             staging_rows: capacity, buffered_units: 1 }
+    }
+
+    #[test]
+    fn native_width_states_sum_scratch_but_share_io_and_route_staging() -> anyhow::Result<()> {
+        use cuteafd_core::tp_units::native_spark_artifacts;
+        for (geometry, coded) in [(cuteafd_core::ExpertGeometry::DEEPSEEK_V41, true),
+            (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_FLASH, false),
+            (cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO, false)] {
+            for world in 2..=8 {
+                let artifacts = native_spark_artifacts(geometry.hidden as usize,
+                    geometry.intermediate as usize, world)?;
+                for compiled in [1, 16, 80, 256, 1024, 4096] {
+                    let live = compiled.min(80);
+                    let shape = extent(live, compiled);
+                    let total = mxfp4_owner_bytes(geometry, &artifacts, coded, shape)?;
+                    let singles = artifacts.iter().map(|artifact|
+                        mxfp4_owner_bytes(geometry, std::slice::from_ref(artifact), coded, shape))
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    assert_eq!(total.scratch, singles.iter().map(|owner| owner.scratch).sum::<u64>());
+                    assert_eq!(total.io, singles[0].io);
+                    assert_eq!(total.pinned_staging, singles[0].pinned_staging);
+                    let capacities = [Some(compiled), (compiled > 1).then_some(1), (compiled > 80).then_some(80)];
+                    let expected = artifacts.iter().map(|a| capacities.into_iter().flatten().map(|rows|
+                        cuteafd_core::mxfp4_layouts::native_scratch_bytes(geometry.hidden as usize,
+                            geometry.experts as usize, geometry.topk as usize, a.logical, a.role, rows, coded).unwrap())
+                        .sum::<u64>()).sum::<u64>();
+                    assert_eq!(total.scratch, expected);
+                    assert_eq!(total.io, u64::from(live) * (u64::from(geometry.hidden) * 97 / 32 + u64::from(geometry.topk) * 8));
+                    assert_eq!(mxfp4_owner_bytes(geometry, &artifacts, coded,
+                        cuteafd_core::OwnerExtent { buffered_units: 3, ..shape })?, total);
+                }
+            }
+        }
+        assert!(mxfp4_owner_bytes(cuteafd_core::ExpertGeometry::DEEPSEEK_V41, &[], true, extent(80, 80)).is_err());
+        Ok(())
     }
 
     #[test]
@@ -524,6 +610,21 @@ mod tests {
             if nvfp4 { crate::plan::testing::write_v41_nvfp4_snapshot(root.path()); }
             else { crate::plan::testing::write_v41_snapshot(root.path()); }
             let input = crate::plan::PlanInput::open(root.path())?;
+            if !nvfp4 {
+                let catalog = input.expert_catalog()?;
+                for world in 2..=8 {
+                    for rank in 0..world {
+                        let mut selected = SparkWorkingSet { spark_layers: vec![3], spark_ranks: world,
+                            prefill_lanes: 2, ..Default::default() };
+                        assert_eq!(mxfp4_rank_artifacts(catalog, &selected, rank)?.len(), 1);
+                        selected.spark_layers = (3..3 + world).collect();
+                        let retained = mxfp4_rank_artifacts(catalog, &selected, rank)?;
+                        assert_eq!(retained.len(), if 72 % world == 0 { 1 } else { 2 });
+                        selected.spark_layers.extend(3 + world..3 + 2 * world);
+                        assert_eq!(mxfp4_rank_artifacts(catalog, &selected, rank)?, retained);
+                    }
+                }
+            }
             let working = SparkWorkingSet { spark_layers: vec![3], spark_ranks: 4,
                 prefill_lanes: 2, ..Default::default() };
             let mut device = DeviceLayout { kind: DeviceKind::Spark, index: 0, capacity_bytes: 121 * GIB,

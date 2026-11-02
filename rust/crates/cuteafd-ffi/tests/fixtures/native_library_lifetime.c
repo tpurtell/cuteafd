@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../../../../../native/shared/cuda/expert_pack_layout.h"
+#include "cuteafd_mxfp4_layouts.h"
 
 struct host_buffer { void *ptr; size_t bytes; uint64_t flags; };
 static char *event_path;
@@ -522,14 +523,17 @@ int cuteafd_pack_expert_plane_async(const uint8_t *source, uint64_t source_bytes
     int status = cuteafd_cuda_stream_synchronize(stream);
     if (status) return status;
     if (pack_status) return pack_status;
-    uint32_t padded = (intermediate + 127) / 128 * 128;
+    uint32_t padded = cuteafd_mxfp4_stored_width(5120, intermediate);
+    if (!padded) return 1;
+    int compact = padded == intermediate && intermediate % 128;
     uint32_t n = plane < 2 ? 2 * padded : 5120;
     uint32_t k = plane < 2 ? 5120 : intermediate;
     int scales = plane % 2;
     uint32_t element = scales ? 1 : 4, divisor = scales ? 32 : 8;
     for (uint64_t index = 0; index < destination_bytes / element; ++index) {
         uint32_t row, col;
-        cuteafd_expert_pack_coordinates(index, k, scales, &row, &col);
+        cuteafd_expert_pack_layout_coordinates(index, n, k,
+            compact && plane < 2 ? padded : 0, scales, compact, &row, &col);
         uint64_t at = ((uint64_t)row * (k / divisor) + col) * element;
         if (row < n && col < k / divisor && at + element <= source_bytes)
             memcpy(destination + index * element, source + at, element);

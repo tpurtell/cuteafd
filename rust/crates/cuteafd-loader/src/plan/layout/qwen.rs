@@ -198,7 +198,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let mark = geometry.ranks[0].retained_mark_bytes;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
-        options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
+        options.prefix_entries("qwen4"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0))) * mark;
     let prefill_shape = if options.prefill_waves > 1 {
         anyhow::ensure!(matches!(report.placement, ExpertPlacement::Sparks { .. }),
             "Qwen prefill waves require single-owner Spark experts");
@@ -221,7 +221,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     let loaded_bytes = device.used_bytes();
     let inputs = crate::placement::families::qwen4::QwenInputs { automatic_context: options.context_tokens == 0,
         admission: QwenAdmissionInputs { prefill_shape, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv, manifest,
-            prefill_rows: span, slots: options.state_slots.unwrap_or(shape.concurrency), mark_bytes: marks,
+            prefill_rows: span, slots: options.resolved_state_slots("qwen4"), mark_bytes: marks,
             full_prefill_logits: logits, ple, future_expert_bytes: 0, headroom: options.headroom_bytes.max(3 * GIB) },
         capacity_bytes: options.rtx_bytes[0],
         baseline: crate::placement::Baseline::Planned { context_bytes: 0, loaded_bytes },
@@ -357,14 +357,14 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let extra = qwen4::dual_ple_demands(&cfg, cfg.layers, &resident)?;
     let geometry = crate::serving_capacity::qwen_cache_geometry(&cfg, cfg.layers, mtp, options.qwen_kv)?;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(concurrency,
-        options.mimo_prefix_entries, geometry.ranks[0].retained_mark_bytes, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+        options.prefix_entries("qwen4"), geometry.ranks[0].retained_mark_bytes, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = options.headroom_bytes.max(3 * GIB);
     let inputs = qwen4::QwenDualInputs { automatic_context: options.context_tokens == 0,
         owner_manifests,
         admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp, kv_format: options.qwen_kv,
-            manifest, prefill_rows: rows, slots: options.state_slots.unwrap_or(concurrency),
+            manifest, prefill_rows: rows, slots: options.resolved_state_slots("qwen4"),
             mark_bytes: marks * geometry.ranks[0].retained_mark_bytes,
             full_prefill_logits: if options.full_prefill_logits { full_prefill_logits_bytes("qwen4", rows, cfg.vocab_size as u64) } else { 0 },
             ple, future_expert_bytes: 0, headroom },

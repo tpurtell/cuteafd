@@ -3,17 +3,19 @@
 #include <cstdint>
 #include <algorithm>
 #include "expert_pack_layout.h"
+#include "cuteafd_mxfp4_layouts.h"
 
 namespace {
 
-// N256/K128 lane-major representation consumed by b12x W4A8.
+// Aligned widths retain N256/K128; exact tails use compact N128/K32 tiles.
 template<bool Gated, bool Scales>
 __global__ void pack(const uint8_t* first, const uint8_t* second, uint8_t* output,
-    uint32_t n, uint32_t k, uint32_t n_pad, uint64_t count) {
+    uint32_t n, uint32_t k, uint32_t n_pad, uint64_t count, bool compact) {
   for (uint64_t index = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
        index < count; index += uint64_t(gridDim.x) * blockDim.x) {
     uint32_t row, col;
-    cuteafd_expert_pack_coordinates(index, k, Scales, &row, &col);
+    cuteafd_expert_pack_layout_coordinates(index, Gated ? 2 * n_pad : n, k,
+        n_pad, Scales, compact, &row, &col);
     const uint8_t* source = first;
     if constexpr (Gated) {
       if (row >= n_pad) { row -= n_pad; source = second; }
@@ -61,7 +63,9 @@ __global__ void pack_scale_codes(const cuteafd_scale_code_job_t* jobs,
         const uint64_t col = tile * 4 + byte;
         if (col < job.columns) code |= uint16_t(source[col] - low) << (byte * 4);
       }
-      const uint64_t index = (resident / 256 * tiles + tile) * 256 + resident % 256;
+      const uint64_t tile_start = resident / 256 * 256;
+      const uint64_t tile_rows = min(uint64_t(256), uint64_t(job.stored_rows) - tile_start);
+      const uint64_t index = tile_start * tiles + tile * tile_rows + resident % 256;
       reinterpret_cast<uint16_t*>(job.destination)[index] = code;
     }
   }
@@ -84,7 +88,7 @@ extern "C" int32_t cuteafd_v41_pack_scale_codes_async(
     const uint64_t tiles = (uint64_t(job.columns) + 3) / 4;
     const uint64_t bytes = uint64_t(job.stored_rows) * (tiles * 2 + 1);
     if (!job.source || !job.destination || !job.rows || !job.columns ||
-        job.stored_rows % 256 || job.start_row > job.stored_rows ||
+        job.stored_rows % 32 || job.start_row > job.stored_rows ||
         job.rows > job.stored_rows - job.start_row || job.pitch < job.columns ||
         job.columns > job.source_bytes ||
         uint64_t(job.rows - 1) > (job.source_bytes - job.columns) / job.pitch ||
@@ -106,12 +110,12 @@ extern "C" int32_t cuteafd_v41_pack_scale_codes_async(
 
 extern "C" int32_t cuteafd_expert_packed_sizes(uint32_t intermediate,
     uint64_t bytes[4]) {
-  // Per-rank intermediate extents are multiples of 32 so the K/32 scale axis is
-  // exact; the 128 padding below is storage-only (V4.1 TP4 576 -> 640).
+  // Storage and exported kernels use the same measured geometry contract.
   const uint64_t hidden = cuteafd_expert_hidden();
   if (!bytes || !intermediate || intermediate % 32 != 0 || intermediate > 8192)
     return cudaErrorInvalidValue;
-  const uint64_t padded = (intermediate + 127) / 128 * 128;
+  const uint64_t padded = cuteafd_mxfp4_stored_width(hidden, intermediate);
+  if (!padded) return cudaErrorInvalidValue;
   bytes[0] = padded * hidden;
   bytes[1] = padded * hidden / 16;
   bytes[2] = hidden * padded / 2;
@@ -142,7 +146,8 @@ extern "C" int32_t cuteafd_pack_expert_plane_async(
   if (plane >= 4 || !source || !destination ||
       cuteafd_expert_packed_sizes(intermediate, sizes)) return cudaErrorInvalidValue;
   const auto hidden = cuteafd_expert_hidden();
-  const auto padded = (intermediate + 127) / 128 * 128;
+  const auto padded = cuteafd_mxfp4_stored_width(hidden, intermediate);
+  const bool compact = padded == intermediate && intermediate % 128;
   const bool gated = plane < 2, scales = plane % 2;
   const uint64_t required = gated ? sizes[plane]
       : uint64_t(hidden) * intermediate / (scales ? 32 : 2);
@@ -162,16 +167,16 @@ extern "C" int32_t cuteafd_pack_expert_plane_async(
   auto s = static_cast<cudaStream_t>(stream);
   if (gated && !scales)
     pack<false, false><<<blocks, 256, 0, s>>>(source, nullptr, destination,
-        2 * padded, hidden, 0, sizes[plane] / 4);
+        2 * padded, hidden, compact ? padded : 0, sizes[plane] / 4, compact);
   else if (gated)
     pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
-        2 * padded, hidden, 0, sizes[plane]);
+        2 * padded, hidden, compact ? padded : 0, sizes[plane], compact);
   else if (!scales)
     pack<false, false><<<blocks, 256, 0, s>>>(source, nullptr, destination,
-        hidden, intermediate, 0, sizes[plane] / 4);
+        hidden, intermediate, 0, sizes[plane] / 4, compact);
   else
     pack<false, true><<<blocks, 256, 0, s>>>(source, nullptr, destination,
-        hidden, intermediate, 0, sizes[plane]);
+        hidden, intermediate, 0, sizes[plane], compact);
   return cudaGetLastError();
 }
 
@@ -203,14 +208,15 @@ extern "C" int32_t cuteafd_pack_expert_weights_async(
   if (sms <= 0) return cudaErrorInvalidDevice;
   const auto blocks = unsigned(std::min<uint64_t>((sizes[0] / 4 + 255) / 256,
       uint64_t(sms) * 4));
-  const auto padded = (intermediate + 127) / 128 * 128;
+  const auto padded = cuteafd_mxfp4_stored_width(hidden, intermediate);
+  const bool compact = padded == intermediate && intermediate % 128;
   auto s = static_cast<cudaStream_t>(stream);
   pack<true, false><<<blocks, 256, 0, s>>>(sources[1], sources[0], destinations[0],
-      intermediate, hidden, padded, sizes[0] / 4);
+      intermediate, hidden, padded, sizes[0] / 4, compact);
   status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   pack<false, false><<<blocks, 256, 0, s>>>(sources[2], nullptr, destinations[1],
-      hidden, intermediate, 0, sizes[2] / 4);
+      hidden, intermediate, 0, sizes[2] / 4, compact);
   return cudaGetLastError();
 }
 
@@ -234,22 +240,23 @@ extern "C" int32_t cuteafd_pack_expert_async(const uint8_t* const sources[6],
     for (int j = 0; j < i; ++j)
       if (overlaps(destinations[i], sizes[i], destinations[j], sizes[j])) return cudaErrorInvalidValue;
   }
-  const uint32_t padded = (intermediate + 127) / 128 * 128;
+  const uint32_t padded = cuteafd_mxfp4_stored_width(hidden, intermediate);
+  const bool compact = padded == intermediate && intermediate % 128;
   auto cuda_stream = static_cast<cudaStream_t>(stream);
-  // First half is up (W3), second half gate (W1), padded independently.
+  // First half is up (W3), second half gate (W1), stored independently.
   pack<true, false><<<256, 256, 0, cuda_stream>>>(sources[1], sources[0], destinations[0],
-      intermediate, hidden, padded, sizes[0] / 4);
+      intermediate, hidden, padded, sizes[0] / 4, compact);
   auto status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   pack<true, true><<<256, 256, 0, cuda_stream>>>(sources[4], sources[3], destinations[1],
-      intermediate, hidden, padded, sizes[1]);
+      intermediate, hidden, padded, sizes[1], compact);
   status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   pack<false, false><<<256, 256, 0, cuda_stream>>>(sources[2], nullptr, destinations[2],
-      hidden, intermediate, 0, sizes[2] / 4);
+      hidden, intermediate, 0, sizes[2] / 4, compact);
   status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   pack<false, true><<<256, 256, 0, cuda_stream>>>(sources[5], nullptr, destinations[3],
-      hidden, intermediate, 0, sizes[3]);
+      hidden, intermediate, 0, sizes[3], compact);
   return cudaGetLastError();
 }

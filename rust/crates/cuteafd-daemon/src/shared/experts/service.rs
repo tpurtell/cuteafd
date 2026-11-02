@@ -178,8 +178,8 @@ fn load_weights<'a>(
     // The workspace is planned from the same layer selection as the load, so a
     // TP2/TP3 topology cannot be budgeted with TP4 scratch.
     let workspace = spark_execution_workspace(config, |live, compiled, staging_rows, _| {
-        let budget = ExpertWeights::plan_execution(config.selection(0)?, library,
-            compiled, live, nvfp4)?;
+        let selections = layers.iter().map(|&layer| config.selection(layer)).collect::<Result<Vec<_>>>()?;
+        let budget = ExpertWeights::plan_execution_layers(selections, library, compiled, live, nvfp4)?;
         let device = budget.total()?;
         let scratch = budget.scratch_bytes.checked_add(budget.decode_scratch_bytes)
             .and_then(|bytes| bytes.checked_add(budget.small_scratch_bytes))
@@ -925,7 +925,12 @@ mod tests {
                     let expected = if world == 4 { ExpertLayer::Backbone { layer: 7, rank } }
                         else { ExpertLayer::BackboneReplicatedTp { layer: 7, rank, world } };
                     assert_eq!(layer, expected, "{family} TP{world} rank {rank}");
-                    assert!(layer.role() <= 8);
+                    let geometry = cuteafd_core::expert_geometry();
+                    let shard = layer.native_shard().unwrap();
+                    let artifacts = cuteafd_core::tp_units::native_spark_artifacts(
+                        geometry.hidden as usize, geometry.intermediate as usize, world).unwrap();
+                    let artifact = artifacts.iter().find(|artifact| artifact.logical == shard.width).unwrap();
+                    assert_eq!(layer.role(), artifact.role);
                     assert!(native.declared_world.ownership_topology().is_none());
                     assert_eq!(native.native_group().unwrap(), None);
                 }

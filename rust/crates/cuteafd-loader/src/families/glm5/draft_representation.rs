@@ -330,7 +330,7 @@ pub fn block_dspark_resident_bytes(config: &serde_json::Value, slots: usize, seq
     if [h,inter,layers,heads,kvh,vocab,block,taps].iter().any(|&n| n > 1_000_000)
         || layers > 1024 || heads > 4096 || kvh > 4096 || taps > 1024 || block > 128
         || !matches!(dim, 64 | 128) || heads % kvh != 0 || taps == 0
-        || cfg.rank != 256 || sequences == 0 || sequences > 32 || sequences > slots {
+        || cfg.rank != 256 || !crate::formats::block_dspark::supports_sequences(sequences) || sequences > slots {
         return Err(GlmDraftStorageError::Unsupported("invalid dSpark geometry or capacity"));
     }
     let q = mul(heads, dim)?;

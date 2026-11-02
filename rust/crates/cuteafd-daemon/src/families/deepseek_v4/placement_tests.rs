@@ -77,13 +77,17 @@ fn planned(shared: &Shared, case: &Case<'_>) -> (MemoryLayout, bool, Vec<String>
     planned_with_host(shared, case, false)
 }
 
-fn planned_with_host(shared: &Shared, case: &Case<'_>, host: bool) -> (MemoryLayout, bool, Vec<String>) {
-    let report = shared.input.plan(&PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
+fn plan_options(case: &Case<'_>, host: bool) -> PlanOptions {
+    PlanOptions { placement: ExpertPlacement::from_spark_ranks(case.sparks),
         layout: Some(LayoutOptions { host_memory: Some((128 << 30, 128 << 30)), rtx_bytes: (0..case.rtx).map(|g| if g == 1 { case.peer_budget.unwrap_or(case.budget) } else { case.budget }).collect(), context_tokens: case.context,
             // Retained measured fixtures and the direct EngineArgs default are C8.
             concurrency: 8, host_cache_bytes: if host { None } else { Some(0) }, workspace_manifest: Some(case.manifest.to_path_buf()), onboard: case.onboard, exchange_f32: case.exchange_f32,
             native_mtp_layers: if case.dspark { 3 } else { 0 }, headroom_bytes: 0, ..Default::default() }),
-        attention_placement: case.attention, ..Default::default() }).unwrap();
+        attention_placement: case.attention, ..Default::default() }
+}
+
+fn planned_with_host(shared: &Shared, case: &Case<'_>, host: bool) -> (MemoryLayout, bool, Vec<String>) {
+    let report = shared.input.plan(&plan_options(case, host)).unwrap();
     let hints = report.hints.iter().map(|h| h.what.clone()).collect();
     (report.memory_layout.unwrap(), report.placement_supported, hints)
 }
@@ -117,7 +121,8 @@ fn runtime_with_host(shared: &Shared, case: &Case<'_>, layout: &MemoryLayout, tp
     if case.dspark { argv.push("--dspark".into()); }
     if host { argv.extend(["--host-cache-bytes".into(), "auto".into()]); }
     if let Some(attention) = case.attention { argv.extend(["--attention-placement".into(), attention.to_string()]); }
-    let cli = Cli::try_parse_from(argv)?;
+    let mut cli = Cli::try_parse_from(argv)?;
+    cli.prefix.resolve_entries(cli.engine.max_sequences);
     // The selected model owns caches only for its retained dSpark stages.
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
@@ -257,15 +262,24 @@ fn planner_equals_runtime_topology_selected_live_units() {
     let manifest = synthetic_context(dir.path());
     let shared = Shared::open(dir.path()).unwrap();
     for rtx in [1, 2] {
-        for sparks in [1, 2, 4, 5, 6, 8] {
-            let case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks,
-                context: 1_048_576, budget: 24 << 30, onboard: Some(Onboard::Layers(2)),
-                dspark: false, exchange_f32: false, peer_budget: None, attention: None };
-            if matches!(sparks, 2 | 4) {
+        let mut case = Case { snapshot: dir.path(), manifest: &manifest, rtx, sparks: 2,
+            context: 1_048_576, budget: 24 << 30, onboard: Some(Onboard::Layers(2)),
+            dspark: false, exchange_f32: false, peer_budget: None, attention: None };
+        let columns = shared.input.spark_ranges(&plan_options(&case, false)).unwrap();
+        let column = columns.iter().find(|column| column.rtx_gpus == rtx).unwrap();
+        let range = column.range.as_ref().expect("fixture has a complete geometric witness");
+        // Four layers hit the size floor, not the full checkpoint's eight-Spark
+        // formula. Existing release support raises this fixture's ceiling to six.
+        assert_eq!((range.size_cap, range.width_cap, range.formula_maximum), (4, 8, 4));
+        assert_eq!((range.shipped_maximum, range.maximum), (6, 6));
+        for sparks in 1..=cuteafd_core::MAX_SPARK_WORLD {
+            case.sparks = sparks;
+            let exported = cuteafd_core::tp_units::native_spark_artifacts(4096, 2048, sparks).is_ok();
+            if range.admit(sparks).is_ok() && exported {
                 assert_equal(&shared, &case, &format!("topology {rtx} RTX + {sparks} Sparks"));
             } else {
                 let (_, supported, hints) = planned(&shared, &case);
-                assert!(!supported, "unexported native TP{sparks} must refuse: {hints:?}");
+                assert!(!supported, "out-of-range or unexported native TP{sparks} must refuse: {hints:?}");
             }
         }
     }
@@ -798,7 +812,8 @@ fn runtime_measured(shared: &Shared, case: &Case<'_>, fixture: &Fixture) -> anyh
         "--native-lib".into(), "/nonexistent/libcuteafd.so".into(), "--peers".into(), peers, "--dspark".into()];
     if let Some(onboard) = case.onboard { argv.extend(["--rtx-expert-layers".into(), onboard.to_string()]); }
     if case.rtx == 2 { argv.extend(["--split-device".into(), "1".into()]); }
-    let cli = Cli::try_parse_from(argv)?;
+    let mut cli = Cli::try_parse_from(argv)?;
+    cli.prefix.resolve_entries(cli.engine.max_sequences);
     let stages = (0..).take_while(|stage| catalog.tensors().iter()
         .any(|t| t.metadata.name.starts_with(&format!("mtp.{stage}.")))).count();
     let code = cuteafd_loader::placement::families::deepseek_v4::code_bytes(

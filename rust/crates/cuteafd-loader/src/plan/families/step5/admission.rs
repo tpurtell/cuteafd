@@ -892,6 +892,7 @@ mod tests {
         inputs.context = EXTENT;
         inputs.requested_pool = None;
         inputs.inventory.gpus[0].baseline = Baseline::Measured { free_bytes: 50 << 30 };
+        inputs.marks.budget_bytes = 32 << 30;
         let refusal = run(&inputs).err().expect("device marks exceed the available budget").to_string();
         for message in ["device-only prefix retention with HOST_CACHE_BYTES=0",
             "request context 1048576", "--host-cache-bytes auto", "MAX_CONTEXT_TOKENS", "262144"] {

@@ -69,10 +69,7 @@ impl Default for CapacityPolicy {
 
 impl CapacityPolicy {
     pub fn state_slots(self) -> Result<u32, CapacityError> {
-        let slots = u64::from(self.concurrency)
-            .checked_mul(5)
-            .ok_or(CapacityError::Overflow("state slots"))?
-            .div_ceil(4);
+        let slots = crate::concurrency::state_slots(u64::from(self.concurrency));
         u32::try_from(slots).map_err(|_| CapacityError::Overflow("state slots"))
     }
 }
@@ -288,7 +285,7 @@ pub fn resolve_capacity_with_startup_peaks(
     hardware: &[DeviceMemory],
     startup_peaks: &[(u32, u64)],
 ) -> Result<ResolvedCapacity, CapacityError> {
-    if policy.concurrency == 0 || policy.target_pool_tokens == 0 {
+    if policy.concurrency == 0 || u64::from(policy.concurrency) > crate::concurrency::MAX_CONCURRENCY || policy.target_pool_tokens == 0 {
         return Err(CapacityError::Invalid(
             "concurrency and pool target must be positive",
         ));
@@ -618,7 +615,7 @@ mod tests {
         let gpu = &result.devices[0];
         assert_eq!(gpu.engine_budget_bytes, 96 * GIB * 97 / 100 - 10 * GIB);
         assert_eq!(result.allocated_gpu_kv_tokens, 63 * 64);
-        assert_eq!((result.concurrency, result.state_slots), (16, 20));
+        assert_eq!((result.concurrency, result.state_slots), (16, 16));
         assert!(gpu.non_engine_bytes + gpu.reserved_bytes + gpu.pool_bytes <= 96 * GIB * 97 / 100);
         assert!(gpu.unused_budget_bytes < GIB);
     }

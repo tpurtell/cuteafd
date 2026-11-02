@@ -75,7 +75,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let mla_weights: u64 = model.mla.iter().map(|r| r.split + r.replicated).sum();
     report.bytes_by_owner.insert("coordinator text weights".into(), embedding + head + residency.split + residency.replicated + mla_weights);
     report.bytes_by_owner.insert("routed expert weights".into(), experts);
-    let slots = opts.state_slots.unwrap_or_else(|| if opts.concurrency > 0 { opts.concurrency } else { 16 });
+    let slots = opts.resolved_state_slots("kimi_k3");
     let path = opts.workspace_manifest.as_deref().unwrap_or_else(||
         std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     // Header-only diagnostics remain available without installed artifacts. An
@@ -94,7 +94,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let state = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) * slots / 2;
     let mark_bytes = cfg.kda_layers() as u64 * (cfg.kda_state_bytes() + cfg.kda_conv_bytes()) / 2;
     let legacy_marks = opts.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-        slots, opts.mimo_prefix_entries, 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
+        opts.resolved_concurrency("kimi_k3"), opts.prefix_entries("kimi_k3"), 2 * mark_bytes, opts.mimo_prefix_mark_bytes,
         opts.host_cache_bytes != Some(0)));
     let mut mark_demands = (0..2).map(|gpu| Demand::new(gpu, Category::Prefix,
         "Kimi exact KDA marks", mark_bytes, Basis::Formula)).collect::<Vec<_>>();

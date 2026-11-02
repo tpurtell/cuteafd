@@ -18,7 +18,7 @@ pub(crate) enum ExpertLayer {
     BackboneFull { layer: usize },
     BackboneTp2 { layer: usize, rank: usize },
     /// Explicit replicated-group native Spark shard. `world` is this group's
-    /// tensor-parallel degree (2, 3, 4 or 6) and `rank` is the shard index
+    /// tensor-parallel degree (2 through 8) and `rank` is the shard index
     /// inside the group (`global_rank % world`). Native checkpoints support
     /// replicated groups; NVFP4 uses pure TP3/TP6 only. `world: 6`
     /// is the pure unreplicated `TP6EP1` layout: six disjoint intermediate
@@ -73,7 +73,38 @@ impl ExpertLayer {
             Self::Dspark { .. } | Self::DsparkTp2 { .. } => usize::MAX,
         }
     }
+    pub(crate) fn native_shard(self) -> Result<cuteafd_core::tp_units::LayerShard> {
+        self.shard_for_geometry(cuteafd_core::expert_geometry())
+    }
+
+    fn shard_for_geometry(self, geometry: cuteafd_core::ExpertGeometry)
+        -> Result<cuteafd_core::tp_units::LayerShard> {
+        let (layer, world, rank) = match self {
+            Self::Backbone { layer, rank } => (layer, 4, rank),
+            Self::BackboneFull { layer } => (layer, 1, 0),
+            Self::BackboneTp2 { layer, rank } => (layer, 2, rank),
+            Self::BackboneReplicatedTp { layer, rank, world } => (layer, world, rank),
+            _ => anyhow::bail!("not a native backbone shard: {self:?}"),
+        };
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
+        Ok(cuteafd_core::tp_units::LayerShard::new(geometry.intermediate as usize,
+            unit, layer, world, rank)?)
+    }
+
+    fn unequal_width(self, geometry: cuteafd_core::ExpertGeometry) -> Option<usize> {
+        let Self::BackboneReplicatedTp { world, .. } = self else { return None; };
+        let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
+        if world == 0 || (geometry.intermediate as usize / unit) % world == 0 { return None; }
+        self.shard_for_geometry(geometry).ok().map(|shard| shard.width)
+    }
+
     pub(crate) fn role(self) -> u32 {
+        self.role_for_geometry(cuteafd_core::expert_geometry())
+    }
+
+    fn role_for_geometry(self, geometry: cuteafd_core::ExpertGeometry) -> u32 {
+        if let Some(role) = self.unequal_width(geometry)
+            .and_then(cuteafd_core::tp_units::native_width_role) { return role; }
         match self {
             Self::Dspark { .. } => 0,
             Self::Backbone { .. } => 1,
@@ -98,6 +129,9 @@ impl ExpertLayer {
         if let Self::BackboneExl3Tp { .. } = self {
             return Self::exl3_shard_refusal();
         }
+        if let Some(width) = self.unequal_width(cuteafd_core::expert_geometry()) {
+            return library.native_width_expert_info(capacity, width);
+        }
         if matches!(self, Self::BackboneFull { .. }) {
             library.v41_local_expert_info(capacity)
         } else if matches!(self, Self::BackboneTp2 { .. }) {
@@ -118,6 +152,9 @@ impl ExpertLayer {
     fn kernel(self, library: &NativeLibrary, capacity: u32) -> Result<V41ExpertKernel<'_>> {
         if let Self::BackboneExl3Tp { .. } = self {
             return Self::exl3_shard_refusal();
+        }
+        if let Some(width) = self.unequal_width(cuteafd_core::expert_geometry()) {
+            return library.native_width_expert_kernel(capacity, width);
         }
         if matches!(self, Self::BackboneFull { .. }) {
             library.v41_local_expert_kernel(capacity)
@@ -248,6 +285,32 @@ impl ExpertFormat {
 #[cfg(test)]
 mod format_dispatch_tests {
     use super::{ExpertFormat, ExpertLayer};
+
+    #[test]
+    fn unequal_native_roles_follow_rotated_adjacent_widths_only() {
+        use cuteafd_core::{ExpertGeometry, tp_units::{LayerShard, native_width_role}};
+        for geometry in [ExpertGeometry::DEEPSEEK_V41, ExpertGeometry::DEEPSEEK_V4_FLASH,
+            ExpertGeometry::DEEPSEEK_V4_PRO] {
+            for world in 2..=8 {
+                let unit = cuteafd_core::mxfp4_layouts::ownership_unit(geometry.intermediate as usize, world);
+                let unequal = (geometry.intermediate as usize / unit) % world != 0;
+                for rank in 0..world {
+                    let mut roles = std::collections::BTreeSet::new();
+                    for layer in 0..world * 2 {
+                        let selected = ExpertLayer::BackboneReplicatedTp { layer, world, rank };
+                        let shard = LayerShard::new(geometry.intermediate as usize, unit, layer, world, rank).unwrap();
+                        assert_eq!(selected.shard_for_geometry(geometry).unwrap(), shard);
+                        let role = selected.role_for_geometry(geometry);
+                        assert_eq!(selected.unequal_width(geometry), unequal.then_some(shard.width));
+                        if unequal { assert_eq!(role, native_width_role(shard.width).unwrap()); }
+                        else { assert!(role <= 8); }
+                        roles.insert(role);
+                    }
+                    assert_eq!(roles.len(), if unequal { 2 } else { 1 });
+                }
+            }
+        }
+    }
 
     #[test]
     fn every_backbone_variant_dispatches_by_checkpoint_format() {
@@ -570,14 +633,17 @@ impl<'a> ExpertWeights<'a> {
                     use cuteafd_loader::formats::scale_codes::Rows;
                     let hidden = catalog.routed_experts().hidden;
                     let logical = intermediate as usize;
-                    let stored = logical.div_ceil(128) * 128;
-                    let first_row = match plan.selection() {
+                    let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, logical)
+                        .context("invalid coded expert resident width")?;
+                    let first_row = if let Some(shard) = plan.geometry() {
+                        shard.first_intermediate()
+                    } else { match plan.selection() {
                         V41ExpertSelection::Backbone { rank, .. }
                         | V41ExpertSelection::BackboneTp2 { rank, .. }
                         | V41ExpertSelection::BackboneTp { rank, .. }
                         | V41ExpertSelection::DsparkTp2 { rank, .. } => rank * logical,
                         _ => 0,
-                    };
+                    }};
                     let targets = [3usize, 4, 5].map(|slot| {
                         let down = slot == 5;
                         let plane = if down { 3 } else { 1 };
@@ -674,8 +740,9 @@ impl<'a> ExpertWeights<'a> {
                 Job::NativePlane { intermediate, plane: 2, at: gate_bytes, bytes: bytes - gate_bytes, dst: plane(2, expert) },
             ] }, std::ptr::null_mut())?;
             if catalog.mxfp4_scale_codes() {
-                let stored = (intermediate as usize).div_ceil(128) * 128;
                 let hidden = catalog.routed_experts().hidden;
+                let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, intermediate as usize)
+                    .context("invalid coded expert resident width")?;
                 for (slot, start_row) in [(4, 0), (3, stored), (5, 0)] {
                     let tensor = catalog.tensor(&n[slot])?;
                     let rows = tensor.metadata.shape[0];
@@ -842,7 +909,10 @@ impl<'a> ExpertWeights<'a> {
                                 use cuteafd_loader::formats::scale_codes::Rows;
                                 let hidden = catalog.routed_experts().hidden;
                                 let logical = rank_plans[rank][lane].intermediate_size();
-                                let stored = logical.div_ceil(128) * 128;
+                                let stored = cuteafd_core::mxfp4_layouts::stored_width(hidden, logical)
+                        .context("invalid coded expert resident width")?;
+                                let first_row = rank_plans[rank][lane].geometry()
+                                    .map_or(rank * logical, |shard| shard.first_intermediate());
                                 let targets = [3usize, 4, 5].map(|slot| {
                                     let job = &jobs[slot];
                                     let slice = job.slices[rank];
@@ -860,7 +930,7 @@ impl<'a> ExpertWeights<'a> {
                                         rows: if down { hidden } else { logical },
                                         pitch: if down { slice.source_row_bytes } else { hidden / 32 },
                                         columns: if down { logical / 32 } else { hidden / 32 },
-                                        first_row: if down { 0 } else { rank * logical } },
+                                        first_row: if down { 0 } else { first_row } },
                                         destination, stored_rows: if down { hidden } else { 2 * stored },
                                         start_row: if slot == 3 { stored } else { 0 } }
                                 });

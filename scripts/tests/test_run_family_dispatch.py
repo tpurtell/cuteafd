@@ -487,7 +487,7 @@ def test_dense_qwen_wip_uses_native_single_gpu_and_no_workers(tmp_path: Path, ca
     assert "cuteafd expertd-native" not in result.stderr
     assert "ssh h0" not in result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
-    assert "--spark-ranks 0" in plan and "--state-slots 8" in plan
+    assert "--spark-ranks 0" in plan and "--state-slots" not in plan
     assert f"--prefix-cache-entries {entries}" in plan
     assert "--prefill-rows 4096" in plan and "--require-ready" not in plan
 
@@ -3576,28 +3576,25 @@ GLMF_RTX_ENCODER_PLAN = {"placement_supported": True, "fits": True, "spark_ranks
 @pytest.mark.parametrize("keys,serve,plan", [
     # The resolved logical-capacity default reaches both commands explicitly.
     ("", {"--max-sequences": "16", "--prefix-cache-entries": "20"},
-     {"--concurrency": "16", "--state-slots": "16", "--mark-lanes": "16"}),
-    # C1 without entries: 8 state slots (serve-glmf's --slots), one mark lane, no marks.
+     {"--concurrency": "16", "--prefix-cache-entries": "20"}),
+    # C1 without entries: one active state slot and no retained marks.
     ("CONCURRENCY=1\nPREFIX_CACHE_ENTRIES=0\n", {"--max-sequences": "1", "--prefix-cache-entries": "0"},
-     {"--concurrency": "1", "--state-slots": "8", "--mark-lanes": "1", "--prefix-cache-entries": "0"}),
+     {"--concurrency": "1", "--prefix-cache-entries": "0"}),
     ("CONCURRENCY=8\nPREFIX_CACHE_ENTRIES=20\nPREFIX_CACHE_MARK_MIB=2048\nGLM5_FLASH_REPLAY_RECORDS=own\n",
      {"--max-sequences": "8", "--prefix-cache-entries": "20", "--prefix-cache-mark-mib": "2048"},
-     {"--concurrency": "8", "--state-slots": "8", "--mark-lanes": "8", "--prefix-cache-entries": "20",
+     {"--concurrency": "8", "--prefix-cache-entries": "20",
       "--prefix-cache-mark-mib": "2048"}),
     ("CONCURRENCY=16\nPREFIX_CACHE_ENTRIES=6\nPREFIX_CACHE_MARK_MIB=1971\nGLM5_FLASH_REPLAY_RECORDS=shared\n",
      {"--max-sequences": "16", "--prefix-cache-entries": "6", "--prefix-cache-mark-mib": "1971",
       "--replay-records": "shared"},
-     {"--concurrency": "16", "--state-slots": "16", "--mark-lanes": "16", "--prefix-cache-entries": "6",
+     {"--concurrency": "16", "--prefix-cache-entries": "6",
       "--prefix-cache-mark-mib": "1971", "--replay-records": "shared"}),
-    # C128: 128 state slots, and the mark arena's lanes capped at DECODE_ROWS (64).
-    ("CONCURRENCY=128\n", {"--max-sequences": "128", "--prefix-cache-entries": "20"},
-     {"--concurrency": "128", "--state-slots": "128", "--mark-lanes": "64"}),
+    # The launcher forwards the global ceiling and its derived retention unchanged.
+    ("CONCURRENCY=64\n", {"--max-sequences": "64", "--prefix-cache-entries": "80"},
+     {"--concurrency": "64", "--prefix-cache-entries": "80"}),
 ])
 def test_glmf_encoder_placement_plans_the_prefix_knobs_serving_takes(tmp_path, keys, serve, plan):
-    """The encoder placement plan reserves what serve-glmf allocates for the keys a launch sets:
-    the sequences (CONCURRENCY) with serve-glmf's state slots, max(--slots 8, --max-sequences), and
-    its mark-arena lanes, min(--max-sequences, 64), PREFIX_CACHE_ENTRIES, PREFIX_CACHE_MARK_MIB and
-    shared replay records. Effective sequences always reach the planner and server."""
+    """The planner and server derive state and mark lanes from the same explicit concurrency."""
     result = _family_launch_result(tmp_path, GLMF_VISION, "zai-org/GLM-5.3-Flash",
                                    "RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nGLM5_FLASH_REPLAY_RECORDS=own\n" + keys,
                                    encoder_plan=GLMF_RTX_ENCODER_PLAN)
@@ -3687,19 +3684,17 @@ def test_glmf_draft_defaults_apply_only_to_the_fp8_drafter(tmp_path, fp8):
 
 
 def test_glmf_plan_counts_follow_serve_glmf_formulas():
-    """The launcher's --state-slots and --mark-lanes restate serve-glmf's own rules: the engine keeps
-    max(--slots, --max-sequences) KDA state slots, --slots defaults to 8, and the prefix mark arena
-    counts min(--max-sequences, DECODE_ROWS) lanes with DECODE_ROWS = 64. Change one, change both."""
+    """State and mark lanes derive from admitted concurrency, without launcher duplicates."""
     glmf = ROOT / "rust/crates/cuteafd-daemon/src/families/glm5_flash"
     serving, engine_args, engine = ((glmf / name).read_text() for name in ("serve.rs", "mod.rs", "engine.rs"))
-    assert "engine_args.slots = engine_args.slots.max(args.max_sequences);" in serving
-    assert "    let lanes = max_sequences.min(DECODE_ROWS);" in serving
+    assert "engine_args.slots = cuteafd_core::concurrency::state_slots(args.max_sequences as u64) as usize;" in serving
+    assert "    let lanes = max_sequences;" in serving
     assert "PrefixMarks::Arena => super::prefix::ArenaMarks::Rule(prefix.mark_rule(lanes))," in serving
     assert "    #[arg(long, default_value_t = 8)]\n    pub slots: usize,\n" in engine_args
     assert "pub(crate) const DECODE_ROWS: usize = 64;" in engine
     launcher = (ROOT / "scripts/launch/run-family.sh").read_text()
-    assert '--state-slots "$((glmf_sequences > 8 ? glmf_sequences : 8))"' in launcher
-    assert '--mark-lanes "$((glmf_sequences < 64 ? glmf_sequences : 64))"' in launcher
+    assert '--state-slots "$((glmf_sequences' not in launcher
+    assert '--mark-lanes "$((glmf_sequences' not in launcher
 
 
 @pytest.mark.parametrize("value", ["0", "eight", "-4"])
@@ -3707,7 +3702,7 @@ def test_glmf_encoder_placement_refuses_a_bad_sequence_count(tmp_path, value):
     result = _family_launch_result(tmp_path, GLMF_VISION, "zai-org/GLM-5.3-Flash",
                                    f"RTX_GPUS=1\nSPECULATOR=off\nVISION=rtx\nCONCURRENCY={value}\n",
                                    encoder_plan=GLMF_RTX_ENCODER_PLAN)
-    assert result.returncode == 2 and "CONCURRENCY must be a positive sequence count" in result.stderr, result.stderr
+    assert result.returncode == 2 and "CONCURRENCY must be an integer in 1..=64" in result.stderr, result.stderr
     assert not any("cuteafd serve-glmf" in line for line in result.stderr.splitlines())
 
 

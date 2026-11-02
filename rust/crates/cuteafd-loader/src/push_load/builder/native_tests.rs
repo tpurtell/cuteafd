@@ -22,7 +22,10 @@ fn real_native_resident_planes_match_mount_staging_after_plan_fusion() {
                     (staging.tensor_names().to_vec(), staging.tensor_ranges().to_vec(), raw, staging.intermediate_size())
                 };
                 let hidden = catalog.config().text().hidden_size;
-                let layout = super::super::native::NativePlanes::new(hidden, width, width.div_ceil(128) * 128, 1, nv).unwrap();
+                let stored = if nv { width.div_ceil(128) * 128 } else {
+                    cuteafd_core::mxfp4_layouts::stored_width(hidden, width).unwrap()
+                };
+                let layout = super::super::native::NativePlanes::new(hidden, width, stored, 1, nv).unwrap();
                 let total = layout.bytes + layout.scalar_bytes();
                 let mut builder = Builder::new(&root, vec![total as u64]);
                 builder.v41_resident(&catalog, &names, &layout, 0, world as u32, rank as u32,
@@ -70,6 +73,29 @@ fn mount_packed(raw: &[u8], ranges: &[std::ops::Range<usize>], plane: usize,
     let n = if plane < 2 { layout.intermediate } else { layout.hidden };
     let mut output = vec![0; layout.planes[plane].1];
     for (index, destination) in output.chunks_exact_mut(element).enumerate() {
+        if layout.kernel_intermediate == layout.intermediate && layout.intermediate % 128 != 0 {
+            let columns = k / divisor;
+            let half_elements = layout.kernel_intermediate * columns;
+            let half = if plane < 2 { index / half_elements } else { 0 };
+            let index = if plane < 2 { index % half_elements } else { index };
+            let nt = index / (128 * columns);
+            let index = index % (128 * columns);
+            let rows = (n - nt * 128).min(128);
+            let block = if scales { 4 } else { 16 };
+            let kt = index / (rows * block);
+            let local = index % (rows * block);
+            let cols = (columns - kt * block).min(block);
+            let (row, col) = if scales { (local / cols, local % cols) } else {
+                let n32 = rows / 32;
+                (((local / 128) % n32) * 32 + (local % 4) * 8 + (local / 16) % 8,
+                    local / (128 * n32) * 4 + (local / 4) % 4)
+            };
+            let slot = (if plane < 2 { if half == 0 { 1 } else { 0 } } else { 2 })
+                + if scales { 3 } else { 0 };
+            let source = ranges[slot].start + ((nt * 128 + row) * columns + kt * block + col) * element;
+            destination.copy_from_slice(&raw[source..source + element]);
+            continue;
+        }
         let tile_elements = if scales { 1024 } else { 4096 };
         let tile = index / tile_elements;
         let local = index % tile_elements;
@@ -99,6 +125,27 @@ fn plane_packed(raw: &[u8], plane: usize,
     let cols = k / divisor;
     let mut output = vec![0; raw.len()];
     for row in 0..rows { for col in 0..cols {
+        if layout.kernel_intermediate == layout.intermediate && layout.intermediate % 128 != 0 {
+            let half = if plane < 2 { layout.kernel_intermediate } else { rows };
+            let half_index = row / half;
+            let local_row = row % half;
+            let nt = local_row / 128;
+            let tile_rows = (half - nt * 128).min(128);
+            let block = if scales { 4 } else { 16 };
+            let kt = col / block;
+            let tile_cols = (cols - kt * block).min(block);
+            let (r, c) = (local_row % 128, col % block);
+            // Flatten the independent [K32, N32, N8, K4, N4] tensor permutation.
+            let lane = if scales { r * tile_cols + c } else {
+                ((((c / 4 * (tile_rows / 32) + r / 32) * 8 + r % 8) * 4
+                    + c % 4) * 4) + (r % 32) / 8
+            };
+            let target = (half_index * half * cols + nt * 128 * cols
+                + kt * tile_rows * block + lane) * element;
+            let source = (row * cols + col) * element;
+            output[target..target + element].copy_from_slice(&raw[source..source + element]);
+            continue;
+        }
         let tile = row / 256 * k.div_ceil(128) + col / (128 / divisor);
         let r = row % 256;
         let c = col % (128 / divisor);
@@ -128,24 +175,29 @@ fn fused_mount(raw: &[u8], ranges: &[std::ops::Range<usize>],
 }
 
 #[test]
-fn padded_native_mount_and_plane_pack_maps_are_byte_exact() {
-    let layout = super::super::native::NativePlanes::new(5120, 576, 640, 1, false).unwrap();
-    let mut raw = Vec::new();
-    let mut ranges = Vec::new();
-    for slot in 0..6 {
-        let start = raw.len();
-        let bytes = 5120 * 576 / if slot >= 3 { 32 } else { 2 };
-        raw.extend((0..bytes).map(|i| ((i * 37 + slot * 53) % 255 + 1) as u8));
-        ranges.push(start..raw.len());
-    }
-    let fused = fused_mount(&raw, &ranges, &layout);
-    for plane in 0..4 {
-        let (offset, bytes) = layout.expert_plane(plane, 0).unwrap();
-        let mount = mount_packed(&raw, &ranges, plane, &layout);
-        let pushed = plane_packed(&fused[offset..offset + bytes], plane, &layout);
-        assert_eq!(mount, pushed, "padded plane {plane}");
-        assert!(mount.iter().any(|&b| b == 0), "padding not exercised");
-        assert!(mount.iter().any(|&b| b != 0), "source not exercised");
+fn native_mount_and_plane_pack_maps_are_byte_exact() {
+    for width in [384, 576] {
+        let stored = cuteafd_core::mxfp4_layouts::stored_width(5120, width).unwrap();
+        let layout = super::super::native::NativePlanes::new(5120, width, stored, 1, false).unwrap();
+        let mut raw = Vec::new();
+        let mut ranges = Vec::new();
+        for slot in 0..6 {
+            let start = raw.len();
+            let bytes = 5120 * width / if slot >= 3 { 32 } else { 2 };
+            raw.extend((0..bytes).map(|i| ((i * 37 + slot * 53) % 255 + 1) as u8));
+            ranges.push(start..raw.len());
+        }
+        let fused = fused_mount(&raw, &ranges, &layout);
+        for plane in 0..4 {
+            let (offset, bytes) = layout.expert_plane(plane, 0).unwrap();
+            let mount = mount_packed(&raw, &ranges, plane, &layout);
+            let pushed = plane_packed(&fused[offset..offset + bytes], plane, &layout);
+            assert_eq!(mount, pushed, "width {width} plane {plane}");
+            assert!(mount.iter().any(|&b| b != 0), "source not exercised");
+            if stored == width {
+                assert!(mount.iter().all(|&b| b != 0), "exact plane has a byte hole");
+            }
+        }
     }
 }
 
@@ -155,7 +207,9 @@ fn live_native_tp4_sample_packed_planes_match_mount() {
     let root = snapshot("CUTEAFD_PUSH_V41").expect("explicit live checkpoint required");
     let catalog = crate::read_official_v41_catalog(&root).unwrap();
     assert!(catalog.nvfp4().is_none());
-    let layout = super::super::native::NativePlanes::new(5120, 576, 640, 1, false).unwrap();
+    let width = catalog.config().text().moe_intermediate_size / 4;
+    let stored = cuteafd_core::mxfp4_layouts::stored_width(5120, width).unwrap();
+    let layout = super::super::native::NativePlanes::new(5120, width, stored, 1, false).unwrap();
     let mut seed = 57320261025u64;
     let mut checked = 0;
     for layer in 19..40 {

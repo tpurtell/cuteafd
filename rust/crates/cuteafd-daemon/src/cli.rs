@@ -424,14 +424,12 @@ pub(crate) struct PlanArgs {
     #[arg(long, value_enum, default_value = "own")]
     pub(crate) replay_records: crate::families::glm5_flash::engine::ReplayRecords,
     /// Concurrent sequences for --layout (0: family serving default; otherwise 8 at <=32 GiB, 16 above).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=64))]
     pub(crate) concurrency: u64,
-    /// The engine's recurrent-state slots for --layout, when they differ from the family's rule
-    /// over --concurrency (GLM 5.3 Flash serves max(--slots, --max-sequences)).
+    /// Diagnostic recurrent-state slots for --layout; automatic serving storage equals concurrency.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) state_slots: Option<u64>,
-    /// GLM 5.3 Flash: the lanes its prefix mark arena counts for --layout (the 2C + 2 floor),
-    /// when they differ from --concurrency (serve-glmf counts min(--max-sequences, 64)).
+    /// Diagnostic active-lane count for GLM Flash's budget-limited prefix mark arena.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub(crate) mark_lanes: Option<u64>,
     /// Prefix mark arena slots (0 disables marks).
@@ -445,8 +443,8 @@ pub(crate) struct PlanArgs {
     #[arg(long, value_parser = crate::shared::prefix::parse_bytes)]
     pub(crate) media_cache_bytes: Option<u64>,
     /// MiMo and GLM 5.3 Flash retained snapshots per bank for --layout (matches serving).
-    #[arg(long, default_value_t = 20)]
-    pub(crate) prefix_cache_entries: u64,
+    #[arg(long)]
+    pub(crate) prefix_cache_entries: Option<u64>,
     /// MiMo and GLM 5.3 Flash device positional-mark budget for --layout, MiB.
     #[arg(long, default_value_t = 2048)]
     pub(crate) prefix_cache_mark_mib: u64,
@@ -454,7 +452,7 @@ pub(crate) struct PlanArgs {
     #[arg(long)]
     pub(crate) mimo_prefix_draft: bool,
     /// MiMo target ring count for --layout (at least concurrency).
-    #[arg(long = "rings", default_value_t = 16)]
+    #[arg(long = "rings", default_value_t = 0)]
     pub(crate) mimo_rings: u64,
     /// MiMo sliding and native-MTP ring format for --layout (matches serving).
     #[arg(long, value_enum, default_value = "int8")]
@@ -879,7 +877,7 @@ mod tests {
         assert_eq!(args.max_context_tokens, 1_048_576);
         assert_eq!(args.reserve.limits(args.max_context_tokens as usize).unwrap().output(), 131_072);
         assert_eq!(args.concurrency, 16);
-        assert_eq!(args.prefix_cache_entries, 20);
+        assert_eq!(args.resolved_prefix_entries(), 20);
         assert_eq!(args.dspark_draft_limit, 5);
         assert!(!args.adaptive_dspark()); // Target-only remains target-only.
         for (flags, adaptive) in [
@@ -920,11 +918,11 @@ mod tests {
         for entries in ["0", "2", "24", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", entries])).is_ok());
         }
-        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "129"])).is_err());
-        for concurrency in ["1", "2", "16"] {
+        assert!(super::Cli::try_parse_from(base.into_iter().chain(["--prefix-cache-entries", "160"])).is_ok());
+        for concurrency in ["1", "2", "16", "17", "32", "64"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency, "--kv-pool-size", "1.5GiB", "--memory-reservation", "87.5%"])).is_ok());
         }
-        for concurrency in ["0", "17"] {
+        for concurrency in ["0", "65", "128"] {
             assert!(super::Cli::try_parse_from(base.into_iter().chain(["--concurrency", concurrency])).is_err());
         }
         for (context, output, valid) in [("256", "128", true), ("0", "128", false),
@@ -1194,7 +1192,7 @@ pub(crate) struct NativeServeArgs {
 
 
     /// Maximum active requests, shared by both execution lanes.
-    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=16))]
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u32).range(1..=64))]
     pub concurrency: u32,
 
     /// Buffered HTTP jobs; defaults to concurrency. At most this many additional callers wait.
@@ -1206,7 +1204,7 @@ pub(crate) struct NativeServeArgs {
     pub http_queue_wait_ms: u64,
 
     /// Retained completed turns, plus a separate prompt-repeat bank of this size; zero disables reuse.
-    #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u32).range(0..=128))]
+    #[arg(long, default_value_t = u32::MAX)]
     pub prefix_cache_entries: u32,
 
     /// Pinned snapshot memory: auto sizes full-context KV for concurrency + 4,
@@ -1324,6 +1322,14 @@ impl NativeServeArgs {
 }
 
 /// When the host snapshot cache copies a retained snapshot (see `cuteafd_hostcache::config::StoreMode`).
+impl NativeServeArgs {
+    pub(crate) fn resolved_prefix_entries(&self) -> u32 {
+        if self.prefix_cache_entries == u32::MAX {
+            cuteafd_core::concurrency::prefix_entries(u64::from(self.concurrency)) as u32
+        } else { self.prefix_cache_entries }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum HostCacheStore {
     OnRetain,

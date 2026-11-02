@@ -86,10 +86,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
         device.items.push(runtime_item(shape.manifest.as_ref(), &program_families(id, split), package, split,
             index, options.rtx_bytes[index]));
     }
-    let spark_working = crate::placement::SparkWorkingSet {
+    let mut spark_working = crate::placement::SparkWorkingSet {
         rtx_layers: Vec::new(),
         spark_layers: if matches!(report.placement, ExpertPlacement::Sparks { .. }) {
-            (0..model.spec().layers.len()).collect() } else { Vec::new() },
+            let first = input.expert_catalog().map(|catalog| catalog.routed_experts().first_layer).unwrap_or(0);
+            (first..model.spec().layers.len()).collect() } else { Vec::new() },
         spark_ranks: match report.placement { ExpertPlacement::Sparks { ranks } => ranks, ExpertPlacement::Local => 0 },
         prefill_lanes: 1,
     };
@@ -130,6 +131,11 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
                 *note = format!("attention placement {}", placement.attention_placement);
             }
             local_layers = placement.onboard_layers;
+            spark_working.spark_layers = placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                (home.experts == crate::placement::ExpertHome::Spark).then_some(layer)).collect();
+            spark_working.rtx_layers = placement.layers.iter().enumerate().filter_map(|(layer, home)|
+                matches!(home.experts, crate::placement::ExpertHome::RtxTp2
+                    | crate::placement::ExpertHome::RtxWhole { .. }).then_some(layer)).collect();
             if let Some(t) = placement.tp2 {
                 notes.push(format!("rtx0/rtx1: {} TP2 expert layer halves ({}..{})", t.layers, t.first, t.first + t.layers));
             }
@@ -185,7 +191,7 @@ fn solve(report: &PlanReport, input: &super::super::PlanInput, options: &LayoutO
         options.host_cache_bytes != Some(0));
     let mark_slots = if let Some(slots) = options.prefix_slots { slots }
         else { v4::mark_slots(&cfg, devices.len(), shape.prefill_rows,
-            shape.native_layers, shape.concurrency, options.mimo_prefix_entries, options.mimo_prefix_mark_bytes, host_marks)? };
+            shape.native_layers, shape.concurrency, options.prefix_entries("deepseek_v4"), options.mimo_prefix_mark_bytes, host_marks)? };
     let onboard = match (options.onboard, options.local_expert_layers) {
         (Some(onboard), _) => onboard,
         (None, Some(n)) => Onboard::Layers(n.saturating_sub(routed.first_layer)),

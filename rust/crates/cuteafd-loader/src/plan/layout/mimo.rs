@@ -122,7 +122,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn super::super::FamilyMo
     }
     if options.mimo_prefix_draft && checkpoint.snapshot.join("dflash/config.json").is_file() {
         let slots = draft_representation::mimo_draft_context_slots(options.mimo_draft_sequences().max(concurrency),
-            options.mimo_rings.max(concurrency), options.draft_context_slots);
+            options.mimo_rings(), options.draft_context_slots);
         notes.push(format!("MiMo DFlash context slots {slots}"));
     }
     if manifest.is_none() { notes.push("MiMo native scratch needs --workspace-manifest; native scratch is not qualified without it".into()); }
@@ -237,7 +237,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     }).collect();
     let fp8_output = output_formats.values().any(|&r| r == R::Fp8);
     let lanes = if options.prefill_lanes > 0 { options.prefill_lanes } else { prefill_shape(spark_ranks, None)?.waves } as usize;
-    let rings = options.mimo_rings.max(concurrency);
+    let rings = options.mimo_rings();
     let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, MimoKvFormats { full: MimoKvCache::Int8, sliding: options.mimo_swa_kv }, 0)?;
     let dir = checkpoint.snapshot.join("dflash");
     let draft = if dir.join("dflash_draft_model.safetensors").is_file() {
@@ -252,7 +252,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     } else { 0 };
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
-        concurrency, options.mimo_prefix_entries, mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
+        concurrency, options.prefix_entries("mimo_v2"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
     let graphs = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, options.mimo_decode_graphs)?;
     let mut runtime = Vec::new();
     for rank in 0..ranks {
@@ -487,7 +487,7 @@ mod tests {
                         let lanes = prefill_shape(6, None).unwrap().waves as usize;
                         let cache = crate::serving_capacity::mimo_cache_geometry(&cfg, cfg.layers, ranks, kv, 0).unwrap();
                         let mark_bytes = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum();
-                        let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.mimo_prefix_entries, mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
+                        let slots = cuteafd_core::prefix::mark_slots_with_host(4, opts.prefix_entries("mimo_v2"), mark_bytes, opts.mimo_prefix_mark_bytes, opts.host_cache_bytes != Some(0));
                         let graph = decode_graph::MimoDecodeGraphPlan::new(cfg.layers, ranks, 64, graphs).unwrap();
                         let runtime = (0..ranks).map(|rank| {
                             let mut additional = transport_reservations(&cfg, ranks, rank, 4096, lanes, 4).unwrap();
@@ -504,7 +504,7 @@ mod tests {
                             output_formats: (0..cfg.layers).map(|l| (format!("model.layers.{l}.self_attn.o_proj.weight"),
                                 if pro { R::Fp8 } else { R::Bf16 })).collect(),
                         }, &MimoCapacityOptions { checkpoint_max_context_tokens: 1 << 20, max_context_tokens: 32768,
-                            rings: 16, mark_slots: slots, kv_cache: kv, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
+                            rings: opts.mimo_rings(), mark_slots: slots, kv_cache: kv, ranks: runtime, host_prefix_bytes: 0 }).unwrap();
                         let mut devices: Vec<_> = (0..ranks).map(|rank| DeviceLayout {
                             kind: DeviceKind::Rtx, index: rank as u32, capacity_bytes: 95 * GIB,
                             items: vec![], kv_tokens: 0,
@@ -772,7 +772,6 @@ mod tests {
 
     #[test]
     fn spark_residency_uses_the_worker_package_slice_policy() {
-        use crate::formats::fp8_experts::Slicing;
         use crate::placement::families::mimo_v2::expert_layer_bytes;
         let dir = tempfile::tempdir().unwrap();
         write_snapshot(dir.path(), &mimo_pro_config(), &mimo_pro_tensors(), Some(8));
@@ -792,16 +791,26 @@ mod tests {
             items: vec![], kv_tokens: 0,
         }).collect::<Vec<_>>();
         spark_experts(&input, &options, &mut sparks, 0).unwrap();
+        let (hidden, experts, intermediate) = (tensors.shape().hidden as u64,
+            tensors.shape().experts as u64, tensors.shape().intermediate as u64);
+        let mut padding = 0;
         for spark in &sparks {
+            let rank = spark.index as usize;
+            let logical = recipe.width_for_layer(rank, 1).unwrap() as u64;
+            let stored = recipe.stored_width_for_layer(rank, 1).unwrap() as u64;
+            let expected = experts * (3 * hidden * stored / 2 + 2 * stored * hidden / 32
+                + hidden * stored.div_ceil(128) * 4);
+            assert_eq!(spark.used_bytes(), expected, "rank {rank}");
             assert_eq!(spark.used_bytes(), expert_layer_bytes(&tensors.for_layer_metadata(1).unwrap(),
-                6, spark.index as usize, recipe.slicing).unwrap());
+                6, rank, recipe.slicing).unwrap());
+            // Gate/up padding and each down-scale row's independent u32 pitch.
+            padding += experts * (3 * hidden * (stored - logical) / 2
+                + 2 * (stored - logical) * hidden / 32
+                + hidden * (stored.div_ceil(128) * 4 - logical / 32));
         }
         assert!(sparks[0].used_bytes() < sparks[4].used_bytes());
-        // Each down-scale row rounds its K32 group count up to four bytes.
-        let scale_padding = tensors.shape().hidden * tensors.shape().experts
-            * (4 * (12 - 11) + 2 * (12 - 10));
-        assert_eq!(sparks.iter().map(DeviceLayout::used_bytes).sum::<u64>(),
-            expert_layer_bytes(tensors, 1, 0, Slicing::Padded).unwrap() + scale_padding as u64);
+        let full = experts * (3 * hidden * intermediate / 2 + 3 * hidden * intermediate / 32);
+        assert_eq!(sparks.iter().map(DeviceLayout::used_bytes).sum::<u64>(), full + padding);
     }
 
     #[test]

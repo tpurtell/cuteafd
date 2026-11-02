@@ -1043,7 +1043,7 @@ impl AttentionRows {
 
     fn new(sequences: &[SequenceRows<'_>], capacity: usize, slots: usize, max_context: usize,
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Self> {
-        ensure!((1..=4096).contains(&capacity) && (1..=64).contains(&slots)
+        ensure!((1..=4096).contains(&capacity) && (1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots)
             && (1..=1_048_576).contains(&max_context), "Kimi row descriptor capacity");
         ensure!(!pool.is_parity() && pool.page_rows() == 64, "Kimi rows require shared uniform 64-row pages");
         ensure!(!sequences.is_empty() && sequences.len() <= slots, "Kimi row descriptor sequence count");

@@ -78,17 +78,10 @@ impl<'a> Weights<'a> {
                 let info = weight.layer.select_info(library, capacity, weight.is_nvfp4())?;
                 ensure!(weight.intermediate() == info.kernel_intermediate as usize,
                     "native resident carrier width differs from installed kernel");
-                let rank = match weight.layer {
-                    ExpertLayer::Backbone { rank, .. } | ExpertLayer::BackboneTp2 { rank, .. }
-                    | ExpertLayer::BackboneReplicatedTp { rank, .. } => rank,
-                    ExpertLayer::BackboneFull { .. } => 0,
-                    other => anyhow::bail!("non-native backbone worker layer {other:?}"),
-                };
                 resident = resident.checked_add(u64::try_from(weight.resident_bytes()?)?)
                     .context("native resident sum overflow")?;
                 slices.push(SparkSlice { unit_map: None, layer: u32::try_from(weight.layer.layer())?,
-                    first: u32::try_from(rank.checked_mul(info.logical_intermediate as usize)
-                        .context("native slice start overflow")?)?,
+                    first: u32::try_from(weight.layer.native_shard()?.first)?,
                     width: info.logical_intermediate, stored_width: info.kernel_intermediate,
                     tiers: vec![], projection_counts: vec![] });
             },
@@ -191,7 +184,7 @@ impl<'a> Weights<'a> {
             Self::Exlr8(weights) => Execution::Exlr8(super::exlr8::Worker::new(library,
                 modules.exlr8()?, weights, config, remaining)?),
             Self::Full(weights) => {
-                let mut execution = weights[0].execution(compiled, config.capacity, remaining)?;
+                let mut execution = ExpertWeights::execution_layers(weights, compiled, config.capacity, remaining)?;
                 execution.install_native_group(config.native_group()?)?;
                 execution.install_worker_timing(config.rank)?;
                 Execution::Full(execution)

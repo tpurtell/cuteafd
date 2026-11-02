@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cuteafd_experts.h"
+#include "cuteafd_mxfp4_layouts.h"
 #include "picojson.h"
 
 namespace {
@@ -78,7 +79,9 @@ bool cpu_pack(const Job& job, std::vector<uint8_t>& out, uint32_t* refused = nul
     const size_t resident = job.start_row + row;
     out[code_bytes + resident] = *limits.first;
     for (size_t column = 0; column < job.columns; ++column) {
-      const size_t word = (resident / 256 * tiles + column / 4) * 256 + resident % 256;
+      const size_t start = resident / 256 * 256;
+      const size_t tile_rows = std::min<size_t>(256, job.stored_rows - start);
+      const size_t word = start * tiles + column / 4 * tile_rows + resident % 256;
       const unsigned shift = unsigned(column % 4) * 4;
       out[word * 2 + shift / 8] |= uint8_t((source[column] - *limits.first) << (shift % 8));
     }
@@ -87,7 +90,9 @@ bool cpu_pack(const Job& job, std::vector<uint8_t>& out, uint32_t* refused = nul
   for (size_t row = 0; row < job.rows; ++row) {
     const size_t resident = job.start_row + row;
     for (size_t column = 0; column < tiles * 4; ++column) {
-      const size_t word = (resident / 256 * tiles + column / 4) * 256 + resident % 256;
+      const size_t start = resident / 256 * 256;
+      const size_t tile_rows = std::min<size_t>(256, job.stored_rows - start);
+      const size_t word = start * tiles + column / 4 * tile_rows + resident % 256;
       const uint8_t offset = (out[word * 2 + column % 4 / 2] >> (column % 2 * 4)) & 15;
       if (column < job.columns)
         require(unsigned(offset) + out[code_bytes + resident] == job.source[row * job.pitch + column],
@@ -163,15 +168,20 @@ void real_expert(const std::filesystem::path& snapshot, const picojson::value& i
   std::copy(up.bytes.begin(), up.bytes.end(), pinned.data);
   std::copy(gate.bytes.begin(), gate.bytes.end(), pinned.data + up.bytes.size());
   std::copy(down.bytes.begin(), down.bytes.end(), pinned.data + up.bytes.size() + gate.bytes.size());
-  for (size_t world : {1, 2, 3, 4, 6}) {
-    require(up.rows % (world * 32) == 0, prefix + ": invalid TP width");
-    const size_t width = up.rows / world;
-    const size_t stored = (width + 127) / 128 * 128;
-    for (size_t rank = 0; rank < world; ++rank) {
+  require(up.rows % 32 == 0, prefix + ": invalid K32 geometry");
+  for (size_t world = 1; world <= 8; ++world) {
+    const size_t unit = cuteafd_mxfp4_ownership_unit(up.rows, world);
+    const size_t units = up.rows / unit, base = units / world, extra = units % world;
+    for (size_t layer = 0; layer < world; ++layer) {
+     for (size_t rank = 0; rank < world; ++rank) {
+      const size_t canonical = extra ? (rank + world - layer) % world : rank;
+      const size_t width = unit * (base + size_t(canonical < extra));
+      const size_t first = unit * (canonical * base + std::min(canonical, extra));
+      const size_t stored = cuteafd_mxfp4_stored_width(down.rows, width);
       Plane s13(plane_bytes(2 * stored, up.columns));
       Plane s2(plane_bytes(down.rows, width / 32));
-      const size_t up_start = rank * width * up.columns;
-      const size_t down_start = rank * width / 32;
+      const size_t up_start = first * up.columns;
+      const size_t down_start = first / 32;
       std::vector<Job> jobs{
           {pinned.data + up_start, s13.data, up.bytes.size() - up_start, s13.bytes,
            up.columns, uint32_t(width), uint32_t(up.columns), uint32_t(2 * stored), 0},
@@ -184,16 +194,18 @@ void real_expert(const std::filesystem::path& snapshot, const picojson::value& i
       require(cpu_pack(jobs[0], expected13) && cpu_pack(jobs[1], expected13)
               && cpu_pack(jobs[2], expected2), prefix + ": source span exceeds 15");
       launch(jobs);
-      const auto label = prefix + " TP" + std::to_string(world) + " rank" + std::to_string(rank);
+      const auto label = prefix + " TP" + std::to_string(world) + " layer" + std::to_string(layer)
+          + " rank" + std::to_string(rank);
       s13.compare(expected13, label + " gate/up");
       s2.compare(expected2, label + " down");
+     }
     }
   }
-  std::printf("%s: all TP1/2/3/4/6 coded planes byte-exact\n", prefix.c_str());
+  std::printf("%s: all TP1..8 rotated exact coded planes byte-exact\n", prefix.c_str());
 }
 
 void edges() {
-  constexpr size_t rows = 259, columns = 18, pitch = 23, stored = 512;
+  constexpr size_t rows = 259, columns = 18, pitch = 23, stored = 288;
   Mapped<uint8_t> source(rows * pitch);
   std::fill_n(source.data, rows * pitch, 0xff);
   for (size_t row = 0; row < rows; ++row)
@@ -224,7 +236,9 @@ void edges() {
     const size_t resident = job.start_row + bad;
     require(actual[code_bytes + resident] == 0, "refused row wrote its base");
     for (size_t tile = 0; tile < (columns + 3) / 4; ++tile) {
-      const size_t at = ((resident / 256 * ((columns + 3) / 4) + tile) * 256 + resident % 256) * 2;
+      const size_t start = resident / 256 * 256;
+      const size_t tile_rows = std::min<size_t>(256, stored - start);
+      const size_t at = (start * ((columns + 3) / 4) + tile * tile_rows + resident % 256) * 2;
       require(actual[at] == 0 && actual[at + 1] == 0, "refused row wrote codes");
     }
   }

@@ -18,6 +18,8 @@ from pathlib import Path
 
 from v41_spark_tp3_launch_geometry import launch_geometry
 from expert_grouping import native_group_macros, slice_group_rows
+from mxfp4_layouts import stored_width, native_slice_width, native_prefill, native_prefill_scratch
+from spark_packages import native_spark_artifacts, native_width_role
 
 os.environ["B12X_COMPILE_DISK_CACHE"] = "0"
 os.environ["B12X_COMPILE_MEMORY_CACHE"] = "0"
@@ -25,7 +27,7 @@ import _pinned_sparkinfer
 
 # Plan-time expert placement roles. Geometry, SM guard and native role id are
 # properties of the role, never of the live row count. `spark` is the historical
-# TP4 shard (576 padded to 640 storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
+# TP4 shard (576 exact storage); `spark_tp2`/`spark_tp3`/`spark_tp6` are
 # the replicated-group shards and are already 128-aligned. These pure tables are
 # the authoritative source for the export geometry and are covered by a CPU-only
 # test that needs neither torch nor CUDA.
@@ -33,37 +35,19 @@ ROLE_GEOMETRY = {
     "coordinator": (128, 2304, 2304, 3),
     "dspark_tp2": (128, 1152, 1152, 3),
     "rtx_tp2": (384, 1152, 1152, 6),
-    "spark_tp2": (384, 1152, 1152, 6),
-    "spark_tp3": (384, 768, 768, 6),
-    "spark_tp6": (384, 384, 384, 6),
-    "spark_tp8": (384, 288, 384, 6),
     "rtx_backbone": (384, 2304, 2304, 6),
-    "spark": (384, 576, 640, 6),
 }
-ROLE_SM = {
-    "coordinator": (12, 0),
-    "dspark_tp2": (12, 0),
-    "rtx_tp2": (12, 0),
-    "rtx_backbone": (12, 0),
-    "spark": (12, 1),
-    "spark_tp2": (12, 1),
-    "spark_tp3": (12, 1),
-    "spark_tp6": (12, 1),
-    "spark_tp8": (12, 1),
-}
+ROLE_GEOMETRY.update({artifact.name: (384, artifact.logical, artifact.stored, 6)
+                      for artifacts in native_spark_artifacts().values() for artifact in artifacts})
+ROLE_SM = {role: (12, 0) for role in ("coordinator", "dspark_tp2", "rtx_tp2", "rtx_backbone")}
+ROLE_SM.update({artifact.name: (12, 1) for artifacts in native_spark_artifacts().values()
+                for artifact in artifacts})
 # Native `cuteafd_expert_info_t.role` values (see native/shared/include/cuteafd_experts.h).
-ROLE_NATIVE_ID = {
-    "coordinator": 0,
-    "spark": 1,
-    "rtx_backbone": 2,
-    "rtx_tp2": 3,
-    "dspark_tp2": 4,
-    "spark_tp2": 5,
-    "spark_tp3": 6,
-    "spark_tp6": 7,
-    "spark_tp8": 8,
-}
-SPARK_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6, "spark_tp8": 8}
+ROLE_NATIVE_ID = {"coordinator": 0, "rtx_backbone": 2, "rtx_tp2": 3, "dspark_tp2": 4}
+ROLE_NATIVE_ID.update({artifact.name: artifact.role for artifacts in native_spark_artifacts().values()
+                       for artifact in artifacts})
+SPARK_TP_DEGREE = {artifact.name: world for world, artifacts in native_spark_artifacts().items()
+                   for artifact in artifacts if not artifact.name.startswith("spark_w")}
 
 # Routed-expert shapes that share the V4.1 storage (packed FP4, E8M0 K32 scales)
 # and slice pipeline. The family names the exported symbols (`cuteafd_{family}_*`)
@@ -74,20 +58,25 @@ FAMILY_GEOMETRY = {
     "dsv4f": {"hidden": 4096, "experts": 256, "topk": 6, "intermediate": 2048},
     "dsv4p": {"hidden": 7168, "experts": 384, "topk": 6, "intermediate": 3072},
 }
-ROLE_TP_DEGREE = {"spark": 4, "spark_tp2": 2, "spark_tp3": 3, "spark_tp6": 6, "spark_tp8": 8,
-                  "rtx_backbone": 1, "rtx_tp2": 2}
+ROLE_TP_DEGREE = {"rtx_backbone": 1, "rtx_tp2": 2}
 
 
 def role_geometry(family, role):
     """(experts, intermediate, kernel_intermediate, topk) for one family role."""
+    shape = FAMILY_GEOMETRY[family]
+    if role.startswith("spark"):
+        artifact = next((artifact for artifacts in native_spark_artifacts(family).values()
+                         for artifact in artifacts if artifact.name == role), None)
+        if artifact is None:
+            raise ValueError(f"{family} has no native Spark artifact {role}")
+        return shape["experts"], artifact.logical, artifact.stored, shape["topk"]
     if family == "v41":
         return ROLE_GEOMETRY[role]
-    shape = FAMILY_GEOMETRY[family]
     tp = ROLE_TP_DEGREE.get(role)
     if tp is None or shape["intermediate"] % tp or (shape["intermediate"] // tp) % 32:
         raise ValueError(f"{family} has no {role} expert slice")
     intermediate = shape["intermediate"] // tp
-    return shape["experts"], intermediate, (intermediate + 127) // 128 * 128, shape["topk"]
+    return shape["experts"], intermediate, stored_width(shape["hidden"], intermediate), shape["topk"]
 
 
 def expert_plane_bytes(family: str, hidden: int, intermediate: int, stored: int) -> tuple[int, ...]:
@@ -101,7 +90,7 @@ def expert_plane_bytes(family: str, hidden: int, intermediate: int, stored: int)
 
 def numerical_recipe(width: int, intermediate: int, *, atomic: bool, compact: bool) -> dict:
     """Pinned slice products and fold order, independent of launch capacity."""
-    if width not in (64, 128, 192) or intermediate <= 0 or intermediate % 32:
+    if width not in (32, 64, 128, 192) or intermediate <= 0 or intermediate % 32:
         raise ValueError("unsupported native slice reduction geometry")
     return dict(
         schema=1,
@@ -134,12 +123,13 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     props = torch.cuda.get_device_properties(0)
     if (props.major, props.minor) not in ((12, 0), (12, 1)):
         raise ValueError("native Blackwell device required")
-    if role not in ROLE_GEOMETRY:
+    width_role = role.startswith("spark_w")
+    if role not in ROLE_GEOMETRY and not width_role:
         raise ValueError(f"unsupported expert placement role {role!r}")
     coordinator = role == "coordinator"
     tp2 = role == "rtx_tp2"
     draft_tp2 = role == "dspark_tp2"
-    expected_sm = ROLE_SM[role]
+    expected_sm = (12, 1) if width_role else ROLE_SM[role]
     if (props.major, props.minor) != expected_sm:
         raise ValueError(
             f"{role} expert slices require SM{expected_sm[0]}{expected_sm[1]}, "
@@ -191,9 +181,14 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
     includes, entries, reductions = [], [], []
     group_rows = slice_group_rows(_pinned_sparkinfer.SOURCE)
     for capacity in capacities:
+        stream_prefill = (standard_names and role not in ("coordinator", "dspark_tp2")
+                          and native_prefill(hidden, intermediate, props.major * 10 + props.minor, capacity))
         compact = compact_max_capacity is not None and capacity <= compact_max_capacity
-        atomic = not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
+        atomic = not stream_prefill and not compact and atomic_min_capacity is not None and capacity >= atomic_min_capacity
         selected_width = width[capacity] if isinstance(width, dict) else width
+        if role.startswith("spark"):
+            selected_width = native_slice_width(hidden, intermediate, props.major * 10 + props.minor,
+                                                capacity, selected_width)
         routes = capacity * topk
         planes = (intermediate + selected_width - 1) // selected_width
         # The native Spark TP3 launch geometry is recorded from the reviewed
@@ -210,10 +205,12 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
                 revision=_pinned_sparkinfer.REVISION,
             )
-            if family == "v41" and role == "spark_tp3"
+            if family == "v41" and role == "spark_tp3" and not stream_prefill
             else None
         )
-        partial_cols = (selected_width // 4 + selected_width // 32) if (family == "v41" and not compact) else hidden
+        # Ordinary FC1 writes FP8 words plus K32 scale words for raw and coded weights.
+        # The hybrid path also reuses this arena for hidden-wide BF16 projections.
+        partial_cols = hidden if compact else selected_width // 4 + selected_width // 32
         specs = [
             (cutlass.Uint32, (capacity, hidden // 4), (wire // 4, 1)),
             (cutlass.Uint8, (capacity, hidden // 32), (wire, 1)),
@@ -246,7 +243,23 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
                     if coordinator else V41SlicePipeline(capacity, selected_width, atomic_tokens=atomic,
                                                experts=experts, topk=topk, intermediate=intermediate,
                                                hidden=hidden, scale_codes=family == "v41",
+                                               exact_storage=kernel_intermediate == intermediate and intermediate % 128 != 0,
                                                fc2_n_splits=fc2_n_splits(role, capacity, selected_width, hidden)))
+        if stream_prefill:
+            from b12x.moe._shared.kernels.v4_stream_pipeline import V4StreamPipeline, stream_scratch_layout
+            from b12x._lib.utils import make_ptr
+            pipeline = V4StreamPipeline(capacity, hidden=hidden, intermediate=intermediate,
+                                        experts=experts, topk=topk, scale_codes=family == "v41")
+            stream_layout, stream_size = native_prefill_scratch(capacity, hidden, intermediate, experts, topk)
+            pinned_layout, pinned_size = stream_scratch_layout(capacity, hidden, intermediate, experts, topk)
+            if tuple(stream_layout) != pinned_layout or stream_size != pinned_size:
+                raise ValueError("native STREAM planner scratch differs from pinned pipeline")
+            scale_type = cutlass.Uint8 if family == "v41" else cutlass.Uint32
+            pointer_types = [cutlass.Uint8, cutlass.Uint32, scale_type, cutlass.Uint32,
+                             scale_type, cutlass.Int32, cutlass.Float32,
+                             cutlass.Int32, cutlass.Int32, cutlass.Int32, cutlass.Uint8,
+                             cutlass.Float32, cutlass.Int32, cutlass.Float32]
+            args = [make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16) for dtype in pointer_types]
         if compact:
             from b12x.moe._shared.kernels.v41_compact_pipeline import V41HybridPipeline
             pipeline = V41HybridPipeline(capacity, selected_width,
@@ -285,6 +298,9 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             "partial",
             "output",
         )
+        if stream_prefill:
+            names = ("x", "w13", "s13", "w2", "s2", "ids", "routing", "meta",
+                     "pair_row", "pair_pos", "act", "grouped_routing", "grouped_route", "output")
         if coordinator:
             names = ("source", *names)
         argument_count = len(names) + 3
@@ -294,7 +310,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         prefix = "cuteafd_" + label
         declarations = (
             [f"{prefix}_Kernel_Module_t*module"]
-            + [f"{prefix}_Tensor_{name}_t*{name}" for name in names]
+            + [f"void*{name}" if stream_prefill else f"{prefix}_Tensor_{name}_t*{name}" for name in names]
             + ["int32_trows", "cudaStream_tstream"]
         )
         if (
@@ -304,12 +320,12 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             raise ValueError("unexpected slice parameter ABI")
         arguments = re.search(rf"void \*args\[{argument_count}\] = \{{([^}}]+)\}}", header)
         if arguments is None or re.sub(r"\s+", "", arguments[1]) != ",".join(
-            name for name in (*names, "&rows", "&stream", "&ret")
+            name for name in (*(tuple("&" + name for name in names) if stream_prefill else names), "&rows", "&stream", "&ret")
         ):
             raise ValueError("unexpected slice argument order")
         # Static tensor layouts must expose exactly one data pointer each.
         bodies = re.findall(r"typedef struct\s*\{([^}]+)\}\s*\w+_Tensor_\w+_t;", header)
-        if len(bodies) != len(names) or any(
+        if (len(bodies) != (0 if stream_prefill else len(names))) or any(
             re.sub(r"\s+", "", b) != "void*data;" for b in bodies
         ):
             raise ValueError("unexpected slice tensor ABI")
@@ -317,7 +333,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         # Existing weight binder owns slots 22..33, 38/39. Other unused slots
         # point at valid dummy scratch to preserve public nonnull validation.
         scratch_slots = [3, 4, 5, 6, 7, 8, 9, 10, 41]
-        for index, slot in zip(range(8, 17), scratch_slots):
+        for index, slot in ([] if stream_prefill else zip(range(8, 17), scratch_slots)):
             dtype, shape, _ = specs[index]
             size = dtype.width // 8
             for dim in shape:
@@ -326,6 +342,12 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             offsets[slot] = offset
             scratch.append(dict(slot=slot, offset=offset, nbytes=size, shape=shape))
             offset += size
+        if stream_prefill:
+            scratch_slots = [3, 4, 5, 6, 7, 8, 41]
+            for plane, slot in zip(stream_layout, scratch_slots, strict=True):
+                offsets[slot] = plane["offset"]
+                scratch.append(dict(slot=slot, **plane))
+            offset = stream_size
         for slot in (37, 40):
             offset = (offset + 15) // 16 * 16
             offsets[slot] = offset
@@ -342,6 +364,8 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         # The old entry gets 44 pointer addresses, seven scalar addresses,
         # stream and status. Repackage them into the generated static ABI.
         mapping = [0, None, 30, 31, 32, 33, 1, 2, *scratch_slots]
+        if stream_prefill:
+            mapping = [0, 30, 31, 32, 33, 1, 2, *scratch_slots]
         input_slot = 11 if coordinator else 0
         mapping[0] = input_slot
         if coordinator:
@@ -361,7 +385,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
         )
         info = [
             3 if atomic else 2,
-            ROLE_NATIVE_ID[role],
+            native_width_role(intermediate) if width_role else ROLE_NATIVE_ID[role],
             experts,
             hidden,
             intermediate,
@@ -391,19 +415,25 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
             + "}}"
         )
         recipe = numerical_recipe(selected_width, intermediate, atomic=atomic, compact=compact)
-        reductions.append(
-            f"case {capacity}: *out = {{1,{selected_width},{recipe['fc2_k_steps']},"
-            f"{planes},{3 if compact else 2 if atomic else 1},{2 if compact else 1},32,128,128}}; return 0;")
+        if stream_prefill:
+            recipe = dict(schema=2, slice_width=128, fc1_mma_mnk=[16, 8, 32],
+                          fc1_k_stage=128, fc2_k_steps=(intermediate + 31) // 32,
+                          block_threads=256, plane_count=1, plane_fold="original_routes",
+                          implementation="native_stream", output_kind="fp32_routes")
+            reductions.append(f"case {capacity}: *out = {{2,128,{recipe['fc2_k_steps']},1,4,3,32,256,128}}; return 0;")
+        else:
+            reductions.append(
+                f"case {capacity}: *out = {{1,{selected_width},{recipe['fc2_k_steps']},"
+                f"{planes},{3 if compact else 2 if atomic else 1},{2 if compact else 1},32,128,128}}; return 0;")
         manifest["variants"].append(
             dict(
                 name=label,
-                implementation="hybrid" if compact else "slices",
-                group_rows=group_rows,
+                implementation="native_stream" if stream_prefill else "hybrid" if compact else "slices",
+                group_rows=128 if stream_prefill else group_rows,
                 compact_group_rows=1 if compact else None,
                 compact_live_rows=min(capacity, compact_live_rows) if compact else None,
                 width=selected_width,
-                numerical_recipe=numerical_recipe(selected_width, intermediate,
-                                                  atomic=atomic, compact=compact),
+                numerical_recipe=recipe,
                 output_kind="fp32_tokens" if atomic else "fp32_routes",
                 native_abi_version=3 if atomic else 2,
                 capacity_rows=capacity,
@@ -447,7 +477,7 @@ def export(output, capacities, width, atomic_min_capacity=None, role="spark", *,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--role", choices=("spark", "spark_tp2", "spark_tp3", "spark_tp6", "spark_tp8", "coordinator", "rtx_backbone", "rtx_tp2", "dspark_tp2"), default="spark")
+    parser.add_argument("--role", default="spark", help="placement role or geometry-derived spark_wWIDTH")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--geometry", choices=sorted(FAMILY_GEOMETRY), default="v41",
                         help="routed-expert family; names the exported symbols")
@@ -455,7 +485,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--width",
         required=True,
-        help="64/128/192 or explicit capacity:width pairs, e.g. 1:64,16:192,80:192",
+        help="32/64/128/192 or explicit capacity:width pairs, e.g. 1:64,16:192,80:192",
     )
     parser.add_argument("--atomic-min-capacity", type=int, choices=[256, 1024, 4096],
                         help="Use ABI 3 direct FP32 token accumulation at these larger capacities")
@@ -480,8 +510,8 @@ if __name__ == "__main__":
         else:
             width = int(args.width)
             widths = [width]
-        if any(w not in (64, 128, 192) for w in widths):
-            raise ValueError("width must be 64, 128 or 192")
+        if any(w not in (32, 64, 128, 192) for w in widths):
+            raise ValueError("width must be 32, 64, 128 or 192")
     except (ValueError, TypeError) as error:
         parser.error(str(error))
     export(args.output_dir, capacities, width, args.atomic_min_capacity, args.role,

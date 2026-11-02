@@ -129,6 +129,10 @@ pub(crate) fn start_worker(args: crate::cli::NativeServeArgs)
 /// Validate and normalize the launch, then spawn the CUDA worker thread.
 /// With `http`, the API and live console load where `serve-native` always loaded them.
 fn start(mut args: crate::cli::NativeServeArgs, http: bool) -> Result<Started> {
+    cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
+    if args.prefix_cache_entries == u32::MAX {
+        args.prefix_cache_entries = cuteafd_core::concurrency::prefix_entries(u64::from(args.concurrency)) as u32;
+    }
     cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
     match cuteafd_transport::fabric::discover() {
         Ok(report) => tracing::info!(target: "cuteafd::fabric", rails = report.rails.use_rails, "{}", report.summary()),
@@ -565,10 +569,10 @@ fn worker(
     let vision_bytes = if small_card { vision_free_before.saturating_sub(lib.cuda_memory_info()?.0) } else { 0 };
     // Reserve both retention banks plus one in-flight snapshot per lane. These
     // allocations are counted before choosing KV capacity and local expert layers.
-    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
+    ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
     cuteafd_ffi::memory_ledger::relabel_other("v41/vision");
     admission::startup_phase(&lib, "v41/vision", device_total)?;
-    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
+    let snapshot_slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled()) as usize;
     let prefix_arenas = prefix::Arenas::new(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
         draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;

@@ -82,8 +82,8 @@ if [[ -n "$spark_tp_roles" ]]; then
   IFS=';' read -ra spark_tp_role_list <<<"$spark_tp_roles"
   for spark_tp_role in "${spark_tp_role_list[@]}"; do
     case "$spark_tp_role" in
-      tp2|tp3|tp6|tp8) ;;
-      *) echo "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3, tp6 and tp8, got: $spark_tp_role" >&2; exit 2 ;;
+      tp2|tp3|tp5|tp6|tp7|tp8) ;;
+      *) echo "CUTEAFD_RELEASE_SPARK_TP_ROLES accepts only tp2, tp3, tp5, tp6, tp7 and tp8, got: $spark_tp_role" >&2; exit 2 ;;
     esac
   done
   [[ "$role" == expert ]] ||

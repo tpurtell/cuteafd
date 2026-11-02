@@ -2,8 +2,8 @@
 
 These exercise the real `parse_args` guard, not source text: the CLI must accept
 `--topologies tp6` and the tile widths the slice kernel can actually compile,
-and must reject a width that is not a real export tile or that would leave a
-partial slice on the per-rank intermediate.
+and must reject a width that is not a real export tile. K32 partial tails are
+valid even when the compute tile does not divide the local source width.
 """
 from __future__ import annotations
 
@@ -37,21 +37,15 @@ def _args(topology: str, widths: str, rows: str = "8"):
     return [
         "--topologies", topology, "--ep-degree", "1", "--widths", widths,
         "--capacity", "80", "--operands", "synthetic",
-        "--output", "/tmp/cuteafd-tp6-parse-test.json", "--rows", rows,
+        "--output", "/unused.json", "--rows", rows,
     ]
 
 
 def test_geometry_table_carries_the_pure_tp6_split() -> None:
     module = _load()
-    geometry = {tag: (degree, intermediate) for degree, intermediate, tag
-                in module.TP_GEOMETRIES}
-    assert geometry["tp6"] == (6, 384)
-    assert geometry["tp4"] == (4, 576)
-    assert geometry["tp3"] == (3, 768)
-    assert geometry["tp2"] == (2, 1152)
-    # Every geometry is the official intermediate 2304 split by its degree.
-    for degree, intermediate in geometry.values():
-        assert degree * intermediate == 2304
+    from spark_packages import native_spark_artifacts
+    assert module.TP_GEOMETRIES == tuple((tp, artifact, f"tp{tp}-{artifact.name}")
+        for tp, artifacts in native_spark_artifacts().items() for artifact in artifacts)
 
 
 @pytest.mark.parametrize("widths", ["192", "128", "64", "64,128,192"])
@@ -71,21 +65,27 @@ def test_rejects_a_width_that_is_not_an_export_tile(widths: str) -> None:
     assert excinfo.value.code == 2
 
 
-def test_rejects_a_width_that_does_not_tile_the_intermediate() -> None:
+def test_accepts_supported_tiles_with_partial_source_tails() -> None:
     module = _load()
-    # TP4's 576 is not divisible by 128, so a 128-wide slice would leave a
-    # partial tile; TP2/TP3/TP6 are all divisible by every supported width.
-    with pytest.raises(SystemExit):
-        module.parse_args(_args("tp4", "128"))
-    for topology in ("tp2", "tp3", "tp6"):
-        options = module.parse_args(_args(topology, "128"))
-        assert options.widths == [128]
+    for topology in ("tp2", "tp3", "tp4", "tp5", "tp6", "tp7", "tp8"):
+        assert module.parse_args(_args(topology, "128")).widths == [128]
 
 
 def test_rejects_an_unknown_topology() -> None:
     module = _load()
     with pytest.raises(SystemExit):
-        module.parse_args(_args("tp5", "192"))
+        module.parse_args(_args("tp9", "192"))
+
+
+@pytest.mark.parametrize("topology,widths,rows", [
+    ("tp5", "128", "1"), ("tp7", "192", "1"),
+    ("tp6", "64,128", "1"), ("tp6", "128", "1,16"),
+])
+def test_multiple_records_are_rejected_before_touching_cuda(topology, widths, rows):
+    module = _load()
+    module._require_blackwell = lambda: pytest.fail("CUDA preflight must not run")
+    with pytest.raises(SystemExit, match="exactly one artifact"):
+        module.main(_args(topology, widths, rows))
 
 
 def test_tp6_topk_and_hidden_match_the_official_geometry() -> None:

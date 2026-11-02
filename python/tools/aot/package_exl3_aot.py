@@ -384,7 +384,7 @@ COORDINATOR_WS_CELLS: dict[tuple[str, int, int], dict] = {
     ('kimik3', 3072, 8256): _WS_K3_PREROTATE,
     ('kimik3', 1536, 8256): _WS_K3_PREROTATE,
     # ML4 K4/empty-K5, 2026-11-01: 1.036x even / 1.060x synthetic-skew.
-    # Provisional: maxq-ranked, needs PRO 6000 confirmation; exact cell only.
+    # Confirmed PRO 6000: 1.05-1.07x (#924 comment 6566325329); exact cell only.
     ('ml4', 3072, 2752): _WS_K3_PREROTATE,
 }
 

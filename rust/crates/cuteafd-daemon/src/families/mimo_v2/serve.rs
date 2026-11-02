@@ -53,7 +53,7 @@ pub(crate) struct ServeArgs {
     /// Sequences decoding at once (each holds an SWA ring).
     #[arg(long, default_value_t = cuteafd_loader::families::mimo_v2::draft_representation::DEFAULT_MAX_SEQUENCES)]
     pub max_sequences: usize,
-    /// Bounded pending API requests (default 16).
+    /// Bounded pending API requests (defaults to concurrency).
     #[arg(long, env = "CUTEAFD_HTTP_QUEUE_DEPTH")]
     pub http_queue_depth: Option<usize>,
     /// Time a caller waits for a pending-queue permit.
@@ -118,17 +118,14 @@ use crate::shared::probe;
 
 
 pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
+    cuteafd_core::concurrency::validate("mimo_v2", args.max_sequences as u64)?;
+    args.prefix.resolve_entries(args.max_sequences as usize);
     anyhow::ensure!(args.prefill_chunk_s.is_none_or(|s| s.is_finite() && s > 0.0 && s <= 5.0),
         "--prefill-chunk-s must be finite and in (0, 5]");
     anyhow::ensure!(args.prefill_chunk_s.is_none() || args.decode_share.decode_share > 0.0,
         "--prefill-chunk-s requires a positive --decode-share");
     let api = args.api.load()?;
     let snapshot: PathBuf = args.engine.snapshot.clone();
-    let effective_sequences = args.max_sequences.clamp(1, DECODE_ROWS);
-    if effective_sequences != args.max_sequences {
-        tracing::warn!(requested = args.max_sequences, effective = effective_sequences, "clamping MiMo decoding sequences");
-        args.max_sequences = effective_sequences;
-    }
     // MiMo's template and tool calls follow Qwen3-Coder's XML (`<tool_call>
     // <function=NAME><parameter=KEY>VALUE</parameter>`), its reasoning `<think>`.
     let encoding = QwenEncoding::from_snapshot(&snapshot)?;
@@ -136,13 +133,13 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
         args.model_id.clone().or_else(|| crate::families::glm5_flash::serve::model_id(&snapshot)).context("model id")?,
         ModelEncoding::Qwen(Arc::new(encoding)),
     );
-    let depth = serving_queue_depth(args.http_queue_depth);
+    let depth = serving_queue_depth(args.http_queue_depth, args.max_sequences);
     anyhow::ensure!(depth > 0, "--http-queue-depth must be positive");
     let (queue, receive) = mpsc::channel::<NativeRequest>(depth);
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let mut engine_args = args.engine.clone();
-    engine_args.rings = engine_args.rings.max(args.max_sequences);
+    engine_args.rings = cuteafd_core::concurrency::request_slots(args.max_sequences as u64, engine_args.rings as u64) as usize;
     let (worker_stats, max_sequences) = (stats.clone(), args.max_sequences);
     engine_args.draft_sequences = engine_args.draft_sequences.max(args.max_sequences);
     engine_args.draft_context_slots = Some(serving_context_slots(
@@ -195,7 +192,7 @@ fn console_layout(args: &ServeArgs, model: &str) -> console::Layout {
     layout.hardware = console::hardware(1 + usize::from(args.engine.split_device.is_some()), sparks,
         args.engine.local_experts);
     layout.split = args.engine.split_device.map(|_| "head split".into());
-    layout.concurrency = args.max_sequences.min(DECODE_ROWS);
+    layout.concurrency = args.max_sequences;
     let policy = args.draft_fixed.map_or_else(|| "adaptive".to_string(), |n| format!("fixed {n}"));
     let drafter = if args.engine.draft.is_some() { Some("DFlash") } else if args.engine.mtp > 0 { Some("MTP") } else { None };
     layout.speculator = drafter.map(|name| console::Speculator {
@@ -265,7 +262,7 @@ fn serve_loop(args: super::EngineArgs, mut receive: mpsc::Receiver<NativeRequest
         engine.check_tp2_routers()?;
         anyhow::ensure!(preparer.is_none() || media.encoder().available_for(false), "vision encoder unavailable before readiness");
         anyhow::ensure!(audio_preparer.is_none() || media.encoder().available_for(true), "audio encoder unavailable before readiness");
-        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences.min(DECODE_ROWS), draft, &prefix,
+        schedule(engine, &opened, &args.snapshot, &mut receive, &stats, max_sequences, draft, &prefix,
             args.token_io.token_select, host_config, &mut media, preparer.as_deref(), || {
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok((engine.max_context, (preparer.is_some() || audio_preparer.is_some()).then(|| (preparer.clone(), audio_preparer.clone(), health.clone(), audio_health.clone())))));
@@ -1169,7 +1166,7 @@ async fn decode_round(lease: LaneLease<'_>, engine: &MimoEngine<'_>, fixed: Opti
         predicted = selection.predicted;
         selection.lengths
     } else { vec![0; active.len()] };
-    if resource::trim_budget(&mut planned, DECODE_ROWS) { predicted = None; }
+    if resource::trim_budget_with_priors(&mut planned, DECODE_ROWS, &priors, |i| active[i].ticket.id()) { predicted = None; }
     if fixed.is_some() {
         if let Some(shared) = shared.as_ref() {
             let candidates: Vec<_> = active.iter().zip(&priors).map(|(a, prior)|
@@ -1387,7 +1384,9 @@ fn select_draft_action(policy: &mut cuteafd_core::DraftPolicy, requests: &[(u64,
     Ok(run)
 }
 
-fn serving_queue_depth(explicit: Option<usize>) -> usize { explicit.unwrap_or(16) }
+fn serving_queue_depth(explicit: Option<usize>, concurrency: usize) -> usize {
+    explicit.unwrap_or(cuteafd_core::concurrency::queue_depth(concurrency as u64) as usize)
+}
 
 fn serving_context_slots(sequences: usize, rings: usize, explicit: Option<usize>, warm: bool) -> usize {
     if warm { explicit.unwrap_or(sequences).max(sequences).max(rings) }
@@ -1554,10 +1553,10 @@ mod port_tests {
         for sequences in [1, 4, 16, 32, 64] {
             let parsed = Cli::parse_from(["serve", "--snapshot", "/model", "--native-lib", "/lib",
                 "--max-sequences", &sequences.to_string()]);
-            assert_eq!(serving_queue_depth(parsed.serve.http_queue_depth), 16);
+            assert_eq!(serving_queue_depth(parsed.serve.http_queue_depth, parsed.serve.max_sequences), parsed.serve.max_sequences);
         }
-        assert_eq!(serving_queue_depth(Some(32)), 32);
-        assert_eq!(serving_queue_depth(Some(1)), 1);
+        assert_eq!(serving_queue_depth(Some(32), 4), 32);
+        assert_eq!(serving_queue_depth(Some(1), 4), 1);
     }
 
     #[test]

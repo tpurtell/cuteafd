@@ -1061,8 +1061,9 @@ mod tests {
         let mark = kda * (state + conv);
         let bf16 = kda * (kda_layer_bytes(&cfg, cfg.kda_heads, KdaState::Bf16, DECODE_ROWS).0 + conv);
         assert_eq!((mark, bf16, kda * replay, mla * 64 * KEY_BYTES), (147_619_840, 76_316_672, 321_421_312, 360_448));
-        let prefix = Cli::parse_from(["serve"]).prefix;
-        for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 18, 28), (16, 34, 34), (64, 130, 130)] {
+        let mut prefix = Cli::parse_from(["serve"]).prefix;
+        prefix.resolve_entries(16);
+        for (lanes, f32_slots, bf16_slots) in [(4, 14, 28), (8, 14, 28), (16, 14, 28), (64, 14, 28)] {
             for (index, state, mark, slots) in [(IndexCache::Keys, KdaState::F32, mark, f32_slots),
                 (IndexCache::Compact, KdaState::F32, mark + mla * TAIL_BYTES, f32_slots),
                 (IndexCache::Keys, KdaState::Bf16, bf16, bf16_slots),
@@ -1086,20 +1087,18 @@ mod tests {
                 assert_eq!(planned, 2);
             }
         }
-        // What either admission now reserves is the arena the ledger measured as `prefix`: FP32 at 8
-        // and 16 sequences, compact at 16, BF16 at 8 and 16 (a flat 18-mark reserve left 16 FP32
-        // marks, 2,361,917,440 B, out at 16 sequences).
+        // Device-only arenas stay within the byte budget at every concurrency.
         let arena = |lanes, index: IndexCache, state: KdaState| {
             let mark = glm_flash_rank_cache_geometry(&cfg, cfg.layers, 1, index.into(), state.bytes() as u64).unwrap()
                 .ranks[0].retained_mark_bytes as usize;
             super::ArenaMarks::Rule(prefix.mark_rule(lanes)).slots_on(&cfg, cfg.layers, index, state).unwrap() * mark
         };
-        assert_eq!(arena(8, IndexCache::Keys, KdaState::F32), 2_657_157_120);
-        assert_eq!(arena(16, IndexCache::Keys, KdaState::F32), 5_019_074_560);
-        assert_eq!(arena(16, IndexCache::Compact, KdaState::F32), 5_019_655_008);
+        assert_eq!(arena(8, IndexCache::Keys, KdaState::F32), 2_066_677_760);
+        assert_eq!(arena(16, IndexCache::Keys, KdaState::F32), 2_066_677_760);
+        assert_eq!(arena(16, IndexCache::Compact, KdaState::F32), 2066916768);
         assert_eq!(arena(8, IndexCache::Keys, KdaState::Bf16), 2_136_866_816);
-        assert_eq!(arena(16, IndexCache::Keys, KdaState::Bf16), 2_594_766_848);
-        assert_eq!(arena(16, IndexCache::Keys, KdaState::F32) - 18 * mark, 2_361_917_440);
+        assert_eq!(arena(16, IndexCache::Keys, KdaState::Bf16), 2_136_866_816);
+        assert!(arena(16, IndexCache::Keys, KdaState::F32) <= 2 << 30);
         let off = PrefixArgs { prefix_cache_entries: 0, ..prefix };
         assert_eq!(super::ArenaMarks::Rule(off.mark_rule(16))
             .slots_on(&cfg, cfg.layers, IndexCache::Keys, KdaState::F32).unwrap(), 0);

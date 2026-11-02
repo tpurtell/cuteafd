@@ -99,7 +99,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 state_slots: args.state_slots,
                 glmf_mark_lanes: args.mark_lanes,
                 prefix_slots: args.prefix_slots,
-                mimo_prefix_entries: args.prefix_cache_entries,
+                mimo_prefix_entries: args.prefix_cache_entries.unwrap_or(u64::MAX),
                 mimo_prefix_mark_bytes: args.prefix_cache_mark_mib.checked_mul(1 << 20)
                     .ok_or_else(|| PlanError::InvalidOption { option: "--prefix-cache-mark-mib", reason: "byte budget overflows".into() })?,
                 mimo_prefix_draft: args.mimo_prefix_draft,
@@ -135,7 +135,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
 }
 
 fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &PlanArgs) {
-    layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries, 1, u64::MAX, layout.host_cache_bytes != Some(0))));
+    layout.prefix_slots = args.prefix_slots.or(Some(cuteafd_core::prefix::mark_slots_with_host(0, args.prefix_cache_entries.unwrap_or_else(|| cuteafd_core::concurrency::prefix_entries(layout.resolved_concurrency("deepseek_v41"))), 1, u64::MAX, layout.host_cache_bytes != Some(0))));
     // Workers must cover both prefill and the 256-row replay bucket.
     layout.spark_capacity_rows = if args.prefill_rows == 0 { 4096 }
         else if args.prefill_rows <= 256 { 256 }
@@ -920,10 +920,10 @@ mod tests {
             prefix_slots: None,
             host_cache_bytes: crate::shared::prefix::HostBudget::Auto,
             media_cache_bytes: None,
-            prefix_cache_entries: 20,
+            prefix_cache_entries: None,
             prefix_cache_mark_mib: 2048,
             mimo_prefix_draft: false,
-            mimo_rings: 16,
+            mimo_rings: 0,
             mimo_swa_kv_cache: crate::families::mimo_v2::SwaKvCacheArg::Int8,
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: None,
@@ -1199,11 +1199,11 @@ mod tests {
                         crate::cli::Commands::ServeMimo(args) => {
                             assert_eq!(resolved, args.max_sequences);
                             let batch = layout.mimo_draft_sequences().max(resolved as u64);
-                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings.max(resolved as u64),
+                            let slots = mimo::mimo_draft_context_slots(batch, layout.mimo_rings(),
                                 layout.draft_context_slots);
                             let startup_batch = args.engine.draft_sequences.max(args.max_sequences);
                             let startup_slots = mimo::mimo_draft_context_slots(startup_batch as u64,
-                                args.engine.rings.max(args.max_sequences) as u64,
+                                cuteafd_core::concurrency::request_slots(args.max_sequences as u64, args.engine.rings as u64),
                                 args.engine.draft_context_slots.map(|n| n as u64));
                             let planned = mimo::MimoDraftCapacity::new(slots as usize, batch as usize, 8).unwrap();
                             let started = mimo::MimoDraftCapacity::new(startup_slots as usize, startup_batch, 8).unwrap();
@@ -1396,7 +1396,7 @@ mod tests {
         for entries in [0, 1, 20, 128] {
             let slots = cuteafd_core::prefix::mark_slots_with_host(0, entries as u64, 1, u64::MAX,
                 layout.host_cache_bytes != Some(0));
-            args.prefix_cache_entries = entries;
+            args.prefix_cache_entries = Some(entries);
             for (rows, capacity) in [(0, 4096), (80, 256), (256, 256), (1024, 1024), (2048, 4096)] {
                 args.prefill_rows = rows;
                 v41_layout(&mut layout, &args);
@@ -1648,39 +1648,38 @@ mod tests {
         let state = |slots: u64| rank.fixed_state_bytes + per_sequence * slots + rank.speculative_replay_bytes;
         // serve-glmf's own counts for `sequences`, `entries` and a mark budget (MiB).
         let served = |sequences: u64, entries: u64, mib: u64| {
-            let (slots, lanes) = (sequences.max(8), sequences.min(64));
+            let (slots, lanes) = (cuteafd_core::concurrency::state_slots(sequences), sequences);
             (cuteafd_core::prefix::mark_slots_with_host(lanes, entries, mark, mib << 20, true) * mark, state(slots))
         };
         // The launcher's arguments for CONCURRENCY, PREFIX_CACHE_ENTRIES and PREFIX_CACHE_MARK_MIB.
         let launcher = |sequences: u64, entries: u64, mib: Option<u64>| {
             let mut argv = vec!["--concurrency".to_string(), sequences.to_string(), "--state-slots".into(),
-                sequences.max(8).to_string(), "--mark-lanes".into(), sequences.min(64).to_string(),
+                cuteafd_core::concurrency::state_slots(sequences).to_string(), "--mark-lanes".into(), sequences.to_string(),
                 "--prefix-cache-entries".into(), entries.to_string()];
             if let Some(mib) = mib { argv.extend(["--prefix-cache-mark-mib".into(), mib.to_string()]); }
             argv
         };
         for (sequences, entries, mib) in [(1, 0, None), (1, 20, None), (5, 6, Some(1971)), (8, 20, None),
-            (16, 20, None), (16, 6, Some(1971)), (64, 20, None), (65, 20, None), (128, 20, None), (128, 0, None)] {
+            (16, 20, None), (16, 6, Some(1971)), (64, 20, None)] {
             let argv = launcher(sequences, entries, mib);
             let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
             assert_eq!(planned(&argv), served(sequences, entries, mib.unwrap_or(2048)), "{argv:?}");
         }
         // Host-on reserves a fixed staging working set even when mark lanes change.
         let staging = cuteafd_core::prefix::HOST_MARK_STAGING_SLOTS;
-        assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(8)));
-        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(8)));
-        for concurrency in [16, 128] {
+        assert_eq!(planned(&launcher(1, 0, None).iter().map(String::as_str).collect::<Vec<_>>()), (0, state(1)));
+        assert_eq!(planned(&["--concurrency", "1", "--prefix-cache-entries", "0"]), (0, state(1)));
+        for concurrency in [16, 64] {
             let args = launcher(concurrency, 20, None);
             assert_eq!(planned(&args.iter().map(String::as_str).collect::<Vec<_>>()),
-                (staging * mark, state(concurrency)));
+                (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
             assert_eq!(planned(&["--concurrency", &concurrency.to_string()]),
-                (staging * mark, state(concurrency)));
+                (staging * mark, state(cuteafd_core::concurrency::state_slots(concurrency))));
         }
         let default_sequences = cuteafd_loader::families::glm5_flash::DEFAULT_MAX_SEQUENCES as u64;
         assert_eq!(planned(&[]), served(default_sequences, 20, 2048));
-        // Explicit host-off retains the legacy lane floor and entries/budget rule exactly.
-        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (34 * mark, state(16)));
-        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "128"]), (258 * mark, state(128)));
+        // Host-off retention remains budgeted separately from the C active state slots.
+        assert_eq!(planned(&["--host-cache-bytes", "0", "--concurrency", "16"]), (cuteafd_core::prefix::mark_slots_for(16, 20, mark, 2048 << 20) * mark, state(16)));
         // The other knobs serve-glmf gets reach the layout as given.
         let custom = layout(&["--concurrency", "16", "--state-slots", "16", "--mark-lanes", "16",
             "--prefix-cache-entries", "6", "--prefix-cache-mark-mib", "1971", "--replay-records", "shared"]);

@@ -2,6 +2,8 @@
   "schema": 1,
   "shared_inputs": [
     "python/tools/lib/spark_packages.py",
+    "python/tools/lib/mxfp4_layouts.py",
+    "scripts/build/mxfp4-layouts.json",
     "scripts/build/spark-package-ranges.json",
     "scripts/lib/wip_aot_scopes.py",
     "scripts/lib/checkpoint-family.py"

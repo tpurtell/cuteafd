@@ -271,7 +271,7 @@ def test_qwen_joint_host_admission_precedes_lazy_allocations_on_every_layout():
     assert "HostAllocation::new" not in future
 
     serve = (root / "serve.rs").read_text()
-    assert "args.planner_host_prefix = Some((prefix.clone(), max_sequences.min(DECODE_ROWS)));" in serve
+    assert "args.planner_host_prefix = Some((prefix.clone(), max_sequences));" in serve
     cache = serve[serve.index("fn prefix_cache"):]
     assert "engine.host_prefix_config.clone().map(|config|" in cache
     assert ".host_config(" not in cache and ".resolve_host_config(" not in cache

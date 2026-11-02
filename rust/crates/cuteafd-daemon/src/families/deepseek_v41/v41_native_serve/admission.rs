@@ -303,8 +303,8 @@ pub(super) fn admit_startup(
     }
     let mut startup = vec![owners::vocabulary_load_phase(&weights, &target,
         VocabularyHead::plan(catalog)? as u64)?];
-    ensure!(args.prefix_cache_entries <= 128, "invalid retained-turn limit");
-    let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.prefix_cache_entries), 1, u64::MAX, args.host_cache_bytes.enabled());
+    ensure!(args.resolved_prefix_entries() <= 128, "invalid retained-turn limit");
+    let slots = cuteafd_core::prefix::mark_slots_with_host(0, u64::from(args.resolved_prefix_entries()), 1, u64::MAX, args.host_cache_bytes.enabled());
     let mut target_owners = owners::TargetOwners::new(weights, target, 1,
         owners::transports_bytes(u64::from(super::DECODE_LANE_ROWS), u64::from(capacity), args.peers.len(), passes)?, slots)?;
     let draft = if args.dspark {
@@ -508,6 +508,7 @@ pub(super) fn resolve_with_owners(
     draft: Option<&families::deepseek_v41::DraftInventory>,
 ) -> Result<Admitted> {
     use cuteafd_core::memory_layout::{Basis, Category};
+    cuteafd_core::concurrency::validate("deepseek_v41", u64::from(args.concurrency))?;
     let ranks = memory.len();
     ensure!(
         matches!(ranks, 1 | 2) && deferred.len() == ranks && minimum <= experts.len(),
@@ -560,7 +561,7 @@ pub(super) fn resolve_with_owners(
         })
         .collect::<Result<Vec<_>>>()?;
     let cards = memory.iter().map(|m| m.1 as u64).collect::<Vec<_>>();
-    let tails = args.concurrency as u64 + 2 * args.prefix_cache_entries as u64;
+    let tails = args.concurrency as u64 + 2 * args.resolved_prefix_entries() as u64;
     let mut pool = PoolPolicy::resolve(
         &cards,
         args.max_context_tokens as u64,
@@ -623,7 +624,7 @@ pub(super) fn resolve_with_owners(
         &mut req,
         &config,
         args.concurrency as u64,
-        args.prefix_cache_entries as u64,
+        args.resolved_prefix_entries() as u64,
         args.tp2_attention,
     )?;
     let placement = solve(&req)?;
@@ -1045,7 +1046,7 @@ mod admission_tests {
         let mut args = args(dir.path());
         args.max_context_tokens = 131_072;
         args.rtx_expert_layers = LocalLayers::Count(0);
-        let tails = args.concurrency as usize + 2 * args.prefix_cache_entries as usize;
+        let tails = args.concurrency as usize + 2 * args.resolved_prefix_entries() as usize;
         let memory = [(80usize << 30, 96usize << 30)];
         for tokens in [32_768, 131_072] {
             args.kv_pool_size = Some(crate::shared::memory::budget::ByteSize(

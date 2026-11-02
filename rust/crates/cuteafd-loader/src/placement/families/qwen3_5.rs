@@ -196,7 +196,7 @@ pub struct NativeBuffers {
 
 impl NativeBuffers {
     pub fn new(cfg: &Qwen35Config, scratch: usize, slots: usize, marks: usize, full_prefill_logits: bool) -> Result<Self> {
-        ensure!((1..=VERIFY_ROWS).contains(&slots), "dense state slots must be 1..64");
+        ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=128 slots");
         // Bound all products below before computing the native allocation recipe.
         ensure!(cfg.hidden <= 16_777_216 && cfg.vocab <= 16_777_216
             && cfg.heads <= 1024 && cfg.head_dim <= 256 && cfg.attention.len() <= 4096,
