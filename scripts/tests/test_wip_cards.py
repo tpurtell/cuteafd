@@ -1176,6 +1176,24 @@ def test_sweep_tokens_reach_every_job(entry, tmp_path, monkeypatch):
         assert matrix['sweep_tokens'] == 1536
 
 
+def test_c1_context_grid_and_decode_markers(entry, tmp_path, monkeypatch):
+    kit = _kit(tmp_path, entry)
+    state = tmp_path / 'state'
+    monkeypatch.setattr(sys, 'argv', ['wip-cards', '--kit', str(kit), '--cards', 'v41-min', '--matrix',
+        '--arm', 'a=b:s', '--state', str(state), '--panels', 'none', '--levels', '1', '--sweep-tokens', '512',
+        '--sweep-c1-contexts', '0,42000,213000', '--nsys-window', '1:2', '--probe', 'v41-min:console', '--dry-run'])
+    assert cards.main() == 0
+    job = json.loads((state / 'plan.json').read_text())['jobs'][0]
+    assert job['entry']['sweep_c1_contexts'] == [0, 42000, 213000]
+    assert job['nsys_window'] == [1, 2]
+    event = dict(e='round', lane=0, t0=10., t1=11., s={'verify': 900}, req=[[7, 5, 3, 2, 3]])
+    steps = {}
+    assert cards.decode_markers(event, steps, [1, 2]) == []
+    assert cards.decode_markers(event, steps, [1, 2])[0]['accepted'] == 2
+    assert cards.decode_markers(event, steps, [1, 2])[0]['step'] == 2
+    assert cards.decode_markers(event, steps, [1, 2]) == []
+
+
 @pytest.mark.parametrize('prompts', ['shared', 'distinct-v1'])
 def test_sweep_prompts_reach_every_job(entry, tmp_path, monkeypatch, prompts):
     kit = _kit(tmp_path, entry)
@@ -1192,6 +1210,8 @@ def test_sweep_prompts_reach_every_job(entry, tmp_path, monkeypatch, prompts):
 @pytest.mark.parametrize('extra,match', [(['--post-load-c1'], 'needs --levels'),
     (['--levels', '1,16', '--post-load-repeat'], 'needs --post-load-c1'), (['--panels', 'none'], 'runs nothing'),
     (['--sweep-prompts', 'shared'], 'needs --levels'),
+    (['--levels', '16', '--sweep-tokens', '512', '--sweep-c1-contexts', '42000'], 'needs distinct'),
+    (['--nsys-window', '1:0'], 'START:COUNT'),
     (['--sweep-tokens', '1536'], 'needs --levels'), (['--levels', '1,16', '--sweep-tokens', '0'], '1..8192'),
     (['--levels', '1,1'], 'distinct'), (['--panels', 'bogus'], 'unknown requested panel')])
 def test_subset_flags_refuse_nonsense(entry, tmp_path, monkeypatch, extra, match):

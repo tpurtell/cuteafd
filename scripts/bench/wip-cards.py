@@ -854,7 +854,8 @@ while True:
 '''
 
 
-def console_frames(url, stop, output):
+def console_frames(url, stop, output, nsys_window=None):
+    steps = {}
     from urllib.parse import urlparse
     parsed = urlparse(url)
     def exact(sock, size):
@@ -898,10 +899,31 @@ def console_frames(url, stop, output):
                         mask = os.urandom(4)
                         sock.sendall(bytes([0x8a, 0x80 | size]) + mask + bytes(x ^ mask[i % 4] for i, x in enumerate(body)))
                     elif opcode == 1:
-                        output.write(json.dumps(json.loads(body)) + '\n')
+                        frame = json.loads(body)
+                        output.write(json.dumps(frame) + '\n')
                         output.flush()
+                        for event in frame.get('ev', []):
+                            decode_markers(event, steps, nsys_window)
         except (OSError, EOFError, ValueError):
             time.sleep(.25)
+
+
+def decode_markers(event, steps, window):
+    if window is None or event.get('e') != 'round':
+        return []
+    start, count = window
+    markers = []
+    for row in event.get('req', []):
+        ident = row[0]
+        step = steps.get(ident, 0)
+        steps[ident] = step + 1
+        if start <= step < start + count:
+            marker = dict(event='decode-step', request=ident, step=step, lane=event.get('lane'),
+                          t0=event.get('t0'), t1=event.get('t1'), stages_us=event.get('s'),
+                          drafted=row[1], verified=row[2], accepted=row[3], emitted=row[4])
+            markers.append(marker)
+            print('nsys-window ' + json.dumps(marker), flush=True)
+    return markers
 
 
 def sampler_cleanup(job):
@@ -931,7 +953,7 @@ def observe(job):
     policy_sample_at = 0.
     reader = None
     if 'console' in job['probes']:
-        reader = threading.Thread(target=console_frames, args=(os.environ['CUTEAFD_SMOKE_URL'], stop, frames), daemon=True)
+        reader = threading.Thread(target=console_frames, args=(os.environ['CUTEAFD_SMOKE_URL'], stop, frames, job.get('nsys_window')), daemon=True)
         reader.start()
     try:
         if 'memory' in job['probes']:
@@ -2267,6 +2289,8 @@ def main():
                         'to <job>/lossless-rows/spec-lossless-rows-*/ with a manifest.json; needs --panels with spec_lossless_set')
     parser.add_argument('--levels', metavar='C,C', help='client-side code-decode sweep at these concurrency levels after the profile, e.g. 1,16')
     parser.add_argument('--sweep-prompts', choices=['shared', 'distinct-v1'], help='--levels workload: identical code prompts per wave, or distinct styles/topics (omitted: existing code with unique nonces)')
+    parser.add_argument('--sweep-c1-contexts', metavar='N,N', help='common C1 prose/code grid at corpus-reference contexts 0,42000,213000 (0 means short); needs --levels 1 --sweep-tokens 512')
+    parser.add_argument('--nsys-window', metavar='START:COUNT', help='print console decode-step markers for this per-request step range; needs --probe CARD:console')
     parser.add_argument('--post-load-c1', action='store_true', help='re-measure C1 after the widest --levels level')
     parser.add_argument('--sweep-tokens', type=int, metavar='N', help='output tokens per --levels decode request '
                         '(default 192); longer runs give profiled waves more decode steps at every width')
@@ -2389,6 +2413,16 @@ def main():
         parser.error('--sweep-tokens needs --levels and 1..8192 tokens')
     if args.sweep_prompts and not args.levels:
         parser.error('--sweep-prompts needs --levels')
+    c1_contexts = None
+    if args.sweep_c1_contexts:
+        c1_contexts = [int(x) for x in args.sweep_c1_contexts.split(',') if x.strip()]
+        if not c1_contexts or len(set(c1_contexts)) != len(c1_contexts) or not set(c1_contexts) <= {0, 42000, 213000} or args.levels != '1' or args.sweep_tokens != 512 or args.post_load_c1:
+            parser.error('--sweep-c1-contexts needs distinct 0,42000,213000, --levels 1 --sweep-tokens 512 and no post-load')
+    nsys_window = None
+    if args.nsys_window:
+        if not re.fullmatch(r'[0-9]+:[1-9][0-9]*', args.nsys_window):
+            parser.error('--nsys-window takes START:COUNT (COUNT > 0)')
+        nsys_window = list(map(int, args.nsys_window.split(':')))
     levels = None
     if args.levels:
         levels = [int(x) for x in args.levels.split(',') if x.strip()]
@@ -2452,6 +2486,8 @@ def main():
             card['prefill_lengths'] = prefill_lengths
             if args.prefill_repeat:
                 card['prefill_repeat'] = True
+        if c1_contexts is not None:
+            card['sweep_c1_contexts'] = c1_contexts
         if levels:
             card['levels'] = levels
             if args.sweep_prompts:
@@ -2518,6 +2554,10 @@ def main():
     jobs = [generate(card, name, arm, state, key_file, {**overrides.get(card['name'], {}), **arm_overrides.get(name, {}).get(card['name'], {})}, probes[card['name']] | arm_probes.get(name, {}).get(card['name'], set()), expected[card['name']], repeat, args.trace, shlex.split(args.exact_state) if args.exact_state else None, [h for h in (args.cold_window or '').split(',') if h] or None) for card, name, arm, repeat in schedule(cards, arms, args.repeats if args.interleave else 1, args.interleave) if card['name'] not in bindings or bindings[card['name']] == name]
     variants = {(c['name'], n): {**c, 'set': {**c['set'], **arm_overrides.get(n, {}).get(c['name'], {})}} for c in cards for n in arms}
     for job in jobs:
+        if nsys_window is not None:
+            if 'console' not in job['probes']:
+                parser.error('--nsys-window needs a console probe on every job')
+            job['nsys_window'] = nsys_window
         job['launcher'] = dict(repo=arms[job['arm']]['repo'], commit=arms[job['arm']]['repo_commit'])
         job['needs'] = slot_needs(variants[(job['card'], job['arm'])])
         # Per arm: an A/B of two builds runs each arm's own smoke runner.
@@ -2591,6 +2631,7 @@ def main():
         (['prefill_purge'] if any(job['entry'].get('prefill_purge') for job in jobs) else []) + \
         (['sweep_tokens'] if args.sweep_tokens is not None else []) + \
         (['sweep_prompts'] if args.sweep_prompts else []) + \
+        (['sweep_c1_contexts'] if c1_contexts is not None else []) + \
         (['baseline'] if any(job['entry'].get('baseline') is False for job in jobs) else []) + \
         (['window'] if any(job['entry'].get('window') for job in jobs) else []) + \
         (['lossless_set'] if any(job['entry'].get('lossless_set') for job in jobs) else []) + \

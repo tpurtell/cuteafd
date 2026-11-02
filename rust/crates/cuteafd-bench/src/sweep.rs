@@ -39,6 +39,10 @@ pub struct RequestTiming {
     pub last_s: f64,
     pub completion_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub prompt_sha256: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -46,6 +50,12 @@ pub struct Point {
     pub c: usize,
     /// `levels`, `post_load` (C1 after the widest level) or `post_load_repeat` (that C1 re-sending the levels C1's prompts).
     pub phase: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_counters: Option<Value>,
     pub aggregate_tok_s: f64,
     pub per_request_tok_s: f64,
     pub ttft_s: f64,
@@ -171,8 +181,9 @@ impl Prompts {
 /// Measures concurrency `c`; `repeat` re-sends those prompts instead of drawing fresh ones.
 /// Returns the point and the prompts used.
 fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tokens: u64, set: PromptSet,
-    on_timed: &mut OnTimed) -> Result<(Point, Prompts)> {
-    let prompts = repeat.cloned().unwrap_or_else(|| Prompts::fresh(c, set));
+    on_timed: &mut OnTimed, context_style: Option<(u64, usize)>) -> Result<(Point, Prompts)> {
+    let prompts = repeat.cloned().unwrap_or_else(|| context_style.map_or_else(|| Prompts::fresh(c, set),
+        |(context, style)| context_prompts(context, style)));
     let batch = |texts: &[String]| -> Vec<Result<Timed>> {
         wave(client, texts.iter().map(|text| plain(client, text, tokens)).collect())
     };
@@ -192,7 +203,9 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     let mark = client.thermal_mark();
     let fabric_mark = client.fabric_mark();
     let tables = mapped_counters(client);
+    let before = client.stats().ok();
     let (results, occupancy) = observed_wave(client, || batch(&prompts.timed));
+    let draft_counters = draft_delta(before.as_ref(), client.stats().ok().as_ref());
     let results = uncached(results)?;
     let mapped_tables = mapped_interval(&tables, &mapped_counters(client));
     let fabric = client.fabric_since(fabric_mark, &format!("{phase}/c{c}"), true).map(|p| serde_json::json!(p));
@@ -204,14 +217,37 @@ fn measure(client: &Client, c: usize, phase: &str, repeat: Option<&Prompts>, tok
     }
     let mut per: Vec<f64> = ok.iter().map(|r| r.chat.timing.decode_tok_s()).collect();
     let mut ttft: Vec<f64> = ok.iter().map(|r| r.chat.timing.ttft_s).collect();
-    let requests = ok.iter().map(|r| RequestTiming { sent_s: r.sent, ttft_s: r.chat.timing.ttft_s,
+    use sha2::{Digest, Sha256};
+    let requests = ok.iter().zip(&prompts.timed).map(|(r, prompt)| RequestTiming { sent_s: r.sent, ttft_s: r.chat.timing.ttft_s,
         first_s: r.first(), last_s: r.last(), completion_tokens: r.chat.timing.completion_tokens,
-        cached_tokens: r.chat.timing.cached_tokens }).collect();
+        cached_tokens: r.chat.timing.cached_tokens, prompt_tokens: r.chat.timing.prompt_tokens,
+        prompt_sha256: format!("{:x}", Sha256::digest(prompt.as_bytes())) }).collect();
     ttft.sort_by(f64::total_cmp);
     let ttft_p95_s = ttft[(ttft.len() * 95).div_ceil(100).saturating_sub(1)];
-    let point = Point { c, phase: phase.into(), aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
+    let point = Point { c, phase: phase.into(), context: context_style.map(|(n, _)| n),
+        style: context_style.map(|(_, style)| CONTENT[style].0.into()), draft_counters, aggregate_tok_s: aggregate(&ok), per_request_tok_s: median(&mut per),
         ttft_s: median(&mut ttft), errors, thermal, fabric, mapped_tables, prompts: set, ttft_p95_s, requests, occupancy };
     Ok((point, prompts))
+}
+
+/// Fixed corpus reference lengths, not a per-server fit: all release arms send
+/// identical bytes. Actual tokenizer lengths and SHA256 are exported per request.
+fn context_prompts(context: u64, style: usize) -> Prompts {
+    let material = if context == 0 { String::new() } else { corpus(4242, context as usize) };
+    let prompt = || format!("[{}] {}\n\n{}", nonce(), material, CONTENT[style].1);
+    Prompts { warm: vec![prompt()], timed: vec![prompt()] }
+}
+
+fn draft_delta(before: Option<&Value>, after: Option<&Value>) -> Option<Value> {
+    let delta = |key: &str| {
+        after?["totals"][key].as_u64()?.checked_sub(before?["totals"][key].as_u64()?)
+    };
+    let rounds = delta("verification_rounds")?;
+    let drafted = delta("drafted_tokens")?;
+    let accepted = delta("accepted_drafts")?;
+    Some(serde_json::json!({"rounds": rounds, "drafted": drafted, "accepted": accepted,
+        "accepted_per_step": (rounds > 0).then(|| accepted as f64 / rounds as f64),
+        "drafted_per_step": (rounds > 0).then(|| drafted as f64 / rounds as f64)}))
 }
 
 fn decoding_requests(sample: &Value) -> Option<u64> {
@@ -325,7 +361,17 @@ pub fn run_windowed(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
 #[allow(clippy::too_many_arguments)]
 pub fn run_selected(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
     post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
-    set: PromptSet, mut on_timed: OnTimed) -> Result<Sweep> {
+    set: PromptSet, on_timed: OnTimed) -> Result<Sweep> {
+    run_configured(url, api_key, levels, post_load_c1, post_load_repeat, prefill_lengths, prefill_options,
+        fabric, tokens, set, &[], on_timed)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_configured(url: &str, api_key: Option<&str>, levels: &[usize], post_load_c1: bool,
+    post_load_repeat: bool, prefill_lengths: &[u64], prefill_options: &PrefillOptions, fabric: bool, tokens: u64,
+    set: PromptSet, c1_contexts: &[u64], mut on_timed: OnTimed) -> Result<Sweep> {
+    anyhow::ensure!(c1_contexts.is_empty() || (levels == [1] && tokens == 512 && !post_load_c1),
+        "C1 contexts require levels=[1], 512 output tokens, and no post-load repeat");
     if !(1..=MAX_TOKENS).contains(&tokens) {
         bail!("sweep tokens must be 1..={MAX_TOKENS}, got {tokens}");
     }
@@ -345,14 +391,21 @@ pub fn run_selected(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
     }
     let mark = client.thermal_mark();
     let mut c1_prompts = None;
-    for &c in levels {
-        let (point, prompts) = measure(&client, c, "levels", None, tokens, set, &mut on_timed)?;
+    for &context in c1_contexts {
+        anyhow::ensure!([0, 42_000, 213_000].contains(&context), "C1 context must be 0, 42000 or 213000");
+        for style in [1, 0] {
+            sweep.points.push(measure(&client, 1, "c1_context", None, tokens, set,
+                &mut on_timed, Some((context, style)))?.0);
+        }
+    }
+    for &c in levels.iter().filter(|_| c1_contexts.is_empty()) {
+        let (point, prompts) = measure(&client, c, "levels", None, tokens, set, &mut on_timed, None)?;
         if c == 1 && post_load_repeat { c1_prompts = Some(prompts); }
         sweep.points.push(point);
     }
     if post_load_c1 {
         let (phase, repeat) = if post_load_repeat { ("post_load_repeat", c1_prompts.as_ref()) } else { ("post_load", None) };
-        sweep.points.push(measure(&client, 1, phase, repeat, tokens, set, &mut on_timed)?.0);
+        sweep.points.push(measure(&client, 1, phase, repeat, tokens, set, &mut on_timed, None)?.0);
     }
     if !levels.is_empty() || post_load_c1 {
         if let Some(window) = client.thermal_since(mark) { sweep.thermal.insert("decode".into(), window); }
@@ -366,6 +419,22 @@ pub fn run_selected(url: &str, api_key: Option<&str>, levels: &[usize], post_loa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c1_context_has_fixed_material_and_distinct_warm_prefix() {
+        let a = context_prompts(42_000, 1);
+        let b = context_prompts(42_000, 1);
+        let body = |s: &str| s.split_once("] ").unwrap().1.to_owned();
+        assert_eq!(body(&a.warm[0]), body(&a.timed[0]));
+        assert_eq!(body(&a.timed[0]), body(&b.timed[0]));
+        assert_ne!(a.warm, a.timed);
+        assert!(a.timed[0].ends_with(CONTENT[1].1));
+        assert!(context_prompts(0, 0).timed[0].ends_with(CONTENT[0].1));
+        let before = serde_json::json!({"totals":{"verification_rounds":10,"drafted_tokens":40,"accepted_drafts":20}});
+        let after = serde_json::json!({"totals":{"verification_rounds":14,"drafted_tokens":56,"accepted_drafts":30}});
+        assert_eq!(draft_delta(Some(&before), Some(&after)).unwrap()["accepted_per_step"], 2.5);
+        assert!(draft_delta(None, Some(&after)).is_none());
+    }
 
     #[test]
     fn levels_parse_in_order_and_refuse_nonsense() {

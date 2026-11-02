@@ -142,6 +142,9 @@ pub struct Entry {
     /// Explicit workload selection; omitted preserves existing code-nonce sweeps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sweep_prompts: Option<crate::sweep::PromptSet>,
+    /// C1 prose/code grid at fixed corpus-reference contexts (0 means short).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sweep_c1_contexts: Option<Vec<u64>>,
     /// `false` runs explicit panels without the server's baseline (basic card
     /// + quick quality); default true. Needs a server build that honours it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,6 +484,7 @@ impl Entry {
             prefill_purge: self.prefill_purge.clone().or_else(|| defaults.prefill_purge.clone()),
             sweep_tokens: self.sweep_tokens.or(defaults.sweep_tokens),
             sweep_prompts: self.sweep_prompts.or(defaults.sweep_prompts),
+            sweep_c1_contexts: self.sweep_c1_contexts.clone().or_else(|| defaults.sweep_c1_contexts.clone()),
             baseline: self.baseline.or(defaults.baseline),
             window: self.window.clone().or_else(|| defaults.window.clone()),
             lossless_set: self.lossless_set.clone().or_else(|| defaults.lossless_set.clone()),
@@ -908,6 +912,11 @@ fn save_state(path: &Path, state: &BTreeMap<String, Outcome>) -> Result<()> {
 
 /// `post_load_c1` runs after the widest level; `post_load_repeat` replays the levels C1.
 fn check_post_load(entry: &Entry) -> Result<()> {
+    if let Some(contexts) = &entry.sweep_c1_contexts {
+        anyhow::ensure!(!contexts.is_empty() && contexts.iter().all(|n| [0, 42000, 213000].contains(n))
+            && entry.levels.as_deref() == Some(&[1]) && entry.sweep_tokens == Some(512)
+            && entry.post_load_c1 != Some(true), "C1 contexts require 0/42000/213000, levels=[1], 512 tokens, no post-load");
+    }
     if entry.sweep_prompts.is_some() && entry.levels.as_ref().is_none_or(Vec::is_empty) {
         bail!("{}: sweep_prompts needs levels", entry.name);
     }
@@ -1401,10 +1410,10 @@ fn run_entry(entry: &Entry, repo: &Path, out_root: &Path, configs: &Path, logs: 
                 .map(|hook| move || window_hook("prefill-purge", hook, purge_url, purge_config));
             let prefill = crate::sweep::PrefillOptions { repeat: entry.prefill_repeat.unwrap_or(false),
                 purge: purge.as_ref().map(|purge| purge as &dyn Fn() -> Result<()>) };
-            let sweep = crate::sweep::run_selected(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
+            let sweep = crate::sweep::run_configured(&url, api_key.as_deref(), entry.levels.as_deref().unwrap_or(&[]),
                 entry.post_load_c1.unwrap_or(false), entry.post_load_repeat.unwrap_or(false), entry.prefill_lengths.as_deref().unwrap_or(&[]),
                 &prefill, entry.fabric.unwrap_or(true), entry.sweep_tokens.unwrap_or(crate::sweep::TOKENS),
-                entry.sweep_prompts.unwrap_or_default(), open);
+                entry.sweep_prompts.unwrap_or_default(), entry.sweep_c1_contexts.as_deref().unwrap_or(&[]), open);
             let closed = close_window(&url, &config_path);
             let sweep = sweep?;
             closed?;
@@ -1664,6 +1673,11 @@ mod tests {
 
     #[test]
     fn sweep_prompts_merge_and_change_resume_key() {
+        let c1 = Entry { levels: Some(vec![1]), sweep_tokens: Some(512), sweep_c1_contexts: Some(vec![0,42000,213000]), ..Default::default() };
+        assert!(check_post_load(&c1).is_ok());
+        assert_eq!(Entry::default().merged(&c1).sweep_c1_contexts, c1.sweep_c1_contexts);
+        assert_ne!(c1.key(), Entry::default().key());
+        assert!(check_post_load(&Entry { levels: Some(vec![16]), ..c1 }).is_err());
         use crate::sweep::PromptSet;
         let defaults = Entry { sweep_prompts: Some(PromptSet::Shared), ..Entry::default() };
         assert!(check_post_load(&defaults).unwrap_err().to_string().contains("sweep_prompts needs levels"));
