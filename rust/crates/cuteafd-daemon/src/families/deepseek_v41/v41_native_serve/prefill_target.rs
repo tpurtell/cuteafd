@@ -645,11 +645,17 @@ impl<'a> PrefillTarget<'a> for DistributedTargetPass<'_, 'a> {
             draft.begin_queued_commit(0, commit.pass, commit.requests, commit.batch, accepted)?;
         }
         commit.pass.enqueue_cache_commit(commit.requests, commit.batch, accepted)?;
-        loop {
+        let outcome = crate::shared::serve::lanes::wait_ready(|| {
             let target_ready = commit.pass.poll_cache_commit()?;
             let draft_ready = commit.draft.as_ref().map(|draft| draft.poll_queued_commit(0)).transpose()?.unwrap_or(true);
-            if target_ready && draft_ready { break; }
-            tokio::task::yield_now().await;
+            Ok(target_ready && draft_ready)
+        }, crate::shared::serve::lanes::COMMIT_DEADLINE).await?;
+        if outcome == crate::shared::serve::lanes::WaitOutcome::TimedOut {
+            // Do not synchronize on the abandoned stream in Drop: that would
+            // block the current-thread serving runtime. Quarantine instead.
+            commit.armed = false;
+            anyhow::bail!("prefill target commit did not drain within {:?}",
+                crate::shared::serve::lanes::COMMIT_DEADLINE);
         }
         if let Some(draft) = &mut commit.draft {
             draft.finish_queued_commit(0, commit.pass, commit.requests, commit.batch, accepted)?;

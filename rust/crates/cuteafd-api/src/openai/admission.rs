@@ -5,14 +5,23 @@ use tokio::sync::{mpsc, Semaphore};
 #[derive(Clone)]
 pub(super) struct Admission {
     waiters: Arc<Semaphore>,
-    depth: usize,
     wait: Duration,
     waits: Arc<AtomicU64>,
     wait_ms: Arc<AtomicU64>,
     rejects: Arc<AtomicU64>,
     rejects_full: Arc<AtomicU64>,
     rejects_timeout: Arc<AtomicU64>,
+    active_waiters: Arc<AtomicU64>,
     waiters_peak: Arc<AtomicU64>,
+}
+
+/// Counts a held waiter slot for the peak gauge and releases it on drop.
+struct WaiterGuard<'a> {
+    admission: &'a Admission,
+    _permit: tokio::sync::SemaphorePermit<'a>,
+}
+impl Drop for WaiterGuard<'_> {
+    fn drop(&mut self) { self.admission.active_waiters.fetch_sub(1, Ordering::Relaxed); }
 }
 #[derive(Debug, PartialEq)]
 pub(super) enum Rejected {
@@ -25,9 +34,10 @@ pub(super) enum Rejected {
 }
 impl Admission {
     pub fn new(depth: usize, wait: Duration) -> Self {
-        Self { waiters: Arc::new(Semaphore::new(depth)), depth, wait,
+        Self { waiters: Arc::new(Semaphore::new(depth)), wait,
             waits: Arc::default(), wait_ms: Arc::default(), rejects: Arc::default(),
-            rejects_full: Arc::default(), rejects_timeout: Arc::default(), waiters_peak: Arc::default() }
+            rejects_full: Arc::default(), rejects_timeout: Arc::default(),
+            active_waiters: Arc::default(), waiters_peak: Arc::default() }
     }
     pub fn metrics(&self) -> serde_json::Value {
         serde_json::json!({"http_queue_waits": self.waits.load(Ordering::Relaxed),
@@ -44,13 +54,16 @@ impl Admission {
             Err(mpsc::error::TrySendError::Full(_)) => {}
         }
         // Without this bound, timeout(send) retains arbitrarily many prompts.
-        let _waiter = self.waiters.try_acquire().map_err(|_| {
+        let permit = self.waiters.try_acquire().map_err(|_| {
             self.rejects.fetch_add(1, Ordering::Relaxed);
             self.rejects_full.fetch_add(1, Ordering::Relaxed);
             Rejected::Full
         })?;
-        let held = self.depth.saturating_sub(self.waiters.available_permits());
-        self.waiters_peak.fetch_max(held as u64, Ordering::Relaxed);
+        // Count the held slot atomically: deriving it from `available_permits`
+        // races with other waiters and can undercount the peak (finding 6).
+        let held = self.active_waiters.fetch_add(1, Ordering::Relaxed) + 1;
+        self.waiters_peak.fetch_max(held, Ordering::Relaxed);
+        let _waiter = WaiterGuard { admission: self, _permit: permit };
         self.waits.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let result = tokio::time::timeout(self.wait, queue.reserve_owned()).await;
@@ -140,5 +153,25 @@ mod tests {
         for p in &pending { p.abort(); }
         for p in pending { let _ = p.await; }
         assert_eq!(admission.metrics()["http_queue_waiters_peak"], 3);
+    }
+    /// Finding 6: the peak is counted from an atomic held-slot counter, not from
+    /// `available_permits` (which races with other waiters and can undercount).
+    /// Under concurrent acquisition the peak must equal the true maximum.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiters_peak_is_exact_under_concurrent_acquisition() {
+        let (tx, _rx) = mpsc::channel(1); tx.send(1).await.unwrap();
+        let admission = Admission::new(8, Duration::from_secs(60));
+        let mut pending = Vec::new();
+        for _ in 0..8 {
+            pending.push(tokio::spawn({let a=admission.clone(); let tx=tx.clone(); async move {a.reserve(tx).await}}));
+        }
+        for _ in 0..1000 {
+            if admission.waiters.available_permits() == 0 { break; }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(admission.waiters.available_permits(), 0);
+        assert_eq!(admission.metrics()["http_queue_waiters_peak"], 8);
+        for p in &pending { p.abort(); }
+        for p in pending { let _ = p.await; }
     }
 }

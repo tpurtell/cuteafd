@@ -406,6 +406,7 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
     let cacheable = request.cacheable && prefixes.borrow().turn_bank_enabled()
         && requests.borrow().cache().request_id(request.lease).is_ok();
     if cacheable {
+        let mut timed_out = false;
         let retained: Result<()> = async {
             let next = request.next_after_commit.as_ref().context("finished request has no retained logits")?;
             prefixes.borrow_mut().capture_session(request.job.usage.as_ref().map(|u| u.session_id().to_owned()));
@@ -417,18 +418,33 @@ async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, req
             if queued {
                 tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
                     "independent snapshot queued");
-                let ready = lanes::wait_ready(|| prefixes.borrow_mut().poll_retain(lane,
-                    &mut requests.borrow_mut(), draft.borrow_mut().as_deref_mut()), lanes::RETAIN_DEADLINE).await?;
-                ensure!(ready, "prefix retain did not publish within {:?}", lanes::RETAIN_DEADLINE);
-                tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
-                    "independent snapshot published");
+                match lanes::wait_ready(|| prefixes.borrow_mut().poll_retain(lane,
+                    &mut requests.borrow_mut(), draft.borrow_mut().as_deref_mut()), lanes::RETAIN_DEADLINE).await? {
+                    lanes::WaitOutcome::Ready => {
+                        tracing::debug!(target: "cuteafd::lane_schedule", lane, request_id=request.id(),
+                            "independent snapshot published");
+                    }
+                    lanes::WaitOutcome::TimedOut => {
+                        // Do not synchronize on the abandoned stream: that would
+                        // block the current-thread serving runtime. Quarantine the
+                        // lane's pending capture instead (its storage is never
+                        // reused) and let the request retire.
+                        timed_out = true;
+                        prefixes.borrow_mut().quarantine_retain(lane);
+                        anyhow::bail!("prefix retain did not publish within {:?}", lanes::RETAIN_DEADLINE);
+                    }
+                }
             }
             Ok(())
         }.await;
         if let Err(error) = retained {
-            if let Err(cleanup) = prefixes.borrow_mut().abort_retain(lane, &mut requests.borrow_mut(),
-                draft.borrow_mut().as_deref_mut()) {
-                tracing::error!(%cleanup, "draining failed independent snapshot");
+            // A timed-out retain already quarantined its lane; only a real error
+            // needs the synchronizing abort.
+            if !timed_out {
+                if let Err(cleanup) = prefixes.borrow_mut().abort_retain(lane, &mut requests.borrow_mut(),
+                    draft.borrow_mut().as_deref_mut()) {
+                    tracing::error!(%cleanup, "draining failed independent snapshot");
+                }
             }
             tracing::warn!(%error, "completed request prefix was not retained");
         }

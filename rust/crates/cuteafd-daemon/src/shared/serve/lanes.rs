@@ -24,22 +24,35 @@ const WAIT_SPINS: u32 = 64;
 /// One sleep of a bounded wait past [`WAIT_SPINS`].
 const WAIT_SLEEP: Duration = Duration::from_micros(200);
 
+/// The outcome of a bounded wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WaitOutcome {
+    /// The copy/commit drained.
+    Ready,
+    /// The deadline expired before it drained.
+    TimedOut,
+}
+
 /// Poll `ready` until it reports true, bounded by `deadline`. A device copy or
 /// commit that never completes must not spin the lane at 100% CPU forever
-/// (W64 F3 cancel storm): after a short spin, sleep; after `deadline`, give up
-/// so the caller can abort the copy and release its owners.
-pub(crate) async fn wait_ready(mut ready: impl FnMut() -> Result<bool>, deadline: Duration) -> Result<bool> {
+/// (W64 F3): after a short spin, sleep; after `deadline`, give up so the caller
+/// can quarantine the copy instead of synchronizing on it.
+///
+/// The already-ready path is the hot path: it polls once and never reads the
+/// clock or sleeps, so a normal round pays no timer cost.
+pub(crate) async fn wait_ready(mut ready: impl FnMut() -> Result<bool>, deadline: Duration) -> Result<WaitOutcome> {
+    if ready()? { return Ok(WaitOutcome::Ready); }
     let started = Instant::now();
     let mut spins = 0u32;
     loop {
-        if ready()? { return Ok(true); }
-        if started.elapsed() >= deadline { return Ok(false); }
+        if started.elapsed() >= deadline { return Ok(WaitOutcome::TimedOut); }
         if spins < WAIT_SPINS {
             spins += 1;
             tokio::task::yield_now().await;
         } else {
             tokio::time::sleep(WAIT_SLEEP).await;
         }
+        if ready()? { return Ok(WaitOutcome::Ready); }
     }
 }
 
@@ -160,19 +173,38 @@ pub(crate) trait LaneCommit {
     /// Drain whatever was enqueued and revoke the round's batch, leaving every
     /// owner releasable. Runs after any failure of the steps above.
     fn abort_and_drain(&mut self) -> Result<()>;
+    /// Abandon a commit whose copies did not drain within the deadline. Must NOT
+    /// synchronize on the abandoned stream: that would block the serving thread
+    /// (V4.1 native serve runs on a current-thread runtime). The default leaves
+    /// the owners in place for the caller to quarantine.
+    fn quarantine(&mut self) -> Result<()> { Ok(()) }
 }
 
 /// Begin, wait (yielding to peer lanes) and publish one commit; on failure
-/// drain it first and return the original error.
+/// drain it first and return the original error. A timed-out commit is
+/// quarantined instead of drained: synchronizing on the stream it just gave up
+/// on would freeze the whole server.
 pub(crate) async fn commit(commit: &mut impl LaneCommit) -> Result<()> {
-    let result = async {
-        commit.begin()?;
-        anyhow::ensure!(wait_ready(|| commit.ready(), COMMIT_DEADLINE).await?,
-            "lane commit did not drain within {COMMIT_DEADLINE:?}");
-        commit.publish()
-    }.await;
+    commit_with_deadline(commit, COMMIT_DEADLINE).await
+}
+
+/// [`commit`] with an explicit deadline (tests use a short one).
+async fn commit_with_deadline(commit: &mut impl LaneCommit, deadline: Duration) -> Result<()> {
+    let mut timed_out = false;
+    let result = match commit.begin() {
+        Ok(()) => match wait_ready(|| commit.ready(), deadline).await {
+            Ok(WaitOutcome::Ready) => commit.publish(),
+            Ok(WaitOutcome::TimedOut) => {
+                timed_out = true;
+                Err(anyhow::anyhow!("lane commit did not drain within {deadline:?}"))
+            }
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
     if let Err(error) = result {
-        if let Err(cleanup) = commit.abort_and_drain() {
+        let cleanup = if timed_out { commit.quarantine() } else { commit.abort_and_drain() };
+        if let Err(cleanup) = cleanup {
             tracing::error!(%cleanup, "draining a failed lane commit");
         }
         return Err(error);
@@ -337,21 +369,51 @@ mod tests {
     #[test]
     fn a_wait_that_never_becomes_ready_gives_up_instead_of_spinning() {
         let started = Instant::now();
-        let ready = block_on(wait_ready(|| Ok(false), Duration::from_millis(20))).unwrap();
-        assert!(!ready);
+        let outcome = block_on(wait_ready(|| Ok(false), Duration::from_millis(20))).unwrap();
+        assert_eq!(outcome, WaitOutcome::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(2), "the wait must not spin past its deadline");
     }
     #[test]
-    fn a_wait_that_becomes_ready_returns_true() {
+    fn a_wait_that_becomes_ready_returns_ready() {
         let mut polls = 0;
-        let ready = block_on(wait_ready(|| { polls += 1; Ok(polls >= 3) }, Duration::from_secs(1))).unwrap();
-        assert!(ready && polls == 3);
+        let outcome = block_on(wait_ready(|| { polls += 1; Ok(polls >= 3) }, Duration::from_secs(1))).unwrap();
+        assert_eq!(outcome, WaitOutcome::Ready);
+        assert_eq!(polls, 3);
+    }
+    /// Finding 4: the already-ready path is the hot path. It must poll exactly
+    /// once and never enter the timer/sleep loop, so a normal round pays no
+    /// timer stall.
+    #[test]
+    fn an_already_ready_wait_polls_once_and_never_sleeps() {
+        let mut polls = 0;
+        let outcome = block_on(wait_ready(|| { polls += 1; Ok(true) }, Duration::ZERO)).unwrap();
+        assert_eq!(outcome, WaitOutcome::Ready);
+        assert_eq!(polls, 1, "the ready path must not poll again");
     }
     #[test]
     fn a_wait_propagates_a_poll_error() {
         let error = block_on(wait_ready(|| -> Result<bool> { anyhow::bail!("poll failed") },
             Duration::from_secs(1))).unwrap_err();
         assert_eq!(error.to_string(), "poll failed");
+    }
+    /// Finding 1: a timed-out commit must be quarantined, not drained. Draining
+    /// synchronizes on the stream the wait just gave up on, which blocks the
+    /// current-thread serving runtime.
+    #[test]
+    fn a_timed_out_commit_is_quarantined_not_drained() {
+        struct Stuck { log: Vec<&'static str> }
+        impl LaneCommit for Stuck {
+            fn begin(&mut self) -> Result<()> { self.log.push("begin"); Ok(()) }
+            fn ready(&mut self) -> Result<bool> { Ok(false) }
+            fn publish(&mut self) -> Result<()> { self.log.push("publish"); Ok(()) }
+            fn abort_and_drain(&mut self) -> Result<()> { self.log.push("abort"); Ok(()) }
+            fn quarantine(&mut self) -> Result<()> { self.log.push("quarantine"); Ok(()) }
+        }
+        let mut stuck = Stuck { log: Vec::new() };
+        // A zero deadline makes the first non-ready poll time out immediately.
+        let error = block_on(commit_with_deadline(&mut stuck, Duration::ZERO));
+        assert!(error.is_err());
+        assert_eq!(stuck.log, ["begin", "quarantine"], "a timed-out commit must not drain");
     }
     /// The commit and the cancel/retire path both use the bounded wait, so a
     /// stuck device copy cannot hold a lane forever.
@@ -362,6 +424,7 @@ mod tests {
         let independent = include_str!("../../families/deepseek_v41/v41_native_serve/scheduler/independent.rs");
         assert!(independent.contains("lanes::wait_ready("));
         assert!(independent.contains("lanes::RETAIN_DEADLINE"));
+        assert!(independent.contains("quarantine_retain"));
         assert!(!independent.contains("loop {\n                    let ready = prefixes.borrow_mut().poll_retain"));
     }
 }

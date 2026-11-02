@@ -20,7 +20,10 @@ impl<'a, T> SnapshotCopies<'a, T> {
     pub fn abort(&mut self) -> Result<()> {
         if self.pending.is_none() { return Ok(()); }
         let drained = unsafe { self.stream.library.cuda_stream_synchronize(self.stream.raw) };
-        self.pending = None;
+        // Only free the lane once the drain is proven. A failed drain may still
+        // have copies in flight; clearing `pending` would let the request be
+        // released and its storage reused underneath them (finding 3).
+        if drained.is_ok() { self.pending = None; }
         drained
     }
 }

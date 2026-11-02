@@ -279,7 +279,10 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         let batch = slot.batch.as_mut().context("encoder unit batch absent")?;
         let rows = super::super::encoder_units::member_rows(batch)?;
         slot.pass.enqueue_cache_commit(&self.requests.borrow(), batch, &rows)?;
-        while !slot.pass.poll_cache_commit()? { tokio::task::yield_now().await; }
+        let outcome = crate::shared::serve::lanes::wait_ready(|| slot.pass.poll_cache_commit(),
+            crate::shared::serve::lanes::COMMIT_DEADLINE).await?;
+        anyhow::ensure!(outcome == crate::shared::serve::lanes::WaitOutcome::Ready,
+            "encoder unit commit did not drain within {:?}", crate::shared::serve::lanes::COMMIT_DEADLINE);
         slot.pass.commit(&mut self.requests.borrow_mut(), batch, &rows)?;
         slot.batch = None;
         crate::families::deepseek_v41::v41_native_serve::console::totals::prefill(unit.rows.len());

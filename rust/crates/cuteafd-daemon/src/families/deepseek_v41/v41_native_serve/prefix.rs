@@ -533,6 +533,17 @@ impl<'a> V41Cache<'a> {
         let family = V41Prefix::new(requests, draft, &self.arenas, self.partial);
         self.cache.abort_capture(&family, ticket).map_err(|e| anyhow::anyhow!("{e}"))
     }
+    /// Abandon a queued retain whose copies did not drain within the deadline.
+    /// Does NOT synchronize on the abandoned stream (that would block the
+    /// current-thread serving runtime); the lane's pending ticket stays in place,
+    /// so its mark/pages are never handed out again. The lane is quarantined
+    /// until the process restarts.
+    pub fn quarantine_retain(&mut self, lane: usize) {
+        if self.pending.get(lane).copied().flatten().is_some() {
+            tracing::error!(target: "cuteafd::prefix", lane,
+                "queued prefix retain did not drain; quarantining its lane");
+        }
+    }
 }
 
 /// The radix key of a request's `tokens` (its prompt then its generated tokens): the prompt's
