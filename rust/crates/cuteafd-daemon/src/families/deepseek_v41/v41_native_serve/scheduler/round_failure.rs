@@ -297,7 +297,7 @@ pub(super) mod tests {
             let (request, output, _) = active_fixture(id, 0);
             slots.insert(id as usize); kv.insert(id); draft.insert(id);
             let now = std::time::Instant::now();
-            pending.push_back((super::super::admission::Prepared { job: request.job, prompt: vec![0], images: vec![], prefix_deferred: false },
+            pending.push_back((super::super::admission::Prepared { job: request.job, prompt: vec![0], images: vec![] },
                 id, request.lease, id as usize, request.image_keys, None, (now, now)));
             outputs.push(output);
         }
